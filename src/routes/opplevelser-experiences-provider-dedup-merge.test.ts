@@ -112,6 +112,9 @@ export function runOpplevelserExperiencesProviderDedupMergeTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -220,6 +223,7 @@ export function runOpplevelserExperiencesProviderDedupMergeTests(
       // repoint ever having happened.
       expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-preexisting-keep' WHERE id = 'prov-preexisting-remove'`).run();
 
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) 403 without X-Admin-Key ─────────────────────────────────────────
@@ -393,6 +397,7 @@ export function runOpplevelserExperiencesProviderDedupMergeTests(
       failed++;
       failures.push("opplevelser-experiences-provider-dedup-merge: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;
       } else {

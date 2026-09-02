@@ -43,7 +43,50 @@ export function __initSchemaForTesting(injected: Database.Database): void {
   initSchema(injected);
 }
 
+// Test-only: pin the singleton to a FRESH, schema-initialised in-memory DB for
+// the duration of one test harness and hand back the restore. Composes the
+// three seams above (peek → set → initSchema) into the one shape every
+// harness that exercises a main-db-gated route needs — since dev-request
+// 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak every
+// apply:true admin write route under /api/opplevelser reads
+// `enrichment_write_pause` off THIS singleton (fail-closed), so a harness that
+// runs after another block left the singleton on a closed throwaway handle
+// would otherwise see 423s. The restore puts back whatever was there before
+// (null → the next getDb() reopens the real file, i.e. the pristine state).
+// Never call from production code.
+export function __pinInMemoryDbForTesting(): () => void {
+  const prev = db;
+  const pinned = new Database(":memory:");
+  pinned.pragma("journal_mode = DELETE");
+  pinned.pragma("foreign_keys = OFF");
+  initSchema(pinned);
+  db = pinned;
+  return () => {
+    // Re-entrancy-safe: only put `prev` back if the singleton is STILL our
+    // pinned handle. If another block pinned/injected after us (top-level
+    // harness blocks in tests/test.ts run concurrently unless chained), a
+    // blind `db = prev` would clobber their handle — and closing ours while
+    // they hold it as THEIR `prev` would leave them restoring to a closed DB.
+    // So when we are no longer current we neither restore nor close (an
+    // in-memory handle leaking for the remainder of the process is harmless).
+    if (db !== pinned) return;
+    db = prev;
+    try { pinned.close(); } catch { /* already closed */ }
+  };
+}
+
+// Test-only: make getDb() ITSELF throw on its next invocations (until reset
+// with null). Needed to prove a guard receives the ACCESSOR as a thunk rather
+// than an eagerly-evaluated handle — a handle whose prepare() throws cannot
+// tell the two apart, because by then getDb() has already returned. Never
+// call from production code.
+let dbAccessorFailureForTesting: Error | null = null;
+export function __setDbAccessorFailureForTesting(err: Error | null): void {
+  dbAccessorFailureForTesting = err;
+}
+
 export function getDb(): Database.Database {
+  if (dbAccessorFailureForTesting) throw dbAccessorFailureForTesting;
   if (!db) {
     // Ensure data directory exists
     const dir = path.dirname(DB_PATH);

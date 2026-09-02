@@ -643,11 +643,24 @@ export function getPublishedExperienceById(
 // detail-completeness-coverage admin report (opplevelser.ts) reports over
 // the SAME "published" set the detail page/`/discover` actually surface,
 // rather than redefining the gate a second time.
+//
+// dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+// rapportspraak, del 2: a provider flagged `catalog_hidden = 1` (the
+// gårdssalg-side visibility lever, POST /admin/gardssalg-provider-visibility)
+// must hide its EXPERIENCES too — before this, only the gårdssalg surfaces
+// honoured the flag, so a hidden provider's verified experiences still
+// surfaced on /discover, the detail page, the sitemap and the FAQ counts.
+// LEFT-JOIN-safe: no provider row → p.catalog_hidden IS NULL → passes, same
+// shape as the brreg_active clause above it and the same
+// `(catalog_hidden IS NULL OR catalog_hidden != 1)` form every gårdssalg
+// query in this file already uses. discoverExperiences() reuses this exact
+// constant (single source of truth) rather than carrying its own copy.
 export const PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
   "AND (p.id IS NULL OR p.brreg_active = 1) " +
-  "AND e.canonical_id IS NULL";
+  "AND e.canonical_id IS NULL " +
+  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
 
 export function getPublishedExperienceBySlug(
   slug: string
@@ -1388,14 +1401,14 @@ export function discoverExperiences(
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
-  const where: string[] = [
-    "e.verification_status = 'verified'",
-    "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
-    "(p.id IS NULL OR p.brreg_active = 1)",
-    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1: never
-    // surface a row the dedup pass merged away as a duplicate.
-    "e.canonical_id IS NULL",
-  ];
+  // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
+  // high/medium + provider brreg_active + canonical (never a dedup-merged
+  // duplicate, dev-request 2026-07-04-opplevagent-dedup-og-norske-titler
+  // item 1) + provider not catalog_hidden (dev-request 2026-09-02-
+  // experiences-skrivepause-catalog-hidden-og-rapportspraak, del 2). This
+  // used to be an inline copy of the same clauses; one constant now, so the
+  // set /discover surfaces can never drift from the detail page / sitemap.
+  const where: string[] = [PUBLISH_GATE_SQL];
   const params: Record<string, unknown> = {};
 
   // near-me geo filter (dev-request 2026-07-04-opplevagent-naer-meg-geosok,

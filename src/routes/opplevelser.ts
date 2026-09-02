@@ -741,6 +741,16 @@ import {
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
+// dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak,
+// del 1: the MECHANICAL enrichment write-pause fence (services/enrichment-
+// write-pause.ts) wired onto every apply:true write route in this file. The
+// pause row lives on the MAIN db (getRfbDb), never on experiences.db — see
+// experiencesWritePauseBlock() below.
+import {
+  enrichmentWritePauseBlock,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  sendEnrichmentWritePausedIfPaused,
+} from "../services/enrichment-write-pause";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
 // shared LLM-judge contact gate for the gardssalg-autosvar-apply call site
 // (applyGardssalgProviderContact's own gate call lives inside
@@ -787,6 +797,73 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   next();
+}
+
+/**
+ * Enrichment write-pause gate for the "experiences" vertical — ONE shared
+ * lookup for the apply:true admin write routes in this file (dev-request
+ * 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak, del 1).
+ *
+ * Returns `null` when writes are allowed, else the exact 423 body to send.
+ * Call it AFTER the route has parsed its apply/dry_run flag and ONLY on the
+ * path that will actually write — a dry-run must never be blocked.
+ *
+ * ── Gated (18 routes) ────────────────────────────────────────────────────
+ * The routine-called enrichment writers: bulk-load, content-refresh,
+ * gardssalg-content-refresh, experiences-description-enrichment,
+ * experiences-title-no-backfill, experiences-content-judge-sweep,
+ * experiences-dedup-backfill, price-freshness-check,
+ * experiences-provider-dedup-merge, gardssalg-provider-dedup-merge,
+ * providers/hjemmeside-write, and (PR #765 review round 2)
+ * gardssalg-website-verification-remediation, gardssalg-website-discovery,
+ * listing-homepage-discovery, brreg-website-discovery,
+ * gardssalg-orgnr-backfill, gardssalg-contact-backfill,
+ * gardssalg-website-review-approve. Proven per route in
+ * opplevelser-write-pause-gate.test.ts.
+ *
+ * ── Disclosed, out-of-scope gaps (PR #765 review round 2) ────────────────
+ * Still UNGATED, documented rather than claimed covered — same discipline as
+ * services/enrichment-write-pause.ts's own "Disclosed, out-of-scope gaps"
+ * block for rfb. Follow-up work, deliberately not gated in this PR:
+ *   - the manual operator levers: every gardssalg-set-* route (address,
+ *     contact-email, contact-phone, content-field, field-lock, hjemmeside,
+ *     org-nr, producer-type, products, provider-name, terminal-status),
+ *     gardssalg-content-clear, gardssalg-content-rollback,
+ *     gardssalg-rollback-veto-override, gardssalg-claim-grant/-revoke,
+ *     gardssalg-booking-activation, gardssalg-provider-visibility,
+ *     gardssalg-medlemsliste-bekreft, PATCH providers/:id/hjemmeside,
+ *     homepage-review-queue/submit, gardssalg/test-provider, rfb-seed
+ *     (POST + DELETE), fylke-2024-migration;
+ *   - the review-approve / judge levers not listed above:
+ *     listing-homepage-review-approve, gardssalg-orgnr-review-approve,
+ *     gardssalg-orgnr-review-judge, gardssalg-autosvar-review-approve,
+ *     gardssalg-field-concordance-review-approve,
+ *     gardssalg-experience-conflict-review;
+ *   - the remaining enrichment / remediation sweeps:
+ *     gardssalg-mojibake-backfill, experiences-dedup-unmerge,
+ *     experiences-canonical-group-merge, gardssalg-address-enrichment,
+ *     gardssalg-autosvar-apply, gardssalg-brreg-verify,
+ *     gardssalg-contact-extraction, gardssalg-content-quality-update,
+ *     gardssalg-drikkeliste-remediation, gardssalg-epost-synthesis-
+ *     remediation, gardssalg-experience-conflict-remediation,
+ *     gardssalg-field-concordance-remediation/-clear,
+ *     gardssalg-kildeklasse-contact-intake, gardssalg-nace-discovery,
+ *     gardssalg-nace-agent-bridge, gardssalg-outreach-size-gate (delegates
+ *     its writes to gated routes in-process, but is not gated itself),
+ *     gardssalg-outreach-preflight/-pilot-send, gardssalg-owner-lock-backfill,
+ *     gardssalg-producer-type-classify, gardssalg-retro-scan,
+ *     gardssalg-second-line-verify, gardssalg-veien-til-pool,
+ *     hjemmeside-cleanup-sweep, evidence-url-verification-sweep,
+ *     experiences-admission-promotion-rollback, experiences-wrong-content-
+ *     rate, rfb-knowledge-enrich, booking-test-send, claim-test-send.
+ *
+ * The pause table lives on the MAIN database (getRfbDb → database/init.ts),
+ * not on experiences.db; the THUNK is passed (not `getRfbDb()`) so a getDb()
+ * that throws fails CLOSED inside the fence as a 423 `fail_closed:true`
+ * rather than escaping as a 500 — see EnrichmentWriteDb in the service.
+ */
+function experiencesWritePauseBlock() {
+  return enrichmentWritePauseBlock(getRfbDb, "experiences");
 }
 
 function parseDiscoverQuery(req: Request) {
@@ -1549,6 +1626,15 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
 
   const dryRun = body.apply !== true;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   // ── 1. Group rows by provider_name (trimmed). ─────────────────────
   const byProvider = new Map<string, BulkRow[]>();
   for (const row of body.experiences) {
@@ -2109,6 +2195,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // limit: default 25, hard cap 100.
   const limit = Math.min(
@@ -3219,6 +3314,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // limit: default 25, hard cap 48 (Math.min mirrors CR_HARD_CAP's role, but
   // scoped to this vertical's real ceiling).
@@ -5470,6 +5574,15 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `website-discovery-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
@@ -5906,6 +6019,15 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const auto = body.auto === true;
   if (auto && Array.isArray(body.approvals) && body.approvals.length > 0) {
@@ -6183,6 +6305,15 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `listing-homepage-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const expDb = getExpDb("experiences");
@@ -6675,6 +6806,15 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `brreg-website-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const expDb = getExpDb("experiences");
@@ -8717,6 +8857,15 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const limit = Math.min(
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CB_DEFAULT_LIMIT,
@@ -11276,6 +11425,15 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const limit = Math.min(
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_OB_DEFAULT_LIMIT,
@@ -19959,6 +20117,15 @@ router.post("/admin/gardssalg-provider-dedup-merge", requireAdmin, (req: Request
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const dryRun = !apply;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
     res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
     return;
@@ -20016,6 +20183,7 @@ router.post("/admin/gardssalg-provider-dedup-merge", requireAdmin, (req: Request
       results,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-provider-dedup-merge] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -20981,6 +21149,16 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     return;
   }
 
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const expDb = getExpDb("experiences");
   try {
     // Shared adapter. Written out per route until now, and BOTH copies here
@@ -21072,6 +21250,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       ...(pagination ? { pagination } : {}),
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-website-verification-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -21388,6 +21567,15 @@ router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, r
     req.query?.apply === "1" ||
     req.query?.apply === "true";
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const limit = Math.min(
     PF_HARD_CAP,
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : PF_DEFAULT_LIMIT
@@ -21609,6 +21797,7 @@ router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, r
       skippedNoProvenance,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[price-freshness-check] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -23342,6 +23531,15 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     const applyMode = body.apply === true;
     const dryRun = !applyMode;
 
+    // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+    if (applyMode) {
+      const pauseBlock = experiencesWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
+
     // `limit`: query param takes precedence over body when both are given
     // (mirrors this route family's existing query/body tolerance elsewhere in
     // this file); non-numeric/absent falls back to the default, and the
@@ -23626,6 +23824,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       needs_review_after: needsReviewAfter,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -24287,6 +24486,15 @@ router.post("/admin/providers/hjemmeside-write", requireAdmin, (req: Request, re
     req.query?.apply === "1" || req.query?.apply === "true";
   const dryRun = !apply;
   const topLevelAllowLockedOverride = body.allow_locked_override === true;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   if (!Array.isArray(body.items)) {
     res.status(400).json({ error: "Body must contain an 'items' array of {provider_id, hjemmeside}" });
@@ -25222,6 +25430,14 @@ router.get(
 // Idempotent (runDedupPass only loads canonical_id IS NULL rows) — safe to
 // call more than once; a second call finds nothing left to merge.
 router.post("/admin/experiences-dedup-backfill", requireAdmin, (_req: Request, res: Response) => {
+  // Enrichment write-pause fence (del 1). This route has NO apply/dry-run
+  // flag — every call writes (runDedupPass UPDATEs canonical_id/merged_from)
+  // — so the gate is unconditional here.
+  const pauseBlock = experiencesWritePauseBlock();
+  if (pauseBlock) {
+    res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+    return;
+  }
   const db = getExpDb("experiences");
   const result = runDedupPass(db);
   res.json({ success: true, ...result });
@@ -25466,6 +25682,15 @@ router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Reque
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const dryRun = !apply;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
     res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
     return;
@@ -25524,6 +25749,7 @@ router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Reque
       results,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[experiences-provider-dedup-merge] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -26816,6 +27042,16 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   // undefined all mean dry run.
   const dryRun = body.dry_run !== false;
 
+  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
+  // is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   // Per-app-instance fetch injection seam (see generateTitleNo's doc comment
   // above): tests set this via `app.set("titleNoBackfillFetchImpl", stub)`
   // on their OWN Express app instance. Production never sets it, so
@@ -27502,6 +27738,16 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
   // "" / undefined all mean dry run.
   const dryRun = body.dry_run !== false;
+
+  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
+  // is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // Optional priority list. Parameterised placeholders only — never string
   // interpolation of caller data into SQL (same discipline as the
