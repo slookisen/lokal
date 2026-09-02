@@ -220,7 +220,11 @@ export const OPPLEVAGENT_PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
   "AND (p.id IS NULL OR p.brreg_active = 1) " +
-  "AND e.canonical_id IS NULL";
+  "AND e.canonical_id IS NULL " +
+  // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+  // rapportspraak Del 2: a catalog_hidden provider's experiences are not
+  // published anywhere, so they must not be translated either. LEFT-JOIN-safe.
+  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
 
 function cleanSource(text: unknown): string {
   return String(text ?? "").replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
