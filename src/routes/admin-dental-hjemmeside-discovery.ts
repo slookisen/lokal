@@ -71,6 +71,13 @@ import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { fetchBrregWebsite } from "../services/brreg-client";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
+// dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning (steg
+// 2c, first prod run 2026-09-02): the random target pick drew 25/25 rows with
+// no Brreg website -- the pool without hjemmeside is dominated by person_enk
+// / holding / lab rows, which Brreg rarely has a website for. Restrict the
+// candidate set to clinic classes so the free Brreg lookups go to rows that
+// can actually end up in the enrichment pool.
+import { DENTAL_CLINIC_CLASS_SQL } from "../services/dental-catalog-class";
 import {
   gardssalgWebsiteEvidenceMatch,
   gardssalgPageText,
@@ -254,6 +261,7 @@ function dentalWdSelectSql(extraWhere: string): string {
        AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
        AND directory_url IS NULL
        AND (is_inactive IS NULL OR is_inactive = 0)
+       AND ${DENTAL_CLINIC_CLASS_SQL}
        ${extraWhere}
   `;
 }

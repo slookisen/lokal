@@ -92,7 +92,13 @@ interface CandidateRow {
 // Shared WHERE clause for both the count and the capped batch query, so the
 // two can never drift out of sync with each other.
 function candidateWhereSql(): string {
-  return "hjemmeside IS NOT NULL AND directory_url IS NULL";
+  // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
+  // (steg 2c, first prod run 2026-09-02): 5 526 of 6 975 rows store an EMPTY
+  // STRING, not NULL, in hjemmeside, so the original `IS NOT NULL` clause
+  // made the candidate set ~all rows and the oldest-first 200-row batch was
+  // the same 200 empty rows on every call (10 apply rounds: scanned 200,
+  // cleaned 0, remaining 6 973). Empty strings have nothing to classify.
+  return "hjemmeside IS NOT NULL AND TRIM(hjemmeside) <> '' AND directory_url IS NULL";
 }
 
 function countCandidates(db: ReturnType<typeof getDb>): number {
@@ -105,15 +111,29 @@ function countCandidates(db: ReturnType<typeof getDb>): number {
 // Deterministic, oldest-registered-first ordering (created_at, then id as a
 // tiebreaker) — a hard LIMIT means only up to HJEMMESIDE_CLEANUP_BATCH_CAP
 // rows are ever scanned/cleaned per invocation.
-function fetchCandidateBatch(db: ReturnType<typeof getDb>, cap: number): CandidateRow[] {
+//
+// `offset` (dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-
+// gjenfinning, steg 2c): a scanned-but-clean row stays a candidate forever
+// (that is correct -- it is a real homepage), which means a caller that
+// always starts at 0 can never see past the first `cap` clean rows. The
+// caller pages with `offset` (response carries `next_offset`) so one sweep
+// pass covers the whole candidate set; classification is pure and cheap,
+// only the writes are bounded by the cap.
+function fetchCandidateBatch(db: ReturnType<typeof getDb>, cap: number, offset = 0): CandidateRow[] {
   return db
     .prepare(
       `SELECT id, navn, hjemmeside, field_provenance FROM dental_agents
        WHERE ${candidateWhereSql()}
        ORDER BY created_at ASC, id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(cap) as CandidateRow[];
+    .all(cap, offset) as CandidateRow[];
+}
+
+// Parse body.offset: non-negative integer, default 0. Anything else → 0.
+export function parseSweepOffset(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 0;
+  return Math.floor(raw);
 }
 
 // Parse dental_agents.field_provenance (JSON string, possibly null/malformed)
@@ -231,14 +251,19 @@ router.post("/", (req: Request, res: Response) => {
   // this codebase (POST /admin/description-truncation-sweep,
   // /admin/agents/brreg-catalog-sweep, ...): writes execute ONLY on the
   // literal JSON boolean false.
-  const body = (req.body ?? {}) as { dry_run?: unknown };
+  const body = (req.body ?? {}) as { dry_run?: unknown; offset?: unknown };
   const dryRun = body.dry_run !== false;
+  const offset = parseSweepOffset(body.offset);
 
   try {
     const db = getDb("dental");
     const candidateCount = countCandidates(db);
-    const batchRows = fetchCandidateBatch(db, HJEMMESIDE_CLEANUP_BATCH_CAP);
+    const batchRows = fetchCandidateBatch(db, HJEMMESIDE_CLEANUP_BATCH_CAP, offset);
     const flagged = classifyCandidateBatch(batchRows);
+    // Paging cursor for the caller: null once this batch was the last one.
+    // On apply, cleaned rows leave the candidate set, so the next page
+    // starts `cleaned` rows earlier than offset + scanned (computed below).
+    const lastPage = batchRows.length < HJEMMESIDE_CLEANUP_BATCH_CAP;
 
     if (dryRun) {
       res.json({
@@ -260,6 +285,8 @@ router.post("/", (req: Request, res: Response) => {
         // batchRows.length was the bug: it subtracted the whole scanned
         // batch, silently treating good rows as if they'd been resolved).
         remaining_count: Math.max(0, candidateCount - flagged.length),
+        offset,
+        next_offset: lastPage ? null : offset + batchRows.length,
       });
       return;
     }
@@ -304,6 +331,8 @@ router.post("/", (req: Request, res: Response) => {
       cleaned_count: cleaned.length,
       cleaned: cleaned.slice(0, HJEMMESIDE_CLEANUP_SAMPLE_CAP),
       remaining_count: remainingCount,
+      offset,
+      next_offset: lastPage ? null : Math.max(0, offset + batchRows.length - cleaned.length),
     });
   } catch (err: any) {
     res.status(500).json({ error: "Hjemmeside cleanup sweep failed", detail: err?.message ?? String(err) });
