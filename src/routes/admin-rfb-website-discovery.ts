@@ -1393,14 +1393,23 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     // tryRfbWebsiteCandidateHost() tier 1 uses, threaded through the SAME
     // tried/excludedHere/existingHosts/hostsProposedThisBatch/fallbackCounters
     // state — no separate evidence-matching or exclusion path.
+    //
+    // Ordering note: the searchImpl-existence check runs BEFORE the budget
+    // check here, deliberately. If no searchImpl is configured (no Brave
+    // key, no test override), tier 2 was never going to run for this target
+    // regardless of the clock — reading the budget first would set
+    // budgetHitForThisTarget on a target whose real problem is "no search
+    // impl wired", masking that with a misleading time_budget_exceeded. Only
+    // once we know a search WOULD have been attempted does the budget check
+    // get to decide whether it actually gets skipped.
     let searchAttempted = false;
     if (!hit && !budgetHitForThisTarget) {
-      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
-        budgetHitForThisTarget = true;
-        timeBudgetExceeded = true;
-      } else {
-        const searchImpl = effectiveRfbWdSearchImpl();
-        if (searchImpl) {
+      const searchImpl = effectiveRfbWdSearchImpl();
+      if (searchImpl) {
+        if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+          budgetHitForThisTarget = true;
+          timeBudgetExceeded = true;
+        } else {
           searchAttempted = true;
           try {
             const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
@@ -1472,17 +1481,36 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         search_attempted: searchAttempted,
       });
     } else {
-      // No verified candidate. Reason: if no candidate host could even be
-      // generated, say so; else if ANY generated host was excluded (curated
-      // aggregator/social host, or a shared-host guard hit) that specific,
-      // actionable reason dominates — a human reviewing "host_already_in_use"
-      // does not need to also know a different, less-likely candidate host
-      // separately failed the evidence check. Only when NO host was ever
-      // excluded does this fall through to the generic "we fetched real
-      // candidates and none of them carried matching evidence" reason.
+      // No verified candidate. Reason, in priority order:
+      //   1. hosts.length === 0 — no candidate host could even be generated,
+      //      so tier 1 never meaningfully entered its loop. This is NEVER a
+      //      budget-caused outcome, no matter when/whether a budget check
+      //      happens to fire elsewhere for this target — it wins even over
+      //      a genuine budgetHitForThisTarget below.
+      //   2. budgetHitForThisTarget — but ONLY true when a budget check
+      //      itself caused hosts that would otherwise have been tried to be
+      //      skipped: a break inside the tier-1 loop, the tier-2 entry gate
+      //      (after confirming a searchImpl is actually configured — see
+      //      the ordering note above tier 2), or a break inside the tier-2
+      //      loop. A target whose tier-1 loop (and tier 2, if attempted)
+      //      ran to its own natural, non-budget-triggered completion never
+      //      sets this flag, even if the wall clock happens to read past
+      //      budget by the time a later, unrelated check gets around to
+      //      looking — such a target's own work already concluded on its
+      //      merits and must report that outcome, not a generic budget
+      //      reason that would discard real diagnostic signal.
+      //   3. excludedHere — ANY generated host that was excluded (curated
+      //      aggregator/social host, or a shared-host guard hit): that
+      //      specific, actionable reason dominates — a human reviewing
+      //      "host_already_in_use" does not need to also know a different,
+      //      less-likely candidate host separately failed the evidence
+      //      check.
+      //   4. no_candidate_verified — real candidates were fetched (tier 1
+      //      and/or tier 2) and none carried matching evidence, and none of
+      //      the above applied.
       let reason: string;
-      if (budgetHitForThisTarget) reason = "time_budget_exceeded";
-      else if (hosts.length === 0) reason = "no_candidate_hosts";
+      if (hosts.length === 0) reason = "no_candidate_hosts";
+      else if (budgetHitForThisTarget) reason = "time_budget_exceeded";
       else if (excludedHere.length > 0) reason = excludedHere[0].reason;
       else reason = "no_candidate_verified";
       rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere, search_attempted: searchAttempted });

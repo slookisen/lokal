@@ -145,6 +145,15 @@
  *       suite's own `finally` — every OTHER block in this file runs before
  *       this one and never touches the override, so they already prove the
  *       real-clock regression case (e) unmodified.
+ *   (tb-d) PR #761 review fix-up regression: a target whose tier-1 loop
+ *       exhausts ALL its hosts via its own natural loop exit (host 1
+ *       excluded host_already_in_use, the rest tried, no budget-triggered
+ *       `break` anywhere) has its clock cross RFB_WD_TIME_BUDGET_MS during
+ *       the LAST host's own fetch, with no searchImpl configured -> reason
+ *       stays the target's own 'host_already_in_use' (NOT the generic
+ *       'time_budget_exceeded' the inverted priority/mis-ordered tier-2
+ *       gate check used to produce), and time_budget_exceeded stays false
+ *       at the response level, since nothing was actually cut short.
  *
  * renderPage() itself is injected via the module-level
  * __setRfbWdRenderPageImplForTesting() test hook (mirrors
@@ -2747,6 +2756,83 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(rejTbC.tried.length < tbcHosts.length, "tb-c5: tried is strictly shorter than the full tier-1 host list");
       assertEq(fetchCalls.length, fetchCallsBeforeTbC + 1, "tb-c6: exactly one fetch call happened -- host 2+ never requested");
       assertEq(rTbC.body.time_budget_exceeded, true, "tb-c7: response-level flag is true");
+
+      // ── (tb-d) CHANGES-REQUESTED fix-up (PR #761 review, 2026-09-02):
+      // reason-branch priority was inverted vs. its own stated intent --
+      // budgetHitForThisTarget was checked BEFORE hosts.length===0/
+      // excludedHere, AND the tier-2 gate read the wall clock BEFORE
+      // checking whether a searchImpl was even configured. Together, a
+      // target whose tier-1 loop ran to its own natural `for`-exit
+      // (excludedHere already holds a legitimate, actionable reason) had
+      // that reason silently overwritten with the generic
+      // time_budget_exceeded whenever the clock happened to read past
+      // RFB_WD_TIME_BUDGET_MS by the time the tier-2 gate got around to
+      // checking -- even with NO Brave key/override configured, since the
+      // old gate order read the clock first regardless of searchImpl.
+      // Reproduces that exactly: host 1 is already carried by another
+      // agent (host_already_in_use, checked synchronously, no fetch, no
+      // clock read), the LAST tier-1 host's own fetch is where the mock
+      // clock crosses the budget (standing in for real elapsed wall-clock
+      // time), and no searchImpl is configured. Tier 1 exhausts every host
+      // via its own natural loop exit -- no budget-triggered `break`
+      // anywhere -- so the reason must stay host_already_in_use, and the
+      // response-level time_budget_exceeded flag must stay false: nothing
+      // was actually cut short by the budget anywhere in this batch.
+      mockNow = 6_000_000; // fresh baseline, well clear of (tb-c)'s advanced clock
+      const tbdBaseline = mockNow;
+      const tbdHosts = gardssalgWebsiteCandidateHosts("Tidsbudsjett Gardsmat AS");
+      assertTrue(tbdHosts.length >= 2, "tb-d0: setup sanity -- at least 2 tier-1 candidate hosts generated");
+      insertAgent({
+        id: "wd-tb-d-owner",
+        name: "Tidsbudsjett Eier AS",
+        orgNr: "977200021",
+        city: "Voss",
+        website: `https://${tbdHosts[0]}`,
+      });
+      insertAgent({ id: "wd-tb-d", name: "Tidsbudsjett Gardsmat AS", orgNr: "977200004", city: "Voss" });
+      // Hosts between the first (owner-shared) and last are left with no
+      // fixture -> stubFetch's default 404 (fetch_failed:http_404, tried
+      // but not evidence-matched, no clock movement). Only the LAST host
+      // gets a real 200 response, and its OWN arrayBuffer read is where the
+      // mock clock is advanced past the budget -- tier 1's `for` loop has
+      // no further host left to check the budget before, so this can never
+      // trigger a budget-triggered `break` anywhere in tier 1.
+      const tbdLastHost = tbdHosts[tbdHosts.length - 1];
+      fixtures.set(`https://${tbdLastHost}`, {
+        ok: true,
+        status: 200,
+        url: `https://${tbdLastHost}`,
+        headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+        arrayBuffer: async () => {
+          mockNow += RFB_WD_TIME_BUDGET_MS + 1;
+          return new TextEncoder().encode(`<html><body>Urelatert innhold<!-- selfref:${tbdLastHost} --></body></html>`).buffer;
+        },
+      } as unknown as Response);
+
+      const rTbD = await callDiscovery({ agentIds: ["wd-tb-d"] });
+      assertTrue(
+        mockNow - tbdBaseline >= RFB_WD_TIME_BUDGET_MS,
+        "tb-d-sanity: the wall clock genuinely crossed the budget during this target's own processing",
+      );
+      assertEq(rTbD.body.proposed.length, 0, "tb-d1: nothing proposed");
+      const rejTbD = rTbD.body.rejected.find((r: any) => r.agent_id === "wd-tb-d");
+      assertTrue(!!rejTbD, "tb-d2: target IS rejected (it did complete), not wholesale-skipped");
+      assertEq(
+        rejTbD.reason,
+        "host_already_in_use",
+        "tb-d3: reason is the target's OWN legitimate excludedHere reason, NOT time_budget_exceeded -- tier 1 exhausted all its hosts on its own merits before the budget ever caused anything to be skipped",
+      );
+      assertTrue(rejTbD.reason !== "time_budget_exceeded", "tb-d4: explicitly not the generic budget reason (PR #761 review finding)");
+      assertEq(
+        rejTbD.tried.length,
+        tbdHosts.length - 1,
+        "tb-d5: tried has exactly the non-excluded hosts -- ALL of tier 1 ran, nothing skipped by the budget",
+      );
+      assertEq(
+        rTbD.body.time_budget_exceeded,
+        false,
+        "tb-d6: response-level flag stays false -- nothing was actually cut short by the budget anywhere in this batch",
+      );
 
       setRfbWdNowForTesting!(null);
     }
