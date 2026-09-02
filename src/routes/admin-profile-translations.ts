@@ -69,6 +69,7 @@ import {
   PROFILE_TRANSLATION_FIELDS,
 } from "../services/profile-translations";
 import { isSvLocaleEnabled } from "../i18n/t";
+import { getWorkerState, tryAcquireTranslationRunLock, releaseTranslationRunLock } from "../services/profile-translations-worker";
 
 const router = Router();
 
@@ -162,6 +163,7 @@ router.get("/status", (req: Request, res: Response) => {
     return res.json({
       platform,
       flags: flagsSnapshot(),
+      worker: getWorkerState(),
       fields: PROFILE_TRANSLATION_FIELDS[platform],
       source_fields_total: items.length,
       pairs_total: pairs,
@@ -315,23 +317,33 @@ router.post("/run", async (req: Request, res: Response) => {
       });
     }
 
+    // Single-flight with the in-process worker (profile-translations-worker.ts):
+    // an item must never be on two belts at once.
+    const lockHolder = `admin-run-${platform}`;
+    if (!tryAcquireTranslationRunLock(lockHolder)) {
+      return res.status(409).json({ error: "busy", note: "en annen kjøring (worker eller admin) holder låsen — prøv igjen senere", lock: getWorkerState().lock });
+    }
     const batchId = batchIdFor(`tr-${platform}`);
     const fetchImpl = (req.app?.get?.("profileTranslationsFetchImpl") as typeof fetch | undefined) ?? undefined;
     const results: ItemResult[] = [];
     const outcomes: Record<string, number> = {};
     const usage = { input_tokens: 0, output_tokens: 0, calls: 0 };
-    for (const p of plan.actionable) {
-      const r = await processTranslationItem(db, platform, p, batchId, { fetchImpl });
-      results.push(r);
-      outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
-      usage.input_tokens += r.usage.input_tokens;
-      usage.output_tokens += r.usage.output_tokens;
-      usage.calls += r.usage.calls;
-      // Stop early when the LLM itself is unreachable (missing key / network)
-      // so one broken run does not burn every item's attempt budget.
-      if (r.outcome === "translate_failed" && /ANTHROPIC_API_KEY|nettverksfeil|status 4\d\d/.test(r.reason || "")) {
-        break;
+    try {
+      for (const p of plan.actionable) {
+        const r = await processTranslationItem(db, platform, p, batchId, { fetchImpl });
+        results.push(r);
+        outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
+        usage.input_tokens += r.usage.input_tokens;
+        usage.output_tokens += r.usage.output_tokens;
+        usage.calls += r.usage.calls;
+        // Stop early when the LLM itself is unreachable (missing key / network)
+        // so one broken run does not burn every item's attempt budget.
+        if (r.outcome === "translate_failed" && /ANTHROPIC_API_KEY|nettverksfeil|status 4\d\d/.test(r.reason || "")) {
+          break;
+        }
       }
+    } finally {
+      releaseTranslationRunLock(lockHolder);
     }
     return res.json({
       enabled: true,
