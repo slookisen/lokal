@@ -42,6 +42,30 @@ export function __initSchemaForTesting(injected: Database.Database): void {
   initSchema(injected);
 }
 
+// Test-only: pin the singleton to a FRESH, schema-initialised in-memory DB for
+// the duration of one test harness and hand back the restore. Composes the
+// three seams above (peek → set → initSchema) into the one shape every
+// harness that exercises a main-db-gated route needs — since dev-request
+// 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak every
+// apply:true admin write route under /api/opplevelser reads
+// `enrichment_write_pause` off THIS singleton (fail-closed), so a harness that
+// runs after another block left the singleton on a closed throwaway handle
+// would otherwise see 423s. The restore puts back whatever was there before
+// (null → the next getDb() reopens the real file, i.e. the pristine state).
+// Never call from production code.
+export function __pinInMemoryDbForTesting(): () => void {
+  const prev = db;
+  const pinned = new Database(":memory:");
+  pinned.pragma("journal_mode = DELETE");
+  pinned.pragma("foreign_keys = OFF");
+  initSchema(pinned);
+  db = pinned;
+  return () => {
+    db = prev;
+    try { pinned.close(); } catch { /* already closed */ }
+  };
+}
+
 export function getDb(): Database.Database {
   if (!db) {
     // Ensure data directory exists

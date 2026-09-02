@@ -92,6 +92,9 @@ export function runOpplevelserGardssalgRewriteTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -492,6 +495,7 @@ export function runOpplevelserGardssalgRewriteTests(
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // `products` is pre-filled (non-empty) on every fixture below so the
@@ -1064,6 +1068,7 @@ export function runOpplevelserGardssalgRewriteTests(
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section B): unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;

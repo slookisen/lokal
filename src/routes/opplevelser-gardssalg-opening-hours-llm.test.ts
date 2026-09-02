@@ -106,6 +106,9 @@ export function runOpplevelserGardssalgOpeningHoursLlmTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -376,6 +379,7 @@ export function runOpplevelserGardssalgOpeningHoursLlmTests(
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // about_text/visit_text/products are pre-filled with content that
@@ -586,6 +590,7 @@ export function runOpplevelserGardssalgOpeningHoursLlmTests(
       failed++;
       failures.push("opplevelser-gardssalg-opening-hours-llm (section B): unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

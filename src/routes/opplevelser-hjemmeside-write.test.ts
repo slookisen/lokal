@@ -101,6 +101,9 @@ export function runOpplevelserHjemmesideWriteTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -314,6 +317,7 @@ export function runOpplevelserHjemmesideWriteTests(
         producer_type: "gaardsutsalg", rfb_seed_source: null,
       });
 
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       function getRow(id: string): { hjemmeside: string | null; content_source: string | null; field_provenance: string | null } | undefined {
@@ -643,6 +647,7 @@ export function runOpplevelserHjemmesideWriteTests(
       failed++;
       failures.push("opplevelser-hjemmeside-write: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;
       } else {

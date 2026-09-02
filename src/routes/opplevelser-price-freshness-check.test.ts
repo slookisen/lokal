@@ -119,6 +119,9 @@ export function runOpplevelserPriceFreshnessCheckTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -162,6 +165,7 @@ export function runOpplevelserPriceFreshnessCheckTests(
       dbFactory.__resetDbFactoryForTesting();
       const db = dbFactory.getDb("experiences");
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserModule = require("./opplevelser") as typeof import("./opplevelser") & { default: any };
       const opplevelserRouter = opplevelserModule.default;
       const {
@@ -487,6 +491,7 @@ export function runOpplevelserPriceFreshnessCheckTests(
       failed++;
       failures.push("opplevelser-price-freshness-check: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;

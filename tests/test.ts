@@ -18533,8 +18533,13 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
 
   const prevPathDedup = process.env.EXPERIENCES_DB_PATH;
   let serverDedup: import("http").Server | null = null;
+  // The dedup-backfill route now reads `enrichment_write_pause` off the MAIN
+  // db singleton (fail-closed) — pin a fresh schema-initialised in-memory
+  // main db for this block, restored in finally.
+  let restoreMainDbDedup: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbDedup = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     // Bust require cache for db-factory + experience-store + the opplevelser
     // route TOGETHER so the route binds to the fresh, :memory:-backed store
@@ -18733,6 +18738,7 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     failed++;
     failures.push("orch-pr-dedup-backfill-endpoint: unexpected error: " + String(err));
   } finally {
+    if (restoreMainDbDedup) restoreMainDbDedup();
     if (serverDedup) {
       await new Promise<void>((resolve) => serverDedup!.close(() => resolve()));
     }
@@ -18780,8 +18786,12 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathTNB = process.env.EXPERIENCES_DB_PATH;
   const prevAnthropicKeyTNB = process.env.ANTHROPIC_API_KEY;
   let serverTNB: import("http").Server | null = null;
+  // title-no-backfill (dry_run:false) is gated on the MAIN db's
+  // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
+  let restoreMainDbTNB: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbTNB = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     const dbFactoryPathTNB = require.resolve("../src/database/db-factory");
     const expStorePathTNB = require.resolve("../src/services/experience-store");
@@ -19056,6 +19066,7 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     failed++;
     failures.push("orch-pr-titleno: unexpected error: " + String(err instanceof Error ? (err.stack || err.message) : err));
   } finally {
+    if (restoreMainDbTNB) restoreMainDbTNB();
     if (serverTNB) {
       await new Promise<void>((resolve) => serverTNB!.close(() => resolve()));
     }
@@ -30015,8 +30026,12 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
   let serverGCR: import("http").Server | null = null;
   let dbFactoryGCR: typeof import("../src/database/db-factory") | null = null;
+  // gardssalg-content-refresh (apply:true) is gated on the MAIN db's
+  // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
+  let restoreMainDbGCR: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbGCR = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     const dbFactoryPathGCR = require.resolve("../src/database/db-factory");
     const expStorePathGCR = require.resolve("../src/services/experience-store");
@@ -30210,6 +30225,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     failed++;
     failures.push("gardssalg-content-refresh: unexpected error: " + String(err));
   } finally {
+    if (restoreMainDbGCR) restoreMainDbGCR();
     if (serverGCR) {
       await new Promise<void>((resolve) => serverGCR!.close(() => resolve()));
     }
@@ -31502,6 +31518,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gscp.failed;
     for (const f of gscp.failures) failures.push("opplevelser-gardssalg-set-contact-phone: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-phone: ${gscp.passed} passed, ${gscp.failed} failed`);
+
+    // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+    // rapportspraak, del 1: the enrichment write-pause fence (main-db
+    // `enrichment_write_pause`, vertical 'experiences') wired onto every
+    // apply:true admin write route under /api/opplevelser. Proves 423 +
+    // zero rows changed under a live pause, dry-run never blocked, rfb-only
+    // pause leaves experiences untouched, and fail-closed on a throwing
+    // main-db lookup. Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-write-pause-gate: enrichment write-pause fence on apply routes ──");
+    const { runOpplevelserWritePauseGateTests } = require("../src/routes/opplevelser-write-pause-gate.test") as
+      typeof import("../src/routes/opplevelser-write-pause-gate.test");
+    const owpg = await runOpplevelserWritePauseGateTests({ log: false });
+    passed += owpg.passed;
+    failed += owpg.failed;
+    for (const f of owpg.failures) failures.push("opplevelser-write-pause-gate: " + f);
+    console.log(`  opplevelser-write-pause-gate: ${owpg.passed} passed, ${owpg.failed} failed`);
 
     // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
     // 2b: the CONTENT-field counterpart to the two contact endpoints above.

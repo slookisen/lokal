@@ -358,9 +358,13 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           -- PUBLISH_GATE_SQL LEFT JOINs this table even when every row here
           -- leaves provider_id NULL (its "p.id IS NULL OR ..." branch is what
           -- passes then) — the table must still exist for the JOIN to parse.
+          -- catalog_hidden: referenced by the gate's fifth clause (dev-request
+          -- 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak,
+          -- del 2) — LEFT-JOIN-safe, so with no provider rows it still passes.
           CREATE TABLE experience_providers (
             id TEXT PRIMARY KEY,
-            brreg_active INTEGER
+            brreg_active INTEGER,
+            catalog_hidden INTEGER
           );
         `);
         const insertP = db.prepare(

@@ -550,16 +550,21 @@ export async function runAdminEnrichmentWritePauseTests(
     function readSrc(rel: string): string {
       return fs.readFileSync(path.join(srcDir, rel), "utf8");
     }
-    // opplevelser.ts mentions controller/enrichment-write-pause.yaml in ONE
-    // pre-existing prose comment (the §8.4 error-rate trigger). That comment is
-    // not a gate and is deliberately left alone; what must stay true is that
-    // the file neither imports nor calls this guard.
+    // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+    // rapportspraak, del 1: opplevelser.ts NOW imports this guard — through
+    // ONE shared helper (experiencesWritePauseBlock → enrichmentWritePauseBlock
+    // with the getRfbDb THUNK, vertical 'experiences') on every apply:true
+    // admin write route. This assertion used to pin the opposite ("neither
+    // imports nor calls"); it now pins the shape the wiring must keep: the
+    // route file never calls the lower-level assert* entry points directly
+    // and always goes through the thunk + 'experiences' helper. The per-route
+    // behaviour is proven in opplevelser-write-pause-gate.test.ts.
     const opplevelserSrc = readSrc("routes/opplevelser.ts");
     assertTrue(
-      !opplevelserSrc.includes("services/enrichment-write-pause") &&
-        !opplevelserSrc.includes("enrichmentWritePauseBlock") &&
+      opplevelserSrc.includes("services/enrichment-write-pause") &&
+        opplevelserSrc.includes('enrichmentWritePauseBlock(getRfbDb, "experiences")') &&
         !opplevelserSrc.includes("assertEnrichmentWriteAllowed"),
-      "ewp-123: opplevelser.ts (gårdssalg/booking gates) neither imports nor calls the enrichment write-pause guard",
+      "ewp-123: opplevelser.ts imports the guard through the one shared experiences helper (getRfbDb thunk + 'experiences'), never the raw assert* entry points",
     );
     assertTrue(
       !readSrc("database/init-experiences.ts").includes("enrichment_write_pause"),
@@ -616,6 +621,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // the service to prove the wiring.
         "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
+        // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+        // rapportspraak, del 1: the experiences vertical's admin write routes
+        // (routes/opplevelser.ts, one shared helper) plus their own test file.
+        "routes/opplevelser-write-pause-gate.test.ts",
+        "routes/opplevelser.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );
