@@ -110,6 +110,9 @@ primary_region = 'arn'
   PROFILE_TRANSLATIONS_WORKER_INTENSIVE_UNTIL = '2026-09-03T09:30:00Z'
   PROFILE_TRANSLATIONS_WORKER_INTENSIVE_CONCURRENCY = '5'
   PROFILE_TRANSLATIONS_WORKER_STEADY_ITEMS_PER_HOUR = '20'
+  # Daniel 2026-09-02 («engelsk er prio»): all English items on both platforms
+  # before any Swedish one. Fail-safe: unknown/empty = en,sv.
+  PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY = 'en,sv'
   PROFILE_TRANSLATIONS_SERVE_ENABLED = 'false'
   OPPLEVAGENT_LANG_SWITCHER_ENABLED = 'false'
   SV_LOCALE_ENABLED = 'false'

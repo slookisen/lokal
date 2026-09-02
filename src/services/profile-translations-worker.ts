@@ -45,6 +45,7 @@ import {
   TRANSLATION_PLATFORMS,
   TRANSLATION_TARGET_LANGS,
   type TranslationPlatform,
+  type TranslationTargetLang,
   type PlannedItem,
   type ItemResult,
   isProfileTranslationPipelineEnabled,
@@ -61,6 +62,11 @@ export interface WorkerConfig {
   intensiveConcurrency: number;
   steadyItemsPerHour: number;
   platforms: TranslationPlatform[];
+  /** Language priority (Daniel 2026-09-02: «engelsk er prio»): every actionable
+   *  item of the first language — across both platforms — is processed before
+   *  any item of the next. Default "en,sv". A language left out of the list is
+   *  never processed by the worker. */
+  langPriority: TranslationTargetLang[];
 }
 
 export const WORKER_DEFAULT_INTENSIVE_CONCURRENCY = 5;
@@ -90,12 +96,17 @@ export function readWorkerConfig(): WorkerConfig {
   const platforms = platformsRaw
     ? (platformsRaw.split(",").map((s) => s.trim()).filter((p) => (TRANSLATION_PLATFORMS as string[]).includes(p)) as TranslationPlatform[])
     : [...TRANSLATION_PLATFORMS];
+  const langRaw = (process.env.PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY || "").trim();
+  const langPriority = langRaw
+    ? (Array.from(new Set(langRaw.split(",").map((s) => s.trim()).filter((l) => (TRANSLATION_TARGET_LANGS as string[]).includes(l)))) as TranslationTargetLang[])
+    : [...TRANSLATION_TARGET_LANGS];
   return {
     enabled: isProfileTranslationWorkerEnabled(),
     intensiveUntil: until && !Number.isNaN(until.getTime()) ? until : null,
     intensiveConcurrency: intFromEnv("PROFILE_TRANSLATIONS_WORKER_INTENSIVE_CONCURRENCY", WORKER_DEFAULT_INTENSIVE_CONCURRENCY, WORKER_MAX_INTENSIVE_CONCURRENCY),
     steadyItemsPerHour: intFromEnv("PROFILE_TRANSLATIONS_WORKER_STEADY_ITEMS_PER_HOUR", WORKER_DEFAULT_STEADY_ITEMS_PER_HOUR, WORKER_MAX_STEADY_ITEMS_PER_HOUR),
     platforms: platforms.length ? platforms : [...TRANSLATION_PLATFORMS],
+    langPriority: langPriority.length ? langPriority : [...TRANSLATION_TARGET_LANGS],
   };
 }
 
@@ -198,38 +209,48 @@ function defaultDbFor(platform: TranslationPlatform) {
   return platform === "rfb" ? getRfbDb() : getVerticalDb("experiences");
 }
 
-/** Interleave the platforms' actionable items (rfb, opplevagent, rfb, …) and
- *  take at most `n`. Also records each platform's remaining estimate. */
+/** Plan up to `n` items: languages strictly in priority order (all `en`
+ *  before any `sv` by default), and within a language the platforms are
+ *  interleaved (rfb, opplevagent, rfb, …) so neither starves the other.
+ *  Also records each platform's remaining estimate (all languages). */
 export function planInterleaved(
   platforms: TranslationPlatform[],
   n: number,
   dbFor: (p: TranslationPlatform) => any,
+  langPriority: TranslationTargetLang[] = [...TRANSLATION_TARGET_LANGS],
 ): Array<{ platform: TranslationPlatform; item: PlannedItem }> {
-  const perPlatform: Array<{ platform: TranslationPlatform; items: PlannedItem[] }> = [];
-  for (const platform of platforms) {
-    try {
-      const plan = planTranslationBatch(dbFor(platform), platform, [...TRANSLATION_TARGET_LANGS], n);
-      perPlatform.push({ platform, items: plan.actionable });
-      const pp = (state.per_platform[platform] = state.per_platform[platform] || { items: 0, verified: 0, remaining_estimate: null });
-      pp.remaining_estimate = plan.actionable.length + plan.remaining_actionable;
-    } catch (e: any) {
-      state.last_error = `plan ${platform}: ${String(e?.message || e)}`;
-      perPlatform.push({ platform, items: [] });
-    }
-  }
   const out: Array<{ platform: TranslationPlatform; item: PlannedItem }> = [];
-  let i = 0;
-  while (out.length < n) {
-    let any = false;
-    for (const p of perPlatform) {
-      if (i < p.items.length) {
-        out.push({ platform: p.platform, item: p.items[i] });
-        any = true;
-        if (out.length >= n) break;
+  const remainingByPlatform: Record<string, number> = {};
+  for (const lang of langPriority) {
+    if (out.length >= n) break;
+    const perPlatform: Array<{ platform: TranslationPlatform; items: PlannedItem[] }> = [];
+    for (const platform of platforms) {
+      try {
+        const plan = planTranslationBatch(dbFor(platform), platform, [lang], n);
+        perPlatform.push({ platform, items: plan.actionable });
+        remainingByPlatform[platform] = (remainingByPlatform[platform] || 0) + plan.actionable.length + plan.remaining_actionable;
+      } catch (e: any) {
+        state.last_error = `plan ${platform}/${lang}: ${String(e?.message || e)}`;
+        perPlatform.push({ platform, items: [] });
       }
     }
-    if (!any) break;
-    i++;
+    let i = 0;
+    while (out.length < n) {
+      let any = false;
+      for (const p of perPlatform) {
+        if (i < p.items.length) {
+          out.push({ platform: p.platform, item: p.items[i] });
+          any = true;
+          if (out.length >= n) break;
+        }
+      }
+      if (!any) break;
+      i++;
+    }
+  }
+  for (const platform of platforms) {
+    const pp = (state.per_platform[platform] = state.per_platform[platform] || { items: 0, verified: 0, remaining_estimate: null });
+    pp.remaining_estimate = remainingByPlatform[platform] || 0;
   }
   return out;
 }
@@ -321,7 +342,7 @@ export async function workerTick(deps: WorkerDeps = {}): Promise<TickResult> {
         const nowT = now();
         if (nowT.getTime() - t0.getTime() > WORKER_INTENSIVE_TICK_BUDGET_MS) break;
         if (workerModeFor(cfg, nowT) !== "intensive") break;
-        const items = planInterleaved(cfg.platforms, batchSize, dbFor);
+        const items = planInterleaved(cfg.platforms, batchSize, dbFor, cfg.langPriority);
         if (!items.length) break;
         const batchId = `wk-int-${nowT.toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
         const r = await processPool(items, cfg.intensiveConcurrency, batchId, deps, dbFor);
@@ -344,7 +365,7 @@ export async function workerTick(deps: WorkerDeps = {}): Promise<TickResult> {
       }
       const allow = cfg.steadyItemsPerHour - state.hour_count;
       if (allow > 0) {
-        const items = planInterleaved(cfg.platforms, Math.min(allow, 5), dbFor);
+        const items = planInterleaved(cfg.platforms, Math.min(allow, 5), dbFor, cfg.langPriority);
         if (items.length) {
           const batchId = `wk-std-${t0.toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
           const r = await processPool(items, 1, batchId, deps, dbFor);
@@ -372,7 +393,7 @@ export function startProfileTranslationsWorker(): NodeJS.Timeout | null {
   const cfg = readWorkerConfig();
   console.log(
     `[profile-translations-worker] started — intensive_until=${cfg.intensiveUntil ? cfg.intensiveUntil.toISOString() : "(unset)"} ` +
-    `concurrency=${cfg.intensiveConcurrency} steady=${cfg.steadyItemsPerHour}/h platforms=${cfg.platforms.join(",")}`,
+    `concurrency=${cfg.intensiveConcurrency} steady=${cfg.steadyItemsPerHour}/h platforms=${cfg.platforms.join(",")} lang_priority=${cfg.langPriority.join(">")}`,
   );
   const timer = setInterval(async () => {
     try {
