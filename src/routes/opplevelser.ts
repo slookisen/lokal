@@ -23263,6 +23263,61 @@ const SWEEP_DEFAULT_LIMIT = 50;
 const SWEEP_MAX_LIMIT = 50;
 const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL";
 
+// ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
+// karantene-utgang-match-til-verified) ──────────────────────────────────────
+// The sweep above only ever DEMOTES (MISMATCH -> needs_review); MATCH never
+// promoted anything back OUT of quarantine, so a `needs_review` row that gets
+// freshly re-enriched from a genuinely verified owner-controlled source and
+// correctly re-judged MATCH stayed invisible forever — never reachable by
+// PUBLISH_GATE_SQL (verified + confidence high/medium + provider
+// brreg_active), which is what /discover, detail pages, MCP get_experience
+// and A2A all gate on. This is the ONE conservative promotion path out,
+// gated on THREE INDEPENDENT requirements ALL being true — never on the
+// judge verdict alone:
+//   1. judge (this same sweep call's OWN fresh re-judge) renders MATCH.
+//   2. the row's provider has brreg_active=1 (a needs_review row quarantined
+//      for a Brreg reason — provider classification != active — must NEVER
+//      be promoted by this path; this requirement is absolute, independent
+//      of the judge verdict).
+//   3. the judged page is an independently VERIFIED source: EITHER the
+//      provider's own ownership-verified hjemmeside
+//      (isHjemmesideVerified(field_provenance)) OR this row's own
+//      evidence_url with evidence_url_verification.verified=true
+//      (isEvidenceUrlVerified(evidence_url_verification)) — a judge MATCH
+//      against an unverified page is not enough on its own.
+// PLUS a precondition checked before any of the three above matter:
+// `confidence` must ALREADY be 'high' or 'medium' — a `low`-confidence row
+// is never promoted no matter what the judge/brreg/source checks say
+// (confidence itself is left completely unchanged by this mechanism either
+// way — this is a read-only eligibility gate on it, never a write).
+//
+// Only fires for a row whose verification_status was 'needs_review' going
+// INTO this iteration (captured as `wasNeedsReview` BEFORE any write this
+// same iteration makes, same discipline as `published_in_sample` above) —
+// the sweep's own WHERE clause (SWEEP_ELIGIBLE_WHERE) is deliberately NOT
+// scoped to needs_review (see block comment above: both published and
+// unpublished rows are swept), so this promotion check re-scopes itself
+// per-row rather than assuming the outer SELECT already did it.
+//
+// Reported per row (dry-run AND apply, same "fetch+judge always runs, only
+// the WRITE is apply-gated" discipline as the rest of this route) as a
+// `promotion` object: `applicable` (was this row needs_review at all),
+// `judge`/`brreg_active`/`source_verified`/`confidence_ok` — the individual
+// requirement verdicts, each evaluated and reported SEPARATELY (never
+// collapsed into one generic bool) — and `status`
+// ("not_applicable" | "held" | "would_promote" | "promoted") plus, when
+// `held`, a `missing` array naming exactly which requirement(s) failed.
+//
+// On an actual promotion (apply mode, eligible): verification_status ->
+// 'verified' (confidence itself untouched); admission_verdict gets a
+// `promoted: <reasoning>` stamp (stampExperienceAdmissionVerdict) IN PLACE
+// OF the normal `match: <reasoning>` stamp this iteration would otherwise
+// write — one stamp per row per sweep call, never two; and ONE row is
+// inserted into experience_admission_promotion_audit (init-experiences.ts),
+// batch_id = this SAME sweep call's batchId, additive/reversible via POST
+// /admin/experiences-admission-promotion-rollback below.
+const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
+
 type ContentJudgeSweepRow = {
   id: string;
   title: string;
@@ -23274,6 +23329,11 @@ type ContentJudgeSweepRow = {
   content_field_evidence: string | null;
   admission_checked_at: string | null;
   verification_status: string;
+  confidence: string | null;
+  provider_id: string | null;
+  evidence_url_verification: string | null;
+  p_brreg_active: number | null;
+  p_field_provenance: string | null;
 };
 
 router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: Request, res: Response) => {
@@ -23325,8 +23385,12 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
 
     const rows = expDb
       .prepare(
-        `SELECT id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, admission_checked_at, verification_status
-           FROM experiences
+        `SELECT e.id, e.title, e.description, e.category, e.price_band, e.price_from, e.evidence_url,
+                e.content_field_evidence, e.admission_checked_at, e.verification_status,
+                e.confidence, e.provider_id, e.evidence_url_verification,
+                p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
           WHERE ${SWEEP_ELIGIBLE_WHERE}
           ORDER BY ${sweepOrderBy}
           LIMIT ?`,
@@ -23344,18 +23408,57 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
        WHERE e.id = ? AND ${PUBLISH_GATE_SQL}`,
     );
 
-    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0, published_in_sample: 0 };
+    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0, published_in_sample: 0, promoted: 0 };
     const results: Array<{
       id: string;
       verdict: "MATCH" | "MISMATCH" | "unresolved";
       reason: string;
       verification_status: string;
       description_nulled: boolean;
+      promotion: {
+        applicable: boolean;
+        judge: "MATCH" | "MISMATCH" | "unresolved";
+        brreg_active: boolean;
+        source_verified: boolean;
+        confidence_ok: boolean;
+        status: "not_applicable" | "held" | "would_promote" | "promoted";
+        missing?: string[];
+      };
       would_be_action?: string;
       action_taken?: string;
     }> = [];
 
-    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+    // batch_id must be genuinely unique PER CALL, not just per-second: this
+    // id is now the primary key the rollback route (below) scopes its
+    // revert to (previously only an informational response field), and two
+    // separate apply:true sweep calls issued within the same wall-clock
+    // second previously produced byte-identical batch_id strings — making
+    // their audit rows indistinguishable and letting a rollback aimed at one
+    // call's promotions also revert an unrelated row a DIFFERENT call
+    // promoted in that same second. crypto.randomUUID() (already used below
+    // for each audit row's own `id`) guarantees no two calls ever collide,
+    // while keeping the human-readable second-truncated timestamp prefix
+    // nothing else in this codebase parses the exact pre-existing format.
+    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+
+    // AC3 (best-effort per dev-request spec): before/after needs_review
+    // totals for THIS call, alongside the batch's own `promoted` count above
+    // — cheap enough (one indexed COUNT(*) each) to sit directly in this
+    // route rather than a separate reporting mechanism. `needs_review_after`
+    // is queried again post-loop even on a dry-run (where it is guaranteed
+    // identical, since dry-run writes nothing) rather than special-cased, so
+    // the two numbers are always a genuine before/after read of the same
+    // query, never a dry-run shortcut that could silently drift from reality.
+    const needsReviewCountStmt = expDb.prepare(
+      `SELECT COUNT(*) AS n FROM experiences WHERE verification_status = 'needs_review'`,
+    );
+    const needsReviewBefore = (needsReviewCountStmt.get() as { n: number }).n;
+
+    const insertPromotionAudit = expDb.prepare(
+      `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
+    );
 
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
@@ -23412,40 +23515,104 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // it counts what was actually served at sample time).
       if (publishedCheckStmt.get(row.id)) counts.published_in_sample++;
 
+      // ── Quarantine-exit promotion eligibility (see block comment above
+      // ContentJudgeSweepRow) — evaluated for EVERY row (dry-run AND apply),
+      // never just apply-mode, so a dry-run's report is as trustworthy a
+      // preview here as it already is for the MISMATCH/MATCH/unresolved
+      // verdict itself. `wasNeedsReview` is captured from `row.
+      // verification_status`, which was read by the SELECT BEFORE this loop
+      // ran and is never mutated in place — the authoritative "status going
+      // INTO this iteration" value.
+      const wasNeedsReview = row.verification_status === "needs_review";
+      const judgeOk = outcome.verdict === "MATCH";
+      const brregActiveOk = row.p_brreg_active === 1;
+      const sourceVerified =
+        isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
+      const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+      const missingPromotionReqs: string[] = [];
+      if (!judgeOk) missingPromotionReqs.push("judge");
+      if (!brregActiveOk) missingPromotionReqs.push("brreg_active");
+      if (!sourceVerified) missingPromotionReqs.push("source_verified");
+      if (!confidenceOk) missingPromotionReqs.push("confidence");
+      const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
+
       let descriptionNulled = false;
+      let promoted = false;
       if (applyMode) {
         if (outcome.verdict === "MISMATCH") {
           expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
+        } else if (eligibleForPromotion) {
+          expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
+          promoted = true;
+          insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
         }
         // MATCH and unresolved are stamped too (see block comment above) —
-        // never skipped just because there's no status change to make.
-        stampExperienceAdmissionVerdict(row.id, `${verdictKey}: ${outcome.reason}`);
+        // never skipped just because there's no status change to make. A
+        // promoted row's stamp gets the `promoted:` prefix IN PLACE OF the
+        // normal `match:` stamp — one admission_verdict write per row per
+        // call, never two.
+        stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
           descriptionNulled = true;
         }
       }
 
-      const actionText =
-        outcome.verdict === "MISMATCH"
+      const actionText = promoted
+        ? "verification_status -> verified (promoted fra needs_review); admission_verdict stemplet (promoted)"
+        : outcome.verdict === "MISMATCH"
           ? "verification_status -> needs_review; admission_verdict stemplet (mismatch)"
-          : outcome.verdict === "MATCH"
-            ? "ingen statusendring; admission_verdict stemplet (match)"
-            : "ingen statusendring; admission_verdict stemplet (unresolved)";
+          : eligibleForPromotion
+            ? "verification_status -> verified (ville blitt forfremmet fra needs_review); admission_verdict stemplet (promoted)"
+            : outcome.verdict === "MATCH"
+              ? wasNeedsReview
+                ? `ingen statusendring (holdt tilbake i needs_review — mangler: ${missingPromotionReqs.join(", ")}); admission_verdict stemplet (match)`
+                : "ingen statusendring; admission_verdict stemplet (match)"
+              : "ingen statusendring; admission_verdict stemplet (unresolved)";
       const descText = isBoilerplate ? "; description nullstilt (boilerplate-kopi av kildeside)" : "";
+
+      const promotionStatus: "not_applicable" | "held" | "would_promote" | "promoted" = !wasNeedsReview
+        ? "not_applicable"
+        : eligibleForPromotion
+          ? (applyMode ? "promoted" : "would_promote")
+          : "held";
+
+      // counts.promoted mirrors match/mismatch/unresolved's "verdict reached
+      // THIS call" semantics (counted unconditionally, apply or dry-run) —
+      // an eligible row counts whether or not the write actually happened:
+      // dry-run counts `would_promote` rows, apply counts actual
+      // `promoted` rows. Previously only incremented inside the applyMode
+      // branch, so a dry-run's counts.promoted was stuck at 0 even when
+      // results[] reported several would_promote rows.
+      if (promotionStatus === "would_promote" || promotionStatus === "promoted") counts.promoted++;
 
       results.push({
         id: row.id,
         verdict: outcome.verdict,
         reason: outcome.reason,
         verification_status:
-          applyMode && outcome.verdict === "MISMATCH" ? "needs_review" : row.verification_status,
+          applyMode && outcome.verdict === "MISMATCH"
+            ? "needs_review"
+            : applyMode && promoted
+              ? "verified"
+              : row.verification_status,
         description_nulled: descriptionNulled,
+        promotion: {
+          applicable: wasNeedsReview,
+          judge: outcome.verdict,
+          brreg_active: brregActiveOk,
+          source_verified: sourceVerified,
+          confidence_ok: confidenceOk,
+          status: promotionStatus,
+          ...(promotionStatus === "held" ? { missing: missingPromotionReqs } : {}),
+        },
         ...(dryRun
           ? { would_be_action: `[dry-run] ${actionText}${descText}` }
           : { action_taken: `${actionText}${descText}` }),
       });
     }
+
+    const needsReviewAfter = (needsReviewCountStmt.get() as { n: number }).n;
 
     res.json({
       success: true,
@@ -23455,9 +23622,106 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       counts,
       results,
       remaining: Math.max(0, totalEligible - rows.length),
+      needs_review_before: needsReviewBefore,
+      needs_review_after: needsReviewAfter,
     });
   } catch (err) {
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-admission-promotion-rollback ──
+//
+// dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified,
+// AC5/6 (rollback): the in-product mechanism for reverting a bad promotion
+// BATCH the sweep above made — mirrors POST /admin/gardssalg-content-
+// rollback's batch_id-targeting convention (this file, above), but against
+// the new experience_admission_promotion_audit table (init-experiences.ts)
+// rather than a field-write audit, since a promotion is a whole-row STATUS
+// transition, not a single field's old/new value.
+//
+// Body: { batch_id: string }. requireAdmin, same as every other admin route
+// in this file. Reverts EVERY row promoted in that batch back to
+// 'needs_review' — but ONLY a row that is:
+//   (a) still traceable to that batch via the audit table (an audit row
+//       exists for it under this batch_id), AND
+//   (b) that audit row is this row's MOST RECENT promotion — i.e. no LATER
+//       audit row exists for the same experience_id (see MAX(rowid)
+//       subquery below), AND
+//   (c) STILL verification_status='verified' right now.
+// A row that moved on since (re-quarantined by a later sweep MISMATCH, hand-
+// edited by an admin, merged/superseded, etc.) is NEVER touched — reverting
+// it here would silently clobber whatever that later, more-informed change
+// did. Requirement (b) exists because SWEEP_ELIGIBLE_WHERE is deliberately
+// NOT scoped to needs_review (see block comment above the sweep route): an
+// already-verified row is re-swept every call, so it can be re-demoted to
+// needs_review by a later MISMATCH and then re-promoted by a completely
+// DIFFERENT, later batch. Without (b), a stale batch_id's rollback would
+// find its own (now-superseded) audit row still sitting there, still see
+// the row currently verification_status='verified' (courtesy of the LATER
+// batch), and wrongly revert a row that batch never touched. rowid (this
+// table's implicit, strictly-insertion-order-monotonic column — NOT the
+// TEXT `id` primary key, and NOT `promoted_at`, which is only second-
+// resolution and can tie between two calls in the same wall-clock second)
+// is what makes "latest promotion for this experience_id" unambiguous even
+// then. This is the same "never touch a row that moved on" discipline
+// planGardssalgContentRollback/planExperienceConflictRollback (above) apply
+// to their own batch_id-scoped reverts.
+//
+// An unknown or empty batch_id is a no-op (0 rows reverted), reported as
+// `success:true, reverted: []` rather than a 404/error — a batch_id that
+// simply matches nothing is not a caller mistake worth failing on (mirrors
+// planGardssalgContentRollback's own "graceful empty result" convention for
+// an unmatched batch_id), UNLESS batch_id is missing/blank entirely, which
+// IS a genuine caller error (400) — there is no "revert everything" mode.
+//
+// Read-only lookup + one UPDATE per row, wrapped in a single db.transaction()
+// so a crash mid-batch never leaves the revert half-applied.
+router.post("/admin/experiences-admission-promotion-rollback", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { batch_id?: unknown };
+    const batchId = typeof body.batch_id === "string" ? body.batch_id.trim() : "";
+    if (!batchId) {
+      res.status(400).json({ error: "batch_id (non-empty string) is required" });
+      return;
+    }
+
+    const expDb = getExpDb("experiences");
+
+    const auditRows = expDb
+      .prepare(
+        `SELECT a.experience_id AS experience_id, a.from_status AS from_status
+           FROM experience_admission_promotion_audit a
+           JOIN experiences e ON e.id = a.experience_id
+          WHERE a.batch_id = ?
+            AND e.verification_status = 'verified'
+            AND a.rowid = (
+              SELECT MAX(a2.rowid)
+                FROM experience_admission_promotion_audit a2
+               WHERE a2.experience_id = a.experience_id
+            )`,
+      )
+      .all(batchId) as Array<{ experience_id: string; from_status: string }>;
+
+    const revertStmt = expDb.prepare(
+      `UPDATE experiences SET verification_status = ? WHERE id = ? AND verification_status = 'verified'`,
+    );
+
+    const reverted: Array<{ experience_id: string; reverted_to: string }> = [];
+    const tx = expDb.transaction(() => {
+      for (const row of auditRows) {
+        const info = revertStmt.run(row.from_status, row.experience_id);
+        if (info.changes > 0) {
+          reverted.push({ experience_id: row.experience_id, reverted_to: row.from_status });
+        }
+      }
+    });
+    tx();
+
+    res.json({ success: true, batch_id: batchId, reverted });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-admission-promotion-rollback failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
