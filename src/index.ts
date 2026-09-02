@@ -83,6 +83,8 @@ import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-co
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
+import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
+import adminDentalBrregAddressSweepRoutes from "./routes/admin-dental-brreg-address-sweep";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -774,6 +776,12 @@ app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbe
 // schema-probe-sweep left only 498/500 remaining when this was mounted
 // before it).
 app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
+// dev-request 2026-09-02-dental-catalog-class-triage (steg 0+1) and
+// 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning (steg 2b):
+// POST /admin/dental/catalog-class-backfill, GET /admin/dental/parking-stats,
+// POST /admin/dental/brreg-address-sweep. Same X-Admin-Key gate, same limiter.
+app.use("/admin/dental", adminLimiter, adminDentalCatalogClassRoutes);
+app.use("/admin/dental", adminLimiter, adminDentalBrregAddressSweepRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls

@@ -482,5 +482,40 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── dev-request 2026-09-02-dental-catalog-class-triage (steg 1 of the
+  //   2026-09-02 dental pipeline review): additive catalog_class column so
+  //   the claim pool, Places auto-select and (later) the public listing can
+  //   tell a patient-facing clinic from the Brreg-sweep residue (sole
+  //   proprietors under their own name, dental labs, holding vehicles,
+  //   county-directory rows). Written only by POST /admin/dental/catalog-
+  //   class-backfill (src/routes/admin-dental-catalog-class.ts) from the pure
+  //   classifier in src/services/dental-catalog-class.ts. NULL = never
+  //   classified = treated as a clinic everywhere (classification is additive
+  //   and only ever REMOVES rows that positively matched a non-clinic rule).
+  //   catalog_class_source records the rule id ("rules_v1:<rule>") or a later
+  //   reviewer ("sonnet"/"manual"). Idempotent ALTERs -- error = already present.
+  const dentalCatalogClassCols = [
+    "ALTER TABLE dental_agents ADD COLUMN catalog_class TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN catalog_class_source TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN catalog_class_at TEXT",
+  ];
+  for (const stmt of dentalCatalogClassCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+  try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dental_catalog_class ON dental_agents (catalog_class)");
+  } catch (err) {
+    console.warn("[init-dental] catalog_class index warning:", err);
+  }
+
+  // ─── dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
+  //   (steg 2): no-retry marker for POST /admin/dental/brreg-address-sweep
+  //   (src/routes/admin-dental-brreg-address-sweep.ts), mirroring
+  //   places_attempted_at -- a row Brreg had no usable street line for is not
+  //   re-asked every cycle. Idempotent ALTER.
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN brreg_address_attempted_at TEXT");
+  } catch { /* already present */ }
+
   console.log("[dental] schema initialized");
 }

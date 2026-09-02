@@ -443,6 +443,44 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     }
   }
 
+  // ── dev-request 2026-09-02-dental-catalog-class-triage (steg 1): ────────
+  //    default-ON non-clinic exclusion + explicit opt-out + env rollback.
+  {
+    const prevEnv = process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED;
+    delete process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED;
+    const { clause } = buildWhereClause({ enrichment_state: "raw", has_hjemmeside: true }, NOW);
+    const c = norm(clause);
+    assertTrue(
+      c.includes("(catalog_class IS NULL OR catalog_class IN ('klinikk','offentlig_klinikk','ukjent'))"),
+      "catalog_class: omitted excludeNonClinic applies the clinic-class clause (default-ON)"
+    );
+    const { clause: optOut } = buildWhereClause({ enrichment_state: "raw", excludeNonClinic: false }, NOW);
+    assertTrue(!norm(optOut).includes("catalog_class"), "catalog_class: explicit excludeNonClinic:false omits the clause");
+    process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED = "true";
+    const { clause: envOff } = buildWhereClause({ enrichment_state: "raw" }, NOW);
+    assertTrue(!norm(envOff).includes("catalog_class"), "catalog_class: env rollback flag omits the clause");
+    if (prevEnv === undefined) delete process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED;
+    else process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED = prevEnv;
+  }
+
+  // ── dev-request 2026-09-02-dental-permanent-triage (steg 3): exclude_ids ─
+  {
+    const { clause, params } = buildWhereClause(
+      { enrichment_state: "raw", exclude_ids: ["a1", "b2", "", 42 as unknown as string] },
+      NOW
+    );
+    const c = norm(clause);
+    assertTrue(c.includes("id NOT IN (?,?)"), "exclude_ids: two valid ids produce a two-placeholder NOT IN");
+    assertTrue(params.slice(-2).join(",") === "a1,b2", "exclude_ids: ids are bound as the trailing params");
+    const { clause: none } = buildWhereClause({ enrichment_state: "raw", exclude_ids: [] }, NOW);
+    assertTrue(!norm(none).includes("id NOT IN"), "exclude_ids: empty array adds no clause");
+    const { clause: absent } = buildWhereClause({ enrichment_state: "raw" }, NOW);
+    assertTrue(!norm(absent).includes("id NOT IN"), "exclude_ids: omitted adds no clause");
+    const many = Array.from({ length: 600 }, (_, i) => `id${i}`);
+    const { params: capped } = buildWhereClause({ enrichment_state: "raw", exclude_ids: many }, NOW);
+    assertTrue(capped.filter((p) => typeof p === "string" && String(p).startsWith("id")).length === 500, "exclude_ids: capped at 500");
+  }
+
   return { passed, failed, failures };
 }
 

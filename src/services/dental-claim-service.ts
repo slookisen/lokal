@@ -8,6 +8,7 @@
 //   claimBatch transaction (before SELECT) and at top of claimStatus.
 
 import { getDb } from "../database/db-factory";
+import { DENTAL_CLINIC_CLASS_SQL } from "./dental-catalog-class";
 
 export const CLAIM_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -72,6 +73,19 @@ export type ClaimFilter = {
   // stamp-based parking signal already computed server-side, so there is no
   // reason for a caller to opt into it separately from the other two.
   excludeParkedExtraction?: boolean;
+  // dev-request 2026-09-02-dental-catalog-class-triage (steg 1): exclude rows
+  // the rule classifier (src/services/dental-catalog-class.ts) positively
+  // marked as NOT a patient-facing clinic (person_enk / lab_leverandor /
+  // holding). Default-ON like excludeParkedExtraction; explicit `false` is
+  // the opt-out for review tooling. NULL / 'ukjent' rows stay claimable so
+  // an unclassified catalog behaves exactly as before this column existed.
+  excludeNonClinic?: boolean;
+  // dev-request 2026-09-02-dental-permanent-triage (steg 3): ids to skip
+  // for this call only -- the SKILL's second METODEN round (§4.1b) passes
+  // the ids it already processed in round 1 so a same-cycle re-claim of an
+  // already-attempted record (FUNN repeated in six consecutive reports,
+  // 2026-08-25..09-02) cannot happen. Capped at 500 like the batch size.
+  exclude_ids?: string[];
 };
 
 export type ClaimedRecord = {
@@ -240,6 +254,28 @@ export function buildWhereClause(
     conditions.push(
       "(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))"
     );
+  }
+
+  // dev-request 2026-09-02-dental-catalog-class-triage (steg 1): default-ON
+  // non-clinic exclusion. Uses the shared clause constant so this query and
+  // the classifier's notion of "clinic" cannot drift apart. Env
+  // DENTAL_CATALOG_CLASS_FILTER_DISABLED="true" is the global rollback flag,
+  // same idiom as DENTAL_EXTRACTION_PARKING_DISABLED above.
+  const catalogClassDisabled = process.env.DENTAL_CATALOG_CLASS_FILTER_DISABLED === "true";
+  if (filter.excludeNonClinic !== false && !catalogClassDisabled) {
+    conditions.push(DENTAL_CLINIC_CLASS_SQL);
+  }
+
+  // dev-request 2026-09-02-dental-permanent-triage (steg 3): per-call id
+  // exclusion (same-cycle round-2 dedup). Validated, capped, parameterised.
+  if (Array.isArray(filter.exclude_ids) && filter.exclude_ids.length > 0) {
+    const ids = filter.exclude_ids
+      .filter((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 64)
+      .slice(0, 500);
+    if (ids.length > 0) {
+      conditions.push(`id NOT IN (${ids.map(() => "?").join(",")})`);
+      params.push(...ids);
+    }
   }
 
   return { clause: conditions.join(" AND "), params };

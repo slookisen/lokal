@@ -34206,6 +34206,21 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-02-dental-catalog-class-triage: rule classifier (pure) ──
+  console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage: catalog-class classifier (pure) ──");
+  try {
+    const { runDentalCatalogClassTests } = require("../src/services/dental-catalog-class.test") as
+      typeof import("../src/services/dental-catalog-class.test");
+    const dcc = runDentalCatalogClassTests({ log: false });
+    passed += dcc.passed;
+    failed += dcc.failed;
+    for (const f of dcc.failures) failures.push("dental-catalog-class: " + f);
+    console.log(`  dental-catalog-class: ${dcc.passed} passed, ${dcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-catalog-class: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as

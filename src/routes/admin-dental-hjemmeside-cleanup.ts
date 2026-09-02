@@ -52,7 +52,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
-import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
+import { classifyHjemmeside, type HjemmesideBadReason } from "../services/dental-hjemmeside-classifier";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -154,7 +154,7 @@ export interface FlaggedRow {
   id: string;
   navn: string;
   hjemmeside: string;
-  reason: "directory" | "business_site" | "parked";
+  reason: HjemmesideBadReason;
 }
 
 // Classifies every row in a batch, keeping only the ones the classifier
@@ -174,7 +174,7 @@ export function classifyCandidateBatch(rows: CandidateRow[]): FlaggedRow[] {
 export interface ApplyCleanupOutcome {
   applied: boolean;
   previous_hjemmeside?: string;
-  reason?: "directory" | "business_site" | "parked";
+  reason?: HjemmesideBadReason;
 }
 
 // Re-fetches a single row's CURRENT hjemmeside/directory_url/field_provenance
