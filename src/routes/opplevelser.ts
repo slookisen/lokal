@@ -23428,7 +23428,18 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       action_taken?: string;
     }> = [];
 
-    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+    // batch_id must be genuinely unique PER CALL, not just per-second: this
+    // id is now the primary key the rollback route (below) scopes its
+    // revert to (previously only an informational response field), and two
+    // separate apply:true sweep calls issued within the same wall-clock
+    // second previously produced byte-identical batch_id strings — making
+    // their audit rows indistinguishable and letting a rollback aimed at one
+    // call's promotions also revert an unrelated row a DIFFERENT call
+    // promoted in that same second. crypto.randomUUID() (already used below
+    // for each audit row's own `id`) guarantees no two calls ever collide,
+    // while keeping the human-readable second-truncated timestamp prefix
+    // nothing else in this codebase parses the exact pre-existing format.
+    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
 
     // AC3 (best-effort per dev-request spec): before/after needs_review
     // totals for THIS call, alongside the batch's own `promoted` count above
@@ -23533,7 +23544,6 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         } else if (eligibleForPromotion) {
           expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
           promoted = true;
-          counts.promoted++;
           insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
         }
         // MATCH and unresolved are stamped too (see block comment above) —
@@ -23566,6 +23576,15 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         : eligibleForPromotion
           ? (applyMode ? "promoted" : "would_promote")
           : "held";
+
+      // counts.promoted mirrors match/mismatch/unresolved's "verdict reached
+      // THIS call" semantics (counted unconditionally, apply or dry-run) —
+      // an eligible row counts whether or not the write actually happened:
+      // dry-run counts `would_promote` rows, apply counts actual
+      // `promoted` rows. Previously only incremented inside the applyMode
+      // branch, so a dry-run's counts.promoted was stuck at 0 even when
+      // results[] reported several would_promote rows.
+      if (promotionStatus === "would_promote" || promotionStatus === "promoted") counts.promoted++;
 
       results.push({
         id: row.id,
@@ -23627,11 +23646,26 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
 // 'needs_review' — but ONLY a row that is:
 //   (a) still traceable to that batch via the audit table (an audit row
 //       exists for it under this batch_id), AND
-//   (b) STILL verification_status='verified' right now.
+//   (b) that audit row is this row's MOST RECENT promotion — i.e. no LATER
+//       audit row exists for the same experience_id (see MAX(rowid)
+//       subquery below), AND
+//   (c) STILL verification_status='verified' right now.
 // A row that moved on since (re-quarantined by a later sweep MISMATCH, hand-
 // edited by an admin, merged/superseded, etc.) is NEVER touched — reverting
 // it here would silently clobber whatever that later, more-informed change
-// did. This is the same "never touch a row that moved on" discipline
+// did. Requirement (b) exists because SWEEP_ELIGIBLE_WHERE is deliberately
+// NOT scoped to needs_review (see block comment above the sweep route): an
+// already-verified row is re-swept every call, so it can be re-demoted to
+// needs_review by a later MISMATCH and then re-promoted by a completely
+// DIFFERENT, later batch. Without (b), a stale batch_id's rollback would
+// find its own (now-superseded) audit row still sitting there, still see
+// the row currently verification_status='verified' (courtesy of the LATER
+// batch), and wrongly revert a row that batch never touched. rowid (this
+// table's implicit, strictly-insertion-order-monotonic column — NOT the
+// TEXT `id` primary key, and NOT `promoted_at`, which is only second-
+// resolution and can tie between two calls in the same wall-clock second)
+// is what makes "latest promotion for this experience_id" unambiguous even
+// then. This is the same "never touch a row that moved on" discipline
 // planGardssalgContentRollback/planExperienceConflictRollback (above) apply
 // to their own batch_id-scoped reverts.
 //
@@ -23660,7 +23694,13 @@ router.post("/admin/experiences-admission-promotion-rollback", requireAdmin, (re
         `SELECT a.experience_id AS experience_id, a.from_status AS from_status
            FROM experience_admission_promotion_audit a
            JOIN experiences e ON e.id = a.experience_id
-          WHERE a.batch_id = ? AND e.verification_status = 'verified'`,
+          WHERE a.batch_id = ?
+            AND e.verification_status = 'verified'
+            AND a.rowid = (
+              SELECT MAX(a2.rowid)
+                FROM experience_admission_promotion_audit a2
+               WHERE a2.experience_id = a.experience_id
+            )`,
       )
       .all(batchId) as Array<{ experience_id: string; from_status: string }>;
 

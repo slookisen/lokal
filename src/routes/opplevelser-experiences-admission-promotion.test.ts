@@ -328,15 +328,42 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         verification_status: "verified", confidence: "high", canonical_id: null,
       });
 
+      // Regression-scenario (Defect 1) fixture: a dedicated row + evidence
+      // URL whose judge verdict this test flips across THREE separate
+      // sweep calls (MATCH -> MISMATCH -> MATCH again), via a call counter
+      // keyed on the row's title — see the regression test block below for
+      // why (rollback must not revert a row a LATER, independent batch
+      // re-promoted).
+      const regressionTitle = "Brefjordekspedisjon";
+      const regressionUrl = "https://good.no/brefjordekspedisjon";
+      let regressionJudgeCalls = 0;
+
       globalThis.fetch = (async (url: any, init: any) => {
         const urlStr = String(url);
         if (urlStr === "https://api.anthropic.com/v1/messages") {
           const body = JSON.parse(init?.body ?? "{}");
           const promptText: string = body?.messages?.[0]?.content ?? "";
+          if (promptText.includes(regressionTitle)) {
+            regressionJudgeCalls++;
+            // 1st and 3rd calls: MATCH (batch A promotes, batch B
+            // re-promotes). 2nd call: MISMATCH (demotes back to
+            // needs_review in between, so batch B is a genuinely
+            // independent later promotion, not a re-run of batch A).
+            if (regressionJudgeCalls === 2) {
+              return mkAnthropicResponse("MISMATCH\nMidlertidig avvik i produktteksten.");
+            }
+            return mkAnthropicResponse("MATCH\nStemmer godt med kilden.");
+          }
           if (promptText.includes("Klatretur i fjellet")) {
             return mkAnthropicResponse("MISMATCH\nSiden handler om noe helt annet.");
           }
           return mkAnthropicResponse("MATCH\nStemmer godt med kilden.");
+        }
+        if (urlStr === regressionUrl) {
+          return mkPageResponse(
+            "<html><body>Brefjordekspedisjon med sertifisert fjellfører, hele dagen langs innsjøen.</body></html>",
+            urlStr,
+          );
         }
         if (urlStr === "https://good.no/fjordtur") {
           return mkPageResponse("<html><body>Fjordtur med guide, avgang hver dag fra brygga.</body></html>", urlStr);
@@ -431,6 +458,12 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         // Audit table is empty after dry-run.
         const auditCount = (expDb.prepare(`SELECT COUNT(*) AS n FROM experience_admission_promotion_audit`).get() as { n: number }).n;
         assertEq(auditCount, 0, "adm-10: experience_admission_promotion_audit has ZERO rows after dry-run");
+
+        // counts.promoted mirrors match/mismatch/unresolved's "verdict
+        // reached this call" semantics: it counts the 2 would_promote rows
+        // even on dry-run (previously always 0 until apply:true, even when
+        // results[] already reported would_promote rows).
+        assertEq(dryRunBody.counts.promoted, 2, "adm-10b: dry-run counts.promoted == 2 (would_promote rows), not stuck at 0");
       }
 
       // ═══ (AC2) apply:true — promotes ONLY the eligible rows ═════════════
@@ -570,6 +603,99 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         });
         assertEq(rAgain.status, 200, "adm-28a: re-running the same rollback -> 200, no crash");
         assertEq(rAgain.body.reverted, [], "adm-28b: second run reverts nothing (rows are no longer 'verified')");
+      }
+
+      // ═══ Regression (Defect 1 fix): rollback must not revert a row a
+      // LATER, independent batch re-promoted ═════════════════════════════
+      //
+      // SWEEP_ELIGIBLE_WHERE is NOT scoped to needs_review, so an
+      // already-verified row is re-swept every call and can be re-demoted
+      // by a later MISMATCH, then re-promoted by a DIFFERENT, later batch.
+      // A rollback aimed at the FIRST (now-superseded) batch must leave the
+      // row's current, independently-re-promoted state alone.
+      {
+        insertExperience.run({
+          id: "adm-regression-latest-batch", provider_id: "prov-active-hjemmeside-verified",
+          title: regressionTitle, slug: "adm-regression-latest-batch",
+          description: "Kort om brefjordekspedisjonen.", category: "aktivitet", price_band: "standard", price_from: 800,
+          evidence_url: regressionUrl, evidence_url_verification: null,
+          verification_status: "needs_review", confidence: "high", canonical_id: null,
+        });
+
+        // ── batch A: promote (judge call #1 -> MATCH) ──────────────────────
+        const rA = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true } });
+        const batchA: string = rA.body.batch_id;
+        const sAfterA = snapshot("adm-regression-latest-batch")!;
+        assertEq(sAfterA.verification_status, "verified", "adm-29a: adm-regression-latest-batch promoted to 'verified' in batch A");
+
+        // ── demote: re-sweep (judge call #2 -> MISMATCH) ───────────────────
+        const rDemote = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true } });
+        const demoteBatchId: string = rDemote.body.batch_id;
+        const sAfterDemote = snapshot("adm-regression-latest-batch")!;
+        assertEq(sAfterDemote.verification_status, "needs_review", "adm-29b: adm-regression-latest-batch demoted back to 'needs_review' (later MISMATCH)");
+
+        // ── batch B: re-promote, a COMPLETELY INDEPENDENT later batch
+        //    (judge call #3 -> MATCH again) ─────────────────────────────────
+        const rB = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true } });
+        const batchB: string = rB.body.batch_id;
+        const sAfterB = snapshot("adm-regression-latest-batch")!;
+        assertEq(sAfterB.verification_status, "verified", "adm-29c: adm-regression-latest-batch re-promoted to 'verified' in batch B");
+
+        // Defect 2: three consecutive apply calls, issued back-to-back (same
+        // wall-clock second, in practice), must never produce colliding
+        // batch_ids.
+        assertTrue(
+          new Set([batchA, demoteBatchId, batchB]).size === 3,
+          "adm-30: three consecutive apply calls produce three distinct batch_ids, even issued back-to-back in the same wall-clock second",
+        );
+
+        // Audit trail: two promotion rows for this experience, batch A then
+        // batch B, in that (insertion) order.
+        const auditHistory = expDb
+          .prepare(
+            `SELECT batch_id, from_status, to_status FROM experience_admission_promotion_audit WHERE experience_id = ? ORDER BY rowid`,
+          )
+          .all("adm-regression-latest-batch") as Array<{ batch_id: string; from_status: string; to_status: string }>;
+        assertEq(auditHistory.length, 2, "adm-31a: exactly 2 promotion-audit rows for adm-regression-latest-batch (batch A + batch B)");
+        assertEq(auditHistory[0]?.batch_id, batchA, "adm-31b: first audit row is batch A's promotion");
+        assertEq(auditHistory[1]?.batch_id, batchB, "adm-31c: second (latest) audit row is batch B's promotion");
+
+        // ── the actual regression: roll back batch A (STALE — superseded by
+        //    batch B's later, independent promotion) — the row must be left
+        //    COMPLETELY UNTOUCHED, even though an audit row for batch A
+        //    genuinely exists for it and it is currently verification_
+        //    status='verified'. ───────────────────────────────────────────
+        const rRollbackStale = await callRoute(opplevelserRouter, {
+          url: "/admin/experiences-admission-promotion-rollback",
+          headers: adminHeaders,
+          body: { batch_id: batchA },
+        });
+        assertEq(rRollbackStale.status, 200, "adm-32a: stale-batch rollback -> 200");
+        const staleRevertedIds = new Set((rRollbackStale.body.reverted as any[]).map((x) => x.experience_id));
+        assertTrue(
+          !staleRevertedIds.has("adm-regression-latest-batch"),
+          "adm-32b: adm-regression-latest-batch is NOT in batch A's rollback revert list (its latest promotion is batch B, not batch A)",
+        );
+
+        const sAfterStaleRollback = snapshot("adm-regression-latest-batch")!;
+        assertEq(sAfterStaleRollback.verification_status, "verified", "adm-33a: adm-regression-latest-batch is STILL 'verified' after batch A's rollback");
+        assertEq(sAfterStaleRollback, sAfterB, "adm-33b: row is byte-for-byte unchanged from its post-batch-B snapshot — batch A's rollback touched nothing about it");
+
+        // ── control: rolling back batch B (its ACTUAL latest promotion)
+        //    DOES revert it — proves the rollback route still works when
+        //    the requested batch_id genuinely IS the latest promotion. ────
+        const rRollbackLatest = await callRoute(opplevelserRouter, {
+          url: "/admin/experiences-admission-promotion-rollback",
+          headers: adminHeaders,
+          body: { batch_id: batchB },
+        });
+        const latestRevertedIds = new Set((rRollbackLatest.body.reverted as any[]).map((x) => x.experience_id));
+        assertTrue(
+          latestRevertedIds.has("adm-regression-latest-batch"),
+          "adm-34a: adm-regression-latest-batch IS in batch B's rollback revert list (batch B genuinely is its latest promotion)",
+        );
+        const sAfterLatestRollback = snapshot("adm-regression-latest-batch")!;
+        assertEq(sAfterLatestRollback.verification_status, "needs_review", "adm-34b: adm-regression-latest-batch reverted to 'needs_review' by its OWN (latest) batch's rollback");
       }
     } catch (err: any) {
       failed++;
