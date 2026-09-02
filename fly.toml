@@ -68,54 +68,6 @@ primary_region = 'arn'
   # once RFB_SECOND_LINE_VERIFICATION_ENABLED above is also 'true'. See
   # dev-request FUNN block for the brregLookup gap.
   RFB_TERMINAL_UNCONFIRMABLE_ENABLED = 'true'
-  # dev-request 2026-08-28-gardssalg-kildebredde-wiring.md Grep 2 (PR #738,
-  # shipped flag-OFF as specified): enables POST /admin/gardssalg-second-line-verify
-  # (on-demand, max 48 ids per call, judge-API-gated, stamps
-  # field_provenance.second_line_verification) and the verified_second_line
-  # mirror in gardssalg-outreach-readiness. Daniel GO'd the flip in live
-  # session 2026-08-29 (A2A daniel-responses/2026-08-29-go-second-line-flipp-
-  # og-remapping-dev-request.md). Deliberately NOT wired into any cron/sweep —
-  # flipping this starts no background volume; it only un-no-ops the endpoint.
-  # Gate is `=== "true"`, read fresh per call; fail-safe: anything else = off,
-  # byte-identical to pre-#738 behavior. Existing stamps survive a flip-off
-  # (permanent provenance) but no new ones are written while off.
-  GS_SECOND_LINE_VERIFICATION_ENABLED = 'true'
-  # dev-request 2026-08-29-gs-second-line-kildeklasse-bredde.md Del C (PR #740,
-  # shipped flag-OFF as specified): enables POST
-  # /admin/gardssalg-kildeklasse-contact-intake (on-demand 1881/bransjeliste
-  # kildeklasse contact-candidate intake). Daniel's drive-order covers the
-  # flip (A2A daniel-responses/2026-08-29-storkonsern-50-og-drive-til-
-  # outreach.md). Deliberately NOT wired into any cron/sweep — flipping this
-  # starts no background volume; it only un-no-ops the endpoint. Gate is
-  # `=== "true"`, read fresh per call; fail-safe: anything else = off,
-  # byte-identical to pre-#740 behavior.
-  GS_KILDEKLASSE_CONTACT_ENABLED = 'true'
-  # dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent (Daniel,
-  # live session 2026-09-02): the EN/SV profile-translation "rullebånd". Four
-  # independent switches, ALL shipped OFF ("i back" — nothing public changes
-  # until Daniel GO's the pulje). Gate is `=== "true"`, read fresh per call;
-  # fail-safe: anything else = off, byte-identical to pre-dev-request pages.
-  #   PROFILE_TRANSLATIONS_ENABLED        — LLM spend: POST /admin/profile-
-  #     translations/run may translate+review+verify (writes only to the
-  #     profile_translations table, never to Norwegian source columns).
-  #   PROFILE_TRANSLATIONS_SERVE_ENABLED  — public rendering of PUBLISHED
-  #     translations on /en and /sv profile pages (both platforms).
-  #   OPPLEVAGENT_LANG_SWITCHER_ENABLED   — language switcher + EN/SV chrome
-  #     labels + hreflang on opplevagent profile pages.
-  #   SV_LOCALE_ENABLED                   — /sv/* URL prefix recognised on
-  #     both hosts (Swedish UI dictionaries + switcher entry).
-  # Rollout order (each its own deploy, each reversible by flipping back):
-  #   1) PROFILE_TRANSLATIONS_ENABLED → routines fill the belt, Daniel spot-
-  #      checks via GET /admin/profile-translations/queue + /preview
-  #   2) POST /publish per platform/lang (the pulje), then
-  #      PROFILE_TRANSLATIONS_SERVE_ENABLED + OPPLEVAGENT_LANG_SWITCHER_ENABLED
-  #   3) SV_LOCALE_ENABLED once the Swedish pulje is published.
-  # Kill switches: flip SERVE back to 'false' (instant, all languages) or
-  # POST /admin/profile-translations/unpublish {platform, lang} (per pulje).
-  PROFILE_TRANSLATIONS_ENABLED = 'false'
-  PROFILE_TRANSLATIONS_SERVE_ENABLED = 'false'
-  OPPLEVAGENT_LANG_SWITCHER_ENABLED = 'false'
-  SV_LOCALE_ENABLED = 'false'
 
 [[mounts]]
   source = 'lokal_data'
