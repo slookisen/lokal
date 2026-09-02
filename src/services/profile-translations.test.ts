@@ -151,6 +151,21 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     ok(v1.ok, "A21 good translation passes deterministic verify", v1.failed);
     const v2 = svc.verifyTranslationDeterministic(src, good.replace("91234567", "91234568"), "en");
     ok(!v2.ok && v2.failed.includes("digits_preserved"), "A22 changed phone digits fail", v2.failed);
+    // ordinals written with digits may be spelled out in the target language (live false positive, 2026-09-02)
+    const ordSrc = "Prisbelønnet eplemost fra eplehagen i 6. generasjon. Fire sorter: Aroma og Discovery.";
+    const ordEn = svc.verifyTranslationDeterministic(ordSrc, "Award-winning apple juice from our sixth-generation orchard. Four varieties: Aroma and Discovery.", "en");
+    ok(ordEn.ok, "A22b spelled-out English ordinal for '6. generasjon' passes", ordEn.failed);
+    const ordSv = svc.verifyTranslationDeterministic(ordSrc, "Prisbelönt äppelmust från äppelodlingen i sjätte generationen. Fyra sorter: Aroma och Discovery.", "sv");
+    ok(ordSv.ok, "A22c spelled-out Swedish ordinal passes", ordSv.failed);
+    const ordDigit = svc.verifyTranslationDeterministic(ordSrc, "Award-winning apple juice from our 6th-generation orchard. Four varieties: Aroma and Discovery.", "en");
+    ok(ordDigit.ok, "A22d digit ordinal '6th' passes", ordDigit.failed);
+    const ordWrong = svc.verifyTranslationDeterministic(ordSrc, "Award-winning apple juice from our fifth-generation orchard. Four varieties: Aroma and Discovery.", "en");
+    ok(!ordWrong.ok && ordWrong.failed.includes("digits_preserved"), "A22e wrong spelled-out ordinal still fails", ordWrong.failed);
+    const ordDropped = svc.verifyTranslationDeterministic(ordSrc, "Award-winning apple juice from our orchard. Four varieties: Aroma and Discovery.", "en");
+    ok(!ordDropped.ok && ordDropped.failed.includes("digits_preserved"), "A22f dropped ordinal still fails", ordDropped.failed);
+    const nonOrd = svc.verifyTranslationDeterministic("Åpent 6. hver dag kl 10–16, 6 sorter ost.", "Open every day 10–16, six kinds of cheese.", "en");
+    ok(!nonOrd.ok && nonOrd.failed.includes("digits_preserved"), "A22g cardinal 6 spelled out is NOT tolerated", nonOrd.failed);
+    ok(svc.ordinalSpelledOut("i 3. generasjon", "third generation", "3", "en") && !svc.ordinalSpelledOut("3 kuer", "third", "3", "en"), "A22h ordinalSpelledOut needs ordinal in source");
     const v3 = svc.verifyTranslationDeterministic(src, good.replace("https://example.no/gard", "https://example.com/farm"), "en");
     ok(!v3.ok && v3.failed.includes("urls_preserved"), "A23 changed URL fails", v3.failed);
     const v4 = svc.verifyTranslationDeterministic(src, good.replace("Saturdays", "lørdager"), "en");
