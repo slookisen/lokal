@@ -41756,6 +41756,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
+// content-judge sweep's new quarantine-exit promotion transition
+// (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
+// + an independently verified source [hjemmeside OR evidence_url] + already
+// high/medium confidence — never on the judge verdict alone), its additive
+// experience_admission_promotion_audit trail, and the batch-level rollback
+// route (POST /admin/experiences-admission-promotion-rollback). Own
+// dedicated in-memory-db harness (mirrors opplevelser-experiences-content-
+// judge-sweep.test.ts's harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: admission promotion + rollback ──");
+  try {
+    const { runOpplevelserExperiencesAdmissionPromotionTests } = require("../src/routes/opplevelser-experiences-admission-promotion.test") as
+      typeof import("../src/routes/opplevelser-experiences-admission-promotion.test");
+    const eap = await runOpplevelserExperiencesAdmissionPromotionTests({ log: false });
+    passed += eap.passed;
+    failed += eap.failed;
+    for (const f of eap.failures) failures.push("opplevelser-experiences-admission-promotion: " + f);
+    console.log(`  opplevelser-experiences-admission-promotion: ${eap.passed} passed, ${eap.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-admission-promotion: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent — the
 // EN/SV profile-translation rullebånd (src/services/profile-translations.ts +
 // src/routes/admin-profile-translations.ts + the sv locale in src/i18n/t.ts):
