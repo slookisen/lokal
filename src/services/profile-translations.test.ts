@@ -1,0 +1,469 @@
+/**
+ * profile-translations.test.ts — dev-request
+ * 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent.
+ *
+ * Sections:
+ *   A. Pure unit tests (no DB, no network): i18n sv plumbing (flag-gated
+ *      /sv prefix, sv→en→no fallback), verifyTranslationDeterministic,
+ *      extractJsonObject, parseReviewVerdict/reviewAccepts, planItem, and the
+ *      PUBLISH_GATE_SQL drift guard.
+ *   B. Store + pipeline against a :memory: RFB db (database/init's
+ *      __setDbForTesting/__initSchemaForTesting) with an injected fetchImpl
+ *      that plays translator + reviewer: verified path, REVISE→retry→APPROVE,
+ *      REJECT, deterministic-verify rejection, missing API key (fail-closed,
+ *      row stays draft), source-change supersede, publish/unpublish/serve-flag
+ *      gating, reject/requeue.
+ *   C. Admin route (src/routes/admin-profile-translations.ts) via
+ *      router.handle(): auth, flag-OFF no-op proof, dry-run planning, a real
+ *      run with the app-level fetch seam, status, publish.
+ *   D. Opplevagent source collection against a :memory: experiences db —
+ *      only PUBLISHED experiences / catalog-visible providers are collected.
+ *
+ * Run standalone: npx tsx src/services/profile-translations.test.ts
+ */
+
+import Database from "better-sqlite3";
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+interface RouteResult { status: number; body: any; }
+
+function callRoute(
+  router: any,
+  opts: { url: string; method?: string; headers?: Record<string, string>; body?: any; app?: any },
+): Promise<RouteResult> {
+  return new Promise((resolve) => {
+    const url = opts.url;
+    const qIndex = url.indexOf("?");
+    const query: Record<string, string> = {};
+    if (qIndex >= 0) {
+      for (const [k, v] of new URLSearchParams(url.slice(qIndex + 1))) query[k] = v;
+    }
+    const req: any = {
+      method: opts.method || "GET",
+      url,
+      originalUrl: url,
+      path: qIndex >= 0 ? url.slice(0, qIndex) : url,
+      query,
+      headers: opts.headers || {},
+      body: opts.body ?? {},
+      app: opts.app || { get: () => undefined },
+      get(name: string) { return (opts.headers || {})[name.toLowerCase()]; },
+    };
+    const res: any = {
+      statusCode: 200,
+      status(code: number) { this.statusCode = code; return this; },
+      json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+      send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+      setHeader() { return this; },
+    };
+    router.handle(req, res, (err: any) => resolve({ status: err ? 500 : 404, body: { error: err ? String(err) : "unhandled" } }));
+  });
+}
+
+/** Fake Anthropic endpoint: answers translator prompts and reviewer prompts
+ *  from queues, recording every call. */
+function makeFakeFetch(script: { translations: any[]; reviews: any[] }, log: { calls: Array<{ system: string; user: string; model: string }> }) {
+  return async (_url: any, init: any): Promise<any> => {
+    const body = JSON.parse(String(init?.body || "{}"));
+    const system = String(body.system || "");
+    const user = String(body.messages?.[0]?.content || "");
+    log.calls.push({ system, user, model: body.model });
+    const isReviewer = /senior .* linguist/i.test(system);
+    const next = isReviewer ? script.reviews.shift() : script.translations.shift();
+    if (next === undefined) {
+      return { ok: false, status: 500, json: async () => ({}), text: async () => "script exhausted" };
+    }
+    if (next && next.__http) {
+      return { ok: false, status: next.__http, json: async () => ({}), text: async () => "err" };
+    }
+    const text = typeof next === "string" ? next : JSON.stringify(next);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ model: body.model, stop_reason: "end_turn", content: [{ type: "text", text }], usage: { input_tokens: 100, output_tokens: 50 } }),
+      text: async () => "",
+    };
+  };
+}
+
+export async function runProfileTranslationsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+  const ok = (cond: boolean, label: string, detail?: unknown) => {
+    if (cond) { passed++; if (log) console.log(`  ok ${label}`); }
+    else { failed++; failures.push(`✗ ${label}${detail !== undefined ? " — " + JSON.stringify(detail) : ""}`); if (log) console.log(`  ✗ ${label}`, detail ?? ""); }
+  };
+  const eq = (a: unknown, b: unknown, label: string) => ok(JSON.stringify(a) === JSON.stringify(b), label, { actual: a, expected: b });
+
+  const envKeys = ["SV_LOCALE_ENABLED", "PROFILE_TRANSLATIONS_ENABLED", "PROFILE_TRANSLATIONS_SERVE_ENABLED", "OPPLEVAGENT_LANG_SWITCHER_ENABLED", "ANTHROPIC_API_KEY", "ADMIN_KEY", "EXPERIENCES_DB_PATH"];
+  const prevEnv: Record<string, string | undefined> = {};
+  for (const k of envKeys) prevEnv[k] = process.env[k];
+  const restoreEnv = () => {
+    for (const k of envKeys) {
+      if (prevEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = prevEnv[k];
+    }
+  };
+
+  const svc = require("./profile-translations") as typeof import("./profile-translations");
+  const i18n = require("../i18n/t") as typeof import("../i18n/t");
+
+  try {
+    // ───────────────────────────── A. pure ─────────────────────────────
+    delete process.env.SV_LOCALE_ENABLED;
+    eq(i18n.detectLangFromPath("/sv/sok"), "no", "A1 /sv not recognised while SV_LOCALE_ENABLED unset");
+    eq(i18n.detectLangFromPath("/en/sok"), "en", "A2 /en still recognised");
+    process.env.SV_LOCALE_ENABLED = "true";
+    eq(i18n.detectLangFromPath("/sv/sok"), "sv", "A3 /sv recognised with flag");
+    eq(i18n.detectLangFromPath("/sv"), "sv", "A4 bare /sv recognised with flag");
+    eq(i18n.detectLangFromPath("/svelvik"), "no", "A5 /svelvik is not /sv");
+    delete process.env.SV_LOCALE_ENABLED;
+    eq(i18n.stripLangPrefix("/sv/produsent/x"), "/produsent/x", "A6 stripLangPrefix sv");
+    eq(i18n.stripLangPrefix("/en"), "/", "A7 stripLangPrefix bare en");
+    eq(i18n.localizedPath("/sok", "sv"), "/sv/sok", "A8 localizedPath sv");
+    eq(i18n.localizedPath("/", "sv"), "/sv", "A9 localizedPath root sv");
+    eq(i18n.localizedPath("/sok", "no"), "/sok", "A10 localizedPath no unchanged");
+    eq(i18n.htmlLangAttr("sv"), "sv", "A11 htmlLangAttr sv");
+    eq(i18n.ogLocale("sv"), "sv_SE", "A12 ogLocale sv");
+    eq(i18n.t("sv", "nav.search"), "Sök", "A13 t() sv dictionary");
+    eq(i18n.t("sv", "producer.title_suffix", { city: "Oslo" }), " — Lokal matproducent i Oslo", "A14 t() sv with params");
+    eq(i18n.t("en", "nav.search"), "Search", "A15 t() en unchanged");
+    eq(i18n.t("no", "nav.search"), "Søk", "A16 t() no unchanged");
+    eq(i18n.t("sv", "nav.lang_sv"), "Svenska", "A17 lang_sv key present");
+    eq(i18n.t("sv", "does.not.exist"), "does.not.exist", "A18 unknown key returns key");
+    eq(i18n.formatPrice(80, "sv"), "80 NOK", "A19 formatPrice sv");
+
+    // PUBLISH_GATE_SQL drift guard
+    const store = require("./experience-store") as typeof import("./experience-store");
+    eq(svc.OPPLEVAGENT_PUBLISH_GATE_SQL, store.PUBLISH_GATE_SQL, "A20 inlined publish gate equals experience-store PUBLISH_GATE_SQL");
+
+    // deterministic verify
+    const src = "Gården ligger i Bø i Telemark. Vi selger ost og honning, åpent lørdager 10–15. Ring 91234567 eller se https://example.no/gard.";
+    const good = "The farm is located in Bø in Telemark. We sell cheese and honey, open Saturdays 10–15. Call 91234567 or see https://example.no/gard.";
+    const v1 = svc.verifyTranslationDeterministic(src, good, "en");
+    ok(v1.ok, "A21 good translation passes deterministic verify", v1.failed);
+    const v2 = svc.verifyTranslationDeterministic(src, good.replace("91234567", "91234568"), "en");
+    ok(!v2.ok && v2.failed.includes("digits_preserved"), "A22 changed phone digits fail", v2.failed);
+    const v3 = svc.verifyTranslationDeterministic(src, good.replace("https://example.no/gard", "https://example.com/farm"), "en");
+    ok(!v3.ok && v3.failed.includes("urls_preserved"), "A23 changed URL fails", v3.failed);
+    const v4 = svc.verifyTranslationDeterministic(src, good.replace("Saturdays", "lørdager"), "en");
+    ok(!v4.ok && v4.failed.includes("no_untranslated_norwegian"), "A24 leftover Norwegian word fails", v4.failed);
+    const v5 = svc.verifyTranslationDeterministic(src, src, "en");
+    ok(!v5.ok && v5.failed.includes("not_verbatim_copy"), "A25 verbatim copy fails", v5.failed);
+    const v6 = svc.verifyTranslationDeterministic("Rørosmeieriet", "Rørosmeieriet", "en", { kind: "title", alreadyTargetLanguage: true });
+    ok(v6.ok, "A26 short proper-noun title identical is fine", v6.failed);
+    const v7 = svc.verifyTranslationDeterministic(src, "<p>" + good + "</p>", "en");
+    ok(!v7.ok && v7.failed.includes("no_markup"), "A27 markup fails", v7.failed);
+    const v8 = svc.verifyTranslationDeterministic(src, "Farm.", "en");
+    ok(!v8.ok && v8.failed.includes("length_ratio"), "A28 far too short fails", v8.failed);
+    const svGood = "Gården ligger i Bø i Telemark. Vi säljer ost och honung, öppet lördagar 10–15. Ring 91234567 eller se https://example.no/gard.";
+    const v9 = svc.verifyTranslationDeterministic(src, svGood, "sv");
+    ok(v9.ok, "A29 Swedish translation with å/ä/ö passes", v9.failed);
+    const v10 = svc.verifyTranslationDeterministic(src, svGood.replace("öppet lördagar", "åpent lørdager"), "sv");
+    ok(!v10.ok && v10.failed.includes("no_untranslated_norwegian"), "A30 Norwegian ø-word leaks into sv fails", v10.failed);
+    const v11 = svc.verifyTranslationDeterministic("Besøk oss på e-post: post@gard.no", "Contact us by e-mail: post@gard.no", "en");
+    ok(v11.ok, "A31 e-mail preserved passes", v11.failed);
+    const v12 = svc.verifyTranslationDeterministic("Besøk oss på e-post: post@gard.no", "Contact us by e-mail: hello@gard.no", "en");
+    ok(!v12.ok && v12.failed.includes("emails_preserved"), "A32 changed e-mail fails", v12.failed);
+
+    // JSON extraction + verdict parsing
+    eq(svc.extractJsonObject('Here you go:\n```json\n{"translation":"x","already_target_language":false,"notes":""}\n```')?.translation, "x", "A33 extractJsonObject strips fences");
+    eq(svc.extractJsonObject("no json here"), null, "A34 extractJsonObject null on prose");
+    const rv = svc.parseReviewVerdict({ verdict: "approve", fidelity: 5, fluency: 4, issues: [{ type: "style", severity: "minor", detail: "x" }], summary: "fine" });
+    ok(!!rv && rv.verdict === "APPROVE" && svc.reviewAccepts(rv), "A35 APPROVE 5/4 minor accepted");
+    const rv2 = svc.parseReviewVerdict({ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [{ type: "number", severity: "major", detail: "price" }] });
+    ok(!!rv2 && !svc.reviewAccepts(rv2), "A36 APPROVE with a major issue is NOT accepted");
+    const rv3 = svc.parseReviewVerdict({ verdict: "APPROVE", fidelity: 3, fluency: 5, issues: [] });
+    ok(!!rv3 && !svc.reviewAccepts(rv3), "A37 APPROVE with fidelity 3 is NOT accepted");
+    eq(svc.parseReviewVerdict({ verdict: "MAYBE", fidelity: 5, fluency: 5 }), null, "A38 unknown verdict → null");
+
+    // planItem
+    const base: any = { source_hash: "h1", status: "verified", attempts: 1 };
+    eq(svc.planItem(null, "h1").action, "new", "A39 planItem new");
+    eq(svc.planItem(base, "h1").action, "skip", "A40 planItem verified same hash skip");
+    eq(svc.planItem(base, "h2").action, "source_changed", "A41 planItem hash changed");
+    eq(svc.planItem({ ...base, status: "rejected" }, "h1"), { action: "skip", reason: "rejected_manual_queue" }, "A42 planItem rejected skip");
+    eq(svc.planItem({ ...base, status: "draft", attempts: 0 }, "h1"), { action: "retry", attempts: 0 }, "A43 planItem draft retry");
+    eq(svc.planItem({ ...base, status: "draft", attempts: svc.MAX_TRANSLATION_ATTEMPTS }, "h1"), { action: "skip", reason: "max_attempts" }, "A44 planItem draft at cap skip");
+
+    // ───────────────────────────── B. store + pipeline (rfb :memory:) ───
+    const initMod = require("../database/init") as typeof import("../database/init");
+    const prevDb = initMod.__peekDbForTesting();
+    const rfbDb = new Database(":memory:");
+    try {
+      initMod.__setDbForTesting(rfbDb as any);
+      initMod.__initSchemaForTesting(rfbDb as any);
+      const hasTable = rfbDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='profile_translations'").get();
+      ok(!!hasTable, "B1 profile_translations table created by rfb initSchema");
+
+      const insAgent = rfbDb.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      insAgent.run("a1", "Solgården", "Vi selger økologiske grønnsaker og honning fra egen gård i Bø. Åpent lørdager 10–15.", "test", "a1@x.no", "https://a1.no", "producer", "k1", 1);
+      insAgent.run("a2", "Inaktiv gård", "Skal ikke oversettes.", "test", "a2@x.no", "https://a2.no", "producer", "k2", 0);
+      insAgent.run("a3", "Logistikk AS", "Ikke en produsent.", "test", "a3@x.no", "https://a3.no", "logistics", "k3", 1);
+      rfbDb.prepare(`INSERT INTO agent_knowledge (agent_id, about) VALUES (?, ?)`).run("a1", "Solgården har vært i familiens eie siden 1952. Vi dyrker gulrøtter, poteter og bær, og har bikuber på tunet.");
+
+      const items = svc.collectSourceItems(rfbDb as any, "rfb");
+      eq(items.map((i) => `${i.entity_id}:${i.field}`), ["a1:description", "a1:about"], "B2 only active producer fields collected");
+
+      const plan = svc.planTranslationBatch(rfbDb as any, "rfb", ["en", "sv"], 10);
+      eq(plan.actionable.length, 4, "B3 2 fields × 2 langs planned");
+      eq(plan.total_pairs, 4, "B4 total pairs 4");
+      const planLimited = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 1);
+      eq([planLimited.actionable.length, planLimited.remaining_actionable], [1, 1], "B5 limit caps actionable and reports remaining");
+
+      // B6: missing API key → translate_failed, stays draft, attempts 1, no fetch
+      delete process.env.ANTHROPIC_API_KEY;
+      const noKeyLog = { calls: [] as any[] };
+      const r0 = await svc.processTranslationItem(rfbDb as any, "rfb", plan.actionable[0], "b-nokey", { fetchImpl: makeFakeFetch({ translations: [], reviews: [] }, noKeyLog) as any });
+      eq([r0.outcome, r0.status, r0.attempts, noKeyLog.calls.length], ["translate_failed", "draft", 1, 0], "B6 missing key fail-closed: draft, no fetch");
+      ok(/ANTHROPIC_API_KEY/.test(r0.reason || ""), "B7 reason names the missing key");
+
+      process.env.ANTHROPIC_API_KEY = "test-key";
+      // B8: happy path — translator JSON, reviewer APPROVE → verified
+      const descEn = plan.actionable.find((p) => p.item.field === "description" && p.lang === "en")!;
+      const log1 = { calls: [] as any[] };
+      const fake1 = makeFakeFetch({
+        translations: [{ translation: "We sell organic vegetables and honey from our own farm in Bø. Open Saturdays 10–15.", already_target_language: false, notes: "" }],
+        reviews: [{ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "Accurate and natural." }],
+      }, log1);
+      const r1 = await svc.processTranslationItem(rfbDb as any, "rfb", descEn, "b-1", { fetchImpl: fake1 as any });
+      eq([r1.outcome, r1.status], ["verified", "verified"], "B8 approve+verify → verified");
+      eq(log1.calls.length, 2, "B9 exactly two LLM calls (translate + review)");
+      ok(/professional Norwegian-to-English translator/.test(log1.calls[0].system), "B10 first call is the translator prompt");
+      ok(/senior English linguist/.test(log1.calls[1].system), "B11 second call is the reviewer prompt");
+      ok(log1.calls[0].user.includes("Solgården") && log1.calls[0].user.includes("Field: description"), "B12 translator prompt carries entity name + field");
+      ok(log1.calls[1].user.includes("We sell organic vegetables"), "B13 reviewer sees the translation");
+      eq(log1.calls[0].model, svc.DEFAULT_TRANSLATOR_MODEL, "B14 default translator model used");
+      const row1 = svc.getTranslationById(rfbDb as any, r1.id)!;
+      ok(!!row1.review_json && !!row1.verify_json && !!row1.verified_at && row1.reviewed_at !== null, "B15 review/verify JSON + timestamps persisted");
+      const audit1 = svc.listTranslationAudit(rfbDb as any, r1.id);
+      eq(audit1.map((a: any) => a.to_status).reverse(), ["draft", "draft", "draft", "reviewed", "verified"], "B16 audit trail: collected, (nokey attempt), translated, reviewed, verified");
+
+      // serve-flag gating
+      delete process.env.PROFILE_TRANSLATIONS_SERVE_ENABLED;
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en"), {}, "B17 verified-but-unpublished not served");
+      const pubDry = svc.publishVerified(rfbDb as any, "rfb", "en", { dryRun: true, batchId: "p0", actor: "test" });
+      eq([pubDry.would_publish, pubDry.published], [1, 0], "B18 publish dry-run counts, writes nothing");
+      eq(svc.getTranslationById(rfbDb as any, r1.id)!.status, "verified", "B19 still verified after dry-run");
+      const pub = svc.publishVerified(rfbDb as any, "rfb", "en", { dryRun: false, batchId: "p1", actor: "test" });
+      eq(pub.published, 1, "B20 publish flips verified → published");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en"), {}, "B21 published but SERVE flag off → not served");
+      process.env.PROFILE_TRANSLATIONS_SERVE_ENABLED = "true";
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en"), { description: "We sell organic vegetables and honey from our own farm in Bø. Open Saturdays 10–15." }, "B22 served with flag on");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "sv"), {}, "B23 sv has nothing published");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "no"), {}, "B24 no never served");
+      const bulk = svc.getPublishedProfileTranslationsBulk(rfbDb as any, "rfb", "agent", ["a1", "a2"], "en");
+      eq(bulk.get("a1")?.description?.slice(0, 7), "We sell", "B25 bulk lookup");
+      const preview = svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true, includeVerified: true });
+      ok(!!preview.description, "B26 preview ignores serve flag");
+      const un = svc.unpublish(rfbDb as any, "rfb", "en", { batchId: "u1", actor: "test" });
+      eq(un.unpublished, 1, "B27 unpublish");
+      eq(svc.getTranslationById(rfbDb as any, r1.id)!.status, "verified", "B28 back to verified after unpublish");
+      svc.publishVerified(rfbDb as any, "rfb", "en", { dryRun: false, batchId: "p2", actor: "test" });
+
+      // B29: REVISE → second attempt → APPROVE
+      const aboutEn = plan.actionable.find((p) => p.item.field === "about" && p.lang === "en")!;
+      const log2 = { calls: [] as any[] };
+      const fake2 = makeFakeFetch({
+        translations: [
+          { translation: "Solgården has been family owned since 1952. We grow carrots, potatoes and berries, and keep beehives.", already_target_language: false, notes: "" },
+          { translation: "Solgården has been in the family's ownership since 1952. We grow carrots, potatoes and berries, and keep beehives in the farmyard.", already_target_language: false, notes: "" },
+        ],
+        reviews: [
+          { verdict: "REVISE", fidelity: 3, fluency: 5, issues: [{ type: "omission", severity: "major", detail: "'på tunet' (in the farmyard) omitted" }], summary: "omission" },
+          { verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" },
+        ],
+      }, log2);
+      const r2 = await svc.processTranslationItem(rfbDb as any, "rfb", aboutEn, "b-2", { fetchImpl: fake2 as any });
+      eq([r2.outcome, r2.attempts], ["verified", 2], "B29 REVISE → retry → APPROVE → verified after 2 attempts");
+      eq(log2.calls.length, 4, "B30 four LLM calls for the revise round");
+      ok(/reviewer rejected the previous attempt/.test(log2.calls[2].user) && /farmyard/.test(log2.calls[2].user), "B31 retry prompt carries the reviewer's issues");
+
+      // B32: REJECT → rejected, no retry
+      const descSv = plan.actionable.find((p) => p.item.field === "description" && p.lang === "sv")!;
+      const log3 = { calls: [] as any[] };
+      const fake3 = makeFakeFetch({
+        translations: [{ translation: "Vi säljer ekologiska grönsaker och honung från vår egen gård i Bø. Öppet lördagar 10–15.", already_target_language: false, notes: "" }],
+        reviews: [{ verdict: "REJECT", fidelity: 1, fluency: 5, issues: [{ type: "meaning", severity: "major", detail: "wrong" }], summary: "bad" }],
+      }, log3);
+      const r3 = await svc.processTranslationItem(rfbDb as any, "rfb", descSv, "b-3", { fetchImpl: fake3 as any });
+      eq([r3.outcome, r3.status, log3.calls.length], ["rejected_review", "rejected", 2], "B32 REJECT → rejected, no retry");
+      eq(svc.planItem(svc.getTranslationById(rfbDb as any, r3.id), descSv.hash), { action: "skip", reason: "rejected_manual_queue" }, "B33 rejected row is skipped by the planner");
+      const rq = svc.requeueTranslation(rfbDb as any, r3.id, "test")!;
+      eq([rq.status, rq.attempts], ["draft", 0], "B34 requeue resets to draft/0");
+
+      // B35: reviewer approves but deterministic verify fails (digit dropped)
+      const aboutSv = plan.actionable.find((p) => p.item.field === "about" && p.lang === "sv")!;
+      const fake4 = makeFakeFetch({
+        translations: [{ translation: "Solgården har varit i familjens ägo i många år. Vi odlar morötter, potatis och bär och har bikupor på gården.", already_target_language: false, notes: "" }],
+        reviews: [{ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" }],
+      }, { calls: [] });
+      const r4 = await svc.processTranslationItem(rfbDb as any, "rfb", aboutSv, "b-4", { fetchImpl: fake4 as any });
+      eq([r4.outcome, r4.status], ["rejected_verify", "rejected"], "B35 approve but digits (1952) dropped → rejected_verify");
+      ok((r4.verify?.failed || []).includes("digits_preserved"), "B36 failed check named", r4.verify?.failed);
+
+      // B37: manual reject of a published row
+      const rej = svc.rejectTranslation(rfbDb as any, r1.id, "spot-check: awkward phrasing", "daniel")!;
+      eq([rej.status, rej.published_at], ["rejected", null], "B37 manual reject unpublishes");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en"), {}, "B38 rejected row no longer served");
+      svc.requeueTranslation(rfbDb as any, r1.id, "test");
+
+      // B39: source change supersedes
+      rfbDb.prepare(`UPDATE agents SET description = ? WHERE id = 'a1'`).run("Vi selger økologiske grønnsaker, honning og egg fra egen gård i Bø. Åpent lørdager 10–16.");
+      const plan2 = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 10);
+      const changed = plan2.actionable.find((p) => p.item.field === "description");
+      ok(!!changed && changed.decision.action === "source_changed", "B39 changed source detected", changed?.decision);
+      const fake5 = makeFakeFetch({
+        translations: [{ translation: "We sell organic vegetables, honey and eggs from our own farm in Bø. Open Saturdays 10–16.", already_target_language: false, notes: "" }],
+        reviews: [{ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" }],
+      }, { calls: [] });
+      const r5 = await svc.processTranslationItem(rfbDb as any, "rfb", changed!, "b-5", { fetchImpl: fake5 as any });
+      const row5 = svc.getTranslationById(rfbDb as any, r5.id)!;
+      eq([r5.outcome, row5.id === r1.id, row5.attempts], ["verified", true, 1], "B40 same row re-translated after source change, attempts reset");
+      ok((row5.prev_translated_text || "").startsWith("We sell organic vegetables and honey"), "B41 previous translation kept in prev_translated_text");
+      eq(row5.source_hash, changed!.hash, "B42 new hash stored");
+
+      const counts = svc.translationStatusCounts(rfbDb as any, "rfb");
+      ok(counts.en && counts.en.verified === 2 && (counts.sv?.draft || 0) === 1 && (counts.sv?.rejected || 0) === 1, "B43 status counts", counts);
+      const q = svc.listTranslationQueue(rfbDb as any, "rfb", { lang: "sv", status: "rejected" });
+      eq(q.length, 1, "B44 queue filter");
+
+      // ───────────────────────────── C. admin route ─────────────────────
+      const router = (require("../routes/admin-profile-translations") as typeof import("../routes/admin-profile-translations")).default;
+      const key = process.env.ADMIN_KEY || "profile-translations-test-key";
+      process.env.ADMIN_KEY = key;
+      const H = { "x-admin-key": key };
+
+      const c1 = await callRoute(router, { url: "/status?platform=rfb" });
+      eq(c1.status, 403, "C1 missing key → 403");
+      const c2 = await callRoute(router, { url: "/status?platform=rfb", headers: { "x-admin-key": "wrong" } });
+      eq(c2.status, 403, "C2 wrong key → 403");
+      const c3 = await callRoute(router, { url: "/status?platform=nope", headers: H });
+      eq(c3.status, 400, "C3 bad platform → 400");
+      const c4 = await callRoute(router, { url: "/status?platform=rfb", headers: H });
+      eq(c4.status, 200, "C4 status 200");
+      ok(c4.body.source_fields_total === 2 && c4.body.counts.en.verified === 2, "C5 status counts + source fields", c4.body);
+      eq(c4.body.flags.pipeline_enabled, false, "C6 flags snapshot reports pipeline off");
+
+      // flag OFF → /run with dry_run:false is a pure no-op (no fetch, no writes)
+      delete process.env.PROFILE_TRANSLATIONS_ENABLED;
+      const before = rfbDb.prepare("SELECT COUNT(*) AS n FROM profile_translation_audit").get() as any;
+      const offLog = { calls: [] as any[] };
+      const app = { get: (k: string) => (k === "profileTranslationsFetchImpl" ? makeFakeFetch({ translations: [], reviews: [] }, offLog) : undefined) };
+      const c7 = await callRoute(router, { url: "/run", method: "POST", headers: H, body: { platform: "rfb", dry_run: false }, app });
+      const after = rfbDb.prepare("SELECT COUNT(*) AS n FROM profile_translation_audit").get() as any;
+      eq([c7.status, c7.body.enabled, offLog.calls.length, after.n - before.n], [200, false, 0, 0], "C7 flag OFF: {enabled:false}, no fetch, no audit writes");
+
+      // dry-run (default) plans without fetch even with the flag on
+      process.env.PROFILE_TRANSLATIONS_ENABLED = "true";
+      const c8 = await callRoute(router, { url: "/run", method: "POST", headers: H, body: { platform: "rfb", langs: ["sv"] }, app });
+      eq([c8.status, c8.body.dry_run, offLog.calls.length], [200, true, 0], "C8 dry_run default → plan only");
+      eq(c8.body.planned_count, 1, "C9 one sv item plannable (the requeued draft)");
+      const c8b = await callRoute(router, { url: "/run", method: "POST", headers: H, body: { platform: "rfb", dry_run: "false" }, app });
+      eq(c8b.body.dry_run, true, "C10 dry_run:\"false\" (string) is still a dry run (STRICT-FALSE)");
+      const c8c = await callRoute(router, { url: "/run", method: "POST", headers: H, body: { platform: "rfb", langs: ["de"] } });
+      eq(c8c.status, 400, "C11 unknown lang → 400");
+
+      // real run through the app-level fetch seam
+      const runLog = { calls: [] as any[] };
+      const appRun = {
+        get: (k: string) => (k === "profileTranslationsFetchImpl"
+          ? makeFakeFetch({
+              translations: [{ translation: "Vi säljer ekologiska grönsaker, honung och ägg från vår egen gård i Bø. Öppet lördagar 10–16.", already_target_language: false, notes: "" }],
+              reviews: [{ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" }],
+            }, runLog)
+          : undefined),
+      };
+      const c12 = await callRoute(router, { url: "/run", method: "POST", headers: H, body: { platform: "rfb", langs: ["sv"], dry_run: false, limit: 5 }, app: appRun });
+      eq([c12.status, c12.body.dry_run, c12.body.processed, c12.body.outcomes.verified, runLog.calls.length], [200, false, 1, 1, 2], "C12 real run: 1 item verified via app fetch seam", c12.body);
+      ok(typeof c12.body.batch_id === "string" && c12.body.usage.calls === 2, "C13 batch id + usage reported");
+
+      const c14 = await callRoute(router, { url: "/queue?platform=rfb&lang=sv&status=verified", headers: H });
+      eq([c14.status, c14.body.count], [200, 1], "C14 queue lists the verified sv row");
+      ok(c14.body.rows[0].review?.verdict === "APPROVE" && c14.body.rows[0].verify?.ok === true, "C15 queue rows expose review + verify JSON");
+      const c16 = await callRoute(router, { url: "/publish", method: "POST", headers: H, body: { platform: "rfb", lang: "sv" } });
+      eq([c16.status, c16.body.dry_run, c16.body.would_publish, c16.body.published], [200, true, 1, 0], "C16 publish default dry-run");
+      const c17 = await callRoute(router, { url: "/publish", method: "POST", headers: H, body: { platform: "rfb", lang: "sv", dry_run: false } });
+      eq(c17.body.published, 1, "C17 publish real");
+      const c18 = await callRoute(router, { url: "/preview?platform=rfb&entity_type=agent&entity_id=a1&lang=sv", headers: H });
+      ok(c18.status === 200 && c18.body.fields.some((f: any) => f.field === "description" && /honung/.test(f.published_text || "")), "C18 preview shows published sv text", c18.body);
+      const c19 = await callRoute(router, { url: "/unpublish", method: "POST", headers: H, body: { platform: "rfb", lang: "sv" } });
+      eq(c19.body.unpublished, 1, "C19 unpublish via route");
+      const c20 = await callRoute(router, { url: "/reject", method: "POST", headers: H, body: { platform: "rfb", id: c14.body.rows[0].id, reason: "test" } });
+      eq([c20.status, c20.body.status], [200, "rejected"], "C20 reject via route");
+      const c21 = await callRoute(router, { url: "/requeue", method: "POST", headers: H, body: { platform: "rfb", id: c14.body.rows[0].id } });
+      eq([c21.status, c21.body.status], [200, "draft"], "C21 requeue via route");
+      const c22 = await callRoute(router, { url: `/audit?platform=rfb&id=${c14.body.rows[0].id}`, headers: H });
+      ok(c22.status === 200 && c22.body.audit.length >= 4, "C22 audit history via route");
+    } finally {
+      if (prevDb) initMod.__setDbForTesting(prevDb);
+      try { rfbDb.close(); } catch { /* ignore */ }
+    }
+
+    // ───────────────────────────── D. opplevagent collection ──────────
+    const prevExpPath = process.env.EXPERIENCES_DB_PATH;
+    const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+    try {
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      dbFactory.__resetDbFactoryForTesting();
+      const expDb = dbFactory.getDb("experiences");
+      ok(!!expDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='profile_translations'").get(), "D1 profile_translations table created by experiences schema");
+      expDb.prepare(`INSERT INTO experience_providers (id, navn, producer_type, brreg_active, about_text, visit_text, opening_hours_text, catalog_hidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run("p1", "Fjordbrygg", "bryggeri", 1, "Fjordbrygg er et lite håndverksbryggeri ved fjorden. Vi brygger på lokalt korn og fjellvann.", "Besøket starter med en omvisning i bryggeriet og avsluttes med smaking av fire øl.", "Fredag og lørdag 12–18", 0);
+      expDb.prepare(`INSERT INTO experience_providers (id, navn, producer_type, brreg_active, about_text, catalog_hidden) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run("p2", "Skjult bryggeri", "bryggeri", 1, "Denne skal ikke samles inn fordi den er skjult i katalogen.", 1);
+      expDb.prepare(`INSERT INTO experiences (id, provider_id, title, title_no, description, meeting_point, category, verification_status, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run("e1", "p1", "Brewery tour", "Bryggeriomvisning med smaking", "Bli med på en guidet omvisning i bryggeriet, og smak fire ulike øl sammen med bryggeren.", "Oppmøte ved hovedinngangen, Fjordveien 12.", "mat", "verified", "high");
+      expDb.prepare(`INSERT INTO experiences (id, provider_id, title, description, category, verification_status, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run("e2", "p1", "Ikke publisert", "Denne raden er ikke verifisert og skal ikke samles inn.", "mat", "needs_review", "high");
+      const items = svc.collectSourceItems(expDb, "opplevagent");
+      eq(items.map((i) => `${i.entity_type}:${i.entity_id}:${i.field}`).sort(), ["experience:e1:description", "experience:e1:meeting_point", "experience:e1:title", "provider:p1:about_text", "provider:p1:opening_hours_text", "provider:p1:visit_text"].sort(), "D2 only published experience + visible provider fields collected");
+      const titleItem = items.find((i) => i.field === "title")!;
+      eq(titleItem.text, "Bryggeriomvisning med smaking", "D3 title source is title_no (the NO display title)");
+      eq(titleItem.entity_name, "Bryggeriomvisning med smaking", "D4 entity_name for experiences is the display title");
+      const scoped = svc.collectSourceItems(expDb, "opplevagent", { entityIds: ["p1"] });
+      eq(scoped.length, 3, "D5 entityIds filter scopes to one provider");
+      const plan = svc.planTranslationBatch(expDb, "opplevagent", ["en"], 100);
+      eq(plan.actionable.length, 6, "D6 six en items planned");
+      const hoursItem = plan.actionable.find((p) => p.item.field === "opening_hours_text")!;
+      const fake = makeFakeFetch({
+        translations: [{ translation: "Friday and Saturday 12–18", already_target_language: false, notes: "" }],
+        reviews: [{ verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" }],
+      }, { calls: [] });
+      const r = await svc.processTranslationItem(expDb, "opplevagent", hoursItem, "d-1", { fetchImpl: fake as any });
+      eq(r.outcome, "verified", "D7 opening hours verified in the experiences db");
+      svc.publishVerified(expDb, "opplevagent", "en", { dryRun: false, batchId: "d-p", actor: "test" });
+      process.env.PROFILE_TRANSLATIONS_SERVE_ENABLED = "true";
+      eq(svc.getPublishedProfileTranslations(expDb, "opplevagent", "provider", "p1", "en"), { opening_hours_text: "Friday and Saturday 12–18" }, "D8 served from the experiences db");
+    } finally {
+      if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExpPath;
+      dbFactory.__resetDbFactoryForTesting();
+    }
+  } catch (err: any) {
+    failed++;
+    failures.push(`✗ unexpected error: ${String(err?.stack || err?.message || err)}`);
+    if (log) console.log("  ✗ unexpected error", err);
+  } finally {
+    restoreEnv();
+  }
+
+  return { passed, failed, failures };
+}
+
+if (require.main === module) {
+  runProfileTranslationsTests({ log: true }).then((s) => {
+    console.log(`\n${s.passed} passed, ${s.failed} failed`);
+    if (s.failed > 0) {
+      for (const f of s.failures) console.log(f);
+      process.exit(1);
+    }
+  });
+}

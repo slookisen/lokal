@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
+import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 
 // ─── Database Initialization ─────────────────────────────────
 // SQLite is the right call for phase 1-3:
@@ -4303,6 +4304,17 @@ function initSchema(db: Database.Database): void {
     console.error("Migration outreach_max_touch_vern_config failed:", err);
   }
 
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+  // profile_translations / profile_translation_audit tables (EN/SV
+  // translations of agents.description + agent_knowledge.about, staged
+  // draft→reviewed→verified→published, never written into the Norwegian
+  // source columns). Same shape in the experiences DB (init-experiences.ts).
+  // Idempotent CREATE IF NOT EXISTS — see src/services/profile-translations.ts.
+  try {
+    ensureProfileTranslationsSchema(db);
+  } catch (err) {
+    console.error("Migration profile_translations failed:", err);
+  }
 }
 
 export function closeDb(): void {

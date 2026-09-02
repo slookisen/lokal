@@ -60,6 +60,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminVerifierClaimCountsRoutes from "./routes/admin-verifier-claim-counts";
+import adminProfileTranslationsRoutes from "./routes/admin-profile-translations";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
@@ -704,6 +705,13 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // count+sample endpoint so platform-verifier can verify claim kinds that were
 // previously silently unverifiable (typed allowlist, see the route file).
 app.use("/admin/verifier/claim-counts", adminLimiter, adminVerifierClaimCountsRoutes);
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+// EN/SV profile-translation "rullebånd" admin surface (status/queue/preview/
+// run/publish/unpublish/reject/requeue) for BOTH platforms — `platform` is a
+// parameter, so the two Cloud Routines drive rfb and opplevagent through this
+// one mount on rettfrabonden.com. LLM spend gated by PROFILE_TRANSLATIONS_ENABLED,
+// public rendering by PROFILE_TRANSLATIONS_SERVE_ENABLED (both default off).
+app.use("/admin/profile-translations", adminLimiter, adminProfileTranslationsRoutes);
 // dev-request 2026-07-16-wrong-entity-opprydding-rfb: catalog-wide retro-sweep
 // for MORE wrong-entity-contamination candidates using cheap DB-only
 // detectors (email-domain vs website-domain mismatch, duplicate boilerplate
