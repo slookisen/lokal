@@ -571,9 +571,16 @@ export function verifyTranslationDeterministic(
   const missingEmails = srcEmails.filter((e) => !outLower.includes(e));
   checks.push({ name: "emails_preserved", ok: missingEmails.length === 0, detail: missingEmails.slice(0, 3).join(" ") || undefined });
 
+  // Norwegian and Swedish are close enough that a short title can be
+  // letter-for-letter identical in both ("Lysefjorden fjordcruise med
+  // elektrisk katamaran", "Norsk Oljemuseum i Stavanger" — both rejected live
+  // 2026-09-02 as verbatim copies although the Swedish IS that text). For sv
+  // an identical output is therefore accepted up to 8 words; English never
+  // shares a whole sentence with Norwegian, so the 4-word rule stays there.
   const srcWords = src.split(/\s+/).filter(Boolean);
   const identical = src.replace(/\s+/g, " ").toLowerCase() === out.replace(/\s+/g, " ").toLowerCase();
-  const identicalOk = !identical || srcWords.length < 4 || opts.alreadyTargetLanguage === true;
+  const identicalWordCap = lang === "sv" ? 8 : 4;
+  const identicalOk = !identical || srcWords.length <= identicalWordCap || opts.alreadyTargetLanguage === true;
   checks.push({ name: "not_verbatim_copy", ok: identicalOk });
 
   // Un-translated Norwegian: any word carrying æ/ø (and, for English, å) in

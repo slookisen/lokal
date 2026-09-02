@@ -182,6 +182,13 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     ok(!v16.ok && v16.failed.includes("no_norwegian_stopwords"), "A32e Norwegian 'og' in Swedish fails", v16.failed);
     const v17 = svc.verifyTranslationDeterministic("Bakeriet Hos Mor selger brød.", "The bakery Hos Mor sells bread.", "en", { entityName: "Bakeriet Hos Mor" });
     ok(v17.ok, "A32f stopword that is part of the entity name is allowed", v17.failed);
+    const v18 = svc.verifyTranslationDeterministic("Lysefjorden fjordcruise med elektrisk katamaran", "Lysefjorden fjordcruise med elektrisk katamaran", "sv", { kind: "title" });
+    ok(v18.ok, "A32g identical short Swedish title (≤8 words) accepted", v18.failed);
+    const v19 = svc.verifyTranslationDeterministic("Lysefjorden fjordcruise med elektrisk katamaran", "Lysefjorden fjordcruise med elektrisk katamaran", "en", { kind: "title" });
+    ok(!v19.ok && v19.failed.includes("not_verbatim_copy"), "A32h identical 5-word English title still rejected", v19.failed);
+    const longNo = "Vi tilbyr guidede turer på fjorden hver dag hele sommeren med erfarne guider og god plass.";
+    const v20 = svc.verifyTranslationDeterministic(longNo, longNo, "sv");
+    ok(!v20.ok && v20.failed.includes("not_verbatim_copy"), "A32i identical long Swedish prose (>8 words) still rejected", v20.failed);
 
     // JSON extraction + verdict parsing
     eq(svc.extractJsonObject('Here you go:\n```json\n{"translation":"x","already_target_language":false,"notes":""}\n```')?.translation, "x", "A33 extractJsonObject strips fences");
