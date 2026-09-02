@@ -120,6 +120,32 @@
  *       idempotent (0 rows created, 0 new rows in the DB).
  *   (kr-agg) aggregator_replace mode never invokes the backfill — response
  *       always reports knowledge_rows_created: 0.
+ * dev-request 2026-09-02-rfb-website-discovery-timeout-tier1-uten-url
+ * (wall-clock time budget on the shared auto-select/agentIds loop, short-
+ * term mitigation for the 0-bytes/60s production timeout — NOT the
+ * parallelization long-term fix, out of scope here):
+ *   (tb-a) a target processed comfortably under RFB_WD_TIME_BUDGET_MS
+ *       behaves byte-identically to before this slice: normal proposal,
+ *       time_budget_exceeded:false, skipped_due_to_time_budget empty.
+ *   (tb-b) a SECOND target in the same batch, reached only after the first
+ *       target's processing has already burned the whole budget -> the
+ *       second target is skipped wholesale (never enters proposed OR
+ *       rejected), zero fetch calls for any of its candidate hosts, its
+ *       agent_id lands in skipped_due_to_time_budget.
+ *   (tb-c) the budget is exhausted MID tier-1 host loop (after host 1
+ *       resolves, before host 2 is tried) -> `tried` contains only host 1,
+ *       reason is the new 'time_budget_exceeded' (not the generic
+ *       'no_candidate_verified'), and host 2+ are never fetched.
+ *   Both (tb-b) and (tb-c) also assert response-level
+ *       time_budget_exceeded:true; (tb-a) asserts it stays false when
+ *       nothing was affected. The clock is a deterministic
+ *       __setRfbWdNowForTesting() override (mirrors
+ *       __setRfbWdRenderPageImplForTesting/__setRfbWdSearchForTesting) reset
+ *       to null (real Date.now()) both at the end of this block and in the
+ *       suite's own `finally` — every OTHER block in this file runs before
+ *       this one and never touches the override, so they already prove the
+ *       real-clock regression case (e) unmodified.
+ *
  * renderPage() itself is injected via the module-level
  * __setRfbWdRenderPageImplForTesting() test hook (mirrors
  * __setRfbCxRowDelayForTesting, admin-rfb-contact-extraction.ts) rather than
@@ -238,6 +264,9 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   let setRfbWdSearchForTesting:
     | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdSearchForTesting"]
     | undefined;
+  let setRfbWdNowForTesting:
+    | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdNowForTesting"]
+    | undefined;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -326,9 +355,13 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       RFB_WD_REVIEW_QUEUE_STALE_DAYS,
       // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning)
       rfbWdPageReferencesOwnHost,
+      // dev-request 2026-09-02-rfb-website-discovery-timeout-tier1-uten-url
+      RFB_WD_TIME_BUDGET_MS,
+      __setRfbWdNowForTesting,
     } = routeModule;
     setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
     setRfbWdSearchForTesting = __setRfbWdSearchForTesting;
+    setRfbWdNowForTesting = __setRfbWdNowForTesting;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -2609,6 +2642,114 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
       delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // dev-request 2026-09-02-rfb-website-discovery-timeout-tier1-uten-url:
+    // wall-clock time budget on the shared auto-select/agentIds loop.
+    // __setRfbWdNowForTesting simulates the clock crossing
+    // RFB_WD_TIME_BUDGET_MS mid-batch, deterministically — no real waiting.
+    // ═══════════════════════════════════════════════════════════════════
+    {
+      const { gardssalgWebsiteCandidateHosts } = require("../services/experience-store") as
+        typeof import("../services/experience-store");
+
+      let mockNow = 1_000_000;
+      setRfbWdNowForTesting!(() => mockNow);
+
+      // ── (tb-a) well under budget -> byte-identical to today's behaviour --
+      insertAgent({ id: "wd-tb-a", name: "Budsjett Gardsprodukter AS", orgNr: "977200001", city: "Molde" });
+      fixtures.set(
+        "https://budsjettgardsprodukter.no",
+        htmlResponse("<html><body>Budsjett Gardsprodukter — org.nr 977 200 001</body></html>", {
+          finalUrl: "https://budsjettgardsprodukter.no",
+        }),
+      );
+      const rTbA = await callDiscovery({ agentIds: ["wd-tb-a"] });
+      assertEq(rTbA.body.proposed.length, 1, "tb-a1: proposed normally when well under budget");
+      assertEq(rTbA.body.proposed[0].candidate_url, "https://budsjettgardsprodukter.no", "tb-a2: normal tier-1 hit, unaffected by the budget check");
+      assertEq(rTbA.body.time_budget_exceeded, false, "tb-a3: time_budget_exceeded is false when nothing was affected");
+      assertEq(rTbA.body.skipped_due_to_time_budget, [], "tb-a4: nothing skipped");
+
+      // ── (tb-b) a target reached only AFTER the budget is already burned by
+      // an earlier target in the SAME batch -> skipped wholesale, before it
+      // ever starts: never in proposed OR rejected, zero fetch calls for any
+      // of its own candidate hosts, its agent_id lands in
+      // skipped_due_to_time_budget. wd-tb-b1's own candidate host verifies
+      // normally (org_nr match) -- its arrayBuffer read is where the mock
+      // clock is advanced past the whole budget, standing in for the real
+      // wall-clock time that fetch/render would have consumed.
+      insertAgent({ id: "wd-tb-b1", name: "Bremsekloss Gardsprodukter AS", orgNr: "977200010", city: "Bergen" });
+      insertAgent({ id: "wd-tb-b2", name: "Forsinket Gardsmat AS", orgNr: "977200002", city: "Ålesund" });
+      const tbB1Hosts = gardssalgWebsiteCandidateHosts("Bremsekloss Gardsprodukter AS");
+      const tbB2Hosts = gardssalgWebsiteCandidateHosts("Forsinket Gardsmat AS");
+      fixtures.set(`https://${tbB1Hosts[0]}`, {
+        ok: true,
+        status: 200,
+        url: `https://${tbB1Hosts[0]}`,
+        headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+        arrayBuffer: async () => {
+          mockNow += RFB_WD_TIME_BUDGET_MS + 1;
+          return new TextEncoder().encode(
+            `<html><body>Bremsekloss Gardsprodukter — org.nr 977 200 010<!-- selfref:${tbB1Hosts[0]} --></body></html>`,
+          ).buffer;
+        },
+      } as unknown as Response);
+
+      const rTbB = await callDiscovery({ agentIds: ["wd-tb-b1", "wd-tb-b2"] });
+      assertEq(
+        rTbB.body.proposed.map((p: any) => p.agent_id),
+        ["wd-tb-b1"],
+        "tb-b1: only the first target (which burned the budget) is proposed",
+      );
+      assertTrue(
+        !rTbB.body.rejected.some((r: any) => r.agent_id === "wd-tb-b2"),
+        "tb-b2: the second target is NOT in rejected either -- fully skipped, not rejected",
+      );
+      assertEq(rTbB.body.skipped_due_to_time_budget, ["wd-tb-b2"], "tb-b3: second target's agent_id recorded in skipped_due_to_time_budget");
+      assertEq(rTbB.body.time_budget_exceeded, true, "tb-b4: response flag is true");
+      assertTrue(
+        !tbB2Hosts.some((h) => fetchCalls.includes(`https://${h}`)),
+        "tb-b5: none of the second target's candidate hosts were ever fetched -- it never started",
+      );
+
+      // ── (tb-c) budget exhausted MID tier-1 host loop: host 1 fetched and
+      // resolves normally (no evidence match), and its own response is where
+      // the mock clock is advanced past the budget, so the loop's NEXT
+      // budget check (before host 2) trips -> host 2+ never fetched, `tried`
+      // is strictly shorter than the full host list, and the rejection
+      // reason is the new time_budget_exceeded rather than the generic
+      // no_candidate_verified.
+      mockNow = 5_000_000; // fresh baseline, well clear of (tb-b)'s advanced clock
+      insertAgent({ id: "wd-tb-c", name: "Avbrutt Gardsbutikk AS", orgNr: "977200003", city: "Kristiansund" });
+      const tbcHosts = gardssalgWebsiteCandidateHosts("Avbrutt Gardsbutikk AS");
+      assertTrue(tbcHosts.length >= 2, "tb-c0: setup sanity -- at least 2 tier-1 candidate hosts generated");
+      fixtures.set(`https://${tbcHosts[0]}`, {
+        ok: true,
+        status: 200,
+        url: `https://${tbcHosts[0]}`,
+        headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+        arrayBuffer: async () => {
+          mockNow += RFB_WD_TIME_BUDGET_MS + 1;
+          return new TextEncoder().encode(`<html><body>Urelatert innhold<!-- selfref:${tbcHosts[0]} --></body></html>`).buffer;
+        },
+      } as unknown as Response);
+      // Deliberately no fixture for host 2+: if the loop DID try them the
+      // stub fetch would 404 through notFoundResponse() -- the fetchCalls
+      // count assertion below proves it never even requested them.
+
+      const fetchCallsBeforeTbC = fetchCalls.length;
+      const rTbC = await callDiscovery({ agentIds: ["wd-tb-c"] });
+      assertEq(rTbC.body.proposed.length, 0, "tb-c1: nothing proposed");
+      const rejTbC = rTbC.body.rejected.find((r: any) => r.agent_id === "wd-tb-c");
+      assertTrue(!!rejTbC, "tb-c2: target IS rejected (it did start), not wholesale-skipped");
+      assertEq(rejTbC.reason, "time_budget_exceeded", "tb-c3: reason is the new time_budget_exceeded, not the generic no_candidate_verified");
+      assertEq(rejTbC.tried, [tbcHosts[0]], "tb-c4: tried contains ONLY host 1 -- the loop stopped before trying host 2");
+      assertTrue(rejTbC.tried.length < tbcHosts.length, "tb-c5: tried is strictly shorter than the full tier-1 host list");
+      assertEq(fetchCalls.length, fetchCallsBeforeTbC + 1, "tb-c6: exactly one fetch call happened -- host 2+ never requested");
+      assertEq(rTbC.body.time_budget_exceeded, true, "tb-c7: response-level flag is true");
+
+      setRfbWdNowForTesting!(null);
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -2633,6 +2774,11 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     }
     try {
       if (setRfbWdRenderPageImplForTesting) setRfbWdRenderPageImplForTesting(null);
+    } catch {
+      /* best-effort restore */
+    }
+    try {
+      if (setRfbWdNowForTesting) setRfbWdNowForTesting(null);
     } catch {
       /* best-effort restore */
     }

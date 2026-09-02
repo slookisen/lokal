@@ -198,6 +198,37 @@ function rfbWdHeadlessFallbackEnabled(): boolean {
 // future, non-batched callers may still want in full).
 export const RFB_WD_RENDER_TIMEOUT_MS = 12_000;
 
+// Short-term wall-clock mitigation (dev-request
+// 2026-09-02-rfb-website-discovery-timeout-tier1-uten-url): the shared
+// auto-select/agentIds loop below can try up to 10 tier-1 name-guessed
+// hosts + 5 tier-2 (Brave) hosts PER TARGET via tryRfbWebsiteCandidateHost,
+// and with RFB_WD_HEADLESS_FALLBACK_ENABLED=true in prod a single host
+// attempt can cost up to ~44s worst case (10s fetch + 10s contamination
+// retry + 12s headless render + 12s render retry). With 25-50 targets
+// processed sequentially and no overall budget, one stubborn "no_website"
+// target could alone burn multiple minutes, which is exactly what produced
+// the observed 0-bytes/60s timeout at both limit=50 and limit=25. 30s
+// leaves margin under that observed 60s cutoff even though a single
+// in-flight host attempt already started can still finish past the budget
+// (this stops NEW host attempts from starting, not one already running).
+// Long-term fix is parallelizing host attempts — explicitly out of scope
+// for this mitigation (see the dev-request's own FUNN TIL OPPFØLGING).
+export const RFB_WD_TIME_BUDGET_MS = 30_000;
+
+// Test-only injection point for the wall-clock used by the time-budget
+// check above (mirrors __setRfbWdRenderPageImplForTesting /
+// __setRfbWdSearchForTesting just below): production code always leaves
+// this null and gets the real Date.now() — a test installs a deterministic
+// override so budget-exceeded behavior can be exercised without actually
+// waiting RFB_WD_TIME_BUDGET_MS of real wall-clock time.
+let rfbWdNowForTesting: (() => number) | null = null;
+export function __setRfbWdNowForTesting(fn: (() => number) | null): void {
+  rfbWdNowForTesting = fn;
+}
+function effectiveRfbWdNowMs(): number {
+  return rfbWdNowForTesting ? rfbWdNowForTesting() : Date.now();
+}
+
 // Per-call fallback counters, threaded through tryRfbWebsiteCandidateHost by
 // mutable reference so both response shapes that call it (the external-
 // candidates path and the auto-select/agentIds path) can report the same
@@ -1284,9 +1315,12 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     }
   }
 
+  const wdStartedAt = effectiveRfbWdNowMs();
   const existingHosts = rfbWdExistingWebsiteHosts(db);
   const hostsProposedThisBatch = new Set<string>();
   const fallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
+  const skippedDueToTimeBudget: string[] = [];
+  let timeBudgetExceeded = false;
 
   const proposed: Array<{
     agent_id: string;
@@ -1308,6 +1342,12 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   }> = [];
 
   for (const t of targets) {
+    if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+      skippedDueToTimeBudget.push(t.id);
+      timeBudgetExceeded = true;
+      continue;
+    }
+
     const evidenceTarget = {
       orgNr: t.org_nr,
       navn: t.name,
@@ -1324,7 +1364,13 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     const excludedHere: Array<{ host: string; reason: string }> = [];
 
     let hit: RfbWdHit | null = null;
+    let budgetHitForThisTarget = false;
     for (const host of hosts) {
+      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+        budgetHitForThisTarget = true;
+        timeBudgetExceeded = true;
+        break;
+      }
       hit = await tryRfbWebsiteCandidateHost(
         host,
         evidenceTarget,
@@ -1348,31 +1394,41 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     // tried/excludedHere/existingHosts/hostsProposedThisBatch/fallbackCounters
     // state — no separate evidence-matching or exclusion path.
     let searchAttempted = false;
-    if (!hit) {
-      const searchImpl = effectiveRfbWdSearchImpl();
-      if (searchImpl) {
-        searchAttempted = true;
-        try {
-          const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
-          const results = await searchImpl(query);
-          const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
-          for (const host of searchHosts) {
-            hit = await tryRfbWebsiteCandidateHost(
-              host,
-              evidenceTarget,
-              existingHosts,
-              hostsProposedThisBatch,
-              tried,
-              excludedHere,
-              fallbackCounters,
-            );
-            if (hit) break;
+    if (!hit && !budgetHitForThisTarget) {
+      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+        budgetHitForThisTarget = true;
+        timeBudgetExceeded = true;
+      } else {
+        const searchImpl = effectiveRfbWdSearchImpl();
+        if (searchImpl) {
+          searchAttempted = true;
+          try {
+            const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
+            const results = await searchImpl(query);
+            const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
+            for (const host of searchHosts) {
+              if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+                budgetHitForThisTarget = true;
+                timeBudgetExceeded = true;
+                break;
+              }
+              hit = await tryRfbWebsiteCandidateHost(
+                host,
+                evidenceTarget,
+                existingHosts,
+                hostsProposedThisBatch,
+                tried,
+                excludedHere,
+                fallbackCounters,
+              );
+              if (hit) break;
+            }
+          } catch {
+            // A search failure (network/HTTP error) must not abort the row —
+            // tier 2 simply found nothing, exactly as if the search response
+            // had been empty. No retry, mirrors braveSearch's own no-retry
+            // contract; never a 500 propagated to the caller.
           }
-        } catch {
-          // A search failure (network/HTTP error) must not abort the row —
-          // tier 2 simply found nothing, exactly as if the search response
-          // had been empty. No retry, mirrors braveSearch's own no-retry
-          // contract; never a 500 propagated to the caller.
         }
       }
     }
@@ -1425,7 +1481,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       // excluded does this fall through to the generic "we fetched real
       // candidates and none of them carried matching evidence" reason.
       let reason: string;
-      if (hosts.length === 0) reason = "no_candidate_hosts";
+      if (budgetHitForThisTarget) reason = "time_budget_exceeded";
+      else if (hosts.length === 0) reason = "no_candidate_hosts";
       else if (excludedHere.length > 0) reason = excludedHere[0].reason;
       else reason = "no_candidate_verified";
       rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere, search_attempted: searchAttempted });
@@ -1444,6 +1501,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     headless_fallback_attempted: fallbackCounters.attempted,
     headless_fallback_verified: fallbackCounters.verified,
     knowledge_rows_created: knowledgeRowsCreated,
+    time_budget_exceeded: timeBudgetExceeded,
+    skipped_due_to_time_budget: skippedDueToTimeBudget,
   });
 });
 
