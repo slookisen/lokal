@@ -516,6 +516,25 @@ export const NORWEGIAN_STOPWORDS_NOT_SWEDISH = new Set([
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const DIGIT_RUN_RE = /\d+/g;
+/** Ordinal written with digits in Norwegian prose: "6. generasjon", "3. søndag". */
+const NB_ORDINAL_RE = /\b(\d{1,2})\.\s+(?=[a-zæøå])/gi;
+const ORDINAL_WORDS: Record<TranslationTargetLang, string[]> = {
+  en: ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth"],
+  sv: ["", "första", "andra", "tredje", "fjärde", "femte", "sjätte", "sjunde", "åttonde", "nionde", "tionde", "elfte", "tolfte", "trettonde", "fjortonde", "femtonde", "sextonde", "sjuttonde", "artonde", "nittonde", "tjugonde"],
+};
+/**
+ * A digit-run missing from the translation is tolerated when the source used it
+ * as an ordinal ("6. generasjon") and the translation spells that ordinal out
+ * ("sixth generation" / "sjätte generationen"). Everything else stays strict.
+ */
+export function ordinalSpelledOut(src: string, out: string, digits: string, lang: TranslationTargetLang): boolean {
+  const n = Number(digits);
+  if (!Number.isInteger(n) || n < 1 || n > 20) return false;
+  const usedAsOrdinal = Array.from(src.matchAll(NB_ORDINAL_RE)).some((m) => Number(m[1]) === n);
+  if (!usedAsOrdinal) return false;
+  const word = ORDINAL_WORDS[lang][n];
+  return new RegExp(`(^|[^a-zäöåæø])${word}([^a-zäöåæø]|$)`, "i").test(out);
+}
 
 function multiset(arr: string[]): Map<string, number> {
   const m = new Map<string, number>();
@@ -559,7 +578,7 @@ export function verifyTranslationDeterministic(
 
   const srcDigits = multiset(src.match(DIGIT_RUN_RE) || []);
   const outDigits = multiset(out.match(DIGIT_RUN_RE) || []);
-  const missingDigits = multisetDiff(srcDigits, outDigits);
+  const missingDigits = multisetDiff(srcDigits, outDigits).filter((d) => !ordinalSpelledOut(src, out, d, lang));
   checks.push({ name: "digits_preserved", ok: missingDigits.length === 0, detail: missingDigits.slice(0, 5).join(",") || undefined });
 
   const srcUrls = (src.match(URL_RE) || []).map((u) => u.replace(/[.,;:]+$/, ""));
@@ -768,7 +787,7 @@ export function buildTranslatorSystemPrompt(lang: TranslationTargetLang): string
 Rules — all of them are mandatory:
 1. Translate the MEANING faithfully into natural, idiomatic ${LANG_NAMES[lang]} as a native copywriter would phrase it. Never translate word for word, never leave Norwegian sentence structure behind, but never add, remove, soften or embellish facts either.
 2. Keep every proper noun unchanged: business/farm names, product brand names, place names (Ålesund stays Ålesund), people's names. Do not translate or "correct" them.
-3. Keep every number, price, currency (NOK/kr → NOK), date, time, URL, e-mail address and phone number EXACTLY as written in the source. Do not convert currencies or units.
+3. Keep every number, price, currency (NOK/kr → NOK), date, time, URL, e-mail address and phone number EXACTLY as written in the source. Do not convert currencies or units. Ordinals written with digits stay digits: "6. generasjon" → ${lang === "sv" ? "6:e generationen" : "6th generation"}, never spelled out.
 4. Keep the paragraph structure. Plain text only: no markdown, no HTML, no bullet symbols the source does not have, no headings, no quotation marks around the whole text.
 5. Use this glossary consistently:
 ${glossaryText(lang)}
