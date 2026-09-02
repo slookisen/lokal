@@ -39,7 +39,8 @@ import {
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
-import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
+import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
+import { getPublishedProfileTranslations } from "../services/profile-translations";
 import {
   parseIsoOrSqlite,
   formatUpdatedPrettyNo,
@@ -413,6 +414,12 @@ function shell(
   const enPath = noPath === "/" ? "/en" : "/en" + noPath;
   const noUrl = BASE_URL + (noPath === "/" ? "" : noPath);
   const enUrl = BASE_URL + enPath;
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: Swedish
+  // alternate + switcher entry, ONLY while SV_LOCALE_ENABLED === "true" (with
+  // the flag off /sv/* is not even routed, so advertising it would be a lie).
+  const svEnabled = isSvLocaleEnabled();
+  const svPath = noPath === "/" ? "/sv" : "/sv" + noPath;
+  const svUrl = BASE_URL + svPath;
 
   const jsonLdScript = extra?.jsonLd
     ? (Array.isArray(extra.jsonLd)
@@ -434,8 +441,8 @@ function shell(
   @media (max-width:640px){.lang-switch button{padding:5px 8px;font-size:13px;} .lang-switch{margin-right:8px;}}
 `;
 
-  const flag = (l: Lang) => l === "en" ? "🇬🇧" : "🇳🇴";
-  const labelShort = (l: Lang) => l === "en" ? "EN" : "NO";
+  const flag = (l: Lang) => l === "en" ? "🇬🇧" : l === "sv" ? "🇸🇪" : "🇳🇴";
+  const labelShort = (l: Lang) => l === "en" ? "EN" : l === "sv" ? "SV" : "NO";
 
   const langSwitcher = `
     <div class="lang-switch" id="langSwitch">
@@ -444,7 +451,8 @@ function shell(
       </button>
       <div class="ls-menu" role="menu">
         <a href="${noUrl}" hreflang="nb" class="${lang === "no" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇳🇴</span> ${escapeHtml(t(lang, "nav.lang_no"))}</a>
-        <a href="${enUrl}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>
+        <a href="${enUrl}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>${svEnabled ? `
+        <a href="${svUrl}" hreflang="sv" class="${lang === "sv" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇸🇪</span> ${escapeHtml(t(lang, "nav.lang_sv"))}</a>` : ""}
       </div>
     </div>`;
 
@@ -462,7 +470,7 @@ function shell(
     document.addEventListener('click', function(){ sw.classList.remove('is-open'); btn.setAttribute('aria-expanded','false'); });
     // Persist the user's choice (for client-only views like /selger).
     sw.querySelectorAll('.ls-menu a').forEach(function(a){
-      a.addEventListener('click', function(){ try{ localStorage.setItem('rfb_lang', a.hreflang === 'en' ? 'en' : 'no'); document.cookie = 'lang=' + (a.hreflang === 'en' ? 'en' : 'no') + '; path=/; max-age=' + (60*60*24*365); }catch(_){} });
+      a.addEventListener('click', function(){ try{ var l = a.hreflang === 'en' ? 'en' : a.hreflang === 'sv' ? 'sv' : 'no'; localStorage.setItem('rfb_lang', l); document.cookie = 'lang=' + l + '; path=/; max-age=' + (60*60*24*365); }catch(_){} });
     });
   })();
   </script>`;
@@ -501,7 +509,8 @@ function shell(
   <meta name="twitter:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="${extra?.robots || "index, follow, max-snippet:-1, max-image-preview:large"}">
   <link rel="alternate" hreflang="nb" href="${noUrl}">
-  <link rel="alternate" hreflang="en" href="${enUrl}">
+  <link rel="alternate" hreflang="en" href="${enUrl}">${svEnabled ? `
+  <link rel="alternate" hreflang="sv" href="${svUrl}">` : ""}
   <link rel="alternate" hreflang="x-default" href="${noUrl}">
   ${jsonLdScript}
   ${CSS}
@@ -4290,6 +4299,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const rawAbout = k.about || "";
     const safeDescription = isJunkDescription(rawDescription) ? "" : rawDescription;
     const safeAbout = isJunkDescription(rawAbout) ? "" : rawAbout;
+    // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: on
+    // /en and /sv, swap in the PUBLISHED, reviewed+verified translation of
+    // each prose field when one exists. getPublishedProfileTranslations()
+    // returns {} unless PROFILE_TRANSLATIONS_SERVE_ENABLED === "true", so with
+    // the flag off this page renders byte-identically to before. The Norwegian
+    // columns are never touched; a field WITHOUT a translation keeps the
+    // existing lang="nb" wrapper + 🇳🇴 badge (mixed language stays declared).
+    const profileTranslations = lang !== "no"
+      ? getPublishedProfileTranslations(getDb(), "rfb", "agent", agent.id, lang)
+      : {};
+    const displayDescription = (safeDescription && profileTranslations.description) || safeDescription;
+    const displayAbout = (safeAbout && profileTranslations.about) || safeAbout;
+    const descriptionIsNb = lang !== "no" && !!safeDescription && !profileTranslations.description;
+    const aboutIsNb = lang !== "no" && !!safeAbout && !profileTranslations.about;
     if (rawDescription && !safeDescription) {
       console.log(`[description-guard] suppressed junk agent.description for ${agent.id} (${agent.name}) on /produsent/${slug}`);
     }
@@ -5270,26 +5293,31 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
         ${answerFirstOpening ? `<p class="pf-answer"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(answerFirstOpening)}</p>` : ""}
         ${(() => {
-          const desc = safeDescription;
-          const about = safeAbout;
+          const desc = displayDescription;
+          const about = displayAbout;
+          const descNb = descriptionIsNb ? ' lang="nb"' : "";
+          const aboutNb = aboutIsNb ? ' lang="nb"' : "";
           if (!desc && !about) return "";
           // If only one exists, use it
-          if (!desc) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(about)}</p>`;
-          if (!about) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</p>`;
+          if (!desc) return `<p class="pf-desc"${aboutNb}>${escapeHtml(about)}</p>`;
+          if (!about) return `<p class="pf-desc"${descNb}>${escapeHtml(desc)}</p>`;
           // If they're the same text, just show one
-          if (desc === about || about.length < 20) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</p>`;
+          if (desc === about || about.length < 20) return `<p class="pf-desc"${descNb}>${escapeHtml(desc)}</p>`;
           // Both exist and differ — pick the most informative as primary,
           // show the other as supplementary if it adds unique context
-          const primary = desc.length >= about.length ? desc : about;
-          const secondary = desc.length >= about.length ? about : desc;
+          const descIsPrimary = desc.length >= about.length;
+          const primary = descIsPrimary ? desc : about;
+          const secondary = descIsPrimary ? about : desc;
+          const primaryNb = descIsPrimary ? descNb : aboutNb;
+          const secondaryNb = descIsPrimary ? aboutNb : descNb;
           const primaryLower = primary.toLowerCase();
           const secondaryAddsInfo = !primaryLower.includes(secondary.substring(0, Math.min(30, secondary.length)).toLowerCase());
           if (secondaryAddsInfo && secondary.length > 30) {
-            return `<p class="pf-desc">${escapeHtml(primary)}</p><p class="pf-desc-extra">${escapeHtml(secondary)}</p>`;
+            return `<p class="pf-desc"${primaryNb}>${escapeHtml(primary)}</p><p class="pf-desc-extra"${secondaryNb}>${escapeHtml(secondary)}</p>`;
           }
-          return `<p class="pf-desc">${escapeHtml(primary)}</p>`;
+          return `<p class="pf-desc"${primaryNb}>${escapeHtml(primary)}</p>`;
         })()}
-        ${lang === "en" && (safeDescription || safeAbout) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
+        ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}

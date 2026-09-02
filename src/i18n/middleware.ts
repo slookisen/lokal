@@ -1,5 +1,5 @@
-// Express middleware that detects /en/* paths, sets req.lang,
-// and rewrites req.url so existing routes still match.
+// Express middleware that detects /en/* (and, when SV_LOCALE_ENABLED, /sv/*)
+// paths, sets req.lang, and rewrites req.url so existing routes still match.
 //
 // Example:
 //   GET /en/sok?q=mat
@@ -19,7 +19,7 @@ declare global {
   namespace Express {
     interface Request {
       lang: Lang;
-      /** The original path including any /en prefix. Useful when
+      /** The original path including any /en or /sv prefix. Useful when
        *  building hreflang alternates and the canonical URL. */
       langOriginalPath: string;
     }
@@ -31,8 +31,8 @@ export function langMiddleware(req: Request, _res: Response, next: NextFunction)
   req.lang = lang;
   req.langOriginalPath = req.path;
 
-  if (lang === "en") {
-    // Strip /en prefix so downstream routes match.
+  if (lang !== "no") {
+    // Strip the /en or /sv prefix so downstream routes match.
     // Preserve query string.
     const stripped = stripLangPrefix(req.path);
     const qIndex = req.url.indexOf("?");

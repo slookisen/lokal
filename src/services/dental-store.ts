@@ -63,6 +63,9 @@ export const DentalAgentSchema = z.object({
   organisasjonsform: z.string().optional().nullable(),
   registreringsdato: z.string().optional().nullable(),
   naeringskode: z.string().optional().nullable(),
+  // dev-request 2026-09-02-dental-catalog-class-triage: read-only on this
+  // schema (hydrated for API consumers); written only by the backfill route.
+  catalog_class: z.string().optional().nullable(),
   treatments: z.array(z.string()).optional(),
   helfo_agreement: HelfoAgreementSchema.optional(),
   languages_spoken: z.array(z.string()).optional(),
@@ -251,6 +254,7 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     organisasjonsform: (row.organisasjonsform as string | null) ?? null,
     registreringsdato: (row.registreringsdato as string | null) ?? null,
     naeringskode: (row.naeringskode as string | null) ?? null,
+    catalog_class: (row.catalog_class as string | null) ?? null,
     treatments: parseJsonArray(row.treatments),
     helfo_agreement:
       (row.helfo_agreement as DentalAgent["helfo_agreement"]) ?? undefined,

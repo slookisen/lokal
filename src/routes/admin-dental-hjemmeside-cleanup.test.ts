@@ -316,6 +316,28 @@ export function runAdminDentalHjemmesideCleanupSweepTests(
 
       // ── (f) applyHjemmesideCleanupToRow: stale-row / already-cleaned skip ──
       // Fresh isolated row for this check.
+      // ── (g) dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-
+      //    gjenfinning: empty-string hjemmeside is NOT a candidate, and the
+      //    caller can page with `offset` past scanned-but-clean rows.
+      insertAgent.run({
+        id: "clinic-empty-string", navn: "Tom Streng Tannlege AS",
+        hjemmeside: "",
+        field_provenance: null,
+        created_at: "2026-02-15T00:00:00.000Z",
+      });
+      const afterBulkDry = await post({});
+      assertEq(afterBulkDry.body.scanned, 9, "g1: empty-string hjemmeside row is not a candidate (9 real-URL rows remain after the bulk apply)");
+      assertEq(afterBulkDry.body.offset, 0, "g2: offset defaults to 0");
+      assertEq(afterBulkDry.body.next_offset, null, "g3: next_offset is null when the batch was the last page");
+      const pagedDry = await post({ offset: 5 });
+      assertEq(pagedDry.body.scanned, 4, "g4: offset:5 skips the first 5 candidates and scans the remaining 4");
+      assertEq(pagedDry.body.offset, 5, "g5: offset is echoed back");
+      const bogusOffset = await post({ offset: -3 });
+      assertEq(bogusOffset.body.offset, 0, "g6: negative/invalid offset falls back to 0");
+      assertEq(routeMod.parseSweepOffset("7"), 0, "g7: parseSweepOffset ignores non-number input");
+      assertEq(routeMod.parseSweepOffset(7.9), 7, "g8: parseSweepOffset floors a fractional number");
+      dentalDb.prepare("DELETE FROM dental_agents WHERE id = ?").run("clinic-empty-string");
+
       insertAgent.run({
         id: "clinic-stale", navn: "Stale Tannlege AS",
         hjemmeside: "https://legelisten.no/stale",

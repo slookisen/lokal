@@ -34292,6 +34292,21 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-02-dental-catalog-class-triage: rule classifier (pure) ──
+  console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage: catalog-class classifier (pure) ──");
+  try {
+    const { runDentalCatalogClassTests } = require("../src/services/dental-catalog-class.test") as
+      typeof import("../src/services/dental-catalog-class.test");
+    const dcc = runDentalCatalogClassTests({ log: false });
+    passed += dcc.passed;
+    failed += dcc.failed;
+    for (const f of dcc.failures) failures.push("dental-catalog-class: " + f);
+    console.log(`  dental-catalog-class: ${dcc.passed} passed, ${dcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-catalog-class: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
@@ -41865,5 +41880,51 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("opplevelser-experiences-admission-promotion: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent — the
+// EN/SV profile-translation rullebånd (src/services/profile-translations.ts +
+// src/routes/admin-profile-translations.ts + the sv locale in src/i18n/t.ts):
+// pure verify/plan/i18n units, the staged store against a :memory: rfb db with
+// an injected fetch playing translator+reviewer, the admin route incl. the
+// flag-OFF no-op proof, and opplevagent source collection against a :memory:
+// experiences db. Tail position is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: profile-translations ──");
+  try {
+    const { runProfileTranslationsTests } = require("../src/services/profile-translations.test") as
+      typeof import("../src/services/profile-translations.test");
+    const pt = await runProfileTranslationsTests({ log: false });
+    passed += pt.passed;
+    failed += pt.failed;
+    for (const f of pt.failures) failures.push("profile-translations: " + f);
+    console.log(`  profile-translations: ${pt.passed} passed, ${pt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel GO #1
+// — the in-process profile-translation worker (src/services/profile-
+// translations-worker.ts): config/mode units, intensive concurrency +
+// platform interleave, steady hourly budget, infra backoff, and the run lock
+// shared with the admin route. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler (GO #1): profile-translations-worker ──");
+  try {
+    const { runProfileTranslationsWorkerTests } = require("../src/services/profile-translations-worker.test") as
+      typeof import("../src/services/profile-translations-worker.test");
+    const pw = await runProfileTranslationsWorkerTests({ log: false });
+    passed += pw.passed;
+    failed += pw.failed;
+    for (const f of pw.failures) failures.push("profile-translations-worker: " + f);
+    console.log(`  profile-translations-worker: ${pw.passed} passed, ${pw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations-worker: unexpected error: " + String(err?.message || err));
   }
 });

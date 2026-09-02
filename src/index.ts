@@ -60,6 +60,8 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminVerifierClaimCountsRoutes from "./routes/admin-verifier-claim-counts";
+import adminProfileTranslationsRoutes from "./routes/admin-profile-translations";
+import { startProfileTranslationsWorker } from "./services/profile-translations-worker";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
@@ -83,6 +85,8 @@ import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-co
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
+import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
+import adminDentalBrregAddressSweepRoutes from "./routes/admin-dental-brreg-address-sweep";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -704,6 +708,13 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // count+sample endpoint so platform-verifier can verify claim kinds that were
 // previously silently unverifiable (typed allowlist, see the route file).
 app.use("/admin/verifier/claim-counts", adminLimiter, adminVerifierClaimCountsRoutes);
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+// EN/SV profile-translation "rullebånd" admin surface (status/queue/preview/
+// run/publish/unpublish/reject/requeue) for BOTH platforms — `platform` is a
+// parameter, so the two Cloud Routines drive rfb and opplevagent through this
+// one mount on rettfrabonden.com. LLM spend gated by PROFILE_TRANSLATIONS_ENABLED,
+// public rendering by PROFILE_TRANSLATIONS_SERVE_ENABLED (both default off).
+app.use("/admin/profile-translations", adminLimiter, adminProfileTranslationsRoutes);
 // dev-request 2026-07-16-wrong-entity-opprydding-rfb: catalog-wide retro-sweep
 // for MORE wrong-entity-contamination candidates using cheap DB-only
 // detectors (email-domain vs website-domain mismatch, duplicate boilerplate
@@ -774,6 +785,12 @@ app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbe
 // schema-probe-sweep left only 498/500 remaining when this was mounted
 // before it).
 app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
+// dev-request 2026-09-02-dental-catalog-class-triage (steg 0+1) and
+// 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning (steg 2b):
+// POST /admin/dental/catalog-class-backfill, GET /admin/dental/parking-stats,
+// POST /admin/dental/brreg-address-sweep. Same X-Admin-Key gate, same limiter.
+app.use("/admin/dental", adminLimiter, adminDentalCatalogClassRoutes);
+app.use("/admin/dental", adminLimiter, adminDentalBrregAddressSweepRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls
@@ -1287,6 +1304,14 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
     }
   }, 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
 }
+
+// ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel
+// GO #1: in-process profile-translation worker (intensive until a timestamp,
+// then a small hourly budget). Gated OFF by default — only runs when
+// PROFILE_TRANSLATIONS_WORKER_ENABLED === "true" (fly.toml), and is a per-tick
+// no-op unless PROFILE_TRANSLATIONS_ENABLED === "true" as well. Never
+// publishes or serves anything; see profile-translations-worker.ts.
+startProfileTranslationsWorker();
 
 // ─── PR-103 (2026-06-03): Backend dental geocoding worker ───────────
 //

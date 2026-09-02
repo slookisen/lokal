@@ -90,6 +90,29 @@ primary_region = 'arn'
   # `=== "true"`, read fresh per call; fail-safe: anything else = off,
   # byte-identical to pre-#740 behavior.
   GS_KILDEKLASSE_CONTACT_ENABLED = 'true'
+  # dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent — Daniel GO #1
+  # (live 2026-09-02 ~21:15Z, A2A daniel-responses/2026-09-02-go-1-oversettelse-
+  # intensiv-12t.md): the EN/SV profile-translation belt. Four independent
+  # switches; gate is `=== "true"`, read fresh per call; fail-safe: anything
+  # else = off. Writes ONLY to the profile_translations table (own rows,
+  # draft→reviewed→verified), NEVER to Norwegian source columns, and NEVER
+  # publishes — PROFILE_TRANSLATIONS_SERVE_ENABLED stays OFF here, so nothing
+  # is visible to visitors until Daniel GO #3 (publish + serve flip).
+  #   PROFILE_TRANSLATIONS_ENABLED        — LLM switch for the pipeline.
+  #   PROFILE_TRANSLATIONS_WORKER_ENABLED — in-process worker (src/services/
+  #     profile-translations-worker.ts): intensive (5 parallel belts, back-to-
+  #     back) until INTENSIVE_UNTIL, then STEADY_ITEMS_PER_HOUR per rolling hour
+  #     («kraftig i 12 timer, deretter mindre puljer pga usage»).
+  # Kill switches: PROFILE_TRANSLATIONS_ENABLED='false' stops all LLM spend on
+  # the next tick; WORKER_ENABLED='false' + deploy stops the interval.
+  PROFILE_TRANSLATIONS_ENABLED = 'true'
+  PROFILE_TRANSLATIONS_WORKER_ENABLED = 'true'
+  PROFILE_TRANSLATIONS_WORKER_INTENSIVE_UNTIL = '2026-09-03T09:30:00Z'
+  PROFILE_TRANSLATIONS_WORKER_INTENSIVE_CONCURRENCY = '5'
+  PROFILE_TRANSLATIONS_WORKER_STEADY_ITEMS_PER_HOUR = '20'
+  PROFILE_TRANSLATIONS_SERVE_ENABLED = 'false'
+  OPPLEVAGENT_LANG_SWITCHER_ENABLED = 'false'
+  SV_LOCALE_ENABLED = 'false'
 
 [[mounts]]
   source = 'lokal_data'
