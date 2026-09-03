@@ -1235,6 +1235,182 @@ export function requeueTranslation(db: Database.Database, id: number, actor: str
   return setStatus(db, row, "draft", { attempts: 0, reject_reason: null, review_json: null, verify_json: null, published_at: null, verified_at: null, reviewed_at: null }, actor, "requeued", null);
 }
 
+// ─── Session lane: collect → translate+review OUTSIDE the app → submit ────
+//
+// Daniel's 2026-09-03 decision: translations are produced by the Claude Code
+// session (or a Cloud Routine session) itself, not by paid Anthropic API
+// calls from the app. The app keeps the store, the planner, the deterministic
+// verifier, the audit trail and the publish gate; the session does the
+// translation and an independent review (a fresh-context sub-agent) and hands
+// both back. Nothing here spends LLM budget, so the lane is NOT gated by
+// PROFILE_TRANSLATIONS_ENABLED — only by the admin key and the run lock.
+
+export interface CollectedItem {
+  id: number;
+  entity_type: string;
+  entity_id: string;
+  entity_name: string;
+  field: string;
+  kind: TranslationFieldKind;
+  lang: TranslationTargetLang;
+  source_text: string;
+  source_hash: string;
+  action: PlanDecision["action"];
+  attempts: number;
+  /** Previous review feedback when the row is being retried (REVISE). */
+  feedback: string | null;
+}
+
+export function kindForField(platform: TranslationPlatform, entityType: string, field: string): TranslationFieldKind {
+  const spec = PROFILE_TRANSLATION_FIELDS[platform].find((f) => f.entity_type === entityType && f.field === field);
+  return spec ? spec.kind : "prose";
+}
+
+/**
+ * Plan a batch exactly like the pipeline would, materialise the draft rows so
+ * every item has a stable id + source_hash, and return the source texts plus
+ * the same translator/reviewer instructions the LLM lane uses.
+ */
+export function collectForSession(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  langs: TranslationTargetLang[],
+  limit: number,
+  opts: { entityIds?: string[]; batchId: string; actor: string },
+): { items: CollectedItem[]; skipped: Record<string, number>; remaining_actionable: number; total_pairs: number; instructions: Record<string, { translator_system: string; reviewer_system: string }> } {
+  const plan = planTranslationBatch(db, platform, langs, limit, { entityIds: opts.entityIds });
+  const items: CollectedItem[] = [];
+  const tx = db.transaction(() => {
+    for (const p of plan.actionable) {
+      const row = upsertDraft(db, platform, p, opts.batchId);
+      let feedback: string | null = null;
+      if (row.review_json) {
+        try {
+          const v = parseReviewVerdict(JSON.parse(row.review_json));
+          if (v && v.verdict === "REVISE") feedback = feedbackFromReview(v);
+        } catch { /* ignore */ }
+      }
+      items.push({
+        id: row.id,
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        entity_name: row.entity_name || p.item.entity_name,
+        field: row.field,
+        kind: p.item.kind,
+        lang: p.lang,
+        source_text: row.source_text,
+        source_hash: row.source_hash,
+        action: p.decision.action,
+        attempts: row.attempts,
+        feedback,
+      });
+      audit(db, row.id, row.status, row.status, opts.actor, "collected (session lane)", opts.batchId);
+    }
+  });
+  tx();
+  const instructions: Record<string, { translator_system: string; reviewer_system: string }> = {};
+  for (const lang of langs) instructions[lang] = { translator_system: buildTranslatorSystemPrompt(lang), reviewer_system: buildReviewerSystemPrompt(lang) };
+  return { items, skipped: plan.skipped, remaining_actionable: plan.remaining_actionable, total_pairs: plan.total_pairs, instructions };
+}
+
+export interface SessionSubmission {
+  id: number;
+  source_hash?: string | null;
+  translated_text: string;
+  already_target_language?: boolean;
+  kept_terms?: string[];
+  notes?: string;
+  review: unknown;
+}
+
+export type SessionSubmitOutcome =
+  | "verified"
+  | "rejected_verify"
+  | "rejected_review"
+  | "revise"
+  | "review_failed"
+  | "translate_failed"
+  | "not_found"
+  | "wrong_platform"
+  | "skipped_status"
+  | "source_changed";
+
+export interface SessionSubmitResult {
+  id: number;
+  outcome: SessionSubmitOutcome;
+  status: TranslationStatus | null;
+  attempts: number;
+  reason?: string;
+  review?: ReviewVerdict | null;
+  verify?: VerifyResult | null;
+}
+
+/**
+ * Store one session-produced translation + its independent review verdict and
+ * run the deterministic verifier — the same status machine as the LLM lane
+ * (draft → reviewed → verified | rejected). Never publishes. A row that is not
+ * a draft, or whose source changed since it was collected, is left untouched.
+ */
+export function submitSessionTranslation(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  sub: SessionSubmission,
+  opts: { actor: string; batchId: string; translatorLabel?: string; reviewerLabel?: string },
+): SessionSubmitResult {
+  const translatorLabel = opts.translatorLabel || "claude-code-session";
+  const reviewerLabel = opts.reviewerLabel || "claude-code-session-review";
+  let row = getTranslationById(db, sub.id);
+  if (!row) return { id: sub.id, outcome: "not_found", status: null, attempts: 0 };
+  if (row.platform !== platform) return { id: sub.id, outcome: "wrong_platform", status: row.status, attempts: row.attempts };
+  if (row.status !== "draft") return { id: sub.id, outcome: "skipped_status", status: row.status, attempts: row.attempts, reason: `row is ${row.status}, only drafts accept a submission` };
+  if (sub.source_hash && sub.source_hash !== row.source_hash) {
+    return { id: sub.id, outcome: "source_changed", status: row.status, attempts: row.attempts, reason: "source_hash differs — re-collect" };
+  }
+  const translation = cleanSource(sub.translated_text);
+  if (!translation) return { id: sub.id, outcome: "translate_failed", status: row.status, attempts: row.attempts, reason: "empty translation" };
+
+  const alreadyTarget = sub.already_target_language === true;
+  const keptTerms = Array.isArray(sub.kept_terms) ? sub.kept_terms.map((t) => String(t).trim()).filter((t) => t && t.length <= 40).slice(0, 8) : [];
+  const notes = String(sub.notes ?? "").slice(0, 1000);
+  const attemptsNow = row.attempts + 1;
+  row = setStatus(
+    db,
+    row,
+    "draft",
+    { attempts: attemptsNow, translated_text: translation, translator_model: translatorLabel, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + (keptTerms.length ? `[kept: ${keptTerms.join(", ")}] ` : "") + notes, batch_id: opts.batchId, reject_reason: null },
+    opts.actor,
+    `translated by session (attempt ${attemptsNow})`,
+    opts.batchId,
+  );
+
+  const verdict = parseReviewVerdict(sub.review);
+  if (!verdict) {
+    row = setStatus(db, row, "draft", { reviewer_model: reviewerLabel, review_json: JSON.stringify({ error: "unparseable verdict" }) }, opts.actor, "review failed: unparseable verdict", opts.batchId);
+    return { id: row.id, outcome: "review_failed", status: row.status, attempts: row.attempts, reason: "unparseable review verdict", review: null };
+  }
+  row = setStatus(db, row, "reviewed", { reviewer_model: reviewerLabel, review_json: JSON.stringify(verdict), reviewed_at: nowIso() }, opts.actor, `reviewed: ${verdict.verdict} f${verdict.fidelity}/fl${verdict.fluency}`, opts.batchId);
+
+  if (reviewAccepts(verdict)) {
+    const kind = kindForField(platform, row.entity_type, row.field);
+    const vr = verifyTranslationDeterministic(row.source_text, translation, row.lang as TranslationTargetLang, { kind, alreadyTargetLanguage: alreadyTarget, entityName: row.entity_name, keptTerms });
+    if (vr.ok) {
+      row = setStatus(db, row, "verified", { verify_json: JSON.stringify(vr), verified_at: nowIso(), reject_reason: null }, opts.actor, "verified", opts.batchId);
+      return { id: row.id, outcome: "verified", status: row.status, attempts: row.attempts, review: verdict, verify: vr };
+    }
+    const reason = `deterministic verify failed: ${vr.failed.join(", ")}`;
+    row = setStatus(db, row, "rejected", { verify_json: JSON.stringify(vr), reject_reason: reason }, opts.actor, reason, opts.batchId);
+    return { id: row.id, outcome: "rejected_verify", status: row.status, attempts: row.attempts, reason, review: verdict, verify: vr };
+  }
+  if (verdict.verdict === "REVISE" && row.attempts < MAX_TRANSLATION_ATTEMPTS) {
+    // Stays a draft: the next /collect returns it with `feedback` for a second pass.
+    row = setStatus(db, row, "draft", {}, opts.actor, `revise requested: ${feedbackFromReview(verdict).slice(0, 300)}`, opts.batchId);
+    return { id: row.id, outcome: "revise", status: row.status, attempts: row.attempts, reason: feedbackFromReview(verdict), review: verdict };
+  }
+  const reason = `reviewer ${verdict.verdict} (fidelity ${verdict.fidelity}, fluency ${verdict.fluency}): ${verdict.summary || feedbackFromReview(verdict)}`.slice(0, 1000);
+  row = setStatus(db, row, "rejected", { reject_reason: reason }, opts.actor, reason, opts.batchId);
+  return { id: row.id, outcome: "rejected_review", status: row.status, attempts: row.attempts, reason, review: verdict };
+}
+
 export function translationStatusCounts(db: Database.Database, platform: TranslationPlatform): Record<string, Record<string, number>> {
   const rows = db
     .prepare(`SELECT lang, status, COUNT(*) AS n FROM profile_translations WHERE platform = ? GROUP BY lang, status`)

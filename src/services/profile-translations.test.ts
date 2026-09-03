@@ -516,6 +516,50 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       eq([c21.status, c21.body.status], [200, "draft"], "C21 requeue via route");
       const c22 = await callRoute(router, { url: `/audit?platform=rfb&id=${c14.body.rows[0].id}`, headers: H });
       ok(c22.status === 200 && c22.body.audit.length >= 4, "C22 audit history via route");
+
+      // ───────────────────────────── E. session lane (collect → submit) ──
+      // Pipeline flag is OFF here (deleted above) — the lane must work anyway.
+      // State at this point: the sv description row is a draft (requeued in
+      // B34, source changed in B38-B42), the sv about row is rejected/draft.
+      const svAboutRow = svc.listTranslationQueue(rfbDb as any, "rfb", { lang: "sv" }).find((r) => r.field === "about")!;
+      if (svAboutRow.status !== "draft") svc.requeueTranslation(rfbDb as any, svAboutRow.id, "test");
+      const e1 = await callRoute(router, { url: "/collect?platform=rfb&langs=sv&limit=10", headers: H });
+      eq(e1.status, 200, "E1 collect 200 with pipeline flag off");
+      ok(e1.body.items_count === 2 && e1.body.items.every((i: any) => i.id > 0 && i.source_hash && i.lang === "sv" && i.source_text && i.kind === "prose"), "E2 two sv drafts collected with ids/hashes", e1.body.items);
+      ok(String(e1.body.instructions.sv.translator_system).includes("Swedish") && String(e1.body.instructions.sv.reviewer_system).length > 100, "E3 instructions carry translator + reviewer system prompts");
+      const eDesc = e1.body.items.find((i: any) => i.field === "description");
+      const eAbout = e1.body.items.find((i: any) => i.field === "about");
+      const goodReview = { verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" };
+      const svDesc = "Vi säljer ekologiska grönsaker, honung och ägg från vår egen gård i Bø. Öppet lördagar 10–16.";
+      const e4 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc }] } });
+      eq(e4.status, 400, "E4 submit without review → 400");
+      const beforeText = svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text;
+      const e5 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, source_hash: "stale", translated_text: svDesc, review: goodReview }] } });
+      eq([e5.status, e5.body.results[0].outcome, svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text], [200, "source_changed", beforeText], "E5 stale source_hash → source_changed, row untouched");
+      const e6 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", actor: "test-session", items: [{ id: eDesc.id, source_hash: eDesc.source_hash, translated_text: svDesc, review: goodReview, kept_terms: [] }] } });
+      eq([e6.status, e6.body.outcomes.verified, e6.body.results[0].status], [200, 1, "verified"], "E6 APPROVE + deterministic verify → verified");
+      const eRow = svc.getTranslationById(rfbDb as any, eDesc.id)!;
+      eq([eRow.translator_model, eRow.reviewer_model, eRow.status, eRow.attempts], ["claude-code-session", "claude-code-session-review", "verified", 1], "E7 session labels + attempt stored");
+      const e8 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: "Något annat.", review: goodReview }] } });
+      eq([e8.body.results[0].outcome, svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text], ["skipped_status", svDesc], "E8 verified row refuses a new submission");
+      const e9 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, source_hash: eAbout.source_hash, translated_text: "Solgården har varit i familjens ägo i många år. Vi odlar morötter, potatis och bär och har bikupor på gården.", review: goodReview }] } });
+      eq([e9.body.results[0].outcome, e9.body.results[0].status], ["rejected_verify", "rejected"], "E9 APPROVE but 1952 dropped → rejected_verify");
+      ok((e9.body.results[0].verify?.failed || []).includes("digits_preserved"), "E10 failed check named in result");
+      await callRoute(router, { url: "/requeue", method: "POST", headers: H, body: { platform: "rfb", id: eAbout.id } });
+      const reviseReview = { verdict: "REVISE", fidelity: 3, fluency: 4, issues: [{ type: "omission", severity: "major", detail: "year 1952 missing" }], summary: "add the year" };
+      const e11 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, translated_text: "Solgården har varit i familjens ägo länge.", review: reviseReview }] } });
+      eq([e11.body.results[0].outcome, e11.body.results[0].status, e11.body.results[0].attempts], ["revise", "draft", 1], "E11 REVISE keeps the draft for a second pass");
+      const e12 = await callRoute(router, { url: "/collect?platform=rfb&langs=sv", headers: H });
+      const e12About = e12.body.items.find((i: any) => i.id === eAbout.id);
+      ok(e12.body.items_count === 1 && e12About && /1952/.test(e12About.feedback || "") && e12About.attempts === 1, "E12 re-collect returns the REVISE feedback for the draft", e12.body.items);
+      const e13 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, translated_text: "Solgården har varit i familjens ägo länge.", review: { verdict: "REJECT", fidelity: 1, fluency: 4, issues: [], summary: "still wrong" } }] } });
+      eq([e13.body.results[0].outcome, e13.body.results[0].status], ["rejected_review", "rejected"], "E13 REJECT → rejected_review");
+      eq(svc.submitSessionTranslation(rfbDb as any, "rfb", { id: 999999, translated_text: "x", review: goodReview }, { actor: "t", batchId: "b" }).outcome, "not_found", "E14 unknown id → not_found");
+      eq(svc.submitSessionTranslation(rfbDb as any, "opplevagent", { id: eDesc.id, translated_text: "x", review: goodReview }, { actor: "t", batchId: "b" }).outcome, "wrong_platform", "E15 platform mismatch refused");
+      const e16 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [] } });
+      eq(e16.status, 400, "E16 empty items → 400");
+      const e17 = await callRoute(router, { url: `/audit?platform=rfb&id=${eDesc.id}`, headers: H });
+      ok(e17.body.audit.some((a: any) => /collected \(session lane\)/.test(a.note || "")) && e17.body.audit.some((a: any) => /translated by session/.test(a.note || "")), "E17 audit trail names the session lane", e17.body.audit);
     } finally {
       if (prevDb) initMod.__setDbForTesting(prevDb);
       try { rfbDb.close(); } catch { /* ignore */ }
