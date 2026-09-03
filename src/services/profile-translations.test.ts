@@ -200,6 +200,36 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     const rp = svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, ["rømmegrøt", "mål"]);
     ok(rp.includes("kept on purpose") && rp.includes("rømmegrøt, mål"), "A24l reviewer prompt lists kept terms");
     ok(!svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, []).includes("kept on purpose"), "A24m reviewer prompt omits kept-terms line when empty");
+    // multi-word kept term (scheme name) + HTML-entity sources (live 2026-09-03)
+    const iptSrc = "Tveitan Gård i Siljan driver storfekjøttproduksjon og Inn på tunet-tjenester for kommunen.";
+    const ipt1 = svc.verifyTranslationDeterministic(iptSrc, "Tveitan Gård in Siljan produces beef and offers Inn på tunet (farm-based care and education) services for the municipality.", "en", { keptTerms: ["inn på tunet"] });
+    ok(ipt1.ok, "A24n multi-word kept term 'Inn på tunet' with gloss passes", ipt1.failed);
+    const ipt2 = svc.verifyTranslationDeterministic(iptSrc, "Tveitan Gård in Siljan produces beef and offers inn på tunet services for the municipality.", "en", { keptTerms: ["inn på tunet"] });
+    ok(!ipt2.ok && ipt2.failed.includes("no_untranslated_norwegian"), "A24o multi-word kept term without gloss (and not capitalised as a name) still fails", ipt2.failed);
+    const si = svc.verifyTranslationDeterministic("Gårdsbutikk med ost. Åpent lørdager 10–15 hele året.", "Farm shop with cheese. Åpent lørdager 10–15 all year.", "en");
+    ok(!si.ok && si.failed.includes("no_untranslated_norwegian"), "A24w sentence-initial capitalised head does not license the following word", si.failed);
+    const sl = svc.verifyTranslationDeterministic("Bondens marked i Sogndal sentrum, Sogn og Fjordane/Vestland.", "Bondens marked (farmers' market) in Sogndal town centre, Sogn og Fjordane/Vestland.", "en");
+    ok(sl.ok, "A24x county name followed by a slash alternative passes", sl.failed);
+    const amp = svc.verifyTranslationDeterministic("Fossmoen Frukt og Cider – Vi tapper naturen på flaske.", "Fossmoen Frukt og Cider – We bottle nature.", "en", { entityName: "Fossmoen Frukt & Cider — Bjerkreim" });
+    ok(amp.ok, "A24y entity name with & matches the source's og in a name phrase", amp.failed);
+    const lc = svc.verifyTranslationDeterministic("Bryggeriet ligger i østre Strandvei 52 og har utsalg.", "The brewery is at Østre Strandvei 52 and has a shop.", "en");
+    ok(lc.ok, "A24z two-word proper name capitalised from a lowercase source form passes", lc.failed);
+    const lc2 = svc.verifyTranslationDeterministic("Vi har åpent lørdager i gårdsbutikken.", "We have Åpent Lørdager in the farm shop.", "en");
+    ok(!lc2.ok && lc2.failed.includes("no_untranslated_norwegian"), "A24z2 capitalising everyday Norwegian words does not license them", lc2.failed);
+    const ipt3 = svc.verifyTranslationDeterministic("Vi har åpent på lørdager.", "We are open på lørdager (Saturdays).", "en", { keptTerms: ["på lørdager"] });
+    ok(!ipt3.ok, "A24p a multi-word term made only of everyday words is not tolerated", ipt3.failed);
+    eq(svc.decodeHtmlEntities("Noraker G&#229;rd &amp; S&#xF8;nner &ndash; &aring;pent"), "Noraker Gård & Sønner – åpent", "A24q HTML entities decoded");
+    const entSrc = "I Aurdal ligger Noraker G&#229;rd som drives i 12. generasjon. Rakfisken fra Noraker G&#229;rd er kjent.";
+    const ent1 = svc.verifyTranslationDeterministic(entSrc, "Noraker Gård in Aurdal is run by the 12th generation. The rakfisk (fermented trout) from Noraker Gård is well known.", "en", { keptTerms: ["rakfisk"] });
+    ok(ent1.ok, "A24r entity-encoded source verifies against decoded translation (no phantom digits)", ent1.failed);
+    const hy = svc.verifyTranslationDeterministic("Vingården ligger i Snåsa og lager vin av druer dyrket i Snåsa.", "The vineyard lies in Snåsa and makes wine from Snåsa-grown grapes.", "en");
+    ok(hy.ok, "A24s hyphenated compound with a preserved proper noun (Snåsa-grown) passes", hy.failed);
+    const bg = svc.verifyTranslationDeterministic("Selskapet driver gårdsbutikken på Skudeneset gård i Søgne.", "The company runs the farm shop at Skudeneset gård in Søgne.", "en");
+    ok(bg.ok, "A24t lowercase name part in a verbatim source bigram (Skudeneset gård) passes", bg.failed);
+    const bg2 = svc.verifyTranslationDeterministic("Vi har en gammel gård i Søgne.", "We have an old gård in Søgne.", "en");
+    ok(!bg2.ok && bg2.failed.includes("no_untranslated_norwegian"), "A24u lowercase common noun without a capitalised neighbour still fails", bg2.failed);
+    const q = svc.verifyTranslationDeterministic("RYGR vant «Årets øl» i 2023 og 2024.", "RYGR won \"Årets øl\" (Beer of the Year) in 2023 and 2024.", "en", { keptTerms: ["årets øl"] });
+    ok(q.ok, "A24v quoted multi-word kept term with gloss after the closing quote passes", q.failed);
     // review round 1 (lokal#771): kept_terms must not be a free whitelist
     const kd1 = svc.verifyTranslationDeterministic("Vi har åpent lørdager og søndager på gården.", "We are open lørdager and søndager at the farm.", "en", { keptTerms: ["lørdager", "søndager"] });
     ok(!kd1.ok && kd1.failed.includes("no_untranslated_norwegian"), "A24n denylisted weekday kept terms are refused", kd1.failed);

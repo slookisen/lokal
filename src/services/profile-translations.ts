@@ -233,8 +233,17 @@ export const OPPLEVAGENT_PUBLISH_GATE_SQL =
   // published anywhere, so they must not be translated either. LEFT-JOIN-safe.
   "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
 
+const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", aring: "å", Aring: "Å", oslash: "ø", Oslash: "Ø", aelig: "æ", AElig: "Æ", eacute: "é", ouml: "ö", auml: "ä", uuml: "ü", ndash: "–", mdash: "—", hellip: "…" };
+/** Decode HTML entities a scraped source may carry ("G&#229;rd", "&amp;") — the
+ *  public page renders them decoded, so the decoded text IS the source. */
+export function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&([a-zA-Z]+);/g, (m, n) => (n in NAMED_ENTITIES ? NAMED_ENTITIES[n] : m));
+}
 function cleanSource(text: unknown): string {
-  return String(text ?? "").replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
+  return decodeHtmlEntities(String(text ?? "")).replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
 }
 
 /** True when a source value is worth translating at all: non-empty, not
@@ -717,13 +726,54 @@ export function verifyTranslationDeterministic(
   // and judges whether keeping them was right.
   const srcLowerWords = new Set(src.toLowerCase().split(splitRe).filter(Boolean));
   const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}\\s*\\(`, "iu").test(out);
+  const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}[\\s"'»”]*\\(`, "iu").test(out);
   const declared = (Array.isArray(opts.keptTerms) ? opts.keptTerms : []).map((t) => String(t).toLowerCase().trim()).filter(Boolean);
-  const keptTerms = new Set(declared.slice(0, 4).filter((t) => srcLowerWords.has(t) && !KEPT_TERM_DENYLIST.has(t) && hasGloss(t)));
+  // A kept term may be a multi-word proper name of a scheme or product
+  // ("Inn på tunet", "Vestlandsk fjordgris"): it must occur verbatim in the
+  // source and carry a gloss in the output; each of its words is then tolerated.
+  const srcLowerFlat = " " + src.toLowerCase().split(/[\s.,;:!?()"'«»–—/-]+/).filter(Boolean).join(" ") + " ";
+  const keptTerms = new Set<string>();
+  for (const t of declared.slice(0, 4)) {
+    if (KEPT_TERM_DENYLIST.has(t) || !hasGloss(t)) continue;
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length === 1) {
+      if (srcLowerWords.has(t)) keptTerms.add(t);
+    } else if (words.length <= 4 && srcLowerFlat.includes(` ${words.join(" ")} `) && words.some((w) => !KEPT_TERM_DENYLIST.has(w) || /^[A-ZÆØÅ]/.test(w))) {
+      for (const w of words) keptTerms.add(w);
+    }
+  }
+  // "Skudeneset gård", "Bondens marked": a lowercase æ/ø/å word that follows
+  // a capitalised word in the output AND forms the same bigram verbatim in
+  // the source is part of a name written lowercase by the producer.
+  const outWs = out.split(/\s+/).map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean);
+  const srcBigrams = new Set<string>();
+  srcWs.map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean).forEach((w, i, arr) => {
+    // The capitalised head must not be sentence-initial ("Åpent lørdager"
+    // at the start of a sentence is capitalised by position, not a name).
+    const headInitial = i - 1 <= 0 || /[.!?:]$/.test(srcWs[i - 2] || "");
+    if (i > 0 && !headInitial) srcBigrams.add(`${arr[i - 1]} ${w}`);
+  });
+  const srcBigramsLower = new Set(Array.from(srcBigrams).map((b) => b.toLowerCase()));
+  const nameBigramWords = new Set<string>();
+  outWs.forEach((w, i) => {
+    if (i === 0) return;
+    const prev = outWs[i - 1];
+    // "Skudeneset gård": a lowercase name part after a capitalised head.
+    if (/^[A-ZÆØÅ]/.test(prev) && /^[a-zæøå]/.test(w) && srcBigrams.has(`${prev} ${w}`)) nameBigramWords.add(w);
+    // "Østre Strandvei 52": a two-word proper name the producer wrote lowercase
+    // in the source ("østre Strandvei"). Both output words capitalised, the same
+    // bigram in the source ignoring case, and neither an everyday word.
+    if (/^[A-ZÆØÅ]/.test(prev) && /^[A-ZÆØÅ]/.test(w) && srcBigramsLower.has(`${prev} ${w}`.toLowerCase())
+        && !KEPT_TERM_DENYLIST.has(w.toLowerCase()) && !KEPT_TERM_DENYLIST.has(prev.toLowerCase())) {
+      nameBigramWords.add(w);
+      nameBigramWords.add(prev);
+    }
+  });
   const leaked = out
     .split(splitRe)
+    .flatMap((w) => w.split("-"))
     .filter((w) => w && nordicRe.test(w))
-    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w));
+    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w) && !nameBigramWords.has(w));
   const leakedUnique = Array.from(new Set(leaked));
   checks.push({
     name: "no_untranslated_norwegian",
@@ -748,9 +798,12 @@ export function verifyTranslationDeterministic(
   // Locative "i" ("Nordlandsmuseet i Bodø") never qualifies.
   const NAME_PHRASE_WORDS = new Set(["og", "av", "fra"]);
   const stripEdges = (w: string): string => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-  const outTokens = out.split(/\s+/).map(stripEdges).filter(Boolean);
-  const srcFlat = " " + srcWs.flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
-  const entityNameFlat = " " + String(opts.entityName || "").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
+  // "/" separates alternatives ("Sogn og Fjordane/Vestland") — split on it too.
+  const outTokens = out.split(/[\s/]+/).map(stripEdges).filter(Boolean);
+  const srcFlat = " " + src.split(/[\s/]+/).flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
+  // Entity names often write "og" as "&" ("Fossmoen Frukt & Cider"); normalise so the
+  // source's "Frukt og Cider" matches.
+  const entityNameFlat = " " + String(opts.entityName || "").replace(/&/g, " og ").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
   let namePhraseBudget = 2;
   const inNamePhrase = (i: number): boolean => {
     if (namePhraseBudget <= 0 || i < 1 || i >= outTokens.length - 1 || !NAME_PHRASE_WORDS.has(outTokens[i])) return false;
