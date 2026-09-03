@@ -784,8 +784,9 @@ export function verifyTranslationDeterministic(
   // Locative "i" ("Nordlandsmuseet i Bodø") never qualifies.
   const NAME_PHRASE_WORDS = new Set(["og", "av", "fra"]);
   const stripEdges = (w: string): string => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-  const outTokens = out.split(/\s+/).map(stripEdges).filter(Boolean);
-  const srcFlat = " " + srcWs.flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
+  // "/" separates alternatives ("Sogn og Fjordane/Vestland") — split on it too.
+  const outTokens = out.split(/[\s/]+/).map(stripEdges).filter(Boolean);
+  const srcFlat = " " + src.split(/[\s/]+/).flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
   const entityNameFlat = " " + String(opts.entityName || "").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
   let namePhraseBudget = 2;
   const inNamePhrase = (i: number): boolean => {
