@@ -726,7 +726,7 @@ export function verifyTranslationDeterministic(
   // and judges whether keeping them was right.
   const srcLowerWords = new Set(src.toLowerCase().split(splitRe).filter(Boolean));
   const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}\\s*\\(`, "iu").test(out);
+  const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}[\\s"'»”]*\\(`, "iu").test(out);
   const declared = (Array.isArray(opts.keptTerms) ? opts.keptTerms : []).map((t) => String(t).toLowerCase().trim()).filter(Boolean);
   // A kept term may be a multi-word proper name of a scheme or product
   // ("Inn på tunet", "Vestlandsk fjordgris"): it must occur verbatim in the
@@ -742,10 +742,19 @@ export function verifyTranslationDeterministic(
       for (const w of words) keptTerms.add(w);
     }
   }
+  // "Skudeneset gård", "Bondens marked": a lowercase æ/ø/å word that follows
+  // a capitalised word in the output AND forms the same bigram verbatim in
+  // the source is part of a name written lowercase by the producer.
+  const outWs = out.split(/\s+/).map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean);
+  const srcBigrams = new Set<string>();
+  srcWs.map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean).forEach((w, i, arr) => { if (i > 0) srcBigrams.add(`${arr[i - 1]} ${w}`); });
+  const nameBigramWords = new Set<string>();
+  outWs.forEach((w, i) => { if (i > 0 && /^[A-ZÆØÅ]/.test(outWs[i - 1]) && /^[a-zæøå]/.test(w) && srcBigrams.has(`${outWs[i - 1]} ${w}`)) nameBigramWords.add(w); });
   const leaked = out
     .split(splitRe)
+    .flatMap((w) => w.split("-"))
     .filter((w) => w && nordicRe.test(w))
-    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w));
+    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w) && !nameBigramWords.has(w));
   const leakedUnique = Array.from(new Set(leaked));
   checks.push({
     name: "no_untranslated_norwegian",

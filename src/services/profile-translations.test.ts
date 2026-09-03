@@ -212,6 +212,14 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     const entSrc = "I Aurdal ligger Noraker G&#229;rd som drives i 12. generasjon. Rakfisken fra Noraker G&#229;rd er kjent.";
     const ent1 = svc.verifyTranslationDeterministic(entSrc, "Noraker Gård in Aurdal is run by the 12th generation. The rakfisk (fermented trout) from Noraker Gård is well known.", "en", { keptTerms: ["rakfisk"] });
     ok(ent1.ok, "A24r entity-encoded source verifies against decoded translation (no phantom digits)", ent1.failed);
+    const hy = svc.verifyTranslationDeterministic("Vingården ligger i Snåsa og lager vin av druer dyrket i Snåsa.", "The vineyard lies in Snåsa and makes wine from Snåsa-grown grapes.", "en");
+    ok(hy.ok, "A24s hyphenated compound with a preserved proper noun (Snåsa-grown) passes", hy.failed);
+    const bg = svc.verifyTranslationDeterministic("Selskapet driver gårdsbutikken på Skudeneset gård i Søgne.", "The company runs the farm shop at Skudeneset gård in Søgne.", "en");
+    ok(bg.ok, "A24t lowercase name part in a verbatim source bigram (Skudeneset gård) passes", bg.failed);
+    const bg2 = svc.verifyTranslationDeterministic("Vi har en gammel gård i Søgne.", "We have an old gård in Søgne.", "en");
+    ok(!bg2.ok && bg2.failed.includes("no_untranslated_norwegian"), "A24u lowercase common noun without a capitalised neighbour still fails", bg2.failed);
+    const q = svc.verifyTranslationDeterministic("RYGR vant «Årets øl» i 2023 og 2024.", "RYGR won \"Årets øl\" (Beer of the Year) in 2023 and 2024.", "en", { keptTerms: ["årets øl"] });
+    ok(q.ok, "A24v quoted multi-word kept term with gloss after the closing quote passes", q.failed);
     // review round 1 (lokal#771): kept_terms must not be a free whitelist
     const kd1 = svc.verifyTranslationDeterministic("Vi har åpent lørdager og søndager på gården.", "We are open lørdager and søndager at the farm.", "en", { keptTerms: ["lørdager", "søndager"] });
     ok(!kd1.ok && kd1.failed.includes("no_untranslated_norwegian"), "A24n denylisted weekday kept terms are refused", kd1.failed);
