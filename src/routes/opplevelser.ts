@@ -2023,6 +2023,21 @@ type CrFetchOutcome =
        * doc comment.
        */
       render?: RenderEscalationDiagnostic;
+      /**
+       * The actual post-redirect/post-render URL of the page this call read —
+       * i.e. `primaryUrl` inside crFetchGardssalgContent (the requested
+       * `fetchUrl`, updated to `primary.finalUrl` after the plain fetch and
+       * again to `rendered.finalUrl` if headless rendering was attempted and
+       * succeeded). ADDITIVE and optional — only crFetchGardssalgContent sets
+       * it; crFetchHomepageContent (the other producer of this union) never
+       * does, same as pagesFetchedPaths above.
+       *
+       * PR #774 review fix: gardssalgWebsiteEvidenceMatch's domain
+       * corroboration must check the host of the page actually fetched, not
+       * the producer's own pre-fetch claimed URL — see
+       * gardssalg-website-verification.ts's `candidateHost`.
+       */
+      finalUrl?: string;
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -2939,7 +2954,16 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, pages, render: renderReport };
+  return {
+    ok: true,
+    primaryHtml,
+    combinedHtml,
+    fetchUrl,
+    pagesFetchedPaths: fetchedPaths,
+    pages,
+    render: renderReport,
+    finalUrl: primaryUrl,
+  };
 }
 
 /**
@@ -2976,6 +3000,7 @@ function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
       pageText: gardssalgPageText(fetched.combinedHtml),
       title: gardssalgPageTitle(fetched.primaryHtml),
       render: fetched.render,
+      finalUrl: fetched.finalUrl,
     };
   };
 }

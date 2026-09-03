@@ -827,6 +827,122 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       assertEq(row.classification, "verified", "z2: own-hjemmeside verification unaffected by an unrelated candidate field");
       assertEq(row.promoted_from_evidence_url, undefined, "z3: no promotion marker on an own-hjemmeside verification");
     }
+
+    // ═══ PR #774 review fix — `candidateHost` must come from the page
+    //     actually FETCHED (fetched.finalUrl), not the producer's own
+    //     pre-fetch claimed URL. Before this fix, both call sites passed the
+    //     pre-fetch `host` (hostFromUrlLike(hjemmeside) / …(candidate)) into
+    //     gardssalgWebsiteEvidenceMatch's 4th argument — nearly tautological
+    //     domain corroboration, and on a parked/expired domain whose
+    //     auto-generated <title> happens to mention the producer's name,
+    //     could wrongly verify. All three fixtures below reuse the exact
+    //     "Austmann" prefix-token+title shape wd-29a already proves verifies
+    //     when title+domain corroborate — the only thing that varies is
+    //     which host reaches the corroboration check. ═══════════════════════
+    {
+      const austmannTarget = {
+        id: "prov-candidatehost-crosshost",
+        navn: "Austmann Bryggeri",
+        hjemmeside: "https://austmann.no",
+      };
+      const austmannPageText = "Velkommen til Austmann. Vi lager håndverksøl.";
+      const austmannTitle = "Austmann – bryggeri i Norge";
+
+      // ── (aa) cross-host redirect / parked-domain scenario: the producer's
+      //     OWN declared hjemmeside host ("austmann.no") DOES contain the
+      //     prefix token — using it (the pre-fix bug) would incorrectly
+      //     verify, exactly like wd-29a. The page actually fetched, though,
+      //     redirected to an unrelated parked host that does NOT contain the
+      //     token — the fix must use THAT host and come out unverified. ────
+      {
+        const producer = blankProducer(austmannTarget);
+        const fetchFn: GsWvFetchFn = async () => ({
+          ok: true,
+          pageText: austmannPageText,
+          title: austmannTitle,
+          finalUrl: "https://totally-unrelated-parked-domain.example",
+        });
+        const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+        assertEq(
+          row.classification,
+          "unverified",
+          "aa1: post-fetch host (parked domain) does NOT corroborate the prefix token -> unverified, even though the " +
+            "pre-fetch declared host (austmann.no) would have incorrectly verified this exact fixture (see wd-29a)"
+        );
+        assertEq(row.evidence?.prefix_token_found, false, "aa2: the new branch itself does not fire once the correct host is used");
+      }
+
+      // ── (bb) mirror case — finalUrl legitimately resolves to the SAME
+      //     host as the pre-fetch declared URL (no redirect, or a same-host
+      //     redirect): verification behavior is unchanged from before this
+      //     fix — still verifies via prefix+title+domain. ──────────────────
+      {
+        const producer = blankProducer(austmannTarget);
+        const fetchFn: GsWvFetchFn = async () => ({
+          ok: true,
+          pageText: austmannPageText,
+          title: austmannTitle,
+          finalUrl: "https://austmann.no/",
+        });
+        const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+        assertEq(row.classification, "verified", "bb1: finalUrl on the same host as before -> verification unchanged, still verified");
+        assertEq(row.evidence?.prefix_token_found, true, "bb2: domain corroboration still fires against the (same) fetched host");
+      }
+
+      // ── (cc) regression — a simpler/older mock fetchFn that does not set
+      //     finalUrl at all: must fall back BYTE-FOR-BYTE to the old
+      //     pre-fetch `host`, so nothing existing breaks. ──────────────────
+      {
+        const producer = blankProducer(austmannTarget);
+        const fetchFn: GsWvFetchFn = async () => ({
+          ok: true,
+          pageText: austmannPageText,
+          title: austmannTitle,
+          // no finalUrl
+        });
+        const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+        assertEq(
+          row.classification,
+          "verified",
+          "cc1: fetchFn that never sets finalUrl falls back to the pre-fetch host -> same outcome as before this fix"
+        );
+        assertEq(row.evidence?.prefix_token_found, true, "cc2: domain corroboration still fires via the fallback host");
+      }
+    }
+
+    // ═══ PR #774 review fix, evidence_url-candidate leg — the same
+    //     cross-host defect is more serious here: a false `verified` sets
+    //     `promoted_from_evidence_url`, which applyGardssalgWebsiteVerification
+    //     WRITES into the producer's real hjemmeside column (a data-integrity
+    //     issue, not just a miscategorization). ═══════════════════════════
+    {
+      // ── (dd) candidate URL's own host contains the prefix token (would
+      //     incorrectly promote under the pre-fix bug), but the page
+      //     actually fetched redirected to an unrelated parked host ->
+      //     must stay missing_source, never promoted. ─────────────────────
+      const producer = blankProducer({
+        id: "prov-evurl-candidatehost-crosshost",
+        navn: "Austmann Bryggeri",
+        hjemmeside: null,
+        evidence_url_candidate: "https://austmann.no/om-oss",
+      });
+      const fetchFn: GsWvFetchFn = async (url) => {
+        assertEq(url, "https://austmann.no/om-oss", "dd1: fetchFn is called with the candidate url");
+        return {
+          ok: true,
+          pageText: "Velkommen til Austmann. Vi lager håndverksøl.",
+          title: "Austmann – bryggeri i Norge",
+          finalUrl: "https://totally-unrelated-parked-domain.example",
+        };
+      };
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(
+        row.classification,
+        "missing_source",
+        "dd2: post-fetch host does not corroborate -> missing_source, NOT verified (the candidate host alone would have incorrectly promoted)"
+      );
+      assertEq(row.promoted_from_evidence_url, undefined, "dd3: no promotion marker — nothing gets written to hjemmeside");
+    }
   })().then(() => ({ passed, failed, failures }));
 }
 

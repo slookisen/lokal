@@ -210,6 +210,22 @@ export type GsWvFetchResult =
        * field of it and nothing here branches on it.
        */
       render?: RenderEscalationDiagnostic;
+      /**
+       * The actual post-redirect/post-render URL of the page this fetch read —
+       * passed straight through from the adapter (crFetchGardssalgContent's
+       * own `finalUrl`, via gsWvFetchFnFromGardssalgCrawler). Optional so an
+       * existing/simpler fetchFn still type-checks; omitting it just means the
+       * caller falls back to the pre-fetch declared host (see `candidateHost`
+       * in classifyGardssalgProducerWebsite / …ViaEvidenceUrlCandidate below).
+       *
+       * PR #774 review fix: gardssalgWebsiteEvidenceMatch's domain
+       * corroboration must check the host of the page actually fetched, not
+       * the producer's own pre-fetch claimed URL — using the claimed URL made
+       * the check nearly tautological and, on a parked/expired domain whose
+       * auto-generated <title> happens to mention the domain name, could
+       * wrongly mark the page verified.
+       */
+      finalUrl?: string;
     }
   | {
       ok: false;
@@ -423,6 +439,19 @@ export async function classifyGardssalgProducerWebsite(
     return { provider_id: producer.id, name: producer.navn, hjemmeside, classification, evidence: null };
   }
 
+  // PR #774 review fix: `host` above is the pre-fetch, producer-CLAIMED host
+  // (hostFromUrlLike(hjemmeside)) — still correct and unchanged for the
+  // aggregator-host check above, which must run before any fetch. But the
+  // domain-corroboration branch inside gardssalgWebsiteEvidenceMatch needs
+  // the host of the page ACTUALLY fetched, or it just compares the
+  // producer's own claimed domain against their own name — nearly
+  // tautological, and on a parked/expired domain whose auto-generated
+  // <title> happens to mention the domain name, could wrongly verify. Falls
+  // back to the pre-fetch `host` when a simpler/older fetchFn test double
+  // doesn't set finalUrl — same fail-soft discipline as the rest of this
+  // file.
+  const candidateHost = fetched.finalUrl ? hostFromUrlLike(fetched.finalUrl) : host;
+
   const evidence = gardssalgWebsiteEvidenceMatch(
     fetched.pageText,
     {
@@ -436,7 +465,7 @@ export async function classifyGardssalgProducerWebsite(
       postnummer: producer.postnummer,
     },
     fetched.title,
-    host
+    candidateHost
   );
 
   // Strict boolean comparison (never a bare `if (evidence.verified)` /
@@ -518,6 +547,15 @@ async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
   }
   if (!fetched.ok) return { ...missingSource, rejected_evidence_url_candidate: candidate }; // Rule 3 — fetch failure leg
 
+  // PR #774 review fix — same reasoning as classifyGardssalgProducerWebsite's
+  // equivalent comment: `host` stays the pre-fetch, candidate-CLAIMED host
+  // (unchanged, still correct for the aggregator-host check above); the
+  // domain-corroboration branch needs the host of the page actually fetched.
+  // This leg matters even more than the own-hjemmeside one — a false verified
+  // here sets promoted_from_evidence_url, which gets WRITTEN into the
+  // producer's real hjemmeside column.
+  const candidateHost = fetched.finalUrl ? hostFromUrlLike(fetched.finalUrl) : host;
+
   const evidence = gardssalgWebsiteEvidenceMatch(
     fetched.pageText,
     {
@@ -531,7 +569,7 @@ async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
       postnummer: producer.postnummer,
     },
     fetched.title,
-    host
+    candidateHost
   );
 
   // Strict boolean comparison — same discipline classifyGardssalgProducer
