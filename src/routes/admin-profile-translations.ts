@@ -43,7 +43,16 @@
  *                                   already_target_language?, kept_terms?, notes?, review}], actor?}
  *                                   store translation + independent review verdict,
  *                                   run the deterministic verifier → verified |
- *                                   rejected. Never publishes. Max 200 items.
+ *                                   rejected. Publishes only when the row was
+ *                                   published before AND the entity is not
+ *                                   owner-claimed AND the auto-republish flag
+ *                                   is on. Max 200 items.
+ *   POST /sweep-stale               {platform, dry_run?, limit?}
+ *                                   hash-compare published/verified rows against
+ *                                   the live Norwegian source and reset the ones
+ *                                   that changed or disappeared. No LLM, no spend,
+ *                                   only ever moves rows AWAY from published.
+ *                                   dry_run STRICT-FALSE.
  *
  * Auth: X-Admin-Key vs ADMIN_KEY / ANALYTICS_ADMIN_KEY — same guard as every
  * other /admin/* route (503 when unconfigured, 403 on mismatch).
@@ -82,6 +91,9 @@ import {
   collectForSession,
   submitSessionTranslation,
   type SessionSubmission,
+  sweepStaleTranslations,
+  listTranslationQueueWithClaims,
+  isAutoRepublishEnabled,
 } from "../services/profile-translations";
 import { isSvLocaleEnabled } from "../i18n/t";
 import { getWorkerState, tryAcquireTranslationRunLock, releaseTranslationRunLock } from "../services/profile-translations-worker";
@@ -150,6 +162,7 @@ function flagsSnapshot() {
     pipeline_enabled: isProfileTranslationPipelineEnabled(),
     serve_enabled: isProfileTranslationServingEnabled(),
     sv_locale_enabled: isSvLocaleEnabled(),
+    auto_republish_enabled: isAutoRepublishEnabled(),
     translator_model: translatorModel(),
     reviewer_model: reviewerModel(),
   };
@@ -205,7 +218,7 @@ router.get("/queue", (req: Request, res: Response) => {
   const validStatus: TranslationStatus[] = ["draft", "reviewed", "verified", "published", "rejected"];
   if (statusRaw && !(validStatus as string[]).includes(statusRaw)) return res.status(400).json({ error: `status må være en av ${validStatus.join(", ")}` });
   try {
-    const rows = listTranslationQueue(dbFor(platform), platform, {
+    const rows = listTranslationQueueWithClaims(dbFor(platform), platform, {
       lang: lang || undefined,
       status: statusRaw as TranslationStatus | undefined,
       limit: Number(req.query.limit) || 50,
@@ -234,6 +247,8 @@ router.get("/queue", (req: Request, res: Response) => {
         batch_id: r.batch_id,
         updated_at: r.updated_at,
         published_at: r.published_at,
+        previously_published: Number(r.previously_published ?? 0) === 1,
+        owner_claimed: r.owner_claimed,
       })),
     });
   } catch (e: any) {
@@ -461,6 +476,23 @@ router.post("/submit", (req: Request, res: Response) => {
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
     releaseTranslationRunLock(lockHolder);
+  }
+});
+
+// ── POST /sweep-stale ────────────────────────────────────────────────────
+router.post("/sweep-stale", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body && typeof req.body === "object" ? req.body : {}) as any;
+  const platform = parsePlatform(body.platform);
+  if (!platform) return res.status(400).json({ error: "platform må være rfb eller opplevagent" });
+  const dryRun = strictDryRun(body);
+  const limitRaw = Number(body.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : undefined;
+  try {
+    const r = sweepStaleTranslations(dbFor(platform), platform, { dryRun, batchId: batchIdFor(`stale-${platform}`), actor: String(body.actor || "stale-sweep").slice(0, 80), limit });
+    return res.json({ platform, dry_run: dryRun, ...r });
+  } catch (e: any) {
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 

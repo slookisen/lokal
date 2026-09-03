@@ -41,6 +41,7 @@
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
+import type Database from "better-sqlite3";
 import {
   TRANSLATION_PLATFORMS,
   TRANSLATION_TARGET_LANGS,
@@ -53,6 +54,8 @@ import {
   processTranslationItem,
   type LlmDeps,
   LLM_INFRA_REASON_RE,
+  sweepStaleTranslations,
+  type StaleSweepResult,
 } from "./profile-translations";
 
 // ─── Config (env, read fresh) ────────────────────────────────────────────
@@ -384,6 +387,61 @@ export async function workerTick(deps: WorkerDeps = {}): Promise<TickResult> {
     releaseTranslationRunLock("worker");
   }
   return { mode, processed, batches };
+}
+
+// ─── Stale sweep (no LLM, independent of the worker flags) ───────────────
+//
+// dev-request 2026-09-03-oversettelse-synk-og-eierprofiler. The Norwegian side
+// is edited by enrichment routines, customer service and the owners
+// themselves; every such edit leaves a published translation describing text
+// that no longer exists. This interval does nothing but compare source hashes
+// and move changed rows back to draft, so the page falls back to Norwegian
+// within minutes instead of within a day.
+//
+// Deliberately DEFAULT ON, unlike the LLM switches: it spends nothing, and its
+// only possible effect is to REMOVE a translation from the page - the safe
+// direction. PROFILE_TRANSLATIONS_STALE_SWEEP_ENABLED='false' turns it off.
+
+const STALE_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+
+export function isStaleSweepEnabled(): boolean {
+  return process.env.PROFILE_TRANSLATIONS_STALE_SWEEP_ENABLED !== "false";
+}
+
+/** One sweep across both platforms. Exported for tests and for the routines. */
+export function staleSweepTick(dbFor: (p: TranslationPlatform) => Database.Database = defaultDbFor): Record<string, StaleSweepResult> {
+  const out: Record<string, StaleSweepResult> = {};
+  const batchId = `stale-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+  for (const platform of TRANSLATION_PLATFORMS) {
+    try {
+      out[platform] = sweepStaleTranslations(dbFor(platform), platform, { dryRun: false, batchId, actor: "stale-sweep" });
+    } catch (err) {
+      console.error(`[profile-translations-stale-sweep] ${platform} failed:`, err);
+    }
+  }
+  return out;
+}
+
+export function startProfileTranslationsStaleSweep(): NodeJS.Timeout | null {
+  if (!isStaleSweepEnabled()) {
+    console.log("[profile-translations-stale-sweep] disabled by PROFILE_TRANSLATIONS_STALE_SWEEP_ENABLED=false");
+    return null;
+  }
+  const run = () => {
+    try {
+      const r = staleSweepTick();
+      for (const [platform, res] of Object.entries(r)) {
+        if (res.unpublished > 0) {
+          console.log(`[profile-translations-stale-sweep] ${platform}: unpublished ${res.unpublished} of ${res.checked} (source gone: ${res.missing_source})`);
+        }
+      }
+    } catch (err) {
+      console.error("[profile-translations-stale-sweep] tick failed:", err);
+    }
+  };
+  const timer = setInterval(run, STALE_SWEEP_INTERVAL_MS);
+  setTimeout(run, 30_000);
+  return timer;
 }
 
 // ─── Bootstrap (called from src/index.ts) ────────────────────────────────
