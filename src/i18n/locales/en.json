@@ -133,7 +133,15 @@
     "address": "Address",
     "no_products": "No products registered yet.",
     "back_to_search": "← Back to search",
-    "see_all_in_city": "See all producers in {city} →"
+    "see_all_in_city": "See all producers in {city} →",
+    "map": "Map",
+    "visit_website": "Visit website",
+    "show_on_map": "Show on map",
+    "download_vcard": "Download contact card",
+    "updated_prefix": "Profile updated:",
+    "badge_brreg": "Registered in Brønnøysund",
+    "badge_organic": "Organic",
+    "no_contact": "No contact info available yet."
   },
   "common": {
     "see_profile": "View profile →",

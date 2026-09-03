@@ -132,7 +132,15 @@
     "address": "Adresse",
     "no_products": "Ingen produkter registrert ennå.",
     "back_to_search": "← Tilbake til søk",
-    "see_all_in_city": "Se alle produsenter i {city} →"
+    "see_all_in_city": "Se alle produsenter i {city} →",
+    "map": "Kart",
+    "visit_website": "Besøk nettside",
+    "show_on_map": "Vis på kart",
+    "download_vcard": "Last ned kontaktkort",
+    "updated_prefix": "Profil oppdatert:",
+    "badge_brreg": "Registrert i Brønnøysund",
+    "badge_organic": "Økologisk",
+    "no_contact": "Ingen kontaktinfo tilgjengelig ennå."
   },
   "common": {
     "see_profile": "Se profil →",

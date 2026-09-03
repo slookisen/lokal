@@ -715,3 +715,48 @@ export function stripInternalNotes(text: string | null | undefined): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+// ─── HTML entities left over from scraping ────────────────────────────────
+//
+// Daniel 2026-09-03 (screenshot, Gvarv Frukt og Bær): the stored description
+// read "you&#039;ll find locally produced products" — the scraper kept the
+// page's HTML entity instead of the apostrophe, and every render site then
+// escapes the `&` again, so the customer sees the entity verbatim. Same class
+// as an internal note: not the producer's words, must never reach a page.
+// Decoded at render (normalizeProse below) and, through the same helper, at
+// the write doors that already gate on notes/code artifacts.
+//
+// Only the entities a scrape realistically leaves behind. Idempotent, and a
+// no-op on text without entities, so it is safe to wrap around any prose.
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  aring: "å", Aring: "Å", oslash: "ø", Oslash: "Ø", aelig: "æ", AElig: "Æ",
+  eacute: "é", egrave: "è", uuml: "ü", ouml: "ö", auml: "ä", ndash: "–", mdash: "—",
+  hellip: "…", laquo: "«", raquo: "»", lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”",
+};
+
+/** Decode numeric (&#39; &#039; &#x27;) and common named HTML entities. */
+export function decodeHtmlEntities(text: string | null | undefined): string {
+  if (!text || typeof text !== "string") return "";
+  if (!text.includes("&")) return text;
+  return text
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, hex) => safeFromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d{1,7});/g, (_, dec) => safeFromCodePoint(parseInt(dec, 10)))
+    .replace(/&([a-zA-Z]{2,8});/g, (m, name) => (name in NAMED_ENTITIES ? NAMED_ENTITIES[name] : m));
+}
+
+function safeFromCodePoint(cp: number): string {
+  // Never decode into control characters or the surrogate range.
+  if (!Number.isFinite(cp) || cp < 0x20 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) return "";
+  return String.fromCodePoint(cp);
+}
+
+/**
+ * Everything a display site should do to stored prose before showing it:
+ * decode scraped entities, then drop internal pipeline notes. Returns "" for
+ * a note-only value, exactly like stripInternalNotes.
+ */
+export function normalizeProse(text: string | null | undefined): string {
+  return stripInternalNotes(decodeHtmlEntities(text));
+}

@@ -2,7 +2,7 @@ import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
-import { isJunkDescription, stripInternalNotes } from "./description-quality";
+import { isJunkDescription, normalizeProse } from "./description-quality";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -361,7 +361,7 @@ class KnowledgeService {
     // Strip an enrichment routine's own working note appended to real prose
     // (Daniel 2026-09-03) — the note goes, the producer's prose stays. A
     // note-ONLY value never reaches here: isJunkDescription above reports it.
-    return stripInternalNotes(value);
+    return normalizeProse(value);
   }
 
   // ─── Normalize products before storage ─────────────────

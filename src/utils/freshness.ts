@@ -58,6 +58,30 @@ export function formatUpdatedPrettyNo(updatedAt: Date, now: Date = new Date()): 
   return `${day}. ${month} ${year}`;
 }
 
+const EN_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+/**
+ * English sibling of formatUpdatedPrettyNo — same thresholds, same UTC
+ * components (Daniel 2026-09-03: "Profil oppdatert: i går" rendered on /en).
+ *   <24h -> "today" / "yesterday", 1-6d -> "N days ago", >=7d -> "11 May 2026".
+ */
+export function formatUpdatedPrettyEn(updatedAt: Date, now: Date = new Date()): string {
+  const diffMs = now.getTime() - updatedAt.getTime();
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffDays < 1) {
+    if (updatedAt.toDateString() === now.toDateString()) return "today";
+    return "yesterday";
+  }
+  if (diffDays === 1) return "yesterday";
+  if (diffDays < 7) return `${diffDays} days ago`;
+  return `${updatedAt.getUTCDate()} ${EN_MONTHS[updatedAt.getUTCMonth()]} ${updatedAt.getUTCFullYear()}`;
+}
+
+/** Language-aware dispatcher; anything that is not "en" gets the Norwegian text. */
+export function formatUpdatedPretty(updatedAt: Date, lang: string, now: Date = new Date()): string {
+  return lang === "en" ? formatUpdatedPrettyEn(updatedAt, now) : formatUpdatedPrettyNo(updatedAt, now);
+}
+
 /**
  * Month-year in Norwegian for the <title> freshness suffix, e.g. "mai 2026".
  * Uses UTC components so the suffix is stable regardless of server TZ.
