@@ -197,7 +197,16 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "natur_friluft", subcategory: null,
         booking_url: "https://generisk.example.no/booking",
         content_source: "provider_site", enrichment_state: "enriched",
-        updated_at: daysAgoIso(1),
+        // Strictly the NEWEST seeded row, on purpose. h5–h7 read
+        // enriched_experiences[0] and expect this row; every other served row
+        // below is seeded with daysAgoIso(1) too, and each daysAgoIso() call
+        // is its own Date.now() — so whenever a millisecond boundary fell
+        // between this insert and a later one, the later row got a strictly
+        // newer updated_at, sorted first under ORDER BY updated_at DESC, and
+        // h5/h6/h7/h12 failed at random (1 in ~5 fresh runs, 2026-09-03).
+        // Half a day younger removes the tie without touching what h12
+        // asserts: a merged-away row bumped to now() still sorts above this.
+        updated_at: daysAgoIso(0.5),
       });
       // A raw (un-enriched) row on the same provider must NOT be served — the
       // spot-check judges written content, and nothing was written here.
