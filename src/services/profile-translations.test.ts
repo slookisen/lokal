@@ -212,6 +212,10 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     ok(sl.ok, "A24x county name followed by a slash alternative passes", sl.failed);
     const amp = svc.verifyTranslationDeterministic("Fossmoen Frukt og Cider – Vi tapper naturen på flaske.", "Fossmoen Frukt og Cider – We bottle nature.", "en", { entityName: "Fossmoen Frukt & Cider — Bjerkreim" });
     ok(amp.ok, "A24y entity name with & matches the source's og in a name phrase", amp.failed);
+    const lc = svc.verifyTranslationDeterministic("Bryggeriet ligger i østre Strandvei 52 og har utsalg.", "The brewery is at Østre Strandvei 52 and has a shop.", "en");
+    ok(lc.ok, "A24z two-word proper name capitalised from a lowercase source form passes", lc.failed);
+    const lc2 = svc.verifyTranslationDeterministic("Vi har åpent lørdager i gårdsbutikken.", "We have Åpent Lørdager in the farm shop.", "en");
+    ok(!lc2.ok && lc2.failed.includes("no_untranslated_norwegian"), "A24z2 capitalising everyday Norwegian words does not license them", lc2.failed);
     const ipt3 = svc.verifyTranslationDeterministic("Vi har åpent på lørdager.", "We are open på lørdager (Saturdays).", "en", { keptTerms: ["på lørdager"] });
     ok(!ipt3.ok, "A24p a multi-word term made only of everyday words is not tolerated", ipt3.failed);
     eq(svc.decodeHtmlEntities("Noraker G&#229;rd &amp; S&#xF8;nner &ndash; &aring;pent"), "Noraker Gård & Sønner – åpent", "A24q HTML entities decoded");

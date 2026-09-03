@@ -753,8 +753,22 @@ export function verifyTranslationDeterministic(
     const headInitial = i - 1 <= 0 || /[.!?:]$/.test(srcWs[i - 2] || "");
     if (i > 0 && !headInitial) srcBigrams.add(`${arr[i - 1]} ${w}`);
   });
+  const srcBigramsLower = new Set(Array.from(srcBigrams).map((b) => b.toLowerCase()));
   const nameBigramWords = new Set<string>();
-  outWs.forEach((w, i) => { if (i > 0 && /^[A-ZÆØÅ]/.test(outWs[i - 1]) && /^[a-zæøå]/.test(w) && srcBigrams.has(`${outWs[i - 1]} ${w}`)) nameBigramWords.add(w); });
+  outWs.forEach((w, i) => {
+    if (i === 0) return;
+    const prev = outWs[i - 1];
+    // "Skudeneset gård": a lowercase name part after a capitalised head.
+    if (/^[A-ZÆØÅ]/.test(prev) && /^[a-zæøå]/.test(w) && srcBigrams.has(`${prev} ${w}`)) nameBigramWords.add(w);
+    // "Østre Strandvei 52": a two-word proper name the producer wrote lowercase
+    // in the source ("østre Strandvei"). Both output words capitalised, the same
+    // bigram in the source ignoring case, and neither an everyday word.
+    if (/^[A-ZÆØÅ]/.test(prev) && /^[A-ZÆØÅ]/.test(w) && srcBigramsLower.has(`${prev} ${w}`.toLowerCase())
+        && !KEPT_TERM_DENYLIST.has(w.toLowerCase()) && !KEPT_TERM_DENYLIST.has(prev.toLowerCase())) {
+      nameBigramWords.add(w);
+      nameBigramWords.add(prev);
+    }
+  });
   const leaked = out
     .split(splitRe)
     .flatMap((w) => w.split("-"))
