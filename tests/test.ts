@@ -34118,6 +34118,37 @@ const _autoPruneRollupPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+// follow-up to lokal#782: the two MANUAL prune routes (/ops/prune and
+// /prune -> pruneOldData) now share runAutoPrune()'s rollup-before-delete.
+// Swaps the getDb() singleton -> strictly after auto-prune-rollup.
+let _opsPruneRollupResolve: () => void = () => {};
+const _opsPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _opsPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_autoPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── manual prune routes: rollup-before-delete (ops/prune + prune) ──");
+  try {
+    const { runOpsPruneRollupTests } = require("../src/routes/analytics-ops-prune-rollup.test") as
+      typeof import("../src/routes/analytics-ops-prune-rollup.test");
+    const opr = await runOpsPruneRollupTests({ log: false });
+    passed += opr.passed;
+    failed += opr.failed;
+    for (const f of opr.failures) failures.push("ops-prune-rollup: " + f);
+    console.log(`  ops-prune-rollup: ${opr.passed} passed, ${opr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ops-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _opsPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
@@ -34133,7 +34164,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_autoPruneRollupPromise]);
+  await Promise.allSettled([_opsPruneRollupPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
@@ -35457,7 +35488,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _tasksPruneAsyncPromise, _rfbDebioSuitePromise, _dispatchTickSuitePromise,
   _samtalerSeoPromise, _descriptionTruncationSweepPromise, _pwaSwPromise,
   _installPromptPromise, _brregCatalogSweepPromise, _brregDescriptionFallbackPromise,
-  _retentionRollupPromise, _autoPruneRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
+  _retentionRollupPromise, _autoPruneRollupPromise, _opsPruneRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
