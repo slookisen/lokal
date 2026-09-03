@@ -233,8 +233,17 @@ export const OPPLEVAGENT_PUBLISH_GATE_SQL =
   // published anywhere, so they must not be translated either. LEFT-JOIN-safe.
   "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
 
+const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", aring: "å", Aring: "Å", oslash: "ø", Oslash: "Ø", aelig: "æ", AElig: "Æ", eacute: "é", ouml: "ö", auml: "ä", uuml: "ü", ndash: "–", mdash: "—", hellip: "…" };
+/** Decode HTML entities a scraped source may carry ("G&#229;rd", "&amp;") — the
+ *  public page renders them decoded, so the decoded text IS the source. */
+export function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&([a-zA-Z]+);/g, (m, n) => (n in NAMED_ENTITIES ? NAMED_ENTITIES[n] : m));
+}
 function cleanSource(text: unknown): string {
-  return String(text ?? "").replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
+  return decodeHtmlEntities(String(text ?? "")).replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
 }
 
 /** True when a source value is worth translating at all: non-empty, not
@@ -719,7 +728,20 @@ export function verifyTranslationDeterministic(
   const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}\\s*\\(`, "iu").test(out);
   const declared = (Array.isArray(opts.keptTerms) ? opts.keptTerms : []).map((t) => String(t).toLowerCase().trim()).filter(Boolean);
-  const keptTerms = new Set(declared.slice(0, 4).filter((t) => srcLowerWords.has(t) && !KEPT_TERM_DENYLIST.has(t) && hasGloss(t)));
+  // A kept term may be a multi-word proper name of a scheme or product
+  // ("Inn på tunet", "Vestlandsk fjordgris"): it must occur verbatim in the
+  // source and carry a gloss in the output; each of its words is then tolerated.
+  const srcLowerFlat = " " + src.toLowerCase().split(/[\s.,;:!?()"'«»–—/-]+/).filter(Boolean).join(" ") + " ";
+  const keptTerms = new Set<string>();
+  for (const t of declared.slice(0, 4)) {
+    if (KEPT_TERM_DENYLIST.has(t) || !hasGloss(t)) continue;
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length === 1) {
+      if (srcLowerWords.has(t)) keptTerms.add(t);
+    } else if (words.length <= 4 && srcLowerFlat.includes(` ${words.join(" ")} `) && words.some((w) => !KEPT_TERM_DENYLIST.has(w) || /^[A-ZÆØÅ]/.test(w))) {
+      for (const w of words) keptTerms.add(w);
+    }
+  }
   const leaked = out
     .split(splitRe)
     .filter((w) => w && nordicRe.test(w))

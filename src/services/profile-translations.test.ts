@@ -200,6 +200,18 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     const rp = svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, ["rømmegrøt", "mål"]);
     ok(rp.includes("kept on purpose") && rp.includes("rømmegrøt, mål"), "A24l reviewer prompt lists kept terms");
     ok(!svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, []).includes("kept on purpose"), "A24m reviewer prompt omits kept-terms line when empty");
+    // multi-word kept term (scheme name) + HTML-entity sources (live 2026-09-03)
+    const iptSrc = "Tveitan Gård i Siljan driver storfekjøttproduksjon og Inn på tunet-tjenester for kommunen.";
+    const ipt1 = svc.verifyTranslationDeterministic(iptSrc, "Tveitan Gård in Siljan produces beef and offers Inn på tunet (farm-based care and education) services for the municipality.", "en", { keptTerms: ["inn på tunet"] });
+    ok(ipt1.ok, "A24n multi-word kept term 'Inn på tunet' with gloss passes", ipt1.failed);
+    const ipt2 = svc.verifyTranslationDeterministic(iptSrc, "Tveitan Gård in Siljan produces beef and offers Inn på tunet services for the municipality.", "en", { keptTerms: ["inn på tunet"] });
+    ok(!ipt2.ok && ipt2.failed.includes("no_untranslated_norwegian"), "A24o multi-word kept term without gloss still fails", ipt2.failed);
+    const ipt3 = svc.verifyTranslationDeterministic("Vi har åpent på lørdager.", "We are open på lørdager (Saturdays).", "en", { keptTerms: ["på lørdager"] });
+    ok(!ipt3.ok, "A24p a multi-word term made only of everyday words is not tolerated", ipt3.failed);
+    eq(svc.decodeHtmlEntities("Noraker G&#229;rd &amp; S&#xF8;nner &ndash; &aring;pent"), "Noraker Gård & Sønner – åpent", "A24q HTML entities decoded");
+    const entSrc = "I Aurdal ligger Noraker G&#229;rd som drives i 12. generasjon. Rakfisken fra Noraker G&#229;rd er kjent.";
+    const ent1 = svc.verifyTranslationDeterministic(entSrc, "Noraker Gård in Aurdal is run by the 12th generation. The rakfisk (fermented trout) from Noraker Gård is well known.", "en", { keptTerms: ["rakfisk"] });
+    ok(ent1.ok, "A24r entity-encoded source verifies against decoded translation (no phantom digits)", ent1.failed);
     // review round 1 (lokal#771): kept_terms must not be a free whitelist
     const kd1 = svc.verifyTranslationDeterministic("Vi har åpent lørdager og søndager på gården.", "We are open lørdager and søndager at the farm.", "en", { keptTerms: ["lørdager", "søndager"] });
     ok(!kd1.ok && kd1.failed.includes("no_untranslated_norwegian"), "A24n denylisted weekday kept terms are refused", kd1.failed);
