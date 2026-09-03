@@ -476,11 +476,11 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
       "iecgt-1: LOCKED row (content_source='manual') -> never thin, even with blank content"
     );
     assertTrue(
-      !isExperienceContentGenuinelyThin(
+      isExperienceContentGenuinelyThin(
         { content_source: null, verification_status: "verified", description: null, category: null, content_field_evidence: null },
         "gard.no"
       ),
-      "iecgt-2: LOCKED row (verification_status='verified') -> never thin"
+      "iecgt-2: PUBLISHED row (verification_status='verified', not owner-locked) with blank content IS thin — dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader split the lock so a published row is fill-blank-only, not fully locked; before that dev-request this asserted the opposite (never thin)"
     );
     assertTrue(
       isExperienceContentGenuinelyThin(

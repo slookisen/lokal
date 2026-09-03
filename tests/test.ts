@@ -32008,6 +32008,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esgs.failures) failures.push("experience-store-gardssalg-sok: " + f);
     console.log(`  experience-store-gardssalg-sok: ${esgs.passed} passed, ${esgs.failed} failed`);
 
+    // dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+    // publiserte-rader: the owner-lock/published-lock SPLIT —
+    // isExperienceOwnerLocked/isExperiencePublished alongside the unchanged-
+    // semantics isExperienceContentLocked, applyExperienceContent's now
+    // owner-lock-only gate (published rows fill-blank-only), the matching
+    // isExperienceContentGenuinelyThin change, and
+    // selectProvidersForContentRefresh now surfacing published+blank
+    // providers. Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block.
+    console.log("\n── experience-store-lock-split: owner-lock vs. published-lock split ──");
+    const { runExperienceStoreLockSplitTests } = require("../src/services/experience-store-lock-split.test") as
+      typeof import("../src/services/experience-store-lock-split.test");
+    const eslr = await runExperienceStoreLockSplitTests({ log: false });
+    passed += eslr.passed;
+    failed += eslr.failed;
+    for (const f of eslr.failures) failures.push("experience-store-lock-split: " + f);
+    console.log(`  experience-store-lock-split: ${eslr.passed} passed, ${eslr.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
     // "Produsenter" section (never merged with "Opplevelser") when a gårdssalg
@@ -34830,13 +34848,51 @@ const _contentRefreshWebsiteVerificationGatePromise: Promise<void> = new Promise
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+// publiserte-rader: POST /admin/content-refresh now treats a PUBLISHED
+// (verified) row as fill-blank-only rather than fully locked — AC1 (dry-run
+// candidate + provenance), AC2 (apply actually fills a blank field), the
+// evidence_url-fallback-must-not-be-used-for-published-rows source
+// requirement, and manual/claim rows staying fully locked even when
+// published. Own dedicated test file (own in-memory prod-schema DB, swaps
+// the shared experiences db-factory getDb() singleton) — mirrors the block
+// immediately above, so it must run strictly after it;
+// _contentRefreshWebsiteVerificationGatePromise is the current tail of that
+// serial chain.
+let _contentRefreshPublishedFillblankResolve: () => void = () => {};
+const _contentRefreshPublishedFillblankPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshPublishedFillblankResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshWebsiteVerificationGatePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-09-02 laas-todeling: published rows are fill-blank-only on POST /admin/content-refresh ──");
+  try {
+    const { runOpplevelserContentRefreshPublishedFillblankTests } = require("../src/routes/opplevelser-content-refresh-published-fillblank.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-published-fillblank.test");
+    const crpf = await runOpplevelserContentRefreshPublishedFillblankTests({ log: false });
+    passed += crpf.passed;
+    failed += crpf.failed;
+    for (const f of crpf.failures) failures.push("opplevelser-content-refresh-published-fillblank: " + f);
+    console.log(`  opplevelser-content-refresh-published-fillblank: ${crpf.passed} passed, ${crpf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-published-fillblank: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshPublishedFillblankResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice:
 // structured `persistence` field + `errors_by_persistence` tally on both
 // POST /admin/content-refresh and POST /admin/gardssalg-content-refresh
 // (src/routes/opplevelser.ts). Own dedicated test file (own in-memory
 // prod-schema DB, swaps the shared experiences db-factory getDb()
 // singleton) — mirrors the block immediately above, so it must run strictly
-// after it; _contentRefreshWebsiteVerificationGatePromise is the current
+// after it; _contentRefreshPublishedFillblankPromise is the current
 // tail of that serial chain.
 let _contentRefreshErrorsByPersistenceResolve: () => void = () => {};
 const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<void>(r => {
@@ -34844,7 +34900,7 @@ const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<voi
 });
 
 (async () => {
-  await Promise.allSettled([_contentRefreshWebsiteVerificationGatePromise]);
+  await Promise.allSettled([_contentRefreshPublishedFillblankPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── 2026-08-02 AC3-slice: errors_by_persistence on content-refresh + gardssalg-content-refresh ──");

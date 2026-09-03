@@ -284,12 +284,14 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         canonical_id: "exp-enriched-1", verification_status: "pending_verify",
         updated_at: daysAgoIso(0),
       });
-      // verification_status NULL: isExperienceContentLocked treats NULL as
-      // UNLOCKED, so applyExperienceContent would enrich this row — but SQL
-      // three-valued logic makes a bare `verification_status != 'verified'`
-      // evaluate to NULL and drop it, i.e. hide precisely the rows that ARE
-      // checkable. Latent today (createExperience coalesces to
-      // 'pending_verify'), pinned so the NULL guard cannot be simplified away.
+      // verification_status NULL: isExperienceOwnerLocked only looks at
+      // content_source, so a NULL verification_status was never excluded by
+      // this endpoint's lock guard in the first place (round-3 review, finding
+      // 3 — pinned historically against a bare `verification_status !=
+      // 'verified'` SQL clause, which SQL three-valued logic would have
+      // evaluated to NULL and dropped, hiding precisely the rows that ARE
+      // checkable). Latent today (createExperience coalesces to
+      // 'pending_verify'); kept as a regression pin.
       insertFull({
         id: "exp-nullverif-1", provider_id: "prov-generic-enriched",
         title: "Opplevelse uten verification_status",
@@ -299,17 +301,21 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         canonical_id: null, verification_status: null,
         updated_at: daysAgoIso(3),
       });
-      // verification_status = 'verified' — the OTHER half of round 2's lock
-      // guard. Round-4 review ran a mutation matrix and found that deleting the
-      // entire `verification_status` clause left the suite GREEN: no fixture
-      // ever set the column to 'verified'. `exp-verified-1` sets
-      // *enrichment_state* = 'verified' and leaves verification_status at the
-      // 'pending_verify' default, and h13 pins only the NULL branch — which
-      // survives deleting the whole clause too. So the one test that looked
-      // like it guarded this clause guarded nothing about it.
+      // verification_status = 'verified', content_source = 'provider_site' —
+      // BEFORE dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-
+      // felt-publiserte-rader this endpoint's lock guard excluded verified
+      // rows entirely (the SAME full lock applyExperienceContent used to
+      // enforce). That dev-request split the lock: a PUBLISHED row is now
+      // "fill-blank-only" for applyExperienceContent, so it CAN legitimately
+      // carry real homepage-written content (content_source='provider_site')
+      // — and hiding it from THIS spot-check would make that entire new write
+      // surface invisible to §8.4's error-rate measurement, exactly backwards
+      // from what the spot-check exists to catch. So this row is now SERVED
+      // (h15 below), the opposite of its pre-2026-09-02 behavior — see that
+      // assertion's own comment.
       insertFull({
         id: "exp-verified-lock-1", provider_id: "prov-generic-enriched",
-        title: "Låst av verification_status", description: "Verifisert av et menneske.",
+        title: "Publisert, homepage-skrevet", description: "Skrevet av content-refresh, nå publisert.",
         category: "kultur_historie", subcategory: null, booking_url: null,
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "verified",
@@ -556,8 +562,9 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         [
           "exp-enriched-1", "exp-homepage-sourced-1", "exp-nullverif-1",
           "exp-rediscovered-1", "exp-subdomain-1", "exp-verified-1",
+          "exp-verified-lock-1",
         ],
-        "h4: exactly the checkable rows are served — raw, manual, claim, merged-away, verification-locked and aggregator-CONTENT rows are all excluded",
+        "h4: exactly the checkable rows are served — raw, manual, claim, merged-away and aggregator-CONTENT rows are excluded; a PUBLISHED (verified) provider_site row IS served since dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader (see h15)",
       );
       assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: ordered updated_at DESC, so the freshest enriched row comes first");
       assertTrue(
@@ -600,16 +607,22 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       // ── (h13) NULL verification_status — round-3 review, finding 3 ───────
       assertTrue(
         (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-nullverif-1"),
-        "h13: a row with verification_status NULL IS served — isExperienceContentLocked calls NULL unlocked, so a bare `!= 'verified'` would hide exactly the rows that are checkable",
+        "h13: a row with verification_status NULL IS served — isExperienceOwnerLocked never looks at verification_status at all, so a bare `!= 'verified'` SQL clause would have hidden exactly the rows that are checkable",
       );
 
-      // ── (h15) verification_status lock — round-4 review, BLOCKING ────────
-      // A mutation matrix showed the ENTIRE verification_status clause could be
-      // deleted with the suite still green, because no fixture set the column
-      // to 'verified'. This assertion is the one that dies on that deletion.
+      // ── (h15) PUBLISHED (verified) rows are now served — dev-request
+      // 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader
+      // ──────────────────────────────────────────────────────────────────
+      // Before that dev-request this endpoint excluded verification_status=
+      // 'verified' rows (the full isExperienceContentLocked lock, mirroring
+      // applyExperienceContent's own then-full lock). The dev-request split
+      // the lock: a published row is fill-blank-only, not fully locked, so it
+      // can legitimately carry real homepage-written content — and the
+      // spot-check must see it, or the entire new write surface would be
+      // invisible to §8.4's error-rate measurement (the opposite of AC5).
       assertTrue(
-        !(genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-verified-lock-1"),
-        "h15: a row locked by verification_status='verified' is never served — the half of round 2's lock guard that no test could kill",
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-verified-lock-1"),
+        "h15: a PUBLISHED (verification_status='verified') provider_site row IS served — the verification_status half of the old full lock was removed from this endpoint's guard, on purpose",
       );
 
       // ── (h16-h18) provenance — round-4 review, BLOCKING ──────────────────

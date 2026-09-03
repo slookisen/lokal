@@ -48,6 +48,10 @@
  *  (10) response shape: each row carries exactly id/navn/hjemmeside/bucket
  *  (11) idempotency: calling the route twice with an unchanged DB yields the
  *       identical bucket for every provider
+ *  (12c) AC3, dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-
+ *       felt-publiserte-rader: a PUBLISHED (verified) experience with a
+ *       genuinely blank description is enrichable, not done — the lock
+ *       split's effect on this endpoint's bucket classification
  */
 
 export interface TestSummary {
@@ -256,6 +260,26 @@ export function runOpplevelserAdminProvidersContentTriageTests(
         brreg_verified: 1, brreg_active: 1, verification_status: "verified",
       });
 
+      // ── (12c) AC3, dev-request 2026-09-02-experiences-laas-todeling-fyll-
+      // tomme-felt-publiserte-rader: hjemmeside + a PUBLISHED (verified)
+      // experience with a genuinely blank description -> enrichable, NOT
+      // done. Before that dev-request this provider would have landed in
+      // `done` (isExperienceContentGenuinelyThin's old full-lock check
+      // treated a published row as locked, so it could never be "thin"),
+      // permanently hiding it from both this endpoint and the live selector
+      // even though it had real work left to do.
+      const provPublishedBlank = expStore.createProvider({
+        navn: "Publisert Blank Gard AS", org_nr: "900001008",
+        fylke: "Vestland", kommune: "Bergen", hjemmeside: "https://www.publisertblankgard.no",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      expStore.createExperience({
+        title: "Publisert opplevelse", provider_id: provPublishedBlank, provider_match_status: "matched",
+        fylke: "Vestland", kommune: "Bergen", confidence: "high",
+        verification_status: "verified", // PUBLISHED — the AC3 case
+        content_source: null,
+      });
+
       // ── (8) catalog_hidden=1 row must never appear/count ─────────────────
       const provHidden = expStore.createProvider({
         navn: "Skjult Gard AS", org_nr: "900001006",
@@ -285,8 +309,8 @@ export function runOpplevelserAdminProvidersContentTriageTests(
 
       // ── (8) hidden row excluded ───────────────────────────────────────────
       assertTrue(!byId[provHidden], "5: catalog_hidden=1 row never appears");
-      assertEq(all.body.total, 6, "6: total excludes the catalog_hidden=1 row (6 visible providers)");
-      assertEq(all.body.count, 6, "7: count == total for a single full-window fetch");
+      assertEq(all.body.total, 7, "6: total excludes the catalog_hidden=1 row (7 visible providers)");
+      assertEq(all.body.count, 7, "7: count == total for a single full-window fetch");
 
       // ── (3)/(4)/(5)/(5b)/(6)/(7) per-provider bucket assertions ──────────
       assertEq(byId[provWaiting].bucket, "waiting", "8: no hjemmeside, no experiences -> waiting");
@@ -302,6 +326,11 @@ export function runOpplevelserAdminProvidersContentTriageTests(
         byId[provEnrichableBulkLoad].bucket,
         "enrichable",
         "12b: hjemmeside + a provider whose only experience came through createExperience()'s bulk-load-shaped new-row branch (category from a harvest row, evidence_url set, content_field_evidence never stamped by applyExperienceContent) -> STILL enrichable, NOT done — the fix-up regression case",
+      );
+      assertEq(
+        byId[provPublishedBlank].bucket,
+        "enrichable",
+        "12c: AC3 (dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader) — hjemmeside + a PUBLISHED (verification_status='verified') experience with a genuinely blank description -> enrichable, moved OUT of done",
       );
 
       // ── (2) bucket-sum invariant: acceptance criterion 1 ─────────────────
@@ -351,10 +380,15 @@ export function runOpplevelserAdminProvidersContentTriageTests(
         headers: { "x-admin-key": testKey },
         query: { limit: "2", after: page3.body.next_after },
       });
-      const stitched = [...page1.body.providers, ...page2.body.providers, ...page3.body.providers, ...page4.body.providers];
-      assertEq(stitched.length, 6, "19: pagination across 3 non-empty pages (2+2+2) stitches to exactly 6 rows");
-      assertEq(page4.body.count, 0, "20: the page after exhaustion is empty");
-      assertEq(page4.body.next_after, null, "21: next_after is null once exhausted");
+      const page5 = await callRoute(opplevelserRouter, {
+        path: "/admin/providers/content-triage",
+        headers: { "x-admin-key": testKey },
+        query: { limit: "2", after: page4.body.next_after },
+      });
+      const stitched = [...page1.body.providers, ...page2.body.providers, ...page3.body.providers, ...page4.body.providers, ...page5.body.providers];
+      assertEq(stitched.length, 7, "19: pagination across 4 non-empty pages (2+2+2+1) stitches to exactly 7 rows");
+      assertEq(page5.body.count, 0, "20: the page after exhaustion is empty");
+      assertEq(page5.body.next_after, null, "21: next_after is null once exhausted");
       // Bucket assigned to a given id must be IDENTICAL whether read from the
       // single full-window fetch or from the paginated walk.
       const stitchedById: Record<string, any> = {};

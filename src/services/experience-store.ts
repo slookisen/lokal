@@ -2083,15 +2083,21 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
           -- classifyProviderContentBucket — the SAME shared classifier the
           -- berikelsestriage triage endpoint uses), which SQL alone cannot
           -- express.
-          -- NULL-guarded on verification_status (round-3-review fix,
-          -- mirrored from GET .../recently-enriched): SQL three-valued
-          -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
-          -- the row, while isExperienceContentLocked treats a NULL
-          -- verification_status as UNLOCKED. Latent today (createExperience
-          -- coalesces to 'pending_verify'), cheap to keep correct.
+          --
+          -- No verification_status clause here (removed, dev-request
+          -- 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-
+          -- rader): only OWNER-locked (content_source manual/claim) rows are
+          -- excluded from this broad pre-filter now. A PUBLISHED (verified)
+          -- row is deliberately let through — isExperienceContentGenuinelyThin
+          -- (called below, per candidate) now checks isExperienceOwnerLocked
+          -- rather than the full lock, so a published row with a genuinely
+          -- blank description/category IS thin and must reach that check
+          -- rather than being excluded here. This is the SQL half of the
+          -- fix; applyExperienceContent's own gate (also owner-lock-only as
+          -- of this dev-request) is what keeps the actual write fill-blank-
+          -- only for such rows.
           SELECT 1 FROM experiences e
            WHERE e.provider_id = p.id
-             AND (e.verification_status IS NULL OR e.verification_status != 'verified')
              AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
              AND e.canonical_id IS NULL
         )
@@ -2211,17 +2217,57 @@ export function getExperiencesForProvider(providerId: string): ExperienceContent
 }
 
 /**
+ * True when an experience is OWNER-locked: a human/owner/curator authored it
+ * directly (`content_source` 'manual' or 'claim'). Full lock — no automated
+ * writer may EVER touch such a row, blank field or not. Independent of
+ * `verification_status` — see isExperiencePublished below for that half.
+ *
+ * Split out of the former single-level isExperienceContentLocked (dev-request
+ * 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader):
+ * before this split, a PUBLISHED-but-not-owner-authored row (verified,
+ * content_source e.g. 'harvest'/'aggregator'/NULL) was locked exactly as hard
+ * as a manual one, so a sampled published row could never receive homepage
+ * content even when every field was empty. Owner-authored rows keep the
+ * original full-lock behavior unchanged.
+ */
+export function isExperienceOwnerLocked(row: {
+  content_source?: string | null;
+}): boolean {
+  return row.content_source === "manual" || row.content_source === "claim";
+}
+
+/**
+ * True when an experience row is PUBLISHED (`verification_status ===
+ * 'verified'`). NOT itself a lock — see applyExperienceContent's dev-request
+ * 2026-09-02 comment: a published-but-not-owner-locked row is now
+ * "fill-blank-only" for the automated homepage writer (an EMPTY field may
+ * still be filled; a NON-empty field is never overwritten, whether that
+ * non-emptiness came from the owner, a prior enrichment pass, or harvest).
+ */
+export function isExperiencePublished(row: {
+  verification_status?: string | null;
+}): boolean {
+  return row.verification_status === "verified";
+}
+
+/**
  * True when an experience is LOCKED against homepage content writes: it is
- * owner/curator/claim authored or already verified. Such rows are never
- * overwritten by a scrape (PURE-ish — reads only the passed row).
+ * owner/curator/claim authored OR already published (verified). Kept as
+ * `isExperienceOwnerLocked(row) || isExperiencePublished(row)` — UNCHANGED
+ * semantics from before the 2026-09-02 lock split — for callers that
+ * OVERWRITE an existing value rather than only fill a blank one (the
+ * price-freshness sweep below is the one such caller in this file): "published
+ * = fill-blank-only" means by definition a published row's non-blank fields
+ * must never be overwritten, so an overwriting writer still needs the FULL
+ * lock, not the split. Do NOT reuse this for a new fill-blank writer — call
+ * isExperienceOwnerLocked directly instead, exactly as applyExperienceContent
+ * and isExperienceContentGenuinelyThin now do.
  */
 export function isExperienceContentLocked(row: {
   content_source?: string | null;
   verification_status?: string | null;
 }): boolean {
-  if (row.verification_status === "verified") return true;
-  if (row.content_source === "manual" || row.content_source === "claim") return true;
-  return false;
+  return isExperienceOwnerLocked(row) || isExperiencePublished(row);
 }
 
 // ── Berikelsestriage classification (dev-request 2026-07-29-blacklist-
@@ -2322,6 +2368,13 @@ export const THIN_CONTENT_JUDGED_FIELDS = ["description", "category"] as const;
  * applyExperienceContent's own doc comment on its two bulk-load call sites)
  * therefore permanently blocked that row from ever being refreshed from the
  * provider's REAL homepage — exactly the bug this function fixes.
+ *
+ * UNLOCKED here means isExperienceOwnerLocked, not isExperienceContentLocked
+ * (dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+ * publiserte-rader): a PUBLISHED row with a genuinely blank description is now
+ * thin too — it becomes "enrichable" so classifyProviderContentBucket / GET
+ * /admin/providers/content-triage stop parking it in `done` forever, matching
+ * applyExperienceContent's now-identical fill-blank-only gate below.
  */
 export function isExperienceContentGenuinelyThin(
   row: {
@@ -2333,7 +2386,7 @@ export function isExperienceContentGenuinelyThin(
   },
   homepageDomain: string | null,
 ): boolean {
-  if (isExperienceContentLocked(row)) return false;
+  if (isExperienceOwnerLocked(row)) return false;
   const evidence = parseContentFieldEvidence(row.content_field_evidence);
   for (const field of THIN_CONTENT_JUDGED_FIELDS) {
     const value = field === "description" ? row.description : row.category;
@@ -2377,11 +2430,18 @@ export type BucketableExperienceRow = {
  *                      never be selected by selectProvidersForContentRefresh
  *                      either; "done" here means "nothing left to do", not
  *                      literally "content was filled".
- *                  (b) a provider whose only live experiences are LOCKED
- *                      (manual/claim/verified) — those rows are never
- *                      touched by the automated writer regardless of
- *                      whether their content is blank, so they are
- *                      permanently out of scope the same way (a) is.
+ *                  (b) a provider whose only live experiences are OWNER-
+ *                      LOCKED (manual/claim) — those rows are never touched
+ *                      by the automated writer regardless of whether their
+ *                      content is blank, so they are permanently out of
+ *                      scope the same way (a) is. A PUBLISHED (verified,
+ *                      not owner-locked) row is NOT in this case since
+ *                      dev-request 2026-09-02-experiences-laas-todeling-
+ *                      fyll-tomme-felt-publiserte-rader: a genuinely blank
+ *                      description/category on a published row now counts
+ *                      as thin (isExperienceContentGenuinelyThin checks
+ *                      isExperienceOwnerLocked, not the full lock), so such
+ *                      a provider correctly lands in `enrichable`, not here.
  *                Documented rule, not an accident: both are "the automated
  *                content-refresh writer will never touch this provider
  *                again", which is exactly what the `done` bucket's
@@ -2504,7 +2564,17 @@ export function applyExperienceContent(
     )
     .get(experienceId) as ExperienceContentRow | undefined;
   if (!row) return [];
-  if (isExperienceContentLocked(row)) return [];
+  // OWNER-lock only (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+  // tomme-felt-publiserte-rader) — NOT isExperienceContentLocked. A PUBLISHED
+  // (verified) row that is not owner-locked now proceeds to the blank-only
+  // write below exactly like any other unlocked row: every `isBlank(row.X)`
+  // check further down is what makes this "fill-blank-only" rather than a
+  // general overwrite, so a published row's non-empty fields are still never
+  // touched. `content_source` is set to 'provider_site' below (after this
+  // gate) only for rows that reach this point, i.e. only when the row is not
+  // owner-locked — already true structurally, called out here because a
+  // published row can now reach that stamp for the first time.
+  if (isExperienceOwnerLocked(row)) return [];
 
   const sets: string[] = [];
   const params: Record<string, unknown> = { id: experienceId };
@@ -2797,6 +2867,18 @@ const PRICE_FRESHNESS_CANDIDATE_WINDOW_MAX = 500;
  * have already clamped it against its own hard cap — PF_HARD_CAP,
  * routes/opplevelser.ts — this function only guards against a nonsensical
  * value).
+ *
+ * DELIBERATELY still the FULL lock (owner-or-published), not just
+ * isExperienceOwnerLocked, even after the 2026-09-02-experiences-laas-
+ * todeling-fyll-tomme-felt-publiserte-rader lock split that made
+ * applyExperienceContent/isExperienceContentGenuinelyThin owner-lock-only.
+ * This sweep OVERWRITES an existing, non-blank `price_from` in place (see
+ * the route recheck below) rather than filling a blank field — and
+ * "published = fill-blank-only" is exactly the rule that a published row's
+ * already-set price must never be overwritten by an automated re-check.
+ * Anyone tempted to narrow this to isExperienceOwnerLocked to match the
+ * other writers should re-read this paragraph first: it would silently
+ * reopen overwrites of verified experiences' prices.
  */
 export function selectExperiencesForPriceFreshnessCheck(limit = 25): PriceFreshnessTarget[] {
   const db = getDb(VERTICAL);
