@@ -1489,6 +1489,80 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       opplevelserMod.__setGardssalgRenderPageImplForTesting(null);
       if (prevRenderFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
       else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevRenderFlag;
+
+      // ── (m) PR #774 review fix — finalUrl propagation END TO END through
+      //     the real crFetchGardssalgContent -> gsWvFetchFnFromGardssalgCrawler
+      //     -> classifyGardssalgProducerWebsite pipeline (the pure/unit-level
+      //     equivalent lives in services/gardssalg-website-verification.
+      //     test.ts; this proves the wiring through the actual adapter and
+      //     route, not just the injected fetchFn shape). A plain (no
+      //     headless render involved) cross-host redirect: the raw fetch
+      //     response's own `.url` differs from the requested url, exactly
+      //     what fetch-page.ts reads as a real redirect — that becomes
+      //     crFetchPage's `finalUrl`, threads through crFetchGardssalgContent
+      //     as `primaryUrl` untouched (no render escalation fires here), into
+      //     its own `finalUrl` field, then into GsWvFetchResult.finalUrl via
+      //     gsWvFetchFnFromGardssalgCrawler, and finally into
+      //     `candidateHost` at the classifyGardssalgProducerWebsite call
+      //     site. ──────────────────────────────────────────────────────────
+      insertProvider.run({
+        id: "prov-candidatehost-crosshost", navn: "Austmann Bryggeri", hjemmeside: "https://austmann.no",
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      const prevFetchForCandidateHost = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        const host = new URL(urlStr).hostname;
+        if (host === "austmann.no") {
+          // The REQUESTED host contains the prefix token "austmann" — a
+          // pre-fix bug reading the pre-fetch declared host would have
+          // incorrectly verified this row (same fixture shape as wd-29a).
+          // The response, though, reports a redirect to an unrelated parked
+          // host via `.url` — a real cross-host redirect.
+          const html =
+            `<html><head><title>Austmann – bryggeri i Norge</title></head>` +
+            `<body><p>Velkommen til Austmann. Vi lager håndverksøl.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: "https://totally-unrelated-parked-domain.example/",
+          } as unknown as Response;
+        }
+        return {
+          ok: false, status: 404, statusText: "Not Found", text: async () => "",
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: { get: () => null }, url: urlStr,
+        } as unknown as Response;
+      }) as typeof fetch;
+
+      const crossHostRes = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-candidatehost-crosshost"], apply: true },
+      });
+      const crossHostRow = (crossHostRes.body.diagnostics as any[] | undefined)?.find(
+        (r) => r.provider_id === "prov-candidatehost-crosshost",
+      );
+      assertEq(
+        crossHostRow?.classification,
+        "unverified",
+        "m1 (PR #774 fix, end-to-end): a real cross-host redirect makes the post-fetch host the one that reaches domain " +
+          "corroboration -> unverified, even though the pre-fetch declared host (austmann.no) would have incorrectly " +
+          "verified this exact prefix+title fixture",
+      );
+      // diagnostics deliberately omits the evidence object (see its own doc
+      // comment above) — read it back off the field_provenance write instead,
+      // same pattern section (e) uses for the audit-table assertions.
+      const crossHostProvenance = JSON.parse(getProviderRow("prov-candidatehost-crosshost").field_provenance);
+      assertEq(
+        crossHostProvenance.hjemmeside_verification.evidence?.prefix_token_found,
+        false,
+        "m2: the prefix-token branch itself never fires once the correct (post-redirect) host is used",
+      );
+
+      globalThis.fetch = prevFetchForCandidateHost;
     } catch (err: any) {
       failed++;
       failures.push(

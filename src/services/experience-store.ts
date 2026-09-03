@@ -7677,6 +7677,24 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
 }
 
 /**
+ * Does `host` contain `token` as a plain substring, once both are lowered,
+ * `host` has any leading `www.` stripped (nothing else — the rest of the
+ * domain is left alone), and both are run through the same `normaliseName`
+ * normalisation the file already uses for names? Hostnames carry no spaces,
+ * so the word-boundary logic `boundaryIncludes` uses elsewhere does not
+ * apply here — plain substring is the correct check (`austmann.no` contains
+ * `austmann` → true; `vinaroma.no` does NOT contain `rosenlund` → false).
+ * Empty host or empty token → false. Pure, local — not exported.
+ */
+function gardssalgHostContainsToken(host: string, token: string): boolean {
+  const hostStripped = (host || "").toLowerCase().replace(/^www\./, "");
+  const normHost = normaliseName(hostStripped);
+  const normToken = normaliseName((token || "").toLowerCase());
+  if (!normHost || !normToken) return false;
+  return normHost.includes(normToken);
+}
+
+/**
  * Ownership evidence for a candidate page — v2 (Daniels retning 2026-07-30:
  * «finne informasjon vi har som passer overens (ikke bare navn)»).
  *
@@ -7723,6 +7741,19 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
  * phone branches — nothing that verified via those stops verifying; only
  * the weakest (name-only-corroborated) branch tightens, and only for
  * callers that opt in by supplying `pageTitle`.
+ *
+ * OR (prefix-token AND title AND domain)  — (Steg 6 smal variant, Daniel-
+ *   authorized narrow extension) accepts a prefix-token match of the
+ *   producer's name (e.g. «Austmann» as a prefix of «Austmann Bryggeri») as
+ *   sufficient evidence WHEN corroborated by BOTH (a) that prefix token
+ *   appearing in the page's own <title>, AND (b) the page's own fetched
+ *   host containing that same token — never place-carrying, never a bare
+ *   prefix without domain corroboration. Independent of the weakest branch
+ *   above (does not require name/place/address/postnr found) and, like the
+ *   weakest branch, entirely caller-optional: `candidateHost` omitted/null
+ *   means this branch can never fire (fail-closed, same pattern as
+ *   `pageTitle`) — every pre-existing caller that doesn't pass the new 4th
+ *   argument sees byte-for-byte unchanged behavior.
  * Pure — exported for tests.
  */
 export function gardssalgWebsiteEvidenceMatch(
@@ -7737,7 +7768,8 @@ export function gardssalgWebsiteEvidenceMatch(
     adresse?: string | null;
     postnummer?: string | null;
   },
-  pageTitle?: string
+  pageTitle?: string,
+  candidateHost?: string | null
 ): {
   org_nr_found: boolean;
   name_found: boolean;
@@ -7746,6 +7778,7 @@ export function gardssalgWebsiteEvidenceMatch(
   address_found: boolean;
   postnr_found: boolean;
   title_found: boolean;
+  prefix_token_found: boolean;
   verified: boolean;
 } {
   const text = pageText || "";
@@ -7807,6 +7840,19 @@ export function gardssalgWebsiteEvidenceMatch(
   // phone are registry-sourced and stay completely untouched by this gate.
   const weakestBranchVerified = titleOffered ? weakestBranchBase && titleFound : weakestBranchBase;
 
+  // Prefix-token + title + domain corroboration (Steg 6 smal variant) —
+  // independent of weakestBranch*, never requires name/place/address/postnr
+  // found. `prefixToken` reuses `normName` (already computed above for the
+  // exact-name check), taking just its first whitespace-separated token; the
+  // >=4 length guard mirrors `nameSpecific`'s spirit against generic short
+  // words. Both the title AND the domain must independently corroborate the
+  // SAME token, and `candidateHost` must actually be offered by the caller —
+  // fail-closed exactly like `pageTitle` above.
+  const prefixToken = normName.split(" ")[0] || "";
+  const prefixTitleFound = titleOffered && prefixToken.length >= 4 && boundaryIncludes(normTitle, prefixToken);
+  const domainCorroborated = candidateHost != null && gardssalgHostContainsToken(candidateHost, prefixToken);
+  const prefixTokenVerified = prefixToken.length >= 4 && prefixTitleFound && domainCorroborated;
+
   return {
     org_nr_found: orgFound,
     name_found: nameFound,
@@ -7815,10 +7861,12 @@ export function gardssalgWebsiteEvidenceMatch(
     address_found: addressFound,
     postnr_found: postnrFound,
     title_found: titleFound,
+    prefix_token_found: prefixTitleFound && domainCorroborated,
     verified:
       orgFound ||
       (phoneFound && (nameFound || placeFound)) ||
-      weakestBranchVerified,
+      weakestBranchVerified ||
+      prefixTokenVerified,
   };
 }
 
