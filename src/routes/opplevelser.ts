@@ -23266,7 +23266,17 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           -- 10-provider sample could pause enrichment writes for the whole
           -- vertical over mismatches that are not errors at all.
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
-        ORDER BY updated_at DESC
+        -- id DESC is a REQUIRED tiebreaker, not cosmetic: without it two rows
+        -- with the same updated_at sort in storage order, which SQLite does
+        -- not guarantee to be stable across environments. runDedupPass bumps
+        -- updated_at when it stamps canonical_id, and the content writers
+        -- stamp several rows in one pass, so same-millisecond ties are normal
+        -- here — and the FIRST row is what the weekly spot-check judges. An
+        -- unstable first row means the §8.4 error-rate measurement silently
+        -- judges a different experience run to run. Found 2026-09-03 when the
+        -- tie made opplevelser-providers-recently-enriched (h5/h6/h7/h12)
+        -- pass locally and fail in CI on byte-identical code.
+        ORDER BY updated_at DESC, id DESC
         -- Over-fetch, then filter, then slice to 10 in JS (round-5 review).
         -- The provenance filter below cannot be expressed in SQL (it compares
         -- registrable domains), and running it AFTER a LIMIT 10 meant a
