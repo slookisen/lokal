@@ -548,6 +548,12 @@ function initSchema(db: Database.Database): void {
     -- The permanent half of views_count in admin-outreach-pool /
     -- admin-outreach-candidates (raw analytics_agent_views rows are pruned once
     -- rolled up here, so those routes must sum rollup + remaining raw).
+    -- Permanent under normal retention pruning (retention-service.ts /
+    -- runAutoPrune never delete a rollup row), but the explicit agent opt-out
+    -- path — DELETE /admin/agents/:id in routes/marketplace.ts — DOES clear
+    -- this table for that agent_id, in the same transaction as the raw
+    -- analytics_agent_views delete: an opt-out is a deletion request, not a
+    -- retention policy.
     CREATE TABLE IF NOT EXISTS agent_view_daily (
       day TEXT NOT NULL,
       agent_id TEXT NOT NULL,

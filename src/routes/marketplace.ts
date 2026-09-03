@@ -3028,6 +3028,20 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
       db.prepare("UPDATE conversations SET seller_agent_id = NULL WHERE seller_agent_id = ?").run(agentId);
       db.prepare("DELETE FROM analytics_agent_views WHERE agent_id = ?").run(agentId);
+      // Opt-out deletion, not retention pruning — this one DOES remove the
+      // rollup row too, deliberately, unlike runAutoPrune/retention-service.ts.
+      // orch-pr-20260903-analytics-rollup-slice2 made agent_view_daily the
+      // PERMANENT half of an agent's view history: the nightly prune rolls
+      // analytics_agent_views up into it and then deletes the raw rows, and
+      // NOTHING in retention-service.ts ever deletes a rollup row. That rule is
+      // about retention policy. THIS route is a user-initiated removal request
+      // (the 409 above names opt-out as the ?force=1 case), and the line above
+      // is clearly meant to be a COMPLETE removal of the agent's tracking data.
+      // Leaving agent_view_daily behind would mean an opt-out no longer removes
+      // the view history, and views_count (admin-outreach-pool.ts /
+      // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
+      // out of the rollup remainder if the same agent_id were ever reused.
+      db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
       db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     });
     deleteAll();

@@ -33,6 +33,27 @@
  *       view total an agent reports is IDENTICAL before and after a
  *       rollup+delete cycle (rollup total + remaining raw rows).
  *
+ * Added in review round 2 (the three blocking findings on 908ae0c):
+ *   (7) Transaction-boundary regression pins for all three rollups. Finding 1:
+ *       the rollup INSERTs and the raw DELETE are one all-or-nothing
+ *       transaction, but a broken boundary is invisible on every happy path —
+ *       the reviewer moved each DELETE out of its db.transaction() callback and
+ *       all three suites still passed. Each rollup now gets two probes: an
+ *       INSERT-side one (the target rollup table is dropped so its INSERT
+ *       throws → the DELETE must be rolled back and any sibling rollup INSERT
+ *       must show nothing) and a DELETE-side one (a BEFORE DELETE trigger
+ *       aborts the raw DELETE → the rollup INSERTs must be rolled back).
+ *   (8) GET /admin/outreach-candidates views_count. Finding 2: the route
+ *       carries the same rollup+raw fix as admin-outreach-pool in TWO SQL
+ *       branches (mode=first / mode=second) and neither was covered. It never
+ *       leaks views_count, so the value is read out through dedupeByEmail()'s
+ *       tiebreaker and bracketed with a probe agent on the same email; both
+ *       endpoints are then shown to report the SAME number for the same agent.
+ *   (9) DELETE /admin/agents/:id (opt-out) clears agent_view_daily. Finding 3:
+ *       the opt-out path is a user-initiated deletion request, NOT retention
+ *       pruning, so it removes the permanent rollup row too — deliberately
+ *       unlike runAutoPrune/retention-service.ts.
+ *
  * Harness mirrors analytics-auto-prune-rollup.test.ts exactly: in-memory
  * better-sqlite3 with the full prod schema injected via __setDbForTesting +
  * __initSchemaForTesting, previous global handle saved/restored.
@@ -93,6 +114,10 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
     try { return getDb(); } catch { return undefined; }
   })();
   const prevAdminKey = process.env.ADMIN_KEY;
+  // Section (8) exercises GET /admin/outreach-candidates, whose global
+  // kill-switch (OUTREACH_PAUSED=true) short-circuits to zero candidates.
+  const prevOutreachPaused = process.env.OUTREACH_PAUSED;
+  delete process.env.OUTREACH_PAUSED;
 
   const testDb = new Database(":memory:");
 
@@ -122,6 +147,58 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
     const count = (t: string) => (testDb.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as { c: number }).c;
     const sumOf = (t: string, c: string) =>
       (testDb.prepare(`SELECT COALESCE(SUM(${c}), 0) as s FROM ${t}`).get() as { s: number }).s;
+
+    // ── Atomicity-probe helpers (used by section (7)) ────────────────────────
+    // Both probes make ONE statement inside a rollup's per-batch transaction
+    // fail, then assert nothing that transaction did survived. They are the
+    // only way to observe the transaction boundary from outside — a rollup that
+    // silently moved its DELETE out of db.transaction() produces byte-identical
+    // results on every happy path.
+
+    /** Full DDL (table first, then its indexes) so a dropped table can be restored. */
+    function tableDdl(table: string): string[] {
+      return (testDb
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE tbl_name = ? AND sql IS NOT NULL " +
+          "ORDER BY (type = 'table') DESC",
+        )
+        .all(table) as Array<{ sql: string }>).map((r) => r.sql);
+    }
+
+    /** Run fn with `table` dropped, so an INSERT targeting it throws. Always restores. */
+    function withDroppedTable(table: string, fn: () => void): void {
+      const ddl = tableDdl(table);
+      testDb.exec(`DROP TABLE ${table}`);
+      try {
+        fn();
+      } finally {
+        for (const sql of ddl) testDb.exec(sql);
+      }
+    }
+
+    /** Run fn with any DELETE on `table` aborted by a trigger. Always removes it. */
+    function withDeleteBlocked(table: string, fn: () => void): void {
+      const trg = `trg_atomicity_probe_${table}`;
+      testDb.exec(
+        `CREATE TRIGGER ${trg} BEFORE DELETE ON ${table} ` +
+        `BEGIN SELECT RAISE(ABORT, 'atomicity probe: DELETE blocked'); END;`,
+      );
+      try {
+        fn();
+      } finally {
+        testDb.exec(`DROP TRIGGER IF EXISTS ${trg}`);
+      }
+    }
+
+    function assertThrows(fn: () => unknown, label: string): void {
+      let threw = false;
+      try {
+        fn();
+      } catch {
+        threw = true;
+      }
+      assertTrue(threw, label);
+    }
 
     // ════════════════════════════════════════════════════════════════════
     // (1) rollupAndPruneQueries
@@ -544,9 +621,492 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       assertEq(after, before, "outreach-pool: views_count UNCHANGED across a rollup+delete cycle (rollup + remaining raw)");
       assertEq(after, 7, "outreach-pool: views_count is still the full lifetime total (7), not the 2 surviving raw rows");
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (7) TRANSACTION-BOUNDARY REGRESSION PINS (review round 2, finding 1)
+    //
+    // The whole safety property of this slice is "the rollup INSERTs and the
+    // raw DELETE are ONE transaction, so a batch is all-or-nothing: history is
+    // never deleted without having landed in a rollup table first, and a rollup
+    // is never left half-written". Every assertion above this point only
+    // observes the happy path, where a broken boundary produces byte-identical
+    // results — the reviewer proved it by moving each DELETE out of its
+    // db.transaction() callback and watching all three suites still pass.
+    //
+    // These probes make ONE statement inside the transaction fail and assert an
+    // all-or-nothing outcome. Two directions are needed to pin the boundary
+    // from both sides:
+    //
+    //   (a) INSERT-side: drop the target rollup table so a rollup INSERT
+    //       throws. Then the DELETE must NOT have happened (source rows all
+    //       survive) and any SIBLING rollup INSERT in the same transaction must
+    //       show nothing either. Catches a DELETE that commits independently /
+    //       ahead of the rollup.
+    //   (b) DELETE-side: a BEFORE DELETE trigger aborts the raw DELETE. Then
+    //       the rollup INSERTs must be rolled back too. Catches the mirror
+    //       break — rollup INSERTs committing in their own transaction with the
+    //       DELETE outside/after it, which the INSERT-side probe alone cannot
+    //       see (the throw would simply short-circuit before the DELETE ran).
+    // ════════════════════════════════════════════════════════════════════
+
+    // (7a) rollupAndPruneQueries — INSERT-side: query_text_daily is gone.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      const newCreated = isoDaysAgo(1);
+      const ins = testDb.prepare(
+        `INSERT INTO analytics_queries
+           (protocol, query, city, result_count, response_time_ms, agent_id, vertical_id, created_at)
+         VALUES ('a2a', ?, 'Oslo', 2, 120, 'gpt-1', 'rfb', ?)`,
+      );
+      ins.run("egg", oldCreated);
+      ins.run("melk", oldCreated);
+      ins.run("honning", oldCreated);
+      ins.run("keep-me", newCreated);
+      assertEq(count("analytics_queries"), 4, "atomicity/queries: 4 seeded rows (3 out-of-window)");
+
+      withDroppedTable("query_text_daily", () => {
+        assertThrows(
+          () => retention.rollupAndPruneQueries(DAYS_TO_KEEP, 7, false),
+          "atomicity/queries: a failing rollup INSERT propagates out of rollupAndPruneQueries",
+        );
+      });
+
+      assertEq(count("analytics_queries"), 4,
+        "atomicity/queries: DELETE rolled back — every source row for the failed batch survives");
+      assertEq(count("query_daily"), 0,
+        "atomicity/queries: the SIBLING rollup INSERT (query_daily) rolled back too — whole transaction, not just the failing statement");
+      assertEq(count("query_text_daily"), 0, "atomicity/queries: query_text_daily empty after the failed batch");
+
+      // Recovery: with the table back, the SAME batch rolls up exactly once —
+      // the failed attempt left no partial state to double-count.
+      const rec = retention.rollupAndPruneQueries(DAYS_TO_KEEP, 7, false);
+      assertEq(rec.rowsDeleted, 3, "atomicity/queries: retry after the failure deletes the 3 out-of-window rows");
+      assertEq(count("analytics_queries"), 1, "atomicity/queries: retry leaves only the in-window row");
+      assertEq(sumOf("query_daily", "query_count"), 3, "atomicity/queries: retry rolls up exactly 3 queries (no double-count)");
+      assertEq(sumOf("query_text_daily", "query_count"), 3, "atomicity/queries: retry rolls up exactly 3 query texts");
+    }
+
+    // (7b) rollupAndPruneQueries — DELETE-side: the raw DELETE aborts.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      testDb.prepare(
+        `INSERT INTO analytics_queries
+           (protocol, query, city, result_count, response_time_ms, agent_id, vertical_id, created_at)
+         VALUES ('a2a', 'egg', 'Oslo', 2, 120, 'gpt-1', 'rfb', ?)`,
+      ).run(oldCreated);
+
+      withDeleteBlocked("analytics_queries", () => {
+        assertThrows(
+          () => retention.rollupAndPruneQueries(DAYS_TO_KEEP, 7, false),
+          "atomicity/queries: a failing raw DELETE propagates out of rollupAndPruneQueries",
+        );
+      });
+
+      assertEq(count("analytics_queries"), 1, "atomicity/queries: source row still there after the aborted DELETE");
+      assertEq(count("query_daily"), 0,
+        "atomicity/queries: query_daily INSERT rolled back with the failed DELETE (INSERTs are NOT committed separately)");
+      assertEq(count("query_text_daily"), 0,
+        "atomicity/queries: query_text_daily INSERT rolled back with the failed DELETE");
+    }
+
+    // (7c) rollupAndPruneAgentViews — INSERT-side: agent_view_daily is gone.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      const newCreated = isoDaysAgo(1);
+      const ins = testDb.prepare(
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
+         VALUES ('agent-a', 'Gård A', 'Oslo', 'seo', 'rfb', ?)`,
+      );
+      ins.run(oldCreated);
+      ins.run(oldCreated);
+      ins.run(oldCreated);
+      ins.run(newCreated);
+      assertEq(count("analytics_agent_views"), 4, "atomicity/agent-views: 4 seeded rows (3 out-of-window)");
+
+      withDroppedTable("agent_view_daily", () => {
+        assertThrows(
+          () => retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false),
+          "atomicity/agent-views: a failing rollup INSERT propagates out of rollupAndPruneAgentViews",
+        );
+      });
+
+      assertEq(count("analytics_agent_views"), 4,
+        "atomicity/agent-views: DELETE rolled back — every source row for the failed batch survives");
+      assertEq(count("agent_view_daily"), 0, "atomicity/agent-views: agent_view_daily empty after the failed batch");
+
+      const rec = retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false);
+      assertEq(rec.rowsDeleted, 3, "atomicity/agent-views: retry after the failure deletes the 3 out-of-window rows");
+      assertEq(sumOf("agent_view_daily", "view_count"), 3, "atomicity/agent-views: retry rolls up exactly 3 views (no double-count)");
+    }
+
+    // (7d) rollupAndPruneAgentViews — DELETE-side: the raw DELETE aborts.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      testDb.prepare(
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
+         VALUES ('agent-a', 'Gård A', 'Oslo', 'seo', 'rfb', ?)`,
+      ).run(oldCreated);
+
+      withDeleteBlocked("analytics_agent_views", () => {
+        assertThrows(
+          () => retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false),
+          "atomicity/agent-views: a failing raw DELETE propagates out of rollupAndPruneAgentViews",
+        );
+      });
+
+      assertEq(count("analytics_agent_views"), 1, "atomicity/agent-views: source row still there after the aborted DELETE");
+      assertEq(count("agent_view_daily"), 0,
+        "atomicity/agent-views: agent_view_daily INSERT rolled back with the failed DELETE");
+    }
+
+    // (7e) rollupAndPrunePageViews / sessions_daily — INSERT-side: sessions_daily
+    //      is gone, so THIS slice's added INSERT (1b) is what throws. page_view_daily
+    //      (INSERT 1a, which already succeeded inside the same transaction) must show
+    //      nothing — that is the "whole transaction rolled back" proof.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      const newCreated = isoDaysAgo(1);
+      const ins = testDb.prepare(
+        `INSERT INTO analytics_page_views
+           (path, source, user_agent_hash, session_id, status_code, vertical_id, created_at)
+         VALUES (?, 'direct', 'h1', ?, 200, 'rfb', ?)`,
+      );
+      ins.run("/a", "sess-A:Mozilla", oldCreated);
+      ins.run("/b", "sess-A:Mozilla", oldCreated);
+      ins.run("/a", "sess-B:Mozilla", oldCreated);
+      ins.run("/keep", "sess-C:Mozilla", newCreated);
+      assertEq(count("analytics_page_views"), 4, "atomicity/page-views: 4 seeded rows (3 out-of-window)");
+
+      withDroppedTable("sessions_daily", () => {
+        assertThrows(
+          () => retention.rollupAndPrunePageViews(DAYS_TO_KEEP, 7, false),
+          "atomicity/page-views: a failing sessions_daily INSERT propagates out of rollupAndPrunePageViews",
+        );
+      });
+
+      assertEq(count("analytics_page_views"), 4,
+        "atomicity/page-views: DELETE rolled back — every source row for the failed batch survives");
+      assertEq(count("page_view_daily"), 0,
+        "atomicity/page-views: the OTHER rollup INSERT (page_view_daily) rolled back too — sessions_daily is inside the SAME transaction, not appended after it");
+      assertEq(count("sessions_daily"), 0, "atomicity/page-views: sessions_daily empty after the failed batch");
+
+      const rec = retention.rollupAndPrunePageViews(DAYS_TO_KEEP, 7, false);
+      assertEq(rec.rowsDeleted, 3, "atomicity/page-views: retry after the failure deletes the 3 out-of-window rows");
+      assertEq(sumOf("page_view_daily", "view_count"), 3, "atomicity/page-views: retry rolls up exactly 3 views (no double-count)");
+      assertEq(sumOf("sessions_daily", "session_count"), 2, "atomicity/page-views: retry rolls up the 2 TRUE distinct sessions");
+    }
+
+    // (7f) rollupAndPrunePageViews — DELETE-side: the raw DELETE aborts.
+    {
+      clearAll();
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      testDb.prepare(
+        `INSERT INTO analytics_page_views
+           (path, source, user_agent_hash, session_id, status_code, vertical_id, created_at)
+         VALUES ('/a', 'direct', 'h1', 'sess-A:Mozilla', 200, 'rfb', ?)`,
+      ).run(oldCreated);
+
+      withDeleteBlocked("analytics_page_views", () => {
+        assertThrows(
+          () => retention.rollupAndPrunePageViews(DAYS_TO_KEEP, 7, false),
+          "atomicity/page-views: a failing raw DELETE propagates out of rollupAndPrunePageViews",
+        );
+      });
+
+      assertEq(count("analytics_page_views"), 1, "atomicity/page-views: source row still there after the aborted DELETE");
+      assertEq(count("page_view_daily"), 0,
+        "atomicity/page-views: page_view_daily INSERT rolled back with the failed DELETE");
+      assertEq(count("sessions_daily"), 0,
+        "atomicity/page-views: sessions_daily INSERT rolled back with the failed DELETE");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (8) GET /admin/outreach-candidates views_count (review round 2, finding 2)
+    //
+    // admin-outreach-candidates.ts carries the SAME rollup+raw views_count fix
+    // as admin-outreach-pool.ts, in TWO separate SQL branches (mode=first, which
+    // reads the outreach_ready_pool VIEW, and mode=second, which reads the base
+    // agents/agent_knowledge conditions without the sent_log exclusion). Section
+    // (6) above only covers the pool, so reverting either branch back to the
+    // unbounded `(SELECT COUNT(*) FROM analytics_agent_views …)` went unnoticed.
+    //
+    // The route never LEAKS views_count (the response is stripped back to
+    // {agent_id, name, email}), so it is read out here the only way a caller
+    // can observe it: through dedupeByEmail()'s tiebreaker. A probe agent shares
+    // the target's email and holds a known number of raw views; the winner
+    // brackets the target's views_count exactly.
+    //
+    //   probe = 7 views → target wins  ⟺ target_views >= 7 (tie breaks on name asc)
+    //   probe = 8 views → probe wins   ⟺ target_views <  8
+    //   ⇒ target_views == 7 — the full lifetime total (5 rolled up + 2 raw),
+    //     NOT the 2 surviving raw rows the reverted query would count.
+    // ════════════════════════════════════════════════════════════════════
+    {
+      clearAll();
+      testDb.exec("DELETE FROM agent_knowledge; DELETE FROM agents; DELETE FROM outreach_sent_log;");
+
+      const testKey = "analytics-rollup-slice2-test-key";
+      process.env.ADMIN_KEY = testKey;
+
+      const insAgent = testDb.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, umbrella_type)
+         VALUES (?, ?, 'desc', 'test', ?, 'https://x.invalid', 'producer', ?, 'Oslo', NULL)`,
+      );
+      const insKnowledge = testDb.prepare(
+        `INSERT INTO agent_knowledge
+           (agent_id, website, email, field_provenance, verification_status, enrichment_status,
+            url_last_probed, url_last_status)
+         VALUES (?, 'https://x.invalid', ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
+      );
+      function insertPoolAgent(id: string, name: string, email: string): void {
+        insAgent.run(id, name, email, `key-${id}`);
+        insKnowledge.run(id, email);
+      }
+      const insView = testDb.prepare(
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
+         VALUES (?, ?, 'Oslo', 'seo', 'rfb', ?)`,
+      );
+      function insertViews(agentId: string, name: string, n: number, createdAt: string): void {
+        for (let i = 0; i < n; i++) insView.run(agentId, name, createdAt);
+      }
+      function insertPriorContact(agentId: string, email: string, daysAgo: number): void {
+        testDb.prepare(
+          `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+           VALUES (?, ?, datetime('now', ?), 'email', ?, 'test:prior', 'rfb')`,
+        ).run(agentId, email.toLowerCase(), `-${daysAgo} days`, `msg-prior-${agentId}`);
+      }
+
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      const newCreated = isoDaysAgo(1);
+
+      // mode=first fixture: never contacted → visible through outreach_ready_pool.
+      insertPoolAgent("cs1-target", "Aa Rollup Target", "cand-first@prod-test.no");
+      insertPoolAgent("cs1-probe", "Zz Probe", "cand-first@prod-test.no");
+      insertViews("cs1-target", "Aa Rollup Target", 5, oldCreated); // → agent_view_daily
+      insertViews("cs1-target", "Aa Rollup Target", 2, newCreated); // → stays raw
+
+      // mode=second fixture: contacted 120 days ago (>60d cooldown), so the
+      // outreach_ready_pool VIEW excludes it and the mode=second branch is the
+      // ONLY query that can return it.
+      insertPoolAgent("cs2-target", "Aa Rollup Target 2", "cand-second@prod-test.no");
+      insertPoolAgent("cs2-probe", "Zz Probe 2", "cand-second@prod-test.no");
+      insertPriorContact("cs2-target", "cand-second@prod-test.no", 120);
+      insertPriorContact("cs2-probe", "cand-second@prod-test.no", 120);
+      insertViews("cs2-target", "Aa Rollup Target 2", 5, oldCreated);
+      insertViews("cs2-target", "Aa Rollup Target 2", 2, newCreated);
+
+      // Prune: the 5 old rows per target move into agent_view_daily and the raw
+      // rows are deleted. Lifetime total per target is still 5 + 2 = 7.
+      const pruned = retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false);
+      assertEq(pruned.rowsDeleted, 10, "outreach-candidates: the 10 old raw agent-view rows rolled up + deleted");
+      assertEq(count("analytics_agent_views"), 4, "outreach-candidates: only the 4 in-window raw rows remain");
+      assertEq(sumOf("agent_view_daily", "view_count"), 10, "outreach-candidates: the pruned views live on in agent_view_daily");
+
+      // Probes are seeded AFTER the prune so all 7 of their views stay raw.
+      insertViews("cs1-probe", "Zz Probe", 7, newCreated);
+      insertViews("cs2-probe", "Zz Probe 2", 7, newCreated);
+
+      const candidatesRouter = (require("../routes/admin-outreach-candidates") as any).default;
+      const candidatesHandler = candidatesRouter.stack
+        .filter((l: any) => l.route && l.route.path === "/" && l.route.methods?.get)
+        .map((l: any) => l.route.stack[0].handle)[0];
+      assertTrue(typeof candidatesHandler === "function", "outreach-candidates: GET / handler resolved");
+
+      const poolRouter2 = (require("../routes/admin-outreach-pool") as any).default;
+      const poolHandler2 = poolRouter2.stack
+        .filter((l: any) => l.route && l.route.path === "/" && l.route.methods?.get)
+        .map((l: any) => l.route.stack[0].handle)[0];
+
+      async function candidateWinnerFor(mode: string, email: string): Promise<string | undefined> {
+        const res = fakeRes();
+        await candidatesHandler(
+          { headers: { "x-admin-key": testKey }, query: { mode, cooldown_days: "60" }, body: {} } as any,
+          res as any,
+        );
+        assertTrue(res.statusCode === 200, `outreach-candidates: 200 from GET /?mode=${mode}`);
+        const list = (res.body?.candidates || []) as Array<{ agent_id: string; email: string }>;
+        return list.find((c) => (c.email || "").toLowerCase() === email)?.agent_id;
+      }
+
+      /** views_count as the POOL reports it, with dedupe OFF so every row is visible. */
+      async function poolViewsCount(agentId: string): Promise<number | undefined> {
+        const res = fakeRes();
+        await poolHandler2(
+          { headers: { "x-admin-key": testKey }, query: { dedupe_by_email: "false", limit: "500" }, body: {} } as any,
+          res as any,
+        );
+        assertTrue(res.statusCode === 200, "outreach-pool: 200 from GET /?dedupe_by_email=false");
+        const row = ((res.body?.agents || []) as Array<any>).find((a) => a.agent_id === agentId);
+        return row?.views_count;
+      }
+
+      // ── mode=first branch ──────────────────────────────────────────────────
+      assertEq(
+        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        "cs1-target",
+        "outreach-candidates mode=first: rollup-backed agent (5 rolled up + 2 raw = 7) beats a 7-raw-view probe on the SAME email — a raw-only COUNT(*) would see 2 and lose",
+      );
+      insertViews("cs1-probe", "Zz Probe", 1, newCreated); // probe now 8
+      assertEq(
+        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        "cs1-probe",
+        "outreach-candidates mode=first: an 8-raw-view probe wins — brackets the rollup-backed views_count at exactly 7, not higher",
+      );
+
+      // ── mode=second branch ─────────────────────────────────────────────────
+      assertEq(
+        await candidateWinnerFor("second", "cand-second@prod-test.no"),
+        "cs2-target",
+        "outreach-candidates mode=second: SAME rollup+raw views_count in the second SQL branch (7 beats a 7-raw probe on name asc)",
+      );
+      insertViews("cs2-probe", "Zz Probe 2", 1, newCreated); // probe now 8
+      assertEq(
+        await candidateWinnerFor("second", "cand-second@prod-test.no"),
+        "cs2-probe",
+        "outreach-candidates mode=second: an 8-raw-view probe wins — brackets the second branch's views_count at exactly 7 too",
+      );
+
+      // ── The two endpoints must AGREE on views_count for the same agent ─────
+      // Both feed marketing-dedupe.ts's tiebreaker and the route files say so
+      // explicitly. The pool reports the number directly; the candidates route's
+      // number is the one bracketed to 7 above, on this exact DB state.
+      assertEq(await poolViewsCount("cs1-target"), 7,
+        "views_count parity: outreach-pool reports 7 for the rollup+raw agent (the same value outreach-candidates was just bracketed to)");
+      assertEq(await poolViewsCount("cs1-probe"), 8,
+        "views_count parity: outreach-pool reports 8 for the raw-only probe");
+
+      // ...and therefore pick the SAME dedupe winner for that shared email.
+      const poolRes = fakeRes();
+      await poolHandler2(
+        { headers: { "x-admin-key": testKey }, query: {}, body: {} } as any,
+        poolRes as any,
+      );
+      const poolWinner = ((poolRes.body?.agents || []) as Array<any>)
+        .find((a) => (a.email || "").toLowerCase() === "cand-first@prod-test.no")?.agent_id;
+      assertEq(
+        poolWinner,
+        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        "views_count parity: outreach-pool and outreach-candidates pick the SAME winner for the same email after a prune cycle",
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (9) Agent opt-out deletion clears agent_view_daily (review round 2,
+    //     finding 3)
+    //
+    // DELETE /admin/agents/:id in routes/marketplace.ts is the opt-out /
+    // removal path (its own 409 names "?force=1" as the opt-out case) and is
+    // meant to remove ALL of an agent's tracking data. After this slice, part
+    // of that history is permanent aggregate in agent_view_daily, so the route
+    // clears that table too — in the SAME transaction as the raw delete.
+    //
+    // DELIBERATE asymmetry with retention: runAutoPrune / retention-service.ts
+    // NEVER delete a rollup row (that is this whole slice's point). An explicit
+    // user-initiated opt-out is a deletion request, not a retention policy.
+    // ════════════════════════════════════════════════════════════════════
+    {
+      clearAll();
+      testDb.exec("DELETE FROM agent_knowledge; DELETE FROM agents; DELETE FROM outreach_sent_log; DELETE FROM agent_blocklist;");
+
+      const testKey = "analytics-rollup-slice2-test-key";
+      process.env.ADMIN_KEY = testKey;
+
+      const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
+      const newCreated = isoDaysAgo(1);
+
+      function insertOptOutAgent(id: string, name: string, email: string): void {
+        testDb.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, umbrella_type, is_verified)
+           VALUES (?, ?, 'desc', 'test', ?, 'https://x.invalid', 'producer', ?, 'Oslo', NULL, 1)`,
+        ).run(id, name, email, `key-${id}`);
+        testDb.prepare(
+          `INSERT INTO agent_knowledge
+             (agent_id, website, email, field_provenance, verification_status, enrichment_status,
+              url_last_probed, url_last_status)
+           VALUES (?, 'https://x.invalid', ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
+        ).run(id, email);
+      }
+      const insView = testDb.prepare(
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
+         VALUES (?, ?, 'Oslo', 'seo', 'rfb', ?)`,
+      );
+
+      insertOptOutAgent("optout-1", "Opt Out Gård", "optout@prod-test.no");
+      insertOptOutAgent("keep-1", "Keep Gård", "keep@prod-test.no");
+      for (let i = 0; i < 5; i++) insView.run("optout-1", "Opt Out Gård", oldCreated);
+      for (let i = 0; i < 2; i++) insView.run("optout-1", "Opt Out Gård", newCreated);
+      for (let i = 0; i < 3; i++) insView.run("keep-1", "Keep Gård", oldCreated);
+
+      retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false);
+      const rollupFor = (agentId: string) =>
+        (testDb.prepare("SELECT COALESCE(SUM(view_count), 0) AS s FROM agent_view_daily WHERE agent_id = ?")
+          .get(agentId) as { s: number }).s;
+      const rawFor = (agentId: string) =>
+        (testDb.prepare("SELECT COUNT(*) AS c FROM analytics_agent_views WHERE agent_id = ?")
+          .get(agentId) as { c: number }).c;
+
+      assertEq(rollupFor("optout-1"), 5, "opt-out: 5 of the agent's views are permanent rollup history before the delete");
+      assertEq(rawFor("optout-1"), 2, "opt-out: 2 of the agent's views are still raw before the delete");
+
+      const marketplaceRouter = (require("../routes/marketplace") as any).default;
+      const deleteHandler = marketplaceRouter.stack
+        .filter((l: any) => l.route && l.route.path === "/agents/:id" && l.route.methods?.delete)
+        .map((l: any) => l.route.stack[0].handle)[0];
+      assertTrue(typeof deleteHandler === "function", "opt-out: DELETE /agents/:id handler resolved");
+
+      const delRes = fakeRes();
+      await deleteHandler(
+        {
+          headers: { "x-admin-key": testKey },
+          params: { id: "optout-1" },
+          // ?force=1 — the opt-out path named by the route's own 409 text.
+          query: { force: "1", skipBlocklist: "1" },
+          body: {},
+          ip: "127.0.0.1",
+        } as any,
+        delRes as any,
+      );
+      assertEq(delRes.statusCode, 200, "opt-out: DELETE /admin/agents/:id?force=1 → 200");
+      assertEq(delRes.body?.success, true, "opt-out: delete reports success");
+
+      assertEq(rawFor("optout-1"), 0, "opt-out: raw analytics_agent_views rows for the agent are gone (pre-existing behaviour)");
+      assertEq(rollupFor("optout-1"), 0,
+        "opt-out: agent_view_daily rows for the agent are gone too — an opt-out DOES remove the rollup, unlike runAutoPrune/retention-service.ts");
+      assertEq(count("agent_view_daily") > 0, true, "opt-out: the delete is scoped to that agent_id (other agents' rollup rows survive)");
+      assertEq(rollupFor("keep-1"), 3, "opt-out: an unrelated agent keeps its full rollup history");
+      assertEq(
+        (testDb.prepare("SELECT COUNT(*) AS c FROM agents WHERE id = 'optout-1'").get() as { c: number }).c,
+        0,
+        "opt-out: the agent row itself is gone",
+      );
+
+      // agent_id reuse: a NEW agent registered under the same id must start at
+      // views_count 0. Without the agent_view_daily delete above, the pool would
+      // report the opted-out producer's 5 rolled-up views for a different farm.
+      insertOptOutAgent("optout-1", "Ny Gård samme id", "ny@prod-test.no");
+      const poolRouter3 = (require("../routes/admin-outreach-pool") as any).default;
+      const poolHandler3 = poolRouter3.stack
+        .filter((l: any) => l.route && l.route.path === "/" && l.route.methods?.get)
+        .map((l: any) => l.route.stack[0].handle)[0];
+      const reuseRes = fakeRes();
+      await poolHandler3(
+        { headers: { "x-admin-key": testKey }, query: { dedupe_by_email: "false", limit: "500" }, body: {} } as any,
+        reuseRes as any,
+      );
+      const reuseRow = ((reuseRes.body?.agents || []) as Array<any>).find((a) => a.agent_id === "optout-1");
+      assertEq(reuseRow?.views_count, 0,
+        "opt-out: a reused agent_id reads back views_count 0 — no rollup remainder resurfaces");
+    }
   } finally {
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
+    if (prevOutreachPaused === undefined) delete process.env.OUTREACH_PAUSED;
+    else process.env.OUTREACH_PAUSED = prevOutreachPaused;
     if (prevDb) __setDbForTesting(prevDb);
   }
 
