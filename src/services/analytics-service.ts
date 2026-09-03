@@ -995,19 +995,48 @@ export class AnalyticsService {
    * the /admin/analytics/ops/prune route. Returns per-table delete counts
    * plus the cutoff timestamp so callers can log usefully. The minimum of
    * 7 days mirrors the /ops/prune route guard (privacy/audit trail).
+   *
+   * orch-pr-20260903-analytics-rollup-slice1: analytics_page_views used to
+   * be a raw, unconditional DELETE here — silently destroying analytics
+   * history with no rollup step first (oldest page view in prod dropped to
+   * 2026-07-04). Now routes through the already-tested
+   * rollupAndPrunePageViews() (rollup-before-delete into page_view_daily,
+   * ON CONFLICT-upsert idempotent) instead. analytics_queries and
+   * analytics_agent_views have no rollup table yet (future slice), so this
+   * function no longer deletes them at all — it only reports, via
+   * read-only COUNT(*), how many rows WOULD have been deleted, for sizing/
+   * observability. Lazy-require retention-service to mirror the same
+   * lazy-require convention already used for this module in
+   * src/routes/analytics.ts (POST /ops/retention-rollup) — avoids any
+   * static import-cycle risk between the two services.
    */
   runAutoPrune(opts: { daysToKeep: number }): {
     daysKept: number;
     cutoff: string;
     deleted: { pageViews: number; queries: number; agentViews: number };
+    skippedPendingRollup: string[];
+    wouldDeleteIfPruned: { queries: number; agentViews: number };
   } {
     const daysKept = Math.max(7, opts.daysToKeep || 60);
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
 
-    const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
-    const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
-    const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+    const { rollupAndPrunePageViews } = require("./retention-service") as typeof import("./retention-service");
+    const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
+
+    // analytics_queries / analytics_agent_views: no rollup table exists yet
+    // for either — never delete, only report what WOULD have been deleted
+    // (read-only sizing/observability, same cutoff semantics as before).
+    const qCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries WHERE created_at < ?").get(cutoff) as { c: number }).c;
+    const avCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views WHERE created_at < ?").get(cutoff) as { c: number }).c;
+
+    // Tables with no rollup coverage yet — computed, not hardcoded, so this
+    // is the natural place to shrink once a rollup table for one of them ships.
+    const rollupCoverage: Record<string, boolean> = {
+      analytics_queries: false,
+      analytics_agent_views: false,
+    };
+    const skippedPendingRollup = Object.keys(rollupCoverage).filter((t) => !rollupCoverage[t]);
 
     // Reclaim WAL space — mirrors the /ops/prune route.
     try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
@@ -1016,9 +1045,14 @@ export class AnalyticsService {
       daysKept,
       cutoff,
       deleted: {
-        pageViews: pvResult.changes || 0,
-        queries: qResult.changes || 0,
-        agentViews: avResult.changes || 0,
+        pageViews: pvResult.rowsDeleted || 0,
+        queries: 0,
+        agentViews: 0,
+      },
+      skippedPendingRollup,
+      wouldDeleteIfPruned: {
+        queries: qCount || 0,
+        agentViews: avCount || 0,
       },
     };
   }

@@ -1164,7 +1164,9 @@ app.listen(Number(PORT), HOST, async () => {
         const result = analyticsService.runAutoPrune({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP });
         console.log(
           `[auto-prune] daysToKeep=${result.daysKept} cutoff=${result.cutoff} ` +
-          `deleted=${JSON.stringify(result.deleted)}`
+          `deleted=${JSON.stringify(result.deleted)} ` +
+          `skippedPendingRollup=${JSON.stringify(result.skippedPendingRollup)} ` +
+          `wouldDeleteIfPruned=${JSON.stringify(result.wouldDeleteIfPruned)}`
         );
         lastPruneAt = now;
 
