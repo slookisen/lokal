@@ -33,6 +33,18 @@
  *   POST /reject                    {platform, id, reason}
  *   POST /requeue                   {platform, id}
  *
+ *   Session lane (2026-09-03, Daniel: no Anthropic API spend — the Claude Code
+ *   session / Cloud Routine session translates and reviews itself):
+ *   GET  /collect?platform=&langs=&limit=&entity_ids=
+ *                                   plan + materialise drafts, return source
+ *                                   texts and the translator/reviewer
+ *                                   instructions. No LLM call, no flag gate.
+ *   POST /submit                    {platform, items:[{id, source_hash?, translated_text,
+ *                                   already_target_language?, kept_terms?, notes?, review}], actor?}
+ *                                   store translation + independent review verdict,
+ *                                   run the deterministic verifier → verified |
+ *                                   rejected. Never publishes. Max 200 items.
+ *
  * Auth: X-Admin-Key vs ADMIN_KEY / ANALYTICS_ADMIN_KEY — same guard as every
  * other /admin/* route (503 when unconfigured, 403 on mismatch).
  *
@@ -67,6 +79,9 @@ import {
   getPublishedProfileTranslations,
   collectSourceItems,
   PROFILE_TRANSLATION_FIELDS,
+  collectForSession,
+  submitSessionTranslation,
+  type SessionSubmission,
 } from "../services/profile-translations";
 import { isSvLocaleEnabled } from "../i18n/t";
 import { getWorkerState, tryAcquireTranslationRunLock, releaseTranslationRunLock } from "../services/profile-translations-worker";
@@ -76,6 +91,10 @@ const router = Router();
 /** Hard per-call cap on LLM items so a runaway routine cannot burn budget. */
 export const PROFILE_TRANSLATIONS_RUN_MAX_ITEMS = 40;
 export const PROFILE_TRANSLATIONS_RUN_DEFAULT_ITEMS = 10;
+/** Session lane caps: collect/submit carry no LLM spend, so they may be larger. */
+export const PROFILE_TRANSLATIONS_COLLECT_MAX_ITEMS = 200;
+export const PROFILE_TRANSLATIONS_COLLECT_DEFAULT_ITEMS = 40;
+export const PROFILE_TRANSLATIONS_SUBMIT_MAX_ITEMS = 200;
 
 function requireAdmin(req: Request, res: Response): boolean {
   const adminKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY;
@@ -377,6 +396,71 @@ router.post("/run", async (req: Request, res: Response) => {
     });
   } catch (e: any) {
     return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// ── GET /collect (session lane) ──────────────────────────────────────────
+router.get("/collect", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const platform = parsePlatform(req.query.platform);
+  if (!platform) return res.status(400).json({ error: "platform må være rfb eller opplevagent" });
+  const langs = parseLangs(req.query.langs);
+  if (!langs) return res.status(400).json({ error: "langs må være en liste av en/sv" });
+  const limitRaw = Number(req.query.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.min(PROFILE_TRANSLATIONS_COLLECT_MAX_ITEMS, Math.floor(limitRaw))
+    : PROFILE_TRANSLATIONS_COLLECT_DEFAULT_ITEMS;
+  const entityIdsRaw = req.query.entity_ids;
+  const entityIds = entityIdsRaw
+    ? String(Array.isArray(entityIdsRaw) ? entityIdsRaw.join(",") : entityIdsRaw).split(",").map((s) => s.trim()).filter(Boolean).slice(0, 500)
+    : undefined;
+  const lockHolder = `admin-session-${platform}`;
+  if (!tryAcquireTranslationRunLock(lockHolder)) {
+    return res.status(409).json({ error: "busy", note: "workeren eller en annen kjøring holder låsen — prøv igjen senere", lock: getWorkerState().lock });
+  }
+  try {
+    const batchId = batchIdFor(`col-${platform}`);
+    const r = collectForSession(dbFor(platform), platform, langs, limit, { entityIds, batchId, actor: String(req.query.actor || "session").slice(0, 80) });
+    return res.json({ platform, langs, limit, batch_id: batchId, flags: flagsSnapshot(), items_count: r.items.length, remaining_after_this_batch: r.remaining_actionable, skipped: r.skipped, pairs_total: r.total_pairs, instructions: r.instructions, items: r.items });
+  } catch (e: any) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    releaseTranslationRunLock(lockHolder);
+  }
+});
+
+// ── POST /submit (session lane) ──────────────────────────────────────────
+router.post("/submit", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body && typeof req.body === "object" ? req.body : {}) as any;
+  const platform = parsePlatform(body.platform);
+  if (!platform) return res.status(400).json({ error: "platform må være rfb eller opplevagent" });
+  if (!Array.isArray(body.items) || body.items.length === 0) return res.status(400).json({ error: "items må være en ikke-tom liste" });
+  if (body.items.length > PROFILE_TRANSLATIONS_SUBMIT_MAX_ITEMS) return res.status(400).json({ error: `maks ${PROFILE_TRANSLATIONS_SUBMIT_MAX_ITEMS} items per kall` });
+  const actor = String(body.actor || "session").slice(0, 80);
+  const subs: SessionSubmission[] = [];
+  for (const it of body.items) {
+    const id = Number(it?.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "hvert item trenger et positivt heltall som id" });
+    if (typeof it.translated_text !== "string") return res.status(400).json({ error: `item ${id}: translated_text må være en streng` });
+    if (!it.review || typeof it.review !== "object") return res.status(400).json({ error: `item ${id}: review (uavhengig verdikt) er påkrevd` });
+    subs.push({ id, source_hash: it.source_hash ? String(it.source_hash) : null, translated_text: it.translated_text, already_target_language: it.already_target_language === true, kept_terms: Array.isArray(it.kept_terms) ? it.kept_terms : [], notes: it.notes ? String(it.notes) : "", review: it.review });
+  }
+  const lockHolder = `admin-session-${platform}`;
+  if (!tryAcquireTranslationRunLock(lockHolder)) {
+    return res.status(409).json({ error: "busy", note: "workeren eller en annen kjøring holder låsen — prøv igjen senere", lock: getWorkerState().lock });
+  }
+  try {
+    const batchId = batchIdFor(`sub-${platform}`);
+    const db = dbFor(platform);
+    const results = subs.map((sub) => submitSessionTranslation(db, platform, sub, { actor, batchId, translatorLabel: body.translator_label ? String(body.translator_label).slice(0, 80) : undefined, reviewerLabel: body.reviewer_label ? String(body.reviewer_label).slice(0, 80) : undefined }));
+    const outcomes: Record<string, number> = {};
+    for (const r of results) outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
+    return res.json({ platform, batch_id: batchId, count: results.length, outcomes, results });
+  } catch (e: any) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    releaseTranslationRunLock(lockHolder);
   }
 });
 

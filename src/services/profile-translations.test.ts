@@ -166,6 +166,88 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     const nonOrd = svc.verifyTranslationDeterministic("Åpent 6. hver dag kl 10–16, 6 sorter ost.", "Open every day 10–16, six kinds of cheese.", "en");
     ok(!nonOrd.ok && nonOrd.failed.includes("digits_preserved"), "A22g cardinal 6 spelled out is NOT tolerated", nonOrd.failed);
     ok(svc.ordinalSpelledOut("i 3. generasjon", "third generation", "3", "en") && !svc.ordinalSpelledOut("3 kuer", "third", "3", "en"), "A22h ordinalSpelledOut needs ordinal in source");
+    const cent = "Lågdalsmuseet – friluftsmuseum med tømmerbygninger fra 1600-tallet";
+    ok(svc.verifyTranslationDeterministic(cent, "Lågdalsmuseet – open-air museum with 17th-century log buildings", "en", { kind: "title" }).ok, "A22i 1600-tallet → 17th-century passes");
+    ok(svc.verifyTranslationDeterministic(cent, "Lågdalsmuseet – open-air museum with log buildings from the 1600s", "en", { kind: "title" }).ok, "A22j 1600-tallet → the 1600s passes");
+    ok(!svc.verifyTranslationDeterministic(cent, "Lågdalsmuseet – open-air museum with 16th-century log buildings", "en", { kind: "title" }).ok, "A22k wrong century fails");
+    // deliberately kept Norwegian terms (translator-declared), proper-noun prefixes, names with function words
+    const keptSrc = "Kari serverer hjemmelaget rømmegrøt og lefse i kafeen hver lørdag. Gården har 90 mål jord.";
+    const keptOut = "Kari serves homemade rømmegrøt (sour cream porridge) and lefse in the café every Saturday. The farm has 90 mål (about 9 hectares) of land.";
+    const k1 = svc.verifyTranslationDeterministic(keptSrc, keptOut, "en");
+    ok(!k1.ok && k1.failed.includes("no_untranslated_norwegian"), "A24b kept dish name without declaration still fails", k1.failed);
+    const k2 = svc.verifyTranslationDeterministic(keptSrc, keptOut, "en", { keptTerms: ["rømmegrøt", "mål"] });
+    ok(k2.ok, "A24c declared kept terms present in source pass", k2.failed);
+    const k3 = svc.verifyTranslationDeterministic(keptSrc, keptOut.replace("sour cream", "rømme"), "en", { keptTerms: ["rømmegrøt", "mål", "rømme"] });
+    ok(!k3.ok && k3.failed.includes("no_untranslated_norwegian"), "A24d declared term not in source is not tolerated", k3.failed);
+    const k4 = svc.verifyTranslationDeterministic(keptSrc, keptOut.replace("Saturday", "lørdag"), "en", { keptTerms: ["rømmegrøt", "mål"] });
+    ok(!k4.ok && k4.failed.includes("no_untranslated_norwegian"), "A24e undeclared leak still fails alongside kept terms", k4.failed);
+    const pn1 = svc.verifyTranslationDeterministic("Hvalsafari og nordlys ved Tromsø-fjordene", "Whale safari and northern lights by the Tromsø Fjords", "en", { kind: "title" });
+    ok(pn1.ok, "A24f capitalised prefix of hyphenated source name (Tromsø-fjordene) passes", pn1.failed);
+    const pn2 = svc.verifyTranslationDeterministic("Camping ved Jærens hvite strender", "Camping by Jæren's white beaches", "en", { kind: "title" });
+    ok(pn2.ok, "A24g genitive source name (Jærens → Jæren's) passes", pn2.failed);
+    const pn3 = svc.verifyTranslationDeterministic("Sommerski på Galdhøpiggen-breen", "Summer skiing on the Galdhøpiggen glacier", "en", { kind: "title" });
+    ok(pn3.ok, "A24h Galdhøpiggen-breen → Galdhøpiggen passes", pn3.failed);
+    const pn4 = svc.verifyTranslationDeterministic("Vi har åpent lørdager på Bø", "We are open lørdager at Bø", "en");
+    ok(!pn4.ok && pn4.failed.includes("no_untranslated_norwegian"), "A24i lowercase leak is not a name prefix", pn4.failed);
+    const np1 = svc.verifyTranslationDeterministic("Bondens marked i sentrum av Sogndal, Sogn og Fjordane. Del av Smak av Nordhordland-nettverket.", "Farmers' market in the centre of Sogndal, Sogn og Fjordane. Part of the Smak av Nordhordland network.", "en");
+    ok(np1.ok, "A24j function words inside verbatim capitalised name phrases pass", np1.failed);
+    const np3 = svc.verifyTranslationDeterministic("Del av Auk — Smaker fra Stjørdalsføret.", "Part of Auk — Smaker fra Stjørdalsføret.", "en");
+    ok(np3.ok, "A24j2 'fra' inside a verbatim network name passes", np3.failed);
+    const np4 = svc.verifyTranslationDeterministic("Nordlandsmuseet i Bodø viser vikingsølv.", "Nordlandsmuseet i Bodø shows Viking silver.", "en");
+    ok(!np4.ok && np4.failed.includes("no_norwegian_stopwords"), "A24j3 locative 'i' between capitalised words still fails", np4.failed);
+    const np2 = svc.verifyTranslationDeterministic("Bondens marked i sentrum av Sogndal, Sogn og Fjordane.", "Farmers' market in Sogndal og Sogn og Fjordane.", "en");
+    ok(!np2.ok && np2.failed.includes("no_norwegian_stopwords"), "A24k 'og' outside a source name phrase still fails", np2.failed);
+    const rp = svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, ["rømmegrøt", "mål"]);
+    ok(rp.includes("kept on purpose") && rp.includes("rømmegrøt, mål"), "A24l reviewer prompt lists kept terms");
+    ok(!svc.buildReviewerUserPrompt("rfb", { entity_type: "agent", entity_id: "x", field: "about", kind: "prose", text: keptSrc, entity_name: "Kari" } as any, "en", keptOut, []).includes("kept on purpose"), "A24m reviewer prompt omits kept-terms line when empty");
+    // review round 1 (lokal#771): kept_terms must not be a free whitelist
+    const kd1 = svc.verifyTranslationDeterministic("Vi har åpent lørdager og søndager på gården.", "We are open lørdager and søndager at the farm.", "en", { keptTerms: ["lørdager", "søndager"] });
+    ok(!kd1.ok && kd1.failed.includes("no_untranslated_norwegian"), "A24n denylisted weekday kept terms are refused", kd1.failed);
+    const kd2 = svc.verifyTranslationDeterministic("Vi driver en økologisk gård med kyr.", "We run an økologisk (organic) gård (farm) with cows.", "en", { keptTerms: ["økologisk", "gård"] });
+    ok(!kd2.ok && kd2.failed.includes("no_untranslated_norwegian"), "A24o everyday words refused even with a gloss", kd2.failed);
+    const kd3 = svc.verifyTranslationDeterministic(keptSrc, keptOut.replace("rømmegrøt (sour cream porridge)", "rømmegrøt"), "en", { keptTerms: ["rømmegrøt", "mål"] });
+    ok(!kd3.ok && kd3.failed.includes("no_untranslated_norwegian"), "A24p kept term without a gloss is not tolerated", kd3.failed);
+    const kd4 = svc.verifyTranslationDeterministic("På gården vår i dalen lager vi tradisjonsmat etter gamle oppskrifter: spekemat, fenalår, pinnekjøtt, rømmegrøt og lefse, alt av lokale råvarer.", "On our farm in the valley we make traditional food to old recipes: spekemat (cured meats), fenalår (cured leg of lamb), pinnekjøtt (salted lamb ribs), rømmegrøt (sour cream porridge) and lefse (flatbread), all from local ingredients.", "en", { keptTerms: ["lefse", "spekemat", "fenalår", "pinnekjøtt", "rømmegrøt"] });
+    ok(!kd4.ok && kd4.failed.includes("no_untranslated_norwegian"), "A24q at most four kept terms are honoured", kd4.failed);
+    const kd5 = svc.verifyTranslationDeterministic("På gården vår i dalen lager vi tradisjonsmat etter gamle oppskrifter: fenalår, pinnekjøtt, rømmegrøt og lefse, alt av lokale råvarer.", "On our farm in the valley we make traditional food to old recipes: fenalår (cured leg of lamb), pinnekjøtt (salted lamb ribs), rømmegrøt (sour cream porridge) and lefse (flatbread), all from local ingredients.", "en", { keptTerms: ["fenalår", "pinnekjøtt", "rømmegrøt", "lefse"] });
+    ok(kd5.ok, "A24r four glossed dish names pass", kd5.failed);
+    eq(kd5.checks.find((c) => c.name === "no_untranslated_norwegian")?.detail, "kept:fenalår,pinnekjøtt,rømmegrøt,lefse", "A24s tolerated kept terms are recorded in the check detail");
+    const st1 = svc.verifyTranslationDeterministic("Bestill på nett og/eller ring oss.", "Order online og/eller call us.", "en");
+    ok(!st1.ok && st1.failed.includes("no_norwegian_stopwords"), "A24t 'og/eller' glued to a slash is still caught", st1.failed);
+    const st2 = svc.verifyTranslationDeterministic("Vi selger kaffe, og kaker.", "We sell coffee,og cakes.", "en");
+    ok(!st2.ok && st2.failed.includes("no_norwegian_stopwords"), "A24u 'og' glued to a comma is still caught", st2.failed);
+    const st3 = svc.verifyTranslationDeterministic("Vi leverer til Bergen og Oslo hver uke.", "We deliver to Bergen og Oslo every week.", "en");
+    ok(!st3.ok && st3.failed.includes("no_norwegian_stopwords"), "A24v coordinated place names ('Bergen og Oslo') are not a name phrase", st3.failed);
+    const st4 = svc.verifyTranslationDeterministic("Kari og Ola driver gården sammen.", "Kari og Ola run the farm together.", "en");
+    ok(!st4.ok && st4.failed.includes("no_norwegian_stopwords"), "A24w coordinated person names are not a name phrase", st4.failed);
+    const st5 = svc.verifyTranslationDeterministic("Vi levererar till Bergen og Oslo varje vecka.", "Vi levererar till Bergen og Oslo varje vecka.", "sv", { alreadyTargetLanguage: true });
+    ok(!st5.ok && st5.failed.includes("no_norwegian_stopwords"), "A24x Swedish path also rejects coordinated 'og'", st5.failed);
+    const st6 = svc.verifyTranslationDeterministic("Del av Auk — Smaker fra Stjørdalsføret.", "Part of Auk — Smaker fra Stjørdalsføret.", "en");
+    ok(st6.ok, "A24y membership marker licenses the network name", st6.failed);
+    const st7 = svc.verifyTranslationDeterministic("Gården ligger i Møre og Romsdal.", "The farm is in Møre og Romsdal.", "en");
+    ok(st7.ok, "A24z known county name passes", st7.failed);
+    const pf1 = svc.verifyTranslationDeterministic("Gården ligger ved fjorden og har egen butikk.", "The Gård lies by the fjord and has its own shop.", "en");
+    ok(!pf1.ok && pf1.failed.includes("no_untranslated_norwegian"), "A24aa sentence-initial common noun does not license its stem", pf1.failed);
+    const pf2 = svc.verifyTranslationDeterministic("Gårdsbutikken er åpen lørdager. Velkommen!", "The Gårdsbutikk is open Saturdays. Welcome!", "en");
+    ok(!pf2.ok && pf2.failed.includes("no_untranslated_norwegian"), "A24ab stem of a sentence-initial noun after a full stop is refused", pf2.failed);
+    const pf3 = svc.verifyTranslationDeterministic("Vi har åpent lørdager.", "We are open Lørdag.", "en");
+    ok(!pf3.ok && pf3.failed.includes("no_untranslated_norwegian"), "A24ac capitalised prefix of a lowercase source word is refused", pf3.failed);
+    const pf4 = svc.verifyTranslationDeterministic("Turen går til Bøen i Telemark.", "The trip goes to Bøe in Telemark.", "en");
+    ok(!pf4.ok && pf4.failed.includes("no_untranslated_norwegian"), "A24ad prefixes shorter than four characters are refused", pf4.failed);
+    const cc1 = svc.verifyTranslationDeterministic("Bygninger fra 1600-tallet og 1600 meter over havet.", "Buildings from the 17th century, high above the sea.", "en");
+    ok(!cc1.ok && cc1.failed.includes("digits_preserved"), "A22l a second missing occurrence of the same digits still fails", cc1.failed);
+    const cc2 = svc.verifyTranslationDeterministic("Damsgård Hovedgård — 1700-tallsgods med historiske hager i Bergen", "Damsgård Hovedgård — 18th-century estate with historic gardens in Bergen", "en", { kind: "title" });
+    ok(cc2.ok, "A22m '1700-tallsgods' → '18th-century' passes", cc2.failed);
+    const pt1 = svc.verifyTranslationDeterministic("Museum Nord – Vesterålen og Lofoten", "Museum Nord – Vesterålen og Lofoten", "en", { kind: "title" });
+    ok(pt1.ok, "A25b all-proper-noun title may be identical in English", pt1.failed);
+    const pt2 = svc.verifyTranslationDeterministic("Guidet tur til Vesterålen og Lofoten", "Guidet tur til Vesterålen og Lofoten", "en", { kind: "title" });
+    ok(!pt2.ok && pt2.failed.includes("not_verbatim_copy"), "A25c identical title with lowercase words still fails", pt2.failed);
+    // junk sources are never planned
+    ok(svc.isJunkSource("Oppdaget via brreg-nace-discovery"), "A40 pipeline metadata is junk");
+    ok(svc.isJunkSource("Saltfjell Rein | lokale råvarer function setREVStartSize(e){ window.requestAnimationFrame }"), "A41 scraped JavaScript is junk");
+    ok(svc.isJunkSource("AS hjem Historie Festkaker Bryllup Dåp Konfirmasjon Kontakt Welcome UTLEIE Nettbutikk hjem Historie Festkaker Bryllup Dåp"), "A42 scraped navigation menu is junk");
+    ok(!svc.isJunkSource("Økologisk fjellgård i Fjellgardane, 15 km vest for Fyresdal sentrum. Elin og Tor brakte liv tilbake til gården."), "A43 a real profile text is not junk");
+    ok(!svc.isJunkSource("Hardanger Cideri — Ullensvang"), "A44 a short title is not junk");
     const v3 = svc.verifyTranslationDeterministic(src, good.replace("https://example.no/gard", "https://example.com/farm"), "en");
     ok(!v3.ok && v3.failed.includes("urls_preserved"), "A23 changed URL fails", v3.failed);
     const v4 = svc.verifyTranslationDeterministic(src, good.replace("Saturdays", "lørdager"), "en");
@@ -254,7 +336,7 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       delete process.env.ANTHROPIC_API_KEY;
       const noKeyLog = { calls: [] as any[] };
       const r0 = await svc.processTranslationItem(rfbDb as any, "rfb", plan.actionable[0], "b-nokey", { fetchImpl: makeFakeFetch({ translations: [], reviews: [] }, noKeyLog) as any });
-      eq([r0.outcome, r0.status, r0.attempts, noKeyLog.calls.length], ["translate_failed", "draft", 1, 0], "B6 missing key fail-closed: draft, no fetch");
+      eq([r0.outcome, r0.status, r0.attempts, noKeyLog.calls.length], ["translate_failed", "draft", 0, 0], "B6 missing key fail-closed: draft, no fetch, attempt NOT counted (infra)");
       ok(/ANTHROPIC_API_KEY/.test(r0.reason || ""), "B7 reason names the missing key");
 
       process.env.ANTHROPIC_API_KEY = "test-key";
@@ -434,6 +516,50 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       eq([c21.status, c21.body.status], [200, "draft"], "C21 requeue via route");
       const c22 = await callRoute(router, { url: `/audit?platform=rfb&id=${c14.body.rows[0].id}`, headers: H });
       ok(c22.status === 200 && c22.body.audit.length >= 4, "C22 audit history via route");
+
+      // ───────────────────────────── E. session lane (collect → submit) ──
+      // Pipeline flag is OFF here (deleted above) — the lane must work anyway.
+      // State at this point: the sv description row is a draft (requeued in
+      // B34, source changed in B38-B42), the sv about row is rejected/draft.
+      const svAboutRow = svc.listTranslationQueue(rfbDb as any, "rfb", { lang: "sv" }).find((r) => r.field === "about")!;
+      if (svAboutRow.status !== "draft") svc.requeueTranslation(rfbDb as any, svAboutRow.id, "test");
+      const e1 = await callRoute(router, { url: "/collect?platform=rfb&langs=sv&limit=10", headers: H });
+      eq(e1.status, 200, "E1 collect 200 with pipeline flag off");
+      ok(e1.body.items_count === 2 && e1.body.items.every((i: any) => i.id > 0 && i.source_hash && i.lang === "sv" && i.source_text && i.kind === "prose"), "E2 two sv drafts collected with ids/hashes", e1.body.items);
+      ok(String(e1.body.instructions.sv.translator_system).includes("Swedish") && String(e1.body.instructions.sv.reviewer_system).length > 100, "E3 instructions carry translator + reviewer system prompts");
+      const eDesc = e1.body.items.find((i: any) => i.field === "description");
+      const eAbout = e1.body.items.find((i: any) => i.field === "about");
+      const goodReview = { verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" };
+      const svDesc = "Vi säljer ekologiska grönsaker, honung och ägg från vår egen gård i Bø. Öppet lördagar 10–16.";
+      const e4 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc }] } });
+      eq(e4.status, 400, "E4 submit without review → 400");
+      const beforeText = svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text;
+      const e5 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, source_hash: "stale", translated_text: svDesc, review: goodReview }] } });
+      eq([e5.status, e5.body.results[0].outcome, svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text], [200, "source_changed", beforeText], "E5 stale source_hash → source_changed, row untouched");
+      const e6 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", actor: "test-session", items: [{ id: eDesc.id, source_hash: eDesc.source_hash, translated_text: svDesc, review: goodReview, kept_terms: [] }] } });
+      eq([e6.status, e6.body.outcomes.verified, e6.body.results[0].status], [200, 1, "verified"], "E6 APPROVE + deterministic verify → verified");
+      const eRow = svc.getTranslationById(rfbDb as any, eDesc.id)!;
+      eq([eRow.translator_model, eRow.reviewer_model, eRow.status, eRow.attempts], ["claude-code-session", "claude-code-session-review", "verified", 1], "E7 session labels + attempt stored");
+      const e8 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: "Något annat.", review: goodReview }] } });
+      eq([e8.body.results[0].outcome, svc.getTranslationById(rfbDb as any, eDesc.id)!.translated_text], ["skipped_status", svDesc], "E8 verified row refuses a new submission");
+      const e9 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, source_hash: eAbout.source_hash, translated_text: "Solgården har varit i familjens ägo i många år. Vi odlar morötter, potatis och bär och har bikupor på gården.", review: goodReview }] } });
+      eq([e9.body.results[0].outcome, e9.body.results[0].status], ["rejected_verify", "rejected"], "E9 APPROVE but 1952 dropped → rejected_verify");
+      ok((e9.body.results[0].verify?.failed || []).includes("digits_preserved"), "E10 failed check named in result");
+      await callRoute(router, { url: "/requeue", method: "POST", headers: H, body: { platform: "rfb", id: eAbout.id } });
+      const reviseReview = { verdict: "REVISE", fidelity: 3, fluency: 4, issues: [{ type: "omission", severity: "major", detail: "year 1952 missing" }], summary: "add the year" };
+      const e11 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, translated_text: "Solgården har varit i familjens ägo länge.", review: reviseReview }] } });
+      eq([e11.body.results[0].outcome, e11.body.results[0].status, e11.body.results[0].attempts], ["revise", "draft", 1], "E11 REVISE keeps the draft for a second pass");
+      const e12 = await callRoute(router, { url: "/collect?platform=rfb&langs=sv", headers: H });
+      const e12About = e12.body.items.find((i: any) => i.id === eAbout.id);
+      ok(e12.body.items_count === 1 && e12About && /1952/.test(e12About.feedback || "") && e12About.attempts === 1, "E12 re-collect returns the REVISE feedback for the draft", e12.body.items);
+      const e13 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eAbout.id, translated_text: "Solgården har varit i familjens ägo länge.", review: { verdict: "REJECT", fidelity: 1, fluency: 4, issues: [], summary: "still wrong" } }] } });
+      eq([e13.body.results[0].outcome, e13.body.results[0].status], ["rejected_review", "rejected"], "E13 REJECT → rejected_review");
+      eq(svc.submitSessionTranslation(rfbDb as any, "rfb", { id: 999999, translated_text: "x", review: goodReview }, { actor: "t", batchId: "b" }).outcome, "not_found", "E14 unknown id → not_found");
+      eq(svc.submitSessionTranslation(rfbDb as any, "opplevagent", { id: eDesc.id, translated_text: "x", review: goodReview }, { actor: "t", batchId: "b" }).outcome, "wrong_platform", "E15 platform mismatch refused");
+      const e16 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [] } });
+      eq(e16.status, 400, "E16 empty items → 400");
+      const e17 = await callRoute(router, { url: `/audit?platform=rfb&id=${eDesc.id}`, headers: H });
+      ok(e17.body.audit.some((a: any) => /collected \(session lane\)/.test(a.note || "")) && e17.body.audit.some((a: any) => /translated by session/.test(a.note || "")), "E17 audit trail names the session lane", e17.body.audit);
     } finally {
       if (prevDb) initMod.__setDbForTesting(prevDb);
       try { rfbDb.close(); } catch { /* ignore */ }

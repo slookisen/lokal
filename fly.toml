@@ -105,8 +105,11 @@ primary_region = 'arn'
   #     («kraftig i 12 timer, deretter mindre puljer pga usage»).
   # Kill switches: PROFILE_TRANSLATIONS_ENABLED='false' stops all LLM spend on
   # the next tick; WORKER_ENABLED='false' + deploy stops the interval.
-  PROFILE_TRANSLATIONS_ENABLED = 'true'
-  PROFILE_TRANSLATIONS_WORKER_ENABLED = 'true'
+  # 2026-09-03 Daniel: no Anthropic API spend for translations — the Claude Code
+  # session / Cloud Routine session translates via GET /collect + POST /submit.
+  # Both LLM switches OFF; the store, verifier, publish gate and flags below stay.
+  PROFILE_TRANSLATIONS_ENABLED = 'false'
+  PROFILE_TRANSLATIONS_WORKER_ENABLED = 'false'
   PROFILE_TRANSLATIONS_WORKER_INTENSIVE_UNTIL = '2026-09-03T09:30:00Z'
   PROFILE_TRANSLATIONS_WORKER_INTENSIVE_CONCURRENCY = '5'
   PROFILE_TRANSLATIONS_WORKER_STEADY_ITEMS_PER_HOUR = '20'

@@ -159,6 +159,13 @@ export function reviewerModel(): string {
 
 /** Translator rounds per item before it lands in the manual `rejected` queue. */
 export const MAX_TRANSLATION_ATTEMPTS = 2;
+/**
+ * LLM-call failures that say nothing about the item itself (no key, network,
+ * HTTP 4xx/5xx such as "credit balance is too low"). They never consume one of
+ * the item's MAX_TRANSLATION_ATTEMPTS — the worker backs off instead — so a
+ * billing outage cannot park half the catalogue in `max_attempts`.
+ */
+export const LLM_INFRA_REASON_RE = /ANTHROPIC_API_KEY|nettverksfeil|status [45]\d\d/;
 
 // ─── Schema ──────────────────────────────────────────────────────────────
 
@@ -422,6 +429,27 @@ export interface PlannedItem {
  * caps the number of ACTIONABLE items (new/retry/source_changed) returned;
  * skipped items are counted in `skipped` so the caller can report coverage.
  */
+/**
+ * Source text that is not a profile text at all: pipeline metadata ("Oppdaget
+ * via brreg-nace-discovery"), scraped JavaScript, or a scraped navigation menu
+ * (many capitalised fragments, no sentence punctuation). Translating it wastes
+ * two LLM calls and the reviewer rejects it anyway; the planner skips it as
+ * `source_junk` so the routine can report the count as a data-quality finding.
+ */
+export function isJunkSource(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (/^oppdaget via\b/i.test(t)) return true;
+  if (/\bfunction\s*\(|window\.|document\.|\{[^}]*\}\s*;?|<\/?[a-z][^>]*>/i.test(t)) return true;
+  const tokens = t.split(/\s+/).filter(Boolean);
+  if (tokens.length >= 12 && !/[.!?…]/.test(t)) {
+    const capitalised = tokens.filter((w) => /^[A-ZÆØÅ]/.test(w)).length;
+    if (capitalised / tokens.length >= 0.5) return true;
+  }
+  if (/\b(handlekurv|nettbutikk|logg inn|min side)\b/i.test(t) && tokens.length >= 8 && !/[.!?]/.test(t)) return true;
+  return false;
+}
+
 export function planTranslationBatch(
   db: Database.Database,
   platform: TranslationPlatform,
@@ -435,8 +463,13 @@ export function planTranslationBatch(
   let totalPairs = 0;
   let remaining = 0;
   for (const item of items) {
+    const junk = isJunkSource(item.text);
     for (const lang of langs) {
       totalPairs++;
+      if (junk) {
+        skipped.source_junk = (skipped.source_junk || 0) + 1;
+        continue;
+      }
       const hash = sourceHash(item.text);
       const existing = getTranslationRow(db, { platform, entity_type: item.entity_type, entity_id: item.entity_id, field: item.field, lang });
       const decision = planItem(existing, hash);
@@ -513,6 +546,18 @@ export interface VerifyResult {
 export const NORWEGIAN_STOPWORDS_NOT_ENGLISH = new Set([
   "i", "og", "til", "fra", "ved", "hos", "med", "av", "om", "eller", "som", "det", "den", "er", "har", "ikke", "også", "når", "hvor", "hva",
 ]);
+/** Everyday Norwegian words a translator may never "keep" via kept_terms. */
+export const KEPT_TERM_DENYLIST = new Set([
+  "mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag", "mandager", "tirsdager", "onsdager", "torsdager", "fredager", "lørdager", "søndager",
+  "åpent", "åpen", "åpne", "åpningstid", "åpningstider", "stengt", "økologisk", "økologiske", "gård", "gården", "gårder", "gårdsbutikk", "gårdsbutikken", "gårdsutsalg",
+  "år", "året", "måned", "måneden", "uke", "uken", "hver", "alle", "både", "også", "når", "hvor", "hvordan", "kjøtt", "brød", "smør", "ost", "øl", "låve", "låven",
+  "sør", "nord", "øst", "vest", "høst", "vår", "sommer", "vinter", "påske", "jul", "første", "nå", "så", "på", "får", "går", "må", "frå", "lørdagsåpent", "søndagsåpent",
+]);
+/** County / region names whose "og" is part of the name. */
+export const KNOWN_NAME_PHRASES = new Set(["sogn og fjordane", "møre og romsdal", "vestfold og telemark", "troms og finnmark", "aust og vest"]);
+/** Source phrases that introduce a network/organisation name right after them. */
+const NAME_MARKER_RE = /(del av|medlem av|medlem i|tilknyttet|nettverket|samvirket|merkevaren|kjeden|i regi av|gjennom)\b[^.!?]{0,40}$/i;
+
 export const NORWEGIAN_STOPWORDS_NOT_SWEDISH = new Set([
   "og", "til", "fra", "ved", "hos", "ikke", "også", "når", "hvor", "hva", "hvordan", "noen", "mye", "bare", "nå",
 ]);
@@ -531,6 +576,18 @@ const ORDINAL_WORDS: Record<TranslationTargetLang, string[]> = {
  * as an ordinal ("6. generasjon") and the translation spells that ordinal out
  * ("sixth generation" / "sjätte generationen"). Everything else stays strict.
  */
+/**
+ * "1600-tallet" is idiomatically "the 1600s" or "the 17th century" in English;
+ * tolerate either. Swedish keeps "1600-talet", so nothing to tolerate there.
+ */
+export function centurySpelledOut(src: string, out: string, digits: string, lang: TranslationTargetLang): boolean {
+  if (!/^\d{2}00$/.test(digits) || !new RegExp(`\\b${digits}-tall`, "i").test(src)) return false;
+  if (lang !== "en") return false;
+  const century = Number(digits.slice(0, 2)) + 1;
+  const suffix = century % 10 === 1 && century !== 11 ? "st" : century % 10 === 2 && century !== 12 ? "nd" : century % 10 === 3 && century !== 13 ? "rd" : "th";
+  return new RegExp(`\\b${digits}s\\b`).test(out) || new RegExp(`\\b${century}${suffix}[ -]century\\b`, "i").test(out);
+}
+
 export function ordinalSpelledOut(src: string, out: string, digits: string, lang: TranslationTargetLang): boolean {
   const n = Number(digits);
   if (!Number.isInteger(n) || n < 1 || n > 20) return false;
@@ -545,11 +602,12 @@ function multiset(arr: string[]): Map<string, number> {
   for (const a of arr) m.set(a, (m.get(a) || 0) + 1);
   return m;
 }
+/** Every missing occurrence, repeated per count ("1600" twice in the source, once in the output → one entry). */
 function multisetDiff(a: Map<string, number>, b: Map<string, number>): string[] {
   const out: string[] = [];
   for (const [k, n] of a) {
     const have = b.get(k) || 0;
-    if (have < n) out.push(k);
+    for (let i = have; i < n; i++) out.push(k);
   }
   return out;
 }
@@ -563,7 +621,7 @@ export function verifyTranslationDeterministic(
   source: string,
   translated: string,
   lang: TranslationTargetLang,
-  opts: { kind?: TranslationFieldKind; alreadyTargetLanguage?: boolean; entityName?: string | null } = {},
+  opts: { kind?: TranslationFieldKind; alreadyTargetLanguage?: boolean; entityName?: string | null; keptTerms?: string[] | null } = {},
 ): VerifyResult {
   const src = cleanSource(source);
   const out = cleanSource(translated);
@@ -582,7 +640,17 @@ export function verifyTranslationDeterministic(
 
   const srcDigits = multiset(src.match(DIGIT_RUN_RE) || []);
   const outDigits = multiset(out.match(DIGIT_RUN_RE) || []);
-  const missingDigits = multisetDiff(srcDigits, outDigits).filter((d) => !ordinalSpelledOut(src, out, d, lang));
+  // A spelled-out ordinal/century idiom excuses exactly ONE missing occurrence
+  // of its digit-run; a second missing "1600" (e.g. an altitude) still fails.
+  const idiomUsed = new Set<string>();
+  const missingDigits = multisetDiff(srcDigits, outDigits).filter((d) => {
+    if (idiomUsed.has(d)) return true;
+    if (ordinalSpelledOut(src, out, d, lang) || centurySpelledOut(src, out, d, lang)) {
+      idiomUsed.add(d);
+      return false;
+    }
+    return true;
+  });
   checks.push({ name: "digits_preserved", ok: missingDigits.length === 0, detail: missingDigits.slice(0, 5).join(",") || undefined });
 
   const srcUrls = (src.match(URL_RE) || []).map((u) => u.replace(/[.,;:]+$/, ""));
@@ -603,7 +671,16 @@ export function verifyTranslationDeterministic(
   const srcWords = src.split(/\s+/).filter(Boolean);
   const identical = src.replace(/\s+/g, " ").toLowerCase() === out.replace(/\s+/g, " ").toLowerCase();
   const identicalWordCap = lang === "sv" ? 8 : 4;
-  const identicalOk = !identical || srcWords.length <= identicalWordCap || opts.alreadyTargetLanguage === true;
+  // "Museum Nord – Vesterålen og Lofoten": a title made only of capitalised
+  // words (plus og/av/fra between them, digits and dashes) is a proper name
+  // and is correctly identical in the target language.
+  const titleTokens = out.split(/[\s.,;:!?()"'«»–—/]+/).filter(Boolean);
+  const allProperNounTitle =
+    kind === "title" &&
+    titleTokens.length > 0 &&
+    titleTokens.length <= 12 &&
+    titleTokens.every((w, i) => /^[A-ZÆØÅ0-9]/.test(w) || (["og", "av", "fra"].includes(w) && i > 0 && i < titleTokens.length - 1));
+  const identicalOk = !identical || srcWords.length <= identicalWordCap || opts.alreadyTargetLanguage === true || allProperNounTitle;
   checks.push({ name: "not_verbatim_copy", ok: identicalOk });
 
   // Un-translated Norwegian: any word carrying æ/ø (and, for English, å) in
@@ -616,13 +693,43 @@ export function verifyTranslationDeterministic(
   const nordicRe = lang === "sv" ? /[æøÆØ]/ : /[æøåÆØÅ]/;
   const splitRe = /[\s.,;:!?()"'«»–—/]+/;
   const srcCapitalized = new Set(src.split(splitRe).filter((w) => w && /^[A-ZÆØÅ]/.test(w)));
+  // Proper nouns also survive with a Norwegian suffix or genitive in the
+  // source ("Tromsø-fjordene" → "Tromsø Fjords", "Jærens" → "Jæren's"): a
+  // capitalised output word that is a prefix (≥ 4 chars) of a capitalised
+  // source token — hyphen-split as well — is a preserved name. Sentence-
+  // initial source tokens do not count: "Gården ligger…" is a common noun
+  // that is capitalised only by position, and its stem ("Gård") must not
+  // become a licensed prefix. Proper nouns are capitalised everywhere.
+  const srcWs = src.split(/\s+/).filter(Boolean);
+  const srcCapitalizedParts = new Set<string>();
+  srcWs.forEach((tok, idx) => {
+    const sentenceInitial = idx === 0 || /[.!?:]$/.test(srcWs[idx - 1]);
+    if (sentenceInitial) return;
+    for (const part of tok.split(/[\s.,;:!?()"'«»–—/-]+/)) if (part && /^[A-ZÆØÅ]/.test(part)) srcCapitalizedParts.add(part);
+  });
+  const isNamePrefix = (w: string): boolean => /^[A-ZÆØÅ]/.test(w) && w.length >= 4 && Array.from(srcCapitalizedParts).some((t) => t.startsWith(w));
   const nameWords = new Set(String(opts.entityName || "").toLowerCase().split(splitRe).filter(Boolean));
+  // Terms the translator declared it kept on purpose (dish names, "mål") are
+  // tolerated only with deterministic evidence of intent: the term occurs in
+  // the source, is not an everyday Norwegian word, and appears in the output
+  // followed by a parenthetical gloss at least once ("rømmegrøt (sour cream
+  // porridge)"). At most 4 per field. The LLM reviewer is shown the same list
+  // and judges whether keeping them was right.
+  const srcLowerWords = new Set(src.toLowerCase().split(splitRe).filter(Boolean));
+  const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hasGloss = (t: string): boolean => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}\\s*\\(`, "iu").test(out);
+  const declared = (Array.isArray(opts.keptTerms) ? opts.keptTerms : []).map((t) => String(t).toLowerCase().trim()).filter(Boolean);
+  const keptTerms = new Set(declared.slice(0, 4).filter((t) => srcLowerWords.has(t) && !KEPT_TERM_DENYLIST.has(t) && hasGloss(t)));
   const leaked = out
     .split(splitRe)
     .filter((w) => w && nordicRe.test(w))
-    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()));
+    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w));
   const leakedUnique = Array.from(new Set(leaked));
-  checks.push({ name: "no_untranslated_norwegian", ok: leakedUnique.length === 0, detail: leakedUnique.slice(0, 5).join(",") || undefined });
+  checks.push({
+    name: "no_untranslated_norwegian",
+    ok: leakedUnique.length === 0,
+    detail: leakedUnique.length ? leakedUnique.slice(0, 5).join(",") : keptTerms.size ? `kept:${Array.from(keptTerms).join(",")}` : undefined,
+  });
 
   // Un-translated Norwegian function words (no æ/ø/å, so the check above
   // cannot see them): "Nordlandsmuseet i Bodø" left as-is in English, "og"/
@@ -632,7 +739,40 @@ export function verifyTranslationDeterministic(
   // verbatim in the entity name are proper-noun parts and are allowed.
   const stopwords = lang === "sv" ? NORWEGIAN_STOPWORDS_NOT_SWEDISH : NORWEGIAN_STOPWORDS_NOT_ENGLISH;
   const nameTokens = new Set(String(opts.entityName || "").split(splitRe).filter(Boolean));
-  const leakedStop = Array.from(new Set(out.split(splitRe).filter((w) => stopwords.has(w) && !nameTokens.has(w))));
+  // "Sogn og Fjordane", "Smak av Nordhordland", "Smaker fra Stjørdalsføret": a
+  // conjunction/preposition inside a capitalised phrase is part of a NAME when
+  // the phrase (a) is a known county with "og", (b) occurs in the entity name,
+  // or (c) is introduced in the source by a membership marker ("del av",
+  // "medlem av", "nettverket", …). Plain coordination ("Bergen og Oslo",
+  // "Kari og Ola") has no such marker and still fails. One phrase per text.
+  // Locative "i" ("Nordlandsmuseet i Bodø") never qualifies.
+  const NAME_PHRASE_WORDS = new Set(["og", "av", "fra"]);
+  const stripEdges = (w: string): string => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  const outTokens = out.split(/\s+/).map(stripEdges).filter(Boolean);
+  const srcFlat = " " + srcWs.flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
+  const entityNameFlat = " " + String(opts.entityName || "").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
+  let namePhraseBudget = 2;
+  const inNamePhrase = (i: number): boolean => {
+    if (namePhraseBudget <= 0 || i < 1 || i >= outTokens.length - 1 || !NAME_PHRASE_WORDS.has(outTokens[i])) return false;
+    const phrase = ` ${outTokens[i - 1]} ${outTokens[i]} ${outTokens[i + 1]} `;
+    if (!/^[A-ZÆØÅ]/.test(outTokens[i - 1]) || !/^[A-ZÆØÅ]/.test(outTokens[i + 1]) || !srcFlat.includes(phrase)) return false;
+    const known = KNOWN_NAME_PHRASES.has(phrase.trim().toLowerCase()) || entityNameFlat.toLowerCase().includes(phrase.toLowerCase());
+    const before = srcFlat.slice(0, srcFlat.indexOf(phrase));
+    const marked = NAME_MARKER_RE.test(before.slice(-45));
+    if (!known && !marked) return false;
+    namePhraseBudget--;
+    return true;
+  };
+  // Stopword hits are counted on the punctuation-split tokens (so "og/eller"
+  // and "coffee,og" are seen); a hit is excused only when every whitespace
+  // occurrence of that word sits inside one licensed name phrase.
+  const stopHits = Array.from(new Set(out.split(splitRe).filter((w) => stopwords.has(w) && !nameTokens.has(w) && !(allProperNounTitle && NAME_PHRASE_WORDS.has(w)))));
+  const leakedStop = stopHits.filter((w) => {
+    const occurrences = outTokens.map((t, i) => (t === w ? i : -1)).filter((i) => i >= 0);
+    const splitCount = out.split(splitRe).filter((t) => t === w).length;
+    if (occurrences.length !== splitCount) return true;
+    return !occurrences.every((i) => inNamePhrase(i));
+  });
   checks.push({ name: "no_norwegian_stopwords", ok: leakedStop.length === 0, detail: leakedStop.slice(0, 5).join(",") || undefined });
 
   if (kind === "title") {
@@ -738,6 +878,10 @@ export const TRANSLATION_GLOSSARY: Record<TranslationTargetLang, Array<[string, 
     ["sideri", "cidery"],
     ["mjøderi", "meadery"],
     ["bryggeri", "brewery"],
+    ["villsau / gammelnorsk sau", "villsau (Old Norwegian heritage sheep) — a domestic breed, never \"wild sheep\""],
+    ["fetevarer", "delicatessen (cheese, butter, cured meats and other deli goods) — not \"cured meats\" alone"],
+    ["saft (solbærsaft, bringebærsaft)", "cordial (a concentrate to dilute) — \"juice\" only for juice/eplemost"],
+    ["morr / fenalår / pinnekjøtt / spekemat", "keep the Norwegian name with a gloss on first use: morr (cured sausage), fenalår (cured leg of lamb), pinnekjøtt (salted lamb ribs); spekemat = cured meats"],
     ["destilleri", "distillery"],
     ["økologisk / Debio-godkjent", "organic / Debio-certified"],
     ["kortreist mat", "locally sourced food"],
@@ -756,6 +900,9 @@ export const TRANSLATION_GLOSSARY: Record<TranslationTargetLang, Array<[string, 
     ["sideri", "cideri"],
     ["mjøderi", "mjödbryggeri"],
     ["bryggeri", "bryggeri"],
+    ["villsau / gammelnorsk sau", "villsau (gammalnorsk får, en tamfårsras) — aldrig \"vilda får\""],
+    ["fetevarer", "delikatesser (ost, smör, charkuterier) — inte enbart \"charkuterier\""],
+    ["saft", "saft (koncentrat) — \"juice\" endast för juice/eplemost"],
     ["destilleri", "destilleri"],
     ["økologisk / Debio-godkjent", "ekologisk / Debio-certifierad"],
     ["kortreist mat", "närproducerad mat"],
@@ -797,9 +944,10 @@ Rules — all of them are mandatory:
 ${glossaryText(lang)}
 6. If the source text is ALREADY written in ${LANG_NAMES[lang]}, return it with only obvious typos fixed and set "already_target_language" to true.
 7. Never invent content to fill gaps. If the source is truncated or unclear, translate exactly what is there and mention it in "notes".
+8. Some Norwegian words may be kept deliberately: names of dishes and products with no ${LANG_NAMES[lang]} equivalent (rømmegrøt, pinnekjøtt, lefse) and the land unit "mål". Keep such a word as written, add a short gloss in parentheses on first use (e.g. "rømmegrøt (sour cream porridge)", "90 mål (about 9 hectares)"), and list every kept word in "kept_terms". Ordinary Norwegian words are never kept.
 
 Respond with ONE JSON object and nothing else:
-{"translation": "<the ${LANG_NAMES[lang]} text>", "already_target_language": false, "notes": "<short translator notes, or empty string>"}`;
+{"translation": "<the ${LANG_NAMES[lang]} text>", "already_target_language": false, "kept_terms": ["<Norwegian words you deliberately kept, or empty>"], "notes": "<short translator notes, or empty string>"}`;
 }
 
 export function buildTranslatorUserPrompt(
@@ -839,13 +987,15 @@ Respond with ONE JSON object and nothing else:
 {"verdict": "APPROVE" | "REVISE" | "REJECT", "fidelity": 1-5, "fluency": 1-5, "issues": [{"type": "meaning|omission|addition|number|terminology|grammar|style|untranslated|format", "severity": "minor|major", "detail": "<what and where>"}], "summary": "<one sentence>"}`;
 }
 
-export function buildReviewerUserPrompt(platform: TranslationPlatform, item: SourceItem, lang: TranslationTargetLang, translation: string): string {
+export function buildReviewerUserPrompt(platform: TranslationPlatform, item: SourceItem, lang: TranslationTargetLang, translation: string, keptTerms?: string[] | null): string {
+  const kept = Array.isArray(keptTerms) ? keptTerms.filter(Boolean) : [];
   return [
     `Platform: ${PLATFORM_CONTEXT[platform]}`,
     `Business / experience name: ${item.entity_name || "(unknown)"}`,
     `Field: ${item.field} — ${FIELD_CONTEXT[item.field] || "profile text"}`,
     `Glossary the translator was told to use:`,
     glossaryText(lang),
+    kept.length ? `Norwegian words the translator says it kept on purpose (judge whether that is right — only dish/product names and the unit "mål" qualify, and each needs a gloss): ${kept.join(", ")}` : "",
     "",
     "Source (Norwegian):",
     "<<<",
@@ -963,23 +1113,26 @@ export async function processTranslationItem(
     addUsage(usage, tr);
     const attemptsNow = row.attempts + 1;
     if (!tr.ok) {
-      row = setStatus(db, row, "draft", { attempts: attemptsNow, translator_model: tModel, translator_notes: `translate failed: ${tr.reason}`, batch_id: batchId }, "pipeline", `translate failed: ${tr.reason}`, batchId);
+      const infra = LLM_INFRA_REASON_RE.test(tr.reason);
+      row = setStatus(db, row, "draft", { attempts: infra ? row.attempts : attemptsNow, translator_model: tModel, translator_notes: `translate failed: ${tr.reason}`, batch_id: batchId }, "pipeline", `translate failed${infra ? " (infra, attempt not counted)" : ""}: ${tr.reason}`, batchId);
       return { ...base, outcome: "translate_failed", status: row.status, attempts: row.attempts, reason: tr.reason, review: lastReview, verify: null, usage };
     }
     const translation = cleanSource(tr.json?.translation);
     const alreadyTarget = tr.json?.already_target_language === true;
     const notes = String(tr.json?.notes ?? "").slice(0, 1000);
+    const keptTerms: string[] = Array.isArray(tr.json?.kept_terms) ? tr.json.kept_terms.map((t: unknown) => String(t).trim()).filter((t: string) => t && t.length <= 40).slice(0, 8) : [];
+    // The verifier honours at most 4 declared terms and only with a gloss (see verifyTranslationDeterministic).
     if (!translation) {
       row = setStatus(db, row, "draft", { attempts: attemptsNow, translator_model: tr.model, translator_notes: "translate failed: empty translation", batch_id: batchId }, "pipeline", "translate failed: empty translation", batchId);
       return { ...base, outcome: "translate_failed", status: row.status, attempts: row.attempts, reason: "empty translation", review: lastReview, verify: null, usage };
     }
-    row = setStatus(db, row, "draft", { attempts: attemptsNow, translated_text: translation, translator_model: tr.model, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + notes, batch_id: batchId }, "pipeline", `translated (attempt ${attemptsNow})`, batchId);
+    row = setStatus(db, row, "draft", { attempts: attemptsNow, translated_text: translation, translator_model: tr.model, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + (keptTerms.length ? `[kept: ${keptTerms.join(", ")}] ` : "") + notes, batch_id: batchId }, "pipeline", `translated (attempt ${attemptsNow})`, batchId);
 
     // ── independent review ──
     const rv = await callClaudeJson(deps, {
       model: rModel,
       system: buildReviewerSystemPrompt(lang),
-      user: buildReviewerUserPrompt(platform, item, lang, translation),
+      user: buildReviewerUserPrompt(platform, item, lang, translation, keptTerms),
       maxTokens: 2048,
     });
     addUsage(usage, rv);
@@ -997,7 +1150,7 @@ export async function processTranslationItem(
 
     if (reviewAccepts(verdict)) {
       // ── deterministic verify ──
-      const vr = verifyTranslationDeterministic(item.text, translation, lang, { kind: item.kind, alreadyTargetLanguage: alreadyTarget, entityName: item.entity_name });
+      const vr = verifyTranslationDeterministic(item.text, translation, lang, { kind: item.kind, alreadyTargetLanguage: alreadyTarget, entityName: item.entity_name, keptTerms });
       if (vr.ok) {
         row = setStatus(db, row, "verified", { verify_json: JSON.stringify(vr), verified_at: nowIso(), reject_reason: null }, "pipeline", "verified", batchId);
         return { ...base, outcome: "verified", status: row.status, attempts: row.attempts, review: verdict, verify: vr, usage };
@@ -1084,6 +1237,182 @@ export function requeueTranslation(db: Database.Database, id: number, actor: str
   const row = getTranslationById(db, id);
   if (!row) return null;
   return setStatus(db, row, "draft", { attempts: 0, reject_reason: null, review_json: null, verify_json: null, published_at: null, verified_at: null, reviewed_at: null }, actor, "requeued", null);
+}
+
+// ─── Session lane: collect → translate+review OUTSIDE the app → submit ────
+//
+// Daniel's 2026-09-03 decision: translations are produced by the Claude Code
+// session (or a Cloud Routine session) itself, not by paid Anthropic API
+// calls from the app. The app keeps the store, the planner, the deterministic
+// verifier, the audit trail and the publish gate; the session does the
+// translation and an independent review (a fresh-context sub-agent) and hands
+// both back. Nothing here spends LLM budget, so the lane is NOT gated by
+// PROFILE_TRANSLATIONS_ENABLED — only by the admin key and the run lock.
+
+export interface CollectedItem {
+  id: number;
+  entity_type: string;
+  entity_id: string;
+  entity_name: string;
+  field: string;
+  kind: TranslationFieldKind;
+  lang: TranslationTargetLang;
+  source_text: string;
+  source_hash: string;
+  action: PlanDecision["action"];
+  attempts: number;
+  /** Previous review feedback when the row is being retried (REVISE). */
+  feedback: string | null;
+}
+
+export function kindForField(platform: TranslationPlatform, entityType: string, field: string): TranslationFieldKind {
+  const spec = PROFILE_TRANSLATION_FIELDS[platform].find((f) => f.entity_type === entityType && f.field === field);
+  return spec ? spec.kind : "prose";
+}
+
+/**
+ * Plan a batch exactly like the pipeline would, materialise the draft rows so
+ * every item has a stable id + source_hash, and return the source texts plus
+ * the same translator/reviewer instructions the LLM lane uses.
+ */
+export function collectForSession(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  langs: TranslationTargetLang[],
+  limit: number,
+  opts: { entityIds?: string[]; batchId: string; actor: string },
+): { items: CollectedItem[]; skipped: Record<string, number>; remaining_actionable: number; total_pairs: number; instructions: Record<string, { translator_system: string; reviewer_system: string }> } {
+  const plan = planTranslationBatch(db, platform, langs, limit, { entityIds: opts.entityIds });
+  const items: CollectedItem[] = [];
+  const tx = db.transaction(() => {
+    for (const p of plan.actionable) {
+      const row = upsertDraft(db, platform, p, opts.batchId);
+      let feedback: string | null = null;
+      if (row.review_json) {
+        try {
+          const v = parseReviewVerdict(JSON.parse(row.review_json));
+          if (v && v.verdict === "REVISE") feedback = feedbackFromReview(v);
+        } catch { /* ignore */ }
+      }
+      items.push({
+        id: row.id,
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        entity_name: row.entity_name || p.item.entity_name,
+        field: row.field,
+        kind: p.item.kind,
+        lang: p.lang,
+        source_text: row.source_text,
+        source_hash: row.source_hash,
+        action: p.decision.action,
+        attempts: row.attempts,
+        feedback,
+      });
+      audit(db, row.id, row.status, row.status, opts.actor, "collected (session lane)", opts.batchId);
+    }
+  });
+  tx();
+  const instructions: Record<string, { translator_system: string; reviewer_system: string }> = {};
+  for (const lang of langs) instructions[lang] = { translator_system: buildTranslatorSystemPrompt(lang), reviewer_system: buildReviewerSystemPrompt(lang) };
+  return { items, skipped: plan.skipped, remaining_actionable: plan.remaining_actionable, total_pairs: plan.total_pairs, instructions };
+}
+
+export interface SessionSubmission {
+  id: number;
+  source_hash?: string | null;
+  translated_text: string;
+  already_target_language?: boolean;
+  kept_terms?: string[];
+  notes?: string;
+  review: unknown;
+}
+
+export type SessionSubmitOutcome =
+  | "verified"
+  | "rejected_verify"
+  | "rejected_review"
+  | "revise"
+  | "review_failed"
+  | "translate_failed"
+  | "not_found"
+  | "wrong_platform"
+  | "skipped_status"
+  | "source_changed";
+
+export interface SessionSubmitResult {
+  id: number;
+  outcome: SessionSubmitOutcome;
+  status: TranslationStatus | null;
+  attempts: number;
+  reason?: string;
+  review?: ReviewVerdict | null;
+  verify?: VerifyResult | null;
+}
+
+/**
+ * Store one session-produced translation + its independent review verdict and
+ * run the deterministic verifier — the same status machine as the LLM lane
+ * (draft → reviewed → verified | rejected). Never publishes. A row that is not
+ * a draft, or whose source changed since it was collected, is left untouched.
+ */
+export function submitSessionTranslation(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  sub: SessionSubmission,
+  opts: { actor: string; batchId: string; translatorLabel?: string; reviewerLabel?: string },
+): SessionSubmitResult {
+  const translatorLabel = opts.translatorLabel || "claude-code-session";
+  const reviewerLabel = opts.reviewerLabel || "claude-code-session-review";
+  let row = getTranslationById(db, sub.id);
+  if (!row) return { id: sub.id, outcome: "not_found", status: null, attempts: 0 };
+  if (row.platform !== platform) return { id: sub.id, outcome: "wrong_platform", status: row.status, attempts: row.attempts };
+  if (row.status !== "draft") return { id: sub.id, outcome: "skipped_status", status: row.status, attempts: row.attempts, reason: `row is ${row.status}, only drafts accept a submission` };
+  if (sub.source_hash && sub.source_hash !== row.source_hash) {
+    return { id: sub.id, outcome: "source_changed", status: row.status, attempts: row.attempts, reason: "source_hash differs — re-collect" };
+  }
+  const translation = cleanSource(sub.translated_text);
+  if (!translation) return { id: sub.id, outcome: "translate_failed", status: row.status, attempts: row.attempts, reason: "empty translation" };
+
+  const alreadyTarget = sub.already_target_language === true;
+  const keptTerms = Array.isArray(sub.kept_terms) ? sub.kept_terms.map((t) => String(t).trim()).filter((t) => t && t.length <= 40).slice(0, 8) : [];
+  const notes = String(sub.notes ?? "").slice(0, 1000);
+  const attemptsNow = row.attempts + 1;
+  row = setStatus(
+    db,
+    row,
+    "draft",
+    { attempts: attemptsNow, translated_text: translation, translator_model: translatorLabel, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + (keptTerms.length ? `[kept: ${keptTerms.join(", ")}] ` : "") + notes, batch_id: opts.batchId, reject_reason: null },
+    opts.actor,
+    `translated by session (attempt ${attemptsNow})`,
+    opts.batchId,
+  );
+
+  const verdict = parseReviewVerdict(sub.review);
+  if (!verdict) {
+    row = setStatus(db, row, "draft", { reviewer_model: reviewerLabel, review_json: JSON.stringify({ error: "unparseable verdict" }) }, opts.actor, "review failed: unparseable verdict", opts.batchId);
+    return { id: row.id, outcome: "review_failed", status: row.status, attempts: row.attempts, reason: "unparseable review verdict", review: null };
+  }
+  row = setStatus(db, row, "reviewed", { reviewer_model: reviewerLabel, review_json: JSON.stringify(verdict), reviewed_at: nowIso() }, opts.actor, `reviewed: ${verdict.verdict} f${verdict.fidelity}/fl${verdict.fluency}`, opts.batchId);
+
+  if (reviewAccepts(verdict)) {
+    const kind = kindForField(platform, row.entity_type, row.field);
+    const vr = verifyTranslationDeterministic(row.source_text, translation, row.lang as TranslationTargetLang, { kind, alreadyTargetLanguage: alreadyTarget, entityName: row.entity_name, keptTerms });
+    if (vr.ok) {
+      row = setStatus(db, row, "verified", { verify_json: JSON.stringify(vr), verified_at: nowIso(), reject_reason: null }, opts.actor, "verified", opts.batchId);
+      return { id: row.id, outcome: "verified", status: row.status, attempts: row.attempts, review: verdict, verify: vr };
+    }
+    const reason = `deterministic verify failed: ${vr.failed.join(", ")}`;
+    row = setStatus(db, row, "rejected", { verify_json: JSON.stringify(vr), reject_reason: reason }, opts.actor, reason, opts.batchId);
+    return { id: row.id, outcome: "rejected_verify", status: row.status, attempts: row.attempts, reason, review: verdict, verify: vr };
+  }
+  if (verdict.verdict === "REVISE" && row.attempts < MAX_TRANSLATION_ATTEMPTS) {
+    // Stays a draft: the next /collect returns it with `feedback` for a second pass.
+    row = setStatus(db, row, "draft", {}, opts.actor, `revise requested: ${feedbackFromReview(verdict).slice(0, 300)}`, opts.batchId);
+    return { id: row.id, outcome: "revise", status: row.status, attempts: row.attempts, reason: feedbackFromReview(verdict), review: verdict };
+  }
+  const reason = `reviewer ${verdict.verdict} (fidelity ${verdict.fidelity}, fluency ${verdict.fluency}): ${verdict.summary || feedbackFromReview(verdict)}`.slice(0, 1000);
+  row = setStatus(db, row, "rejected", { reject_reason: reason }, opts.actor, reason, opts.batchId);
+  return { id: row.id, outcome: "rejected_review", status: row.status, attempts: row.attempts, reason, review: verdict };
 }
 
 export function translationStatusCounts(db: Database.Database, platform: TranslationPlatform): Record<string, Record<string, number>> {
