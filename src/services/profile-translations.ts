@@ -787,7 +787,9 @@ export function verifyTranslationDeterministic(
   // "/" separates alternatives ("Sogn og Fjordane/Vestland") — split on it too.
   const outTokens = out.split(/[\s/]+/).map(stripEdges).filter(Boolean);
   const srcFlat = " " + src.split(/[\s/]+/).flatMap((w) => w.split("-")).map(stripEdges).filter(Boolean).join(" ") + " ";
-  const entityNameFlat = " " + String(opts.entityName || "").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
+  // Entity names often write "og" as "&" ("Fossmoen Frukt & Cider"); normalise so the
+  // source's "Frukt og Cider" matches.
+  const entityNameFlat = " " + String(opts.entityName || "").replace(/&/g, " og ").split(/\s+/).map(stripEdges).filter(Boolean).join(" ") + " ";
   let namePhraseBudget = 2;
   const inNamePhrase = (i: number): boolean => {
     if (namePhraseBudget <= 0 || i < 1 || i >= outTokens.length - 1 || !NAME_PHRASE_WORDS.has(outTokens[i])) return false;

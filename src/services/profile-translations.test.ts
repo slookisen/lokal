@@ -210,6 +210,8 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
     ok(!si.ok && si.failed.includes("no_untranslated_norwegian"), "A24w sentence-initial capitalised head does not license the following word", si.failed);
     const sl = svc.verifyTranslationDeterministic("Bondens marked i Sogndal sentrum, Sogn og Fjordane/Vestland.", "Bondens marked (farmers' market) in Sogndal town centre, Sogn og Fjordane/Vestland.", "en");
     ok(sl.ok, "A24x county name followed by a slash alternative passes", sl.failed);
+    const amp = svc.verifyTranslationDeterministic("Fossmoen Frukt og Cider – Vi tapper naturen på flaske.", "Fossmoen Frukt og Cider – We bottle nature.", "en", { entityName: "Fossmoen Frukt & Cider — Bjerkreim" });
+    ok(amp.ok, "A24y entity name with & matches the source's og in a name phrase", amp.failed);
     const ipt3 = svc.verifyTranslationDeterministic("Vi har åpent på lørdager.", "We are open på lørdager (Saturdays).", "en", { keptTerms: ["på lørdager"] });
     ok(!ipt3.ok, "A24p a multi-word term made only of everyday words is not tolerated", ipt3.failed);
     eq(svc.decodeHtmlEntities("Noraker G&#229;rd &amp; S&#xF8;nner &ndash; &aring;pent"), "Noraker Gård & Sønner – åpent", "A24q HTML entities decoded");
