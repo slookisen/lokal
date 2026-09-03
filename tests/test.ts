@@ -31460,6 +31460,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorj.failures) failures.push("opplevelser-gardssalg-orgnr-review-judge: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-review-judge: ${gorj.passed} passed, ${gorj.failed} failed`);
 
+    // dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror:
+    // POST /admin/gardssalg-website-review-judge — LLM-judge tier for the
+    // website-discovery review queue's [0.90, 0.95) confidence band,
+    // mirroring RFB's shipped rfb-website-review-judge. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-website-review-judge: LLM-judge tier for the website review queue ──");
+    const { runOpplevelserGardssalgWebsiteReviewJudgeTests } = require("../src/routes/opplevelser-gardssalg-website-review-judge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-review-judge.test");
+    const gwrj = await runOpplevelserGardssalgWebsiteReviewJudgeTests({ log: false });
+    passed += gwrj.passed;
+    failed += gwrj.failed;
+    for (const f of gwrj.failures) failures.push("opplevelser-gardssalg-website-review-judge: " + f);
+    console.log(`  opplevelser-gardssalg-website-review-judge: ${gwrj.passed} passed, ${gwrj.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and

@@ -755,7 +755,7 @@ import {
 // shared LLM-judge contact gate for the gardssalg-autosvar-apply call site
 // (applyGardssalgProviderContact's own gate call lives inside
 // experience-store.ts and needs no separate import here).
-import { gateContactCandidates, classifyContactCandidateDefect } from "../services/contact-candidate-judge";
+import { gateContactCandidates, classifyContactCandidateDefect, judgeContactCandidate } from "../services/contact-candidate-judge";
 // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
 // LLM-judge tier for the org.nr review queue's mid-confidence rows (name+
 // place evidence, short of the exact-match auto-write bar). A SEPARATE
@@ -6171,6 +6171,274 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     written,
     rejected,
     ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
+  });
+});
+
+// ─── POST /admin/gardssalg-website-review-judge ─────────────────────────────
+//
+// dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror (the
+// route directly above, `gardssalg-website-review-approve`'s `auto: true`
+// mode, only ever drains this queue at its default `min_confidence: 1.0` —
+// the org_nr_found tier). The [0.90, 0.95) band below that bar — the
+// phone_found (0.95 is the FLOOR of the next tier up, so this route's own
+// ceiling is exclusive at 0.95), address_found (0.92), and name+place (0.90,
+// the v1 floor) confidence tiers assigned in the scan branch above (search
+// `hit.evidence.org_nr_found` above) — currently just sits `pending`
+// (reason = 'website_discovery_candidate') forever: not confident enough for
+// the deterministic auto-approve bar, but too costly to review by hand at
+// gårdssalg's own scale. This route adds an LLM-judge tier for EXACTLY that
+// band, mirroring RFB's shipped POST /admin/rfb-website-review-judge
+// (admin-rfb-website-discovery.ts) in shape/ordering (backstop -> synthetic
+// Norwegian source-context sentence built from the stored evidence flags,
+// since the raw fetched page text is never persisted -> LLM judge -> write
+// through the existing approve lever, never a second write path) AND this
+// SAME file's own gardssalg-orgnr-review-judge sibling (immediately above
+// the approve route it writes through, same guarded-UPDATE-with-changed-
+// rows-aware-reason helper pair, same fail-closed-per-row try/catch).
+//
+// Bookkeeping: this table (gardssalg_website_review_queue) has NO `status`
+// column — only `reason` (default 'website_discovery_candidate', see its
+// CREATE TABLE in database/init-experiences.ts). "Already judged" is
+// therefore recorded by OVERWRITING `reason`, guarded on the ORIGINAL value
+// (exactly like gardssalgOrgnrJudgeAppendReason below) so a row that changed
+// underneath this run (re-upserted by a concurrent discovery scan, or
+// resolved by a concurrent approve call) is never clobbered.
+//
+// On GODKJENN: writes through POST /admin/gardssalg-website-review-approve
+// in-process (callGardssalgAdminRouteInProcess) — the SAME guarded write
+// path (fill-only, lock guard, shared-host identity re-check, audit +
+// provenance, queue-entry clearing on success) every other adoption of this
+// queue already goes through. A write-time guard rejection on that inner
+// call (fill-only race, owner claim, shared-host conflict, …) is counted as
+// REJECTED here, never silently miscounted as an approval — see step 5 in
+// the per-row loop below.
+//
+// Explicitly out of scope (per the byggspec): part (iii) of the parent
+// dev-request (parking error rows — an unrelated table/mechanism); any
+// change to the >=1.0 auto-approve tier above or to the separate
+// experience_homepage_review_queue / Del B confidence===0.8 route (see that
+// route's own large doc comment nearby for why ITS threshold is likewise
+// fixed, not caller-supplied); a caller-supplied confidence-threshold
+// parameter here — deliberate, same reasoning: this queue's confidence scale
+// is not simply monotone across all tiers, so a caller-adjustable threshold
+// would be unsafe; wiring this route into any scheduled-agents/*.md charter
+// file (a separate, later slice).
+export const GARDSSALG_WD_JUDGE_MIN_CONFIDENCE = 0.9;
+export const GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
+
+interface GardssalgWdJudgeQueueRow {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string;
+}
+
+/** Mirrors rfbWdJudgeSourceContext (admin-rfb-website-discovery.ts): the
+ *  stored `evidence` column is JSON.stringify'd
+ *  ReturnType<typeof gardssalgWebsiteEvidenceMatch> (org_nr_found/
+ *  name_found/place_found/phone_found/address_found/postnr_found/
+ *  title_found/prefix_token_found/verified — see that function in
+ *  experience-store.ts). The raw fetched page text that satisfied those
+ *  flags is NEVER persisted on this row (confirmed by reading
+ *  upsertGardssalgWebsiteReviewQueue's INSERT column list above) — re-
+ *  fetching the candidate page here just to hand the judge raw text would
+ *  add a second live network round-trip to every judge run, so this
+ *  constructs a compact synthetic Norwegian context sentence from the
+ *  structured flags instead, same as the RFB sibling. Parses `evidence`
+ *  defensively — malformed/missing JSON means "no matched signals", never
+ *  throws. */
+function gardssalgWdJudgeSourceContext(row: {
+  final_url: string | null;
+  candidate_url: string;
+  evidence: string | null;
+  confidence: number | null;
+}): string {
+  const url = row.final_url || row.candidate_url;
+  let evidence: Partial<ReturnType<typeof gardssalgWebsiteEvidenceMatch>> = {};
+  try {
+    const parsed = JSON.parse(row.evidence || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) evidence = parsed;
+  } catch {
+    // malformed/missing evidence JSON -> treat as no matched signals; the
+    // judge still gets the URL and confidence, just no signal list.
+  }
+  const matched: string[] = [];
+  if (evidence.org_nr_found) matched.push("organisasjonsnummer");
+  if (evidence.name_found) matched.push("produsentnavn");
+  if (evidence.place_found) matched.push("sted/kommune");
+  if (evidence.phone_found) matched.push("telefonnummer");
+  if (evidence.address_found) matched.push("adresse");
+  if (evidence.postnr_found) matched.push("postnummer");
+  const matchedText = matched.length > 0 ? matched.join(", ") : "ingen strukturerte treff";
+  const confidenceText = typeof row.confidence === "number" ? row.confidence.toFixed(2) : "ukjent";
+  return (
+    `Automatisk nettside-oppdagelse for gårdssalg fant kandidat-URL-en ${url} og verifiserte følgende ` +
+    `eierskapssignaler på siden mot produsentens registrerte data: ${matchedText} ` +
+    `(evidensbasert konfidens: ${confidenceText}). Selve sidens rå tekstinnhold er ikke ` +
+    `lagret her — kun disse strukturerte treffene fra det opprinnelige sidebesøket.`
+  );
+}
+
+/** Mirrors gardssalgOrgnrJudgeAppendReason: guarded on the ORIGINAL reason so
+ *  a row that changed underneath this run is never clobbered. Returns the
+ *  number of rows the guarded UPDATE actually matched (0 or 1). */
+function gardssalgWdJudgeAppendReason(db: Database.Database, providerId: string, note: string): number {
+  const result = db.prepare(
+    `UPDATE gardssalg_website_review_queue SET reason = ?, updated_at = datetime('now') WHERE provider_id = ? AND reason = 'website_discovery_candidate'`,
+  ).run(note, providerId);
+  return result.changes;
+}
+
+/** Mirrors gardssalgOrgnrJudgeReportedReason: if the guarded UPDATE above
+ *  matched zero rows, the reported reason must say so honestly instead of
+ *  silently claiming the note landed. */
+function gardssalgWdJudgeReportedReason(note: string, changes: number): string {
+  return changes > 0 ? note : `${note} (queue row changed concurrently, note not persisted)`;
+}
+
+router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown };
+  let limit = GARDSSALG_AUTO_APPROVE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, GARDSSALG_AUTO_APPROVE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getExpDb("experiences");
+  const pending = db
+    .prepare(
+      `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason
+         FROM gardssalg_website_review_queue
+        WHERE reason = 'website_discovery_candidate'
+          AND confidence >= ? AND confidence < ?
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as GardssalgWdJudgeQueueRow[];
+
+  // Enrichment write-pause gate (same discipline as gardssalg-website-review-
+  // approve's own `apply` check, immediately above) — gated over the WHOLE
+  // selected batch before any write, so a paused vertical blocks the batch
+  // whole: zero writes, never a partially-applied one. This route has no
+  // dry-run mode (every GODKJENN writes), so the gate always runs here.
+  if (pending.length > 0) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ provider_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  for (const q of pending) {
+    // Cheap structural backstop first — cost control, same ordering
+    // contact-candidate-judge.ts's own gateContactCandidates uses: a
+    // structurally-defective candidate never spends an LLM call.
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    if (defect.defective) {
+      const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
+      const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      continue;
+    }
+
+    let verdict: { approved: boolean; reason?: string };
+    try {
+      verdict = await judgeContactCandidate({
+        fieldType: "website",
+        candidate: q.candidate_url,
+        sourceContext: gardssalgWdJudgeSourceContext(q),
+        businessName: q.provider_name || q.provider_id,
+      });
+    } catch (err: any) {
+      // judgeContactCandidate's own contract never throws, but this loop
+      // must fail-closed even if that contract is ever violated — never let
+      // one row's unexpected error crash the rest of the batch.
+      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+    }
+
+    if (!verdict.approved) {
+      const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
+      const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      continue;
+    }
+
+    // GODKJENN — reuse gardssalg-website-review-approve's FULL guarded write
+    // path in-process (fill-only, lock guard, shared-host identity re-check,
+    // audit/provenance, queue-entry clearing on success), never a second
+    // write path.
+    try {
+      const approveResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-review-approve", {
+        approvals: [{ provider_id: q.provider_id, url: q.candidate_url }],
+        apply: true,
+      });
+      const writtenList = Array.isArray(approveResp.body?.written) ? approveResp.body.written : [];
+      const wasWritten = writtenList.some((w: any) => w?.provider_id === q.provider_id);
+      if (wasWritten) {
+        approved++;
+        results.push({ provider_id: q.provider_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but a write-time guard on the approve
+        // route (fill-only race, owner claim, shared-host conflict, …) still
+        // blocked the write — never silently miscounted as an approval.
+        const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
+        const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
+        const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`;
+        const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+        rejected++;
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      }
+    } catch (err: any) {
+      // Never let one row's unexpected error crash the rest of the batch —
+      // fail THAT row closed, continue with the rest.
+      const note = `uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`;
+      let changes = 0;
+      try {
+        changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      } catch {
+        // best-effort — the row's reason may not update, but the outcome is
+        // still correctly counted/reported below (changes stays 0, so the
+        // reported reason honestly notes the write didn't land).
+      }
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM gardssalg_website_review_queue
+        WHERE reason = 'website_discovery_candidate' AND confidence >= ? AND confidence < ?`,
+    )
+    .get(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE) as { c: number };
+
+  res.json({
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
   });
 });
 
