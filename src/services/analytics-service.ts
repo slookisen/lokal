@@ -973,16 +973,19 @@ export class AnalyticsService {
    * Useful for privacy compliance and storage management
    */
   pruneOldData(olderThanDays: number): number {
+    // dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention:
+    // used to be a third copy of the raw DELETE against all three analytics
+    // tables (reachable via POST /admin/analytics/prune). Now delegates to
+    // runAutoPrune() so every prune path shares the same rollup-before-delete
+    // invariant. Returns the total rows actually deleted (page views only,
+    // until queries/agent_views get rollup tables).
     try {
-      const db = getDb();
-      const cutoff = sqliteDatetime(new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000));
-
-      const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
-      const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
-      const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
-
-      const total = (pvResult.changes || 0) + (qResult.changes || 0) + (avResult.changes || 0);
-      console.log(`[analytics] Pruned ${total} old records`);
+      const r = this.runAutoPrune({ daysToKeep: olderThanDays });
+      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews;
+      console.log(
+        `[analytics] Pruned ${total} old records (rollup-before-delete) ` +
+        `skippedPendingRollup=${JSON.stringify(r.skippedPendingRollup)}`
+      );
       return total;
     } catch (err) {
       console.error("[analytics] Failed to prune data:", err);
@@ -991,8 +994,9 @@ export class AnalyticsService {
   }
 
   /**
-   * PR-92: Structured prune helper used by the daily scheduled task and by
-   * the /admin/analytics/ops/prune route. Returns per-table delete counts
+   * PR-92: Structured prune helper used by the daily scheduled task, by
+   * the /admin/analytics/ops/prune route and by pruneOldData()
+   * (/admin/analytics/prune) — the single prune path for analytics tables. Returns per-table delete counts
    * plus the cutoff timestamp so callers can log usefully. The minimum of
    * 7 days mirrors the /ops/prune route guard (privacy/audit trail).
    *

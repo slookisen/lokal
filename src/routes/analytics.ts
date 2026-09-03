@@ -940,41 +940,41 @@ router.post("/ops/clear-cache", (_req: Request, res: Response) => {
 
 /**
  * POST /admin/analytics/ops/prune
- * Delete analytics data older than N days. Default: 30 days.
+ * Prune analytics data older than N days. Default: 30 days.
  * Use when: DB size is large, or analytics tables have too many rows.
  * Body: { daysToKeep?: number }
+ *
+ * dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention
+ * (FUNN rfb-analytics-ops-prune-route-samme-blodning-annen-sti): this route
+ * used to carry its own copy of the raw, unconditional
+ * `DELETE ... WHERE created_at < ?` against all three analytics tables —
+ * the exact history-destroying pattern lokal#782 removed from the nightly
+ * auto-prune tick, reachable via a different path. It now delegates to the
+ * same AnalyticsService.runAutoPrune(): analytics_page_views are rolled up
+ * into page_view_daily in the same transaction as the delete, and
+ * analytics_queries / analytics_agent_views are never deleted until their
+ * rollup tables exist (reported via skippedPendingRollup /
+ * wouldDeleteIfPruned). Response shape is a superset of the old one.
  */
 router.post("/ops/prune", (req: Request, res: Response) => {
   try {
     const db = getDb();
-    const daysToKeep = Math.max(7, parseInt(req.body.daysToKeep) || 30);
-    const cutoff = sqliteDatetime(new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000));
+    const daysToKeep = Math.max(7, parseInt(req.body?.daysToKeep) || 30);
 
-    const pvBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
-    const qBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
-    const avBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views").get() as any).c;
-
-    db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
-    db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
-    db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+    const result = analyticsService.runAutoPrune({ daysToKeep });
 
     const pvAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
     const qAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
     const avAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views").get() as any).c;
 
-    // Reclaim disk space
-    db.pragma("wal_checkpoint(TRUNCATE)");
-
     res.json({
       success: true,
       action: "prune",
-      daysKept: daysToKeep,
-      cutoff,
-      deleted: {
-        pageViews: pvBefore - pvAfter,
-        queries: qBefore - qAfter,
-        agentViews: avBefore - avAfter,
-      },
+      daysKept: result.daysKept,
+      cutoff: result.cutoff,
+      deleted: result.deleted,
+      skippedPendingRollup: result.skippedPendingRollup,
+      wouldDeleteIfPruned: result.wouldDeleteIfPruned,
       remaining: {
         pageViews: pvAfter,
         queries: qAfter,
