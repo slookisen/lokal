@@ -162,7 +162,15 @@ function withDefaultScheme(u: string): string {
 }
 
 // Extract registrable domain (e.g. "www.gard.no" → "gard.no")
-function hostnameFromUrl(u: string | null | undefined): string | null {
+//
+// Exported (dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email):
+// admin-rfb-contact-extraction.ts's backfill_from_contact_email mode needs
+// the EXACT SAME domain-coherence rule computeKvalitetsGate's
+// email_own_domain uses (exact/subdomain hostname equality) — not the
+// registrable-domain equality cross-source-validator.ts's
+// isAcceptableHomepageEmail/registrableDomain use, which can disagree on
+// multi-level TLDs. Reused, not reimplemented.
+export function hostnameFromUrl(u: string | null | undefined): string | null {
   if (!u) return null;
   try {
     const url = new URL(withDefaultScheme(u));
@@ -172,7 +180,7 @@ function hostnameFromUrl(u: string | null | undefined): string | null {
   }
 }
 
-function emailDomain(e: string | null | undefined): string | null {
+export function emailDomain(e: string | null | undefined): string | null {
   if (!e || !e.includes("@")) return null;
   return e.split("@")[1].toLowerCase();
 }
