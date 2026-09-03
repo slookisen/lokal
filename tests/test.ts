@@ -34063,13 +34063,51 @@ const _retentionRollupPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice1: nightly auto-prune
+// (AnalyticsService.runAutoPrune(), src/services/analytics-service.ts) now
+// routes analytics_page_views through rollupAndPrunePageViews()
+// (rollup-before-delete into page_view_daily) instead of a raw DELETE, and
+// no longer deletes analytics_queries / analytics_agent_views at all
+// (read-only COUNT(*) sizing only — skippedPendingRollup flags both as
+// pending future rollup coverage). Swaps the shared getDb() singleton (own
+// dedicated test file, in-memory prod-schema DB) — mirroring the
+// retention-rollup block above — so it must run strictly after every other
+// singleton-swapping block; _retentionRollupPromise is the current tail of
+// that serial chain.
+let _autoPruneRollupResolve: () => void = () => {};
+const _autoPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _autoPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_retentionRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice1: auto-prune rollup ──");
+  try {
+    const { runAutoPruneRollupTests } = require("../src/services/analytics-auto-prune-rollup.test") as
+      typeof import("../src/services/analytics-auto-prune-rollup.test");
+    const apr = await runAutoPruneRollupTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("auto-prune-rollup: " + f);
+    console.log(`  auto-prune-rollup: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("auto-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _autoPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
 // mirroring the already-shipped HCR_CONTENT_PATHS pattern in
 // routes/admin-knowledge.ts. Stubs globalThis.fetch — own dedicated test
 // file, no shared getDb() singleton — so it runs strictly after the last
-// singleton-swapping block (retention-rollup) purely to keep a single,
+// singleton-swapping block (auto-prune-rollup) purely to keep a single,
 // easy-to-follow serial ordering with the rest of this dev-request's tests,
 // not because of any actual shared-state dependency.
 let _pageEvidenceCrawlResolve: () => void = () => {};
@@ -34078,7 +34116,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_retentionRollupPromise]);
+  await Promise.allSettled([_autoPruneRollupPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
@@ -35402,7 +35440,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _tasksPruneAsyncPromise, _rfbDebioSuitePromise, _dispatchTickSuitePromise,
   _samtalerSeoPromise, _descriptionTruncationSweepPromise, _pwaSwPromise,
   _installPromptPromise, _brregCatalogSweepPromise, _brregDescriptionFallbackPromise,
-  _retentionRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
+  _retentionRollupPromise, _autoPruneRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
