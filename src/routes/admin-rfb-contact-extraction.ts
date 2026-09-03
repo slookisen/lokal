@@ -106,7 +106,17 @@ import {
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
-import { hostFromUrlLike } from "../services/cross-source-validator";
+import { hostFromUrlLike, FREE_MAIL_DOMAINS } from "../services/cross-source-validator";
+// dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email (mode
+// "backfill_from_contact_email", below): the domain-coherence rule to mirror
+// EXACTLY is lokal-agent-verifier.ts's computeKvalitetsGate email_own_domain
+// (exact/subdomain hostname equality) — NOT
+// cross-source-validator.ts's isAcceptableHomepageEmail/registrableDomain
+// (registrable-domain equality, which can disagree with the verifier's rule
+// on multi-level TLDs). hostnameFromUrl/emailDomain are the verifier's own
+// helpers, now exported specifically so this route can reuse them instead of
+// re-deriving similar-but-subtly-different logic.
+import { hostnameFromUrl as verifierHostnameFromUrl, emailDomain as verifierEmailDomain } from "../agents/lokal-agent-verifier";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
 // shared LLM-judge + deterministic-backstop contact gate (mirrors lokal#655's
 // marketplace.ts pattern; see contact-candidate-judge.ts's own doc comment).
@@ -249,6 +259,67 @@ function selectRfbCxTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): R
   return ids.map((id) => byId.get(id)).filter((r): r is RfbCxTargetRow => !!r);
 }
 
+// ─── mode: "backfill_from_contact_email" cohort ────────────────────────────
+//
+// dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email (option
+// A): 58+ rows carry a harvested, domain-coherent agents.contact_email (from
+// a much earlier live-website scrape) but a blank agent_knowledge.email — the
+// column BOTH funnel gates actually read. These rows are invisible to
+// RFB_CX_ELIGIBLE_WHERE above (contact_email is already non-blank so the
+// first clause excludes them, and they were never DNS-checked as dead so the
+// second clause doesn't match either). This is a pure re-classification/
+// backfill of an address ALREADY on file — no page fetch, no new scrape.
+//
+// Cohort requires field_provenance.contact_email_dns_check.live = 1
+// (explicitly DNS-confirmed alive) rather than merely "not flagged dead" —
+// a never-DNS-checked row (json_extract returns NULL, not 0) must NOT be
+// eligible, since an explicit-1 check is the only way to guarantee AC3
+// (liveness actually verified) with no live network call in this route.
+const RFB_CX_BACKFILL_ELIGIBLE_WHERE = `
+  AND TRIM(COALESCE(k.email,'')) = ''
+  AND TRIM(COALESCE(a.contact_email,'')) != ''
+  AND json_extract(k.field_provenance,'$.contact_email_dns_check.live') = 1
+`;
+
+function selectRfbCxBackfillTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
+  return db
+    .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .all(limit) as RfbCxTargetRow[];
+}
+
+function selectRfbCxBackfillTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): RfbCxTargetRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE} AND a.id IN (${placeholders})`)}`)
+    .all(...ids) as RfbCxTargetRow[];
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  return ids.map((id) => byId.get(id)).filter((r): r is RfbCxTargetRow => !!r);
+}
+
+// source_type for backfill-mode writes specifically — distinct from
+// RFB_CX_PROVENANCE_SOURCE_TYPE (fresh scrape) so these writes are
+// distinguishable in field_provenance.email as "copied from an
+// already-harvested agents.contact_email", per the dev-request's AC1.
+const RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE = "harvest_contact_email";
+
+// Domain-coherence check mirroring lokal-agent-verifier.ts's
+// computeKvalitetsGate email_own_domain EXACTLY: own-domain-or-subdomain
+// match against the website's host (either direction — subdomain email on a
+// bare-domain site, or vice versa), OR the email's domain is a known
+// free-mail/ISP provider.
+function backfillEmailOwnDomain(email: string, website: string): boolean {
+  const websiteHost = verifierHostnameFromUrl(website);
+  const eDom = verifierEmailDomain(email);
+  const emailMatchesSite = !!(
+    websiteHost &&
+    eDom &&
+    (eDom === websiteHost || eDom.endsWith("." + websiteHost) || websiteHost.endsWith("." + eDom))
+  );
+  const isFreeMail = !!(eDom && FREE_MAIL_DOMAINS.includes(eDom));
+  return emailMatchesSite || isFreeMail;
+}
+
 type ItemOutcome =
   | "written"
   | "no_contact_found"
@@ -259,7 +330,12 @@ type ItemOutcome =
   | "cooldown_skipped"
   | "fetch_failed"
   | "host_excluded"
-  | "not_found";
+  | "not_found"
+  // backfill_from_contact_email mode only (dev-request
+  // 2026-09-02-rfb-innhoestet-contact-email-uten-k-email): a.contact_email
+  // fails the domain-coherence check email_own_domain mirrors — neither an
+  // own-domain/subdomain match against k.website nor a FREE_MAIL_DOMAINS hit.
+  | "rejected_domain_mismatch";
 
 interface ResultItem {
   agent_id: string;
@@ -299,6 +375,20 @@ const RFB_CX_PROVENANCE_SOURCE_TYPE = "rfb_contact_extraction";
  * admin-agents-contact-email-write.ts's applyContactEmail exactly, including
  * the race-caught re-check (a row locked/curated between this batch's scan
  * and this row's write is left alone).
+ *
+ * The agents.contact_email UPDATE + its agent_knowledge_audit row are
+ * skipped when newEmail is byte-identical to the row's current
+ * contact_email (mirrors applyContactEmail's own skipped_unchanged
+ * convention) — genuinely a no-op in normal (scrape) mode, and BY
+ * CONSTRUCTION always the case in mode:"backfill_from_contact_email" (that
+ * mode copies an already-on-file agents.contact_email into
+ * agent_knowledge.email, so newEmail === cur.contact_email on every call).
+ * Skipping avoids fabricating an "X changed to X" row in an audit trail
+ * admin-agent-audit.ts documents as the Daniel-only view of real
+ * profile-update history. The fill-only agent_knowledge.email write below
+ * still runs regardless, and the caller-visible outcome stays "written"
+ * either way — this changes DB-level audit noise only, never the API
+ * response.
  */
 function applyRfbCxWrite(
   db: ReturnType<typeof getDb>,
@@ -306,6 +396,7 @@ function applyRfbCxWrite(
   newEmail: string,
   sourceUrl: string,
   batchId: string,
+  sourceType: string = RFB_CX_PROVENANCE_SOURCE_TYPE,
 ): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } {
   const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } => {
     const cur = db
@@ -328,12 +419,30 @@ function applyRfbCxWrite(
     if (cur.claimed_at) return { outcome: "skippedLocked", oldValue: cur.contact_email };
     if (isContactEmailCurated(cur.curated_fields)) return { outcome: "skippedCurated", oldValue: cur.contact_email };
 
-    db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newEmail, agentId);
-    db.prepare(
-      `INSERT INTO agent_knowledge_audit
-         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
-       VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
-    ).run(randomUUID(), agentId, cur.contact_email, newEmail, `rfb-contact-extraction ${sourceUrl} batch:${batchId}`);
+    // Genuinely-unchanged guard (mirrors admin-agents-contact-email-write.ts's
+    // skipped_unchanged convention): in the normal (scrape) mode newEmail is
+    // freshly discovered and this is almost always a real change, but in
+    // mode:"backfill_from_contact_email" newEmail is BY CONSTRUCTION identical
+    // to cur.contact_email (that mode's entire premise is copying an
+    // already-on-file address into agent_knowledge.email) — writing the SAME
+    // value back to agents.contact_email and inserting an
+    // agent_knowledge_audit row claiming it "changed" from X to X would
+    // fabricate audit noise on an endpoint admin-agent-audit.ts documents as
+    // the Daniel-only view of real profile-update history, and would break
+    // the dev-request's rollback contract (resetting k.email for
+    // provenance:harvest_contact_email rows must be sufficient — a spurious
+    // audit row is exactly the "something else" that wouldn't clean up).
+    // Skip ONLY the contact_email column write + its audit row; the
+    // fill-only agent_knowledge.email write below still runs, and the
+    // caller-visible outcome stays "written" either way.
+    if (newEmail !== cur.contact_email) {
+      db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newEmail, agentId);
+      db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
+      ).run(randomUUID(), agentId, cur.contact_email, newEmail, `rfb-contact-extraction ${sourceUrl} batch:${batchId}`);
+    }
 
     // agent_knowledge.email — FILL-ONLY (see header comment). A row already
     // carrying a non-empty value here keeps it untouched; only a genuinely
@@ -352,7 +461,7 @@ function applyRfbCxWrite(
         }
       }
       const mergedProv = mergeFieldProvenance(existingProv, {
-        email: [{ value: newEmail, source_type: RFB_CX_PROVENANCE_SOURCE_TYPE, source_url: sourceUrl, fetched_at: nowIso }],
+        email: [{ value: newEmail, source_type: sourceType, source_url: sourceUrl, fetched_at: nowIso }],
       });
       db.prepare(`UPDATE agent_knowledge SET email = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
         newEmail,
@@ -382,7 +491,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
   rfbCxRunning = true;
 
   try {
-    const body = (req.body ?? {}) as { limit?: unknown; agentIds?: unknown; apply?: unknown };
+    const body = (req.body ?? {}) as { limit?: unknown; agentIds?: unknown; apply?: unknown; mode?: unknown };
     const apply =
       body.apply === true ||
       body.apply === 1 ||
@@ -391,6 +500,13 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
       req.query?.apply === "1" ||
       req.query?.apply === "true";
     const dryRun = !apply;
+    // dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email
+    // (option A): mode:"backfill_from_contact_email" is a pure DB
+    // re-classification/backfill of an address ALREADY on file
+    // (agents.contact_email) — no page fetch, different cohort, different
+    // per-row checks (see the isBackfillMode branch below). Any other/absent
+    // mode value keeps today's normal scrape flow completely untouched.
+    const isBackfillMode = body.mode === "backfill_from_contact_email";
 
     const batchId = `rfb-contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
     const db = getDb();
@@ -406,7 +522,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         res.status(400).json({ error: `Too many agentIds (max ${RFB_CX_HARD_CAP} per call)` });
         return;
       }
-      targets = selectRfbCxTargetsByIds(db, ids);
+      targets = isBackfillMode ? selectRfbCxBackfillTargetsByIds(db, ids) : selectRfbCxTargetsByIds(db, ids);
       const foundIds = new Set(targets.map((t) => t.id));
       for (const id of ids) {
         if (!foundIds.has(id)) results.push({ agent_id: id, outcome: "not_found" });
@@ -416,7 +532,75 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_CX_DEFAULT_LIMIT,
         RFB_CX_HARD_CAP,
       );
-      targets = selectRfbCxTargets(db, limit);
+      targets = isBackfillMode ? selectRfbCxBackfillTargets(db, limit) : selectRfbCxTargets(db, limit);
+    }
+
+    if (isBackfillMode) {
+      // No page fetch — the email is already known from a.contact_email, so
+      // no rfbCxRowDelayMs pacing and no client-disconnect check either (both
+      // exist solely to be polite to third-party hosts / bail out of a
+      // long-running live-fetch loop; neither applies to a pure DB pass).
+      for (const t of targets) {
+        if (t.claimed_at) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "skippedLocked" });
+          continue;
+        }
+        if (isContactEmailCurated(t.curated_fields)) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "skippedCurated" });
+          continue;
+        }
+
+        const contactEmail = (t.contact_email || "").trim();
+        if (isPlatformOwnedEmailDomain(contactEmail)) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "rejected_platform_domain", email: contactEmail });
+          continue;
+        }
+        if (!isSyntacticallyValidEmail(contactEmail)) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "rejected_invalid_syntax", email: contactEmail });
+          continue;
+        }
+        if (!backfillEmailOwnDomain(contactEmail, t.website)) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "rejected_domain_mismatch", email: contactEmail });
+          continue;
+        }
+
+        if (dryRun) {
+          results.push({
+            agent_id: t.id, agent_name: t.name, outcome: "written",
+            email: contactEmail, source_url: t.website, old_value: t.contact_email,
+          });
+          continue;
+        }
+
+        // source_url = t.website (the producer's own site), per the
+        // dev-request's spec — NOT the (unrelated) location the address was
+        // originally scraped from.
+        const written = applyRfbCxWrite(db, t.id, contactEmail, t.website, batchId, RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE);
+        if (written.outcome === "written") {
+          results.push({
+            agent_id: t.id, agent_name: t.name, outcome: "written",
+            email: contactEmail, source_url: t.website, old_value: written.oldValue,
+          });
+        } else {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: written.outcome, old_value: written.oldValue });
+        }
+      }
+
+      const backfillCounts = results.reduce<Record<string, number>>((acc, r) => {
+        acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
+        return acc;
+      }, {});
+
+      res.json({
+        success: true,
+        dry_run: dryRun,
+        batch_id: batchId,
+        scanned: targets.length,
+        aborted_client_disconnect: false,
+        counts: backfillCounts,
+        results,
+      });
+      return;
     }
 
     let clientDisconnected = false;
