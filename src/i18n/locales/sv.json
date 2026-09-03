@@ -133,7 +133,15 @@
     "address": "Adress",
     "no_products": "Inga produkter registrerade ännu.",
     "back_to_search": "← Tillbaka till sökningen",
-    "see_all_in_city": "Se alla producenter i {city} →"
+    "see_all_in_city": "Se alla producenter i {city} →",
+    "map": "Karta",
+    "visit_website": "Besök webbplats",
+    "show_on_map": "Visa på karta",
+    "download_vcard": "Ladda ner kontaktkort",
+    "updated_prefix": "Profil uppdaterad:",
+    "badge_brreg": "Registrerad i Brønnøysund",
+    "badge_organic": "Ekologiskt",
+    "no_contact": "Ingen kontaktinfo tillgänglig ännu."
   },
   "common": {
     "see_profile": "Visa profil →",

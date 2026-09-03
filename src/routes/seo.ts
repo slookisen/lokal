@@ -29,7 +29,7 @@ import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription, stripInternalNotes } from "../services/description-quality";
+import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
 import {
@@ -45,6 +45,7 @@ import { getPublishedProfileTranslations } from "../services/profile-translation
 import {
   parseIsoOrSqlite,
   formatUpdatedPrettyNo,
+  formatUpdatedPretty,
   titleFreshnessSuffix,
   sitemapHintsForStatus,
   lastmodForDate,
@@ -121,17 +122,21 @@ const DAY_NAMES: Record<string, string> = {
 
 const MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Des"];
 
-const CATEGORY_MAP: Record<string, { name: string; emoji: string }> = {
-  vegetables: { name: "Gr\u00f8nnsaker", emoji: "&#127813;" },
-  fruit: { name: "Frukt", emoji: "&#127822;" },
-  berries: { name: "B\u00e6r", emoji: "&#127827;" },
-  dairy: { name: "Meieri", emoji: "&#129472;" },
-  eggs: { name: "Egg", emoji: "&#129370;" },
-  meat: { name: "Kj\u00f8tt", emoji: "&#129385;" },
-  fish: { name: "Fisk", emoji: "&#128031;" },
-  bread: { name: "Br\u00f8d", emoji: "&#127858;" },
-  honey: { name: "Honning", emoji: "&#127855;" },
-  herbs: { name: "Urter", emoji: "&#127807;" },
+// Daniel 2026-09-03 (screenshot): category chips read "Kjøtt / Grønnsaker /
+// Frukt" on /en. `name` stays the Norwegian label every existing caller
+// reads; `en`/`sv` are the display labels for the prefixed pages, reached
+// through catLabel(cat, lang) below.
+const CATEGORY_MAP: Record<string, { name: string; en: string; sv: string; emoji: string }> = {
+  vegetables: { name: "Gr\u00f8nnsaker", en: "Vegetables", sv: "Gr\u00f6nsaker", emoji: "&#127813;" },
+  fruit: { name: "Frukt", en: "Fruit", sv: "Frukt", emoji: "&#127822;" },
+  berries: { name: "B\u00e6r", en: "Berries", sv: "B\u00e4r", emoji: "&#127827;" },
+  dairy: { name: "Meieri", en: "Dairy", sv: "Mejeri", emoji: "&#129472;" },
+  eggs: { name: "Egg", en: "Eggs", sv: "\u00c4gg", emoji: "&#129370;" },
+  meat: { name: "Kj\u00f8tt", en: "Meat", sv: "K\u00f6tt", emoji: "&#129385;" },
+  fish: { name: "Fisk", en: "Fish", sv: "Fisk", emoji: "&#128031;" },
+  bread: { name: "Br\u00f8d", en: "Bread", sv: "Br\u00f6d", emoji: "&#127858;" },
+  honey: { name: "Honning", en: "Honey", sv: "Honung", emoji: "&#127855;" },
+  herbs: { name: "Urter", en: "Herbs", sv: "\u00d6rter", emoji: "&#127807;" },
 };
 
 // Badge-label-only translations for platform categories (search-enrich.ts
@@ -145,6 +150,25 @@ const CATEGORY_MAP: Record<string, { name: string; emoji: string }> = {
 const CATEGORY_BADGE_LABELS_ONLY: Record<string, string> = {
   bakery: "Bakeri", beverages: "Drikke", preserves: "Syltetøy", other: "Annet",
 };
+const CATEGORY_BADGE_LABELS_EN: Record<string, string> = {
+  bakery: "Bakery", beverages: "Beverages", preserves: "Preserves", other: "Other",
+};
+const CATEGORY_BADGE_LABELS_SV: Record<string, string> = {
+  bakery: "Bageri", beverages: "Dryck", preserves: "Sylt", other: "Annat",
+};
+
+/**
+ * Display label for a category key in the page's language. Norwegian is the
+ * existing formatCat() text (byte-identical); en/sv come from the maps above
+ * and fall back to the capitalised key so an unmapped key never renders as a
+ * raw slug in another language either.
+ */
+export function catLabel(cat: string, lang: Lang): string {
+  if (!cat) return "";
+  if (lang === "en") return CATEGORY_MAP[cat]?.en || CATEGORY_BADGE_LABELS_EN[cat] || cat.charAt(0).toUpperCase() + cat.slice(1);
+  if (lang === "sv") return CATEGORY_MAP[cat]?.sv || CATEGORY_BADGE_LABELS_SV[cat] || cat.charAt(0).toUpperCase() + cat.slice(1);
+  return formatCat(cat);
+}
 
 // ─── Salgskanal (sales-channel) category display + membership ───────────
 // dev-request 2026-07-06-rfb-salgskanal-kategorier, public-facing slice
@@ -290,8 +314,7 @@ export function formatCat(cat: string): string {
 // from structured fields (never formatCat()'s NB text). Do not reuse
 // formatCat for English pages.
 export function formatCatEn(cat: string): string {
-  if (!cat) return "";
-  return cat.charAt(0).toUpperCase() + cat.slice(1);
+  return catLabel(cat, "en");
 }
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
@@ -594,7 +617,7 @@ function cardLocationText(a: any, suffix: string = ""): string {
 function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): string {
   const cityText = cardLocationText(a);
   const slug = slugify(a.name);
-  const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
+  const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
   let desc = a.description || "";
   if (isJunkDescription(desc)) {
@@ -655,7 +678,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   const postal = knowledge?.postalCode ? ` ${escapeHtml(knowledge.postalCode)}` : "";
   const cityText = cardLocationText(a, postal);
   const slug = slugify(a.name);
-  const cats = (a.categories || []).slice(0, 5).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
+  const cats = (a.categories || []).slice(0, 5).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
 
   // Description: prefer knowledge.about, fall back to agent description. Cap at 350 chars.
@@ -738,7 +761,7 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
   const city = a.city || a.location?.city || "";
   const cityText = cardLocationText(a);
   const slug = slugify(a.name);
-  const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
+  const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
 
   // Description: keep existing truncation behavior (~180 chars)
@@ -1084,7 +1107,7 @@ router.get("/", (req: Request, res: Response) => {
     const categoryChips = Object.entries(CATEGORY_MAP)
       .map(([_key, val]) => {
         const count = categoryCounts[_key] || 0;
-        return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="chip">${val.emoji} ${escapeHtml(val.name)} (${count})</a>`;
+        return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="chip">${val.emoji} ${escapeHtml(catLabel(_key, lang))} (${count})</a>`;
       }).join("");
 
     const featuredCards = featured.map((a: any, i: number) => {
@@ -2434,7 +2457,7 @@ router.get("/reise", async (req: Request, res: Response) => {
   <div class="reise-along">${escapeHtml(en ? `after ${Math.round(s.alongKm)} km` : `etter ${Math.round(s.alongKm)} km`)}</div>
   <div class="reise-name"><a href="${escapeHtml(s.url)}">${escapeHtml(s.name)}</a></div>
   <div class="reise-detour">${detour}${s.place ? " · " + escapeHtml(s.place) : ""}</div>
-  ${s.categories.length ? `<div class="reise-cats">${escapeHtml(s.categories.map(formatCat).join(", "))}</div>` : ""}
+  ${s.categories.length ? `<div class="reise-cats">${escapeHtml(s.categories.map((c: string) => catLabel(c, lang)).join(", "))}</div>` : ""}
 </li>`;
     }).join("");
 
@@ -3990,18 +4013,25 @@ export function buildProducerAnswerFirstOpening(params: {
   cityName: string;
   productsList: any[];
   categories: string[];
+  /** Page language — Daniel 2026-09-03: this line rendered Norwegian on /en. */
+  lang?: Lang;
 }): string | null {
+  const lang: Lang = params.lang || "no";
   const productNames = (params.productsList || [])
     .map((p: any) => (typeof p === "string" ? p : p?.name))
     .filter(Boolean)
     .slice(0, 4);
-  const catLabels = (params.categories || []).map((c: string) => formatCat(c)).filter(Boolean).slice(0, 4);
+  const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 4);
   const sellItems = productNames.length ? productNames : catLabels;
 
   const hasSellItems = sellItems.length > 0;
   const hasCity = !!params.cityName;
   if ((hasSellItems ? 1 : 0) + (hasCity ? 1 : 0) < 2) return null;
 
+  if (lang === "en") {
+    const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
+    return `${params.name} in ${params.cityName} sells ${whatPartEn} — find contact details and order directly below.`;
+  }
   const whatPart = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " med mer" : "");
   return `${params.name} i ${params.cityName} selger ${whatPart} — finn kontaktinfo og bestill direkte under.`;
 }
@@ -4314,8 +4344,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // front of it must survive — so the note is stripped, not the field
     // (Daniel 2026-09-03, "Interne notater skal ikke vises"). A value that is
     // NOTHING but a note is already reported by isJunkDescription below.
-    const safeDescription = isJunkDescription(rawDescription) ? "" : stripInternalNotes(rawDescription);
-    const safeAbout = isJunkDescription(rawAbout) ? "" : stripInternalNotes(rawAbout);
+    const safeDescription = isJunkDescription(rawDescription) ? "" : normalizeProse(rawDescription);
+    const safeAbout = isJunkDescription(rawAbout) ? "" : normalizeProse(rawAbout);
     // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: on
     // /en and /sv, swap in the PUBLISHED, reviewed+verified translation of
     // each prose field when one exists. getPublishedProfileTranslations()
@@ -4516,10 +4546,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // if no contact fields are set. Maps search always falls back to
       // "<name>, <city>, Norge" even if address is missing.
       const umbContactItems: string[] = [];
-      if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
-      if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
-      if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
-      if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+      if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
+      if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
+      if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
+      if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
       if (k.address || isDisplayablePhone(k.phone) || k.email || k.website) {
         const umbMapsParts = [agent.name];
@@ -4527,7 +4557,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (cityName) umbMapsParts.push(cityName);
         umbMapsParts.push("Norge");
         const umbMapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(umbMapsParts.join(", "))}`;
-        umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${umbMapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+        umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${umbMapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
       }
       const umbContactHtml = umbContactItems.length
         ? `<div class="card"><div class="card-head"><span>&#128242;</span><h3>Kontakt</h3></div><div class="card-body">${umbContactItems.join("")}</div></div>`
@@ -4736,14 +4766,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // GET/POST /admin/agents/brreg-catalog-sweep backlog sweep) surfaces a
     // separate public badge. Distinct from `isVerified` (manual/legacy
     // verification) — an agent can have one, both, or neither.
-    if (agent.brregVerified) badges.push(`<span class="badge badge-v">&#10003; Registrert i Brønnøysund</span>`);
+    if (agent.brregVerified) badges.push(`<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.badge_brreg"))}</span>`);
     const certs = k.certifications || [];
-    if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; \u00d8kologisk</span>`);
-    (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(formatCat(c))}</span>`));
+    if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
+    (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
     // Contact items
     const contactItems: string[] = [];
-    if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
+    if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
     // ─── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
     // (work item 3): mailto:/tel: get a data-track-kind hook (beacon fired
     // by a delegated click listener at the bottom of this page — see the
@@ -4751,15 +4781,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // this platform's CSP/SES setup forbids inline handlers). The beacon
     // is fire-and-forget and never blocks navigation, so these links keep
     // working identically with JS disabled or if the beacon call fails.
-    if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
-    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}" data-track-kind="email">${escapeHtml(k.email)}</a></div></div></div>`);
+    if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
+    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}" data-track-kind="email">${escapeHtml(k.email)}</a></div></div></div>`);
     // Website now routes through the counting redirect (GET /ut/:agentId/website,
     // src/routes/contact-tracking.ts) instead of linking straight to
     // agent_knowledge.website. This works with JS fully disabled (it's a
     // plain server-side 302), and still carries the same default UTM tags
     // the direct link used to (resolveRedirectUrl applies addUtmParams for
     // the "website" kind specifically — see that file).
-    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="/ut/${encodeURIComponent(agent.id)}/website" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="/ut/${encodeURIComponent(agent.id)}/website" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
     // Google Maps link — ALWAYS search by business name, never raw coordinates.
     // Our lat/lng are often just city-center approximations, not actual business
@@ -4769,7 +4799,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (cityName) mapsSearchParts.push(cityName);
     mapsSearchParts.push("Norge");
     const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(mapsSearchParts.join(", "))}`;
-    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
 
     // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];
@@ -4813,7 +4843,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     const relatedHtml = related.map((a: any) => {
       const trust = Math.round((a.trustScore || 0) * 100);
-      const cats = (a.categories || []).slice(0, 2).map((c: string) => `<span class="tag" style="font-size:0.66rem;">${escapeHtml(formatCat(c))}</span>`).join("");
+      const cats = (a.categories || []).slice(0, 2).map((c: string) => `<span class="tag" style="font-size:0.66rem;">${escapeHtml(catLabel(c, lang))}</span>`).join("");
       return `<a href="${localizedPath("/produsent/" + slugify(a.name), lang)}" class="rel-card">
         <div class="rel-name">${escapeHtml(a.name)}</div>
         <div class="rel-meta">${escapeHtml(cityName)} · Trust ${trust}%</div>
@@ -5157,7 +5187,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Categories as additionalType
     if ((agent.categories || []).length) {
-      jsonLd.additionalType = (agent.categories as string[]).map((c: string) => formatCat(c)).join(", ");
+      jsonLd.additionalType = (agent.categories as string[]).map((c: string) => catLabel(c, lang)).join(", ");
     }
 
     // GEO: FAQPage JSON-LD — see buildProducerFaqJsonLd for the quality gate.
@@ -5186,6 +5216,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         cityName,
         productsList,
         categories: (agent.categories as string[]) || [],
+        lang,
       });
       if (!answerFirstOpening) {
         console.log(`[seo] /produsent/${slug}: answer-first opening skipped (insufficient real facts) — falling back to existing description block`);
@@ -5235,10 +5266,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       }
       if (primaryCategory) {
         const catRows = getRelatedBySameCategory(db, agent.id, primaryCategory, cityName || null, 5);
-        const catLabel = formatCat(primaryCategory).toLowerCase();
+        const catWord = catLabel(primaryCategory, lang).toLowerCase();
         const heading = lang === "en"
-          ? `Other ${catLabel} producers in Norway`
-          : `Andre ${catLabel}-produsenter i Norge`;
+          ? `Other ${catWord} producers in Norway`
+          : `Andre ${catWord}-produsenter i Norge`;
         relCategorySection = renderRelatedSection(catRows, heading, lang);
       }
     } catch (e) {
@@ -5305,10 +5336,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     <div class="pf-header">
       <div class="pf-hero">
         <div class="pf-badges">${badges.join("")}</div>
-        ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">Profil oppdatert: ${escapeHtml(formatUpdatedPrettyNo(updatedAtDate))}</time></p>` : ""}
+        ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">${escapeHtml(t(lang, "producer.updated_prefix"))} ${escapeHtml(formatUpdatedPretty(updatedAtDate, lang))}</time></p>` : ""}
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
-        ${answerFirstOpening ? `<p class="pf-answer"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(answerFirstOpening)}</p>` : ""}
+        ${answerFirstOpening ? `<p class="pf-answer">${escapeHtml(answerFirstOpening)}</p>` : ""}
         ${(() => {
           const desc = displayDescription;
           const about = displayAbout;
@@ -5347,9 +5378,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
         <div class="ct-actions">
-          ${k.website ? `<a href="/ut/${encodeURIComponent(agent.id)}/website" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
-          <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
-          <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; Last ned kontaktkort</a>
+          ${k.website ? `<a href="/ut/${encodeURIComponent(agent.id)}/website" class="btn-p" target="_blank" rel="noopener">&#127760; ${escapeHtml(t(lang, "producer.visit_website"))}</a>` : ""}
+          <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; ${escapeHtml(t(lang, "producer.show_on_map"))}</a>
+          <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; ${escapeHtml(t(lang, "producer.download_vcard"))}</a>
         </div>
       </div>
     </div>

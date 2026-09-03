@@ -8516,9 +8516,17 @@ console.log("\n── PR-30: source-presence checks on seo.ts ──");
     seoSrc.includes('class="profile-meta"'),
     "pr30: seo.ts emits .profile-meta paragraph for the freshness badge"
   );
+  // 2026-09-03 engelsk ramme: the label moved from a literal into the
+  // dictionary (producer.updated_prefix) so /en can say "Profile updated:".
+  // Same intent as before — the Norwegian label still ships — checked at
+  // both ends: seo.ts reads the key, and no.json carries the exact text.
   assertTrue(
-    seoSrc.includes('Profil oppdatert:'),
-    "pr30: seo.ts emits 'Profil oppdatert:' label"
+    seoSrc.includes('t(lang, "producer.updated_prefix")'),
+    "pr30: seo.ts emits the freshness label through producer.updated_prefix"
+  );
+  assertTrue(
+    require("../src/i18n/locales/no.json").producer?.updated_prefix === "Profil oppdatert:",
+    "pr30: no.json carries the 'Profil oppdatert:' label"
   );
   assertTrue(
     seoSrc.includes('class="updated-at"'),
@@ -41044,6 +41052,22 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("content-quality: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03 (skjermbilder): kategorier, kontaktkort, fallback-setning,
+// dato og skrapte HTML-entiteter på /en — rfb-en-chrome (rene funksjoner).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 engelsk ramme på rfb: rfb-en-chrome ──");
+  try {
+    const { runRfbEnChromeTests } = require("../src/routes/rfb-en-chrome.test") as typeof import("../src/routes/rfb-en-chrome.test");
+    const ec = runRfbEnChromeTests({ log: false });
+    passed += ec.passed; failed += ec.failed;
+    for (const f of ec.failures) failures.push("rfb-en-chrome: " + f);
+    console.log(`  rfb-en-chrome: ${ec.passed} passed, ${ec.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-en-chrome: unexpected error: " + String(err?.message || err));
   }
 });
 
