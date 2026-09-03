@@ -9468,7 +9468,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // Test 2.12: producer card order — affiliations card sits between Produkter and Sesongkalender
   // so that the most-likely-clicked sections (products, affiliations) come before secondary info
-  const prodCardOrderMatch = seoSrc.match(/Produkter \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
+  // 2026-09-03 produkt-ordliste: the heading reads producer.products from the
+  // dictionary ("Produkter"/"Products") — same card order is asserted, the
+  // anchor is the new heading form.
+  const prodCardOrderMatch = seoSrc.match(/t\(lang, "producer\.products"\)\)\} \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
   assertTrue(
     !!prodCardOrderMatch,
     "phase5.11-a2: producer affiliations card sits between Produkter and Sesongkalender"
@@ -41015,6 +41018,21 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-en-chrome: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — product-glossary.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 produkt-ordliste: product-glossary ──");
+  try {
+    const { runProductGlossaryTests } = require("../src/i18n/product-glossary.test") as typeof import("../src/i18n/product-glossary.test");
+    const pg = runProductGlossaryTests({ log: false });
+    passed += pg.passed; failed += pg.failed;
+    for (const f of pg.failures) failures.push("product-glossary: " + f);
+    console.log(`  product-glossary: ${pg.passed} passed, ${pg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-glossary: unexpected error: " + String(err?.message || err));
   }
 });
 
