@@ -391,6 +391,47 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
         content_source: null, homepage_unreachable_since: null,
       });
 
+      // ── (q) merged_into read-path filter regression (dev-request
+      // 2026-09-03-gardssalg-merged-provider-read-path-filter, bug fix) ──────
+      // q1: a fourth "Kinn Bryggeri" row that WOULD join the existing (d)
+      // name_exact group on its own merits, but has been folded away via
+      // POST /admin/gardssalg-provider-dedup-merge (merged_into set) — must
+      // never be counted into that group; the group must stay exactly the
+      // same 3 rows it was before this fixture existed.
+      insertProvider.run({
+        id: "prov-kinn-merged", navn: "Kinn Bryggeri", org_nr: null, postnummer: "6900",
+        rfb_seed_source: null, producer_type: "bryggeri",
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-kinn-a' WHERE id = 'prov-kinn-merged'`).run();
+      // q2: a pair that would otherwise form its OWN org_nr-signal group
+      // (same padding-trick as the (e) org_nr-only fixtures above, since
+      // org_nr has a UNIQUE raw-column constraint), but BOTH sides are
+      // merged away into the same (external, not itself a row here) survivor
+      // — from a batch like nace-agent-bridge-20260828's. With both sides
+      // excluded from the scan entirely, no pair is ever formed, so this
+      // "group" must not appear in the output AT ALL (not even as a
+      // zero/one-row remnant).
+      insertProvider.run({
+        id: "prov-nace-merged-a", navn: "Nace Bru Utsalg AS", org_nr: "950111222", postnummer: null,
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      insertProvider.run({
+        id: "prov-nace-merged-b", navn: "Nace Bru Produkter AS", org_nr: " 950111222 ", postnummer: null,
+        rfb_seed_source: null, producer_type: "gardssalg",
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      expDb
+        .prepare(
+          `UPDATE experience_providers SET merged_into = 'prov-nace-merged-survivor'
+             WHERE id IN ('prov-nace-merged-a', 'prov-nace-merged-b')`,
+        )
+        .run();
+
       const opplevelserModule = require("./opplevelser") as typeof import("./opplevelser");
       const opplevelserRouter = opplevelserModule.default as any;
 
@@ -556,7 +597,7 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
         !!kinn && kinn.rows.some((r: any) => r.id === "prov-kinn-b"),
         "d2: Kinn Bryggeri groups WITH the second Kinn Bryggeri row",
       );
-      assertEq(kinn?.rows.length, 3, "d3: Kinn Bryggeri group has exactly 3 rows (bare x2 + AS-suffixed; the test-gardssalg homonym is excluded)");
+      assertEq(kinn?.rows.length, 3, "d3: Kinn Bryggeri group has exactly 3 rows (bare x2 + AS-suffixed; the test-gardssalg homonym AND the merged-away prov-kinn-merged are excluded)");
       assertTrue(!!kinn && kinn.signals.includes("name_exact"), "d4: Kinn Bryggeri group's signals include name_exact");
       assertEq(kinn?.confidence, "high", "d5: Kinn Bryggeri group is HIGH confidence (exact name match)");
       assertEq(kinn?.confidence_signals, ["name_exact"], "d6: Kinn Bryggeri group's confidence_signals is exactly [\"name_exact\"]");
@@ -565,6 +606,28 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
       assertTrue(
         !!kinn && kinn.rows.some((r: any) => r.id === "prov-kinn-c"),
         "d9: acceptance #3 — \"Kinn Bryggeri AS\" lands in the SAME group as the bare rows (normaliseNamePruned's existing as/asa/da/ans/sa stripping already covers this; regression-proofed here now that 'high' requires an identity-bearing signal)",
+      );
+
+      // ── (q) merged_into read-path filter regression (dev-request
+      // 2026-09-03-gardssalg-merged-provider-read-path-filter, bug fix) ──────
+      assertTrue(
+        !!kinn && !kinn.rows.some((r: any) => r.id === "prov-kinn-merged"),
+        "q1: merged-away prov-kinn-merged does NOT appear in the Kinn Bryggeri group despite otherwise matching name_exact",
+      );
+      assertTrue(
+        !groupContaining("prov-kinn-merged"),
+        "q2: merged-away prov-kinn-merged appears in NO group at all",
+      );
+      // With both sides of the would-be org_nr-signal pair merged away, no
+      // pair is ever formed — the "group" disappears from the output
+      // entirely, not just one of its two rows.
+      assertTrue(
+        !groupContaining("prov-nace-merged-a"),
+        "q3: a group whose members are ALL merged away (nace-agent-bridge-20260828 shape) does not appear in the output at all",
+      );
+      assertTrue(
+        !groupContaining("prov-nace-merged-b"),
+        "q4: same group, other side — also absent",
       );
 
       // ── (e) org_nr-only signal ───────────────────────────────────────────
