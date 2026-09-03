@@ -435,7 +435,8 @@ export async function classifyGardssalgProducerWebsite(
       adresse: producer.adresse,
       postnummer: producer.postnummer,
     },
-    fetched.title
+    fetched.title,
+    host
   );
 
   // Strict boolean comparison (never a bare `if (evidence.verified)` /
@@ -529,7 +530,8 @@ async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
       adresse: producer.adresse,
       postnummer: producer.postnummer,
     },
-    fetched.title
+    fetched.title,
+    host
   );
 
   // Strict boolean comparison — same discipline classifyGardssalgProducer
