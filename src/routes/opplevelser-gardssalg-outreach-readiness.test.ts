@@ -62,6 +62,12 @@
  *   (d) a non-gårdssalg provider (no producer_type, not rfb-seed) is
  *       excluded, same scoping as the sibling contact-coverage report
  *   (e) zero-provider edge case
+ *
+ * Extended for dev-request 2026-09-03-gardssalg-merged-provider-read-path-
+ * filter (bug fix): a row folded away by POST /admin/gardssalg-provider-
+ * dedup-merge (merged_into set) is excluded from the readiness output
+ * entirely, even when every other field would otherwise tier it
+ * outreach_ready — see the prov-merged fixture and its "g1" assertion below.
  */
 
 export interface TestSummary {
@@ -369,6 +375,27 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         brreg_verified: 1,
       });
 
+      // Bug-fix regression fixture (dev-request 2026-09-03-gardssalg-merged-
+      // provider-read-path-filter): a row that is otherwise a byte-for-byte
+      // clone of prov-ready (every field that would tier it outreach_ready
+      // on its own merits) but has been folded away via
+      // POST /admin/gardssalg-provider-dedup-merge — merged_into points at
+      // prov-ready as the survivor. This is the "provider 046d8d21" prod
+      // shape: a merged row that keeps showing up in readiness output
+      // because nothing filters on merged_into. Set via a raw UPDATE since
+      // insertProvider's own column list (above) deliberately mirrors every
+      // OTHER fixture's insert shape unchanged.
+      insertProvider.run({
+        id: "prov-merged", navn: "Sammenslått Gård AS", org_nr: "121121121", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@sammenslatt.no", telefon: null, hjemmeside: "https://sammenslatt.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider, cider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "sammenslatt-gard-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+      });
+      expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-ready' WHERE id = 'prov-merged'`).run();
+
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) auth gate ────────────────────────────────────────────────────
@@ -402,7 +429,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       const byId = (id: string) =>
         (ok.body.providers as any[]).find((r) => r.name === NAME_BY_FIXTURE_ID[id]);
 
-      assertEq(ok.body.providers.length, 11, "d1: total providers is 11 (non-gårdssalg row excluded)");
+      assertEq(ok.body.providers.length, 11, "d1: total providers is 11 (non-gårdssalg row excluded, and merged-away prov-merged is ALSO excluded despite otherwise qualifying outreach_ready)");
 
       const ready = byId("prov-ready");
       assertTrue(!!ready, "b3: outreach_ready fixture present");
@@ -501,6 +528,17 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertTrue(
         !(ok.body.providers as any[]).some((r) => r.name === "Ikke Gårdssalg AS"),
         "d2: non-gårdssalg provider excluded from providers list",
+      );
+
+      // ── merged_into read-path filter regression (dev-request 2026-09-03-
+      // gardssalg-merged-provider-read-path-filter) ────────────────────────
+      // prov-merged is a byte-for-byte outreach_ready-shaped fixture (same
+      // shape as prov-ready) whose ONLY difference is merged_into being set
+      // — it must never appear in the readiness output at all, regardless of
+      // how content-complete/searchable/verified it otherwise looks.
+      assertTrue(
+        !(ok.body.providers as any[]).some((r) => r.name === "Sammenslått Gård AS"),
+        "g1: merged-away provider (merged_into set) is excluded from providers list despite otherwise qualifying outreach_ready",
       );
 
       // ── (c) summary ──────────────────────────────────────────────────────

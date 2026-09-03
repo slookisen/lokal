@@ -14395,6 +14395,44 @@ export function computeGardssalgReadinessTier(input: {
   return "outreach_ready";
 }
 
+// Shared exclusion predicate for `experience_providers.merged_into` (bug
+// fix, dev-request-driven: POST /admin/gardssalg-provider-dedup-merge stamps
+// merged_into on the row it folds away, but NO read path was ever filtering
+// on it — see merged_into's own doc comment in database/init-experiences.ts,
+// "a future consumer is responsible for filtering merged_into IS NULL").
+// ONE reusable SQL fragment, wired into every gårdssalg read path instead of
+// five separately-maintained copies of the same condition:
+//   - computeGardssalgReadinessRows' own base query, below (which in turn
+//     covers GET .../gardssalg-outreach-readiness, GET .../gardssalg-
+//     outreach-candidates, and GET .../gardssalg-outreach-daily-prep — all
+//     three call this one function, never a per-route copy);
+//   - GET .../gardssalg-provider-dedup-audit's own scope-WHERE, further
+//     below in this file.
+// POST .../gardssalg-outreach-preflight does NOT use this fragment directly
+// — a merged id must be rejected with its OWN explicit reason (not folded
+// into the generic "ikke_funnet" bucket a row simply missing from the
+// readiness rows would get), so computeGardssalgOutreachPreflight instead
+// calls getGardssalgMergedIntoId() (below) for exactly the ids that
+// computeGardssalgReadinessRows' own merged_into filtering left out.
+// Deliberately does NOT touch agents.merged_into (RFB directory's own,
+// unrelated dedup marker — see that column's own doc comment) or the merge
+// endpoint itself — pure read-side filtering, no data writes.
+const GARDSSALG_NOT_MERGED_WHERE = "merged_into IS NULL";
+
+// See GARDSSALG_NOT_MERGED_WHERE above — the single-id counterpart used by
+// computeGardssalgOutreachPreflight to give a merged provider id its own
+// explicit rejection reason (naming merged_into) instead of the generic
+// "ikke_funnet" a row absent from computeGardssalgReadinessRows' output
+// would otherwise report. Returns the survivor id (merged_into's value) when
+// the row exists and is merged-away, null when the row doesn't exist or is
+// not merged.
+function getGardssalgMergedIntoId(expDb: Database.Database, providerId: string): string | null {
+  const row = expDb
+    .prepare("SELECT merged_into FROM experience_providers WHERE id = ?")
+    .get(providerId) as { merged_into: string | null } | undefined;
+  return row?.merged_into ?? null;
+}
+
 // Extracted for dev-request
 // 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 5 (the
 // outreach pre-flight gate): the per-row readiness computation used to live
@@ -14408,6 +14446,9 @@ export function computeGardssalgReadinessTier(input: {
 // a few hundred lines below). The conflict scan itself is ALWAYS run
 // unfiltered (full corpus) regardless of providerIds — duplicate-conflict
 // detection needs the whole picture, only the returned rows are filtered.
+// Rows with merged_into set (folded away by POST .../gardssalg-provider-
+// dedup-merge) are excluded from the base query below (GARDSSALG_NOT_MERGED_
+// WHERE) — never surfaced by ANY caller of this function.
 function computeGardssalgReadinessRows(
   expDb: Database.Database,
   providerIds?: string[],
@@ -14490,7 +14531,8 @@ function computeGardssalgReadinessRows(
                 content_source, booking_live, catalog_hidden, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status
            FROM experience_providers
-          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND ${GARDSSALG_NOT_MERGED_WHERE}`;
   const params: string[] = [];
   if (providerIds && providerIds.length > 0) {
     const placeholders = providerIds.map(() => "?").join(", ");
@@ -15336,6 +15378,17 @@ export function computeGardssalgOutreachPreflight(
     orderedIds.map((id) => {
       const row = byId.get(id);
       if (!row) {
+        // A requested id absent from computeGardssalgReadinessRows' output is
+        // EITHER genuinely unknown OR a row that WAS merged away by
+        // POST /admin/gardssalg-provider-dedup-merge (that function's own
+        // base query excludes merged_into IS NOT NULL rows entirely — see
+        // GARDSSALG_NOT_MERGED_WHERE). Distinguish the two: a merged id gets
+        // its own explicit reason naming merged_into, never folded into the
+        // generic "ikke_funnet" bucket a truly-unknown id gets.
+        const mergedIntoId = getGardssalgMergedIntoId(expDb, id);
+        if (mergedIntoId) {
+          return { provider_id: id, name: null, go: false, reason: `merged_into:${mergedIntoId}` };
+        }
         return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
       }
       if (row.readiness_tier === "outreach_ready") {
@@ -19893,12 +19946,18 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
         // (producer_type set OR seeded via rfb-seed), minus the hidden
         // booking-flyt-v1 synthetic test provider (excluded the same way
         // gardssalgSharedHostCounts() excludes it above) — a fixed test row
-        // must never surface as a "duplicate candidate".
+        // must never surface as a "duplicate candidate" — and minus rows
+        // already folded away by POST /admin/gardssalg-provider-dedup-merge
+        // (GARDSSALG_NOT_MERGED_WHERE, above) — a merged row must never be
+        // counted into a dedup-audit group again, and a group left with zero
+        // surviving (unmerged) rows simply disappears from the output as a
+        // consequence of never being unioned together in the first place.
         `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
                 rfb_seed_source, producer_type, content_source, homepage_unreachable_since
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+            AND ${GARDSSALG_NOT_MERGED_WHERE}`
       )
       .all() as GsDedupRow[];
   } catch (err) {
