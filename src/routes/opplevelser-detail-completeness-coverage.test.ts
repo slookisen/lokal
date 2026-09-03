@@ -26,6 +26,11 @@
  *       booking_url + phone + website all present — proves the report
  *       follows the publish gate, not raw field presence over the whole table
  *   (d) zero-published-row edge case
+ *   (with_description, dev-request 2026-09-02-experiences-laas-todeling-
+ *    fyll-tomme-felt-publiserte-rader, Part C): additive count+pct field over
+ *    the same PUBLISH_GATE_SQL set — a row counts when description is
+ *    non-blank AND not junk (isJunkDescription); folded into the (b)/(d)
+ *    fixtures above rather than a separate block.
  */
 
 export interface TestSummary {
@@ -138,13 +143,17 @@ export function runOpplevelserDetailCompletenessCoverageTests(
         brreg_verified: 1, brreg_active: 1, verification_status: "verified",
       });
 
-      // R1: booking_url + phone + website all present.
+      // R1: booking_url + phone + website all present. Also carries the ONE
+      // genuine (non-blank, non-junk) description in this fixture — used by
+      // the with_description assertions below (Part C, dev-request
+      // 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader).
       expStore.createExperience({
         title: "Full opplevelse", provider_id: providerA, provider_match_status: "matched",
         verification_status: "verified", confidence: "high",
         booking_url: "https://a.no/book",
+        description: "En rolig fottur til utsiktspunktet med lokal guide og kaffepause underveis.",
       });
-      // R2: booking_url + phone, no website.
+      // R2: booking_url + phone, no website. description left BLANK.
       expStore.createExperience({
         title: "Booking og telefon", provider_id: providerB, provider_match_status: "matched",
         verification_status: "verified", confidence: "medium",
@@ -163,11 +172,14 @@ export function runOpplevelserDetailCompletenessCoverageTests(
         verification_status: "verified", confidence: "high",
       });
       // R5: whitespace-only booking_url/phone, empty-string website — must
-      // all be treated as absent (trimmed presence check).
+      // all be treated as absent (trimmed presence check). description is
+      // JUNK (skip-link boilerplate, isJunkDescription rule 1) — must NOT
+      // count toward with_description even though it's non-blank.
       expStore.createExperience({
         title: "Blanke felt", provider_id: providerE, provider_match_status: "matched",
         verification_status: "verified", confidence: "high",
         booking_url: "   ",
+        description: "Hopp til innhold. Meny. Kontakt. Facebook.",
       });
 
       // ── (c) NOT-published rows — each has ALL three fields present, to
@@ -230,6 +242,13 @@ export function runOpplevelserDetailCompletenessCoverageTests(
       assertEq(ok.body.with_website?.count, 1, "b7: with_website.count is 1 (R1 only — R5's empty string excluded)");
       assertEq(ok.body.with_website?.pct, 20, "b8: with_website.pct is 20 (1/5)");
 
+      // with_description (Part C, dev-request 2026-09-02-experiences-laas-
+      // todeling-fyll-tomme-felt-publiserte-rader): 1 genuine description
+      // (R1), 1 blank (R2/R3/R4 — no description set), 1 junk (R5, skip-link
+      // boilerplate) — only R1 counts.
+      assertEq(ok.body.with_description?.count, 1, "b10: with_description.count is 1 (R1 only — R2-R4 blank, R5 junk)");
+      assertEq(ok.body.with_description?.pct, 20, "b11: with_description.pct is 20 (1/5)");
+
       // No raw PII leak beyond aggregate counts — same privacy posture as
       // gardssalg-contact-coverage (booleans/counts only, no raw values).
       const serialized = JSON.stringify(ok.body);
@@ -245,6 +264,7 @@ export function runOpplevelserDetailCompletenessCoverageTests(
       assertEq(empty.body.with_booking_url, { count: 0, pct: 0 }, "d3: with_booking_url is {count:0, pct:0}, no divide-by-zero crash");
       assertEq(empty.body.with_phone, { count: 0, pct: 0 }, "d4: with_phone is {count:0, pct:0}");
       assertEq(empty.body.with_website, { count: 0, pct: 0 }, "d5: with_website is {count:0, pct:0}");
+      assertEq(empty.body.with_description, { count: 0, pct: 0 }, "d6: with_description is {count:0, pct:0}");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-detail-completeness-coverage: unexpected error: " + String(err?.stack || err?.message || err));

@@ -40,6 +40,14 @@ import {
   getProviderContentTarget,
   getExperiencesForProvider,
   applyExperienceContent,
+  // dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+  // publiserte-rader — the route's own candidate-gating loops below reuse
+  // this SAME predicate applyExperienceContent's internal gate uses, rather
+  // than re-deriving "is this row owner-locked" inline (the pre-split code
+  // duplicated `verification_status === 'verified' || content_source ===
+  // 'manual' || content_source === 'claim'` here, which is exactly the kind
+  // of copy this dev-request's "one function, no copies" rule closes).
+  isExperienceOwnerLocked,
   harvestProvenanceOf,
   markProviderEnriched,
   markProviderContentAttempted,
@@ -343,10 +351,15 @@ import {
   // dev-request 2026-08-25-experiences-pris-ferskhet — price_from is written
   // once (harvest/content-refresh fill-if-blank) and never re-checked; this
   // sweep re-fetches a row's price provenance page and re-runs
-  // extractPriceFrom against it. isExperienceContentLocked is the SAME LOCK
-  // MODEL predicate applyExperienceContent/selectProvidersForContentRefresh
-  // already enforce, reused here rather than re-derived (acceptance
-  // criterion 4: locked/verified fields are never touched).
+  // extractPriceFrom against it. This sweep OVERWRITES an existing price in
+  // place, so it deliberately keeps the FULL lock (owner-or-published) —
+  // isExperienceContentLocked — rather than the owner-lock-only predicate
+  // applyExperienceContent/selectProvidersForContentRefresh now use (dev-
+  // request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-
+  // rader split the two): "published = fill-blank-only" means a published
+  // row's already-set price must never be overwritten here (acceptance
+  // criterion 4: locked/verified fields are never touched). See that
+  // function's own doc comment (experience-store.ts) for the full rationale.
   isExperienceContentLocked,
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
@@ -2519,8 +2532,16 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       booking_url:    bookingResult.value,
     };
 
+    // OWNER-lock only (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+    // tomme-felt-publiserte-rader) — was isExperienceContentLocked (owner OR
+    // published) before this dev-request, which meant a PUBLISHED row never
+    // even reached `toApply` and applyExperienceContent's own blank-only
+    // write was unreachable dead code for every verified row. A published
+    // row now goes into `toApply` exactly like any other unlocked row;
+    // applyExperienceContent's isBlank checks (not this gate) are what keep
+    // its non-empty fields untouched — see that function's doc comment.
     for (const e of expRows) {
-      if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
+      if (isExperienceOwnerLocked(e)) {
         // Count as skipped_locked only if at least one thin field would have been filled.
         const anyThin = (candidateDescription && !e.description) || (candidateCategory && !e.category)
           || (candidateObj.price_from !== null && !e.price_from)
@@ -2541,7 +2562,10 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 
     if (dryRun) {
       for (const e of expRows) {
-        if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") continue;
+        // Same owner-lock-only gate as the toApply loop above — a published
+        // row's would-be-filled BLANK fields must appear in the dry-run
+        // preview (AC1), which the old full-lock gate here used to hide.
+        if (isExperienceOwnerLocked(e)) continue;
         // descriptionAllowedFor() mirrors the apply branch exactly (junk +
         // homepage-boilerplate guards), so a dry-run honestly reports which
         // writes would be skipped — the skips land in description_guard_skips.
@@ -23138,32 +23162,28 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           -- fill the whole window. The spot-check would then judge rows that
           -- no longer exist anywhere, against the provider's homepage.
           AND canonical_id IS NULL
-          -- Lock guard: the same two-part clause as
-          -- experience-store.ts:1708-1709, which is the one genuine precedent
-          -- for it (round-3 review — round 2's comment also cited :2222/:2360/
-          -- :2859, but those are the content_source half ALONE and they
-          -- query experience_providers, guarding applyProviderContent, whose
-          -- lock model deliberately has no verification_status). The canonical
-          -- definition is isExperienceContentLocked (:1775-1782).
-          --
-          -- applyExperienceContent() provably REFUSES to write owner- or
-          -- claim-authored or already-verified rows, so serving them here
-          -- would hand the weekly spot-check content that never came from the
-          -- homepage it is about to judge against. That matters concretely:
-          -- §8.4 of the platform-verifier SKILL sets
+          -- Lock guard: OWNER-lock only (content_source), no longer a
+          -- verification_status clause here (dev-request 2026-09-02-
+          -- experiences-laas-todeling-fyll-tomme-felt-publiserte-rader
+          -- removed it — mirrors the identical change to
+          -- selectProvidersForContentRefresh's EXISTS clause,
+          -- experience-store.ts). applyExperienceContent() now provably
+          -- REFUSES to write only owner- or claim-authored rows (see its own
+          -- doc comment); a PUBLISHED (verified) row can be legitimately
+          -- homepage-written today (content_source='provider_site', a blank
+          -- field filled) and this spot-check's WHOLE PURPOSE is to catch
+          -- exactly those writes for the weekly quality judgment — hiding
+          -- verified rows here would make the entire new write surface
+          -- invisible to §8.4's error-rate measurement, the opposite of what
+          -- this dev-request's acceptance criteria require. An owner-locked
+          -- row is still excluded: applyExperienceContent() refuses those
+          -- unconditionally, so serving one here would hand the spot-check
+          -- content that never came from the homepage it is about to judge
+          -- against — §8.4 of the platform-verifier SKILL sets
           -- controller/enrichment-write-pause.yaml → enabled: true at
           -- error_rate > 0.10, so a couple of owner-written rows in a
           -- 10-provider sample could pause enrichment writes for the whole
           -- vertical over mismatches that are not errors at all.
-          --
-          -- NULL-guarded, unlike :1708 (round-3 review): SQL three-valued
-          -- logic makes NULL != 'verified' evaluate to NULL, which excludes
-          -- the row — while isExperienceContentLocked treats a NULL
-          -- verification_status as UNLOCKED, i.e. a row applyExperienceContent
-          -- would happily enrich. Hiding exactly those rows is the false
-          -- checked=0 this endpoint exists to remove. Latent today
-          -- (createExperience coalesces to 'pending_verify'), cheap forever.
-          AND (verification_status IS NULL OR verification_status != 'verified')
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
         ORDER BY updated_at DESC
         -- Over-fetch, then filter, then slice to 10 in JS (round-5 review).
@@ -25461,11 +25481,13 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
     booking_url: string | null;
     telefon: string | null;
     hjemmeside: string | null;
+    description: string | null;
   }> = [];
   try {
     rows = expDb
       .prepare(
-        `SELECT e.booking_url AS booking_url, p.telefon AS telefon, p.hjemmeside AS hjemmeside
+        `SELECT e.booking_url AS booking_url, p.telefon AS telefon, p.hjemmeside AS hjemmeside,
+                e.description AS description
            FROM experiences e
            LEFT JOIN experience_providers p ON p.id = e.provider_id
           WHERE ${PUBLISH_GATE_SQL}`
@@ -25484,10 +25506,19 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
   let withBookingUrl = 0;
   let withPhone = 0;
   let withWebsite = 0;
+  // with_description (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+  // tomme-felt-publiserte-rader, Part C) — additive coverage field over the
+  // SAME PUBLISH_GATE_SQL set as the rest of this report. A row counts only
+  // when its description is non-blank AND not junk (expDescIsJunk — the same
+  // render-time guard applied everywhere else in this file), so scraped nav/
+  // boilerplate text that a reader would never see as a real description does
+  // not inflate this count.
+  let withDescription = 0;
   for (const r of rows) {
     if (present(r.booking_url)) withBookingUrl++;
     if (present(r.telefon)) withPhone++;
     if (present(r.hjemmeside)) withWebsite++;
+    if (present(r.description) && !expDescIsJunk(r.description)) withDescription++;
   }
 
   const total = rows.length;
@@ -25496,6 +25527,7 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
     with_booking_url: { count: withBookingUrl, pct: pct(withBookingUrl, total) },
     with_phone: { count: withPhone, pct: pct(withPhone, total) },
     with_website: { count: withWebsite, pct: pct(withWebsite, total) },
+    with_description: { count: withDescription, pct: pct(withDescription, total) },
   });
 });
 
