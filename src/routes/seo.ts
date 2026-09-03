@@ -39,7 +39,8 @@ import {
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
-import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
+import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
+import { rfbLangSessionMiddleware } from "../i18n/middleware";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import {
   parseIsoOrSqlite,
@@ -50,6 +51,10 @@ import {
 } from "../utils/freshness";
 
 const router = Router();
+// Daniel 2026-09-03: the language a person chose follows them across pages
+// (session cookie; URL still wins; off unless LANG_COOKIE_REDIRECT_ENABLED).
+// Mounted on THIS router so it is scoped to the RFB host by construction.
+router.use(rfbLangSessionMiddleware);
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -441,6 +446,12 @@ function shell(
   @media (max-width:640px){.lang-switch button{padding:5px 8px;font-size:13px;} .lang-switch{margin-right:8px;}}
 `;
 
+  // With the language session on, each switcher link records the choice
+  // server-side (i18n/middleware.ts rfbLangSessionMiddleware step 1). "Norsk"
+  // NEEDS this: without ?setlang=no the unprefixed URL would bounce straight
+  // back to /en. With the flag off the links are byte-identical to before.
+  const withSetlang = (url: string, l: Lang) =>
+    isLangCookieRedirectEnabled() ? `${url}${url.includes("?") ? "&" : "?"}setlang=${l}` : url;
   const flag = (l: Lang) => l === "en" ? "🇬🇧" : l === "sv" ? "🇸🇪" : "🇳🇴";
   const labelShort = (l: Lang) => l === "en" ? "EN" : l === "sv" ? "SV" : "NO";
 
@@ -450,9 +461,9 @@ function shell(
         <span class="ls-flag">${flag(lang)}</span><span>${labelShort(lang)}</span><span class="ls-caret">▾</span>
       </button>
       <div class="ls-menu" role="menu">
-        <a href="${noUrl}" hreflang="nb" class="${lang === "no" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇳🇴</span> ${escapeHtml(t(lang, "nav.lang_no"))}</a>
-        <a href="${enUrl}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>${svEnabled ? `
-        <a href="${svUrl}" hreflang="sv" class="${lang === "sv" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇸🇪</span> ${escapeHtml(t(lang, "nav.lang_sv"))}</a>` : ""}
+        <a href="${withSetlang(noUrl, "no")}" hreflang="nb" class="${lang === "no" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇳🇴</span> ${escapeHtml(t(lang, "nav.lang_no"))}</a>
+        <a href="${withSetlang(enUrl, "en")}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>${svEnabled ? `
+        <a href="${withSetlang(svUrl, "sv")}" hreflang="sv" class="${lang === "sv" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇸🇪</span> ${escapeHtml(t(lang, "nav.lang_sv"))}</a>` : ""}
       </div>
     </div>`;
 
@@ -521,7 +532,7 @@ function shell(
   <nav class="nav">
     <a href="${localizedPath("/", lang)}" class="nav-logo"><div class="nav-icon">🌱</div> <span translate="no">${getConfig().display_name}</span></a>
     <div class="nav-links">
-      <a href="${localizedPath("/samtaler", lang)}">${escapeHtml(t(lang, "nav.conversations"))}</a>
+      <a href="/samtaler">${escapeHtml(t(lang, "nav.conversations"))}</a>
       <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "nav.search"))}</a>
       <a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "nav.how_it_works"))}</a>
       <a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "nav.about"))}</a>
@@ -538,7 +549,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="${localizedPath("/kontakt", lang)}">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -1116,7 +1127,7 @@ router.get("/", (req: Request, res: Response) => {
           const metaLine = memberCount > 0
             ? `${memberCount} ${escapeHtml(umbCountSuffix)}`
             : (lang === "en" ? "National network" : "Nasjonalt nettverk");
-          return `<a href="/produsent/${slug}" class="umb-card">
+          return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="umb-card">
             <span class="umb-card-badge">${escapeHtml(umbBadgeLabel)}</span>
             <div class="umb-card-name">${escapeHtml(u.name)}</div>
             <div class="umb-card-meta">${metaLine}</div>
@@ -3384,7 +3395,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         lang === "en" ? "No producers found." : "Ingen produsenter funnet.",
         `<div class="sec" style="text-align:center;padding:80px 24px;">
           <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
-          <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
+          <p style="color:var(--g500);"><a href="${localizedPath("/", lang)}">Tilbake til forsiden</a></p>
         </div>`,
         {
           robots: "noindex, follow",
@@ -3484,7 +3495,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     const content = `
     <section class="city-hero">
       <div class="container">
-        <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
+        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>${lang === "en" ? `Local food in <span translate="no">${escapeHtml(cityName)}</span>` : `Lokal mat i <span translate="no">${escapeHtml(cityName)}</span>`}</h1>
         <p>${lang === "en" ? `${cityAgents.length} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-omr\u00e5det.`}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
@@ -4495,7 +4506,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           if (parent?.name) {
             const parentSlug = slugify(parent.name);
             umbParentJsonLd = { name: parent.name, slug: parentSlug };
-            umbParentHtml = `<div class="umb-parent-link">&larr; <a href="/produsent/${parentSlug}">Del av: ${escapeHtml(parent.name)}</a></div>`;
+            umbParentHtml = `<div class="umb-parent-link">&larr; <a href="${localizedPath("/produsent/" + parentSlug, lang)}">Del av: ${escapeHtml(parent.name)}</a></div>`;
           }
         } catch (e) { /* parent not found — ignore */ }
       }
@@ -4549,7 +4560,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             const countSuffix = m.umbrella_type && m.member_count
               ? ` &middot; ${m.member_count} ${m.umbrella_type === 'venue' ? 'produsenter' : 'markedsplasser'}`
               : "";
-            return `<a href="/produsent/${m.producer_slug}" class="umb-member-card">` +
+            return `<a href="${localizedPath("/produsent/" + m.producer_slug, lang)}" class="umb-member-card">` +
               `<div class="umb-member-name">${escapeHtml(m.producer_name)}</div>` +
               `<div class="umb-member-meta">${m.city ? escapeHtml(m.city) : ""}${countSuffix}</div>` +
               `</a>`;
@@ -4622,7 +4633,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
               const endTime = r.end_at ? (r.end_at || "").slice(11, 16) : "";
               const timeStr = time ? ` ${escapeHtml(time)}${endTime ? "&ndash;" + escapeHtml(endTime) : ""}` : "";
               // Show venue annotation when this isn't a venue page itself.
-              const venueAnno = !isVenue ? ` &middot; <a href="/produsent/${slugify(r.venue_name)}">${escapeHtml(r.venue_name)}</a>` : "";
+              const venueAnno = !isVenue ? ` &middot; <a href="${localizedPath("/produsent/" + slugify(r.venue_name), lang)}">${escapeHtml(r.venue_name)}</a>` : "";
               const loc = r.location_text ? ` (${escapeHtml(r.location_text)})` : "";
               return `<li><strong>${escapeHtml(date)}</strong>${timeStr} &mdash; ${escapeHtml(r.event_name)}${loc}${venueAnno}</li>`;
             }).join("");
@@ -4668,7 +4679,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       }
 
       const umbContent = `
-    <div class="bc"><a href="/">Hjem</a><span>/</span>${escapeHtml(agent.name)}</div>
+    <div class="bc"><a href="${localizedPath("/", lang)}">Hjem</a><span>/</span>${escapeHtml(agent.name)}</div>
 
     <div class="pf-header" style="grid-template-columns: 1fr;">
       <div class="umb-hero">
@@ -4803,7 +4814,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const relatedHtml = related.map((a: any) => {
       const trust = Math.round((a.trustScore || 0) * 100);
       const cats = (a.categories || []).slice(0, 2).map((c: string) => `<span class="tag" style="font-size:0.66rem;">${escapeHtml(formatCat(c))}</span>`).join("");
-      return `<a href="/produsent/${slugify(a.name)}" class="rel-card">
+      return `<a href="${localizedPath("/produsent/" + slugify(a.name), lang)}" class="rel-card">
         <div class="rel-name">${escapeHtml(a.name)}</div>
         <div class="rel-meta">${escapeHtml(cityName)} · Trust ${trust}%</div>
         <div style="margin-top:6px;">${cats}</div>
@@ -4862,7 +4873,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           const pendingTitle = isPending
             ? ` title="Vi har gjettet denne tilknytningen basert på tekst på din nettside. Logg inn på eier-portalen for å bekrefte eller avvise."`
             : "";
-          return `<a href="/produsent/${a.umbrella_slug}" class="aff-item${pendingClass}" rel="related"${pendingTitle}>` +
+          return `<a href="${localizedPath("/produsent/" + a.umbrella_slug, lang)}" class="aff-item${pendingClass}" rel="related"${pendingTitle}>` +
                  `<span class="aff-icon">&#129309;</span>` +  // 🤝 handshake
                  `<span class="aff-name">${escapeHtml(a.umbrella_name)}${pendingSuffix}</span>${labelsTxt}` +
                  `</a>`;
@@ -5287,7 +5298,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     const content = `
-    <div class="bc"><a href="/">Hjem</a>${cityName ? `<span>/</span><a href="/${slugify(cityName)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
+    <div class="bc"><a href="${localizedPath("/", lang)}">Hjem</a>${cityName ? `<span>/</span><a href="${localizedPath("/" + slugify(cityName), lang)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
     ${heroClaimHtml}
 
