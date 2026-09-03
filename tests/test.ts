@@ -34472,6 +34472,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-catalog-class: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
+  //    listPublicDentalAgents/countPublicDentalAgents/getDentalStats/
+  //    getDentalAgentsForSitemap/listRelatedClinics/listPoststeder ──
+  console.log("\n── dev-request 2026-09-03-dental-catalog-class-public-filter: public read surfaces (dental-store) ──");
+  try {
+    const { runDentalStorePublicCatalogClassFilterTests } = require("../src/services/dental-store.test") as
+      typeof import("../src/services/dental-store.test");
+    const dspf = runDentalStorePublicCatalogClassFilterTests({ log: false });
+    passed += dspf.passed;
+    failed += dspf.failed;
+    for (const f of dspf.failures) failures.push("dental-store public catalog-class filter: " + f);
+    console.log(`  dental-store public catalog-class filter: ${dspf.passed} passed, ${dspf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store public catalog-class filter: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
