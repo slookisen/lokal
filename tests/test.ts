@@ -3124,6 +3124,8 @@ const _pr21Promises: Promise<unknown>[] = [];
   const {
     probeAgentUrl,
     applyUrlProbeResult,
+    headProbe,
+    computeKvalitetsGate,
   } = require("../src/agents/lokal-agent-verifier");
 
   // Helper: build a fake fetch returning the configured status, with optional
@@ -3189,6 +3191,122 @@ const _pr21Promises: Promise<unknown>[] = [];
     const r = await probeAgentUrl("https://redir.no", { fetchImpl: makeFetch(301), timeoutMs: 1000 });
     assertEq(r.status, 301, "pr21: 301 → status=301");
     assertTrue(r.ok === true, "pr21: 301 → ok=true (URL is reachable via redirect)");
+  })());
+
+  // ── dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405 ────
+  // probeAgentUrl itself now normalizes a scheme-less input URL (e.g. a
+  // stored agent_knowledge.website value like "merkja.no") the same way
+  // hostnameFromUrl always has — before this fix, fetch(url) would throw on
+  // that invalid URL and the probe fell into the network-error branch
+  // (status=0), producing url_last_status=0 for a perfectly live site.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("merkja.no", { fetchImpl: makeFetch(200, { calls }), timeoutMs: 1000 });
+    assertEq(r.status, 200, "pr21-scheme: scheme-less \"merkja.no\" → status=200 (was: 0, invalid URL)");
+    assertTrue(r.ok === true, "pr21-scheme: scheme-less input → ok=true");
+    assertEq(calls[0]!.url, "https://merkja.no", `pr21-scheme: scheme-less input reaches fetch already normalized to https:// (got ${JSON.stringify(calls)})`);
+  })());
+
+  // Already-schemed input is passed through unchanged (idempotent — no
+  // "https://https://" double-prefixing).
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("https://qvenbrygg.no", { fetchImpl: makeFetch(200, { calls }), timeoutMs: 1000 });
+    assertEq(r.status, 200, "pr21-scheme: already-schemed input → status=200");
+    assertEq(calls[0]!.url, "https://qvenbrygg.no", `pr21-scheme: already-schemed input untouched (got ${JSON.stringify(calls)})`);
+  })());
+
+  // ── dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405 ────
+  // headProbe — the kvalitets-gate's probe (computeKvalitetsGate's
+  // website_ok) — used to be its own raw fetch(url,{method:"HEAD"}) with no
+  // scheme normalization and no HEAD→GET fallback, so a scheme-less
+  // agent_knowledge.website or a HEAD-rejecting server would falsely fail
+  // the gate even though probeAgentUrl (above) already handled both cases
+  // correctly for url_last_status. headProbe now delegates to probeAgentUrl
+  // so there is exactly one probing implementation, and (mirroring
+  // probeAgentUrl's own opts.fetchImpl) now takes an optional 3rd fetchImpl
+  // param purely so it can be tested the same fetchImpl-injection way as
+  // probeAgentUrl above, instead of monkey-patching globalThis.fetch (which
+  // this file's OTHER concurrently in-flight fire-and-forget test promises
+  // — this same _pr21Promises array included — would otherwise race with).
+  // runVerifierBatch's `opts.headProbe ?? headProbe` call site never passes
+  // this 3rd arg, so the calling convention is unchanged.
+
+  // Acceptance 1: scheme-less input is normalized to https:// BEFORE the
+  // network call — same status, and the same requested URL, as
+  // already-schemed input. Pre-fix, "example.no" would throw inside
+  // fetch() (invalid URL) and headProbe would return null.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusSchemeLess = await headProbe("example.no", 1000, makeFetch(200, { calls }));
+    const statusSchemed = await headProbe("https://example.no", 1000, makeFetch(200, { calls }));
+    assertEq(statusSchemeLess, 200, "headprobe-fix: scheme-less input reaches 200 (was: fetch() throws on invalid URL → null)");
+    assertEq(statusSchemed, 200, "headprobe-fix: already-schemed input still reaches 200");
+    assertEq(statusSchemeLess, statusSchemed, "headprobe-fix: scheme-less and https:// input yield the SAME status");
+    assertEq(calls[0]!.url, "https://example.no",
+      `headprobe-fix: scheme-less "example.no" was normalized to https:// before the fetch call (calls: ${JSON.stringify(calls)})`);
+  })());
+
+  // Acceptance 2: HEAD → 405 falls back to a ranged GET, and the GET's
+  // result (not the 405) is what the probe reports — and that in turn makes
+  // computeKvalitetsGate's website_ok=true where it used to be false.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusHeadRejected = await headProbe("https://head-rejects.no", 1000, makeFetch({ HEAD: 405, GET: 200 }, { calls }));
+    assertEq(statusHeadRejected, 200,
+      "headprobe-fix: HEAD 405 → falls back to GET → reports the GET's 200 (was: reported 405, gate failed)");
+    assertEq(calls.length, 2, `headprobe-fix: exactly HEAD then GET were attempted (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: first attempt is HEAD");
+    assertEq(calls[1]!.method, "GET", "headprobe-fix: fallback attempt is GET");
+    const gateAfterFallback = computeKvalitetsGate({
+      http_status: statusHeadRejected,
+      email: "post@head-rejects.no",
+      website: "https://head-rejects.no",
+      about: "x",
+      products: [],
+      brreg: null,
+    });
+    assertTrue(gateAfterFallback.reasons.website_ok,
+      "headprobe-fix: HEAD-405-then-GET-200 makes computeKvalitetsGate's website_ok=true (was website_unreachable/http_405)");
+  })());
+
+  // Network failure on HEAD (probeAgentUrl's internal status=0, not a
+  // thrown exception headProbe has to catch) also falls back to GET.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const erroringOnHead = async (url: string, init?: any) => {
+      const method = (init?.method || "GET").toUpperCase();
+      calls.push({ url, method });
+      if (method === "HEAD") throw new Error("simulated network failure");
+      return { status: 200 };
+    };
+    const statusHeadNetworkFail = await headProbe("https://head-network-fails.no", 1000, erroringOnHead as any);
+    assertEq(statusHeadNetworkFail, 200, "headprobe-fix: HEAD network failure (status 0) → falls back to GET → reports 200");
+    assertEq(calls.length, 2, `headprobe-fix: network-failing HEAD still triggers a GET fallback (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: first attempt is HEAD (network failure)");
+    assertEq(calls[1]!.method, "GET", "headprobe-fix: fallback attempt is GET");
+  })());
+
+  // Acceptance 3 / non-regression: a plain https:// URL that succeeds on
+  // HEAD reports that HEAD status directly, with NO GET call at all — the
+  // normal, unchanged path must not regress.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusNormal = await headProbe("https://gard.no", 1000, makeFetch(200, { calls }));
+    assertEq(statusNormal, 200, "headprobe-fix: normal HEAD-succeeds path still reports 200");
+    assertEq(calls.length, 1, `headprobe-fix: no GET fallback when HEAD already succeeds (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: only HEAD attempted");
+  })());
+
+  // Total failure on BOTH HEAD and GET still yields null (not
+  // probeAgentUrl's raw 0), preserving headProbe's pre-existing
+  // null-on-unreachable contract that computeKvalitetsGate's
+  // website_unreachable flag (vs. a numeric http_<status> flag) depends on.
+  _pr21Promises.push((async () => {
+    const totalFailure = async () => { throw new Error("simulated total outage"); };
+    const statusTotalFailure = await headProbe("https://totally-down.no", 1000, totalFailure as any);
+    assertEq(statusTotalFailure, null,
+      "headprobe-fix: total network failure still yields null (preserves website_unreachable flag semantics), not probeAgentUrl's raw 0");
   })());
 
   // ── PR-21: applyUrlProbeResult demotes rich → partial when broken ──
