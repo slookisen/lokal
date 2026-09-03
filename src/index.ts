@@ -69,6 +69,8 @@ import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-em
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminAgentsDescriptionCodeArtifactSweepRoutes from "./routes/admin-agents-description-code-artifact-sweep";
+import adminAgentsInternalNoteSweepRoutes from "./routes/admin-agents-internal-note-sweep";
+import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-correction";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
@@ -647,6 +649,12 @@ app.use(
   adminLimiter,
   adminAgentsDescriptionCodeArtifactSweepRoutes,
 );
+// POST /admin/agents/internal-note-sweep and POST /admin/agents/content-
+// correction (Daniel 2026-09-03: «Interne notater skal ikke vises» / «fiks den
+// byttede teksten på Epleblomsten og Nordlysmat»). Same ordering rule as the
+// siblings above — mount BEFORE /admin/agents.
+app.use("/admin/agents/internal-note-sweep", adminLimiter, adminAgentsInternalNoteSweepRoutes);
+app.use("/admin/agents/content-correction", adminLimiter, adminAgentsContentCorrectionRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
 // state that services/enrichment-write-pause.ts enforces on every enrichment

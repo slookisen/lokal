@@ -40970,6 +40970,26 @@ runSerial(async () => {
   }
 });
 
+// Daniel 2026-09-03: «Interne notater skal ikke vises» / «fiks den byttede
+// teksten på Epleblomsten og Nordlysmat» — description-quality internal-note
+// detector, POST /admin/agents/internal-note-sweep and POST /admin/agents/
+// content-correction. Same DB-swap discipline as the siblings above.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 interne notater + innholdsretting: content-quality ──");
+  try {
+    const { runAdminAgentsContentQualityTests } = require("../src/routes/admin-agents-content-quality.test") as
+      typeof import("../src/routes/admin-agents-content-quality.test");
+    const cq = await runAdminAgentsContentQualityTests({ log: false });
+    passed += cq.passed;
+    failed += cq.failed;
+    for (const f of cq.failures) failures.push("content-quality: " + f);
+    console.log(`  content-quality: ${cq.passed} passed, ${cq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-quality: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-03-mikhailo-quarantine-gates: three additive quarantine
 // gates on self-registered marketplace agents (Gate 1 visibility, Gate 2
 // verified-badge withholding, Gate 3 delayed IndexNow), keyed off two new

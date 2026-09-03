@@ -29,7 +29,7 @@ import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription } from "../services/description-quality";
+import { isJunkDescription, stripInternalNotes } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
 import {
@@ -4297,8 +4297,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // so a junk value never reaches any public output for this page.
     const rawDescription = agent.description || "";
     const rawAbout = k.about || "";
-    const safeDescription = isJunkDescription(rawDescription) ? "" : rawDescription;
-    const safeAbout = isJunkDescription(rawAbout) ? "" : rawAbout;
+    // stripInternalNotes: an enrichment routine's own working note appended to
+    // real producer prose ("… NB: nettside midlertidig utilgjengelig — kontakt
+    // bør bekreftes av verifier.") must not reach a customer, but the prose in
+    // front of it must survive — so the note is stripped, not the field
+    // (Daniel 2026-09-03, "Interne notater skal ikke vises"). A value that is
+    // NOTHING but a note is already reported by isJunkDescription below.
+    const safeDescription = isJunkDescription(rawDescription) ? "" : stripInternalNotes(rawDescription);
+    const safeAbout = isJunkDescription(rawAbout) ? "" : stripInternalNotes(rawAbout);
     // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: on
     // /en and /sv, swap in the PUBLISHED, reviewed+verified translation of
     // each prose field when one exists. getPublishedProfileTranslations()

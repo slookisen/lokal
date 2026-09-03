@@ -9,7 +9,7 @@ import {
   DiscoveryResult,
 } from "../models/marketplace";
 import { slugify } from "../utils/slug";
-import { isJunkDescription } from "./description-quality";
+import { isJunkDescription, stripInternalNotes } from "./description-quality";
 import { normalizeCityLabel } from "./city-normalizer";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
 // dev-request 2026-07-25-reisesok…, Fase 2a: this file used to carry its own
@@ -887,6 +887,10 @@ class MarketplaceRegistry {
     if (cardDescription && isJunkDescription(cardDescription)) {
       console.log(`[description-guard] suppressed junk description (agent-card) for ${agent.id} (${agent.name})`);
       cardDescription = "";
+    } else if (cardDescription) {
+      // Strip an appended internal pipeline note (Daniel 2026-09-03) before
+      // it reaches the public, unauthenticated agent card.
+      cardDescription = stripInternalNotes(cardDescription);
     }
 
     return {

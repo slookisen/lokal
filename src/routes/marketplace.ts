@@ -23,7 +23,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
-import { isJunkDescription, looksLikeCodeArtifact } from "../services/description-quality";
+import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
@@ -462,6 +462,12 @@ router.post("/register", (req: Request, res: Response) => {
     // earlier than a human reviewer would.
     if (looksLikeCodeArtifact(registration.description)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    // Daniel 2026-09-03 ("Interne notater skal ikke vises"): same door, same
+    // shape, for an enrichment routine's own verification note.
+    if (hasInternalNote(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
 
@@ -1162,6 +1168,9 @@ function descriptionWriteGuardError(description: unknown): { status: number; bod
   }
   if (looksLikeCodeArtifact(description as string | null | undefined)) {
     return { status: 400, body: { error: "description contains code/script artifacts — rejected" } };
+  }
+  if (hasInternalNote(description as string | null | undefined)) {
+    return { status: 400, body: { error: "description contains an internal pipeline note — rejected" } };
   }
   return null;
 }
@@ -1868,6 +1877,10 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: "about contains code/script artifacts — rejected" });
     return;
   }
+  if (typeof req.body?.about === "string" && hasInternalNote(req.body.about)) {
+    res.status(400).json({ success: false, error: "about contains an internal pipeline note — rejected" });
+    return;
+  }
 
   try {
     if (isAdmin) {
@@ -1996,6 +2009,10 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
     // check needed on this route.
     if (looksLikeCodeArtifact(trimmed)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    if (hasInternalNote(trimmed)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
     updates.description = trimmed;
@@ -2144,6 +2161,12 @@ router.post("/admin/register", (req: Request, res: Response) => {
     // default correctly passes (looksLikeCodeArtifact("") === false).
     if (looksLikeCodeArtifact(registration.description)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    // Daniel 2026-09-03 ("Interne notater skal ikke vises"): same door, same
+    // shape, for an enrichment routine's own verification note.
+    if (hasInternalNote(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
 
