@@ -660,6 +660,43 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       eq(f21.body.flags.auto_republish_enabled, false, "F21 status reports the auto-republish flag");
       rfbDb.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run("a1");
 
+      // ─────────────── G. owner-authored translations ────────────────────
+      // (Daniel 2026-09-03: "eier burde kunne redigere sin engelske profil,
+      //  samt vi kan legge til engelsk tekst uten at den er låst")
+      const gOwn = "Solgården is a family farm in Bø. We grow organic vegetables and keep bees, and we welcome visitors every Saturday.";
+      const g1 = svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", text: gOwn, actor: "owner:a1" });
+      ok(!!g1 && g1.owner_text === gOwn && g1.status === "published", "G1 owner text is stored and published immediately", { status: g1?.status });
+      ok(!!g1?.owner_text_source_hash && g1.owner_text_source_hash === g1.source_hash, "G1b the Norwegian it was written against is recorded");
+      const g2 = svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true });
+      eq(g2.description, gOwn, "G2 the page serves the owner's own text");
+
+      // the pipeline must never touch it again
+      const gPlan = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 10);
+      ok(!gPlan.actionable.some((p: any) => p.item.field === "description" && p.lang === "en"), "G3 the planner skips an owner-authored field", gPlan.skipped);
+      eq(gPlan.skipped.owner_authored, 1, "G4 and reports it as owner_authored", gPlan.skipped);
+
+      // a Norwegian edit must not delete the owner's own words
+      rfbDb.prepare("UPDATE agents SET description = ? WHERE id = ?").run("Vi selger økologiske grønnsaker, honning og nypressa eplemost fra egen gård i Bø.", "a1");
+      const g5 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: false, batchId: "g", actor: "stale-sweep" });
+      ok(!g5.ids.includes(g1!.id), "G5 the stale sweep leaves an owner-authored row alone", g5.ids);
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true }).description, gOwn, "G6 the owner's text is still served after a Norwegian edit");
+      const g7 = svc.listOwnerTranslations(rfbDb as any, "rfb", "a1", "en").find((r: any) => r.field === "description")!;
+      eq([g7.written_by === undefined, g7.owner_text === gOwn, g7.source_changed_since_owner_edit], [true, true, true], "G7 the portal view flags that the Norwegian has changed since they wrote it");
+      ok(g7.source_text.includes("eplemost"), "G7b the portal shows the CURRENT Norwegian", g7.source_text);
+
+      // handing it back to the pipeline
+      const g8 = svc.clearOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", actor: "owner:a1" });
+      eq([g8!.status, g8!.owner_text, g8!.translated_text], ["draft", null, null], "G8 clearing hands the field back to the pipeline");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true }).description, undefined, "G9 nothing is served until it is re-translated");
+      const g10 = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 10);
+      ok(g10.actionable.some((p: any) => p.item.field === "description" && p.lang === "en"), "G10 the planner picks the field up again");
+
+      // a field with no Norwegian text cannot be given an English one
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "about", lang: "en", text: "x", actor: "t" }) === null, false, "G11 an existing Norwegian field accepts owner text");
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "nope", field: "about", lang: "en", text: "x", actor: "t" }), null, "G12 an unknown entity is refused");
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", text: "   ", actor: "t" }), null, "G13 empty text is refused");
+      svc.clearOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "about", lang: "en", actor: "t" });
+
       const e17 = await callRoute(router, { url: `/audit?platform=rfb&id=${eDesc.id}`, headers: H });
       ok(e17.body.audit.some((a: any) => /collected \(session lane\)/.test(a.note || "")) && e17.body.audit.some((a: any) => /translated by session/.test(a.note || "")), "E17 audit trail names the session lane", e17.body.audit);
     } finally {
