@@ -747,7 +747,12 @@ export function verifyTranslationDeterministic(
   // the source is part of a name written lowercase by the producer.
   const outWs = out.split(/\s+/).map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean);
   const srcBigrams = new Set<string>();
-  srcWs.map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean).forEach((w, i, arr) => { if (i > 0) srcBigrams.add(`${arr[i - 1]} ${w}`); });
+  srcWs.map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")).filter(Boolean).forEach((w, i, arr) => {
+    // The capitalised head must not be sentence-initial ("Åpent lørdager"
+    // at the start of a sentence is capitalised by position, not a name).
+    const headInitial = i - 1 <= 0 || /[.!?:]$/.test(srcWs[i - 2] || "");
+    if (i > 0 && !headInitial) srcBigrams.add(`${arr[i - 1]} ${w}`);
+  });
   const nameBigramWords = new Set<string>();
   outWs.forEach((w, i) => { if (i > 0 && /^[A-ZÆØÅ]/.test(outWs[i - 1]) && /^[a-zæøå]/.test(w) && srcBigrams.has(`${outWs[i - 1]} ${w}`)) nameBigramWords.add(w); });
   const leaked = out
