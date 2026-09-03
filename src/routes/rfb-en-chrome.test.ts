@@ -14,7 +14,7 @@
  *   - the producer.* dictionary keys the contact card now reads exist in all
  *     three locales.
  */
-import { catLabel, formatCat, formatCatEn, buildProducerAnswerFirstOpening } from "./seo";
+import { catLabel, formatCat, formatCatEn, productLabel, buildProducerAnswerFirstOpening } from "./seo";
 import { formatUpdatedPretty, formatUpdatedPrettyEn, formatUpdatedPrettyNo } from "../utils/freshness";
 import { decodeHtmlEntities, normalizeProse } from "../services/description-quality";
 import { t } from "../i18n/t";
@@ -49,8 +49,19 @@ export function runRfbEnChromeTests(opts: { log?: boolean } = {}): TestSummary {
   eq(buildProducerAnswerFirstOpening({ ...base }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo og bestill direkte under.", "a1: Norwegian sentence unchanged (no lang = no)");
   eq(buildProducerAnswerFirstOpening({ ...base, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details and order directly below.", "a2: English sentence with English category labels");
   eq(buildProducerAnswerFirstOpening({ ...base, categories: ["meat"], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat — find contact details and order directly below.", "a3: no ' and more' when three or fewer");
-  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "eplemost" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells eplemost — find contact details and order directly below.", "a4: product names are the producer's own words and stay as written");
+  // Daniel 2026-09-03 «ja kjør ordlisten for produktene også»: known product
+  // words are translated; an unknown one is the producer's own wording.
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "eplemost" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells apple juice — find contact details and order directly below.", "a4: a known product word is translated through the glossary");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Bestemors spesial" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Bestemors spesial — find contact details and order directly below.", "a4b: an unknown product name stays exactly as written");
   eq(buildProducerAnswerFirstOpening({ ...base, cityName: "", lang: "en" }), null, "a5: still null without two real facts");
+  // Live 2026-09-03 (Gvarv): products listed as bare category words rendered
+  // "sells Kjøtt, Grønnsaker, Frukt" on /en. Same product -> category label.
+  const gvarv = { ...base, productsList: [{ name: "Kjøtt" }, { name: "Grønnsaker" }, { name: "Frukt" }, { name: "eplemost" }] };
+  eq(buildProducerAnswerFirstOpening({ ...gvarv, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details and order directly below.", "a6: product names that are category words get the English category label");
+  eq(buildProducerAnswerFirstOpening({ ...gvarv }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo og bestill direkte under.", "a7: …and stay exactly as written in Norwegian");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Eplemost" }, { name: "honning" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Apple juice, Honey — find contact details and order directly below.", "a8: glossary word keeps its capitalisation; a lower-case category word still maps");
+  eq(productLabel("Bakeri", "en"), "Bakery", "a9: badge-only category words map too");
+  eq(productLabel("Kjøtt", "no"), "Kjøtt", "a10: productLabel is a no-op in Norwegian");
 
   // ── updated-at ──
   const now = new Date("2026-09-03T12:00:00Z");

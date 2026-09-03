@@ -41,6 +41,7 @@ import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
+import { translateProductName } from "../i18n/product-glossary";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import {
   parseIsoOrSqlite,
@@ -315,6 +316,35 @@ export function formatCat(cat: string): string {
 // formatCat for English pages.
 export function formatCatEn(cat: string): string {
   return catLabel(cat, "en");
+}
+
+// Reverse map: Norwegian category word (lower-cased) -> category key.
+const CATEGORY_NAME_TO_KEY: Record<string, string> = Object.fromEntries([
+  ...Object.entries(CATEGORY_MAP).map(([k, v]) => [v.name.toLowerCase(), k]),
+  ...Object.entries(CATEGORY_BADGE_LABELS_ONLY).map(([k, v]) => [v.toLowerCase(), k]),
+]);
+
+/**
+ * Display label for a PRODUCT name in the page language. Live 2026-09-03:
+ * many producers list their products as bare category words ("Kjøtt",
+ * "Grønnsaker", "Frukt"), so the English opening line read "sells Kjøtt,
+ * Grønnsaker, Frukt". A product name that is exactly a known category word
+ * is the same product under its category label; everything else is the
+ * producer's own wording and is returned unchanged. Norwegian: unchanged.
+ */
+export function productLabel(name: string, lang: Lang): string {
+  if (!name || lang === "no") return name;
+  const key = CATEGORY_NAME_TO_KEY[name.trim().toLowerCase()];
+  if (key) return catLabel(key, lang);
+  // Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — everything
+  // that is not a bare category word goes through the curated glossary,
+  // which returns the name unchanged unless every word of it is known.
+  return translateProductName(name, lang);
+}
+
+/** True iff a product name is exactly a known category word (any case). */
+export function isCategoryWord(name: string): boolean {
+  return !!CATEGORY_NAME_TO_KEY[(name || "").trim().toLowerCase()];
 }
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
@@ -700,7 +730,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
   let productLine = "";
   if (products.length) {
-    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(p.name || "")}`).join(", ");
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(p.name || "", lang))}`).join(", ");
     const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
     productLine = `<div class="pc-products">${top}${more}</div>`;
   }
@@ -4020,6 +4050,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productNames = (params.productsList || [])
     .map((p: any) => (typeof p === "string" ? p : p?.name))
     .filter(Boolean)
+    .map((n: string) => productLabel(n, lang))
     .slice(0, 4);
   const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 4);
   const sellItems = productNames.length ? productNames : catLabels;
@@ -4813,7 +4844,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
           const org = typeof p === "object" && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
           const price = typeof p === "object" && p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
-          return `<div class="prod-item"><span class="prod-name">${escapeHtml(name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
+          return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
@@ -5064,7 +5095,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (!rawName) return null;
 
         // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
-        let productName = rawName;
+        let productName = productLabel(rawName, lang);
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
         // Extract numeric price from various formats
@@ -5402,7 +5433,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
         ${productsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#127813;</span><h3>Produkter (${productsList.length})</h3></div>
+          <div class="card-head"><span>&#127813;</span><h3>${escapeHtml(t(lang, "producer.products"))} (${productsList.length})</h3></div>
           <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
         </div>` : ""}
 
