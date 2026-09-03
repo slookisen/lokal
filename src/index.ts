@@ -61,7 +61,7 @@ import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminVerifierClaimCountsRoutes from "./routes/admin-verifier-claim-counts";
 import adminProfileTranslationsRoutes from "./routes/admin-profile-translations";
-import { startProfileTranslationsWorker } from "./services/profile-translations-worker";
+import { startProfileTranslationsWorker, startProfileTranslationsStaleSweep } from "./services/profile-translations-worker";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
@@ -1312,6 +1312,10 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
 // no-op unless PROFILE_TRANSLATIONS_ENABLED === "true" as well. Never
 // publishes or serves anything; see profile-translations-worker.ts.
 startProfileTranslationsWorker();
+// dev-request 2026-09-03-oversettelse-synk-og-eierprofiler: keeps published
+// translations in step with the Norwegian source. No LLM, default on, and it
+// can only ever unpublish - see profile-translations-worker.ts.
+startProfileTranslationsStaleSweep();
 
 // ─── PR-103 (2026-06-03): Backend dental geocoding worker ───────────
 //

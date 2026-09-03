@@ -588,6 +588,115 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       eq(svc.submitSessionTranslation(rfbDb as any, "opplevagent", { id: eDesc.id, translated_text: "x", review: goodReview }, { actor: "t", batchId: "b" }).outcome, "wrong_platform", "E15 platform mismatch refused");
       const e16 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [] } });
       eq(e16.status, 400, "E16 empty items → 400");
+      // ─────────────── F. sync: stale sweep, claims, auto-republish ──────
+      // (dev-request 2026-09-03-oversettelse-synk-og-eierprofiler)
+      const fRow = svc.getTranslationById(rfbDb as any, eDesc.id)!;
+      eq(fRow.status, "verified", "F1 fixture row is verified before publish");
+      const fPub = await callRoute(router, { url: "/publish", method: "POST", headers: H, body: { platform: "rfb", lang: "sv", ids: [eDesc.id], dry_run: false } });
+      eq([fPub.status, fPub.body.published], [200, 1], "F2 publish via route");
+      eq(Number(svc.getTranslationById(rfbDb as any, eDesc.id)!.previously_published), 1, "F3 publishing stamps previously_published");
+
+      // nothing changed yet → sweep finds nothing stale
+      const f4 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: true, batchId: "s1", actor: "t" });
+      eq([f4.stale, f4.unpublished], [0, 0], "F4 unchanged source: sweep finds nothing", f4);
+
+      // the producer edits the Norwegian description
+      rfbDb.prepare("UPDATE agents SET description = ? WHERE id = ?").run("Vi selger nå også epler og plommer fra egen hage i Bø.", "a1");
+      const f5 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: true, batchId: "s2", actor: "t" });
+      eq([f5.stale >= 1, f5.unpublished, f5.ids.includes(eDesc.id)], [true, 0, true], "F5 dry-run detects the changed source without writing", f5);
+      eq(svc.getTranslationById(rfbDb as any, eDesc.id)!.status, "published", "F6 dry-run left the row published");
+      const f7 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: false, batchId: "s3", actor: "stale-sweep" });
+      ok(f7.unpublished >= 1 && f7.ids.includes(eDesc.id), "F7 apply unpublishes the changed row", f7);
+      const f8 = svc.getTranslationById(rfbDb as any, eDesc.id)!;
+      eq([f8.status, f8.published_at, f8.translated_text, Number(f8.previously_published)], ["draft", null, null, 1], "F8 row is a draft again, published_at cleared, previously_published kept");
+      ok((f8.prev_translated_text || "").startsWith("Vi säljer"), "F9 the old translation is kept as prev_translated_text", f8.prev_translated_text);
+      ok(f8.source_text.includes("plommer"), "F9b the sweep carried the new Norwegian into the row", f8.source_text);
+      ok(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "sv", { ignoreServeFlag: true }).description === undefined, "F10 the page no longer serves the stale translation");
+
+      // a source that disappears entirely (producer deactivated) is unpublished too
+      const f11before = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: true, batchId: "s4", actor: "t" });
+      rfbDb.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").run("a1");
+      const f11 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: true, batchId: "s5", actor: "t" });
+      ok(f11.missing_source > f11before.missing_source, "F11 a vanished source counts as missing_source", { before: f11before.missing_source, after: f11.missing_source });
+      rfbDb.prepare("UPDATE agents SET is_active = 1 WHERE id = ?").run("a1");
+
+      // auto-republish policy
+      delete process.env.PROFILE_TRANSLATIONS_AUTO_REPUBLISH_ENABLED;
+      eq(svc.isAutoRepublishEnabled(), false, "F12 auto-republish is off by default");
+      const svDesc2 = "Vi säljer nu också äpplen och plommon från vår egen trädgård i Bø.";
+      const goodReview2 = { verdict: "APPROVE", fidelity: 5, fluency: 5, issues: [], summary: "ok" };
+      const f13 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc2, review: goodReview2 }] } });
+      eq([f13.body.results[0].outcome, f13.body.results[0].status], ["verified", "verified"], "F13 flag off: a re-translation stops at verified");
+
+      process.env.PROFILE_TRANSLATIONS_AUTO_REPUBLISH_ENABLED = "true";
+      svc.requeueTranslation(rfbDb as any, eDesc.id, "test");
+      rfbDb.prepare("UPDATE profile_translations SET previously_published = 1 WHERE id = ?").run(eDesc.id);
+      const f14 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc2, review: goodReview2 }] } });
+      eq([f14.body.results[0].outcome, f14.body.results[0].status], ["auto_republished", "published"], "F14 flag on + previously published + unclaimed → auto-republished");
+
+      // a first-ever translation is never auto-published
+      svc.requeueTranslation(rfbDb as any, eDesc.id, "test");
+      rfbDb.prepare("UPDATE profile_translations SET previously_published = 0 WHERE id = ?").run(eDesc.id);
+      const f15 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc2, review: goodReview2 }] } });
+      eq([f15.body.results[0].outcome, f15.body.results[0].status], ["verified", "verified"], "F15 a first-ever translation still waits for a human");
+
+      // an owner-claimed producer is never auto-published, even when known
+      eq(svc.isEntityOwnerClaimed(rfbDb as any, "rfb", "agent", "a1"), false, "F16 a1 is not claimed yet");
+      rfbDb.prepare("INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status) VALUES (?, ?, ?, ?, 'verified')").run("c1", "a1", "Eier", "eier@a1.no");
+      eq(svc.isEntityOwnerClaimed(rfbDb as any, "rfb", "agent", "a1"), true, "F17 a verified claim makes the entity owner-claimed");
+      svc.requeueTranslation(rfbDb as any, eDesc.id, "test");
+      rfbDb.prepare("UPDATE profile_translations SET previously_published = 1 WHERE id = ?").run(eDesc.id);
+      const f18 = await callRoute(router, { url: "/submit", method: "POST", headers: H, body: { platform: "rfb", items: [{ id: eDesc.id, translated_text: svDesc2, review: goodReview2 }] } });
+      eq([f18.body.results[0].outcome, f18.body.results[0].status], ["verified", "verified"], "F18 owner-claimed profile is never auto-republished");
+      delete process.env.PROFILE_TRANSLATIONS_AUTO_REPUBLISH_ENABLED;
+
+      // the queue exposes claim status so the spot check can pick claimed rows
+      const f19 = await callRoute(router, { url: "/queue?platform=rfb&lang=sv&limit=50", headers: H });
+      const f19row = f19.body.rows.find((r: any) => r.id === eDesc.id);
+      eq(f19row.owner_claimed, true, "F19 /queue reports owner_claimed");
+      const f20 = await callRoute(router, { url: "/sweep-stale", method: "POST", headers: H, body: { platform: "rfb" } });
+      eq([f20.status, f20.body.dry_run], [200, true], "F20 /sweep-stale defaults to dry-run (STRICT-FALSE)");
+      const f21 = await callRoute(router, { url: "/status?platform=rfb", headers: H });
+      eq(f21.body.flags.auto_republish_enabled, false, "F21 status reports the auto-republish flag");
+      rfbDb.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run("a1");
+
+      // ─────────────── G. owner-authored translations ────────────────────
+      // (Daniel 2026-09-03: "eier burde kunne redigere sin engelske profil,
+      //  samt vi kan legge til engelsk tekst uten at den er låst")
+      const gOwn = "Solgården is a family farm in Bø. We grow organic vegetables and keep bees, and we welcome visitors every Saturday.";
+      const g1 = svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", text: gOwn, actor: "owner:a1" });
+      ok(!!g1 && g1.owner_text === gOwn && g1.status === "published", "G1 owner text is stored and published immediately", { status: g1?.status });
+      ok(!!g1?.owner_text_source_hash && g1.owner_text_source_hash === g1.source_hash, "G1b the Norwegian it was written against is recorded");
+      const g2 = svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true });
+      eq(g2.description, gOwn, "G2 the page serves the owner's own text");
+
+      // the pipeline must never touch it again
+      const gPlan = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 10);
+      ok(!gPlan.actionable.some((p: any) => p.item.field === "description" && p.lang === "en"), "G3 the planner skips an owner-authored field", gPlan.skipped);
+      eq(gPlan.skipped.owner_authored, 1, "G4 and reports it as owner_authored", gPlan.skipped);
+
+      // a Norwegian edit must not delete the owner's own words
+      rfbDb.prepare("UPDATE agents SET description = ? WHERE id = ?").run("Vi selger økologiske grønnsaker, honning og nypressa eplemost fra egen gård i Bø.", "a1");
+      const g5 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: false, batchId: "g", actor: "stale-sweep" });
+      ok(!g5.ids.includes(g1!.id), "G5 the stale sweep leaves an owner-authored row alone", g5.ids);
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true }).description, gOwn, "G6 the owner's text is still served after a Norwegian edit");
+      const g7 = svc.listOwnerTranslations(rfbDb as any, "rfb", "a1", "en").find((r: any) => r.field === "description")!;
+      eq([g7.written_by === undefined, g7.owner_text === gOwn, g7.source_changed_since_owner_edit], [true, true, true], "G7 the portal view flags that the Norwegian has changed since they wrote it");
+      ok(g7.source_text.includes("eplemost"), "G7b the portal shows the CURRENT Norwegian", g7.source_text);
+
+      // handing it back to the pipeline
+      const g8 = svc.clearOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", actor: "owner:a1" });
+      eq([g8!.status, g8!.owner_text, g8!.translated_text], ["draft", null, null], "G8 clearing hands the field back to the pipeline");
+      eq(svc.getPublishedProfileTranslations(rfbDb as any, "rfb", "agent", "a1", "en", { ignoreServeFlag: true }).description, undefined, "G9 nothing is served until it is re-translated");
+      const g10 = svc.planTranslationBatch(rfbDb as any, "rfb", ["en"], 10);
+      ok(g10.actionable.some((p: any) => p.item.field === "description" && p.lang === "en"), "G10 the planner picks the field up again");
+
+      // a field with no Norwegian text cannot be given an English one
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "about", lang: "en", text: "x", actor: "t" }) === null, false, "G11 an existing Norwegian field accepts owner text");
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "nope", field: "about", lang: "en", text: "x", actor: "t" }), null, "G12 an unknown entity is refused");
+      eq(svc.setOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "description", lang: "en", text: "   ", actor: "t" }), null, "G13 empty text is refused");
+      svc.clearOwnerTranslation(rfbDb as any, "rfb", { entityType: "agent", entityId: "a1", field: "about", lang: "en", actor: "t" });
+
       const e17 = await callRoute(router, { url: `/audit?platform=rfb&id=${eDesc.id}`, headers: H });
       ok(e17.body.audit.some((a: any) => /collected \(session lane\)/.test(a.note || "")) && e17.body.audit.some((a: any) => /translated by session/.test(a.note || "")), "E17 audit trail names the session lane", e17.body.audit);
     } finally {

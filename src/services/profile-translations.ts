@@ -133,6 +133,11 @@ export interface TranslationRow {
   reviewed_at: string | null;
   verified_at: string | null;
   published_at: string | null;
+  previously_published?: number;
+  owner_text?: string | null;
+  owner_text_at?: string | null;
+  owner_text_by?: string | null;
+  owner_text_source_hash?: string | null;
 }
 
 // ─── Flags (read fresh per call — fly.toml flip takes effect immediately) ──
@@ -216,6 +221,32 @@ export function ensureProfileTranslationsSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_profile_translation_audit_tid
       ON profile_translation_audit(translation_id);
   `);
+  // Additive migration (dev-request 2026-09-03-oversettelse-synk-og-eierprofiler):
+  // 1 once the row has been published at least once. Auto-republish after a
+  // source change only ever applies to a row Daniel has already approved.
+  try {
+    db.exec("ALTER TABLE profile_translations ADD COLUMN previously_published INTEGER NOT NULL DEFAULT 0");
+  } catch {
+    // column already exists
+  }
+  // Owner-authored translation (dev-request 2026-09-03, Daniel: "eier burde
+  // kunne redigere sin engelske profil"). When owner_text is set the producer
+  // has written this language themselves: it is served as-is, the pipeline
+  // never spends a translation on the field again, and the stale sweep leaves
+  // it alone. owner_text_source_hash records which Norwegian they wrote it
+  // against, so the portal can tell them the Norwegian has moved on.
+  for (const col of [
+    "ALTER TABLE profile_translations ADD COLUMN owner_text TEXT",
+    "ALTER TABLE profile_translations ADD COLUMN owner_text_at TEXT",
+    "ALTER TABLE profile_translations ADD COLUMN owner_text_by TEXT",
+    "ALTER TABLE profile_translations ADD COLUMN owner_text_source_hash TEXT",
+  ]) {
+    try {
+      db.exec(col);
+    } catch {
+      // column already exists
+    }
+  }
 }
 
 // ─── Source collection ───────────────────────────────────────────────────
@@ -411,11 +442,14 @@ export type PlanDecision =
   | { action: "new" }
   | { action: "retry"; attempts: number }
   | { action: "source_changed"; previous_status: TranslationStatus }
-  | { action: "skip"; reason: "up_to_date" | "rejected_manual_queue" | "max_attempts" };
+  | { action: "skip"; reason: "up_to_date" | "rejected_manual_queue" | "max_attempts" | "owner_authored" };
 
 /** Decide what the pipeline should do with one (item, lang) pair. Pure. */
 export function planItem(existing: TranslationRow | null, hash: string): PlanDecision {
   if (!existing) return { action: "new" };
+  // The producer wrote this language themselves - never spend a translation on
+  // it again, and never overwrite it. Only they (or Daniel) can clear it.
+  if (existing.owner_text && existing.owner_text.trim()) return { action: "skip", reason: "owner_authored" };
   if (existing.source_hash !== hash) return { action: "source_changed", previous_status: existing.status };
   if (existing.status === "verified" || existing.status === "published" || existing.status === "reviewed") {
     return { action: "skip", reason: "up_to_date" };
@@ -1250,7 +1284,7 @@ export function publishVerified(
   }
   if (opts.dryRun) return { would_publish: rows.length, published: 0, ids: rows.map((r) => r.id) };
   const tx = db.transaction(() => {
-    for (const r of rows) setStatus(db, r, "published", { published_at: nowIso(), batch_id: opts.batchId }, opts.actor, "published", opts.batchId);
+    for (const r of rows) setStatus(db, r, "published", { published_at: nowIso(), previously_published: 1, batch_id: opts.batchId }, opts.actor, "published", opts.batchId);
   });
   tx();
   return { would_publish: rows.length, published: rows.length, ids: rows.map((r) => r.id) };
@@ -1290,6 +1324,272 @@ export function requeueTranslation(db: Database.Database, id: number, actor: str
   const row = getTranslationById(db, id);
   if (!row) return null;
   return setStatus(db, row, "draft", { attempts: 0, reject_reason: null, review_json: null, verify_json: null, published_at: null, verified_at: null, reviewed_at: null }, actor, "requeued", null);
+}
+
+// --- Owner-claimed entities ----------------------------------------------
+//
+// A profile whose owner has verified it carries a "Bekreftet av eier" badge,
+// so an AI translation the owner never saw is the highest-risk text on the
+// site. The pipeline still translates it (an owner-authored Norwegian text
+// deserves an English version), but such a row is NEVER auto-published: it
+// waits for a human read - the routines' mandatory spot check, then Daniel.
+// rfb: agent_claims.status = 'verified', the canonical signal that
+// knowledge-service.isAgentClaimed uses. opplevagent:
+// experience_providers.claimed_at, on the provider itself or on the provider
+// behind an experience.
+
+export function isEntityOwnerClaimed(db: Database.Database, platform: TranslationPlatform, entityType: string, entityId: string): boolean {
+  try {
+    if (platform === "rfb") {
+      const row = db.prepare("SELECT COUNT(*) AS c FROM agent_claims WHERE agent_id = ? AND status = 'verified'").get(entityId) as { c: number } | undefined;
+      return !!row && row.c > 0;
+    }
+    if (entityType === "provider") {
+      const row = db.prepare("SELECT claimed_at FROM experience_providers WHERE id = ?").get(entityId) as { claimed_at: string | null } | undefined;
+      return !!row?.claimed_at;
+    }
+    const row = db
+      .prepare("SELECT p.claimed_at AS claimed_at FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id WHERE e.id = ?")
+      .get(entityId) as { claimed_at: string | null } | undefined;
+    return !!row?.claimed_at;
+  } catch {
+    // Table missing (a :memory: fixture without the claims schema) - fail SAFE
+    // for publishing: unknown claim status must never unlock auto-publish.
+    return true;
+  }
+}
+
+// --- Staleness sweep (no LLM, no spend) ----------------------------------
+//
+// The Norwegian side is written by many hands: enrichment routines, customer
+// service, and the owners themselves. Any of those edits leaves a published
+// translation describing text that no longer exists. planTranslationBatch
+// already detects this by source hash, but only when a translation batch runs
+// - up to a day later. This sweep does the hash comparison ALONE: one query
+// per platform, no LLM call, and it only ever moves rows AWAY from published
+// (back to draft), so the page falls back to Norwegian within minutes of any
+// edit. Re-translating them is the batch lane's job.
+
+export interface StaleSweepResult {
+  checked: number;
+  stale: number;
+  unpublished: number;
+  ids: number[];
+  missing_source: number;
+}
+
+/**
+ * Compare every non-draft row's stored source_hash against the live source
+ * text and reset the ones that no longer match. `dryRun` reports without
+ * writing. A row whose source has disappeared entirely (unpublished
+ * experience, hidden provider, deleted producer) is unpublished too - the
+ * Norwegian page is gone, so the English one must go with it.
+ */
+export function sweepStaleTranslations(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  opts: { dryRun: boolean; batchId: string; actor: string; limit?: number } = { dryRun: true, batchId: "sweep", actor: "stale-sweep" },
+): StaleSweepResult {
+  const live = new Map<string, string>();
+  for (const item of collectSourceItems(db, platform)) {
+    live.set([item.entity_type, item.entity_id, item.field].join(" | "), sourceHash(item.text));
+  }
+  const rows = (db
+    .prepare("SELECT * FROM profile_translations WHERE platform = ? AND status IN ('published','verified','reviewed')")
+    .all(platform) as TranslationRow[])
+    // An owner-authored text is the producer's own words, not a rendering of
+    // the Norwegian - a Norwegian edit must not delete it. The portal shows
+    // them that the Norwegian has changed (owner_text_source_hash).
+    .filter((r) => !(r.owner_text && r.owner_text.trim()));
+  const liveText = new Map<string, string>();
+  for (const item of collectSourceItems(db, platform)) {
+    liveText.set([item.entity_type, item.entity_id, item.field].join(" | "), item.text);
+  }
+  const stale: Array<{ row: TranslationRow; text: string | null; hash: string | null }> = [];
+  let missingSource = 0;
+  for (const r of rows) {
+    const key = [r.entity_type, r.entity_id, r.field].join(" | ");
+    const hash = live.get(key);
+    if (hash === undefined) {
+      missingSource++;
+      stale.push({ row: r, text: null, hash: null });
+    } else if (hash !== r.source_hash) {
+      stale.push({ row: r, text: liveText.get(key) ?? null, hash });
+    }
+  }
+  const cap = Math.max(1, Math.min(2000, opts.limit ?? 2000));
+  const act = stale.slice(0, cap);
+  if (opts.dryRun) return { checked: rows.length, stale: stale.length, unpublished: 0, ids: act.map((x) => x.row.id), missing_source: missingSource };
+  const tx = db.transaction(() => {
+    for (const { row: r, text, hash } of act) {
+      setStatus(
+        db,
+        r,
+        "draft",
+        {
+          // Carry the new Norwegian in immediately when it still exists, so the
+          // row is ready for the next batch without waiting for a re-collect.
+          ...(text !== null && hash !== null ? { source_text: text, source_hash: hash } : {}),
+          published_at: null,
+          verified_at: null,
+          reviewed_at: null,
+          verify_json: null,
+          review_json: null,
+          prev_translated_text: r.translated_text,
+          translated_text: null,
+          attempts: 0,
+          batch_id: opts.batchId,
+        },
+        opts.actor,
+        "source changed or disappeared - unpublished by stale sweep",
+        opts.batchId,
+      );
+    }
+  });
+  tx();
+  return { checked: rows.length, stale: stale.length, unpublished: act.length, ids: act.map((x) => x.row.id), missing_source: missingSource };
+}
+
+// --- Owner-authored translations ------------------------------------------
+
+export interface OwnerTranslationView {
+  entity_type: string;
+  entity_id: string;
+  field: string;
+  lang: string;
+  source_text: string;
+  /** What the page shows today: the owner's own text when set, else the AI one. */
+  current_text: string | null;
+  owner_text: string | null;
+  owner_text_at: string | null;
+  /** True when the owner wrote this against an older Norwegian text. */
+  source_changed_since_owner_edit: boolean;
+  machine_text: string | null;
+  status: TranslationStatus;
+  published: boolean;
+}
+
+/** Everything a producer may see and edit for one entity, one language. */
+export function listOwnerTranslations(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  entityId: string,
+  lang: TranslationTargetLang,
+): OwnerTranslationView[] {
+  const rows = db
+    .prepare("SELECT * FROM profile_translations WHERE platform = ? AND entity_id = ? AND lang = ? ORDER BY field")
+    .all(platform, entityId, lang) as TranslationRow[];
+  const live = new Map(collectSourceItems(db, platform, { entityIds: [entityId] }).map((i) => [i.field, i]));
+  const out: OwnerTranslationView[] = [];
+  for (const r of rows) {
+    const owner = r.owner_text && r.owner_text.trim() ? r.owner_text : null;
+    const item = live.get(r.field);
+    out.push({
+      entity_type: r.entity_type,
+      entity_id: r.entity_id,
+      field: r.field,
+      lang: r.lang,
+      source_text: item ? item.text : r.source_text,
+      current_text: owner ?? (r.status === "published" ? r.translated_text : null),
+      owner_text: owner,
+      owner_text_at: r.owner_text_at ?? null,
+      source_changed_since_owner_edit: !!owner && !!r.owner_text_source_hash && !!item && sourceHash(item.text) !== r.owner_text_source_hash,
+      machine_text: r.translated_text,
+      status: r.status,
+      published: r.status === "published",
+    });
+  }
+  // A field the producer has, that has never been through the pipeline, is
+  // still theirs to write - offer it as an empty row.
+  for (const [field, item] of live) {
+    if (!rows.some((r) => r.field === field)) {
+      out.push({
+        entity_type: item.entity_type,
+        entity_id: item.entity_id,
+        field,
+        lang,
+        source_text: item.text,
+        current_text: null,
+        owner_text: null,
+        owner_text_at: null,
+        source_changed_since_owner_edit: false,
+        machine_text: null,
+        status: "draft",
+        published: false,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Store a producer's own text for one field and language. It is served as-is
+ * (no reviewer, no verifier - these are the producer's own words about their
+ * own business, exactly like the Norwegian they already control), the pipeline
+ * stops translating that field, and the stale sweep leaves it alone.
+ */
+export function setOwnerTranslation(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  args: { entityType: string; entityId: string; field: string; lang: TranslationTargetLang; text: string; actor: string },
+): TranslationRow | null {
+  const text = cleanSource(args.text);
+  if (!text) return null;
+  const item = collectSourceItems(db, platform, { entityIds: [args.entityId] }).find(
+    (i) => i.entity_type === args.entityType && i.field === args.field,
+  );
+  if (!item) return null;
+  const key = { platform, entity_type: args.entityType, entity_id: args.entityId, field: args.field, lang: args.lang };
+  const hash = sourceHash(item.text);
+  let row = getTranslationRow(db, key);
+  if (!row) {
+    db.prepare(
+      `INSERT INTO profile_translations
+         (platform, entity_type, entity_id, entity_name, field, lang, source_text, source_hash, status, attempts, batch_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, ?, ?, ?)`,
+    ).run(platform, key.entity_type, key.entity_id, item.entity_name, key.field, key.lang, item.text, hash, "owner", nowIso(), nowIso());
+    row = getTranslationRow(db, key)!;
+    audit(db, row.id, null, "draft", args.actor, "created by owner edit", null);
+  }
+  return setStatus(
+    db,
+    row,
+    "published",
+    {
+      owner_text: text,
+      owner_text_at: nowIso(),
+      owner_text_by: args.actor.slice(0, 120),
+      owner_text_source_hash: hash,
+      source_text: item.text,
+      source_hash: hash,
+      published_at: nowIso(),
+      previously_published: 1,
+      reject_reason: null,
+    },
+    args.actor,
+    "owner-authored translation saved",
+    null,
+  );
+}
+
+/** Hand the field back to the pipeline. The AI text (if any) is NOT restored
+ *  automatically: the row goes to draft and is re-translated on the next run. */
+export function clearOwnerTranslation(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  args: { entityType: string; entityId: string; field: string; lang: TranslationTargetLang; actor: string },
+): TranslationRow | null {
+  const row = getTranslationRow(db, { platform, entity_type: args.entityType, entity_id: args.entityId, field: args.field, lang: args.lang });
+  if (!row) return null;
+  return setStatus(
+    db,
+    row,
+    "draft",
+    { owner_text: null, owner_text_at: null, owner_text_by: null, owner_text_source_hash: null, translated_text: null, published_at: null, verified_at: null, reviewed_at: null, attempts: 0 },
+    args.actor,
+    "owner-authored translation cleared - back to the pipeline",
+    null,
+  );
 }
 
 // ─── Session lane: collect → translate+review OUTSIDE the app → submit ────
@@ -1382,6 +1682,7 @@ export interface SessionSubmission {
 
 export type SessionSubmitOutcome =
   | "verified"
+  | "auto_republished"
   | "rejected_verify"
   | "rejected_review"
   | "revise"
@@ -1408,6 +1709,16 @@ export interface SessionSubmitResult {
  * (draft → reviewed → verified | rejected). Never publishes. A row that is not
  * a draft, or whose source changed since it was collected, is left untouched.
  */
+/** Flag + policy gate for putting a re-translation straight back on the page. */
+export function isAutoRepublishEnabled(): boolean {
+  return process.env.PROFILE_TRANSLATIONS_AUTO_REPUBLISH_ENABLED === "true";
+}
+function autoRepublishOnVerify(db: Database.Database, platform: TranslationPlatform, row: TranslationRow): boolean {
+  if (!isAutoRepublishEnabled()) return false;
+  if (Number(row.previously_published ?? 0) !== 1) return false;
+  return !isEntityOwnerClaimed(db, platform, row.entity_type, row.entity_id);
+}
+
 export function submitSessionTranslation(
   db: Database.Database,
   platform: TranslationPlatform,
@@ -1452,6 +1763,14 @@ export function submitSessionTranslation(
     const vr = verifyTranslationDeterministic(row.source_text, translation, row.lang as TranslationTargetLang, { kind, alreadyTargetLanguage: alreadyTarget, entityName: row.entity_name, keptTerms });
     if (vr.ok) {
       row = setStatus(db, row, "verified", { verify_json: JSON.stringify(vr), verified_at: nowIso(), reject_reason: null }, opts.actor, "verified", opts.batchId);
+      // Steady state (Daniel 2026-09-03): a row Daniel has already published
+      // once, whose Norwegian later changed, may go straight back out when the
+      // reviewer and the deterministic verifier both pass. A first-ever
+      // translation, and ANY owner-claimed profile, still waits for a human.
+      if (autoRepublishOnVerify(db, platform, row)) {
+        row = setStatus(db, row, "published", { published_at: nowIso(), previously_published: 1 }, opts.actor, "auto-republished (previously published, source changed)", opts.batchId);
+        return { id: row.id, outcome: "auto_republished", status: row.status, attempts: row.attempts, review: verdict, verify: vr };
+      }
       return { id: row.id, outcome: "verified", status: row.status, attempts: row.attempts, review: verdict, verify: vr };
     }
     const reason = `deterministic verify failed: ${vr.failed.join(", ")}`;
@@ -1478,6 +1797,20 @@ export function translationStatusCounts(db: Database.Database, platform: Transla
     out[r.lang][r.status] = r.n;
   }
   return out;
+}
+
+/** Queue rows annotated with owner-claim status (publish gate + spot-check picking). */
+export function listTranslationQueueWithClaims(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  opts: { lang?: TranslationTargetLang; status?: TranslationStatus; limit?: number; entityId?: string } = {},
+): Array<TranslationRow & { owner_claimed: boolean }> {
+  const claimed = new Map<string, boolean>();
+  return listTranslationQueue(db, platform, opts).map((r) => {
+    const key = [r.entity_type, r.entity_id].join(" | ");
+    if (!claimed.has(key)) claimed.set(key, isEntityOwnerClaimed(db, platform, r.entity_type, r.entity_id));
+    return { ...r, owner_claimed: claimed.get(key)! };
+  });
 }
 
 export function listTranslationQueue(
@@ -1522,15 +1855,17 @@ export function getPublishedProfileTranslations(
   if (!opts.ignoreServeFlag && !isProfileTranslationServingEnabled()) return {};
   try {
     const statuses = opts.includeVerified ? "('published','verified')" : "('published')";
+    // COALESCE: an owner-authored text wins over the machine one, and is served
+    // whatever the pipeline status says — it is the producer's own words.
     const rows = db
       .prepare(
-        `SELECT field, translated_text FROM profile_translations
-          WHERE platform = ? AND entity_type = ? AND entity_id = ? AND lang = ? AND status IN ${statuses}
-            AND translated_text IS NOT NULL AND translated_text != ''`,
+        `SELECT field, COALESCE(NULLIF(TRIM(owner_text), ''), translated_text) AS text FROM profile_translations
+          WHERE platform = ? AND entity_type = ? AND entity_id = ? AND lang = ?
+            AND (TRIM(COALESCE(owner_text, '')) != '' OR (status IN ${statuses} AND translated_text IS NOT NULL AND translated_text != ''))`,
       )
-      .all(platform, entityType, String(entityId), lang) as Array<{ field: string; translated_text: string }>;
+      .all(platform, entityType, String(entityId), lang) as Array<{ field: string; text: string }>;
     const out: Record<string, string> = {};
-    for (const r of rows) out[r.field] = r.translated_text;
+    for (const r of rows) if (r.text) out[r.field] = r.text;
     return out;
   } catch {
     return {};
@@ -1556,14 +1891,15 @@ export function getPublishedProfileTranslationsBulk(
       const placeholders = chunk.map(() => "?").join(",");
       const rows = db
         .prepare(
-          `SELECT entity_id, field, translated_text FROM profile_translations
-            WHERE platform = ? AND entity_type = ? AND lang = ? AND status = 'published'
-              AND translated_text IS NOT NULL AND translated_text != '' AND entity_id IN (${placeholders})`,
+          `SELECT entity_id, field, COALESCE(NULLIF(TRIM(owner_text), ''), translated_text) AS text FROM profile_translations
+            WHERE platform = ? AND entity_type = ? AND lang = ? AND entity_id IN (${placeholders})
+              AND (TRIM(COALESCE(owner_text, '')) != '' OR (status = 'published' AND translated_text IS NOT NULL AND translated_text != ''))`,
         )
-        .all(platform, entityType, lang, ...chunk) as Array<{ entity_id: string; field: string; translated_text: string }>;
+        .all(platform, entityType, lang, ...chunk) as Array<{ entity_id: string; field: string; text: string }>;
       for (const r of rows) {
+        if (!r.text) continue;
         const m = out.get(r.entity_id) || {};
-        m[r.field] = r.translated_text;
+        m[r.field] = r.text;
         out.set(r.entity_id, m);
       }
     }
