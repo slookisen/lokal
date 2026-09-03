@@ -99,6 +99,11 @@ export function runRfbEnChromeTests(opts: { log?: boolean } = {}): TestSummary {
   eq(dayName("sat", "no"), "Lørdag", "d3: Norwegian unchanged");
   eq(dayName("sat", "sv"), "Lördag", "d4: Swedish");
   eq(dayName("weird", "en"), "weird", "d5: unknown key falls through unchanged");
+  // live 2026-09-03 (Gvarv): a range key rendered raw in both languages
+  eq(dayName("mon-sun", "en"), "Monday\u2013Sunday", "d5b: range key -> Monday–Sunday");
+  eq(dayName("mon-sun", "no"), "Mandag\u2013Søndag", "d5c: …and Mandag–Søndag on the Norwegian page");
+  eq(dayName("man-fre", "en"), "Monday\u2013Friday", "d5d: Norwegian abbreviation range");
+  eq(dayName("mon-xyz", "en"), "mon-xyz", "d5e: half-known range stays raw");
   eq([monthAbbr(5, "en"), monthAbbr(10, "en"), monthAbbr(12, "en")], ["May","Oct","Dec"], "d6: English month abbreviations");
   eq([monthAbbr(5, "no"), monthAbbr(12, "no")], ["Mai","Des"], "d7: Norwegian unchanged");
   eq(monthAbbr(13, "en"), "13", "d8: out of range -> number");
