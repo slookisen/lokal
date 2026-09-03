@@ -663,6 +663,32 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_review_queue failed:", err);
   }
 
+  // ─── gardssalg_website_review_queue.parked_since (dev-request 2026-09-02-
+  // gardssalg-website-review-queue-terminal-parking) ─────────────────────────
+  // The two terminal-failure `reason` values written to this table
+  // (`verification_failed` from gardssalg-website-verification.ts,
+  // `candidate_evidence_failed` from the external-candidates route in
+  // opplevelser.ts) are never selected by the ONLY drain routes on this
+  // table (gardssalg-website-review-judge / -approve, both scoped to
+  // `reason = 'website_discovery_candidate'`), so they accumulate forever
+  // with no path to resolution. `parked_since` is a nullable TEXT column,
+  // stamped once by POST /admin/gardssalg-website-review-queue-park, that
+  // marks a row as knowingly parked WITHOUT deleting it or touching its
+  // `reason`/`evidence`/`candidate_url` — same nullable-TEXT-stamped-once,
+  // never-deleted, excluded-from-future-auto-select shape as
+  // agent_knowledge.pending_verify_parked_since (src/database/init.ts,
+  // "pending_verify no-progress parking" migration above this file's own
+  // twin). ADD COLUMN + try/catch per statement, same idiom as that
+  // precedent, so this is safe to run against a database that already has
+  // the table.
+  for (const stmt of [`ALTER TABLE gardssalg_website_review_queue ADD COLUMN parked_since TEXT`]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // ─── provider_work_queue (dev-request 2026-08-17-forsyningskjede-
   // samarbeid-og-kvalitetsoppdatering, Skive 1) ───────────────────────────────
   // Shared hand-off queue between the three gårdssalg pipelines (ownership-

@@ -6466,6 +6466,87 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
   });
 });
 
+// ─── POST /admin/gardssalg-website-review-queue-park ────────────────────────
+//
+// dev-request 2026-09-02-gardssalg-website-review-queue-terminal-parking.
+// The two terminal-failure `reason` values on THIS table —
+// `verification_failed` (written from gardssalg-website-verification.ts) and
+// `candidate_evidence_failed` (written from the external-candidates route,
+// above) — are never touched by either drain route on this queue
+// (gardssalg-website-review-judge and -approve, both scoped to
+// `reason = 'website_discovery_candidate'` only), so they accumulate forever
+// with no path to resolution or visible expiry (measured ~111 rows:
+// 75 verification_failed + 36 candidate_evidence_failed as of 2026-09-02).
+//
+// This route is a small, additive, fully reversible "parking" mechanism:
+// it marks those rows as knowingly parked by stamping `parked_since`
+// (added just above the drain routes' CREATE TABLE in
+// database/init-experiences.ts) — it NEVER deletes a row and NEVER touches
+// `reason`/`evidence`/`candidate_url`, mirroring the precedent already
+// shipped for agent_knowledge.pending_verify_parked_since (init.ts): a
+// nullable TEXT column, stamped once, excluded from future auto-select by a
+// `parked_since IS NULL` filter, never deleted.
+//
+// `{"apply"?: boolean}` — omitted or `false` is a dry-run (report only,
+// write nothing); `true` applies. The apply-time UPDATE is guarded on
+// `parked_since IS NULL` (in addition to the SELECT's own filter) so a
+// concurrent second call for the same row can't double-count or clobber —
+// same guarded-UPDATE discipline as gardssalgWdJudgeAppendReason above.
+// Explicitly out of scope: the website_discovery_candidate drain path
+// (untouched, read-only-verified); deleting rows (never); a new table (this
+// is one column + one route on the existing table).
+router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true;
+
+  const db = getExpDb("experiences");
+  const candidates = db
+    .prepare(
+      `SELECT provider_id, reason FROM gardssalg_website_review_queue
+        WHERE reason IN ('verification_failed', 'candidate_evidence_failed')
+          AND parked_since IS NULL
+        ORDER BY updated_at ASC`,
+    )
+    .all() as Array<{ provider_id: string; reason: string }>;
+
+  // A true no-op on an empty selection — never throws, dry-run or apply.
+  if (candidates.length === 0) {
+    res.json({ would_park: 0, parked: 0, results: [] });
+    return;
+  }
+
+  if (!apply) {
+    res.json({
+      would_park: candidates.length,
+      parked: 0,
+      results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
+    });
+    return;
+  }
+
+  const stampPark = db.prepare(
+    `UPDATE gardssalg_website_review_queue
+        SET parked_since = datetime('now'), updated_at = datetime('now')
+      WHERE provider_id = ? AND parked_since IS NULL`,
+  );
+  let parked = 0;
+  for (const c of candidates) {
+    const result = stampPark.run(c.provider_id);
+    if (result.changes > 0) parked++;
+    // changes === 0 means a concurrent call already parked this row between
+    // our SELECT and this UPDATE — correctly excluded from `parked`, but the
+    // row still reports in `results` below since it WAS a would-park
+    // candidate at selection time; `results` mirrors the selected set
+    // identically across dry-run and apply, `parked` is what actually landed.
+  }
+
+  res.json({
+    would_park: candidates.length,
+    parked,
+    results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
+  });
+});
+
 // ─── POST /api/opplevelser/admin/listing-homepage-discovery (admin) ────────
 //
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
