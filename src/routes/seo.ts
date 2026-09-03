@@ -316,6 +316,26 @@ export function formatCat(cat: string): string {
 export function formatCatEn(cat: string): string {
   return catLabel(cat, "en");
 }
+
+// Reverse map: Norwegian category word (lower-cased) -> category key.
+const CATEGORY_NAME_TO_KEY: Record<string, string> = Object.fromEntries([
+  ...Object.entries(CATEGORY_MAP).map(([k, v]) => [v.name.toLowerCase(), k]),
+  ...Object.entries(CATEGORY_BADGE_LABELS_ONLY).map(([k, v]) => [v.toLowerCase(), k]),
+]);
+
+/**
+ * Display label for a PRODUCT name in the page language. Live 2026-09-03:
+ * many producers list their products as bare category words ("Kjøtt",
+ * "Grønnsaker", "Frukt"), so the English opening line read "sells Kjøtt,
+ * Grønnsaker, Frukt". A product name that is exactly a known category word
+ * is the same product under its category label; everything else is the
+ * producer's own wording and is returned unchanged. Norwegian: unchanged.
+ */
+export function productLabel(name: string, lang: Lang): string {
+  if (!name || lang === "no") return name;
+  const key = CATEGORY_NAME_TO_KEY[name.trim().toLowerCase()];
+  return key ? catLabel(key, lang) : name;
+}
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
 }
@@ -4020,6 +4040,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productNames = (params.productsList || [])
     .map((p: any) => (typeof p === "string" ? p : p?.name))
     .filter(Boolean)
+    .map((n: string) => productLabel(n, lang))
     .slice(0, 4);
   const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 4);
   const sellItems = productNames.length ? productNames : catLabels;
