@@ -14,7 +14,8 @@
  *   - the producer.* dictionary keys the contact card now reads exist in all
  *     three locales.
  */
-import { catLabel, formatCat, formatCatEn, productLabel, buildProducerAnswerFirstOpening } from "./seo";
+import { catLabel, formatCat, formatCatEn, productLabel, buildProducerAnswerFirstOpening, dayName, monthAbbr, applyPublishedTranslations } from "./seo";
+import { translateDeliveryTerm } from "../i18n/product-glossary";
 import { formatUpdatedPretty, formatUpdatedPrettyEn, formatUpdatedPrettyNo } from "../utils/freshness";
 import { decodeHtmlEntities, normalizeProse } from "../services/description-quality";
 import { t } from "../i18n/t";
@@ -91,6 +92,31 @@ export function runRfbEnChromeTests(opts: { log?: boolean } = {}): TestSummary {
   }
   eq(t("en", "producer.download_vcard"), "Download contact card", "k2: button text is English");
   eq(t("no", "producer.download_vcard"), "Last ned kontaktkort", "k3: …and unchanged in Norwegian");
+
+  // ── part 2 (Daniel 2026-09-03, four screenshots): hours, season, delivery, headings ──
+  eq(["mon","tue","wed","thu","fri","sat","sun"].map((d) => dayName(d, "en")), ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], "d1: English day names for short keys");
+  eq(dayName("saturday", "en"), "Saturday", "d2: long keys too");
+  eq(dayName("sat", "no"), "Lørdag", "d3: Norwegian unchanged");
+  eq(dayName("sat", "sv"), "Lördag", "d4: Swedish");
+  eq(dayName("weird", "en"), "weird", "d5: unknown key falls through unchanged");
+  eq([monthAbbr(5, "en"), monthAbbr(10, "en"), monthAbbr(12, "en")], ["May","Oct","Dec"], "d6: English month abbreviations");
+  eq([monthAbbr(5, "no"), monthAbbr(12, "no")], ["Mai","Des"], "d7: Norwegian unchanged");
+  eq(monthAbbr(13, "en"), "13", "d8: out of range -> number");
+  eq(["Gårdsbutikk","Kontant","Kort","Vipps","Bondens marked","Faktura","Nettbetaling","Direkteleveranse","Lokalbutikk"].map((v) => translateDeliveryTerm(v, "en")),
+     ["Farm shop","Cash","Card","Vipps","Farmers' market","Invoice","Online payment","Direct delivery","Local shop"], "d9: delivery/payment terms in English (the screenshot values)");
+  eq(translateDeliveryTerm("Butikk Verksgata 13", "en"), "Butikk Verksgata 13", "d10: free-text value stays exactly as written");
+  eq(translateDeliveryTerm("Kontant", "no"), "Kontant", "d11: Norwegian unchanged");
+  eq(translateDeliveryTerm("kontant", "en"), "cash", "d12: capitalisation shape kept");
+  for (const k of ["affiliations","season","hours","delivery_payment","delivery_radius","min_order","delivery_methods","payment","today","part_of","show_on_google_maps","disclaimer_public","disclaimer_owner"]) {
+    eq([t("en", `producer.${k}`) !== `producer.${k}`, t("no", `producer.${k}`) !== `producer.${k}`, t("sv", `producer.${k}`) !== `producer.${k}`], [true, true, true], `d13: producer.${k} exists in en/no/sv`);
+  }
+  eq([t("en", "nav.home"), t("no", "nav.home"), t("en", "nav.back_home")], ["Home", "Hjem", "Back to the front page"], "d14: nav.home / nav.back_home");
+  eq(t("no", "producer.hours"), "Åpningstider", "d15: Norwegian heading text unchanged");
+  // applyPublishedTranslations pure paths (DB-backed behaviour is covered by the
+  // serve-flag gate inside getPublishedProfileTranslationsBulk)
+  const rows = [{ id: "x", description: "Norsk", about: "Om" }];
+  eq(applyPublishedTranslations(rows, "no")[0].description, "Norsk", "d16: no-op for Norwegian");
+  eq(applyPublishedTranslations([], "en").length, 0, "d17: empty list is fine");
 
   return { passed, failed, failures };
 }

@@ -9471,7 +9471,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   // 2026-09-03 produkt-ordliste: the heading reads producer.products from the
   // dictionary ("Produkter"/"Products") — same card order is asserted, the
   // anchor is the new heading form.
-  const prodCardOrderMatch = seoSrc.match(/t\(lang, "producer\.products"\)\)\} \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
+  // 2026-09-03 del 2: the affiliations/season headings read the dictionary too.
+  const prodCardOrderMatch = seoSrc.match(/t\(lang, "producer\.products"\)\)\} \(\${productsList\.length\}\)[\s\S]{0,1500}t\(lang, "producer\.affiliations"\)[\s\S]{0,1500}t\(lang, "producer\.season"\)/);
   assertTrue(
     !!prodCardOrderMatch,
     "phase5.11-a2: producer affiliations card sits between Produkter and Sesongkalender"
@@ -10634,7 +10635,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   assertTrue(
     // 2026-09-03 språk-økt: the link is now localizedPath("/produsent/" + parentSlug, lang)
     // (byte-identical href for Norwegian; carries /en on the English page).
-    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\$\{localizedPath\("\/produsent\/" \+ parentSlug, lang\)\}">Del av: /.test(seoSrc),
+    // 2026-09-03 del 2: "Del av:" reads producer.part_of.
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\$\{localizedPath\("\/produsent\/" \+ parentSlug, lang\)\}">\$\{escapeHtml\(t\(lang, "producer\.part_of"\)\)\} /.test(seoSrc),
     "phase5.11-a5: parent breadcrumb rendered as '← Del av:' link when parent_umbrella_id is set"
   );
   // The breadcrumb is injected ABOVE the H1 inside .umb-hero

@@ -158,6 +158,9 @@ export const PRODUCT_WORDS: Record<string, Entry> = {
   kvit: { en: "white", sv: "vit" }, hvit: { en: "white", sv: "vit" }, blå: { en: "blue", sv: "blå" }, trøffel: { en: "truffle", sv: "tryffel" },
   vellagra: { en: "well-aged", sv: "vällagrad" }, vellagret: { en: "well-aged", sv: "vällagrad" }, pepparost: { en: "pepper cheese", sv: "pepparost" },
   edamer: { en: "edam", sv: "edamer" }, brisket: { en: "brisket", sv: "brisket" },
+  // wine (seen live 2026-09-03: Fruktvin, Isvin)
+  vin: { en: "wine", sv: "vin" }, fruktvin: { en: "fruit wine", sv: "fruktvin" }, isvin: { en: "ice wine", sv: "isvin" },
+  eplevin: { en: "apple wine", sv: "äppelvin" }, plommevin: { en: "plum wine", sv: "plommonvin" }, bringebærvin: { en: "raspberry wine", sv: "hallonvin" },
   // qualifiers
   økologisk: { en: "organic", sv: "ekologisk" }, økologiske: { en: "organic", sv: "ekologiska" },
   fersk: { en: "fresh", sv: "färsk" }, ferske: { en: "fresh", sv: "färska" }, hjemmelaget: { en: "homemade", sv: "hemlagad" },
@@ -236,4 +239,34 @@ export function glossaryCoverage(freq: Array<[string, number]>, lang: Lang, isCa
     if (isCategoryWord(n) || translateProductName(n, lang) !== n) translated += c;
   }
   return { translated, total, pct: total ? Math.round((translated / total) * 100) : 0 };
+}
+
+// ─── Delivery / payment terms ──────────────────────────────────────────────
+// `agent_knowledge.deliveryOptions` / `paymentMethods` are FREE TEXT from the
+// producer (no enum in code): "Gårdsbutikk", "Kontant", "Kort", "Vipps",
+// "Butikk Verksgata 13" … Same rule as products: an exact known term renders
+// in the page language, anything else stays exactly as written.
+export const DELIVERY_TERMS: Record<string, Entry> = {
+  "gårdsbutikk": { en: "farm shop", sv: "gårdsbutik" }, "gardsbutikk": { en: "farm shop", sv: "gårdsbutik" },
+  "lokalbutikk": { en: "local shop", sv: "lokal butik" }, "butikk": { en: "shop", sv: "butik" },
+  "bondens marked": { en: "farmers' market", sv: "bondens marknad" }, "reko-ring": { en: "REKO ring", sv: "REKO-ring" },
+  "reko": { en: "REKO", sv: "REKO" }, "direkteleveranse": { en: "direct delivery", sv: "direktleverans" },
+  "hjemlevering": { en: "home delivery", sv: "hemleverans" }, "levering": { en: "delivery", sv: "leverans" },
+  "henting": { en: "pick-up", sv: "avhämtning" }, "hente selv": { en: "collect in person", sv: "hämta själv" },
+  "selvplukk": { en: "pick-your-own", sv: "självplock" }, "post": { en: "mail order", sv: "post" },
+  "postordre": { en: "mail order", sv: "postorder" }, "nettbutikk": { en: "online shop", sv: "webbutik" },
+  "abonnement": { en: "subscription", sv: "prenumeration" }, "andelslandbruk": { en: "community-supported agriculture", sv: "andelsjordbruk" },
+  "torg": { en: "market square", sv: "torg" }, "torget": { en: "the market square", sv: "torget" },
+  "dagligvare": { en: "grocery stores", sv: "dagligvaruhandel" }, "restaurant": { en: "restaurants", sv: "restauranger" },
+  "kontant": { en: "cash", sv: "kontant" }, "kort": { en: "card", sv: "kort" }, "bankkort": { en: "debit card", sv: "bankkort" },
+  "kredittkort": { en: "credit card", sv: "kreditkort" }, "vipps": { en: "Vipps", sv: "Vipps" }, "faktura": { en: "invoice", sv: "faktura" },
+  "nettbetaling": { en: "online payment", sv: "onlinebetalning" }, "bankoverføring": { en: "bank transfer", sv: "banköverföring" },
+  "forskudd": { en: "prepayment", sv: "förskott" }, "swish": { en: "Swish", sv: "Swish" }, "paypal": { en: "PayPal", sv: "PayPal" },
+};
+
+/** Exact known delivery/payment term in `lang`; otherwise unchanged. Norwegian: unchanged. */
+export function translateDeliveryTerm(value: string, lang: Lang): string {
+  if (!value || lang === "no") return value;
+  const t = pick(DELIVERY_TERMS[value.trim().toLowerCase()], lang);
+  return t === null ? value : recase(value.trim(), t);
 }

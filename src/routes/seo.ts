@@ -41,7 +41,8 @@ import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
-import { translateProductName } from "../i18n/product-glossary";
+import { translateProductName, translateDeliveryTerm } from "../i18n/product-glossary";
+import { getPublishedProfileTranslationsBulk } from "../services/profile-translations";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import {
   parseIsoOrSqlite,
@@ -122,6 +123,59 @@ const DAY_NAMES: Record<string, string> = {
 };
 
 const MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Des"];
+// Daniel 2026-09-03 (screenshot: "Mandag … Søndag", "I dag" on /en).
+const DAY_NAMES_EN: Record<string, string> = {
+  mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday", sat: "Saturday", sun: "Sunday",
+  monday: "Monday", tuesday: "Tuesday", wednesday: "Wednesday", thursday: "Thursday", friday: "Friday", saturday: "Saturday", sunday: "Sunday",
+};
+const DAY_NAMES_SV: Record<string, string> = {
+  mon: "M\u00e5ndag", tue: "Tisdag", wed: "Onsdag", thu: "Torsdag", fri: "Fredag", sat: "L\u00f6rdag", sun: "S\u00f6ndag",
+  monday: "M\u00e5ndag", tuesday: "Tisdag", wednesday: "Onsdag", thursday: "Torsdag", friday: "Fredag", saturday: "L\u00f6rdag", sunday: "S\u00f6ndag",
+};
+const MONTH_NAMES_EN = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_NAMES_SV = ["", "Jan", "Feb", "Mar", "Apr", "Maj", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dec"];
+export function dayName(key: string, lang: Lang): string {
+  const k = (key || "").toLowerCase();
+  const m = lang === "en" ? DAY_NAMES_EN : lang === "sv" ? DAY_NAMES_SV : DAY_NAMES;
+  return m[k] || DAY_NAMES[k] || key;
+}
+export function monthAbbr(m: number, lang: Lang): string {
+  const arr = lang === "en" ? MONTH_NAMES_EN : lang === "sv" ? MONTH_NAMES_SV : MONTH_NAMES;
+  return arr[m] || String(m);
+}
+
+/**
+ * Daniel 2026-09-03: related/featured/search/city/category cards on /en showed
+ * Norwegian descriptions — the cards read agents.description straight from
+ * the row, never the translation store. Swap in the PUBLISHED translation of
+ * description/about where one exists (bulk, one query per list). Respects the
+ * serve flag through getPublishedProfileTranslationsBulk (returns {} when
+ * off), so with the flag off every list renders byte-identically. Norwegian:
+ * no-op. Mutates the passed objects (they are per-request rows).
+ */
+export function applyPublishedTranslations<T extends { id: string; description?: string | null; about?: string | null }>(
+  rows: T[],
+  lang: Lang,
+  knowledgeById?: Map<string, { about?: string | null }>,
+): T[] {
+  if (lang === "no" || !rows.length) return rows;
+  let map: Map<string, Record<string, string>>;
+  try {
+    map = getPublishedProfileTranslationsBulk(getDb(), "rfb", "agent", rows.map((r) => r.id), lang);
+  } catch (e) {
+    console.error("[seo] applyPublishedTranslations failed — cards keep Norwegian:", e);
+    return rows;
+  }
+  for (const r of rows) {
+    const t = map.get(r.id);
+    if (!t) continue;
+    if (t.description && r.description) r.description = t.description;
+    if (t.about && "about" in r && r.about) r.about = t.about;
+    const k = knowledgeById?.get(r.id);
+    if (k && t.about && k.about) k.about = t.about;
+  }
+  return rows;
+}
 
 // Daniel 2026-09-03 (screenshot): category chips read "Kjøtt / Grønnsaker /
 // Frukt" on /en. `name` stays the Norwegian label every existing caller
@@ -1140,15 +1194,16 @@ router.get("/", (req: Request, res: Response) => {
         return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="chip">${val.emoji} ${escapeHtml(catLabel(_key, lang))} (${count})</a>`;
       }).join("");
 
+    // Published translations for the whole featured list in one query
+    // (description on the row, about on the knowledge object).
+    const featuredKnowledge = new Map<string, any>();
+    featured.forEach((a: any, i: number) => {
+      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id)?.knowledge || {});
+    });
+    applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
-      if (i < 3 && a.isClaimed) {
-        const info = knowledgeService.getAgentInfo(a.id);
-        return producerCardUltraRich(a, info?.knowledge || {}, lang);
-      }
-      if (i < 11 && a.isClaimed) {
-        const info = knowledgeService.getAgentInfo(a.id);
-        return producerCardMediumRich(a, info?.knowledge || {}, lang);
-      }
+      if (i < 3 && a.isClaimed) return producerCardUltraRich(a, featuredKnowledge.get(a.id) || {}, lang);
+      if (i < 11 && a.isClaimed) return producerCardMediumRich(a, featuredKnowledge.get(a.id) || {}, lang);
       return producerCard(a, undefined, lang);
     }).join("");
 
@@ -1602,6 +1657,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       } catch { /* non-critical — don't break search if logging fails */ }
     }
 
+    applyPublishedTranslations(results.map((r: any) => r.agent), lang);
     const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons, lang)).join("");
 
     // REVIEW FOLLOW-UP item 7: on a coordinates-only search this used to build
@@ -3270,6 +3326,7 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
       ? `${n} producer${n === 1 ? "" : "s"}`
       : `${n} produsent${n === 1 ? "" : "er"}`;
 
+    applyPublishedTranslations(members, lang);
     const cards = members.map((a: any) => producerCard(a, undefined, lang)).join("");
     const body = members.length > 0
       ? `<div class="sk-grid">${cards}</div>`
@@ -3352,6 +3409,7 @@ router.get("/verifisert-av-eier", (req: Request, res: Response) => {
       ? "Producers whose owner has personally claimed and confirmed this profile."
       : "Produsenter der eieren selv har krevd og bekreftet profilen.";
 
+    applyPublishedTranslations(members, lang);
     const cards = members.map((a: any) => producerCard(a, undefined, lang)).join("");
     const body = members.length > 0
       ? `<div class="sk-grid">${cards}</div>`
@@ -3448,7 +3506,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         lang === "en" ? "No producers found." : "Ingen produsenter funnet.",
         `<div class="sec" style="text-align:center;padding:80px 24px;">
           <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
-          <p style="color:var(--g500);"><a href="${localizedPath("/", lang)}">Tilbake til forsiden</a></p>
+          <p style="color:var(--g500);"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.back_home"))}</a></p>
         </div>`,
         {
           robots: "noindex, follow",
@@ -3470,6 +3528,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     // Use the first agent as representative — getCityStats groups by city
     analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
 
+    applyPublishedTranslations(cityAgents, lang);
     const producerCards = cityAgents.map((a: any) => producerCard(a, undefined, lang)).join("");
 
     // City-specific context paragraph (SEO: gives Google unique content per city
@@ -3548,7 +3607,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     const content = `
     <section class="city-hero">
       <div class="container">
-        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
+        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>${lang === "en" ? `Local food in <span translate="no">${escapeHtml(cityName)}</span>` : `Lokal mat i <span translate="no">${escapeHtml(cityName)}</span>`}</h1>
         <p>${lang === "en" ? `${cityAgents.length} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-omr\u00e5det.`}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
@@ -4271,7 +4330,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ? `<div class="sec">
             <h2 style="font-size:1.4rem;margin-bottom:8px;">${enS ? "Did you mean any of these?" : "Mente du noen av disse?"}</h2>
             <p style="color:var(--g500);margin-bottom:24px;">${enS ? `We have ${totalAgents}+ producers. These are the closest matches for what you searched.` : `Vi har ${totalAgents}+ produsenter. Disse ligner mest på det du søkte etter.`}</p>
-            <div class="grid">${match.suggestions.map((a: any) => producerCard(a, undefined, lang)).join("")}</div>
+            <div class="grid">${applyPublishedTranslations(match.suggestions, lang).map((a: any) => producerCard(a, undefined, lang)).join("")}</div>
           </div>`
         : "";
 
@@ -4567,7 +4626,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           if (parent?.name) {
             const parentSlug = slugify(parent.name);
             umbParentJsonLd = { name: parent.name, slug: parentSlug };
-            umbParentHtml = `<div class="umb-parent-link">&larr; <a href="${localizedPath("/produsent/" + parentSlug, lang)}">Del av: ${escapeHtml(parent.name)}</a></div>`;
+            umbParentHtml = `<div class="umb-parent-link">&larr; <a href="${localizedPath("/produsent/" + parentSlug, lang)}">${escapeHtml(t(lang, "producer.part_of"))} ${escapeHtml(parent.name)}</a></div>`;
           }
         } catch (e) { /* parent not found — ignore */ }
       }
@@ -4588,7 +4647,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (cityName) umbMapsParts.push(cityName);
         umbMapsParts.push("Norge");
         const umbMapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(umbMapsParts.join(", "))}`;
-        umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${umbMapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+        umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${umbMapsUrl}" target="_blank" rel="noopener">${escapeHtml(t(lang, "producer.show_on_google_maps"))}</a></div></div></div>`);
       }
       const umbContactHtml = umbContactItems.length
         ? `<div class="card"><div class="card-head"><span>&#128242;</span><h3>Kontakt</h3></div><div class="card-body">${umbContactItems.join("")}</div></div>`
@@ -4740,7 +4799,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       }
 
       const umbContent = `
-    <div class="bc"><a href="${localizedPath("/", lang)}">Hjem</a><span>/</span>${escapeHtml(agent.name)}</div>
+    <div class="bc"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a><span>/</span>${escapeHtml(agent.name)}</div>
 
     <div class="pf-header" style="grid-template-columns: 1fr;">
       <div class="umb-hero">
@@ -4830,7 +4889,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (cityName) mapsSearchParts.push(cityName);
     mapsSearchParts.push("Norge");
     const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(mapsSearchParts.join(", "))}`;
-    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.map"))}</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">${escapeHtml(t(lang, "producer.show_on_google_maps"))}</a></div></div></div>`);
 
     // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];
@@ -4856,7 +4915,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ? hoursList.map((h: any) => {
           const isToday = h.day === todayShort || h.day === today;
           const cls = isToday ? " hrs-today" : "";
-          return `<div class="hrs-day${cls}">${DAY_NAMES[h.day] || h.day}${isToday ? '<span class="hrs-open"><span class="hrs-dot"></span> I dag</span>' : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
+          return `<div class="hrs-day${cls}">${escapeHtml(dayName(h.day, lang))}${isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
         }).join("")
       : hoursText ? `<div class="hrs-day">${escapeHtml(hoursText)}</div>` : "";
 
@@ -4901,22 +4960,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             const m = i + 1;
             const active = months.includes(m);
             const cls = active ? (m === currentMonth ? "sm-now" : "sm-on") : "sm-off";
-            return `<span class="${cls}" title="${MONTH_NAMES[m] || m}">${MONTH_NAMES[m]?.charAt(0) || m}</span>`;
+            return `<span class="${cls}" title="${monthAbbr(m, lang)}">${monthAbbr(m, lang).charAt(0)}</span>`;
           }).join("");
           return `<div class="season-row">
-            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(s.product || "")}</div>
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(s.product || "", lang))}</div>
             <div class="season-bar">${monthDots}</div>
-            ${s.note ? `<div class="season-note">${escapeHtml(s.note)}</div>` : ""}
+            ${s.note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(s.note)}</div>` : ""}
           </div>`;
         }).join("")
       : "";
 
     // Delivery info
     const deliveryParts: string[] = [];
-    if (k.deliveryRadius) deliveryParts.push(`<div class="del-item"><strong>Leveringsradius:</strong> ${k.deliveryRadius} km</div>`);
-    if (k.minOrderValue) deliveryParts.push(`<div class="del-item"><strong>Minstebestilling:</strong> ${k.minOrderValue} kr</div>`);
-    if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>Leveringsmetoder:</strong> ${(k.deliveryOptions as string[]).join(", ")}</div>`);
-    if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>Betaling:</strong> ${(k.paymentMethods as string[]).join(", ")}</div>`);
+    if (k.deliveryRadius) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_radius"))}</strong> ${escapeHtml(String(k.deliveryRadius))} km</div>`);
+    if (k.minOrderValue) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.min_order"))}</strong> ${escapeHtml(String(k.minOrderValue))} kr</div>`);
+    if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_methods"))}</strong> ${escapeHtml((k.deliveryOptions as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
+    if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.payment"))}</strong> ${escapeHtml((k.paymentMethods as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
     const deliveryHtml = deliveryParts.join("");
 
     // ─── Phase 5.11 A2: affiliations card (producer view) ───────────
@@ -5293,7 +5352,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         const heading = lang === "en"
           ? `Other local food producers in ${cityName}`
           : `Andre lokale matprodusenter i ${cityName}`;
-        relCitySection = renderRelatedSection(cityRows, heading, lang);
+        relCitySection = renderRelatedSection(applyPublishedTranslations(cityRows, lang), heading, lang);
       }
       if (primaryCategory) {
         const catRows = getRelatedBySameCategory(db, agent.id, primaryCategory, cityName || null, 5);
@@ -5301,7 +5360,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         const heading = lang === "en"
           ? `Other ${catWord} producers in Norway`
           : `Andre ${catWord}-produsenter i Norge`;
-        relCategorySection = renderRelatedSection(catRows, heading, lang);
+        relCategorySection = renderRelatedSection(applyPublishedTranslations(catRows, lang), heading, lang);
       }
     } catch (e) {
       // Non-fatal — the producer page must still render. SEO sections
@@ -5360,7 +5419,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     const content = `
-    <div class="bc"><a href="${localizedPath("/", lang)}">Hjem</a>${cityName ? `<span>/</span><a href="${localizedPath("/" + slugify(cityName), lang)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
+    <div class="bc"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a>${cityName ? `<span>/</span><a href="${localizedPath("/" + slugify(cityName), lang)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
     ${heroClaimHtml}
 
@@ -5439,25 +5498,25 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
         ${affiliationsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#129309;</span><h3>Tilknytninger</h3></div>
+          <div class="card-head"><span>&#129309;</span><h3>${escapeHtml(t(lang, "producer.affiliations"))}</h3></div>
           <div class="card-body"><div class="aff-grid">${affiliationsHtml}</div></div>
         </div>` : ""}
 
         ${seasonHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#127793;</span><h3>Sesongkalender</h3></div>
+          <div class="card-head"><span>&#127793;</span><h3>${escapeHtml(t(lang, "producer.season"))}</h3></div>
           <div class="card-body"><div class="season-grid">${seasonHtml}</div></div>
         </div>` : ""}
 
         ${hoursHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#128339;</span><h3>\u00c5pningstider</h3></div>
+          <div class="card-head"><span>&#128339;</span><h3>${escapeHtml(t(lang, "producer.hours"))}</h3></div>
           <div class="card-body"><div class="hrs-grid">${hoursHtml}</div></div>
         </div>` : ""}
 
         ${deliveryHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#128666;</span><h3>Levering og betaling</h3></div>
+          <div class="card-head"><span>&#128666;</span><h3>${escapeHtml(t(lang, "producer.delivery_payment"))}</h3></div>
           <div class="card-body"><div class="del-grid">${deliveryHtml}</div></div>
         </div>` : ""}
 
@@ -5501,7 +5560,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           }${k.lastEnrichedAt ? ` \u2014 ${lang === "en" ? "Last updated" : "Sist oppdatert"} ${new Date(k.lastEnrichedAt).toLocaleDateString(lang === "en" ? "en-US" : "nb-NO")}` : ""}
         </div>
 
-        ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(meta.disclaimer)}</p>` : ""}
+        ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(t(lang, meta.dataSource === "owner" ? "producer.disclaimer_owner" : "producer.disclaimer_public"))}</p>` : ""}
       </div>
 
       <div>
