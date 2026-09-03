@@ -150,11 +150,22 @@ function parseProducts(raw: unknown): unknown[] {
   }
 }
 
+// dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405: shared
+// scheme-normalization helper. agent_knowledge.website (and similar stored
+// URL columns) sometimes holds scheme-less values ("merkja.no",
+// "www.qvenbrygg.no") — `new URL()` / `fetch()` both throw on those. This is
+// the SAME `u.startsWith("http") ? u : https://${u}` pattern hostnameFromUrl
+// already used inline; factored out here so headProbe and probeAgentUrl
+// share exactly one normalization implementation instead of re-deriving it.
+function withDefaultScheme(u: string): string {
+  return u.startsWith("http") ? u : `https://${u}`;
+}
+
 // Extract registrable domain (e.g. "www.gard.no" → "gard.no")
 function hostnameFromUrl(u: string | null | undefined): string | null {
   if (!u) return null;
   try {
-    const url = new URL(u.startsWith("http") ? u : `https://${u}`);
+    const url = new URL(withDefaultScheme(u));
     return url.hostname.replace(/^www\./i, "").toLowerCase();
   } catch {
     return null;
@@ -166,18 +177,32 @@ function emailDomain(e: string | null | undefined): string | null {
   return e.split("@")[1].toLowerCase();
 }
 
-// HEAD-fetch with short timeout. We don't follow redirects deeply;
-// a 200/301/302 all count as "reachable".
-async function headProbe(url: string, timeoutMs = 5000): Promise<number | null> {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
-    const r = await fetch(url, { method: "HEAD", signal: ctrl.signal, redirect: "follow" });
-    clearTimeout(t);
-    return r.status;
-  } catch {
-    return null;
-  }
+// HEAD-fetch used by the kvalitets-gate (computeKvalitetsGate's website_ok).
+//
+// dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405: this used to
+// be its own raw fetch(url, {method:"HEAD"}) with no scheme normalization
+// and no fallback when a server rejects HEAD — so scheme-less
+// agent_knowledge.website values (fetch() throws on those → null → gate
+// fails as "unreachable" even though the site is live) and HEAD-rejecting
+// servers (405) both produced a false website_ok=false, even though the
+// SIBLING freshness probe probeAgentUrl (below) already handled both cases
+// correctly for url_last_status. headProbe now delegates to probeAgentUrl
+// so there is exactly one probing implementation: same scheme
+// normalization, same HEAD→GET-on-405/0 fallback, same 8s timeout. Only
+// probeAgentUrl's status===0 (total network failure) is translated back to
+// `null` here, to preserve headProbe's pre-existing null-on-unreachable
+// contract (computeKvalitetsGate treats http_status===null as
+// "website_unreachable" specifically, vs. a numeric status >=400).
+//
+// `fetchImpl` is an optional third param (mirrors probeAgentUrl's own
+// injection point) purely so tests can exercise this function directly
+// without monkey-patching globalThis.fetch — it is never passed by
+// runVerifierBatch's `opts.headProbe ?? headProbe` call site, which only
+// ever calls it with (url), so this is additive and does not change that
+// calling convention.
+export async function headProbe(url: string, timeoutMs = 8000, fetchImpl?: FetchLike): Promise<number | null> {
+  const result = await probeAgentUrl(withDefaultScheme(url), { timeoutMs, fetchImpl });
+  return result.status === 0 ? null : result.status;
 }
 
 // ─── PR-21 / WO-19 (2026-05-10): link-freshness probe ─────────────
@@ -216,6 +241,12 @@ export async function probeAgentUrl(
 ): Promise<ProbeResult> {
   const timeoutMs = opts?.timeoutMs ?? 8000;
   const fetchImpl: FetchLike = (opts?.fetchImpl ?? (fetch as unknown as FetchLike));
+  // dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405: normalize
+  // scheme-less input the same way headProbe/hostnameFromUrl do, so
+  // scheme-less agent_knowledge.website rows ("merkja.no") don't hit
+  // fetch() with an invalid URL and record url_last_status=0 for a
+  // perfectly live site.
+  url = withDefaultScheme(url);
   const start = Date.now();
 
   // Helper: one fetch attempt with its own AbortController + timeout.
