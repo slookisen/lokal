@@ -135,10 +135,25 @@ const DAY_NAMES_SV: Record<string, string> = {
 const MONTH_NAMES_EN = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const MONTH_NAMES_SV = ["", "Jan", "Feb", "Mar", "Apr", "Maj", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dec"];
 export function dayName(key: string, lang: Lang): string {
-  const k = (key || "").toLowerCase();
+  const k = (key || "").toLowerCase().trim();
   const m = lang === "en" ? DAY_NAMES_EN : lang === "sv" ? DAY_NAMES_SV : DAY_NAMES;
-  return m[k] || DAY_NAMES[k] || key;
+  if (m[k] || DAY_NAMES[k]) return m[k] || DAY_NAMES[k];
+  // Enrichment stores ranges as one row ("mon-sun", "mon-fri", "man-fre"):
+  // live on Gvarv 2026-09-03 the raw key rendered in BOTH languages. Render
+  // "Monday–Sunday" / "Mandag–Søndag" when both ends are known days.
+  const range = /^([a-zæøå]+)\s*[-–]\s*([a-zæøå]+)$/.exec(k);
+  if (range) {
+    const norm = (d: string) => NO_DAY_ALIASES[d] || d;
+    const a = norm(range[1]), b = norm(range[2]);
+    if ((m[a] || DAY_NAMES[a]) && (m[b] || DAY_NAMES[b])) return `${m[a] || DAY_NAMES[a]}\u2013${m[b] || DAY_NAMES[b]}`;
+  }
+  return key;
 }
+/** Norwegian day abbreviations the enrichment may emit inside a range key. */
+const NO_DAY_ALIASES: Record<string, string> = {
+  man: "mon", tir: "tue", ons: "wed", tor: "thu", fre: "fri", lør: "sat", lor: "sat", søn: "sun", son: "sun",
+  mandag: "mon", tirsdag: "tue", onsdag: "wed", torsdag: "thu", fredag: "fri", lørdag: "sat", søndag: "sun",
+};
 export function monthAbbr(m: number, lang: Lang): string {
   const arr = lang === "en" ? MONTH_NAMES_EN : lang === "sv" ? MONTH_NAMES_SV : MONTH_NAMES;
   return arr[m] || String(m);
