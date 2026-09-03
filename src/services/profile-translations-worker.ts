@@ -52,6 +52,7 @@ import {
   planTranslationBatch,
   processTranslationItem,
   type LlmDeps,
+  LLM_INFRA_REASON_RE,
 } from "./profile-translations";
 
 // ─── Config (env, read fresh) ────────────────────────────────────────────
@@ -255,7 +256,7 @@ export function planInterleaved(
   return out;
 }
 
-const INFRA_RE = /ANTHROPIC_API_KEY|nettverksfeil|status 4\d\d/;
+const INFRA_RE = LLM_INFRA_REASON_RE;
 
 function recordResult(platform: TranslationPlatform, r: ItemResult): void {
   state.totals[r.outcome] = (state.totals[r.outcome] || 0) + 1;
