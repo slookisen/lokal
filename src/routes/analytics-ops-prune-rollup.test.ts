@@ -15,7 +15,11 @@
  *   (a) old analytics_page_views rows are gone from the raw table AND
  *       rolled up into page_view_daily (rollup actually ran) — newer rows
  *       are left in place;
- *   (b) analytics_queries / analytics_agent_views are COMPLETELY untouched;
+ *   (b) analytics_queries / analytics_agent_views are rolled up into
+ *       query_daily / query_text_daily / agent_view_daily BEFORE their raw
+ *       rows are deleted (updated for orch-pr-20260903-analytics-rollup-
+ *       slice2 — before that slice these two tables had no rollup
+ *       destination, so both routes deliberately never touched them);
  *   (c) the response reports skippedPendingRollup / wouldDeleteIfPruned
  *       (ops/prune) and the old response fields still exist;
  *   (d) the 7-day floor still holds on both routes.
@@ -117,7 +121,9 @@ export async function runOpsPruneRollupTests(opts: { log?: boolean } = {}): Prom
     function seed(): { oldPv: number; newPv: number; oldQueries: number; oldAgentViews: number } {
       testDb.exec(
         "DELETE FROM analytics_page_views; DELETE FROM analytics_queries; " +
-        "DELETE FROM analytics_agent_views; DELETE FROM page_view_daily;"
+        "DELETE FROM analytics_agent_views; DELETE FROM page_view_daily; " +
+        "DELETE FROM query_daily; DELETE FROM query_text_daily; " +
+        "DELETE FROM agent_view_daily; DELETE FROM sessions_daily;"
       );
       const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
       const newCreated = isoDaysAgo(1);
@@ -151,6 +157,8 @@ export async function runOpsPruneRollupTests(opts: { log?: boolean } = {}): Prom
     const count = (t: string) => (testDb.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as { c: number }).c;
     const dailySum = () =>
       (testDb.prepare("SELECT COALESCE(SUM(view_count), 0) as s FROM page_view_daily").get() as { s: number }).s;
+    const sumOf = (table: string, col: string) =>
+      (testDb.prepare(`SELECT COALESCE(SUM(${col}), 0) as s FROM ${table}`).get() as { s: number }).s;
 
     // ── POST /ops/prune ──────────────────────────────────────────────────
     {
@@ -167,21 +175,23 @@ export async function runOpsPruneRollupTests(opts: { log?: boolean } = {}): Prom
       assertEq(dailySum(), seeded.oldPv, "ops/prune: page_view_daily view_count sums to the rolled-up old rows");
       assertEq(r.body?.deleted?.pageViews, seeded.oldPv, "ops/prune: deleted.pageViews reports rolled-up+deleted rows");
 
-      assertEq(count("analytics_queries"), seeded.oldQueries, "ops/prune: analytics_queries untouched");
-      assertEq(count("analytics_agent_views"), seeded.oldAgentViews, "ops/prune: analytics_agent_views untouched");
-      assertEq(r.body?.deleted?.queries, 0, "ops/prune: deleted.queries is 0");
-      assertEq(r.body?.deleted?.agentViews, 0, "ops/prune: deleted.agentViews is 0");
+      assertEq(count("analytics_queries"), 0, "ops/prune: old analytics_queries rows deleted after rollup");
+      assertEq(count("analytics_agent_views"), 0, "ops/prune: old analytics_agent_views rows deleted after rollup");
+      assertEq(r.body?.deleted?.queries, seeded.oldQueries, "ops/prune: deleted.queries reports the rolled-up+deleted rows");
+      assertEq(r.body?.deleted?.agentViews, seeded.oldAgentViews, "ops/prune: deleted.agentViews reports the rolled-up+deleted rows");
+      assertEq(sumOf("query_daily", "query_count"), seeded.oldQueries, "ops/prune: query_daily carries the deleted queries' aggregate");
+      assertEq(sumOf("agent_view_daily", "view_count"), seeded.oldAgentViews, "ops/prune: agent_view_daily carries the deleted agent views' aggregate");
 
       assertEq(
         r.body?.skippedPendingRollup,
-        ["analytics_queries", "analytics_agent_views"],
-        "ops/prune: skippedPendingRollup names both tables without rollup coverage",
+        [],
+        "ops/prune: skippedPendingRollup is empty — every analytics table has rollup coverage",
       );
       assertEq(r.body?.wouldDeleteIfPruned?.queries, seeded.oldQueries, "ops/prune: wouldDeleteIfPruned.queries sizing");
       assertEq(r.body?.wouldDeleteIfPruned?.agentViews, seeded.oldAgentViews, "ops/prune: wouldDeleteIfPruned.agentViews sizing");
       assertEq(
         r.body?.remaining,
-        { pageViews: seeded.newPv, queries: seeded.oldQueries, agentViews: seeded.oldAgentViews },
+        { pageViews: seeded.newPv, queries: 0, agentViews: 0 },
         "ops/prune: remaining counts reflect the post-prune tables",
       );
 
@@ -209,12 +219,18 @@ export async function runOpsPruneRollupTests(opts: { log?: boolean } = {}): Prom
       assertEq(r.status, 200, "prune: 200");
       assertEq(r.body?.success, true, "prune: success:true");
       assertEq(r.body?.olderThanDays, DAYS_TO_KEEP, "prune: olderThanDays echoed");
-      assertEq(r.body?.message, `Pruned ${seeded.oldPv} old analytics records`, "prune: message counts only rolled-up page views");
+      assertEq(
+        r.body?.message,
+        `Pruned ${seeded.oldPv + seeded.oldQueries + seeded.oldAgentViews} old analytics records`,
+        "prune: message counts every rolled-up+deleted row across all three tables",
+      );
 
       assertEq(count("analytics_page_views"), seeded.newPv, "prune: only newer analytics_page_views rows remain");
       assertEq(dailySum(), seeded.oldPv, "prune: old page views rolled up into page_view_daily");
-      assertEq(count("analytics_queries"), seeded.oldQueries, "prune: analytics_queries untouched");
-      assertEq(count("analytics_agent_views"), seeded.oldAgentViews, "prune: analytics_agent_views untouched");
+      assertEq(count("analytics_queries"), 0, "prune: old analytics_queries rows deleted after rollup");
+      assertEq(count("analytics_agent_views"), 0, "prune: old analytics_agent_views rows deleted after rollup");
+      assertEq(sumOf("query_daily", "query_count"), seeded.oldQueries, "prune: old queries rolled up into query_daily");
+      assertEq(sumOf("agent_view_daily", "view_count"), seeded.oldAgentViews, "prune: old agent views rolled up into agent_view_daily");
 
       seed();
       const r5 = await call(postPrune, { olderThanDays: 3 });
