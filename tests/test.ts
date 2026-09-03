@@ -10621,7 +10621,9 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a5: umbParentHtml initialized empty"
   );
   assertTrue(
-    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\/produsent\/\$\{parentSlug\}">Del av: /.test(seoSrc),
+    // 2026-09-03 språk-økt: the link is now localizedPath("/produsent/" + parentSlug, lang)
+    // (byte-identical href for Norwegian; carries /en on the English page).
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\$\{localizedPath\("\/produsent\/" \+ parentSlug, lang\)\}">Del av: /.test(seoSrc),
     "phase5.11-a5: parent breadcrumb rendered as '← Del av:' link when parent_umbrella_id is set"
   );
   // The breadcrumb is injected ABOVE the H1 inside .umb-hero
@@ -10868,8 +10870,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // ─── Source-presence: link target uses slugify ───────────────────
   assertTrue(
-    /href="\/produsent\/\$\{slug\}"/.test(seoSrc),
-    "phase5.11-a6: umbrella cards link to /produsent/<slug>"
+    // 2026-09-03 språk-økt: umbrella cards now link via localizedPath (same
+    // /produsent/<slug> for Norwegian; /en/produsent/<slug> on the English page).
+    /href="\$\{localizedPath\("\/produsent\/" \+ slug, lang\)\}" class="umb-card"/.test(seoSrc),
+    "phase5.11-a6: umbrella cards link to /produsent/<slug> (language-aware)"
   );
 
   // ─── Source-presence: CSS class definitions ──────────────────────
@@ -41020,6 +41024,45 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("description-code-artifact-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «Interne notater skal ikke vises» / «fiks den byttede
+// teksten på Epleblomsten og Nordlysmat» — description-quality internal-note
+// detector, POST /admin/agents/internal-note-sweep and POST /admin/agents/
+// content-correction. Same DB-swap discipline as the siblings above.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 interne notater + innholdsretting: content-quality ──");
+  try {
+    const { runAdminAgentsContentQualityTests } = require("../src/routes/admin-agents-content-quality.test") as
+      typeof import("../src/routes/admin-agents-content-quality.test");
+    const cq = await runAdminAgentsContentQualityTests({ log: false });
+    passed += cq.passed;
+    failed += cq.failed;
+    for (const f of cq.failures) failures.push("content-quality: " + f);
+    console.log(`  content-quality: ${cq.passed} passed, ${cq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-quality: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «Om man har valgt å bytte til Engelsk skal det språket
+// være default for den brukeren frem til dem bytter tilbake eller går ut av
+// siden» — i18n/middleware.ts rfbLangSessionMiddleware (real express app over
+// loopback, sets/restores its own flags).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 språk-økt (rfb_lang_session): lang-session ──");
+  try {
+    const { runLangSessionTests } = require("../src/i18n/lang-session.test") as typeof import("../src/i18n/lang-session.test");
+    const ls = await runLangSessionTests({ log: false });
+    passed += ls.passed;
+    failed += ls.failed;
+    for (const f of ls.failures) failures.push("lang-session: " + f);
+    console.log(`  lang-session: ${ls.passed} passed, ${ls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lang-session: unexpected error: " + String(err?.message || err));
   }
 });
 
