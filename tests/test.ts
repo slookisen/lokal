@@ -42381,3 +42381,29 @@ runSerial(async () => {
     failures.push("profile-translations-worker: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-02-dental-verifier-website-ownership — the new
+// automated dental verifier (src/services/dental-verifier.ts): pure unit
+// coverage (countRichFields, websiteOwnershipMatch, isWebsiteOwnershipCache
+// Fresh, interpretBrregResult, computeDentalVerifiedRule) plus integration
+// coverage of runDentalVerifierBatch() against an in-memory dental.db with
+// injected brregLookupFn/fetchPageFn/now (verified rule, 3-strike downgrade,
+// any-success-resets-the-streak, Brreg dissolved/bankrupt inactive path,
+// 7-day homepage cache TTL, offentlig_klinikk+directory_url path, NACE
+// mismatch, specialists_verified, rejected/non-clinic picker exclusion).
+// Tail position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-dental-verifier-website-ownership: dental-verifier ──");
+  try {
+    const { runDentalVerifierTests } = require("../src/services/dental-verifier.test") as
+      typeof import("../src/services/dental-verifier.test");
+    const dv = await runDentalVerifierTests({ log: false });
+    passed += dv.passed;
+    failed += dv.failed;
+    for (const f of dv.failures) failures.push("dental-verifier: " + f);
+    console.log(`  dental-verifier: ${dv.passed} passed, ${dv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-verifier: unexpected error: " + String(err?.message || err));
+  }
+});

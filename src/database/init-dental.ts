@@ -517,5 +517,97 @@ export function initDentalSchema(db: Database.Database): void {
     db.exec("ALTER TABLE dental_agents ADD COLUMN brreg_address_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // ─── dev-request 2026-09-02-dental-verifier-website-ownership ────────────
+  //   Dental has NO automated verifier: verification_status='verified' is
+  //   today only ever set by hand (92 of 6975 rows, all manual). This adds
+  //   the columns src/services/dental-verifier.ts needs. The dev-request
+  //   that filed this claimed website_ownership/website_ownership_checked_at/
+  //   brreg_status/brreg_checked_at/last_verified_at already existed on
+  //   dental_agents — verified directly against this file before writing a
+  //   line of migration code: only `verification_status` and
+  //   `last_verified_at` (Phase 6 base schema, top of this file) actually do.
+  //   The other four do not exist and are added here, plus three more the
+  //   verifier also needs that the dev-request didn't mention at all
+  //   (specialists_verified, verifier_review_reason, website_ownership_streak).
+  //
+  //   - website_ownership TEXT: 'verified' | 'unverified' | 'n/a' | NULL
+  //     (never checked). 'verified' = the fetched hjemmeside mentions this
+  //     clinic's own org_nr, or its normalized name + poststed/postnummer.
+  //     'unverified' = the page was fetched but didn't mention this clinic
+  //     (or the fetch failed in a non-transient way — a dead/wrong URL IS a
+  //     statement about the stored value, same precedent
+  //     gardssalg-website-verification.ts already established for its own
+  //     "unverified" bucket). 'n/a' = hjemmeside is blank — nothing to check,
+  //     never fetched, never counts as a strike either way.
+  //   - website_ownership_checked_at TEXT: ISO timestamp of the last
+  //     REAL fetch attempt (never stamped on a cache-skip or a transient
+  //     failure) -- backs the 7-day don't-refetch-a-resolved-homepage TTL.
+  //   - website_ownership_streak INTEGER: consecutive 'unverified' results.
+  //     Deliberately a NEW, independent counter from the existing
+  //     wrong_entity_streak pair added just above by dev-request 2026-08-23-
+  //     dental-wrong-entity-streak-parking -- that counter is written ONLY
+  //     by recordDentalExtractionResult(), driven by the enrichment SKILL's
+  //     own sub-agent judging a DEEP-SCRAPE result as describing a different
+  //     clinic. This verifier's website-ownership check is a completely
+  //     separate call path (a live homepage refetch + substring match, no
+  //     LLM sub-agent involved) checking a related but distinct question.
+  //     Writing to the SAME wrong_entity_streak column from a second,
+  //     independent caller would be exactly the cross-contamination that
+  //     column's own doc comment (this file, ~line 124) and its dedicated
+  //     test suite (dental-wrong-entity-streak.test.ts) says the two-way
+  //     split exists to prevent -- a third, unrelated source incrementing
+  //     that same counter defeats the point of it being "independent" at
+  //     all. So: a new, third, equally-independent counter, mirroring the
+  //     same stamp-based idiom (3 strikes -> needs_review, any 'verified'
+  //     result resets to 0, per the RFB agent_knowledge.wrong_entity_streak
+  //     precedent's own "any success resets the strike counter" semantics).
+  //   - brreg_status TEXT: 'active' | 'dissolved' | 'bankrupt' |
+  //     'orgnr_not_found_or_unreachable' | NULL (no org_nr / never checked).
+  //     The last bucket is deliberately NOT split into "not found" vs.
+  //     "network error" -- verifyOrgNumber() (services/brreg-client.ts)
+  //     itself cannot tell those apart (its own doc comment: "Never throws:
+  //     any network/parse error or 404 resolves to the safe default
+  //     result"), and this exact ambiguity already has an established name
+  //     elsewhere in this codebase (routes/opplevelser.ts's own
+  //     "orgnr_not_found_or_unreachable" comment) -- reused verbatim here
+  //     rather than inventing a second name for the same gap. Only a
+  //     genuine 200-response 'dissolved'/'bankrupt' outcome ever sets
+  //     is_inactive/downgrades a clinic -- this ambiguous bucket alone never
+  //     does (same fail-closed-but-not-punitive precedent as fetch-page.ts's
+  //     'transient' persistence class).
+  //   - brreg_checked_at TEXT: ISO timestamp of the last verifyOrgNumber()
+  //     call for this clinic.
+  //   - specialists_verified INTEGER: 1 when listSpecialistsForClinic() (this
+  //     clinic's dental_clinic_affiliations, already INNER JOINed against
+  //     dental_persons -- the HPR-linked table) returns at least one active
+  //     row. Informational; never gates the verified/downgrade rules.
+  //   - verifier_review_reason TEXT: short machine-readable reason the
+  //     verifier itself set verification_status='needs_review' (e.g.
+  //     'brreg_dissolved', 'brreg_bankrupt', 'brreg_nace_mismatch',
+  //     'website_ownership_streak') -- distinct from any future generic
+  //     "review_reason" concept, and from RFB agent_knowledge's own
+  //     verification_review_reason column (a different table, different
+  //     vertical, never shared per this codebase's vertical-isolation
+  //     convention).
+  //   All nullable/zero-defaulted, purely additive. Idempotent ALTERs --
+  //   error = already present.
+  const dentalVerifierCols = [
+    "ALTER TABLE dental_agents ADD COLUMN website_ownership TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN website_ownership_checked_at TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN website_ownership_streak INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN brreg_status TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN brreg_checked_at TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN specialists_verified INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN verifier_review_reason TEXT",
+  ];
+  for (const stmt of dentalVerifierCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+  try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dental_last_verified_at ON dental_agents (last_verified_at)");
+  } catch (err) {
+    console.warn("[init-dental] last_verified_at index warning:", err);
+  }
+
   console.log("[dental] schema initialized");
 }
