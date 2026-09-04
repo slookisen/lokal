@@ -14,7 +14,7 @@
 // Off via ?dedupe_by_email=false; defaults to true.
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, POOL_CONTENT_THRESHOLD_SQL } from "../database/init";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
@@ -130,12 +130,22 @@ router.get("/stats", (req: Request, res: Response) => {
     // Funnel: each step ANDs one more outreach_ready_pool gate onto the last,
     // in the same order the VIEW applies them, so the counts strictly
     // decrease and the biggest single drop identifies the bottleneck gate.
+    //
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A):
+    // the VIEW now also requires POOL_CONTENT_THRESHOLD_SQL alongside
+    // enrichment_status IN ('partial','rich') — ANDed in here too (imported
+    // from database/init.ts verbatim, not re-derived) so this funnel's counts
+    // never drift from what the VIEW actually admits. The
+    // `verified_and_rich_or_partial` key name is left as-is even though the
+    // gate is now stricter than its name alone suggests — renaming it is out
+    // of scope for this dev-request.
     const funnelBase = `
       FROM agents a
       INNER JOIN agent_knowledge k ON k.agent_id = a.id
       WHERE a.umbrella_type IS NULL
         AND k.verification_status = 'verified'
-        AND k.enrichment_status IN ('partial', 'rich')`;
+        AND k.enrichment_status IN ('partial', 'rich')
+        AND ${POOL_CONTENT_THRESHOLD_SQL}`;
     const verifiedRichOrPartial = db.prepare(`SELECT COUNT(*) AS c ${funnelBase}`).get() as { c: number };
     const withEmail = db
       .prepare(`SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''`)

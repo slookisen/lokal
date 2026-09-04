@@ -1281,6 +1281,32 @@ console.log("── admin-outreach-gate-tynne-profiler (VIEW tightening + sent-l
   console.log(`  admin-outreach-gate-tynne-profiler: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── 2026-09-02 dev-request: rfb-pool-view-rich-vs-partial (Daniel option A)
+// — outreach_ready_pool VIEW now accepts enrichment_status='partial' when the
+// content_threshold gate (about>=80 OR products>=3) passes, mirrored in
+// funnelBase (admin-outreach-pool.ts stats) and nowInPool (lokal-agent-
+// verifier.ts) via the shared POOL_CONTENT_THRESHOLD_SQL constant. Own
+// in-memory prod-schema DB (own dedicated test file, mirrors admin-outreach-
+// pool-blocker-breakdown.test.ts's convention) — runs via runSerial() like
+// that file, since it's async (runVerifierBatch) and swaps the global db
+// singleton (save/restore handled inside the test file itself). ──
+runSerial(async () => {
+  console.log("\n── admin-outreach-pool-rich-vs-partial (VIEW/funnelBase/nowInPool content-threshold) ──");
+  try {
+    const { runAdminOutreachPoolRichVsPartialTests } =
+      require("../src/routes/admin-outreach-pool-rich-vs-partial.test") as
+        typeof import("../src/routes/admin-outreach-pool-rich-vs-partial.test");
+    const r = await runAdminOutreachPoolRichVsPartialTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-outreach-pool-rich-vs-partial: " + f);
+    console.log(`  admin-outreach-pool-rich-vs-partial: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-outreach-pool-rich-vs-partial: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── 2026-07-18 dev-request: admin-blocklist-manual-entry-api — generic
 // { identifier_type, identifier_value, reason? } shape for POST /admin/blocklist,
 // plus the free-mail/ISP + vipps.no website_domain guard ──
@@ -5447,16 +5473,19 @@ async function runIntegrationTests(): Promise<void> {
       "intg-3: stegB — owner-curated address (only gating field) + corroborated email + live website → verified"
     );
 
-    // lokal#433 requirement UNCHANGED by Steg B: outreach_ready_pool requires
-    // enrichment_status='rich' (about>=150 chars AND products>=3 AND address),
-    // independent of verification_status. This fixture's about text is only
-    // 77 chars, so computeEnrichmentStatus still returns 'partial' — the
-    // agent is 'verified' now (Steg B) but still correctly excluded from the
-    // pool by the untouched rich-only gate, proving Steg B did not weaken it.
+    // enrichment_status stays 'partial': this fixture's about text is only 77
+    // chars (< 150), so computeEnrichmentStatus does not return 'rich'.
     assertEq(agentResult?.new_enrichment_status, "partial",
-      "intg-3: stegB — enrichment_status stays 'partial' (about=77 chars < 150) — lokal#433's rich-only bar is untouched");
+      "intg-3: stegB — enrichment_status stays 'partial' (about=77 chars < 150) — the 'rich' bar is untouched");
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A):
+    // outreach_ready_pool now accepts 'partial' too, as long as
+    // POOL_CONTENT_THRESHOLD_SQL passes (about>=80 OR products>=3). This
+    // fixture's about is 77 chars (<80) but insertTestAgent's DEFAULT products
+    // is 3 items (see insertTestAgent above — this fixture never overrides
+    // `products`), so content_threshold passes via the products leg and the
+    // agent now DOES reach the pool — was excluded pre-2026-09-02 (rich-only).
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
-    assertTrue(!poolRow, "intg-3: stegB — partial-owner agent still NOT in outreach_ready_pool (enrichment_status='partial', not 'rich' — lokal#433 gate unaffected by Steg B)");
+    assertTrue(!!poolRow, "intg-3: stegB — partial-owner agent now IS in outreach_ready_pool (enrichment_status='partial' but content_threshold passes via the default 3 products) — dev-request 2026-09-02-rfb-pool-view-rich-vs-partial");
   }
 
   // ── orch-pr-16 Fixture A: free-mail (gmail) producer is NOT downgraded ──────

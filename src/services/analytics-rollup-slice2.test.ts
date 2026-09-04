@@ -572,13 +572,18 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, umbrella_type)
          VALUES ('agent-pool', 'Pool Gård', 'desc', 'test', 'a@x.invalid', 'https://x.invalid', 'producer', 'key-pool', 'Oslo', NULL)`,
       ).run();
+      // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+      // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+      // products>=3) against the raw columns, not just enrichment_status='rich'
+      // — an explicit about text keeps this fixture pool-eligible (this test is
+      // about views_count surviving a prune cycle, not content depth).
       testDb.prepare(
         `INSERT INTO agent_knowledge
-           (agent_id, website, email, verification_status, enrichment_status, url_last_probed, url_last_status,
+           (agent_id, website, email, about, verification_status, enrichment_status, url_last_probed, url_last_status,
             google_rating, google_review_count)
-         VALUES ('agent-pool', 'https://x.invalid', 'post@x.invalid', 'verified', 'rich',
+         VALUES ('agent-pool', 'https://x.invalid', 'post@x.invalid', ?, 'verified', 'rich',
                  datetime('now', '-1 day'), 200, 4.5, 10)`,
-      ).run();
+      ).run("x".repeat(200));
 
       // 5 views well past the cutoff (will be rolled up + deleted) and
       // 2 inside the window (stay raw). Lifetime total = 7 either way.
@@ -857,15 +862,20 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, umbrella_type)
          VALUES (?, ?, 'desc', 'test', ?, 'https://x.invalid', 'producer', ?, 'Oslo', NULL)`,
       );
+      // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+      // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+      // products>=3) against the raw columns, not just enrichment_status='rich'
+      // — an explicit about text keeps these fixtures pool-eligible (this test
+      // is about views_count rollup parity, not content depth).
       const insKnowledge = testDb.prepare(
         `INSERT INTO agent_knowledge
-           (agent_id, website, email, field_provenance, verification_status, enrichment_status,
+           (agent_id, website, email, about, field_provenance, verification_status, enrichment_status,
             url_last_probed, url_last_status)
-         VALUES (?, 'https://x.invalid', ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
+         VALUES (?, 'https://x.invalid', ?, ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
       );
       function insertPoolAgent(id: string, name: string, email: string): void {
         insAgent.run(id, name, email, `key-${id}`);
-        insKnowledge.run(id, email);
+        insKnowledge.run(id, email, "x".repeat(200));
       }
       const insView = testDb.prepare(
         `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
@@ -1024,12 +1034,17 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
           `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, umbrella_type, is_verified)
            VALUES (?, ?, 'desc', 'test', ?, 'https://x.invalid', 'producer', ?, 'Oslo', NULL, 1)`,
         ).run(id, name, email, `key-${id}`);
+        // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+        // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+        // products>=3) against the raw columns, not just enrichment_status='rich'
+        // — an explicit about text keeps this fixture pool-eligible (this test is
+        // about opt-out deletion clearing agent_view_daily, not content depth).
         testDb.prepare(
           `INSERT INTO agent_knowledge
-             (agent_id, website, email, field_provenance, verification_status, enrichment_status,
+             (agent_id, website, email, about, field_provenance, verification_status, enrichment_status,
               url_last_probed, url_last_status)
-           VALUES (?, 'https://x.invalid', ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
-        ).run(id, email);
+           VALUES (?, 'https://x.invalid', ?, ?, '{}', 'verified', 'rich', datetime('now', '-1 day'), 200)`,
+        ).run(id, email, "x".repeat(200));
       }
       const insView = testDb.prepare(
         `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)

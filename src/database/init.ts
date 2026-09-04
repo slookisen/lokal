@@ -112,6 +112,23 @@ export function getDb(): Database.Database {
   return db;
 }
 
+// Shared content-depth predicate for the `outreach_ready_pool` VIEW (defined
+// inside initSchema below) and every other query that must agree with it on
+// what counts as "enough content to email a producer about their own
+// profile" — dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel
+// option A, 2026-09-02). Mirrors computeKvalitetsGate's `content_threshold`
+// (src/agents/lokal-agent-verifier.ts) — about>=80 OR products>=3 — verbatim;
+// do not hand-edit one without the other. `k` must alias `agent_knowledge` in
+// the query that interpolates this (matches the VIEW's own join alias).
+// Consumed via template-literal interpolation, same convention as
+// PUBLISH_GATE_SQL (src/services/experience-store.ts): admin-outreach-pool.ts
+// imports and ANDs this into `funnelBase` so the stats funnel never drifts
+// from the VIEW; lokal-agent-verifier.ts's `nowInPool` mirrors the identical
+// boolean in JS via computeKvalitetsGate's own `content_threshold` output
+// (same about/products inputs), rather than importing this SQL string.
+export const POOL_CONTENT_THRESHOLD_SQL =
+  "(length(COALESCE(k.about,'')) >= 80 OR json_array_length(COALESCE(k.products,'[]')) >= 3)";
+
 function initSchema(db: Database.Database): void {
   db.exec(`
     -- ════════════════════════════════════════════════════════════
@@ -2232,12 +2249,12 @@ function initSchema(db: Database.Database): void {
   // WO #9 switches over. Filtered by:
   //   - non-null email
   //   - verification_status = 'verified'
-  //   - enrichment_status = 'rich'
+  //   - enrichment_status IN ('rich','partial') AND POOL_CONTENT_THRESHOLD_SQL
   //   - never sent through the new pipeline (outreach_sent_log)
   // NOTE: agents.removed_at does not exist yet (Phase 5.10) — using
   // 1=1 as placeholder so the VIEW resolves on prod today.
   //
-  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler ───
+  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler (SUPERSEDED below) ───
   // Was `enrichment_status IN ('partial', 'rich')`. `partial` profiles are
   // half-empty by computeEnrichmentStatus's own definition (lokal-agent-
   // verifier.ts) — an outreach email pointing a producer at their own thin
@@ -2248,6 +2265,22 @@ function initSchema(db: Database.Database): void {
   // expected consequence — the bottleneck moves to enrichment, which is
   // exactly where dev-request 2026-07-29-blacklist-backfill-og-
   // berikelsestriage (slice 3) is already refilling it with `rich` profiles.
+  //
+  // ─── dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A,
+  // 2026-09-02) — supersedes the 2026-07-30 tightening above ───
+  // The `rich`-only gate above double-punished content: computeKvalitetsGate's
+  // own `content_threshold` (about>=80 OR products>=3) already screens content
+  // depth before an agent can even reach `verified`, so re-checking a STRICTER
+  // bar (`rich` = about>=150 AND products>=3 AND address) here just stranded
+  // 165+ verified/emailed/live-site producers outside the pool for no gain
+  // (measured 2026-09-02, verification-pilot/2026-09-02-rfb-poolpush-rapport.md
+  // §1). Fix: accept `partial` too, but ONLY when it clears the same
+  // content_threshold bar the gate already computes — POOL_CONTENT_THRESHOLD_SQL
+  // below, mirrored verbatim (not re-derived) in lokal-agent-verifier.ts's
+  // `nowInPool` and admin-outreach-pool.ts's `funnelBase` so all three call
+  // sites agree. Daniel, live session 2026-09-02, verbatim: "go på A, og kjør
+  // dublettene og skjul-lista" (daniel-responses/2026-09-02-go-a-dubletter-og-
+  // skjul-lista.md).
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -2279,7 +2312,8 @@ function initSchema(db: Database.Database): void {
         AND k.email != ''
         AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
         AND k.verification_status = 'verified'
-        AND k.enrichment_status = 'rich'
+        AND k.enrichment_status IN ('rich','partial')
+        AND ${POOL_CONTENT_THRESHOLD_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
