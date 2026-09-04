@@ -43,6 +43,22 @@ const CATEGORY_MAP_KEYS_TO_NAMES: Record<string, string> = {
   herbs: "Urter",
 };
 
+// 2026-09-03 (Daniel, skjermbilde av /en): the English homepage now shows
+// English category labels. Hard-coded here on purpose — a real expectation,
+// not a re-read of CATEGORY_MAP — so a regression to Norwegian on /en fails.
+const CATEGORY_MAP_KEYS_TO_NAMES_EN: Record<string, string> = {
+  vegetables: "Vegetables",
+  fruit: "Fruit",
+  berries: "Berries",
+  dairy: "Dairy",
+  eggs: "Eggs",
+  meat: "Meat",
+  fish: "Fish",
+  bread: "Bread",
+  honey: "Honey",
+  herbs: "Herbs",
+};
+
 export async function runHomepageCategoryChipsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -173,12 +189,19 @@ export async function runHomepageCategoryChipsTests(opts: { log?: boolean } = {}
       const rowHtml = rowMatches[0]?.[1] || "";
       const chipCount = (rowHtml.match(/class="chip"/g) || []).length;
       assertEq(chipCount, 10, `${label}: pill row contains exactly 10 chips (one per CATEGORY_MAP category)`);
-      for (const name of Object.values(CATEGORY_MAP_KEYS_TO_NAMES)) {
+      // Labels follow the page language (2026-09-03): Norwegian on /, English on /en.
+      const expectedNames = lang === "en" ? CATEGORY_MAP_KEYS_TO_NAMES_EN : CATEGORY_MAP_KEYS_TO_NAMES;
+      for (const name of Object.values(expectedNames)) {
         const occurrences = rowHtml.split(name).length - 1;
         assertEq(occurrences, 1, `${label}: "${name}" appears exactly once in the pill row`);
       }
-      // Live counts rendered compactly, e.g. "Grønnsaker (1)".
-      assertTrue(/Grønnsaker \(1\)/.test(rowHtml) || /Grønnsaker \(\d+\)/.test(rowHtml),
+      // …and the other language's labels must NOT leak into this page's row.
+      const otherNames = lang === "en" ? CATEGORY_MAP_KEYS_TO_NAMES : CATEGORY_MAP_KEYS_TO_NAMES_EN;
+      const leaked = Object.values(otherNames).filter((n) => n !== "Egg" && rowHtml.includes(n)); // "Egg" is a substring of "Eggs"
+      assertEq(leaked, [], `${label}: no ${lang === "en" ? "Norwegian" : "English"} category label leaks into the pill row`);
+      // Live counts rendered compactly, e.g. "Grønnsaker (1)" / "Vegetables (1)".
+      const first = lang === "en" ? "Vegetables" : "Grønnsaker";
+      assertTrue(new RegExp(`${first} \\(\\d+\\)`).test(rowHtml),
         `${label}: pill row shows a live count next to a category name`);
 
       // ── (2) the 3 old ad-hoc duplicate chips are gone (by their old,

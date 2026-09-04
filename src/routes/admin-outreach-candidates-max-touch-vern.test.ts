@@ -114,12 +114,17 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
       VALUES (?, ?, 'test producer', 'test', ?, 'https://example.no', 'producer', ?)
     `).run(id, name, email, `key-${id}`);
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+    // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+    // products>=3) against the raw columns, not just enrichment_status='rich'
+    // — an explicit about text keeps this synthetic fixture pool-eligible
+    // (this test is about max-touch-vern, not content depth).
     db.prepare(`
       INSERT INTO agent_knowledge
-        (agent_id, email, field_provenance, verification_status, enrichment_status,
+        (agent_id, email, about, field_provenance, verification_status, enrichment_status,
          url_last_status, url_last_probed)
-      VALUES (?, ?, '{}', 'verified', 'rich', 200, datetime('now'))
-    `).run(id, email);
+      VALUES (?, ?, ?, '{}', 'verified', 'rich', 200, datetime('now'))
+    `).run(id, email, "x".repeat(200));
   }
 
   // Prior contacts recorded in outreach_sent_log — mode=second's cooldown/

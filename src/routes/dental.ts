@@ -53,6 +53,8 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
+import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
+import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
@@ -388,7 +390,14 @@ router.get("/discover", (req: Request, res: Response) => {
       100,
       Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20)
     );
-    const agents = listDentalAgents(filter, limit, 0);
+    // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
+    // opt-in via listDentalAgents's excludeNonClinic (4th param) -- gated
+    // behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" so GET /agents (this
+    // module's OTHER listDentalAgents caller, not one of slice 1b's named
+    // public surfaces) stays byte-identical.
+    const agents = listDentalAgents(filter, limit, 0, {
+      excludeNonClinic: isDentalPublicCatalogClassFilterEnabled(),
+    });
     res.json({
       vertical: "dental",
       query: filter,
@@ -1065,6 +1074,8 @@ router.post(
              FROM dental_agents
             WHERE enrichment_state IN ('raw','thin_site','enriched')
               AND verification_status != 'rejected'
+              AND (is_inactive IS NULL OR is_inactive = 0)
+              AND ${DENTAL_CLINIC_CLASS_SQL}
               AND (
                     hjemmeside IS NULL OR hjemmeside = ''
                  OR adresse    IS NULL OR adresse    = ''
@@ -1287,7 +1298,20 @@ router.post(
       const gPhone = normalizePlacePhone(place.internationalPhoneNumber);
       const gWebsite =
         typeof place.websiteUri === "string" ? place.websiteUri.trim() : "";
-      const gWebsiteValid = isValidHttpUrl(gWebsite);
+      // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
+      // (steg 2): a Places websiteUri that is itself a directory / booking
+      // portal / social page (dental-hjemmeside-classifier) or a
+      // fylkeskommune/kommune dental-service page (dental-catalog-class) is
+      // NEVER written as the clinic's own hjemmeside -- measured 189 + 50
+      // such rows in the live catalog on 2026-09-02, several of them
+      // written by this very endpoint (e.g. tannlegernorge.no for Høylandet
+      // Tannklinikk, FUNN 2026-08-24/27/28). Address/phone/opening-hours
+      // from the same match are still fill-only written below; only the
+      // website column is withheld.
+      const gWebsiteValid =
+        isValidHttpUrl(gWebsite) &&
+        !classifyHjemmeside(gWebsite).isBad &&
+        !isPublicDentalServiceHost(gWebsite);
       const ohConverted = placesPeriodsToOpeningHours(
         place.regularOpeningHours?.periods
       );

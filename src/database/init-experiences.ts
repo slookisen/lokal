@@ -19,6 +19,7 @@
 // boot doesn't crash a re-deploy (jf. dental Appendix C #2).
 
 import Database from "better-sqlite3";
+import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 
 export function initExperiencesSchema(db: Database.Database): void {
   // experience_providers — one row per provider (organisasjon), Brreg-verified
@@ -662,6 +663,32 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_review_queue failed:", err);
   }
 
+  // ─── gardssalg_website_review_queue.parked_since (dev-request 2026-09-02-
+  // gardssalg-website-review-queue-terminal-parking) ─────────────────────────
+  // The two terminal-failure `reason` values written to this table
+  // (`verification_failed` from gardssalg-website-verification.ts,
+  // `candidate_evidence_failed` from the external-candidates route in
+  // opplevelser.ts) are never selected by the ONLY drain routes on this
+  // table (gardssalg-website-review-judge / -approve, both scoped to
+  // `reason = 'website_discovery_candidate'`), so they accumulate forever
+  // with no path to resolution. `parked_since` is a nullable TEXT column,
+  // stamped once by POST /admin/gardssalg-website-review-queue-park, that
+  // marks a row as knowingly parked WITHOUT deleting it or touching its
+  // `reason`/`evidence`/`candidate_url` — same nullable-TEXT-stamped-once,
+  // never-deleted, excluded-from-future-auto-select shape as
+  // agent_knowledge.pending_verify_parked_since (src/database/init.ts,
+  // "pending_verify no-progress parking" migration above this file's own
+  // twin). ADD COLUMN + try/catch per statement, same idiom as that
+  // precedent, so this is safe to run against a database that already has
+  // the table.
+  for (const stmt of [`ALTER TABLE gardssalg_website_review_queue ADD COLUMN parked_since TEXT`]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // ─── provider_work_queue (dev-request 2026-08-17-forsyningskjede-
   // samarbeid-og-kvalitetsoppdatering, Skive 1) ───────────────────────────────
   // Shared hand-off queue between the three gårdssalg pipelines (ownership-
@@ -1267,6 +1294,53 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_provider_field_write_audit failed:", err);
   }
 
+  // ─── experience_admission_promotion_audit (dev-request 2026-09-02-
+  // experiences-karantene-utgang-match-til-verified) ─────────────────────────
+  // Insert-only, per-row changelog for the ONE promotion transition the
+  // content-judge sweep (POST /admin/experiences-content-judge-sweep,
+  // routes/opplevelser.ts) is now allowed to make OUT of quarantine: a
+  // `needs_review` row whose fresh judge verdict is MATCH, whose provider is
+  // `brreg_active=1`, and whose judged page is an independently
+  // ownership/evidence-verified source (isHjemmesideVerified OR
+  // isEvidenceUrlVerified) gets promoted to `verified`. Mirrors
+  // experience_provider_field_write_audit's shape/indexing idiom just above
+  // (this fleet's established reversible-write audit-trail convention) but is
+  // NOT that same table reused directly — this audit is keyed on an
+  // EXPERIENCE row (FK'd to `experiences`), while
+  // experience_provider_field_write_audit is FK'd to `experience_providers`,
+  // the wrong parent for a per-experience status transition. `batch_id` is
+  // the sweep's own `content-judge-sweep-<timestamp>` batch id (already
+  // computed in the route for its response's `batch_id` field) — reused here
+  // unchanged, not re-minted, so a whole promotion batch can be rolled back
+  // via POST /admin/experiences-admission-promotion-rollback by that same id.
+  // `from_status`/`to_status` are always 'needs_review'/'verified' in
+  // practice (the only transition this mechanism performs), stored as plain
+  // columns rather than hardcoded so the rollback route's query stays a
+  // simple, generic "read this row's own before-state back" instead of
+  // assuming a literal. `reason` carries the judge's own reasoning text (the
+  // same string stampExperienceAdmissionVerdict's `promoted: <reasoning>`
+  // admission_verdict stamp on the experiences row carries), so the audit
+  // trail is self-explanatory without cross-referencing admission_verdict.
+  // ON DELETE CASCADE so an audit row never outlives its experience.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_admission_promotion_audit (
+        id TEXT PRIMARY KEY,
+        experience_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        from_status TEXT NOT NULL,
+        to_status TEXT NOT NULL,
+        reason TEXT,
+        promoted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (experience_id) REFERENCES experiences(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_admission_promotion_audit_experience ON experience_admission_promotion_audit(experience_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_admission_promotion_audit_batch ON experience_admission_promotion_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration experience_admission_promotion_audit failed:", err);
+  }
+
   // ─── experience_fylke_2024_migration_audit (dev-request
   // 2026-08-07-orch-fylke-2024-migrasjon) ─────────────────────────────────
   // Insert-only changelog for POST /api/opplevelser/admin/fylke-2024-
@@ -1703,6 +1777,18 @@ export function initExperiencesSchema(db: Database.Database): void {
   ];
   for (const stmt of priceFreshnessCols) {
     try { db.exec(stmt); } catch { /* already present */ }
+  }
+
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+  // profile_translations / profile_translation_audit tables (EN/SV
+  // translations of experience + gårdssalg-provider prose, staged
+  // draft→reviewed→verified→published, never written into the Norwegian
+  // source columns). Same shape in the rfb DB (init.ts). Idempotent
+  // CREATE IF NOT EXISTS — see src/services/profile-translations.ts.
+  try {
+    ensureProfileTranslationsSchema(db);
+  } catch (e) {
+    console.error("[experiences] profile_translations schema failed:", e);
   }
 
   console.log("[experiences] schema initialized");

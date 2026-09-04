@@ -73,8 +73,9 @@
  *        prod. Also confirms `stop_reason` is wired through to the route's
  *        JSON response.
  *   (B2) [criterion 5] Write-behavior regression: apply=true against a
- *        provider with one LOCKED (verified) thin experience and one
- *        UNLOCKED thin experience, addressed via explicit providerIds (so
+ *        provider with one OWNER-LOCKED (content_source='claim', also
+ *        published) thin experience and one UNLOCKED thin experience,
+ *        addressed via explicit providerIds (so
  *        this exercises ONLY the untouched write/apply path, decoupled from
  *        the selector change) — skipped_locked and by_field behave exactly
  *        as before (fill-only rule + lock guard untouched by this fix).
@@ -139,6 +140,9 @@ export function runOpplevelserContentRefreshScanWindowTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -348,6 +352,7 @@ export function runOpplevelserContentRefreshScanWindowTests(
       // ═══════════════════════════════════════════════════════════════════
       dbFactory.__resetDbFactoryForTesting();
       const db2 = dbFactory.getDb("experiences");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       function seedNonEnrichableCohortOn(targetDb: typeof db2, idPrefix: string, count: number, baseTimeMs: number): void {
@@ -460,9 +465,18 @@ export function runOpplevelserContentRefreshScanWindowTests(
         JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" } }),
         provB2,
       );
+      // OWNER-locked (content_source='claim'), not just published — dev-
+      // request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+      // publiserte-rader split the lock so a merely-published (verified,
+      // not owner-authored) row is now fill-blank-only, no longer fully
+      // locked; this fixture needs the FULL (owner) lock to still exercise
+      // "a locked row's fields are never touched" the way this regression
+      // guard intends. See experience-store-lock-split.test.ts for coverage
+      // of the published-but-not-owner-locked case this fixture used to be.
       const lockedExpB2 = expStore.createExperience({
         title: "Familiegård låst", provider_id: provB2, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "verified",
+        content_source: "claim",
       });
       const unlockedExpB2 = expStore.createExperience({
         title: "Familiegård ulåst", provider_id: provB2, provider_match_status: "matched",
@@ -493,7 +507,7 @@ export function runOpplevelserContentRefreshScanWindowTests(
       assertTrue(
         Array.isArray(b2.body.skipped_locked) &&
           b2.body.skipped_locked.some((s: any) => s.provider_id === provB2 && s.experience_ids.includes(lockedExpB2)),
-        "b2-4: the LOCKED (verified) experience is reported in skipped_locked — lock guard unchanged",
+        "b2-4: the OWNER-LOCKED (content_source='claim') experience is reported in skipped_locked — lock guard unchanged",
       );
       assertEq(b2.body.by_field.description, 1, "b2-5: exactly one description write (the UNLOCKED experience only) — fill-only rule unchanged");
       assertTrue(
@@ -501,13 +515,14 @@ export function runOpplevelserContentRefreshScanWindowTests(
         "b2-6: provider reported in `changed` with description among the written fields",
       );
       const lockedRowB2 = db2.prepare("SELECT description FROM experiences WHERE id = ?").get(lockedExpB2) as { description: string | null };
-      assertEq(lockedRowB2.description, null, "b2-7: the LOCKED experience's description was NOT written (still blank)");
+      assertEq(lockedRowB2.description, null, "b2-7: the OWNER-LOCKED experience's description was NOT written (still blank)");
       const unlockedRowB2 = db2.prepare("SELECT description FROM experiences WHERE id = ?").get(unlockedExpB2) as { description: string | null };
       assertEq(unlockedRowB2.description, ABOUT_TEXT, "b2-8: the UNLOCKED experience's description WAS written with the extracted text");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-content-refresh-scan-window: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;

@@ -24,7 +24,7 @@ import { slugify } from "../utils/slug";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription } from "../services/description-quality";
+import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { computeEffectiveAvailability } from "../services/supply-graph";
@@ -463,7 +463,9 @@ export function registerTools(
         if (isJunkDescription(k.about)) {
           console.log(`[description-guard] suppressed junk knowledge.about (lokal_info) for ${agent.id} (${agent.name})`);
         } else {
-          sections.push(`\n${k.about}`);
+          // Strip an appended internal pipeline note (Daniel 2026-09-03) —
+          // an AI agent must not relay the fleet's own working notes either.
+          sections.push(`\n${normalizeProse(k.about)}`);
         }
       }
 
@@ -1070,7 +1072,7 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
     if (isJunkDescription(agent.description)) {
       console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
     } else {
-      lines.push(`   ${agent.description}`);
+      lines.push(`   ${normalizeProse(agent.description)}`);
     }
   }
 

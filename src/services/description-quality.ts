@@ -107,6 +107,16 @@ export function isJunkDescription(text: string | null | undefined): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
 
+  // Rule -1: the value is nothing but an internal pipeline note (Daniel
+  // 2026-09-03, "Interne notater skal ikke vises") — e.g. "Importert fra
+  // Hanen-medlemslisten — venter på verifisering", which is the ENTIRE
+  // description on several live producers. Reporting it as junk here makes
+  // every existing display guard suppress it with no new call site.
+  // A note APPENDED to real prose is deliberately NOT junk: that case keeps
+  // the prose and loses only the note, via stripInternalNotes() at the
+  // render sites. See the internal-note section at the end of this file.
+  if (stripInternalNotes(trimmed) === "") return true;
+
   // Rule 0: scraped JS/markup code artifact (dev-request 2026-08-24-
   // produsentbeskrivelser-skrapt-js-opprydding) — a DIFFERENT failure mode
   // from the nav-boilerplate rules below, checked FIRST via its own
@@ -609,4 +619,144 @@ export function looksTruncatedMidWord(text: string | null | undefined): boolean 
   }
 
   return false;
+}
+
+// ─── Internal pipeline notes ────────────────────────────────────────────────
+//
+// Daniel 2026-09-03: «Interne notater skal ikke vises.»
+//
+// The English translation run on 2026-09-03 read every RFB prose field word
+// for word and surfaced a class of content no display guard had caught: an
+// enrichment routine writing its OWN working notes into `agents.description`,
+// where they render to customers as if the producer had written them. Live
+// examples, all confirmed in production that day:
+//
+//   Negarden Linge / Bugarden / Vollan Gård / Torheim Gard / Beiarmat
+//     "Importert fra Hanen-medlemslisten — venter på verifisering"
+//   Sirdal Tradisjonsmat — Tjørhom
+//     "… Orgnr 933084353. NB: nettside midlertidig utilgjengelig — kontakt
+//      bør bekreftes av verifier."
+//   Hagan Gartneri — Kolvereid
+//     "… Lokalt besøksmål for hele Nærøysund. Kontakt ikke verifisert —
+//      verifisering pågår."
+//
+// Two shapes, needing two different answers — which is why this is NOT folded
+// into isJunkDescription's whole-field suppression:
+//
+//   1. The note IS the whole value  → nothing to show; suppress the field.
+//   2. The note is APPENDED to real producer prose → suppressing the field
+//      would throw away good content. Strip the note sentence, keep the rest.
+//
+// So the unit of work is the SENTENCE, not the field. stripInternalNotes()
+// drops offending sentences and returns what remains; when that is empty the
+// value was note-only and isJunkDescription() reports it as junk, so every
+// existing display guard suppresses it with no new call site needed.
+//
+// SAFETY POSTURE — same bias as the rest of this module: never eat normal
+// prose. Each predicate below is an internal verification-status phrase that
+// a farmer writing about their own farm has no reason to produce. Words that
+// DO occur in ordinary prose are deliberately excluded: an earlier draft of
+// this scan keyed on "oppdatert", which matched perfectly legitimate copy
+// ("åpningstider oppdateres hver onsdag kveld", "abonnere på nyheitsbrevet
+// vårt for å halde deg oppdatert") — that word is not in the rules below.
+
+/** Sentence-level predicates for an internal verification/pipeline note. */
+const INTERNAL_NOTE_SENTENCE_RULES: readonly RegExp[] = [
+  // "NB: … verifier …" — an editorial aside addressed at the fleet.
+  /\bnb:\s*[^]*?\bverifier\b/i,
+  // "… bør bekreftes av verifier" (with or without the NB: prefix).
+  /\bbekreftes av\s+verifier\b/i,
+  // Queue-status clauses: "venter på verifisering", "verifisering pågår".
+  /\bventer på verifisering\b/i,
+  /\bverifisering pågår\b/i,
+  // "Kontakt(en) (er) ikke verifisert".
+  /\bkontakt(?:en)?\s+(?:er\s+)?ikke verifisert\b/i,
+];
+
+/** True iff ONE sentence is an internal verification/pipeline note. */
+function isInternalNoteSentence(sentence: string): boolean {
+  const s = sentence.trim();
+  if (!s) return false;
+  return INTERNAL_NOTE_SENTENCE_RULES.some((re) => re.test(s));
+}
+
+/**
+ * Split into sentences for note-stripping. Deliberately simple: break after
+ * `.`/`!`/`?` followed by whitespace. Norwegian producer prose in this corpus
+ * does not lean on abbreviations that would fool it, and a mis-split can only
+ * ever cost us a slightly narrower strip — never a wrongly deleted sentence,
+ * since each fragment still has to match a rule above to be dropped.
+ */
+function splitSentences(text: string): string[] {
+  return text.split(/(?<=[.!?])\s+/);
+}
+
+/** True iff the text carries at least one internal-note sentence. */
+export function hasInternalNote(text: string | null | undefined): boolean {
+  if (!text || typeof text !== "string") return false;
+  return splitSentences(text).some(isInternalNoteSentence);
+}
+
+/**
+ * Remove internal verification/pipeline notes, keeping the producer's own
+ * prose. Returns "" when the value was nothing BUT a note (case 1 above) —
+ * callers should then treat the field as absent, which isJunkDescription()
+ * already arranges for every existing display guard.
+ *
+ * Idempotent, and a no-op (returns the input trimmed) when no rule matches,
+ * so it is safe to wrap around any description/about at render time.
+ */
+export function stripInternalNotes(text: string | null | undefined): string {
+  if (!text || typeof text !== "string") return "";
+  if (!hasInternalNote(text)) return text.trim();
+  return splitSentences(text)
+    .filter((s) => !isInternalNoteSentence(s))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ─── HTML entities left over from scraping ────────────────────────────────
+//
+// Daniel 2026-09-03 (screenshot, Gvarv Frukt og Bær): the stored description
+// read "you&#039;ll find locally produced products" — the scraper kept the
+// page's HTML entity instead of the apostrophe, and every render site then
+// escapes the `&` again, so the customer sees the entity verbatim. Same class
+// as an internal note: not the producer's words, must never reach a page.
+// Decoded at render (normalizeProse below) and, through the same helper, at
+// the write doors that already gate on notes/code artifacts.
+//
+// Only the entities a scrape realistically leaves behind. Idempotent, and a
+// no-op on text without entities, so it is safe to wrap around any prose.
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  aring: "å", Aring: "Å", oslash: "ø", Oslash: "Ø", aelig: "æ", AElig: "Æ",
+  eacute: "é", egrave: "è", uuml: "ü", ouml: "ö", auml: "ä", ndash: "–", mdash: "—",
+  hellip: "…", laquo: "«", raquo: "»", lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”",
+};
+
+/** Decode numeric (&#39; &#039; &#x27;) and common named HTML entities. */
+export function decodeHtmlEntities(text: string | null | undefined): string {
+  if (!text || typeof text !== "string") return "";
+  if (!text.includes("&")) return text;
+  return text
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, hex) => safeFromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d{1,7});/g, (_, dec) => safeFromCodePoint(parseInt(dec, 10)))
+    .replace(/&([a-zA-Z]{2,8});/g, (m, name) => (name in NAMED_ENTITIES ? NAMED_ENTITIES[name] : m));
+}
+
+function safeFromCodePoint(cp: number): string {
+  // Never decode into control characters or the surrogate range.
+  if (!Number.isFinite(cp) || cp < 0x20 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) return "";
+  return String.fromCodePoint(cp);
+}
+
+/**
+ * Everything a display site should do to stored prose before showing it:
+ * decode scraped entities, then drop internal pipeline notes. Returns "" for
+ * a note-only value, exactly like stripInternalNotes.
+ */
+export function normalizeProse(text: string | null | undefined): string {
+  return stripInternalNotes(decodeHtmlEntities(text));
 }

@@ -99,12 +99,17 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
       VALUES (?, ?, 'test producer', 'test', ?, 'https://example.no', 'producer', ?)
     `).run(id, name, email, `key-${id}`);
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+    // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+    // products>=3) against the raw columns, not just enrichment_status='rich'
+    // — an explicit about text keeps this synthetic fixture pool-eligible
+    // (this test is about dedupe/gate-integrity, not content depth).
     db.prepare(`
       INSERT INTO agent_knowledge
-        (agent_id, email, field_provenance, verification_status, enrichment_status,
+        (agent_id, email, about, field_provenance, verification_status, enrichment_status,
          url_last_status, url_last_probed, google_rating, google_review_count)
-      VALUES (?, ?, '{}', 'verified', 'rich', 200, datetime('now'), ?, ?)
-    `).run(id, email, opts2.googleRating ?? null, opts2.googleReviewCount ?? null);
+      VALUES (?, ?, ?, '{}', 'verified', 'rich', 200, datetime('now'), ?, ?)
+    `).run(id, email, "x".repeat(200), opts2.googleRating ?? null, opts2.googleReviewCount ?? null);
   }
 
   // Record N profile-view rows for an agent (analytics_agent_views is what

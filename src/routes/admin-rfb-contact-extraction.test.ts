@@ -59,6 +59,27 @@
  * touch agent_knowledge.email either) — not just the existing
  * agents.contact_email assertions.
  *
+ * dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email (option
+ * A): mode:"backfill_from_contact_email" — a pure DB re-classification/
+ * backfill of an address ALREADY on file in agents.contact_email into
+ * agent_knowledge.email (no page fetch, so no fixtures/stubFetch use for
+ * this section at all). Section (bf) covers:
+ *   (bf1) dry-run over the new cohort reports the copy, writes nothing.
+ *   (bf2) apply writes agent_knowledge.email with
+ *         source_type:"harvest_contact_email" and source_url = k.website.
+ *   (bf3) a platform-owned contact_email is rejected
+ *         ("rejected_platform_domain"), never written.
+ *   (bf4) a domain-mismatched (non-free-mail) contact_email is rejected
+ *         ("rejected_domain_mismatch"), never written.
+ *   (bf5) a row with no contact_email_dns_check.live=1 (missing, or
+ *         explicitly 0) is NOT in the cohort at all — not just skipped, not
+ *         present in `results`.
+ *   (bf6) a row whose agent_knowledge.email is already non-blank is
+ *         untouched (fill-only) — also not in the cohort (blank-email is
+ *         part of the cohort filter itself).
+ *   (bf7) the free-mail exemption: a gmail.com contact_email on a company
+ *         whose website is a different domain IS accepted and written.
+ *
  * globalThis.fetch is mocked directly, keyed on exact URL (same convention
  * as admin-rfb-website-discovery.test.ts). This file is intentionally NOT
  * wired into tests/test.ts (outside this slice's touched-files list — see
@@ -277,6 +298,8 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
     }
     const deadDnsProvenance = (domain: string) =>
       JSON.stringify({ contact_email_dns_check: { checked_at: "2026-08-01T00:00:00.000Z", domain, live: false, method: "none", batch_id: "x" } });
+    const liveDnsProvenance = (domain: string) =>
+      JSON.stringify({ contact_email_dns_check: { checked_at: "2026-08-01T00:00:00.000Z", domain, live: true, method: "none", batch_id: "x" } });
 
     // ── (a) auth ──────────────────────────────────────────────────────────
     {
@@ -612,6 +635,124 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       } finally {
         process.env.ANTHROPIC_API_KEY = savedKey;
       }
+    }
+
+    // ── (bf) mode: "backfill_from_contact_email" (dev-request
+    // 2026-09-02-rfb-innhoestet-contact-email-uten-k-email, option A) — a
+    // pure DB re-classification/backfill of an address ALREADY on file in
+    // agents.contact_email into agent_knowledge.email. No page fetch: no
+    // fixtures.set(...) needed for any row in this section, and fetchCalls
+    // must never grow across it.
+    {
+      const fetchesBeforeBf = fetchCalls.length;
+
+      // (bf1)/(bf2): dry-run reports the copy without writing; apply then
+      // actually writes agent_knowledge.email with
+      // source_type:"harvest_contact_email" and source_url = k.website.
+      insertAgent({
+        id: "cx-bf-basic", name: "Nydal Gard", website: "https://nydalgard.no",
+        contactEmail: "post@nydalgard.no", fieldProvenance: liveDnsProvenance("nydalgard.no"),
+      });
+
+      const dry = await callExtraction({ agentIds: ["cx-bf-basic"], mode: "backfill_from_contact_email" });
+      assertEq(dry.status, 200, "bf1-1: 200");
+      assertEq(dry.body.dry_run, true, "bf1-2: dry-run by default");
+      const dryItem = dry.body.results.find((x: any) => x.agent_id === "cx-bf-basic");
+      assertTrue(!!dryItem, "bf1-3: result present for cx-bf-basic");
+      assertEq(dryItem.outcome, "written", "bf1-4: outcome is 'written' (would-write in dry-run)");
+      assertEq(dryItem.email, "post@nydalgard.no", "bf1-5: reports the already-known contact_email");
+      assertEq(dryItem.source_url, "https://nydalgard.no", "bf1-6: source_url is k.website");
+      assertEq(knowledgeEmailOf("cx-bf-basic"), null, "bf1-7: dry-run wrote NOTHING to agent_knowledge.email");
+
+      const applied = await callExtraction({ agentIds: ["cx-bf-basic"], mode: "backfill_from_contact_email", apply: true });
+      assertEq(applied.status, 200, "bf2-1: 200");
+      assertEq(applied.body.dry_run, false, "bf2-2: apply turns off dry-run");
+      const appliedItem = applied.body.results.find((x: any) => x.agent_id === "cx-bf-basic");
+      assertEq(appliedItem.outcome, "written", "bf2-3: outcome written");
+      assertEq(knowledgeEmailOf("cx-bf-basic"), "post@nydalgard.no", "bf2-4: agent_knowledge.email was filled from agents.contact_email");
+      assertEq(contactEmailOf("cx-bf-basic"), "post@nydalgard.no", "bf2-5: agents.contact_email unchanged (same-value no-op)");
+      const bfProv = fieldProvenanceOf("cx-bf-basic");
+      assertTrue(Array.isArray(bfProv.email) && bfProv.email.length === 1, "bf2-6: field_provenance.email has exactly one entry");
+      assertEq(bfProv.email[0].source_type, "harvest_contact_email", "bf2-7 (AC1): source_type is 'harvest_contact_email', distinguishing this from a fresh scrape");
+      assertEq(bfProv.email[0].source_url, "https://nydalgard.no", "bf2-8: field_provenance.email[0].source_url is k.website");
+      assertEq(bfProv.email[0].value, "post@nydalgard.no", "bf2-9: field_provenance.email[0].value matches the written address");
+
+      // (bf2-audit) regression guard (CHANGES-REQUESTED review finding):
+      // newEmail in backfill mode is BY CONSTRUCTION identical to the row's
+      // pre-existing agents.contact_email (that's the whole premise of this
+      // mode — copying an already-on-file address into agent_knowledge.email),
+      // so applyRfbCxWrite must skip both the agents.contact_email UPDATE and
+      // the agent_knowledge_audit INSERT for it — a fabricated "X changed to
+      // X" audit row would pollute admin-agent-audit.ts's Daniel-only audit
+      // trail and break the dev-request's rollback contract (resetting
+      // k.email for provenance:harvest_contact_email rows must be
+      // sufficient). Only the outcome stays "written" (asserted as bf2-3
+      // above) — no DB-level contact_email audit row should exist.
+      const bf2AuditRows = testDb
+        .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = 'contact_email'")
+        .all("cx-bf-basic");
+      assertEq(bf2AuditRows.length, 0, "bf2-audit: no agent_knowledge_audit row for contact_email — value was unchanged");
+
+      // (bf3): platform-owned domain -> rejected, never written.
+      insertAgent({
+        id: "cx-bf-platform", name: "Feilkontakt Backfill Gard", website: "https://feilbf.no",
+        contactEmail: "kontakt@rettfrabonden.com", fieldProvenance: liveDnsProvenance("rettfrabonden.com"),
+      });
+      const bf3 = await callExtraction({ agentIds: ["cx-bf-platform"], mode: "backfill_from_contact_email", apply: true });
+      const bf3Item = bf3.body.results.find((x: any) => x.agent_id === "cx-bf-platform");
+      assertEq(bf3Item.outcome, "rejected_platform_domain", "bf3-1: platform-owned domain rejected");
+      assertEq(knowledgeEmailOf("cx-bf-platform"), null, "bf3-2: nothing written to agent_knowledge.email");
+
+      // (bf4): non-free-mail domain mismatch (contact_email's domain differs
+      // from k.website's host) -> rejected, never written.
+      insertAgent({
+        id: "cx-bf-mismatch", name: "Ukoblet Backfill Gard", website: "https://ukobletbf.no",
+        contactEmail: "post@heltannenbedrift.no", fieldProvenance: liveDnsProvenance("heltannenbedrift.no"),
+      });
+      const bf4 = await callExtraction({ agentIds: ["cx-bf-mismatch"], mode: "backfill_from_contact_email", apply: true });
+      const bf4Item = bf4.body.results.find((x: any) => x.agent_id === "cx-bf-mismatch");
+      assertEq(bf4Item.outcome, "rejected_domain_mismatch", "bf4-1: domain mismatch rejected");
+      assertEq(knowledgeEmailOf("cx-bf-mismatch"), null, "bf4-2: nothing written to agent_knowledge.email");
+
+      // (bf7): free-mail exemption — a gmail.com contact_email on a company
+      // whose website is a completely different domain IS accepted.
+      insertAgent({
+        id: "cx-bf-freemail", name: "Fjellro Backfill Gard", website: "https://fjellrobf.no",
+        contactEmail: "fjellrogard@gmail.com", fieldProvenance: liveDnsProvenance("gmail.com"),
+      });
+      const bf7 = await callExtraction({ agentIds: ["cx-bf-freemail"], mode: "backfill_from_contact_email", apply: true });
+      const bf7Item = bf7.body.results.find((x: any) => x.agent_id === "cx-bf-freemail");
+      assertEq(bf7Item.outcome, "written", "bf7-1: free-mail exemption accepted");
+      assertEq(knowledgeEmailOf("cx-bf-freemail"), "fjellrogard@gmail.com", "bf7-2: gmail.com address written despite domain differing from website");
+
+      // (bf5)/(bf6): cohort exclusion, proven via AUTO-SELECT (no agentIds)
+      // so that "not in the cohort at all" is distinguishable from the
+      // agentIds path's own "not_found" (which reports an id that simply
+      // isn't a row at all — a different case). A row absent from `results`
+      // here means selectRfbCxBackfillTargets never selected it.
+      insertAgent({
+        id: "cx-bf-notchecked", name: "Usjekket Gard", website: "https://usjekketbf.no",
+        contactEmail: "post@usjekketbf.no", // field_provenance defaults to "{}" -> no dns_check.live key at all
+      });
+      insertAgent({
+        id: "cx-bf-deadflag", name: "Dødflagg Gard", website: "https://dodflaggbf.no",
+        contactEmail: "post@dodflaggbf.no", fieldProvenance: deadDnsProvenance("dodflaggbf.no"), // live: false
+      });
+      insertAgent({
+        id: "cx-bf-filled", name: "Alt Fylt Backfill Gard", website: "https://fyltbf.no",
+        contactEmail: "post@fyltbf.no", knowledgeEmail: "original@fyltbf.no", fieldProvenance: liveDnsProvenance("fyltbf.no"),
+      });
+
+      const scan = await callExtraction({ limit: 48, mode: "backfill_from_contact_email" });
+      const scanIds = new Set(scan.body.results.map((x: any) => x.agent_id));
+      assertTrue(!scanIds.has("cx-bf-notchecked"), "bf5-1: a row with NO contact_email_dns_check.live key is NOT in the cohort at all");
+      assertTrue(!scanIds.has("cx-bf-deadflag"), "bf5-2: a row with contact_email_dns_check.live=false is NOT in the cohort at all (mere 'not flagged dead' is not enough — must be explicitly live=1)");
+      assertTrue(!scanIds.has("cx-bf-filled"), "bf6-1: a row whose agent_knowledge.email is already non-blank is NOT in the cohort at all (fill-only is enforced at the cohort level)");
+      assertEq(knowledgeEmailOf("cx-bf-notchecked"), null, "bf5-3: untouched — still null");
+      assertEq(knowledgeEmailOf("cx-bf-deadflag"), null, "bf5-4: untouched — still null");
+      assertEq(knowledgeEmailOf("cx-bf-filled"), "original@fyltbf.no", "bf6-2: untouched — pre-existing value preserved exactly");
+
+      assertEq(fetchCalls.length, fetchesBeforeBf, "bf-nofetch: backfill_from_contact_email never makes a live page fetch");
     }
   } catch (err: any) {
     failed++;

@@ -51,6 +51,12 @@
  * "provider_link"); a name_token-basis pair is candidate-only and must come
  * back go:true from the gate (it answered go:false,
  * reason:"dublettkonflikt" on pre-slice-1 code).
+ *
+ * Extended for dev-request 2026-09-03-gardssalg-merged-provider-read-path-
+ * filter (bug fix) — block (d-merged): a merged-away id (merged_into set by
+ * POST /admin/gardssalg-provider-dedup-merge) is rejected with its own
+ * explicit reason naming merged_into, never folded into the generic
+ * ikke_funnet bucket a genuinely-nonexistent id gets.
  */
 
 export interface TestSummary {
@@ -302,6 +308,23 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         brreg_verified: 1,
       });
 
+      // Bug-fix regression fixture (dev-request 2026-09-03-gardssalg-merged-
+      // provider-read-path-filter): otherwise outreach_ready-shaped (same
+      // shape as prov-ready), but merged_into is set — folded away by
+      // POST /admin/gardssalg-provider-dedup-merge. Used ONLY by the (d)
+      // block below: unlike a genuinely nonexistent id (ikke_funnet), a
+      // merged id must get its OWN explicit reason naming merged_into.
+      insertProvider.run({
+        id: "prov-merged", navn: "Sammenslått Gård AS", org_nr: "121121121", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@sammenslatt.no", telefon: null, hjemmeside: "https://sammenslatt.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider, cider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "sammenslatt-gard-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+      });
+      expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-ready' WHERE id = 'prov-merged'`).run();
+
       // ── outreach-guard fixtures (dev-request 2026-07-31-gardssalg-
       // provider-dubletter-på-tvers-av-seeds, Slice 2) — five otherwise-
       // independent outreach_ready-tier rows (same shape as prov-ready
@@ -425,6 +448,24 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         "d5: prov-unreach unaffected by the missing id in the same batch",
       );
       assertEq(withMissing.body.summary, { go: 1, no_go: 2, total: 3 }, "d6: summary counts the missing id as no_go");
+
+      // ── (d-merged) a merged-away id gets its OWN explicit reason, never
+      // folded into the generic ikke_funnet bucket ──────────────────────────
+      const withMerged = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        body: { provider_ids: ["prov-merged", "prov-does-not-exist"] },
+      });
+      assertEq(withMerged.status, 200, "d7: batch with a merged-away id -> 200");
+      assertEq(
+        withMerged.body.results[0],
+        { provider_id: "prov-merged", name: null, go: false, reason: "merged_into:prov-ready" },
+        "d8: merged-away id -> go:false, reason names merged_into (and its survivor), not ikke_funnet",
+      );
+      assertEq(
+        withMerged.body.results[1],
+        { provider_id: "prov-does-not-exist", name: null, go: false, reason: "ikke_funnet" },
+        "d9: a genuinely nonexistent id in the SAME batch still gets ikke_funnet — the two reasons don't bleed into each other",
+      );
 
       // ── (e) duplicate ids deduped, first-seen order preserved ───────────
       const withDupes = await callRoute(opplevelserRouter, {

@@ -574,9 +574,14 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
           db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
                       VALUES (?,?, 'x','test', ?, 'https://x.example.no','producer',?,1)`)
             .run(id, id, email, `key-${id}`);
-          db.prepare(`INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status,
+          // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+          // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+          // products>=3) against the raw columns, not just enrichment_status='rich'
+          // — an explicit about text keeps this fixture pool-eligible (this test is
+          // about cross-platform cooldown reporting, not content depth).
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, email, about, verification_status, enrichment_status,
                         url_last_status, url_last_probed)
-                      VALUES (?,?, 'verified','rich',200,datetime('now'))`).run(id, email);
+                      VALUES (?,?,?, 'verified','rich',200,datetime('now'))`).run(id, email, "x".repeat(200));
         };
         mkEligible("tr-cand-clean", "ren@gaard.no");
         mkEligible("tr-cand-overlap", "overlapp2@gaard.no");

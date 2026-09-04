@@ -55,6 +55,14 @@
  *       stays unchanged (untouched, not garbage) on a follow-up GET.
  *   (g) PUT with price_band: null -> 200, clears a previously-set value
  *       (nullable() is preserved; the enum guard doesn't disallow clearing).
+ *
+ * dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
+ * GET /discover reuses listDentalAgents's excludeNonClinic opt, gated by
+ * DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1". Covers:
+ *   (h) flag unset -> /discover returns all rows including catalog_class
+ *       person_enk/lab_leverandor/holding (unchanged behavior).
+ *   (i) flag="1" -> /discover excludes those 3 non-clinic rows but still
+ *       returns the catalog_class NULL/klinikk/offentlig_klinikk/ukjent rows.
  */
 
 export interface TestSummary {
@@ -143,10 +151,12 @@ export function runDentalTests(
     const prevDentalPath = process.env.DENTAL_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+    const prevPublicCatalogClassFilter = process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
     const testKey = process.env.ADMIN_KEY || "dental-fingerprint-guard-test-key";
     process.env.DENTAL_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     delete process.env.ANALYTICS_ADMIN_KEY;
+    delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const dentalPath = require.resolve("./dental");
@@ -266,6 +276,29 @@ export function runDentalTests(
         specialists: null,
         price_band: "premium",
       });
+
+      // (h)-(i) subjects: dev-request 2026-09-03-dental-catalog-class-public-filter
+      // (slice 1b) — GET /discover's catalog_class filter. One row per
+      // catalog_class outcome, catalog_class set via a raw UPDATE since
+      // insertAgent's column list (mirrors createDentalAgent) doesn't write it.
+      const insertDiscoverAgent = dentalDb.prepare(
+        `INSERT INTO dental_agents (id, navn, hjemmeside, telefon, om_oss, specialists)
+         VALUES (@id, @navn, @hjemmeside, @telefon, @om_oss, @specialists)`,
+      );
+      const setCatalogClass = dentalDb.prepare(`UPDATE dental_agents SET catalog_class = ? WHERE id = ?`);
+      const discoverSeed: Array<{ id: string; navn: string; catalog_class: string | null }> = [
+        { id: "discover-klinikk", navn: "Discover Klinikk AS", catalog_class: "klinikk" },
+        { id: "discover-offentlig", navn: "Discover Offentlig Klinikk", catalog_class: "offentlig_klinikk" },
+        { id: "discover-ukjent", navn: "Discover Ukjent AS", catalog_class: "ukjent" },
+        { id: "discover-null", navn: "Discover Uklassifisert AS", catalog_class: null },
+        { id: "discover-person-enk", navn: "KARI DISCOVER", catalog_class: "person_enk" },
+        { id: "discover-lab", navn: "Discover Dental Lab AS", catalog_class: "lab_leverandor" },
+        { id: "discover-holding", navn: "Discover Holding AS", catalog_class: "holding" },
+      ];
+      for (const row of discoverSeed) {
+        insertDiscoverAgent.run({ id: row.id, navn: row.navn, hjemmeside: null, telefon: null, om_oss: null, specialists: null });
+        if (row.catalog_class !== null) setCatalogClass.run(row.catalog_class, row.id);
+      }
 
       const dentalRouter = (require("./dental") as typeof import("./dental")).default as any;
 
@@ -484,6 +517,34 @@ export function runDentalTests(
           "g4: price_band was actually cleared to null",
         );
       }
+
+      // ── (h) GET /discover, flag unset -> unchanged (all 7 seeded rows) ──
+      {
+        delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
+        const resp = await callRoute(dentalRouter, { method: "GET", path: "/discover?limit=100", headers: {} });
+        assertEq(resp.status, 200, "h1: GET /discover -> 200");
+        const navnSet = new Set((resp.body?.results ?? []).map((r: any) => r.navn));
+        assertTrue(navnSet.has("KARI DISCOVER"), "h2: flag unset -- /discover includes the person_enk row (unchanged behavior)");
+        assertTrue(navnSet.has("Discover Dental Lab AS"), "h3: flag unset -- /discover includes the lab_leverandor row");
+        assertTrue(navnSet.has("Discover Holding AS"), "h4: flag unset -- /discover includes the holding row");
+        assertTrue(navnSet.has("Discover Klinikk AS"), "h5: flag unset -- /discover includes the klinikk row");
+      }
+
+      // ── (i) GET /discover, flag="1" -> non-clinic rows excluded ──────────
+      {
+        process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER = "1";
+        const resp = await callRoute(dentalRouter, { method: "GET", path: "/discover?limit=100", headers: {} });
+        assertEq(resp.status, 200, "i1: GET /discover with flag=1 -> 200");
+        const navnSet = new Set((resp.body?.results ?? []).map((r: any) => r.navn));
+        assertTrue(!navnSet.has("KARI DISCOVER"), "i2: flag=1 -- /discover excludes the person_enk row");
+        assertTrue(!navnSet.has("Discover Dental Lab AS"), "i3: flag=1 -- /discover excludes the lab_leverandor row");
+        assertTrue(!navnSet.has("Discover Holding AS"), "i4: flag=1 -- /discover excludes the holding row");
+        assertTrue(navnSet.has("Discover Klinikk AS"), "i5: flag=1 -- /discover still includes the klinikk row");
+        assertTrue(navnSet.has("Discover Offentlig Klinikk"), "i6: flag=1 -- /discover still includes the offentlig_klinikk row");
+        assertTrue(navnSet.has("Discover Ukjent AS"), "i7: flag=1 -- /discover still includes the explicit ukjent row");
+        assertTrue(navnSet.has("Discover Uklassifisert AS"), "i8: flag=1 -- /discover still includes the catalog_class NULL row");
+        delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
+      }
     } catch (err: any) {
       failed++;
       failures.push("dental: unexpected error: " + String(err?.stack || err?.message || err));
@@ -491,6 +552,7 @@ export function runDentalTests(
       if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
       if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+      if (prevPublicCatalogClassFilter === undefined) delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER; else process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER = prevPublicCatalogClassFilter;
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

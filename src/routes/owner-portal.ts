@@ -4,6 +4,14 @@ import { emailService } from "../services/email-service";
 import { slugify } from "../utils/slug";
 import { getOwnerStats } from "../services/owner-stats-service";
 import { looksLikeCodeArtifact } from "../services/description-quality";
+import {
+  listOwnerTranslations,
+  setOwnerTranslation,
+  clearOwnerTranslation,
+  TRANSLATION_TARGET_LANGS,
+  PROFILE_TRANSLATION_FIELDS,
+  type TranslationTargetLang,
+} from "../services/profile-translations";
 import crypto from "crypto";
 
 const router = Router();
@@ -21,6 +29,9 @@ const router = Router();
 //   - POST /api/agents/:id/update-profile → Whitelist update + audit log
 //   - GET /api/agents/:id/profile → Session-aware read (shows lock status)
 //   - GET /admin/agent-audit → Daniel-only audit trail
+//   - GET  /api/agents/:id/translations?lang= → owner sees their English/Swedish
+//   - POST /api/agents/:id/translations → owner writes their own English/Swedish
+//   - DELETE /api/agents/:id/translations → hand the field back to the pipeline
 
 // ─────────────────────────────────────────────────────────────────
 // Constants & Helpers
@@ -1384,5 +1395,140 @@ function escapeHtml(text: string): string {
   };
   return text.replace(/[&<>"']/g, (char) => map[char]);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/agents/:id/translations?lang=en
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-09-03-oversettelse-synk-og-eierprofiler (Daniel: "eier
+// burde kunne redigere sin engelske profil"). Shows the producer, per field,
+// the Norwegian source, what the page shows today, and whether the text is
+// their own or the machine's. Session-gated exactly like update-profile.
+
+const OWNER_TRANSLATABLE_FIELDS = PROFILE_TRANSLATION_FIELDS.rfb.map((f) => f.field);
+
+function parseOwnerLang(raw: unknown): TranslationTargetLang | null {
+  const l = String(raw || "en").trim();
+  return (TRANSLATION_TARGET_LANGS as readonly string[]).includes(l) ? (l as TranslationTargetLang) : null;
+}
+
+router.get("/api/agents/:id/translations", (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const sessionData = verifyOwnerSession(req);
+    if (!sessionData.valid) {
+      return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
+    }
+    if (sessionData.agentId !== id) {
+      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    }
+    const lang = parseOwnerLang(req.query.lang);
+    if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
+    const rows = listOwnerTranslations(getDb(), "rfb", id, lang);
+    return res.json({
+      success: true,
+      agent_id: id,
+      lang,
+      fields: rows.map((r) => ({
+        field: r.field,
+        source_text: r.source_text,
+        current_text: r.current_text,
+        written_by: r.owner_text ? "owner" : r.current_text ? "ai" : null,
+        owner_text: r.owner_text,
+        owner_text_at: r.owner_text_at,
+        source_changed_since_owner_edit: r.source_changed_since_owner_edit,
+        ai_suggestion: r.owner_text ? r.machine_text : null,
+        published: r.published,
+      })),
+    });
+  } catch (e: any) {
+    console.error("[owner-portal] GET translations failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/agents/:id/translations  {lang, field, text}
+// ─────────────────────────────────────────────────────────────────
+// The producer's own words in their own language about their own business —
+// served as written, no reviewer and no verifier, exactly like the Norwegian
+// text they already control. From then on the pipeline leaves the field alone.
+
+router.post("/api/agents/:id/translations", (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const sessionData = verifyOwnerSession(req);
+    if (!sessionData.valid) {
+      return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
+    }
+    if (sessionData.agentId !== id) {
+      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    }
+    const lang = parseOwnerLang(req.body?.lang);
+    if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
+    const field = String(req.body?.field || "").trim();
+    if (!OWNER_TRANSLATABLE_FIELDS.includes(field)) {
+      return res.status(400).json({ success: false, error: "bad_field", message: `field må være en av ${OWNER_TRANSLATABLE_FIELDS.join(", ")}.` });
+    }
+    const text = String(req.body?.text ?? "");
+    if (!text.trim()) return res.status(400).json({ success: false, error: "empty_text", message: "Teksten kan ikke være tom." });
+    if (text.length > 8000) return res.status(400).json({ success: false, error: "too_long", message: "Teksten er for lang (maks 8000 tegn)." });
+    if (looksLikeCodeArtifact(text)) {
+      return res.status(400).json({ success: false, error: "looks_like_code", message: "Teksten ser ut som kode eller nettside-innhold." });
+    }
+    const row = setOwnerTranslation(getDb(), "rfb", {
+      entityType: "agent",
+      entityId: id,
+      field,
+      lang,
+      text,
+      actor: `owner:${sessionData.agentId}`,
+    });
+    if (!row) {
+      return res.status(404).json({ success: false, error: "field_not_found", message: "Feltet finnes ikke på denne profilen ennå — fyll ut den norske teksten først." });
+    }
+    console.log(`[owner-portal] owner wrote ${lang} ${field} for agent ${id}`);
+    return res.json({ success: true, agent_id: id, lang, field, saved_at: row.owner_text_at, published: true });
+  } catch (e: any) {
+    console.error("[owner-portal] POST translations failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// DELETE /api/agents/:id/translations  {lang, field}
+// ─────────────────────────────────────────────────────────────────
+// Hands the field back to the translation pipeline. The old machine text is
+// not restored silently — the field is re-translated on the next run.
+
+router.delete("/api/agents/:id/translations", (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const sessionData = verifyOwnerSession(req);
+    if (!sessionData.valid) {
+      return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
+    }
+    if (sessionData.agentId !== id) {
+      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    }
+    const lang = parseOwnerLang(req.body?.lang ?? req.query?.lang);
+    if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
+    const field = String(req.body?.field ?? req.query?.field ?? "").trim();
+    if (!OWNER_TRANSLATABLE_FIELDS.includes(field)) {
+      return res.status(400).json({ success: false, error: "bad_field", message: `field må være en av ${OWNER_TRANSLATABLE_FIELDS.join(", ")}.` });
+    }
+    const row = clearOwnerTranslation(getDb(), "rfb", {
+      entityType: "agent",
+      entityId: id,
+      field,
+      lang,
+      actor: `owner:${sessionData.agentId}`,
+    });
+    if (!row) return res.status(404).json({ success: false, error: "not_found" });
+    return res.json({ success: true, agent_id: id, lang, field, status: row.status });
+  } catch (e: any) {
+    console.error("[owner-portal] DELETE translations failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
 
 export default router;

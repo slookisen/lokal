@@ -643,11 +643,24 @@ export function getPublishedExperienceById(
 // detail-completeness-coverage admin report (opplevelser.ts) reports over
 // the SAME "published" set the detail page/`/discover` actually surface,
 // rather than redefining the gate a second time.
+//
+// dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+// rapportspraak, del 2: a provider flagged `catalog_hidden = 1` (the
+// gårdssalg-side visibility lever, POST /admin/gardssalg-provider-visibility)
+// must hide its EXPERIENCES too — before this, only the gårdssalg surfaces
+// honoured the flag, so a hidden provider's verified experiences still
+// surfaced on /discover, the detail page, the sitemap and the FAQ counts.
+// LEFT-JOIN-safe: no provider row → p.catalog_hidden IS NULL → passes, same
+// shape as the brreg_active clause above it and the same
+// `(catalog_hidden IS NULL OR catalog_hidden != 1)` form every gårdssalg
+// query in this file already uses. discoverExperiences() reuses this exact
+// constant (single source of truth) rather than carrying its own copy.
 export const PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
   "AND (p.id IS NULL OR p.brreg_active = 1) " +
-  "AND e.canonical_id IS NULL";
+  "AND e.canonical_id IS NULL " +
+  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
 
 export function getPublishedExperienceBySlug(
   slug: string
@@ -1388,14 +1401,14 @@ export function discoverExperiences(
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
-  const where: string[] = [
-    "e.verification_status = 'verified'",
-    "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
-    "(p.id IS NULL OR p.brreg_active = 1)",
-    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1: never
-    // surface a row the dedup pass merged away as a duplicate.
-    "e.canonical_id IS NULL",
-  ];
+  // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
+  // high/medium + provider brreg_active + canonical (never a dedup-merged
+  // duplicate, dev-request 2026-07-04-opplevagent-dedup-og-norske-titler
+  // item 1) + provider not catalog_hidden (dev-request 2026-09-02-
+  // experiences-skrivepause-catalog-hidden-og-rapportspraak, del 2). This
+  // used to be an inline copy of the same clauses; one constant now, so the
+  // set /discover surfaces can never drift from the detail page / sitemap.
+  const where: string[] = [PUBLISH_GATE_SQL];
   const params: Record<string, unknown> = {};
 
   // near-me geo filter (dev-request 2026-07-04-opplevagent-naer-meg-geosok,
@@ -2070,15 +2083,21 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
           -- classifyProviderContentBucket — the SAME shared classifier the
           -- berikelsestriage triage endpoint uses), which SQL alone cannot
           -- express.
-          -- NULL-guarded on verification_status (round-3-review fix,
-          -- mirrored from GET .../recently-enriched): SQL three-valued
-          -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
-          -- the row, while isExperienceContentLocked treats a NULL
-          -- verification_status as UNLOCKED. Latent today (createExperience
-          -- coalesces to 'pending_verify'), cheap to keep correct.
+          --
+          -- No verification_status clause here (removed, dev-request
+          -- 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-
+          -- rader): only OWNER-locked (content_source manual/claim) rows are
+          -- excluded from this broad pre-filter now. A PUBLISHED (verified)
+          -- row is deliberately let through — isExperienceContentGenuinelyThin
+          -- (called below, per candidate) now checks isExperienceOwnerLocked
+          -- rather than the full lock, so a published row with a genuinely
+          -- blank description/category IS thin and must reach that check
+          -- rather than being excluded here. This is the SQL half of the
+          -- fix; applyExperienceContent's own gate (also owner-lock-only as
+          -- of this dev-request) is what keeps the actual write fill-blank-
+          -- only for such rows.
           SELECT 1 FROM experiences e
            WHERE e.provider_id = p.id
-             AND (e.verification_status IS NULL OR e.verification_status != 'verified')
              AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
              AND e.canonical_id IS NULL
         )
@@ -2198,17 +2217,57 @@ export function getExperiencesForProvider(providerId: string): ExperienceContent
 }
 
 /**
+ * True when an experience is OWNER-locked: a human/owner/curator authored it
+ * directly (`content_source` 'manual' or 'claim'). Full lock — no automated
+ * writer may EVER touch such a row, blank field or not. Independent of
+ * `verification_status` — see isExperiencePublished below for that half.
+ *
+ * Split out of the former single-level isExperienceContentLocked (dev-request
+ * 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader):
+ * before this split, a PUBLISHED-but-not-owner-authored row (verified,
+ * content_source e.g. 'harvest'/'aggregator'/NULL) was locked exactly as hard
+ * as a manual one, so a sampled published row could never receive homepage
+ * content even when every field was empty. Owner-authored rows keep the
+ * original full-lock behavior unchanged.
+ */
+export function isExperienceOwnerLocked(row: {
+  content_source?: string | null;
+}): boolean {
+  return row.content_source === "manual" || row.content_source === "claim";
+}
+
+/**
+ * True when an experience row is PUBLISHED (`verification_status ===
+ * 'verified'`). NOT itself a lock — see applyExperienceContent's dev-request
+ * 2026-09-02 comment: a published-but-not-owner-locked row is now
+ * "fill-blank-only" for the automated homepage writer (an EMPTY field may
+ * still be filled; a NON-empty field is never overwritten, whether that
+ * non-emptiness came from the owner, a prior enrichment pass, or harvest).
+ */
+export function isExperiencePublished(row: {
+  verification_status?: string | null;
+}): boolean {
+  return row.verification_status === "verified";
+}
+
+/**
  * True when an experience is LOCKED against homepage content writes: it is
- * owner/curator/claim authored or already verified. Such rows are never
- * overwritten by a scrape (PURE-ish — reads only the passed row).
+ * owner/curator/claim authored OR already published (verified). Kept as
+ * `isExperienceOwnerLocked(row) || isExperiencePublished(row)` — UNCHANGED
+ * semantics from before the 2026-09-02 lock split — for callers that
+ * OVERWRITE an existing value rather than only fill a blank one (the
+ * price-freshness sweep below is the one such caller in this file): "published
+ * = fill-blank-only" means by definition a published row's non-blank fields
+ * must never be overwritten, so an overwriting writer still needs the FULL
+ * lock, not the split. Do NOT reuse this for a new fill-blank writer — call
+ * isExperienceOwnerLocked directly instead, exactly as applyExperienceContent
+ * and isExperienceContentGenuinelyThin now do.
  */
 export function isExperienceContentLocked(row: {
   content_source?: string | null;
   verification_status?: string | null;
 }): boolean {
-  if (row.verification_status === "verified") return true;
-  if (row.content_source === "manual" || row.content_source === "claim") return true;
-  return false;
+  return isExperienceOwnerLocked(row) || isExperiencePublished(row);
 }
 
 // ── Berikelsestriage classification (dev-request 2026-07-29-blacklist-
@@ -2309,6 +2368,13 @@ export const THIN_CONTENT_JUDGED_FIELDS = ["description", "category"] as const;
  * applyExperienceContent's own doc comment on its two bulk-load call sites)
  * therefore permanently blocked that row from ever being refreshed from the
  * provider's REAL homepage — exactly the bug this function fixes.
+ *
+ * UNLOCKED here means isExperienceOwnerLocked, not isExperienceContentLocked
+ * (dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+ * publiserte-rader): a PUBLISHED row with a genuinely blank description is now
+ * thin too — it becomes "enrichable" so classifyProviderContentBucket / GET
+ * /admin/providers/content-triage stop parking it in `done` forever, matching
+ * applyExperienceContent's now-identical fill-blank-only gate below.
  */
 export function isExperienceContentGenuinelyThin(
   row: {
@@ -2320,7 +2386,7 @@ export function isExperienceContentGenuinelyThin(
   },
   homepageDomain: string | null,
 ): boolean {
-  if (isExperienceContentLocked(row)) return false;
+  if (isExperienceOwnerLocked(row)) return false;
   const evidence = parseContentFieldEvidence(row.content_field_evidence);
   for (const field of THIN_CONTENT_JUDGED_FIELDS) {
     const value = field === "description" ? row.description : row.category;
@@ -2364,11 +2430,18 @@ export type BucketableExperienceRow = {
  *                      never be selected by selectProvidersForContentRefresh
  *                      either; "done" here means "nothing left to do", not
  *                      literally "content was filled".
- *                  (b) a provider whose only live experiences are LOCKED
- *                      (manual/claim/verified) — those rows are never
- *                      touched by the automated writer regardless of
- *                      whether their content is blank, so they are
- *                      permanently out of scope the same way (a) is.
+ *                  (b) a provider whose only live experiences are OWNER-
+ *                      LOCKED (manual/claim) — those rows are never touched
+ *                      by the automated writer regardless of whether their
+ *                      content is blank, so they are permanently out of
+ *                      scope the same way (a) is. A PUBLISHED (verified,
+ *                      not owner-locked) row is NOT in this case since
+ *                      dev-request 2026-09-02-experiences-laas-todeling-
+ *                      fyll-tomme-felt-publiserte-rader: a genuinely blank
+ *                      description/category on a published row now counts
+ *                      as thin (isExperienceContentGenuinelyThin checks
+ *                      isExperienceOwnerLocked, not the full lock), so such
+ *                      a provider correctly lands in `enrichable`, not here.
  *                Documented rule, not an accident: both are "the automated
  *                content-refresh writer will never touch this provider
  *                again", which is exactly what the `done` bucket's
@@ -2491,7 +2564,17 @@ export function applyExperienceContent(
     )
     .get(experienceId) as ExperienceContentRow | undefined;
   if (!row) return [];
-  if (isExperienceContentLocked(row)) return [];
+  // OWNER-lock only (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+  // tomme-felt-publiserte-rader) — NOT isExperienceContentLocked. A PUBLISHED
+  // (verified) row that is not owner-locked now proceeds to the blank-only
+  // write below exactly like any other unlocked row: every `isBlank(row.X)`
+  // check further down is what makes this "fill-blank-only" rather than a
+  // general overwrite, so a published row's non-empty fields are still never
+  // touched. `content_source` is set to 'provider_site' below (after this
+  // gate) only for rows that reach this point, i.e. only when the row is not
+  // owner-locked — already true structurally, called out here because a
+  // published row can now reach that stamp for the first time.
+  if (isExperienceOwnerLocked(row)) return [];
 
   const sets: string[] = [];
   const params: Record<string, unknown> = { id: experienceId };
@@ -2784,6 +2867,18 @@ const PRICE_FRESHNESS_CANDIDATE_WINDOW_MAX = 500;
  * have already clamped it against its own hard cap — PF_HARD_CAP,
  * routes/opplevelser.ts — this function only guards against a nonsensical
  * value).
+ *
+ * DELIBERATELY still the FULL lock (owner-or-published), not just
+ * isExperienceOwnerLocked, even after the 2026-09-02-experiences-laas-
+ * todeling-fyll-tomme-felt-publiserte-rader lock split that made
+ * applyExperienceContent/isExperienceContentGenuinelyThin owner-lock-only.
+ * This sweep OVERWRITES an existing, non-blank `price_from` in place (see
+ * the route recheck below) rather than filling a blank field — and
+ * "published = fill-blank-only" is exactly the rule that a published row's
+ * already-set price must never be overwritten by an automated re-check.
+ * Anyone tempted to narrow this to isExperienceOwnerLocked to match the
+ * other writers should re-read this paragraph first: it would silently
+ * reopen overwrites of verified experiences' prices.
  */
 export function selectExperiencesForPriceFreshnessCheck(limit = 25): PriceFreshnessTarget[] {
   const db = getDb(VERTICAL);
@@ -7664,6 +7759,24 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
 }
 
 /**
+ * Does `host` contain `token` as a plain substring, once both are lowered,
+ * `host` has any leading `www.` stripped (nothing else — the rest of the
+ * domain is left alone), and both are run through the same `normaliseName`
+ * normalisation the file already uses for names? Hostnames carry no spaces,
+ * so the word-boundary logic `boundaryIncludes` uses elsewhere does not
+ * apply here — plain substring is the correct check (`austmann.no` contains
+ * `austmann` → true; `vinaroma.no` does NOT contain `rosenlund` → false).
+ * Empty host or empty token → false. Pure, local — not exported.
+ */
+function gardssalgHostContainsToken(host: string, token: string): boolean {
+  const hostStripped = (host || "").toLowerCase().replace(/^www\./, "");
+  const normHost = normaliseName(hostStripped);
+  const normToken = normaliseName((token || "").toLowerCase());
+  if (!normHost || !normToken) return false;
+  return normHost.includes(normToken);
+}
+
+/**
  * Ownership evidence for a candidate page — v2 (Daniels retning 2026-07-30:
  * «finne informasjon vi har som passer overens (ikke bare navn)»).
  *
@@ -7710,6 +7823,19 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
  * phone branches — nothing that verified via those stops verifying; only
  * the weakest (name-only-corroborated) branch tightens, and only for
  * callers that opt in by supplying `pageTitle`.
+ *
+ * OR (prefix-token AND title AND domain)  — (Steg 6 smal variant, Daniel-
+ *   authorized narrow extension) accepts a prefix-token match of the
+ *   producer's name (e.g. «Austmann» as a prefix of «Austmann Bryggeri») as
+ *   sufficient evidence WHEN corroborated by BOTH (a) that prefix token
+ *   appearing in the page's own <title>, AND (b) the page's own fetched
+ *   host containing that same token — never place-carrying, never a bare
+ *   prefix without domain corroboration. Independent of the weakest branch
+ *   above (does not require name/place/address/postnr found) and, like the
+ *   weakest branch, entirely caller-optional: `candidateHost` omitted/null
+ *   means this branch can never fire (fail-closed, same pattern as
+ *   `pageTitle`) — every pre-existing caller that doesn't pass the new 4th
+ *   argument sees byte-for-byte unchanged behavior.
  * Pure — exported for tests.
  */
 export function gardssalgWebsiteEvidenceMatch(
@@ -7724,7 +7850,8 @@ export function gardssalgWebsiteEvidenceMatch(
     adresse?: string | null;
     postnummer?: string | null;
   },
-  pageTitle?: string
+  pageTitle?: string,
+  candidateHost?: string | null
 ): {
   org_nr_found: boolean;
   name_found: boolean;
@@ -7733,6 +7860,7 @@ export function gardssalgWebsiteEvidenceMatch(
   address_found: boolean;
   postnr_found: boolean;
   title_found: boolean;
+  prefix_token_found: boolean;
   verified: boolean;
 } {
   const text = pageText || "";
@@ -7794,6 +7922,19 @@ export function gardssalgWebsiteEvidenceMatch(
   // phone are registry-sourced and stay completely untouched by this gate.
   const weakestBranchVerified = titleOffered ? weakestBranchBase && titleFound : weakestBranchBase;
 
+  // Prefix-token + title + domain corroboration (Steg 6 smal variant) —
+  // independent of weakestBranch*, never requires name/place/address/postnr
+  // found. `prefixToken` reuses `normName` (already computed above for the
+  // exact-name check), taking just its first whitespace-separated token; the
+  // >=4 length guard mirrors `nameSpecific`'s spirit against generic short
+  // words. Both the title AND the domain must independently corroborate the
+  // SAME token, and `candidateHost` must actually be offered by the caller —
+  // fail-closed exactly like `pageTitle` above.
+  const prefixToken = normName.split(" ")[0] || "";
+  const prefixTitleFound = titleOffered && prefixToken.length >= 4 && boundaryIncludes(normTitle, prefixToken);
+  const domainCorroborated = candidateHost != null && gardssalgHostContainsToken(candidateHost, prefixToken);
+  const prefixTokenVerified = prefixToken.length >= 4 && prefixTitleFound && domainCorroborated;
+
   return {
     org_nr_found: orgFound,
     name_found: nameFound,
@@ -7802,10 +7943,12 @@ export function gardssalgWebsiteEvidenceMatch(
     address_found: addressFound,
     postnr_found: postnrFound,
     title_found: titleFound,
+    prefix_token_found: prefixTitleFound && domainCorroborated,
     verified:
       orgFound ||
       (phoneFound && (nameFound || placeFound)) ||
-      weakestBranchVerified,
+      weakestBranchVerified ||
+      prefixTokenVerified,
   };
 }
 

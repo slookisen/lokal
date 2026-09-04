@@ -40,6 +40,14 @@ import {
   getProviderContentTarget,
   getExperiencesForProvider,
   applyExperienceContent,
+  // dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+  // publiserte-rader — the route's own candidate-gating loops below reuse
+  // this SAME predicate applyExperienceContent's internal gate uses, rather
+  // than re-deriving "is this row owner-locked" inline (the pre-split code
+  // duplicated `verification_status === 'verified' || content_source ===
+  // 'manual' || content_source === 'claim'` here, which is exactly the kind
+  // of copy this dev-request's "one function, no copies" rule closes).
+  isExperienceOwnerLocked,
   harvestProvenanceOf,
   markProviderEnriched,
   markProviderContentAttempted,
@@ -343,10 +351,15 @@ import {
   // dev-request 2026-08-25-experiences-pris-ferskhet — price_from is written
   // once (harvest/content-refresh fill-if-blank) and never re-checked; this
   // sweep re-fetches a row's price provenance page and re-runs
-  // extractPriceFrom against it. isExperienceContentLocked is the SAME LOCK
-  // MODEL predicate applyExperienceContent/selectProvidersForContentRefresh
-  // already enforce, reused here rather than re-derived (acceptance
-  // criterion 4: locked/verified fields are never touched).
+  // extractPriceFrom against it. This sweep OVERWRITES an existing price in
+  // place, so it deliberately keeps the FULL lock (owner-or-published) —
+  // isExperienceContentLocked — rather than the owner-lock-only predicate
+  // applyExperienceContent/selectProvidersForContentRefresh now use (dev-
+  // request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-
+  // rader split the two): "published = fill-blank-only" means a published
+  // row's already-set price must never be overwritten here (acceptance
+  // criterion 4: locked/verified fields are never touched). See that
+  // function's own doc comment (experience-store.ts) for the full rationale.
   isExperienceContentLocked,
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
@@ -741,11 +754,21 @@ import {
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
+// dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak,
+// del 1: the MECHANICAL enrichment write-pause fence (services/enrichment-
+// write-pause.ts) wired onto every apply:true write route in this file. The
+// pause row lives on the MAIN db (getRfbDb), never on experiences.db — see
+// experiencesWritePauseBlock() below.
+import {
+  enrichmentWritePauseBlock,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  sendEnrichmentWritePausedIfPaused,
+} from "../services/enrichment-write-pause";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
 // shared LLM-judge contact gate for the gardssalg-autosvar-apply call site
 // (applyGardssalgProviderContact's own gate call lives inside
 // experience-store.ts and needs no separate import here).
-import { gateContactCandidates, classifyContactCandidateDefect } from "../services/contact-candidate-judge";
+import { gateContactCandidates, classifyContactCandidateDefect, judgeContactCandidate } from "../services/contact-candidate-judge";
 // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
 // LLM-judge tier for the org.nr review queue's mid-confidence rows (name+
 // place evidence, short of the exact-match auto-write bar). A SEPARATE
@@ -787,6 +810,73 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   next();
+}
+
+/**
+ * Enrichment write-pause gate for the "experiences" vertical — ONE shared
+ * lookup for the apply:true admin write routes in this file (dev-request
+ * 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak, del 1).
+ *
+ * Returns `null` when writes are allowed, else the exact 423 body to send.
+ * Call it AFTER the route has parsed its apply/dry_run flag and ONLY on the
+ * path that will actually write — a dry-run must never be blocked.
+ *
+ * ── Gated (18 routes) ────────────────────────────────────────────────────
+ * The routine-called enrichment writers: bulk-load, content-refresh,
+ * gardssalg-content-refresh, experiences-description-enrichment,
+ * experiences-title-no-backfill, experiences-content-judge-sweep,
+ * experiences-dedup-backfill, price-freshness-check,
+ * experiences-provider-dedup-merge, gardssalg-provider-dedup-merge,
+ * providers/hjemmeside-write, and (PR #765 review round 2)
+ * gardssalg-website-verification-remediation, gardssalg-website-discovery,
+ * listing-homepage-discovery, brreg-website-discovery,
+ * gardssalg-orgnr-backfill, gardssalg-contact-backfill,
+ * gardssalg-website-review-approve. Proven per route in
+ * opplevelser-write-pause-gate.test.ts.
+ *
+ * ── Disclosed, out-of-scope gaps (PR #765 review round 2) ────────────────
+ * Still UNGATED, documented rather than claimed covered — same discipline as
+ * services/enrichment-write-pause.ts's own "Disclosed, out-of-scope gaps"
+ * block for rfb. Follow-up work, deliberately not gated in this PR:
+ *   - the manual operator levers: every gardssalg-set-* route (address,
+ *     contact-email, contact-phone, content-field, field-lock, hjemmeside,
+ *     org-nr, producer-type, products, provider-name, terminal-status),
+ *     gardssalg-content-clear, gardssalg-content-rollback,
+ *     gardssalg-rollback-veto-override, gardssalg-claim-grant/-revoke,
+ *     gardssalg-booking-activation, gardssalg-provider-visibility,
+ *     gardssalg-medlemsliste-bekreft, PATCH providers/:id/hjemmeside,
+ *     homepage-review-queue/submit, gardssalg/test-provider, rfb-seed
+ *     (POST + DELETE), fylke-2024-migration;
+ *   - the review-approve / judge levers not listed above:
+ *     listing-homepage-review-approve, gardssalg-orgnr-review-approve,
+ *     gardssalg-orgnr-review-judge, gardssalg-autosvar-review-approve,
+ *     gardssalg-field-concordance-review-approve,
+ *     gardssalg-experience-conflict-review;
+ *   - the remaining enrichment / remediation sweeps:
+ *     gardssalg-mojibake-backfill, experiences-dedup-unmerge,
+ *     experiences-canonical-group-merge, gardssalg-address-enrichment,
+ *     gardssalg-autosvar-apply, gardssalg-brreg-verify,
+ *     gardssalg-contact-extraction, gardssalg-content-quality-update,
+ *     gardssalg-drikkeliste-remediation, gardssalg-epost-synthesis-
+ *     remediation, gardssalg-experience-conflict-remediation,
+ *     gardssalg-field-concordance-remediation/-clear,
+ *     gardssalg-kildeklasse-contact-intake, gardssalg-nace-discovery,
+ *     gardssalg-nace-agent-bridge, gardssalg-outreach-size-gate (delegates
+ *     its writes to gated routes in-process, but is not gated itself),
+ *     gardssalg-outreach-preflight/-pilot-send, gardssalg-owner-lock-backfill,
+ *     gardssalg-producer-type-classify, gardssalg-retro-scan,
+ *     gardssalg-second-line-verify, gardssalg-veien-til-pool,
+ *     hjemmeside-cleanup-sweep, evidence-url-verification-sweep,
+ *     experiences-admission-promotion-rollback, experiences-wrong-content-
+ *     rate, rfb-knowledge-enrich, booking-test-send, claim-test-send.
+ *
+ * The pause table lives on the MAIN database (getRfbDb → database/init.ts),
+ * not on experiences.db; the THUNK is passed (not `getRfbDb()`) so a getDb()
+ * that throws fails CLOSED inside the fence as a 423 `fail_closed:true`
+ * rather than escaping as a 500 — see EnrichmentWriteDb in the service.
+ */
+function experiencesWritePauseBlock() {
+  return enrichmentWritePauseBlock(getRfbDb, "experiences");
 }
 
 function parseDiscoverQuery(req: Request) {
@@ -1549,6 +1639,15 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
 
   const dryRun = body.apply !== true;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   // ── 1. Group rows by provider_name (trimmed). ─────────────────────
   const byProvider = new Map<string, BulkRow[]>();
   for (const row of body.experiences) {
@@ -1937,6 +2036,21 @@ type CrFetchOutcome =
        * doc comment.
        */
       render?: RenderEscalationDiagnostic;
+      /**
+       * The actual post-redirect/post-render URL of the page this call read —
+       * i.e. `primaryUrl` inside crFetchGardssalgContent (the requested
+       * `fetchUrl`, updated to `primary.finalUrl` after the plain fetch and
+       * again to `rendered.finalUrl` if headless rendering was attempted and
+       * succeeded). ADDITIVE and optional — only crFetchGardssalgContent sets
+       * it; crFetchHomepageContent (the other producer of this union) never
+       * does, same as pagesFetchedPaths above.
+       *
+       * PR #774 review fix: gardssalgWebsiteEvidenceMatch's domain
+       * corroboration must check the host of the page actually fetched, not
+       * the producer's own pre-fetch claimed URL — see
+       * gardssalg-website-verification.ts's `candidateHost`.
+       */
+      finalUrl?: string;
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -2109,6 +2223,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // limit: default 25, hard cap 100.
   const limit = Math.min(
@@ -2409,8 +2532,16 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       booking_url:    bookingResult.value,
     };
 
+    // OWNER-lock only (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+    // tomme-felt-publiserte-rader) — was isExperienceContentLocked (owner OR
+    // published) before this dev-request, which meant a PUBLISHED row never
+    // even reached `toApply` and applyExperienceContent's own blank-only
+    // write was unreachable dead code for every verified row. A published
+    // row now goes into `toApply` exactly like any other unlocked row;
+    // applyExperienceContent's isBlank checks (not this gate) are what keep
+    // its non-empty fields untouched — see that function's doc comment.
     for (const e of expRows) {
-      if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
+      if (isExperienceOwnerLocked(e)) {
         // Count as skipped_locked only if at least one thin field would have been filled.
         const anyThin = (candidateDescription && !e.description) || (candidateCategory && !e.category)
           || (candidateObj.price_from !== null && !e.price_from)
@@ -2431,7 +2562,10 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 
     if (dryRun) {
       for (const e of expRows) {
-        if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") continue;
+        // Same owner-lock-only gate as the toApply loop above — a published
+        // row's would-be-filled BLANK fields must appear in the dry-run
+        // preview (AC1), which the old full-lock gate here used to hide.
+        if (isExperienceOwnerLocked(e)) continue;
         // descriptionAllowedFor() mirrors the apply branch exactly (junk +
         // homepage-boilerplate guards), so a dry-run honestly reports which
         // writes would be skipped — the skips land in description_guard_skips.
@@ -2844,7 +2978,16 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, pages, render: renderReport };
+  return {
+    ok: true,
+    primaryHtml,
+    combinedHtml,
+    fetchUrl,
+    pagesFetchedPaths: fetchedPaths,
+    pages,
+    render: renderReport,
+    finalUrl: primaryUrl,
+  };
 }
 
 /**
@@ -2881,6 +3024,7 @@ function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
       pageText: gardssalgPageText(fetched.combinedHtml),
       title: gardssalgPageTitle(fetched.primaryHtml),
       render: fetched.render,
+      finalUrl: fetched.finalUrl,
     };
   };
 }
@@ -3219,6 +3363,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // limit: default 25, hard cap 48 (Math.min mirrors CR_HARD_CAP's role, but
   // scoped to this vertical's real ceiling).
@@ -5470,6 +5623,15 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `website-discovery-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
@@ -5906,6 +6068,15 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const auto = body.auto === true;
   if (auto && Array.isArray(body.approvals) && body.approvals.length > 0) {
@@ -6024,6 +6195,355 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     written,
     rejected,
     ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
+  });
+});
+
+// ─── POST /admin/gardssalg-website-review-judge ─────────────────────────────
+//
+// dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror (the
+// route directly above, `gardssalg-website-review-approve`'s `auto: true`
+// mode, only ever drains this queue at its default `min_confidence: 1.0` —
+// the org_nr_found tier). The [0.90, 0.95) band below that bar — the
+// phone_found (0.95 is the FLOOR of the next tier up, so this route's own
+// ceiling is exclusive at 0.95), address_found (0.92), and name+place (0.90,
+// the v1 floor) confidence tiers assigned in the scan branch above (search
+// `hit.evidence.org_nr_found` above) — currently just sits `pending`
+// (reason = 'website_discovery_candidate') forever: not confident enough for
+// the deterministic auto-approve bar, but too costly to review by hand at
+// gårdssalg's own scale. This route adds an LLM-judge tier for EXACTLY that
+// band, mirroring RFB's shipped POST /admin/rfb-website-review-judge
+// (admin-rfb-website-discovery.ts) in shape/ordering (backstop -> synthetic
+// Norwegian source-context sentence built from the stored evidence flags,
+// since the raw fetched page text is never persisted -> LLM judge -> write
+// through the existing approve lever, never a second write path) AND this
+// SAME file's own gardssalg-orgnr-review-judge sibling (immediately above
+// the approve route it writes through, same guarded-UPDATE-with-changed-
+// rows-aware-reason helper pair, same fail-closed-per-row try/catch).
+//
+// Bookkeeping: this table (gardssalg_website_review_queue) has NO `status`
+// column — only `reason` (default 'website_discovery_candidate', see its
+// CREATE TABLE in database/init-experiences.ts). "Already judged" is
+// therefore recorded by OVERWRITING `reason`, guarded on the ORIGINAL value
+// (exactly like gardssalgOrgnrJudgeAppendReason below) so a row that changed
+// underneath this run (re-upserted by a concurrent discovery scan, or
+// resolved by a concurrent approve call) is never clobbered.
+//
+// On GODKJENN: writes through POST /admin/gardssalg-website-review-approve
+// in-process (callGardssalgAdminRouteInProcess) — the SAME guarded write
+// path (fill-only, lock guard, shared-host identity re-check, audit +
+// provenance, queue-entry clearing on success) every other adoption of this
+// queue already goes through. A write-time guard rejection on that inner
+// call (fill-only race, owner claim, shared-host conflict, …) is counted as
+// REJECTED here, never silently miscounted as an approval — see step 5 in
+// the per-row loop below.
+//
+// Explicitly out of scope (per the byggspec): part (iii) of the parent
+// dev-request (parking error rows — an unrelated table/mechanism); any
+// change to the >=1.0 auto-approve tier above or to the separate
+// experience_homepage_review_queue / Del B confidence===0.8 route (see that
+// route's own large doc comment nearby for why ITS threshold is likewise
+// fixed, not caller-supplied); a caller-supplied confidence-threshold
+// parameter here — deliberate, same reasoning: this queue's confidence scale
+// is not simply monotone across all tiers, so a caller-adjustable threshold
+// would be unsafe; wiring this route into any scheduled-agents/*.md charter
+// file (a separate, later slice).
+export const GARDSSALG_WD_JUDGE_MIN_CONFIDENCE = 0.9;
+export const GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
+
+interface GardssalgWdJudgeQueueRow {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string;
+}
+
+/** Mirrors rfbWdJudgeSourceContext (admin-rfb-website-discovery.ts): the
+ *  stored `evidence` column is JSON.stringify'd
+ *  ReturnType<typeof gardssalgWebsiteEvidenceMatch> (org_nr_found/
+ *  name_found/place_found/phone_found/address_found/postnr_found/
+ *  title_found/prefix_token_found/verified — see that function in
+ *  experience-store.ts). The raw fetched page text that satisfied those
+ *  flags is NEVER persisted on this row (confirmed by reading
+ *  upsertGardssalgWebsiteReviewQueue's INSERT column list above) — re-
+ *  fetching the candidate page here just to hand the judge raw text would
+ *  add a second live network round-trip to every judge run, so this
+ *  constructs a compact synthetic Norwegian context sentence from the
+ *  structured flags instead, same as the RFB sibling. Parses `evidence`
+ *  defensively — malformed/missing JSON means "no matched signals", never
+ *  throws. */
+function gardssalgWdJudgeSourceContext(row: {
+  final_url: string | null;
+  candidate_url: string;
+  evidence: string | null;
+  confidence: number | null;
+}): string {
+  const url = row.final_url || row.candidate_url;
+  let evidence: Partial<ReturnType<typeof gardssalgWebsiteEvidenceMatch>> = {};
+  try {
+    const parsed = JSON.parse(row.evidence || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) evidence = parsed;
+  } catch {
+    // malformed/missing evidence JSON -> treat as no matched signals; the
+    // judge still gets the URL and confidence, just no signal list.
+  }
+  const matched: string[] = [];
+  if (evidence.org_nr_found) matched.push("organisasjonsnummer");
+  if (evidence.name_found) matched.push("produsentnavn");
+  if (evidence.place_found) matched.push("sted/kommune");
+  if (evidence.phone_found) matched.push("telefonnummer");
+  if (evidence.address_found) matched.push("adresse");
+  if (evidence.postnr_found) matched.push("postnummer");
+  const matchedText = matched.length > 0 ? matched.join(", ") : "ingen strukturerte treff";
+  const confidenceText = typeof row.confidence === "number" ? row.confidence.toFixed(2) : "ukjent";
+  return (
+    `Automatisk nettside-oppdagelse for gårdssalg fant kandidat-URL-en ${url} og verifiserte følgende ` +
+    `eierskapssignaler på siden mot produsentens registrerte data: ${matchedText} ` +
+    `(evidensbasert konfidens: ${confidenceText}). Selve sidens rå tekstinnhold er ikke ` +
+    `lagret her — kun disse strukturerte treffene fra det opprinnelige sidebesøket.`
+  );
+}
+
+/** Mirrors gardssalgOrgnrJudgeAppendReason: guarded on the ORIGINAL reason so
+ *  a row that changed underneath this run is never clobbered. Returns the
+ *  number of rows the guarded UPDATE actually matched (0 or 1). */
+function gardssalgWdJudgeAppendReason(db: Database.Database, providerId: string, note: string): number {
+  const result = db.prepare(
+    `UPDATE gardssalg_website_review_queue SET reason = ?, updated_at = datetime('now') WHERE provider_id = ? AND reason = 'website_discovery_candidate'`,
+  ).run(note, providerId);
+  return result.changes;
+}
+
+/** Mirrors gardssalgOrgnrJudgeReportedReason: if the guarded UPDATE above
+ *  matched zero rows, the reported reason must say so honestly instead of
+ *  silently claiming the note landed. */
+function gardssalgWdJudgeReportedReason(note: string, changes: number): string {
+  return changes > 0 ? note : `${note} (queue row changed concurrently, note not persisted)`;
+}
+
+router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown };
+  let limit = GARDSSALG_AUTO_APPROVE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, GARDSSALG_AUTO_APPROVE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getExpDb("experiences");
+  const pending = db
+    .prepare(
+      `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason
+         FROM gardssalg_website_review_queue
+        WHERE reason = 'website_discovery_candidate'
+          AND confidence >= ? AND confidence < ?
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as GardssalgWdJudgeQueueRow[];
+
+  // Enrichment write-pause gate (same discipline as gardssalg-website-review-
+  // approve's own `apply` check, immediately above) — gated over the WHOLE
+  // selected batch before any write, so a paused vertical blocks the batch
+  // whole: zero writes, never a partially-applied one. This route has no
+  // dry-run mode (every GODKJENN writes), so the gate always runs here.
+  if (pending.length > 0) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ provider_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  for (const q of pending) {
+    // Cheap structural backstop first — cost control, same ordering
+    // contact-candidate-judge.ts's own gateContactCandidates uses: a
+    // structurally-defective candidate never spends an LLM call.
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    if (defect.defective) {
+      const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
+      const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      continue;
+    }
+
+    let verdict: { approved: boolean; reason?: string };
+    try {
+      verdict = await judgeContactCandidate({
+        fieldType: "website",
+        candidate: q.candidate_url,
+        sourceContext: gardssalgWdJudgeSourceContext(q),
+        businessName: q.provider_name || q.provider_id,
+      });
+    } catch (err: any) {
+      // judgeContactCandidate's own contract never throws, but this loop
+      // must fail-closed even if that contract is ever violated — never let
+      // one row's unexpected error crash the rest of the batch.
+      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+    }
+
+    if (!verdict.approved) {
+      const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
+      const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      continue;
+    }
+
+    // GODKJENN — reuse gardssalg-website-review-approve's FULL guarded write
+    // path in-process (fill-only, lock guard, shared-host identity re-check,
+    // audit/provenance, queue-entry clearing on success), never a second
+    // write path.
+    try {
+      const approveResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-review-approve", {
+        approvals: [{ provider_id: q.provider_id, url: q.candidate_url }],
+        apply: true,
+      });
+      const writtenList = Array.isArray(approveResp.body?.written) ? approveResp.body.written : [];
+      const wasWritten = writtenList.some((w: any) => w?.provider_id === q.provider_id);
+      if (wasWritten) {
+        approved++;
+        results.push({ provider_id: q.provider_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but a write-time guard on the approve
+        // route (fill-only race, owner claim, shared-host conflict, …) still
+        // blocked the write — never silently miscounted as an approval.
+        const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
+        const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
+        const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`;
+        const changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+        rejected++;
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+      }
+    } catch (err: any) {
+      // Never let one row's unexpected error crash the rest of the batch —
+      // fail THAT row closed, continue with the rest.
+      const note = `uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`;
+      let changes = 0;
+      try {
+        changes = gardssalgWdJudgeAppendReason(db, q.provider_id, note);
+      } catch {
+        // best-effort — the row's reason may not update, but the outcome is
+        // still correctly counted/reported below (changes stays 0, so the
+        // reported reason honestly notes the write didn't land).
+      }
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgWdJudgeReportedReason(note, changes) });
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM gardssalg_website_review_queue
+        WHERE reason = 'website_discovery_candidate' AND confidence >= ? AND confidence < ?`,
+    )
+    .get(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE) as { c: number };
+
+  res.json({
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
+  });
+});
+
+// ─── POST /admin/gardssalg-website-review-queue-park ────────────────────────
+//
+// dev-request 2026-09-02-gardssalg-website-review-queue-terminal-parking.
+// The two terminal-failure `reason` values on THIS table —
+// `verification_failed` (written from gardssalg-website-verification.ts) and
+// `candidate_evidence_failed` (written from the external-candidates route,
+// above) — are never touched by either drain route on this queue
+// (gardssalg-website-review-judge and -approve, both scoped to
+// `reason = 'website_discovery_candidate'` only), so they accumulate forever
+// with no path to resolution or visible expiry (measured ~111 rows:
+// 75 verification_failed + 36 candidate_evidence_failed as of 2026-09-02).
+//
+// This route is a small, additive, fully reversible "parking" mechanism:
+// it marks those rows as knowingly parked by stamping `parked_since`
+// (added just above the drain routes' CREATE TABLE in
+// database/init-experiences.ts) — it NEVER deletes a row and NEVER touches
+// `reason`/`evidence`/`candidate_url`, mirroring the precedent already
+// shipped for agent_knowledge.pending_verify_parked_since (init.ts): a
+// nullable TEXT column, stamped once, excluded from future auto-select by a
+// `parked_since IS NULL` filter, never deleted.
+//
+// `{"apply"?: boolean}` — omitted or `false` is a dry-run (report only,
+// write nothing); `true` applies. The apply-time UPDATE is guarded on
+// `parked_since IS NULL` (in addition to the SELECT's own filter) so a
+// concurrent second call for the same row can't double-count or clobber —
+// same guarded-UPDATE discipline as gardssalgWdJudgeAppendReason above.
+// Explicitly out of scope: the website_discovery_candidate drain path
+// (untouched, read-only-verified); deleting rows (never); a new table (this
+// is one column + one route on the existing table).
+router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true;
+
+  const db = getExpDb("experiences");
+  const candidates = db
+    .prepare(
+      `SELECT provider_id, reason FROM gardssalg_website_review_queue
+        WHERE reason IN ('verification_failed', 'candidate_evidence_failed')
+          AND parked_since IS NULL
+        ORDER BY updated_at ASC`,
+    )
+    .all() as Array<{ provider_id: string; reason: string }>;
+
+  // A true no-op on an empty selection — never throws, dry-run or apply.
+  if (candidates.length === 0) {
+    res.json({ would_park: 0, parked: 0, results: [] });
+    return;
+  }
+
+  if (!apply) {
+    res.json({
+      would_park: candidates.length,
+      parked: 0,
+      results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
+    });
+    return;
+  }
+
+  const stampPark = db.prepare(
+    `UPDATE gardssalg_website_review_queue
+        SET parked_since = datetime('now'), updated_at = datetime('now')
+      WHERE provider_id = ? AND parked_since IS NULL`,
+  );
+  let parked = 0;
+  for (const c of candidates) {
+    const result = stampPark.run(c.provider_id);
+    if (result.changes > 0) parked++;
+    // changes === 0 means a concurrent call already parked this row between
+    // our SELECT and this UPDATE — correctly excluded from `parked`, but the
+    // row still reports in `results` below since it WAS a would-park
+    // candidate at selection time; `results` mirrors the selected set
+    // identically across dry-run and apply, `parked` is what actually landed.
+  }
+
+  res.json({
+    would_park: candidates.length,
+    parked,
+    results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
   });
 });
 
@@ -6183,6 +6703,15 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `listing-homepage-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const expDb = getExpDb("experiences");
@@ -6675,6 +7204,15 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
   const batchTag = `brreg-website-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const expDb = getExpDb("experiences");
@@ -8717,6 +9255,15 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const limit = Math.min(
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CB_DEFAULT_LIMIT,
@@ -11276,6 +11823,15 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const limit = Math.min(
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_OB_DEFAULT_LIMIT,
@@ -14237,6 +14793,44 @@ export function computeGardssalgReadinessTier(input: {
   return "outreach_ready";
 }
 
+// Shared exclusion predicate for `experience_providers.merged_into` (bug
+// fix, dev-request-driven: POST /admin/gardssalg-provider-dedup-merge stamps
+// merged_into on the row it folds away, but NO read path was ever filtering
+// on it — see merged_into's own doc comment in database/init-experiences.ts,
+// "a future consumer is responsible for filtering merged_into IS NULL").
+// ONE reusable SQL fragment, wired into every gårdssalg read path instead of
+// five separately-maintained copies of the same condition:
+//   - computeGardssalgReadinessRows' own base query, below (which in turn
+//     covers GET .../gardssalg-outreach-readiness, GET .../gardssalg-
+//     outreach-candidates, and GET .../gardssalg-outreach-daily-prep — all
+//     three call this one function, never a per-route copy);
+//   - GET .../gardssalg-provider-dedup-audit's own scope-WHERE, further
+//     below in this file.
+// POST .../gardssalg-outreach-preflight does NOT use this fragment directly
+// — a merged id must be rejected with its OWN explicit reason (not folded
+// into the generic "ikke_funnet" bucket a row simply missing from the
+// readiness rows would get), so computeGardssalgOutreachPreflight instead
+// calls getGardssalgMergedIntoId() (below) for exactly the ids that
+// computeGardssalgReadinessRows' own merged_into filtering left out.
+// Deliberately does NOT touch agents.merged_into (RFB directory's own,
+// unrelated dedup marker — see that column's own doc comment) or the merge
+// endpoint itself — pure read-side filtering, no data writes.
+const GARDSSALG_NOT_MERGED_WHERE = "merged_into IS NULL";
+
+// See GARDSSALG_NOT_MERGED_WHERE above — the single-id counterpart used by
+// computeGardssalgOutreachPreflight to give a merged provider id its own
+// explicit rejection reason (naming merged_into) instead of the generic
+// "ikke_funnet" a row absent from computeGardssalgReadinessRows' output
+// would otherwise report. Returns the survivor id (merged_into's value) when
+// the row exists and is merged-away, null when the row doesn't exist or is
+// not merged.
+function getGardssalgMergedIntoId(expDb: Database.Database, providerId: string): string | null {
+  const row = expDb
+    .prepare("SELECT merged_into FROM experience_providers WHERE id = ?")
+    .get(providerId) as { merged_into: string | null } | undefined;
+  return row?.merged_into ?? null;
+}
+
 // Extracted for dev-request
 // 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 5 (the
 // outreach pre-flight gate): the per-row readiness computation used to live
@@ -14250,6 +14844,9 @@ export function computeGardssalgReadinessTier(input: {
 // a few hundred lines below). The conflict scan itself is ALWAYS run
 // unfiltered (full corpus) regardless of providerIds — duplicate-conflict
 // detection needs the whole picture, only the returned rows are filtered.
+// Rows with merged_into set (folded away by POST .../gardssalg-provider-
+// dedup-merge) are excluded from the base query below (GARDSSALG_NOT_MERGED_
+// WHERE) — never surfaced by ANY caller of this function.
 function computeGardssalgReadinessRows(
   expDb: Database.Database,
   providerIds?: string[],
@@ -14332,7 +14929,8 @@ function computeGardssalgReadinessRows(
                 content_source, booking_live, catalog_hidden, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status
            FROM experience_providers
-          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND ${GARDSSALG_NOT_MERGED_WHERE}`;
   const params: string[] = [];
   if (providerIds && providerIds.length > 0) {
     const placeholders = providerIds.map(() => "?").join(", ");
@@ -15178,6 +15776,17 @@ export function computeGardssalgOutreachPreflight(
     orderedIds.map((id) => {
       const row = byId.get(id);
       if (!row) {
+        // A requested id absent from computeGardssalgReadinessRows' output is
+        // EITHER genuinely unknown OR a row that WAS merged away by
+        // POST /admin/gardssalg-provider-dedup-merge (that function's own
+        // base query excludes merged_into IS NOT NULL rows entirely — see
+        // GARDSSALG_NOT_MERGED_WHERE). Distinguish the two: a merged id gets
+        // its own explicit reason naming merged_into, never folded into the
+        // generic "ikke_funnet" bucket a truly-unknown id gets.
+        const mergedIntoId = getGardssalgMergedIntoId(expDb, id);
+        if (mergedIntoId) {
+          return { provider_id: id, name: null, go: false, reason: `merged_into:${mergedIntoId}` };
+        }
         return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
       }
       if (row.readiness_tier === "outreach_ready") {
@@ -19735,12 +20344,18 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
         // (producer_type set OR seeded via rfb-seed), minus the hidden
         // booking-flyt-v1 synthetic test provider (excluded the same way
         // gardssalgSharedHostCounts() excludes it above) — a fixed test row
-        // must never surface as a "duplicate candidate".
+        // must never surface as a "duplicate candidate" — and minus rows
+        // already folded away by POST /admin/gardssalg-provider-dedup-merge
+        // (GARDSSALG_NOT_MERGED_WHERE, above) — a merged row must never be
+        // counted into a dedup-audit group again, and a group left with zero
+        // surviving (unmerged) rows simply disappears from the output as a
+        // consequence of never being unioned together in the first place.
         `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
                 rfb_seed_source, producer_type, content_source, homepage_unreachable_since
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+            AND ${GARDSSALG_NOT_MERGED_WHERE}`
       )
       .all() as GsDedupRow[];
   } catch (err) {
@@ -19959,6 +20574,15 @@ router.post("/admin/gardssalg-provider-dedup-merge", requireAdmin, (req: Request
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const dryRun = !apply;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
     res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
     return;
@@ -20016,6 +20640,7 @@ router.post("/admin/gardssalg-provider-dedup-merge", requireAdmin, (req: Request
       results,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-provider-dedup-merge] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -20981,6 +21606,16 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     return;
   }
 
+  // Enrichment write-pause fence (del 1, review round 2) — apply only; dry-run
+  // is never blocked. Placed BEFORE any target lookup or outbound fetch.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const expDb = getExpDb("experiences");
   try {
     // Shared adapter. Written out per route until now, and BOTH copies here
@@ -21072,6 +21707,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       ...(pagination ? { pagination } : {}),
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-website-verification-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -21388,6 +22024,15 @@ router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, r
     req.query?.apply === "1" ||
     req.query?.apply === "true";
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const limit = Math.min(
     PF_HARD_CAP,
     typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : PF_DEFAULT_LIMIT
@@ -21609,6 +22254,7 @@ router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, r
       skippedNoProvenance,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[price-freshness-check] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -22597,34 +23243,40 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           -- fill the whole window. The spot-check would then judge rows that
           -- no longer exist anywhere, against the provider's homepage.
           AND canonical_id IS NULL
-          -- Lock guard: the same two-part clause as
-          -- experience-store.ts:1708-1709, which is the one genuine precedent
-          -- for it (round-3 review — round 2's comment also cited :2222/:2360/
-          -- :2859, but those are the content_source half ALONE and they
-          -- query experience_providers, guarding applyProviderContent, whose
-          -- lock model deliberately has no verification_status). The canonical
-          -- definition is isExperienceContentLocked (:1775-1782).
-          --
-          -- applyExperienceContent() provably REFUSES to write owner- or
-          -- claim-authored or already-verified rows, so serving them here
-          -- would hand the weekly spot-check content that never came from the
-          -- homepage it is about to judge against. That matters concretely:
-          -- §8.4 of the platform-verifier SKILL sets
+          -- Lock guard: OWNER-lock only (content_source), no longer a
+          -- verification_status clause here (dev-request 2026-09-02-
+          -- experiences-laas-todeling-fyll-tomme-felt-publiserte-rader
+          -- removed it — mirrors the identical change to
+          -- selectProvidersForContentRefresh's EXISTS clause,
+          -- experience-store.ts). applyExperienceContent() now provably
+          -- REFUSES to write only owner- or claim-authored rows (see its own
+          -- doc comment); a PUBLISHED (verified) row can be legitimately
+          -- homepage-written today (content_source='provider_site', a blank
+          -- field filled) and this spot-check's WHOLE PURPOSE is to catch
+          -- exactly those writes for the weekly quality judgment — hiding
+          -- verified rows here would make the entire new write surface
+          -- invisible to §8.4's error-rate measurement, the opposite of what
+          -- this dev-request's acceptance criteria require. An owner-locked
+          -- row is still excluded: applyExperienceContent() refuses those
+          -- unconditionally, so serving one here would hand the spot-check
+          -- content that never came from the homepage it is about to judge
+          -- against — §8.4 of the platform-verifier SKILL sets
           -- controller/enrichment-write-pause.yaml → enabled: true at
           -- error_rate > 0.10, so a couple of owner-written rows in a
           -- 10-provider sample could pause enrichment writes for the whole
           -- vertical over mismatches that are not errors at all.
-          --
-          -- NULL-guarded, unlike :1708 (round-3 review): SQL three-valued
-          -- logic makes NULL != 'verified' evaluate to NULL, which excludes
-          -- the row — while isExperienceContentLocked treats a NULL
-          -- verification_status as UNLOCKED, i.e. a row applyExperienceContent
-          -- would happily enrich. Hiding exactly those rows is the false
-          -- checked=0 this endpoint exists to remove. Latent today
-          -- (createExperience coalesces to 'pending_verify'), cheap forever.
-          AND (verification_status IS NULL OR verification_status != 'verified')
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
-        ORDER BY updated_at DESC
+        -- id DESC is a REQUIRED tiebreaker, not cosmetic: without it two rows
+        -- with the same updated_at sort in storage order, which SQLite does
+        -- not guarantee to be stable across environments. runDedupPass bumps
+        -- updated_at when it stamps canonical_id, and the content writers
+        -- stamp several rows in one pass, so same-millisecond ties are normal
+        -- here — and the FIRST row is what the weekly spot-check judges. An
+        -- unstable first row means the §8.4 error-rate measurement silently
+        -- judges a different experience run to run. Found 2026-09-03 when the
+        -- tie made opplevelser-providers-recently-enriched (h5/h6/h7/h12)
+        -- pass locally and fail in CI on byte-identical code.
+        ORDER BY updated_at DESC, id DESC
         -- Over-fetch, then filter, then slice to 10 in JS (round-5 review).
         -- The provenance filter below cannot be expressed in SQL (it compares
         -- registrable domains), and running it AFTER a LIMIT 10 meant a
@@ -23263,6 +23915,61 @@ const SWEEP_DEFAULT_LIMIT = 50;
 const SWEEP_MAX_LIMIT = 50;
 const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL";
 
+// ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
+// karantene-utgang-match-til-verified) ──────────────────────────────────────
+// The sweep above only ever DEMOTES (MISMATCH -> needs_review); MATCH never
+// promoted anything back OUT of quarantine, so a `needs_review` row that gets
+// freshly re-enriched from a genuinely verified owner-controlled source and
+// correctly re-judged MATCH stayed invisible forever — never reachable by
+// PUBLISH_GATE_SQL (verified + confidence high/medium + provider
+// brreg_active), which is what /discover, detail pages, MCP get_experience
+// and A2A all gate on. This is the ONE conservative promotion path out,
+// gated on THREE INDEPENDENT requirements ALL being true — never on the
+// judge verdict alone:
+//   1. judge (this same sweep call's OWN fresh re-judge) renders MATCH.
+//   2. the row's provider has brreg_active=1 (a needs_review row quarantined
+//      for a Brreg reason — provider classification != active — must NEVER
+//      be promoted by this path; this requirement is absolute, independent
+//      of the judge verdict).
+//   3. the judged page is an independently VERIFIED source: EITHER the
+//      provider's own ownership-verified hjemmeside
+//      (isHjemmesideVerified(field_provenance)) OR this row's own
+//      evidence_url with evidence_url_verification.verified=true
+//      (isEvidenceUrlVerified(evidence_url_verification)) — a judge MATCH
+//      against an unverified page is not enough on its own.
+// PLUS a precondition checked before any of the three above matter:
+// `confidence` must ALREADY be 'high' or 'medium' — a `low`-confidence row
+// is never promoted no matter what the judge/brreg/source checks say
+// (confidence itself is left completely unchanged by this mechanism either
+// way — this is a read-only eligibility gate on it, never a write).
+//
+// Only fires for a row whose verification_status was 'needs_review' going
+// INTO this iteration (captured as `wasNeedsReview` BEFORE any write this
+// same iteration makes, same discipline as `published_in_sample` above) —
+// the sweep's own WHERE clause (SWEEP_ELIGIBLE_WHERE) is deliberately NOT
+// scoped to needs_review (see block comment above: both published and
+// unpublished rows are swept), so this promotion check re-scopes itself
+// per-row rather than assuming the outer SELECT already did it.
+//
+// Reported per row (dry-run AND apply, same "fetch+judge always runs, only
+// the WRITE is apply-gated" discipline as the rest of this route) as a
+// `promotion` object: `applicable` (was this row needs_review at all),
+// `judge`/`brreg_active`/`source_verified`/`confidence_ok` — the individual
+// requirement verdicts, each evaluated and reported SEPARATELY (never
+// collapsed into one generic bool) — and `status`
+// ("not_applicable" | "held" | "would_promote" | "promoted") plus, when
+// `held`, a `missing` array naming exactly which requirement(s) failed.
+//
+// On an actual promotion (apply mode, eligible): verification_status ->
+// 'verified' (confidence itself untouched); admission_verdict gets a
+// `promoted: <reasoning>` stamp (stampExperienceAdmissionVerdict) IN PLACE
+// OF the normal `match: <reasoning>` stamp this iteration would otherwise
+// write — one stamp per row per sweep call, never two; and ONE row is
+// inserted into experience_admission_promotion_audit (init-experiences.ts),
+// batch_id = this SAME sweep call's batchId, additive/reversible via POST
+// /admin/experiences-admission-promotion-rollback below.
+const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
+
 type ContentJudgeSweepRow = {
   id: string;
   title: string;
@@ -23274,6 +23981,11 @@ type ContentJudgeSweepRow = {
   content_field_evidence: string | null;
   admission_checked_at: string | null;
   verification_status: string;
+  confidence: string | null;
+  provider_id: string | null;
+  evidence_url_verification: string | null;
+  p_brreg_active: number | null;
+  p_field_provenance: string | null;
 };
 
 router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: Request, res: Response) => {
@@ -23281,6 +23993,15 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     const body = (req.body ?? {}) as { apply?: unknown; limit?: unknown; sample?: unknown };
     const applyMode = body.apply === true;
     const dryRun = !applyMode;
+
+    // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+    if (applyMode) {
+      const pauseBlock = experiencesWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
 
     // `limit`: query param takes precedence over body when both are given
     // (mirrors this route family's existing query/body tolerance elsewhere in
@@ -23325,8 +24046,12 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
 
     const rows = expDb
       .prepare(
-        `SELECT id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, admission_checked_at, verification_status
-           FROM experiences
+        `SELECT e.id, e.title, e.description, e.category, e.price_band, e.price_from, e.evidence_url,
+                e.content_field_evidence, e.admission_checked_at, e.verification_status,
+                e.confidence, e.provider_id, e.evidence_url_verification,
+                p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
           WHERE ${SWEEP_ELIGIBLE_WHERE}
           ORDER BY ${sweepOrderBy}
           LIMIT ?`,
@@ -23344,18 +24069,57 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
        WHERE e.id = ? AND ${PUBLISH_GATE_SQL}`,
     );
 
-    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0, published_in_sample: 0 };
+    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0, published_in_sample: 0, promoted: 0 };
     const results: Array<{
       id: string;
       verdict: "MATCH" | "MISMATCH" | "unresolved";
       reason: string;
       verification_status: string;
       description_nulled: boolean;
+      promotion: {
+        applicable: boolean;
+        judge: "MATCH" | "MISMATCH" | "unresolved";
+        brreg_active: boolean;
+        source_verified: boolean;
+        confidence_ok: boolean;
+        status: "not_applicable" | "held" | "would_promote" | "promoted";
+        missing?: string[];
+      };
       would_be_action?: string;
       action_taken?: string;
     }> = [];
 
-    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+    // batch_id must be genuinely unique PER CALL, not just per-second: this
+    // id is now the primary key the rollback route (below) scopes its
+    // revert to (previously only an informational response field), and two
+    // separate apply:true sweep calls issued within the same wall-clock
+    // second previously produced byte-identical batch_id strings — making
+    // their audit rows indistinguishable and letting a rollback aimed at one
+    // call's promotions also revert an unrelated row a DIFFERENT call
+    // promoted in that same second. crypto.randomUUID() (already used below
+    // for each audit row's own `id`) guarantees no two calls ever collide,
+    // while keeping the human-readable second-truncated timestamp prefix
+    // nothing else in this codebase parses the exact pre-existing format.
+    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+
+    // AC3 (best-effort per dev-request spec): before/after needs_review
+    // totals for THIS call, alongside the batch's own `promoted` count above
+    // — cheap enough (one indexed COUNT(*) each) to sit directly in this
+    // route rather than a separate reporting mechanism. `needs_review_after`
+    // is queried again post-loop even on a dry-run (where it is guaranteed
+    // identical, since dry-run writes nothing) rather than special-cased, so
+    // the two numbers are always a genuine before/after read of the same
+    // query, never a dry-run shortcut that could silently drift from reality.
+    const needsReviewCountStmt = expDb.prepare(
+      `SELECT COUNT(*) AS n FROM experiences WHERE verification_status = 'needs_review'`,
+    );
+    const needsReviewBefore = (needsReviewCountStmt.get() as { n: number }).n;
+
+    const insertPromotionAudit = expDb.prepare(
+      `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
+    );
 
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
@@ -23412,40 +24176,104 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // it counts what was actually served at sample time).
       if (publishedCheckStmt.get(row.id)) counts.published_in_sample++;
 
+      // ── Quarantine-exit promotion eligibility (see block comment above
+      // ContentJudgeSweepRow) — evaluated for EVERY row (dry-run AND apply),
+      // never just apply-mode, so a dry-run's report is as trustworthy a
+      // preview here as it already is for the MISMATCH/MATCH/unresolved
+      // verdict itself. `wasNeedsReview` is captured from `row.
+      // verification_status`, which was read by the SELECT BEFORE this loop
+      // ran and is never mutated in place — the authoritative "status going
+      // INTO this iteration" value.
+      const wasNeedsReview = row.verification_status === "needs_review";
+      const judgeOk = outcome.verdict === "MATCH";
+      const brregActiveOk = row.p_brreg_active === 1;
+      const sourceVerified =
+        isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
+      const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+      const missingPromotionReqs: string[] = [];
+      if (!judgeOk) missingPromotionReqs.push("judge");
+      if (!brregActiveOk) missingPromotionReqs.push("brreg_active");
+      if (!sourceVerified) missingPromotionReqs.push("source_verified");
+      if (!confidenceOk) missingPromotionReqs.push("confidence");
+      const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
+
       let descriptionNulled = false;
+      let promoted = false;
       if (applyMode) {
         if (outcome.verdict === "MISMATCH") {
           expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
+        } else if (eligibleForPromotion) {
+          expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
+          promoted = true;
+          insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
         }
         // MATCH and unresolved are stamped too (see block comment above) —
-        // never skipped just because there's no status change to make.
-        stampExperienceAdmissionVerdict(row.id, `${verdictKey}: ${outcome.reason}`);
+        // never skipped just because there's no status change to make. A
+        // promoted row's stamp gets the `promoted:` prefix IN PLACE OF the
+        // normal `match:` stamp — one admission_verdict write per row per
+        // call, never two.
+        stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
           descriptionNulled = true;
         }
       }
 
-      const actionText =
-        outcome.verdict === "MISMATCH"
+      const actionText = promoted
+        ? "verification_status -> verified (promoted fra needs_review); admission_verdict stemplet (promoted)"
+        : outcome.verdict === "MISMATCH"
           ? "verification_status -> needs_review; admission_verdict stemplet (mismatch)"
-          : outcome.verdict === "MATCH"
-            ? "ingen statusendring; admission_verdict stemplet (match)"
-            : "ingen statusendring; admission_verdict stemplet (unresolved)";
+          : eligibleForPromotion
+            ? "verification_status -> verified (ville blitt forfremmet fra needs_review); admission_verdict stemplet (promoted)"
+            : outcome.verdict === "MATCH"
+              ? wasNeedsReview
+                ? `ingen statusendring (holdt tilbake i needs_review — mangler: ${missingPromotionReqs.join(", ")}); admission_verdict stemplet (match)`
+                : "ingen statusendring; admission_verdict stemplet (match)"
+              : "ingen statusendring; admission_verdict stemplet (unresolved)";
       const descText = isBoilerplate ? "; description nullstilt (boilerplate-kopi av kildeside)" : "";
+
+      const promotionStatus: "not_applicable" | "held" | "would_promote" | "promoted" = !wasNeedsReview
+        ? "not_applicable"
+        : eligibleForPromotion
+          ? (applyMode ? "promoted" : "would_promote")
+          : "held";
+
+      // counts.promoted mirrors match/mismatch/unresolved's "verdict reached
+      // THIS call" semantics (counted unconditionally, apply or dry-run) —
+      // an eligible row counts whether or not the write actually happened:
+      // dry-run counts `would_promote` rows, apply counts actual
+      // `promoted` rows. Previously only incremented inside the applyMode
+      // branch, so a dry-run's counts.promoted was stuck at 0 even when
+      // results[] reported several would_promote rows.
+      if (promotionStatus === "would_promote" || promotionStatus === "promoted") counts.promoted++;
 
       results.push({
         id: row.id,
         verdict: outcome.verdict,
         reason: outcome.reason,
         verification_status:
-          applyMode && outcome.verdict === "MISMATCH" ? "needs_review" : row.verification_status,
+          applyMode && outcome.verdict === "MISMATCH"
+            ? "needs_review"
+            : applyMode && promoted
+              ? "verified"
+              : row.verification_status,
         description_nulled: descriptionNulled,
+        promotion: {
+          applicable: wasNeedsReview,
+          judge: outcome.verdict,
+          brreg_active: brregActiveOk,
+          source_verified: sourceVerified,
+          confidence_ok: confidenceOk,
+          status: promotionStatus,
+          ...(promotionStatus === "held" ? { missing: missingPromotionReqs } : {}),
+        },
         ...(dryRun
           ? { would_be_action: `[dry-run] ${actionText}${descText}` }
           : { action_taken: `${actionText}${descText}` }),
       });
     }
+
+    const needsReviewAfter = (needsReviewCountStmt.get() as { n: number }).n;
 
     res.json({
       success: true,
@@ -23455,9 +24283,107 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       counts,
       results,
       remaining: Math.max(0, totalEligible - rows.length),
+      needs_review_before: needsReviewBefore,
+      needs_review_after: needsReviewAfter,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-admission-promotion-rollback ──
+//
+// dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified,
+// AC5/6 (rollback): the in-product mechanism for reverting a bad promotion
+// BATCH the sweep above made — mirrors POST /admin/gardssalg-content-
+// rollback's batch_id-targeting convention (this file, above), but against
+// the new experience_admission_promotion_audit table (init-experiences.ts)
+// rather than a field-write audit, since a promotion is a whole-row STATUS
+// transition, not a single field's old/new value.
+//
+// Body: { batch_id: string }. requireAdmin, same as every other admin route
+// in this file. Reverts EVERY row promoted in that batch back to
+// 'needs_review' — but ONLY a row that is:
+//   (a) still traceable to that batch via the audit table (an audit row
+//       exists for it under this batch_id), AND
+//   (b) that audit row is this row's MOST RECENT promotion — i.e. no LATER
+//       audit row exists for the same experience_id (see MAX(rowid)
+//       subquery below), AND
+//   (c) STILL verification_status='verified' right now.
+// A row that moved on since (re-quarantined by a later sweep MISMATCH, hand-
+// edited by an admin, merged/superseded, etc.) is NEVER touched — reverting
+// it here would silently clobber whatever that later, more-informed change
+// did. Requirement (b) exists because SWEEP_ELIGIBLE_WHERE is deliberately
+// NOT scoped to needs_review (see block comment above the sweep route): an
+// already-verified row is re-swept every call, so it can be re-demoted to
+// needs_review by a later MISMATCH and then re-promoted by a completely
+// DIFFERENT, later batch. Without (b), a stale batch_id's rollback would
+// find its own (now-superseded) audit row still sitting there, still see
+// the row currently verification_status='verified' (courtesy of the LATER
+// batch), and wrongly revert a row that batch never touched. rowid (this
+// table's implicit, strictly-insertion-order-monotonic column — NOT the
+// TEXT `id` primary key, and NOT `promoted_at`, which is only second-
+// resolution and can tie between two calls in the same wall-clock second)
+// is what makes "latest promotion for this experience_id" unambiguous even
+// then. This is the same "never touch a row that moved on" discipline
+// planGardssalgContentRollback/planExperienceConflictRollback (above) apply
+// to their own batch_id-scoped reverts.
+//
+// An unknown or empty batch_id is a no-op (0 rows reverted), reported as
+// `success:true, reverted: []` rather than a 404/error — a batch_id that
+// simply matches nothing is not a caller mistake worth failing on (mirrors
+// planGardssalgContentRollback's own "graceful empty result" convention for
+// an unmatched batch_id), UNLESS batch_id is missing/blank entirely, which
+// IS a genuine caller error (400) — there is no "revert everything" mode.
+//
+// Read-only lookup + one UPDATE per row, wrapped in a single db.transaction()
+// so a crash mid-batch never leaves the revert half-applied.
+router.post("/admin/experiences-admission-promotion-rollback", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { batch_id?: unknown };
+    const batchId = typeof body.batch_id === "string" ? body.batch_id.trim() : "";
+    if (!batchId) {
+      res.status(400).json({ error: "batch_id (non-empty string) is required" });
+      return;
+    }
+
+    const expDb = getExpDb("experiences");
+
+    const auditRows = expDb
+      .prepare(
+        `SELECT a.experience_id AS experience_id, a.from_status AS from_status
+           FROM experience_admission_promotion_audit a
+           JOIN experiences e ON e.id = a.experience_id
+          WHERE a.batch_id = ?
+            AND e.verification_status = 'verified'
+            AND a.rowid = (
+              SELECT MAX(a2.rowid)
+                FROM experience_admission_promotion_audit a2
+               WHERE a2.experience_id = a.experience_id
+            )`,
+      )
+      .all(batchId) as Array<{ experience_id: string; from_status: string }>;
+
+    const revertStmt = expDb.prepare(
+      `UPDATE experiences SET verification_status = ? WHERE id = ? AND verification_status = 'verified'`,
+    );
+
+    const reverted: Array<{ experience_id: string; reverted_to: string }> = [];
+    const tx = expDb.transaction(() => {
+      for (const row of auditRows) {
+        const info = revertStmt.run(row.from_status, row.experience_id);
+        if (info.changes > 0) {
+          reverted.push({ experience_id: row.experience_id, reverted_to: row.from_status });
+        }
+      }
+    });
+    tx();
+
+    res.json({ success: true, batch_id: batchId, reverted });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-admission-promotion-rollback failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
@@ -24023,6 +24949,15 @@ router.post("/admin/providers/hjemmeside-write", requireAdmin, (req: Request, re
     req.query?.apply === "1" || req.query?.apply === "true";
   const dryRun = !apply;
   const topLevelAllowLockedOverride = body.allow_locked_override === true;
+
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   if (!Array.isArray(body.items)) {
     res.status(400).json({ error: "Body must contain an 'items' array of {provider_id, hjemmeside}" });
@@ -24637,11 +25572,13 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
     booking_url: string | null;
     telefon: string | null;
     hjemmeside: string | null;
+    description: string | null;
   }> = [];
   try {
     rows = expDb
       .prepare(
-        `SELECT e.booking_url AS booking_url, p.telefon AS telefon, p.hjemmeside AS hjemmeside
+        `SELECT e.booking_url AS booking_url, p.telefon AS telefon, p.hjemmeside AS hjemmeside,
+                e.description AS description
            FROM experiences e
            LEFT JOIN experience_providers p ON p.id = e.provider_id
           WHERE ${PUBLISH_GATE_SQL}`
@@ -24660,10 +25597,19 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
   let withBookingUrl = 0;
   let withPhone = 0;
   let withWebsite = 0;
+  // with_description (dev-request 2026-09-02-experiences-laas-todeling-fyll-
+  // tomme-felt-publiserte-rader, Part C) — additive coverage field over the
+  // SAME PUBLISH_GATE_SQL set as the rest of this report. A row counts only
+  // when its description is non-blank AND not junk (expDescIsJunk — the same
+  // render-time guard applied everywhere else in this file), so scraped nav/
+  // boilerplate text that a reader would never see as a real description does
+  // not inflate this count.
+  let withDescription = 0;
   for (const r of rows) {
     if (present(r.booking_url)) withBookingUrl++;
     if (present(r.telefon)) withPhone++;
     if (present(r.hjemmeside)) withWebsite++;
+    if (present(r.description) && !expDescIsJunk(r.description)) withDescription++;
   }
 
   const total = rows.length;
@@ -24672,6 +25618,7 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
     with_booking_url: { count: withBookingUrl, pct: pct(withBookingUrl, total) },
     with_phone: { count: withPhone, pct: pct(withPhone, total) },
     with_website: { count: withWebsite, pct: pct(withWebsite, total) },
+    with_description: { count: withDescription, pct: pct(withDescription, total) },
   });
 });
 
@@ -24958,6 +25905,14 @@ router.get(
 // Idempotent (runDedupPass only loads canonical_id IS NULL rows) — safe to
 // call more than once; a second call finds nothing left to merge.
 router.post("/admin/experiences-dedup-backfill", requireAdmin, (_req: Request, res: Response) => {
+  // Enrichment write-pause fence (del 1). This route has NO apply/dry-run
+  // flag — every call writes (runDedupPass UPDATEs canonical_id/merged_from)
+  // — so the gate is unconditional here.
+  const pauseBlock = experiencesWritePauseBlock();
+  if (pauseBlock) {
+    res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+    return;
+  }
   const db = getExpDb("experiences");
   const result = runDedupPass(db);
   res.json({ success: true, ...result });
@@ -25202,6 +26157,15 @@ router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Reque
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const dryRun = !apply;
 
+  // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
+  if (apply) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
     res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
     return;
@@ -25260,6 +26224,7 @@ router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Reque
       results,
     });
   } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[experiences-provider-dedup-merge] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -26552,6 +27517,16 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   // undefined all mean dry run.
   const dryRun = body.dry_run !== false;
 
+  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
+  // is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   // Per-app-instance fetch injection seam (see generateTitleNo's doc comment
   // above): tests set this via `app.set("titleNoBackfillFetchImpl", stub)`
   // on their OWN Express app instance. Production never sets it, so
@@ -27238,6 +28213,16 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
   // "" / undefined all mean dry run.
   const dryRun = body.dry_run !== false;
+
+  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
+  // is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // Optional priority list. Parameterised placeholders only — never string
   // interpolation of caller data into SQL (same discipline as the

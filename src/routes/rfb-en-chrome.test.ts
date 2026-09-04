@@ -1,0 +1,127 @@
+/**
+ * rfb-en-chrome.test.ts — Daniel 2026-09-03 (screenshots of /en/produsent/…
+ * and /en): "Er kategorier, produkter, kontaktinfo punkter også oversatt?"
+ * They were not. Pure-function tests for the pieces that made an English
+ * page read Norwegian even with translations served:
+ *   - catLabel(): category chips/badges in en/sv, Norwegian byte-identical
+ *     to formatCat(); formatCatEn() keeps its old contract (d1–d3 in
+ *     rfb-producer-en-seo.test.ts) on top of real labels.
+ *   - buildProducerAnswerFirstOpening(): the generated "… selger … — finn
+ *     kontaktinfo …" line gets an English sentence.
+ *   - formatUpdatedPretty(): "Profil oppdatert: i går" → "Profile updated:
+ *     yesterday", same thresholds, injectable `now`.
+ *   - decodeHtmlEntities() / normalizeProse(): "you&#039;ll" from a scrape.
+ *   - the producer.* dictionary keys the contact card now reads exist in all
+ *     three locales.
+ */
+import { catLabel, formatCat, formatCatEn, productLabel, buildProducerAnswerFirstOpening, dayName, monthAbbr, applyPublishedTranslations } from "./seo";
+import { translateDeliveryTerm } from "../i18n/product-glossary";
+import { formatUpdatedPretty, formatUpdatedPrettyEn, formatUpdatedPrettyNo } from "../utils/freshness";
+import { decodeHtmlEntities, normalizeProse } from "../services/description-quality";
+import { t } from "../i18n/t";
+
+export interface TestSummary { passed: number; failed: number; failures: string[] }
+
+export function runRfbEnChromeTests(opts: { log?: boolean } = {}): TestSummary {
+  const log = opts.log ?? false;
+  let passed = 0, failed = 0; const failures: string[] = [];
+  const eq = (a: unknown, b: unknown, label: string) => {
+    if (JSON.stringify(a) === JSON.stringify(b)) { passed++; if (log) console.log(`  ok ${label}`); }
+    else { failed++; const m = `✗ ${label}\n    expected: ${JSON.stringify(b)}\n    actual:   ${JSON.stringify(a)}`; failures.push(m); if (log) console.log("  " + m); }
+  };
+
+  // ── catLabel ──
+  const keys = ["vegetables","fruit","berries","dairy","eggs","meat","fish","bread","honey","herbs"];
+  const en = ["Vegetables","Fruit","Berries","Dairy","Eggs","Meat","Fish","Bread","Honey","Herbs"];
+  eq(keys.map((k) => catLabel(k, "en")), en, "c1: every homepage category has a real English label");
+  eq(keys.map((k) => catLabel(k, "no")), keys.map(formatCat), "c2: Norwegian labels are byte-identical to formatCat()");
+  eq(catLabel("meat", "no"), "Kjøtt", "c3: Kjøtt stays Kjøtt on the Norwegian page");
+  eq(catLabel("meat", "sv"), "Kött", "c4: Swedish label exists");
+  eq(["bakery","beverages","preserves","other"].map((k) => catLabel(k, "en")), ["Bakery","Beverages","Preserves","Other"], "c5: badge-only categories have English labels");
+  eq(catLabel("bakery", "no"), "Bakeri", "c6: …and keep their Norwegian one");
+  eq(catLabel("unknown-thing", "en"), "Unknown-thing", "c7: unmapped key falls back to the capitalised key in English");
+  eq(catLabel("unknown-thing", "no"), "unknown-thing", "c8: …and to the raw key in Norwegian (unchanged behaviour)");
+  eq(catLabel("", "en"), "", "c9: empty key -> empty string");
+  eq([formatCatEn("vegetables"), formatCatEn("dairy"), formatCatEn("")], ["Vegetables", "Dairy", ""], "c10: formatCatEn keeps its existing contract");
+  eq(formatCatEn("meat"), "Meat", "c11: …and now returns a real label, not the capitalised key");
+
+  // ── answer-first opening ──
+  const base = { name: "Gvarv Frukt og Bær", cityName: "Gvarv", productsList: [], categories: ["meat","vegetables","fruit","honey"] };
+  eq(buildProducerAnswerFirstOpening({ ...base }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo og bestill direkte under.", "a1: Norwegian sentence unchanged (no lang = no)");
+  eq(buildProducerAnswerFirstOpening({ ...base, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details and order directly below.", "a2: English sentence with English category labels");
+  eq(buildProducerAnswerFirstOpening({ ...base, categories: ["meat"], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat — find contact details and order directly below.", "a3: no ' and more' when three or fewer");
+  // Daniel 2026-09-03 «ja kjør ordlisten for produktene også»: known product
+  // words are translated; an unknown one is the producer's own wording.
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "eplemost" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells apple juice — find contact details and order directly below.", "a4: a known product word is translated through the glossary");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Bestemors spesial" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Bestemors spesial — find contact details and order directly below.", "a4b: an unknown product name stays exactly as written");
+  eq(buildProducerAnswerFirstOpening({ ...base, cityName: "", lang: "en" }), null, "a5: still null without two real facts");
+  // Live 2026-09-03 (Gvarv): products listed as bare category words rendered
+  // "sells Kjøtt, Grønnsaker, Frukt" on /en. Same product -> category label.
+  const gvarv = { ...base, productsList: [{ name: "Kjøtt" }, { name: "Grønnsaker" }, { name: "Frukt" }, { name: "eplemost" }] };
+  eq(buildProducerAnswerFirstOpening({ ...gvarv, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details and order directly below.", "a6: product names that are category words get the English category label");
+  eq(buildProducerAnswerFirstOpening({ ...gvarv }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo og bestill direkte under.", "a7: …and stay exactly as written in Norwegian");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Eplemost" }, { name: "honning" }], lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Apple juice, Honey — find contact details and order directly below.", "a8: glossary word keeps its capitalisation; a lower-case category word still maps");
+  eq(productLabel("Bakeri", "en"), "Bakery", "a9: badge-only category words map too");
+  eq(productLabel("Kjøtt", "no"), "Kjøtt", "a10: productLabel is a no-op in Norwegian");
+
+  // ── updated-at ──
+  const now = new Date("2026-09-03T12:00:00Z");
+  const d = (iso: string) => new Date(iso);
+  eq(formatUpdatedPrettyEn(d("2026-09-03T08:00:00Z"), now), "today", "u1: today");
+  eq(formatUpdatedPrettyEn(d("2026-09-02T08:00:00Z"), now), "yesterday", "u2: yesterday");
+  eq(formatUpdatedPrettyEn(d("2026-08-31T08:00:00Z"), now), "3 days ago", "u3: N days ago");
+  eq(formatUpdatedPrettyEn(d("2026-05-11T08:00:00Z"), now), "11 May 2026", "u4: absolute date past a week");
+  eq(formatUpdatedPretty(d("2026-09-02T08:00:00Z"), "en", now), "yesterday", "u5: dispatcher en");
+  eq(formatUpdatedPretty(d("2026-09-02T08:00:00Z"), "no", now), formatUpdatedPrettyNo(d("2026-09-02T08:00:00Z"), now), "u6: dispatcher no = existing Norwegian");
+  eq(formatUpdatedPretty(d("2026-09-02T08:00:00Z"), "sv", now), "i går", "u7: sv falls back to Norwegian text (no sv formatter yet)");
+
+  // ── entities ──
+  eq(decodeHtmlEntities("Here, you&#039;ll find products"), "Here, you'll find products", "e1: &#039; (the Gvarv case)");
+  eq(decodeHtmlEntities("you&#39;ll &amp; more &#x27;x&#x27;"), "you'll & more 'x'", "e2: &#39;, &amp;, hex");
+  eq(decodeHtmlEntities("G&aring;rd &oslash;st &AElig;"), "Gård øst Æ", "e3: Norwegian named entities");
+  eq(decodeHtmlEntities("Vi selger egg og honning."), "Vi selger egg og honning.", "e4: no-op without entities");
+  eq(decodeHtmlEntities(decodeHtmlEntities("you&#039;ll")), "you'll", "e5: idempotent");
+  eq(decodeHtmlEntities("a &unknownthing; b"), "a &unknownthing; b", "e6: unknown named entity left alone");
+  eq(decodeHtmlEntities("x&#0;y&#7;z"), "xyz", "e7: control characters never decoded");
+  eq(decodeHtmlEntities(null), "", "e8: null -> ''");
+  eq(normalizeProse("Vi selger egg. You&#039;ll love it. Kontakt ikke verifisert — verifisering pågår."), "Vi selger egg. You'll love it.", "e9: normalizeProse = decode + strip note");
+
+  // ── dictionary keys the contact card now reads ──
+  for (const k of ["address","phone","email","website","map","visit_website","show_on_map","download_vcard","updated_prefix","badge_brreg","badge_organic"]) {
+    eq([t("en", `producer.${k}`) !== `producer.${k}`, t("no", `producer.${k}`) !== `producer.${k}`, t("sv", `producer.${k}`) !== `producer.${k}`], [true, true, true], `k: producer.${k} exists in en/no/sv`);
+  }
+  eq(t("en", "producer.download_vcard"), "Download contact card", "k2: button text is English");
+  eq(t("no", "producer.download_vcard"), "Last ned kontaktkort", "k3: …and unchanged in Norwegian");
+
+  // ── part 2 (Daniel 2026-09-03, four screenshots): hours, season, delivery, headings ──
+  eq(["mon","tue","wed","thu","fri","sat","sun"].map((d) => dayName(d, "en")), ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], "d1: English day names for short keys");
+  eq(dayName("saturday", "en"), "Saturday", "d2: long keys too");
+  eq(dayName("sat", "no"), "Lørdag", "d3: Norwegian unchanged");
+  eq(dayName("sat", "sv"), "Lördag", "d4: Swedish");
+  eq(dayName("weird", "en"), "weird", "d5: unknown key falls through unchanged");
+  // live 2026-09-03 (Gvarv): a range key rendered raw in both languages
+  eq(dayName("mon-sun", "en"), "Monday\u2013Sunday", "d5b: range key -> Monday–Sunday");
+  eq(dayName("mon-sun", "no"), "Mandag\u2013Søndag", "d5c: …and Mandag–Søndag on the Norwegian page");
+  eq(dayName("man-fre", "en"), "Monday\u2013Friday", "d5d: Norwegian abbreviation range");
+  eq(dayName("mon-xyz", "en"), "mon-xyz", "d5e: half-known range stays raw");
+  eq([monthAbbr(5, "en"), monthAbbr(10, "en"), monthAbbr(12, "en")], ["May","Oct","Dec"], "d6: English month abbreviations");
+  eq([monthAbbr(5, "no"), monthAbbr(12, "no")], ["Mai","Des"], "d7: Norwegian unchanged");
+  eq(monthAbbr(13, "en"), "13", "d8: out of range -> number");
+  eq(["Gårdsbutikk","Kontant","Kort","Vipps","Bondens marked","Faktura","Nettbetaling","Direkteleveranse","Lokalbutikk"].map((v) => translateDeliveryTerm(v, "en")),
+     ["Farm shop","Cash","Card","Vipps","Farmers' market","Invoice","Online payment","Direct delivery","Local shop"], "d9: delivery/payment terms in English (the screenshot values)");
+  eq(translateDeliveryTerm("Butikk Verksgata 13", "en"), "Butikk Verksgata 13", "d10: free-text value stays exactly as written");
+  eq(translateDeliveryTerm("Kontant", "no"), "Kontant", "d11: Norwegian unchanged");
+  eq(translateDeliveryTerm("kontant", "en"), "cash", "d12: capitalisation shape kept");
+  for (const k of ["affiliations","season","hours","delivery_payment","delivery_radius","min_order","delivery_methods","payment","today","part_of","show_on_google_maps","disclaimer_public","disclaimer_owner"]) {
+    eq([t("en", `producer.${k}`) !== `producer.${k}`, t("no", `producer.${k}`) !== `producer.${k}`, t("sv", `producer.${k}`) !== `producer.${k}`], [true, true, true], `d13: producer.${k} exists in en/no/sv`);
+  }
+  eq([t("en", "nav.home"), t("no", "nav.home"), t("en", "nav.back_home")], ["Home", "Hjem", "Back to the front page"], "d14: nav.home / nav.back_home");
+  eq(t("no", "producer.hours"), "Åpningstider", "d15: Norwegian heading text unchanged");
+  // applyPublishedTranslations pure paths (DB-backed behaviour is covered by the
+  // serve-flag gate inside getPublishedProfileTranslationsBulk)
+  const rows = [{ id: "x", description: "Norsk", about: "Om" }];
+  eq(applyPublishedTranslations(rows, "no")[0].description, "Norsk", "d16: no-op for Norwegian");
+  eq(applyPublishedTranslations([], "en").length, 0, "d17: empty list is fine");
+
+  return { passed, failed, failures };
+}

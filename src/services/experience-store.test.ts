@@ -476,11 +476,11 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
       "iecgt-1: LOCKED row (content_source='manual') -> never thin, even with blank content"
     );
     assertTrue(
-      !isExperienceContentGenuinelyThin(
+      isExperienceContentGenuinelyThin(
         { content_source: null, verification_status: "verified", description: null, category: null, content_field_evidence: null },
         "gard.no"
       ),
-      "iecgt-2: LOCKED row (verification_status='verified') -> never thin"
+      "iecgt-2: PUBLISHED row (verification_status='verified', not owner-locked) with blank content IS thin — dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-publiserte-rader split the lock so a published row is fill-blank-only, not fully locked; before that dev-request this asserted the opposite (never thin)"
     );
     assertTrue(
       isExperienceContentGenuinelyThin(
@@ -1228,6 +1228,116 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     } catch (err: any) {
       failed++;
       failures.push("published-experience-by-id (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
+  // ── PUBLISH_GATE_SQL: provider catalog_hidden=1 hides its experiences ────
+  // (dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+  // rapportspraak, del 2). A provider flagged catalog_hidden=1 carrying a
+  // verified/high experience must be invisible on EVERY publish-gated
+  // surface — /discover (which now reuses PUBLISH_GATE_SQL instead of an
+  // inline copy), the by-slug and by-id detail reads, the sitemap slug list
+  // and the FAQ/provider counts — while a visible provider (catalog_hidden
+  // NULL or 0) is unaffected. Same in-memory-DB scaffold as the block above.
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      // Visible provider — catalog_hidden left at its NULL default.
+      const visibleProviderId = expStore.createProvider({
+        navn: "Synlig Gard AS", kommune: "Tromsø", fylke: "Troms",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      // Visible provider — catalog_hidden EXPLICITLY 0 (the "!= 1" half of the clause).
+      const visibleZeroProviderId = expStore.createProvider({
+        navn: "Synlig Null Gard AS", kommune: "Tromsø", fylke: "Troms",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      db.prepare("UPDATE experience_providers SET catalog_hidden = 0 WHERE id = ?").run(visibleZeroProviderId);
+      // Hidden provider — identical in every other respect (brreg_active=1,
+      // verified) so catalog_hidden is the ONLY thing separating it.
+      const hiddenProviderId = expStore.createProvider({
+        navn: "Skjult Gard AS", kommune: "Tromsø", fylke: "Troms",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      db.prepare("UPDATE experience_providers SET catalog_hidden = 1 WHERE id = ?").run(hiddenProviderId);
+
+      const visibleExpId = expStore.createExperience({
+        title: "Synlig hvalsafari", slug: "synlig-hvalsafari", provider_id: visibleProviderId,
+        provider_match_status: "matched", kommune: "Tromsø", fylke: "Troms", category: "safari",
+        verification_status: "verified", confidence: "high",
+      } as any);
+      const visibleZeroExpId = expStore.createExperience({
+        title: "Synlig null nordlystur", slug: "synlig-null-nordlystur", provider_id: visibleZeroProviderId,
+        provider_match_status: "matched", kommune: "Tromsø", fylke: "Troms", category: "safari",
+        verification_status: "verified", confidence: "high",
+      } as any);
+      const hiddenExpId = expStore.createExperience({
+        title: "Skjult fjordcruise", slug: "skjult-fjordcruise", provider_id: hiddenProviderId,
+        provider_match_status: "matched", kommune: "Bergen", fylke: "Vestland", category: "safari",
+        verification_status: "verified", confidence: "high",
+      } as any);
+
+      // Sanity: the hidden row passes every OTHER gate clause — only
+      // catalog_hidden keeps it out. Proven via the RAW read.
+      const rawHidden = expStore.getExperienceById(hiddenExpId);
+      assertEq(rawHidden?.verification_status, "verified", "ch-0a: hidden fixture is verified (raw read)");
+      assertEq(rawHidden?.confidence, "high", "ch-0b: hidden fixture is confidence=high (raw read)");
+
+      // (1) discoverExperiences: only the visible rows.
+      const discovered = expStore.discoverExperiences({}, 50).map((r) => r.id).sort();
+      assertEq(discovered, [visibleExpId, visibleZeroExpId].sort(), "ch-1a: discoverExperiences returns ONLY the visible providers' rows");
+      assertTrue(!discovered.includes(hiddenExpId), "ch-1b: ...and never the catalog_hidden=1 provider's row");
+      // discoverExperiencesRelaxed inherits the same gate automatically.
+      const relaxed = expStore.discoverExperiencesRelaxed({ fylke: "Vestland" }, 50);
+      assertTrue(!relaxed.results.some((r) => r.id === hiddenExpId), "ch-1c: discoverExperiencesRelaxed never surfaces the hidden row either, even when relaxing towards its fylke");
+
+      // (2) by-slug + by-id published getters: null for the hidden one.
+      assertEq(expStore.getPublishedExperienceBySlug("skjult-fjordcruise"), null, "ch-2a: getPublishedExperienceBySlug -> null for the hidden provider's row");
+      assertEq(expStore.getPublishedExperienceBySlug("synlig-hvalsafari")?.id, visibleExpId, "ch-2b: ...while the visible provider's row is still served by slug");
+      assertEq(expStore.getPublishedExperienceById(hiddenExpId), null, "ch-2c: getPublishedExperienceById -> null for the hidden provider's row");
+      assertEq(expStore.getPublishedExperienceById(visibleZeroExpId)?.id, visibleZeroExpId, "ch-2d: ...and catalog_hidden=0 is treated as visible by id");
+      assertTrue(!!expStore.getExperienceById(hiddenExpId), "ch-2e: the RAW getExperienceById (admin/diagnostic) still returns the hidden row");
+
+      // (3) sitemap + FAQ-style PUBLISH_GATE_SQL consumers exclude it.
+      const sitemapSlugs = expStore.listPublishedExperienceSlugs().map((r) => r.slug).sort();
+      assertEq(sitemapSlugs, ["synlig-hvalsafari", "synlig-null-nordlystur"], "ch-3a: listPublishedExperienceSlugs (sitemap) lists only the visible slugs");
+      const faq = expStore.getCategoryFaqStats("safari");
+      assertEq(faq.fylkeCount, 1, "ch-3b: getCategoryFaqStats counts only the visible providers' fylke (Vestland/hidden excluded)");
+      assertEq(expStore.countPublishedProviders(), 2, "ch-3c: countPublishedProviders excludes the hidden provider");
+
+      // (4) Grep-guard: the verified clause lives in PUBLISH_GATE_SQL and the
+      // (out-of-scope, provider-join-less) listCategories() only — the inline
+      // copy discoverExperiences() used to carry is gone.
+      const storeSource = (require("fs") as typeof import("fs")).readFileSync(
+        require.resolve("./experience-store").replace(/\.js$/, ".ts"),
+        "utf8",
+      );
+      const verifiedClauseCount = (storeSource.match(/verification_status = 'verified'/g) ?? []).length;
+      assertTrue(verifiedClauseCount <= 2, `ch-4: experience-store.ts spells the verified clause at most twice (PUBLISH_GATE_SQL + listCategories); found ${verifiedClauseCount}`);
+      assertTrue(expStore.PUBLISH_GATE_SQL.includes("(p.catalog_hidden IS NULL OR p.catalog_hidden != 1)"), "ch-5: PUBLISH_GATE_SQL carries the LEFT-JOIN-safe catalog_hidden clause");
+    } catch (err: any) {
+      failed++;
+      failures.push("publish-gate-catalog-hidden (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;

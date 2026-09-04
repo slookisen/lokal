@@ -92,6 +92,9 @@ export function runOpplevelserGardssalgDrikkelisteRemediationRunde2Tests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -137,6 +140,7 @@ export function runOpplevelserGardssalgDrikkelisteRemediationRunde2Tests(
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
 
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       const brregClient = require("../services/brreg-client") as typeof import("../services/brreg-client");
@@ -439,6 +443,7 @@ export function runOpplevelserGardssalgDrikkelisteRemediationRunde2Tests(
       failed++;
       failures.push("opplevelser-gardssalg-drikkeliste-remediation-runde2: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;

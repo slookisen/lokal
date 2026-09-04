@@ -23,7 +23,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
-import { isJunkDescription, looksLikeCodeArtifact } from "../services/description-quality";
+import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
@@ -462,6 +462,12 @@ router.post("/register", (req: Request, res: Response) => {
     // earlier than a human reviewer would.
     if (looksLikeCodeArtifact(registration.description)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    // Daniel 2026-09-03 ("Interne notater skal ikke vises"): same door, same
+    // shape, for an enrichment routine's own verification note.
+    if (hasInternalNote(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
 
@@ -1162,6 +1168,9 @@ function descriptionWriteGuardError(description: unknown): { status: number; bod
   }
   if (looksLikeCodeArtifact(description as string | null | undefined)) {
     return { status: 400, body: { error: "description contains code/script artifacts — rejected" } };
+  }
+  if (hasInternalNote(description as string | null | undefined)) {
+    return { status: 400, body: { error: "description contains an internal pipeline note — rejected" } };
   }
   return null;
 }
@@ -1868,6 +1877,10 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: "about contains code/script artifacts — rejected" });
     return;
   }
+  if (typeof req.body?.about === "string" && hasInternalNote(req.body.about)) {
+    res.status(400).json({ success: false, error: "about contains an internal pipeline note — rejected" });
+    return;
+  }
 
   try {
     if (isAdmin) {
@@ -1996,6 +2009,10 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
     // check needed on this route.
     if (looksLikeCodeArtifact(trimmed)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    if (hasInternalNote(trimmed)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
     updates.description = trimmed;
@@ -2144,6 +2161,12 @@ router.post("/admin/register", (req: Request, res: Response) => {
     // default correctly passes (looksLikeCodeArtifact("") === false).
     if (looksLikeCodeArtifact(registration.description)) {
       res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    // Daniel 2026-09-03 ("Interne notater skal ikke vises"): same door, same
+    // shape, for an enrichment routine's own verification note.
+    if (hasInternalNote(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
     }
 
@@ -3035,6 +3058,20 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
       db.prepare("UPDATE conversations SET seller_agent_id = NULL WHERE seller_agent_id = ?").run(agentId);
       db.prepare("DELETE FROM analytics_agent_views WHERE agent_id = ?").run(agentId);
+      // Opt-out deletion, not retention pruning — this one DOES remove the
+      // rollup row too, deliberately, unlike runAutoPrune/retention-service.ts.
+      // orch-pr-20260903-analytics-rollup-slice2 made agent_view_daily the
+      // PERMANENT half of an agent's view history: the nightly prune rolls
+      // analytics_agent_views up into it and then deletes the raw rows, and
+      // NOTHING in retention-service.ts ever deletes a rollup row. That rule is
+      // about retention policy. THIS route is a user-initiated removal request
+      // (the 409 above names opt-out as the ?force=1 case), and the line above
+      // is clearly meant to be a COMPLETE removal of the agent's tracking data.
+      // Leaving agent_view_daily behind would mean an opt-out no longer removes
+      // the view history, and views_count (admin-outreach-pool.ts /
+      // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
+      // out of the rollup remainder if the same agent_id were ever reused.
+      db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
       db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     });
     deleteAll();
@@ -5052,11 +5089,18 @@ router.post("/admin/affiliations", (req: Request, res: Response) => {
     const db = getDb();
 
     // Verify producer + umbrella exist (and are the right kinds)
-    const producer = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(producerId) as any;
+    const producer = db.prepare("SELECT id, umbrella_type, parent_umbrella_id FROM agents WHERE id = ?").get(producerId) as any;
     if (!producer) { res.status(404).json({ success: false, error: `producer_id ${producerId} not found` }); return; }
     if (producer.umbrella_type) {
-      res.status(400).json({ success: false, error: "producer_id is an umbrella — affiliations link producers TO umbrellas" });
-      return;
+      // Exception: a regional market_network umbrella is allowed to affiliate with its
+      // own parent market_network umbrella (child joining its own parent) — this is the
+      // same shape already used by the 11 existing sibling regional↔national affiliations.
+      const isChildOfTargetUmbrella =
+        producer.umbrella_type === "market_network" && producer.parent_umbrella_id === umbrellaId;
+      if (!isChildOfTargetUmbrella) {
+        res.status(400).json({ success: false, error: "producer_id is an umbrella — affiliations link producers TO umbrellas" });
+        return;
+      }
     }
     const umbrella = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(umbrellaId) as any;
     if (!umbrella) { res.status(404).json({ success: false, error: `umbrella_id ${umbrellaId} not found` }); return; }

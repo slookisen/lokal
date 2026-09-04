@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
+import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 
 // ─── Database Initialization ─────────────────────────────────
 // SQLite is the right call for phase 1-3:
@@ -42,7 +43,50 @@ export function __initSchemaForTesting(injected: Database.Database): void {
   initSchema(injected);
 }
 
+// Test-only: pin the singleton to a FRESH, schema-initialised in-memory DB for
+// the duration of one test harness and hand back the restore. Composes the
+// three seams above (peek → set → initSchema) into the one shape every
+// harness that exercises a main-db-gated route needs — since dev-request
+// 2026-09-02-experiences-skrivepause-catalog-hidden-og-rapportspraak every
+// apply:true admin write route under /api/opplevelser reads
+// `enrichment_write_pause` off THIS singleton (fail-closed), so a harness that
+// runs after another block left the singleton on a closed throwaway handle
+// would otherwise see 423s. The restore puts back whatever was there before
+// (null → the next getDb() reopens the real file, i.e. the pristine state).
+// Never call from production code.
+export function __pinInMemoryDbForTesting(): () => void {
+  const prev = db;
+  const pinned = new Database(":memory:");
+  pinned.pragma("journal_mode = DELETE");
+  pinned.pragma("foreign_keys = OFF");
+  initSchema(pinned);
+  db = pinned;
+  return () => {
+    // Re-entrancy-safe: only put `prev` back if the singleton is STILL our
+    // pinned handle. If another block pinned/injected after us (top-level
+    // harness blocks in tests/test.ts run concurrently unless chained), a
+    // blind `db = prev` would clobber their handle — and closing ours while
+    // they hold it as THEIR `prev` would leave them restoring to a closed DB.
+    // So when we are no longer current we neither restore nor close (an
+    // in-memory handle leaking for the remainder of the process is harmless).
+    if (db !== pinned) return;
+    db = prev;
+    try { pinned.close(); } catch { /* already closed */ }
+  };
+}
+
+// Test-only: make getDb() ITSELF throw on its next invocations (until reset
+// with null). Needed to prove a guard receives the ACCESSOR as a thunk rather
+// than an eagerly-evaluated handle — a handle whose prepare() throws cannot
+// tell the two apart, because by then getDb() has already returned. Never
+// call from production code.
+let dbAccessorFailureForTesting: Error | null = null;
+export function __setDbAccessorFailureForTesting(err: Error | null): void {
+  dbAccessorFailureForTesting = err;
+}
+
 export function getDb(): Database.Database {
+  if (dbAccessorFailureForTesting) throw dbAccessorFailureForTesting;
   if (!db) {
     // Ensure data directory exists
     const dir = path.dirname(DB_PATH);
@@ -67,6 +111,45 @@ export function getDb(): Database.Database {
   }
   return db;
 }
+
+// Shared content-depth predicate for the `outreach_ready_pool` VIEW (defined
+// inside initSchema below) and every other query that must agree with it on
+// what counts as "enough content to email a producer about their own
+// profile" — dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel
+// option A, 2026-09-02). Mirrors computeKvalitetsGate's `content_threshold`
+// (src/agents/lokal-agent-verifier.ts) — about>=80 OR products>=3 — verbatim;
+// do not hand-edit one without the other. `k` must alias `agent_knowledge` in
+// the query that interpolates this (matches the VIEW's own join alias).
+// Consumed via template-literal interpolation, same convention as
+// PUBLISH_GATE_SQL (src/services/experience-store.ts): admin-outreach-pool.ts
+// imports and ANDs this into `funnelBase` so the stats funnel never drifts
+// from the VIEW; lokal-agent-verifier.ts's `nowInPool` mirrors the identical
+// boolean in JS via computeKvalitetsGate's own `content_threshold` output
+// (same about/products inputs), rather than importing this SQL string.
+//
+// json_valid() GUARD (fix-up on PR #796, independent-reviewer finding):
+// `agent_knowledge.products` has no JSON validation at the schema level (no
+// CHECK constraint, no trigger) and is written by 100+ files, so a malformed
+// value is realistic, not hypothetical. SQLite's json_array_length() throws
+// a hard "malformed JSON" error on a non-JSON string, and — empirically
+// verified against better-sqlite3 (12.8.0) / SQLite 3.51.3, not merely
+// reasoned about — a bare `OR json_array_length(...)` does NOT reliably
+// avoid that: SQLite's boolean short-circuiting is context-dependent, so the
+// fix must specifically be validated in the WHERE-clause context this
+// constant is actually used in (the outreach_ready_pool VIEW's WHERE, and
+// funnelBase's WHERE in admin-outreach-pool.ts) — both AND ${POOL_CONTENT_
+// THRESHOLD_SQL} into a WHERE clause, never a SELECT result-column list.
+// Confirmed empirically there: `json_valid(COALESCE(k.products,'[]')) AND
+// json_array_length(COALESCE(k.products,'[]')) >= 3`, filtered via WHERE,
+// DOES short-circuit — json_array_length is never reached when json_valid
+// is 0 — so a malformed row fails content_threshold safely (excluded, not a
+// crash) and does not take the whole VIEW down for every other row. NOTE:
+// this guard is WHERE-clause-safe specifically; if this constant is ever
+// interpolated into a SELECT result-column expression instead (not a WHERE
+// predicate), re-verify empirically first — result-column AND does not
+// short-circuit the same way in this SQLite build.
+export const POOL_CONTENT_THRESHOLD_SQL =
+  "(length(COALESCE(k.about,'')) >= 80 OR (json_valid(COALESCE(k.products,'[]')) AND json_array_length(COALESCE(k.products,'[]')) >= 3))";
 
 function initSchema(db: Database.Database): void {
   db.exec(`
@@ -462,6 +545,80 @@ function initSchema(db: Database.Database): void {
       PRIMARY KEY (day, path, source, bot_type, vertical_id)
     );
     CREATE INDEX IF NOT EXISTS idx_page_view_daily_day ON page_view_daily(day DESC);
+
+    -- orch-pr-20260903-analytics-rollup-slice2: rollup coverage for the two
+    -- analytics tables slice 1 had to stop deleting from (analytics_queries,
+    -- analytics_agent_views), plus a true per-day distinct-session table.
+    -- Same additive CREATE TABLE IF NOT EXISTS idiom as page_view_daily above:
+    -- every write is an ON CONFLICT DO UPDATE additive upsert from
+    -- retention-service.ts, so re-running a rollup batch never double-counts.
+    --
+    -- query_daily: aggregated agent/AI query counts per day×protocol×agent×vertical×city.
+    -- response_time_ms_sum/_n are computed ONLY over rows with a non-NULL
+    -- response_time_ms (avg = sum/n). A NULL latency is never coerced to 0 in
+    -- either field — that would silently drag the reconstructed average down.
+    CREATE TABLE IF NOT EXISTS query_daily (
+      day TEXT NOT NULL,
+      protocol TEXT NOT NULL DEFAULT 'unknown',
+      agent_id TEXT NOT NULL DEFAULT '',
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      city TEXT NOT NULL DEFAULT '',
+      query_count INTEGER NOT NULL DEFAULT 0,
+      result_count_sum INTEGER NOT NULL DEFAULT 0,
+      response_time_ms_sum INTEGER NOT NULL DEFAULT 0,
+      response_time_ms_n INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, protocol, agent_id, vertical_id, city)
+    );
+    CREATE INDEX IF NOT EXISTS idx_query_daily_day ON query_daily(day DESC);
+
+    -- query_text_daily: what was actually searched for, per day×query×vertical.
+    -- Kept separate from query_daily so the (high-cardinality) query text does
+    -- not explode query_daily's primary key.
+    CREATE TABLE IF NOT EXISTS query_text_daily (
+      day TEXT NOT NULL,
+      query TEXT NOT NULL,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      query_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, query, vertical_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_query_text_daily_day ON query_text_daily(day DESC);
+
+    -- agent_view_daily: aggregated producer-profile views per day×agent×source×city.
+    -- The permanent half of views_count in admin-outreach-pool /
+    -- admin-outreach-candidates (raw analytics_agent_views rows are pruned once
+    -- rolled up here, so those routes must sum rollup + remaining raw).
+    -- Permanent under normal retention pruning (retention-service.ts /
+    -- runAutoPrune never delete a rollup row), but the explicit agent opt-out
+    -- path — DELETE /admin/agents/:id in routes/marketplace.ts — DOES clear
+    -- this table for that agent_id, in the same transaction as the raw
+    -- analytics_agent_views delete: an opt-out is a deletion request, not a
+    -- retention policy.
+    CREATE TABLE IF NOT EXISTS agent_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_source TEXT NOT NULL DEFAULT 'unknown',
+      city TEXT NOT NULL DEFAULT '',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id, view_source, city)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_view_daily_day ON agent_view_daily(day DESC);
+    CREATE INDEX IF NOT EXISTS idx_agent_view_daily_agent ON agent_view_daily(agent_id);
+
+    -- sessions_daily: TRUE distinct-session count per day×vertical×bot_type.
+    -- Deliberately NOT derivable from page_view_daily: that table's
+    -- session_count is per-PATH, so summing it overcounts any session that
+    -- visited more than one path on the same day. Computed with
+    -- COUNT(DISTINCT session_id) over the raw analytics_page_views rows in the
+    -- same batch transaction that rolls up page_view_daily, before they are
+    -- deleted.
+    CREATE TABLE IF NOT EXISTS sessions_daily (
+      day TEXT NOT NULL,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      bot_type TEXT NOT NULL DEFAULT 'human',
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, vertical_id, bot_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_daily_day ON sessions_daily(day DESC);
 
     CREATE TABLE IF NOT EXISTS runs_daily_summary (
       day TEXT NOT NULL,
@@ -2114,12 +2271,12 @@ function initSchema(db: Database.Database): void {
   // WO #9 switches over. Filtered by:
   //   - non-null email
   //   - verification_status = 'verified'
-  //   - enrichment_status = 'rich'
+  //   - enrichment_status IN ('rich','partial') AND POOL_CONTENT_THRESHOLD_SQL
   //   - never sent through the new pipeline (outreach_sent_log)
   // NOTE: agents.removed_at does not exist yet (Phase 5.10) — using
   // 1=1 as placeholder so the VIEW resolves on prod today.
   //
-  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler ───
+  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler (SUPERSEDED below) ───
   // Was `enrichment_status IN ('partial', 'rich')`. `partial` profiles are
   // half-empty by computeEnrichmentStatus's own definition (lokal-agent-
   // verifier.ts) — an outreach email pointing a producer at their own thin
@@ -2130,6 +2287,22 @@ function initSchema(db: Database.Database): void {
   // expected consequence — the bottleneck moves to enrichment, which is
   // exactly where dev-request 2026-07-29-blacklist-backfill-og-
   // berikelsestriage (slice 3) is already refilling it with `rich` profiles.
+  //
+  // ─── dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A,
+  // 2026-09-02) — supersedes the 2026-07-30 tightening above ───
+  // The `rich`-only gate above double-punished content: computeKvalitetsGate's
+  // own `content_threshold` (about>=80 OR products>=3) already screens content
+  // depth before an agent can even reach `verified`, so re-checking a STRICTER
+  // bar (`rich` = about>=150 AND products>=3 AND address) here just stranded
+  // 165+ verified/emailed/live-site producers outside the pool for no gain
+  // (measured 2026-09-02, verification-pilot/2026-09-02-rfb-poolpush-rapport.md
+  // §1). Fix: accept `partial` too, but ONLY when it clears the same
+  // content_threshold bar the gate already computes — POOL_CONTENT_THRESHOLD_SQL
+  // below, mirrored verbatim (not re-derived) in lokal-agent-verifier.ts's
+  // `nowInPool` and admin-outreach-pool.ts's `funnelBase` so all three call
+  // sites agree. Daniel, live session 2026-09-02, verbatim: "go på A, og kjør
+  // dublettene og skjul-lista" (daniel-responses/2026-09-02-go-a-dubletter-og-
+  // skjul-lista.md).
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -2161,7 +2334,8 @@ function initSchema(db: Database.Database): void {
         AND k.email != ''
         AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
         AND k.verification_status = 'verified'
-        AND k.enrichment_status = 'rich'
+        AND k.enrichment_status IN ('rich','partial')
+        AND ${POOL_CONTENT_THRESHOLD_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
@@ -4303,6 +4477,17 @@ function initSchema(db: Database.Database): void {
     console.error("Migration outreach_max_touch_vern_config failed:", err);
   }
 
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+  // profile_translations / profile_translation_audit tables (EN/SV
+  // translations of agents.description + agent_knowledge.about, staged
+  // draft→reviewed→verified→published, never written into the Norwegian
+  // source columns). Same shape in the experiences DB (init-experiences.ts).
+  // Idempotent CREATE IF NOT EXISTS — see src/services/profile-translations.ts.
+  try {
+    ensureProfileTranslationsSchema(db);
+  } catch (err) {
+    console.error("Migration profile_translations failed:", err);
+  }
 }
 
 export function closeDb(): void {

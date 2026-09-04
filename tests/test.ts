@@ -1281,6 +1281,32 @@ console.log("── admin-outreach-gate-tynne-profiler (VIEW tightening + sent-l
   console.log(`  admin-outreach-gate-tynne-profiler: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── 2026-09-02 dev-request: rfb-pool-view-rich-vs-partial (Daniel option A)
+// — outreach_ready_pool VIEW now accepts enrichment_status='partial' when the
+// content_threshold gate (about>=80 OR products>=3) passes, mirrored in
+// funnelBase (admin-outreach-pool.ts stats) and nowInPool (lokal-agent-
+// verifier.ts) via the shared POOL_CONTENT_THRESHOLD_SQL constant. Own
+// in-memory prod-schema DB (own dedicated test file, mirrors admin-outreach-
+// pool-blocker-breakdown.test.ts's convention) — runs via runSerial() like
+// that file, since it's async (runVerifierBatch) and swaps the global db
+// singleton (save/restore handled inside the test file itself). ──
+runSerial(async () => {
+  console.log("\n── admin-outreach-pool-rich-vs-partial (VIEW/funnelBase/nowInPool content-threshold) ──");
+  try {
+    const { runAdminOutreachPoolRichVsPartialTests } =
+      require("../src/routes/admin-outreach-pool-rich-vs-partial.test") as
+        typeof import("../src/routes/admin-outreach-pool-rich-vs-partial.test");
+    const r = await runAdminOutreachPoolRichVsPartialTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-outreach-pool-rich-vs-partial: " + f);
+    console.log(`  admin-outreach-pool-rich-vs-partial: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-outreach-pool-rich-vs-partial: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── 2026-07-18 dev-request: admin-blocklist-manual-entry-api — generic
 // { identifier_type, identifier_value, reason? } shape for POST /admin/blocklist,
 // plus the free-mail/ISP + vipps.no website_domain guard ──
@@ -3124,6 +3150,8 @@ const _pr21Promises: Promise<unknown>[] = [];
   const {
     probeAgentUrl,
     applyUrlProbeResult,
+    headProbe,
+    computeKvalitetsGate,
   } = require("../src/agents/lokal-agent-verifier");
 
   // Helper: build a fake fetch returning the configured status, with optional
@@ -3189,6 +3217,122 @@ const _pr21Promises: Promise<unknown>[] = [];
     const r = await probeAgentUrl("https://redir.no", { fetchImpl: makeFetch(301), timeoutMs: 1000 });
     assertEq(r.status, 301, "pr21: 301 → status=301");
     assertTrue(r.ok === true, "pr21: 301 → ok=true (URL is reachable via redirect)");
+  })());
+
+  // ── dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405 ────
+  // probeAgentUrl itself now normalizes a scheme-less input URL (e.g. a
+  // stored agent_knowledge.website value like "merkja.no") the same way
+  // hostnameFromUrl always has — before this fix, fetch(url) would throw on
+  // that invalid URL and the probe fell into the network-error branch
+  // (status=0), producing url_last_status=0 for a perfectly live site.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("merkja.no", { fetchImpl: makeFetch(200, { calls }), timeoutMs: 1000 });
+    assertEq(r.status, 200, "pr21-scheme: scheme-less \"merkja.no\" → status=200 (was: 0, invalid URL)");
+    assertTrue(r.ok === true, "pr21-scheme: scheme-less input → ok=true");
+    assertEq(calls[0]!.url, "https://merkja.no", `pr21-scheme: scheme-less input reaches fetch already normalized to https:// (got ${JSON.stringify(calls)})`);
+  })());
+
+  // Already-schemed input is passed through unchanged (idempotent — no
+  // "https://https://" double-prefixing).
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("https://qvenbrygg.no", { fetchImpl: makeFetch(200, { calls }), timeoutMs: 1000 });
+    assertEq(r.status, 200, "pr21-scheme: already-schemed input → status=200");
+    assertEq(calls[0]!.url, "https://qvenbrygg.no", `pr21-scheme: already-schemed input untouched (got ${JSON.stringify(calls)})`);
+  })());
+
+  // ── dev-request 2026-09-02-rfb-verifier-headprobe-scheme-og-405 ────
+  // headProbe — the kvalitets-gate's probe (computeKvalitetsGate's
+  // website_ok) — used to be its own raw fetch(url,{method:"HEAD"}) with no
+  // scheme normalization and no HEAD→GET fallback, so a scheme-less
+  // agent_knowledge.website or a HEAD-rejecting server would falsely fail
+  // the gate even though probeAgentUrl (above) already handled both cases
+  // correctly for url_last_status. headProbe now delegates to probeAgentUrl
+  // so there is exactly one probing implementation, and (mirroring
+  // probeAgentUrl's own opts.fetchImpl) now takes an optional 3rd fetchImpl
+  // param purely so it can be tested the same fetchImpl-injection way as
+  // probeAgentUrl above, instead of monkey-patching globalThis.fetch (which
+  // this file's OTHER concurrently in-flight fire-and-forget test promises
+  // — this same _pr21Promises array included — would otherwise race with).
+  // runVerifierBatch's `opts.headProbe ?? headProbe` call site never passes
+  // this 3rd arg, so the calling convention is unchanged.
+
+  // Acceptance 1: scheme-less input is normalized to https:// BEFORE the
+  // network call — same status, and the same requested URL, as
+  // already-schemed input. Pre-fix, "example.no" would throw inside
+  // fetch() (invalid URL) and headProbe would return null.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusSchemeLess = await headProbe("example.no", 1000, makeFetch(200, { calls }));
+    const statusSchemed = await headProbe("https://example.no", 1000, makeFetch(200, { calls }));
+    assertEq(statusSchemeLess, 200, "headprobe-fix: scheme-less input reaches 200 (was: fetch() throws on invalid URL → null)");
+    assertEq(statusSchemed, 200, "headprobe-fix: already-schemed input still reaches 200");
+    assertEq(statusSchemeLess, statusSchemed, "headprobe-fix: scheme-less and https:// input yield the SAME status");
+    assertEq(calls[0]!.url, "https://example.no",
+      `headprobe-fix: scheme-less "example.no" was normalized to https:// before the fetch call (calls: ${JSON.stringify(calls)})`);
+  })());
+
+  // Acceptance 2: HEAD → 405 falls back to a ranged GET, and the GET's
+  // result (not the 405) is what the probe reports — and that in turn makes
+  // computeKvalitetsGate's website_ok=true where it used to be false.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusHeadRejected = await headProbe("https://head-rejects.no", 1000, makeFetch({ HEAD: 405, GET: 200 }, { calls }));
+    assertEq(statusHeadRejected, 200,
+      "headprobe-fix: HEAD 405 → falls back to GET → reports the GET's 200 (was: reported 405, gate failed)");
+    assertEq(calls.length, 2, `headprobe-fix: exactly HEAD then GET were attempted (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: first attempt is HEAD");
+    assertEq(calls[1]!.method, "GET", "headprobe-fix: fallback attempt is GET");
+    const gateAfterFallback = computeKvalitetsGate({
+      http_status: statusHeadRejected,
+      email: "post@head-rejects.no",
+      website: "https://head-rejects.no",
+      about: "x",
+      products: [],
+      brreg: null,
+    });
+    assertTrue(gateAfterFallback.reasons.website_ok,
+      "headprobe-fix: HEAD-405-then-GET-200 makes computeKvalitetsGate's website_ok=true (was website_unreachable/http_405)");
+  })());
+
+  // Network failure on HEAD (probeAgentUrl's internal status=0, not a
+  // thrown exception headProbe has to catch) also falls back to GET.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const erroringOnHead = async (url: string, init?: any) => {
+      const method = (init?.method || "GET").toUpperCase();
+      calls.push({ url, method });
+      if (method === "HEAD") throw new Error("simulated network failure");
+      return { status: 200 };
+    };
+    const statusHeadNetworkFail = await headProbe("https://head-network-fails.no", 1000, erroringOnHead as any);
+    assertEq(statusHeadNetworkFail, 200, "headprobe-fix: HEAD network failure (status 0) → falls back to GET → reports 200");
+    assertEq(calls.length, 2, `headprobe-fix: network-failing HEAD still triggers a GET fallback (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: first attempt is HEAD (network failure)");
+    assertEq(calls[1]!.method, "GET", "headprobe-fix: fallback attempt is GET");
+  })());
+
+  // Acceptance 3 / non-regression: a plain https:// URL that succeeds on
+  // HEAD reports that HEAD status directly, with NO GET call at all — the
+  // normal, unchanged path must not regress.
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const statusNormal = await headProbe("https://gard.no", 1000, makeFetch(200, { calls }));
+    assertEq(statusNormal, 200, "headprobe-fix: normal HEAD-succeeds path still reports 200");
+    assertEq(calls.length, 1, `headprobe-fix: no GET fallback when HEAD already succeeds (got ${JSON.stringify(calls)})`);
+    assertEq(calls[0]!.method, "HEAD", "headprobe-fix: only HEAD attempted");
+  })());
+
+  // Total failure on BOTH HEAD and GET still yields null (not
+  // probeAgentUrl's raw 0), preserving headProbe's pre-existing
+  // null-on-unreachable contract that computeKvalitetsGate's
+  // website_unreachable flag (vs. a numeric http_<status> flag) depends on.
+  _pr21Promises.push((async () => {
+    const totalFailure = async () => { throw new Error("simulated total outage"); };
+    const statusTotalFailure = await headProbe("https://totally-down.no", 1000, totalFailure as any);
+    assertEq(statusTotalFailure, null,
+      "headprobe-fix: total network failure still yields null (preserves website_unreachable flag semantics), not probeAgentUrl's raw 0");
   })());
 
   // ── PR-21: applyUrlProbeResult demotes rich → partial when broken ──
@@ -5329,16 +5473,19 @@ async function runIntegrationTests(): Promise<void> {
       "intg-3: stegB — owner-curated address (only gating field) + corroborated email + live website → verified"
     );
 
-    // lokal#433 requirement UNCHANGED by Steg B: outreach_ready_pool requires
-    // enrichment_status='rich' (about>=150 chars AND products>=3 AND address),
-    // independent of verification_status. This fixture's about text is only
-    // 77 chars, so computeEnrichmentStatus still returns 'partial' — the
-    // agent is 'verified' now (Steg B) but still correctly excluded from the
-    // pool by the untouched rich-only gate, proving Steg B did not weaken it.
+    // enrichment_status stays 'partial': this fixture's about text is only 77
+    // chars (< 150), so computeEnrichmentStatus does not return 'rich'.
     assertEq(agentResult?.new_enrichment_status, "partial",
-      "intg-3: stegB — enrichment_status stays 'partial' (about=77 chars < 150) — lokal#433's rich-only bar is untouched");
+      "intg-3: stegB — enrichment_status stays 'partial' (about=77 chars < 150) — the 'rich' bar is untouched");
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A):
+    // outreach_ready_pool now accepts 'partial' too, as long as
+    // POOL_CONTENT_THRESHOLD_SQL passes (about>=80 OR products>=3). This
+    // fixture's about is 77 chars (<80) but insertTestAgent's DEFAULT products
+    // is 3 items (see insertTestAgent above — this fixture never overrides
+    // `products`), so content_threshold passes via the products leg and the
+    // agent now DOES reach the pool — was excluded pre-2026-09-02 (rich-only).
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
-    assertTrue(!poolRow, "intg-3: stegB — partial-owner agent still NOT in outreach_ready_pool (enrichment_status='partial', not 'rich' — lokal#433 gate unaffected by Steg B)");
+    assertTrue(!!poolRow, "intg-3: stegB — partial-owner agent now IS in outreach_ready_pool (enrichment_status='partial' but content_threshold passes via the default 3 products) — dev-request 2026-09-02-rfb-pool-view-rich-vs-partial");
   }
 
   // ── orch-pr-16 Fixture A: free-mail (gmail) producer is NOT downgraded ──────
@@ -6413,6 +6560,18 @@ const _m2Promise = (async function runOwnerPortalTests() {
         city TEXT,
         view_source TEXT DEFAULT 'unknown',
         created_at TEXT DEFAULT (datetime('now'))
+      );
+      -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+      -- outreach routes' views_count is now "agent_view_daily rollup total +
+      -- remaining raw rows", so this hand-rolled fixture schema needs the
+      -- rollup table too or those queries fail with "no such table".
+      CREATE TABLE agent_view_daily (
+        day TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        view_source TEXT NOT NULL DEFAULT 'unknown',
+        city TEXT NOT NULL DEFAULT '',
+        view_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, agent_id, view_source, city)
       );
       CREATE VIEW outreach_ready_pool AS
         SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
@@ -8398,9 +8557,17 @@ console.log("\n── PR-30: source-presence checks on seo.ts ──");
     seoSrc.includes('class="profile-meta"'),
     "pr30: seo.ts emits .profile-meta paragraph for the freshness badge"
   );
+  // 2026-09-03 engelsk ramme: the label moved from a literal into the
+  // dictionary (producer.updated_prefix) so /en can say "Profile updated:".
+  // Same intent as before — the Norwegian label still ships — checked at
+  // both ends: seo.ts reads the key, and no.json carries the exact text.
   assertTrue(
-    seoSrc.includes('Profil oppdatert:'),
-    "pr30: seo.ts emits 'Profil oppdatert:' label"
+    seoSrc.includes('t(lang, "producer.updated_prefix")'),
+    "pr30: seo.ts emits the freshness label through producer.updated_prefix"
+  );
+  assertTrue(
+    require("../src/i18n/locales/no.json").producer?.updated_prefix === "Profil oppdatert:",
+    "pr30: no.json carries the 'Profil oppdatert:' label"
   );
   assertTrue(
     seoSrc.includes('class="updated-at"'),
@@ -9342,7 +9509,11 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // Test 2.12: producer card order — affiliations card sits between Produkter and Sesongkalender
   // so that the most-likely-clicked sections (products, affiliations) come before secondary info
-  const prodCardOrderMatch = seoSrc.match(/Produkter \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
+  // 2026-09-03 produkt-ordliste: the heading reads producer.products from the
+  // dictionary ("Produkter"/"Products") — same card order is asserted, the
+  // anchor is the new heading form.
+  // 2026-09-03 del 2: the affiliations/season headings read the dictionary too.
+  const prodCardOrderMatch = seoSrc.match(/t\(lang, "producer\.products"\)\)\} \(\${productsList\.length\}\)[\s\S]{0,1500}t\(lang, "producer\.affiliations"\)[\s\S]{0,1500}t\(lang, "producer\.season"\)/);
   assertTrue(
     !!prodCardOrderMatch,
     "phase5.11-a2: producer affiliations card sits between Produkter and Sesongkalender"
@@ -9495,6 +9666,21 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   assertTrue(
     /umbrella_id is not an umbrella/.test(postAffBody),
     "phase5.11-a3: POST /admin/affiliations rejects umbrella_id that is NOT an umbrella"
+  );
+
+  // Test 3.14b: POST /admin/affiliations allows a regional market_network umbrella to
+  // affiliate with its own parent market_network umbrella (child joining its own parent)
+  assertTrue(
+    /producer\.umbrella_type === "market_network" && producer\.parent_umbrella_id === umbrellaId/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations has market_network-child-of-target-umbrella exception check"
+  );
+  assertTrue(
+    postAffBody.includes("parent_umbrella_id FROM agents WHERE id = ?"),
+    "phase5.11-a3: POST /admin/affiliations reads producer.parent_umbrella_id to evaluate the exception"
+  );
+  assertTrue(
+    /if \(!isChildOfTargetUmbrella\) \{[\s\S]{0,200}producer_id is an umbrella — affiliations link producers TO umbrellas[\s\S]{0,200}\}/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations still unconditionally rejects producer_id-is-umbrella in the general (non-exception) case"
   );
 
   // Test 3.15: POST /admin/affiliations is idempotent (upsert via UNIQUE)
@@ -10503,7 +10689,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a5: umbParentHtml initialized empty"
   );
   assertTrue(
-    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\/produsent\/\$\{parentSlug\}">Del av: /.test(seoSrc),
+    // 2026-09-03 språk-økt: the link is now localizedPath("/produsent/" + parentSlug, lang)
+    // (byte-identical href for Norwegian; carries /en on the English page).
+    // 2026-09-03 del 2: "Del av:" reads producer.part_of.
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\$\{localizedPath\("\/produsent\/" \+ parentSlug, lang\)\}">\$\{escapeHtml\(t\(lang, "producer\.part_of"\)\)\} /.test(seoSrc),
     "phase5.11-a5: parent breadcrumb rendered as '← Del av:' link when parent_umbrella_id is set"
   );
   // The breadcrumb is injected ABOVE the H1 inside .umb-hero
@@ -10750,8 +10939,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // ─── Source-presence: link target uses slugify ───────────────────
   assertTrue(
-    /href="\/produsent\/\$\{slug\}"/.test(seoSrc),
-    "phase5.11-a6: umbrella cards link to /produsent/<slug>"
+    // 2026-09-03 språk-økt: umbrella cards now link via localizedPath (same
+    // /produsent/<slug> for Norwegian; /en/produsent/<slug> on the English page).
+    /href="\$\{localizedPath\("\/produsent\/" \+ slug, lang\)\}" class="umb-card"/.test(seoSrc),
+    "phase5.11-a6: umbrella cards link to /produsent/<slug> (language-aware)"
   );
 
   // ─── Source-presence: CSS class definitions ──────────────────────
@@ -17765,6 +17956,24 @@ console.log("\n── experiences scaffold: experience-store ──");
 // unverified-without-evidence skipped, idempotent re-run inserts 0.
 console.log("\n── orch-pr-18: POST /api/opplevelser/admin/bulk-load ──");
 
+// Resolver handles for two blocks declared FURTHER DOWN this file, hoisted so
+// that orch-pr-18 (below) can genuinely await them. Before this hoist, both
+// `await _orchPr...Promise` lines at the top of the orch-pr-18 IIFE were TDZ
+// ReferenceErrors silently swallowed by their own `catch { /* upstream */ }`,
+// so orch-pr-18 actually started at module-load time, unordered relative to
+// every other __setDbForTesting() caller in the file — and its bulk-load
+// requests (now gated on the MAIN db's enrichment_write_pause, fail-closed)
+// non-deterministically saw a foreign, partial-schema singleton ("no such
+// table: enrichment_write_pause" → 423 → bl-4a..4d; PR #765 review finding
+// 1). The IIFEs that RESOLVE these are unchanged and stay where they were
+// (cart MVP ≈ line 25300, prune-dead-urls ≈ line 27080).
+let _orchPr20260614_6Resolve: () => void = () => {};
+const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
+let _orchPr9PruneDeadUrlsResolve: () => void = () => {};
+const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
+  _orchPr9PruneDeadUrlsResolve = r;
+});
+
 let _orchPr18BulkLoadResolve: () => void = () => {};
 const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   _orchPr18BulkLoadResolve = r;
@@ -17778,6 +17987,10 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
   let server18: import("http").Server | null = null;
   let prevRfbDb18: unknown = null;
+  // The handle this block pins (hoisted so the finally can check the
+  // singleton is STILL ours before putting prevRfbDb18 back — never a blind
+  // restore over a sibling block's handle; PR #765 review finding 1b).
+  let rfbDb18Handle: unknown = null;
   // Admission-gate stub bookkeeping (see the stub block inside the try) —
   // hoisted out of the try so the finally can restore them.
   let prevFetch18: typeof globalThis.fetch | null = null;
@@ -17821,6 +18034,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     const RfbDatabase18 = require("better-sqlite3") as typeof import("better-sqlite3");
     prevRfbDb18 = initMod18.__peekDbForTesting();
     const rfbDb18 = new RfbDatabase18(":memory:");
+    rfbDb18Handle = rfbDb18;
     initMod18.__setDbForTesting(rfbDb18 as any);
     initMod18.__initSchemaForTesting(rfbDb18 as any);
     const blocklistSvc18 = require("../src/services/blocklist-service") as typeof import("../src/services/blocklist-service");
@@ -18348,17 +18562,12 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       // Skive D this IIFE never touched that singleton (only dbFactory18's
       // own separate "experiences" cache, which is NOT part of that
       // hazard), so it was never exposed to it; pinning rfbDb18 above (for
-      // agent_blocklist) newly exposes it — and this IIFE's own intended
-      // prerequisite gate (the two `await _orchPr...Promise` lines at the
-      // very top of this IIFE) turns out to be a no-op here: both promises
-      // are declared with `const` FURTHER DOWN this file (after this IIFE),
-      // so referencing them this early is a TDZ ReferenceError that gets
-      // silently swallowed by their own `catch { /* upstream */ }` — this
-      // IIFE actually starts unordered relative to virtually everything
-      // else (confirmed empirically; pre-existing, not introduced by this
-      // PR, and out of scope to fix broadly here — the file's own header
-      // documents a prior attempt at a full ad-hoc-family barrier tripping
-      // a DIFFERENT unrelated race elsewhere in the suite).
+      // agent_blocklist) newly exposes it. (Historical note: this IIFE's
+      // two `await _orchPr...Promise` prerequisite lines used to be TDZ
+      // no-ops because both promises were declared FURTHER DOWN the file;
+      // since PR #765 review finding 1 their declarations are hoisted above
+      // this block, so this IIFE now genuinely runs after prune-dead-urls.
+      // The re-pin-before-dispatch discipline below is kept regardless.)
       //
       // bulkReq()'s own HTTP round trip has multiple await points between
       // "addManualEntry() wrote to rfbDb18" and "the route handler's
@@ -18494,8 +18703,11 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
     try {
-      if (prevRfbDb18) {
-        (require("../src/database/init") as typeof import("../src/database/init")).__setDbForTesting(prevRfbDb18 as any);
+      const initFin18 = require("../src/database/init") as typeof import("../src/database/init");
+      // Re-entrancy-safe: only restore if the singleton is still OUR handle
+      // (same rule __pinInMemoryDbForTesting's restore follows).
+      if (prevRfbDb18 && initFin18.__peekDbForTesting() === rfbDb18Handle) {
+        initFin18.__setDbForTesting(prevRfbDb18 as any);
       }
     } catch {
       // best-effort cleanup
@@ -18533,8 +18745,13 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
 
   const prevPathDedup = process.env.EXPERIENCES_DB_PATH;
   let serverDedup: import("http").Server | null = null;
+  // The dedup-backfill route now reads `enrichment_write_pause` off the MAIN
+  // db singleton (fail-closed) — pin a fresh schema-initialised in-memory
+  // main db for this block, restored in finally.
+  let restoreMainDbDedup: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbDedup = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     // Bust require cache for db-factory + experience-store + the opplevelser
     // route TOGETHER so the route binds to the fresh, :memory:-backed store
@@ -18733,6 +18950,7 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     failed++;
     failures.push("orch-pr-dedup-backfill-endpoint: unexpected error: " + String(err));
   } finally {
+    if (restoreMainDbDedup) restoreMainDbDedup();
     if (serverDedup) {
       await new Promise<void>((resolve) => serverDedup!.close(() => resolve()));
     }
@@ -18770,6 +18988,21 @@ let _titleNoBackfillResolve: () => void = () => {};
 const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   _titleNoBackfillResolve = r;
 });
+// gardssalg-content-refresh's resolver, hoisted next to title-no-backfill's
+// (its IIFE stays where it is, ≈ line 30030). Both blocks pin the MAIN db
+// singleton AND swap the experiences db-factory singleton, so every
+// downstream "full branch set" Deps list (_orchPr21SentLogActorDeps,
+// _adminAgentsRegisterDeps, _oaHomeCountersDeps, _tasksPruneAsyncDeps) must
+// be able to wait on BOTH — the oa-home-counters block (which hosts
+// opplevelser-discover-geo and the big sibling-test run) used to wait only
+// on dedup-backfill, so once gardssalg-content-refresh was serialised after
+// title-no-backfill it slid into that block's window and both sides saw each
+// other's db-factory reset ("database connection is not open" /
+// discover-geo reading 0 rows; PR #765 review finding 1 follow-through).
+let _gardssalgContentRefreshResolve: () => void = () => {};
+const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => {
+  _gardssalgContentRefreshResolve = r;
+});
 
 (async () => {
   // Run after the dedup-backfill test above, which also swaps the
@@ -18780,8 +19013,12 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathTNB = process.env.EXPERIENCES_DB_PATH;
   const prevAnthropicKeyTNB = process.env.ANTHROPIC_API_KEY;
   let serverTNB: import("http").Server | null = null;
+  // title-no-backfill (dry_run:false) is gated on the MAIN db's
+  // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
+  let restoreMainDbTNB: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbTNB = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     const dbFactoryPathTNB = require.resolve("../src/database/db-factory");
     const expStorePathTNB = require.resolve("../src/services/experience-store");
@@ -19056,6 +19293,7 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     failed++;
     failures.push("orch-pr-titleno: unexpected error: " + String(err instanceof Error ? (err.stack || err.message) : err));
   } finally {
+    if (restoreMainDbTNB) restoreMainDbTNB();
     if (serverTNB) {
       await new Promise<void>((resolve) => serverTNB!.close(() => resolve()));
     }
@@ -24485,6 +24723,20 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+    -- outreach-candidates views_count is now "agent_view_daily rollup total +
+    -- remaining raw rows", because the nightly prune deletes raw
+    -- analytics_agent_views rows once they are rolled up here. This
+    -- hand-rolled fixture schema needs the rollup table too.
+    CREATE TABLE agent_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_source TEXT NOT NULL DEFAULT 'unknown',
+      city TEXT NOT NULL DEFAULT '',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id, view_source, city)
+    );
+
     CREATE TABLE agent_blocklist (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       identifier_type TEXT NOT NULL,
@@ -25299,8 +25551,9 @@ const _orchPr14ProductIdPromise: Promise<void> = new Promise<void>(r => { _orchP
 // ── orch-pr-20260614-6: Phase 1 cart MVP ────────────────────────────────────
 console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
 
-let _orchPr20260614_6Resolve: () => void = () => {};
-const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
+// _orchPr20260614_6Resolve / _orchPr20260614_6Promise are declared ABOVE the
+// orch-pr-18 bulk-load block (grep "hoisted so that orch-pr-18") so that
+// block's `await _orchPr20260614_6Promise` is a real await.
 
 (async () => {
   // Wait for Phase 0 to finish so we know __setDbForTesting works
@@ -27061,10 +27314,9 @@ console.log("\n── orch-pr-27: isDirectoryOrAggregatorHost matcher ──");
 // ── orch-pr-9: prune-dead-urls endpoint ──────────────────────────────────────
 console.log("\n── orch-pr-9: POST /admin/prune-dead-urls ──");
 
-let _orchPr9PruneDeadUrlsResolve: () => void = () => {};
-const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
-  _orchPr9PruneDeadUrlsResolve = r;
-});
+// _orchPr9PruneDeadUrlsResolve / _orchPr9PruneDeadUrlsPromise are declared
+// ABOVE the orch-pr-18 bulk-load block (grep "hoisted so that orch-pr-18") so
+// that block's `await _orchPr9PruneDeadUrlsPromise` is a real await.
 
 (async () => {
   // Wait for all prior DB-mutating IIFEs to complete
@@ -27358,6 +27610,8 @@ const _orchPr21SentLogActorDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -27785,6 +28039,8 @@ const _adminAgentsRegisterDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -30001,22 +30257,34 @@ console.log("\n── gardssalg-content-enrichment: summarizeVisit / extractOpen
 // is covered independently by the pure-function block above.
 console.log("\n── gardssalg-content-refresh: POST /api/opplevelser/admin/gardssalg-content-refresh ──");
 
-let _gardssalgContentRefreshResolve: () => void = () => {};
-const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => {
-  _gardssalgContentRefreshResolve = r;
-});
+// _gardssalgContentRefreshResolve / _gardssalgContentRefreshPromise are
+// declared next to the title-no-backfill resolver (grep "hoisted next to") so
+// the "full branch set" Deps lists declared between there and here can wait
+// on this block too. The IIFE below resolves it; unchanged.
 
 (async () => {
   // Serialize after the prior DB-mutating async block (also swaps the
   // experiences db-factory singleton) — same reasoning as that block's own
   // "Run after the prior DB-mutating IIFE" comment.
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
+  // ALSO after title-no-backfill: both that block and this one pin the MAIN
+  // db singleton via __pinInMemoryDbForTesting() for a gated route, and both
+  // used to await only dedup-backfill — i.e. they ran CONCURRENTLY, pinning /
+  // restoring the same singleton interleaved (A pins, B pins with prev = A's
+  // handle, A restores + closes, B restores to A's CLOSED handle → "database
+  // connection is not open" in whichever block ran next; PR #765 review
+  // finding 1). Chain: dedup-backfill → title-no-backfill → this block.
+  try { await _titleNoBackfillPromise; } catch { /* upstream */ }
 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
   let serverGCR: import("http").Server | null = null;
   let dbFactoryGCR: typeof import("../src/database/db-factory") | null = null;
+  // gardssalg-content-refresh (apply:true) is gated on the MAIN db's
+  // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
+  let restoreMainDbGCR: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    restoreMainDbGCR = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
     const dbFactoryPathGCR = require.resolve("../src/database/db-factory");
     const expStorePathGCR = require.resolve("../src/services/experience-store");
@@ -30210,6 +30478,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     failed++;
     failures.push("gardssalg-content-refresh: unexpected error: " + String(err));
   } finally {
+    if (restoreMainDbGCR) restoreMainDbGCR();
     if (serverGCR) {
       await new Promise<void>((resolve) => serverGCR!.close(() => resolve()));
     }
@@ -30335,6 +30604,8 @@ const _oaHomeCountersDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -31394,6 +31665,35 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorj.failures) failures.push("opplevelser-gardssalg-orgnr-review-judge: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-review-judge: ${gorj.passed} passed, ${gorj.failed} failed`);
 
+    // dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror:
+    // POST /admin/gardssalg-website-review-judge — LLM-judge tier for the
+    // website-discovery review queue's [0.90, 0.95) confidence band,
+    // mirroring RFB's shipped rfb-website-review-judge. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-website-review-judge: LLM-judge tier for the website review queue ──");
+    const { runOpplevelserGardssalgWebsiteReviewJudgeTests } = require("../src/routes/opplevelser-gardssalg-website-review-judge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-review-judge.test");
+    const gwrj = await runOpplevelserGardssalgWebsiteReviewJudgeTests({ log: false });
+    passed += gwrj.passed;
+    failed += gwrj.failed;
+    for (const f of gwrj.failures) failures.push("opplevelser-gardssalg-website-review-judge: " + f);
+    console.log(`  opplevelser-gardssalg-website-review-judge: ${gwrj.passed} passed, ${gwrj.failed} failed`);
+
+    // dev-request 2026-09-02-gardssalg-website-review-queue-terminal-parking:
+    // POST /admin/gardssalg-website-review-queue-park — parks the two
+    // terminal-failure `reason` values (verification_failed,
+    // candidate_evidence_failed) on gardssalg_website_review_queue that the
+    // judge/approve drain routes above never touch. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-website-review-queue-park: terminal-failure row parking ──");
+    const { runOpplevelserGardssalgWebsiteReviewQueueParkTests } = require("../src/routes/opplevelser-gardssalg-website-review-queue-park.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-review-queue-park.test");
+    const gwrqp = await runOpplevelserGardssalgWebsiteReviewQueueParkTests({ log: false });
+    passed += gwrqp.passed;
+    failed += gwrqp.failed;
+    for (const f of gwrqp.failures) failures.push("opplevelser-gardssalg-website-review-queue-park: " + f);
+    console.log(`  opplevelser-gardssalg-website-review-queue-park: ${gwrqp.passed} passed, ${gwrqp.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and
@@ -31502,6 +31802,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gscp.failed;
     for (const f of gscp.failures) failures.push("opplevelser-gardssalg-set-contact-phone: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-phone: ${gscp.passed} passed, ${gscp.failed} failed`);
+
+    // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
+    // rapportspraak, del 1: the enrichment write-pause fence (main-db
+    // `enrichment_write_pause`, vertical 'experiences') wired onto every
+    // apply:true admin write route under /api/opplevelser. Proves 423 +
+    // zero rows changed under a live pause, dry-run never blocked, rfb-only
+    // pause leaves experiences untouched, and fail-closed on a throwing
+    // main-db lookup. Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-write-pause-gate: enrichment write-pause fence on apply routes ──");
+    const { runOpplevelserWritePauseGateTests } = require("../src/routes/opplevelser-write-pause-gate.test") as
+      typeof import("../src/routes/opplevelser-write-pause-gate.test");
+    const owpg = await runOpplevelserWritePauseGateTests({ log: false });
+    passed += owpg.passed;
+    failed += owpg.failed;
+    for (const f of owpg.failures) failures.push("opplevelser-write-pause-gate: " + f);
+    console.log(`  opplevelser-write-pause-gate: ${owpg.passed} passed, ${owpg.failed} failed`);
 
     // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
     // 2b: the CONTENT-field counterpart to the two contact endpoints above.
@@ -31792,6 +32109,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esgs.failed;
     for (const f of esgs.failures) failures.push("experience-store-gardssalg-sok: " + f);
     console.log(`  experience-store-gardssalg-sok: ${esgs.passed} passed, ${esgs.failed} failed`);
+
+    // dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+    // publiserte-rader: the owner-lock/published-lock SPLIT —
+    // isExperienceOwnerLocked/isExperiencePublished alongside the unchanged-
+    // semantics isExperienceContentLocked, applyExperienceContent's now
+    // owner-lock-only gate (published rows fill-blank-only), the matching
+    // isExperienceContentGenuinelyThin change, and
+    // selectProvidersForContentRefresh now surfacing published+blank
+    // providers. Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block.
+    console.log("\n── experience-store-lock-split: owner-lock vs. published-lock split ──");
+    const { runExperienceStoreLockSplitTests } = require("../src/services/experience-store-lock-split.test") as
+      typeof import("../src/services/experience-store-lock-split.test");
+    const eslr = await runExperienceStoreLockSplitTests({ log: false });
+    passed += eslr.passed;
+    failed += eslr.failed;
+    for (const f of eslr.failures) failures.push("experience-store-lock-split: " + f);
+    console.log(`  experience-store-lock-split: ${eslr.passed} passed, ${eslr.failed} failed`);
 
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
@@ -32155,6 +32490,8 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -32817,7 +33154,8 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     _pr106Promise, _pr110Promise, _pr125Promise, _seoDentalPromise, _platformVerifierPromise,
     _orchPr20260614_2Promise, _orchPr20260614Promise, _orchPr20260614_5Promise,
     _orchPr20260614_6Promise, _orchPr14ProductIdPromise, _orchPr9PruneDeadUrlsPromise,
-    _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
+    _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _titleNoBackfillPromise,
+    _gardssalgContentRefreshPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
     _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise, _adminDbTableSizesPromise,
     _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
     _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _tasksPruneAsyncPromise,
@@ -33812,13 +34150,118 @@ const _retentionRollupPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice1: nightly auto-prune
+// (AnalyticsService.runAutoPrune(), src/services/analytics-service.ts) now
+// routes analytics_page_views through rollupAndPrunePageViews()
+// (rollup-before-delete into page_view_daily) instead of a raw DELETE, and
+// no longer deletes analytics_queries / analytics_agent_views at all
+// (read-only COUNT(*) sizing only — skippedPendingRollup flags both as
+// pending future rollup coverage). Swaps the shared getDb() singleton (own
+// dedicated test file, in-memory prod-schema DB) — mirroring the
+// retention-rollup block above — so it must run strictly after every other
+// singleton-swapping block; _retentionRollupPromise is the current tail of
+// that serial chain.
+let _autoPruneRollupResolve: () => void = () => {};
+const _autoPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _autoPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_retentionRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice1: auto-prune rollup ──");
+  try {
+    const { runAutoPruneRollupTests } = require("../src/services/analytics-auto-prune-rollup.test") as
+      typeof import("../src/services/analytics-auto-prune-rollup.test");
+    const apr = await runAutoPruneRollupTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("auto-prune-rollup: " + f);
+    console.log(`  auto-prune-rollup: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("auto-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _autoPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+// follow-up to lokal#782: the two MANUAL prune routes (/ops/prune and
+// /prune -> pruneOldData) now share runAutoPrune()'s rollup-before-delete.
+// Swaps the getDb() singleton -> strictly after auto-prune-rollup.
+let _opsPruneRollupResolve: () => void = () => {};
+const _opsPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _opsPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_autoPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── manual prune routes: rollup-before-delete (ops/prune + prune) ──");
+  try {
+    const { runOpsPruneRollupTests } = require("../src/routes/analytics-ops-prune-rollup.test") as
+      typeof import("../src/routes/analytics-ops-prune-rollup.test");
+    const opr = await runOpsPruneRollupTests({ log: false });
+    passed += opr.passed;
+    failed += opr.failed;
+    for (const f of opr.failures) failures.push("ops-prune-rollup: " + f);
+    console.log(`  ops-prune-rollup: ${opr.passed} passed, ${opr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ops-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _opsPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice2: the two analytics tables slice 1
+// had to stop deleting from (analytics_queries, analytics_agent_views) now
+// have rollup destinations — query_daily / query_text_daily /
+// agent_view_daily — plus sessions_daily (TRUE distinct sessions per day,
+// written from the same page-view scan as page_view_daily). runAutoPrune()
+// resumes deleting from all three tables, and admin-outreach-pool /
+// admin-outreach-candidates now count lifetime views as rollup + remaining
+// raw so the dedupe tiebreaker does not silently undercount as history is
+// pruned. Swaps the shared getDb() singleton -> strictly after ops-prune-rollup.
+let _rollupSlice2Resolve: () => void = () => {};
+const _rollupSlice2Promise: Promise<void> = new Promise<void>(r => {
+  _rollupSlice2Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_opsPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice2: query/agent-view/sessions rollup ──");
+  try {
+    const { runAnalyticsRollupSlice2Tests } = require("../src/services/analytics-rollup-slice2.test") as
+      typeof import("../src/services/analytics-rollup-slice2.test");
+    const rs2 = await runAnalyticsRollupSlice2Tests({ log: false });
+    passed += rs2.passed;
+    failed += rs2.failed;
+    for (const f of rs2.failures) failures.push("analytics-rollup-slice2: " + f);
+    console.log(`  analytics-rollup-slice2: ${rs2.passed} passed, ${rs2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-rollup-slice2: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rollupSlice2Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
 // mirroring the already-shipped HCR_CONTENT_PATHS pattern in
 // routes/admin-knowledge.ts. Stubs globalThis.fetch — own dedicated test
 // file, no shared getDb() singleton — so it runs strictly after the last
-// singleton-swapping block (retention-rollup) purely to keep a single,
+// singleton-swapping block (auto-prune-rollup) purely to keep a single,
 // easy-to-follow serial ordering with the rest of this dev-request's tests,
 // not because of any actual shared-state dependency.
 let _pageEvidenceCrawlResolve: () => void = () => {};
@@ -33827,7 +34270,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_retentionRollupPromise]);
+  await Promise.allSettled([_rollupSlice2Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
@@ -34204,6 +34647,38 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-09-02-dental-catalog-class-triage: rule classifier (pure) ──
+  console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage: catalog-class classifier (pure) ──");
+  try {
+    const { runDentalCatalogClassTests } = require("../src/services/dental-catalog-class.test") as
+      typeof import("../src/services/dental-catalog-class.test");
+    const dcc = runDentalCatalogClassTests({ log: false });
+    passed += dcc.passed;
+    failed += dcc.failed;
+    for (const f of dcc.failures) failures.push("dental-catalog-class: " + f);
+    console.log(`  dental-catalog-class: ${dcc.passed} passed, ${dcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-catalog-class: unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
+  //    listPublicDentalAgents/countPublicDentalAgents/getDentalStats/
+  //    getDentalAgentsForSitemap/listRelatedClinics/listPoststeder ──
+  console.log("\n── dev-request 2026-09-03-dental-catalog-class-public-filter: public read surfaces (dental-store) ──");
+  try {
+    const { runDentalStorePublicCatalogClassFilterTests } = require("../src/services/dental-store.test") as
+      typeof import("../src/services/dental-store.test");
+    const dspf = runDentalStorePublicCatalogClassFilterTests({ log: false });
+    passed += dspf.passed;
+    failed += dspf.failed;
+    for (const f of dspf.failures) failures.push("dental-store public catalog-class filter: " + f);
+    console.log(`  dental-store public catalog-class filter: ${dspf.passed} passed, ${dspf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store public catalog-class filter: unexpected error: " + String(err?.message || err));
   }
 
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
@@ -34597,13 +35072,51 @@ const _contentRefreshWebsiteVerificationGatePromise: Promise<void> = new Promise
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-experiences-laas-todeling-fyll-tomme-felt-
+// publiserte-rader: POST /admin/content-refresh now treats a PUBLISHED
+// (verified) row as fill-blank-only rather than fully locked — AC1 (dry-run
+// candidate + provenance), AC2 (apply actually fills a blank field), the
+// evidence_url-fallback-must-not-be-used-for-published-rows source
+// requirement, and manual/claim rows staying fully locked even when
+// published. Own dedicated test file (own in-memory prod-schema DB, swaps
+// the shared experiences db-factory getDb() singleton) — mirrors the block
+// immediately above, so it must run strictly after it;
+// _contentRefreshWebsiteVerificationGatePromise is the current tail of that
+// serial chain.
+let _contentRefreshPublishedFillblankResolve: () => void = () => {};
+const _contentRefreshPublishedFillblankPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshPublishedFillblankResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshWebsiteVerificationGatePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-09-02 laas-todeling: published rows are fill-blank-only on POST /admin/content-refresh ──");
+  try {
+    const { runOpplevelserContentRefreshPublishedFillblankTests } = require("../src/routes/opplevelser-content-refresh-published-fillblank.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-published-fillblank.test");
+    const crpf = await runOpplevelserContentRefreshPublishedFillblankTests({ log: false });
+    passed += crpf.passed;
+    failed += crpf.failed;
+    for (const f of crpf.failures) failures.push("opplevelser-content-refresh-published-fillblank: " + f);
+    console.log(`  opplevelser-content-refresh-published-fillblank: ${crpf.passed} passed, ${crpf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-published-fillblank: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshPublishedFillblankResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice:
 // structured `persistence` field + `errors_by_persistence` tally on both
 // POST /admin/content-refresh and POST /admin/gardssalg-content-refresh
 // (src/routes/opplevelser.ts). Own dedicated test file (own in-memory
 // prod-schema DB, swaps the shared experiences db-factory getDb()
 // singleton) — mirrors the block immediately above, so it must run strictly
-// after it; _contentRefreshWebsiteVerificationGatePromise is the current
+// after it; _contentRefreshPublishedFillblankPromise is the current
 // tail of that serial chain.
 let _contentRefreshErrorsByPersistenceResolve: () => void = () => {};
 const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<void>(r => {
@@ -34611,7 +35124,7 @@ const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<voi
 });
 
 (async () => {
-  await Promise.allSettled([_contentRefreshWebsiteVerificationGatePromise]);
+  await Promise.allSettled([_contentRefreshPublishedFillblankPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── 2026-08-02 AC3-slice: errors_by_persistence on content-refresh + gardssalg-content-refresh ──");
@@ -35098,7 +35611,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _tasksPruneAsyncPromise, _rfbDebioSuitePromise, _dispatchTickSuitePromise,
   _samtalerSeoPromise, _descriptionTruncationSweepPromise, _pwaSwPromise,
   _installPromptPromise, _brregCatalogSweepPromise, _brregDescriptionFallbackPromise,
-  _retentionRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
+  _retentionRollupPromise, _autoPruneRollupPromise, _opsPruneRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
@@ -40681,6 +41194,76 @@ runSerial(async () => {
   }
 });
 
+// Daniel 2026-09-03: «Interne notater skal ikke vises» / «fiks den byttede
+// teksten på Epleblomsten og Nordlysmat» — description-quality internal-note
+// detector, POST /admin/agents/internal-note-sweep and POST /admin/agents/
+// content-correction. Same DB-swap discipline as the siblings above.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 interne notater + innholdsretting: content-quality ──");
+  try {
+    const { runAdminAgentsContentQualityTests } = require("../src/routes/admin-agents-content-quality.test") as
+      typeof import("../src/routes/admin-agents-content-quality.test");
+    const cq = await runAdminAgentsContentQualityTests({ log: false });
+    passed += cq.passed;
+    failed += cq.failed;
+    for (const f of cq.failures) failures.push("content-quality: " + f);
+    console.log(`  content-quality: ${cq.passed} passed, ${cq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-quality: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03 (skjermbilder): kategorier, kontaktkort, fallback-setning,
+// dato og skrapte HTML-entiteter på /en — rfb-en-chrome (rene funksjoner).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 engelsk ramme på rfb: rfb-en-chrome ──");
+  try {
+    const { runRfbEnChromeTests } = require("../src/routes/rfb-en-chrome.test") as typeof import("../src/routes/rfb-en-chrome.test");
+    const ec = runRfbEnChromeTests({ log: false });
+    passed += ec.passed; failed += ec.failed;
+    for (const f of ec.failures) failures.push("rfb-en-chrome: " + f);
+    console.log(`  rfb-en-chrome: ${ec.passed} passed, ${ec.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-en-chrome: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — product-glossary.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 produkt-ordliste: product-glossary ──");
+  try {
+    const { runProductGlossaryTests } = require("../src/i18n/product-glossary.test") as typeof import("../src/i18n/product-glossary.test");
+    const pg = runProductGlossaryTests({ log: false });
+    passed += pg.passed; failed += pg.failed;
+    for (const f of pg.failures) failures.push("product-glossary: " + f);
+    console.log(`  product-glossary: ${pg.passed} passed, ${pg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-glossary: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «Om man har valgt å bytte til Engelsk skal det språket
+// være default for den brukeren frem til dem bytter tilbake eller går ut av
+// siden» — i18n/middleware.ts rfbLangSessionMiddleware (real express app over
+// loopback, sets/restores its own flags).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 språk-økt (rfb_lang_session): lang-session ──");
+  try {
+    const { runLangSessionTests } = require("../src/i18n/lang-session.test") as typeof import("../src/i18n/lang-session.test");
+    const ls = await runLangSessionTests({ log: false });
+    passed += ls.passed;
+    failed += ls.failed;
+    for (const f of ls.failures) failures.push("lang-session: " + f);
+    console.log(`  lang-session: ${ls.passed} passed, ${ls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lang-session: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-03-mikhailo-quarantine-gates: three additive quarantine
 // gates on self-registered marketplace agents (Gate 1 visibility, Gate 2
 // verified-badge withholding, Gate 3 delayed IndexNow), keyed off two new
@@ -41753,5 +42336,103 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-verifier-claim-counts: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
+// content-judge sweep's new quarantine-exit promotion transition
+// (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
+// + an independently verified source [hjemmeside OR evidence_url] + already
+// high/medium confidence — never on the judge verdict alone), its additive
+// experience_admission_promotion_audit trail, and the batch-level rollback
+// route (POST /admin/experiences-admission-promotion-rollback). Own
+// dedicated in-memory-db harness (mirrors opplevelser-experiences-content-
+// judge-sweep.test.ts's harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: admission promotion + rollback ──");
+  try {
+    const { runOpplevelserExperiencesAdmissionPromotionTests } = require("../src/routes/opplevelser-experiences-admission-promotion.test") as
+      typeof import("../src/routes/opplevelser-experiences-admission-promotion.test");
+    const eap = await runOpplevelserExperiencesAdmissionPromotionTests({ log: false });
+    passed += eap.passed;
+    failed += eap.failed;
+    for (const f of eap.failures) failures.push("opplevelser-experiences-admission-promotion: " + f);
+    console.log(`  opplevelser-experiences-admission-promotion: ${eap.passed} passed, ${eap.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-admission-promotion: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent — the
+// EN/SV profile-translation rullebånd (src/services/profile-translations.ts +
+// src/routes/admin-profile-translations.ts + the sv locale in src/i18n/t.ts):
+// pure verify/plan/i18n units, the staged store against a :memory: rfb db with
+// an injected fetch playing translator+reviewer, the admin route incl. the
+// flag-OFF no-op proof, and opplevagent source collection against a :memory:
+// experiences db. Tail position is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: profile-translations ──");
+  try {
+    const { runProfileTranslationsTests } = require("../src/services/profile-translations.test") as
+      typeof import("../src/services/profile-translations.test");
+    const pt = await runProfileTranslationsTests({ log: false });
+    passed += pt.passed;
+    failed += pt.failed;
+    for (const f of pt.failures) failures.push("profile-translations: " + f);
+    console.log(`  profile-translations: ${pt.passed} passed, ${pt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel GO #1
+// — the in-process profile-translation worker (src/services/profile-
+// translations-worker.ts): config/mode units, intensive concurrency +
+// platform interleave, steady hourly budget, infra backoff, and the run lock
+// shared with the admin route. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler (GO #1): profile-translations-worker ──");
+  try {
+    const { runProfileTranslationsWorkerTests } = require("../src/services/profile-translations-worker.test") as
+      typeof import("../src/services/profile-translations-worker.test");
+    const pw = await runProfileTranslationsWorkerTests({ log: false });
+    passed += pw.passed;
+    failed += pw.failed;
+    for (const f of pw.failures) failures.push("profile-translations-worker: " + f);
+    console.log(`  profile-translations-worker: ${pw.passed} passed, ${pw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations-worker: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-02-dental-verifier-website-ownership — the new
+// automated dental verifier (src/services/dental-verifier.ts): pure unit
+// coverage (countRichFields, websiteOwnershipMatch, isWebsiteOwnershipCache
+// Fresh, interpretBrregResult, computeDentalVerifiedRule) plus integration
+// coverage of runDentalVerifierBatch() against an in-memory dental.db with
+// injected brregLookupFn/fetchPageFn/now (verified rule, 3-strike downgrade,
+// any-success-resets-the-streak, Brreg dissolved/bankrupt inactive path,
+// 7-day homepage cache TTL, offentlig_klinikk+directory_url path, NACE
+// mismatch, specialists_verified, rejected/non-clinic picker exclusion).
+// Tail position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-dental-verifier-website-ownership: dental-verifier ──");
+  try {
+    const { runDentalVerifierTests } = require("../src/services/dental-verifier.test") as
+      typeof import("../src/services/dental-verifier.test");
+    const dv = await runDentalVerifierTests({ log: false });
+    passed += dv.passed;
+    failed += dv.failed;
+    for (const f of dv.failures) failures.push("dental-verifier: " + f);
+    console.log(`  dental-verifier: ${dv.passed} passed, ${dv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-verifier: unexpected error: " + String(err?.message || err));
   }
 });

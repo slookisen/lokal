@@ -454,9 +454,14 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         // below would read false for reasons that have nothing to do with
         // suppression — a test that "passes" because its fixture never qualified
         // proves nothing about the clause under test.
-        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status,
+        // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+        // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+        // products>=3) against the raw columns, not just enrichment_status='rich'
+        // — an explicit about text keeps this fixture pool-eligible (this test is
+        // about cross-platform suppression scoping, not content depth).
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, about, verification_status, enrichment_status,
                       url_last_status, url_last_probed)
-                    VALUES ('agent-doble','doble@example.no','verified','rich',200,datetime('now'))`).run();
+                    VALUES ('agent-doble','doble@example.no',?,'verified','rich',200,datetime('now'))`).run("x".repeat(200));
 
         const mkSend = (vertical: string, msgId: string) => {
           const c = require("./crm-service").crmService.resolveContact("doble@example.no", null, vertical);

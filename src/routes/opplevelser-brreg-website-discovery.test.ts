@@ -65,6 +65,9 @@ export function runOpplevelserBrregWebsiteDiscoveryTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) { passed++; if (log) console.log(`  ✓ ${label}`); }
@@ -98,6 +101,7 @@ export function runOpplevelserBrregWebsiteDiscoveryTests(
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const oppl = require("./opplevelser") as typeof import("./opplevelser");
       const opplevelserRouter = oppl.default as any;
       const brregClient = require("../services/brreg-client") as typeof import("../services/brreg-client");
@@ -767,6 +771,7 @@ export function runOpplevelserBrregWebsiteDiscoveryTests(
       failed++;
       failures.push("opplevelser-brreg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;

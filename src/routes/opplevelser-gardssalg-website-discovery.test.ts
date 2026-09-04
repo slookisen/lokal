@@ -852,6 +852,70 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(pnAlone.verified, false, "wd-12j: place+postnummer WITHOUT the name never verifies — thousands share a postal code");
       }
 
+      // ── wd-29: prefix-token + domain corroboration branch (Steg 6 smal
+      //    variant, dev-request 2026-08-02-opplevagent-hjemmesideverifisering-
+      //    og-enrichment-gate) — a NEW, independent 4th verified branch: a
+      //    prefix-token match of the producer's name (e.g. «Austmann» as a
+      //    prefix of «Austmann Bryggeri») is accepted as sufficient evidence
+      //    ONLY when corroborated by BOTH the page's own <title> AND the
+      //    page's own fetched host — never place-carrying, never a bare
+      //    prefix without domain corroboration. ─────────────────────────────
+      {
+        const austmannTarget = { orgNr: null, navn: "Austmann Bryggeri", kommune: null, poststed: null };
+        const austmannText = "Velkommen til Austmann. Vi lager håndverksøl.";
+
+        // (i) prefix + title + domain corroboration → verified.
+        const pfx1 = expStore.gardssalgWebsiteEvidenceMatch(
+          austmannText, austmannTarget, "Austmann – bryggeri i Norge", "austmann.no");
+        assertEq(pfx1.name_found, false, "wd-29a: the FULL name «austmann bryggeri» is not in the body — only the prefix token is");
+        assertEq(pfx1.prefix_token_found, true, "wd-29b: prefix token corroborated by both title and domain");
+        assertEq(pfx1.verified, true, "wd-29c: prefix + title + domain corroboration verifies on its own, no other branch involved");
+
+        // (ii) same row, host that does NOT contain the prefix → no domain
+        // corroboration → not verified (and no other branch fires either).
+        const pfx2 = expStore.gardssalgWebsiteEvidenceMatch(
+          austmannText, austmannTarget, "Austmann – bryggeri i Norge", "example.no");
+        assertEq(pfx2.prefix_token_found, false, "wd-29d: without domain corroboration, prefix_token_found is false");
+        assertEq(pfx2.verified, false, "wd-29e: …and nothing else verifies for this fixture either");
+
+        // (iii) same row, no title source offered at all → fail-closed, same
+        // pattern as the pre-existing `pageTitle` fail-closed behavior.
+        const pfx3 = expStore.gardssalgWebsiteEvidenceMatch(austmannText, austmannTarget, undefined, "austmann.no");
+        assertEq(pfx3.verified, false, "wd-29f: fail-closed when no title source is offered, even with domain corroboration");
+
+        // (iv) a place-carrying-only fixture (kommune in the page body) with
+        // NO prefix-title-match and NO domain corroboration → the new branch
+        // does not contribute — the existing weakest-branch behavior for
+        // this fixture (verified via name+place, no title offered) is
+        // completely unaffected, proving the new branch isn't leaking
+        // place-carrying in.
+        const placeOnlyBase = { orgNr: null, navn: "Fjelldal Brenneri", kommune: "Saltdal", poststed: null };
+        const placeOnlyPfx = expStore.gardssalgWebsiteEvidenceMatch(
+          "Fjelldal Brenneri ligger i Saltdal", placeOnlyBase, undefined, "example.no");
+        assertEq(placeOnlyPfx.verified, true, "wd-29g: place-carrying-only fixture still verifies via the pre-existing weakest branch");
+        assertEq(placeOnlyPfx.prefix_token_found, false, "wd-29h: …and the NEW branch itself never fired for it");
+
+        // (v) short-prefix guard: "Ol Gård" → prefix token "ol" (2 chars) —
+        // must never fire the new branch even with title+domain otherwise
+        // lined up (mirrors nameSpecific's guard against generic short
+        // single tokens).
+        const olTarget = { orgNr: null, navn: "Ol Gård", kommune: null, poststed: null };
+        const pfxShort = expStore.gardssalgWebsiteEvidenceMatch(
+          "Om Ol Gård", olTarget, "Ol Gård – hjemmeside", "olgard.no");
+        assertEq(pfxShort.prefix_token_found, false, "wd-29i: a prefix token shorter than 4 characters never fires the new branch");
+        assertEq(pfxShort.verified, false, "wd-29j: …so this fixture stays unverified overall");
+
+        // (vi) the Rosenlund/vinaroma.no example from the spec: title
+        // corroborates but the domain does not contain the prefix token →
+        // domain corroboration fails and the branch does not verify,
+        // regardless of the title match.
+        const rosenlundTarget = { orgNr: null, navn: "Rosenlund Gård", kommune: null, poststed: null };
+        const pfxRosenlund = expStore.gardssalgWebsiteEvidenceMatch(
+          "Rosenlund – gårdsbutikk", rosenlundTarget, "Rosenlund Gårdsbutikk", "vinaroma.no");
+        assertEq(pfxRosenlund.prefix_token_found, false, "wd-29k: vinaroma.no does not contain «rosenlund» — domain corroboration fails despite the title match");
+        assertEq(pfxRosenlund.verified, false, "wd-29l: …so verified stays false via this branch");
+      }
+
       // ── wd-13: contact-page link extraction ────────────────────────────
       {
         const html = `<a href="/kontakt">Kontakt oss</a>

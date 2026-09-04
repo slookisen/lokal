@@ -14,7 +14,7 @@
 // Off via ?dedupe_by_email=false; defaults to true.
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, POOL_CONTENT_THRESHOLD_SQL } from "../database/init";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
@@ -130,12 +130,22 @@ router.get("/stats", (req: Request, res: Response) => {
     // Funnel: each step ANDs one more outreach_ready_pool gate onto the last,
     // in the same order the VIEW applies them, so the counts strictly
     // decrease and the biggest single drop identifies the bottleneck gate.
+    //
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A):
+    // the VIEW now also requires POOL_CONTENT_THRESHOLD_SQL alongside
+    // enrichment_status IN ('partial','rich') — ANDed in here too (imported
+    // from database/init.ts verbatim, not re-derived) so this funnel's counts
+    // never drift from what the VIEW actually admits. The
+    // `verified_and_rich_or_partial` key name is left as-is even though the
+    // gate is now stricter than its name alone suggests — renaming it is out
+    // of scope for this dev-request.
     const funnelBase = `
       FROM agents a
       INNER JOIN agent_knowledge k ON k.agent_id = a.id
       WHERE a.umbrella_type IS NULL
         AND k.verification_status = 'verified'
-        AND k.enrichment_status IN ('partial', 'rich')`;
+        AND k.enrichment_status IN ('partial', 'rich')
+        AND ${POOL_CONTENT_THRESHOLD_SQL}`;
     const verifiedRichOrPartial = db.prepare(`SELECT COUNT(*) AS c ${funnelBase}`).get() as { c: number };
     const withEmail = db
       .prepare(`SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''`)
@@ -531,7 +541,16 @@ router.get("/", (req: Request, res: Response) => {
             p.*,
             k.google_rating,
             k.google_review_count,
-            (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id) AS views_count
+            -- orch-pr-20260903-analytics-rollup-slice2: views_count is a
+            -- LIFETIME total feeding the dedupe tiebreaker in
+            -- marketing-dedupe.ts. From that slice on, the nightly prune rolls
+            -- analytics_agent_views up into agent_view_daily and then DELETEs
+            -- the raw rows, so a bare COUNT(*) would silently undercount every
+            -- agent whose views predate the prune cutoff — and would shuffle
+            -- dedupe winners as history ages out. Lifetime total = permanent
+            -- rollup + whatever raw rows have not been pruned yet.
+            (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id), 0)
+             + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id)) AS views_count
          FROM outreach_ready_pool p
          INNER JOIN agent_knowledge k ON k.agent_id = p.agent_id
          ORDER BY COALESCE(p.outreach_eligible_at, '9999-12-31') ASC

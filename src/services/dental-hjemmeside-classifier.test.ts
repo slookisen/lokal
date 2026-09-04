@@ -179,6 +179,28 @@ export function runDentalHjemmesideClassifierTests(
       failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.stack || err?.message || err));
     }
 
+    // ── dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning ──
+    //    (steg 2a): extended directory list + "social" class.
+    try {
+      assertEq(
+        classifyHjemmeside("https://www.tannlegernorge.no/trondelag/hoylandet/hoylandet-tannklinikk/"),
+        { isBad: true, reason: "directory" },
+        "tannlegernorge.no (distinct from tannlegerinorge.no) is a directory",
+      );
+      assertEq(classifyHjemmeside("https://aksdal.opusdentalonline.com/login.aspx"), { isBad: true, reason: "directory" }, "Opus booking portal is a directory");
+      assertEq(classifyHjemmeside("https://maps.app.goo.gl/khd59A3DhXxvbekNA"), { isBad: true, reason: "directory" }, "Google Maps short link is a directory");
+      assertEq(classifyHjemmeside("https://www.odont.uio.no/iko/personer/vit/thjortsj/"), { isBad: true, reason: "directory" }, "UiO staff page is a directory");
+      assertEq(classifyHjemmeside("https://www.proff.no/selskap/x"), { isBad: true, reason: "directory" }, "proff.no is a directory");
+      assertEq(classifyHjemmeside("https://www.facebook.com/bergdentalas/"), { isBad: true, reason: "social" }, "Facebook page is social");
+      assertEq(classifyHjemmeside("https://nb-no.facebook.com/Finneidfjord-Tannklinikk-1499079680303795/"), { isBad: true, reason: "social" }, "localized Facebook subdomain is social");
+      assertEq(classifyHjemmeside("https://www.instagram.com/klinikk"), { isBad: true, reason: "social" }, "Instagram is social");
+      assertEq(classifyHjemmeside("https://tannlegegiving.no/"), { isBad: false, reason: null }, "own domain still not flagged");
+      assertEq(classifyHjemmeside("https://www.mrfylke.no/tannhelse/klinikker/x"), { isBad: false, reason: null }, "fylkeskommune host is NOT flagged by this classifier (handled by dental-catalog-class)");
+    } catch (err: any) {
+      failed++;
+      failures.push("dental-hjemmeside-classifier (steg 2a): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
     return { passed, failed, failures };
   })();
 }

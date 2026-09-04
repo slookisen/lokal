@@ -17,9 +17,11 @@
 // clinic's real homepage out of hjemmeside, so every heuristic below is
 // deliberately conservative — when genuinely unsure, don't flag.
 
+export type HjemmesideBadReason = "directory" | "business_site" | "parked" | "social";
+
 export interface HjemmesideClassification {
   isBad: boolean;
-  reason: "directory" | "business_site" | "parked" | null;
+  reason: HjemmesideBadReason | null;
 }
 
 // Known directory / booking-portal / industry-association domains that show
@@ -33,6 +35,36 @@ export const KNOWN_DIRECTORY_DOMAINS: readonly string[] = [
   "tannlegerinorge.no",
   "tannlegetidende.no",
   "kjeveortopediskforening.no",
+  // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
+  // (steg 2 of the 2026-09-02 dental pipeline review): measured against the
+  // live catalog -- tannlegernorge.no (25 rows; NOT the same site as
+  // tannlegerinorge.no above, which is why the sweep never caught it),
+  // the three big Norwegian business directories, Google's Opus online-
+  // booking portal (a login page, not a homepage), a UiO staff page that
+  // Places wrote as a clinic homepage, and the Google Maps short-link
+  // domains Places sometimes returns as websiteUri.
+  "tannlegernorge.no",
+  "1881.no",
+  "gulesider.no",
+  "proff.no",
+  "opusdentalonline.com",
+  "odont.uio.no",
+  "maps.app.goo.gl",
+  "goo.gl",
+  "alti.no",
+];
+
+// Social-media / page-builder hosts that show up as hjemmeside instead of a
+// clinic's own site. Flagged with reason "social": a Facebook page IS often
+// the clinic's only web presence, so the cleanup sweep still moves it to
+// directory_url (it cannot be crawled by Stage X and pollutes the
+// raw+hjemmeside pool), but the public profile may keep rendering it from
+// directory_url as a "Facebook"-link later (steg 5).
+export const KNOWN_SOCIAL_DOMAINS: readonly string[] = [
+  "facebook.com",
+  "fb.com",
+  "instagram.com",
+  "linkedin.com",
 ];
 
 // Small, conservative list of domain-PARKING service hostnames. We cannot
@@ -106,6 +138,10 @@ export function classifyHjemmeside(url: string | null | undefined): HjemmesideCl
 
   for (const parkingHost of KNOWN_PARKING_HOSTNAMES) {
     if (hostMatchesDomain(hostname, parkingHost)) return { isBad: true, reason: "parked" };
+  }
+
+  for (const socialHost of KNOWN_SOCIAL_DOMAINS) {
+    if (hostMatchesDomain(hostname, socialHost)) return { isBad: true, reason: "social" };
   }
 
   return NOT_BAD;

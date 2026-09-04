@@ -42,9 +42,15 @@
  *     (review_required on its own) still reaches verified — the literal
  *     "~136 blocked_phone_only" acceptance scenario — while phone is STILL
  *     computed and present in cross_source_reason for review-queue display.
- *   - Regression: lokal#433's enrichment_status='rich'-only outreach_ready_pool
- *     requirement is completely unaffected — a 'verified' agent whose content
- *     only reaches 'partial' (not 'rich') still never appears in the pool.
+ *   - Fixture 12 (formerly a lokal#433 'rich'-only regression pin, UPDATED for
+ *     dev-request 2026-09-02-rfb-pool-view-rich-vs-partial, Daniel option A):
+ *     outreach_ready_pool now accepts 'partial' too, as long as content_
+ *     threshold (about>=80 OR products>=3) is cleared — the same gate
+ *     computeKvalitetsGate already applies before an agent can even reach
+ *     'verified'. A 'verified'-but-'partial' agent whose about clears 80
+ *     chars now DOES reach the pool (was excluded pre-2026-09-02); Steg B
+ *     itself is still unaffected either way — this fixture only pins the
+ *     separate VIEW-content-threshold gate's current behaviour.
  *
  * Exported runLokalAgentVerifierStegBEmailWebsiteGateTests({log}) ->
  * TestSummary; wired into tests/test.ts.
@@ -358,15 +364,20 @@ export function runLokalAgentVerifierStegBEmailWebsiteGateTests(
         },
       });
 
-      // ── Fixture 12 (lokal#433 regression): 'rich' requirement untouched ────
+      // ── Fixture 12 (VIEW content-threshold behaviour, UPDATED 2026-09-02) ───
       // Same corroborated-email + address + website as fixture 11, but
       // PARTIAL content: about is 80-149 chars (clears computeKvalitetsGate's
       // content_threshold — about>=80 OR products>=3 — so the agent CAN reach
       // 'verified') yet stays under computeEnrichmentStatus's 'rich' bar
-      // (about>=150 AND products>=3 AND address). Must reach 'verified' (Steg
-      // B gates cleared) but must NEVER appear in outreach_ready_pool, because
-      // enrichment_status lands on 'partial', not 'rich' — proves Steg B did
-      // not loosen the separate lokal#433 gate.
+      // (about>=150 AND products>=3 AND address), so enrichment_status lands
+      // on 'partial', not 'rich'. Must reach 'verified' (Steg B gates
+      // cleared). Pre-2026-09-02 this agent was excluded from
+      // outreach_ready_pool solely for being 'partial' — dev-request
+      // 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A) changed
+      // the VIEW to accept 'partial' when content_threshold passes, which it
+      // does here (about=105>=80), so this agent now DOES reach the pool.
+      // Proves Steg B and the VIEW's content-threshold gate stay independent
+      // — Steg B never had to change for this.
       seedAgent({
         id: "stegb-rich-regression",
         name: "Delvisinnhold Gård",
@@ -502,14 +513,17 @@ export function runLokalAgentVerifierStegBEmailWebsiteGateTests(
       assertEq(phoneReason?.verdict, "review_required",
         "stegb-29: phone's OWN verdict is still review_required (1 source) — it just doesn't gate the agent anymore");
 
-      // ── Fixture 12 assertions (lokal#433 regression) ─────────────────────────
+      // ── Fixture 12 assertions (VIEW content-threshold behaviour) ────────────
       const r12 = resultFor("stegb-rich-regression");
       assertEq(r12.new_verification_status, "verified",
         "stegb-30: Steg B gates (address + corroborated email + live website) all clear -> verified");
       assertEq(r12.new_enrichment_status, "partial",
-        "stegb-31: enrichment_status lands on 'partial' (about=105 chars clears content_threshold>=80 but is under the 'rich' bar of >=150; 0 products) — lokal#433's rich bar is a completely separate, untouched computation");
+        "stegb-31: enrichment_status lands on 'partial' (about=105 chars clears content_threshold>=80 but is under the 'rich' bar of >=150; 0 products) — the 'rich' bar is a completely separate, untouched computation");
       const pool12 = db.prepare("SELECT 1 FROM outreach_ready_pool WHERE agent_id = ?").get("stegb-rich-regression");
-      assertTrue(!pool12, "stegb-32: 'verified'-but-partial agent still never reaches outreach_ready_pool — lokal#433's enrichment_status='rich' requirement is completely unaffected by Steg B");
+      assertTrue(!!pool12,
+        "stegb-32 (dev-request 2026-09-02-rfb-pool-view-rich-vs-partial): 'verified'+'partial' agent now DOES reach outreach_ready_pool because content_threshold passes (about=105>=80) — the VIEW no longer requires 'rich'");
+      assertTrue(r12.outreach_eligible_at !== null,
+        "stegb-33: outreach_eligible_at is stamped (nowInPool=true) — verifier-side pool_added counting agrees with the VIEW");
     } finally {
       initMod.__setDbForTesting(prevDb);
       (globalThis as any).fetch = prevFetch;
