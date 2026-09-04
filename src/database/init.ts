@@ -126,8 +126,30 @@ export function getDb(): Database.Database {
 // from the VIEW; lokal-agent-verifier.ts's `nowInPool` mirrors the identical
 // boolean in JS via computeKvalitetsGate's own `content_threshold` output
 // (same about/products inputs), rather than importing this SQL string.
+//
+// json_valid() GUARD (fix-up on PR #796, independent-reviewer finding):
+// `agent_knowledge.products` has no JSON validation at the schema level (no
+// CHECK constraint, no trigger) and is written by 100+ files, so a malformed
+// value is realistic, not hypothetical. SQLite's json_array_length() throws
+// a hard "malformed JSON" error on a non-JSON string, and — empirically
+// verified against better-sqlite3 (12.8.0) / SQLite 3.51.3, not merely
+// reasoned about — a bare `OR json_array_length(...)` does NOT reliably
+// avoid that: SQLite's boolean short-circuiting is context-dependent, so the
+// fix must specifically be validated in the WHERE-clause context this
+// constant is actually used in (the outreach_ready_pool VIEW's WHERE, and
+// funnelBase's WHERE in admin-outreach-pool.ts) — both AND ${POOL_CONTENT_
+// THRESHOLD_SQL} into a WHERE clause, never a SELECT result-column list.
+// Confirmed empirically there: `json_valid(COALESCE(k.products,'[]')) AND
+// json_array_length(COALESCE(k.products,'[]')) >= 3`, filtered via WHERE,
+// DOES short-circuit — json_array_length is never reached when json_valid
+// is 0 — so a malformed row fails content_threshold safely (excluded, not a
+// crash) and does not take the whole VIEW down for every other row. NOTE:
+// this guard is WHERE-clause-safe specifically; if this constant is ever
+// interpolated into a SELECT result-column expression instead (not a WHERE
+// predicate), re-verify empirically first — result-column AND does not
+// short-circuit the same way in this SQLite build.
 export const POOL_CONTENT_THRESHOLD_SQL =
-  "(length(COALESCE(k.about,'')) >= 80 OR json_array_length(COALESCE(k.products,'[]')) >= 3)";
+  "(length(COALESCE(k.about,'')) >= 80 OR (json_valid(COALESCE(k.products,'[]')) AND json_array_length(COALESCE(k.products,'[]')) >= 3))";
 
 function initSchema(db: Database.Database): void {
   db.exec(`

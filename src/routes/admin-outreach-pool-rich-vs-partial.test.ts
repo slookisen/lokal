@@ -35,6 +35,26 @@
  *    gate.test.ts integration fixtures (seed via runVerifierBatch, assert on
  *    outreach_ready_pool membership / outreach_eligible_at). Test 4.
  *
+ * 5. MALFORMED-JSON REGRESSION (fix-up on PR #796, independent-reviewer
+ *    finding): `k.products` has no JSON validation at the schema level, and
+ *    SQLite's `json_array_length()` throws a hard "malformed JSON" error on
+ *    a non-JSON string — with the pre-fix `OR json_array_length(...)`
+ *    predicate, ONE row with corrupted `products` made `outreach_ready_pool`
+ *    throw for the WHOLE VIEW (every row, not just the bad one), and made
+ *    GET /admin/outreach-ready-pool/stats 500. Fixed by guarding with
+ *    `json_valid(...) AND json_array_length(...)` (POOL_CONTENT_THRESHOLD_SQL,
+ *    database/init.ts) — verified empirically (see that file's comment) that
+ *    SQLite short-circuits AND in this WHERE-clause context, so
+ *    json_array_length is never reached when json_valid is false. Test 5
+ *    seeds a malformed-products row alongside a healthy 'rich' row in the
+ *    SAME query batch and asserts: (a) the VIEW query does not throw, (b)
+ *    the malformed row is safely excluded (not admitted), and (c) the
+ *    healthy row still appears — i.e. one bad row does not take down
+ *    visibility for everyone else. Test 6 covers the same malformed-JSON
+ *    safety for the /stats funnelBase query path (same POOL_CONTENT_
+ *    THRESHOLD_SQL import), since it is a separate query string that could
+ *    in principle drift from the VIEW.
+ *
  * SCOPE NOTE: GET /admin/outreach-candidates (admin-outreach-candidates.ts)
  * reads this same VIEW but then re-runs its OWN independent
  * coreEligibilityCheck(), which still hard-codes enrichment_status==='rich'
@@ -224,6 +244,80 @@ export function runAdminOutreachPoolRichVsPartialTests(opts: { log?: boolean } =
         statsRes.body?.pool_size,
         viewRows.length,
         "rvp-06: pool_funnel.verified_and_rich_or_partial's cohort and pool_size (raw VIEW COUNT(*)) agree — both content-threshold-gated identically",
+      );
+
+      // ── Test 5 (malformed-JSON regression, fix-up on PR #796) ──────────
+      // Reuses the SAME `db` as Tests 1-3 (still holding rvp-partial-pass,
+      // rvp-partial-thin, rvp-rich-control) so the healthy rows below are
+      // genuinely "the same query batch" the reviewer's finding is about —
+      // one corrupted row must not take down visibility for the others.
+      // Inserted via raw db.prepare (not the insertKnowledge() helper, which
+      // always JSON.stringifies its `products` argument) specifically so
+      // `products` lands as the literal non-JSON string 'CORRUPTED-NOT-JSON',
+      // reproducing the exact malformed value the reviewer seeded.
+      insertAgent("rvp-malformed-products", "Korrupt Data Gård", "malformed@rvp-test.no");
+      db.prepare(`
+        INSERT INTO agent_knowledge
+          (agent_id, email, field_provenance, verification_status, enrichment_status,
+           url_last_status, url_last_probed, about, products)
+        VALUES (?, ?, '{}', 'verified', 'partial', 200, datetime('now'), ?, 'CORRUPTED-NOT-JSON')
+      `).run("rvp-malformed-products", "malformed@rvp-test.no", "x".repeat(40)); // short about too -> would only pass via products
+
+      let viewRowsAfterMalformed: Array<{ agent_id: string }> = [];
+      let viewThrew: unknown = null;
+      try {
+        viewRowsAfterMalformed = db
+          .prepare(`SELECT agent_id FROM outreach_ready_pool ORDER BY email`)
+          .all() as Array<{ agent_id: string }>;
+      } catch (err) {
+        viewThrew = err;
+      }
+      assertEq(
+        viewThrew,
+        null,
+        "rvp-12: querying outreach_ready_pool with a malformed-products row present does NOT throw (json_valid guard)",
+      );
+      const idsAfterMalformed = viewRowsAfterMalformed.map((r) => r.agent_id);
+      assertTrue(
+        !idsAfterMalformed.includes("rvp-malformed-products"),
+        "rvp-13: the malformed-products row itself does NOT appear in the pool (fails content_threshold safely, not a crash)",
+      );
+      assertTrue(
+        idsAfterMalformed.includes("rvp-rich-control"),
+        "rvp-14: a separate, otherwise-healthy 'rich' row in the same batch still appears — one bad row does not take down the whole VIEW",
+      );
+      assertTrue(
+        idsAfterMalformed.includes("rvp-partial-pass"),
+        "rvp-15: a separate, otherwise-healthy 'partial' row in the same batch still appears too",
+      );
+
+      // ── Test 6 (malformed-JSON regression, /stats funnelBase path) ─────
+      // Same malformed row is now also in the funnelBase query's join —
+      // confirms the stats endpoint (a separate query string from the VIEW,
+      // same POOL_CONTENT_THRESHOLD_SQL import) doesn't 500 either, and its
+      // count still matches pool_size exactly (malformed row excluded from
+      // both, consistently).
+      delete require.cache[require.resolve("./admin-outreach-pool")];
+      const statsRouteMod2 = require("./admin-outreach-pool");
+      const statsRouter2 = statsRouteMod2.default;
+      const statsRes2 = callRouteSync(statsRouter2, {
+        url: "/stats",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(
+        statsRes2.status,
+        200,
+        "rvp-16: GET /admin/outreach-ready-pool/stats -> 200 even with a malformed-products row present (no 500)",
+      );
+      assertEq(
+        statsRes2.body?.pool_funnel?.verified_and_rich_or_partial,
+        2,
+        "rvp-17: funnelBase's count is unaffected by the malformed row (still 2: partial-pass + rich-control)",
+      );
+      assertEq(
+        statsRes2.body?.pool_size,
+        viewRowsAfterMalformed.length,
+        "rvp-18: pool_size and funnelBase's count still agree with the malformed row present",
       );
 
       // ── Test 4 (nowInPool / verifier) ───────────────────────────────────
