@@ -9639,6 +9639,21 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a3: POST /admin/affiliations rejects umbrella_id that is NOT an umbrella"
   );
 
+  // Test 3.14b: POST /admin/affiliations allows a regional market_network umbrella to
+  // affiliate with its own parent market_network umbrella (child joining its own parent)
+  assertTrue(
+    /producer\.umbrella_type === "market_network" && producer\.parent_umbrella_id === umbrellaId/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations has market_network-child-of-target-umbrella exception check"
+  );
+  assertTrue(
+    postAffBody.includes("parent_umbrella_id FROM agents WHERE id = ?"),
+    "phase5.11-a3: POST /admin/affiliations reads producer.parent_umbrella_id to evaluate the exception"
+  );
+  assertTrue(
+    /if \(!isChildOfTargetUmbrella\) \{[\s\S]{0,200}producer_id is an umbrella — affiliations link producers TO umbrellas[\s\S]{0,200}\}/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations still unconditionally rejects producer_id-is-umbrella in the general (non-exception) case"
+  );
+
   // Test 3.15: POST /admin/affiliations is idempotent (upsert via UNIQUE)
   assertTrue(
     /UPDATE agent_affiliations[\s\S]{0,2000}WHERE id = \?/.test(postAffBody) &&

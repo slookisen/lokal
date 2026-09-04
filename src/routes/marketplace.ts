@@ -5059,11 +5059,18 @@ router.post("/admin/affiliations", (req: Request, res: Response) => {
     const db = getDb();
 
     // Verify producer + umbrella exist (and are the right kinds)
-    const producer = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(producerId) as any;
+    const producer = db.prepare("SELECT id, umbrella_type, parent_umbrella_id FROM agents WHERE id = ?").get(producerId) as any;
     if (!producer) { res.status(404).json({ success: false, error: `producer_id ${producerId} not found` }); return; }
     if (producer.umbrella_type) {
-      res.status(400).json({ success: false, error: "producer_id is an umbrella — affiliations link producers TO umbrellas" });
-      return;
+      // Exception: a regional market_network umbrella is allowed to affiliate with its
+      // own parent market_network umbrella (child joining its own parent) — this is the
+      // same shape already used by the 11 existing sibling regional↔national affiliations.
+      const isChildOfTargetUmbrella =
+        producer.umbrella_type === "market_network" && producer.parent_umbrella_id === umbrellaId;
+      if (!isChildOfTargetUmbrella) {
+        res.status(400).json({ success: false, error: "producer_id is an umbrella — affiliations link producers TO umbrellas" });
+        return;
+      }
     }
     const umbrella = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(umbrellaId) as any;
     if (!umbrella) { res.status(404).json({ success: false, error: `umbrella_id ${umbrellaId} not found` }); return; }
