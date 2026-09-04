@@ -507,6 +507,80 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_page_view_daily_day ON page_view_daily(day DESC);
 
+    -- orch-pr-20260903-analytics-rollup-slice2: rollup coverage for the two
+    -- analytics tables slice 1 had to stop deleting from (analytics_queries,
+    -- analytics_agent_views), plus a true per-day distinct-session table.
+    -- Same additive CREATE TABLE IF NOT EXISTS idiom as page_view_daily above:
+    -- every write is an ON CONFLICT DO UPDATE additive upsert from
+    -- retention-service.ts, so re-running a rollup batch never double-counts.
+    --
+    -- query_daily: aggregated agent/AI query counts per day×protocol×agent×vertical×city.
+    -- response_time_ms_sum/_n are computed ONLY over rows with a non-NULL
+    -- response_time_ms (avg = sum/n). A NULL latency is never coerced to 0 in
+    -- either field — that would silently drag the reconstructed average down.
+    CREATE TABLE IF NOT EXISTS query_daily (
+      day TEXT NOT NULL,
+      protocol TEXT NOT NULL DEFAULT 'unknown',
+      agent_id TEXT NOT NULL DEFAULT '',
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      city TEXT NOT NULL DEFAULT '',
+      query_count INTEGER NOT NULL DEFAULT 0,
+      result_count_sum INTEGER NOT NULL DEFAULT 0,
+      response_time_ms_sum INTEGER NOT NULL DEFAULT 0,
+      response_time_ms_n INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, protocol, agent_id, vertical_id, city)
+    );
+    CREATE INDEX IF NOT EXISTS idx_query_daily_day ON query_daily(day DESC);
+
+    -- query_text_daily: what was actually searched for, per day×query×vertical.
+    -- Kept separate from query_daily so the (high-cardinality) query text does
+    -- not explode query_daily's primary key.
+    CREATE TABLE IF NOT EXISTS query_text_daily (
+      day TEXT NOT NULL,
+      query TEXT NOT NULL,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      query_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, query, vertical_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_query_text_daily_day ON query_text_daily(day DESC);
+
+    -- agent_view_daily: aggregated producer-profile views per day×agent×source×city.
+    -- The permanent half of views_count in admin-outreach-pool /
+    -- admin-outreach-candidates (raw analytics_agent_views rows are pruned once
+    -- rolled up here, so those routes must sum rollup + remaining raw).
+    -- Permanent under normal retention pruning (retention-service.ts /
+    -- runAutoPrune never delete a rollup row), but the explicit agent opt-out
+    -- path — DELETE /admin/agents/:id in routes/marketplace.ts — DOES clear
+    -- this table for that agent_id, in the same transaction as the raw
+    -- analytics_agent_views delete: an opt-out is a deletion request, not a
+    -- retention policy.
+    CREATE TABLE IF NOT EXISTS agent_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_source TEXT NOT NULL DEFAULT 'unknown',
+      city TEXT NOT NULL DEFAULT '',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id, view_source, city)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_view_daily_day ON agent_view_daily(day DESC);
+    CREATE INDEX IF NOT EXISTS idx_agent_view_daily_agent ON agent_view_daily(agent_id);
+
+    -- sessions_daily: TRUE distinct-session count per day×vertical×bot_type.
+    -- Deliberately NOT derivable from page_view_daily: that table's
+    -- session_count is per-PATH, so summing it overcounts any session that
+    -- visited more than one path on the same day. Computed with
+    -- COUNT(DISTINCT session_id) over the raw analytics_page_views rows in the
+    -- same batch transaction that rolls up page_view_daily, before they are
+    -- deleted.
+    CREATE TABLE IF NOT EXISTS sessions_daily (
+      day TEXT NOT NULL,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      bot_type TEXT NOT NULL DEFAULT 'human',
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, vertical_id, bot_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_daily_day ON sessions_daily(day DESC);
+
     CREATE TABLE IF NOT EXISTS runs_daily_summary (
       day TEXT NOT NULL,
       vertical TEXT NOT NULL,

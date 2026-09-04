@@ -316,7 +316,13 @@ router.get("/", (req: Request, res: Response) => {
           p.outreach_eligible_at,
           k.google_rating,
           k.google_review_count,
-          (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id) AS views_count,
+          -- orch-pr-20260903-analytics-rollup-slice2: rollup + raw, see the
+          -- same expression in admin-outreach-pool.ts. These two endpoints
+          -- feed the SAME dedupe tiebreaker and are explicitly documented to
+          -- agree on a collision winner, so both must count lifetime views the
+          -- same way once pruned raw rows live on in agent_view_daily.
+          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id), 0)
+           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id)) AS views_count,
           ${suppressionCols}
         FROM outreach_ready_pool p
         INNER JOIN agents a ON a.id = p.agent_id
@@ -335,7 +341,9 @@ router.get("/", (req: Request, res: Response) => {
           k.outreach_eligible_at,
           k.google_rating,
           k.google_review_count,
-          (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id) AS views_count,
+          -- orch-pr-20260903-analytics-rollup-slice2: rollup + raw, see above.
+          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = a.id), 0)
+           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id)) AS views_count,
           ${suppressionCols}
         FROM agents a
         INNER JOIN agent_knowledge k ON k.agent_id = a.id

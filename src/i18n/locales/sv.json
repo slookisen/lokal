@@ -8,7 +8,9 @@
     "language": "Språk",
     "lang_no": "Norsk",
     "lang_en": "English",
-    "lang_sv": "Svenska"
+    "lang_sv": "Svenska",
+    "home": "Hem",
+    "back_home": "Tillbaka till startsidan"
   },
   "footer": {
     "tagline": "Norges första agent-till-agent-nätverk (A2A) för lokal mat. Vi gör matproducenter synliga för AI-assistenter — så att kunderna hittar dig när de frågar.",
@@ -133,7 +135,29 @@
     "address": "Adress",
     "no_products": "Inga produkter registrerade ännu.",
     "back_to_search": "← Tillbaka till sökningen",
-    "see_all_in_city": "Se alla producenter i {city} →"
+    "see_all_in_city": "Se alla producenter i {city} →",
+    "map": "Karta",
+    "visit_website": "Besök webbplats",
+    "show_on_map": "Visa på karta",
+    "download_vcard": "Ladda ner kontaktkort",
+    "updated_prefix": "Profil uppdaterad:",
+    "badge_brreg": "Registrerad i Brønnøysund",
+    "badge_organic": "Ekologiskt",
+    "no_contact": "Ingen kontaktinfo tillgänglig ännu.",
+    "affiliations": "Anknytningar",
+    "season": "Säsongskalender",
+    "hours": "Öppettider",
+    "delivery_payment": "Leverans och betalning",
+    "delivery_radius": "Leveransradie:",
+    "min_order": "Minsta beställning:",
+    "delivery_methods": "Leveranssätt:",
+    "payment": "Betalning:",
+    "today": "I dag",
+    "part_of": "Del av:",
+    "show_on_google_maps": "Visa på Google Maps",
+    "disclaimer_public": "Informationen bygger på offentligt tillgängliga källor och kan vara inaktuell. Kontakta säljaren direkt för aktuell information.",
+    "disclaimer_owner": "Informationen är verifierad av ägaren.",
+    "season_note_nb": "Anteckning på norska"
   },
   "common": {
     "see_profile": "Visa profil →",

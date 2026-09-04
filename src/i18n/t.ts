@@ -49,6 +49,23 @@ export function enabledLangs(): Lang[] {
 }
 
 /**
+ * Daniel 2026-09-03: «Om man har valgt å bytte til Engelsk skal det språket
+ * være default for den brukeren frem til dem bytter tilbake eller går ut av
+ * siden. Altså skal man slippe å bytte språk for hver ny side man går inn på.»
+ *
+ * Gate for the RFB language SESSION cookie (see i18n/middleware.ts
+ * rfbLangSessionMiddleware). Read fresh per request like every other flag.
+ * Default OFF: with the flag unset, no cookie is set or read and every route
+ * behaves byte-for-byte as before. The URL stays the single source of truth
+ * for what a page renders — the cookie only ever REDIRECTS a person from an
+ * unprefixed URL to the prefixed one they chose, it never changes what a
+ * given URL serves (so crawlers, which send no cookie, see canonical NO).
+ */
+export function isLangCookieRedirectEnabled(): boolean {
+  return process.env.LANG_COOKIE_REDIRECT_ENABLED === "true";
+}
+
+/**
  * Look up a translation key like "nav.search" or "home.hero_pill".
  * Fallback chain: target lang → EN (for sv) → NO → the key itself.
  * Substitutes {placeholders} from the params object.

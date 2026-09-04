@@ -197,7 +197,16 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "natur_friluft", subcategory: null,
         booking_url: "https://generisk.example.no/booking",
         content_source: "provider_site", enrichment_state: "enriched",
-        updated_at: daysAgoIso(1),
+        // Strictly the NEWEST seeded row, on purpose. h5–h7 read
+        // enriched_experiences[0] and expect this row; every other served row
+        // below is seeded with daysAgoIso(1) too, and each daysAgoIso() call
+        // is its own Date.now() — so whenever a millisecond boundary fell
+        // between this insert and a later one, the later row got a strictly
+        // newer updated_at, sorted first under ORDER BY updated_at DESC, and
+        // h5/h6/h7/h12 failed at random (1 in ~5 fresh runs, 2026-09-03).
+        // Half a day younger removes the tie without touching what h12
+        // asserts: a merged-away row bumped to now() still sorts above this.
+        updated_at: daysAgoIso(0.5),
       });
       // A raw (un-enriched) row on the same provider must NOT be served — the
       // spot-check judges written content, and nothing was written here.
@@ -1369,6 +1378,52 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       assertTrue(
         (runtimeResp.body.providers as any[]).every((p) => Array.isArray(p.enriched_experiences) && p.enriched_experiences.length === 0),
         "i9: …with an empty list alongside it",
+      );
+
+      // ── (j) same-updated_at tie → deterministic order ────────────────────
+      // Regression pin for the 2026-09-03 CI/local split: `enriched_experiences`
+      // used to be `ORDER BY updated_at DESC` with no secondary key, so two rows
+      // sharing an `updated_at` came back in storage order — stable on one
+      // machine, different on another, byte-identical code. The fixture fix in
+      // cf8e315 spaced the seeded timestamps apart, which stopped the symptom
+      // but left the query itself untested against a REAL tie. This block seeds
+      // an exact tie on purpose, so a revert of the `, id DESC` tiebreaker fails
+      // here instead of resurfacing as a phantom CI flake somewhere else.
+      //
+      // Seeded after every assertion above, so the extra provider cannot shift
+      // any earlier expectation.
+      const TIE_TS = daysAgoIso(1);
+      insertProvider.run({
+        id: "prov-tie-order", navn: "Uavgjort Tidsstempel AS",
+        hjemmeside: "https://uavgjort.example.no",
+        last_enriched_at: TIE_TS,
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      for (const suffix of ["a", "b"]) {
+        insertExperience.run({
+          id: `exp-tie-${suffix}`, provider_id: "prov-tie-order",
+          title: `Uavgjort ${suffix}`, description: `Beskrivelse ${suffix}.`,
+          category: "natur_friluft", subcategory: null, booking_url: null,
+          content_source: "provider_site", enrichment_state: "enriched",
+          // Byte-identical on purpose — this is the whole point of the test.
+          updated_at: TIE_TS,
+        });
+      }
+
+      const tieFirstIds: string[] = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const tieResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const tieRow = (tieResp.body.providers as any[]).find((p) => p.id === "prov-tie-order");
+        tieFirstIds.push(tieRow?.enriched_experiences?.[0]?.id);
+      }
+      assertEq(
+        tieFirstIds,
+        ["exp-tie-b", "exp-tie-b", "exp-tie-b"],
+        "j1: two rows with an identical updated_at order by id DESC, identically on every call",
       );
     } catch (err: any) {
       failed++;

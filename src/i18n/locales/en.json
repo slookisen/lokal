@@ -8,7 +8,9 @@
     "language": "Language",
     "lang_no": "Norsk",
     "lang_en": "English",
-    "lang_sv": "Svenska"
+    "lang_sv": "Svenska",
+    "home": "Home",
+    "back_home": "Back to the front page"
   },
   "footer": {
     "tagline": "Norway's first agent-to-agent (A2A) network for local food. We make food producers visible to AI assistants — so customers find you when they ask.",
@@ -133,7 +135,29 @@
     "address": "Address",
     "no_products": "No products registered yet.",
     "back_to_search": "← Back to search",
-    "see_all_in_city": "See all producers in {city} →"
+    "see_all_in_city": "See all producers in {city} →",
+    "map": "Map",
+    "visit_website": "Visit website",
+    "show_on_map": "Show on map",
+    "download_vcard": "Download contact card",
+    "updated_prefix": "Profile updated:",
+    "badge_brreg": "Registered in Brønnøysund",
+    "badge_organic": "Organic",
+    "no_contact": "No contact info available yet.",
+    "affiliations": "Affiliations",
+    "season": "Season calendar",
+    "hours": "Opening hours",
+    "delivery_payment": "Delivery and payment",
+    "delivery_radius": "Delivery radius:",
+    "min_order": "Minimum order:",
+    "delivery_methods": "Delivery methods:",
+    "payment": "Payment:",
+    "today": "Today",
+    "part_of": "Part of:",
+    "show_on_google_maps": "Show on Google Maps",
+    "disclaimer_public": "This information is based on publicly available sources and may be out of date. Contact the seller directly for up-to-date information.",
+    "disclaimer_owner": "This information has been verified by the owner.",
+    "season_note_nb": "Note in Norwegian"
   },
   "common": {
     "see_profile": "View profile →",

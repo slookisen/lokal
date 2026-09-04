@@ -973,16 +973,21 @@ export class AnalyticsService {
    * Useful for privacy compliance and storage management
    */
   pruneOldData(olderThanDays: number): number {
+    // dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention:
+    // used to be a third copy of the raw DELETE against all three analytics
+    // tables (reachable via POST /admin/analytics/prune). Now delegates to
+    // runAutoPrune() so every prune path shares the same rollup-before-delete
+    // invariant. Returns the total rows actually deleted — as of
+    // orch-pr-20260903-analytics-rollup-slice2 that is all three analytics
+    // tables again (each rolled up into its own daily table first), not just
+    // page views.
     try {
-      const db = getDb();
-      const cutoff = sqliteDatetime(new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000));
-
-      const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
-      const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
-      const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
-
-      const total = (pvResult.changes || 0) + (qResult.changes || 0) + (avResult.changes || 0);
-      console.log(`[analytics] Pruned ${total} old records`);
+      const r = this.runAutoPrune({ daysToKeep: olderThanDays });
+      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews;
+      console.log(
+        `[analytics] Pruned ${total} old records (rollup-before-delete) ` +
+        `skippedPendingRollup=${JSON.stringify(r.skippedPendingRollup)}`
+      );
       return total;
     } catch (err) {
       console.error("[analytics] Failed to prune data:", err);
@@ -991,23 +996,70 @@ export class AnalyticsService {
   }
 
   /**
-   * PR-92: Structured prune helper used by the daily scheduled task and by
-   * the /admin/analytics/ops/prune route. Returns per-table delete counts
+   * PR-92: Structured prune helper used by the daily scheduled task, by
+   * the /admin/analytics/ops/prune route and by pruneOldData()
+   * (/admin/analytics/prune) — the single prune path for analytics tables. Returns per-table delete counts
    * plus the cutoff timestamp so callers can log usefully. The minimum of
    * 7 days mirrors the /ops/prune route guard (privacy/audit trail).
+   *
+   * orch-pr-20260903-analytics-rollup-slice1: analytics_page_views used to
+   * be a raw, unconditional DELETE here — silently destroying analytics
+   * history with no rollup step first (oldest page view in prod dropped to
+   * 2026-07-04). Now routes through the already-tested
+   * rollupAndPrunePageViews() (rollup-before-delete into page_view_daily,
+   * ON CONFLICT-upsert idempotent) instead. analytics_queries and
+   * analytics_agent_views had no rollup table at that point (future slice),
+   * so slice 1 stopped deleting them at all — it only reported, via
+   * read-only COUNT(*), how many rows WOULD have been deleted.
+   *
+   * orch-pr-20260903-analytics-rollup-slice2: those rollup tables now exist
+   * (query_daily / query_text_daily / agent_view_daily, plus sessions_daily
+   * off the page-view scan), so both tables route through their own
+   * rollup-before-delete helpers and deletion resumes for all three tables
+   * with zero aggregate-history loss. rollupCoverage flips to true for both,
+   * which makes skippedPendingRollup an empty array under normal operation —
+   * the field is deliberately KEPT (not removed) so the response shape stays
+   * a superset for every existing caller, and so a future table without
+   * coverage has somewhere to show up. wouldDeleteIfPruned is likewise kept
+   * and still measured BEFORE the deletes, so it keeps its sizing meaning.
+   * Lazy-require retention-service to mirror the same
+   * lazy-require convention already used for this module in
+   * src/routes/analytics.ts (POST /ops/retention-rollup) — avoids any
+   * static import-cycle risk between the two services.
    */
   runAutoPrune(opts: { daysToKeep: number }): {
     daysKept: number;
     cutoff: string;
     deleted: { pageViews: number; queries: number; agentViews: number };
+    skippedPendingRollup: string[];
+    wouldDeleteIfPruned: { queries: number; agentViews: number };
   } {
     const daysKept = Math.max(7, opts.daysToKeep || 60);
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
 
-    const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
-    const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
-    const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews } =
+      require("./retention-service") as typeof import("./retention-service");
+
+    // Sizing counts are read BEFORE the rollup+delete runs, so
+    // wouldDeleteIfPruned keeps meaning exactly what it meant in slice 1:
+    // "how many rows were older than the cutoff going into this pass".
+    const qCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries WHERE created_at < ?").get(cutoff) as { c: number }).c;
+    const avCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views WHERE created_at < ?").get(cutoff) as { c: number }).c;
+
+    const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
+    const qResult = rollupAndPruneQueries(daysKept, 7, false);
+    const avResult = rollupAndPruneAgentViews(daysKept, 7, false);
+
+    // Rollup coverage per source table — computed, not hardcoded, so a future
+    // analytics table without a rollup destination shows up here instead of
+    // being silently deleted. All three are covered as of slice 2, so
+    // skippedPendingRollup is [] under normal operation.
+    const rollupCoverage: Record<string, boolean> = {
+      analytics_queries: true,
+      analytics_agent_views: true,
+    };
+    const skippedPendingRollup = Object.keys(rollupCoverage).filter((t) => !rollupCoverage[t]);
 
     // Reclaim WAL space — mirrors the /ops/prune route.
     try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
@@ -1016,9 +1068,14 @@ export class AnalyticsService {
       daysKept,
       cutoff,
       deleted: {
-        pageViews: pvResult.changes || 0,
-        queries: qResult.changes || 0,
-        agentViews: avResult.changes || 0,
+        pageViews: pvResult.rowsDeleted || 0,
+        queries: qResult.rowsDeleted || 0,
+        agentViews: avResult.rowsDeleted || 0,
+      },
+      skippedPendingRollup,
+      wouldDeleteIfPruned: {
+        queries: qCount || 0,
+        agentViews: avCount || 0,
       },
     };
   }

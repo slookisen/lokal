@@ -131,7 +131,7 @@ import { checkAboutCandidateSubstantiatedBySource } from "../services/about-sour
 // had zero content validation on `description` before this. Same detector,
 // same rejection message shape as marketplace.ts's three gates; see the
 // write site below (agentColumnUpdates) for the call.
-import { looksLikeCodeArtifact } from "../services/description-quality";
+import { looksLikeCodeArtifact, hasInternalNote } from "../services/description-quality";
 
 const router = Router();
 
@@ -618,6 +618,10 @@ router.put("/", (req: Request, res: Response) => {
     // endpoint `lokal-agent-enrichment` PUTs into) that let the real live
     // Helios Trondheim Squarespace-JS artifact land in `about` even after
     // #706 shipped.
+    if (hasInternalNote(body.about)) {
+      res.status(400).json({ error: "about contains an internal pipeline note — rejected" });
+      return;
+    }
     if (looksLikeCodeArtifact(body.about)) {
       res.status(400).json({ error: "about contains code/script artifacts — rejected" });
       return;
@@ -698,6 +702,16 @@ router.put("/", (req: Request, res: Response) => {
     // unlike marketplaceRegistry.updateAgent()).
     if (looksLikeCodeArtifact(body.description)) {
       res.status(400).json({ error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+    // Daniel 2026-09-03 ("Interne notater skal ikke vises"): this is the live
+    // enrichment write path, and it is where every note now in production
+    // came from — a routine appending its own verification status to the
+    // customer-facing description. Refuse at the door, same shape as the
+    // code-artifact gate above, so the render-time strip stays a safety net
+    // for existing rows rather than the only defence.
+    if (hasInternalNote(body.description)) {
+      res.status(400).json({ error: "description contains an internal pipeline note — rejected" });
       return;
     }
     agentColumnUpdates.push({ col: "description", val: body.description });

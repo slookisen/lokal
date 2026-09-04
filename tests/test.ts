@@ -6532,6 +6532,18 @@ const _m2Promise = (async function runOwnerPortalTests() {
         view_source TEXT DEFAULT 'unknown',
         created_at TEXT DEFAULT (datetime('now'))
       );
+      -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+      -- outreach routes' views_count is now "agent_view_daily rollup total +
+      -- remaining raw rows", so this hand-rolled fixture schema needs the
+      -- rollup table too or those queries fail with "no such table".
+      CREATE TABLE agent_view_daily (
+        day TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        view_source TEXT NOT NULL DEFAULT 'unknown',
+        city TEXT NOT NULL DEFAULT '',
+        view_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, agent_id, view_source, city)
+      );
       CREATE VIEW outreach_ready_pool AS
         SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
                k.email, k.phone, k.verification_status, k.enrichment_status,
@@ -8516,9 +8528,17 @@ console.log("\n── PR-30: source-presence checks on seo.ts ──");
     seoSrc.includes('class="profile-meta"'),
     "pr30: seo.ts emits .profile-meta paragraph for the freshness badge"
   );
+  // 2026-09-03 engelsk ramme: the label moved from a literal into the
+  // dictionary (producer.updated_prefix) so /en can say "Profile updated:".
+  // Same intent as before — the Norwegian label still ships — checked at
+  // both ends: seo.ts reads the key, and no.json carries the exact text.
   assertTrue(
-    seoSrc.includes('Profil oppdatert:'),
-    "pr30: seo.ts emits 'Profil oppdatert:' label"
+    seoSrc.includes('t(lang, "producer.updated_prefix")'),
+    "pr30: seo.ts emits the freshness label through producer.updated_prefix"
+  );
+  assertTrue(
+    require("../src/i18n/locales/no.json").producer?.updated_prefix === "Profil oppdatert:",
+    "pr30: no.json carries the 'Profil oppdatert:' label"
   );
   assertTrue(
     seoSrc.includes('class="updated-at"'),
@@ -9460,7 +9480,11 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // Test 2.12: producer card order — affiliations card sits between Produkter and Sesongkalender
   // so that the most-likely-clicked sections (products, affiliations) come before secondary info
-  const prodCardOrderMatch = seoSrc.match(/Produkter \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
+  // 2026-09-03 produkt-ordliste: the heading reads producer.products from the
+  // dictionary ("Produkter"/"Products") — same card order is asserted, the
+  // anchor is the new heading form.
+  // 2026-09-03 del 2: the affiliations/season headings read the dictionary too.
+  const prodCardOrderMatch = seoSrc.match(/t\(lang, "producer\.products"\)\)\} \(\${productsList\.length\}\)[\s\S]{0,1500}t\(lang, "producer\.affiliations"\)[\s\S]{0,1500}t\(lang, "producer\.season"\)/);
   assertTrue(
     !!prodCardOrderMatch,
     "phase5.11-a2: producer affiliations card sits between Produkter and Sesongkalender"
@@ -9613,6 +9637,21 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   assertTrue(
     /umbrella_id is not an umbrella/.test(postAffBody),
     "phase5.11-a3: POST /admin/affiliations rejects umbrella_id that is NOT an umbrella"
+  );
+
+  // Test 3.14b: POST /admin/affiliations allows a regional market_network umbrella to
+  // affiliate with its own parent market_network umbrella (child joining its own parent)
+  assertTrue(
+    /producer\.umbrella_type === "market_network" && producer\.parent_umbrella_id === umbrellaId/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations has market_network-child-of-target-umbrella exception check"
+  );
+  assertTrue(
+    postAffBody.includes("parent_umbrella_id FROM agents WHERE id = ?"),
+    "phase5.11-a3: POST /admin/affiliations reads producer.parent_umbrella_id to evaluate the exception"
+  );
+  assertTrue(
+    /if \(!isChildOfTargetUmbrella\) \{[\s\S]{0,200}producer_id is an umbrella — affiliations link producers TO umbrellas[\s\S]{0,200}\}/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations still unconditionally rejects producer_id-is-umbrella in the general (non-exception) case"
   );
 
   // Test 3.15: POST /admin/affiliations is idempotent (upsert via UNIQUE)
@@ -10621,7 +10660,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a5: umbParentHtml initialized empty"
   );
   assertTrue(
-    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\/produsent\/\$\{parentSlug\}">Del av: /.test(seoSrc),
+    // 2026-09-03 språk-økt: the link is now localizedPath("/produsent/" + parentSlug, lang)
+    // (byte-identical href for Norwegian; carries /en on the English page).
+    // 2026-09-03 del 2: "Del av:" reads producer.part_of.
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\$\{localizedPath\("\/produsent\/" \+ parentSlug, lang\)\}">\$\{escapeHtml\(t\(lang, "producer\.part_of"\)\)\} /.test(seoSrc),
     "phase5.11-a5: parent breadcrumb rendered as '← Del av:' link when parent_umbrella_id is set"
   );
   // The breadcrumb is injected ABOVE the H1 inside .umb-hero
@@ -10868,8 +10910,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 
   // ─── Source-presence: link target uses slugify ───────────────────
   assertTrue(
-    /href="\/produsent\/\$\{slug\}"/.test(seoSrc),
-    "phase5.11-a6: umbrella cards link to /produsent/<slug>"
+    // 2026-09-03 språk-økt: umbrella cards now link via localizedPath (same
+    // /produsent/<slug> for Norwegian; /en/produsent/<slug> on the English page).
+    /href="\$\{localizedPath\("\/produsent\/" \+ slug, lang\)\}" class="umb-card"/.test(seoSrc),
+    "phase5.11-a6: umbrella cards link to /produsent/<slug> (language-aware)"
   );
 
   // ─── Source-presence: CSS class definitions ──────────────────────
@@ -24650,6 +24694,20 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+    -- outreach-candidates views_count is now "agent_view_daily rollup total +
+    -- remaining raw rows", because the nightly prune deletes raw
+    -- analytics_agent_views rows once they are rolled up here. This
+    -- hand-rolled fixture schema needs the rollup table too.
+    CREATE TABLE agent_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_source TEXT NOT NULL DEFAULT 'unknown',
+      city TEXT NOT NULL DEFAULT '',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id, view_source, city)
+    );
+
     CREATE TABLE agent_blocklist (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       identifier_type TEXT NOT NULL,
@@ -34063,13 +34121,118 @@ const _retentionRollupPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice1: nightly auto-prune
+// (AnalyticsService.runAutoPrune(), src/services/analytics-service.ts) now
+// routes analytics_page_views through rollupAndPrunePageViews()
+// (rollup-before-delete into page_view_daily) instead of a raw DELETE, and
+// no longer deletes analytics_queries / analytics_agent_views at all
+// (read-only COUNT(*) sizing only — skippedPendingRollup flags both as
+// pending future rollup coverage). Swaps the shared getDb() singleton (own
+// dedicated test file, in-memory prod-schema DB) — mirroring the
+// retention-rollup block above — so it must run strictly after every other
+// singleton-swapping block; _retentionRollupPromise is the current tail of
+// that serial chain.
+let _autoPruneRollupResolve: () => void = () => {};
+const _autoPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _autoPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_retentionRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice1: auto-prune rollup ──");
+  try {
+    const { runAutoPruneRollupTests } = require("../src/services/analytics-auto-prune-rollup.test") as
+      typeof import("../src/services/analytics-auto-prune-rollup.test");
+    const apr = await runAutoPruneRollupTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("auto-prune-rollup: " + f);
+    console.log(`  auto-prune-rollup: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("auto-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _autoPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+// follow-up to lokal#782: the two MANUAL prune routes (/ops/prune and
+// /prune -> pruneOldData) now share runAutoPrune()'s rollup-before-delete.
+// Swaps the getDb() singleton -> strictly after auto-prune-rollup.
+let _opsPruneRollupResolve: () => void = () => {};
+const _opsPruneRollupPromise: Promise<void> = new Promise<void>(r => {
+  _opsPruneRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_autoPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── manual prune routes: rollup-before-delete (ops/prune + prune) ──");
+  try {
+    const { runOpsPruneRollupTests } = require("../src/routes/analytics-ops-prune-rollup.test") as
+      typeof import("../src/routes/analytics-ops-prune-rollup.test");
+    const opr = await runOpsPruneRollupTests({ log: false });
+    passed += opr.passed;
+    failed += opr.failed;
+    for (const f of opr.failures) failures.push("ops-prune-rollup: " + f);
+    console.log(`  ops-prune-rollup: ${opr.passed} passed, ${opr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ops-prune-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _opsPruneRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice2: the two analytics tables slice 1
+// had to stop deleting from (analytics_queries, analytics_agent_views) now
+// have rollup destinations — query_daily / query_text_daily /
+// agent_view_daily — plus sessions_daily (TRUE distinct sessions per day,
+// written from the same page-view scan as page_view_daily). runAutoPrune()
+// resumes deleting from all three tables, and admin-outreach-pool /
+// admin-outreach-candidates now count lifetime views as rollup + remaining
+// raw so the dedupe tiebreaker does not silently undercount as history is
+// pruned. Swaps the shared getDb() singleton -> strictly after ops-prune-rollup.
+let _rollupSlice2Resolve: () => void = () => {};
+const _rollupSlice2Promise: Promise<void> = new Promise<void>(r => {
+  _rollupSlice2Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_opsPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice2: query/agent-view/sessions rollup ──");
+  try {
+    const { runAnalyticsRollupSlice2Tests } = require("../src/services/analytics-rollup-slice2.test") as
+      typeof import("../src/services/analytics-rollup-slice2.test");
+    const rs2 = await runAnalyticsRollupSlice2Tests({ log: false });
+    passed += rs2.passed;
+    failed += rs2.failed;
+    for (const f of rs2.failures) failures.push("analytics-rollup-slice2: " + f);
+    console.log(`  analytics-rollup-slice2: ${rs2.passed} passed, ${rs2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-rollup-slice2: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rollupSlice2Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
 // mirroring the already-shipped HCR_CONTENT_PATHS pattern in
 // routes/admin-knowledge.ts. Stubs globalThis.fetch — own dedicated test
 // file, no shared getDb() singleton — so it runs strictly after the last
-// singleton-swapping block (retention-rollup) purely to keep a single,
+// singleton-swapping block (auto-prune-rollup) purely to keep a single,
 // easy-to-follow serial ordering with the rest of this dev-request's tests,
 // not because of any actual shared-state dependency.
 let _pageEvidenceCrawlResolve: () => void = () => {};
@@ -34078,7 +34241,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_retentionRollupPromise]);
+  await Promise.allSettled([_rollupSlice2Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
@@ -35419,7 +35582,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _tasksPruneAsyncPromise, _rfbDebioSuitePromise, _dispatchTickSuitePromise,
   _samtalerSeoPromise, _descriptionTruncationSweepPromise, _pwaSwPromise,
   _installPromptPromise, _brregCatalogSweepPromise, _brregDescriptionFallbackPromise,
-  _retentionRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
+  _retentionRollupPromise, _autoPruneRollupPromise, _opsPruneRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
@@ -40999,6 +41162,76 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("description-code-artifact-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «Interne notater skal ikke vises» / «fiks den byttede
+// teksten på Epleblomsten og Nordlysmat» — description-quality internal-note
+// detector, POST /admin/agents/internal-note-sweep and POST /admin/agents/
+// content-correction. Same DB-swap discipline as the siblings above.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 interne notater + innholdsretting: content-quality ──");
+  try {
+    const { runAdminAgentsContentQualityTests } = require("../src/routes/admin-agents-content-quality.test") as
+      typeof import("../src/routes/admin-agents-content-quality.test");
+    const cq = await runAdminAgentsContentQualityTests({ log: false });
+    passed += cq.passed;
+    failed += cq.failed;
+    for (const f of cq.failures) failures.push("content-quality: " + f);
+    console.log(`  content-quality: ${cq.passed} passed, ${cq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-quality: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03 (skjermbilder): kategorier, kontaktkort, fallback-setning,
+// dato og skrapte HTML-entiteter på /en — rfb-en-chrome (rene funksjoner).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 engelsk ramme på rfb: rfb-en-chrome ──");
+  try {
+    const { runRfbEnChromeTests } = require("../src/routes/rfb-en-chrome.test") as typeof import("../src/routes/rfb-en-chrome.test");
+    const ec = runRfbEnChromeTests({ log: false });
+    passed += ec.passed; failed += ec.failed;
+    for (const f of ec.failures) failures.push("rfb-en-chrome: " + f);
+    console.log(`  rfb-en-chrome: ${ec.passed} passed, ${ec.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-en-chrome: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — product-glossary.
+runSerial(async () => {
+  console.log("\n── 2026-09-03 produkt-ordliste: product-glossary ──");
+  try {
+    const { runProductGlossaryTests } = require("../src/i18n/product-glossary.test") as typeof import("../src/i18n/product-glossary.test");
+    const pg = runProductGlossaryTests({ log: false });
+    passed += pg.passed; failed += pg.failed;
+    for (const f of pg.failures) failures.push("product-glossary: " + f);
+    console.log(`  product-glossary: ${pg.passed} passed, ${pg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-glossary: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Daniel 2026-09-03: «Om man har valgt å bytte til Engelsk skal det språket
+// være default for den brukeren frem til dem bytter tilbake eller går ut av
+// siden» — i18n/middleware.ts rfbLangSessionMiddleware (real express app over
+// loopback, sets/restores its own flags).
+runSerial(async () => {
+  console.log("\n── 2026-09-03 språk-økt (rfb_lang_session): lang-session ──");
+  try {
+    const { runLangSessionTests } = require("../src/i18n/lang-session.test") as typeof import("../src/i18n/lang-session.test");
+    const ls = await runLangSessionTests({ log: false });
+    passed += ls.passed;
+    failed += ls.failed;
+    for (const f of ls.failures) failures.push("lang-session: " + f);
+    console.log(`  lang-session: ${ls.passed} passed, ${ls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lang-session: unexpected error: " + String(err?.message || err));
   }
 });
 

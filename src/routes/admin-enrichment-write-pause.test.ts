@@ -619,8 +619,10 @@ export async function runAdminEnrichmentWritePauseTests(
         // url-write sibling, and is now wired to the same gate the same way
         // — plus its own test file, which sets up pause state directly via
         // the service to prove the wiring.
-        "routes/admin-agents-description-code-artifact-sweep.test.ts",
+        "routes/admin-agents-content-correction.ts",
+      "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
+      "routes/admin-agents-internal-note-sweep.ts",
         // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
         // rapportspraak, del 1: the experiences vertical's admin write routes
         // (routes/opplevelser.ts, one shared helper) plus their own test file.

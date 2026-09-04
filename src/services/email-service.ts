@@ -1262,7 +1262,12 @@ kontakt@opplevagent.no
 // template (A2A verticals/rfb/email-templates/outreach-v2.md) adapted for
 // drink producers on Opplevagent. The two arms are attributable in every log
 // by SUBJECT alone: standard asks «Stemmer det vi har om …?», personal asks
-// «Har vi info riktig om …?» (the RFB formula).
+// «Har vi riktig info om …?» (adapted from the RFB formula «Har vi info
+// riktig om …?» — word order corrected 2026-09-03, dev-request
+// 2026-09-03-opplevagent-e-postmal-spraak-og-linjeskift; the RFB master
+// template's own wording is untouched, tracked separately if ever fixed).
+// Historical rows sent before 2026-09-03 were filed under the old subject —
+// attribution queries over that period must match on both formulas.
 //
 // The personal variant is deliberately TEXT-ONLY (html: undefined) — the RFB
 // template's spam-checklist specifies plain text, and matching its wire
@@ -1277,24 +1282,18 @@ export function renderGardssalgOutreachPersonal(
   profileUrl: string,
 ): { subject: string; text: string; html?: string } {
   return {
-    subject: `Har vi info riktig om ${providerName}?`,
+    subject: `Har vi riktig info om ${providerName}?`,
     text: `Hei,
 
-Jeg har laget en profil for ${providerName} som del av en åpen katalog
-over norske drikkeprodusenter og gårdsopplevelser. Du finner den her:
+Jeg har laget en profil for ${providerName} som del av en åpen katalog over norske drikkeprodusenter og gårdsopplevelser. Du finner den her:
 
 ${profileUrl}
 
-Bakgrunnen: AI-assistenter (typ ChatGPT, Claude) svarer i økende grad
-direkte på spørsmål som «hvilke bryggerier kan jeg besøke i Telemark».
-Norske produsenter forsvinner ofte i svarene fordi info-en deres ligger
-spredt. Vi samler det på ett sted, og holder profilene oppdaterte.
+Bakgrunnen: AI-assistenter som ChatGPT og Claude svarer i økende grad direkte på spørsmål som «hvor kan jeg besøke en lokal produsent i nærheten». Norske produsenter forsvinner ofte i svarene fordi informasjonen deres ligger spredt. Jeg samler den på ett sted og holder profilene oppdaterte.
 
-Det koster ingenting og dere er ikke bundet til noe. Jeg ville bare
-sjekke at info stemmer, og at dere er OK med å være synlige der.
+Det koster ingenting, og dere er ikke bundet til noe. Jeg ville bare sjekke at informasjonen stemmer, og at dere er OK med å være synlige der.
 
-Si fra om noe må endres — eller om dere helst fjernes. Begge deler
-ordnes innen 24 timer.
+Si fra om noe må endres, eller om dere heller vil fjernes. Begge deler ordnes innen 24 timer.
 
 Mvh,
 Daniel Fredriksen
