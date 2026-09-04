@@ -54,7 +54,7 @@ import {
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
-import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL } from "../services/dental-catalog-class";
+import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
@@ -390,7 +390,14 @@ router.get("/discover", (req: Request, res: Response) => {
       100,
       Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20)
     );
-    const agents = listDentalAgents(filter, limit, 0);
+    // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
+    // opt-in via listDentalAgents's excludeNonClinic (4th param) -- gated
+    // behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" so GET /agents (this
+    // module's OTHER listDentalAgents caller, not one of slice 1b's named
+    // public surfaces) stays byte-identical.
+    const agents = listDentalAgents(filter, limit, 0, {
+      excludeNonClinic: isDentalPublicCatalogClassFilterEnabled(),
+    });
     res.json({
       vertical: "dental",
       query: filter,

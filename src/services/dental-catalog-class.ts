@@ -70,6 +70,25 @@ export const DENTAL_CLINIC_CLASSES: readonly DentalCatalogClass[] = ["klinikk", 
 export const DENTAL_CLINIC_CLASS_SQL =
   "(catalog_class IS NULL OR catalog_class IN ('klinikk','offentlig_klinikk','ukjent'))";
 
+// dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b): the
+// PUBLIC-facing read surfaces (site /sok, /fylke, /sted + front-page/
+// county/city counters, GET /api/tannlege/discover, the MCP server's
+// tannlege_* tools, and the sitemap) still showed every row regardless of
+// catalog_class -- including person_enk/lab_leverandor/holding rows the
+// claim-pool (dental-claim-service.ts) and Places auto-select (routes/
+// dental.ts) already learned to skip via DENTAL_CLINIC_CLASS_SQL above.
+//
+// This is a SEPARATE opt-in rollout knob from that claim-pool filter's
+// DENTAL_CATALOG_CLASS_FILTER_DISABLED kill-switch (which is default-ON):
+// the public surfaces need their own gradual, default-OFF rollout, so
+// unset/falsy must stay byte-identical to pre-slice-1b behavior. Reuses
+// the SAME DENTAL_CLINIC_CLASS_SQL clause (NULL/ukjent stay eligible; only
+// positively-classified non-clinic rows are excluded) so the public and
+// claim-pool notions of "clinic" cannot drift apart.
+export function isDentalPublicCatalogClassFilterEnabled(): boolean {
+  return process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER === "1";
+}
+
 export interface CatalogClassInput {
   navn: string | null | undefined;
   naeringskode?: string | null;
