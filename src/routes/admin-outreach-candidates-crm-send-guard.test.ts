@@ -112,12 +112,20 @@ export function runAdminOutreachCandidatesCrmSendGuardTests(opts: { log?: boolea
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
       VALUES (?, ?, 'test producer', 'test', ?, 'https://example.no', 'producer', ?)
     `).run(id, name, email, `key-${id}`);
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial: outreach_ready_pool
+    // now ALSO requires POOL_CONTENT_THRESHOLD_SQL (about>=80 chars OR
+    // products>=3) directly against these raw columns, not just
+    // enrichment_status='rich' — real 'rich' rows always clear it (rich
+    // implies about>=150+products>=3), but this synthetic fixture hard-codes
+    // enrichment_status without populating about/products, so it needs an
+    // explicit about text here to stay pool-eligible (this test is about
+    // send-suppression, not content depth).
     db.prepare(`
       INSERT INTO agent_knowledge
-        (agent_id, email, field_provenance, verification_status, enrichment_status,
+        (agent_id, email, about, field_provenance, verification_status, enrichment_status,
          url_last_status, url_last_probed)
-      VALUES (?, ?, '{}', 'verified', 'rich', 200, datetime('now'))
-    `).run(id, email);
+      VALUES (?, ?, ?, '{}', 'verified', 'rich', 200, datetime('now'))
+    `).run(id, email, "x".repeat(200));
   }
 
   function insertMarketingSend(agentEmail: string, sentAtIso: string): void {

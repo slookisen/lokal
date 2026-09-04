@@ -2125,7 +2125,17 @@ export async function runVerifierBatch(opts: {
       }
     }
 
-    const nowInPool = newVerification === "verified" && newEnrichment !== "thin";
+    // dev-request 2026-09-02-rfb-pool-view-rich-vs-partial (Daniel option A,
+    // 2026-09-02): outreach_ready_pool (database/init.ts) now admits
+    // enrichment_status IN ('rich','partial') AND POOL_CONTENT_THRESHOLD_SQL
+    // (about>=80 OR products>=3), not just 'rich' — so `nowInPool` (which
+    // stamps outreach_eligible_at and drives the pool_added metric) must
+    // require the identical content threshold or it over-counts rows the
+    // VIEW would still reject. `gate.reasons.content_threshold` already IS
+    // that exact boolean — computeKvalitetsGate (above) computed it from the
+    // same `agent.about`/`products` used for `newEnrichment` a few lines up —
+    // so it's reused verbatim rather than recomputed.
+    const nowInPool = newVerification === "verified" && newEnrichment !== "thin" && gate.reasons.content_threshold;
     const eligibleAt = nowInPool && !wasInPool ? startedAt : null;
 
     applyVerifierOutcome(db, agent.id, {
