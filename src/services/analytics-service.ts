@@ -977,8 +977,10 @@ export class AnalyticsService {
     // used to be a third copy of the raw DELETE against all three analytics
     // tables (reachable via POST /admin/analytics/prune). Now delegates to
     // runAutoPrune() so every prune path shares the same rollup-before-delete
-    // invariant. Returns the total rows actually deleted (page views only,
-    // until queries/agent_views get rollup tables).
+    // invariant. Returns the total rows actually deleted — as of
+    // orch-pr-20260903-analytics-rollup-slice2 that is all three analytics
+    // tables again (each rolled up into its own daily table first), not just
+    // page views.
     try {
       const r = this.runAutoPrune({ daysToKeep: olderThanDays });
       const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews;
@@ -1006,10 +1008,21 @@ export class AnalyticsService {
    * 2026-07-04). Now routes through the already-tested
    * rollupAndPrunePageViews() (rollup-before-delete into page_view_daily,
    * ON CONFLICT-upsert idempotent) instead. analytics_queries and
-   * analytics_agent_views have no rollup table yet (future slice), so this
-   * function no longer deletes them at all — it only reports, via
-   * read-only COUNT(*), how many rows WOULD have been deleted, for sizing/
-   * observability. Lazy-require retention-service to mirror the same
+   * analytics_agent_views had no rollup table at that point (future slice),
+   * so slice 1 stopped deleting them at all — it only reported, via
+   * read-only COUNT(*), how many rows WOULD have been deleted.
+   *
+   * orch-pr-20260903-analytics-rollup-slice2: those rollup tables now exist
+   * (query_daily / query_text_daily / agent_view_daily, plus sessions_daily
+   * off the page-view scan), so both tables route through their own
+   * rollup-before-delete helpers and deletion resumes for all three tables
+   * with zero aggregate-history loss. rollupCoverage flips to true for both,
+   * which makes skippedPendingRollup an empty array under normal operation —
+   * the field is deliberately KEPT (not removed) so the response shape stays
+   * a superset for every existing caller, and so a future table without
+   * coverage has somewhere to show up. wouldDeleteIfPruned is likewise kept
+   * and still measured BEFORE the deletes, so it keeps its sizing meaning.
+   * Lazy-require retention-service to mirror the same
    * lazy-require convention already used for this module in
    * src/routes/analytics.ts (POST /ops/retention-rollup) — avoids any
    * static import-cycle risk between the two services.
@@ -1025,20 +1038,26 @@ export class AnalyticsService {
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
 
-    const { rollupAndPrunePageViews } = require("./retention-service") as typeof import("./retention-service");
-    const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
+    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews } =
+      require("./retention-service") as typeof import("./retention-service");
 
-    // analytics_queries / analytics_agent_views: no rollup table exists yet
-    // for either — never delete, only report what WOULD have been deleted
-    // (read-only sizing/observability, same cutoff semantics as before).
+    // Sizing counts are read BEFORE the rollup+delete runs, so
+    // wouldDeleteIfPruned keeps meaning exactly what it meant in slice 1:
+    // "how many rows were older than the cutoff going into this pass".
     const qCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries WHERE created_at < ?").get(cutoff) as { c: number }).c;
     const avCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views WHERE created_at < ?").get(cutoff) as { c: number }).c;
 
-    // Tables with no rollup coverage yet — computed, not hardcoded, so this
-    // is the natural place to shrink once a rollup table for one of them ships.
+    const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
+    const qResult = rollupAndPruneQueries(daysKept, 7, false);
+    const avResult = rollupAndPruneAgentViews(daysKept, 7, false);
+
+    // Rollup coverage per source table — computed, not hardcoded, so a future
+    // analytics table without a rollup destination shows up here instead of
+    // being silently deleted. All three are covered as of slice 2, so
+    // skippedPendingRollup is [] under normal operation.
     const rollupCoverage: Record<string, boolean> = {
-      analytics_queries: false,
-      analytics_agent_views: false,
+      analytics_queries: true,
+      analytics_agent_views: true,
     };
     const skippedPendingRollup = Object.keys(rollupCoverage).filter((t) => !rollupCoverage[t]);
 
@@ -1050,8 +1069,8 @@ export class AnalyticsService {
       cutoff,
       deleted: {
         pageViews: pvResult.rowsDeleted || 0,
-        queries: 0,
-        agentViews: 0,
+        queries: qResult.rowsDeleted || 0,
+        agentViews: avResult.rowsDeleted || 0,
       },
       skippedPendingRollup,
       wouldDeleteIfPruned: {

@@ -952,9 +952,15 @@ router.post("/ops/clear-cache", (_req: Request, res: Response) => {
  * auto-prune tick, reachable via a different path. It now delegates to the
  * same AnalyticsService.runAutoPrune(): analytics_page_views are rolled up
  * into page_view_daily in the same transaction as the delete, and
- * analytics_queries / analytics_agent_views are never deleted until their
- * rollup tables exist (reported via skippedPendingRollup /
+ * analytics_queries / analytics_agent_views were never deleted until their
+ * rollup tables existed (reported via skippedPendingRollup /
  * wouldDeleteIfPruned). Response shape is a superset of the old one.
+ *
+ * orch-pr-20260903-analytics-rollup-slice2: those rollup tables now exist
+ * (query_daily / query_text_daily / agent_view_daily), so all three tables are
+ * rolled up and pruned again. This route needed NO change — it just echoes
+ * whatever runAutoPrune() returns; skippedPendingRollup is simply [] now and
+ * deleted.queries/.agentViews carry real counts instead of a hardcoded 0.
  */
 router.post("/ops/prune", (req: Request, res: Response) => {
   try {

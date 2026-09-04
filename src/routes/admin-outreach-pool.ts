@@ -531,7 +531,16 @@ router.get("/", (req: Request, res: Response) => {
             p.*,
             k.google_rating,
             k.google_review_count,
-            (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id) AS views_count
+            -- orch-pr-20260903-analytics-rollup-slice2: views_count is a
+            -- LIFETIME total feeding the dedupe tiebreaker in
+            -- marketing-dedupe.ts. From that slice on, the nightly prune rolls
+            -- analytics_agent_views up into agent_view_daily and then DELETEs
+            -- the raw rows, so a bare COUNT(*) would silently undercount every
+            -- agent whose views predate the prune cutoff — and would shuffle
+            -- dedupe winners as history ages out. Lifetime total = permanent
+            -- rollup + whatever raw rows have not been pruned yet.
+            (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id), 0)
+             + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id)) AS views_count
          FROM outreach_ready_pool p
          INNER JOIN agent_knowledge k ON k.agent_id = p.agent_id
          ORDER BY COALESCE(p.outreach_eligible_at, '9999-12-31') ASC

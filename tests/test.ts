@@ -6532,6 +6532,18 @@ const _m2Promise = (async function runOwnerPortalTests() {
         view_source TEXT DEFAULT 'unknown',
         created_at TEXT DEFAULT (datetime('now'))
       );
+      -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+      -- outreach routes' views_count is now "agent_view_daily rollup total +
+      -- remaining raw rows", so this hand-rolled fixture schema needs the
+      -- rollup table too or those queries fail with "no such table".
+      CREATE TABLE agent_view_daily (
+        day TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        view_source TEXT NOT NULL DEFAULT 'unknown',
+        city TEXT NOT NULL DEFAULT '',
+        view_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, agent_id, view_source, city)
+      );
       CREATE VIEW outreach_ready_pool AS
         SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
                k.email, k.phone, k.verification_status, k.enrichment_status,
@@ -24667,6 +24679,20 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
+    -- outreach-candidates views_count is now "agent_view_daily rollup total +
+    -- remaining raw rows", because the nightly prune deletes raw
+    -- analytics_agent_views rows once they are rolled up here. This
+    -- hand-rolled fixture schema needs the rollup table too.
+    CREATE TABLE agent_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_source TEXT NOT NULL DEFAULT 'unknown',
+      city TEXT NOT NULL DEFAULT '',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id, view_source, city)
+    );
+
     CREATE TABLE agent_blocklist (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       identifier_type TEXT NOT NULL,
@@ -34149,6 +34175,42 @@ const _opsPruneRollupPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260903-analytics-rollup-slice2: the two analytics tables slice 1
+// had to stop deleting from (analytics_queries, analytics_agent_views) now
+// have rollup destinations — query_daily / query_text_daily /
+// agent_view_daily — plus sessions_daily (TRUE distinct sessions per day,
+// written from the same page-view scan as page_view_daily). runAutoPrune()
+// resumes deleting from all three tables, and admin-outreach-pool /
+// admin-outreach-candidates now count lifetime views as rollup + remaining
+// raw so the dedupe tiebreaker does not silently undercount as history is
+// pruned. Swaps the shared getDb() singleton -> strictly after ops-prune-rollup.
+let _rollupSlice2Resolve: () => void = () => {};
+const _rollupSlice2Promise: Promise<void> = new Promise<void>(r => {
+  _rollupSlice2Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_opsPruneRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260903-analytics-rollup-slice2: query/agent-view/sessions rollup ──");
+  try {
+    const { runAnalyticsRollupSlice2Tests } = require("../src/services/analytics-rollup-slice2.test") as
+      typeof import("../src/services/analytics-rollup-slice2.test");
+    const rs2 = await runAnalyticsRollupSlice2Tests({ log: false });
+    passed += rs2.passed;
+    failed += rs2.failed;
+    for (const f of rs2.failures) failures.push("analytics-rollup-slice2: " + f);
+    console.log(`  analytics-rollup-slice2: ${rs2.passed} passed, ${rs2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-rollup-slice2: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rollupSlice2Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
@@ -34164,7 +34226,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_opsPruneRollupPromise]);
+  await Promise.allSettled([_rollupSlice2Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
