@@ -41226,6 +41226,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-03-rfb-trust-score-offentlig-visning (alternativ A,
+// Daniel-GO 2026-09-03): removes the public "Trust Score" percentage bar
+// (producer cards — all renderer variants — and the producer profile page's
+// pf-stats tile) while leaving agents.trust_score / discovery sort order
+// untouched. Own harness (__setDbForTesting/__initSchemaForTesting, real
+// router handlers pulled off the route stack) — mirrors
+// rfb-verifisert-av-eier-badge-rename.test.ts's harness. Runs via
+// runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-03-rfb-trust-score-offentlig-visning: public Trust Score removal ──");
+  try {
+    const { runTrustScorePublicDisplayRemovedTests } = require("../src/routes/rfb-trust-score-public-display-removed.test") as
+      typeof import("../src/routes/rfb-trust-score-public-display-removed.test");
+    const ts = await runTrustScorePublicDisplayRemovedTests({ log: false });
+    passed += ts.passed;
+    failed += ts.failed;
+    for (const f of ts.failures) failures.push("rfb-trust-score-public-display-removed: " + f);
+    console.log(`  rfb-trust-score-public-display-removed: ${ts.passed} passed, ${ts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-trust-score-public-display-removed: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-08-01-rfb-agents-url-skrivespak: `agents.url` write lever.
 // Sister to the contact-email block and the same defect class — the homepage
 // column the catalog serves (and enrichment reads a producer's email off) had

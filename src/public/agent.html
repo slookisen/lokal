@@ -48,11 +48,6 @@
         .city-info{color:rgba(254,250,224,0.8);margin-bottom:16px;font-size:16px}
         .categories{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
         .cat-tag{background:rgba(254,250,224,0.15);color:var(--cream);padding:4px 12px;border-radius:16px;font-size:13px;border:1px solid rgba(254,250,224,0.3)}
-        .trust-section{max-width:250px}
-        .trust-label{font-size:13px;color:rgba(254,250,224,0.9);margin-bottom:6px;font-weight:500}
-        .trust-bar{background:rgba(254,250,224,0.2);height:8px;border-radius:4px;overflow:hidden}
-        .trust-fill{height:100%;border-radius:4px;transition:width .3s}
-        .trust-pct{font-size:13px;color:rgba(254,250,224,0.9);margin-top:4px}
         main{padding:40px 20px}
         section{margin-bottom:40px}
         section.hidden{display:none}
@@ -77,13 +72,6 @@
         .contact-value a:hover{color:var(--orange)}
         .map-wrap{border-radius:4px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1);margin-top:12px}
         #map{height:350px;width:100%}
-        .trust-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
-        .trust-card{background:var(--bgL);padding:14px;border-radius:4px;border-left:3px solid var(--orange)}
-        .trust-card-label{font-size:11px;color:var(--txtL);text-transform:uppercase;font-weight:600;margin-bottom:6px}
-        .trust-card-score{font-size:22px;font-weight:700;color:var(--fg)}
-        .trust-card-detail{font-size:12px;color:var(--txtL);margin-top:4px}
-        .tips{margin-top:16px}
-        .tip{background:var(--cream);padding:10px 14px;border-radius:4px;margin-bottom:8px;font-size:14px;color:var(--dk);border-left:3px solid var(--orange)}
         .cta-section{background:var(--cream);padding:36px;border-radius:4px;text-align:center;border:2px solid var(--fg)}
         .cta-section h2{border:none;margin-bottom:12px}
         .cta-section p{color:var(--txtL);margin-bottom:20px}
@@ -97,7 +85,6 @@
             main{padding:24px 16px}
             .products-grid{grid-template-columns:1fr}
             .contact-grid{grid-template-columns:1fr}
-            .trust-grid{grid-template-columns:repeat(2,1fr)}
             #map{height:250px}
             .cta-section{padding:24px 16px}
         }
@@ -128,15 +115,12 @@
 
     function getAgentId(){var m=window.location.pathname.match(/\/agent\/([^/]+)/);return m?m[1]:null}
 
-    function trustColor(score){if(score>=0.7)return '#2D6A4F';if(score>=0.4)return '#E76F51';return '#999'}
-
     function render(data){
         var a=data.agent||{};
         var k=data.knowledge||{};
         var m=data.meta||{};
         var name=esc(a.name||'Agent');
         var city=esc(a.city||'Norge');
-        var ts=Math.round((a.trustScore||0)*100);
         var desc=safeDesc(k.about||'');
 
         // Update page meta
@@ -164,10 +148,6 @@
             cats.forEach(function(c){html+='<span class="cat-tag">'+(CAT_NAMES[c]||esc(c))+'</span>'});
             html+='</div>';
         }
-        // Trust bar
-        html+='<div class="trust-section"><div class="trust-label">Tillitsscore</div>';
-        html+='<div class="trust-bar"><div class="trust-fill" style="width:'+ts+'%;background:'+trustColor(a.trustScore)+'"></div></div>';
-        html+='<div class="trust-pct">'+ts+'%</div></div>';
         html+='</div></header>';
 
         html+='<main class="container">';
@@ -231,9 +211,6 @@
         // Map placeholder
         html+='<section id="map-section" class="hidden"><h2>Kart</h2><div class="map-wrap"><div id="map"></div></div></section>';
 
-        // Trust breakdown placeholder
-        html+='<section id="trust-section"><h2>Tillitsanalyse</h2><div id="trust-grid" class="trust-grid"></div><div id="trust-tips" class="tips"></div></section>';
-
         // CTA
         if(!a.isClaimed&&!a.isVerified){
             html+='<section class="cta-section"><h2>Er dette din butikk?</h2><p>Krev din agent, oppdater informasjonen og bli mer synlig for kunder.</p>';
@@ -248,28 +225,6 @@
         document.getElementById('app').innerHTML=html;
 
         return {agentId:a.id, lat:a.lat, lng:a.lng, name:a.name};
-    }
-
-    function renderTrust(data){
-        var container=document.getElementById('trust-grid');
-        var tipsEl=document.getElementById('trust-tips');
-        if(!container||!data||!data.success)return;
-        var d=data.data;
-        var signals=d.signals||{};
-        var html='';
-        var labels={verification:'Verifisering',completeness:'Komplett',freshness:'Aktivitet',interaction:'Interaksjon',community:'Fellesskap'};
-        Object.keys(signals).forEach(function(key){
-            var s=signals[key];
-            html+='<div class="trust-card"><div class="trust-card-label">'+labels[key]+'</div>';
-            html+='<div class="trust-card-score">'+Math.round(s.value*100)+'%</div>';
-            html+='<div class="trust-card-detail">'+esc(s.detail)+'</div></div>';
-        });
-        container.innerHTML=html;
-        if(tipsEl&&d.tips&&d.tips.length){
-            var th='';
-            d.tips.forEach(function(t){th+='<div class="tip">'+esc(t)+'</div>'});
-            tipsEl.innerHTML=th;
-        }
     }
 
     function initMap(lat,lng,name){
@@ -312,10 +267,6 @@
             }
 
             var info=render(merged);
-
-            // Fetch trust breakdown
-            var trustRes=await fetch('/api/marketplace/agents/'+agentId+'/trust');
-            if(trustRes.ok){var trustData=await trustRes.json();renderTrust(trustData)}
 
             // Init map
             if(fullAgent&&fullAgent.location){initMap(fullAgent.location.lat,fullAgent.location.lng,info.name)}
