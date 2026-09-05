@@ -231,23 +231,120 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
       "coreEligibilityCheck: reports the correct failed condition for 'thin'",
     );
 
-    // dev-request 2026-07-30-outreach-gate-tynne-profiler: 'partial' used to pass
-    // this check (see the retired `passesPartial` case below this block's history)
-    // — it must now fail, mirroring the outreach_ready_pool VIEW's tightened gate.
-    // Mutation pin: reverting the `!== "rich"` condition back to the old
-    // partial-or-rich check makes this assertion fail.
-    const failPartial = coreEligibilityCheck({
+    // dev-request 2026-09-05-orch-pr-1-coreeligibility-partial: a 'partial' row
+    // now qualifies IFF isContentQualified(row) is true (about>=80 chars OR
+    // products>=3), mirroring the outreach_ready_pool VIEW's own widened gate
+    // (PR #796 / dev-request 2026-09-02-rfb-pool-view-rich-vs-partial). A
+    // 'partial' row with NO about/products (this fixture) fails the content
+    // threshold and must be rejected — but with the NEW `content_threshold_
+    // not_met` label, not the OLD `enrichment_status_not_rich` label (that
+    // label is now reserved for genuinely non-rich, non-partial statuses, e.g.
+    // 'thin', tested above). Mutation pin: reverting the content-threshold
+    // branch back to a bare `!== "rich"` check makes this assertion fail.
+    const failPartialThin = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "partial",
       email: "x@example.no",
       umbrella_type: null,
     });
-    assertEq(failPartial.ok, false, "coreEligibilityCheck: fails when enrichment_status is 'partial' (tightened 2026-07-30)");
     assertEq(
-      failPartial.failedCondition,
-      "enrichment_status_not_rich",
-      "coreEligibilityCheck: reports the correct failed condition for 'partial'",
+      failPartialThin.ok,
+      false,
+      "coreEligibilityCheck: fails when enrichment_status is 'partial' and content threshold is not met",
     );
+    assertEq(
+      failPartialThin.failedCondition,
+      "content_threshold_not_met",
+      "coreEligibilityCheck: reports the NEW 'content_threshold_not_met' condition for a thin 'partial' row (NOT 'enrichment_status_not_rich')",
+    );
+
+    // ── dev-request 2026-09-05-orch-pr-1-coreeligibility-partial: new tests ──
+    //
+    // 1. A 'partial' row with about~90 chars (clears the 80-char threshold)
+    //    must PASS.
+    const passPartialAbout = coreEligibilityCheck({
+      verification_status: "verified",
+      enrichment_status: "partial",
+      email: "x@example.no",
+      umbrella_type: null,
+      about: "x".repeat(90),
+      products: [],
+    });
+    assertEq(
+      passPartialAbout.ok,
+      true,
+      "coreEligibilityCheck: 'partial' with about>=80 chars PASSES (content threshold met via about)",
+    );
+    assertEq(
+      passPartialAbout.failedCondition,
+      null,
+      "coreEligibilityCheck: failedCondition is null for a content-threshold-qualifying 'partial' row",
+    );
+
+    // 2. A 'partial' row with 3 products (clears the products>=3 threshold,
+    //    short about) must also PASS.
+    const passPartialProducts = coreEligibilityCheck({
+      verification_status: "verified",
+      enrichment_status: "partial",
+      email: "x@example.no",
+      umbrella_type: null,
+      about: "kort",
+      products: [{ name: "a" }, { name: "b" }, { name: "c" }],
+    });
+    assertEq(
+      passPartialProducts.ok,
+      true,
+      "coreEligibilityCheck: 'partial' with products>=3 PASSES (content threshold met via products, short about)",
+    );
+
+    // 3. A 'partial' row with about~40 chars AND only 1 product (fails BOTH
+    //    legs of the threshold) must FAIL with the NEW failedCondition.
+    const failPartialContent = coreEligibilityCheck({
+      verification_status: "verified",
+      enrichment_status: "partial",
+      email: "x@example.no",
+      umbrella_type: null,
+      about: "x".repeat(40),
+      products: [{ name: "Poteter" }],
+    });
+    assertEq(
+      failPartialContent.ok,
+      false,
+      "coreEligibilityCheck: 'partial' with about=40 chars + 1 product FAILS (neither leg of the threshold clears)",
+    );
+    assertEq(
+      failPartialContent.failedCondition,
+      "content_threshold_not_met",
+      "coreEligibilityCheck: reports 'content_threshold_not_met' (NOT 'enrichment_status_not_rich') for a thin 'partial' row",
+    );
+
+    // 4. Parity: the same about/products fixtures must agree between
+    //    isContentQualified() (the extracted predicate, database/init.ts) and
+    //    coreEligibilityCheck() — the whole point of extracting ONE canonical
+    //    predicate instead of duplicating the threshold.
+    const { isContentQualified } = require("../database/init") as typeof import("../database/init");
+    const parityFixtures: Array<{ about: string; products: unknown[]; label: string }> = [
+      { about: "x".repeat(90), products: [], label: "about>=80, 0 products" },
+      { about: "kort", products: [{ name: "a" }, { name: "b" }, { name: "c" }], label: "short about, 3 products" },
+      { about: "x".repeat(40), products: [{ name: "Poteter" }], label: "about=40, 1 product" },
+      { about: "", products: [], label: "empty about, 0 products" },
+    ];
+    for (const fx of parityFixtures) {
+      const directResult = isContentQualified({ about: fx.about, products: fx.products });
+      const viaCheck = coreEligibilityCheck({
+        verification_status: "verified",
+        enrichment_status: "partial",
+        email: "x@example.no",
+        umbrella_type: null,
+        about: fx.about,
+        products: fx.products,
+      });
+      assertEq(
+        viaCheck.ok,
+        directResult,
+        `coreEligibilityCheck/isContentQualified parity (${fx.label}): both must agree on eligibility`,
+      );
+    }
 
     const failEmail = coreEligibilityCheck({
       verification_status: "verified",

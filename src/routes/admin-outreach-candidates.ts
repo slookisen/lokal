@@ -38,7 +38,7 @@
 //      Idempotent: rows with the same message_id are skipped.
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, isContentQualified } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { dedupeByEmail } from "../services/marketing-dedupe";
 import {
@@ -166,6 +166,13 @@ export interface CoreEligibilityRow {
   enrichment_status: string | null | undefined;
   email: string | null | undefined;
   umbrella_type: string | null | undefined;
+  // dev-request 2026-09-05-orch-pr-1-coreeligibility-partial: only needed to
+  // decide whether a 'partial' row clears isContentQualified's threshold
+  // (about>=80 chars OR products>=3, database/init.ts). A 'rich' row never
+  // reads these — callers/fixtures that only ever pass 'rich' rows can omit
+  // them entirely.
+  about?: string | null | undefined;
+  products?: string | unknown[] | null | undefined;
 }
 
 export function coreEligibilityCheck(
@@ -175,10 +182,31 @@ export function coreEligibilityCheck(
   if (row.verification_status !== "verified") {
     return { ok: false, failedCondition: "verification_status_not_verified" };
   }
-  // dev-request 2026-07-30-outreach-gate-tynne-profiler: mirrors the
-  // outreach_ready_pool VIEW's tightened gate (was partial-or-rich).
+  // dev-request 2026-09-05-orch-pr-1-coreeligibility-partial: mirrors the
+  // outreach_ready_pool VIEW's WIDENED gate (PR #796 / dev-request
+  // 2026-09-02-rfb-pool-view-rich-vs-partial) — 'rich' always qualifies;
+  // 'partial' also qualifies IFF it clears the same content threshold the
+  // VIEW enforces (isContentQualified — the exact POOL_CONTENT_THRESHOLD_SQL
+  // predicate mirrored in JS, database/init.ts). This used to be a hard
+  // `!== 'rich'` check (dev-request 2026-07-30-outreach-gate-tynne-profiler),
+  // which rejected EVERY 'partial' row unconditionally — including the ones
+  // #796 deliberately made pool-eligible — so this route's own gate-integrity
+  // re-verification (below) silently rejected all of them post-slice and, at
+  // low `limit` values, returned an empty candidate list even though the VIEW
+  // itself was returning dozens of eligible rows (2026-09-05 production P0).
   if (row.enrichment_status !== "rich") {
-    return { ok: false, failedCondition: "enrichment_status_not_rich" };
+    const partialQualifies = row.enrichment_status === "partial" && isContentQualified(row);
+    if (!partialQualifies) {
+      // A genuinely non-rich, non-qualifying-partial status (thin/null/other)
+      // keeps the ORIGINAL label; only a 'partial' row that fails the content
+      // threshold gets the NEW label — the two failure reasons are distinct
+      // and must not collapse back into one string.
+      return {
+        ok: false,
+        failedCondition:
+          row.enrichment_status === "partial" ? "content_threshold_not_met" : "enrichment_status_not_rich",
+      };
+    }
   }
   if (!row.email || row.email.trim() === "") {
     return { ok: false, failedCondition: "email_missing" };
@@ -726,19 +754,24 @@ router.get("/", (req: Request, res: Response) => {
       });
     }
 
-    // Cap by limit AFTER suppression + dedupe + ordering
-    const cappedCandidates = ordered.slice(0, limit);
-
     // ── Fix 2 (2026-07-15 P0 gate-integrity): fresh, independent re-verification
-    // pass over the EXACT agent_ids about to be returned. Genuinely independent
-    // — a brand-new db.prepare(...).all(...) call, not a reuse of the in-memory
-    // `rows`/`candidates` computed above — so it catches drift between the
-    // initial SELECT and this moment. This can only REMOVE a candidate from the
-    // response, never add one.
+    // pass over the FULL `ordered` list (not just the capped page). Genuinely
+    // independent — a brand-new db.prepare(...).all(...) call, not a reuse of
+    // the in-memory `rows`/`candidates` computed above — so it catches drift
+    // between the initial SELECT and this moment. This can only REMOVE a
+    // candidate from the response, never add one.
+    //
+    // dev-request 2026-09-05-orch-pr-1-coreeligibility-partial (item 5): this
+    // now runs BEFORE the limit cap (was: cap first, then re-verify only the
+    // capped page). Re-verifying only the top-`limit` slice meant a run of
+    // rejected candidates at the front of `ordered` could return FEWER than
+    // `limit` results — or zero — even when enough eligible candidates existed
+    // further down the ranked list. Re-verifying the whole list first and
+    // capping the survivors backfills from `ordered` for free.
     let gateIntegrityViolations = 0;
-    let finalCandidates = cappedCandidates;
-    if (cappedCandidates.length > 0) {
-      const ids = cappedCandidates.map((c) => c.agent_id);
+    let eligibleOrdered = ordered;
+    if (ordered.length > 0) {
+      const ids = ordered.map((c) => c.agent_id);
       const placeholders = ids.map(() => "?").join(",");
       const recheckRows = db.prepare(`
         SELECT
@@ -746,7 +779,9 @@ router.get("/", (req: Request, res: Response) => {
           k.verification_status,
           k.enrichment_status,
           k.email,
-          a.umbrella_type
+          a.umbrella_type,
+          k.about,
+          k.products
         FROM agents a
         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id IN (${placeholders})
@@ -756,10 +791,12 @@ router.get("/", (req: Request, res: Response) => {
         enrichment_status: string | null;
         email: string | null;
         umbrella_type: string | null;
+        about: string | null;
+        products: string | null;
       }>;
       const recheckById = new Map(recheckRows.map((r) => [r.agent_id, r]));
 
-      finalCandidates = cappedCandidates.filter((c) => {
+      eligibleOrdered = ordered.filter((c) => {
         const fresh = recheckById.get(c.agent_id);
         const result = coreEligibilityCheck(fresh);
         if (!result.ok) {
@@ -772,6 +809,9 @@ router.get("/", (req: Request, res: Response) => {
         return true;
       });
     }
+
+    // Cap by limit AFTER suppression + dedupe + ordering + gate-integrity re-check.
+    const finalCandidates = eligibleOrdered.slice(0, limit);
 
     res.json({
       success: true,
