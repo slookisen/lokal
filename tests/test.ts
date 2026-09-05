@@ -42629,3 +42629,35 @@ runSerial(async () => {
     failures.push("gardssalg-rfb-enrich: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-05-google-rating-batch-provenance-write-mismatch:
+// POST /admin/google-rating-batch's PR-82 include_address_phone block could
+// report addressWritten:true / phoneWritten:true (the column really was
+// empty and really did get written) while field_provenance for that field
+// stayed at its stale pre-existing source count — mergeFieldProvenance's
+// exact-match dedup (source_type + value, admin-knowledge.ts, correct and
+// unchanged) silently swallowed the fresh write whenever an EARLIER write
+// to that same field's provenance survived a later external blank of the
+// column itself (e.g. admin-contact-write-guard-retro-sweep.ts's
+// applyPhoneBlank, which sets phone = NULL and never touches
+// field_provenance) and Google/BRREG's answer for the business is
+// unchanged. Own dedicated in-memory-db + fetch-stub harness exercising the
+// real POST /admin/google-rating-batch and GET /admin/pool-blocker-explain
+// handlers together (mirrors pending-verify-unpark-data-enriched-at-
+// writesites.test.ts block (f)'s own harness). Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-05-google-rating-batch-provenance-write-mismatch: stale-refill provenance dedup fix ──");
+  try {
+    const { runGoogleRatingBatchProvenanceStaleRefillTests } = require("../src/routes/google-rating-batch-provenance-stale-refill.test") as
+      typeof import("../src/routes/google-rating-batch-provenance-stale-refill.test");
+    const grbp = await runGoogleRatingBatchProvenanceStaleRefillTests({ log: false });
+    passed += grbp.passed;
+    failed += grbp.failed;
+    for (const f of grbp.failures) failures.push("google-rating-batch-provenance-stale-refill: " + f);
+    console.log(`  google-rating-batch-provenance-stale-refill: ${grbp.passed} passed, ${grbp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("google-rating-batch-provenance-stale-refill: unexpected error: " + String(err?.message || err));
+  }
+});
