@@ -30,11 +30,27 @@
 //   not_a_clinic     -> recordExclusion(reason:"not_a_clinic") + fill-only
 //                       verification_status='rejected' (never clobbers an
 //                       existing needs_review/rejected status set by some
-//                       other mechanism). catalog_class/catalog_class_source
-//                       are deliberately left untouched on this row — the
-//                       exclusions table is the source of truth for "not a
-//                       clinic at all", not the catalog_class enum (which
-//                       has no "rejected" member by design).
+//                       other mechanism). catalog_class ITSELF is
+//                       deliberately left untouched on this row — the
+//                       exclusions table remains the source of truth for
+//                       "not a clinic at all", not the catalog_class enum
+//                       (which has no "rejected" member by design). BUT
+//                       catalog_class_source/catalog_class_at ARE stamped
+//                       (literal "sonnet:not_a_clinic") — this is provenance
+//                       metadata this endpoint already owns, and writing it
+//                       here is what makes CANDIDATE_SQL's own
+//                       "catalog_class_source NOT LIKE 'sonnet%'" clause
+//                       naturally exclude this row from every future scan.
+//                       Without this stamp the row would never leave the
+//                       candidate cohort (not_a_clinic never changes
+//                       catalog_class, which the ukjent/company_dental_nace
+//                       predicate keeps matching), so it would be
+//                       re-selected, re-judged (repeat LLM cost) and
+//                       re-excluded (a fresh duplicate dental_exclusions
+//                       row) on every subsequent apply:true call — and,
+//                       since selection is ORDER BY navn ASC, id ASC LIMIT
+//                       ?, a stuck row sorting early could permanently
+//                       starve real candidates out of the limit budget.
 //   ukjent           -> no write at all. Row keeps its current class and is
 //                       NOT stamped sonnet%, so it stays eligible for a
 //                       future re-run.
@@ -78,6 +94,14 @@ function requireAdmin(req: Request, res: Response): boolean {
 export const CATALOG_CLASS_SONNET_SAMPLE_DEFAULT_LIMIT = 20;
 export const CATALOG_CLASS_SONNET_SAMPLE_LIMIT_CAP = 50;
 export const CATALOG_CLASS_SONNET_SAMPLE_SOURCE = "sonnet";
+// Stamped on catalog_class_source (catalog_class itself is left untouched)
+// for a not_a_clinic verdict. Matches CANDIDATE_SQL's own
+// "catalog_class_source NOT LIKE 'sonnet%'" clause, so a not_a_clinic row is
+// naturally excluded from every future scan — see the file-header comment
+// (addresses independent-review CHANGES-REQUESTED: without this stamp a
+// not_a_clinic row was re-selected/re-judged/re-excluded on every
+// subsequent apply:true call).
+export const CATALOG_CLASS_SONNET_SAMPLE_NOT_A_CLINIC_SOURCE = "sonnet:not_a_clinic";
 
 // Exported so tests can assert the candidate cohort directly without
 // re-deriving the SQL string.
@@ -155,6 +179,12 @@ router.post("/catalog-class-sonnet-sample", async (req: Request, res: Response) 
       `UPDATE dental_agents SET verification_status = 'rejected'
         WHERE id = ? AND (verification_status IS NULL OR verification_status NOT IN ('rejected','needs_review'))`,
     );
+    // Stamps provenance ONLY — never touches catalog_class itself. This is
+    // what makes CANDIDATE_SQL's existing "NOT LIKE 'sonnet%'" clause
+    // naturally exclude a not_a_clinic row from all future scans.
+    const stampNotAClinicSourceStmt = db.prepare(
+      `UPDATE dental_agents SET catalog_class_source = ?, catalog_class_at = ? WHERE id = ?`,
+    );
 
     // Sequential — never Promise.all — to avoid bursting the Anthropic API.
     for (const row of rows) {
@@ -189,6 +219,7 @@ router.post("/catalog-class-sonnet-sample", async (req: Request, res: Response) 
         });
         excluded_count++;
         rejectStatusStmt.run(row.id);
+        stampNotAClinicSourceStmt.run(CATALOG_CLASS_SONNET_SAMPLE_NOT_A_CLINIC_SOURCE, nowIso, row.id);
       } else if (isRealClass(verdict.verdict_class)) {
         updateClassStmt.run(verdict.verdict_class, CATALOG_CLASS_SONNET_SAMPLE_SOURCE, nowIso, row.id);
         applied++;

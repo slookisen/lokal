@@ -28,8 +28,13 @@
  *       sonnet%-stamped — rows each violating exactly one condition are
  *       excluded.
  *   (b) dry-run (apply omitted/false) writes nothing at all.
- *   (c) apply:true + not_a_clinic verdict -> a dental_exclusions row appears
- *       AND verification_status becomes 'rejected'.
+ *   (c) apply:true + not_a_clinic verdict -> a dental_exclusions row appears,
+ *       verification_status becomes 'rejected', catalog_class itself is left
+ *       untouched, but catalog_class_source/catalog_class_at ARE stamped
+ *       ("sonnet:not_a_clinic") — the fix for independent-review
+ *       CHANGES-REQUESTED (see (i) below): this is what makes the row
+ *       naturally drop out of CANDIDATE_SQL's own cohort on every future
+ *       scan.
  *   (d) regression: apply:true + not_a_clinic verdict does NOT overwrite a
  *       pre-existing 'needs_review' row's verification_status (exclusion is
  *       still recorded).
@@ -45,6 +50,13 @@
  *       MOCKED judge response of not_a_clinic proves the full pipeline
  *       (selection -> judged -> excluded -> rejected) end to end. Test
  *       fixture only — no hardcoded name check exists in production code.
+ *   (i) regression for independent-review CHANGES-REQUESTED: calling
+ *       apply:true TWICE in a row for the same not_a_clinic row asserts
+ *       exactly ONE dental_exclusions row exists afterward (not two), that
+ *       the row is no longer a candidate on the second call (candidate
+ *       count zero), and that the judge mock was invoked only ONCE total
+ *       across both calls (no repeat LLM cost). Before the fix this row was
+ *       re-selected/re-judged/re-excluded on every apply:true call.
  *
  * Standalone:
  *   npx tsx src/routes/admin-dental-catalog-class-sonnet-sample.test.ts
@@ -282,10 +294,11 @@ export function runAdminDentalCatalogClassSonnetSampleTests(
         assertEq(exclRow?.evidence, "Dette er ikke en tannklinikk.", "c4: exclusion evidence carries the judge's reason");
         assertEq(exclRow?.excluded_by, "dental-catalog-class-sonnet-sample", "c5: excluded_by names this endpoint");
 
-        const agentRow = dentalDb.prepare("SELECT verification_status, catalog_class, catalog_class_source FROM dental_agents WHERE id = ?").get("i-not-a-clinic") as any;
+        const agentRow = dentalDb.prepare("SELECT verification_status, catalog_class, catalog_class_source, catalog_class_at FROM dental_agents WHERE id = ?").get("i-not-a-clinic") as any;
         assertEq(agentRow.verification_status, "rejected", "c6: verification_status becomes 'rejected'");
-        assertEq(agentRow.catalog_class, "klinikk", "c7: catalog_class is left untouched on a not_a_clinic row");
-        assertEq(agentRow.catalog_class_source, "rules_v1:company_dental_nace", "c8: catalog_class_source is left untouched on a not_a_clinic row");
+        assertEq(agentRow.catalog_class, "klinikk", "c7: catalog_class itself is left untouched on a not_a_clinic row");
+        assertEq(agentRow.catalog_class_source, routeMod.CATALOG_CLASS_SONNET_SAMPLE_NOT_A_CLINIC_SOURCE, "c8: catalog_class_source IS stamped 'sonnet:not_a_clinic' on a not_a_clinic row (fix for independent-review CHANGES-REQUESTED — makes the row drop out of CANDIDATE_SQL's cohort)");
+        assertTrue(typeof agentRow.catalog_class_at === "string" && agentRow.catalog_class_at.length > 0, "c8b: catalog_class_at is stamped alongside catalog_class_source");
       }
 
       {
@@ -384,6 +397,61 @@ export function runAdminDentalCatalogClassSonnetSampleTests(
         assertEq(postRow.verification_status, "rejected", "h7: end-to-end — verification_status becomes rejected");
         assertEq(postRow.catalog_class, "klinikk", "h8: end-to-end — catalog_class enum itself is left untouched (exclusions table is the source of truth)");
       }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (i) regression for independent-review CHANGES-REQUESTED: apply:true
+      //     called TWICE in a row for the same not_a_clinic row must NOT
+      //     produce a second dental_exclusions row, must NOT re-judge the
+      //     row (no repeat LLM cost), and the row must no longer appear in
+      //     the candidate set at all on the second call.
+      // ═══════════════════════════════════════════════════════════════════
+      seed({
+        id: "l-repeat-not-a-clinic",
+        navn: "L REPEAT NOT A CLINIC AS",
+        naeringskode: "86.230",
+        organisasjonsform: "AS",
+        hjemmeside: "https://l-repeat.no",
+        org_nr: "999000444",
+        catalog_class: "ukjent",
+        catalog_class_source: null,
+      });
+      // Preset so the mock CAN return not_a_clinic again if (contrary to the
+      // fix) the row is ever re-selected/re-judged on the second call.
+      verdictsByNavn.set("L REPEAT NOT A CLINIC AS", { verdict_class: "not_a_clinic", reason: "Ikke en tannklinikk (repeat-test)." });
+
+      const judgeCallsBeforeI = judgeCalls.length;
+
+      const repeatApply1 = await post({ apply: true, limit: 50 });
+      assertEq(repeatApply1.status, 200, "i0: first apply run for the repeat-test row -> 200");
+      const namesJudgedInRun1 = judgeCalls.slice(judgeCallsBeforeI).map((c) => c.navn);
+      assertTrue(namesJudgedInRun1.includes("L REPEAT NOT A CLINIC AS"), "i1: repeat-test row is judged on the first call");
+
+      const judgeCallsAfterRun1 = judgeCalls.length;
+      const repeatCallCountAfterRun1 = judgeCalls.filter((c) => c.navn === "L REPEAT NOT A CLINIC AS").length;
+      assertEq(repeatCallCountAfterRun1, 1, "i2: repeat-test row judged exactly once after the first call");
+
+      const repeatApply2 = await post({ apply: true, limit: 50 });
+      assertEq(repeatApply2.status, 200, "i3: second apply run -> 200");
+      const namesJudgedInRun2 = judgeCalls.slice(judgeCallsAfterRun1).map((c) => c.navn);
+      assertTrue(!namesJudgedInRun2.includes("L REPEAT NOT A CLINIC AS"), "i4: repeat-test row is NOT re-judged on the second call (no longer a candidate)");
+
+      const repeatCallCountFinal = judgeCalls.filter((c) => c.navn === "L REPEAT NOT A CLINIC AS").length;
+      assertEq(repeatCallCountFinal, 1, "i5: repeat-test row's judge mock was invoked exactly ONCE total across both apply:true calls (no repeat LLM cost)");
+
+      const repeatExclRows = dentalDb.prepare("SELECT * FROM dental_exclusions WHERE org_nr = ?").all("999000444") as any[];
+      assertEq(repeatExclRows.length, 1, "i6: exactly ONE dental_exclusions row exists for the org after two apply:true calls (not two/duplicated)");
+      assertEq(repeatExclRows[0]?.reason, "not_a_clinic", "i7: the single exclusion row's reason is 'not_a_clinic'");
+
+      const repeatAgentRow = dentalDb.prepare("SELECT catalog_class, catalog_class_source FROM dental_agents WHERE id = ?").get("l-repeat-not-a-clinic") as any;
+      assertEq(repeatAgentRow.catalog_class, "ukjent", "i8: catalog_class itself remains untouched after both calls");
+      assertEq(repeatAgentRow.catalog_class_source, routeMod.CATALOG_CLASS_SONNET_SAMPLE_NOT_A_CLINIC_SOURCE, "i9: catalog_class_source is stamped 'sonnet:not_a_clinic' after the first call, keeping the row out of every later scan");
+
+      // Directly confirm the row is absent from the raw candidate SQL cohort
+      // after the fix (not just "the mock wasn't called for it").
+      const repeatStillCandidate = dentalDb
+        .prepare(`SELECT COUNT(*) AS n FROM dental_agents WHERE id = 'l-repeat-not-a-clinic' AND ${routeMod.CATALOG_CLASS_SONNET_SAMPLE_CANDIDATE_SQL}`)
+        .get() as any;
+      assertEq(repeatStillCandidate.n, 0, "i10: repeat-test row's candidate-count is zero directly against CANDIDATE_SQL after the fix");
 
       // ── admin gate ───────────────────────────────────────────────────────
       const noKey = await post({ limit: 5 }, false);
