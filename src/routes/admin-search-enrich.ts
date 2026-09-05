@@ -200,8 +200,19 @@ router.post("/", async (req: Request, res: Response) => {
   const rows: ResultRow[] = [];
   const now = new Date().toISOString();
 
+  // NOTE (review fix, orch-pr-20260901-1): this statement stamps ONLY
+  // last_search_at — the skip-tracking column that means "we looked at this
+  // row" — never updated_at. updated_at must mean "this row's content
+  // actually changed" (agent_knowledge.updated_at is DEFAULT (datetime('now'))
+  // and is otherwise only touched by real column writes — see applyWrite()
+  // below / applyEnrichWrite in search-enrich-sweep.ts). Several downstream
+  // consumers key off that meaning, notably admin-agents-pending-verify-
+  // unpark.ts's freshness filter (agent_knowledge.updated_at >
+  // pending_verify_parked_since) — a row this loop merely LOOKED AT and found
+  // nothing new for must NOT look "freshly updated" to that filter, or the
+  // filter is defeated for exactly the rows it exists to exclude.
   const stampSearchStmt = hasLastSearchAt
-    ? db.prepare("UPDATE agent_knowledge SET last_search_at = ?, updated_at = ? WHERE agent_id = ?")
+    ? db.prepare("UPDATE agent_knowledge SET last_search_at = ? WHERE agent_id = ?")
     : null;
 
   // Real deps for enrichOneAgent: Brave search (env key) + same-host crawler.
@@ -260,10 +271,12 @@ router.post("/", async (req: Request, res: Response) => {
       row.email_reason = `error:${agentErr?.message ?? String(agentErr)}`;
       row.tier = "none";
     } finally {
-      // skip-tracking: stamp every processed agent (best-effort)
+      // skip-tracking: stamp every processed agent (best-effort). Only
+      // last_search_at — see the statement's own comment above for why
+      // updated_at must NOT be bumped here.
       if (apply && stampSearchStmt) {
         try {
-          stampSearchStmt.run(now, now, t.agent_id);
+          stampSearchStmt.run(now, t.agent_id);
         } catch {
           /* non-fatal */
         }

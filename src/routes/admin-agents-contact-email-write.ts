@@ -191,8 +191,13 @@ interface ResultItem {
  * may legitimately have no agent_knowledge row at all (contact_email lives on
  * `agents`). An INNER JOIN here would silently make such rows unwritable —
  * exactly the class of bug this route was created to fix.
+ *
+ * Exported (dev-request 2026-09-01-rfb-pending-verify-unpark-lever, AC6): so
+ * the write-site no-op regression test for this route's data_enriched_at
+ * stamp can call it directly instead of round-tripping the whole HTTP batch
+ * shape — no behavior change, purely a testability export.
  */
-function applyContactEmail(
+export function applyContactEmail(
   db: ReturnType<typeof getDb>,
   agentId: string,
   newValue: string | null,
@@ -233,6 +238,12 @@ function applyContactEmail(
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
       ).run(randomUUID(), agentId, cur.contact_email, storedNew, `${batchTag}: ${reason}`);
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+      // write-site (a)): only reached on a genuine change (currentValue !== storedNew
+      // was already checked above) — never a no-op stamp. This function writes
+      // agents.contact_email, not agent_knowledge, so there is no existing
+      // agent_knowledge UPDATE to attach this to; a dedicated statement is used.
+      db.prepare(`UPDATE agent_knowledge SET data_enriched_at = datetime('now') WHERE agent_id = ?`).run(agentId);
 
       return { outcome: "written", oldValue: currentValue };
     });

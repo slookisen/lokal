@@ -2817,16 +2817,50 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
             const provJson = JSON.stringify(mergedProv);
 
-            // Single transactional write: column updates + provenance.
+            // Review finding (2nd round, orch-pr-20260901-1): don't stamp
+            // field_provenance/updated_at on a call that writes nothing new.
+            // writeAddr/writePhone are fill-empty-only (see above), so on any
+            // repeat call for an agent that already has address+phone both
+            // are false — but mergeFieldProvenance's dedupKey (source_type +
+            // value, no timestamp) means a repeated Google/BRREG answer with
+            // the SAME value also produces no new provenance entry. Compare
+            // against the canonical re-merge of the existing provenance alone
+            // (mergeFieldProvenance(existingProv, {})) rather than the raw
+            // stored string, so a legacy/unnormalised on-disk shape doesn't
+            // read as "changed" by shape alone. Mirrors the "only stamp
+            // updated_at on a genuine write" discipline of applyEnrichWrite
+            // (src/services/search-enrich-sweep.ts) / applyRfbCxWrite
+            // (admin-rfb-contact-extraction.ts) — a real column write (writeAddr
+            // / writePhone) is always a genuine change and is never gated by
+            // this comparison.
+            const provenanceChanged =
+              JSON.stringify(mergeFieldProvenance(existingProv, {})) !== provJson;
+
+            // Single transactional write: column updates + provenance. Only
+            // touches field_provenance/updated_at when a real column write
+            // happened OR the merged provenance actually differs from what's
+            // already stored — a pure re-confirmation of already-known,
+            // already-recorded data is a true no-op and must not bump
+            // updated_at (downstream freshness filters, e.g. the
+            // pending-verify-unpark lever, key off updated_at meaning "this
+            // row's content genuinely changed").
             const tx = db.transaction(() => {
               const sets: string[] = [];
               const params: any[] = [];
               if (writeAddr) { sets.push("address = ?"); params.push(gAddrRaw); }
               if (writePhone) { sets.push("phone = ?"); params.push(gPhone); }
-              sets.push("field_provenance = ?"); params.push(provJson);
-              sets.push("updated_at = ?"); params.push(nowIso);
-              params.push(agentId);
-              db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
+              if (writeAddr || writePhone || provenanceChanged) {
+                sets.push("field_provenance = ?"); params.push(provJson);
+                sets.push("updated_at = ?"); params.push(nowIso);
+                // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel
+                // Alternativ B, write-site (f)): same gate as updated_at above —
+                // never stamped on a pure no-op re-confirmation.
+                sets.push("data_enriched_at = ?"); params.push(nowIso);
+              }
+              if (sets.length > 0) {
+                params.push(agentId);
+                db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
+              }
             });
             tx();
             addressWritten = writeAddr;
@@ -7051,10 +7085,28 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     let curatedFieldsCache: ReturnType<typeof knowledgeService.getCuratedFields> | null = null;
     let emailReplaced = false;
 
+    // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+    // write-site (g)): mirrors write-site (f)'s already-fixed provenanceChanged
+    // guard in POST /admin/google-rating-batch EXACTLY — compare the merged
+    // provenance against the canonical re-merge of the existing provenance alone,
+    // so a repeated homepage answer with the SAME value (no new provenance entry)
+    // doesn't read as "changed" by shape alone. existingProv/provJson are the
+    // same values computed just above.
+    const provenanceChanged =
+      JSON.stringify(mergeFieldProvenance(existingProv, {})) !== provJson;
+
     // Optionally back-fill empty columns (mirrors google-rating-batch: only write if column empty).
     const tx = db.transaction(() => {
       const sets: string[] = [];
       const params: unknown[] = [];
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (write-site (g)):
+      // tracks whether ANY of phone/address/email actually got a real column
+      // write below — used (together with provenanceChanged) to gate
+      // field_provenance/updated_at/data_enriched_at further down so a call that
+      // extracted fields but wrote NOTHING new (fieldsFound.length > 0 yet every
+      // value byte-identical to what's already stored) is a true no-op, same
+      // class of bug write-site (f) had before its own fix.
+      let columnWritten = false;
 
       const currPhone = (kRow.phone ?? "").toString().trim();
       const currAddr = (kRow.address ?? "").toString().trim();
@@ -7063,10 +7115,12 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       if (!currPhone && gatedPhone) {
         sets.push("phone = ?");
         params.push(gatedPhone);
+        columnWritten = true;
       }
       if (!currAddr && extractedAddress) {
         sets.push("address = ?");
         params.push(extractedAddress);
+        columnWritten = true;
       }
       // orch-pr-<N> (2026-07-05): mirrors the phone/address backfill above.
       // Without this, an extracted+guarded email only ever lands in
@@ -7078,6 +7132,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       if (!currEmail && incomingProv.email) {
         sets.push("email = ?");
         params.push(incomingProv.email.sources[0].value);
+        columnWritten = true;
       } else if (
         // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
         // low_quality mode only — a NON-empty stored email that is itself
@@ -7099,12 +7154,28 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
           sets.push("email = ?");
           params.push(incomingProv.email.sources[0].value);
           emailReplaced = true;
+          columnWritten = true;
         }
       }
-      sets.push("field_provenance = ?");
-      params.push(provJson);
-      sets.push("updated_at = ?");
-      params.push(nowIso);
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (write-site (g)):
+      // field_provenance/updated_at/data_enriched_at are stamped ONLY when a real
+      // column was written above OR the merged provenance genuinely differs from
+      // what's already stored — mirrors write-site (f)'s discipline. A pure
+      // re-confirmation of already-known, already-recorded data (fieldsFound
+      // non-empty but every value byte-identical to what's on file) is a true
+      // no-op and must not bump any of these three columns.
+      // last_enrichment_attempt_at / last_enrichment_outcome / no_yield_streak /
+      // wrong_entity_streak below are UNCONDITIONAL and stay that way — they
+      // track the ATTEMPT itself, not whether the content changed, and must
+      // never be gated by this comparison.
+      if (columnWritten || provenanceChanged) {
+        sets.push("field_provenance = ?");
+        params.push(provJson);
+        sets.push("updated_at = ?");
+        params.push(nowIso);
+        sets.push("data_enriched_at = ?");
+        params.push(nowIso);
+      }
       // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
       // an 'enriched' outcome resets no_yield_streak to 0 — the moment real
       // progress happens, any accumulated no-yield backoff is cleared (the

@@ -42436,3 +42436,54 @@ runSerial(async () => {
     failures.push("dental-verifier: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alt B):
+// POST /admin/agents/pending-verify-unpark — the targeted lever to release
+// individual `pending_verify` rows from the 30-day parking mechanism early,
+// once data_enriched_at shows they demonstrably received new data since
+// being parked. Own dedicated in-memory-db harness (mirrors the sibling
+// pending-verify-parking test file's own harness). This suite existed on
+// disk (standalone-run convention, per its own header) but was never wired
+// into this aggregator, so its regression coverage was not actually
+// enforced by `npm test`/CI. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-01-rfb-pending-verify-unpark-lever: pending-verify-unpark ──");
+  try {
+    const { runAdminAgentsPendingVerifyUnparkTests } = require("../src/routes/admin-agents-pending-verify-unpark.test") as
+      typeof import("../src/routes/admin-agents-pending-verify-unpark.test");
+    const pvu = await runAdminAgentsPendingVerifyUnparkTests({ log: false });
+    passed += pvu.passed;
+    failed += pvu.failed;
+    for (const f of pvu.failures) failures.push("admin-agents-pending-verify-unpark: " + f);
+    console.log(`  admin-agents-pending-verify-unpark: ${pvu.passed} passed, ${pvu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-pending-verify-unpark: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, AC6 regression suite: proves each of the 7 curated write
+// sites that stamp agent_knowledge.data_enriched_at does so ONLY on a
+// genuine content write, never on a no-op call — the exact false-admit
+// failure mode pending-verify-unpark's freshness filter depends on not
+// happening. Own dedicated in-memory-db + fetch-stub harness spanning six
+// otherwise-unrelated route/service modules (mirrors homepage-provenance-
+// junk-email-replace.test.ts / marketplace-rfb-contact-judge.test.ts's own
+// harness pattern). Also existed on disk unwired until now. Tail position is
+// the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-01-rfb-pending-verify-unpark-lever: data_enriched_at write-site AC6 regression ──");
+  try {
+    const { runPendingVerifyUnparkWriteSitesTests } = require("../src/routes/pending-verify-unpark-data-enriched-at-writesites.test") as
+      typeof import("../src/routes/pending-verify-unpark-data-enriched-at-writesites.test");
+    const pvuws = await runPendingVerifyUnparkWriteSitesTests({ log: false });
+    passed += pvuws.passed;
+    failed += pvuws.failed;
+    for (const f of pvuws.failures) failures.push("pending-verify-unpark-data-enriched-at-writesites: " + f);
+    console.log(`  pending-verify-unpark-data-enriched-at-writesites: ${pvuws.passed} passed, ${pvuws.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("pending-verify-unpark-data-enriched-at-writesites: unexpected error: " + String(err?.message || err));
+  }
+});

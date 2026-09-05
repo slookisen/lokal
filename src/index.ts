@@ -82,6 +82,7 @@ import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
+import adminAgentsPendingVerifyUnparkRoutes from "./routes/admin-agents-pending-verify-unpark";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-contacts-diagnose";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -847,6 +848,13 @@ app.use("/admin/dod-bulk", adminLimiter, adminDodBulkRoutes);
 // (fill-or-replace-if-flagged-dead), never phone, never field_provenance.
 // POST /admin/rfb-contact-extraction (dry-run default).
 app.use("/admin", adminLimiter, adminRfbContactExtractionRoutes);
+// dev-requests/2026-09-01-rfb-pending-verify-unpark-lever.md: targeted lever
+// to release individual `pending_verify` rows from 30-day parking early, once
+// they've actually received new data since being parked (agent_knowledge.
+// updated_at > pending_verify_parked_since) — mirrors unparkAgentsGeocode's
+// pattern for the geocode worker's own parking mechanism.
+// POST /admin/agents/pending-verify-unpark (dry-run default).
+app.use("/admin", adminLimiter, adminAgentsPendingVerifyUnparkRoutes);
 // orch-pr-10 (2026-06-14): per-producer Brave search→crawl→confirm→email — POST /admin/search-enrich (dry-run default)
 app.use("/admin/search-enrich", adminLimiter, express.json(), adminSearchEnrichRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
