@@ -758,6 +758,24 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_analytics_mcp_calls_tool_name ON analytics_mcp_calls(tool_name);
   `);
 
+  // ─── agent_blocklist.linked_org_nr (dev-request 2026-09-03-rfb-
+  // korrigering-navn-sted-kategorier, Mål 3) ──────────────────────
+  // Incident: deleting "Moland Gård — Telemark" auto-blocklisted it by
+  // identifier_type='name_normalized', which would also wrongly block a
+  // future, different, real "Moland Gård" (a different org.nr) re-registering
+  // under the exact same name string. This column lets a name_normalized row
+  // record which org.nr it was actually about, so isBlocked() can tell "same
+  // company, deleted on purpose" apart from "different company, same name"
+  // when a candidate's org.nr is known. Set ONLY on identifier_type=
+  // 'name_normalized' rows, and only when an org.nr was known at
+  // blocklist-insert time (blocklist-service.ts add()); NULL otherwise —
+  // including for every pre-existing row, and for every non-name_normalized
+  // row type. Idempotent ALTER, same defensive try/catch pattern as the
+  // agents.org_nr migration below (~line 3510).
+  try {
+    db.exec(`ALTER TABLE agent_blocklist ADD COLUMN linked_org_nr TEXT`);
+  } catch { /* already exists — expected */ }
+
   // ════════════════════════════════════════════════════════════
   // CRM: contacts, threads, messages, actions, outbox
   // Inbox-CRM for customer-service workflow.

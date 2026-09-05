@@ -2175,6 +2175,7 @@ router.post("/admin/register", (req: Request, res: Response) => {
       name: registration.name,
       website: (registration as any).url,
       email: (registration as any).contactEmail,
+      orgNr: (registration as any).orgNr,
     });
     if (blocked.blocked) {
       console.log(`[blocklist] refused /admin/register for ${registration.name} (matched ${blocked.matchedBy})`);
@@ -3095,6 +3096,18 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
         const fullAgent = db.prepare("SELECT id, name, contact_email, url FROM agents WHERE id = ?").get(agentId) as any;
         // fullAgent is null here (we just deleted) — fromRegistry (captured
         // pre-delete above, includeUnvetted:true) supplies the richer data.
+        //
+        // orgNr note (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+        // kategorier, Mål 3): this call site cannot supply orgNr today.
+        // fromRegistry is a RegisteredAgent (marketplaceRegistry.rowToAgent()),
+        // which does not map agents.org_nr onto the returned object even
+        // though the column exists — so there is no org-number field to read
+        // here. The agent row is already deleted by this point (deleteAll()
+        // above), so a fresh SELECT ... FROM agents would return nothing
+        // anyway; deliberately not adding one. Leaving orgNr omitted is a
+        // no-op today — add()/isBlocked() already do nothing extra when
+        // orgNr is absent, i.e. no regression from today's behavior. If
+        // rowToAgent() ever starts mapping org_nr, wire it through here.
         blocklistResult = blocklistAdd({
           agentId,
           name: agent.name,

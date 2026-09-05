@@ -24746,6 +24746,10 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       original_agent_id TEXT,
       original_agent_name TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 3
+      -- (mirrors database/init.ts): isBlocked() SELECTs this column
+      -- unconditionally, so this minimal hand-rolled schema needs it too.
+      linked_org_nr TEXT,
       UNIQUE(identifier_type, identifier_value)
     );
 

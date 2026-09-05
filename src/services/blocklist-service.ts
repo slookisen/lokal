@@ -30,6 +30,14 @@ export type BlocklistEntry = {
   original_agent_id: string | null;
   original_agent_name: string | null;
   created_at: string;
+  // dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 3:
+  // set ONLY on 'name_normalized' rows, and only when an org.nr was known
+  // at insert time (add(), when both input.name and input.orgNr are given).
+  // NULL for every other row type and for every row where no org.nr was
+  // known. Lets isBlocked() tell "same company, deleted on purpose" apart
+  // from "different company, same name" when the candidate's org.nr is
+  // known too — see isBlocked() below.
+  linked_org_nr: string | null;
 };
 
 // ─── Normalisering ──────────────────────────────────────────────
@@ -163,9 +171,26 @@ export function isBlocked(opts: {
     }
     for (const [type, value] of checks) {
       const hit = db.prepare(
-        "SELECT identifier_type, identifier_value FROM agent_blocklist WHERE identifier_type = ? AND identifier_value = ? LIMIT 1"
-      ).get(type, value) as { identifier_type: BlocklistEntry["identifier_type"]; identifier_value: string } | undefined;
+        "SELECT identifier_type, identifier_value, linked_org_nr FROM agent_blocklist WHERE identifier_type = ? AND identifier_value = ? LIMIT 1"
+      ).get(type, value) as { identifier_type: BlocklistEntry["identifier_type"]; identifier_value: string; linked_org_nr: string | null } | undefined;
       if (hit) {
+        // Mål 3 disambiguation: a 'name_normalized' row that was recorded
+        // against a KNOWN org.nr does not block a candidate we can
+        // affirmatively show is a DIFFERENT org.nr — e.g. "Moland Gård"
+        // blocklisted for org.nr 927532778 must not block a re-import of a
+        // different, real "Moland Gård" at org.nr 933527484. This only ever
+        // turns a would-be block into a non-block; it never adds a new
+        // block. Every other case (no linked_org_nr recorded, no
+        // opts.orgNr given, or the two org.nrs match) keeps today's
+        // behavior unchanged — still blocked.
+        if (
+          hit.identifier_type === "name_normalized" &&
+          hit.linked_org_nr &&
+          opts.orgNr &&
+          normalizeOrgNr(opts.orgNr) !== hit.linked_org_nr
+        ) {
+          continue;
+        }
         return { blocked: true, matchedBy: hit.identifier_type, matchedValue: hit.identifier_value };
       }
     }
@@ -217,9 +242,16 @@ export function add(input: {
     const norm = normalizeOrgNr(input.orgNr);
     if (norm) rowsToInsert.push({ type: "org_nr", value: norm });
   }
+  // Mål 3: capture the normalized name_normalized value separately so the
+  // linked_org_nr UPDATE below (which only ever targets this one row type)
+  // doesn't have to re-derive or re-search for it.
+  let nameNormalizedValue: string | null = null;
   if (input.name) {
     const norm = normalizeName(input.name);
-    if (norm) rowsToInsert.push({ type: "name_normalized", value: norm });
+    if (norm) {
+      rowsToInsert.push({ type: "name_normalized", value: norm });
+      nameNormalizedValue = norm;
+    }
   }
 
   if (rowsToInsert.length === 0) {
@@ -231,12 +263,46 @@ export function add(input: {
       (identifier_type, identifier_value, reason, source_email, original_agent_id, original_agent_name, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
+  // dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 3:
+  // when a name_normalized row is written AND an org.nr was known at
+  // insert time, record which org.nr this specific name blocklisting was
+  // actually about — see isBlocked()'s disambiguation and the
+  // linked_org_nr column comment in database/init.ts. Every other row
+  // type is untouched (column stays NULL).
+  // Bugfix (reviewer finding, 2026-09-05): this UPDATE matches on
+  // identifier_value alone, table-wide — NOT "the row this call just
+  // inserted". agent_blocklist has UNIQUE(identifier_type, identifier_value),
+  // so a later, unrelated add() call that happens to reuse an EXISTING
+  // name_normalized row's exact string is a no-op INSERT OR IGNORE for that
+  // row — but this UPDATE would otherwise still fire unconditionally,
+  // overwriting the PRE-EXISTING row's linked_org_nr with the new call's
+  // org.nr and silently narrowing what may have been a deliberate,
+  // conservative (no-org-nr) block. Gated below on
+  // nameNormalizedInsertedThisCall so it only ever touches a row THIS call
+  // actually newly inserted.
+  const normalizedOrgNrForLink = input.orgNr ? normalizeOrgNr(input.orgNr) : "";
+  const linkStmt = db.prepare(
+    `UPDATE agent_blocklist SET linked_org_nr = ? WHERE identifier_type = 'name_normalized' AND identifier_value = ?`
+  );
 
   let inserted = 0;
+  // Tracks whether THIS call's own name_normalized row insert actually
+  // changed a row (i.e. it was newly inserted now, not an INSERT OR IGNORE
+  // no-op against a pre-existing row from an earlier, different add() call).
+  // Guards the linkStmt.run() below so a later, unrelated add() call that
+  // happens to reuse an existing name string can never overwrite that
+  // pre-existing row's linked_org_nr — see the bugfix note above linkStmt.
+  let nameNormalizedInsertedThisCall = false;
   const tx = db.transaction(() => {
     for (const r of rowsToInsert) {
       const res = stmt.run(r.type, r.value, reason, input.sourceEmail || null, input.agentId || null, auditName, now);
-      if (res.changes > 0) inserted++;
+      if (res.changes > 0) {
+        inserted++;
+        if (r.type === "name_normalized") nameNormalizedInsertedThisCall = true;
+      }
+    }
+    if (nameNormalizedValue && normalizedOrgNrForLink && nameNormalizedInsertedThisCall) {
+      linkStmt.run(normalizedOrgNrForLink, nameNormalizedValue);
     }
   });
   tx();

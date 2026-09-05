@@ -27,7 +27,7 @@
 
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting } from "../database/init";
-import { isBlocked } from "../services/blocklist-service";
+import { add as blocklistAddDirect, isBlocked } from "../services/blocklist-service";
 
 export interface TestSummary {
   passed: number;
@@ -284,6 +284,69 @@ export function runAdminBlocklistManualEntryTests(opts: { log?: boolean } = {}):
     assertEq(resLegacyOrgNr.status, 201, "legacy shape: orgNr field accepted -> 201");
     assertEq(resLegacyOrgNr.body?.inserted, 2, "legacy shape: inserts both website_domain and org_nr");
     assertEq(countRows("org_nr", "988111222"), 1, "legacy shape: org_nr row written via the named-field shape");
+
+    // ── 11. linked_org_nr disambiguation (dev-request 2026-09-03-rfb-
+    //    korrigering-navn-sted-kategorier, Mål 3). Incident: deleting
+    //    "Moland Gård — Telemark" auto-blocklisted the name, which would
+    //    also wrongly block a DIFFERENT, real "Moland Gård" (different
+    //    org.nr) re-registering under the exact same name string. A
+    //    name_normalized row recorded against a KNOWN org.nr must not
+    //    block a candidate we can affirmatively show is a different
+    //    org.nr — but must stay conservative (still block) whenever we
+    //    can't disambiguate. Fresh/unique names per case for isolation. ──
+
+    // (a) add(name, orgNr=111111111) → isBlocked(same name, orgNr=222222222)
+    //     is NOT blocked (different org.nr, same name).
+    blocklistAddDirect({ name: "Moland Gård", orgNr: "111111111", reason: "test: Mål 3 disambiguation" });
+    const molandDifferentOrgNr = isBlocked({ name: "Moland Gård", orgNr: "222222222" });
+    assertEq(molandDifferentOrgNr.blocked, false, "linked_org_nr: different org.nr, same name -> NOT blocked");
+
+    // (b) same setup, isBlocked(same name, orgNr=111111111) -> still blocked
+    //     (same org.nr). Note: add({name, orgNr}) also inserts a plain
+    //     identifier_type='org_nr' row (unrelated to Mål 3), and isBlocked()'s
+    //     checks loop tries org_nr before name_normalized, so this
+    //     particular case matches via matchedBy='org_nr' rather than ever
+    //     reaching the name_normalized/linked_org_nr comparison — still a
+    //     correct "still blocked" per acceptance criterion (b).
+    const molandSameOrgNr = isBlocked({ name: "Moland Gård", orgNr: "111111111" });
+    assertEq(molandSameOrgNr.blocked, true, "linked_org_nr: same org.nr, same name -> still blocked");
+
+    // (c) same setup, isBlocked(same name, no orgNr given at all) -> still
+    //     blocked (conservative default — can't disambiguate without an
+    //     incoming org.nr).
+    const molandNoOrgNr = isBlocked({ name: "Moland Gård" });
+    assertEq(molandNoOrgNr.blocked, true, "linked_org_nr: no orgNr given -> conservative default, still blocked");
+
+    // (d) regression guard: add(name="X", NO orgNr) then isBlocked(name="X",
+    //     orgNr=999999999) -> still blocked (no linked_org_nr was ever
+    //     recorded, so no disambiguation is possible — must stay blocked,
+    //     exactly like today).
+    blocklistAddDirect({ name: "Blokkert Gård Uten Orgnr", reason: "test: Mål 3 regression guard" });
+    const noLinkRegression = isBlocked({ name: "Blokkert Gård Uten Orgnr", orgNr: "999999999" });
+    assertEq(noLinkRegression.blocked, true, "linked_org_nr: no linked_org_nr recorded -> still blocked regardless of incoming orgNr");
+
+    // (e) regression guard: a LATER, UNRELATED add() call for a DIFFERENT
+    //     org.nr that happens to reuse an EXISTING name_normalized row's
+    //     exact string must not retroactively stamp that pre-existing row's
+    //     linked_org_nr. Reviewer-found bug: the linked_org_nr UPDATE in
+    //     add() matched on identifier_value alone, table-wide, so it fired
+    //     even when the name_normalized row's own INSERT OR IGNORE was a
+    //     no-op against a pre-existing row from an earlier, different add()
+    //     call — silently narrowing an existing conservative (no-org-nr)
+    //     block. Fresh name string ("Solvang Gård") so this doesn't collide
+    //     with cases (a)-(d) above.
+    blocklistAddDirect({ name: "Solvang Gård", reason: "name-only block, no org.nr known" });
+    const solvangBeforeUnrelatedAdd = isBlocked({ name: "Solvang Gård", orgNr: "999999999" });
+    assertEq(solvangBeforeUnrelatedAdd.blocked, true, "linked_org_nr regression: name-only block with no org.nr -> conservative default, blocked");
+
+    // Second, unrelated add() call: same name string, but a DIFFERENT
+    // org.nr, from what should be treated as an unrelated event (e.g. a
+    // different company's own opt-out that happens to share the exact name
+    // string). Because the name_normalized row already exists, this is a
+    // no-op INSERT OR IGNORE for that row.
+    blocklistAddDirect({ name: "Solvang Gård", orgNr: "222222222", reason: "unrelated later call, same name string" });
+    const solvangAfterUnrelatedAdd = isBlocked({ name: "Solvang Gård", orgNr: "999999999" });
+    assertEq(solvangAfterUnrelatedAdd.blocked, true, "linked_org_nr regression: unrelated later add() with a different org.nr must NOT weaken the pre-existing name-only block");
   } catch (err) {
     failed++;
     failures.push(`admin-blocklist-manual-entry: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
