@@ -81,6 +81,14 @@ export const AdminRegistrationSchema = z.object({
   contactEmail: z.string().default(""),
 
   url: z.string().default(""),  // empty = "no known website" — DB layer falls back; do NOT default to our domain (creates false-positive blocklist matches)
+  // dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 3:
+  // Norwegian org.nr, purely additive — existing callers that omit it are
+  // unaffected. Lets POST /admin/register pass a known org.nr into
+  // isBlocked()'s name_normalized/linked_org_nr disambiguation (see
+  // blocklist-service.ts) so a name-based blocklist entry recorded against
+  // one org.nr doesn't wrongly block a different, real company of the same
+  // name whose org.nr is known here.
+  orgNr: z.string().optional(),
   version: z.string().default("1.0.0"),
   capabilities: z.record(z.string(), z.any()).default({}),
 
