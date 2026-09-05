@@ -1,4 +1,4 @@
-﻿import { v4 as uuid } from "uuid";
+import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { getConfig } from "../config/vertical-config";
@@ -728,8 +728,13 @@ class MarketplaceRegistry {
     // — and because categories are a hard filter, "butter and cream" returned
     // meat producers and no dairy at all (verified 2026-09-05). Norwegian
     // «and» (duck) still matches: the guard only fires once the query has
-    // already been shown to contain English food vocabulary, and an English
-    // "duck farm" reaches `meat` through the glossary instead.
+    // already been shown to contain English food vocabulary. NB: this does
+    // NOT mean an English "duck farm" reaches `meat` — it does not. The
+    // Norwegian key «and» is excluded from norwegianTermsForEnglishQuery's
+    // reverse index by AMBIGUOUS_EN (product-glossary.ts), specifically so
+    // it never fires this guard on itself, so no duck→and reverse mapping
+    // is ever built. English "duck" queries not selecting `meat` remains a
+    // known, separate gap this fix does not close.
     const suppressEnglishConjunction = englishTerms.length > 0;
     for (const [category, keywords] of Object.entries(categoryMap)) {
       for (const kw of keywords) {
@@ -971,7 +976,7 @@ class MarketplaceRegistry {
       description: "A2A marketplace for local food in Norway. " +
         `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
-        "Agent-markedsplass for lokal mat i Norge — ferske gr\u00f8nnsaker, frukt, kj\u00f8tt, fisk, meieri, honning, br\u00f8d, \u00f8kologisk, kortreist, g\u00e5rdsbutikk, REKO-ring og mer.",
+        "Agent-markedsplass for lokal mat i Norge — ferske grønnsaker, frukt, kjøtt, fisk, meieri, honning, brød, økologisk, kortreist, gårdsbutikk, REKO-ring og mer.",
       // A2A spec: this MUST be the JSON-RPC endpoint, not the website root.
       // Compliant clients (incl. a2aregistry.org) POST messages directly to
       // this URL. Pointing it at `${baseUrl}` made every client land on
@@ -989,7 +994,7 @@ class MarketplaceRegistry {
         url: baseUrl,
         contactUrl: `${baseUrl}/docs`,
         description: "Open agent-to-agent food marketplace operator. " +
-          "Norges f\u00f8rste A2A-markedsplass for lokal mat.",
+          "Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
       // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields.
@@ -1051,7 +1056,7 @@ class MarketplaceRegistry {
           name: "Discover Local Food Agents / Finn lokale matagenter",
           description: `Search a registry of ${stats.totalAgents || 1396}+ verified local food producers in Norway. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
-            "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
+            "location (Oslo, Bergen, Trondheim, Stavanger, Tromsø, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
             `Søk blant ${stats.totalAgents || 1396}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
@@ -1062,12 +1067,12 @@ class MarketplaceRegistry {
             "food marketplace", "food supplier", "grocery", "farm to table", "sustainable food",
             "food delivery", "food procurement", "wholesale food", "restaurant supply",
             // Norwegian keywords (for Nordic agents)
-            "lokal mat", "ferske gr\u00f8nnsaker", "\u00f8kologisk", "g\u00e5rdsutsalg", "frukt",
-            "kj\u00f8tt", "fisk", "sj\u00f8mat", "meieri", "egg", "honning", "urter", "br\u00f8d", "b\u00e6r",
+            "lokal mat", "ferske grønnsaker", "økologisk", "gårdsutsalg", "frukt",
+            "kjøtt", "fisk", "sjømat", "meieri", "egg", "honning", "urter", "brød", "bær",
             "matmarked", "matleveranse", "kortreist mat", "sesongvarer",
             // Geographic (city-level discovery)
-            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "Troms\u00f8",
-            "Kristiansand", "Drammen", "Fredrikstad", "Bod\u00f8",
+            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "Tromsø",
+            "Kristiansand", "Drammen", "Fredrikstad", "Bodø",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -1086,7 +1091,7 @@ class MarketplaceRegistry {
             "Registrer en ny matprodusent som agent i Rett fra Bonden-markedsplassen.",
           tags: [
             "register", "onboard", "producer", "farm", "shop", "cooperative",
-            "registrering", "produsent", "g\u00e5rd", "butikk", "andelslag",
+            "registrering", "produsent", "gård", "butikk", "andelslag",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -1097,14 +1102,14 @@ class MarketplaceRegistry {
         },
         {
           id: "search-compare-food",
-          name: "Search & Compare Local Food / S\u00f8k og sammenlign",
+          name: "Search & Compare Local Food / Søk og sammenlign",
           description: "Natural language search across all producers. Compare prices, delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
             "Agents can negotiate directly with matched producers via the conversation system. " +
-            "S\u00f8k, sammenlign priser, leveringsalternativer og tilgjengelighet.",
+            "Søk, sammenlign priser, leveringsalternativer og tilgjengelighet.",
           tags: [
             "search", "compare", "price", "delivery", "availability", "negotiate",
-            "s\u00f8k", "sammenlign", "pris", "levering", "tilgjengelighet",
+            "søk", "sammenlign", "pris", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -1119,10 +1124,10 @@ class MarketplaceRegistry {
           description: "Initiate a buyer-seller conversation between agents. " +
             "Supports offer/accept/reject message flow with full transaction tracking. " +
             "Consumer agents can negotiate prices, quantities, and delivery terms. " +
-            "Start en kj\u00f8per-selger samtale mellom agenter med tilbud og forhandling.",
+            "Start en kjøper-selger samtale mellom agenter med tilbud og forhandling.",
           tags: [
             "negotiate", "conversation", "order", "buy", "transaction",
-            "forhandling", "samtale", "bestilling", "kj\u00f8p", "handel",
+            "forhandling", "samtale", "bestilling", "kjøp", "handel",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -1141,33 +1146,33 @@ class MarketplaceRegistry {
           name: "X-API-Key",
           description: "API key received upon registration. Required for write operations. " +
             "Read/search operations are open. " +
-            "API-n\u00f8kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
+            "API-nøkkel mottatt ved registrering. Kreves for skriveoperasjoner.",
         },
         // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs-only
-        // advertisement \u2014 issuance/rate-limiting/ledger already shipped in
+        // advertisement — issuance/rate-limiting/ledger already shipped in
         // PR #337/#350). A SECOND, unrelated scheme sharing the same
-        // X-API-Key header name as `apiKey` above \u2014 intentional, not a
+        // X-API-Key header name as `apiKey` above — intentional, not a
         // collision; see description.
         consumerApiKey: {
           type: "apiKey",
           in: "header",
           name: "X-API-Key",
           description: "Free, voluntary consumer-identity key for AI agents calling this API " +
-            "\u2014 get one via POST /api/keys (optional label/contact_email in the JSON body), " +
+            "— get one via POST /api/keys (optional label/contact_email in the JSON body), " +
             "no login or account needed. Uses the SAME header name (X-API-Key) as the `apiKey` " +
             "scheme above, but is a separate, optional credential for a different purpose: " +
             "read/search calls are already fully open with no key at all, and nothing here is " +
             "required. Sending a consumer key raises your rate-limit ceiling on the general " +
             "REST/a2a surface (about 3x) and gets your calls counted in a per-key usage ledger " +
-            "\u2014 /api/marketplace/search and /api/marketplace/discover currently sit behind a " +
+            "— /api/marketplace/search and /api/marketplace/discover currently sit behind a " +
             "separate, static per-IP quota that a consumer key does not raise. " +
-            "Gratis, frivillig forbruker-identitetsn\u00f8kkel for AI-agenter \u2014 hentes via " +
+            "Gratis, frivillig forbruker-identitetsnøkkel for AI-agenter — hentes via " +
             "POST /api/keys, ingen innlogging eller konto kreves. Bruker samme headernavn " +
             "(X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et " +
-            "annet form\u00e5l \u2014 les/s\u00f8k er allerede helt \u00e5pent uten n\u00f8kkel. " +
-            "Gir h\u00f8yere rate-grense p\u00e5 det generelle REST-/a2a-grensesnittet (ca. 3x) og en " +
-            "egen forbrukslogg \u2014 /api/marketplace/search og /api/marketplace/discover ligger " +
-            "i dag bak en egen, flat kvote som ikke \u00f8kes av n\u00f8kkelen.",
+            "annet formål — les/søk er allerede helt åpent uten nøkkel. " +
+            "Gir høyere rate-grense på det generelle REST-/a2a-grensesnittet (ca. 3x) og en " +
+            "egen forbrukslogg — /api/marketplace/search og /api/marketplace/discover ligger " +
+            "i dag bak en egen, flat kvote som ikke økes av nøkkelen.",
         },
       },
       // A2A v1.0 `security` requirement list (dev-request 2026-07-13-a2a-card-v1-signing
@@ -1635,7 +1640,7 @@ class MarketplaceRegistry {
     return db.prepare("SELECT * FROM listings WHERE agent_id = ? ORDER BY created_at DESC").all(agentId) as any[];
   }
 
-  // ─── Check if agent exists by name (for idempotent seeding) â"€
+  // ─── Check if agent exists by name (for idempotent seeding) ──
 
   getAgentByName(name: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -1691,7 +1696,7 @@ class MarketplaceRegistry {
     // Verification bonus
     if (agent.is_verified) score += 0.15;
 
-    // Completion rate (contacted â†' chosen)
+    // Completion rate (contacted → chosen)
     if (m.times_contacted > 0) {
       const completionRate = Math.min(1, m.times_chosen / m.times_contacted);
       score += 0.15 * completionRate;
@@ -1859,7 +1864,7 @@ class MarketplaceRegistry {
     }
 
     score += 0.05 * agent.trustScore;
-    if (agent.trustScore > 0.8) reasons.push("H\u00f8y tillitsscore");
+    if (agent.trustScore > 0.8) reasons.push("Høy tillitsscore");
 
     if (agent.isVerified) {
       score += 0.05;
@@ -2103,10 +2108,3 @@ export function isProximityIntent(query: string): boolean {
 
 // Singleton
 export const marketplaceRegistry = new MarketplaceRegistry();
-
-
-
-
-
-
-
