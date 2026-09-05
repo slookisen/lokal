@@ -202,6 +202,17 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
       const iM1 = r.body.indexOf("Medium Gaard Fire");
       assertTrue(iU1 >= 0 && iU2 > iU1 && iU3 > iU2 && iM1 > iU3,
         "homepage: card order is still descending by trust_score (ultra-1 < ultra-2 < ultra-3 < medium-1 by position) — sort/tiering untouched");
+
+      // CSS regression guard: removing the .trust-m sibling left .pc-foot's
+      // single remaining child (the "see profile" link) at flex-start under
+      // the old justify-content:space-between — must be flex-end instead.
+      // Also: the profile-page-only .pf-stat-icon.t rule must not be
+      // declared on a page that never renders that icon variant anymore.
+      assertTrue(/\.pc-foot\s*\{[^}]*justify-content:\s*flex-end/.test(r.body),
+        "homepage: .pc-foot uses justify-content:flex-end (not the old space-between, which left-aligned the lone remaining child)");
+      assertTrue(!/\.pc-foot\s*\{[^}]*justify-content:\s*space-between/.test(r.body),
+        "homepage: .pc-foot no longer uses justify-content:space-between");
+      assertTrue(!r.body.includes(".pf-stat-icon.t"), "homepage: the orphaned .pf-stat-icon.t CSS rule is gone");
     }
     {
       const r = invoke("/", { lang: "en", query: {} });
@@ -251,6 +262,7 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
     {
       const appSrc = fs.readFileSync(path.join(__dirname, "../public/app.html"), "utf8");
       const dashboardSrc = fs.readFileSync(path.join(__dirname, "../public/dashboard.html"), "utf8");
+      const agentSrc = fs.readFileSync(path.join(__dirname, "../public/agent.html"), "utf8");
       const mcpServerSrc = fs.readFileSync(path.join(__dirname, "../mcp/server.ts"), "utf8");
       const selgerSrc = fs.readFileSync(path.join(__dirname, "../public/selger.html"), "utf8");
 
@@ -268,10 +280,43 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
           `${name}: the trust sort option is relabeled to "Anbefalt" (sort itself untouched)`);
         assertTrue(!src.includes('<option value="trust">Trust Score</option>'),
           `${name}: the old "Trust Score" sort-option label is gone`);
+        // Prospective-seller marketing benefit-card: no percentage/bar, but
+        // the same confusing name on an in-scope public page (flagged
+        // non-blocking by the second review round) - relabeled for
+        // consistency with the sort-option relabel two lines above.
+        assertTrue(src.includes("<h3>Bedre rangering</h3>"),
+          `${name}: the seller-benefits marketing card is relabeled to "Bedre rangering"`);
+        assertTrue(!src.includes("<h3>Trust Score</h3>"),
+          `${name}: the old "Trust Score" marketing-card heading is gone`);
       }
 
       assertTrue(!mcpServerSrc.includes("Trust: "), "mcp/server.ts: no tool prints a \"Trust: NN%\" text line anymore");
       assertTrue(mcpServerSrc.includes("Verifisert av eier"), "mcp/server.ts: the unrelated \"Verifisert av eier\" badge text is untouched");
+
+      // agent.html - a legacy client-side-rendered public producer page
+      // (same og:/meta pattern as the SSR /produsent/:slug page, keyed by
+      // /agent/<id>), listed by name in sw.js's offline-cache page list.
+      // Carried BOTH a header trust-bar/pct (like the seo.ts cards) AND a
+      // full per-signal "Tillitsanalyse" breakdown grid shown unconditionally
+      // to any visitor (no ownership/claim gate at all - unlike selger.html)
+      // - the widest, least-gated trust-score exposure of any surface this
+      // dev-request touches. Found by the second independent review round.
+      assertTrue(!agentSrc.includes("trust-bar"), "agent.html: no element carries the trust-bar class");
+      assertTrue(!agentSrc.includes("trust-fill"), "agent.html: no element carries the trust-fill class");
+      assertTrue(!agentSrc.includes("trust-pct"), "agent.html: the header trust-pct markup/CSS is gone");
+      assertTrue(!agentSrc.includes("trust-grid"), "agent.html: the trust-breakdown grid markup/CSS is gone");
+      assertTrue(!agentSrc.includes("trust-card"), "agent.html: the trust-breakdown per-signal card markup/CSS is gone");
+      assertTrue(!agentSrc.includes("trustColor"), "agent.html: the now-unused trustColor() helper is gone");
+      assertTrue(!agentSrc.includes("renderTrust"), "agent.html: the now-unused renderTrust() function and its call site are gone");
+      assertTrue(!agentSrc.includes("trustScore"), "agent.html: no leftover agent.trustScore read remains");
+      assertTrue(!/Tillitsscore/.test(agentSrc), "agent.html: the header \"Tillitsscore\" label is gone");
+      assertTrue(!/Tillitsanalyse/.test(agentSrc), "agent.html: the \"Tillitsanalyse\" breakdown section heading is gone");
+      assertTrue(!agentSrc.includes("/trust'"), "agent.html: the GET .../agents/:id/trust fetch call is gone");
+      // The rest of the page - header, categories, CTA, map, provenance -
+      // must survive; this removes the trust UI, not the whole page.
+      assertTrue(agentSrc.includes('class="hero-title"'), "agent.html: the page header itself still renders");
+      assertTrue(agentSrc.includes('class="cta-section"'), "agent.html: the claim-your-listing CTA still renders");
+      assertTrue(agentSrc.includes('id="map-section"'), "agent.html: the map section still renders");
 
       // Deliberately NOT removed - selger.html is the producer's own
       // claimed-ownership dashboard (dev-request's alternative B, "vis det
