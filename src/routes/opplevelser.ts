@@ -14251,6 +14251,7 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
       `SELECT a.id AS agent_id, a.name AS name,
               COALESCE(k.website, a.url) AS url,
               a.lat AS lat, a.lng AS lng,
+              a.org_nr AS org_nr, a.city AS city,
               k.about AS about, k.address AS address, k.phone AS phone,
               k.email AS email, k.products AS products,
               k.verification_review_reason AS verification_review_reason
@@ -14271,7 +14272,8 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
   try {
     providers = expDb.prepare(
       `SELECT id, navn, hjemmeside, adresse, telefon, epost, lat, lon,
-              about_text, products, content_source, field_provenance
+              about_text, products, content_source, field_provenance,
+              org_nr, kommune
          FROM experience_providers
         WHERE rfb_seed_source = 'rfb-seed'`
     ).all() as EnrichProviderRow[];
@@ -14322,6 +14324,13 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
     no_domain: results.filter((r) => r.status === "no_domain").length,
     no_match: results.filter((r) => r.status === "no_match").length,
     nothing_to_fill: results.filter((r) => r.status === "nothing_to_fill").length,
+    // dev-request 2026-09-05-outreach-navnelik-kontaktkobling: a name-only
+    // hit whose org.nr/municipality CONFIRMED disagreed with the provider's
+    // own — refused rather than auto-copied (see gardssalg-rfb-enrich.ts's
+    // nameMatchDisambiguation). Never in would_enrich; reported here so
+    // Daniel can see these flagged for manual review, same as no_match/
+    // no_domain above.
+    ambiguous_name_match: results.filter((r) => r.status === "ambiguous_name_match").length,
     field_fill_counts: fieldFillCounts,
   };
 

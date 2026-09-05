@@ -42606,3 +42606,26 @@ runSerial(async () => {
     failures.push("pending-verify-unpark-data-enriched-at-writesites: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-05-outreach-navnelik-kontaktkobling — root-cause fix
+// for the "Moland Gård" Bø-vs-Drangedal incident (2026-09-03): the byName
+// fallback in src/services/gardssalg-rfb-enrich.ts's pickEnrichmentFields
+// could copy a real contact email onto a DIFFERENT, unrelated agent record
+// that merely shared a trading name, with no org.nr/municipality
+// confirmation. Pure module, no DB/fetch/env — registered via runSerial()
+// purely for the tail-position convention, not because it needs isolation.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-05-outreach-navnelik-kontaktkobling: gardssalg-rfb-enrich name-match disambiguation ──");
+  try {
+    const { runGardssalgRfbEnrichTests } = require("../src/services/gardssalg-rfb-enrich.test") as
+      typeof import("../src/services/gardssalg-rfb-enrich.test");
+    const gre = runGardssalgRfbEnrichTests({ log: false });
+    passed += gre.passed;
+    failed += gre.failed;
+    for (const f of gre.failures) failures.push("gardssalg-rfb-enrich: " + f);
+    console.log(`  gardssalg-rfb-enrich: ${gre.passed} passed, ${gre.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-rfb-enrich: unexpected error: " + String(err?.message || err));
+  }
+});
