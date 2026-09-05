@@ -34668,6 +34668,37 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-catalog-class: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-02-dental-catalog-class-triage (slice 1c): Sonnet-
+  //    sample judge over the ambiguous ukjent / company_dental_nace-klinikk
+  //    cohort ──
+  console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage (slice 1c): dental-catalog-class-judge ──");
+  try {
+    const { runDentalCatalogClassJudgeTests } = require("../src/services/dental-catalog-class-judge.test") as
+      typeof import("../src/services/dental-catalog-class-judge.test");
+    const dccj = await runDentalCatalogClassJudgeTests({ log: false });
+    passed += dccj.passed;
+    failed += dccj.failed;
+    for (const f of dccj.failures) failures.push("dental-catalog-class-judge: " + f);
+    console.log(`  dental-catalog-class-judge: ${dccj.passed} passed, ${dccj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-catalog-class-judge: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage (slice 1c): admin-dental-catalog-class-sonnet-sample ──");
+  try {
+    const { runAdminDentalCatalogClassSonnetSampleTests } = require("../src/routes/admin-dental-catalog-class-sonnet-sample.test") as
+      typeof import("../src/routes/admin-dental-catalog-class-sonnet-sample.test");
+    const dccss = await runAdminDentalCatalogClassSonnetSampleTests({ log: false });
+    passed += dccss.passed;
+    failed += dccss.failed;
+    for (const f of dccss.failures) failures.push("admin-dental-catalog-class-sonnet-sample: " + f);
+    console.log(`  admin-dental-catalog-class-sonnet-sample: ${dccss.passed} passed, ${dccss.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-catalog-class-sonnet-sample: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
   //    listPublicDentalAgents/countPublicDentalAgents/getDentalStats/
   //    getDentalAgentsForSitemap/listRelatedClinics/listPoststeder ──
