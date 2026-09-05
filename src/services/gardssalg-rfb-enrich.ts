@@ -20,8 +20,24 @@
 //
 // This file is PURE (no DB/IO) so it is unit-testable; the route wires it to the
 // two DBs and does the dry-run/apply write.
+//
+// dev-request 2026-09-05-outreach-navnelik-kontaktkobling (root-cause fix,
+// "Moland Gård" Bø-vs-Drangedal incident, 2026-09-03): a later change
+// (indexRfbByName/pickEnrichmentFields' byName fallback) started
+// auto-copying on a normalized-name-only hit — Daniel's 2026-07-12 rule
+// above says name-only should be "flagged for manual review, never
+// auto-copied" — with no org.nr/municipality confirmation, even though both
+// `agents`/`agent_knowledge` (org_nr, city) and `experience_providers`
+// (org_nr, kommune) carry exactly that disambiguating data. Two different
+// real businesses sharing a trading name collided: a genuine person's email
+// (RFB agent, correctly matched to THEIR own business) was auto-copied onto
+// a DIFFERENT, unrelated provider row that merely shared the name. Fixed
+// below (nameMatchDisambiguation) by requiring org.nr — or, absent that,
+// municipality — to agree whenever both sides actually carry the data;
+// still additive (a name-only match with no disambiguating data on either
+// side, or a genuinely unique name, behaves exactly as before).
 
-import { normalizeDomain, normalizeName } from "./blocklist-service";
+import { normalizeDomain, normalizeName, normalizeOrgNr } from "./blocklist-service";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
 import { isGardssalgFieldOwnerLocked } from "./experience-store";
@@ -45,6 +61,15 @@ export interface EnrichProviderRow {
   // defensive-parse-in-the-helper pattern every other sub-slice already
   // uses; this file never parses it directly).
   field_provenance: string | null;
+  // dev-request 2026-09-05-outreach-navnelik-kontaktkobling (root-cause fix,
+  // "Moland Gård" Bø-vs-Drangedal incident, 2026-09-03): experience_providers.
+  // org_nr / .kommune — read ONLY to disambiguate the NAME-fallback match
+  // below when two different real businesses share the same/near-identical
+  // trading name. Optional (not every caller/fixture supplies them) so this
+  // is purely additive — a caller that omits them gets the EXACT pre-fix
+  // behavior (see nameMatchDisambiguation's own doc comment).
+  org_nr?: string | null;
+  kommune?: string | null;
 }
 
 /** Minimal shape of the RFB source (agents + agent_knowledge joined). */
@@ -60,19 +85,112 @@ export interface RfbSource {
   email: string | null;          // agent_knowledge.email
   products: string | null;       // agent_knowledge.products (JSON)
   verification_review_reason: string | null; // inference_only_fields signal
+  // dev-request 2026-09-05-outreach-navnelik-kontaktkobling — agents.org_nr /
+  // agents.city, read ONLY for the same name-match disambiguation described
+  // on EnrichProviderRow above. Optional for the same additive reason.
+  org_nr?: string | null;
+  city?: string | null;
 }
 
 export interface EnrichResult {
   provider_id: string;
   navn: string;
-  status: "would_enrich" | "locked" | "no_domain" | "no_match" | "nothing_to_fill";
+  status: "would_enrich" | "locked" | "no_domain" | "no_match" | "nothing_to_fill" | "ambiguous_name_match";
   matched_rfb?: { agent_id: string; name: string; domain: string };
   // How the RFB producer was matched: 'domain' (strict website match — strongest)
   // or 'name' (exact normalized-name via the rfb-seed provenance — the seed was
   // name-based, so an exact-name hit is reliable recovery, not fuzzy matching).
   matched_by?: "domain" | "name";
+  // Set ONLY on status 'ambiguous_name_match' — see nameMatchDisambiguation's
+  // doc comment. Human-readable, quotable in a report: which disambiguating
+  // signal disagreed and what the two conflicting values were.
+  ambiguous_reason?: string;
   copy: Record<string, string | number>;      // field → value that WOULD be written
   skipped: Array<{ field: string; reason: string }>;
+}
+
+/**
+ * Root-cause fix, dev-request 2026-09-05-outreach-navnelik-kontaktkobling
+ * (the "Moland Gård" Bø-vs-Drangedal incident, 2026-09-03: a real person's
+ * email — the genuine owner of a farm-sale business in Bø — was written onto
+ * a DIFFERENT, unrelated agent record that merely shared the trading name
+ * "Moland Gård", located in Drangedal, different org.nr. Root cause: this
+ * module's byName fallback (pickEnrichmentFields below) copied
+ * `email`/`phone`/`address` from an RFB agent to a gårdssalg provider on a
+ * bare normalized-name hit alone, with no org.nr/municipality confirmation,
+ * even though BOTH sides of the match (agents.org_nr/.city,
+ * experience_providers.org_nr/.kommune) can carry exactly the data needed to
+ * tell two same-named businesses apart).
+ *
+ * Mirrors the pattern blocklist-service.ts's isBlocked() already established
+ * for this exact class of bug (name-collision disambiguation, PR #801,
+ * dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier Mål 3): prefer
+ * org.nr when both sides have it (the strongest, unambiguous signal);
+ * otherwise fall back to municipality/kommune when both sides have THAT.
+ * Absence of either signal on EITHER side is never treated as a mismatch —
+ * only an actual, confirmed DISAGREEMENT between two known values blocks the
+ * match. This is deliberately additive: a genuinely unique name, or a name
+ * match where neither side happens to carry org.nr/kommune data yet, behaves
+ * EXACTLY as it did before this fix (returns confirmed:true, same as the
+ * pre-fix "accept the name hit" behavior) — no new false negatives.
+ */
+export function nameMatchDisambiguation(
+  provider: Pick<EnrichProviderRow, "org_nr" | "kommune">,
+  src: Pick<RfbSource, "org_nr" | "city">,
+): { confirmed: boolean; reason?: string } {
+  const providerOrgNr = provider.org_nr ? normalizeOrgNr(provider.org_nr) : "";
+  const srcOrgNr = src.org_nr ? normalizeOrgNr(src.org_nr) : "";
+  if (providerOrgNr && srcOrgNr) {
+    if (providerOrgNr === srcOrgNr) return { confirmed: true };
+    return {
+      confirmed: false,
+      reason:
+        `org.nr mismatch — provider org.nr ${providerOrgNr} vs. matched RFB agent org.nr ${srcOrgNr}: ` +
+        `same/similar name, different real business`,
+    };
+  }
+
+  const providerMunicipality = normalizeMunicipalityName(provider.kommune);
+  const srcMunicipality = normalizeMunicipalityName(src.city);
+  if (providerMunicipality && srcMunicipality) {
+    if (providerMunicipality === srcMunicipality) return { confirmed: true };
+    return {
+      confirmed: false,
+      reason:
+        `municipality mismatch — provider kommune "${provider.kommune}" vs. matched RFB agent city "${src.city}": ` +
+        `same/similar name, different real business`,
+    };
+  }
+
+  // Neither signal is available on BOTH sides — nothing to disagree with.
+  // Preserve the exact pre-fix behavior: accept the normalized-name hit.
+  return { confirmed: true };
+}
+
+/**
+ * Same diacritic-folding normalization blocklist-service.ts's normalizeName
+ * uses, WITHOUT that function's business-suffix stripping (kommune/city
+ * names never carry a "gårdsbutikk"/"ysteri"/etc. suffix, and reusing a
+ * stripper tuned for producer names risks silently mangling a place name
+ * that happens to contain one of those substrings). Lowercase + trim +
+ * æ/ø/å-fold + collapse whitespace/punctuation — enough to make
+ * "Drangedal"/"drangedal " and "Bø"/"Bo " compare equal regardless of case
+ * or incidental whitespace, nothing more.
+ */
+function normalizeMunicipalityName(input: string | null | undefined): string {
+  if (!input) return "";
+  return String(input)
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "o")
+    .replace(/å/g, "a")
+    .replace(/ä/g, "a")
+    .replace(/ö/g, "o")
+    .replace(/ü/g, "u")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 // Emails that are obviously placeholders / non-contactable — never copy these.
@@ -217,8 +335,19 @@ export function indexRfbByDomain(sources: RfbSource[]): Map<string, RfbSource> {
  * were seeded from RFB by name (rfb-seed), so a provider's `navn` is the exact
  * name of its RFB agent — an exact normalized-name hit is reliable provenance
  * recovery, not fuzzy matching. Same collision safety as the domain index: if
- * two DIFFERENT producers normalize to the same name, that name is dropped
- * (un-matchable) so we never attach the wrong producer's info.
+ * two DIFFERENT producers normalize to the same name AMONG THESE `sources`
+ * (i.e. two distinct RFB agents), that name is dropped (un-matchable) so we
+ * never attach the wrong producer's info.
+ *
+ * This index alone does NOT guard against the other collision shape — a
+ * SINGLE RFB agent whose name happens to also match a DIFFERENT real
+ * business's provider row that isn't in `sources` at all (e.g. a gårdssalg
+ * provider seeded from a different source, no RFB agent counterpart). That
+ * is a genuinely different business hiding behind the same string, not a
+ * same-source duplicate this index can see — pickEnrichmentFields's caller-
+ * side nameMatchDisambiguation (org.nr / municipality confirmation) is what
+ * catches THAT shape (dev-request 2026-09-05-outreach-navnelik-
+ * kontaktkobling, the "Moland Gård" Bø-vs-Drangedal incident).
  */
 export function indexRfbByName(sources: RfbSource[]): Map<string, RfbSource> {
   const map = new Map<string, RfbSource>();
@@ -239,7 +368,15 @@ export function indexRfbByName(sources: RfbSource[]): Map<string, RfbSource> {
 
 /**
  * Decide what to copy from RFB into a seeded gårdssalg provider. Pure.
- *   - Locked (content_source manual) → status 'locked', copy {}.
+ *   - Locked (content_source manual) → status 'locked', copy {}. Checked
+ *     FIRST/unconditionally, same as before this fix — a manual row is never
+ *     written to regardless of match quality, so it never reaches the
+ *     ambiguity check below.
+ *   - Ambiguous name match (dev-request 2026-09-05-outreach-navnelik-
+ *     kontaktkobling), for every row that reaches the match step (i.e. not
+ *     'manual'): a normalized-name hit whose org.nr or municipality
+ *     CONFIRMED disagrees with the provider's own → status
+ *     'ambiguous_name_match', copy {}. See nameMatchDisambiguation.
  *   - claim rows (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
  *     laas, sub-slice 3k): NO LONGER a row-level bail. Only manual rows are
  *     unconditionally 'locked' now. A claim row falls through to the normal
@@ -289,13 +426,39 @@ export function pickEnrichmentFields(
   let matchedBy: "domain" | "name" | undefined = src ? "domain" : undefined;
 
   // 2) Fallback: exact normalized-name match via the rfb-seed provenance.
+  //
+  // Root-cause fix (dev-request 2026-09-05-outreach-navnelik-kontaktkobling,
+  // the "Moland Gård" Bø-vs-Drangedal incident): a bare normalized-name hit
+  // is NOT, by itself, proof this is the SAME real business as the provider
+  // — see nameMatchDisambiguation's doc comment. A confirmed disagreement
+  // (org.nr or municipality known on BOTH sides and DIFFERENT) refuses the
+  // match entirely rather than silently copying the wrong producer's
+  // email/phone/address onto this provider; the row is flagged
+  // 'ambiguous_name_match' for manual review instead, never guessed at.
+  let ambiguousNameMatch: { agent_id: string; name: string; reason: string } | undefined;
   if (!src && byName) {
     const nm = normalizeName(provider.navn);
     const nsrc = nm ? byName.get(nm) : undefined;
-    if (nsrc) { src = nsrc; matchedBy = "name"; }
+    if (nsrc) {
+      const disambiguation = nameMatchDisambiguation(provider, nsrc);
+      if (disambiguation.confirmed) {
+        src = nsrc;
+        matchedBy = "name";
+      } else {
+        ambiguousNameMatch = { agent_id: nsrc.agent_id, name: nsrc.name, reason: disambiguation.reason ?? "ambiguous name match" };
+      }
+    }
   }
 
   if (!src) {
+    if (ambiguousNameMatch) {
+      return {
+        ...base,
+        status: "ambiguous_name_match",
+        matched_rfb: { agent_id: ambiguousNameMatch.agent_id, name: ambiguousNameMatch.name, domain: "" },
+        ambiguous_reason: ambiguousNameMatch.reason,
+      };
+    }
     // No domain to try AND no name hit → nothing to go on (no_domain); had a
     // usable domain/name but no RFB producer → no_match. Both need manual review.
     return { ...base, status: domainMatchable ? "no_match" : "no_domain" };
