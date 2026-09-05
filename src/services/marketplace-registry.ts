@@ -1,4 +1,4 @@
-﻿import { v4 as uuid } from "uuid";
+import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { getConfig } from "../config/vertical-config";
@@ -24,6 +24,11 @@ import {
   assertEnrichmentWriteAllowedOrThrow,
   normalizeEnrichmentVertical,
 } from "./enrichment-write-pause";
+// dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: the English→Norwegian
+// half of the product glossary. PURE (its only import is `type Lang`), so this
+// does not breach this file's rfb-vertical isolation — same rule as
+// geo-distance.ts above.
+import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/product-glossary";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -231,7 +236,11 @@ class MarketplaceRegistry {
         "egg", "melk", "ost", "brød", "korn", "grønt", "grønnsaker",
         "lokalmat", "økologisk", "tradisjon", "tradisjons",
       ]);
-      const distinctiveWords = nameWords.filter(w => !GENERIC_NAME_TOKENS.has(w) && w.length >= 3);
+      // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: a place name
+      // is never a distinctive producer-name token. "vestfold" matched eight
+      // unrelated producers by name and buried the real honey producers.
+      const distinctiveWords = nameWords.filter(w =>
+        !GENERIC_NAME_TOKENS.has(w) && !KNOWN_PLACE_WORDS.has(w) && w.length >= 3);
       if (distinctiveWords.length > 0) {
         const fuzzyRows = allRows
           .map(row => {
@@ -604,6 +613,25 @@ class MarketplaceRegistry {
 
   parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } {
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
+
+    // ── English queries (dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil) ──
+    // The category keywords below are Norwegian. An English query therefore
+    // detected NO category — and since discover() applies `categories` as a
+    // HARD filter (step 3), no category means no filter at all, and the search
+    // silently degrades to "the N nearest producers, whatever they sell".
+    // Measured live 2026-09-05 against prod: `ost Bergen` → Ostegården,
+    // Colonialen, Møllendal (three real cheese sellers); `producers near
+    // Bergen that sell cheese` → ten producers, none of which sells cheese.
+    // 13 of 20 sampled English queries parsed differently from their Norwegian
+    // equivalent. This is what OpenAI's reviewers ran, and it is why the
+    // ChatGPT app submission was rejected on 2026-09-05.
+    //
+    // Fix: append the Norwegian equivalents of any English food words to the
+    // text the keyword matcher reads. `q` itself is untouched, so the name
+    // branch, the skip-word logic and _proximityIntent all keep seeing exactly
+    // what the user typed — only category/tag detection gets the extra words.
+    const englishTerms = norwegianTermsForEnglishQuery(query);
+    const qTerms = englishTerms.length ? `${q} ${englishTerms.join(" ")}` : q;
     const parsed: Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } = {};
 
     // ── Proximity intent (dev-request 2026-07-25 fix 0e) ──────────────
@@ -655,6 +683,12 @@ class MarketplaceRegistry {
       "bread": [
         "brød", "bread", "bakervarer", "lefse", "flatbrød", "rundstykker",
         "boller", "kanelboller", "surdeig", "grovbrød",
+        // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: «bakeri» —
+        // the single most obvious word for this category, and a producer-name
+        // indicator since day one — was in no keyword list, so neither
+        // «bakeri Trondheim» nor "bakery in Trondheim" selected a category.
+        // Norwegian was broken here too; this is not an English-only gap.
+        "bakeri", "bakeriet", "bakevarer", "bakst",
       ],
       "honey": ["honning", "honey", "birøkt"],
       "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
@@ -689,14 +723,28 @@ class MarketplaceRegistry {
 
     const detectedCategories: string[] = [];
     const productTerms: string[] = [];
+    // «and» is Norwegian for duck, and English for "and". Before this guard
+    // EVERY English query containing the conjunction was classified as `meat`
+    // — and because categories are a hard filter, "butter and cream" returned
+    // meat producers and no dairy at all (verified 2026-09-05). Norwegian
+    // «and» (duck) still matches: the guard only fires once the query has
+    // already been shown to contain English food vocabulary. NB: this does
+    // NOT mean an English "duck farm" reaches `meat` — it does not. The
+    // Norwegian key «and» is excluded from norwegianTermsForEnglishQuery's
+    // reverse index by AMBIGUOUS_EN (product-glossary.ts), specifically so
+    // it never fires this guard on itself, so no duck→and reverse mapping
+    // is ever built. English "duck" queries not selecting `meat` remains a
+    // known, separate gap this fix does not close.
+    const suppressEnglishConjunction = englishTerms.length > 0;
     for (const [category, keywords] of Object.entries(categoryMap)) {
       for (const kw of keywords) {
+        if (kw === "and" && suppressEnglishConjunction) continue;
         // Word-boundary matching, to avoid partial matches ("ost" in "geitost").
         // NB norwegianWordBoundary(), not \b — see the comment on that helper.
         // With \b, the headline keyword of this whole slice — «øl» — could
         // never match ANYTHING, because \b is ASCII-only and sees no boundary
         // between start-of-string and «ø».
-        if (norwegianWordBoundary(kw).test(q)) {
+        if (norwegianWordBoundary(kw).test(qTerms)) {
           if (!detectedCategories.includes(category)) detectedCategories.push(category);
           // Store the specific product term (not the category keyword like "vegetables")
           // REVIEW N2: NO drink keyword becomes a product term. The
@@ -743,7 +791,7 @@ class MarketplaceRegistry {
 
     const detectedTags: string[] = [];
     for (const [tag, keywords] of Object.entries(tagMap)) {
-      if (keywords.some(kw => q.includes(kw))) {
+      if (keywords.some(kw => qTerms.includes(kw))) {
         detectedTags.push(tag);
       }
     }
@@ -763,7 +811,8 @@ class MarketplaceRegistry {
       "det", "er", "en", "et", "og", "med", "til", "av", "som", "dem", "de", "vi",
       "liste", "prisliste", "priser", "pris", "produkter", "varer", "varene", "koster",
       "kost", "selger", "tilbyr", "finne", "finn", "søk", "kjøpe", "bestille",
-      "nær", "nærme", "nærmeste", "meg", "oss", "her", "der", "hvor"]);
+      "nær", "nærme", "nærmeste", "meg", "oss", "her", "der", "hvor",
+      ...ENGLISH_SKIP_WORDS]);
 
     const nameIndicators = ["gård", "gard", "farm", "mat", "ysteri", "bakeri", "bryggeri",
       "marked", "butikk", "kooperativ", "meieri", "slakteri", "gardsmat", "gardsutsalg"];
@@ -774,12 +823,22 @@ class MarketplaceRegistry {
     );
 
     if (indicatorIndex >= 0) {
-      // Pass 1: Indicator word found — extract name from surrounding words
+      // Pass 1: Indicator word found — extract name from surrounding words.
+      // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: place names
+      // and food words are filtered out here too, not just in Pass 2. Without
+      // it, "a farm in Vestfold with raw honey" built the name query
+      // "farm Vestfold raw honey" — and the fuzzy fallback then answered with
+      // every producer that merely has "Vestfold" in its name, discarding the
+      // honey category that had been detected correctly one block above.
       const nameParts: string[] = [];
       for (const word of queryWords) {
         const clean = word.replace(/[.,!?]/g, "");
         if (clean.length < 2) continue;
-        if (skipWords.has(clean.toLowerCase())) continue;
+        const low = clean.toLowerCase();
+        if (skipWords.has(low)) continue;
+        if (KNOWN_PLACE_WORDS.has(low)) continue;
+        if (detectedCategories.length > 0
+            && (isCategoryOrTagWord(low, categoryMap, tagMap) || isEnglishFoodWord(low))) continue;
         nameParts.push(clean);
       }
       if (nameParts.length >= 1 && nameParts.join(" ").length >= 4) {
@@ -799,22 +858,7 @@ class MarketplaceRegistry {
       // overriding the category filter (fish) and yielding wildly off-topic
       // results. The route's geocoding handles location filtering separately,
       // so we can safely treat these as location words, not name tokens.
-      const KNOWN_PLACE_WORDS = new Set([
-        // Top-30 cities (mirrors geocoding-service.ts MAJOR_CITIES)
-        "oslo", "bergen", "trondheim", "stavanger", "tromsø", "tromso",
-        "kristiansand", "drammen", "fredrikstad", "bodø", "bodo",
-        "ålesund", "alesund", "tønsberg", "tonsberg", "haugesund",
-        "sandnes", "lillestrøm", "lillestrom", "hamar", "lillehammer",
-        "sandefjord", "sarpsborg", "skien", "molde", "moss", "asker",
-        "kongsberg", "porsgrunn", "arendal", "larvik", "halden",
-        // Common region/fylke names
-        "vestland", "viken", "rogaland", "trøndelag", "trondelag",
-        "nordland", "innlandet", "troms", "finnmark", "agder", "vestfold",
-        "telemark", "østfold", "ostfold", "akershus", "buskerud", "oppland",
-        "hedmark", "sogn", "fjordane", "møre", "more", "romsdal",
-        // Common Oslo districts / neighborhoods
-        "grünerløkka", "grunerlokka", "frogner", "majorstuen", "sentrum",
-      ]);
+      // (hoisted to module scope — see KNOWN_PLACE_WORDS above)
 
       // Don't name-search if all words are food/location/place terms (avoid false positives)
       const isKnownTerm = (w: string) => {
@@ -932,7 +976,7 @@ class MarketplaceRegistry {
       description: "A2A marketplace for local food in Norway. " +
         `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
-        "Agent-markedsplass for lokal mat i Norge — ferske gr\u00f8nnsaker, frukt, kj\u00f8tt, fisk, meieri, honning, br\u00f8d, \u00f8kologisk, kortreist, g\u00e5rdsbutikk, REKO-ring og mer.",
+        "Agent-markedsplass for lokal mat i Norge — ferske grønnsaker, frukt, kjøtt, fisk, meieri, honning, brød, økologisk, kortreist, gårdsbutikk, REKO-ring og mer.",
       // A2A spec: this MUST be the JSON-RPC endpoint, not the website root.
       // Compliant clients (incl. a2aregistry.org) POST messages directly to
       // this URL. Pointing it at `${baseUrl}` made every client land on
@@ -950,7 +994,7 @@ class MarketplaceRegistry {
         url: baseUrl,
         contactUrl: `${baseUrl}/docs`,
         description: "Open agent-to-agent food marketplace operator. " +
-          "Norges f\u00f8rste A2A-markedsplass for lokal mat.",
+          "Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
       // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields.
@@ -1012,7 +1056,7 @@ class MarketplaceRegistry {
           name: "Discover Local Food Agents / Finn lokale matagenter",
           description: `Search a registry of ${stats.totalAgents || 1396}+ verified local food producers in Norway. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
-            "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
+            "location (Oslo, Bergen, Trondheim, Stavanger, Tromsø, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
             `Søk blant ${stats.totalAgents || 1396}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
@@ -1023,12 +1067,12 @@ class MarketplaceRegistry {
             "food marketplace", "food supplier", "grocery", "farm to table", "sustainable food",
             "food delivery", "food procurement", "wholesale food", "restaurant supply",
             // Norwegian keywords (for Nordic agents)
-            "lokal mat", "ferske gr\u00f8nnsaker", "\u00f8kologisk", "g\u00e5rdsutsalg", "frukt",
-            "kj\u00f8tt", "fisk", "sj\u00f8mat", "meieri", "egg", "honning", "urter", "br\u00f8d", "b\u00e6r",
+            "lokal mat", "ferske grønnsaker", "økologisk", "gårdsutsalg", "frukt",
+            "kjøtt", "fisk", "sjømat", "meieri", "egg", "honning", "urter", "brød", "bær",
             "matmarked", "matleveranse", "kortreist mat", "sesongvarer",
             // Geographic (city-level discovery)
-            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "Troms\u00f8",
-            "Kristiansand", "Drammen", "Fredrikstad", "Bod\u00f8",
+            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "Tromsø",
+            "Kristiansand", "Drammen", "Fredrikstad", "Bodø",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -1047,7 +1091,7 @@ class MarketplaceRegistry {
             "Registrer en ny matprodusent som agent i Rett fra Bonden-markedsplassen.",
           tags: [
             "register", "onboard", "producer", "farm", "shop", "cooperative",
-            "registrering", "produsent", "g\u00e5rd", "butikk", "andelslag",
+            "registrering", "produsent", "gård", "butikk", "andelslag",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -1058,14 +1102,14 @@ class MarketplaceRegistry {
         },
         {
           id: "search-compare-food",
-          name: "Search & Compare Local Food / S\u00f8k og sammenlign",
+          name: "Search & Compare Local Food / Søk og sammenlign",
           description: "Natural language search across all producers. Compare prices, delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
             "Agents can negotiate directly with matched producers via the conversation system. " +
-            "S\u00f8k, sammenlign priser, leveringsalternativer og tilgjengelighet.",
+            "Søk, sammenlign priser, leveringsalternativer og tilgjengelighet.",
           tags: [
             "search", "compare", "price", "delivery", "availability", "negotiate",
-            "s\u00f8k", "sammenlign", "pris", "levering", "tilgjengelighet",
+            "søk", "sammenlign", "pris", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -1080,10 +1124,10 @@ class MarketplaceRegistry {
           description: "Initiate a buyer-seller conversation between agents. " +
             "Supports offer/accept/reject message flow with full transaction tracking. " +
             "Consumer agents can negotiate prices, quantities, and delivery terms. " +
-            "Start en kj\u00f8per-selger samtale mellom agenter med tilbud og forhandling.",
+            "Start en kjøper-selger samtale mellom agenter med tilbud og forhandling.",
           tags: [
             "negotiate", "conversation", "order", "buy", "transaction",
-            "forhandling", "samtale", "bestilling", "kj\u00f8p", "handel",
+            "forhandling", "samtale", "bestilling", "kjøp", "handel",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -1102,33 +1146,33 @@ class MarketplaceRegistry {
           name: "X-API-Key",
           description: "API key received upon registration. Required for write operations. " +
             "Read/search operations are open. " +
-            "API-n\u00f8kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
+            "API-nøkkel mottatt ved registrering. Kreves for skriveoperasjoner.",
         },
         // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs-only
-        // advertisement \u2014 issuance/rate-limiting/ledger already shipped in
+        // advertisement — issuance/rate-limiting/ledger already shipped in
         // PR #337/#350). A SECOND, unrelated scheme sharing the same
-        // X-API-Key header name as `apiKey` above \u2014 intentional, not a
+        // X-API-Key header name as `apiKey` above — intentional, not a
         // collision; see description.
         consumerApiKey: {
           type: "apiKey",
           in: "header",
           name: "X-API-Key",
           description: "Free, voluntary consumer-identity key for AI agents calling this API " +
-            "\u2014 get one via POST /api/keys (optional label/contact_email in the JSON body), " +
+            "— get one via POST /api/keys (optional label/contact_email in the JSON body), " +
             "no login or account needed. Uses the SAME header name (X-API-Key) as the `apiKey` " +
             "scheme above, but is a separate, optional credential for a different purpose: " +
             "read/search calls are already fully open with no key at all, and nothing here is " +
             "required. Sending a consumer key raises your rate-limit ceiling on the general " +
             "REST/a2a surface (about 3x) and gets your calls counted in a per-key usage ledger " +
-            "\u2014 /api/marketplace/search and /api/marketplace/discover currently sit behind a " +
+            "— /api/marketplace/search and /api/marketplace/discover currently sit behind a " +
             "separate, static per-IP quota that a consumer key does not raise. " +
-            "Gratis, frivillig forbruker-identitetsn\u00f8kkel for AI-agenter \u2014 hentes via " +
+            "Gratis, frivillig forbruker-identitetsnøkkel for AI-agenter — hentes via " +
             "POST /api/keys, ingen innlogging eller konto kreves. Bruker samme headernavn " +
             "(X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et " +
-            "annet form\u00e5l \u2014 les/s\u00f8k er allerede helt \u00e5pent uten n\u00f8kkel. " +
-            "Gir h\u00f8yere rate-grense p\u00e5 det generelle REST-/a2a-grensesnittet (ca. 3x) og en " +
-            "egen forbrukslogg \u2014 /api/marketplace/search og /api/marketplace/discover ligger " +
-            "i dag bak en egen, flat kvote som ikke \u00f8kes av n\u00f8kkelen.",
+            "annet formål — les/søk er allerede helt åpent uten nøkkel. " +
+            "Gir høyere rate-grense på det generelle REST-/a2a-grensesnittet (ca. 3x) og en " +
+            "egen forbrukslogg — /api/marketplace/search og /api/marketplace/discover ligger " +
+            "i dag bak en egen, flat kvote som ikke økes av nøkkelen.",
         },
       },
       // A2A v1.0 `security` requirement list (dev-request 2026-07-13-a2a-card-v1-signing
@@ -1596,7 +1640,7 @@ class MarketplaceRegistry {
     return db.prepare("SELECT * FROM listings WHERE agent_id = ? ORDER BY created_at DESC").all(agentId) as any[];
   }
 
-  // ─── Check if agent exists by name (for idempotent seeding) â"€
+  // ─── Check if agent exists by name (for idempotent seeding) ──
 
   getAgentByName(name: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -1652,7 +1696,7 @@ class MarketplaceRegistry {
     // Verification bonus
     if (agent.is_verified) score += 0.15;
 
-    // Completion rate (contacted â†' chosen)
+    // Completion rate (contacted → chosen)
     if (m.times_contacted > 0) {
       const completionRate = Math.min(1, m.times_chosen / m.times_contacted);
       score += 0.15 * completionRate;
@@ -1820,7 +1864,7 @@ class MarketplaceRegistry {
     }
 
     score += 0.05 * agent.trustScore;
-    if (agent.trustScore > 0.8) reasons.push("H\u00f8y tillitsscore");
+    if (agent.trustScore > 0.8) reasons.push("Høy tillitsscore");
 
     if (agent.isVerified) {
       score += 0.05;
@@ -1997,6 +2041,60 @@ const PRODUCT_TERM_EXCLUSIONS = new Set<string>([
 // ~120 pre-existing keywords in ways nobody asked for. This class is the
 // minimal superset that fixes Norwegian.
 const NORWEGIAN_WORD_CHAR = "0-9A-Za-zÀ-ÖØ-öø-ÿ_";
+// ─── Place names that must never drive a producer NAME search ─────────────
+// PR-72 introduced this list but scoped it to parseNaturalQuery's Pass 2. The
+// indicator branch (Pass 1, "…farm in Vestfold…") and discover()'s relaxed
+// fuzzy fallback never saw it, so a place name kept leaking in as a name
+// token. Measured live 2026-09-05: `Find a farm in Vestfold with raw honey`
+// returned eight producers whose only common trait was the word "Vestfold" in
+// their NAME — a deer farm, a bakery, a fruit farm — while the two real honey
+// producers `honning Vestfold` finds (TønsbergBier, Sætrehonning) never
+// appeared. The name branch returns early and skips the category filter
+// entirely, so this silently outranks a correctly detected category.
+// dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil.
+const KNOWN_PLACE_WORDS = new Set([
+  // Top-30 cities (mirrors geocoding-service.ts MAJOR_CITIES)
+  "oslo", "bergen", "trondheim", "stavanger", "tromsø", "tromso",
+  "kristiansand", "drammen", "fredrikstad", "bodø", "bodo",
+  "ålesund", "alesund", "tønsberg", "tonsberg", "haugesund",
+  "sandnes", "lillestrøm", "lillestrom", "hamar", "lillehammer",
+  "sandefjord", "sarpsborg", "skien", "molde", "moss", "asker",
+  "kongsberg", "porsgrunn", "arendal", "larvik", "halden",
+  // Common region/fylke names
+  "vestland", "viken", "rogaland", "trøndelag", "trondelag",
+  "nordland", "innlandet", "troms", "finnmark", "agder", "vestfold",
+  "telemark", "østfold", "ostfold", "akershus", "buskerud", "oppland",
+  "hedmark", "sogn", "fjordane", "møre", "more", "romsdal",
+  // Common Oslo districts / neighborhoods
+  "grünerløkka", "grunerlokka", "frogner", "majorstuen", "sentrum",
+]);
+
+// English filler words a reviewer types around the food word ("Show me
+// producers near Bergen that SELL cheese", "FIND a farm WITH raw honey").
+// They are not Norwegian, so they passed every skip-word test and became
+// "distinctive" name tokens. Norwegian equivalents are in skipWords already.
+const ENGLISH_SKIP_WORDS = [
+  "find", "show", "me", "my", "get", "give", "list", "search", "looking",
+  "look", "want", "need", "buy", "order", "sell", "sells", "selling", "sale",
+  "the", "that", "this", "these", "those", "with", "without", "from", "for",
+  "near", "nearby", "closest", "close", "around", "any", "some", "all",
+  "please", "can", "you", "who", "what", "where", "which", "how", "does",
+  "are", "there", "have", "has", "and", "or", "of", "in", "on", "at", "to",
+  "producer", "producers", "farm", "farms", "farmer", "farmers", "shop",
+  "shops", "store", "stores", "local", "raw", "fresh", "good", "best",
+];
+
+/** Is `w` one of the food-category / tag keywords the parser already matched? */
+function isCategoryOrTagWord(
+  w: string,
+  categoryMap: Record<string, string[]>,
+  tagMap: Record<string, string[]>,
+): boolean {
+  for (const kws of Object.values(categoryMap)) if (kws.includes(w)) return true;
+  for (const kws of Object.values(tagMap)) if (kws.includes(w)) return true;
+  return false;
+}
+
 export function norwegianWordBoundary(keyword: string): RegExp {
   const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[^${NORWEGIAN_WORD_CHAR}])${escaped}(?:$|[^${NORWEGIAN_WORD_CHAR}])`);
@@ -2010,10 +2108,3 @@ export function isProximityIntent(query: string): boolean {
 
 // Singleton
 export const marketplaceRegistry = new MarketplaceRegistry();
-
-
-
-
-
-
-
