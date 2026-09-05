@@ -151,6 +151,38 @@ export function getDb(): Database.Database {
 export const POOL_CONTENT_THRESHOLD_SQL =
   "(length(COALESCE(k.about,'')) >= 80 OR (json_valid(COALESCE(k.products,'[]')) AND json_array_length(COALESCE(k.products,'[]')) >= 3))";
 
+// Pure TS mirror of POOL_CONTENT_THRESHOLD_SQL above, for callers that check
+// an already-fetched row in-process instead of interpolating raw SQL — e.g.
+// coreEligibilityCheck's defense-in-depth re-verification in
+// admin-outreach-candidates.ts (dev-request 2026-09-05-orch-pr-1-
+// coreeligibility-partial), which re-checks a row's core eligibility without
+// re-querying the VIEW. MUST stay logically equivalent to
+// POOL_CONTENT_THRESHOLD_SQL — same thresholds (about>=80, products>=3) and
+// the same "malformed products JSON => excluded, not a crash" behavior as the
+// SQL's json_valid() guard (a JSON.parse failure here is treated as an empty
+// products list, exactly like json_valid()=0 short-circuits the SQL's
+// json_array_length() call). Do not hand-edit one without the other.
+export function isContentQualified(row: {
+  about?: string | null;
+  products?: string | unknown[] | null;
+}): boolean {
+  const aboutLen = (row.about || "").length;
+  if (aboutLen >= 80) return true;
+
+  let products: unknown[] = [];
+  if (Array.isArray(row.products)) {
+    products = row.products;
+  } else if (typeof row.products === "string" && row.products.length > 0) {
+    try {
+      const parsed = JSON.parse(row.products);
+      if (Array.isArray(parsed)) products = parsed;
+    } catch {
+      products = []; // malformed JSON -> excluded, mirrors json_valid() guard
+    }
+  }
+  return products.length >= 3;
+}
+
 function initSchema(db: Database.Database): void {
   db.exec(`
     -- ════════════════════════════════════════════════════════════
