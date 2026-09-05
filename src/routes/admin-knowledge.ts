@@ -495,6 +495,18 @@ export function canCorrectFactualField(opts: {
     return { allowed: true, reason: "ok_homepage_preferred_over_google_places" };
   }
 
+  // ── Owner correction always wins for categories/products ───────────────────
+  // Dev-request 2026-09-05 (Daniel/session): a genuine owner-asserted correction
+  // ("source_type: owner", Tier-S) on categories or products must win regardless
+  // of how well-sourced the existing value already is — "eierens egen korreksjon
+  // slår alt". Scoped narrowly to these two fields only; about/description stay
+  // under the existing rules below, and address/phone are not CONTENT_FIELDS so
+  // isContentField is false for them regardless. The curated_locked refusal
+  // above still applies absolutely — this never bypasses it.
+  if ((field === "categories" || field === "products") && incoming.hasTierS) {
+    return { allowed: true, reason: "ok_owner_correction" };
+  }
+
   // 2. Existing value already well-sourced (>=2 distinct Tier-A) — not legacy-bad.
   if (existing.tierADistinct >= 2) {
     return { allowed: false, reason: "existing_already_two_tierA" };
