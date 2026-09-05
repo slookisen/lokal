@@ -36,6 +36,11 @@ import {
   normalizeEnrichmentVertical,
 } from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
+// POST /:id/slug-alias below (dev-request 2026-09-03-rfb-korrigering-navn-
+// sted-kategorier, Mål 1): reuses the SAME insertAgentSlugAlias helper that
+// updateAgent()'s rename hook writes through internally — no duplicated SQL
+// between the automatic path and this one-shot manual-backfill route.
+import { insertAgentSlugAlias } from "../services/marketplace-registry";
 import {
   verifyOrgNumber,
   fetchBrregActivityDescription,
@@ -4670,6 +4675,56 @@ router.post("/tynne-profiler-improve", async (req: Request, res: Response) => {
     by_outcome: byOutcome,
     results,
   });
+});
+
+// ─── POST /:id/slug-alias (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+// kategorier, Mål 1 — slug-alias/301 ved navnebytte) ───────────────────────
+// One-shot manual-backfill tool: writes a single agent_slug_aliases row so
+// /produsent/<oldSlug> 301s to the agent's current page instead of 404ing.
+// This is NOT a general bulk-rename utility — one call writes exactly one
+// row (no batch parameter) — it exists to backfill renames that happened
+// BEFORE updateAgent()'s automatic alias hook shipped (e.g. Romstad Gård,
+// romstad-gard-molde -> romstad-gard-bjugn). Every rename going forward
+// writes its own alias automatically; this route is only for that pre-
+// existing backlog.
+//
+// Body: { oldSlug: string }. Validates the agent exists before writing so a
+// typo'd :id gets a clear 404 instead of a silently orphaned alias row (the
+// FK is ON DELETE CASCADE, not ON INSERT — sqlite would happily insert a row
+// pointing at a nonexistent agent_id unless we check first).
+router.post("/:id/slug-alias", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const id = req.params.id as string;
+  const rawOldSlug = typeof req.body?.oldSlug === "string" ? req.body.oldSlug.trim() : "";
+  // PR #800 review finding 2: normalize through the same slugify() the read
+  // path (resolveAgentSlugAlias, called from the lowercased /produsent/:slug
+  // URL param) expects. Without this, a human operator backfilling with e.g.
+  // "Romstad-Gard-Molde" (mixed case) writes a row that SQLite's
+  // case-sensitive TEXT comparison silently never matches at request time.
+  const oldSlug = rawOldSlug ? slugify(rawOldSlug) : "";
+
+  if (!oldSlug) {
+    res.status(400).json({ error: "oldSlug (string, non-empty) is required" });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    const existing = db.prepare(`SELECT id FROM agents WHERE id = ?`).get(id) as { id: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found", agent_id: id });
+      return;
+    }
+
+    // Deliberate human-operated correction path: allowed to overwrite an
+    // existing alias row (PR #800 review finding 1).
+    insertAgentSlugAlias(id, oldSlug, { allowOverwrite: true });
+
+    res.json({ success: true, old_slug: oldSlug, agent_id: id });
+  } catch (err: any) {
+    res.status(500).json({ error: "slug-alias write failed", detail: err.message });
+  }
 });
 
 export default router;
