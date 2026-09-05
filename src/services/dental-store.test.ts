@@ -191,7 +191,7 @@ export function runDentalStorePublicCatalogClassFilterTests(
 }
 
 /**
- * dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records:
+ * dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
  * Stage V's "10% sample of last-24h commits" selector always drew the same 3
  * records because `.agent.updated_at` was always absent/null in the API
  * response it reads. Root cause: updateDentalAgent() already stamps

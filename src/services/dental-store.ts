@@ -71,7 +71,7 @@ export const DentalAgentSchema = z.object({
   // dev-request 2026-09-02-dental-catalog-class-triage: read-only on this
   // schema (hydrated for API consumers); written only by the backfill route.
   catalog_class: z.string().optional().nullable(),
-  // dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records:
+  // dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
   // read-only on this schema -- hydrated for API consumers; written only by
   // updateDentalAgent()'s own unconditional `updated_at = datetime('now')`
   // stamp (never via this schema/PUT body -- see DENTAL_AGENT_WRITABLE_FIELDS).
@@ -265,7 +265,7 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     registreringsdato: (row.registreringsdato as string | null) ?? null,
     naeringskode: (row.naeringskode as string | null) ?? null,
     catalog_class: (row.catalog_class as string | null) ?? null,
-    // dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records:
+    // dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
     // hydrateAgent() never included updated_at, so callers (including Stage
     // V's "10% sample of last-24h commits" selector) could never read the
     // real timestamp updateDentalAgent() already stamps on every write.
