@@ -1446,6 +1446,47 @@ if (
   }, 60 * 60_000);
 }
 
+// ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
+// (option A, Daniel GO 2026-09-05): gårdssalg outreach is sent by the
+// platform itself once a day ──────────────────────────────────────────
+//
+// Checks every 10 minutes; fires once inside the 08:00–08:59 UTC window
+// (10:00 norsk sommertid) via shouldRunGardssalgOutreachDaily, exactly like
+// the auto-prune block above. The job's own four guards (env switch, lane
+// pause, fresh bounce/complaint → auto-pause, today's cap already sent) live
+// in runGardssalgOutreachDaily — the DB is the memory, so a restart or a
+// second tick inside the window cannot double-send. `lastRunAt` is only
+// stamped after a run that did not throw, so a transient DB error at 08:00
+// is retried on the next tick within the window.
+//
+// Disable on dev / CI (or as a deploy-level kill-switch) with
+// GARDSSALG_OUTREACH_DAILY_DISABLED=1. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-outreach-daily-run.
+if (
+  process.env.ENABLE_EXPERIENCES === "1" &&
+  process.env.GARDSSALG_OUTREACH_DAILY_DISABLED !== "1"
+) {
+  let lastGardssalgOutreachRunAt: Date | null = null;
+  const gardssalgOutreachDailyTick = async () => {
+    const now = new Date();
+    try {
+      const { shouldRunGardssalgOutreachDaily, runGardssalgOutreachDaily } = await import("./routes/opplevelser");
+      if (!shouldRunGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })) return;
+      const r = await runGardssalgOutreachDaily({ apply: true, trigger: "cron", now });
+      lastGardssalgOutreachRunAt = now;
+      console.log(
+        `[gardssalg-outreach-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `sent=${r.summary.sent} errors=${r.summary.error} budget=${r.budget} cap=${r.daily_cap} ` +
+          `auto_paused=${r.auto_paused} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-outreach-daily] tick failed (non-fatal, retried next tick):", err);
+    }
+  };
+  setTimeout(() => { void gardssalgOutreachDailyTick(); }, 90_000);
+  setInterval(() => { void gardssalgOutreachDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
 // (Fase 1a): backend RFB agents geocoding worker ─────────────────────
 //
