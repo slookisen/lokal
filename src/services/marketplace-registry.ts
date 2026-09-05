@@ -1864,9 +1864,54 @@ export function ensureAgentSlugAliasesTable(db: ReturnType<typeof getDb>): void 
 // POST /admin/agents/:id/slug-alias (routes/admin-agents.ts, the one-shot
 // manual-backfill tool for renames that happened before this slice
 // shipped). No duplicated SQL between the two call sites.
-export function insertAgentSlugAlias(agentId: string, oldSlug: string): void {
+//
+// PR #800 review finding 1 (alias-hijack via self-service rename): `old_slug`
+// is a global PRIMARY KEY, and this used to be an unconditional
+// INSERT OR REPLACE — so ANY caller writing to ANY old_slug silently stole
+// that row from whichever agent currently owned it. Proven exploit: an
+// ordinary producer's own self-service PUT /api/marketplace/agents/:id
+// rename (gated only by their own API key) reaches updateAgent()'s automatic
+// hook, which called this with no ownership check at all. Renaming
+// TO another producer's already-abandoned old slug and then immediately
+// away again overwrote that row to point at the attacker, silently
+// hijacking the abandoning producer's historical URL.
+//
+// `allowOverwrite` (default false) is the fix: the automatic rename hook
+// (updateAgent()) leaves it at the default and MUST NOT clobber a row that
+// already belongs to a different agent_id — it just logs and skips, because
+// this is best-effort and must never block the rename itself. Only the
+// deliberate, human-operated admin backfill route (POST
+// /admin/agents/:id/slug-alias) passes `{ allowOverwrite: true }`, because an
+// operator correcting history SHOULD be able to overwrite.
+export function insertAgentSlugAlias(
+  agentId: string,
+  oldSlug: string,
+  opts?: { allowOverwrite?: boolean },
+): void {
   const db = getDb();
   ensureAgentSlugAliasesTable(db);
+
+  if (opts?.allowOverwrite) {
+    db.prepare(
+      "INSERT OR REPLACE INTO agent_slug_aliases (old_slug, agent_id) VALUES (?, ?)"
+    ).run(oldSlug, agentId);
+    return;
+  }
+
+  const existing = db
+    .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = ?")
+    .get(oldSlug) as { agent_id: string } | undefined;
+
+  if (existing && existing.agent_id !== agentId) {
+    console.warn(
+      `[marketplace-registry] slug-alias collision: old_slug "${oldSlug}" already claimed by agent ${existing.agent_id}, refusing to overwrite for renaming agent ${agentId}`,
+    );
+    return;
+  }
+
+  // No existing row, or the same agent re-claiming/re-abandoning the same
+  // slug (idempotent, harmless) — INSERT OR REPLACE is safe here since it's
+  // the same owner either way.
   db.prepare(
     "INSERT OR REPLACE INTO agent_slug_aliases (old_slug, agent_id) VALUES (?, ?)"
   ).run(oldSlug, agentId);

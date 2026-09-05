@@ -33,6 +33,28 @@
  *   (f) POST /admin/agents/:id/slug-alias: missing X-Admin-Key -> 403; valid
  *       key + a real agent id -> writes the row, resolveAgentSlugAlias finds
  *       it afterward.
+ *   (g) PR #800 review finding 1 regression: the automatic updateAgent()
+ *       rename hook must NOT let one agent's rename hijack a DIFFERENT
+ *       agent's already-abandoned alias. Reproduces the reviewer's exact
+ *       attack — agent A abandons slug X (alias X->A written); unrelated
+ *       agent D is renamed TO a name that also slugifies to X and then
+ *       immediately away again, both via updateAgent() (the self-service
+ *       rename path) — and asserts the alias still resolves to A afterward,
+ *       not D, with a console.warn collision message logged instead of a
+ *       silent overwrite.
+ *   (h) Idempotent case: the SAME agent abandoning the SAME slug a second
+ *       time (reclaim -> re-abandon) must still update cleanly through the
+ *       default (allowOverwrite:false) path, with NO collision warning —
+ *       proves the fix only blocks a DIFFERENT agent_id, not the same one.
+ *   (i) POST /admin/agents/:id/slug-alias with allowOverwrite:true (the
+ *       route's hardcoded behavior) CAN overwrite an alias that already
+ *       points at a different agent — the deliberate human-operator
+ *       correction path must not be broken by finding 1's fix.
+ *   (j) PR #800 review finding 2 regression: the admin route normalizes
+ *       oldSlug through slugify() before writing, so a mixed-case/
+ *       punctuated backfill value (e.g. "Romstad-Gard-Molde"-style input)
+ *       is stored in the same normalized form resolveAgentSlugAlias's
+ *       lowercase-URL-param read path expects.
  *
  * Exported runMarketplaceRegistrySlugAliasTests({log}) -> TestSummary; wired
  * into tests/test.ts. Standalone:
@@ -222,6 +244,152 @@ export async function runMarketplaceRegistrySlugAliasTests(opts: { log?: boolean
         const row = testDb.prepare("SELECT 1 FROM agent_slug_aliases WHERE old_slug = 'irrelevant-slug'").get();
         assertTrue(!row, "f3b: no orphaned alias row written for a nonexistent agent");
       }
+    }
+
+    // ── (g) PR #800 review finding 1 regression: alias-hijack via
+    // self-service rename must be refused by the automatic hook ──────────
+    {
+      const warnCalls: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: any[]) => { warnCalls.push(args.join(" ")); };
+      try {
+        // Agent A abandons "old-name-attack-gard" — legitimate rename, alias written.
+        seedAgent({ id: "agent-attack-a", name: "Old Name Attack Gard" });
+        marketplaceRegistry.updateAgent("agent-attack-a", { name: "New Name For A" });
+        {
+          const row = testDb
+            .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = ?")
+            .get(slugify("Old Name Attack Gard")) as { agent_id: string } | undefined;
+          assertEq(row?.agent_id, "agent-attack-a", "g0-setup: A's abandoned slug alias points at A");
+        }
+
+        // Unrelated agent D: rename TO the same slug A abandoned, then away
+        // again — both through updateAgent(), the exact self-service path a
+        // producer's own PUT /api/marketplace/agents/:id reaches.
+        seedAgent({ id: "agent-attack-d", name: "Temp Name For D" });
+        marketplaceRegistry.updateAgent("agent-attack-d", { name: "Old Name Attack Gard" });
+        warnCalls.length = 0; // only care about the warning from the SECOND rename below
+        marketplaceRegistry.updateAgent("agent-attack-d", { name: "Away Again For D" });
+
+        const afterAttack = testDb
+          .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = ?")
+          .get(slugify("Old Name Attack Gard")) as { agent_id: string } | undefined;
+        assertEq(
+          afterAttack?.agent_id,
+          "agent-attack-a",
+          "g1: alias for the contested slug STILL resolves to A, not the attacking agent D",
+        );
+        const stillResolvesToA = marketplaceRegistry.resolveAgentSlugAlias(slugify("Old Name Attack Gard"));
+        assertEq(stillResolvesToA?.id, "agent-attack-a", "g2: resolveAgentSlugAlias also confirms A, not D");
+        assertTrue(
+          warnCalls.some(w => w.includes("slug-alias collision") && w.includes(slugify("Old Name Attack Gard"))),
+          "g3: a collision warning was logged instead of a silent overwrite",
+        );
+      } finally {
+        console.warn = origWarn;
+      }
+    }
+
+    // ── (h) idempotent case: the SAME agent re-abandoning the SAME slug a
+    // second time must still update cleanly, with NO false collision warning ──
+    {
+      const warnCalls: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: any[]) => { warnCalls.push(args.join(" ")); };
+      try {
+        seedAgent({ id: "agent-idem", name: "Idem Gard" });
+        marketplaceRegistry.updateAgent("agent-idem", { name: "Idem Gard Two" }); // abandons "idem-gard" -> E
+        marketplaceRegistry.updateAgent("agent-idem", { name: "Idem Gard" }); // reclaims it (abandons "idem-gard-two")
+        warnCalls.length = 0;
+        marketplaceRegistry.updateAgent("agent-idem", { name: "Idem Gard Three" }); // re-abandons "idem-gard"
+
+        const row = testDb
+          .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = 'idem-gard'")
+          .get() as { agent_id: string } | undefined;
+        assertEq(row?.agent_id, "agent-idem", "h1: re-abandoned slug still points at the same (idempotent) owner");
+        assertTrue(
+          warnCalls.every(w => !w.includes("slug-alias collision")),
+          "h2: no false collision warning when the same agent re-abandons a slug it already owns",
+        );
+      } finally {
+        console.warn = origWarn;
+      }
+    }
+
+    // ── (i) admin route with allowOverwrite:true CAN still overwrite an
+    // existing alias — the deliberate human-operator correction path ────────
+    {
+      const routePath = require.resolve("../routes/admin-agents");
+      delete require.cache[routePath];
+      const routerModule = require("../routes/admin-agents").default as any;
+      const layer = routerModule.stack.find(
+        (l: any) => l.route && l.route.path === "/:id/slug-alias" && l.route.methods && l.route.methods.post,
+      );
+      const handler = layer.route.stack[0].handle;
+      const testKey = (process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY) as string;
+
+      // "Old Name Attack Gard"'s alias currently points at agent-attack-a (case g).
+      // A human operator deliberately reassigns it to a fresh agent.
+      seedAgent({ id: "agent-correction", name: "Correction Target Gard" });
+      const res = fakeRes();
+      handler(
+        {
+          params: { id: "agent-correction" },
+          headers: { "x-admin-key": testKey },
+          body: { oldSlug: "Old Name Attack Gard" },
+        } as any,
+        res,
+      );
+      assertEq(res.statusCode, 200, "i1: admin backfill (overwrite) -> 200");
+      const resolved = marketplaceRegistry.resolveAgentSlugAlias(slugify("Old Name Attack Gard"));
+      assertEq(
+        resolved?.id,
+        "agent-correction",
+        "i2: admin route with allowOverwrite:true DID overwrite the existing alias to the new agent",
+      );
+    }
+
+    // ── (j) PR #800 review finding 2 regression: admin route normalizes
+    // oldSlug through slugify() before writing ──────────────────────────────
+    {
+      const routePath = require.resolve("../routes/admin-agents");
+      delete require.cache[routePath];
+      const routerModule = require("../routes/admin-agents").default as any;
+      const layer = routerModule.stack.find(
+        (l: any) => l.route && l.route.path === "/:id/slug-alias" && l.route.methods && l.route.methods.post,
+      );
+      const handler = layer.route.stack[0].handle;
+      const testKey = (process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY) as string;
+
+      seedAgent({ id: "agent-mixedcase", name: "Mixed Case Backfill Gard" });
+      const mixedCaseInput = "Romstad-Gard-Molde"; // reviewer's exact example
+      const expectedNormalized = slugify(mixedCaseInput); // "romstad-gard-molde"
+      assertTrue(
+        mixedCaseInput !== expectedNormalized,
+        "j0-setup: fixture sanity — raw input differs from its normalized form (proves this exercises normalization, not a no-op)",
+      );
+
+      const res = fakeRes();
+      handler(
+        { params: { id: "agent-mixedcase" }, headers: { "x-admin-key": testKey }, body: { oldSlug: mixedCaseInput } } as any,
+        res,
+      );
+      assertEq(res.statusCode, 200, "j1: mixed-case backfill -> 200");
+      assertEq(res.body?.old_slug, expectedNormalized, "j2: response echoes the NORMALIZED old_slug, not the raw input");
+
+      const rawRow = testDb.prepare("SELECT 1 FROM agent_slug_aliases WHERE old_slug = ?").get(mixedCaseInput);
+      assertTrue(!rawRow, "j3: no row stored under the raw, unnormalized input");
+
+      const normalizedRow = testDb
+        .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = ?")
+        .get(expectedNormalized) as { agent_id: string } | undefined;
+      assertEq(normalizedRow?.agent_id, "agent-mixedcase", "j4: row stored under the normalized slug");
+
+      // Mirrors the real read path (seo.ts lowercases req.params.slug but does
+      // not re-run slugify) — the backfilled alias must resolve there.
+      const resolved = marketplaceRegistry.resolveAgentSlugAlias(expectedNormalized.toLowerCase());
+      assertTrue(!!resolved, "j5: resolveAgentSlugAlias finds the backfilled alias via the lowercase read path");
+      assertEq(resolved?.id, "agent-mixedcase", "j6: resolves to the right agent");
     }
   } catch (err) {
     failed++;

@@ -4696,7 +4696,13 @@ router.post("/:id/slug-alias", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const id = req.params.id as string;
-  const oldSlug = typeof req.body?.oldSlug === "string" ? req.body.oldSlug.trim() : "";
+  const rawOldSlug = typeof req.body?.oldSlug === "string" ? req.body.oldSlug.trim() : "";
+  // PR #800 review finding 2: normalize through the same slugify() the read
+  // path (resolveAgentSlugAlias, called from the lowercased /produsent/:slug
+  // URL param) expects. Without this, a human operator backfilling with e.g.
+  // "Romstad-Gard-Molde" (mixed case) writes a row that SQLite's
+  // case-sensitive TEXT comparison silently never matches at request time.
+  const oldSlug = rawOldSlug ? slugify(rawOldSlug) : "";
 
   if (!oldSlug) {
     res.status(400).json({ error: "oldSlug (string, non-empty) is required" });
@@ -4711,7 +4717,9 @@ router.post("/:id/slug-alias", (req: Request, res: Response) => {
       return;
     }
 
-    insertAgentSlugAlias(id, oldSlug);
+    // Deliberate human-operated correction path: allowed to overwrite an
+    // existing alias row (PR #800 review finding 1).
+    insertAgentSlugAlias(id, oldSlug, { allowOverwrite: true });
 
     res.json({ success: true, old_slug: oldSlug, agent_id: id });
   } catch (err: any) {
