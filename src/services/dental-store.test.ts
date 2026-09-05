@@ -190,8 +190,124 @@ export function runDentalStorePublicCatalogClassFilterTests(
   return { passed, failed, failures };
 }
 
+/**
+ * dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records:
+ * Stage V's "10% sample of last-24h commits" selector always drew the same 3
+ * records because `.agent.updated_at` was always absent/null in the API
+ * response it reads. Root cause: updateDentalAgent() already stamps
+ * `updated_at = datetime('now')` on every writing PUT (the dental_agents.
+ * updated_at column itself is fine) but hydrateAgent() -- the function both
+ * getDentalAgentById() and listDentalAgents() go through to build the
+ * DentalAgent object returned to callers -- built its return object
+ * field-by-field and simply never included updated_at, so the hydrated
+ * object had no updated_at property at all no matter how many real writes
+ * happened. Fixed by adding updated_at to hydrateAgent()'s returned object
+ * (kept read-only: never added to DENTAL_AGENT_WRITABLE_FIELDS, so a PUT
+ * body can't forge the sort key -- it stays server-stamped only).
+ *
+ * Covers:
+ *   (a) getDentalAgentById() after an updateDentalAgent() write returns a
+ *       real, non-undefined, non-null updated_at timestamp string.
+ *   (b) DENTAL_AGENT_WRITABLE_FIELDS.includes("updated_at") is false --
+ *       regression guard: if someone later adds it, a PUT client could forge
+ *       the sort key, and this test must fail.
+ *   (c) listDentalAgents() rows also carry updated_at for a row that was
+ *       just updated -- covers Stage V's actual read path (the list
+ *       endpoint), not just a single GET.
+ */
+export function runDentalStoreUpdatedAtHydrationTests(
+  opts: { log?: boolean } = {}
+): TestSummary {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
+  const prevDentalPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPath = require.resolve("../database/db-factory");
+  const dentalStorePath = require.resolve("./dental-store");
+  const cachePaths = [dbFactoryPath, dentalStorePath];
+  for (const p of cachePaths) delete require.cache[p];
+
+  try {
+    const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+    dbFactory.__resetDbFactoryForTesting();
+    const store = require("./dental-store") as typeof import("./dental-store");
+
+    // (b) regression guard -- independent of any seeded data.
+    assertTrue(
+      !store.DENTAL_AGENT_WRITABLE_FIELDS.includes("updated_at"),
+      "regression guard: updated_at is NOT in DENTAL_AGENT_WRITABLE_FIELDS (server-stamped only, never client-settable via PUT)"
+    );
+
+    const id = store.createDentalAgent({
+      navn: "Timestamp Test Tannklinikk AS",
+      org_nr: "911700001",
+      fylke: "OSLO",
+      poststed: "OSLO",
+    } as any);
+
+    const ok = store.updateDentalAgent(id, { telefon: "12345678" });
+    assertTrue(ok, "setup: updateDentalAgent() with a writing field ('telefon') reports success");
+
+    // (a) single-GET read path (GET /api/tannlege/agents/:id)
+    const single = store.getDentalAgentById(id) as Record<string, unknown> | null;
+    assertTrue(!!single, "setup: getDentalAgentById() finds the updated row");
+    const singleUpdatedAt = single?.updated_at;
+    assertTrue(
+      typeof singleUpdatedAt === "string" && singleUpdatedAt.length > 0,
+      `getDentalAgentById() returns a non-null, non-absent updated_at string after updateDentalAgent() (got ${JSON.stringify(singleUpdatedAt)})`
+    );
+
+    // (c) list read path -- Stage V's actual selector reads listDentalAgents(),
+    // not a single GET (GET /api/tannlege/agents).
+    const listed = store.listDentalAgents({}, 50, 0) as Array<Record<string, unknown>>;
+    const listedRow = listed.find((a) => a.id === id);
+    assertTrue(!!listedRow, "setup: listDentalAgents() includes the updated row");
+    const listedUpdatedAt = listedRow?.updated_at;
+    assertTrue(
+      typeof listedUpdatedAt === "string" && listedUpdatedAt.length > 0,
+      `listDentalAgents() rows also carry a non-null, non-absent updated_at string after updateDentalAgent() (got ${JSON.stringify(listedUpdatedAt)})`
+    );
+    assertTrue(
+      listedUpdatedAt === singleUpdatedAt,
+      "listDentalAgents()'s updated_at matches getDentalAgentById()'s updated_at for the same row"
+    );
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store updated_at hydration: unexpected error: " + String(err?.stack || err?.message || err));
+  } finally {
+    if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH;
+    else process.env.DENTAL_DB_PATH = prevDentalPath;
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+    } catch {
+      // best-effort cleanup
+    }
+    for (const p of cachePaths) delete require.cache[p];
+  }
+
+  return { passed, failed, failures };
+}
+
 if (require.main === module) {
   const r = runDentalStorePublicCatalogClassFilterTests({ log: true });
   console.log(`\ndental-store public catalog-class filter: ${r.passed} passed, ${r.failed} failed`);
-  process.exit(r.failed > 0 ? 1 : 0);
+  const r2 = runDentalStoreUpdatedAtHydrationTests({ log: true });
+  console.log(`\ndental-store updated_at hydration: ${r2.passed} passed, ${r2.failed} failed`);
+  process.exit(r.failed > 0 || r2.failed > 0 ? 1 : 0);
 }
