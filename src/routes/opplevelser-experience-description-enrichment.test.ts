@@ -1,34 +1,67 @@
 /**
  * opplevelser-experience-description-enrichment.test.ts — tests for
  * dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
- * ("Innholdsberikelse"): the source-grounded, judge-gated writer for
- * `experiences.description` behind
+ * ("Innholdsberikelse"), EXTENDED by dev-request 2026-09-02-experiences-
+ * beskrivelsesnivaa-kort-og-kildetro ("Beskrivelsesnivå"): the level-selected,
+ * source-grounded/judge-gated writer for `experiences.description` behind
  * POST /api/opplevelser/admin/experiences-description-enrichment.
  *
+ * The 2026-09-02 dev-request REPLACED the original single-tier ≥400-word
+ * design with THREE per-row outcomes, selected by selectExperienceDescription-
+ * Tier() before any LLM call:
+ *   - `kildetro`    60-150 words, grounded ONLY in the provider's own
+ *                   eierskapsverifiserte hjemmeside, judged against that
+ *                   homepage text as fasit.
+ *   - `faktalinje`  1-2 setninger, <=40 words, grounded ONLY in the row's own
+ *                   structured facts (>=4 distinct fact-kinds, down from the
+ *                   retired tier's 6) — the retired tier's generator/judge
+ *                   MACHINERY (never-fabricate fetch contract, sentinel
+ *                   escape, ungrounded-number scan, GODKJENN/AVVIS judge
+ *                   protocol) is reused unchanged; only the length bar and
+ *                   thin-data floor moved.
+ *   - `skip`        neither bar clears. Zero LLM calls.
+ * The original ≥400-word single tier is fully RETIRED — no row can reach it
+ * any more. Sections B/B2 below, which used to exercise that retired tier,
+ * are updated in place to assert the new faktalinje bar instead, preserving
+ * their regression value on the shared fact-builder/sentinel/judge-token
+ * machinery those sections were really testing all along.
+ *
  * Sections:
- *   A — pure helpers (fact assembly / thin-data measure / word count /
- *       ungrounded-number scan / candidate predicate). No DB, no network.
- *   B — generateExperienceDescriptionNo(): the never-fabricate, never-throw
- *       contract (thin row -> zero LLM calls, missing key, sentinel, word
- *       floor/ceiling, ungrounded numbers, non-200, unparseable body,
- *       non-array content shape, network throw).
- *   C — judgeExperienceDescriptionCandidate(): the exact-token GODKJENN /
- *       AVVIS contract, fail-closed on every deviation.
- *   D — the route: candidate-set composition, dry_run strict-false idiom
- *       (asserted with a before/after row dump, not just the response
- *       shape), apply-mode writes + provenance stamp, judge rejection,
- *       every fail-closed path, the parameterised `ids` filter and the
- *       batch cap.
+ *   A  — pure helpers (fact assembly / thin-data measure / word count /
+ *        ungrounded-number scan / candidate predicate). No DB, no network.
+ *   A2 — selectExperienceDescriptionTier(): level selection (kildetro /
+ *        faktalinje / skip), including the blocked-homepage fallthrough.
+ *   B  — generateExperienceDescriptionNo()/-Detailed(): now the `faktalinje`
+ *        generator — never-fabricate, never-throw contract at the NEW
+ *        4-fact/<=40-word bar (thin row -> zero LLM calls, missing key,
+ *        sentinel, word ceiling, ungrounded numbers, non-200, unparseable
+ *        body, non-array content shape, network throw).
+ *   C  — judgeExperienceDescriptionCandidate(): the exact-token GODKJENN /
+ *        AVVIS contract, fail-closed on every deviation, PLUS the new
+ *        optional `groundTruthText` parameter (kildetro's "dommer med
+ *        fasit") — additive, so every pre-existing case above is unchanged.
+ *   E  — generateExperienceDescriptionKildetro(): the new 60-150-word,
+ *        homepage-grounded generator (title-token requirement, word floor/
+ *        ceiling, sentinel, API-deviation fail-closed contract).
+ *   D  — the route: candidate-set composition, dry_run strict-false idiom,
+ *        apply-mode writes + provenance stamp per tier, judge rejection,
+ *        every fail-closed path, the parameterised `ids` filter, the batch
+ *        cap, PLUS (2026-09-02) the kildetro path end-to-end (homepage-fetch
+ *        stub + LLM stub independently controlled), the blocked-homepage
+ *        fallthrough, the auto-supersede upgrade, and the new
+ *        no_title_node/fetch_failed skipped_reasons buckets.
  *
  * Setup convention mirrors opplevelser-gardssalg-products.test.ts /
  * opplevelser-gardssalg-rewrite.test.ts: EXPERIENCES_DB_PATH=":memory:", a
  * fresh require of db-factory + experience-store + the opplevelser router
  * per run, and the router exercised directly via router.handle(). The
- * Anthropic call is NEVER real — sections A-C stub globalThis.fetch, and
- * section D uses the route's OWN per-app-instance injection seam
- * ("experienceDescriptionFetchImpl", the twin of the title-no backfill's
- * "titleNoBackfillFetchImpl"), reached through the fake `req.app` the
- * callRoute() helper below supplies.
+ * Anthropic call is NEVER real — sections A-C/E stub globalThis.fetch or a
+ * direct fetchImpl argument, and section D uses the route's OWN per-app-
+ * instance injection seams ("experienceDescriptionFetchImpl" for the LLM,
+ * the twin of the title-no backfill's "titleNoBackfillFetchImpl", PLUS the
+ * NEW "experienceDescriptionHomepageFetchImpl" for kildetro's independent
+ * homepage fetch), reached through the fake `req.app` the callRoute() helper
+ * below supplies. Neither ever touches the real network.
  */
 
 import {
@@ -39,7 +72,9 @@ import {
   experienceDescriptionNeedsEnrichment,
   generateExperienceDescriptionNo,
   generateExperienceDescriptionNoDetailed,
+  generateExperienceDescriptionKildetro,
   judgeExperienceDescriptionCandidate,
+  selectExperienceDescriptionTier,
   EXP_DESC_GENERATED_PROVENANCE_SENTINEL,
   type ExperienceDescriptionCandidate,
 } from "./opplevelser";
@@ -56,7 +91,7 @@ interface RouteResult {
 }
 
 /** Minimal req/res harness. `app` is a stand-in for the Express Application
- *  the route reads its fetch-injection seam off (req.app.get(...)) — the
+ *  the route reads its fetch-injection seams off (req.app.get(...)) — the
  *  router alone never populates it. */
 function callRoute(
   router: any,
@@ -98,13 +133,12 @@ function callRoute(
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
-// A ≥400-word Norwegian prose fixture that contains NO digits at all, so it
-// can never trip expDescHasUngroundedNumbers() no matter which fact row it
-// is paired with. It is deliberately built by repeating one realistic
-// paragraph: the deterministic gates only measure word count / digits, and
-// the "is this padding?" judgement is the LLM judge's job — which is mocked
-// here. Length is asserted below (fx-0) so a future edit can't silently
-// drop it under the 400-word floor.
+// A ≥400-word Norwegian prose fixture that contains NO digits at all. Kept
+// for the PURE judge tests (section C), which grade arbitrary candidate
+// prose against a facts block / ground-truth text and never enforce a word
+// count themselves — length-agnostic, so it remains a valid "some real
+// prose" fixture even though no generator in this file can produce ≥400
+// words any more.
 const FIXTURE_PARAGRAPH = [
   "Denne opplevelsen tar deg med ut i naturen sammen med en lokal tilbyder som kjenner området godt.",
   "Turen egner seg for deg som ønsker en aktiv dag ute, og opplegget legges opp slik at både nybegynnere og mer erfarne deltakere finner sin plass.",
@@ -125,8 +159,42 @@ function buildFixtureDescription(): string {
 }
 const FIXTURE_DESCRIPTION = buildFixtureDescription();
 
+// ── faktalinje fixture: <=40 words, digit-free — the NEW tier's shape. ─────
+const FAKTALINJE_FIXTURE =
+  "Denne opplevelsen byr på en aktiv dag ute i naturen sammen med en lokal tilbyder som legger vekt på trygghet og godt følge.";
+// A short, plainly ACCEPTABLE text under what used to be a 400-word floor —
+// regression-guards the deliberate design choice that faktalinje has NO
+// minimum beyond non-empty (gen-5 below).
+const FAKTALINJE_VERY_SHORT = "Kort tur ved sjøen for hele familien.";
+// Two faktalinje-shaped sentences back to back clears 40 words -> ceiling.
+const FAKTALINJE_TOO_LONG = `${FAKTALINJE_FIXTURE} ${FAKTALINJE_FIXTURE}`;
+
+// ── kildetro fixtures: 60-150 words, homepage-grounded. ────────────────────
+// Mentions "kajakktur"/"fjorden" — the two >=5-char tokens of richCandidate()
+// / the route-level seed's title "Kajakktur i fjorden" — so
+// descriptionMentionsExperienceTitle() passes.
+const KILDETRO_SENTENCE_ON_TOPIC =
+  "Vi tilbyr en kajakktur i rolig sjø for både nybegynnere og erfarne padlere, og turen starter ved brygga rett ved sjøen der guiden ønsker alle velkommen.";
+function buildOnTopicKildetroFixture(): string {
+  const parts: string[] = [];
+  while (expDescWordCount(parts.join(" ")) < 70) parts.push(KILDETRO_SENTENCE_ON_TOPIC);
+  return parts.join(" ");
+}
+const KILDETRO_FIXTURE = buildOnTopicKildetroFixture();
+
+// Same length bar, but never mentions the experience — homepage-wide "om
+// oss" marketing copy, the exact shape the title-token guard exists to catch.
+const KILDETRO_SENTENCE_OFF_TOPIC =
+  "Vi er en lokal bedrift som har drevet med opplevelser i mange år, og vi legger stor vekt på kvalitet, trygghet og godt vertskap for alle våre gjester.";
+function buildOffTopicKildetroFixture(): string {
+  const parts: string[] = [];
+  while (expDescWordCount(parts.join(" ")) < 70) parts.push(KILDETRO_SENTENCE_OFF_TOPIC);
+  return parts.join(" ");
+}
+const KILDETRO_NO_TITLE_FIXTURE = buildOffTopicKildetroFixture();
+
 /** A short, perfectly ordinary Norwegian description — non-blank and NOT
- *  junk by isJunkDescription(), i.e. content this endpoint must never
+ *  junk by isJunkDescription()'s rule, i.e. content this endpoint must never
  *  touch. */
 const GOOD_EXISTING_DESCRIPTION =
   "Bli med på en rolig padletur i skjermede farvann sammen med lokale guider. Turen passer for både nybegynnere og erfarne, og vi holder til rett ved sjøen.";
@@ -136,7 +204,9 @@ const GOOD_EXISTING_DESCRIPTION =
 const JUNK_EXISTING_DESCRIPTION =
   "Skip to content Homme 8, 4715 Øvrebø 41360545 john@hommegaard.no Facebook-f Instagram Forside Gårdsutsalg Produksjon Meny";
 
-/** A 13-of-13 fact row (the "rich" shape). */
+/** A 13-of-13 fact row (the "rich" shape). No provider hjemmeside/field_
+ *  provenance by default -> selectExperienceDescriptionTier() resolves this
+ *  to `faktalinje` unless a test explicitly adds a verified homepage. */
 function richCandidate(over: Partial<ExperienceDescriptionCandidate> = {}): ExperienceDescriptionCandidate {
   return {
     id: "exp-rich", title: "Kajakktur i fjorden", description: null,
@@ -150,8 +220,14 @@ function richCandidate(over: Partial<ExperienceDescriptionCandidate> = {}): Expe
     booking_url: "https://example.no/book",
     content_source: null, content_field_evidence: null,
     provider_navn: "Fjordtur AS", provider_brreg_verified: 1,
+    provider_field_provenance: null, provider_hjemmeside: null,
     ...over,
   };
+}
+
+/** field_provenance JSON matching isHjemmesideVerified()'s expected shape. */
+function verifiedFieldProvenance(): string {
+  return JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified" } });
 }
 
 export function runOpplevelserExperienceDescriptionEnrichmentTests(
@@ -202,6 +278,18 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertTrue(wc >= 400 && wc <= 1200, `fx-0a: fixture description is 400-1200 words (was ${wc})`);
         assertTrue(!/\d/.test(FIXTURE_DESCRIPTION), "fx-0b: fixture description contains no digits at all");
       }
+      {
+        const wc = expDescWordCount(FAKTALINJE_FIXTURE);
+        assertTrue(wc >= 1 && wc <= 40, `fx-0c: faktalinje fixture is <=40 words (was ${wc})`);
+        assertTrue(!/\d/.test(FAKTALINJE_FIXTURE), "fx-0d: faktalinje fixture contains no digits at all");
+        assertTrue(expDescWordCount(FAKTALINJE_TOO_LONG) > 40, "fx-0e: the doubled faktalinje fixture clears the 40-word ceiling");
+      }
+      {
+        const wc = expDescWordCount(KILDETRO_FIXTURE);
+        assertTrue(wc >= 60 && wc <= 150, `fx-0f: kildetro fixture is 60-150 words (was ${wc})`);
+        const wc2 = expDescWordCount(KILDETRO_NO_TITLE_FIXTURE);
+        assertTrue(wc2 >= 60 && wc2 <= 150, `fx-0g: off-topic kildetro fixture is 60-150 words (was ${wc2})`);
+      }
 
       // ── ed-1: the rich row exposes all 13 distinct fact kinds. ─────────
       {
@@ -236,7 +324,8 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(onlyPlace.map(([k]) => k), ["Sted"], "ed-2c: kommune + fylke together are ONE 'Sted' fact");
       }
 
-      // ── ed-3: a genuinely thin row falls under the threshold. ──────────
+      // ── ed-3: a genuinely thin row falls under the NEW faktalinje
+      //    threshold (4, down from the retired tier's 6). ─────────────────
       {
         const thin = buildExperienceDescriptionFacts({
           ...richCandidate(), subcategory: null, season: null, indoor_outdoor: null,
@@ -244,7 +333,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           price_band: null, price_from: null, languages: null, accessibility: null,
           meeting_point: null, booking_url: null, provider_navn: null,
         });
-        assertEq(thin.length, 2, "ed-3: title+category+kommune/fylke only -> 2 fact-fields (below the 6 threshold)");
+        assertEq(thin.length, 2, "ed-3: title+category+kommune/fylke only -> 2 fact-fields (below the 4 threshold)");
       }
 
       // ── ed-4: malformed JSON array columns are treated as absent, never
@@ -289,10 +378,79 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Section B — generateExperienceDescriptionNo()
+    // Section A2 — selectExperienceDescriptionTier()
     // ═══════════════════════════════════════════════════════════════════
     try {
-      // ── gen-1: THIN row -> null, and the LLM is never called. ──────────
+      // ── st-1: verified homepage + clean domain -> kildetro. ────────────
+      {
+        const r = selectExperienceDescriptionTier(richCandidate({
+          provider_field_provenance: verifiedFieldProvenance(),
+          provider_hjemmeside: "kajakkfjord.example",
+        }));
+        assertEq(r.level, "kildetro", "st-1a: verified homepage + clean domain -> kildetro");
+        assertTrue(r.reasoning.length > 0, "st-1b: reasoning string present");
+      }
+
+      // ── st-2: verified homepage + BLOCKED domain (dmo_visit_domain) with
+      //    enough facts -> falls through to faktalinje, NOT skip. ─────────
+      {
+        const r = selectExperienceDescriptionTier(richCandidate({
+          provider_field_provenance: verifiedFieldProvenance(),
+          provider_hjemmeside: "visitbergen.no",
+        }));
+        assertEq(r.level, "faktalinje", "st-2a: verified-but-blocked homepage + >=4 facts -> faktalinje (never skip)");
+        assertTrue(r.reasoning.includes("blokkert"), "st-2b: reasoning names the homepage as blocked");
+      }
+
+      // ── st-3: verified homepage + BLOCKED domain with too few facts ->
+      //    skip (a blocked homepage does not manufacture facts). ──────────
+      {
+        const thinRow = richCandidate({
+          provider_field_provenance: verifiedFieldProvenance(),
+          provider_hjemmeside: "visitbergen.no",
+          subcategory: null, season: null, indoor_outdoor: null,
+          duration_min: null, duration_max: null, group_min: null, group_max: null,
+          price_band: null, price_from: null, languages: null, accessibility: null,
+          meeting_point: null, booking_url: null, provider_navn: null,
+        });
+        assertEq(selectExperienceDescriptionTier(thinRow).level, "skip", "st-3: blocked homepage + <4 facts -> skip");
+      }
+
+      // ── st-4: no hjemmeside at all, >=4 facts -> faktalinje. ────────────
+      assertEq(selectExperienceDescriptionTier(richCandidate()).level, "faktalinje",
+        "st-4: unverified/absent homepage + >=4 facts -> faktalinje");
+
+      // ── st-5: no hjemmeside, <4 facts -> skip. ──────────────────────────
+      {
+        const thinRow = richCandidate({
+          subcategory: null, season: null, indoor_outdoor: null,
+          duration_min: null, duration_max: null, group_min: null, group_max: null,
+          price_band: null, price_from: null, languages: null, accessibility: null,
+          meeting_point: null, booking_url: null, provider_navn: null,
+        });
+        assertEq(selectExperienceDescriptionTier(thinRow).level, "skip", "st-5: no homepage + <4 facts -> skip");
+      }
+
+      // ── st-6: malformed/absent field_provenance fails CLOSED (never
+      //    "assume verified"), even with a hjemmeside string present. ─────
+      {
+        const r = selectExperienceDescriptionTier(richCandidate({
+          provider_field_provenance: "not valid json {{{",
+          provider_hjemmeside: "kajakkfjord.example",
+        }));
+        assertEq(r.level, "faktalinje", "st-6: malformed field_provenance -> NOT verified -> faktalinje (fail-closed)");
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("experience-description-enrichment (section A2): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section B — generateExperienceDescriptionNo() / -Detailed(): now the
+    // `faktalinje` generator (4-fact floor, <=40-word ceiling, no floor)
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      // ── gen-1: THIN row (<4 facts) -> null, and the LLM is never called. ─
       process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
       {
         let calls = 0;
@@ -304,7 +462,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           meeting_point: null, booking_url: null, provider_navn: null,
         });
         const r = await generateExperienceDescriptionNo(thinRow, stub);
-        assertEq(r, null, "gen-1a: thin row -> null");
+        assertEq(r, null, "gen-1a: thin row (2 facts, below the 4-fact floor) -> null");
         assertEq(calls, 0, "gen-1b: thin row makes ZERO LLM calls");
       }
 
@@ -319,16 +477,17 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       }
       process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
 
-      // ── gen-3: happy path + the exact Anthropic request contract. ──────
+      // ── gen-3: happy path + the exact Anthropic request contract at the
+      //    faktalinje bar. ────────────────────────────────────────────────
       {
         let capturedUrl: any = null;
         let capturedInit: any = null;
         const stub = (async (url: any, init: any) => {
           capturedUrl = url; capturedInit = init;
-          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FIXTURE_DESCRIPTION }] }) };
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_FIXTURE }] }) };
         }) as unknown as typeof fetch;
         const r = await generateExperienceDescriptionNo(richCandidate(), stub);
-        assertEq(r, FIXTURE_DESCRIPTION, "gen-3a: valid ≥400-word response is returned verbatim");
+        assertEq(r, FAKTALINJE_FIXTURE, "gen-3a: a valid <=40-word response is returned verbatim");
         assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "gen-3b: calls the exact Anthropic messages endpoint");
         const body = JSON.parse(capturedInit.body);
         assertEq(body.model, "claude-haiku-4-5", "gen-3c: model is claude-haiku-4-5");
@@ -338,13 +497,12 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertTrue(prompt.includes("Pris: fra 890 kroner per person"), "gen-3f: prompt carries the row's own structured facts");
         assertTrue(prompt.includes("Bruk KUN faktaopplysningene"), "gen-3g: prompt carries the kun-kildebasert instruction");
         assertTrue(prompt.includes("UTILSTREKKELIG_GRUNNLAG"), "gen-3h: prompt carries the too-thin escape sentinel");
-        assertTrue(prompt.includes("minst 400 ord"), "gen-3i: prompt carries the ≥400-word floor");
+        assertTrue(prompt.includes("ALDRI mer enn 40 ord"), "gen-3i: prompt carries the NEW <=40-word ceiling (not the retired 400-word floor)");
+        assertTrue(prompt.includes("ÉN til TO setninger"), "gen-3i2: prompt asks for one to two sentences");
 
-        // ── gen-3j..m: the tightened ABSOLUTTE REGLER against ungrounded
-        //    place/season/weather flavor text (lokal PR #482 finding: 3/11
-        //    dry-run candidates were correctly judge-rejected for exactly
-        //    this class of fabrication — naming a place not in the facts,
-        //    or asserting weather/season tied to unlisted geography). ─────
+        // ── gen-3j/k: the anti-fabrication ABSOLUTTE REGLER against
+        //    ungrounded place/season flavor text survive unchanged from the
+        //    retired tier's prompt (lokal PR #482 finding). ────────────────
         assertTrue(
           prompt.includes("Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten"),
           "gen-3j: prompt forbids naming any place/region/fjord/mountain/landmark not in the facts list",
@@ -353,13 +511,11 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           prompt.includes("Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region"),
           "gen-3k: prompt forbids season/climate/weather claims tied to a specific place or region",
         );
+        // ── gen-3l: NEW faktalinje-specific rule from the dev-request's own
+        //    spec text ("ingen adjektiver uten kilde"). ─────────────────────
         assertTrue(
-          prompt.includes("Ikke skriv generelle beskrivelser av landsdelen eller regionen opplevelsen ligger i, med mindre hver enkelt påstand er direkte forankret i en oppgitt fakta"),
-          "gen-3l: prompt forbids ungrounded general regional description",
-        );
-        assertTrue(
-          !prompt.includes("utendørsaktiviteter krever klær etter været"),
-          "gen-3m: the old weather-flavored worked example (the exact failure class it invited) is gone from the prompt",
+          prompt.includes("Ikke bruk adjektiver eller vurderende ord") && prompt.includes("direkte forankret i en oppgitt fakta"),
+          "gen-3l: prompt forbids unsourced adjectives/evaluative language",
         );
       }
 
@@ -373,33 +529,34 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), null, `${label}: sentinel response -> null`);
       }
 
-      // ── gen-5: below the word floor -> null. ───────────────────────────
+      // ── gen-5: a very short text (well under what used to be the 400-word
+      //    floor) is now ACCEPTED — faktalinje has NO minimum beyond non-
+      //    empty. Regression-guard against silently reintroducing a floor. ─
       {
-        const short = "Dette er en altfor kort beskrivelse som aldri skal skrives til databasen.";
-        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: short }] }) })) as unknown as typeof fetch;
-        assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), null, "gen-5: <400 words -> null");
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_VERY_SHORT }] }) })) as unknown as typeof fetch;
+        assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), FAKTALINJE_VERY_SHORT,
+          "gen-5: a short (<10-word) response is accepted verbatim — no word floor for faktalinje");
       }
 
-      // ── gen-6: above the word ceiling -> null (runaway repetition). ────
+      // ── gen-6: above the NEW 40-word ceiling -> null. ──────────────────
       {
-        const huge = Array.from({ length: 1300 }, () => "ord").join(" ");
-        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: huge }] }) })) as unknown as typeof fetch;
-        assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), null, "gen-6: >1200 words -> null");
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_TOO_LONG }] }) })) as unknown as typeof fetch;
+        assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), null, "gen-6: >40 words -> null");
       }
 
       // ── gen-7: a fabricated number that is not in the facts -> null. ───
       {
-        const fabricated = FIXTURE_DESCRIPTION + " Gården ble grunnlagt i 1847 og ligger 12 kilometer fra sentrum.";
+        const fabricated = "Gården ble grunnlagt i 1847 og ligger 12 kilometer fra sentrum.";
         const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: fabricated }] }) })) as unknown as typeof fetch;
         assertEq(await generateExperienceDescriptionNo(richCandidate(), stub), null,
           "gen-7a: prose containing an ungrounded year/distance -> null (never written)");
-        const grounded = FIXTURE_DESCRIPTION + " Turen varer mellom 120 og 180 minutter for 2 til 8 personer.";
+        const grounded = "Turen varer mellom 120 og 180 minutter for 2 til 8 personer.";
         const stub2 = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: grounded }] }) })) as unknown as typeof fetch;
         assertEq(await generateExperienceDescriptionNo(richCandidate(), stub2), grounded,
           "gen-7b: prose whose numbers all come from the facts is accepted");
       }
 
-      // ── gen-8..11: every API deviation resolves to null, never a throw. ─
+      // ── gen-8..13: every API deviation resolves to null, never a throw. ─
       {
         const cases: Array<[string, any]> = [
           ["gen-8: non-200 response", async () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) })],
@@ -426,14 +583,10 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
 
     // ═══════════════════════════════════════════════════════════════════
     // Section B2 — generateExperienceDescriptionNoDetailed(): diagnostic
-    // reason granularity behind the single `null` above (dev-request
-    // 2026-07-12-opplevagent-serp-innholdsberikelse, item 1b — added after
-    // item 1(a)'s post-deploy probe found 17/17 candidates collapsing into
-    // one skip_reason with no way to tell which gate fired). Every case
-    // mirrors a Section B case 1:1; this only asserts `.reason` is the
-    // correct DISTINCT tag and that `.text` is byte-identical to what
-    // generateExperienceDescriptionNo() already returns for the same input
-    // (i.e. this is purely additive bookkeeping, not a behavior change).
+    // reason granularity behind the single `null` above. Every case mirrors
+    // a Section B case 1:1; this only asserts `.reason` is the correct
+    // DISTINCT tag and that `.text` is byte-identical to what
+    // generateExperienceDescriptionNo() already returns for the same input.
     // ═══════════════════════════════════════════════════════════════════
     try {
       process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
@@ -458,9 +611,9 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
 
       {
-        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FIXTURE_DESCRIPTION }] }) })) as unknown as typeof fetch;
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_FIXTURE }] }) })) as unknown as typeof fetch;
         const r = await generateExperienceDescriptionNoDetailed(richCandidate(), stub);
-        assertEq(r.text, FIXTURE_DESCRIPTION, "gen-r3a: success -> text set");
+        assertEq(r.text, FAKTALINJE_FIXTURE, "gen-r3a: success -> text set");
         assertEq(r.reason, null, "gen-r3b: success -> no fail reason");
       }
 
@@ -473,18 +626,20 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "sentinel_smuggled", "gen-r4b: sentinel smuggled into prose -> reason sentinel_smuggled");
       }
 
+      // ── gen-r5: no floor -> a short text SUCCEEDS (reason null), mirrors
+      //    Section B's gen-5 design-choice regression guard. ───────────────
       {
-        const short = "Dette er en altfor kort beskrivelse som aldri skal skrives til databasen.";
-        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: short }] }) })) as unknown as typeof fetch;
-        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "below_word_floor", "gen-r5: <400 words -> reason below_word_floor");
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_VERY_SHORT }] }) })) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionNoDetailed(richCandidate(), stub);
+        assertEq(r.text, FAKTALINJE_VERY_SHORT, "gen-r5a: short text -> text set (no floor)");
+        assertEq(r.reason, null, "gen-r5b: short text -> no fail reason");
       }
       {
-        const huge = Array.from({ length: 1300 }, () => "ord").join(" ");
-        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: huge }] }) })) as unknown as typeof fetch;
-        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "above_word_ceiling", "gen-r6: >1200 words -> reason above_word_ceiling");
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_TOO_LONG }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "above_word_ceiling", "gen-r6: >40 words -> reason above_word_ceiling");
       }
       {
-        const fabricated = FIXTURE_DESCRIPTION + " Gården ble grunnlagt i 1847 og ligger 12 kilometer fra sentrum.";
+        const fabricated = "Gården ble grunnlagt i 1847 og ligger 12 kilometer fra sentrum.";
         const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: fabricated }] }) })) as unknown as typeof fetch;
         assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "ungrounded_numbers", "gen-r7: ungrounded number -> reason ungrounded_numbers");
       }
@@ -535,7 +690,8 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
 
       // ── jd-2: GODKJENN -> approved, and the judge sees BOTH the prose and
-      //    the exact facts block it was grounded in. ──────────────────────
+      //    the exact facts block it was grounded in (no groundTruthText ->
+      //    byte-identical control flow/tokens to before this dev-request). ─
       {
         let capturedInit: any = null;
         const stub = (async (_u: any, init: any) => {
@@ -595,9 +751,163 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           assertTrue(!threw, `${label} -> never throws`);
         }
       }
+
+      // ═══════════════════════════════════════════════════════════════
+      // jd-10+ — the NEW optional `groundTruthText` parameter (kildetro's
+      // "dommer med fasit"). Strictly additive: jd-1..jd-9 above never pass
+      // it and are therefore untouched by this addition.
+      // ═══════════════════════════════════════════════════════════════
+      const HOMEPAGE_GROUND_TRUTH =
+        "Vi tilbyr en kajakktur i rolig sjø for nybegynnere og erfarne padlere, med oppmøte ved brygga.";
+
+      // ── jd-10: groundTruthText provided -> the prompt swaps the facts
+      //    block for the homepage excerpt as fasit. ───────────────────────
+      {
+        let capturedInit: any = null;
+        const stub = (async (_u: any, init: any) => {
+          capturedInit = init;
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "GODKJENN\nAlt stemmer med hjemmesiden." }] }) };
+        }) as unknown as typeof fetch;
+        const v = await judgeExperienceDescriptionCandidate(KILDETRO_FIXTURE, FACTS_BLOCK, stub, HOMEPAGE_GROUND_TRUTH);
+        assertEq(v.approved, true, "jd-10a: GODKJENN with groundTruthText -> approved");
+        const prompt = JSON.parse(capturedInit.body).messages[0].content as string;
+        assertTrue(prompt.includes(HOMEPAGE_GROUND_TRUTH), "jd-10b: prompt carries the homepage ground-truth excerpt");
+        assertTrue(prompt.includes(KILDETRO_FIXTURE.slice(0, 80)), "jd-10c: prompt still carries the candidate text");
+        assertTrue(!prompt.includes("Faktaliste (alt som er kjent):"), "jd-10d: groundTruth mode does not use the facts-block framing");
+        assertTrue(prompt.includes("AKKURAT denne opplevelsen"), "jd-10e: groundTruth mode checks the text is about THIS experience, not generic marketing");
+      }
+
+      // ── jd-11: groundTruthText provided + AVVIS -> rejected. ───────────
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "AVVIS\nPrisen finnes ikke på hjemmesiden." }] }) })) as unknown as typeof fetch;
+        const v = await judgeExperienceDescriptionCandidate(KILDETRO_FIXTURE, FACTS_BLOCK, stub, "En kort hjemmesidetekst uten pris.");
+        assertEq(v.approved, false, "jd-11: AVVIS with groundTruthText -> rejected");
+      }
+
+      // ── jd-12: missing key still rejects fail-closed even with
+      //    groundTruthText supplied (the key check runs before either
+      //    prompt branch). ─────────────────────────────────────────────
+      delete process.env.ANTHROPIC_API_KEY;
+      {
+        let calls = 0;
+        const stub = (async () => { calls++; throw new Error("jd-12: must not be called"); }) as unknown as typeof fetch;
+        const v = await judgeExperienceDescriptionCandidate(KILDETRO_FIXTURE, FACTS_BLOCK, stub, HOMEPAGE_GROUND_TRUTH);
+        assertEq(v.approved, false, "jd-12a: missing key -> rejected fail-closed (groundTruth mode too)");
+        assertEq(calls, 0, "jd-12b: zero calls");
+      }
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
     } catch (err: any) {
       failed++;
       failures.push("experience-description-enrichment (section C): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      globalThis.fetch = prevFetch;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section E — generateExperienceDescriptionKildetro()
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+
+      // ── kt-1: missing key -> null, zero calls. ─────────────────────────
+      delete process.env.ANTHROPIC_API_KEY;
+      {
+        let calls = 0;
+        const stub = (async () => { calls++; throw new Error("kt-1: must not be called"); }) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub);
+        assertEq(r.text, null, "kt-1a: missing key -> null");
+        assertEq(r.reason, "no_api_key", "kt-1b: reason no_api_key");
+        assertEq(calls, 0, "kt-1c: zero LLM calls");
+      }
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+
+      // ── kt-2: empty/blank homepage text -> null, ZERO calls (checked
+      //    before any fetch — never spend a call on nothing to ground on). ─
+      for (const [label, text] of [["kt-2a", ""], ["kt-2b", "   \n  "]] as Array<[string, string]>) {
+        let calls = 0;
+        const stub = (async () => { calls++; throw new Error(`${label}: must not be called`); }) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), text, stub);
+        assertEq(r.text, null, `${label}: blank homepage text -> null`);
+        assertEq(r.reason, "empty_response", `${label}: reason empty_response`);
+        assertEq(calls, 0, `${label}: zero LLM calls`);
+      }
+
+      // ── kt-3: happy path + the exact request contract. ─────────────────
+      {
+        let capturedUrl: any = null;
+        let capturedInit: any = null;
+        const stub = (async (url: any, init: any) => {
+          capturedUrl = url; capturedInit = init;
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FIXTURE }] }) };
+        }) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), "Homepage tekst om kajakktur i fjorden.", stub);
+        assertEq(r.text, KILDETRO_FIXTURE, "kt-3a: valid 60-150-word response returned verbatim");
+        assertEq(r.reason, null, "kt-3b: no fail reason");
+        assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "kt-3c: calls the exact Anthropic endpoint");
+        const body = JSON.parse(capturedInit.body);
+        assertEq(body.model, "claude-haiku-4-5", "kt-3d: model is claude-haiku-4-5");
+        const prompt = body.messages[0].content as string;
+        assertTrue(prompt.includes("Homepage tekst om kajakktur i fjorden."), "kt-3e: prompt carries the homepage source text");
+        assertTrue(prompt.includes("Kajakktur i fjorden"), "kt-3f: prompt names the experience title");
+        assertTrue(prompt.includes("KUN opplysninger som faktisk står i kildeteksten"), "kt-3g: prompt carries the source-only instruction");
+        assertTrue(prompt.includes("minst 60 ord") && prompt.includes("høyst 150 ord"), "kt-3h: prompt carries the 60-150-word bar");
+      }
+
+      // ── kt-4: the sentinel escape -> null. ──────────────────────────────
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "UTILSTREKKELIG_GRUNNLAG" }] }) })) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), "En hjemmeside uten noe brukbart.", stub);
+        assertEq(r.text, null, "kt-4a: sentinel -> null");
+        assertEq(r.reason, "sentinel", "kt-4b: reason sentinel");
+      }
+
+      // ── kt-5: below the 60-word floor -> null. ──────────────────────────
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "En kort tekst under seksti ord." }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub)).reason, "below_word_floor",
+          "kt-5: <60 words -> reason below_word_floor");
+      }
+
+      // ── kt-6: above the 150-word ceiling -> null. ───────────────────────
+      {
+        const huge = `${KILDETRO_FIXTURE} ${KILDETRO_FIXTURE}`;
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: huge }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub)).reason, "above_word_ceiling",
+          "kt-6: >150 words -> reason above_word_ceiling");
+      }
+
+      // ── kt-7: title-token miss -> reason no_title_node, never written. ──
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_NO_TITLE_FIXTURE }] }) })) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub);
+        assertEq(r.text, null, "kt-7a: homepage-wide marketing copy that never names the experience -> null");
+        assertEq(r.reason, "no_title_node", "kt-7b: reason no_title_node");
+      }
+
+      // ── kt-8..13: every API deviation resolves to null, never a throw. ──
+      {
+        const cases: Array<[string, any, string]> = [
+          ["kt-8: non-200", async () => ({ ok: false, status: 500, json: async () => ({}) }), "http_error"],
+          ["kt-9: unparseable JSON body", async () => ({ ok: true, status: 200, json: async () => { throw new Error("not json"); } }), "unparseable_json"],
+          ["kt-10: non-array content shape", async () => ({ ok: true, status: 200, json: async () => ({ content: { unexpected: "shape" } }) }), "unexpected_response_shape"],
+          ["kt-11: network throw", async () => { throw new Error("simulated network failure"); }, "network_error"],
+          ["kt-12: empty text", async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "   " }] }) }), "empty_response"],
+          ["kt-13: no text block", async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "tool_use" }] }) }), "unexpected_response_shape"],
+        ];
+        for (const [label, impl, expectedReason] of cases) {
+          let threw = false;
+          let r: { text: string | null; reason: string | null } = { text: "sentinel", reason: null };
+          try {
+            r = await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, impl as unknown as typeof fetch);
+          } catch { threw = true; }
+          assertEq(r.text, null, `${label} -> null text`);
+          assertEq(r.reason, expectedReason, `${label} -> reason ${expectedReason}`);
+          assertTrue(!threw, `${label} -> never throws`);
+        }
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("experience-description-enrichment (section E): unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
       globalThis.fetch = prevFetch;
     }
@@ -625,10 +935,15 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const router = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
-      // Per-test app settings object — the route's fetch-injection seam.
+      // Per-test app settings object — the route's TWO fetch-injection seams
+      // (dev-request 2026-09-02: kildetro spends an independent homepage
+      // fetch alongside the LLM call, so each gets its own stub key).
       const appSettings: Record<string, unknown> = {};
       function setStub(stub: typeof fetch | undefined): void {
         appSettings["experienceDescriptionFetchImpl"] = stub;
+      }
+      function setHomepageStub(stub: typeof fetch | undefined): void {
+        appSettings["experienceDescriptionHomepageFetchImpl"] = stub;
       }
 
       // `key: null` means "send NO X-Admin-Key header at all". It cannot be
@@ -644,10 +959,10 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       }
 
       const rowOf = (id: string): any =>
-        expDb.prepare("SELECT id, description, content_field_evidence, updated_at FROM experiences WHERE id = ?").get(id);
+        expDb.prepare("SELECT id, description, content_field_evidence, content_source, updated_at FROM experiences WHERE id = ?").get(id);
       const descOf = (id: string): string | null => (rowOf(id)?.description ?? null);
       const dumpAll = (): string =>
-        JSON.stringify(expDb.prepare("SELECT id, description, content_field_evidence, updated_at FROM experiences ORDER BY id").all());
+        JSON.stringify(expDb.prepare("SELECT id, description, content_field_evidence, content_source, updated_at FROM experiences ORDER BY id").all());
 
       // ── Stub factory: routes on the prompt so ONE stub serves both the
       //    generate and the judge leg, and counts each. ──────────────────
@@ -662,11 +977,39 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
             return o.judge ? await o.judge() : { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "GODKJENN\nOK." }] }) };
           }
           counters.generate++;
-          return o.generate ? await o.generate() : { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FIXTURE_DESCRIPTION }] }) };
+          return o.generate ? await o.generate() : { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_FIXTURE }] }) };
         }) as unknown as typeof fetch;
       }
       const neverCall = (label: string): typeof fetch =>
         (async () => { throw new Error(`${label}: fetch must NOT be called`); }) as unknown as typeof fetch;
+
+      /** A homepage-fetch stub: the primary "/" page succeeds with `html`,
+       *  every other path (sub-page crawl, other hosts) 404s harmlessly —
+       *  mirrors the existing opplevelser-content-refresh-*.test.ts stub
+       *  shape for globalThis.fetch, just wired through the route's OWN
+       *  homepage-fetch injection seam instead of a global swap. */
+      function makeHomepageStub(html: string): typeof fetch {
+        return (async (url: any) => {
+          let u: URL;
+          try { u = new URL(String(url)); } catch {
+            return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } } as unknown as Response;
+          }
+          if (u.pathname === "/" || u.pathname === "") {
+            const bytes = new TextEncoder().encode(html);
+            return {
+              ok: true, status: 200,
+              arrayBuffer: async () => bytes.buffer,
+              headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+              url: String(url),
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } } as unknown as Response;
+        }) as unknown as typeof fetch;
+      }
+      const homepageNeverCall = (label: string): typeof fetch =>
+        (async () => { throw new Error(`${label}: homepage fetch must NOT be called`); }) as unknown as typeof fetch;
+      const ON_TOPIC_HOMEPAGE_HTML =
+        "<html><body><p>Vi tilbyr kajakktur i fjorden for hele familien. Kontakt oss for mer informasjon.</p></body></html>";
 
       // ── Seed ────────────────────────────────────────────────────────
       const providerId = expStore.createProvider({
@@ -728,8 +1071,10 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(r.body.candidates, 0, `${label} is never a candidate`);
       }
 
-      // ── ed-r4: THIN row, apply mode -> zero LLM calls, nothing written. ─
+      // ── ed-r4: THIN row (2 facts, < the 4-fact floor), apply mode ->
+      //    zero LLM calls, nothing written, level "skip". ─────────────────
       setStub(neverCall("ed-r4"));
+      setHomepageStub(homepageNeverCall("ed-r4"));
       {
         const before = dumpAll();
         const r = await post({ dry_run: false, ids: [idThin] });
@@ -740,23 +1085,28 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(r.body.skipped, 1, "ed-r4e: skipped: 1");
         assertEq(r.body.skipped_reasons.thin_data, 1, "ed-r4f: skip reason is thin_data");
         assertEq(descOf(idThin), null, "ed-r4g: description still NULL");
-        assertEq(dumpAll(), before, "ed-r4h: NOT ONE row changed (fetch stub would have thrown on any call)");
+        assertEq(dumpAll(), before, "ed-r4h: NOT ONE row changed (fetch stubs would have thrown on any call)");
       }
 
       // ── ed-r4b: a real generation-gate failure surfaces WHICH gate fired,
-      //    end-to-end through the dry-run route response (item 1b diagnostic). ─
+      //    end-to-end through the dry-run route response, AND the resolved
+      //    `level` is surfaced alongside it (item 1b diagnostic + the
+      //    2026-09-02 level field). idRich1 has no provider hjemmeside ->
+      //    resolves to faktalinje -> the NEW gate that can fire without a
+      //    floor is the 40-word CEILING, not the retired 400-word floor. ──
       {
         setStub(makeStub({
           generate: async () => ({
             ok: true, status: 200,
-            json: async () => ({ content: [{ type: "text", text: "Dette er en altfor kort beskrivelse som aldri skal skrives." }] }),
+            json: async () => ({ content: [{ type: "text", text: FAKTALINJE_TOO_LONG }] }),
           }),
         }));
         const r = await post({ ids: [idRich1] });
         assertEq(r.body.sample.length, 1, "ed-r4b1: one sampled candidate");
-        assertEq(r.body.sample[0].skip_reason, "generation_failed", "ed-r4b2: skip_reason is generation_failed");
-        assertEq(r.body.sample[0].generation_fail_reason, "below_word_floor",
-          "ed-r4b3: generation_fail_reason names the exact gate (word floor), not just the collapsed skip_reason");
+        assertEq(r.body.sample[0].level, "faktalinje", "ed-r4b2: level is faktalinje (no provider hjemmeside)");
+        assertEq(r.body.sample[0].skip_reason, "generation_failed", "ed-r4b3: skip_reason is generation_failed");
+        assertEq(r.body.sample[0].generation_fail_reason, "above_word_ceiling",
+          "ed-r4b4: generation_fail_reason names the exact gate (the NEW 40-word ceiling)");
       }
 
       // ── ed-r5: dry_run (default + non-literal-false) writes NOTHING. ───
@@ -778,14 +1128,19 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         const r = await post({ ids: [idRich1] });
         assertEq(r.body.sample.length, 1, "ed-r5f: sample has the one targeted candidate");
         assertEq(r.body.sample[0].id, idRich1, "ed-r5g: sampled row is the targeted one");
-        assertEq(r.body.sample[0].proposed_description, FIXTURE_DESCRIPTION, "ed-r5h: proposal is the generated text");
+        assertEq(r.body.sample[0].level, "faktalinje", "ed-r5g2: level is faktalinje");
+        assertTrue(typeof r.body.sample[0].reasoning === "string" && r.body.sample[0].reasoning.length > 0, "ed-r5g3: reasoning string present");
+        assertEq(r.body.sample[0].proposed_description, FAKTALINJE_FIXTURE, "ed-r5h: proposal is the generated text");
         assertEq(r.body.sample[0].judge_approved, true, "ed-r5i: judge verdict is surfaced in the preview");
         assertEq(r.body.sample[0].skip_reason, null, "ed-r5j: no skip reason on an approved proposal");
         assertEq(r.body.sample[0].generation_fail_reason, null, "ed-r5j2: no generation_fail_reason on an approved proposal");
-        assertTrue(r.body.sample[0].word_count >= 400, "ed-r5k: word_count surfaced and ≥400");
+        assertTrue(r.body.sample[0].word_count >= 1 && r.body.sample[0].word_count <= 40, "ed-r5k: word_count surfaced and within the faktalinje bar");
       }
 
-      // ── ed-r6: apply mode — generation + judge approve -> written. ─────
+      // ── ed-r6: apply mode — generation + judge approve -> written, and
+      //    content_source is UNCHANGED for a faktalinje write (the one
+      //    behavior change this dev-request makes to the write path is
+      //    gated strictly behind level === "kildetro"). ───────────────────
       {
         expDb.prepare("UPDATE experiences SET updated_at = '2020-01-01 00:00:00' WHERE id = ?").run(idRich1);
         counters.generate = 0; counters.judge = 0;
@@ -797,14 +1152,16 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(r.body.remaining, 0, "ed-r6e: remaining: 0");
         assertEq(counters.generate, 1, "ed-r6f: exactly one generate call");
         assertEq(counters.judge, 1, "ed-r6g: exactly one judge call");
-        assertEq(descOf(idRich1), FIXTURE_DESCRIPTION, "ed-r6h: description WAS written");
+        assertEq(descOf(idRich1), FAKTALINJE_FIXTURE, "ed-r6h: description WAS written");
         const evidence = JSON.parse(rowOf(idRich1).content_field_evidence || "{}");
         assertEq(evidence.description, EXP_DESC_GENERATED_PROVENANCE_SENTINEL,
           "ed-r6i: content_field_evidence.description stamped with the generated (non-homepage) sentinel");
+        assertEq(rowOf(idRich1).content_source, null, "ed-r6i2: content_source UNCHANGED for a faktalinje write");
         assertTrue(rowOf(idRich1).updated_at !== "2020-01-01 00:00:00", "ed-r6j: updated_at was bumped");
       }
 
-      // ── ed-r7: idempotent — the written row is no longer a candidate. ──
+      // ── ed-r7: idempotent — the written row is no longer a candidate
+      //    (still no verified homepage, so no auto-supersede either). ─────
       {
         const r = await post({ ids: [idRich1] });
         assertEq(r.body.candidates, 0, "ed-r7: a row we just filled is no longer a candidate");
@@ -814,7 +1171,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       {
         const r = await post({ dry_run: false, ids: [idJunk] });
         assertEq(r.body.written, 1, "ed-r8a: written: 1");
-        assertEq(descOf(idJunk), FIXTURE_DESCRIPTION, "ed-r8b: junk description replaced by the generated one");
+        assertEq(descOf(idJunk), FAKTALINJE_FIXTURE, "ed-r8b: junk description replaced by the generated one");
       }
 
       // ── ed-r9: judge REJECTS -> nothing written. ───────────────────────
@@ -903,7 +1260,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(r.body.remaining, 2, "ed-r13d: remaining: 2");
         assertEq(counters.generate, 10, "ed-r13e: exactly 10 generate calls (cap respected before the LLM)");
         assertEq(counters.judge, 10, "ed-r13f: exactly 10 judge calls");
-        const filled = batchIds.filter((id) => descOf(id) === FIXTURE_DESCRIPTION).length;
+        const filled = batchIds.filter((id) => descOf(id) === FAKTALINJE_FIXTURE).length;
         assertEq(filled, 10, "ed-r13g: exactly 10 of the 12 rows got a description");
       }
 
@@ -919,6 +1276,185 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       assertEq(descOf(idManual), null, "ed-r15b: a content_source='manual' row was never written to");
       assertEq(descOf(idClaim), null, "ed-r15c: a content_source='claim' row was never written to");
       assertEq(descOf(idMerged), null, "ed-r15d: a dedup-merged-away row was never written to");
+
+      // ═══════════════════════════════════════════════════════════════
+      // ed-k* — kildetro end-to-end, blocked-homepage fallthrough,
+      // auto-supersede, and the new no_title_node/fetch_failed buckets
+      // (dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-
+      // kildetro). Each block gets its OWN fresh experience row so it
+      // never interacts with the fixtures/state built up above.
+      // ═══════════════════════════════════════════════════════════════
+
+      // ── ed-k1: a provider with a verified CLEAN-domain homepage ->
+      //    kildetro end-to-end: homepage fetch + LLM generate + LLM judge,
+      //    each independently stubbed, write stamps the REAL homepage URL
+      //    AND content_source = 'provider_site'. ─────────────────────────
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Kajakkfjord AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("kajakkfjord.example", verifiedFieldProvenance(), ktProviderId);
+        const idKt1 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Kajakktur i fjorden" }) as any);
+
+        setStub(makeStub({ generate: async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FIXTURE }] }) }) }));
+        setHomepageStub(makeHomepageStub(ON_TOPIC_HOMEPAGE_HTML));
+
+        const dry = await post({ ids: [idKt1] });
+        assertEq(dry.body.sample.length, 1, "ed-k1a: one sampled candidate");
+        assertEq(dry.body.sample[0].level, "kildetro", "ed-k1b: level is kildetro (verified clean-domain homepage)");
+        assertEq(dry.body.sample[0].proposed_description, KILDETRO_FIXTURE, "ed-k1c: dry-run proposal is the homepage-grounded text");
+        assertEq(dry.body.sample[0].judge_approved, true, "ed-k1d: judge approved in the dry-run preview");
+
+        counters.generate = 0; counters.judge = 0;
+        const apply = await post({ dry_run: false, ids: [idKt1] });
+        assertEq(apply.body.written, 1, "ed-k1e: written: 1");
+        assertEq(counters.generate, 1, "ed-k1f: exactly one LLM generate call");
+        assertEq(counters.judge, 1, "ed-k1g: exactly one LLM judge call");
+        assertEq(descOf(idKt1), KILDETRO_FIXTURE, "ed-k1h: description is the homepage-grounded text");
+        const row = rowOf(idKt1);
+        assertEq(row.content_source, "provider_site", "ed-k1i: content_source stamped 'provider_site' — the ONE write-path change this dev-request makes, gated to kildetro");
+        const evidence = JSON.parse(row.content_field_evidence || "{}");
+        assertEq(evidence.description, "https://kajakkfjord.example", "ed-k1j: content_field_evidence.description is the REAL homepage URL, never the generated-provenance sentinel");
+      }
+
+      // ── ed-k2: verified homepage, BLOCKED domain (dmo_visit_domain) ->
+      //    falls through to faktalinje — the homepage fetch seam is NEVER
+      //    touched (a blocked domain is never even attempted as a source). ─
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Bergen Opplevelser AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("visitbergen.no", verifiedFieldProvenance(), ktProviderId);
+        const idKt2 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Fjordsafari med RIB" }) as any);
+
+        setStub(makeStub({}));
+        setHomepageStub(homepageNeverCall("ed-k2"));
+        const dry = await post({ ids: [idKt2] });
+        assertEq(dry.body.sample[0].level, "faktalinje", "ed-k2a: blocked-domain homepage -> faktalinje, not skip");
+        assertTrue(dry.body.sample[0].reasoning.includes("blokkert"), "ed-k2b: reasoning names the homepage as blocked");
+
+        const apply = await post({ dry_run: false, ids: [idKt2] });
+        assertEq(apply.body.written, 1, "ed-k2c: written via the faktalinje path");
+        assertEq(rowOf(idKt2).content_source, null, "ed-k2d: content_source untouched (faktalinje write)");
+        const evidence = JSON.parse(rowOf(idKt2).content_field_evidence || "{}");
+        assertEq(evidence.description, EXP_DESC_GENERATED_PROVENANCE_SENTINEL, "ed-k2e: sentinel evidence, never a URL, for the blocked-domain fallthrough");
+      }
+
+      // ── ed-k3: verified clean-domain homepage, but the homepage FETCH
+      //    fails -> generation_failed / fetch_failed, and the LLM seam is
+      //    NEVER touched (no point spending a generate/judge call on a row
+      //    with no source text at all). ────────────────────────────────────
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Uoppnaelig Fjordtur AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("uoppnaelig-fjordtur.example", verifiedFieldProvenance(), ktProviderId);
+        const idKt3 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Fjordtur med kajakk" }) as any);
+
+        setStub(neverCall("ed-k3"));
+        setHomepageStub((async () => ({ ok: false, status: 500, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } })) as unknown as typeof fetch);
+
+        const before = dumpAll();
+        const r = await post({ dry_run: false, ids: [idKt3] });
+        assertEq(r.status, 200, "ed-k3a: 200, never throws");
+        assertEq(r.body.written, 0, "ed-k3b: written: 0");
+        assertEq(r.body.skipped_reasons.fetch_failed, 1, "ed-k3c: skipped_reasons.fetch_failed counts this row");
+        assertEq(dumpAll(), before, "ed-k3d: ZERO rows changed");
+      }
+
+      // ── ed-k4: verified clean-domain homepage, fetch succeeds, but the
+      //    generated text never names the experience -> no_title_node. ────
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Generisk Fjordtur AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("generisk-fjordtur.example", verifiedFieldProvenance(), ktProviderId);
+        const idKt4 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Kajakktur i fjorden" }) as any);
+
+        setStub(makeStub({ generate: async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_NO_TITLE_FIXTURE }] }) }) }));
+        setHomepageStub(makeHomepageStub(ON_TOPIC_HOMEPAGE_HTML));
+
+        const before = dumpAll();
+        const r = await post({ dry_run: false, ids: [idKt4] });
+        assertEq(r.body.written, 0, "ed-k4a: written: 0");
+        assertEq(r.body.skipped_reasons.no_title_node, 1, "ed-k4b: skipped_reasons.no_title_node counts this row");
+        assertEq(dumpAll(), before, "ed-k4c: ZERO rows changed");
+      }
+
+      // ── ed-k5: verified clean-domain homepage, but the JUDGE (graded
+      //    against the homepage text as fasit) rejects -> nothing written. ─
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Uenig Fjordtur AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("uenig-fjordtur.example", verifiedFieldProvenance(), ktProviderId);
+        const idKt5 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Kajakktur i fjorden" }) as any);
+
+        setStub(makeStub({ generate: async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FIXTURE }] }) }), judge: async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "AVVIS\nPåstand uten dekning i hjemmesideteksten." }] }) }) }));
+        setHomepageStub(makeHomepageStub(ON_TOPIC_HOMEPAGE_HTML));
+
+        const before = dumpAll();
+        const r = await post({ dry_run: false, ids: [idKt5] });
+        assertEq(r.body.written, 0, "ed-k5a: written: 0 — judge-with-ground-truth rejected");
+        assertEq(r.body.skipped_reasons.judge_rejected, 1, "ed-k5b: skip reason judge_rejected");
+        assertEq(dumpAll(), before, "ed-k5c: ZERO rows changed");
+      }
+
+      // ── ed-k6: auto-supersede — an EXISTING faktalinje row (sentinel in
+      //    content_field_evidence.description) whose provider has SINCE
+      //    gained a verified clean-domain homepage is re-selected and
+      //    UPGRADED to kildetro, never re-run through faktalinje again. ────
+      {
+        const ktProviderId = expStore.createProvider({
+          navn: "Nyverifisert Fjordtur AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        const idKt6 = expStore.createExperience(richSeed({ provider_id: ktProviderId, title: "Kajakktur i fjorden" }) as any);
+        // Simulate an existing faktalinje write from a PREVIOUS run (no
+        // verified homepage existed at the time).
+        expDb.prepare("UPDATE experiences SET description = ?, content_field_evidence = ? WHERE id = ?")
+          .run(FAKTALINJE_FIXTURE, JSON.stringify({ description: EXP_DESC_GENERATED_PROVENANCE_SENTINEL }), idKt6);
+
+        // Before the homepage verifies: NOT a candidate (a non-blank,
+        // non-junk description with no eligible upgrade path).
+        {
+          const r = await post({ ids: [idKt6] });
+          assertEq(r.body.candidates, 0, "ed-k6a: an existing faktalinje row with no upgrade path is NOT re-selected");
+        }
+
+        // The provider gains a verified clean-domain homepage.
+        expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+          .run("nyverifisert-fjordtur.example", verifiedFieldProvenance(), ktProviderId);
+
+        setStub(makeStub({ generate: async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FIXTURE }] }) }) }));
+        setHomepageStub(makeHomepageStub(ON_TOPIC_HOMEPAGE_HTML));
+
+        const dry = await post({ ids: [idKt6] });
+        assertEq(dry.body.candidates, 1, "ed-k6b: NOW a candidate — the provider gained a verified homepage");
+        assertEq(dry.body.sample[0].level, "kildetro", "ed-k6c: resolves to kildetro (upgrade), not faktalinje again");
+
+        const apply = await post({ dry_run: false, ids: [idKt6] });
+        assertEq(apply.body.written, 1, "ed-k6d: written: 1 (upgraded)");
+        assertEq(descOf(idKt6), KILDETRO_FIXTURE, "ed-k6e: description replaced with the kildetro text");
+        assertEq(rowOf(idKt6).content_source, "provider_site", "ed-k6f: content_source stamped on the upgrade write");
+        const evidence = JSON.parse(rowOf(idKt6).content_field_evidence || "{}");
+        assertEq(evidence.description, "https://nyverifisert-fjordtur.example", "ed-k6g: evidence now carries the real homepage URL, sentinel replaced");
+
+        // ── ed-k7: an ALREADY-kildetro row (real URL in evidence) is NEVER
+        //    re-selected, even though it "looks like" it has a homepage. ────
+        const r2 = await post({ ids: [idKt6] });
+        assertEq(r2.body.candidates, 0, "ed-k7: an already-kildetro row (real URL, not the sentinel) is never re-selected");
+      }
 
       dbFactory.__resetDbFactoryForTesting();
     } catch (err: any) {

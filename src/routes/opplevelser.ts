@@ -1971,12 +1971,12 @@ const CR_CONCURRENCY = 3;
  * guardrail has been in warn-breach (35.3 vs a threshold of 15) for 20+
  * controller cycles with no way to see what the 35 actually were.
  */
-async function crFetchPage(url: string): Promise<FetchPageResult> {
-  return fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+async function crFetchPage(url: string, fetchImpl?: typeof fetch): Promise<FetchPageResult> {
+  return fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS, fetchImpl });
 }
 
-async function crFetchHtml(url: string): Promise<string | null> {
-  const r = await crFetchPage(url);
+async function crFetchHtml(url: string, fetchImpl?: typeof fetch): Promise<string | null> {
+  const r = await crFetchPage(url, fetchImpl);
   return r.ok ? r.html : null;
 }
 
@@ -2174,9 +2174,9 @@ function descriptionMentionsExperienceTitle(description: string, title: string):
   return pool.some((t) => descTokens.has(t));
 }
 
-async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutcome> {
+async function crFetchHomepageContent(homepageUrl: string, fetchImpl?: typeof fetch): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primary = await crFetchPage(fetchUrl);
+  const primary = await crFetchPage(fetchUrl, fetchImpl);
   if (!primary.ok) {
     return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
   }
@@ -2199,7 +2199,7 @@ async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutco
     const discovered = discoverContentLinks(primaryHtml, u.toString(), CR_CONTENT_PATHS.length);
     const targets = discovered.length > 0 ? discovered : CR_CONTENT_PATHS.map((p) => `${base}${p}`);
     for (const target of targets) {
-      const sub = await crFetchHtml(target);
+      const sub = await crFetchHtml(target, fetchImpl);
       if (sub) {
         combinedHtml += "\n" + sub;
         pages.push({ label: target, html: sub });
@@ -27603,10 +27603,19 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
 // scraped nav junk that isJunkDescription() suppresses at render time.
 //
 // WHAT THIS BUILDS. A fail-closed writer for that column: for each candidate
-// row it generates a ≥400-word Norwegian description grounded ONLY in that
-// row's OWN structured catalog columns (the exact field set the detail page
-// already renders as `facts`/`badges`), has a SECOND LLM judge verify the
-// text invents nothing and is real prose, and only then writes it. The read
+// row a level-selection pass (selectExperienceDescriptionTier(), added by
+// dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro)
+// picks ONE of three outcomes — `kildetro` (60-150 words, grounded ONLY in
+// the provider's own eierskapsverifiserte hjemmeside), `faktalinje` (1-2
+// setninger/<=40 words, grounded ONLY in the row's own structured catalog
+// columns, for providers without a usable homepage), or `skip` (neither bar
+// clears — zero LLM calls) — has a SECOND LLM judge verify the text invents
+// nothing and is real prose (against the homepage text as fasit for
+// `kildetro`, against the facts block for `faktalinje`), and only then
+// writes it. The ORIGINAL single-tier ≥400-word design this replaced is
+// described in the "SAFETY POSTURE" section right below verbatim, since
+// every fail-closed principle it lays out still applies unchanged to both
+// new tiers — only the length/source-material bar per tier changed. The read
 // path is untouched — experiences-seo.ts already renders `description` when
 // it is present and non-junk.
 //
@@ -27652,7 +27661,10 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
 // apply the `verified` half. Anyone widening this gate should re-read this
 // paragraph first.
 import { isJunkDescription as expDescIsJunk } from "../services/description-quality";
-import { parseContentFieldEvidence as expDescParseFieldEvidence } from "../services/experience-store";
+import {
+  parseContentFieldEvidence as expDescParseFieldEvidence,
+  gardssalgSharedDomainReason as expDescSharedDomainReason,
+} from "../services/experience-store";
 
 // Batch cap: HALF of TITLE_NO_BATCH_CAP (20). This feature spends TWO LLM
 // calls per row (generate + judge) instead of one, and the generate call
@@ -27704,6 +27716,33 @@ const EXP_DESC_SENTINEL = "UTILSTREKKELIG_GRUNNLAG";
 const EXP_DESC_JUDGE_APPROVE_TOKEN = "GODKJENN";
 const EXP_DESC_JUDGE_REJECT_TOKEN = "AVVIS";
 
+// ─── Beskrivelsesnivå (dev-request 2026-09-02-experiences-beskrivelsesnivaa-
+// kort-og-kildetro) ──────────────────────────────────────────────────────
+// Replaces the single 400-1200-word tier above with TWO per-row tiers,
+// selected by selectExperienceDescriptionTier() before any LLM call:
+//
+//   `kildetro`    — 60-150 words, grounded ONLY in the provider's own
+//                   eierskapsverifiserte hjemmeside (never a directory/DMO/
+//                   blog domain), judged against that homepage text as
+//                   fasit. Highest-trust tier.
+//   `faktalinje`  — 1-2 setninger, <=40 words, generated from >=4 structured
+//                   fact-fields (down from the retired tier's 6) for
+//                   providers without a usable homepage. Same generated-
+//                   provenance sentinel as before.
+//   `skip`        — neither bar is cleared. Zero LLM calls.
+//
+// EXP_DESC_MIN_FACT_FIELDS/EXP_DESC_MIN_WORDS/EXP_DESC_MAX_WORDS above are
+// deliberately left untouched (name + value) even though the single-tier
+// 400-1200-word path they gated is retired — nothing else in the codebase
+// reads them, and leaving the historical bar visible in the source is
+// cheaper than deleting it. No code path below reads them.
+const EXP_DESC_KILDETRO_MIN_WORDS = 60;
+const EXP_DESC_KILDETRO_MAX_WORDS = 150;
+const EXP_DESC_FAKTALINJE_MAX_WORDS = 40;
+const EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS = 4;
+
+export type ExperienceDescriptionTier = "kildetro" | "faktalinje" | "skip";
+
 /**
  * Per-field provenance recorded for a description written by THIS writer.
  * Deliberately not a URL, exactly like HARVEST_PROVENANCE_SENTINEL in
@@ -27744,6 +27783,15 @@ export type ExperienceDescriptionCandidate = {
   content_field_evidence: string | null;
   provider_navn: string | null;
   provider_brreg_verified: number | null;
+  // dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+  // the provider's OWN field_provenance/hjemmeside, needed by
+  // selectExperienceDescriptionTier() to decide kildetro vs. faktalinje vs.
+  // skip. Optional (rather than required) because a handful of pure-fixture
+  // callers in tests build a candidate without a provider join at all — a
+  // missing/undefined value reads as "no verified homepage", never as
+  // "verified" (isHjemmesideVerified fails closed on null/undefined too).
+  provider_field_provenance?: string | null;
+  provider_hjemmeside?: string | null;
 };
 
 // Norwegian display labels. Intentional small duplication of the maps in
@@ -27877,6 +27925,67 @@ export function buildExperienceDescriptionFacts(
   return facts;
 }
 
+/**
+ * Level selection — decides, per row, which tier (if any) is worth an LLM
+ * call, and WHY. Called by the route BEFORE enrichOneExperienceDescription;
+ * `enrichOneExperienceDescription` itself calls this again (pure + cheap, no
+ * network) so the dry-run preview and the apply run can never drift on which
+ * tier a row resolves to — the same drift hazard the cascade's original doc
+ * comment already calls out for the single-tier design.
+ *
+ * `kildetro` iff the provider's OWN hjemmeside is ownership-verified
+ * (isHjemmesideVerified) AND its host is not a directory/aggregator/DMO/blog
+ * (gardssalgSharedDomainReason). A BLOCKED homepage (the second condition
+ * fails) is not "no site" — it falls through to `faktalinje` eligibility
+ * exactly like a provider with no hjemmeside at all, since the row's own
+ * structured facts are unaffected by which text sources are unsafe to quote.
+ *
+ * `faktalinje` iff not `kildetro`-eligible AND the row clears
+ * EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS (4) distinct fact-kinds.
+ *
+ * Else `skip` — zero LLM calls, by construction (the caller never reaches a
+ * generator for this row).
+ */
+export function selectExperienceDescriptionTier(
+  row: ExperienceDescriptionCandidate
+): { level: ExperienceDescriptionTier; reasoning: string } {
+  const factCount = buildExperienceDescriptionFacts(row).length;
+
+  if (isHjemmesideVerified(row.provider_field_provenance ?? null)) {
+    const host = hostFromUrlLike(row.provider_hjemmeside ?? "");
+    const blockedReason = expDescSharedDomainReason(host);
+    if (!blockedReason) {
+      return {
+        level: "kildetro",
+        reasoning: "tilbyder har en eierskapsverifisert hjemmeside på et rent domene",
+      };
+    }
+    // Blocked homepage: don't use THIS site as a source, but the row can
+    // still get a faktalinje from its own structured fields.
+    if (factCount >= EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS) {
+      return {
+        level: "faktalinje",
+        reasoning: `hjemmesiden er blokkert som kilde (${blockedReason}); ${factCount} faktafelt tilgjengelig`,
+      };
+    }
+    return {
+      level: "skip",
+      reasoning: `hjemmesiden er blokkert som kilde (${blockedReason}); for få faktafelt (${factCount} < ${EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS})`,
+    };
+  }
+
+  if (factCount >= EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS) {
+    return {
+      level: "faktalinje",
+      reasoning: `ingen verifisert hjemmeside; ${factCount} faktafelt tilgjengelig`,
+    };
+  }
+  return {
+    level: "skip",
+    reasoning: `ingen verifisert hjemmeside; for få faktafelt (${factCount} < ${EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS})`,
+  };
+}
+
 /** The exact text block handed to BOTH the generator and the judge, so the
  *  judge grades against byte-identical grounding material. */
 export function renderExperienceDescriptionFactsBlock(
@@ -27949,39 +28058,56 @@ export type ExpDescGenFailReason =
   | "char_cap_exceeded"
   | "below_word_floor"
   | "above_word_ceiling"
-  | "ungrounded_numbers";
+  | "ungrounded_numbers"
+  // dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+  // kildetro-only gates. "fetch_failed" also covers the homepage-fetch step
+  // itself, one level up from generation (see enrichOneExperienceDescription) —
+  // surfaced here rather than as a THIRD outcome-level reason type so a
+  // dry-run/apply caller has exactly one place to look for "why null".
+  | "no_title_node"
+  | "fetch_failed";
 
+/**
+ * `faktalinje` generator — 1-2 setninger, <=EXP_DESC_FAKTALINJE_MAX_WORDS ord,
+ * for providers with no usable homepage source. Historically this function
+ * generated the now-RETIRED 400-1200-word single tier (EXP_DESC_MIN_WORDS/
+ * EXP_DESC_MAX_WORDS/EXP_DESC_MIN_FACT_FIELDS above, kept defined but no
+ * longer read by any code path) — the never-fabricate contract, the fetch
+ * shape, the escape-sentinel idiom and the ungrounded-number scan below are
+ * unchanged from that path; only the thin-data floor, the prompt's length
+ * instruction and the word ceiling moved to the faktalinje bar (dev-request
+ * 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro).
+ */
 export async function generateExperienceDescriptionNoDetailed(
   row: ExperienceDescriptionCandidate,
   fetchImpl: typeof fetch = fetch
 ): Promise<{ text: string | null; reason: ExpDescGenFailReason | null }> {
   const facts = buildExperienceDescriptionFacts(row);
-  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) return { text: null, reason: "thin_data" }; // thin -> never call the LLM
+  if (facts.length < EXP_DESC_FAKTALINJE_MIN_FACT_FIELDS) return { text: null, reason: "thin_data" }; // thin -> never call the LLM
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return { text: null, reason: "no_api_key" };
 
   const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
-  const prompt = `Du skriver produktbeskrivelser for opplevagent.no, en norsk markedsplass for opplevelser. Skriv beskrivelsen av opplevelsen under.
+  const prompt = `Du skriver et kort faktasammendrag for opplevagent.no, en norsk markedsplass for opplevelser. Skriv ÉN til TO setninger om opplevelsen under.
 
 ABSOLUTTE REGLER:
 - Bruk KUN faktaopplysningene i listen nedenfor. Du har ingen annen kunnskap om denne opplevelsen.
 - Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
 - Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
 - Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
-- Du KAN utdype og forklare de oppgitte faktaene, og gi tydelig generelle, praktiske råd som følger direkte av dem (for eksempel at en opplevelse med lang varighet gjerne krever at man setter av god tid). Slike generelle råd må aldri formuleres som en konkret opplysning om nettopp denne opplevelsen.
 - Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten — heller ikke et sted du "vet" ligger i nærheten eller naturlig hører med. Står det ikke i listen, finnes det ikke i teksten.
-- Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region. Generelle, stedsnavn- og årstidsløse råd om aktivitetsklær er greit (for eksempel at det gjerne lønner seg å kle seg etter forholdene ved utendørsaktiviteter), men så snart rådet nevner et sted, en region eller en årstid, er det ikke lenger tillatt.
-- Ikke skriv generelle beskrivelser av landsdelen eller regionen opplevelsen ligger i, med mindre hver enkelt påstand er direkte forankret i en oppgitt fakta.
-- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
-- Teksten skal være minst ${EXP_DESC_MIN_WORDS} ord og høyst ${EXP_DESC_MAX_WORDS} ord.
+- Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region.
+- Ikke bruk adjektiver eller vurderende ord (for eksempel "flott", "unik", "fantastisk") med mindre ordet er direkte forankret i en oppgitt fakta.
+- Skriv på norsk bokmål, i sammenhengende setninger. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være ÉN til TO setninger, og ALDRI mer enn ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord totalt.
 - Ikke gjenta setninger eller fyll ut med tomme fraser.
-- Hvis faktagrunnlaget er for tynt til å skrive ${EXP_DESC_MIN_WORDS} ord uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+- Hvis faktagrunnlaget er for tynt til å skrive noe meningsfylt uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
 
 Fakta:
 ${factsBlock}
 
-Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+Svar med kun selve setningen/setningene (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -27994,7 +28120,7 @@ Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, 
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5",
-        max_tokens: 3000,
+        max_tokens: 300,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -28022,8 +28148,7 @@ Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, 
   if (cleaned.length > EXP_DESC_MAX_CHARS) return { text: null, reason: "char_cap_exceeded" };
 
   const words = expDescWordCount(cleaned);
-  if (words < EXP_DESC_MIN_WORDS) return { text: null, reason: "below_word_floor" };
-  if (words > EXP_DESC_MAX_WORDS) return { text: null, reason: "above_word_ceiling" };
+  if (words > EXP_DESC_FAKTALINJE_MAX_WORDS) return { text: null, reason: "above_word_ceiling" };
 
   if (expDescHasUngroundedNumbers(cleaned, factsBlock)) return { text: null, reason: "ungrounded_numbers" };
 
@@ -28037,6 +28162,101 @@ export async function generateExperienceDescriptionNo(
   return (await generateExperienceDescriptionNoDetailed(row, fetchImpl)).text;
 }
 
+/**
+ * `kildetro` generator — 60-150 words, grounded ONLY in `homepageText` (the
+ * provider's own eierskapsverifiserte hjemmeside's visible text, obtained by
+ * the caller via crFetchHomepageContent()+extractVisibleText() — the SAME
+ * fetch+extract path /admin/content-refresh already uses). Never handed the
+ * row's structured facts as a source — a `kildetro` claim traces to the
+ * homepage or it is not written. The title-token check
+ * (descriptionMentionsExperienceTitle) guards against homepage-wide "om oss"
+ * marketing copy that never actually names THIS experience.
+ */
+export async function generateExperienceDescriptionKildetro(
+  row: ExperienceDescriptionCandidate,
+  homepageText: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ text: string | null; reason: ExpDescGenFailReason | null }> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return { text: null, reason: "no_api_key" };
+
+  // Same cap idiom/value as GARDSSALG_REWRITE_SOURCE_CHAR_CAP — a symmetrical
+  // source-text cap for a source-grounded rewrite prompt.
+  const cappedSource = (homepageText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  if (!cappedSource.trim()) return { text: null, reason: "empty_response" };
+
+  const prompt = `Du skriver en kort produktbeskrivelse for opplevagent.no, en norsk markedsplass for opplevelser. Beskrivelsen skal handle om opplevelsen «${row.title}».
+
+Kilden under er teksten på tilbyderens EGEN hjemmeside — det eneste du vet om opplevelsen.
+
+ABSOLUTTE REGLER:
+- Bruk KUN opplysninger som faktisk står i kildeteksten under. Du har ingen annen kunnskap om denne opplevelsen eller tilbyderen.
+- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall som ikke står i kildeteksten.
+- Ikke gjett, ikke anta, ikke lån detaljer fra liknende opplevelser du kjenner til.
+- Teksten skal handle om AKKURAT denne opplevelsen — ikke generell «om oss»-markedsføring om bedriften som helhet, med mindre kilden faktisk beskriver denne opplevelsen spesifikt.
+- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være minst ${EXP_DESC_KILDETRO_MIN_WORDS} ord og høyst ${EXP_DESC_KILDETRO_MAX_WORDS} ord.
+- Ikke gjenta setninger eller fyll ut med tomme fraser.
+- Hvis kildeteksten ikke inneholder noe brukbart om nettopp DENNE opplevelsen, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+
+Kildetekst (tilbyderens hjemmeside):
+${cappedSource}
+
+Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { text: null, reason: "network_error" };
+  }
+
+  if (!response.ok) return { text: null, reason: "http_error" };
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { text: null, reason: "unparseable_json" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return { text: null, reason: "unexpected_response_shape" };
+
+  const cleaned = text.trim();
+  if (!cleaned) return { text: null, reason: "empty_response" };
+  if (cleaned === EXP_DESC_SENTINEL) return { text: null, reason: "sentinel" };
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return { text: null, reason: "sentinel_smuggled" };
+  if (cleaned.length > EXP_DESC_MAX_CHARS) return { text: null, reason: "char_cap_exceeded" };
+
+  const words = expDescWordCount(cleaned);
+  if (words < EXP_DESC_KILDETRO_MIN_WORDS) return { text: null, reason: "below_word_floor" };
+  if (words > EXP_DESC_KILDETRO_MAX_WORDS) return { text: null, reason: "above_word_ceiling" };
+
+  // Title-token requirement: a "kildetro" text that never names the
+  // experience is homepage-wide marketing, not a description of THIS
+  // experience (mirrors descriptionGuardSkips's own
+  // "homepage_boilerplate_no_title_token" shape above).
+  if (!descriptionMentionsExperienceTitle(cleaned, row.title)) {
+    return { text: null, reason: "no_title_node" };
+  }
+
+  return { text: cleaned, reason: null };
+}
+
 export interface ExperienceDescriptionJudgeVerdict {
   approved: boolean;
   reasoning: string;
@@ -28045,15 +28265,28 @@ export interface ExperienceDescriptionJudgeVerdict {
 /**
  * The anti-fabrication judge. Same shape and the same fail-closed discipline
  * as judgeGardssalgAboutCandidate() above (exact-token verdict on the first
- * line, any doubt -> reject, never throws, never silently approves) — but the
- * question is different: it is handed BOTH the candidate prose AND the exact
- * facts block the prose was supposed to be grounded in, and must confirm that
- * the text adds no fact that is not in that block.
+ * line, any doubt -> reject, never throws, never silently approves).
+ *
+ * Two modes, selected by the OPTIONAL 4th parameter (dev-request 2026-09-02-
+ * experiences-beskrivelsesnivaa-kort-og-kildetro):
+ *   - `groundTruthText` OMITTED (`faktalinje`): fasit is `factsBlock`, the
+ *     structured catalog fields — same request/response contract, tokens and
+ *     control flow as the original single-tier judge; only the length
+ *     instruction line in the prompt now names the faktalinje bar instead of
+ *     the retired 400-word floor (nothing else about this branch changed).
+ *   - `groundTruthText` PROVIDED (`kildetro`): fasit is instead the
+ *     provider's own homepage visible-text excerpt — "does every claim in
+ *     this candidate trace back to what the homepage actually says" (the
+ *     dev-request's own AC2: "dommer med fasit").
+ * Strictly additive at the TYPE level: adding the parameter can never change
+ * behavior for a caller that does not pass it (untouched control flow,
+ * tokens, fail-closed error handling below the prompt string itself).
  */
 export async function judgeExperienceDescriptionCandidate(
   candidateText: string,
   factsBlock: string,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  groundTruthText?: string
 ): Promise<ExperienceDescriptionJudgeVerdict> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -28061,7 +28294,33 @@ export async function judgeExperienceDescriptionCandidate(
   }
 
   const capped = (candidateText || "").slice(0, EXP_DESC_MAX_CHARS);
-  const prompt = `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
+  const prompt = groundTruthText
+    ? `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av kildeteksten under, som er hentet fra tilbyderens EGEN hjemmeside og er FASIT for hva som er sant om opplevelsen.
+
+Kildetekst (tilbyderens hjemmeside — fasit):
+${groundTruthText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP)}
+
+Kandidattekst:
+${capped}
+
+Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i kandidatteksten kan spores direkte til kildeteksten over.
+- Kandidatteksten inneholder ingen konkrete opplysninger som IKKE finnes i kildeteksten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
+- Kandidatteksten handler om AKKURAT denne opplevelsen — ikke bare generell «om oss»-markedsføring om bedriften som helhet.
+- Teksten er sammenhengende, ekte norsk prosa på 60-150 ord — ikke fyllstoff, ikke gjentatte setninger.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${EXP_DESC_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${EXP_DESC_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`
+    : `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
 
 Faktaliste (alt som er kjent):
 ${factsBlock}
@@ -28072,7 +28331,7 @@ ${capped}
 Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
 - Hver konkrete opplysning i teksten (pris, varighet, gruppestørrelse, sted, sesong, inne/ute, språk, tilgjengelighet, oppmøtested, bestilling, tilbydernavn) stemmer med faktalisten.
 - Teksten inneholder ingen konkrete opplysninger som IKKE står i faktalisten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
-- Teksten er sammenhengende, ekte norsk prosa på minst ${EXP_DESC_MIN_WORDS} ord — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
+- Teksten er kort, sammenhengende, ekte norsk prosa (én til to setninger, høyst ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord) — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
 - Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
 
 Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
@@ -28141,6 +28400,12 @@ export type ExperienceDescriptionOutcome = {
   id: string;
   title: string;
   fact_count: number;
+  // Tier selection (dev-request 2026-09-02-experiences-beskrivelsesnivaa-
+  // kort-og-kildetro), surfaced on EVERY outcome — including "skip", where
+  // every other field below is a null/zero placeholder and no LLM call was
+  // ever made.
+  level: ExperienceDescriptionTier;
+  reasoning: string;
   thin: boolean;
   proposed_description: string | null;
   word_count: number;
@@ -28151,6 +28416,12 @@ export type ExperienceDescriptionOutcome = {
    *  "generation_failed" — see ExpDescGenFailReason. Always null for the
    *  other two skip_reason values. Never read by the write path. */
   generation_fail_reason: ExpDescGenFailReason | null;
+  /** Set ONLY for a successfully-written `kildetro` outcome: the real
+   *  homepage URL actually fetched — the exact value the write path stamps
+   *  into content_field_evidence.description (never the generated-provenance
+   *  sentinel). Null for every `faktalinje`/`skip` outcome and for a
+   *  `kildetro` attempt that never reached a successful fetch. */
+  homepage_url: string | null;
 };
 
 /**
@@ -28158,34 +28429,93 @@ export type ExperienceDescriptionOutcome = {
  * apply run can never drift on what they would do (the drift hazard this
  * repo already hit with gardssalgReplaceableFieldAction). Pure with respect
  * to the DB — it decides, the caller writes.
+ *
+ * `fetchImpl` serves BOTH the generator and the judge LLM calls (unchanged
+ * seam from before this dev-request). `homepageFetchImpl` is a SEPARATE seam
+ * used ONLY on the `kildetro` path's homepage fetch (crFetchHomepageContent)
+ * — kept independent so a test can stub the homepage fetch and the LLM call
+ * with two different fakes instead of one stub having to distinguish both
+ * kinds of request by inspecting the URL/body.
  */
 export async function enrichOneExperienceDescription(
   row: ExperienceDescriptionCandidate,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  homepageFetchImpl: typeof fetch = fetch
 ): Promise<ExperienceDescriptionOutcome> {
+  const { level, reasoning } = selectExperienceDescriptionTier(row);
   const facts = buildExperienceDescriptionFacts(row);
-  const base = { id: row.id, title: row.title, fact_count: facts.length };
+  const base = { id: row.id, title: row.title, fact_count: facts.length, level, reasoning };
 
-  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) {
-    // Thin -> zero LLM calls, zero tokens, nothing written.
+  if (level === "skip") {
+    // Zero LLM calls, zero tokens, nothing written — matches AC1.
     return {
       ...base, thin: true, proposed_description: null, word_count: 0,
       judge_approved: null, judge_reasoning: null, skip_reason: "thin_data",
-      generation_fail_reason: null,
+      generation_fail_reason: null, homepage_url: null,
     };
   }
 
-  const { text: proposed, reason: genFailReason } = await generateExperienceDescriptionNoDetailed(row, fetchImpl);
+  if (level === "faktalinje") {
+    const { text: proposed, reason: genFailReason } = await generateExperienceDescriptionNoDetailed(row, fetchImpl);
+    if (!proposed) {
+      return {
+        ...base, thin: false, proposed_description: null, word_count: 0,
+        judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+        generation_fail_reason: genFailReason, homepage_url: null,
+      };
+    }
+
+    const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
+    const verdict = await judgeExperienceDescriptionCandidate(proposed, factsBlock, fetchImpl);
+    return {
+      ...base,
+      thin: false,
+      proposed_description: proposed,
+      word_count: expDescWordCount(proposed),
+      judge_approved: verdict.approved,
+      judge_reasoning: verdict.reasoning,
+      skip_reason: verdict.approved ? null : "judge_rejected",
+      generation_fail_reason: null,
+      homepage_url: null,
+    };
+  }
+
+  // level === "kildetro" ──────────────────────────────────────────────────
+  const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+  let fetched: CrFetchOutcome;
+  try {
+    fetched = await crFetchHomepageContent(hjemmeside, homepageFetchImpl);
+  } catch {
+    // fetchPage()/crFetchHomepageContent() never throw in practice (they
+    // return a classified failure) — this catch is the same defensive
+    // never-fabricate posture the rest of this cascade already applies to
+    // every external call.
+    return {
+      ...base, thin: false, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+      generation_fail_reason: "fetch_failed", homepage_url: null,
+    };
+  }
+  if (!fetched.ok) {
+    return {
+      ...base, thin: false, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+      generation_fail_reason: "fetch_failed", homepage_url: null,
+    };
+  }
+
+  const homepageText = extractVisibleText(fetched.combinedHtml);
+  const { text: proposed, reason: genFailReason } = await generateExperienceDescriptionKildetro(row, homepageText, fetchImpl);
   if (!proposed) {
     return {
       ...base, thin: false, proposed_description: null, word_count: 0,
       judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
-      generation_fail_reason: genFailReason,
+      generation_fail_reason: genFailReason, homepage_url: fetched.fetchUrl,
     };
   }
 
   const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
-  const verdict = await judgeExperienceDescriptionCandidate(proposed, factsBlock, fetchImpl);
+  const verdict = await judgeExperienceDescriptionCandidate(proposed, factsBlock, fetchImpl, homepageText);
   return {
     ...base,
     thin: false,
@@ -28195,6 +28525,7 @@ export async function enrichOneExperienceDescription(
     judge_reasoning: verdict.reasoning,
     skip_reason: verdict.approved ? null : "judge_rejected",
     generation_fail_reason: null,
+    homepage_url: verdict.approved ? fetched.fetchUrl : null,
   };
 }
 
@@ -28259,6 +28590,13 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // app instance, production never does, so this falls back to global fetch.
   const fetchImpl =
     ((req.app?.get?.("experienceDescriptionFetchImpl")) as typeof fetch | undefined) ?? fetch;
+  // A SEPARATE seam for the `kildetro` path's homepage fetch (dev-request
+  // 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro) — kildetro
+  // spends TWO independent network calls per row (homepage fetch + LLM), so
+  // tests need to stub each independently rather than one stub having to
+  // distinguish both kinds of request.
+  const homepageFetchImpl =
+    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
 
   const db = getExpDb("experiences");
   const sql =
@@ -28267,7 +28605,8 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
             e.price_band, e.price_from, e.price_unit, e.languages, e.accessibility,
             e.meeting_point, e.kommune, e.fylke, e.booking_url,
             e.content_source, e.content_field_evidence,
-            p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified
+            p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified,
+            p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
       WHERE e.canonical_id IS NULL
@@ -28278,7 +28617,24 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // The junk guard is JS, not SQL — so the blank/junk filter runs here rather
   // than in the WHERE clause. A GOOD existing description drops out at this
   // line and is never seen again by this endpoint.
-  const candidateRows = scanned.filter((r) => experienceDescriptionNeedsEnrichment(r.description));
+  //
+  // Auto-supersede (dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-
+  // og-kildetro): a row already carrying a `faktalinje` (the generated-
+  // provenance sentinel in content_field_evidence.description) is normally
+  // NOT a candidate — experienceDescriptionNeedsEnrichment() sees a non-
+  // blank, non-junk description and correctly says "leave it". But if the
+  // provider has since GAINED a verified clean-domain homepage, that row now
+  // deserves the higher-trust `kildetro` tier — this is the one case where a
+  // non-blank description is revisited, and ONLY as a tier UPGRADE: an
+  // already-`kildetro` row (a real URL, never the sentinel, in evidence) is
+  // never re-selected here, and a still-ineligible `faktalinje` row is never
+  // re-run over itself.
+  const candidateRows = scanned.filter((r) => {
+    if (experienceDescriptionNeedsEnrichment(r.description)) return true;
+    const evidence = expDescParseFieldEvidence(r.content_field_evidence);
+    if (evidence.description !== EXP_DESC_GENERATED_PROVENANCE_SENTINEL) return false;
+    return selectExperienceDescriptionTier(r).level === "kildetro";
+  });
 
   if (dryRun) {
     // slice() of an empty array iterates zero times -> zero LLM calls, same
@@ -28286,7 +28642,7 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     const sample = candidateRows.slice(0, EXP_DESC_DRY_RUN_SAMPLE);
     const proposals: ExperienceDescriptionOutcome[] = [];
     for (const row of sample) {
-      proposals.push(await enrichOneExperienceDescription(row, fetchImpl));
+      proposals.push(await enrichOneExperienceDescription(row, fetchImpl, homepageFetchImpl));
     }
     res.json({
       success: true,
@@ -28301,21 +28657,35 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   const batch = candidateRows.slice(0, EXP_DESC_BATCH_CAP);
   const outcomes: ExperienceDescriptionOutcome[] = [];
   for (const row of batch) {
-    outcomes.push(await enrichOneExperienceDescription(row, fetchImpl));
+    outcomes.push(await enrichOneExperienceDescription(row, fetchImpl, homepageFetchImpl));
   }
 
   const writable = batch
     .map((row, i) => ({ row, outcome: outcomes[i] }))
     .filter(({ outcome }) => outcome.judge_approved === true && !!outcome.proposed_description);
 
-  const setDescription = db.prepare(
+  // Two prepared writes: `kildetro` additionally stamps content_source =
+  // 'provider_site' (the one behavior change to the *existing* write path,
+  // gated strictly behind level === "kildetro") — `faktalinje`'s write stays
+  // byte-identical to the retired single tier's write (sentinel evidence, no
+  // content_source change).
+  const setDescriptionFaktalinje = db.prepare(
     "UPDATE experiences SET description = ?, content_field_evidence = ?, updated_at = datetime('now') WHERE id = ?"
+  );
+  const setDescriptionKildetro = db.prepare(
+    "UPDATE experiences SET description = ?, content_field_evidence = ?, content_source = 'provider_site', updated_at = datetime('now') WHERE id = ?"
   );
   const tx = db.transaction(() => {
     for (const { row, outcome } of writable) {
       const evidence = expDescParseFieldEvidence(row.content_field_evidence);
-      evidence.description = EXP_DESC_GENERATED_PROVENANCE_SENTINEL;
-      setDescription.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
+      if (outcome.level === "kildetro") {
+        // Real homepage URL actually used — never the generated sentinel.
+        evidence.description = outcome.homepage_url || (row.provider_hjemmeside ?? "");
+        setDescriptionKildetro.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
+      } else {
+        evidence.description = EXP_DESC_GENERATED_PROVENANCE_SENTINEL;
+        setDescriptionFaktalinje.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
+      }
     }
   });
   tx();
@@ -28335,6 +28705,11 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
       thin_data: outcomes.filter((o) => o.skip_reason === "thin_data").length,
       generation_failed: outcomes.filter((o) => o.skip_reason === "generation_failed").length,
       judge_rejected: outcomes.filter((o) => o.skip_reason === "judge_rejected").length,
+      // kildetro-only gate breakdown, alongside the three shared buckets
+      // above (both are always a SUBSET of generation_failed, never double-
+      // counted against the totals).
+      no_title_node: outcomes.filter((o) => o.generation_fail_reason === "no_title_node").length,
+      fetch_failed: outcomes.filter((o) => o.generation_fail_reason === "fetch_failed").length,
     },
   });
 });

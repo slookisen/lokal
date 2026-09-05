@@ -3332,9 +3332,18 @@ function renderOpplevelseDetail(
   const heroMedia = renderHeroMedia(exp as unknown as Record<string, unknown>, cat, place);
 
   // Description block (graceful fallback when no own summary yet, or when
-  // the guard above suppressed a junk value).
+  // the guard above suppressed a junk value). dev-request 2026-09-02-
+  // experiences-beskrivelsesnivaa-kort-og-kildetro: a `faktalinje` row (the
+  // short structured-facts tier — description_kind is computed at hydration
+  // time in experience-store.ts, no dedicated DB column) is marked so a
+  // reader can tell it's an auto-generated summary, not the provider's own
+  // words. Only ever shown alongside an ACTUAL rendered description — never
+  // next to the "publiseres fortløpende" placeholder.
+  const descAutoBadge = exp.description_kind === "faktalinje"
+    ? `<span class="badge badge-auto">Automatisk sammendrag fra katalogdata</span>`
+    : "";
   const descBlock = safeExpDescription
-    ? `<p class="lede">${escapeHtml(safeExpDescription)}</p>`
+    ? `<p class="lede">${escapeHtml(safeExpDescription)}</p>${descAutoBadge}`
     : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(exp.title)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
 
   // Booking CTA.
@@ -3542,6 +3551,11 @@ ${ldScripts}
   a.badge-cat{background:var(--fjord-800);color:#fff;border-color:var(--fjord-800)}
   a.badge-cat:hover{text-decoration:none;filter:brightness(1.08)}
   .badge-verified{background:#e7f6ec;color:#0f7a3d;border-color:#bfe6cd}
+  /* dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+     marks a faktalinje (auto-generated, structured-facts-only) description
+     — deliberately muted/neutral, never the category/verified accent
+     colours, so it reads as a disclosure, not an endorsement. */
+  .badge-auto{background:var(--canvas-2);color:var(--ink-soft);border-style:dashed;font-weight:500;margin-top:8px}
   .layout{display:grid;grid-template-columns:1fr 340px;gap:32px;margin:26px 0 10px;align-items:start}
   @media(max-width:860px){.layout{grid-template-columns:1fr;gap:22px}}
   .lede{font-size:1.08rem;color:var(--ink);margin-bottom:22px}
@@ -4119,8 +4133,17 @@ function renderCard(
     console.log(`[description-guard] suppressed junk description (opplevelse card) for ${row.slug} (${row.title})`);
     cardDescription = "";
   }
+  // dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+  // same faktalinje disclosure as the detail page — only alongside an actual
+  // rendered description, never when the junk guard above blanked it. Uses
+  // `.tag` (this page's own muted-pill class, already styled here) rather
+  // than the detail page's `.badge-auto` — the two templates carry separate
+  // <style> blocks and this one has no `.badge` family at all.
+  const cardDescAutoBadge = cardDescription && row.description_kind === "faktalinje"
+    ? `<span class="tag">Automatisk sammendrag</span>`
+    : "";
   const desc = cardDescription
-    ? `<p class="c-desc">${escapeHtml(cardDescription)}</p>`
+    ? `<p class="c-desc">${escapeHtml(cardDescription)}</p>${cardDescAutoBadge}`
     : "";
   const distanceLabel = distance
     ? formatDistanceLabel(distance.distance_km, distance.geo_precision, row.kommune)
@@ -7868,6 +7891,7 @@ function toNearbyCardRows(nearby: ReturnType<typeof discoverExperiences>): {
       title: e.title,
       title_no: e.title_no ?? null,
       description: e.description ?? null,
+      description_kind: e.description_kind ?? null,
       category: e.category ?? null,
       fylke: e.fylke ?? null,
       kommune: e.kommune ?? null,
@@ -8190,6 +8214,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
             title: e.title,
             title_no: e.title_no ?? null,
             description: e.description ?? null,
+            description_kind: e.description_kind ?? null,
             category: e.category ?? null,
             fylke: e.fylke ?? null,
             kommune: e.kommune ?? null,

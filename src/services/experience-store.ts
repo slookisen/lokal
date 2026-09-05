@@ -185,6 +185,16 @@ export const ExperienceSchema = z.object({
   title_no: z.string().optional().nullable(),
   slug: z.string().optional().nullable(),
   description: z.string().optional().nullable(),
+  // dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+  // "faktalinje" when `description` was written by the short structured-facts
+  // tier (routes/opplevelser.ts's experiences-description-enrichment writer)
+  // rather than sourced from the provider's own homepage; NULL for every
+  // other row (blank, hand-authored, harvested, or the higher-trust
+  // `kildetro` tier). Computed at READ time from content_field_evidence's
+  // existing sentinel — no dedicated DB column, no write path ever sets this
+  // field directly (see hydrateExperience below). Never set by
+  // createExperience()/applyExperienceContent(), exactly like title_no isn't.
+  description_kind: z.enum(["faktalinje"]).optional().nullable(),
   category: z.string().optional().nullable(),
   subcategory: z.string().optional().nullable(),
   activity_tags: z.array(z.string()).optional(),
@@ -297,6 +307,7 @@ function hydrateExperience(row: Record<string, unknown>): Experience & { id: str
     title_no: (row.title_no as string | null) ?? null,
     slug: (row.slug as string | null) ?? null,
     description: (row.description as string | null) ?? null,
+    description_kind: descriptionKindOf(row.content_field_evidence as string | null | undefined),
     category: (row.category as string | null) ?? null,
     subcategory: (row.subcategory as string | null) ?? null,
     activity_tags: parseJsonArray(row.activity_tags),
@@ -753,6 +764,11 @@ export type ExperienceCardRow = {
   // to `title` when NULL. See ExperienceSchema's title_no field for detail.
   title_no: string | null;
   description: string | null;
+  // dev-request 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro:
+  // "faktalinje" when `description` came from the short structured-facts
+  // tier, else null — see ExperienceSchema's description_kind field for
+  // detail. Threaded through exactly like title_no above.
+  description_kind: "faktalinje" | null;
   category: string | null;
   fylke: string | null;
   kommune: string | null;
@@ -770,6 +786,7 @@ export type ExperienceCardRow = {
 
 const CARD_COLS =
   "e.slug AS slug, e.title AS title, e.title_no AS title_no, e.description AS description, " +
+  "e.content_field_evidence AS content_field_evidence, " +
   "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
   "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
   "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence, " +
@@ -789,6 +806,7 @@ function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
     title: row.title as string,
     title_no: (row.title_no as string | null) ?? null,
     description: (row.description as string | null) ?? null,
+    description_kind: descriptionKindOf(row.content_field_evidence as string | null | undefined),
     category: (row.category as string | null) ?? null,
     fylke: (row.fylke as string | null) ?? null,
     kommune: (row.kommune as string | null) ?? null,
@@ -2307,6 +2325,30 @@ export function parseContentFieldEvidence(raw: string | null | undefined): Recor
        recently-enriched endpoint's identical parse) */
   }
   return {};
+}
+
+// Deliberately a LOCAL copy of routes/opplevelser.ts's
+// EXP_DESC_GENERATED_PROVENANCE_SENTINEL, not an import of it: this service
+// module is imported BY routes/opplevelser.ts (parseContentFieldEvidence,
+// gardssalgSharedDomainReason above) — importing the other way would create a
+// route<->service import cycle. Ten characters of duplication is cheaper than
+// that coupling, same call this file already made for HARVEST_PROVENANCE_
+// SENTINEL's sibling constants. MUST stay byte-identical to the route's own
+// constant — both are covered by the description-enrichment test suite.
+const DESCRIPTION_KIND_FAKTALINJE_SENTINEL = "generated:katalogfelt-llm";
+
+/**
+ * `description_kind` for a hydrated row (dev-request 2026-09-02-experiences-
+ * beskrivelsesnivaa-kort-og-kildetro): "faktalinje" iff `description`'s
+ * provenance entry is exactly the generated-facts sentinel, else null. A
+ * `kildetro` row (a real homepage URL in evidence) intentionally also
+ * resolves to null here — the badge only needs to flag the lower-trust
+ * faktalinje case; a `kildetro` row renders with no badge, same as any other
+ * genuine description (hand-authored, harvested, or otherwise).
+ */
+function descriptionKindOf(contentFieldEvidenceRaw: string | null | undefined): "faktalinje" | null {
+  const evidence = parseContentFieldEvidence(contentFieldEvidenceRaw);
+  return evidence.description === DESCRIPTION_KIND_FAKTALINJE_SENTINEL ? "faktalinje" : null;
 }
 
 /** The provider-level homepage domain a field's evidence is compared
