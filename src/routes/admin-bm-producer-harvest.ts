@@ -17,8 +17,10 @@
 //
 //   APPLY MODE (dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 3).
 //   Re-runs the same fetch/match loop as the dry-run branch above, for the
-//   apply-mode slug window (default 20, hard max 50 — deliberately far below
-//   the dry-run cap of 400), and writes `agents.contact_email` from the
+//   apply-mode slug window (default 20, hard max now HARD_CAP_SLUGS/400 —
+//   same ceiling as the dry-run cap, since slice 6 removed the old
+//   deliberately-lower 50 cap; the DEFAULT of 20 is still far below both),
+//   and writes `agents.contact_email` from the
 //   harvested BM record's email for exactly the rows that pass the same
 //   claimed/curated/validation gates as
 //   POST /admin/agents/contact-email-write (admin-agents-contact-email-write.ts,
@@ -123,9 +125,37 @@ const HARD_CAP_SLUGS = 400;
 
 // ─── Apply-mode (slice 3) ───────────────────────────────────────────────────
 
-/** Default stays deliberately far below HARD_CAP_SLUGS (400) — apply mode WRITES, dry-run only reads. */
+/** Default (20) stays deliberately far below HARD_CAP_SLUGS (400) — apply mode WRITES, dry-run only reads. */
 const APPLY_DEFAULT_LIMIT = 20;
-const APPLY_MAX_LIMIT = HARD_CAP_SLUGS; // was: 50 — see dev-request 2026-08-14-bm-fullhoest-katalogbred Slice 6: a monthly apply run must cover the whole catalog, not just the first 50 slugs (no offset/cursor exists)
+const APPLY_MAX_LIMIT = HARD_CAP_SLUGS; // was: 50 — see dev-request 2026-08-14-bm-fullhoest-katalogbred Slice 6: a monthly apply run must cover the whole catalog, not just the first 50 slugs (no offset/cursor exists). Now EQUALS the dry-run cap (400), no longer "far below" it — see APPLY_TIME_BUDGET_MS below for the wall-clock safety valve this raise requires.
+
+// Wall-clock safety valve for the apply-mode loop (code-review finding on
+// this same PR: raising APPLY_MAX_LIMIT to 400 raises the theoretical
+// worst-case sequential runtime — each matched slug with an eligible url
+// candidate can trigger a live outbound fetch via evaluateRfbWebsiteCandidate
+// (~10-25s per slow/dead host) — from ~21 minutes to ~2.8 hours, with
+// nothing bounding it). Mirrors the RFB_WD_TIME_BUDGET_MS /
+// time_budget_exceeded / skipped_due_to_time_budget convention
+// admin-rfb-website-discovery.ts already established for this exact same
+// class of problem — same field names, same "stop starting new work, don't
+// abort work already in flight" semantics. 60s is generous for this route's
+// DB-only per-row cost (dry-run's own ~400-slug/no-fetch runs are far
+// faster) but well short of typical HTTP gateway/proxy timeouts.
+export const APPLY_TIME_BUDGET_MS = 60_000;
+
+// Test-only injection point for the wall-clock used by the time-budget check
+// below (mirrors __setRfbWdNowForTesting, admin-rfb-website-discovery.ts):
+// production code always leaves this null and gets the real Date.now() — a
+// test installs a deterministic override so budget-exceeded behavior can be
+// exercised without actually waiting APPLY_TIME_BUDGET_MS of real wall-clock
+// time.
+let bmHarvestNowForTesting: (() => number) | null = null;
+export function __setBmHarvestNowForTesting(fn: (() => number) | null): void {
+  bmHarvestNowForTesting = fn;
+}
+function effectiveBmHarvestNowMs(): number {
+  return bmHarvestNowForTesting ? bmHarvestNowForTesting() : Date.now();
+}
 
 /**
  * Defense-in-depth: bm-producer-harvest.ts's own parser already excludes
@@ -359,7 +389,7 @@ router.get("/", async (req: Request, res: Response) => {
   // "1", "yes", anything else stays on the safe dry-run path below.
   const dryRunParam = typeof req.query.dry_run === "string" ? req.query.dry_run : "true";
   if (dryRunParam === "false") {
-    const tApply0 = Date.now();
+    const tApply0 = effectiveBmHarvestNowMs();
     try {
       let limit = APPLY_DEFAULT_LIMIT;
       if (typeof req.query.limit === "string") {
@@ -396,7 +426,21 @@ router.get("/", async (req: Request, res: Response) => {
 
       const results: ApplyResultItem[] = [];
 
+      // Wall-clock safety valve (see APPLY_TIME_BUDGET_MS above): checked
+      // BEFORE any per-slug work starts, so it bounds total elapsed time
+      // rather than just capping in-flight work. A pure safety valve — for
+      // any realistic batch (or a test where slugs resolve near-instantly)
+      // this never trips and changes nothing. Once tripped, no further slug
+      // is started at all (not even its own fetchBmProducerRecord call) —
+      // `break`, not `continue`, since every remaining requested slug is
+      // uniformly skipped and there is nothing per-slug to record for them.
+      let timeBudgetExceeded = false;
       for (const slug of slugsToProcess) {
+        if (effectiveBmHarvestNowMs() - tApply0 > APPLY_TIME_BUDGET_MS) {
+          timeBudgetExceeded = true;
+          break;
+        }
+
         const record = await fetchBmProducerRecord(slug);
         if (!record) {
           results.push({ slug, outcome: "parse_failed" });
@@ -631,10 +675,18 @@ router.get("/", async (req: Request, res: Response) => {
         dry_run: false,
         batch_tag: batchTag,
         total_slugs,
-        scanned: slugsToProcess.length,
+        // `scanned` reflects how many slugs were actually attempted before
+        // the time budget (if any) cut in — NOT the full requested/capped
+        // `limit`. Equals slugsToProcess.length in the (overwhelmingly
+        // common) case where the budget was never hit, since results gets
+        // exactly one push per attempted slug and the loop only exits early
+        // via the budget `break` above.
+        scanned: results.length,
         counts,
         results,
-        duration_ms: Date.now() - tApply0,
+        time_budget_exceeded: timeBudgetExceeded,
+        skipped_due_to_time_budget: slugsToProcess.length - results.length,
+        duration_ms: effectiveBmHarvestNowMs() - tApply0,
       });
     } catch (err: any) {
       res.status(500).json({

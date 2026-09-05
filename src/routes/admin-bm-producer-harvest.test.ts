@@ -74,7 +74,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
-import router from "./admin-bm-producer-harvest";
+import router, { APPLY_TIME_BUDGET_MS, __setBmHarvestNowForTesting } from "./admin-bm-producer-harvest";
 
 export interface TestSummary {
   passed: number;
@@ -821,6 +821,121 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           } finally {
             (globalThis as any).fetch = prevFetchSyn;
           }
+        }
+
+        // ── Fixup (code-review CHANGES-REQUESTED on this same PR): wall-clock
+        // time budget in the apply-mode loop. Raising APPLY_MAX_LIMIT to 400
+        // raises the theoretical worst-case sequential runtime unboundedly
+        // (each matched slug with an eligible url candidate can trigger a
+        // live outbound evaluateRfbWebsiteCandidate fetch) — APPLY_TIME_BUDGET_MS
+        // + __setBmHarvestNowForTesting mirror admin-rfb-website-discovery.ts's
+        // own RFB_WD_TIME_BUDGET_MS / __setRfbWdNowForTesting convention
+        // exactly: a deterministic mock clock advanced INSIDE a mocked fetch
+        // response, standing in for the real wall-clock time a slow/dead
+        // candidate host would have consumed — no real waiting, no artificial
+        // production-code delay.
+        {
+          const TB_TOTAL = 5;
+          const tbSlug = (i: number) => `tb-gard-${i}`;
+          const tbSitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${Array.from(
+            { length: TB_TOTAL },
+            (_, i) => `<url><loc>https://bondensmarked.no/produsenter/${tbSlug(i)}</loc></url>`,
+          ).join("")}</urlset>`;
+          // Deliberately unmatched (no catalog counterpart inserted for any
+          // tb-gard-N slug) — this test proves the budget/counting mechanics
+          // in isolation, independent of any write outcome.
+          const tbPage = (i: number) =>
+            `<script type="application/ld+json">${ld(`TB Uncatalogued ${i} AS`, "Bostad")}</script>`;
+
+          const prevFetchTb = globalThis.fetch;
+
+          // ── (tb-a) budget exceeded partway through the batch: the FIRST
+          // slug's own producer-page fetch is where the mock clock is
+          // advanced past APPLY_TIME_BUDGET_MS (standing in for a slow/dead
+          // url-candidate host fetch that same slug's processing would
+          // otherwise have triggered) — the loop's NEXT budget check, before
+          // slug 2 starts, must trip. Slug 2+ must never be fetched at all.
+          try {
+            let tbFetchCount = 0;
+            let mockNow = 2_000_000;
+            let firstFetchSeen = false;
+            __setBmHarvestNowForTesting(() => mockNow);
+            (globalThis as any).fetch = async (url: any) => {
+              const u = String(url);
+              if (u === "https://bondensmarked.no/sitemap.xml") {
+                return new Response(tbSitemap, { status: 200, headers: { "content-type": "application/xml" } });
+              }
+              const m = /\/produsenter\/(tb-gard-(\d+))$/.exec(u);
+              if (m) {
+                tbFetchCount++;
+                if (!firstFetchSeen) {
+                  firstFetchSeen = true;
+                  mockNow += APPLY_TIME_BUDGET_MS + 1;
+                }
+                return new Response(tbPage(Number(m[2])), { status: 200, headers: { "content-type": "text/html" } });
+              }
+              return new Response("not found", { status: 404 });
+            };
+
+            const rTb = await get({ dry_run: "false", limit: String(TB_TOTAL) });
+            assertEq(rTb.body?.scanned, 1, "tb1: only the first slug was attempted before the budget check stopped the loop");
+            assertEq(rTb.body?.time_budget_exceeded, true, "tb2: time_budget_exceeded is true");
+            assertEq(
+              rTb.body?.skipped_due_to_time_budget,
+              TB_TOTAL - 1,
+              "tb3: every remaining requested slug is counted as skipped_due_to_time_budget",
+            );
+            assertEq(rTb.body?.results?.length, 1, "tb4: results array holds exactly one attempted slug's row");
+            assertEq(
+              tbFetchCount,
+              1,
+              "tb5: only the first slug's producer page was ever fetched -- the budget check stopped the loop BEFORE slug 2's own work started, not after",
+            );
+          } finally {
+            __setBmHarvestNowForTesting(null);
+            (globalThis as any).fetch = prevFetchTb;
+          }
+
+          // ── (tb-b) control: well under budget -> byte-identical to
+          // pre-fix behavior. Proves this is a pure safety valve that changes
+          // NOTHING when the budget isn't hit.
+          try {
+            let mockNow2 = 3_000_000;
+            __setBmHarvestNowForTesting(() => mockNow2);
+            (globalThis as any).fetch = async (url: any) => {
+              const u = String(url);
+              if (u === "https://bondensmarked.no/sitemap.xml") {
+                return new Response(tbSitemap, { status: 200, headers: { "content-type": "application/xml" } });
+              }
+              const m = /\/produsenter\/(tb-gard-(\d+))$/.exec(u);
+              if (m) {
+                return new Response(tbPage(Number(m[2])), { status: 200, headers: { "content-type": "text/html" } });
+              }
+              return new Response("not found", { status: 404 });
+            };
+
+            const rTbOk = await get({ dry_run: "false", limit: String(TB_TOTAL) });
+            assertEq(rTbOk.body?.scanned, TB_TOTAL, "tb6: well under budget -> scanned equals the full requested window, unaffected");
+            assertEq(rTbOk.body?.time_budget_exceeded, false, "tb7: well under budget -> time_budget_exceeded is false");
+            assertEq(rTbOk.body?.skipped_due_to_time_budget, 0, "tb8: well under budget -> nothing skipped");
+          } finally {
+            __setBmHarvestNowForTesting(null);
+            (globalThis as any).fetch = prevFetchTb;
+          }
+
+          // restore the main fixture set for subsequent assertions
+          (globalThis as any).fetch = async (url: any) => {
+            const u = String(url);
+            if (u === "https://bondensmarked.no/sitemap.xml") {
+              return new Response(sitemapXml, { status: 200, headers: { "content-type": "application/xml" } });
+            }
+            const mm = /\/produsenter\/([a-z0-9-]+)$/.exec(u);
+            const s = mm ? mm[1] : "";
+            if (s in pages) {
+              return new Response(pages[s], { status: 200, headers: { "content-type": "text/html" } });
+            }
+            return new Response("not found", { status: 404 });
+          };
         }
 
         // ── AC10/AC11: idempotency — second apply of the SAME window writes
