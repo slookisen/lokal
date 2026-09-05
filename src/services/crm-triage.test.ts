@@ -180,6 +180,23 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       }
 
       // ═══════════════════════════════════════════════════════════════
+      // tr14e-tr14i — isAutoDismissedSender: dev-request 2026-08-21-crm-
+      // untriaged-kofrysning-og-lopetellerfeil (GitHub CI notification mail is
+      // 22 of 47 open untriaged rows in one snapshot, and can never resolve to
+      // a platform alias).
+      // ═══════════════════════════════════════════════════════════════
+      assertEq(triage.isAutoDismissedSender("notifications@github.com"), true,
+        "tr14e: the exact known noise-source address is auto-dismissed");
+      assertEq(triage.isAutoDismissedSender("Notifications@GitHub.com"), true,
+        "tr14f: matching is case-insensitive, same as the platform alias table");
+      assertEq(triage.isAutoDismissedSender("  notifications@github.com  "), true,
+        "tr14g: leading/trailing whitespace is tolerated");
+      assertEq(triage.isAutoDismissedSender("kontakt@rettfrabonden.com"), false,
+        "tr14h: a real platform sender is NOT auto-dismissed");
+      assertEq(triage.isAutoDismissedSender("ukjent@example.no"), false,
+        "tr14i: an unrelated unknown sender is NOT auto-dismissed");
+
+      // ═══════════════════════════════════════════════════════════════
       // tr15-tr23 — the bucket.
       // ═══════════════════════════════════════════════════════════════
       {
@@ -309,6 +326,64 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
         assertTrue(String(parked?.reason).length > 10, "tr30b: …with a reason a human can act on");
         assertTrue(String(parked?.raw_payload).includes("tr-ing-unknown-m1"),
           "tr30c: …and the full payload, so assignment can replay it without going back to Gmail");
+      }
+
+      // ── Auto-dismiss: GitHub CI notification mail never opens a row ──
+      //
+      // dev-request 2026-08-21-crm-untriaged-kofrysning-og-lopetellerfeil.
+      // Same unroutable path as tr25-30 (no known platform alias in the
+      // recipient headers) but primaryFromEmail is the known noise source.
+      {
+        const openBefore = triage.countOpenUntriaged();
+        const r = await call("POST", "/ingest", {
+          threadId: "tr-ing-ghnotif", primaryFromEmail: "notifications@github.com",
+          subject: "[slookisen/lokal] CI run failed", messages: msgFixture("tr-ing-ghnotif-m1"),
+          routingSignals: { deliveredTo: "da.fredriksen@gmail.com" },
+        });
+        assertEq(r.status, 202, "tr66: a GitHub CI notification still answers 202 — accepted, not an error, and not retried");
+        assertEq(r.body?.untriaged, false, "tr66b: …but signals it is NOT open, unlike the ordinary unroutable case");
+        assertEq(r.body?.dismissed, true, "tr66c: …and that it was auto-dismissed");
+        assertEq(r.body?.alreadyDismissed, false, "tr66d: …for the first time, not a repeat");
+        assertEq(triage.countOpenUntriaged(), openBefore, "tr67: …and the OPEN queue did not grow — this is the whole point");
+
+        const row = db.prepare("SELECT * FROM crm_untriaged WHERE thread_id = ?").get("tr-ing-ghnotif") as any;
+        assertTrue(!!row, "tr68: the thread IS durably recorded — auto-dismiss still keeps the audit trail, it does not vanish the message");
+        assertTrue(row.resolved_at !== null, "tr68b: …and it is already resolved");
+        assertEq(row.resolved_vertical, null, "tr68c: …as a dismissal (vertical null), not an assignment");
+        assertEq(row.resolved_by, "auto:ci_notification_filter", "tr68d: …attributed to the automated filter, not a human");
+
+        assertEq(triage.listUntriaged({ includeResolved: false }).some((x) => x.id === row.id), false,
+          "tr69: …and it does not appear in Daniel's open queue at all");
+
+        // Same thread ingested again (the CS agent re-sends every threadId
+        // each cron run) must not throw and must report the repeat.
+        const r2 = await call("POST", "/ingest", {
+          threadId: "tr-ing-ghnotif", primaryFromEmail: "notifications@github.com",
+          subject: "[slookisen/lokal] CI run failed", messages: msgFixture("tr-ing-ghnotif-m1"),
+          routingSignals: { deliveredTo: "da.fredriksen@gmail.com" },
+        });
+        assertEq(r2.status, 202, "tr70: re-ingesting the SAME already-dismissed thread does not error");
+        assertEq(r2.body?.alreadyDismissed, true, "tr70b: …and reports it was already dismissed");
+        assertEq(triage.countOpenUntriaged(), openBefore, "tr70c: …still without opening a row");
+      }
+
+      // ── Regression: a DIFFERENT unroutable sender is unaffected ───
+      //
+      // Proves the change is scoped to notifications@github.com and did not
+      // touch the general unroutable path.
+      {
+        const openBefore = triage.countOpenUntriaged();
+        const r = await call("POST", "/ingest", {
+          threadId: "tr-ing-other-unroutable", primaryFromEmail: "helt-ukjent@example.no",
+          subject: "Ukjent avsender", messages: msgFixture("tr-ing-other-unroutable-m1"),
+          routingSignals: { deliveredTo: "da.fredriksen@gmail.com" },
+        });
+        assertEq(r.status, 202, "tr71: an ordinary unroutable sender still answers 202 exactly as before");
+        assertEq(r.body?.untriaged, true, "tr71b: …with today's original shape, untouched by the github.com-notifications branch");
+        assertEq(r.body?.dismissed, undefined, "tr71c: …and no dismissed field at all");
+        assertEq(triage.countOpenUntriaged(), openBefore + 1, "tr72: …and it DOES occupy the open queue, unlike the github-notification case");
+        const row = db.prepare("SELECT resolved_at FROM crm_untriaged WHERE thread_id = ?").get("tr-ing-other-unroutable") as any;
+        assertEq(row?.resolved_at, null, "tr72b: …left open, not auto-resolved");
       }
 
       // ── Decidable: routes, and stamps what the HEADERS said ───────

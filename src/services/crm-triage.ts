@@ -79,6 +79,18 @@ const PLATFORM_ADDRESSES: Readonly<Record<string, CrmVertical>> = {
   "kontakt@opplevagent.no": "experiences",
 };
 
+// dev-requests/2026-08-21-crm-untriaged-kofrysning-og-lopetellerfeil.md: a
+// known, permanent noise source (GitHub CI notification mail — 22 of 47 open
+// rows in one untriaged-queue snapshot) that can never resolve to a platform
+// alias and must not sit in Daniel's manual queue forever. Kept to exactly
+// this one address on purpose — no speculative entries.
+const AUTO_DISMISS_SENDERS: ReadonlySet<string> = new Set(["notifications@github.com"]);
+
+/** Is this sender a known, permanent noise source that should never occupy the open untriaged queue? */
+export function isAutoDismissedSender(fromEmail: string): boolean {
+  return AUTO_DISMISS_SENDERS.has(fromEmail.trim().toLowerCase());
+}
+
 export type TriageCode =
   | "no_signals"
   | "no_platform_address"
