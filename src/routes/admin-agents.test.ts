@@ -198,6 +198,16 @@ export async function runAdminAgentsRegisterTests(opts: { log?: boolean } = {}):
         source: "test",
       });
       assertEq(r.status, 201, "case1: rfb active+allow-listed NACE → 201 registered");
+      // dev-request 2026-09-04-brreg-registrer-respons-mangler-id-felt:
+      // callers correlate a registered candidate off a literal `id` field
+      // (matching the naming already used by the duplicate branch's
+      // `existing_id`) — assert it's present, non-empty, and matches the
+      // pre-existing `agent_id` field (kept for backward compatibility).
+      assertTrue(
+        typeof r.body?.id === "string" && r.body.id.length > 0,
+        "case1: response has non-empty id field",
+      );
+      assertEq(r.body?.id, r.body?.agent_id, "case1: id matches agent_id");
       const row = readRow(orgNr);
       assertEq(row?.org_nr, orgNr, "case1: org_nr column written");
       assertEq(row?.brreg_verified, 1, "case1: brreg_verified=1 (badge-eligible)");

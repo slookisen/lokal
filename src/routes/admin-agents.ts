@@ -684,6 +684,7 @@ router.post("/register", async (req: Request, res: Response) => {
 
     res.status(201).json({
       success: true,
+      id: id,
       agent_id: id,
       slug: slugify(name),
       contact_email: contactEmailValue,
