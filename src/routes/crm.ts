@@ -15,6 +15,7 @@ import {
   getUntriaged,
   markUntriagedResolved,
   countOpenUntriaged,
+  isAutoDismissedSender,
 } from "../services/crm-triage";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
@@ -930,6 +931,26 @@ router.post("/ingest", (req, res) => {
         signals,
         rawPayload: parsed.data,
       });
+
+      // dev-requests/2026-08-21-crm-untriaged-kofrysning-og-lopetellerfeil.md:
+      // a known, permanent noise source (GitHub CI notification mail) can
+      // never resolve to a platform alias, so it would otherwise sit in
+      // Daniel's manual queue forever. Still parked first — same durable
+      // audit-trail invariant as every other unroutable thread, "accepted and
+      // durably recorded, but deliberately not filed" — but then immediately
+      // resolved as dismissed so it never occupies the OPEN queue.
+      if (isAutoDismissedSender(parsed.data.primaryFromEmail)) {
+        markUntriagedResolved(parked.id, null, "auto:ci_notification_filter");
+        return res.status(202).json({
+          untriaged: false,
+          dismissed: true,
+          dismissedId: parked.id,
+          alreadyDismissed: parked.alreadyResolved,
+          reason: "auto_dismissed_ci_notification",
+          openUntriaged: countOpenUntriaged(),
+        });
+      }
+
       // 202: accepted and durably recorded, but deliberately not filed. Not an
       // error — the agent did its job — and NOT 4xx, because the agent must not
       // retry it. `untriaged: true` is the field a caller branches on.
