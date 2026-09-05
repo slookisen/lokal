@@ -49,6 +49,7 @@ import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
+import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
@@ -697,6 +698,7 @@ app.use("/admin/outreach-sent-log", adminLimiter, adminOutreachCandidatesRoutes)
 // not scoped to the candidates gate alone.
 app.use("/admin/outreach-max-touch-vern", adminLimiter, adminOutreachMaxTouchVernRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
 // run-ledger; ?alert=1 emails when a watcher is silent.
 app.use("/admin/loop-heartbeat", adminLimiter, adminLoopHeartbeatRoutes);

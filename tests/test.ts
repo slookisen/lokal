@@ -39533,6 +39533,28 @@ runSerial(async () => {
   }
 });
 
+// ── orch-pr-20260905-dental-verifier-canary: admin-key-gated canary trigger
+// route for the dental verifier (POST /admin/run-dental-verifier). Mutates
+// process.env.ADMIN_KEY/ANALYTICS_ADMIN_KEY and the route's own
+// __setRunDentalVerifierBatchForTesting mock seam — runs via runSerial()
+// same as the verifier-drain-observability block above, for the same
+// shared-global-state reason.
+runSerial(async () => {
+  console.log("\n── admin-run-dental-verifier (dental verifier canary trigger route) ──");
+  try {
+    const { runAdminRunDentalVerifierTests } = require("../src/routes/admin-run-dental-verifier.test") as
+      typeof import("../src/routes/admin-run-dental-verifier.test");
+    const rdv = await runAdminRunDentalVerifierTests({ log: false });
+    passed += rdv.passed;
+    failed += rdv.failed;
+    for (const f of rdv.failures) failures.push("admin-run-dental-verifier: " + f);
+    console.log(`  admin-run-dental-verifier: ${rdv.passed} passed, ${rdv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-run-dental-verifier: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-21-analytics-tre-boetter-mcp-logging-a2a-transparens
 // (Slice B): MCP/A2A/agent-card usage logging + GET /admin/analytics/mcp-usage.
 // Own in-memory DB (swaps the shared getDb() singleton) — runs via runSerial()
