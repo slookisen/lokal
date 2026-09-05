@@ -16,7 +16,7 @@ import {
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
-import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -3108,11 +3108,39 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
         // no-op today — add()/isBlocked() already do nothing extra when
         // orgNr is absent, i.e. no regression from today's behavior. If
         // rowToAgent() ever starts mapping org_nr, wire it through here.
+        //
+        // Survivor-email guard (bugfix, prod incident: post@akergaardsbutikk.no
+        // / survivor agent 5e652eb0-... got auto-blocklisted here despite still
+        // legitimately belonging to that still-active agent). A duplicate-
+        // agent-row cleanup deletes ONE row but the same contact email can
+        // still legitimately belong to ANOTHER row that stays active — e.g.
+        // the genuine survivor of the duplicate. Blocklisting the email in
+        // that case doesn't just stop re-discovery of the deleted spam/dupe
+        // row, it also poisons all FUTURE contact with the correct, still-
+        // active producer. The just-deleted row is already gone from `agents`
+        // (deleteAll() ran above), so every remaining is_active=1 row sharing
+        // this email is, by definition, a different agent than the one just
+        // deleted — no agentId exclusion needed. Case-insensitive compare,
+        // matching this codebase's LOWER(...) = LOWER(?) convention elsewhere.
+        // Only the email identifier is skipped when a survivor is found —
+        // agentId/website/name still get blocklisted exactly as before.
+        const emailToBlock = fromRegistry?.contactEmail;
+        let emailHasActiveSurvivor = false;
+        if (emailToBlock) {
+          const normalizedEmailToBlock = normalizeEmail(emailToBlock);
+          if (normalizedEmailToBlock) {
+            const survivor = db.prepare(
+              "SELECT 1 FROM agents WHERE is_active = 1 AND LOWER(contact_email) = LOWER(?) LIMIT 1"
+            ).get(normalizedEmailToBlock) as any;
+            emailHasActiveSurvivor = !!survivor;
+          }
+        }
+
         blocklistResult = blocklistAdd({
           agentId,
           name: agent.name,
           website: fromRegistry?.url,
-          email: fromRegistry?.contactEmail,
+          email: emailHasActiveSurvivor ? undefined : fromRegistry?.contactEmail,
           reason: req.body?.reason || "auto-blocklisted on admin DELETE",
           sourceEmail: req.body?.sourceEmail,
           agentNameForAudit: agent.name,
