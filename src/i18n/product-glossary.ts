@@ -316,10 +316,63 @@ function englishVariants(term: string): string[] {
 
 let reverseIndex: Map<string, string[]> | null = null;
 
+/**
+ * Every generated English word-form that must never be indexed because it
+ * ALSO reads as an ordinary Norwegian word this glossary already knows.
+ *
+ * Round 1 (2026-09-05) only skipped indexing when the (Norwegian, English)
+ * PAIR itself was spelled identically (yoghurt/yoghurt, bacon/bacon). Round 2
+ * found that incomplete, and round 3 found it incomplete again — in both
+ * cases because `englishVariants()` GENERATES a form of an otherwise-genuine
+ * translation that collides with an unrelated Norwegian word even though the
+ * (no, en) pair that produced it isn't identical-spelling:
+ *   - burgere → "burgers"; englishVariants("burgers") generates the singular
+ *     "burger", which is itself the standalone Norwegian loanword
+ *     PRODUCT_WORDS["burger"].
+ *   - saft → "juice"; the base form "juice" IS the standalone Norwegian
+ *     loanword PRODUCT_WORDS["juice"].
+ *   - egg → "eggs"; englishVariants("eggs") singularises to "egg", which is
+ *     the Norwegian word "egg" itself (PRODUCT_WORDS["egg"], a different,
+ *     unrelated entry to the one that generated it).
+ * Two rounds of hand-listing specific words each missed cases (round 3 found
+ * a further miss, "egg", by exhaustive test rather than by hand — see
+ * marketplace-search-english-queries.test.ts), so this is computed from the
+ * vocabulary itself, two ways, instead of a maintained list:
+ *   1. Every word-form (base AND generated variants) of any (no, en) pair
+ *      that is ALREADY identical-spelling (same check as `add()` below) —
+ *      catches "burger"/"burgers", "juice"/"juices", etc. in one go instead
+ *      of only the exact spelling that made the PAIR identical.
+ *   2. Every key that literally exists in PRODUCT_WORDS or PRODUCT_PHRASES —
+ *      i.e. any string this glossary already treats as Norwegian, full stop,
+ *      regardless of whether ITS OWN entry happens to be identical-spelling.
+ *      This is what catches "egg": the entry that produces the colliding
+ *      variant (egg→"eggs") is not itself identical-spelling, so (1) alone
+ *      misses it, but "egg" is unmistakably already Norwegian vocabulary.
+ * Between the two, every generated variant is checked against the glossary's
+ * own Norwegian vocabulary, not against a name someone had to notice and
+ * write down — closing the whole defect class, including cases no review has
+ * hand-checked yet.
+ */
+function computeExcludedForms(): Set<string> {
+  const forms = new Set<string>();
+  const scan = (rec: Record<string, Entry>) => {
+    for (const [no, entry] of Object.entries(rec)) {
+      forms.add(no.toLowerCase()); // (2): the Norwegian key itself
+      if (entry.en.toLowerCase() === no.toLowerCase()) {
+        for (const v of englishVariants(entry.en)) forms.add(v); // (1): its own word-forms
+      }
+    }
+  };
+  scan(PRODUCT_WORDS);
+  scan(PRODUCT_PHRASES);
+  return forms;
+}
+
 /** english term → the Norwegian words that mean it (built once, lazily). */
 function getReverseIndex(): Map<string, string[]> {
   if (reverseIndex) return reverseIndex;
   const idx = new Map<string, string[]>();
+  const excludedForms = computeExcludedForms();
   const add = (en: string, no: string) => {
     // Identical-spelling loanwords ("yoghurt", "burger", "bacon", "skyr",
     // "kefir", "quinoa", "catering", "squash", "chutney", "juice", …) are
@@ -340,6 +393,13 @@ function getReverseIndex(): Map<string, string[]> {
     // salmon→laks, …) are real translations and still indexed below.
     if (en.toLowerCase() === no.toLowerCase()) return;
     for (const v of englishVariants(en)) {
+      // Rounds 2 & 3 (2026-09-05): a GENERATED variant of a genuine
+      // translation can independently collide with the glossary's own
+      // Norwegian vocabulary (burgere→"burgers" generates "burger";
+      // saft→"juice" generates "juice" itself; egg→"eggs" generates "egg")
+      // even though the (no, en) pair above isn't identical. Skip those the
+      // same way, for the same reason — see computeExcludedForms().
+      if (excludedForms.has(v)) continue;
       const cur = idx.get(v);
       if (!cur) idx.set(v, [no]);
       else if (!cur.includes(no)) cur.push(no);
@@ -403,4 +463,12 @@ export function isEnglishFoodWord(word: string): boolean {
 /** Test/report helper: how many distinct English words the index covers. */
 export function reverseGlossarySize(): number {
   return getReverseIndex().size;
+}
+
+// Test-only: every key currently in the reverse index, so a test can iterate
+// the REAL vocabulary the code produces instead of a hand-picked word list —
+// exactly the pattern that missed "burger"/"juice" across two review rounds.
+// Never call from production code.
+export function __peekReverseIndexKeysForTesting(): string[] {
+  return [...getReverseIndex().keys()];
 }

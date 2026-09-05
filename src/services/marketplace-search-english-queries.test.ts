@@ -53,6 +53,9 @@ import {
   norwegianTermsForEnglishQuery,
   isEnglishFoodWord,
   reverseGlossarySize,
+  __peekReverseIndexKeysForTesting,
+  PRODUCT_WORDS,
+  PRODUCT_PHRASES,
 } from "../i18n/product-glossary";
 
 type TestSummary = { passed: number; failed: number; failures: string[] };
@@ -186,6 +189,74 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
       `regression guard: real translation pair cheese → ost is still indexed after the loanword fix`);
     ok(norwegianTermsForEnglishQuery("yoghurt").length === 0,
       `regression guard: identical-spelling "yoghurt" maps to nothing (not even itself) in the reverse index`);
+
+    // ────────────────────────────────────────────────────────────────────
+    // C3 — exhaustive: NO key in the REAL reverse index collides with an
+    // ordinary Norwegian word this glossary already knows.
+    //
+    // C2 above regression-tests two SPECIFIC loanwords ("yoghurt", "bacon")
+    // that a human found by manual review. That review missed three more
+    // instances of the SAME defect class, each found only by a later review
+    // round (or, for the third, only by the exhaustive scan below — no
+    // review has caught it until now):
+    //   - "burger": burgere→"burgers"; englishVariants() generates the
+    //     singular "burger", which independently collides with the
+    //     standalone loanword PRODUCT_WORDS["burger"], even though the pair
+    //     burgere/"burgers" itself isn't identical-spelling.
+    //   - "juice": saft→"juice"; the base form collides with the standalone
+    //     loanword PRODUCT_WORDS["juice"].
+    //   - "egg": PRODUCT_WORDS["egg"] (no) → "eggs" (en) is not an
+    //     identical-spelling pair either, but englishVariants("eggs")
+    //     singularises to "egg" — which collides with the Norwegian word
+    //     "egg" itself. Before this fix, a completely ordinary Norwegian
+    //     query "and og egg" ("duck and eggs") wrongly dropped `meat`,
+    //     keeping only `eggs`.
+    // Two rounds of hand-listing specific words each missed cases — hand-
+    // picking words is exactly the pattern that keeps missing cases, so this
+    // test does not hand-pick anything.
+    //
+    // It walks EVERY key currently produced by the real reverse index — via
+    // __peekReverseIndexKeysForTesting, which reads the actual exported
+    // index, not a re-implementation of its construction logic — and checks
+    // each one against the glossary's own real Norwegian vocabulary
+    // (PRODUCT_WORDS / PRODUCT_PHRASES, also the real exports). A surviving
+    // English key that is ALSO literally a Norwegian word this glossary
+    // knows is exactly the defect: it means some genuinely-Norwegian query
+    // using that word would be mistaken for English content and could
+    // suppress the duck keyword. This is the general, always-computable form
+    // of the invariant "no indexed key silently suppresses the Norwegian
+    // duck category": it is not phrased as parseNaturalQuery("and og "+k)
+    // for literal every key, because plenty of keys are genuine English-only
+    // translations (e.g. "cheese", "salmon") that legitimately DO suppress
+    // "and" when combined with it — that suppression is the correct,
+    // already-tested behaviour in section C above, not a bug. The bug is
+    // specifically an indexed key that is ALSO Norwegian, and that is what
+    // this scan catches exhaustively, mechanically, for the current
+    // vocabulary and for any future glossary addition that reintroduces it.
+    {
+      const keys = __peekReverseIndexKeysForTesting();
+      ok(keys.length > 300, `exhaustive check has the expected reverse index to walk (${keys.length} keys)`);
+      const norwegianVocab = new Set([
+        ...Object.keys(PRODUCT_WORDS).map(w => w.toLowerCase()),
+        ...Object.keys(PRODUCT_PHRASES).map(w => w.toLowerCase()),
+      ]);
+      const offending = keys.filter(k => norwegianVocab.has(k));
+      ok(offending.length === 0,
+        `exhaustive: no reverse-index key collides with a Norwegian vocabulary word this glossary already knows` +
+        (offending.length ? ` (offending: ${JSON.stringify(offending)})` : ""));
+    }
+
+    // The three collisions this class has produced so far (two found by
+    // hand across two review rounds, one found only by the scan above),
+    // confirmed end-to-end through the real search parser — same pattern as
+    // the yoghurt/bacon regressions in C2, for the ones that needed fixing
+    // in THIS round.
+    ok(cats("and og burger").includes("meat"),
+      `NO "and og burger" (duck and burger) → meat (burgere→"burgers" singularises to the standalone loanword "burger")`);
+    ok(cats("and og juice").includes("meat"),
+      `NO "and og juice" (duck and juice) → meat (saft→"juice" collides with the standalone loanword "juice")`);
+    ok(cats("and og egg").includes("meat"),
+      `NO "and og egg" (duck and eggs) → meat (egg→"eggs" singularises back to the Norwegian word "egg" itself)`);
 
     // ════════════════════════════════════════════════════════════════════
     // D — «bakeri» selected no category, in EITHER language
