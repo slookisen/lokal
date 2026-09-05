@@ -324,6 +324,29 @@ export function runAdminBlocklistManualEntryTests(opts: { log?: boolean } = {}):
     blocklistAddDirect({ name: "Blokkert Gård Uten Orgnr", reason: "test: Mål 3 regression guard" });
     const noLinkRegression = isBlocked({ name: "Blokkert Gård Uten Orgnr", orgNr: "999999999" });
     assertEq(noLinkRegression.blocked, true, "linked_org_nr: no linked_org_nr recorded -> still blocked regardless of incoming orgNr");
+
+    // (e) regression guard: a LATER, UNRELATED add() call for a DIFFERENT
+    //     org.nr that happens to reuse an EXISTING name_normalized row's
+    //     exact string must not retroactively stamp that pre-existing row's
+    //     linked_org_nr. Reviewer-found bug: the linked_org_nr UPDATE in
+    //     add() matched on identifier_value alone, table-wide, so it fired
+    //     even when the name_normalized row's own INSERT OR IGNORE was a
+    //     no-op against a pre-existing row from an earlier, different add()
+    //     call — silently narrowing an existing conservative (no-org-nr)
+    //     block. Fresh name string ("Solvang Gård") so this doesn't collide
+    //     with cases (a)-(d) above.
+    blocklistAddDirect({ name: "Solvang Gård", reason: "name-only block, no org.nr known" });
+    const solvangBeforeUnrelatedAdd = isBlocked({ name: "Solvang Gård", orgNr: "999999999" });
+    assertEq(solvangBeforeUnrelatedAdd.blocked, true, "linked_org_nr regression: name-only block with no org.nr -> conservative default, blocked");
+
+    // Second, unrelated add() call: same name string, but a DIFFERENT
+    // org.nr, from what should be treated as an unrelated event (e.g. a
+    // different company's own opt-out that happens to share the exact name
+    // string). Because the name_normalized row already exists, this is a
+    // no-op INSERT OR IGNORE for that row.
+    blocklistAddDirect({ name: "Solvang Gård", orgNr: "222222222", reason: "unrelated later call, same name string" });
+    const solvangAfterUnrelatedAdd = isBlocked({ name: "Solvang Gård", orgNr: "999999999" });
+    assertEq(solvangAfterUnrelatedAdd.blocked, true, "linked_org_nr regression: unrelated later add() with a different org.nr must NOT weaken the pre-existing name-only block");
   } catch (err) {
     failed++;
     failures.push(`admin-blocklist-manual-entry: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);

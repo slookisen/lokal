@@ -269,18 +269,39 @@ export function add(input: {
   // actually about — see isBlocked()'s disambiguation and the
   // linked_org_nr column comment in database/init.ts. Every other row
   // type is untouched (column stays NULL).
+  // Bugfix (reviewer finding, 2026-09-05): this UPDATE matches on
+  // identifier_value alone, table-wide — NOT "the row this call just
+  // inserted". agent_blocklist has UNIQUE(identifier_type, identifier_value),
+  // so a later, unrelated add() call that happens to reuse an EXISTING
+  // name_normalized row's exact string is a no-op INSERT OR IGNORE for that
+  // row — but this UPDATE would otherwise still fire unconditionally,
+  // overwriting the PRE-EXISTING row's linked_org_nr with the new call's
+  // org.nr and silently narrowing what may have been a deliberate,
+  // conservative (no-org-nr) block. Gated below on
+  // nameNormalizedInsertedThisCall so it only ever touches a row THIS call
+  // actually newly inserted.
   const normalizedOrgNrForLink = input.orgNr ? normalizeOrgNr(input.orgNr) : "";
   const linkStmt = db.prepare(
     `UPDATE agent_blocklist SET linked_org_nr = ? WHERE identifier_type = 'name_normalized' AND identifier_value = ?`
   );
 
   let inserted = 0;
+  // Tracks whether THIS call's own name_normalized row insert actually
+  // changed a row (i.e. it was newly inserted now, not an INSERT OR IGNORE
+  // no-op against a pre-existing row from an earlier, different add() call).
+  // Guards the linkStmt.run() below so a later, unrelated add() call that
+  // happens to reuse an existing name string can never overwrite that
+  // pre-existing row's linked_org_nr — see the bugfix note above linkStmt.
+  let nameNormalizedInsertedThisCall = false;
   const tx = db.transaction(() => {
     for (const r of rowsToInsert) {
       const res = stmt.run(r.type, r.value, reason, input.sourceEmail || null, input.agentId || null, auditName, now);
-      if (res.changes > 0) inserted++;
+      if (res.changes > 0) {
+        inserted++;
+        if (r.type === "name_normalized") nameNormalizedInsertedThisCall = true;
+      }
     }
-    if (nameNormalizedValue && normalizedOrgNrForLink) {
+    if (nameNormalizedValue && normalizedOrgNrForLink && nameNormalizedInsertedThisCall) {
       linkStmt.run(normalizedOrgNrForLink, nameNormalizedValue);
     }
   });
