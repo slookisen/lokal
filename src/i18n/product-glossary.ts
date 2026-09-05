@@ -270,3 +270,117 @@ export function translateDeliveryTerm(value: string, lang: Lang): string {
   const t = pick(DELIVERY_TERMS[value.trim().toLowerCase()], lang);
   return t === null ? value : recase(value.trim(), t);
 }
+
+// ─── Reverse lookup: English query word → Norwegian search terms ───────────
+// OpenAI's app reviewers test in English; the catalogue, the producers' own
+// product text and `parseNaturalQuery`'s category keywords are Norwegian.
+// Measured live 2026-09-05: `ost Bergen` finds Ostegården (world's best
+// cheese 2018), Colonialen and Møllendal — `producers near Bergen that sell
+// cheese` finds NONE of them, because "cheese" is in no keyword list, so the
+// category filter is skipped entirely and the search degrades to "the ten
+// nearest producers, whatever they sell". Same for milk, salmon, seafood,
+// potatoes, strawberries, apples, butter … That is what the ChatGPT app
+// submission was rejected on (2026-09-05, «one or more of your test cases did
+// not produce correct results»).
+//
+// The vocabulary already exists in this file — it is what renders the English
+// producer pages. This index just reads it backwards, so one glossary keeps
+// serving both, and a word added for rendering improves search for free.
+//
+// Deliberately NOT a second hand-maintained keyword list in
+// marketplace-registry.ts: that is exactly how the two drifted apart.
+
+/** English words that are also Norwegian food words — never auto-mapped. */
+const AMBIGUOUS_EN = new Set([
+  // "is" = ice cream in Norwegian, the verb in English; "and" = duck in
+  // Norwegian, the conjunction in English (see MEAT_KEYWORD_FALSE_FRIENDS in
+  // marketplace-registry.ts); "most" = juice; "te" = tea; "biff"/"burger"/
+  // "bacon"/"chutney"/"squash"/"chili"/"skyr"/"kefir"/"quinoa"/"catering"
+  // are identical in both and need no mapping.
+  "is", "and", "most", "te", "of", "in", "with", "from", "a", "an",
+]);
+
+/** Conservative English morphology: the forms a reviewer actually types. */
+function englishVariants(term: string): string[] {
+  const t = term.toLowerCase().trim();
+  if (!t) return [];
+  const out = new Set<string>([t]);
+  if (t.endsWith("ies")) out.add(t.slice(0, -3) + "y");       // berries → berry
+  else if (t.endsWith("es")) out.add(t.slice(0, -2));          // potatoes → potato
+  if (t.endsWith("s") && t.length > 3) out.add(t.slice(0, -1)); // apples → apple
+  else out.add(t + "s");                                       // apple → apples
+  return [...out].filter(w => w.length >= 3 && !AMBIGUOUS_EN.has(w));
+}
+
+let reverseIndex: Map<string, string[]> | null = null;
+
+/** english term → the Norwegian words that mean it (built once, lazily). */
+function getReverseIndex(): Map<string, string[]> {
+  if (reverseIndex) return reverseIndex;
+  const idx = new Map<string, string[]>();
+  const add = (en: string, no: string) => {
+    for (const v of englishVariants(en)) {
+      const cur = idx.get(v);
+      if (!cur) idx.set(v, [no]);
+      else if (!cur.includes(no)) cur.push(no);
+    }
+  };
+  for (const [no, entry] of Object.entries(PRODUCT_WORDS)) {
+    if (AMBIGUOUS_EN.has(no.toLowerCase())) continue; // "and" (duck), "is" (ice cream)
+    add(entry.en, no);
+  }
+  for (const [no, entry] of Object.entries(PRODUCT_PHRASES)) add(entry.en, no);
+  reverseIndex = idx;
+  return idx;
+}
+
+/**
+ * Norwegian search terms for the English food words in `query`.
+ *
+ * Returns [] for a Norwegian query (nothing matches) and for a query with no
+ * food words, so the caller can append the result unconditionally. Multi-word
+ * English phrases ("goat cheese", "baked goods") are matched before single
+ * words, and single words are matched on a word boundary so "cheese" does not
+ * fire inside "cheesecake-free".
+ */
+export function norwegianTermsForEnglishQuery(query: string): string[] {
+  const q = (query || "").toLowerCase();
+  if (!q.trim()) return [];
+  const idx = getReverseIndex();
+  const found = new Set<string>();
+
+  // Phrases first — "goat cheese" must map to geitost, not just ost.
+  for (const [en, nos] of idx) {
+    if (!en.includes(" ")) continue;
+    if (q.includes(en)) nos.forEach(n => found.add(n));
+  }
+  for (const word of q.split(/[^a-z0-9'-]+/)) {
+    const nos = idx.get(word);
+    if (nos) nos.forEach(n => found.add(n));
+  }
+  return [...found];
+}
+
+/**
+ * True when `word` is an English food word this glossary knows.
+ *
+ * The producer-NAME branch in marketplace-registry.ts skips category words so
+ * they cannot become name tokens, but it only knew Norwegian ones — so
+ * "goat cheese farm" still built the name query "goat cheese" and fuzzy-
+ * matched producer names instead of filtering on dairy.
+ */
+export function isEnglishFoodWord(word: string): boolean {
+  const w = (word || "").toLowerCase().trim();
+  if (!w) return false;
+  const idx = getReverseIndex();
+  if (idx.has(w)) return true;
+  // A modifier that only ever appears inside a known phrase ("goat" in "goat
+  // cheese") is a food word too — otherwise it survives alone as a name token.
+  for (const en of idx.keys()) if (en.includes(" ") && en.split(" ").includes(w)) return true;
+  return false;
+}
+
+/** Test/report helper: how many distinct English words the index covers. */
+export function reverseGlossarySize(): number {
+  return getReverseIndex().size;
+}

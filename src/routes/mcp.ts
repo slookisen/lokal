@@ -1094,7 +1094,15 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
   // Product summary: top products with "get details" hint
   if (productSummary) {
     lines.push(`   ${productSummary}`);
-    lines.push(`   _Bruk lokal_info med agentId "${agent.id}" for full prisliste_`);
+    // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: this line used
+    // to promise "full prisliste". lokal_info's own tool description was
+    // corrected in 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet
+    // ("most producers do not list exact prices"), but this runtime string was
+    // missed — so the search output still told the model a price list was one
+    // call away, the model told the user, and lokal_info returned product
+    // names. Measured 2026-08-24: 6 of 224 producers (3 %) carried any price
+    // marker at all. Say what the next call actually returns.
+    lines.push(`   _Bruk lokal_info med agentId "${agent.id}" for kontaktinfo, åpningstider og hele produktlista (pris kun der produsenten har oppgitt den)_`);
   }
 
   // Profile link
