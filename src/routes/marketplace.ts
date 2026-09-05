@@ -2815,7 +2815,57 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
               } catch { /* tolerate junk */ }
             }
-            const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
+            let mergedProv = mergeFieldProvenance(existingProv, incomingProv);
+
+            // ── Bug fix (dev-request 2026-09-05-google-rating-batch-
+            // provenance-write-mismatch): a GENUINE column fill (writeAddr /
+            // writePhone true — the column really was empty and really did
+            // just get written) must always land at least one fresh
+            // field_provenance entry for that field. Without this, an
+            // external write-site that blanks the column but leaves
+            // field_provenance untouched (e.g. admin-contact-write-guard-
+            // retro-sweep.ts's applyPhoneBlank, which sets phone = NULL and
+            // never touches field_provenance) leaves a STALE {source_type,
+            // value} record on file. Since BRREG/Google answers are stable
+            // for a given business, a later re-fill of the now-empty column
+            // often reproduces that exact same value — and
+            // mergeFieldProvenance's exact-match dedupKey (source_type +
+            // trimmed value, no timestamp; admin-knowledge.ts), which is
+            // CORRECT and must stay unchanged for its other callers and for
+            // this route's own already-populated-column no-op case (see the
+            // provenanceChanged comment below / AC-b regression test),
+            // treats that reproduced value as "already known" and silently
+            // adds nothing — so addressWritten/phoneWritten correctly report
+            // true (the column write is real) while pool-blocker-explain's
+            // source count for that field never moves, defeating PR-82's
+            // entire purpose. A column that was EMPTY going into this call
+            // cannot have been "already corroborated" by anything currently
+            // live — whatever produced a matching stale record predates
+            // this fill — so this call's own source must be forced in,
+            // regardless of an identical-looking prior entry. Only fires
+            // on a genuine fill (writeAddr/writePhone true); the no-op /
+            // already-populated-column path below is completely unaffected.
+            if (writeAddr && gAddrRaw) {
+              const addrArr = mergedProv.address ?? [];
+              const gotFreshEntry = addrArr.some((r) => r.fetched_at === nowIso && r.source_type === gAddrSource);
+              if (!gotFreshEntry) {
+                mergedProv = {
+                  ...mergedProv,
+                  address: [...addrArr, { source_type: gAddrSource, value: gAddrRaw, fetched_at: nowIso }],
+                };
+              }
+            }
+            if (writePhone && gPhone) {
+              const phoneArr = mergedProv.phone ?? [];
+              const gotFreshEntry = phoneArr.some((r) => r.fetched_at === nowIso && r.source_type === "google_places");
+              if (!gotFreshEntry) {
+                mergedProv = {
+                  ...mergedProv,
+                  phone: [...phoneArr, { source_type: "google_places", value: gPhone, fetched_at: nowIso }],
+                };
+              }
+            }
+
             const provJson = JSON.stringify(mergedProv);
 
             // Review finding (2nd round, orch-pr-20260901-1): don't stamp
