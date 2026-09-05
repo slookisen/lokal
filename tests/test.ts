@@ -34681,6 +34681,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-store public catalog-class filter: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records:
+  //    hydrateAgent() now includes updated_at (read-only, server-stamped) ──
+  console.log("\n── dev-request 2026-09-05-dental-stage-v-sample-selector-same-3-records: updated_at hydration (dental-store) ──");
+  try {
+    const { runDentalStoreUpdatedAtHydrationTests } = require("../src/services/dental-store.test") as
+      typeof import("../src/services/dental-store.test");
+    const dsua = runDentalStoreUpdatedAtHydrationTests({ log: false });
+    passed += dsua.passed;
+    failed += dsua.failed;
+    for (const f of dsua.failures) failures.push("dental-store updated_at hydration: " + f);
+    console.log(`  dental-store updated_at hydration: ${dsua.passed} passed, ${dsua.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store updated_at hydration: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
