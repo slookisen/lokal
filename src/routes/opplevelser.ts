@@ -13269,6 +13269,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
+import { recordRun } from "../services/run-ledger";
 import {
   indexRfbByDomain,
   indexRfbByName,
@@ -16612,55 +16613,21 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
   }
   const template: GardssalgOutreachTemplate = (templateRaw as GardssalgOutreachTemplate | undefined) ?? "standard";
 
-  type PilotResultRow = {
-    provider_id: string;
-    status: "sent" | "would_send" | "skipped" | "error";
-    reason?: string;
-    preflight_reason?: string;
-    last_sent_at?: string;
-    suppressed_by?: string;
-    cross_platform?: boolean;
-    // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
-    // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
-    // RFB send to the same address is surfaced through these informational
-    // fields instead (see the eligibility function's own doc comment).
-    cross_platform_recent?: true;
-    cross_platform_last_sent_at?: string;
-    cross_platform_by?: string;
-    // dev-request 2026-08-09-outreach-send-uten-crm-spor: present only on a
-    // real (non-test) `sent` row — true when the send was filed in the CRM,
-    // false when the mail went out but the CRM write failed. Absent on test
-    // sends, which are deliberately not filed.
-    crm_recorded?: boolean;
-  };
-
   const expDb = getExpDb("experiences");
-  const results: PilotResultRow[] = [];
+  const results: GardssalgOutreachSendResultRow[] = [];
 
   try {
-    // Single eligibility pass, reused per-provider below — computes preflight
-    // GO/NO-GO (which itself folds in the Skive-1 size gate), no_email,
-    // blocklist, own-table cooldown, and cross-platform cooldown, in that
-    // order. Extracted to computeGardssalgOutreachSendEligibility just above
-    // so GET /admin/gardssalg-outreach-daily-prep (further below) can run the
-    // exact same dry-run check — single source of truth, never a
-    // second/forked copy.
+    // Single eligibility pass — the same computeGardssalgOutreachSendEligibility
+    // GET /admin/gardssalg-outreach-daily-prep runs, so preflight (incl. the
+    // size gate), no_email, blocklist, own-table cooldown and cross-platform
+    // cooldown are enforced on the actual send path, never a forked copy.
     const eligibility = computeGardssalgOutreachSendEligibility(expDb, providerIds);
 
     for (const elig of eligibility) {
       if (!elig.eligible) {
-        // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
-        // stoerrelsesgate), krav 4: the size gate is "enforced on the actual
-        // send path itself, not just in the readiness/preflight report" — it
-        // is, via computeGardssalgOutreachSendEligibility's own preflight
-        // call (single source of truth, never a forked GO/NO-GO copy), so
-        // this branch already blocks a "stor"-flagged id even against a
-        // caller who skips the separate preflight call and goes straight
-        // here with apply:true. `reason`/`preflight_reason`/`last_sent_at`/
-        // `suppressed_by`/`cross_platform` are copied through as-is —
-        // JSON.stringify drops the ones left undefined, so an id skipped for
-        // e.g. `no_email` still serializes with no stray `last_sent_at` key,
-        // identical to the previous inline behavior.
+        // NO-GO / skipped: no send attempt. `reason`/`preflight_reason`/
+        // `last_sent_at`/`suppressed_by`/`cross_platform` are copied through
+        // as-is — JSON.stringify drops the ones left undefined.
         results.push({
           provider_id: elig.provider_id,
           status: elig.status,
@@ -16670,13 +16637,11 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
           suppressed_by: elig.suppressed_by,
           cross_platform: elig.cross_platform,
         });
-        continue; // NO-GO / skipped: no send attempt.
+        continue;
       }
 
-      // ── Eligible ──────────────────────────────────────────────────────
-      // Grep 7: carry the informational cross-platform fields through on the
-      // dry-run row (JSON.stringify drops them when absent, same convention
-      // as the skip branch above).
+      // Eligible. Dry run carries the informational cross-platform fields
+      // through (JSON.stringify drops them when absent, same convention).
       if (!apply) {
         results.push({
           provider_id: elig.provider_id,
@@ -16688,126 +16653,166 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         continue;
       }
 
-      const providerId = elig.provider_id;
-      const email = elig.epost;
-      const providerName = elig.navn || providerId;
-      const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${elig.slug ?? ""}`;
-      // One timestamp per provider, captured BEFORE the send so the CRM row's
-      // sentAt and its fallback messageId are derived from the same instant.
-      const sentAtIso = new Date().toISOString();
-
-      try {
-        const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
-          isTestSend: isTest,
+      results.push(
+        await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
           template,
-        });
-        if (!sendResult.success) {
-          results.push({ provider_id: providerId, status: "error", reason: sendResult.error || "send_failed" });
-          continue;
-        }
-        expDb
-          .prepare(
-            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, is_test)
-             VALUES (?, ?, 'email', ?, ?)`,
-          )
-          .run(providerId, email, sendResult.messageId ?? null, isTest ? 1 : 0);
-
-        // ── File the send in the CRM (dev-request
-        // 2026-08-09-outreach-send-uten-crm-spor) ────────────────────────
-        //
-        // Pilot 1 (2026-08-08) went out to four real producers and left NO
-        // trace in the CRM: this route's only write was the sent-log row
-        // above, so the dashboard showed zero producer contacts for the
-        // experiences platform while four producers had in fact been
-        // emailed. The RFB marketing lane has always ingested its sends;
-        // this lane simply never got that step.
-        //
-        // Why it matters beyond bookkeeping: when the producer replies, the
-        // reply arrives at kontakt@opplevagent.no and is ingested as an
-        // INBOUND message. Without an outbound thread already on file, that
-        // reply lands as a context-free new enquiry — whoever answers cannot
-        // see what we said to them. Filing the send under a stable
-        // per-producer threadId is what lets the reply thread onto it.
-        //
-        // Deliberately NOT fatal: the email has already left the building by
-        // the time we get here. A CRM hiccup must never turn a delivered
-        // send into a reported error, or the caller would retry and mail the
-        // producer twice. The outcome is reported per row as
-        // `crm_recorded` instead.
-        //
-        // Test sends are skipped on purpose: is_test mail is redirected to
-        // the operator by the send guard, so filing it as a producer thread
-        // would put a conversation in the CRM that the producer never saw.
-        // The sent-log row above already records it, flagged is_test=1.
-        let crmRecorded: boolean | undefined;
-        if (!isTest) {
-          try {
-            const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
-            crmService.ingestThread(
-              {
-                threadId: `opplevagent-outreach-${providerId}`,
-                subject: rendered.subject,
-                category: "marketing",
-                messages: [
-                  {
-                    // Resend's own id when we have it. The fallback is
-                    // deterministic per (provider, send) so a retry of the
-                    // SAME send cannot create a duplicate message row.
-                    messageId: sendResult.messageId ?? `outreach-${providerId}-${sentAtIso}`,
-                    direction: "out",
-                    fromEmail: CRM_SENDER_ADDRESS,
-                    toEmails: [email],
-                    subject: rendered.subject,
-                    bodyText: rendered.text,
-                    bodyHtml: rendered.html,
-                    sentAt: sentAtIso,
-                    rawMetadata: {
-                      source: "gardssalg-outreach-pilot-send",
-                      provider_id: providerId,
-                      reply_to: GARDSSALG_OUTREACH_REPLY_TO,
-                      // A/B arm, directly queryable — the subject formula
-                      // carries the same signal for human eyes.
-                      template,
-                    },
-                  },
-                ],
-              },
-              email,
-              "experiences",
-            );
-            crmRecorded = true;
-          } catch (crmErr) {
-            crmRecorded = false;
-            console.error(
-              "[gardssalg-outreach-pilot-send] CRM ingest failed after a SUCCESSFUL send",
-              { providerId, email, error: crmErr instanceof Error ? crmErr.message : String(crmErr) },
-            );
-          }
-        }
-        results.push({ provider_id: providerId, status: "sent", ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }) });
-      } catch (err) {
-        results.push({
-          provider_id: providerId,
-          status: "error",
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
+          isTest,
+          source: "gardssalg-outreach-pilot-send",
+        }),
+      );
     }
 
-    const summary = { sent: 0, would_send: 0, skipped: 0, error: 0, total: results.length };
-    for (const r of results) {
-      if (r.status === "sent") summary.sent++;
-      else if (r.status === "would_send") summary.would_send++;
-      else if (r.status === "skipped") summary.skipped++;
-      else if (r.status === "error") summary.error++;
-    }
-
+    const summary = summariseGardssalgOutreachSendResults(results);
     res.json({ dry_run: !apply, results, summary });
   } catch (err) {
     console.error("[gardssalg-outreach-pilot-send] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
+
+// dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien (Daniel, option
+// A, GO 2026-09-05): the per-provider send is extracted out of the route below
+// so the platform-side daily job (runGardssalgOutreachDaily, further down) and
+// this route share ONE send path — same email-service call, same
+// experience_outreach_sent_log row, same CRM filing. The route's own request
+// validation, dry-run semantics and response shape are unchanged.
+export type GardssalgOutreachSendResultRow = {
+  provider_id: string;
+  status: "sent" | "would_send" | "skipped" | "error";
+  reason?: string;
+  preflight_reason?: string;
+  last_sent_at?: string;
+  suppressed_by?: string;
+  cross_platform?: boolean;
+  // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
+  // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
+  // RFB send to the same address is surfaced through these informational
+  // fields instead (see the eligibility function's own doc comment).
+  cross_platform_recent?: true;
+  cross_platform_last_sent_at?: string;
+  cross_platform_by?: string;
+  // dev-request 2026-08-09-outreach-send-uten-crm-spor: present only on a
+  // real (non-test) `sent` row — true when the send was filed in the CRM,
+  // false when the mail went out but the CRM write failed. Absent on test
+  // sends, which are deliberately not filed.
+  crm_recorded?: boolean;
+};
+
+export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility, { eligible: true }>;
+
+/**
+ * Send ONE outreach email to an already-eligible provider and record it:
+ * (1) emailService.sendGardssalgOutreach (the send guard / test redirect
+ * lives inside it, unchanged), (2) one experience_outreach_sent_log row (the
+ * lane's own cooldown source), (3) the CRM outbound thread (real sends only —
+ * dev-request 2026-08-09-outreach-send-uten-crm-spor). Never throws for a
+ * per-provider failure: the row's `status` carries the outcome, so a caller
+ * looping over several providers cannot lose the rows already sent.
+ */
+export async function sendGardssalgOutreachToEligibleProvider(
+  expDb: ReturnType<typeof getExpDb>,
+  elig: GardssalgOutreachEligibleRow,
+  opts: { template: GardssalgOutreachTemplate; isTest: boolean; source: string },
+): Promise<GardssalgOutreachSendResultRow> {
+  const { template, isTest } = opts;
+  const providerId = elig.provider_id;
+  const email = elig.epost;
+  const providerName = elig.navn || providerId;
+  const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${elig.slug ?? ""}`;
+  // One timestamp per provider, captured BEFORE the send so the CRM row's
+  // sentAt and its fallback messageId are derived from the same instant.
+  const sentAtIso = new Date().toISOString();
+
+  try {
+    const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
+      isTestSend: isTest,
+      template,
+    });
+    if (!sendResult.success) {
+      return { provider_id: providerId, status: "error", reason: sendResult.error || "send_failed" };
+    }
+    expDb
+      .prepare(
+        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, is_test)
+         VALUES (?, ?, 'email', ?, ?)`,
+      )
+      .run(providerId, email, sendResult.messageId ?? null, isTest ? 1 : 0);
+
+    // File the send in the CRM. Deliberately NOT fatal: the email has already
+    // left the building — a CRM hiccup must never turn a delivered send into a
+    // reported error, or the caller would retry and mail the producer twice.
+    // Test sends are skipped on purpose (redirected to the operator by the
+    // send guard, so a producer thread would describe mail they never saw).
+    let crmRecorded: boolean | undefined;
+    if (!isTest) {
+      try {
+        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
+        crmService.ingestThread(
+          {
+            threadId: `opplevagent-outreach-${providerId}`,
+            subject: rendered.subject,
+            category: "marketing",
+            messages: [
+              {
+                // Resend's own id when we have it. The fallback is
+                // deterministic per (provider, send) so a retry of the
+                // SAME send cannot create a duplicate message row.
+                messageId: sendResult.messageId ?? `outreach-${providerId}-${sentAtIso}`,
+                direction: "out",
+                fromEmail: CRM_SENDER_ADDRESS,
+                toEmails: [email],
+                subject: rendered.subject,
+                bodyText: rendered.text,
+                bodyHtml: rendered.html,
+                sentAt: sentAtIso,
+                rawMetadata: {
+                  source: opts.source,
+                  provider_id: providerId,
+                  reply_to: GARDSSALG_OUTREACH_REPLY_TO,
+                  template,
+                },
+              },
+            ],
+          },
+          email,
+          "experiences",
+        );
+        crmRecorded = true;
+      } catch (crmErr) {
+        crmRecorded = false;
+        console.error(`[${opts.source}] CRM ingest failed after a SUCCESSFUL send`, {
+          providerId,
+          email,
+          error: crmErr instanceof Error ? crmErr.message : String(crmErr),
+        });
+      }
+    }
+    return { provider_id: providerId, status: "sent", ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }) };
+  } catch (err) {
+    return {
+      provider_id: providerId,
+      status: "error",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export function summariseGardssalgOutreachSendResults(results: GardssalgOutreachSendResultRow[]): {
+  sent: number;
+  would_send: number;
+  skipped: number;
+  error: number;
+  total: number;
+} {
+  const summary = { sent: 0, would_send: 0, skipped: 0, error: 0, total: results.length };
+  for (const r of results) {
+    if (r.status === "sent") summary.sent++;
+    else if (r.status === "would_send") summary.would_send++;
+    else if (r.status === "skipped") summary.skipped++;
+    else if (r.status === "error") summary.error++;
+  }
+  return summary;
+}
 
 // ─── GET /api/opplevelser/admin/gardssalg-outreach-daily-prep ─────────────
 //
@@ -17074,8 +17079,20 @@ export function computeGardssalgAddressBasis(
   return "unverified";
 }
 
-router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request, res: Response) => {
-  const expDb = getExpDb("experiences");
+// dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien (option A):
+// the daily-prep computation is extracted out of the GET route so the
+// platform-side daily send (runGardssalgOutreachDaily, further down) uses the
+// EXACT list the route shows — one selection, never a forked copy. `response`
+// is the route's JSON body unchanged; `selected` is the same list as
+// `response.candidates`, but as the eligibility rows the send helper takes.
+export class GardssalgOutreachDailyPrepError extends Error {
+  constructor(public readonly stage: "providers" | "eligibility", public readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "GardssalgOutreachDailyPrepError";
+  }
+}
+
+export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getExpDb>) {
   // Resolved exactly once per request, before the pool-exhausted early
   // return below (which also reports it) so no two places in one response
   // can disagree about which cap was in effect.
@@ -17085,9 +17102,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   try {
     rows = computeGardssalgReadinessRows(expDb);
   } catch (err) {
-    console.error("[gardssalg-outreach-daily-prep] failed to query providers:", err);
-    res.status(500).json({ error: "Failed to query experience_providers" });
-    return;
+    throw new GardssalgOutreachDailyPrepError("providers", err);
   }
 
   const generatedAt = new Date().toISOString();
@@ -17110,7 +17125,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     // explicitly, offer the cheap refill hint (needs_enrichment count), omit
     // the quarantine hint gracefully (computing it requires running the
     // dry-run eligibility check below, which needs at least one id to check).
-    res.json({
+    const response = {
       generated_at: generatedAt,
       candidates: [],
       excluded: [],
@@ -17120,8 +17135,8 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       note: "No outreach_ready candidates exist right now — the pool is exhausted.",
       refill_hints: { needs_enrichment_count: needsEnrichmentCount },
       active_contact_email_overrides: activeContactEmailOverrides,
-    });
-    return;
+    };
+    return { response, selected: [] as GardssalgOutreachEligibleRow[] };
   }
 
   const readyIds = readyRows.map((r) => r.id);
@@ -17142,9 +17157,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     // (see that block's own comment).
     eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true });
   } catch (err) {
-    console.error("[gardssalg-outreach-daily-prep] failed to compute eligibility:", err);
-    res.status(500).json({ error: "Internal error" });
-    return;
+    throw new GardssalgOutreachDailyPrepError("eligibility", err);
   }
 
   const eligible = eligibility.filter(
@@ -17391,7 +17404,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     };
   }
 
-  res.json({
+  const response = {
     generated_at: generatedAt,
     candidates,
     excluded,
@@ -17407,7 +17420,25 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     note,
     ...(refillHints ? { refill_hints: refillHints } : {}),
     active_contact_email_overrides: activeContactEmailOverrides,
-  });
+  };
+  return { response, selected };
+}
+
+router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request, res: Response) => {
+  let prep: ReturnType<typeof computeGardssalgOutreachDailyPrep>;
+  try {
+    prep = computeGardssalgOutreachDailyPrep(getExpDb("experiences"));
+  } catch (err) {
+    if (err instanceof GardssalgOutreachDailyPrepError && err.stage === "providers") {
+      console.error("[gardssalg-outreach-daily-prep] failed to query providers:", err.cause);
+      res.status(500).json({ error: "Failed to query experience_providers" });
+      return;
+    }
+    console.error("[gardssalg-outreach-daily-prep] failed to compute eligibility:", err instanceof GardssalgOutreachDailyPrepError ? err.cause : err);
+    res.status(500).json({ error: "Internal error" });
+    return;
+  }
+  res.json(prep.response);
 });
 
 // ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
@@ -17485,6 +17516,410 @@ router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, 
     res.json({ success: true, dry_run: false, config });
   } catch (err) {
     console.error("[gardssalg-outreach-size-gate] write failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── Platform-side daily send for the gårdssalg/drikke outreach lane ────────
+//
+// dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien, option A
+// (Daniel, GO 2026-09-05 «Go og send»): the Cloud Routine that used to press
+// the send button had a language model — and its permission classifier — in
+// the send path; four of five daily runs (2026-09-01..05) sent nothing for
+// that reason alone. Everything that DECIDES what goes out already lives
+// server-side (readiness, preflight/size gate, blocklist, cooldown, address
+// basis, dedupe, daily cap, template, CRM filing). This block makes the
+// server press the button too, once a day, with four absolute stop-guards
+// checked in code before the first email:
+//
+//   1. GARDSSALG_OUTREACH_DAILY_DISABLED=1 (env)          → nothing runs at all
+//   2. lane paused (experience_outreach_lane_state)      → skip
+//      Anyone with the admin key may set paused:true (routines included, e.g.
+//      on a bounce); clearing it is Daniel's call — same rule as the old
+//      controller/opplevagent-outreach-pause.yaml, now one endpoint instead
+//      of a file.
+//   3. hard bounce / spam complaint on a recipient contacted in the last
+//      48h                                                → auto-pause + skip
+//   4. today's real sends already reach daily_cap        → skip
+//      (the DB is the memory here, so a restart or a second tick inside the
+//      window can never double-send; a manual send earlier the same day
+//      simply shrinks the budget)
+//
+// Selection is computeGardssalgOutreachDailyPrep (the exact list the
+// daily-prep route shows), the send is sendGardssalgOutreachToEligibleProvider
+// (the exact code the pilot-send route runs), and every run — skipped or not
+// — posts a run envelope under agent "opplevagent-outreach-platform" so the
+// verifier and the report routine see it. The routine itself is now
+// report-only (A2A charter).
+
+export interface GardssalgOutreachLaneState {
+  paused: boolean;
+  changed_at: string | null;
+  changed_by: string | null;
+  reason: string | null;
+}
+
+export function getGardssalgOutreachLaneState(expDb: ReturnType<typeof getExpDb>): GardssalgOutreachLaneState {
+  const row = expDb
+    .prepare(`SELECT paused, changed_at, changed_by, reason FROM experience_outreach_lane_state WHERE id = 1`)
+    .get() as { paused: number; changed_at: string | null; changed_by: string | null; reason: string | null } | undefined;
+  if (!row) return { paused: false, changed_at: null, changed_by: null, reason: null };
+  return { paused: row.paused === 1, changed_at: row.changed_at, changed_by: row.changed_by, reason: row.reason };
+}
+
+export function setGardssalgOutreachLanePaused(
+  expDb: ReturnType<typeof getExpDb>,
+  opts: { paused: boolean; by: string; reason: string | null },
+): GardssalgOutreachLaneState {
+  expDb
+    .prepare(
+      `INSERT INTO experience_outreach_lane_state (id, paused, changed_at, changed_by, reason)
+       VALUES (1, @paused, @changed_at, @changed_by, @reason)
+       ON CONFLICT(id) DO UPDATE SET
+         paused = excluded.paused,
+         changed_at = excluded.changed_at,
+         changed_by = excluded.changed_by,
+         reason = excluded.reason`,
+    )
+    .run({
+      paused: opts.paused ? 1 : 0,
+      changed_at: new Date().toISOString(),
+      changed_by: opts.by,
+      reason: opts.reason,
+    });
+  return getGardssalgOutreachLaneState(expDb);
+}
+
+export const GARDSSALG_OUTREACH_DAILY_AGENT = "opplevagent-outreach-platform";
+export const GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC = 8;
+const GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS = 48;
+
+/** Pure scheduling guard, same shape as analytics-service's shouldRunAutoPrune. */
+export function shouldRunGardssalgOutreachDaily(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+  windowHourUtc?: number;
+  minHoursBetween?: number;
+}): boolean {
+  const windowHourUtc = opts.windowHourUtc ?? GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC;
+  const minHoursBetween = opts.minHoursBetween ?? 20;
+  if (opts.now.getUTCHours() !== windowHourUtc) return false;
+  if (opts.lastRunAt) {
+    const deltaMs = opts.now.getTime() - opts.lastRunAt.getTime();
+    if (deltaMs < minHoursBetween * 3600_000) return false;
+  }
+  return true;
+}
+
+/** Real (non-test) sends logged today (UTC) on this lane, whoever sent them. */
+export function countGardssalgOutreachSentToday(expDb: ReturnType<typeof getExpDb>, now: Date): number {
+  const day = now.toISOString().slice(0, 10);
+  const row = expDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM experience_outreach_sent_log
+        WHERE is_test = 0 AND substr(replace(sent_at, 'T', ' '), 1, 10) = ?`,
+    )
+    .get(day) as { n: number };
+  return row.n;
+}
+
+/**
+ * Hard bounces / complaints (RFB db email_bounces — the table the candidate
+ * gate already reads) on addresses this lane contacted in the last 48h. The
+ * gate never selects an address that is already bounced, so any hit here is
+ * a NEW bounce on a recent send — exactly the "stop and let a human look"
+ * case the routine's self-pause rule was written for.
+ */
+export function findGardssalgOutreachRecentBounces(
+  expDb: ReturnType<typeof getExpDb>,
+  rfbDb: ReturnType<typeof getRfbDb>,
+  now: Date,
+): Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }> {
+  const since = new Date(now.getTime() - GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS * 3600_000)
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
+  const recent = expDb
+    .prepare(
+      `SELECT DISTINCT recipient_email FROM experience_outreach_sent_log
+        WHERE is_test = 0 AND replace(substr(sent_at, 1, 19), 'T', ' ') >= ?`,
+    )
+    .all(since) as Array<{ recipient_email: string }>;
+  const hits: Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }> = [];
+  for (const r of recent) {
+    const b = rfbDb
+      .prepare(
+        `SELECT bounce_type, bounced_at FROM email_bounces
+          WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
+          ORDER BY bounced_at DESC LIMIT 1`,
+      )
+      .get(r.recipient_email) as { bounce_type: string | null; bounced_at: string } | undefined;
+    if (b) hits.push({ recipient_email: r.recipient_email, bounce_type: b.bounce_type, bounced_at: b.bounced_at });
+  }
+  return hits;
+}
+
+export type GardssalgOutreachDailyRunSkipReason =
+  | "disabled_by_env"
+  | "paused"
+  | "bounce_or_complaint_recent"
+  | "daily_cap_already_sent"
+  | "no_candidates";
+
+export interface GardssalgOutreachDailyRunReport {
+  run_id: string;
+  agent: string;
+  trigger: "cron" | "manual";
+  apply: boolean;
+  started_at: string;
+  finished_at: string;
+  skipped_reason: GardssalgOutreachDailyRunSkipReason | null;
+  daily_cap: number;
+  sent_today_before: number;
+  budget: number;
+  lane: GardssalgOutreachLaneState;
+  auto_paused: boolean;
+  recent_bounces: Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }>;
+  candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second" }>;
+  results: GardssalgOutreachSendResultRow[];
+  summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
+  envelope_recorded: boolean;
+}
+
+/**
+ * The daily send. `apply: false` is a full dry run (guards evaluated, list
+ * computed, nothing written, no envelope). `apply: true` sends up to
+ * (daily_cap − sent today) emails with the reviewed `personal` template and
+ * records a run envelope whatever the outcome. Throws only if the selection
+ * itself fails (a DB error) — per-provider send failures are rows, not
+ * exceptions, so an error on provider 3 never loses providers 1–2.
+ */
+export async function runGardssalgOutreachDaily(opts: {
+  apply: boolean;
+  trigger: "cron" | "manual";
+  now?: Date;
+}): Promise<GardssalgOutreachDailyRunReport> {
+  const now = opts.now ?? new Date();
+  const startedAt = now.toISOString();
+  const day = startedAt.slice(0, 10);
+  // One cron run per day shares the day's id (recordRun's ON CONFLICT DO NOTHING
+  // then makes a second tick in the same window a no-op on the ledger too);
+  // manual runs get a millisecond + random suffix so two admin calls in the
+  // same second cannot collapse into one ledger row.
+  const runId =
+    opts.trigger === "cron"
+      ? `run-${day}-${GARDSSALG_OUTREACH_DAILY_AGENT}`
+      : `run-${day}-${GARDSSALG_OUTREACH_DAILY_AGENT}-manual-${startedAt.slice(11, 23).replace(/[:.]/g, "")}-${Math.random().toString(16).slice(2, 6)}`;
+  const expDb = getExpDb("experiences");
+  const dailyCap = resolveDailyPrepMaxCandidates();
+  const empty = { sent: 0, would_send: 0, skipped: 0, error: 0, total: 0 };
+
+  const finish = (partial: {
+    skipped_reason: GardssalgOutreachDailyRunSkipReason | null;
+    sent_today_before: number;
+    budget: number;
+    auto_paused?: boolean;
+    recent_bounces?: GardssalgOutreachDailyRunReport["recent_bounces"];
+    candidates?: GardssalgOutreachDailyRunReport["candidates"];
+    results?: GardssalgOutreachSendResultRow[];
+  }): GardssalgOutreachDailyRunReport => {
+    const results = partial.results ?? [];
+    const report: GardssalgOutreachDailyRunReport = {
+      run_id: runId,
+      agent: GARDSSALG_OUTREACH_DAILY_AGENT,
+      trigger: opts.trigger,
+      apply: opts.apply,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      skipped_reason: partial.skipped_reason,
+      daily_cap: dailyCap,
+      sent_today_before: partial.sent_today_before,
+      budget: partial.budget,
+      lane: getGardssalgOutreachLaneState(expDb),
+      auto_paused: partial.auto_paused ?? false,
+      recent_bounces: partial.recent_bounces ?? [],
+      candidates: partial.candidates ?? [],
+      results,
+      summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
+      envelope_recorded: false,
+    };
+    // Envelope: real runs only (a dry run leaves no trace anywhere), and never
+    // when the env switch turned the job off entirely.
+    if (opts.apply && report.skipped_reason !== "disabled_by_env") {
+      // The day's cron id is reused only while it is free; a later real run the
+      // same day (a retry after a recorded skip) gets a time suffix instead of
+      // silently colliding with recordRun's ON CONFLICT DO NOTHING.
+      try {
+        const isTaken = getRfbDb().prepare(`SELECT 1 FROM runs WHERE run_id = ?`);
+        const base = report.run_id;
+        let n = 0;
+        while (isTaken.get(report.run_id)) {
+          n += 1;
+          report.run_id = `${base}-${report.finished_at.slice(11, 23).replace(/[:.]/g, "")}${n > 1 ? `-${n}` : ""}`;
+        }
+      } catch {
+        // ledger unavailable — recordRun below reports it
+      }
+      const sentIds = results.filter((r) => r.status === "sent").map((r) => r.provider_id);
+      const secondTouchSent = report.candidates.filter(
+        (c) => c.touch === "second" && sentIds.includes(c.provider_id),
+      ).length;
+      const firstTouchSent = sentIds.length - secondTouchSent;
+      const status = report.summary.error > 0 ? (report.summary.sent > 0 ? "partial" : "failed") : "completed";
+      const notes =
+        (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
+        `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
+        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
+        (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "");
+      try {
+        recordRun({
+          run_id: report.run_id,
+          vertical: "experiences",
+          agent: GARDSSALG_OUTREACH_DAILY_AGENT,
+          trigger_source: opts.trigger === "cron" ? "cron" : "manual",
+          started_at: startedAt,
+          finished_at: report.finished_at,
+          status,
+          claims: [
+            {
+              type: "emails_sent",
+              value: report.summary.sent,
+              meta: { lane: "gardssalg-outreach", table: "experience_outreach_sent_log", template: "personal", provider_ids: sentIds },
+            },
+            { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
+            { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
+          ],
+          evidence: [{ claim_idx: 0, ids: sentIds }],
+          notes,
+        });
+        report.envelope_recorded = true;
+      } catch (err) {
+        console.error("[gardssalg-outreach-daily] run envelope not recorded (non-fatal):", err);
+      }
+    }
+    console.log(
+      `[gardssalg-outreach-daily] run_id=${report.run_id} apply=${opts.apply} skipped=${report.skipped_reason ?? "-"} ` +
+        `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} cap=${dailyCap} ` +
+        `auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}`,
+    );
+    return report;
+  };
+
+  // Guard 1 — env switch.
+  if (process.env.GARDSSALG_OUTREACH_DAILY_DISABLED === "1") {
+    return finish({ skipped_reason: "disabled_by_env", sent_today_before: 0, budget: 0 });
+  }
+  // Guard 2 — lane paused.
+  if (getGardssalgOutreachLaneState(expDb).paused) {
+    return finish({ skipped_reason: "paused", sent_today_before: 0, budget: 0 });
+  }
+  // Guard 3 — fresh hard bounce / complaint → auto-pause.
+  const recentBounces = findGardssalgOutreachRecentBounces(expDb, getRfbDb(), now);
+  if (recentBounces.length > 0) {
+    if (opts.apply) {
+      setGardssalgOutreachLanePaused(expDb, {
+        paused: true,
+        by: GARDSSALG_OUTREACH_DAILY_AGENT,
+        reason:
+          `auto-pause: hard bounce/complaint on ${recentBounces.length} recipient(s) contacted in the last ` +
+          `${GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS}h (${recentBounces.map((b) => b.recipient_email).join(", ")}). ` +
+          `Clearing the pause is Daniel's call: POST /api/opplevelser/admin/gardssalg-outreach-lane {"paused": false}.`,
+      });
+    }
+    return finish({
+      skipped_reason: "bounce_or_complaint_recent",
+      sent_today_before: 0,
+      budget: 0,
+      auto_paused: opts.apply,
+      recent_bounces: recentBounces,
+    });
+  }
+  // Guard 4 — budget left today.
+  const sentToday = countGardssalgOutreachSentToday(expDb, now);
+  const budget = Math.max(0, dailyCap - sentToday);
+  if (budget === 0) {
+    return finish({ skipped_reason: "daily_cap_already_sent", sent_today_before: sentToday, budget });
+  }
+
+  const prep = computeGardssalgOutreachDailyPrep(expDb);
+  const selected = prep.selected.slice(0, budget);
+  if (selected.length === 0) {
+    return finish({ skipped_reason: "no_candidates", sent_today_before: sentToday, budget });
+  }
+  const hasPriorSend = expDb.prepare(
+    `SELECT 1 FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0 LIMIT 1`,
+  );
+  const candidates = selected.map((e) => ({
+    provider_id: e.provider_id,
+    name: e.navn ?? null,
+    recipient_email: e.epost,
+    touch: (hasPriorSend.get(e.provider_id) ? "second" : "first") as "first" | "second",
+  }));
+
+  const results: GardssalgOutreachSendResultRow[] = [];
+  for (const elig of selected) {
+    if (!opts.apply) {
+      results.push({ provider_id: elig.provider_id, status: "would_send" });
+      continue;
+    }
+    results.push(
+      await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
+        template: "personal",
+        isTest: false,
+        source: "gardssalg-outreach-daily-run",
+      }),
+    );
+  }
+  return finish({ skipped_reason: null, sent_today_before: sentToday, budget, candidates, results });
+}
+
+// ─── GET/POST /api/opplevelser/admin/gardssalg-outreach-lane (admin) ────────
+// The lane's single switch. GET reports state + the knobs the job runs with;
+// POST {paused: boolean, by?: string, reason?: string} flips it.
+router.get("/admin/gardssalg-outreach-lane", requireAdmin, (_req: Request, res: Response) => {
+  try {
+    res.json({
+      ...getGardssalgOutreachLaneState(getExpDb("experiences")),
+      daily_disabled_by_env: process.env.GARDSSALG_OUTREACH_DAILY_DISABLED === "1",
+      daily_cap: resolveDailyPrepMaxCandidates(),
+      window_hour_utc: GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC,
+      agent: GARDSSALG_OUTREACH_DAILY_AGENT,
+    });
+  } catch (err) {
+    console.error("[gardssalg-outreach-lane] GET failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+router.post("/admin/gardssalg-outreach-lane", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { paused?: unknown; by?: unknown; reason?: unknown };
+  if (typeof body.paused !== "boolean") {
+    res.status(400).json({ error: "paused must be a boolean" });
+    return;
+  }
+  const by = typeof body.by === "string" && body.by.trim() !== "" ? body.by.trim().slice(0, 120) : "admin-api";
+  const reason = typeof body.reason === "string" && body.reason.trim() !== "" ? body.reason.trim().slice(0, 500) : null;
+  try {
+    const state = setGardssalgOutreachLanePaused(getExpDb("experiences"), { paused: body.paused, by, reason });
+    console.log(`[gardssalg-outreach-lane] paused=${state.paused} by=${by}${reason ? ` reason=${reason}` : ""}`);
+    res.json(state);
+  } catch (err) {
+    console.error("[gardssalg-outreach-lane] POST failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-outreach-daily-run (admin) ───────
+// Runs the daily job on demand. `apply` absent/falsy = dry run (default);
+// `apply: true` sends for real, within today's remaining budget, and records
+// the run envelope — identical to what the 08:00Z tick does.
+router.post("/admin/gardssalg-outreach-daily-run", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  try {
+    const report = await runGardssalgOutreachDaily({ apply: body.apply === true, trigger: "manual" });
+    res.json(report);
+  } catch (err) {
+    console.error("[gardssalg-outreach-daily-run] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
