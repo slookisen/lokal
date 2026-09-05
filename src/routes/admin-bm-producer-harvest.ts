@@ -123,9 +123,9 @@ const HARD_CAP_SLUGS = 400;
 
 // ─── Apply-mode (slice 3) ───────────────────────────────────────────────────
 
-/** Deliberately far below HARD_CAP_SLUGS (400) — apply mode WRITES, dry-run only reads. */
+/** Default stays deliberately far below HARD_CAP_SLUGS (400) — apply mode WRITES, dry-run only reads. */
 const APPLY_DEFAULT_LIMIT = 20;
-const APPLY_MAX_LIMIT = 50;
+const APPLY_MAX_LIMIT = HARD_CAP_SLUGS; // was: 50 — see dev-request 2026-08-14-bm-fullhoest-katalogbred Slice 6: a monthly apply run must cover the whole catalog, not just the first 50 slugs (no offset/cursor exists)
 
 /**
  * Defense-in-depth: bm-producer-harvest.ts's own parser already excludes

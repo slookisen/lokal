@@ -15,8 +15,13 @@
  *
  * Slice 3 (apply mode), new in this file:
  *   AC7  — dry_run=false no longer 501s; it fetches+matches+writes for real.
- *   AC8  — apply-mode limit defaults to 20, hard-caps at 50 (independent of
- *          the dry-run branch's 400 cap, untouched by this slice).
+ *   AC8  — apply-mode limit defaults to 20, hard-caps at APPLY_MAX_LIMIT.
+ *          Slice 6 (dev-request 2026-08-14-bm-fullhoest-katalogbred) raised
+ *          APPLY_MAX_LIMIT to reuse HARD_CAP_SLUGS (400) instead of a
+ *          separate lower literal (50), so a monthly apply run can progress
+ *          past the first 50 producers — proven at scale below (a limit
+ *          above the old 50-cap now actually scans more than 50, and an
+ *          unreasonably large limit still clamps at 400, not unbounded).
  *   AC9  — every outcome: written, skipped_claimed, skipped_curated,
  *          skipped_unchanged, rejected_invalid_email, rejected_platform_domain,
  *          skipped_bm_domain (both the bmDomainEmailExcluded-flag path and the
@@ -738,13 +743,85 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           };
         }
 
-        // ── AC8: apply-mode limit — default 20, hard-capped at 50 ─────────
+        // ── AC8: apply-mode limit — default 20, hard-capped at APPLY_MAX_LIMIT
+        // (Slice 6: APPLY_MAX_LIMIT now equals HARD_CAP_SLUGS=400, not 50).
+        // This fixture catalog only has slugOrder.length (~21) slugs total,
+        // so an over-cap request here is bounded by "total available", not
+        // by the 400 ceiling itself — the dedicated Slice 6 block below (a
+        // 450-slug synthetic sitemap, deliberately larger than 400) is what
+        // actually proves the new ceiling value; this block just keeps
+        // proving the default/invalid-limit fallbacks are unchanged.
         let rDefault = await get({ dry_run: "false" });
         assertEq(rDefault.body?.scanned, Math.min(20, slugOrder.length), "ac8: missing limit defaults to 20 in apply mode");
         let rOverCap = await get({ dry_run: "false", limit: "9999" });
-        assertEq(rOverCap.body?.scanned, Math.min(50, slugOrder.length), "ac8: an over-cap limit is clamped to 50, not 400");
+        assertEq(
+          rOverCap.body?.scanned,
+          Math.min(400, slugOrder.length),
+          "ac8: an over-cap limit is clamped at most to HARD_CAP_SLUGS (400) — this fixture catalog has far fewer slugs, so it's actually bounded by total_slugs",
+        );
         let rInvalidLimit = await get({ dry_run: "false", limit: "not-a-number" });
         assertEq(rInvalidLimit.body?.scanned, Math.min(20, slugOrder.length), "ac8: invalid limit falls back to the 20 default");
+
+        // ── Slice 6 (dev-request 2026-08-14-bm-fullhoest-katalogbred): the
+        // apply-mode ceiling was raised from a literal 50 to HARD_CAP_SLUGS
+        // (400) — the bug being fixed is that apply mode always took
+        // allSlugs.slice(0, limit) with no offset/cursor, so a periodic
+        // apply run could never progress past the first 50 producers no
+        // matter what `limit` was requested. Proven here against a 450-slug
+        // synthetic sitemap (deliberately ABOVE 400, and none of the
+        // synthetic slugs match anything in the catalog fixtures above, so
+        // this exercises only the slice-and-scan mechanics, not any write
+        // path):
+        //   - limit=200 (above the OLD 50-cap) now actually scans 200 —
+        //     pre-fix this would have silently clamped to 50.
+        //   - limit=100000 (unreasonably large) still clamps to exactly 400
+        //     — not unbounded, and not the full 450-slug catalog either.
+        {
+          const SYN_TOTAL = 450;
+          const HARD_CAP_SLUGS_EXPECTED = 400; // mirrors HARD_CAP_SLUGS in admin-bm-producer-harvest.ts
+          const synSlug = (i: number) => `syn-gard-${String(i).padStart(4, "0")}`;
+          const synSitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${Array.from(
+            { length: SYN_TOTAL },
+            (_, i) => `<url><loc>https://bondensmarked.no/produsenter/${synSlug(i)}</loc></url>`,
+          ).join("")}</urlset>`;
+          const synPage = `<script type="application/ld+json">${ld("Synthetic Uncatalogued AS", "Bostad")}</script>`;
+
+          const prevFetchSyn = globalThis.fetch;
+          (globalThis as any).fetch = async (url: any) => {
+            const u = String(url);
+            if (u === "https://bondensmarked.no/sitemap.xml") {
+              return new Response(synSitemap, { status: 200, headers: { "content-type": "application/xml" } });
+            }
+            const m = /\/produsenter\/([a-z0-9-]+)$/.exec(u);
+            if (m && /^syn-gard-\d{4}$/.test(m[1])) {
+              return new Response(synPage, { status: 200, headers: { "content-type": "text/html" } });
+            }
+            return new Response("not found", { status: 404 });
+          };
+
+          try {
+            const rMid = await get({ dry_run: "false", limit: "200" });
+            assertEq(
+              rMid.body?.total_slugs,
+              SYN_TOTAL,
+              "slice6: synthetic sitemap fixture itself carries the full 450-slug total",
+            );
+            assertEq(
+              rMid.body?.scanned,
+              200,
+              "slice6: limit=200 (above the old 50-cap) now scans 200 — pre-fix this would have silently clamped to 50",
+            );
+
+            const rHuge = await get({ dry_run: "false", limit: "100000" });
+            assertEq(
+              rHuge.body?.scanned,
+              HARD_CAP_SLUGS_EXPECTED,
+              "slice6: an unreasonably large limit (100000) is still clamped to HARD_CAP_SLUGS (400) — not unbounded, and not the full 450-slug catalog",
+            );
+          } finally {
+            (globalThis as any).fetch = prevFetchSyn;
+          }
+        }
 
         // ── AC10/AC11: idempotency — second apply of the SAME window writes
         // nothing further, and the audit table still holds exactly one row.
