@@ -5,9 +5,13 @@
  * `pending_verify` rows from the 30-day parking mechanism
  * (pending_verify_parked_since, stamped in applyVerifierOutcome —
  * src/agents/lokal-agent-verifier.ts) early, once they have demonstrably
- * received new data since being parked (agent_knowledge.updated_at >
- * pending_verify_parked_since). Mirrors unparkAgentsGeocode's dry-run-by-
- * default / count-then-write shape (src/services/agents-geocode-worker.ts).
+ * received new data since being parked (agent_knowledge.data_enriched_at >
+ * pending_verify_parked_since — a dedicated freshness column, NOT
+ * agent_knowledge.updated_at: see the route file's own header comment for why
+ * `updated_at` was rejected as a platform-wide freshness signal, dev-request
+ * 2026-09-01-rfb-pending-verify-unpark-lever build log, Daniel Alternativ B).
+ * Mirrors unparkAgentsGeocode's dry-run-by-default / count-then-write shape
+ * (src/services/agents-geocode-worker.ts).
  *
  * Covers (src/routes/admin-agents-pending-verify-unpark.ts):
  *   (a) missing/wrong X-Admin-Key -> 403.
@@ -19,11 +23,11 @@
  *       reported applied:true, and the row now satisfies
  *       pickPendingVerifyBatch's own selectability clause (NULL
  *       pending_verify_parked_since trivially passes it).
- *   (d) AC3 — cohort mode (no agentIds): a parked row whose updated_at is
- *       NOT newer than pending_verify_parked_since is excluded entirely —
+ *   (d) AC3 — cohort mode (no agentIds): a parked row whose data_enriched_at
+ *       is NOT newer than pending_verify_parked_since is excluded entirely —
  *       never appears in `rows`, never gets unparked — while a sibling fresh
  *       parked row in the SAME cohort call still gets unparked.
- *   (e) agentIds mode force-unparks a STALE row (updated_at <=
+ *   (e) agentIds mode force-unparks a STALE row (data_enriched_at <=
  *       parked_since) but reports freshnessMet:false for it; a fresh row in
  *       the same agentIds call reports freshnessMet:true.
  *   (f) a row that is NOT currently parked (pending_verify_parked_since IS
@@ -138,7 +142,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       name?: string;
       email?: string | null;
       parkedSince?: string | null; // pending_verify_parked_since
-      updatedAt?: string | null; // agent_knowledge.updated_at
+      dataEnrichedAt?: string | null; // agent_knowledge.data_enriched_at (freshness signal)
       noProgressCount?: number;
       createdAt?: string;
     }): string {
@@ -149,9 +153,9 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       ).run(id, o.name ?? id, `key-${id}`, o.createdAt ?? "2026-01-01 00:00:00");
       testDb.prepare(
         `INSERT INTO agent_knowledge (agent_id, email, verification_status,
-           pending_verify_parked_since, pending_verify_no_progress_count, updated_at)
+           pending_verify_parked_since, pending_verify_no_progress_count, data_enriched_at)
          VALUES (?, ?, 'pending_verify', ?, ?, ?)`,
-      ).run(id, o.email ?? null, o.parkedSince ?? null, o.noProgressCount ?? 3, o.updatedAt ?? "2026-01-01 00:00:00");
+      ).run(id, o.email ?? null, o.parkedSince ?? null, o.noProgressCount ?? 3, o.dataEnrichedAt ?? "2026-01-01 00:00:00");
       return id;
     }
 
@@ -211,7 +215,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (b) AC1 — dry-run on a fresh parked row writes nothing ─────────────
     {
-      const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-08-15 00:00:00" });
+      const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", dataEnrichedAt: "2026-08-15 00:00:00" });
       const r = await callUnpark({ agentIds: [id] });
       assertEq(r.status, 200, "b1: 200");
       assertEq(r.body.dry_run, true, "b2: dry_run true by default");
@@ -233,7 +237,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       // holds regardless of what the real wall-clock date is when this
       // suite runs.
       const parkedSince = sqlNow();
-      const id = insertAgent({ parkedSince, updatedAt: "2026-08-15 00:00:00" });
+      const id = insertAgent({ parkedSince, dataEnrichedAt: "2026-08-15 00:00:00" });
       assertEq(isSelectableByPickPendingVerifyBatch(id), false, "c0: NOT selectable while parked (sanity check)");
 
       const r = await callUnpark({ agentIds: [id], apply: true });
@@ -251,8 +255,8 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (d) AC3 — cohort mode excludes a stale (non-fresh) parked row ──────
     {
-      const staleId = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-07-01 00:00:00" }); // updated BEFORE parking
-      const freshId = insertAgent({ parkedSince: "2026-08-02 00:00:00", updatedAt: "2026-08-20 00:00:00" }); // updated AFTER parking
+      const staleId = insertAgent({ parkedSince: "2026-08-01 00:00:00", dataEnrichedAt: "2026-07-01 00:00:00" }); // enriched BEFORE parking
+      const freshId = insertAgent({ parkedSince: "2026-08-02 00:00:00", dataEnrichedAt: "2026-08-20 00:00:00" }); // enriched AFTER parking
 
       const r = await callUnpark({ apply: true }); // cohort mode: no agentIds
       assertEq(r.status, 200, "d1: 200");
@@ -268,19 +272,19 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       assertEq(knowledgeRow(freshId).pending_verify_parked_since, null, "d7: fresh row's parked_since cleared");
     }
 
-    // ── (d2) Defect-2 regression: updated_at EXACTLY EQUAL to parked_since is
-    // NOT fresh (mutation-test guard: flipping the freshness comparison from
-    // `>` to `>=` in either selectCohortCandidates or
+    // ── (d2) Defect-2 regression: data_enriched_at EXACTLY EQUAL to
+    // parked_since is NOT fresh (mutation-test guard: flipping the freshness
+    // comparison from `>` to `>=` in either selectCohortCandidates or
     // selectAgentIdsCandidates must be caught here — a write racing exactly
     // with the parking stamp is not "genuinely new" evidence; strict `>` is
     // the intended semantics). ──
     {
-      const equalId = insertAgent({ parkedSince: "2026-08-05 00:00:00", updatedAt: "2026-08-05 00:00:00" });
+      const equalId = insertAgent({ parkedSince: "2026-08-05 00:00:00", dataEnrichedAt: "2026-08-05 00:00:00" });
 
       // cohort mode: an exactly-equal row must NOT be a candidate at all.
       const cohortR = await callUnpark({ apply: true, limit: 500 });
       const cohortRow = cohortR.body.rows.find((x: any) => x.agentId === equalId);
-      assertEq(cohortRow, undefined, "d2-1: exactly-equal updated_at/parked_since row is NOT a cohort candidate");
+      assertEq(cohortRow, undefined, "d2-1: exactly-equal data_enriched_at/parked_since row is NOT a cohort candidate");
       assertEq(
         knowledgeRow(equalId).pending_verify_parked_since,
         "2026-08-05 00:00:00",
@@ -297,8 +301,8 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (e) agentIds mode force-unparks a stale row, reports freshnessMet:false ──
     {
-      const staleId = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-07-01 00:00:00" });
-      const freshId = insertAgent({ parkedSince: "2026-08-02 00:00:00", updatedAt: "2026-08-20 00:00:00" });
+      const staleId = insertAgent({ parkedSince: "2026-08-01 00:00:00", dataEnrichedAt: "2026-07-01 00:00:00" });
+      const freshId = insertAgent({ parkedSince: "2026-08-02 00:00:00", dataEnrichedAt: "2026-08-20 00:00:00" });
 
       const r = await callUnpark({ agentIds: [staleId, freshId], apply: true });
       assertEq(r.body.mode, "agentIds", "e1: mode reported as agentIds");
@@ -317,7 +321,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (f) a non-parked row is excluded / left untouched in both modes ────
     {
-      const notParkedId = insertAgent({ parkedSince: null, updatedAt: "2026-08-20 00:00:00" });
+      const notParkedId = insertAgent({ parkedSince: null, dataEnrichedAt: "2026-08-20 00:00:00" });
 
       // cohort mode: never appears
       const cohortR = await callUnpark({ apply: true, limit: 500 });
@@ -347,7 +351,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (h) apply touches ONLY the two parking columns ──────────────────────
     {
-      const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-08-15 00:00:00", email: "keep-me@example.com" });
+      const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", dataEnrichedAt: "2026-08-15 00:00:00", email: "keep-me@example.com" });
       await callUnpark({ agentIds: [id], apply: true });
       const row = testDb.prepare(`SELECT email, verification_status FROM agent_knowledge WHERE agent_id = ?`).get(id) as any;
       assertEq(row.email, "keep-me@example.com", "h1: sibling column (email) left untouched by apply");
@@ -356,15 +360,74 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
     // ── (i) limit + oldest-parked-first ordering in cohort mode ────────────
     {
-      const older = insertAgent({ parkedSince: "2026-07-01 00:00:00", updatedAt: "2026-07-15 00:00:00" });
-      const newer = insertAgent({ parkedSince: "2026-07-10 00:00:00", updatedAt: "2026-07-20 00:00:00" });
-      const newest = insertAgent({ parkedSince: "2026-07-20 00:00:00", updatedAt: "2026-07-25 00:00:00" });
+      const older = insertAgent({ parkedSince: "2026-07-01 00:00:00", dataEnrichedAt: "2026-07-15 00:00:00" });
+      const newer = insertAgent({ parkedSince: "2026-07-10 00:00:00", dataEnrichedAt: "2026-07-20 00:00:00" });
+      const newest = insertAgent({ parkedSince: "2026-07-20 00:00:00", dataEnrichedAt: "2026-07-25 00:00:00" });
 
       const r = await callUnpark({ limit: 2 }); // dry-run cohort, capped to 2 of the 3 fresh rows just inserted (plus any left over from earlier blocks — filter to just these 3 ids)
       const ids = r.body.rows.map((x: any) => x.agentId).filter((x: string) => [older, newer, newest].includes(x));
       assertEq(ids, [older, newer], "i1: only the 2 oldest-parked of this trio are candidates, oldest-first, respecting limit:2");
       // `newest` must remain untouched — still parked.
       assertEq(knowledgeRow(newest).pending_verify_parked_since, "2026-07-20 00:00:00", "i2: row beyond the limit left untouched");
+    }
+
+    // ── (j) AC5 — migration backfill: a pre-existing row with real
+    // agent_knowledge_audit history but an EMPTY data_enriched_at column
+    // (exactly the 46 e-mail-write rows from 2026-09-01, written before this
+    // column existed) gets backfilled from MAX(agent_knowledge_audit.
+    // changed_at) on a subsequent initSchema pass — same idempotent
+    // backfill a real server restart against an already-migrated database
+    // would run (src/database/init.ts, gated on data_enriched_at IS NULL) —
+    // and then correctly surfaces as a freshness candidate. Regression for
+    // dev-request 2026-09-01-rfb-pending-verify-unpark-lever §3b. ──
+    {
+      const id = "pv-agent-ac5-backfill";
+      testDb.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, created_at)
+         VALUES (?, ?, 't', 't', '', 'https://example.com', 'producer', ?, 'rfb', '2026-01-01 00:00:00')`,
+      ).run(id, id, `key-${id}`);
+      // parked BEFORE the audit write below, and data_enriched_at explicitly
+      // NULL — the exact pre-migration shape §3b describes.
+      testDb.prepare(
+        `INSERT INTO agent_knowledge (agent_id, email, verification_status,
+           pending_verify_parked_since, pending_verify_no_progress_count, data_enriched_at)
+         VALUES (?, NULL, 'pending_verify', '2026-08-10 00:00:00', 3, NULL)`,
+      ).run(id);
+      const auditChangedAt = "2026-08-20 00:00:00"; // AFTER pending_verify_parked_since
+      testDb.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_at)
+         VALUES (?, ?, 'contact_email', NULL, 'x@example.com', 'system', ?)`,
+      ).run(`audit-${id}`, id, auditChangedAt);
+
+      const before = testDb.prepare(`SELECT data_enriched_at FROM agent_knowledge WHERE agent_id = ?`).get(id) as { data_enriched_at: string | null };
+      assertEq(before.data_enriched_at, null, "j1: data_enriched_at NULL before the backfill pass (pre-migration shape)");
+
+      // Re-run the migration pass — mirrors a server restart against an
+      // already-migrated database that now has pre-existing audit history
+      // for a row the column never got to stamp forward. Idempotent: gated
+      // on `data_enriched_at IS NULL AND EXISTS(... audit ...)`, so every
+      // OTHER row in this shared test DB (already non-NULL from earlier
+      // blocks, or NULL with no audit history) is left untouched by this
+      // second pass.
+      __initSchemaForTesting(testDb as any);
+
+      const after = testDb.prepare(`SELECT data_enriched_at FROM agent_knowledge WHERE agent_id = ?`).get(id) as { data_enriched_at: string | null };
+      assertEq(after.data_enriched_at, auditChangedAt, "j2: AC5 — data_enriched_at backfilled to MAX(agent_knowledge_audit.changed_at)");
+
+      // A dry-run WITHOUT agentIds (cohort mode) must now list this row as a
+      // freshness candidate — the exact AC5 assertion ("en tørrkjøring uten
+      // agentIds lister dem som kandidater, ikke 0").
+      const r = await callUnpark({ limit: 500 });
+      const row = r.body.rows.find((x: any) => x.agentId === id);
+      assertTrue(!!row, "j3: AC5 — backfilled row appears in a cohort dry-run's candidate list");
+      assertEq(row?.freshnessMet, true, "j4: AC5 — backfilled row's freshness is satisfied (backfilled data_enriched_at > parked_since)");
+      // Dry-run — must not have written anything.
+      assertEq(
+        testDb.prepare(`SELECT pending_verify_parked_since FROM agent_knowledge WHERE agent_id = ?`).get(id),
+        { pending_verify_parked_since: "2026-08-10 00:00:00" },
+        "j5: dry-run leaves the row's parked_since untouched",
+      );
     }
   } catch (err: any) {
     failed++;

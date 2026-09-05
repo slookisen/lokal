@@ -24,15 +24,33 @@
 // everything early"): a parked row is only unparked in COHORT mode (no
 // `agentIds` — an admin-picked limit/batch) when it has demonstrably received
 // NEW data since it was parked:
-//   agent_knowledge.updated_at > agent_knowledge.pending_verify_parked_since
+//   agent_knowledge.data_enriched_at > agent_knowledge.pending_verify_parked_since
 // Without this filter, an early bulk unpark is just a second round of wasted
 // sweep cycles on the exact same unresolvable rows parking was built to
-// protect against. `updated_at` is a real, regularly-bumped column (confirmed
-// write site: src/routes/admin-rfb-contact-extraction.ts:357, and the
-// column's own DEFAULT (datetime('now')) in src/database/init.ts) — a row
-// that received a freshly-scraped email, a corrected website, or any other
-// enrichment write after being parked will show a newer `updated_at` than its
-// `pending_verify_parked_since` stamp.
+// protect against.
+//
+// Why `data_enriched_at`, not `agent_knowledge.updated_at` (revised
+// 2026-09-02, dev-request 2026-09-01-rfb-pending-verify-unpark-lever build
+// log, Daniel Alternativ B): the original spec proposed `updated_at` as the
+// freshness signal, but 3 independent code-review rounds on this route's own
+// build found `updated_at` is NOT a reliable platform-wide "this row's
+// content genuinely changed" signal — at least 3 separate write sites
+// (marketplace.ts's google-rating-batch and homepage-provenance-batch,
+// admin-search-enrich.ts) were stamping it UNCONDITIONALLY on no-op calls
+// (a re-scrape that found nothing new, a repeated already-on-file value).
+// A freshness filter built on that column would have falsely admitted rows
+// that received zero new data — exactly the wasted-cycle problem parking
+// exists to prevent. Daniel chose a dedicated, non-overloaded column instead
+// of auditing/patching every current and future `updated_at` write site
+// platform-wide: `data_enriched_at` is stamped ONLY by an explicit, curated
+// list of write sites (admin-agents-contact-email-write.ts,
+// admin-agents-url-write.ts, admin-rfb-contact-extraction.ts,
+// admin-agents.ts's applyAgentBrregContact, search-enrich-sweep.ts, and the
+// two genuine-write branches of marketplace.ts's google-rating-batch /
+// homepage-provenance-batch) — each gated so a no-op call never touches it
+// (regression-tested per site). Pre-existing rows that received real writes
+// before this column existed are covered by a one-time backfill in
+// src/database/init.ts (MAX(agent_knowledge_audit.changed_at) per agent_id).
 //
 // `agentIds` mode (explicit admin selection) OVERRIDES the freshness filter —
 // the admin is being explicit, so a stale/unresolvable row named by id is
@@ -156,7 +174,7 @@ function selectAgentIdsCandidates(db: ReturnType<typeof getDb>, ids: string[]): 
       `SELECT a.id AS agent_id, a.name AS agent_name,
               CASE WHEN k.pending_verify_parked_since IS NOT NULL THEN 1 ELSE 0 END AS was_parked,
               CASE WHEN k.pending_verify_parked_since IS NOT NULL
-                        AND k.updated_at > k.pending_verify_parked_since THEN 1 ELSE 0 END AS freshness_met
+                        AND k.data_enriched_at > k.pending_verify_parked_since THEN 1 ELSE 0 END AS freshness_met
          FROM agents a
          JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id IN (${placeholders})`
@@ -177,7 +195,7 @@ function selectCohortCandidates(db: ReturnType<typeof getDb>, limit: number): Un
          FROM agents a
          JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.pending_verify_parked_since IS NOT NULL
-          AND k.updated_at > k.pending_verify_parked_since
+          AND k.data_enriched_at > k.pending_verify_parked_since
         ORDER BY k.pending_verify_parked_since ASC
         LIMIT ?`
     )

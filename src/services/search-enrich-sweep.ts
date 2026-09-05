@@ -186,9 +186,13 @@ export function applyEnrichWrite(
       colVals.push(chosenUrl);
     }
     if (colSets.length > 0) {
-      colVals.push(nowIso, agentId);
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+      // write-site (e), branch 1): only reached when colSets is non-empty, i.e. a
+      // genuine fill-empty write happened above — never a no-op. Same nowIso
+      // already used for updated_at.
+      colVals.push(nowIso, nowIso, agentId);
       db.prepare(
-        `UPDATE agent_knowledge SET ${colSets.join(", ")}, updated_at = ? WHERE agent_id = ?`,
+        `UPDATE agent_knowledge SET ${colSets.join(", ")}, updated_at = ?, data_enriched_at = ? WHERE agent_id = ?`,
       ).run(...colVals);
     }
 
@@ -220,9 +224,12 @@ export function applyEnrichWrite(
           ],
         },
       });
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+      // write-site (e), branch 2): only reached when emailWritten is true — never a
+      // no-op. Same nowIso already used for updated_at.
       db.prepare(
-        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?",
-      ).run(JSON.stringify(merged), nowIso, agentId);
+        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ?, data_enriched_at = ? WHERE agent_id = ?",
+      ).run(JSON.stringify(merged), nowIso, nowIso, agentId);
     }
   });
   tx();

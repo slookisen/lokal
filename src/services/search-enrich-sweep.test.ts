@@ -50,7 +50,13 @@ function makeDb(): Database.Database {
       address TEXT, postal_code TEXT, website TEXT, phone TEXT, email TEXT,
       verification_status TEXT,
       field_provenance TEXT NOT NULL DEFAULT '{}',
-      updated_at TEXT
+      updated_at TEXT,
+      -- dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel
+      -- Alternativ B): applyEnrichWrite's two genuine-write branches now
+      -- also stamp this column alongside updated_at — needed here or every
+      -- write silently throws (caught by applyFindings' per-row try/catch)
+      -- since this hand-rolled schema predates that column.
+      data_enriched_at TEXT
     );
     CREATE TABLE crm_contacts (
       id INTEGER PRIMARY KEY, agent_id TEXT, status TEXT

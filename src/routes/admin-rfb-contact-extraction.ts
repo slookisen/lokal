@@ -389,8 +389,13 @@ const RFB_CX_PROVENANCE_SOURCE_TYPE = "rfb_contact_extraction";
  * still runs regardless, and the caller-visible outcome stays "written"
  * either way — this changes DB-level audit noise only, never the API
  * response.
+ *
+ * Exported (dev-request 2026-09-01-rfb-pending-verify-unpark-lever, AC6): so
+ * the write-site no-op regression test for this function's data_enriched_at
+ * stamp can call it directly instead of round-tripping the whole HTTP batch
+ * shape — no behavior change, purely a testability export.
  */
-function applyRfbCxWrite(
+export function applyRfbCxWrite(
   db: ReturnType<typeof getDb>,
   agentId: string,
   newEmail: string,
@@ -463,9 +468,14 @@ function applyRfbCxWrite(
       const mergedProv = mergeFieldProvenance(existingProv, {
         email: [{ value: newEmail, source_type: sourceType, source_url: sourceUrl, fetched_at: nowIso }],
       });
-      db.prepare(`UPDATE agent_knowledge SET email = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+      // write-site (c)): this fill-only branch is already gated above by
+      // `if (!cur.knowledge_email || !cur.knowledge_email.trim())` — never a no-op.
+      // Same nowIso already used for updated_at, no separate Date computation.
+      db.prepare(`UPDATE agent_knowledge SET email = ?, field_provenance = ?, updated_at = ?, data_enriched_at = ? WHERE agent_id = ?`).run(
         newEmail,
         JSON.stringify(mergedProv),
+        nowIso,
         nowIso,
         agentId,
       );

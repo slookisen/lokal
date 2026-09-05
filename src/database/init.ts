@@ -1822,6 +1822,24 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+  // 2026-09-02) — dedikert ferskhetskolonne for unpark-leverens filter, FRIKOBLET fra
+  // agent_knowledge.updated_at (som 3 reviewrunder viste IKKE er et pålitelig
+  // plattformbredt "fikk ny data"-signal — se dev-requestens egen byggelogg). Stemples
+  // KUN av et eksplisitt kuratert sett skrivesteder (se admin-agents-contact-email-write.ts,
+  // admin-agents-url-write.ts, admin-rfb-contact-extraction.ts, admin-agents.ts,
+  // search-enrich-sweep.ts, og de to genuine-write-grenene i marketplace.ts's
+  // google-rating-batch/homepage-provenance-batch), aldri generisk. Backfill for
+  // pre-eksisterende rader lever LENGER NED i denne filen, RETT ETTER
+  // agent_knowledge_audit-tabellen opprettes (se kommentaren der) — ikke her — fordi
+  // backfillen leser FRA agent_knowledge_audit, som ikke finnes ennå på dette punktet i
+  // en fersk databases første initSchema-kjøring.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN data_enriched_at TEXT`);
+  } catch {
+    // Kolonne finnes alt
+  }
+
   // ─── dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff ──
   // POST /admin/homepage-provenance-batch's default auto-select ordered by
   // k.updated_at ASC, but its two "nothing useful came out of this fetch"
@@ -2446,6 +2464,36 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_knowledge_audit_changed_at ON agent_knowledge_audit(changed_at)`);
   } catch (err) {
     console.error("Migration agent_knowledge_audit failed:", err);
+  }
+
+  // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever — data_enriched_at
+  // backfill (hardt krav, AC5). Placed HERE (not next to the ALTER TABLE above)
+  // because this UPDATE reads FROM agent_knowledge_audit, which this initSchema
+  // pass has only just created immediately above — placing the backfill before
+  // the CREATE TABLE would silently no-op (caught error) on a brand-new database
+  // (e.g. every fresh test DB) on its very first ever run, since the table would
+  // not exist yet at that point in this same top-to-bottom pass. On a database
+  // that already has agent_knowledge_audit from a prior deploy, this ordering
+  // makes no difference. Idempotent: only rows with data_enriched_at IS NULL
+  // AND at least one audit row are touched, so a row already stamped by a real
+  // write site (Step 2 in the write-sites listed above) is never overwritten by
+  // a later server restart running this backfill again. Rows with no audit
+  // history at all correctly stay NULL — they never had a tracked write.
+  try {
+    db.exec(`
+      UPDATE agent_knowledge
+         SET data_enriched_at = (
+           SELECT MAX(changed_at) FROM agent_knowledge_audit
+            WHERE agent_knowledge_audit.agent_id = agent_knowledge.agent_id
+         )
+       WHERE data_enriched_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM agent_knowledge_audit
+            WHERE agent_knowledge_audit.agent_id = agent_knowledge.agent_id
+         )
+    `);
+  } catch (err) {
+    console.error("Migration data_enriched_at backfill failed:", err);
   }
 
   // ─── Phase 5.3 (WO-16): cross-source verification columns ────────────────

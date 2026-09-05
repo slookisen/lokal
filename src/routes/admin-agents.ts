@@ -2505,12 +2505,16 @@ export function applyAgentBrregContact(
 
     // Fill-only column writes — guard re-checked INSIDE the UPDATE's own
     // WHERE (mirrors applyAgentOrgNr's org_nr UPDATE above exactly).
+    // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+    // write-site (d)): the WHERE clause itself already excludes a no-op (a
+    // non-blank existing value matches zero rows), so data_enriched_at here is
+    // never stamped on a no-op call — same @now already bound to updated_at.
     let addressColumnWritten = false;
     let phoneColumnWritten = false;
     if (addressVal) {
       const upd = db
         .prepare(
-          `UPDATE agent_knowledge SET address = @val, updated_at = @now
+          `UPDATE agent_knowledge SET address = @val, updated_at = @now, data_enriched_at = @now
             WHERE agent_id = @id AND (address IS NULL OR TRIM(address) = '')`,
         )
         .run({ id: agentId, val: addressVal, now: nowIso });
@@ -2519,7 +2523,7 @@ export function applyAgentBrregContact(
     if (phoneVal) {
       const upd = db
         .prepare(
-          `UPDATE agent_knowledge SET phone = @val, updated_at = @now
+          `UPDATE agent_knowledge SET phone = @val, updated_at = @now, data_enriched_at = @now
             WHERE agent_id = @id AND (phone IS NULL OR TRIM(phone) = '')`,
         )
         .run({ id: agentId, val: phoneVal, now: nowIso });

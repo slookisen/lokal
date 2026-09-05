@@ -238,8 +238,13 @@ function isOwnerLocked(s: LockSnapshot): boolean {
  * NOTE the LEFT JOIN: `url` lives on `agents`; an agent may have no
  * agent_knowledge row at all, and an INNER JOIN would silently make such rows
  * unwritable — the same trap the sibling route documents.
+ *
+ * Exported (dev-request 2026-09-01-rfb-pending-verify-unpark-lever, AC6): so
+ * the write-site no-op regression test for this route's data_enriched_at
+ * stamp can call it directly instead of round-tripping the whole HTTP batch
+ * shape — no behavior change, purely a testability export.
  */
-function applyUrl(
+export function applyUrl(
   agentId: string,
   newValue: string | null,
   reason: string,
@@ -264,6 +269,12 @@ function applyUrl(
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, 'url', ?, ?, 'system', NULL, datetime('now'), ?)`,
       ).run(randomUUID(), agentId, cur.url, storedNew, `${batchTag}: ${reason}`);
+      // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
+      // write-site (b)): only reached on a genuine change (currentValue !== storedNew
+      // was already checked above) — never a no-op stamp. Mirrors write-site (a) in
+      // admin-agents-contact-email-write.ts: this function writes agents.url, not
+      // agent_knowledge, so a dedicated statement is used.
+      db.prepare(`UPDATE agent_knowledge SET data_enriched_at = datetime('now') WHERE agent_id = ?`).run(agentId);
 
       return { outcome: "written", oldValue: cur.url };
     });
