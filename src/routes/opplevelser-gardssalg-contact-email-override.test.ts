@@ -287,16 +287,16 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
       insertProvider.run({
         id: "prov-override-active", navn: "7 Fjell-liknende Bryggeri", org_nr: "200000001", kommune: "Bergen",
         rfb_seed_source: "rfb-seed", producer_type: "bryggeri",
-        epost: "post@override-active-thirdparty.example.org", telefon: null,
-        hjemmeside: "https://override-active.example.no",
+        epost: "post@override-active-thirdparty.no", telefon: null,
+        hjemmeside: "https://override-active-siteroot.no",
         about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Øl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "override-active-gard",
         field_provenance: withVerifiedWebsite({
           contact_email_domain_override: overrideStamp(
-            "post@override-active-thirdparty.example.org",
-            "override-active.example.no",
-            "override-active-thirdparty.example.org",
+            "post@override-active-thirdparty.no",
+            "override-active-siteroot.no",
+            "override-active-thirdparty.no",
           ),
         }),
         brreg_verified: 1, antall_ansatte: 8, naeringskode: null,
@@ -309,16 +309,16 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
       insertProvider.run({
         id: "prov-override-lapsed", navn: "Svalbard-liknende Bryggeri", org_nr: "200000002", kommune: "Longyearbyen",
         rfb_seed_source: "rfb-seed", producer_type: "bryggeri",
-        epost: "post@override-lapsed-newaddress.example.org", telefon: null,
-        hjemmeside: "https://override-lapsed.example.no",
+        epost: "post@override-lapsed-newaddress.no", telefon: null,
+        hjemmeside: "https://override-lapsed-siteroot.no",
         about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Øl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "override-lapsed-gard",
         field_provenance: withVerifiedWebsite({
           contact_email_domain_override: overrideStamp(
-            "post@override-lapsed-OLD-address.example.org",
-            "override-lapsed.example.no",
-            "override-lapsed-OLD-address.example.org",
+            "post@override-lapsed-OLD-address.no",
+            "override-lapsed-siteroot.no",
+            "override-lapsed-OLD-address.no",
           ),
         }),
         brreg_verified: 1, antall_ansatte: 6, naeringskode: null,
@@ -329,8 +329,8 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
       insertProvider.run({
         id: "prov-plain-unverified", navn: "Kontroll Uverifisert Gård", org_nr: "200000003", kommune: "Aurland",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
-        epost: "post@plain-unverified-thirdparty.example.org", telefon: null,
-        hjemmeside: "https://plain-unverified.example.no",
+        epost: "post@plain-unverified-thirdparty.no", telefon: null,
+        hjemmeside: "https://plain-unverified-siteroot.no",
         about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "plain-unverified-gard",
@@ -349,7 +349,7 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
 
       assertTrue(candByIdFull.has("prov-override-active"), "b2: prov-override-active IS a candidate — the active override let it through");
       assertTrue(!exclByIdFull.has("prov-override-active"), "b3: prov-override-active is NOT excluded");
-      assertEq(candByIdFull.get("prov-override-active")?.recipient_email, "post@override-active-thirdparty.example.org", "b4: candidate carries the approved address as recipient_email");
+      assertEq(candByIdFull.get("prov-override-active")?.recipient_email, "post@override-active-thirdparty.no", "b4: candidate carries the approved address as recipient_email");
 
       assertTrue(exclByIdFull.has("prov-override-lapsed"), "c1: prov-override-lapsed IS excluded — its stamp no longer matches the current epost");
       assertEq(exclByIdFull.get("prov-override-lapsed")?.reason, "address_domain_mismatch", "c2: prov-override-lapsed excluded reason is address_domain_mismatch, same as an unoverridden row");
@@ -376,16 +376,16 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
       insertProvider.run({
         id: "prov-override-not-ready", navn: "Ikke Klar Men Overstyrt Gård", org_nr: "200000004", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
-        epost: "post@not-ready-override.example.org", telefon: null,
-        hjemmeside: "https://not-ready-override.example.no",
+        epost: "post@not-ready-override-mailbox.no", telefon: null,
+        hjemmeside: "https://not-ready-override-siteroot.no",
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null,
         field_provenance: withVerifiedWebsite({
           contact_email_domain_override: overrideStamp(
-            "post@not-ready-override.example.org",
-            "not-ready-override.example.no",
-            "not-ready-override.example.org",
+            "post@not-ready-override-mailbox.no",
+            "not-ready-override-siteroot.no",
+            "not-ready-override-mailbox.no",
           ),
         }),
         brreg_verified: 0, antall_ansatte: null, naeringskode: null,

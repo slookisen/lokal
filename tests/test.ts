@@ -40219,6 +40219,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil — the OpenAI ChatGPT
+// app rejection (2026-09-05): English reviewer queries selected no category,
+// so the hard category filter never ran.
+runSerial(() => {
+  console.log("\n── 2026-09-05 engelsk søk: marketplace-search-english-queries ──");
+  try {
+    const { runMarketplaceSearchEnglishQueryTests } = require("../src/services/marketplace-search-english-queries.test") as
+      typeof import("../src/services/marketplace-search-english-queries.test");
+    const eq = runMarketplaceSearchEnglishQueryTests({ log: false });
+    passed += eq.passed;
+    failed += eq.failed;
+    for (const f of eq.failures) failures.push("marketplace-search-english-queries: " + f);
+    console.log(`  marketplace-search-english-queries: ${eq.passed} passed, ${eq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-search-english-queries: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0g:
 // `lokal_search` — the MCP tool AI assistants actually call — now accepts
 // lat/lng/radius_km (it had no way to receive the user's position at all), and

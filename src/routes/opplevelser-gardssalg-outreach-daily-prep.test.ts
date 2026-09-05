@@ -360,7 +360,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       insertProvider.run({
         id: "prov-d-unverified", navn: "Delta Uverifisert Gård", org_nr: "100000004", kommune: "Aurland",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
-        epost: "post@unrelated-third-domain.example.org", telefon: null, hjemmeside: "https://delta-unverified.example.no",
+        epost: "post@unrelated-third-domain-mismatch.no", telefon: null, hjemmeside: "https://delta-unverified.example.no",
         about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "delta-unverified-gard", field_provenance: VERIFIED_PROVENANCE,
@@ -429,7 +429,8 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         brreg_verified: 0, antall_ansatte: null, naeringskode: null,
       });
 
-      const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const opplevelserModule = require("./opplevelser") as typeof import("./opplevelser");
+      const opplevelserRouter = opplevelserModule.default as any;
       const auth = { "x-admin-key": testKey };
 
       // ══ (a) auth ═══════════════════════════════════════════════════════
@@ -813,6 +814,212 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         assertEq(capExhausted.body.missing, { count: 7, reason: "pool_exhausted" }, "l-f3: missing.count 7, reason pool_exhausted");
         assertEq(capExhausted.body.pool.daily_cap, 7, "l-f4: pool.daily_cap is 7 (pool-exhausted branch)");
       });
+
+      // ══ (m) unit tests: computeGardssalgAddressBasis — dev-request
+      // 2026-09-02-gardssalg-adressegrunnlag-2linje-uten-hjemmeside ══════════
+      // Pure-function tests, no DB/route involved — exercises the exported
+      // function directly with the exact same field_provenance shape
+      // isGardssalgSecondLineVerified reads (second_line_verification.verified
+      // === true).
+      const SECOND_LINE_VERIFIED_PROVENANCE = JSON.stringify({
+        second_line_verification: {
+          verified: true,
+          at: "2026-09-01T00:00:00.000Z",
+          sources: ["brreg", "1881"],
+          judge_reason: "identity match — org number + registered address align",
+        },
+      });
+      const computeAddrBasis = opplevelserModule.computeGardssalgAddressBasis;
+
+      // (m-a) AC4a: no website + second-line-verified -> new accepting basis.
+      assertEq(
+        computeAddrBasis("post@unrelated-third-domain-mismatch.no", null, SECOND_LINE_VERIFIED_PROVENANCE),
+        "second_line_verified",
+        "m-a1: no website (null) + second-line-verified -> address_basis 'second_line_verified'",
+      );
+      assertEq(
+        computeAddrBasis("post@unrelated-third-domain-mismatch.no", "", SECOND_LINE_VERIFIED_PROVENANCE),
+        "second_line_verified",
+        "m-a2: no website (empty string) + second-line-verified -> 'second_line_verified'",
+      );
+
+      // (m-b) AC4b: no website + NOT second-line-verified -> still "unverified"
+      // exactly as today (byte-identical regression guard).
+      assertEq(
+        computeAddrBasis("post@unrelated-third-domain-mismatch.no", null, VERIFIED_PROVENANCE),
+        "unverified",
+        "m-b1: no website + NOT second-line-verified (unrelated provenance key) -> still 'unverified'",
+      );
+      assertEq(
+        computeAddrBasis("post@unrelated-third-domain-mismatch.no", null, null),
+        "unverified",
+        "m-b2: no website + null field_provenance -> still 'unverified'",
+      );
+      assertEq(
+        computeAddrBasis(
+          "post@unrelated-third-domain-mismatch.no",
+          null,
+          JSON.stringify({ second_line_verification: { verified: false } }),
+        ),
+        "unverified",
+        "m-b3: no website + second_line_verification.verified===false -> still 'unverified'",
+      );
+
+      // (m-c) second-line-verified applies regardless of freemail (Daniel's
+      // answer "A" — it trumps the domain check entirely with no website,
+      // not gated on non-freemail only).
+      assertEq(
+        computeAddrBasis("gaardsbutikk@gmail.com", null, SECOND_LINE_VERIFIED_PROVENANCE),
+        "second_line_verified",
+        "m-c1: freemail + no website + second-line-verified -> 'second_line_verified' (wins over the freemail branch)",
+      );
+      assertEq(
+        computeAddrBasis("gaardsbutikk@gmail.com", null, VERIFIED_PROVENANCE),
+        "freemail_pointing_to_producer",
+        "m-c2: freemail + no website + NOT second-line-verified -> unaffected, still 'freemail_pointing_to_producer'",
+      );
+
+      // (m-d) second-line-verified only rescues NO-WEBSITE rows — a genuine
+      // domain mismatch WITH a website is still 'unverified' even when the
+      // row is second-line-verified (purely additive: existing branches for
+      // websited rows are untouched by this new case).
+      assertEq(
+        computeAddrBasis(
+          "post@unrelated-third-domain-mismatch.no",
+          "https://some-producer.example.no",
+          SECOND_LINE_VERIFIED_PROVENANCE,
+        ),
+        "unverified",
+        "m-d: a genuine domain mismatch WITH a website is still 'unverified' even if second-line-verified",
+      );
+
+      // (m-e) AC2 (unit level): a website + email domain pair domainsEquivalent
+      // recognizes as the same brand across TLDs -> 'domain_equivalent_to_website',
+      // not 'unverified'. Exact fixture pair the sibling contact-audit route's
+      // own Skive D regression test already uses (nogne-o.no / nogne-o.com).
+      assertEq(
+        computeAddrBasis("post@nogne-o.com", "https://nogne-o.no", null),
+        "domain_equivalent_to_website",
+        "m-e: nogne-o.no website / nogne-o.com email (brand-alias, cross-TLD) -> 'domain_equivalent_to_website'",
+      );
+
+      // (m-f) AC3 (unit level, negative/no-regression): a genuinely different,
+      // non-equivalent company domain pair is STILL 'unverified' — same
+      // fixture pair the contact-audit route's own regression test uses
+      // (lofotpils.no website / dng-norge.no email).
+      assertEq(
+        computeAddrBasis("kontakt@dng-norge.no", "https://lofotpils.no", null),
+        "unverified",
+        "m-f: a genuine unrelated-company domain pair (lofotpils.no / dng-norge.no) is still 'unverified' — no regression",
+      );
+
+      // (m-g) unrelated early-return edge cases, unchanged.
+      assertEq(computeAddrBasis(null, null, null), "unverified", "m-g1: null epost -> 'unverified' (unchanged)");
+      assertEq(computeAddrBasis("not-an-email", null, null), "unverified", "m-g2: no '@' in epost -> 'unverified' (unchanged)");
+
+      // ══ (n) route-level: AC1 — no website + verified_second_line=true is no
+      // longer excluded as address_domain_mismatch ════════════════════════════
+      insertProvider.run({
+        id: "prov-secondline-nowebsite", navn: "Sigma Andrelinje Gård", org_nr: "100000014", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "kontakt@nowebsite-secondline.example.org", telefon: null, hjemmeside: null,
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "sigma-andrelinje-gard", field_provenance: SECOND_LINE_VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const secondLine = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(secondLine.status, 200, "n1: second-line-verified-no-website batch -> 200");
+      const secondLineById = new Map((secondLine.body.candidates as any[]).map((c) => [c.provider_id, c]));
+      const secondLineExcludedById = new Map((secondLine.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertTrue(
+        secondLineById.has("prov-secondline-nowebsite"),
+        "n2: AC1 — no-website + verified_second_line=true is now a candidate, not excluded",
+      );
+      assertTrue(
+        !secondLineExcludedById.has("prov-secondline-nowebsite"),
+        "n3: AC1 — never appears in excluded (specifically not address_domain_mismatch)",
+      );
+      assertEq(
+        secondLineById.get("prov-secondline-nowebsite")?.address_basis,
+        "second_line_verified",
+        "n4: candidate's own address_basis is 'second_line_verified'",
+      );
+      assertEq(
+        secondLine.body.second_line_verified_count,
+        1,
+        "n5: response reports second_line_verified_count 1 (krav 4 — how many went through on 2nd-line)",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-secondline-nowebsite'`).run();
+
+      // ══ (o) route-level: AC2 — a brand-alias/cross-TLD website+email pair
+      // (nogne-o.no / nogne-o.com) is no longer excluded in daily-prep, same
+      // as the sibling contact-audit route ════════════════════════════════════
+      insertProvider.run({
+        id: "prov-nogneo-brandalias", navn: "Nogne-O Brandalias Gård", org_nr: "100000015", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "post@nogne-o.com", telefon: null, hjemmeside: "https://nogne-o.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "nogne-o-brandalias-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const brandAlias = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(brandAlias.status, 200, "o1: brand-alias batch -> 200");
+      const brandAliasById = new Map((brandAlias.body.candidates as any[]).map((c) => [c.provider_id, c]));
+      const brandAliasExcludedById = new Map((brandAlias.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertTrue(
+        brandAliasById.has("prov-nogneo-brandalias"),
+        "o2: AC2 — nogne-o.no/.com brand-alias pair is now a candidate, not excluded",
+      );
+      assertTrue(
+        !brandAliasExcludedById.has("prov-nogneo-brandalias"),
+        "o3: AC2 — never appears in excluded",
+      );
+      assertEq(
+        brandAliasById.get("prov-nogneo-brandalias")?.address_basis,
+        "domain_equivalent_to_website",
+        "o4: candidate's own address_basis is 'domain_equivalent_to_website'",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-nogneo-brandalias'`).run();
+
+      // ══ (p) route-level: AC3 negative/no-regression — a genuinely foreign,
+      // non-equivalent email domain WITH a website is still excluded exactly
+      // as before, and the excluded entry now also carries address_basis
+      // (AC5) ═══════════════════════════════════════════════════════════════
+      insertProvider.run({
+        id: "prov-mismatch-real-dailyprep", navn: "Reell Mismatch Gård", org_nr: "100000016", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "kontakt@dng-norge.no", telefon: null, hjemmeside: "https://lofotpils.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "reell-mismatch-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const realMismatch = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(realMismatch.status, 200, "p1: genuine-mismatch batch -> 200");
+      const realMismatchById = new Map((realMismatch.body.candidates as any[]).map((c) => [c.provider_id, c]));
+      const realMismatchExcludedById = new Map((realMismatch.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertTrue(
+        !realMismatchById.has("prov-mismatch-real-dailyprep"),
+        "p2: AC3 — a genuine unrelated-company domain pair (lofotpils.no / dng-norge.no) is NOT a candidate (no regression)",
+      );
+      assertEq(
+        realMismatchExcludedById.get("prov-mismatch-real-dailyprep")?.reason,
+        "address_domain_mismatch",
+        "p3: AC3 — still excluded, reason address_domain_mismatch (unchanged)",
+      );
+      assertEq(
+        realMismatchExcludedById.get("prov-mismatch-real-dailyprep")?.address_basis,
+        "unverified",
+        "p4: AC5 — the excluded entry now also carries address_basis ('unverified')",
+      );
+      assertEq(
+        realMismatch.body.second_line_verified_count,
+        0,
+        "p5: second_line_verified_count is 0 when no candidate went through on that basis",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-mismatch-real-dailyprep'`).run();
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));

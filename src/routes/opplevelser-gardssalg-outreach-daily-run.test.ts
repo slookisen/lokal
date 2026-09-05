@@ -328,7 +328,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(prep.status, 200, "h5: daily-prep route still 200 after extraction");
       assertEq(
         Object.keys(prep.body).filter((k) => k !== "refill_hints"),
-        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides"],
+        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count"],
         "h6: daily-prep response shape unchanged",
       );
       assertEq(prep.body.pool.daily_cap, 4, "h7: daily-prep still reports the cap");

@@ -270,3 +270,205 @@ export function translateDeliveryTerm(value: string, lang: Lang): string {
   const t = pick(DELIVERY_TERMS[value.trim().toLowerCase()], lang);
   return t === null ? value : recase(value.trim(), t);
 }
+
+// ─── Reverse lookup: English query word → Norwegian search terms ───────────
+// OpenAI's app reviewers test in English; the catalogue, the producers' own
+// product text and `parseNaturalQuery`'s category keywords are Norwegian.
+// Measured live 2026-09-05: `ost Bergen` finds Ostegården (world's best
+// cheese 2018), Colonialen and Møllendal — `producers near Bergen that sell
+// cheese` finds NONE of them, because "cheese" is in no keyword list, so the
+// category filter is skipped entirely and the search degrades to "the ten
+// nearest producers, whatever they sell". Same for milk, salmon, seafood,
+// potatoes, strawberries, apples, butter … That is what the ChatGPT app
+// submission was rejected on (2026-09-05, «one or more of your test cases did
+// not produce correct results»).
+//
+// The vocabulary already exists in this file — it is what renders the English
+// producer pages. This index just reads it backwards, so one glossary keeps
+// serving both, and a word added for rendering improves search for free.
+//
+// Deliberately NOT a second hand-maintained keyword list in
+// marketplace-registry.ts: that is exactly how the two drifted apart.
+
+/** English words that are also Norwegian food words — never auto-mapped. */
+const AMBIGUOUS_EN = new Set([
+  // "is" = ice cream in Norwegian, the verb in English; "and" = duck in
+  // Norwegian, the conjunction in English (see MEAT_KEYWORD_FALSE_FRIENDS in
+  // marketplace-registry.ts); "most" = juice; "te" = tea; "biff"/"burger"/
+  // "bacon"/"chutney"/"squash"/"chili"/"skyr"/"kefir"/"quinoa"/"catering"
+  // are identical in both and need no mapping (excluded separately below,
+  // in getReverseIndex, since that check is spelling-based rather than a
+  // fixed word list).
+  "is", "and", "most", "te", "of", "in", "with", "from", "a", "an",
+]);
+
+/** Conservative English morphology: the forms a reviewer actually types. */
+function englishVariants(term: string): string[] {
+  const t = term.toLowerCase().trim();
+  if (!t) return [];
+  const out = new Set<string>([t]);
+  if (t.endsWith("ies")) out.add(t.slice(0, -3) + "y");       // berries → berry
+  else if (t.endsWith("es")) out.add(t.slice(0, -2));          // potatoes → potato
+  if (t.endsWith("s") && t.length > 3) out.add(t.slice(0, -1)); // apples → apple
+  else out.add(t + "s");                                       // apple → apples
+  return [...out].filter(w => w.length >= 3 && !AMBIGUOUS_EN.has(w));
+}
+
+let reverseIndex: Map<string, string[]> | null = null;
+
+/**
+ * Every generated English word-form that must never be indexed because it
+ * ALSO reads as an ordinary Norwegian word this glossary already knows.
+ *
+ * Round 1 (2026-09-05) only skipped indexing when the (Norwegian, English)
+ * PAIR itself was spelled identically (yoghurt/yoghurt, bacon/bacon). Round 2
+ * found that incomplete, and round 3 found it incomplete again — in both
+ * cases because `englishVariants()` GENERATES a form of an otherwise-genuine
+ * translation that collides with an unrelated Norwegian word even though the
+ * (no, en) pair that produced it isn't identical-spelling:
+ *   - burgere → "burgers"; englishVariants("burgers") generates the singular
+ *     "burger", which is itself the standalone Norwegian loanword
+ *     PRODUCT_WORDS["burger"].
+ *   - saft → "juice"; the base form "juice" IS the standalone Norwegian
+ *     loanword PRODUCT_WORDS["juice"].
+ *   - egg → "eggs"; englishVariants("eggs") singularises to "egg", which is
+ *     the Norwegian word "egg" itself (PRODUCT_WORDS["egg"], a different,
+ *     unrelated entry to the one that generated it).
+ * Two rounds of hand-listing specific words each missed cases (round 3 found
+ * a further miss, "egg", by exhaustive test rather than by hand — see
+ * marketplace-search-english-queries.test.ts), so this is computed from the
+ * vocabulary itself, two ways, instead of a maintained list:
+ *   1. Every word-form (base AND generated variants) of any (no, en) pair
+ *      that is ALREADY identical-spelling (same check as `add()` below) —
+ *      catches "burger"/"burgers", "juice"/"juices", etc. in one go instead
+ *      of only the exact spelling that made the PAIR identical.
+ *   2. Every key that literally exists in PRODUCT_WORDS or PRODUCT_PHRASES —
+ *      i.e. any string this glossary already treats as Norwegian, full stop,
+ *      regardless of whether ITS OWN entry happens to be identical-spelling.
+ *      This is what catches "egg": the entry that produces the colliding
+ *      variant (egg→"eggs") is not itself identical-spelling, so (1) alone
+ *      misses it, but "egg" is unmistakably already Norwegian vocabulary.
+ * Between the two, every generated variant is checked against the glossary's
+ * own Norwegian vocabulary, not against a name someone had to notice and
+ * write down — closing the whole defect class, including cases no review has
+ * hand-checked yet.
+ */
+function computeExcludedForms(): Set<string> {
+  const forms = new Set<string>();
+  const scan = (rec: Record<string, Entry>) => {
+    for (const [no, entry] of Object.entries(rec)) {
+      forms.add(no.toLowerCase()); // (2): the Norwegian key itself
+      if (entry.en.toLowerCase() === no.toLowerCase()) {
+        for (const v of englishVariants(entry.en)) forms.add(v); // (1): its own word-forms
+      }
+    }
+  };
+  scan(PRODUCT_WORDS);
+  scan(PRODUCT_PHRASES);
+  return forms;
+}
+
+/** english term → the Norwegian words that mean it (built once, lazily). */
+function getReverseIndex(): Map<string, string[]> {
+  if (reverseIndex) return reverseIndex;
+  const idx = new Map<string, string[]>();
+  const excludedForms = computeExcludedForms();
+  const add = (en: string, no: string) => {
+    // Identical-spelling loanwords ("yoghurt", "burger", "bacon", "skyr",
+    // "kefir", "quinoa", "catering", "squash", "chutney", "juice", …) are
+    // real Norwegian words that happen to be spelled exactly like their
+    // English translation. They carry no cross-language mapping value: if
+    // the literal word is present in the query text at all, any category
+    // keyword equal to it already matches directly against `q` via
+    // norwegianWordBoundary in marketplace-registry.ts — appending it again
+    // through the reverse index is a no-op for matching, and only pollutes
+    // norwegianTermsForEnglishQuery()'s "this looks like an English query"
+    // signal. Bug (2026-09-05): a 100%-Norwegian query "and og yoghurt"
+    // ("duck and yogurt") returned englishTerms=["yoghurt"] purely because
+    // "yoghurt" round-trips to itself, which fired
+    // suppressEnglishConjunction and silently dropped the `and` (duck)
+    // keyword — and therefore the `meat` category — from a HARD filter, for
+    // a query with no English in it at all. Only identical-spelling pairs
+    // are skipped; genuinely different-spelling pairs (cheese→ost,
+    // salmon→laks, …) are real translations and still indexed below.
+    if (en.toLowerCase() === no.toLowerCase()) return;
+    for (const v of englishVariants(en)) {
+      // Rounds 2 & 3 (2026-09-05): a GENERATED variant of a genuine
+      // translation can independently collide with the glossary's own
+      // Norwegian vocabulary (burgere→"burgers" generates "burger";
+      // saft→"juice" generates "juice" itself; egg→"eggs" generates "egg")
+      // even though the (no, en) pair above isn't identical. Skip those the
+      // same way, for the same reason — see computeExcludedForms().
+      if (excludedForms.has(v)) continue;
+      const cur = idx.get(v);
+      if (!cur) idx.set(v, [no]);
+      else if (!cur.includes(no)) cur.push(no);
+    }
+  };
+  for (const [no, entry] of Object.entries(PRODUCT_WORDS)) {
+    if (AMBIGUOUS_EN.has(no.toLowerCase())) continue; // "and" (duck), "is" (ice cream)
+    add(entry.en, no);
+  }
+  for (const [no, entry] of Object.entries(PRODUCT_PHRASES)) add(entry.en, no);
+  reverseIndex = idx;
+  return idx;
+}
+
+/**
+ * Norwegian search terms for the English food words in `query`.
+ *
+ * Returns [] for a Norwegian query (nothing matches) and for a query with no
+ * food words, so the caller can append the result unconditionally. Multi-word
+ * English phrases ("goat cheese", "baked goods") are matched before single
+ * words, and single words are matched on a word boundary so "cheese" does not
+ * fire inside "cheesecake-free".
+ */
+export function norwegianTermsForEnglishQuery(query: string): string[] {
+  const q = (query || "").toLowerCase();
+  if (!q.trim()) return [];
+  const idx = getReverseIndex();
+  const found = new Set<string>();
+
+  // Phrases first — "goat cheese" must map to geitost, not just ost.
+  for (const [en, nos] of idx) {
+    if (!en.includes(" ")) continue;
+    if (q.includes(en)) nos.forEach(n => found.add(n));
+  }
+  for (const word of q.split(/[^a-z0-9'-]+/)) {
+    const nos = idx.get(word);
+    if (nos) nos.forEach(n => found.add(n));
+  }
+  return [...found];
+}
+
+/**
+ * True when `word` is an English food word this glossary knows.
+ *
+ * The producer-NAME branch in marketplace-registry.ts skips category words so
+ * they cannot become name tokens, but it only knew Norwegian ones — so
+ * "goat cheese farm" still built the name query "goat cheese" and fuzzy-
+ * matched producer names instead of filtering on dairy.
+ */
+export function isEnglishFoodWord(word: string): boolean {
+  const w = (word || "").toLowerCase().trim();
+  if (!w) return false;
+  const idx = getReverseIndex();
+  if (idx.has(w)) return true;
+  // A modifier that only ever appears inside a known phrase ("goat" in "goat
+  // cheese") is a food word too — otherwise it survives alone as a name token.
+  for (const en of idx.keys()) if (en.includes(" ") && en.split(" ").includes(w)) return true;
+  return false;
+}
+
+/** Test/report helper: how many distinct English words the index covers. */
+export function reverseGlossarySize(): number {
+  return getReverseIndex().size;
+}
+
+// Test-only: every key currently in the reverse index, so a test can iterate
+// the REAL vocabulary the code produces instead of a hand-picked word list —
+// exactly the pattern that missed "burger"/"juice" across two review rounds.
+// Never call from production code.
+export function __peekReverseIndexKeysForTesting(): string[] {
+  return [...getReverseIndex().keys()];
+}
