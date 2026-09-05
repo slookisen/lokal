@@ -4249,6 +4249,57 @@ export function buildProducerMetaDescription(
   return desc;
 }
 
+// ─── Role/vetted gate for /produsent/:slug (dev-request 2026-07-23-crm-
+// house-bucket-kimaere-opprydding, extracted as a reusable helper by
+// dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 1) ──────
+// This route serves two intentional kinds of public page: real producers
+// (role='producer') and umbrella-tagged agents (lokallag/venues/market
+// networks, discriminated by `umbrella_type` being non-null regardless of
+// `role`). ANY other active agent — role='logistics', 'consumer', 'quality',
+// 'price-intel', or a legacy row with an unexpected role — must never get a
+// public producer page just because it's `is_active=1` and its slugified
+// name happens to match. A self-registered profile that hasn't been vetted
+// by a human yet must also be refused, exactly like an unknown slug — never
+// leak "this exists but is hidden".
+//
+// Factored out so BOTH the primary agent lookup below AND a slug-alias hit
+// (Mål 1 — an old, abandoned slug resolving to the agent's current page) run
+// through the exact same SQL/logic: a revived alias must never reach a
+// non-producer, non-umbrella, or not-yet-vetted agent's page either.
+//
+// `requestedSlug` is only used for the log lines below (so a suppressed
+// alias hit still logs against the URL a visitor actually typed).
+function passesRoleGate(
+  agent: { id: string; name: string; role?: string },
+  requestedSlug: string,
+): boolean {
+  let roleGateUmbrellaType: string | null = null;
+  let roleGateIsVetted = 1;
+  try {
+    const row = getDb()
+      .prepare("SELECT umbrella_type, is_vetted FROM agents WHERE id = ?")
+      .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null } | undefined;
+    roleGateUmbrellaType = row ? row.umbrella_type : null;
+    // is_vetted defaults to 1 in the schema (see database/init.ts) — a
+    // NULL/undefined read (shouldn't happen post-migration, but this
+    // route never fabricates trust either way) is treated as vetted.
+    roleGateIsVetted = row && row.is_vetted != null ? row.is_vetted : 1;
+  } catch (e) {
+    console.error("[seo] role-gate umbrella lookup failed:", e);
+  }
+  const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
+  const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
+  if (failsRoleGate || !roleGateIsVetted) {
+    if (!roleGateIsVetted) {
+      console.log(`[seo:quarantine-gate] suppressed not-yet-vetted agent ${agent.id} (${agent.name}) on /produsent/${requestedSlug}`);
+    } else {
+      console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${requestedSlug}`);
+    }
+    return false;
+  }
+  return true;
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -4291,39 +4342,36 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // non-producer role is rejected. Umbrella-tagged agents are exempted from
     // the role check entirely: they're looked up by the same call but are a
     // distinct, intentional rendering path (see isUmbrella below).
-    if (agent) {
-      let roleGateUmbrellaType: string | null = null;
-      let roleGateIsVetted = 1;
-      try {
-        const row = getDb()
-          .prepare("SELECT umbrella_type, is_vetted FROM agents WHERE id = ?")
-          .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null } | undefined;
-        roleGateUmbrellaType = row ? row.umbrella_type : null;
-        // is_vetted defaults to 1 in the schema (see database/init.ts) — a
-        // NULL/undefined read (shouldn't happen post-migration, but this
-        // route never fabricates trust either way) is treated as vetted.
-        roleGateIsVetted = row && row.is_vetted != null ? row.is_vetted : 1;
-      } catch (e) {
-        console.error("[seo] role-gate umbrella lookup failed:", e);
-      }
-      const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
-      const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
-      // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
-      // self-registered profile that hasn't been vetted by a human yet must
-      // 404 exactly like an unknown slug — never leak "this exists but is
-      // hidden". Unconditional (applies to producers AND umbrella rows
-      // alike, though umbrellas are never self-registered in practice).
-      if (failsRoleGate || !roleGateIsVetted) {
-        if (!roleGateIsVetted) {
-          console.log(`[seo:quarantine-gate] suppressed not-yet-vetted agent ${agent.id} (${agent.name}) on /produsent/${slug}`);
-        } else {
-          console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${slug}`);
-        }
-        agent = undefined;
-      }
+    // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
+    // self-registered profile that hasn't been vetted by a human yet must
+    // 404 exactly like an unknown slug — never leak "this exists but is
+    // hidden". Unconditional (applies to producers AND umbrella rows
+    // alike, though umbrellas are never self-registered in practice).
+    if (agent && !passesRoleGate(agent, slug)) {
+      agent = undefined;
     }
 
     if (!agent) {
+      // ─── Slug-alias check (dev-request 2026-09-03-rfb-korrigering-navn-
+      // sted-kategorier, Mål 1) ───────────────────────────────────────────
+      // An exact historical-rename match is stronger evidence than the
+      // fuzzy name-similarity guess below, so it's checked FIRST. Runs the
+      // alias hit through the exact same role/is_vetted gate as the primary
+      // lookup above (passesRoleGate) — a revived alias must never become a
+      // back door to a non-producer, non-umbrella, or not-yet-vetted
+      // agent's page. No hit, or gate failure -> fall through unchanged to
+      // the existing fuzzy fallback.
+      const aliasHit = marketplaceRegistry.resolveAgentSlugAlias(slug);
+      if (aliasHit && passesRoleGate(aliasHit, slug)) {
+        const canonical = slugify(aliasHit.name);
+        if (canonical && canonical !== slug) {
+          // 301 tells crawlers to update their index — same rationale as
+          // the fuzzy-match redirect below, but backed by an exact
+          // historical record instead of a similarity guess.
+          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+        }
+      }
+
       // Fuzzy fallback so AI-engine traffic that constructs slugs from
       // names (e.g. Perplexity citing "bondens-marked-grunerlokka" when
       // the canonical is "bondens-marked-birkelunden-grunerlokka") gets

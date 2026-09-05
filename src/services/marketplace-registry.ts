@@ -1308,6 +1308,26 @@ class MarketplaceRegistry {
       }
     }
 
+    // ─── Slug-alias side-write (dev-request 2026-09-03-rfb-korrigering-navn-
+    // sted-kategorier, Mål 1) ───────────────────────────────────────────────
+    // Slug is NOT a persisted column (see getAgentBySlugIncludingUmbrellas
+    // below) — it is recomputed from `name` on every /produsent/:slug lookup.
+    // A rename therefore kills the old URL immediately and silently unless we
+    // record the abandoned slug here. Only fires when the RESOLVABLE slug
+    // actually changes — compare slugify(old) vs slugify(new), not raw
+    // string inequality on `name`, so a purely cosmetic edit (punctuation,
+    // casing) that slugifies identically writes no alias row. Best-effort:
+    // a failed alias write must never block the rename itself, same
+    // "best-effort side-write" discipline as the provider_work_queue writes
+    // in dev-request 2026-08-17-forsyningskjede...'s Skive 1.
+    if (updates.name !== undefined && slugify(updates.name) !== slugify(existing.name)) {
+      try {
+        insertAgentSlugAlias(id, slugify(existing.name));
+      } catch (err) {
+        console.error("[marketplace-registry] slug-alias write failed (rename proceeds regardless):", err);
+      }
+    }
+
     values.push(id);
     db.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`).run(...values);
     this.invalidateCache();
@@ -1402,6 +1422,26 @@ class MarketplaceRegistry {
     const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
     const row = rows.find(r => slugify(r.name).toLowerCase() === target);
     return row ? this.rowToAgent(row) : undefined;
+  }
+
+  // ─── Slug-alias resolution (dev-request 2026-09-03-rfb-korrigering-navn-
+  // sted-kategorier, Mål 1) ────────────────────────────────────────────────
+  // Read-only companion to insertAgentSlugAlias below. Looks up an abandoned
+  // slug (written by updateAgent()'s rename hook, or backfilled via
+  // POST /admin/agents/:id/slug-alias) and returns the agent it now belongs
+  // to — but ONLY if that agent is still `is_active`. Never resurrects a
+  // deleted/deactivated agent's alias into a working redirect target. Pure
+  // read; never writes.
+  resolveAgentSlugAlias(oldSlug: string): RegisteredAgent | undefined {
+    const db = getDb();
+    ensureAgentSlugAliasesTable(db);
+    const row = db
+      .prepare("SELECT agent_id FROM agent_slug_aliases WHERE old_slug = ?")
+      .get(oldSlug) as { agent_id: string } | undefined;
+    if (!row) return undefined;
+    const agent = this.getAgent(row.agent_id);
+    if (!agent || !agent.isActive) return undefined;
+    return agent;
   }
 
   // ─── Phase 5.11 follow-up: id lookup that INCLUDES umbrella-tagged agents ──
@@ -1789,6 +1829,47 @@ class MarketplaceRegistry {
 
     return { score: Math.min(1, score), reasons };
   }
+}
+
+// ─── Agent slug aliases (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+// kategorier, Mål 1 — slug-alias/301 ved navnebytte) ───────────────────────
+// Slug is not a persisted column — it is recomputed from `name` on every
+// /produsent/:slug lookup (getAgentBySlugIncludingUmbrellas above), so a
+// rename kills the old URL immediately and silently. This table records the
+// abandoned slug so the old URL can 301 forward instead of 404ing.
+//
+// Lazy DDL, same pattern as ensureRfbWebsiteReviewQueueTable
+// (routes/admin-rfb-website-discovery.ts): created at point of use, not
+// wired into database/init.ts's startup migration.
+//
+// old_slug is the PRIMARY KEY (not composite with agent_id): a historical
+// slug is globally unique in the URL namespace regardless of which agent
+// last owned it — INSERT OR REPLACE on collision (the same slug abandoned
+// by two different agents over time) lets the most recently abandoned
+// ownership win, consistent with the redirect's purpose ("help the most
+// recent link"), not a full historical archive.
+export function ensureAgentSlugAliasesTable(db: ReturnType<typeof getDb>): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_slug_aliases (
+      old_slug TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    )
+  `);
+}
+
+// Small exported helper — called both internally by updateAgent() above
+// (best-effort, on a rename that actually changes the computed slug) and by
+// POST /admin/agents/:id/slug-alias (routes/admin-agents.ts, the one-shot
+// manual-backfill tool for renames that happened before this slice
+// shipped). No duplicated SQL between the two call sites.
+export function insertAgentSlugAlias(agentId: string, oldSlug: string): void {
+  const db = getDb();
+  ensureAgentSlugAliasesTable(db);
+  db.prepare(
+    "INSERT OR REPLACE INTO agent_slug_aliases (old_slug, agent_id) VALUES (?, ?)"
+  ).run(oldSlug, agentId);
 }
 
 // ─── Haversine distance ──────────────────────────────────────

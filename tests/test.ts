@@ -40997,6 +40997,33 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 1
+// (slug-alias/301 ved navnebytte): ensureAgentSlugAliasesTable /
+// insertAgentSlugAlias / resolveAgentSlugAlias (src/services/marketplace-
+// registry.ts), updateAgent()'s rename hook (alias written only when the
+// RESOLVABLE slug actually changes), and POST /admin/agents/:id/slug-alias
+// (src/routes/admin-agents.ts). The /produsent/:slug redirect + role-gate
+// integration cases for this same slice live in produsent-role-gate.test.ts
+// above (cases f/g). Own harness (__setDbForTesting/__initSchemaForTesting,
+// real admin route handler pulled off the route stack — mirrors
+// admin-agents.test.ts's POST /register harness). Runs via runSerial() like
+// the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 1: marketplace-registry slug-alias ──");
+  try {
+    const { runMarketplaceRegistrySlugAliasTests } = require("../src/services/marketplace-registry-slug-alias.test") as
+      typeof import("../src/services/marketplace-registry-slug-alias.test");
+    const msa = await runMarketplaceRegistrySlugAliasTests({ log: false });
+    passed += msa.passed;
+    failed += msa.failed;
+    for (const f of msa.failures) failures.push("marketplace-registry-slug-alias: " + f);
+    console.log(`  marketplace-registry-slug-alias: ${msa.passed} passed, ${msa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-registry-slug-alias: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2:
 // POST /admin/crm-chimera-agent-clear (src/routes/admin-crm-chimera-agent-clear.ts)
 // — clears the ONE hardcoded chimera agent_knowledge row (agent_id

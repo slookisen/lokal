@@ -33,6 +33,17 @@
  *   (e) unknown slug entirely               -> 404 (regression guard: the
  *       gate must not change the pre-existing not-found path's shape).
  *
+ * Mål 1 addendum (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+ * kategorier — slug-alias/301 ved navnebytte, extracted the role-gate above
+ * into the reusable passesRoleGate() helper in seo.ts so both cases below
+ * run through it):
+ *   (f) an agent renamed via the REAL updateAgent() rename hook -> GET
+ *       /produsent/<old-slug> 301s to /produsent/<current-slug>.
+ *   (g) same rename mechanism, but the agent is role='logistics' (the (c)
+ *       house-bucket shape) -> the alias hit does NOT redirect; falls
+ *       through unchanged to the ordinary not-found page (an alias must
+ *       never be a back door around the role/is_vetted gate).
+ *
  * Exported runProdusentRoleGateTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/routes/produsent-role-gate.test.ts
  */
@@ -120,6 +131,17 @@ export async function runProdusentRoleGateTests(opts: { log?: boolean } = {}): P
     seedAgent({ id: "quality-1", name: "Kvalitetstest Konto", role: "quality" });
     seedAgent({ id: "priceintel-1", name: "Prisintel Test Konto", role: "price-intel" });
 
+    // ── Mål 1 fixtures: slug-alias/301 on rename (dev-request 2026-09-03-
+    // rfb-korrigering-navn-sted-kategorier) — renamed via the REAL
+    // updateAgent() rename hook, not a hand-rolled alias-table insert, so
+    // this exercises the actual write path end to end.
+    seedAgent({ id: "renamed-prod-1", name: "Gamle Testgård Navn", role: "producer" });
+    seedAgent({ id: "renamed-gated-1", name: "Gamle Portvakt Navn", role: "logistics" });
+    const { marketplaceRegistry } = require("../services/marketplace-registry") as
+      typeof import("../services/marketplace-registry");
+    marketplaceRegistry.updateAgent("renamed-prod-1", { name: "Nye Testgård Navn" });
+    marketplaceRegistry.updateAgent("renamed-gated-1", { name: "Nye Portvakt Navn" });
+
     // seo.ts's shell() calls getConfig(), which throws unless the vertical
     // configs were cold-loaded at boot. Same best-effort load as
     // admin-agents-brreg-catalog-sweep.test.ts / reise-page.test.ts.
@@ -136,17 +158,18 @@ export async function runProdusentRoleGateTests(opts: { log?: boolean } = {}): P
     assertTrue(!!layer, "setup: GET /produsent/:slug layer is registered");
     const handler = layer.route.stack[layer.route.stack.length - 1].handle;
 
-    function invokeProdusent(slug: string): { status: number; body: string } {
+    function invokeProdusent(slug: string): { status: number; body: string; location?: string } {
       let status = 200;
       let body = "";
+      let location: string | undefined;
       const res: any = {
         status: (c: number) => { status = c; return res; },
         send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
-        redirect: (_c: number, _l: string) => { status = 301; return res; },
+        redirect: (_c: number, l: string) => { status = 301; location = l; return res; },
       };
       const req: any = { params: { slug }, lang: "no", ip: "127.0.0.1" };
       handler(req, res);
-      return { status, body };
+      return { status, body, location };
     }
 
     // ── (a) real producer — unchanged, renders 200 ─────────────────────
@@ -189,6 +212,35 @@ export async function runProdusentRoleGateTests(opts: { log?: boolean } = {}): P
       const r = invokeProdusent("dette-finnes-ikke-i-det-hele-tatt");
       assertEq(r.status, 404, "e1: unknown slug still 404s");
       assertTrue(r.body.includes("Produsent ikke funnet"), "e2: unknown slug gets the not-found page (pre-existing behavior, unchanged)");
+    }
+
+    // ── (f) Mål 1 (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+    // kategorier): a renamed producer's OLD slug 301s to the current slug,
+    // checked BEFORE the fuzzy fallback (exact historical match beats a
+    // similarity guess) ──────────────────────────────────────────────────
+    {
+      const r = invokeProdusent("gamle-testgard-navn");
+      assertEq(r.status, 301, "f1: renamed producer's old slug 301s instead of 404ing");
+      assertTrue(!!r.location && r.location.includes("nye-testgard-navn"), "f2: redirect Location points at the agent's current slug");
+    }
+
+    // ── (g) Mål 1: a slug-alias hit for a role-gated agent must NOT
+    // redirect — the alias path runs through the exact same role/is_vetted
+    // gate as a direct slug match (same house-bucket shape as (c) above,
+    // just reached via a revived alias instead of a direct name match).
+    // NB: unlike (c), this does NOT assert the agent's name is entirely
+    // absent from the body — the pre-existing fuzzy "Mente du...?"
+    // suggestions grid (findProducerMatches) draws from
+    // getActiveAgents(), which has never filtered by role (only the
+    // primary/alias lookups' passesRoleGate does), so a role-gated agent
+    // can legitimately appear there as a SUGGESTION. That's unrelated,
+    // pre-existing behavior this slice does not touch — the thing under
+    // test here is specifically that no 301 REDIRECT happens. ─────────
+    {
+      const r = invokeProdusent("gamle-portvakt-navn");
+      assertEq(r.status, 404, "g1: alias hit for a role-gated (role='logistics') agent does not redirect");
+      assertTrue(r.body.includes("Produsent ikke funnet"), "g2: falls through unchanged to the ordinary not-found page");
+      assertEq(r.location, undefined, "g3: no Location header is ever set — the gate blocked the redirect itself");
     }
   } catch (err) {
     failed++;
