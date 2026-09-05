@@ -24,6 +24,15 @@
  *   (g) an agent with no usable Brreg beskrivelse (empty on all 3
  *       naeringskode) is skipped (no_brreg_description) and left untouched.
  *
+ * Also covers (pure-function, no DB/fetch involved) dev-request
+ * 2026-09-05-owner-correction-categories-products: canCorrectFactualField()
+ * in admin-knowledge.ts — an owner-asserted (Tier-S) correction on
+ * `categories`/`products` must be allowed even when the existing value is
+ * already well-sourced (>=2 distinct Tier-A), while `about`/`description`
+ * keep the existing (stricter) behavior and the absolute curated_locked
+ * refusal still wins over the new rule. Style mirrors the canCorrect*
+ * pure-function tests already in tests/test.ts (search "canCorrectFactualField").
+ *
  * All Brreg I/O is stubbed via a monkey-patched global.fetch (mirrors
  * admin-agents-brreg-catalog-sweep.test.ts exactly — fetchBrregActivityDescription
  * defaults its fetchImpl param to the global `fetch` identifier). ZERO real
@@ -164,6 +173,81 @@ export async function runBrregDescriptionFallbackTests(opts: { log?: boolean } =
       );
       assertTrue(!!layer, `setup: ${method.toUpperCase()} ${path} handler is registered on the router`);
       return layer.route.stack[0].handle;
+    }
+
+    // ── dev-request 2026-09-05-owner-correction-categories-products ────────
+    // Pure-function tests on canCorrectFactualField() — no DB/fetch fixtures
+    // needed. Style mirrors the canCorrectFactualField() tests in
+    // tests/test.ts (homepageRec/gplacesRec/ownerRec/twoTierA helpers).
+    {
+      const adminKnowledgeMod = require("../routes/admin-knowledge") as typeof import("../routes/admin-knowledge");
+      const canCorrect = adminKnowledgeMod.canCorrectFactualField;
+      // website_homepage (not the bare "homepage" token) so these existing
+      // fixtures already carry "preferred content" (PR-A) — required so the
+      // incoming owner source (also preferred content) does NOT get
+      // short-circuited by the earlier PR-A fast path (which only fires when
+      // the EXISTING value lacks preferred content); this way the existing
+      // value genuinely reaches the tierADistinct>=2 / "not known-bad" branch
+      // that the new owner-correction rule must override.
+      const whpRec = (v: string) => ({ value: v, source_type: "website_homepage", fetched_at: "2026-09-01T00:00:00Z" });
+      const gplacesRec = (v: string) => ({ value: v, source_type: "google_places", fetched_at: "2026-09-01T00:00:00Z" });
+      const ownerRec = (v: string) => ({ value: v, source_type: "owner", fetched_at: "2026-09-01T00:00:00Z" });
+      const twoTierA = (v: string) => [whpRec(v), gplacesRec(v)];
+
+      // (a) categories: existing already well-sourced (>=2 distinct Tier-A,
+      //     NOT known-bad) — an owner correction must still win.
+      {
+        const d = canCorrect({
+          field: "categories",
+          existingFieldProvenance: twoTierA("Bakeri"),
+          websiteOwnershipUnverified: false,
+          incomingFieldProvenance: [ownerRec("Gårdsbutikk")],
+          isCurated: false,
+        });
+        assertTrue(d.allowed === true, "owner-correction-a: categories owner correction ALLOWED over existing 2xTierA");
+        assertEq(d.reason, "ok_owner_correction", "owner-correction-a: reason is ok_owner_correction");
+      }
+
+      // (b) same shape for products.
+      {
+        const d = canCorrect({
+          field: "products",
+          existingFieldProvenance: twoTierA("epler"),
+          websiteOwnershipUnverified: false,
+          incomingFieldProvenance: [ownerRec("pærer")],
+          isCurated: false,
+        });
+        assertTrue(d.allowed === true, "owner-correction-b: products owner correction ALLOWED over existing 2xTierA");
+        assertEq(d.reason, "ok_owner_correction", "owner-correction-b: reason is ok_owner_correction");
+      }
+
+      // (c) regression guard: identical setup but field "about" — NOT in
+      //     scope for this rule, must remain REFUSED (unchanged behavior).
+      {
+        const d = canCorrect({
+          field: "about",
+          existingFieldProvenance: twoTierA("Om gården vår"),
+          websiteOwnershipUnverified: false,
+          incomingFieldProvenance: [ownerRec("Ny tekst om gården")],
+          isCurated: false,
+        });
+        assertTrue(d.allowed === false, "owner-correction-c: about is OUT of scope, still REFUSED despite owner source");
+        assertEq(d.reason, "existing_already_two_tierA", "owner-correction-c: reason is unchanged existing_already_two_tierA");
+      }
+
+      // (d) regression guard: curated/locked categories field — the absolute
+      //     hard-refusal #1 must still win over the new owner-correction rule.
+      {
+        const d = canCorrect({
+          field: "categories",
+          existingFieldProvenance: twoTierA("Bakeri"),
+          websiteOwnershipUnverified: false,
+          incomingFieldProvenance: [ownerRec("Gårdsbutikk")],
+          isCurated: true,
+        });
+        assertTrue(d.allowed === false, "owner-correction-d: curated/locked categories still REFUSED despite owner source");
+        assertEq(d.reason, "curated_locked", "owner-correction-d: reason is curated_locked (absolute, checked first)");
+      }
     }
 
     const postFallback = getHandler("post", "/brreg-description-fallback");
