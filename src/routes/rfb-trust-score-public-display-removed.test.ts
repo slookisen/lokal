@@ -4,11 +4,29 @@
  * 2026-09-03 ~14:2xZ, "A på trust-score" — daniel-responses/2026-09-03-go-a-
  * trust-score-og-importer-drangedal.md).
  *
- * Covers the removal of the public "Trust Score" percentage bar
- * (`.trust-m`/`.trust-bar`/`.trust-fill`, `src/routes/seo.ts`) from:
- *   - all three producer-card renderer variants (plain, ultra-rich,
- *     medium-rich) used on the homepage and list pages, and
- *   - the producer profile page's `pf-stats` block (`GET /produsent/:slug`).
+ * Covers the removal of the public "Trust Score" percentage bar from every
+ * surface an unauthenticated visitor/agent reaches:
+ *   - `src/routes/seo.ts` — all three producer-card renderer variants (plain,
+ *     ultra-rich, medium-rich) on the homepage/list pages, and the producer
+ *     profile page's `pf-stats` block (`GET /produsent/:slug`).
+ *   - `src/public/app.html` (live consumer SPA) and `src/public/dashboard.html`
+ *     (legacy, still `express.static`-served) — the per-card trust bar, the
+ *     agent-detail modal's trust row, and their now-dead CSS. The "Trust
+ *     Score" SORT option is relabeled ("Anbefalt"), not removed — the sort
+ *     mechanism itself is unchanged (non-goal), only its visible label.
+ *   - `src/mcp/server.ts` — the `lokal_search`/`lokal_salgskanal` MCP tools'
+ *     text output no longer prints a `Trust: NN%` line (an A2A/MCP client is
+ *     as much a "public list view" as a browser). `Verifisert av eier` (an
+ *     unrelated, untouched badge) still prints.
+ *
+ * Deliberately NOT touched — `src/public/selger.html`'s trust-score
+ * breakdown ("🎯 Veien til 100% Trust Score" + per-signal tips). That is the
+ * producer's OWN claimed-ownership dashboard, i.e. the existing partial seed
+ * of the dev-request's alternative B ("vis det kun for eieren... B senere",
+ * "eier-visning finnes delvis") — Daniel approved only alternative A (public
+ * removal) now; B is explicitly future work, not this PR's to delete. This
+ * suite asserts selger.html is unchanged, so a future slice doesn't
+ * accidentally re-flag or re-remove it.
  *
  * `agent.trustScore`/`agents.trust_score` itself, and discovery's
  * `ORDER BY trust_score DESC` sort, are untouched (non-goal) — this suite
@@ -22,6 +40,13 @@
  * rfb-verifisert-av-eier-badge-rename.test.ts (own `Database(":memory:")`,
  * `__setDbForTesting`/`__initSchemaForTesting`, the real `seo.ts` router's
  * handlers pulled directly off the route stack — no HTTP server, no port).
+ * The static-file/MCP-source checks use the same raw `fs.readFileSync` +
+ * string-search convention rfb-verifisert-av-eier-badge-rename.test.ts
+ * already uses for app.html/selger.html/dashboard.html/admin.html — no
+ * existing in-process test harness registers `src/mcp/server.ts`'s tools
+ * (unlike `src/routes/mcp.ts`, which mcp-search-geo.test.ts exercises via a
+ * duck-typed server), so a source-text check is this repo's established
+ * fallback for that file rather than a novel harness.
  *
  * Exported runTrustScorePublicDisplayRemovedTests({log}) -> TestSummary;
  * wired into tests/test.ts.
@@ -34,6 +59,8 @@
  */
 
 import Database from "better-sqlite3";
+import * as fs from "fs";
+import * as path from "path";
 
 export interface TestSummary {
   passed: number;
@@ -212,6 +239,49 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
     {
       const row = testDb.prepare("SELECT trust_score FROM agents WHERE id = 'ultra-1'").get() as { trust_score: number };
       assertTrue(Math.abs(row.trust_score - 0.95) < 1e-9, "db: agents.trust_score for ultra-1 is unchanged (0.95), only its public rendering was removed");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // (4) Static public-facing surfaces beyond seo.ts's SSR templates:
+    // the consumer SPA (app.html), the legacy-but-still-served dashboard
+    // (dashboard.html), and the MCP tool text output. Same
+    // fs.readFileSync + string-search convention as
+    // rfb-verifisert-av-eier-badge-rename.test.ts's static-file checks.
+    // ══════════════════════════════════════════════════════════════
+    {
+      const appSrc = fs.readFileSync(path.join(__dirname, "../public/app.html"), "utf8");
+      const dashboardSrc = fs.readFileSync(path.join(__dirname, "../public/dashboard.html"), "utf8");
+      const mcpServerSrc = fs.readFileSync(path.join(__dirname, "../mcp/server.ts"), "utf8");
+      const selgerSrc = fs.readFileSync(path.join(__dirname, "../public/selger.html"), "utf8");
+
+      for (const [name, src] of [["app.html", appSrc], ["dashboard.html", dashboardSrc]] as const) {
+        assertTrue(!src.includes("trust-bar"), `${name}: no element carries the trust-bar class`);
+        assertTrue(!src.includes("trust-fill"), `${name}: no element carries the trust-fill class`);
+        assertTrue(!src.includes("modal-trust-bar"), `${name}: the modal's trust bar markup/CSS is gone`);
+        assertTrue(!src.includes("modal-trust-fill"), `${name}: the modal's trust fill markup/CSS is gone`);
+        assertTrue(!src.includes("trustPct"), `${name}: no leftover trustPct computation remains`);
+        assertTrue(!/Pålitelighet/.test(src), `${name}: the per-card "Pålitelighet" trust label is gone`);
+        // The sort mechanism itself (value="trust", same server-side field,
+        // same ranking - non-goal) is unchanged; only its visible label is,
+        // so the trust-score-implying string doesn't show up in the UI.
+        assertTrue(src.includes('<option value="trust">Anbefalt</option>'),
+          `${name}: the trust sort option is relabeled to "Anbefalt" (sort itself untouched)`);
+        assertTrue(!src.includes('<option value="trust">Trust Score</option>'),
+          `${name}: the old "Trust Score" sort-option label is gone`);
+      }
+
+      assertTrue(!mcpServerSrc.includes("Trust: "), "mcp/server.ts: no tool prints a \"Trust: NN%\" text line anymore");
+      assertTrue(mcpServerSrc.includes("Verifisert av eier"), "mcp/server.ts: the unrelated \"Verifisert av eier\" badge text is untouched");
+
+      // Deliberately NOT removed - selger.html is the producer's own
+      // claimed-ownership dashboard (dev-request's alternative B, "vis det
+      // kun for eieren... B senere"), not the public produsentside/listeside
+      // this PR (alternative A) is scoped to. Assert it is UNCHANGED so a
+      // future wake doesn't mistake it for a leftover gap.
+      assertTrue(selgerSrc.includes('data-i18n="stat_trust">Trust Score<'),
+        "selger.html: the owner-dashboard Trust Score stat card is deliberately untouched (alternative B, not this PR's scope)");
+      assertTrue(selgerSrc.includes("Veien til 100% Trust Score"),
+        "selger.html: the owner-facing trust breakdown title is deliberately untouched (alternative B, not this PR's scope)");
     }
   } catch (err) {
     failed++;

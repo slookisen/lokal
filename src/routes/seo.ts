@@ -493,7 +493,7 @@ const CSS = `
   .pc-city { font-size: 0.8rem; color: var(--g500); margin-top: 2px; }
   .pc-desc { font-size: 0.85rem; color: var(--g500); line-height: 1.5; margin-bottom: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .pc-tags { margin-bottom: 12px; }
-  .pc-foot { display: flex; justify-content: space-between; align-items: center; padding-top: 12px; border-top: 1px solid var(--g100); }
+  .pc-foot { display: flex; justify-content: flex-end; align-items: center; padding-top: 12px; border-top: 1px solid var(--g100); }
   .pc-link { font-size: 0.8rem; font-weight: 600; color: var(--green-700); }
 
   /* Footer */
@@ -3651,7 +3651,6 @@ const PROFILE_CSS = `
   .pf-stats { display: flex; gap: 22px; margin-top: 18px; flex-wrap: wrap; }
   .pf-stat { display: flex; align-items: center; gap: 8px; }
   .pf-stat-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
-  .pf-stat-icon.t { background: var(--green-100); }
   .pf-stat-icon.r { background: #fef3c7; }
   .pf-stat-icon.h { background: #dbeafe; }
   .pf-stat-icon.a { background: #ede9fe; }
