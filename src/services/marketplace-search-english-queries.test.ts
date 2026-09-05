@@ -154,6 +154,39 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
     ok(cats("and").includes("meat"), `NO "and" (duck) → meat, unchanged`);
     ok(cats("and fra Hedmark").includes("meat"), `NO "and fra Hedmark" → meat, unchanged`);
 
+    // ────────────────────────────────────────────────────────────────────
+    // C2 — regression: an identical-spelling loanword must NOT be mistaken
+    // for "this looks like an English query" and suppress the Norwegian
+    // «and» (duck) keyword.
+    //
+    // `norwegianTermsForEnglishQuery` is built off a reverse index of
+    // English→Norwegian translations. A loanword like "yoghurt" is spelled
+    // IDENTICALLY in both languages, so before the fix it round-tripped to
+    // itself in that index — `norwegianTermsForEnglishQuery("and og
+    // yoghurt")` returned `["yoghurt"]` purely from a 100%-Norwegian query,
+    // which made `suppressEnglishConjunction` fire and silently dropped the
+    // `and` (duck) keyword — and therefore the `meat` category — from a HARD
+    // category filter, for a query with no English word in it at all.
+    // Measured 2026-09-05: this is exactly the "category silently dropped"
+    // defect class the rest of this file exists to fix, reproduced here for
+    // a pure Norwegian query.
+    ok(cats("and og yoghurt").includes("meat"),
+      `NO "and og yoghurt" (duck and yogurt) → meat (identical-spelling loanword "yoghurt" must not suppress "and")`);
+    ok(norwegianTermsForEnglishQuery("and og yoghurt").length === 0,
+      `reverse glossary: identical-spelling loanword "yoghurt" contributes no English-query signal on its own`);
+    // Same shape with a different identical-spelling loanword.
+    ok(cats("and og bacon").includes("meat"),
+      `NO "and og bacon" (duck and bacon) → meat (identical-spelling loanword "bacon" must not suppress "and")`);
+
+    // Positive-mapping sanity check, right next to the fix above: a REAL
+    // cross-language pair (different spelling, genuine translation) must
+    // still be indexed — confirms the identical-spelling fix did not
+    // overreach and start excluding real translations too.
+    ok(norwegianTermsForEnglishQuery("cheese").includes("ost"),
+      `regression guard: real translation pair cheese → ost is still indexed after the loanword fix`);
+    ok(norwegianTermsForEnglishQuery("yoghurt").length === 0,
+      `regression guard: identical-spelling "yoghurt" maps to nothing (not even itself) in the reverse index`);
+
     // ════════════════════════════════════════════════════════════════════
     // D — «bakeri» selected no category, in EITHER language
     // ════════════════════════════════════════════════════════════════════

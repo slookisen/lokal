@@ -296,7 +296,9 @@ const AMBIGUOUS_EN = new Set([
   // Norwegian, the conjunction in English (see MEAT_KEYWORD_FALSE_FRIENDS in
   // marketplace-registry.ts); "most" = juice; "te" = tea; "biff"/"burger"/
   // "bacon"/"chutney"/"squash"/"chili"/"skyr"/"kefir"/"quinoa"/"catering"
-  // are identical in both and need no mapping.
+  // are identical in both and need no mapping (excluded separately below,
+  // in getReverseIndex, since that check is spelling-based rather than a
+  // fixed word list).
   "is", "and", "most", "te", "of", "in", "with", "from", "a", "an",
 ]);
 
@@ -319,6 +321,24 @@ function getReverseIndex(): Map<string, string[]> {
   if (reverseIndex) return reverseIndex;
   const idx = new Map<string, string[]>();
   const add = (en: string, no: string) => {
+    // Identical-spelling loanwords ("yoghurt", "burger", "bacon", "skyr",
+    // "kefir", "quinoa", "catering", "squash", "chutney", "juice", …) are
+    // real Norwegian words that happen to be spelled exactly like their
+    // English translation. They carry no cross-language mapping value: if
+    // the literal word is present in the query text at all, any category
+    // keyword equal to it already matches directly against `q` via
+    // norwegianWordBoundary in marketplace-registry.ts — appending it again
+    // through the reverse index is a no-op for matching, and only pollutes
+    // norwegianTermsForEnglishQuery()'s "this looks like an English query"
+    // signal. Bug (2026-09-05): a 100%-Norwegian query "and og yoghurt"
+    // ("duck and yogurt") returned englishTerms=["yoghurt"] purely because
+    // "yoghurt" round-trips to itself, which fired
+    // suppressEnglishConjunction and silently dropped the `and` (duck)
+    // keyword — and therefore the `meat` category — from a HARD filter, for
+    // a query with no English in it at all. Only identical-spelling pairs
+    // are skipped; genuinely different-spelling pairs (cheese→ost,
+    // salmon→laks, …) are real translations and still indexed below.
+    if (en.toLowerCase() === no.toLowerCase()) return;
     for (const v of englishVariants(en)) {
       const cur = idx.get(v);
       if (!cur) idx.set(v, [no]);
