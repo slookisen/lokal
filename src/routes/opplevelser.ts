@@ -28246,6 +28246,8 @@ Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, 
   if (words < EXP_DESC_KILDETRO_MIN_WORDS) return { text: null, reason: "below_word_floor" };
   if (words > EXP_DESC_KILDETRO_MAX_WORDS) return { text: null, reason: "above_word_ceiling" };
 
+  if (expDescHasUngroundedNumbers(cleaned, cappedSource)) return { text: null, reason: "ungrounded_numbers" };
+
   // Title-token requirement: a "kildetro" text that never names the
   // experience is homepage-wide marketing, not a description of THIS
   // experience (mirrors descriptionGuardSkips's own

@@ -193,6 +193,16 @@ function buildOffTopicKildetroFixture(): string {
 }
 const KILDETRO_NO_TITLE_FIXTURE = buildOffTopicKildetroFixture();
 
+// A kildetro candidate that names a price NOT present anywhere in its
+// grounding text — the shape kt-14 below proves gets caught. Built on top
+// of the (digit-free) on-topic fixture so it also clears the title-token
+// and word-count bars; only the ungrounded-number gate should fire.
+const KILDETRO_FABRICATED_NUMBER = `${KILDETRO_FIXTURE} Turen koster 1500 kroner.`;
+// Same fabricated-looking sentence, but this time the "1500" DOES appear in
+// the (fictitious) homepage source below — kt-15 proves a number that's
+// actually grounded is never a false positive.
+const KILDETRO_HOMEPAGE_GROUNDED_PRICE = `${KILDETRO_FIXTURE} Prisen er 1500 kroner ifølge nettsiden.`;
+
 /** A short, perfectly ordinary Norwegian description — non-blank and NOT
  *  junk by isJunkDescription()'s rule, i.e. content this endpoint must never
  *  touch. */
@@ -289,6 +299,8 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertTrue(wc >= 60 && wc <= 150, `fx-0f: kildetro fixture is 60-150 words (was ${wc})`);
         const wc2 = expDescWordCount(KILDETRO_NO_TITLE_FIXTURE);
         assertTrue(wc2 >= 60 && wc2 <= 150, `fx-0g: off-topic kildetro fixture is 60-150 words (was ${wc2})`);
+        const wc3 = expDescWordCount(KILDETRO_FABRICATED_NUMBER);
+        assertTrue(wc3 >= 60 && wc3 <= 150, `fx-0h: fabricated-number kildetro fixture is 60-150 words (was ${wc3})`);
       }
 
       // ── ed-1: the rich row exposes all 13 distinct fact kinds. ─────────
@@ -874,6 +886,29 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: huge }] }) })) as unknown as typeof fetch;
         assertEq((await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub)).reason, "above_word_ceiling",
           "kt-6: >150 words -> reason above_word_ceiling");
+      }
+
+      // ── kt-14: a candidate that names a number NOT present anywhere in
+      //    the homepage source text -> rejected, reason ungrounded_numbers
+      //    (mirrors gen-r7's faktalinje coverage of the same shared helper,
+      //    but grounded against homepageText/cappedSource instead of a facts
+      //    block — the review finding this pair of tests closes). ──────────
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FABRICATED_NUMBER }] }) })) as unknown as typeof fetch;
+        // Grounding text is digit-free -> "1500" in the candidate has no match.
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_FIXTURE, stub);
+        assertEq(r.text, null, "kt-14a: number absent from the homepage source -> null, never written");
+        assertEq(r.reason, "ungrounded_numbers", "kt-14b: reason ungrounded_numbers");
+      }
+
+      // ── kt-15: no false-positive regression — a number that DOES appear
+      //    in the homepage source text is accepted, not flagged. ──────────
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: KILDETRO_FABRICATED_NUMBER }] }) })) as unknown as typeof fetch;
+        // Grounding text also contains "1500" (phrased differently) -> grounded.
+        const r = await generateExperienceDescriptionKildetro(richCandidate(), KILDETRO_HOMEPAGE_GROUNDED_PRICE, stub);
+        assertEq(r.text, KILDETRO_FABRICATED_NUMBER, "kt-15a: number present in the homepage source -> accepted verbatim");
+        assertEq(r.reason, null, "kt-15b: no fail reason");
       }
 
       // ── kt-7: title-token miss -> reason no_title_node, never written. ──
