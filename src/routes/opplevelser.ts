@@ -17013,6 +17013,8 @@ export function countActiveGardssalgContactEmailOverrides(expDb: ReturnType<type
 export type GardssalgAddressBasis =
   | "same_domain_as_website"
   | "published_on_producer_site"
+  | "domain_equivalent_to_website"
+  | "second_line_verified"
   | "freemail_pointing_to_producer"
   | "unverified";
 
@@ -17058,19 +17060,46 @@ export function computeGardssalgAddressBasis(
     }
   }
 
+  // Fourth (dev-request 2026-09-02-gardssalg-adressegrunnlag-2linje-uten-
+  // hjemmeside): the pair itself may not be a real mismatch at all — the
+  // email domain is merely a cross-TLD/hyphenation brand-alias variant of
+  // the website's own domain (e.g. nogne-o.no email vs nogne-o.com website).
+  // Reuses domainsEquivalent(), the SAME PR-129 same-brand-different-TLD
+  // logic the sibling contact-audit route's own Skive D check (~L9674)
+  // already applies — so daily-prep and audit agree on equivalent-brand
+  // domains instead of daily-prep using a strictly narrower (===-only) check.
+  if (emailRoot && websiteRoot && domainsEquivalent(emailRoot, websiteRoot)) {
+    return "domain_equivalent_to_website";
+  }
+
+  // Fifth (same dev-request): no established website at all, but the row's
+  // contact info is already anchored via a 2nd-line source
+  // (isGardssalgSecondLineVerified — Brreg + a corroborating identity source
+  // + an LLM identity judge), an accepted trust tier elsewhere in this
+  // codebase. Daniel confirmed live (2026-09-02) that a verified 2nd-line
+  // row must never be stopped by the domain check, even with no website —
+  // and this applies regardless of whether the email is freemail or not, so
+  // it is checked BEFORE the freemail branch below (it must win for a
+  // no-website row that also happens to be freemail).
+  if (!websiteRoot && isGardssalgSecondLineVerified(fieldProvenanceRaw)) {
+    return "second_line_verified";
+  }
+
   // Third: a free-mail domain (gmail.com, online.no, …) is not itself
   // ownership evidence, but it is also not a THIRD PARTY's business domain —
   // it is the weakest of the three positive bases the dev-request names, so
-  // it is checked last.
+  // it is checked last (unless already resolved as second-line-verified
+  // above, which takes priority over freemail for a no-website row).
   if (emailRoot && FREE_MAIL_DOMAINS.includes(emailRoot)) {
     return "freemail_pointing_to_producer";
   }
 
   // Address is on a domain that is neither the website's own domain, nor
-  // homepage-evidenced, nor recognized free-mail — e.g. exactly the
-  // Hardanger Saft (nils.j.lekve@ulvik.org) class the dev-request measured.
-  // Surfaced honestly as "unverified" rather than guessed at; Skive 3 is
-  // where this signal graduates into an actual exclusion.
+  // homepage-evidenced, nor domain-equivalent, nor recognized free-mail, nor
+  // second-line-verified — e.g. exactly the Hardanger Saft
+  // (nils.j.lekve@ulvik.org) class the dev-request measured. Surfaced
+  // honestly as "unverified" rather than guessed at; Skive 3 is where this
+  // signal graduates into an actual exclusion.
   return "unverified";
 }
 
@@ -17120,6 +17149,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       note: "No outreach_ready candidates exist right now — the pool is exhausted.",
       refill_hints: { needs_enrichment_count: needsEnrichmentCount },
       active_contact_email_overrides: activeContactEmailOverrides,
+      second_line_verified_count: 0,
     });
     return;
   }
@@ -17163,6 +17193,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     suppressed_by?: string;
     cross_platform?: boolean;
     quarantine_until?: string;
+    address_basis?: GardssalgAddressBasis;
   };
 
   // ── producer_type / naeringskode / hjemmeside / field_provenance /
@@ -17223,7 +17254,12 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       // has since changed, the override no longer matches and this row is
       // excluded again like any other unverified address (AC2).
       if (!isGardssalgContactEmailOverrideActive(extra?.field_provenance ?? null, e.epost)) {
-        skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "address_domain_mismatch" });
+        skive3Excluded.push({
+          provider_id: e.provider_id,
+          name: e.navn,
+          reason: "address_domain_mismatch",
+          address_basis: addressBasis,
+        });
         continue;
       }
     }
@@ -17391,6 +17427,12 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     };
   }
 
+  // dev-request 2026-09-02-gardssalg-adressegrunnlag-2linje-uten-hjemmeside:
+  // "how many candidates went through on 2nd-line" — counted over the FINAL
+  // `candidates` (post-cap) list, same as every other count in this response
+  // being derived from an already-materialized array rather than a fresh scan.
+  const secondLineVerifiedCount = candidates.filter((c) => c.address_basis === "second_line_verified").length;
+
   res.json({
     generated_at: generatedAt,
     candidates,
@@ -17407,6 +17449,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     note,
     ...(refillHints ? { refill_hints: refillHints } : {}),
     active_contact_email_overrides: activeContactEmailOverrides,
+    second_line_verified_count: secondLineVerifiedCount,
   });
 });
 
