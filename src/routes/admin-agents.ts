@@ -2496,8 +2496,9 @@ export function applyAgentBrregContact(
     }
     if (Object.keys(incoming).length > 0) {
       const merged = mergeFieldProvenance(freshProv, incoming);
-      db.prepare(`UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
+      db.prepare(`UPDATE agent_knowledge SET field_provenance = ?, updated_at = ?, data_enriched_at = ? WHERE agent_id = ?`).run(
         JSON.stringify(merged),
+        nowIso,
         nowIso,
         agentId,
       );

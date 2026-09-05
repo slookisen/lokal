@@ -278,6 +278,33 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
       const written = applyAgentBrregContact(db as any, id, { phone: "+4712345678" }, "https://brreg.example");
       assertEq(written, ["phone"], "d3: empty phone column -> touched=['phone']");
       assertTrue(!!knowledgeDataEnrichedAt(id), "d4: genuine fill-only write DOES stamp data_enriched_at");
+
+      // Regression (review finding, 2026-09-05): column already filled with a
+      // DIFFERENT value than the BRREG candidate -> fill-only UPDATE's WHERE
+      // (column IS NULL OR '') matches zero rows and never stamps
+      // data_enriched_at, BUT that candidate is not yet recorded in
+      // field_provenance -> the OTHER write path (the field_provenance UPDATE
+      // gated on Object.keys(incoming).length > 0) fires a genuine content
+      // write (new corroborating BRREG source) and must stamp
+      // data_enriched_at itself. Before the fix this path never touched
+      // data_enriched_at, leaving a pending_verify row parked forever despite
+      // real new evidence.
+      const id3 = "d-writesite-agent-3";
+      insertAgent(id3);
+      const oldAddr = "Gamleveien 5, 1400 Ski";
+      const newAddr = "Nyveien 9, 1400 Ski";
+      const oldProv = JSON.stringify({
+        address: { sources: [{ source_type: "brreg", value: oldAddr, fetched_at: "2026-01-01T00:00:00.000Z", source_url: "https://brreg.example" }] },
+      });
+      db.prepare(
+        `INSERT INTO agent_knowledge (agent_id, address, field_provenance, data_enriched_at) VALUES (?, ?, ?, NULL)`,
+      ).run(id3, oldAddr, oldProv);
+
+      const corroborated = applyAgentBrregContact(db as any, id3, { address: newAddr }, "https://brreg.example/2");
+      assertEq(corroborated, ["address"], "d5: new address not yet in provenance -> touched=['address'] even though column already non-blank");
+      const rowAfter = db.prepare(`SELECT address FROM agent_knowledge WHERE agent_id = ?`).get(id3) as { address: string | null };
+      assertEq(rowAfter.address, oldAddr, "d6: fill-only column write does NOT fire (column already had a different, non-blank value) -> address column unchanged");
+      assertTrue(!!knowledgeDataEnrichedAt(id3), "d7: field_provenance-only write path DOES stamp data_enriched_at (the confirmed bug fix)");
     }
 
     // ════════════════════════════════════════════════════════════════════
