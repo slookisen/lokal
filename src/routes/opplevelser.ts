@@ -20385,6 +20385,37 @@ class GsDedupUnionFind {
 
 const gsDedupPresent = (v: string | null): boolean => v !== null && v.trim() !== "";
 
+// The "official gårdssalg catalog" scope-WHERE this audit has always used —
+// split into two named consts (2026-09-05, out_of_scope_twins slice below) so
+// the out-of-scope query can negate EXACTLY the catalog-membership half while
+// still applying the synthetic-test-row exclusion on BOTH sides. Getting this
+// split wrong (negating the WHOLE in-scope condition, test-row-exclusion
+// included) would let the fixed booking-flyt-v1 test row leak into
+// out_of_scope_twins as a "duplicate candidate" — precisely the thing the
+// ORIGINAL in-scope query's own comment says must never happen, just via the
+// new bucket instead of the old one. Deliberately excludes
+// GARDSSALG_NOT_MERGED_WHERE — callers AND it in separately, since both the
+// in-scope and out-of-scope queries need it (a merged row must never appear
+// on EITHER side of the audit, per spec-punkt 3 of the parent dev-request).
+// NB: `IFNULL(rfb_seed_source, '')` (not a bare `rfb_seed_source = 'rfb-seed'`)
+// is required here, not cosmetic — SQL three-valued logic. When
+// rfb_seed_source IS NULL, `rfb_seed_source = 'rfb-seed'` evaluates to NULL
+// (not FALSE), so `producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'`
+// evaluates to NULL (not FALSE) for any row with BOTH producer_type and
+// rfb_seed_source NULL. `NOT (NULL)` is ALSO NULL, which SQLite's WHERE
+// treats as false — so the out-of-scope query below (`WHERE NOT (...)`)
+// would silently exclude EVERY genuinely-out-of-scope row that has neither
+// column set, i.e. exactly the Himkok/Kinn-class rows this bucket exists to
+// find. The IFNULL coercion makes the OR total (always TRUE/FALSE, never
+// NULL), so the negation behaves correctly. Provably behavior-neutral for
+// the EXISTING in-scope query above: a bare `WHERE (X OR NULL) AND ...`
+// already treats that row as non-matching (NULL is falsy in a WHERE, same
+// as FALSE), so coercing NULL->FALSE here changes nothing there.
+const GARDSSALG_DEDUP_CATALOG_WHERE =
+  "(producer_type IS NOT NULL OR IFNULL(rfb_seed_source, '') = 'rfb-seed')";
+const GARDSSALG_DEDUP_NOT_TEST_ROW_WHERE = "(producer_type IS NULL OR producer_type != 'test-gardssalg')";
+const GARDSSALG_DEDUP_IN_SCOPE_WHERE = `${GARDSSALG_DEDUP_CATALOG_WHERE} AND ${GARDSSALG_DEDUP_NOT_TEST_ROW_WHERE}`;
+
 router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
 
@@ -20405,13 +20436,62 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
         `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
                 rfb_seed_source, producer_type, content_source, homepage_unreachable_since
            FROM experience_providers
-          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+          WHERE ${GARDSSALG_DEDUP_IN_SCOPE_WHERE}
             AND ${GARDSSALG_NOT_MERGED_WHERE}`
       )
       .all() as GsDedupRow[];
   } catch (err) {
     console.error("[gardssalg-provider-dedup-audit] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  // ── out_of_scope_twins (dev-request 2026-07-31-gardssalg-provider-
+  // dubletter-på-tvers-av-seeds, Daniel 2.9 scope-WHERE decision, 2026-09-02:
+  // "ikke utvid [scope-WHERE]; read-only out_of_scope_twins-bøtte i stedet")
+  // ──────────────────────────────────────────────────────────────────────
+  // A row OUTSIDE the official gårdssalg catalog (fails
+  // GARDSSALG_DEDUP_IN_SCOPE_WHERE above) can still be the exact same
+  // real-world producer as a row INSIDE it (Himkok/Kinn-class: an older,
+  // pre-classification row vs. a newer gårdssalg-seeded row of the same
+  // producer). Widening the scope-WHERE itself was explicitly rejected by
+  // Daniel (would drown the review in unrelated opplevagent rows) — this is
+  // the narrower, read-only alternative: report the cross-scope pairs
+  // without ever pulling out-of-scope rows into the main grouping/confidence
+  // machinery above.
+  //
+  // Matching signals — deliberately ONLY the two IDENTITY-bearing signals
+  // already used for "high" confidence above, plus exact name (never
+  // name_first_token/name_first_token_postal — those are a first-name-word
+  // coincidence, not evidence, and are explicitly excluded by this bucket's
+  // own spec):
+  //   (i)   org_nr — both sides non-blank and equal
+  //   (ii)  domain — both sides have a hjemmeside whose registrable domain
+  //         (homepageRegistrableDomain) is equal
+  //   (iii) name_exact — gsDedupBestNameTier() returns exactly "name_exact"
+  //         (score===1.0, same helper/normalisation as the main grouping)
+  //
+  // Deliberately NOT applying the org_nr-conflict override (point 3 above,
+  // GS_DEDUP_HIGH_CONF_NAME_TIERS): this bucket has no "confidence" tier to
+  // protect — it lists raw per-pair signals for human review, never feeds an
+  // auto-merge decision, and the parent dev-request's own spec for this
+  // slice does not ask for that nuance. A future slice can add it if a real
+  // false-positive class shows up in review, same discipline as the
+  // org_nr-override itself was added after a measured false-high batch.
+  let outOfScopeRows: GsDedupRow[] = [];
+  try {
+    outOfScopeRows = expDb
+      .prepare(
+        `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
+                rfb_seed_source, producer_type, content_source, homepage_unreachable_since
+           FROM experience_providers
+          WHERE NOT (${GARDSSALG_DEDUP_CATALOG_WHERE})
+            AND ${GARDSSALG_DEDUP_NOT_TEST_ROW_WHERE}
+            AND ${GARDSSALG_NOT_MERGED_WHERE}`
+      )
+      .all() as GsDedupRow[];
+  } catch (err) {
+    console.error("[gardssalg-provider-dedup-audit] failed to query out-of-scope providers:", err);
     res.status(500).json({ error: "Failed to query experience_providers" });
     return;
   }
@@ -20569,10 +20649,41 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
     });
   }
 
+  // ── out_of_scope_twins pairing (see the query comment above) ───────────
+  const outOfScopeTwins: Array<{
+    signals: string[];
+    in_scope: ReturnType<typeof toRowOut>;
+    out_of_scope: ReturnType<typeof toRowOut>;
+  }> = [];
+  for (const outRow of outOfScopeRows) {
+    for (const inRow of rows) {
+      const twinSignals: string[] = [];
+
+      const orgA = outRow.org_nr && outRow.org_nr.trim();
+      const orgB = inRow.org_nr && inRow.org_nr.trim();
+      if (orgA && orgB && orgA === orgB) twinSignals.push("org_nr");
+
+      const domA = homepageRegistrableDomain(outRow.hjemmeside);
+      const domB = homepageRegistrableDomain(inRow.hjemmeside);
+      if (domA && domB && domA === domB) twinSignals.push("domain");
+
+      if (gsDedupBestNameTier(outRow, inRow) === "name_exact") twinSignals.push("name_exact");
+
+      if (twinSignals.length > 0) {
+        outOfScopeTwins.push({
+          signals: twinSignals,
+          in_scope: toRowOut(inRow),
+          out_of_scope: toRowOut(outRow),
+        });
+      }
+    }
+  }
+
   res.json({
     total_providers_scanned: rows.length,
     groups_found: groups.length,
     groups,
+    out_of_scope_twins: outOfScopeTwins,
   });
 });
 

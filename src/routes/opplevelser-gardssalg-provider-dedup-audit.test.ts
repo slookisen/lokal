@@ -391,6 +391,60 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
         content_source: null, homepage_unreachable_since: null,
       });
 
+      // ── (r) out_of_scope_twins fixtures (dev-request 2026-07-31-gardssalg-
+      // provider-dubletter-på-tvers-av-seeds, Daniel 2.9 scope-WHERE decision,
+      // 2026-09-02: "ikke utvid; read-only out_of_scope_twins-bøtte i stedet") ──
+      // r1: org_nr twin — an out-of-scope row (no producer_type, not
+      // rfb-seed) sharing an org_nr with an in-scope row. Same UNIQUE-
+      // constraint whitespace-padding trick as fixture (e) above.
+      insertProvider.run({
+        id: "prov-oos-orgnr-inscope", navn: "Tvillingnummer Gård", org_nr: "500999888", postnummer: null,
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      insertProvider.run({
+        id: "prov-oos-orgnr-outscope", navn: "Helt Annet Navn AS", org_nr: " 500999888 ", postnummer: null,
+        rfb_seed_source: null, producer_type: null,
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      // r2: domain twin — an out-of-scope row sharing a registrable domain
+      // (one bare, one www.+path) with an in-scope row, no org_nr/name overlap.
+      insertProvider.run({
+        id: "prov-oos-domain-inscope", navn: "Kyststed Utsalg", org_nr: null, postnummer: null,
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: null, telefon: null, hjemmeside: "https://www.tvillingdomene.no/om-oss",
+        content_source: null, homepage_unreachable_since: null,
+      });
+      insertProvider.run({
+        id: "prov-oos-domain-outscope", navn: "Ukjent Aktor", org_nr: null, postnummer: null,
+        rfb_seed_source: null, producer_type: null,
+        epost: null, telefon: null, hjemmeside: "http://tvillingdomene.no",
+        content_source: null, homepage_unreachable_since: null,
+      });
+      // r3 (negative control): an out-of-scope row sharing ONLY a
+      // first-token-level name signal (never org_nr, never domain, never
+      // name_exact) with an in-scope row — must NEVER appear in
+      // out_of_scope_twins (acceptance criterion: "ALDRI name_first_token").
+      insertProvider.run({
+        id: "prov-oos-negctrl-inscope", navn: "Bjelland Bryggeri", org_nr: null, postnummer: "4200",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      insertProvider.run({
+        id: "prov-oos-negctrl-outscope", navn: "Bjelland", org_nr: null, postnummer: "4200",
+        rfb_seed_source: null, producer_type: null,
+        epost: null, telefon: null, hjemmeside: null,
+        content_source: null, homepage_unreachable_since: null,
+      });
+      // r4: name_exact out-of-scope twin — reuses the ALREADY-EXISTING (h)
+      // "prov-not-gardssalg" fixture (navn "Wilsgård", out of scope), which
+      // exactly matches in-scope prov-wilsgard-b's navn "Wilsgård" — proves
+      // out_of_scope_twins works on a fixture whose scope-exclusion is
+      // already separately tested (h1) rather than inventing a redundant one.
+
       // ── (q) merged_into read-path filter regression (dev-request
       // 2026-09-03-gardssalg-merged-provider-read-path-filter, bug fix) ──────
       // q1: a fourth "Kinn Bryggeri" row that WOULD join the existing (d)
@@ -723,7 +777,56 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
       const allReturnedIds = new Set(groups.flatMap((g) => g.rows.map((r: any) => r.id)));
       assertTrue(!allReturnedIds.has("prov-not-gardssalg"), "h1: non-gårdssalg row never appears in any group");
       assertTrue(!allReturnedIds.has("prov-test-gardssalg"), "h2: synthetic test-gardssalg row never appears in any group");
-      assertEq(first.body.total_providers_scanned, 21, "h3: total_providers_scanned excludes the 2 out-of-scope rows (23 inserted - 2 excluded)");
+      assertEq(first.body.total_providers_scanned, 24, "h3: total_providers_scanned excludes out-of-scope rows (29 inserted - 5 out-of-scope-shaped)");
+
+      // ── (r) out_of_scope_twins (dev-request 2026-07-31-gardssalg-provider-
+      // dubletter-på-tvers-av-seeds, Daniel 2.9 scope-WHERE decision) ────────
+      const twins: any[] = first.body.out_of_scope_twins;
+      assertTrue(Array.isArray(twins), "r0: response carries an out_of_scope_twins array");
+
+      function twinPair(outId: string, inId: string): any | undefined {
+        return twins.find((t) => t.out_of_scope.id === outId && t.in_scope.id === inId);
+      }
+
+      const orgnrTwin = twinPair("prov-oos-orgnr-outscope", "prov-oos-orgnr-inscope");
+      assertTrue(!!orgnrTwin, "r1: org_nr twin pair present in out_of_scope_twins");
+      assertEq(orgnrTwin?.signals, ["org_nr"], "r1b: org_nr twin signals == [\"org_nr\"] only");
+
+      const domainTwin = twinPair("prov-oos-domain-outscope", "prov-oos-domain-inscope");
+      assertTrue(!!domainTwin, "r2: domain twin pair present in out_of_scope_twins");
+      assertEq(domainTwin?.signals, ["domain"], "r2b: domain twin signals == [\"domain\"] only");
+
+      const nameExactTwin = twinPair("prov-not-gardssalg", "prov-wilsgard-b");
+      assertTrue(!!nameExactTwin, "r4: name_exact twin pair present (reuses existing (h) prov-not-gardssalg fixture)");
+      assertEq(nameExactTwin?.signals, ["name_exact"], "r4b: name_exact twin signals == [\"name_exact\"] only");
+
+      assertTrue(
+        !twinPair("prov-oos-negctrl-outscope", "prov-oos-negctrl-inscope"),
+        "r3: name_first_token-only pair NEVER appears in out_of_scope_twins (ALDRI name_first_token)",
+      );
+      assertTrue(
+        !twins.some((t) => t.out_of_scope.id === "prov-oos-negctrl-outscope" || t.in_scope.id === "prov-oos-negctrl-outscope"),
+        "r3b: the name_first_token-only out-of-scope row appears in NO twin pair at all",
+      );
+
+      assertTrue(
+        !twins.some((t) => t.out_of_scope.id === "prov-kinn-merged" || t.in_scope.id === "prov-kinn-merged"),
+        "r5: merged-away row never appears in out_of_scope_twins on either side (acceptance criterion 3)",
+      );
+
+      const twinShapeKeys = Object.keys(orgnrTwin ?? {}).sort();
+      assertEq(twinShapeKeys, ["in_scope", "out_of_scope", "signals"], "r6: twin entry shape is exactly signals/in_scope/out_of_scope");
+      const expectedTwinRowKeys = ["content_source", "has_email", "has_phone", "homepage_unreachable_since", "id", "navn", "org_nr", "producer_type", "rfb_seed_source", "unreachable"].sort();
+      assertEq(
+        Object.keys(orgnrTwin?.in_scope ?? {}).sort(),
+        expectedTwinRowKeys,
+        "r7: in_scope row shape matches the main groups' row shape (no raw PII)",
+      );
+      assertEq(
+        Object.keys(orgnrTwin?.out_of_scope ?? {}).sort(),
+        expectedTwinRowKeys,
+        "r7b: out_of_scope row shape matches the main groups' row shape (no raw PII)",
+      );
 
       // ── (i) per-row response shape / no raw PII ──────────────────────────
       const sampleRow = wilsgard.rows.find((r: any) => r.id === "prov-wilsgard-b");
