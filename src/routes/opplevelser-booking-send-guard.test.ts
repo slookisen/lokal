@@ -387,7 +387,7 @@ export function runOpplevelserBookingSendGuardTests(
 
       const bookingInput = {
         provider_id: "prov-live",
-        slot_at: "2026-09-01T12:00:00.000Z",
+        slot_at: "2026-11-01T12:00:00.000Z",
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",

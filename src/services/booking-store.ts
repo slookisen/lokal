@@ -166,6 +166,16 @@ export const BookingInputSchema = z.object({
   guest_phone: z.string().max(30).optional(),
   commission_rate: z.number().min(0).max(1).optional(),
   notes: z.string().max(500).optional(),
+  // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering"):
+  // when a guest resends after the route layer told them their slot falls
+  // outside the provider's stated opening_hours_text, this flag says "yes,
+  // I still want this time" and the route proceeds to create the booking
+  // anyway. A deliberate, explicit schema field — zod already strips unknown
+  // keys everywhere this schema is parsed, so this is not a smuggling risk.
+  // Consumed at the route layer only (services/gardssalg-opening-hours.ts's
+  // checkBookingSlotAllowed()) — createBooking() itself never reads or
+  // stores it (no DB column for this slice).
+  confirm_outside_hours: z.boolean().optional(),
 });
 export type BookingInput = z.infer<typeof BookingInputSchema>;
 
@@ -568,6 +578,15 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
 export async function sendProducerNotification(
   booking: GardssalgBooking,
   producerEmail: string | null | undefined,
+  // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
+  // validering"): the provider's OWN stated opening_hours_text, attached
+  // ALWAYS when non-blank — regardless of whether this particular booking
+  // fell inside or outside those hours — so a mismatch is visible to the
+  // producer ("tilbyderens oppgitte tider legges alltid ved i varselet så
+  // avviket er synlig for dem", the dev-request's own spec line). Optional
+  // and additive: every existing caller that doesn't pass it keeps behaving
+  // exactly as before.
+  openingHoursText?: string | null,
 ): Promise<void> {
   if (!producerEmail) {
     console.error(
@@ -605,6 +624,12 @@ export async function sendProducerNotification(
     ? slotNb(booking.respond_token_expires_at)
     : null;
 
+  // Slice 1 ("myk åpningstidsvalidering"): attach the producer's OWN stated
+  // hours whenever non-blank, regardless of inside/outside-hours outcome —
+  // this is what makes a mismatch visible to them (see this function's
+  // param doc comment).
+  const hoursRaw = openingHoursText && openingHoursText.trim() ? openingHoursText.trim() : null;
+
   const htmlContent = `
 <p>Hei,</p>
 <p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>
@@ -616,6 +641,7 @@ export async function sendProducerNotification(
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">E-post:</td><td>${escEmailHtml(booking.guest_email)}</td></tr>
   ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${escEmailHtml(booking.guest_phone)}</td></tr>` : ""}
   ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kommentar fra gjesten:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
+  ${hoursRaw ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dine oppgitte åpningstider:</td><td>${escEmailHtml(hoursRaw)}</td></tr>` : ""}
 </table>
 ${respondUrl ? `<p><strong>Svar på forespørselen:</strong></p>
 <p><a href="${respondUrl}" style="display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px">Åpne svarsiden</a></p>
@@ -626,7 +652,7 @@ Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
 <p>Hilsen<br>Opplevagent</p>
   `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}\n${respondUrl ? `\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}${deadlineFormatted ? `\nSvarfrist: ${deadlineFormatted} — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}\n` : ""}\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
+  const textContent = `Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}${hoursRaw ? `\nDine oppgitte åpningstider: ${hoursRaw}` : ""}\n${respondUrl ? `\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}${deadlineFormatted ? `\nSvarfrist: ${deadlineFormatted} — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}\n` : ""}\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
 
   await emailService.sendEmail({
     to: producerEmail,

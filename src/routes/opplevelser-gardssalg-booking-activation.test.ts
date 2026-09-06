@@ -441,7 +441,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       const bookA = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-a", slot_at: "2026-09-01T12:00", party_size: 2,
+          provider_id: "prov-a", slot_at: "2026-11-01T12:00", party_size: 2,
           guest_name: "Gjest A", guest_email: "gjest.a@example.no",
         },
       });
@@ -452,7 +452,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       const bookB = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-b", slot_at: "2026-09-01T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: "2026-11-01T12:00", party_size: 2,
           guest_name: "Gjest B", guest_email: "gjest.b@example.no",
         },
       });
@@ -501,13 +501,13 @@ export function runOpplevelserGardssalgBookingActivationTests(
         }
 
         const mcpA = await callTool("book_gardssalg", {
-          provider_id: "prov-a", slot_at: "2026-09-02T12:00", party_size: 2,
+          provider_id: "prov-a", slot_at: "2026-11-02T12:00", party_size: 2,
           guest_name: "MCP Gjest A", guest_email: "mcp.a@example.no",
         });
         assertEq(mcpA?.success, false, "ac4-11: MCP book_gardssalg against paused prov-a -> success:false");
 
         const mcpB = await callTool("book_gardssalg", {
-          provider_id: "prov-b", slot_at: "2026-09-02T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: "2026-11-02T12:00", party_size: 2,
           guest_name: "MCP Gjest B", guest_email: "mcp.b@example.no",
         });
         assertEq(mcpB?.success, true, "ac4-12: MCP book_gardssalg against still-live prov-b -> success:true (no leak from prov-a's brake)");
@@ -536,12 +536,12 @@ export function runOpplevelserGardssalgBookingActivationTests(
         }
 
         const locA = await postForm("gard-a", {
-          slot_at: "2026-09-03T12:00", party_size: "2", guest_name: "SSR Gjest A", guest_email: "ssr.a@example.no",
+          slot_at: "2026-11-03T12:00", party_size: "2", guest_name: "SSR Gjest A", guest_email: "ssr.a@example.no",
         });
         assertTrue(!!locA && locA.includes("error=paused"), `ac4-14: SSR no-JS form against paused prov-a redirects with ?error=paused (got ${locA})`);
 
         const locB = await postForm("gard-b", {
-          slot_at: "2026-09-03T12:00", party_size: "2", guest_name: "SSR Gjest B", guest_email: "ssr.b@example.no",
+          slot_at: "2026-11-03T12:00", party_size: "2", guest_name: "SSR Gjest B", guest_email: "ssr.b@example.no",
         });
         assertTrue(!!locB && locB.includes("/confirm/"), `ac4-15: SSR no-JS form against still-live prov-b redirects to the confirmation page (got ${locB})`);
         assertEq(countBookings(), 3, "ac4-16: three total bookings now (all prov-b across the three surfaces), still zero for prov-a");
@@ -554,7 +554,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       const dispatchOffBook = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-b", slot_at: "2026-09-04T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: "2026-11-04T12:00", party_size: 2,
           guest_name: "Gjest Uten Dispatch", guest_email: "nodispatch@example.no",
         },
       });

@@ -189,7 +189,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       // ── (b) non-live producer (booking_live=0) -> clear rejection ────────
       const pausedCall = await callTool("book_gardssalg", {
         provider_id: "bk-paused",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 2,
         guest_name: "Ola Nordmann",
         guest_email: "ola@example.no",
@@ -205,7 +205,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       // ── (f) unknown provider_id -> same gate, same clear rejection ───────
       const unknownCall = await callTool("book_gardssalg", {
         provider_id: "does-not-exist",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 2,
         guest_name: "Ola Nordmann",
         guest_email: "ola@example.no",
@@ -219,7 +219,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       delete process.env.BOOKING_DISPATCH_ENABLED;
       const dispatchOffCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -234,7 +234,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const badEmailCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "not-an-email",
@@ -245,7 +245,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const badPartySizeCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 0,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -255,7 +255,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const emptyNameCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 2,
         guest_name: "",
         guest_email: "kari@example.no",
@@ -267,7 +267,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       //     booking_live=1 -> pending row + confirm_token created ──────────
       const okCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-08-20T12:00",
+        slot_at: "2026-10-20T12:00",
         party_size: 3,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
