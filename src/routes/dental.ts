@@ -643,8 +643,18 @@ const STAGE_V_FIELDS = new Set<StageVField>(["helfo_agreement", "treatments", "o
 const StageVTreatmentsValueSchema = z.array(z.string().trim().min(1)).min(1).max(50);
 
 // Mirrors DentalAgentSchema.shape.opening_hours's inner object shape
-// (day enum + HH:MM regex) exactly, plus a max-length guard (a week has at
-// most 7 days).
+// (day enum + HH:MM regex) exactly, plus a max-length guard: up to 14 rows
+// (2x weekdays) covers a single split shift (e.g. lunch-closed = 2 rows/day)
+// on every day of the week. Raised from 7 -> 14 (dev-request
+// 2026-09-02-dental-stage-v-opening-hours-7-item-cap) after the 7-row cap
+// structurally rejected every split-shift clinic's Stage V opening_hours
+// correction (4 independent occurrences: 2026-08-29, 08-30, 09-01, 09-02).
+// Deliberately NOT made unbounded like the underlying storage schema
+// (DentalAgentSchema.shape.opening_hours, dental-store.ts) -- this guard is
+// still meant to catch a genuinely malformed/runaway observation upstream,
+// per that schema's own comment above (StageVTreatmentsValueSchema); 14 is
+// the largest legitimate value for a single week under one split shift per
+// day.
 const StageVOpeningHoursValueSchema = z
   .array(
     z.object({
@@ -653,7 +663,7 @@ const StageVOpeningHoursValueSchema = z
       close: z.string().regex(/^\d{2}:\d{2}$/),
     })
   )
-  .max(7);
+  .max(14);
 
 router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Response) => {
   try {
@@ -694,7 +704,7 @@ router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Res
       const parsed = StageVOpeningHoursValueSchema.safeParse(value);
       if (!parsed.success) {
         res.status(400).json({
-          error: "Invalid value: opening_hours must be an array of up to 7 {day,open,close} objects",
+          error: "Invalid value: opening_hours must be an array of up to 14 {day,open,close} objects",
           details: parsed.error.issues,
         });
         return;
