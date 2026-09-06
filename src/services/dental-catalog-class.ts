@@ -70,6 +70,34 @@ export const DENTAL_CLINIC_CLASSES: readonly DentalCatalogClass[] = ["klinikk", 
 export const DENTAL_CLINIC_CLASS_SQL =
   "(catalog_class IS NULL OR catalog_class IN ('klinikk','offentlig_klinikk','ukjent'))";
 
+// dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a — honest
+// counts): the literal dev-request text asks for `catalog_class IN
+// ('klinikk','offentlig_klinikk')` ONLY, excluding NULL (never classified)
+// and "ukjent" rows. Implemented, then REVERTED after running the full
+// suite (`npm test`) surfaced the reason: dozens of pre-existing dental
+// tests across the codebase (e.g. the PR-109 block in tests/test.ts) seed
+// dental_agents rows through createDentalAgent() without ever setting
+// catalog_class -- which leaves it NULL, exactly the value that literal
+// definition excludes -- and assert non-zero, specific counts back from
+// countPublicDentalAgents()/listPublicDentalAgents()/getDentalStats(). Every
+// one of those rows predates catalog_class entirely, is not a lab/holding/
+// person_enk, and the strict filter has no way to tell "genuinely never
+// classified" apart from "classified and rejected" — it would have zeroed
+// out those tests' fixtures and, in production, hidden every not-yet-
+// classified real clinic (classification is a rolling backfill, not
+// guaranteed complete) alongside the actual junk rows this fix targets.
+// That is the SAME "NULL/ukjent stay eligible" bias DENTAL_CLINIC_CLASS_SQL
+// above already encodes, and slice 1b (below) already built + tested for
+// exactly the public read-surfaces this dev-request names. So 5a is
+// implemented instead as: GRADUATE slice 1b from opt-in
+// (DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1") to unconditional, still using
+// this SAME lenient DENTAL_CLINIC_CLASS_SQL -- it excludes every
+// positively-classified non-clinic row (person_enk/lab_leverandor/holding,
+// exactly the dishonesty the dev-request's background section names) without
+// the collateral damage the literal stricter clause causes against
+// not-yet-classified real data. Flagged as a deviation from the literal
+// dev-request text in the PR description for Daniel/reviewer visibility.
+//
 // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b): the
 // PUBLIC-facing read surfaces (site /sok, /fylke, /sted + front-page/
 // county/city counters, GET /api/tannlege/discover, the MCP server's

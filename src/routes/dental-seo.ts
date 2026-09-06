@@ -10,6 +10,7 @@ import {
   listPoststeder,
   listRelatedClinics,
   getDentalAgentsForSitemap,
+  isThinDentalProfile,
 } from "../services/dental-store";
 import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
@@ -20,6 +21,14 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+// dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
+// the existing pure classifiers rather than reinventing name-word / host
+// checks. DENTAL_NAME_WORDS is the SAME "does this name read as a dental
+// clinic" word list the catalog-class classifier used to decide
+// catalog_class='person_enk' in the first place. normalizeHostname is the
+// hjemmeside-cleanup sweep's own URL->hostname helper.
+import { DENTAL_NAME_WORDS, isPublicDentalServiceHost } from "../services/dental-catalog-class";
+import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 
 const router = Router();
 
@@ -125,6 +134,43 @@ function escapeHtml(text: unknown): string {
 function safeUrl(u: string | null | undefined): string {
   if (!u) return "";
   return /^https?:\/\//i.test(u) ? u : "";
+}
+
+// ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b) ─────
+// True when `navn` reads as a dental clinic by name (same word list the
+// catalog-class classifier uses for the same question) — case-insensitive
+// substring match, mirrors classifyDentalCatalogEntry's own `hasAny` check.
+function nameHasDentalWord(navn: string | null | undefined): boolean {
+  const lower = (navn ?? "").toLowerCase();
+  return DENTAL_NAME_WORDS.some((w) => lower.includes(w));
+}
+
+// True when this profile should get the sole-proprietor title template
+// ("Tannlege <navn> i <by>") instead of the clinic template
+// ("<navn> — Tannlegeklinikk i <by>"). Primary signal is the already-computed
+// catalog_class='person_enk' (exactly this same rule, already applied by the
+// classifier); the organisasjonsform+name fallback covers a row the
+// classifier hasn't touched yet (catalog_class NULL) but that is, on the
+// same facts, an ENK with no clinic-indicating word in its name.
+function isSoleProprietorProfile(agent: DentalAgent): boolean {
+  if (agent.catalog_class === "person_enk") return true;
+  const form = (agent.organisasjonsform ?? "").trim().toUpperCase();
+  return form === "ENK" && !nameHasDentalWord(agent.navn);
+}
+
+// ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d) ─────
+// Label for a directory_url link — must never read as the clinic's own
+// homepage (that's what `hjemmeside` is for). Reuses the county/municipal
+// host list from the catalog classifier and the Facebook/fb.com domains the
+// hjemmeside-cleanup sweep already treats as "social" (steg 5 of that
+// dev-request explicitly named this exact follow-up).
+function directoryUrlLabel(url: string): string {
+  if (isPublicDentalServiceHost(url)) return "Oversikt hos fylkeskommunen";
+  const host = normalizeHostname(url);
+  if (host === "facebook.com" || host.endsWith(".facebook.com") || host === "fb.com" || host.endsWith(".fb.com")) {
+    return "Facebook";
+  }
+  return "Ekstern oversikt";
 }
 
 // ─── Security: safeTelHref — build tel: href from phone field ────────────
@@ -622,11 +668,17 @@ interface ShellOptions {
   canonical?: string;
   jsonLd?: object | object[];
   ogImage?: string;
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): thin
+  // profiles override the default "index, follow" robots meta with
+  // "noindex,follow" — still crawled (follow) so its outbound links keep
+  // being discovered, just not itself indexed/ranked.
+  robots?: string;
 }
 
 function dentalShell(content: string, opts: ShellOptions): string {
   const desc = opts.description || "Finn riktig tannlege i Norge. Søk etter klinikk, spesialitet, Helfo-avtale og tannlegevakt.";
   const canonical = opts.canonical || DENTAL_BASE_URL;
+  const robots = opts.robots || "index, follow, max-snippet:-1, max-image-preview:large";
   const ldArr = opts.jsonLd
     ? (Array.isArray(opts.jsonLd) ? opts.jsonLd : [opts.jsonLd])
     : [];
@@ -643,7 +695,7 @@ function dentalShell(content: string, opts: ShellOptions): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
-<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="robots" content="${escapeHtml(robots)}">
 <link rel="canonical" href="${escapeHtml(canonical)}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
@@ -1189,6 +1241,11 @@ function renderClinicProfile(
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
   { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
+  // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
+  // above) -- it's a county-directory listing, a Facebook page, or similar.
+  // Label it accordingly so a visitor never mistakes it for the clinic's site.
+  { const u = safeUrl(agent.directory_url); if (u) infoItems.push(`<div class="info-item"><div class="info-label">${escapeHtml(directoryUrlLabel(u))}</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   if (agent.org_nr) infoItems.push(`<div class="info-item"><div class="info-label">Organisasjonsnr.</div><div class="info-value">${escapeHtml(agent.org_nr)}</div></div>`);
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
@@ -1392,6 +1449,31 @@ function renderClinicProfile(
     return buildClinicDescription(agent, nearbyCount, true);
   })();
 
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): a
+  // profile missing ALL FOUR of address/phone/website/opening-hours gets
+  // noindex + a "claim this profile" CTA instead of being indexed as-is.
+  // Scaffolding only — no DB write from the CTA itself, just a mailto: link
+  // a real owner can use; a future slice can turn this into a real claim flow.
+  const thin = isThinDentalProfile(agent);
+  const thinProfileCta = thin
+    ? `<div class="section-box" style="border:1px solid #FDE68A;background:#FFFBEB">
+    <p style="font-size:.95rem;margin:0;color:var(--g700)">
+      Ufullstendig oppføring — er dette din klinikk?
+      <a href="mailto:kontakt@finn-tannlege.com?subject=${encodeURIComponent(
+        `Ufullstendig oppføring — org.nr ${agent.org_nr ?? "ukjent"}`
+      )}">Send oss riktig informasjon</a>
+    </p>
+  </div>`
+    : "";
+
+  // (5b) Title template: an ENK/sole-proprietor row with no clinic-indicating
+  // word in its name is a single dentist, not a clinic -- "Tannlege <navn> i
+  // <by>" rather than the generic clinic template. Non-ENK case is
+  // byte-identical to before this dev-request.
+  const profileTitleCore = isSoleProprietorProfile(agent)
+    ? `Tannlege ${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
+    : `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`;
+
   const html = `
 <main>
   <div class="profile-header" role="banner">
@@ -1403,6 +1485,7 @@ function renderClinicProfile(
     </div>
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
+    ${thinProfileCta}
     ${omOssSection}
     ${keyInfoSection}
     ${hoursSection}
@@ -1418,8 +1501,9 @@ function renderClinicProfile(
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(dentalShell(html, {
-    title: `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""} | Finn-tannlege.com`,
+    title: `${profileTitleCore} | Finn-tannlege.com`,
     description: metaDesc,
+    ...(thin ? { robots: "noindex,follow" } : {}),
     canonical,
     jsonLd: jsonLdArr,
   }));

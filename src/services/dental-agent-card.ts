@@ -20,9 +20,18 @@ export function getDentalAgentCard(): object {
   const url = baseUrl();
   const card = {
     name: "Finn-tannlege",
+    // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
+    // "~6 900 klinikker" claim here counted every Brreg-sweep row (raw
+    // sole-proprietors, labs, holding vehicles included), not just real
+    // clinics -- the exact dishonesty this dev-request fixes. Rather than
+    // wiring a live DB count into this module (deliberately DB-free/pure —
+    // see the file header — and called from many test-suite call sites that
+    // assume no DB dependency), the stale specific number is simply dropped
+    // here; GET /tannlege_stats (dental-mcp.ts) and getDentalStats() give an
+    // agent/visitor the real, honestly-filtered count.
     description:
-      "A2A-markedsplass for norske tannlegeklinikker — ~6 900 klinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
-      "A2A marketplace for Norwegian dental clinics — ~6,900 clinics with Helfo-agreement, speciality, and emergency-duty data.",
+      "A2A-markedsplass for norske tannlegeklinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
+      "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-duty data.",
     url: `${url}/a2a`,
     // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
     // dual-published alongside legacy `authentication` below (additive-only —

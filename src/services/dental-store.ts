@@ -28,7 +28,7 @@ import { mergeFieldProvenance } from "../routes/admin-knowledge";
 // PUBLIC list/count/sitemap functions below gate an additive catalog_class
 // exclusion behind this flag -- see the doc comment on the helper itself
 // for why it's a separate knob from the claim-pool's filter.
-import { DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "./dental-catalog-class";
+import { DENTAL_CLINIC_CLASS_SQL } from "./dental-catalog-class";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -71,6 +71,11 @@ export const DentalAgentSchema = z.object({
   // dev-request 2026-09-02-dental-catalog-class-triage: read-only on this
   // schema (hydrated for API consumers); written only by the backfill route.
   catalog_class: z.string().optional().nullable(),
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d): read-only
+  // on this schema (hydrated for API consumers/the profile page); written
+  // only by POST /admin/dental/hjemmeside-cleanup-sweep (see the ALTER TABLE
+  // comment in init-dental.ts for the full history of this column).
+  directory_url: z.string().optional().nullable(),
   // dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
   // read-only on this schema -- hydrated for API consumers; written only by
   // updateDentalAgent()'s own unconditional `updated_at = datetime('now')`
@@ -265,6 +270,10 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     registreringsdato: (row.registreringsdato as string | null) ?? null,
     naeringskode: (row.naeringskode as string | null) ?? null,
     catalog_class: (row.catalog_class as string | null) ?? null,
+    // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
+    // hydrate directory_url so the profile page can display it (labeled,
+    // never as the clinic's own homepage) instead of silently dropping it.
+    directory_url: (row.directory_url as string | null) ?? null,
     // dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
     // hydrateAgent() never included updated_at, so callers (including Stage
     // V's "10% sample of last-24h commits" selector) could never read the
@@ -424,7 +433,7 @@ function pushSpecialtyClause(
   specialty: string
 ): void {
   where.push(
-    "(available_specialties LIKE @specialty OR specialists LIKE @specialtyPerson)"
+    "(available_specialties LIKE @specialty OR specialists LIKE @specialtyPerson OR nb_lower(specialists) LIKE @specialtyTitle)"
   );
   // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
   params.specialty = `%"${specialty}"%`;
@@ -432,6 +441,16 @@ function pushSpecialtyClause(
   //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
   //   colon-space variant; JSON.stringify emits no space, so this is exact).
   params.specialtyPerson = `%"specialty":"${specialty}"%`;
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): also
+  // match on the deep-scrape specialists[].title free-text field (e.g.
+  // "Spesialist i periodonti") -- NOT just the structured .specialty field
+  // above. This is genuinely free text (arbitrary casing/phrasing), so this
+  // clause substring-matches the lower-cased specialists blob for the
+  // lower-cased specialty word inside a "title": key, via the same
+  // Unicode-aware nb_lower() scalar function pushFreeTextClause uses (plain
+  // LIKE doesn't case-fold æ/ø/å). Additive — the two clauses above are
+  // untouched, this only widens what counts as a match.
+  params.specialtyTitle = `%"title":"%${specialty.toLowerCase()}%`;
 }
 
 // dev-request 2026-08-24-tannlege-sok-case-folding-oe: the free-text `q`
@@ -997,11 +1016,20 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
   // the verification_status='rejected' exclusion right above.
   const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"];
   const params: Record<string, unknown> = {};
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" excludes positively-classified
-  // non-clinic rows (person_enk/lab_leverandor/holding); NULL/ukjent stay
-  // eligible (DENTAL_CLINIC_CLASS_SQL). Unset/falsy = unchanged behavior.
-  if (isDentalPublicCatalogClassFilterEnabled()) { where.push(DENTAL_CLINIC_CLASS_SQL); }
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
+  // catalog_class exclusion is now UNCONDITIONAL for this public surface
+  // (was gated behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" in slice 1b's
+  // gradual, default-OFF rollout below -- that rollout is graduated to
+  // permanent-on here). Uses the SAME lenient DENTAL_CLINIC_CLASS_SQL the
+  // claim-pool/Places auto-select already use (NULL/"ukjent" stay eligible,
+  // only positively-classified person_enk/lab_leverandor/holding rows are
+  // excluded) rather than the dev-request text's literal stricter
+  // klinikk/offentlig_klinikk-only wording — see DENTAL_CLINIC_CLASS_SQL's
+  // doc comment in dental-catalog-class.ts for why (the stricter clause
+  // broke a large slice of the pre-existing dental test suite, whose
+  // fixtures predate catalog_class and are therefore NULL, not yet a proven
+  // non-clinic).
+  where.push(DENTAL_CLINIC_CLASS_SQL);
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
@@ -1020,6 +1048,35 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
     ` WHERE ${where.join(" AND ")}`;
   const row = db.prepare(sql).get(params) as { n: number };
   return row.n;
+}
+
+// ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b) ──────
+// "Thin profile": a row missing ALL FOUR of address, phone, website and
+// opening-hours text -- i.e. a visitor lands on a page with nothing but a
+// name and (maybe) an org number, which is worse than not showing the page
+// at all. Used by the profile page (noindex + "is this your clinic?" CTA)
+// and by the sitemap (excluded outright — we must not ask Google to index a
+// page we ourselves mark noindex). Kept as BOTH a SQL fragment (sitemap,
+// cheap filtering with no per-row hydration) and a JS predicate (profile
+// page, already has a hydrated agent in hand) describing the exact same
+// rule against the exact same four columns — keep them in sync.
+export const DENTAL_THIN_PROFILE_SQL =
+  "(" +
+  "(adresse IS NULL OR adresse = '') AND " +
+  "(telefon IS NULL OR telefon = '') AND " +
+  "(mobil IS NULL OR mobil = '') AND " +
+  "(hjemmeside IS NULL OR hjemmeside = '') AND " +
+  "(opening_hours IS NULL OR opening_hours = '' OR opening_hours = '[]')" +
+  ")";
+
+export function isThinDentalProfile(
+  agent: Pick<DentalAgent, "adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours">
+): boolean {
+  const hasAddress = !!(agent.adresse && agent.adresse.trim());
+  const hasPhone = !!((agent.telefon && agent.telefon.trim()) || (agent.mobil && agent.mobil.trim()));
+  const hasWebsite = !!(agent.hjemmeside && agent.hjemmeside.trim());
+  const hasHours = !!(agent.opening_hours && agent.opening_hours.length > 0);
+  return !hasAddress && !hasPhone && !hasWebsite && !hasHours;
 }
 
 /**
@@ -1042,10 +1099,10 @@ export function listPublicDentalAgents(
   // the verification_status='rejected' exclusion right below.
   const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"]; // always exclude rejected + inactive
   const params: Record<string, unknown> = {};
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // same opt-in exclusion as countPublicDentalAgents() above -- kept in
-  // sync so the count and the list it describes never diverge.
-  if (isDentalPublicCatalogClassFilterEnabled()) { where.push(DENTAL_CLINIC_CLASS_SQL); }
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
+  // unconditional honest-count filter as countPublicDentalAgents() above --
+  // kept in sync so the count and the list it describes never diverge.
+  where.push(DENTAL_CLINIC_CLASS_SQL);
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
@@ -1092,15 +1149,20 @@ export function getAvailableSpecialties(candidates: string[]): string[] {
   // offered ONLY by permanently-closed clinics (is_inactive=1) must not be
   // shown in the dropdown -- same unconditional exclusion as
   // verification_status='rejected' immediately below.
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): same
+  // three-way match (available_specialties / specialists[].specialty /
+  // specialists[].title) as pushSpecialtyClause() above — the dropdown must
+  // not hide a specialty that /spesialitet/:slug would actually return
+  // clinics for.
   const stmt = db.prepare(
     `SELECT 1 FROM dental_agents
      WHERE verification_status != 'rejected'
        AND (is_inactive IS NULL OR is_inactive = 0)
-       AND (available_specialties LIKE @s OR specialists LIKE @p)
+       AND (available_specialties LIKE @s OR specialists LIKE @p OR nb_lower(specialists) LIKE @t)
      LIMIT 1`
   );
   return candidates.filter((name) => {
-    const row = stmt.get({ s: `%"${name}"%`, p: `%"specialty":"${name}"%` });
+    const row = stmt.get({ s: `%"${name}"%`, p: `%"specialty":"${name}"%`, t: `%"title":"%${name.toLowerCase()}%` });
     return !!row;
   });
 }
@@ -1120,12 +1182,12 @@ export function getDentalStats(): DentalStats {
   // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
   // closed clinics (is_inactive=1) must not inflate the public frontpage
   // stats -- same unconditional exclusion shape as verification_status='rejected'.
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // same opt-in catalog_class exclusion as listPublicDentalAgents() above,
-  // so the frontpage/fylke counters never show a bigger number than the
-  // filtered listing they sit next to.
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
+  // unconditional honest-count catalog_class filter as listPublicDentalAgents()
+  // above, so the frontpage/fylke counters never show a bigger number than
+  // the filtered listing they sit next to.
   const base = "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
-    (isDentalPublicCatalogClassFilterEnabled() ? ` AND ${DENTAL_CLINIC_CLASS_SQL}` : "");
+    ` AND ${DENTAL_CLINIC_CLASS_SQL}`;
 
   const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
 
@@ -1502,6 +1564,23 @@ export function updateDentalAgent(
     }
   }
 
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): keep
+  // is_chain_member in sync with chain_brand going forward. Whatever the
+  // patch itself said about is_chain_member (via the allow-list loop above,
+  // if it was also present in the body) is overridden here — chain_brand is
+  // the source of truth, so a PUT can no longer set them out of sync (e.g.
+  // clearing chain_brand while leaving is_chain_member=1 stale, or vice
+  // versa). Only runs when this PUT actually touches chain_brand; a PUT
+  // that doesn't mention chain_brand at all leaves is_chain_member alone.
+  if ("chain_brand" in patch) {
+    const nextChainBrand = patch.chain_brand;
+    const derivedIsChainMember = nextChainBrand && String(nextChainBrand).trim() !== "" ? 1 : 0;
+    const existingIsChainMemberSetIdx = sets.findIndex((s) => s.startsWith("is_chain_member "));
+    if (existingIsChainMemberSetIdx !== -1) sets.splice(existingIsChainMemberSetIdx, 1);
+    sets.push("is_chain_member = @is_chain_member_synced");
+    params.is_chain_member_synced = derivedIsChainMember;
+  }
+
   if (sets.length === 0) return true; // nothing to do
   sets.push("updated_at = datetime('now')");
   // 2026-08-21 dental-enrichment-spotcheck-vs-envelope-avstemming: dental was
@@ -1794,12 +1873,12 @@ export interface PoststedRow {
 
 export function listPoststeder(minCount = 1): PoststedRow[] {
   const db = getDb("dental");
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // same opt-in catalog_class exclusion as the other public functions in
-  // this file -- the per-poststed counts shown on /sted must match the
-  // filtered listing behind each city link. Applied only to the outer
-  // COUNT(*)/HAVING (the `n` returned to callers); the fylke subquery is
-  // left unfiltered since it merely picks the majority fylke label for a
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
+  // unconditional honest-count catalog_class filter as the other public
+  // functions in this file -- the per-poststed counts shown on /sted must
+  // match the filtered listing behind each city link. Applied only to the
+  // outer COUNT(*)/HAVING (the `n` returned to callers); the fylke subquery
+  // is left unfiltered since it merely picks the majority fylke label for a
   // poststed, not a count shown to visitors.
   // For each poststed, pick the most common fylke (subquery via GROUP BY + ORDER BY n DESC LIMIT 1)
   const rows = db.prepare(`
@@ -1813,7 +1892,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     FROM dental_agents da
     WHERE verification_status != 'rejected'
       AND poststed IS NOT NULL AND poststed != ''
-      ${isDentalPublicCatalogClassFilterEnabled() ? `AND ${DENTAL_CLINIC_CLASS_SQL}` : ""}
+      AND ${DENTAL_CLINIC_CLASS_SQL}
     GROUP BY poststed
     HAVING n >= ?
     ORDER BY n DESC
@@ -1836,11 +1915,11 @@ export function listRelatedClinics(
 ): Array<DentalAgent & { id: string }> {
   if (!agent.poststed) return [];
   const db = getDb("dental");
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // same opt-in exclusion as listPublicDentalAgents() -- the "related
-  // clinics" widget on a public clinic page must not surface non-clinic
-  // rows the main listing already hides.
-  const catalogClassClause = isDentalPublicCatalogClassFilterEnabled() ? `AND ${DENTAL_CLINIC_CLASS_SQL}` : "";
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
+  // unconditional honest-count filter as listPublicDentalAgents() -- the
+  // "related clinics" widget on a public clinic page must not surface
+  // non-clinic rows the main listing already hides.
+  const catalogClassClause = `AND ${DENTAL_CLINIC_CLASS_SQL}`;
   const rows = db.prepare(`
     SELECT * FROM dental_agents
     WHERE poststed = ?
@@ -1863,16 +1942,23 @@ export function listRelatedClinics(
  */
 export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: string; updated_at: string | null }> {
   const db = getDb("dental");
-  // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-  // same opt-in exclusion as listPublicDentalAgents() -- the sitemap must
-  // not list per-clinic pages for rows the public listing already hides.
-  const catalogClassClause = isDentalPublicCatalogClassFilterEnabled() ? `AND ${DENTAL_CLINIC_CLASS_SQL}` : "";
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
+  // unconditional honest-count filter as listPublicDentalAgents() -- the
+  // sitemap must not list per-clinic pages for rows the public listing
+  // already hides.
+  const catalogClassClause = `AND ${DENTAL_CLINIC_CLASS_SQL}`;
+  // (5b — thin profiles): a profile with none of address/phone/website/
+  // opening-hours (DENTAL_THIN_PROFILE_SQL, same rule the profile page uses
+  // for its noindex+CTA) is placeholder-quality and must not be indexed —
+  // exclude it from the sitemap entirely rather than submitting a page we
+  // ourselves mark noindex.
   const rows = db.prepare(`
     SELECT org_nr, navn, updated_at
     FROM dental_agents
     WHERE verification_status != 'rejected'
       AND org_nr IS NOT NULL AND org_nr != ''
       ${catalogClassClause}
+      AND NOT ${DENTAL_THIN_PROFILE_SQL}
     ORDER BY navn ASC
   `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
   return rows;
