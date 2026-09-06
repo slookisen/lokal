@@ -122,6 +122,7 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       enrichmentStatus?: string | null;
       email?: string | null;
       about?: string | null;
+      products?: string | null;
       fieldProvenance?: string | null;
       urlLastStatus?: number | null;
       urlLastProbed?: string | null;
@@ -136,17 +137,24 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       ).run(o.id, o.name, o.aUrl ?? "", `key-${o.id}`);
       testDb.prepare(
         `INSERT INTO agent_knowledge (
-           agent_id, website, verification_status, enrichment_status, email, about,
+           agent_id, website, verification_status, enrichment_status, email, about, products,
            field_provenance, url_last_status, url_last_probed, homepage_unreachable_since,
            no_yield_streak, wrong_entity_streak, last_enrichment_attempt_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         o.id, o.website ?? null, o.verificationStatus ?? "pending_verify",
-        o.enrichmentStatus ?? "partial", o.email ?? null, o.about ?? null,
+        o.enrichmentStatus ?? "partial", o.email ?? null, o.about ?? null, o.products ?? "[]",
         o.fieldProvenance ?? "{}", o.urlLastStatus ?? null, o.urlLastProbed ?? null,
         o.homepageUnreachableSince ?? null, o.noYieldStreak ?? 0, o.wrongEntityStreak ?? 0,
         o.lastEnrichmentAttemptAt ?? null, new Date().toISOString(),
       );
+    }
+
+    function insertSentLog(o: { agentId?: string | null; recipientEmail?: string | null }): void {
+      testDb.prepare(
+        `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+         VALUES (?, ?, ?, 'email', 'rfb')`,
+      ).run(o.agentId ?? null, o.recipientEmail ?? null, new Date().toISOString());
     }
 
     const nowIso = new Date().toISOString();
@@ -343,6 +351,88 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
         clean.body.agents[0].signals.email_ownership_unproven, false,
         "i7: absent stored verdict is reported as false, never null/undefined",
       );
+    }
+
+    // ── (j) dev-request 2026-09-06: already_sent (outreach_sent_log) is a
+    //     distinct blocker from already_contacted (CRM-derived) — an agent
+    //     can be excluded by the VIEW's NOT EXISTS(outreach_sent_log) leg
+    //     with no matching crm_messages row at all. --
+    {
+      insertAgent({
+        id: "pbe-sent",
+        name: "Sendt Gard",
+        website: "https://sendtgard.no",
+        about: "Ferdig beriket gard, allerede kontaktet via utsendingsjobben.",
+        verificationStatus: "verified",
+        enrichmentStatus: "rich",
+        email: "post@sendtgard.no",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      insertSentLog({ agentId: "pbe-sent" });
+      const r = await callExplain({ agentId: "pbe-sent" });
+      const a = r.body.agents[0];
+      assertTrue(
+        a.pool_blockers.includes("already_sent (outreach_sent_log)"),
+        "j1: outreach_sent_log row blocks via already_sent",
+      );
+      assertTrue(
+        !a.pool_blockers.includes("already_contacted"),
+        "j2: already_contacted (CRM-derived) is independent and absent here",
+      );
+      assertEq(a.signals.already_sent, true, "j3: raw already_sent signal surfaced");
+      assertEq(a.in_pool, false, "j4: VIEW agrees — excluded via its outreach_sent_log NOT EXISTS leg");
+    }
+
+    // ── (k) partial + content threshold MET (about >= 80) -> no
+    //     content_threshold_not_met blocker, VIEW admits it --
+    {
+      insertAgent({
+        id: "pbe-partial-in",
+        name: "Partial Innenfor",
+        website: "https://partialinnenfor.no",
+        about: "A".repeat(90),
+        verificationStatus: "verified",
+        enrichmentStatus: "partial",
+        email: "post@partialinnenfor.no",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      const r = await callExplain({ agentId: "pbe-partial-in" });
+      const a = r.body.agents[0];
+      assertTrue(
+        !a.pool_blockers.some((b: string) => b.startsWith("content_threshold_not_met")),
+        "k1: about>=80 partial row has no content_threshold_not_met blocker",
+      );
+      assertTrue(
+        !a.pool_blockers.some((b: string) => b.startsWith("enrichment_status_not_rich")),
+        "k2: partial no longer masquerades as enrichment_status_not_rich",
+      );
+      assertEq(a.in_pool, true, "k3: VIEW admits a qualified partial row");
+    }
+
+    // ── (l) partial + content threshold NOT met (about < 80, < 3 products)
+    //     -> content_threshold_not_met blocker, VIEW excludes it --
+    {
+      insertAgent({
+        id: "pbe-partial-out",
+        name: "Partial Utenfor",
+        website: "https://partialutenfor.no",
+        about: "A".repeat(40),
+        products: JSON.stringify([{ name: "Ost" }]),
+        verificationStatus: "verified",
+        enrichmentStatus: "partial",
+        email: "post@partialutenfor.no",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      const r = await callExplain({ agentId: "pbe-partial-out" });
+      const a = r.body.agents[0];
+      assertTrue(
+        a.pool_blockers.includes("content_threshold_not_met (partial: about <80 chars and <3 products)"),
+        "l1: under-threshold partial row names content_threshold_not_met",
+      );
+      assertEq(a.in_pool, false, "l2: VIEW excludes the under-threshold partial row");
     }
 
     // ── (h) read-only: no writes happen --
