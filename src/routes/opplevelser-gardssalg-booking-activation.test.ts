@@ -174,6 +174,13 @@ export function runOpplevelserGardssalgBookingActivationTests(
     let emailSvc: any = null;
     let origConfigured: unknown;
     let origTransporter: unknown;
+    let origSendEmail: unknown;
+    // dev-request 2026-07-14-booking-flyt-v1 slice 1, review fix-up: capture
+    // to/subject/htmlContent/textContent too — same recipe as tests/test.ts's
+    // bekreft-løkka block (emailCallsBKC) — so the opening-hours section below
+    // can assert the producer notification actually CARRIES
+    // opening_hours_text, not just that a send was attempted.
+    let emailCalls: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
 
     try {
       try {
@@ -195,8 +202,18 @@ export function runOpplevelserGardssalgBookingActivationTests(
       emailSvc = emailMod.emailService as any;
       origConfigured = emailSvc.isConfigured;
       origTransporter = emailSvc.transporter;
+      origSendEmail = emailSvc.sendEmail;
       emailSvc.isConfigured = true;
       emailSvc.transporter = { sendMail: async () => ({ messageId: "stub" }) };
+      emailSvc.sendEmail = async (opts: {
+        to: string; subject: string; htmlContent?: string; textContent?: string;
+      }) => {
+        emailCalls.push({
+          to: opts.to, subject: opts.subject,
+          htmlContent: opts.htmlContent || "", textContent: opts.textContent || "",
+        });
+        return { success: true, messageId: "test" };
+      };
 
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
@@ -253,6 +270,22 @@ export function runOpplevelserGardssalgBookingActivationTests(
         epost: "post@gardeier.no", telefon: null, hjemmeside: "https://gardeier.no",
         content_source: "provider_site", booking_live: 0, catalog_hidden: 0, slug: "gard-eier",
       });
+      // prov-hours: booking_live=1, real epost, with a PARSEABLE
+      // opening_hours_text ("Man-fre 10:00-18:00", the exact snippet used by
+      // gardssalg-opening-hours.test.ts's own unit tests) — used below for
+      // the review fix-up's route-level opening-hours coverage (JSON API +
+      // SSR entry points). insertProvider's column list has no
+      // opening_hours_text slot, so this fixture is inserted directly.
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
+            epost, telefon, hjemmeside, content_source, booking_live, catalog_hidden,
+            slug, opening_hours_text, enrichment_state, verification_status, source, confidence)
+         VALUES
+           ('prov-hours', 'Gård Med Åpningstider AS', 'experiences', '777777777', 'Voss', 'rfb-seed', NULL,
+            'post@gardhours.no', NULL, 'https://gardhours.no',
+            'provider_site', 1, 0, 'gard-hours', 'Man-fre 10:00-18:00', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+      ).run();
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
       const authHeaders = { "x-admin-key": testKey };
@@ -588,6 +621,171 @@ export function runOpplevelserGardssalgBookingActivationTests(
         .get("prov-owner") as { n: number };
       assertTrue(ownerRowStillThere.n >= 1, "ac7-6: the owner's audit row is still there — never mutated/deleted");
       assertTrue(adminRowNowThere.n >= 1, "ac7-7: the admin's own audit row is also there — neither clobbers the other's trail");
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Opening-hours soft validation (review fix-up, dev-request 2026-07-14-
+      // booking-flyt-v1 slice 1): route-level coverage of
+      // checkBookingSlotAllowed() (services/gardssalg-opening-hours.ts)
+      // through the ACTUAL JSON API (POST /api/opplevelser/book) and the
+      // no-JS SSR fallback (experiences-seo.ts), against prov-hours
+      // (opening_hours_text = "Man-fre 10:00-18:00"). Previously this choke
+      // point had only pure-function unit coverage
+      // (gardssalg-opening-hours.test.ts) — never exercised through a real
+      // router. The book_gardssalg MCP entry point's equivalent coverage
+      // lives in opplevelser-gardssalg-mcp-booking.test.ts.
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        // Offset-from-now (never a hardcoded calendar date) so this section
+        // never goes stale the way the hardcoded slot_at fixtures elsewhere
+        // in this file periodically need a "date-repairs" bump (see this
+        // very branch's own prior commit). A calendar date's day-of-week is
+        // timezone-independent, so walking it via getUTCDay() is safe even
+        // though the returned "YYYY-MM-DDTHH:mm" string is later read as
+        // EUROPE/OSLO wall time by normaliseBookingSlotInput()/
+        // osloDatetimeLocalToUtcIso().
+        function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
+          const d = new Date();
+          d.setUTCHours(0, 0, 0, 0);
+          d.setUTCDate(d.getUTCDate() + minDaysAhead);
+          while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
+          const pad = (n: number): string => String(n).padStart(2, "0");
+          return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
+        }
+        // Next Saturday at noon — OUTSIDE "Man-fre 10:00-18:00", always a
+        // few days out, always well inside the (default 90-day) window.
+        const outsideHoursSlot = nextWeekdayDatetimeLocal(6, 12, 0);
+        // Comfortably beyond the default 90-day window.
+        const tooFarAheadDate = new Date();
+        tooFarAheadDate.setUTCDate(tooFarAheadDate.getUTCDate() + 120);
+        const tooFarAheadSlot =
+          `${tooFarAheadDate.getUTCFullYear()}-${String(tooFarAheadDate.getUTCMonth() + 1).padStart(2, "0")}-` +
+          `${String(tooFarAheadDate.getUTCDate()).padStart(2, "0")}T12:00`;
+        const pastSlot = "2020-01-06T12:00";
+
+        // ─── JSON API: POST /api/opplevelser/book ───────────────────────
+
+        // past slot -> HARD 400, no row created.
+        const beforeCountPast = countBookings();
+        const jsonPast = await callRoute(opplevelserRouter, {
+          url: "/book", headers: {},
+          body: { provider_id: "prov-hours", slot_at: pastSlot, party_size: 2, guest_name: "Gjest Fortid", guest_email: "fortid@example.no" },
+        });
+        assertEq(jsonPast.status, 400, "oh-json-1: JSON API rejects a past slot_at with 400");
+        assertTrue(typeof jsonPast.body?.error === "string" && jsonPast.body.error.length > 0, "oh-json-1b: 400 body carries a human-readable error");
+        assertEq(countBookings(), beforeCountPast, "oh-json-1c: no gardssalg_bookings row created for the past-slot rejection");
+
+        // >90-days-ahead slot -> same HARD 400.
+        const beforeCountFar = countBookings();
+        const jsonFar = await callRoute(opplevelserRouter, {
+          url: "/book", headers: {},
+          body: { provider_id: "prov-hours", slot_at: tooFarAheadSlot, party_size: 2, guest_name: "Gjest Frem I Tid", guest_email: "framtid@example.no" },
+        });
+        assertEq(jsonFar.status, 400, "oh-json-2: JSON API rejects a slot >BOOKING_MAX_DAYS_AHEAD (90d default) ahead with 400 too");
+        assertEq(countBookings(), beforeCountFar, "oh-json-2b: no row created for the too-far-ahead rejection");
+
+        // outside stated hours, no confirm -> SOFT 200, booking NOT created.
+        const beforeCountOutside = countBookings();
+        const jsonOutside = await callRoute(opplevelserRouter, {
+          url: "/book", headers: {},
+          body: { provider_id: "prov-hours", slot_at: outsideHoursSlot, party_size: 2, guest_name: "Gjest Utenfor", guest_email: "utenfor@example.no" },
+        });
+        assertEq(jsonOutside.status, 200, "oh-json-3: an outside-hours slot -> 200 (a soft warning, not a hard error)");
+        assertEq(jsonOutside.body.success, false, "oh-json-3b: …success:false");
+        assertEq(jsonOutside.body.outside_hours, true, "oh-json-3c: …outside_hours:true");
+        assertEq(jsonOutside.body.opening_hours_text, "Man-fre 10:00-18:00", "oh-json-3d: …echoes the provider's raw opening_hours_text");
+        assertEq(countBookings(), beforeCountOutside, "oh-json-3e: NO booking row created for the soft-blocked outside-hours request");
+
+        // SAME outside-hours slot WITH confirm_outside_hours:true -> booking
+        // IS created, and the producer notification carries the provider's
+        // own opening_hours_text verbatim (the reviewer's exact finding).
+        emailCalls = [];
+        const beforeCountConfirm = countBookings();
+        const jsonConfirmed = await callRoute(opplevelserRouter, {
+          url: "/book", headers: {},
+          body: {
+            provider_id: "prov-hours", slot_at: outsideHoursSlot, party_size: 2,
+            guest_name: "Gjest Bekreftet", guest_email: "bekreftet@example.no", confirm_outside_hours: true,
+          },
+        });
+        assertEq(jsonConfirmed.status, 201, "oh-json-4: confirm_outside_hours:true on the same outside-hours slot -> 201 created");
+        assertEq(countBookings(), beforeCountConfirm + 1, "oh-json-4b: exactly one new row created");
+        const confirmedRow = expDb
+          .prepare(`SELECT * FROM gardssalg_bookings WHERE booking_ref = ?`)
+          .get(jsonConfirmed.body.booking_ref) as any;
+        assertTrue(!!confirmedRow, "oh-json-4c: the created row is findable by booking_ref");
+        assertEq(confirmedRow.provider_id, "prov-hours", "oh-json-4d: row belongs to prov-hours");
+        // Fire-and-forget producer email — give its microtask chain a beat to
+        // finish before inspecting the capture (same wait-a-tick recipe as
+        // e.g. pilot-ordre-loop.test.ts elsewhere in this suite).
+        await new Promise((r) => setTimeout(r, 20));
+        const prodMailJson = emailCalls.find((c) => c.to === "post@gardhours.no");
+        assertTrue(!!prodMailJson, "oh-json-4e: producer notification email was attempted");
+        assertTrue(!!prodMailJson && prodMailJson.htmlContent.includes("Man-fre 10:00-18:00"), "oh-json-4f: producer notification HTML carries the provider's own opening_hours_text verbatim");
+        assertTrue(!!prodMailJson && prodMailJson.textContent.includes("Man-fre 10:00-18:00"), "oh-json-4g: producer notification TEXT part also carries opening_hours_text verbatim");
+
+        // past + confirm_outside_hours:true -> STILL rejected. confirm_
+        // outside_hours only ever bypasses the SOFT hours check, never the
+        // HARD bounds.
+        const beforeCountPastConfirm = countBookings();
+        const jsonPastConfirmed = await callRoute(opplevelserRouter, {
+          url: "/book", headers: {},
+          body: {
+            provider_id: "prov-hours", slot_at: pastSlot, party_size: 2,
+            guest_name: "Gjest Fortid Bekreftet", guest_email: "fortid-bekreftet@example.no", confirm_outside_hours: true,
+          },
+        });
+        assertEq(jsonPastConfirmed.status, 400, "oh-json-5: confirm_outside_hours:true does NOT bypass the hard past-slot bound");
+        assertEq(countBookings(), beforeCountPastConfirm, "oh-json-5b: no row created");
+
+        // ─── SSR no-JS fallback: POST /kategori/gardssalg/book/:providerSlug ─
+        // NB: this surface deliberately has NO confirm_outside_hours bypass
+        // (see the route handler's own comment in experiences-seo.ts) — a
+        // no-JS form has no round trip to offer that choice, so there is no
+        // "confirmed" SSR scenario to test; every outside-hours submission
+        // here hard-explains the mismatch and expects the guest to resubmit
+        // with a different time via the visible form fields.
+        const seoRouterOH = (require("./experiences-seo") as typeof import("./experiences-seo")).default;
+        const appOH = express();
+        appOH.use(seoRouterOH as any);
+        const serverOH = http.createServer(appOH);
+        servers.push(serverOH);
+        await new Promise<void>((resolve) => serverOH.listen(0, "127.0.0.1", resolve));
+        const portOH = (serverOH.address() as AddressInfo).port;
+        const baseOH = `http://127.0.0.1:${portOH}`;
+
+        async function postFormOH(slug: string, form: Record<string, string>): Promise<string | null> {
+          const res = await fetch(`${baseOH}/kategori/gardssalg/book/${encodeURIComponent(slug)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams(form).toString(),
+            redirect: "manual",
+          });
+          return res.headers.get("location");
+        }
+
+        const beforeCountSsrPast = countBookings();
+        const locPast = await postFormOH("gard-hours", {
+          slot_at: pastSlot, party_size: "2", guest_name: "SSR Gjest Fortid", guest_email: "ssr-fortid@example.no",
+        });
+        assertTrue(!!locPast && locPast.includes("error=slot_bounds"), `oh-ssr-1: SSR no-JS form rejects a past slot_at with ?error=slot_bounds (got ${locPast})`);
+        assertEq(countBookings(), beforeCountSsrPast, "oh-ssr-1b: no row created for the past-slot SSR rejection");
+
+        const beforeCountSsrFar = countBookings();
+        const locFar = await postFormOH("gard-hours", {
+          slot_at: tooFarAheadSlot, party_size: "2", guest_name: "SSR Gjest Frem", guest_email: "ssr-frem@example.no",
+        });
+        assertTrue(!!locFar && locFar.includes("error=slot_bounds"), `oh-ssr-2: SSR no-JS form rejects a >90-day-ahead slot_at with ?error=slot_bounds too (got ${locFar})`);
+        assertEq(countBookings(), beforeCountSsrFar, "oh-ssr-2b: no row created for the too-far-ahead SSR rejection");
+
+        const beforeCountSsrOutside = countBookings();
+        const locOutside = await postFormOH("gard-hours", {
+          slot_at: outsideHoursSlot, party_size: "2", guest_name: "SSR Gjest Utenfor", guest_email: "ssr-utenfor@example.no",
+        });
+        assertTrue(!!locOutside && locOutside.includes("error=outside_hours"), `oh-ssr-3: SSR no-JS form soft-blocks an outside-hours slot with ?error=outside_hours (got ${locOutside})`);
+        const hoursParam = locOutside ? new URL(locOutside, baseOH).searchParams.get("hours") : null;
+        assertEq(hoursParam, "Man-fre 10:00-18:00", "oh-ssr-3b: redirect's ?hours= carries the provider's raw opening_hours_text (round-tripped through encode/decode)");
+        assertEq(countBookings(), beforeCountSsrOutside, "oh-ssr-3c: NO booking row created for the SSR soft-blocked outside-hours submission");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-booking-activation: unexpected error: " + String(err?.stack || err?.message || err));
@@ -598,6 +796,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       if (emailSvc) {
         emailSvc.isConfigured = origConfigured;
         emailSvc.transporter = origTransporter;
+        emailSvc.sendEmail = origSendEmail;
       }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;

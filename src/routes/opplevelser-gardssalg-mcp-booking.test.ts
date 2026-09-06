@@ -107,12 +107,31 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
     for (const p of cachePaths) delete require.cache[p];
 
     let server: http.Server | undefined;
+    let emailModMcp: typeof import("../services/email-service") | undefined;
+    let origSendEmailMcp: unknown;
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const db = dbFactory.getDb("experiences");
       const bookingStore = require("../services/booking-store") as typeof import("../services/booking-store");
+
+      // dev-request 2026-07-14-booking-flyt-v1 slice 1 ("myk åpningstids-
+      // validering"), review fix-up: capture outgoing email content so the
+      // confirm_outside_hours scenario below can assert the producer
+      // notification actually CARRIES opening_hours_text — same
+      // emailService.sendEmail override recipe as tests/test.ts's
+      // bekreft-løkka block (emailCallsBKC) / opplevelser-gardssalg-
+      // booking-activation.test.ts's own emailCalls capture.
+      emailModMcp = require("../services/email-service") as typeof import("../services/email-service");
+      let emailCallsMcp: Array<{ to: string; htmlContent: string; textContent: string }> = [];
+      origSendEmailMcp = emailModMcp.emailService.sendEmail;
+      (emailModMcp.emailService as any).sendEmail = async (opts: {
+        to: string; htmlContent?: string; textContent?: string;
+      }) => {
+        emailCallsMcp.push({ to: opts.to, htmlContent: opts.htmlContent || "", textContent: opts.textContent || "" });
+        return { success: true, messageId: "test" };
+      };
 
       // ── Fixtures ────────────────────────────────────────────────────────
       const insertProvider = db.prepare(
@@ -135,6 +154,21 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
         id: "bk-paused", navn: "Ikke Klar Gård AS", fylke: "Vestland", kommune: "Bergen", producer_type: "cideri",
         booking_live: 0, catalog_hidden: null, epost: "produsent@ikke-klar.example.no", slug: "ikke-klar-gaard",
       });
+      // bk-hours: onboarded + dispatched exactly like bk-live, but ALSO
+      // carries a PARSEABLE opening_hours_text ("Man-fre 10:00-18:00", the
+      // same snippet gardssalg-opening-hours.test.ts's own unit tests use) —
+      // used below for the review fix-up's route-level opening-hours
+      // coverage of the book_gardssalg MCP tool. A separate fixture from
+      // bk-live so none of the existing scenarios above are affected.
+      db.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, fylke, kommune, producer_type, booking_live, catalog_hidden, epost, slug,
+            opening_hours_text, enrichment_state, verification_status, source, confidence)
+         VALUES
+           ('bk-hours', 'Åpningstid Gård AS', 'experiences', 'Vestland', 'Bergen', 'bryggeri',
+            1, NULL, 'produsent@apningstid-gaard.example.no', 'apningstid-gaard',
+            'Man-fre 10:00-18:00', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+      ).run();
 
       // ── Real MCP session over HTTP ───────────────────────────────────────
       const mcpRouter = (require("./experiences-mcp") as typeof import("./experiences-mcp")).default;
@@ -318,10 +352,126 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       const resolved = bookingStore.resolveBooking(realToken, "confirmed_attended", "test-producer");
       assertTrue(!!resolved, "d3: the REAL confirm_token (read directly from the DB, never returned by the tool) resolves via the existing, untouched resolveBooking()");
       assertEq(resolved?.status, "confirmed_attended", "d4: resolveBooking() with the real token flips status as designed — proving the ONLY path to confirmation is that existing token flow, not this tool");
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Opening-hours soft validation (review fix-up, dev-request 2026-07-14-
+      // booking-flyt-v1 slice 1): route-level coverage of checkBookingSlotAllowed()
+      // (services/gardssalg-opening-hours.ts) THROUGH the actual book_gardssalg
+      // MCP tool call, against bk-hours (opening_hours_text = "Man-fre
+      // 10:00-18:00") — mirroring the reviewer's own throwaway MCP-HTTP-
+      // session probe as a permanent test.
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        // Offset-from-now (never a hardcoded calendar date) so this section
+        // never goes stale the way the hardcoded slot_at fixtures elsewhere
+        // in this suite periodically need a "date-repairs" bump. A calendar
+        // date's day-of-week is timezone-independent, so walking it via
+        // getUTCDay() is safe even though the returned "YYYY-MM-DDTHH:mm"
+        // string is later read as EUROPE/OSLO wall time by
+        // normaliseBookingSlotInput()/osloDatetimeLocalToUtcIso().
+        function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
+          const d = new Date();
+          d.setUTCHours(0, 0, 0, 0);
+          d.setUTCDate(d.getUTCDate() + minDaysAhead);
+          while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
+          const pad = (n: number): string => String(n).padStart(2, "0");
+          return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
+        }
+        // Next Saturday at noon — OUTSIDE "Man-fre 10:00-18:00", always a
+        // few days out, always well inside the (default 90-day) window.
+        const outsideHoursSlotMcp = nextWeekdayDatetimeLocal(6, 12, 0);
+        // Comfortably beyond the default 90-day window.
+        const tooFarAheadDateMcp = new Date();
+        tooFarAheadDateMcp.setUTCDate(tooFarAheadDateMcp.getUTCDate() + 120);
+        const tooFarAheadSlotMcp =
+          `${tooFarAheadDateMcp.getUTCFullYear()}-${String(tooFarAheadDateMcp.getUTCMonth() + 1).padStart(2, "0")}-` +
+          `${String(tooFarAheadDateMcp.getUTCDate()).padStart(2, "0")}T12:00`;
+        const pastSlotMcp = "2020-01-06T12:00";
+
+        // ── past slot -> HARD rejection (isError:true, reason:"slot_bounds") ──
+        const beforeCountPastMcp = countRows();
+        const pastCall = await callTool("book_gardssalg", {
+          provider_id: "bk-hours", slot_at: pastSlotMcp, party_size: 2,
+          guest_name: "MCP Gjest Fortid", guest_email: "mcp-fortid@example.no",
+        });
+        assertEq(pastCall.parsed.success, false, "oh-mcp-1: a past slot_at -> success:false");
+        assertEq(pastCall.parsed.rejected, true, "oh-mcp-1b: …rejected:true");
+        assertEq(pastCall.parsed.reason, "slot_bounds", "oh-mcp-1c: …reason:'slot_bounds'");
+        assertTrue(pastCall.body.result?.isError === true, "oh-mcp-1d: tool result IS marked isError for the hard bounds rejection");
+        assertEq(countRows(), beforeCountPastMcp, "oh-mcp-1e: no gardssalg_bookings row created");
+
+        // ── >90-days-ahead slot -> same hard rejection ──────────────────────
+        const beforeCountFarMcp = countRows();
+        const farCall = await callTool("book_gardssalg", {
+          provider_id: "bk-hours", slot_at: tooFarAheadSlotMcp, party_size: 2,
+          guest_name: "MCP Gjest Frem I Tid", guest_email: "mcp-frem@example.no",
+        });
+        assertEq(farCall.parsed.reason, "slot_bounds", "oh-mcp-2: a slot >BOOKING_MAX_DAYS_AHEAD (90d default) ahead -> reason:'slot_bounds' too");
+        assertTrue(farCall.body.result?.isError === true, "oh-mcp-2b: …also isError:true");
+        assertEq(countRows(), beforeCountFarMcp, "oh-mcp-2c: no row created");
+
+        // ── outside stated hours, no confirm -> SOFT block (not isError) ────
+        const beforeCountOutsideMcp = countRows();
+        const outsideCall = await callTool("book_gardssalg", {
+          provider_id: "bk-hours", slot_at: outsideHoursSlotMcp, party_size: 2,
+          guest_name: "MCP Gjest Utenfor", guest_email: "mcp-utenfor@example.no",
+        });
+        assertEq(outsideCall.parsed.success, false, "oh-mcp-3: an outside-hours slot -> success:false");
+        assertEq(outsideCall.parsed.outside_hours, true, "oh-mcp-3b: …outside_hours:true");
+        assertEq(outsideCall.parsed.opening_hours_text, "Man-fre 10:00-18:00", "oh-mcp-3c: …echoes the provider's raw opening_hours_text");
+        assertTrue(outsideCall.body.result?.isError !== true, "oh-mcp-3d: NOT marked isError — a soft, retryable outcome, not a tool failure");
+        assertEq(countRows(), beforeCountOutsideMcp, "oh-mcp-3e: no row created for the soft-blocked outside-hours attempt");
+
+        // ── same outside-hours slot WITH confirm_outside_hours:true ─────────
+        // -> booking IS created, and the producer notification carries the
+        // provider's own opening_hours_text verbatim (the reviewer's exact
+        // finding: this was proven live via a throwaway probe, never locked
+        // in as a permanent assertion).
+        const beforeCountConfirmMcp = countRows();
+        const confirmCall = await callTool("book_gardssalg", {
+          provider_id: "bk-hours", slot_at: outsideHoursSlotMcp, party_size: 2,
+          guest_name: "MCP Gjest Bekreftet", guest_email: "mcp-bekreftet@example.no",
+          confirm_outside_hours: true,
+        });
+        assertEq(confirmCall.parsed.success, true, "oh-mcp-4: confirm_outside_hours:true on the same outside-hours slot -> success:true");
+        assertEq(confirmCall.parsed.pending, true, "oh-mcp-4b: …pending:true (still not auto-confirmed)");
+        assertEq(countRows(), beforeCountConfirmMcp + 1, "oh-mcp-4c: exactly one new row created");
+        const confirmedRowMcp = db
+          .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
+          .get(confirmCall.parsed.booking_ref) as Record<string, unknown>;
+        assertTrue(!!confirmedRowMcp, "oh-mcp-4d: the created row is findable by booking_ref");
+        assertEq(confirmedRowMcp.provider_id, "bk-hours", "oh-mcp-4e: row belongs to bk-hours");
+        // Fire-and-forget producer email — give its microtask chain a beat to
+        // finish before inspecting the capture (same wait-a-tick recipe as
+        // e.g. pilot-ordre-loop.test.ts elsewhere in this suite).
+        await new Promise((r) => setTimeout(r, 20));
+        const prodMailMcp = emailCallsMcp.find((c) => c.to === "produsent@apningstid-gaard.example.no");
+        assertTrue(!!prodMailMcp, "oh-mcp-4f: producer notification email was attempted");
+        assertTrue(
+          !!prodMailMcp && prodMailMcp.htmlContent.includes("Man-fre 10:00-18:00"),
+          "oh-mcp-4g: producer notification HTML carries the provider's own opening_hours_text verbatim",
+        );
+
+        // ── past + confirm_outside_hours:true -> STILL rejected ─────────────
+        // confirm_outside_hours only ever bypasses the SOFT opening-hours
+        // check, never the HARD past/too-far-ahead bounds — the reviewer
+        // proved this behaviourally; this locks it in as a real assertion.
+        const beforeCountPastConfirmMcp = countRows();
+        const pastConfirmCall = await callTool("book_gardssalg", {
+          provider_id: "bk-hours", slot_at: pastSlotMcp, party_size: 2,
+          guest_name: "MCP Gjest Fortid Bekreftet", guest_email: "mcp-fortid-bekreftet@example.no",
+          confirm_outside_hours: true,
+        });
+        assertEq(pastConfirmCall.parsed.reason, "slot_bounds", "oh-mcp-5: confirm_outside_hours:true does NOT bypass the hard past-slot bound");
+        assertEq(countRows(), beforeCountPastConfirmMcp, "oh-mcp-5b: no row created");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-mcp-booking: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      if (emailModMcp) {
+        (emailModMcp.emailService as any).sendEmail = origSendEmailMcp;
+      }
       if (server) {
         await new Promise<void>((resolve) => server!.close(() => resolve()));
       }
