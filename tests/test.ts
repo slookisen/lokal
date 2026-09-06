@@ -30747,6 +30747,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gops.failures) failures.push("opplevelser-gardssalg-outreach-pilot-send: " + f);
     console.log(`  opplevelser-gardssalg-outreach-pilot-send: ${gops.passed} passed, ${gops.failed} failed`);
 
+    // dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien, option
+    // A: the platform-side daily send (runGardssalgOutreachDaily + lane switch +
+    // scheduling guard) built on the extracted daily-prep selection and the
+    // extracted per-provider send above. Same in-memory-DB + fake-transporter
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-daily-run: platform-side daily send ──");
+    const { runOpplevelserGardssalgOutreachDailyRunTests } = require("../src/routes/opplevelser-gardssalg-outreach-daily-run.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-daily-run.test");
+    const godr = await runOpplevelserGardssalgOutreachDailyRunTests({ log: false });
+    passed += godr.passed;
+    failed += godr.failed;
+    for (const f of godr.failures) failures.push("opplevelser-gardssalg-outreach-daily-run: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-daily-run: ${godr.passed} passed, ${godr.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed

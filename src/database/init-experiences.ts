@@ -1413,6 +1413,27 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_outreach_sent_log failed:", err);
   }
 
+  // ─── experience_outreach_lane_state (dev-request
+  // 2026-09-03-opplevagent-sending-uten-llm-i-sendestien, option A) ────────
+  // Single-row switch for the platform-side daily gårdssalg outreach send
+  // (routes/opplevelser.ts runGardssalgOutreachDaily). paused=1 stops the
+  // job; the job itself sets it on a fresh hard bounce/complaint. Replaces
+  // the A2A file controller/opplevagent-outreach-pause.yaml as the source of
+  // truth. Additive only.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_outreach_lane_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        paused INTEGER NOT NULL DEFAULT 0,
+        changed_at TEXT,
+        changed_by TEXT,
+        reason TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_outreach_lane_state failed:", err);
+  }
+
   // ─── gardssalg_experience_conflict_review (dev-request 2026-08-07-dublett-
   // evidensbasis-og-pool-avblokkering, slice 2) ──────────────────────────────
   // Human confirm/reject verdicts over the gårdssalg producer<->experience
