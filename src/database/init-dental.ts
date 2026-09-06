@@ -19,6 +19,11 @@
 // partial-init from an earlier boot doesn't crash a re-deploy.
 
 import Database from "better-sqlite3";
+// dental-catalog-class.ts is a pure, dependency-free module (no getDb, no
+// other service import) -- safe to import here with zero require-cycle
+// risk, unlike dental-store.ts (see the 5c backfill comment below for why
+// THAT one must not be imported from inside schema-init).
+import { DENTAL_CLINIC_CLASS_SQL } from "../services/dental-catalog-class";
 
 export function initDentalSchema(db: Database.Database): void {
   // dev-request 2026-08-24-tannlege-sok-case-folding-oe: SQLite's built-in
@@ -607,6 +612,89 @@ export function initDentalSchema(db: Database.Database): void {
     db.exec("CREATE INDEX IF NOT EXISTS idx_dental_last_verified_at ON dental_agents (last_verified_at)");
   } catch (err) {
     console.warn("[init-dental] last_verified_at index warning:", err);
+  }
+
+  // ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c) ────
+  //   One-time backfill: is_chain_member defaulted to 0 on every row even
+  //   when chain_brand already held a real brand name (chain detection
+  //   populates chain_brand but nothing ever flipped this column). Wired in
+  //   here — not a manual admin endpoint — so it runs automatically on
+  //   every deploy, same as the catalog_class columns/index above. The
+  //   extra `is_chain_member != 1` guard makes every run AFTER the first a
+  //   true no-op (nothing left to touch), and it never resets a row back to
+  //   0 -- ongoing sync for chain_brand becoming empty again is handled by
+  //   updateDentalAgent() (dental-store.ts) on the write path, going
+  //   forward, per this same dev-request.
+  try {
+    db.exec(
+      "UPDATE dental_agents SET is_chain_member = 1 " +
+        "WHERE chain_brand IS NOT NULL AND chain_brand <> '' " +
+        "AND (is_chain_member IS NULL OR is_chain_member != 1)"
+    );
+  } catch (err) {
+    console.warn("[init-dental] is_chain_member backfill warning:", err);
+  }
+
+  // ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c) ────
+  //   One-time bulk backfill: available_specialties was empty on every row
+  //   despite dental_clinic_affiliations already holding the data to
+  //   compute it -- recomputeAvailableSpecialties() (dental-store.ts) was
+  //   only ever wired to run INCREMENTALLY, from createAffiliation(), so
+  //   every affiliation that existed before that wiring (the bulk
+  //   ambulant-model import) never got its clinic's available_specialties
+  //   populated. Re-derive it here for every clinic-class row
+  //   (DENTAL_CLINIC_CLASS_SQL — same "is this a clinic" gate the claim pool
+  //   and Places auto-select already use) that has at least one active
+  //   affiliation with a specialty on it.
+  //
+  //   Deliberately NOT calling dental-store.ts's recomputeAvailableSpecialties()
+  //   itself: that function calls getDb("dental") internally, and this code
+  //   runs from INSIDE that very getDb("dental") call (initDentalSchema is
+  //   invoked by db-factory.ts before the handle is cached in its `handles`
+  //   map) — a reentrant getDb("dental") at that point would not find a
+  //   cached handle yet and would open a second connection and recurse into
+  //   initDentalSchema again. So this duplicates that function's SQL
+  //   directly against the `db` handle already in hand, producing the exact
+  //   same JSON shape (DISTINCT specialty_used_here, sorted, JSON.stringify)
+  //   so the two are provably equivalent.
+  //
+  //   Idempotent via the `available_specialties IS NULL OR = ''` guard: only
+  //   ever fills an EMPTY value, so a subsequent boot is a cheap no-op and
+  //   this never clobbers a value the incremental path (or a later manual
+  //   correction) already computed. It also never stamps updated_at, so it
+  //   stays invisible to "last touched" queries — this is a read-side cache
+  //   fill from data that already existed, not a content change.
+  try {
+    const clinicIdsWithSpecialtyAffiliations = db.prepare(`
+      SELECT DISTINCT a.clinic_agent_id AS id
+      FROM dental_clinic_affiliations a
+      JOIN dental_agents da ON da.id = a.clinic_agent_id
+      WHERE a.is_active = 1
+        AND a.specialty_used_here IS NOT NULL AND a.specialty_used_here <> ''
+        AND ${DENTAL_CLINIC_CLASS_SQL}
+        AND (da.available_specialties IS NULL OR da.available_specialties = '')
+    `).all() as Array<{ id: string }>;
+
+    const selectSpecialtiesForClinic = db.prepare(`
+      SELECT DISTINCT specialty_used_here
+      FROM dental_clinic_affiliations
+      WHERE clinic_agent_id = ? AND is_active = 1
+        AND specialty_used_here IS NOT NULL AND specialty_used_here <> ''
+    `);
+    const fillAvailableSpecialties = db.prepare(
+      "UPDATE dental_agents SET available_specialties = ? " +
+        "WHERE id = ? AND (available_specialties IS NULL OR available_specialties = '')"
+    );
+
+    for (const { id } of clinicIdsWithSpecialtyAffiliations) {
+      const rows = selectSpecialtiesForClinic.all(id) as Array<{ specialty_used_here: string }>;
+      const specialties = rows.map((r) => r.specialty_used_here).sort();
+      if (specialties.length > 0) {
+        fillAvailableSpecialties.run(JSON.stringify(specialties), id);
+      }
+    }
+  } catch (err) {
+    console.warn("[init-dental] available_specialties bulk backfill warning:", err);
   }
 
   console.log("[dental] schema initialized");

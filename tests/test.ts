@@ -34753,6 +34753,56 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-store updated_at hydration: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: 5b/5c/5d
+  //    dental-store.ts coverage (thin-profile predicate + sitemap exclusion,
+  //    chain-sync, specialty title matching, directory_url hydration) ──
+  console.log("\n── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: dental-store 5b/5c/5d ──");
+  try {
+    const { runDentalProfilkvalitetTests } = require("../src/services/dental-store.test") as
+      typeof import("../src/services/dental-store.test");
+    const dpk = runDentalProfilkvalitetTests({ log: false });
+    passed += dpk.passed;
+    failed += dpk.failed;
+    for (const f of dpk.failures) failures.push("dental-store profilkvalitet (5b/5c/5d): " + f);
+    console.log(`  dental-store profilkvalitet (5b/5c/5d): ${dpk.passed} passed, ${dpk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store profilkvalitet (5b/5c/5d): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: 5c
+  //    one-time backfills wired into initDentalSchema() itself ──────────
+  console.log("\n── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: init-dental backfills (5c) ──");
+  try {
+    const { runInitDentalBackfillTests } = require("../src/database/init-dental.test") as
+      typeof import("../src/database/init-dental.test");
+    const idb = runInitDentalBackfillTests({ log: false });
+    passed += idb.passed;
+    failed += idb.failed;
+    for (const f of idb.failures) failures.push("init-dental backfills (5c): " + f);
+    console.log(`  init-dental backfills (5c): ${idb.passed} passed, ${idb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("init-dental backfills (5c): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: 5b/5d
+  //    route-level coverage (GET /klinikk/id/:id — noindex+CTA, title
+  //    template, directory_url labeling) ──────────────────────────────
+  console.log("\n── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: dental-seo 5b/5d ──");
+  try {
+    const { runDentalSeoProfilkvalitetTests } = require("../src/routes/dental-seo.test") as
+      typeof import("../src/routes/dental-seo.test");
+    const dsp = await runDentalSeoProfilkvalitetTests({ log: false });
+    passed += dsp.passed;
+    failed += dsp.failed;
+    for (const f of dsp.failures) failures.push("dental-seo profilkvalitet (5b/5d): " + f);
+    console.log(`  dental-seo profilkvalitet (5b/5d): ${dsp.passed} passed, ${dsp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as

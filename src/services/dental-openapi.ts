@@ -15,9 +15,13 @@ export function getDentalOpenapi(): object {
     openapi: "3.1.0",
     info: {
       title: "Finn-tannlege.com API",
+      // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): see
+      // the identical note in dental-agent-card.ts -- the stale "~6 900"
+      // count (raw Brreg-sweep rows, not honestly-filtered clinics) is
+      // dropped rather than wired to a live DB count from this DB-free spec
+      // module; GET /api/tannlege/stats gives the real number.
       description:
-        "REST API for Norwegian dental clinic discovery. " +
-        "~6 900 clinics sourced from Brreg, HPR, and direct enrichment. " +
+        "REST API for Norwegian dental clinic discovery, sourced from Brreg, HPR, and direct enrichment. " +
         "All read endpoints are public; no authentication required.",
       version: "0.1.0",
       contact: { url: `${url}/kontakt` },
