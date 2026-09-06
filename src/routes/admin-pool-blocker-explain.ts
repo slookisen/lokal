@@ -14,11 +14,18 @@
 // Funnel A — "outreach-ready pool" (mirrors the outreach_ready_pool VIEW's
 // own WHERE, database/init.ts — the REAL membership gate, deliberately
 // stricter than admin-outreach-pool.ts's pool_funnel stats legs): umbrella
-// exclusion → verification_status='verified' → enrichment_status='rich' →
-// email present → URL probed fresh (30d) AND healthy (2xx/3xx). The VIEW's
-// outreach_sent_log/cooldown exclusions are approximated here by the CRM
-// contacted_at join (same derivation as /admin/agents/dump) and reported as
-// `already_contacted` — in_pool is always the VIEW's own verdict.
+// exclusion → verification_status='verified' → enrichment_status IN
+// ('rich','partial') with 'partial' additionally gated on
+// POOL_CONTENT_THRESHOLD_SQL (about>=80 OR products>=3, via the shared
+// isContentQualified() mirror) → email present → URL probed fresh (30d) AND
+// healthy (2xx/3xx) → not already sent. The VIEW's outreach_sent_log
+// exclusion is re-derived 1:1 here (same vertical_id='rfb' + agent_id-or-
+// recipient_email predicate) and reported as `already_sent`; a separate,
+// narrower CRM contacted_at join (same derivation as /admin/agents/dump) is
+// also reported as `already_contacted` for observability, but only
+// `already_sent` mirrors the VIEW's actual exclusion — in_pool is always the
+// VIEW's own verdict (dev-request 2026-09-06-rfb-pool-blocker-explain-
+// usendt-blocker-og-innholdsterskel-etikett).
 //
 // Funnel B — "homepage-provenance-batch default auto-select" (mirrors the
 // selector SQL in routes/marketplace.ts POST /admin/homepage-provenance-batch
@@ -34,7 +41,7 @@
 // import).
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, isContentQualified } from "../database/init";
 
 const router = Router();
 
@@ -79,6 +86,7 @@ interface ExplainRow {
   k_phone: string | null;
   k_address: string | null;
   about: string | null;
+  products: string | null;
   field_provenance: string | null;
   verification_review_reason: string | null;
   last_verified_at: string | null;
@@ -91,6 +99,7 @@ interface ExplainRow {
   wrong_entity_streak: number | null;
   last_enrichment_attempt_at: string | null;
   contacted_at: string | null;
+  already_sent: number;
   in_pool: number;
 }
 
@@ -192,6 +201,7 @@ router.get("/", (req: Request, res: Response) => {
            k.website AS k_website, k.verification_status AS verification_status,
            k.enrichment_status AS enrichment_status, k.email AS k_email,
            k.phone AS k_phone, k.address AS k_address, k.about AS about,
+           k.products AS products,
            k.field_provenance AS field_provenance,
            k.verification_review_reason AS verification_review_reason,
            k.last_verified_at AS last_verified_at,
@@ -210,6 +220,12 @@ router.get("/", (req: Request, res: Response) => {
                AND a.contact_email IS NOT NULL AND a.contact_email != ''
                AND LOWER(c.email) = LOWER(a.contact_email)
            ) AS contacted_at,
+           EXISTS(
+             SELECT 1 FROM outreach_sent_log o
+             WHERE o.vertical_id = 'rfb'
+               AND (o.agent_id = a.id
+                    OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email)))
+           ) AS already_sent,
            EXISTS(SELECT 1 FROM outreach_ready_pool p WHERE p.agent_id = a.id) AS in_pool
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
@@ -244,7 +260,11 @@ router.get("/", (req: Request, res: Response) => {
     if (row.verification_status !== "verified") {
       poolBlockers.push(`verification_status_not_verified (=${row.verification_status ?? "NULL"})`);
     }
-    if (row.enrichment_status !== "rich") {
+    if (row.enrichment_status === "partial") {
+      if (!isContentQualified({ about: row.about, products: row.products })) {
+        poolBlockers.push("content_threshold_not_met (partial: about <80 chars and <3 products)");
+      }
+    } else if (row.enrichment_status !== "rich") {
       poolBlockers.push(`enrichment_status_not_rich (=${row.enrichment_status ?? "NULL"})`);
     }
     if (!email) poolBlockers.push("no_email");
@@ -254,6 +274,7 @@ router.get("/", (req: Request, res: Response) => {
       else if (!urlHealthy) poolBlockers.push(`url_unhealthy (last_status=${row.url_last_status ?? "NULL"})`);
     }
     if (row.contacted_at) poolBlockers.push("already_contacted");
+    if (row.already_sent === 1) poolBlockers.push("already_sent (outreach_sent_log)");
 
     // Guards 3 + 4 (skive A) — the verifier's own stored verdict. These block
     // promotion to `verified` even when every column leg above is clean, so
@@ -327,6 +348,7 @@ router.get("/", (req: Request, res: Response) => {
         backoff_active: backoffActive,
         claimed: row.claimed_at !== null,
         contacted_at: row.contacted_at,
+        already_sent: row.already_sent === 1,
         // Guards 3+4 as raw signals alongside the blocker strings, so a
         // caller can act on them without string-parsing.
         domain_coherence: domainCoherence,
