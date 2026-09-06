@@ -3624,6 +3624,67 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
 }
 
 /**
+ * Drink-cohort auto-select for POST /admin/gardssalg-content-refresh's
+ * `cohort: "drink"` mode (A2A experiences-enrichment Step 4b-i, dev-request
+ * 2026-08-19-kursjustering-drikkefunnel-llm-og-supply Grep 1).
+ *
+ * WHY THIS EXISTS: the routine used to build the drink queue client-side —
+ * GET /admin/gardssalg-verified-drinkproducer-cohort (the FULL verified
+ * cohort, ~138 rows, insertion order, no thin-filter, no attempt-ordering)
+ * and then `head -8` of that list per call. Because that list is stable
+ * across runs and the first rows were long since fully enriched, every run
+ * re-tried the same already-complete handful, saw `agents_enriched: 0`
+ * twice, and stopped — while thin drink rows further down the list were
+ * never reached (measured 2026-08-19 → 2026-09-06: 10+ consecutive runs of
+ * "0 beriket etter 2 kall" against a 126–138-row cohort).
+ *
+ * This selection is the SAME eligibility clause as
+ * selectGardssalgProvidersForContentRefresh above (gårdssalg row with a
+ * website, not row-locked 'manual', THIN on at least one content field, not
+ * parked), narrowed to `producer_type IN drinkTypes` and ordered by the SAME
+ * oldest-attempted-first cadence — so the caller gets the next thin drink
+ * rows the attempt-stamp discipline says are due, not the head of a static
+ * list. The hjemmeside-verification gate (isHjemmesideVerified, a JS-side
+ * fail-closed parse in routes/opplevelser.ts) is applied by the ROUTE on
+ * these rows, exactly as the cohort endpoint does, so the two never
+ * disagree on what "verified" means; `cap` is therefore the pre-filter
+ * fetch size, not the caller's batch limit (the route slices to `limit`
+ * after filtering).
+ *
+ * drinkTypes is parameter-bound (never interpolated); an empty list returns
+ * [] rather than a degenerate `IN ()` clause. Excludes 'test-gardssalg' by
+ * construction (not a drink type).
+ */
+export function selectDrinkProducersForContentRefresh(
+  drinkTypes: readonly string[],
+  cap = 500
+): GardssalgContentRefreshTarget[] {
+  if (drinkTypes.length === 0) return [];
+  const db = getDb(VERTICAL);
+  const safeCap = Math.max(1, Math.min(2000, Math.floor(cap)));
+  const placeholders = drinkTypes.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
+              about_text, visit_text, opening_hours_text, products, field_provenance
+         FROM experience_providers
+        WHERE producer_type IN (${placeholders})
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (content_source IS NULL OR content_source != 'manual')
+          AND (
+                about_text IS NULL OR TRIM(about_text) = ''
+             OR visit_text IS NULL OR TRIM(visit_text) = ''
+             OR opening_hours_text IS NULL OR TRIM(opening_hours_text) = ''
+             OR products IS NULL OR TRIM(products) = '' OR TRIM(products) = '[]'
+              )
+          ${providerParkingExclusionSql()}
+        ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
+        LIMIT ?`
+    )
+    .all(...drinkTypes, safeCap) as GardssalgContentRefreshTarget[];
+}
+
+/**
  * Resolve an explicit providerId for the gårdssalg content-refresh's
  * `providerIds` override. Scoped to the gårdssalg WHERE clause (producer_type
  * set OR rfb-seed) — NOT the thin/lock filters above, so an admin can force a

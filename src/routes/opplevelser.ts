@@ -60,6 +60,10 @@ import {
   // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
   // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
   selectGardssalgProvidersForContentRefresh,
+  // A2A experiences-enrichment Step 4b-i (Grep 1, dev-request 2026-08-19-
+  // kursjustering-drikkefunnel-llm-og-supply): server-side drink-cohort
+  // queue for `cohort: "drink"` — see the route's target-selection block.
+  selectDrinkProducersForContentRefresh,
   getGardssalgProviderContentTarget,
   applyGardssalgProviderContent,
   // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 6 —
@@ -3363,7 +3367,7 @@ export function isGardssalgContactEmailFlaggedForReview(
 }
 
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; cohort?: unknown };
 
   // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
   const apply =
@@ -3392,8 +3396,42 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   );
 
   // ── Target selection ──────────────────────────────────────────────
+  // Three modes, reported back as `selection` so a run report can tell them
+  // apart without re-deriving from the request:
+  //   "provider_ids"  — explicit override list (admin/backfill use; NOT
+  //                     thin-filtered, NOT attempt-ordered — by design).
+  //   "drink_cohort"  — `cohort: "drink"` (A2A experiences-enrichment Step
+  //                     4b-i, Grep 1 of dev-request 2026-08-19-kursjustering-
+  //                     drikkefunnel-llm-og-supply): SERVER-SIDE queue of
+  //                     verified drink producers that are still THIN on at
+  //                     least one content field, oldest-attempted first.
+  //                     Replaces the routine's old client-side pattern
+  //                     (GET .../gardssalg-verified-drinkproducer-cohort →
+  //                     `head -8` → providerIds), which re-tried the same
+  //                     already-complete head of a static list every run and
+  //                     reported "0 beriket" against the wrong rows — see
+  //                     selectDrinkProducersForContentRefresh's doc comment.
+  //   "auto"          — the unchanged generic gårdssalg auto-select.
+  // providerIds wins over cohort when both are sent (explicit beats implicit).
+  // Any cohort value other than "drink" is a 400, never a silent fallback to
+  // "auto": a typo must not quietly turn a drink-first call into a generic
+  // drain that the report then attributes to the drink cohort.
   let targets: GardssalgContentRefreshTarget[];
-  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+  let selection: "provider_ids" | "drink_cohort" | "auto";
+  // drink_cohort only: how many verified+thin drink rows were eligible BEFORE
+  // this call's `limit` slice (i.e. the queue depth the caller is draining).
+  // null for the other two modes, where no such queue exists.
+  let cohortEligibleTotal: number | null = null;
+  const hasProviderIds = Array.isArray(body.providerIds) && body.providerIds.length > 0;
+  if (!hasProviderIds && body.cohort !== undefined && body.cohort !== null && body.cohort !== "drink") {
+    res.status(400).json({
+      error: "invalid_cohort",
+      message: 'cohort must be "drink" (the only cohort mode this route supports) or omitted for auto-select',
+    });
+    return;
+  }
+  if (hasProviderIds) {
+    selection = "provider_ids";
     const ids = (body.providerIds as unknown[])
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
       .map((id) => id.trim())
@@ -3401,7 +3439,20 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     targets = ids
       .map((id) => getGardssalgProviderContentTarget(id))
       .filter((t): t is GardssalgContentRefreshTarget => t !== null);
+  } else if (body.cohort === "drink") {
+    selection = "drink_cohort";
+    // The verification gate is applied HERE (same isHjemmesideVerified the
+    // cohort endpoint and processOne() below use) rather than in SQL, so the
+    // three can never disagree on what "verified" means; the store call
+    // therefore fetches the whole thin-drink superset (small — the entire
+    // drink cohort is ~140 rows) and the batch `limit` is applied after.
+    const eligible = selectDrinkProducersForContentRefresh(Array.from(DRINK_PRODUCER_TYPES)).filter((t) =>
+      isHjemmesideVerified(t.field_provenance)
+    );
+    cohortEligibleTotal = eligible.length;
+    targets = eligible.slice(0, limit);
   } else {
+    selection = "auto";
     targets = selectGardssalgProvidersForContentRefresh(limit);
   }
 
@@ -4240,6 +4291,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 
   res.json({
     dry_run: dryRun,
+    // Which target-selection mode served this call, and (drink_cohort only)
+    // the eligible queue depth before `limit` — so a run report can say
+    // "N thin verified drink rows remain" instead of guessing from `scanned`.
+    selection,
+    cohort_eligible_total: cohortEligibleTotal,
     scanned,
     // agents_enriched: the method's PRIMARY success metric (enrichment-metode
     // slice 1) — providers that actually had >=1 field improved this run.
