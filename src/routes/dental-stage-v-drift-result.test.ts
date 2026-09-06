@@ -50,7 +50,7 @@
  *   (i) 400 for malformed treatments values (wrong type, empty-string
  *       element, >50 elements)
  *   (j) 400 for malformed opening_hours values (wrong type, invalid day,
- *       invalid HH:MM, >7 elements)
+ *       invalid HH:MM, >14 elements)
  *   (k) treatments happy path: first differing observation -> pending, DB
  *       unchanged; second observation with the SAME set but a DIFFERENT
  *       element ORDER -> corrected, proving the order-insensitive
@@ -60,6 +60,15 @@
  *   (m) unrelated field_provenance keys survive both corrections untouched
  *   (n) verification_status untouched by the treatments/opening_hours
  *       corrections too
+ *
+ * dev-request 2026-09-02-dental-stage-v-opening-hours-7-item-cap: the
+ * opening_hours row cap was raised 7 -> 14 (StageVOpeningHoursValueSchema,
+ * dental.ts) after the 7-row cap structurally rejected every split-shift
+ * clinic's opening_hours correction (2 periods/day x >=4 weekdays > 7 rows).
+ * Section (j)'s "too long" case moved from 8 to 15 rows accordingly.
+ * Additional coverage below (section o):
+ *   (o) an 8-row split-shift submission (2 periods x 4 weekdays) -> 200, not
+ *       400; exactly 14 rows -> still 200 (upper edge of the new cap)
  */
 
 export interface TestSummary {
@@ -359,6 +368,11 @@ export function runDentalStageVDriftResultTests(
         });
         assertEq(invalidTime.status, 400, "j3: opening_hours with an invalid HH:MM open time -> 400");
 
+        // Cap is 14 (dev-request 2026-09-02-dental-stage-v-opening-hours-
+        // 7-item-cap, raised from 7 to cover split-shift clinics) -- so the
+        // "too long" regression guard now needs 15 rows (2 periods/day x 7
+        // days + 1) to still exceed it. See section (o) below for the
+        // split-shift happy-path coverage this cap raise exists for.
         const tooLong = await callRoute(dentalRouter, {
           method: "POST",
           path: "/admin/stage-v-drift-result",
@@ -367,18 +381,25 @@ export function runDentalStageVDriftResultTests(
             agentId: idB,
             field: "opening_hours",
             value: [
-              { day: "mon", open: "08:00", close: "16:00" },
-              { day: "tue", open: "08:00", close: "16:00" },
-              { day: "wed", open: "08:00", close: "16:00" },
-              { day: "thu", open: "08:00", close: "16:00" },
-              { day: "fri", open: "08:00", close: "16:00" },
-              { day: "sat", open: "08:00", close: "16:00" },
-              { day: "sun", open: "08:00", close: "16:00" },
-              { day: "mon", open: "09:00", close: "17:00" },
+              { day: "mon", open: "08:00", close: "12:00" },
+              { day: "mon", open: "13:00", close: "16:00" },
+              { day: "tue", open: "08:00", close: "12:00" },
+              { day: "tue", open: "13:00", close: "16:00" },
+              { day: "wed", open: "08:00", close: "12:00" },
+              { day: "wed", open: "13:00", close: "16:00" },
+              { day: "thu", open: "08:00", close: "12:00" },
+              { day: "thu", open: "13:00", close: "16:00" },
+              { day: "fri", open: "08:00", close: "12:00" },
+              { day: "fri", open: "13:00", close: "16:00" },
+              { day: "sat", open: "08:00", close: "12:00" },
+              { day: "sat", open: "13:00", close: "16:00" },
+              { day: "sun", open: "08:00", close: "12:00" },
+              { day: "sun", open: "13:00", close: "16:00" },
+              { day: "mon", open: "17:00", close: "18:00" },
             ],
           },
         });
-        assertEq(tooLong.status, 400, "j4: opening_hours with 8 entries (>7) -> 400");
+        assertEq(tooLong.status, 400, "j4: opening_hours with 15 entries (>14) -> 400");
       }
 
       // ── (k) treatments happy path: pending -> corrected, order-insensitive ──
@@ -471,6 +492,65 @@ export function runDentalStageVDriftResultTests(
 
         // ── (n) verification_status untouched by treatments/opening_hours corrections ──
         assertEq(afterSecond.verification_status, "pending_verify", "n1: verification_status untouched by the treatments/opening_hours corrections");
+      }
+
+      // ── (o) split-shift opening_hours submissions: 8 rows (2 periods x 4
+      // weekdays, e.g. lunch-closed mon-thu) -> 200, not 400; exactly 14 rows
+      // (the new cap's upper edge) -> also still 200. dev-request
+      // 2026-09-02-dental-stage-v-opening-hours-7-item-cap: this is the
+      // exact submission shape (DRONNINGENS TENNER AS, 8 rows) that a 400
+      // blocked 4 independent days running under the old 7-row cap. ────────
+      {
+        const idC = dstore.createDentalAgent({
+          navn: "Drift Route Split-Shift AS",
+          org_nr: "911300333",
+        } as any);
+
+        // 8 rows: 2 periods (morning/afternoon, lunch-closed) x 4 weekdays.
+        const splitShiftEightRows = [
+          { day: "mon", open: "08:00", close: "12:00" },
+          { day: "mon", open: "13:00", close: "16:00" },
+          { day: "tue", open: "08:00", close: "12:00" },
+          { day: "tue", open: "13:00", close: "16:00" },
+          { day: "wed", open: "08:00", close: "12:00" },
+          { day: "wed", open: "13:00", close: "16:00" },
+          { day: "thu", open: "08:00", close: "12:00" },
+          { day: "thu", open: "13:00", close: "16:00" },
+        ];
+        const eightRows = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idC, field: "opening_hours", value: splitShiftEightRows },
+        });
+        assertEq(eightRows.status, 200, "o1: split-shift opening_hours with 8 rows (2 periods x 4 weekdays) -> 200, not 400");
+        assertEq(eightRows.body.pending, true, "o2: 8-row split-shift first observation -> pending:true (no prior value to match)");
+
+        // Exactly 14 rows (2 periods x all 7 days) -- the new cap's upper
+        // edge -- must still be accepted, not rejected.
+        const splitShiftFourteenRows = [
+          { day: "mon", open: "08:00", close: "12:00" },
+          { day: "mon", open: "13:00", close: "16:00" },
+          { day: "tue", open: "08:00", close: "12:00" },
+          { day: "tue", open: "13:00", close: "16:00" },
+          { day: "wed", open: "08:00", close: "12:00" },
+          { day: "wed", open: "13:00", close: "16:00" },
+          { day: "thu", open: "08:00", close: "12:00" },
+          { day: "thu", open: "13:00", close: "16:00" },
+          { day: "fri", open: "08:00", close: "12:00" },
+          { day: "fri", open: "13:00", close: "16:00" },
+          { day: "sat", open: "08:00", close: "12:00" },
+          { day: "sat", open: "13:00", close: "16:00" },
+          { day: "sun", open: "08:00", close: "12:00" },
+          { day: "sun", open: "13:00", close: "16:00" },
+        ];
+        const fourteenRows = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idC, field: "opening_hours", value: splitShiftFourteenRows },
+        });
+        assertEq(fourteenRows.status, 200, "o3: split-shift opening_hours with exactly 14 rows (cap upper edge) -> 200, not 400");
       }
     } catch (err: any) {
       failed++;
