@@ -103,7 +103,14 @@ import {
   sendBookingConfirmation,
   sendProducerNotification,
   BOOKING_NOT_ACTIVATED_MSG,
+  // slice 1 ("myk åpningstidsvalidering"): normalise BEFORE
+  // checkBookingSlotAllowed() — see that call site's own comment.
+  normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
+// — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
+// fallback use, never re-derived here.
+import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
 
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
@@ -289,6 +296,14 @@ export const BookGardssalgInputSchema = {
   ),
   notes: z.string().optional().describe(
     "Optional free-text note to the producer (e.g. dietary needs, arrival details)."
+  ),
+  // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering"):
+  // set this to true ONLY on a retry after a previous call returned
+  // outside_hours:true and you still want that exact time — see this tool's
+  // description below and checkBookingSlotAllowed() (services/gardssalg-
+  // opening-hours.ts).
+  confirm_outside_hours: z.boolean().optional().describe(
+    "Set to true only when RETRYING after a previous call to this tool returned outside_hours:true and the requested time should be kept anyway, despite falling outside the producer's stated opening hours. Omit on a first attempt."
   ),
 };
 
@@ -844,7 +859,11 @@ function registerExperienceTools(
         "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; produsenten " +
         "mottar forespørselen og svarer (bekrefter, foreslår nytt tidspunkt eller avslår). " +
         "Required: provider_id (from discover_gardssalg), slot_at (requested date/time), party_size, " +
-        "guest_name, guest_email. Optional: experience_id, guest_phone, notes. " +
+        "guest_name, guest_email. Optional: experience_id, guest_phone, notes, confirm_outside_hours. " +
+        "The requested slot_at is ALWAYS hard-rejected if it's in the past or too far ahead. If the " +
+        "producer has stated opening hours and slot_at falls outside them, this returns " +
+        "outside_hours:true (not an error) instead of creating the booking — retry once with " +
+        "confirm_outside_hours:true if the exact requested time should be kept anyway. " +
         "Example: book a table for 4 at provider '3f1b2c4d-...' for '2026-08-15T13:00' for " +
         "'Kari Nordmann' <kari@example.no>.",
       inputSchema: BookGardssalgInputSchema,
@@ -856,7 +875,7 @@ function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes }) => {
+    async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {
       try {
         // Build a candidate object matching BookingInput's own field names
         // and hand it straight to BookingInputSchema.safeParse() — the SAME
@@ -874,6 +893,7 @@ function registerExperienceTools(
         if (experience_id) candidate.experience_id = experience_id;
         if (guest_phone) candidate.guest_phone = guest_phone;
         if (notes) candidate.notes = notes;
+        if (confirm_outside_hours) candidate.confirm_outside_hours = confirm_outside_hours;
 
         const parsed = BookingInputSchema.safeParse(candidate);
         if (!parsed.success) {
@@ -901,7 +921,7 @@ function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+          | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
           | null;
         if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
           return {
@@ -917,6 +937,56 @@ function registerExperienceTools(
                   " / Booking is not activated for this producer yet.",
               }, null, 2),
             }],
+          };
+        }
+
+        // ─── dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpnings-
+        // tidsvalidering") — the SAME shared choke point POST /api/
+        // opplevelser/book and the no-JS SSR fallback use. HARD-rejects a
+        // past/too-far-ahead slot; SOFTLY warns (still success:false, but not
+        // an MCP error — the agent is expected to retry with
+        // confirm_outside_hours:true if it still wants that time) when the
+        // slot falls outside the provider's stated opening_hours_text.
+        const slotCheck = checkBookingSlotAllowed(
+          { opening_hours_text: provider?.opening_hours_text ?? null },
+          { slot_at: normaliseBookingSlotInput(parsed.data.slot_at), confirm_outside_hours: parsed.data.confirm_outside_hours },
+        );
+        if (!slotCheck.ok) {
+          const body = slotCheck.body as {
+            error?: string;
+            outside_hours?: boolean;
+            opening_hours_text?: string | null;
+            message?: string;
+          };
+          if (body.outside_hours) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  pending: false,
+                  outside_hours: true,
+                  opening_hours_text: body.opening_hours_text ?? null,
+                  message:
+                    (body.message ?? "") +
+                    " / The requested time falls outside the producer's stated opening hours. " +
+                    "Retry this tool with confirm_outside_hours: true if you still want that exact time.",
+                }, null, 2),
+              }],
+            };
+          }
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                rejected: true,
+                reason: "slot_bounds",
+                message: `${body.error ?? "Ugyldig tidspunkt."} / The requested time is invalid — it must be in the future and within the booking window.`,
+              }, null, 2),
+            }],
+            isError: true,
           };
         }
 
@@ -947,7 +1017,7 @@ function registerExperienceTools(
         sendBookingConfirmation(booking).catch((e) =>
           console.error("[book_gardssalg] confirmation email failed", booking.booking_ref, e),
         );
-        sendProducerNotification(booking, provider?.epost ?? null).catch((e) =>
+        sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null).catch((e) =>
           console.error("[book_gardssalg] producer notification failed", booking.booking_ref, e),
         );
 

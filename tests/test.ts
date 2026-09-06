@@ -28846,7 +28846,7 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
     { providerSlug: slugGB }, `/kategori/gardssalg/book/${slugGB}`,
     {
       body: {
-        slot_at: "2026-08-15T14:00", party_size: "3",
+        slot_at: "2026-10-15T14:00", party_size: "3",
         guest_name: "Kari Nordmann", guest_email: "kari@example.no", guest_phone: "12345678",
       },
     });
@@ -29149,7 +29149,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   emailCallsGDL = [];
   const postLiveGDL = invokeSeoGDL("post", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`,
-    { body: { slot_at: "2026-08-22T15:00", party_size: "4", guest_name: "Lise Berg", guest_email: "lise@example.no" } });
+    { body: { slot_at: "2026-10-21T15:00", party_size: "4", guest_name: "Lise Berg", guest_email: "lise@example.no" } });
   assertEq(postLiveGDL.status, 303, "gdl-11a: valid no-JS submission while live → 303 redirect (unchanged)");
   const redirLiveGDL = postLiveGDL.redirectTo || "";
   assertTrue(redirLiveGDL.includes("/confirm/"), "gdl-11b: redirects to the confirm sub-path (unchanged)");
@@ -29164,7 +29164,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   // gdl-12: JSON API while live → 201 created, real booking, both emails.
   emailCallsGDL = [];
   const jsonLiveGDL = invokeOppGDL({
-    provider_id: provIdGDL, slot_at: "2026-08-23T10:00", party_size: 1,
+    provider_id: provIdGDL, slot_at: "2026-10-22T10:00", party_size: 1,
     guest_name: "Jon Dahl", guest_email: "jon@example.no",
   });
   assertEq(jsonLiveGDL.status, 201, "gdl-12a: POST /api/opplevelser/book while live → 201 (unchanged)");
@@ -29184,7 +29184,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
     .run("sideri", provNoEmailGDL);
   emailCallsGDL = [];
   const jsonNoEpostGDL = invokeOppGDL({
-    provider_id: provNoEmailGDL, slot_at: "2026-08-24T11:00", party_size: 2,
+    provider_id: provNoEmailGDL, slot_at: "2026-10-23T11:00", party_size: 2,
     guest_name: "Silje Vik", guest_email: "silje@example.no",
   });
   assertEq(jsonNoEpostGDL.status, 201, "gdl-13a: booking still succeeds when the provider has no epost on file");
@@ -29381,7 +29381,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   emailCallsTP = [];
   const beforeBookOffTP = countBookingsTP();
   const bookOffTP = invokeBookTP({
-    provider_id: testIdTP, slot_at: "2026-09-03T13:00", party_size: 3,
+    provider_id: testIdTP, slot_at: "2026-11-02T13:00", party_size: 3,
     guest_name: "Testgjest Off", guest_email: "gjest-off@example.no",
   });
   assertEq(bookOffTP.status, 201, "tp-08c: hidden test provider books (201) even with the global flag OFF");
@@ -29406,7 +29406,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   emailCallsTP = [];
   const beforeBookTP = countBookingsTP();
   const bookTP = invokeBookTP({
-    provider_id: testIdTP, slot_at: "2026-09-01T13:00", party_size: 2,
+    provider_id: testIdTP, slot_at: "2026-10-31T13:00", party_size: 2,
     guest_name: "Testgjest", guest_email: "gjest@example.no",
   });
   assertEq(bookTP.status, 201, "tp-06a: booking against the hidden test provider is NOT paused → 201");
@@ -29426,7 +29426,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   emailCallsTP = [];
   const beforeBook2TP = countBookingsTP();
   const bookNormalTP = invokeBookTP({
-    provider_id: normalIdTP, slot_at: "2026-09-02T13:00", party_size: 2,
+    provider_id: normalIdTP, slot_at: "2026-11-01T13:00", party_size: 2,
     guest_name: "Testgjest 2", guest_email: "gjest2@example.no",
   });
   assertEq(bookNormalTP.status, 200, "tp-07a: booking a non-onboarded (booking_live=0) provider → 200 paused, not 201");
@@ -29589,7 +29589,7 @@ const _bekreftLoekkePromise = runSerial(async () => {
   emailCallsBKC = [];
   const postFormBKC = await invokeSeoBKC("post", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`,
-    { body: { slot_at: "2030-08-15T14:00", party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
+    { body: { slot_at: "2026-10-15T14:00", party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
   assertEq(postFormBKC.status, 303, "bkc-02a: no-JS submission with a note → 303");
   const refFormBKC = decodeURIComponent((postFormBKC.redirectTo || "").split("/confirm/")[1] || "");
   const bookingFormBKC = bookStBKC.getBookingByRef(refFormBKC);
@@ -29626,7 +29626,7 @@ const _bekreftLoekkePromise = runSerial(async () => {
 
   // ═══ (1d) JSON API: notes persist; confirm_url no longer leaks to guest ═══
   const jsonBookBKC = await invokeOppBKC("post", "/book", {}, {
-    provider_id: provIdBKC, slot_at: "2030-08-16T11:00", party_size: 4,
+    provider_id: provIdBKC, slot_at: "2026-10-16T11:00", party_size: 4,
     guest_name: "Jon Agent", guest_email: "jon-agent@example.no", notes: "Betaler med kort — går det?",
   });
   assertEq(jsonBookBKC.status, 201, "bkc-04a: JSON API booking with notes → 201");
@@ -29666,12 +29666,19 @@ const _bekreftLoekkePromise = runSerial(async () => {
     "bkc-07c: booking still reserved after the refused early POST");
 
   // ═══ (2c) past visit: attended → correction → undo, billable follows ═══
-  const pastBookBKC = await invokeOppBKC("post", "/book", {}, {
+  // dev-request 2026-07-14-booking-flyt-v1 slice 1 ("myk åpningstidsvalidering")
+  // now HARD-rejects a past slot_at at the PUBLIC route — this fixture needs
+  // a booking that is ALREADY in the past (to exercise the post-visit
+  // attendance flow), so it calls createBooking() directly, exactly like the
+  // route handler does internally, bypassing the route-level slot-bounds
+  // check entirely (that check is route-layer only, never inside
+  // createBooking() itself — see checkBookingSlotAllowed()'s own doc comment).
+  const pastBookingBKC = bookStBKC.createBooking({
     provider_id: provIdBKC, slot_at: "2020-01-06T12:00", party_size: 3,
     guest_name: "Per Fortid", guest_email: "per@example.no",
   });
-  const pastRefBKC = String(pastBookBKC.json?.booking_ref);
-  const pastTokenBKC = String(bookStBKC.getBookingByRef(pastRefBKC)?.confirm_token);
+  const pastRefBKC = pastBookingBKC.booking_ref;
+  const pastTokenBKC = pastBookingBKC.confirm_token;
   const pastPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
     { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`);
   assertTrue(pastPageBKC.body.includes('value="attended"') && pastPageBKC.body.includes('value="no_show"'),
@@ -38875,7 +38882,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
 
   async function bookPV(extra: Record<string, unknown> = {}): Promise<ReturnType<typeof bookStPV.getBookingByRef>> {
     const r = await invokeOppPV("post", "/book", {}, {
-      provider_id: provIdPV, slot_at: "2030-09-10T13:00", party_size: 2,
+      provider_id: provIdPV, slot_at: "2026-09-10T13:00", party_size: 2,
       guest_name: "Gjest Previsit", guest_email: "gjest-pv@example.no", ...extra,
     });
     assertEq(r.status, 201, "pv-book: booking created (201)");
@@ -39011,11 +39018,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   // Valid suggestion.
   const suggestPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2030-09-12T15:00" } });
+    { body: { action: "foresla", suggested_slot: "2026-09-12T15:00" } });
   assertTrue((suggestPostPV.redirectTo || "").includes("done=foreslatt"), "pv-08a: suggestion accepted");
   let b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "time_suggested", "pv-08b: pre_status → time_suggested");
-  assertEq(b3RowPV?.suggested_slot_at, "2030-09-12T13:00:00.000Z",
+  assertEq(b3RowPV?.suggested_slot_at, "2026-09-12T13:00:00.000Z",
     "pv-08c: suggested_slot_at persisted as the UTC INSTANT — the naked form value is Oslo wall time (15:00 CEST = 13:00Z), tz-fix 2026-07-30");
   assertTrue(!!b3RowPV?.guest_decision_token, "pv-08d: guest_decision_token generated");
   assertEq(b3RowPV?.respond_token_used_at, null, "pv-08e: suggest is NOT terminal — respond token not consumed");
@@ -39030,9 +39037,9 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   emailCallsPV = [];
   await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2030-09-13T11:00" } });
+    { body: { action: "foresla", suggested_slot: "2026-09-13T11:00" } });
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
-  assertEq(b3RowPV?.suggested_slot_at, "2030-09-13T09:00:00.000Z",
+  assertEq(b3RowPV?.suggested_slot_at, "2026-09-13T09:00:00.000Z",
     "pv-09a: re-suggest replaces the slot (stored as UTC instant, 11:00 CEST = 09:00Z)");
   assertTrue(b3RowPV?.guest_decision_token !== firstDecisionTokenPV, "pv-09b: re-suggest rotates the guest token");
   const staleDecisionPV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
@@ -39132,7 +39139,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertTrue((acceptPostPV.redirectTo || "").includes("done=akseptert"), "pv-11a: accept POST → PRG done=akseptert");
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "provider_confirmed", "pv-11b: accept → provider_confirmed");
-  assertEq(b3RowPV?.slot_at, "2030-09-13T09:00:00.000Z",
+  assertEq(b3RowPV?.slot_at, "2026-09-13T09:00:00.000Z",
     "pv-11c: slot_at REPLACED by the accepted suggestion (kanonisk UTC-instant, tz-fix 2026-07-30)");
   assertTrue(!!b3RowPV?.respond_token_used_at, "pv-11d: respond token consumed by the terminal outcome");
   assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv3@example.no" && c.subject.includes("bekreftet")),
@@ -39333,11 +39340,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   const b9 = await bookPV({ guest_email: "gjest-pv9@example.no" });
   await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b9!.respond_token) }, `/kategori/gardssalg/svar/${b9!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2030-09-12T15:00" } });
+    { body: { action: "foresla", suggested_slot: "2026-09-12T15:00" } });
   dbPV.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = '2099-01-01T00:00:00.000Z' WHERE booking_ref = ?")
     .run(String(b9!.booking_ref));
   emailCallsPV = [];
-  fu = await bookStPV.processBookingFollowups(new Date("2030-09-13T00:00:00Z"));
+  fu = await bookStPV.processBookingFollowups(new Date("2026-09-13T00:00:00Z"));
   assertEq(fu.expired, 1, "pv-23a: a PASSED suggested time expires the loop even with a live token");
   assertEq(bookStPV.getBookingByRef(String(b9!.booking_ref))?.pre_status, "expired",
     "pv-23b: pre_status → expired");
@@ -39360,7 +39367,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     "pv-24c: decline is bounded by the same window (followups own the closure)");
   let b12CheckPV = bookStPV.getBookingByRef(String(b12!.booking_ref));
   assertEq(b12CheckPV?.pre_status, "time_suggested", "pv-24d: refused decisions mutate nothing");
-  assertEq(b12CheckPV?.slot_at, "2030-09-10T11:00:00.000Z",
+  assertEq(b12CheckPV?.slot_at, "2026-09-10T11:00:00.000Z",
     "pv-24e: slot_at untouched (fortsatt den kanoniske UTC-instanten fra opprettelsen)");
 
   // (d) truthful expired page: deadline passed but the followup engine has
@@ -39448,7 +39455,17 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
 
   // ═══ (24) REVIEW FINDING 3: post-visit-resolved bookings are outside the
   //     pre-visit loop — no reminders/expiry, no answers, friendly page ═══
-  const b11 = await bookPV({ guest_email: "gjest-pv11@example.no", slot_at: "2020-01-06T12:00" });
+  // dev-request 2026-07-14-booking-flyt-v1 slice 1 ("myk åpningstidsvalidering")
+  // now HARD-rejects a past slot_at at the PUBLIC route — this fixture
+  // deliberately needs an ALREADY-past visit (to reach the post-visit
+  // resolved state below), so it calls createBooking() directly instead of
+  // going through bookPV()'s route call, exactly like the equivalent
+  // bekreft-løkka fixture above (pastBookingBKC) bypasses the route for the
+  // same reason.
+  const b11 = bookStPV.createBooking({
+    provider_id: provIdPV, slot_at: "2020-01-06T12:00", party_size: 2,
+    guest_name: "Gjest Previsit", guest_email: "gjest-pv11@example.no",
+  });
   bookStPV.resolveBooking(String(b11!.confirm_token), "confirmed_attended", "pv-test");
   assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.status, "confirmed_attended",
     "pv-27-setup: b11 resolved post-visit");
@@ -42673,5 +42690,30 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("google-rating-batch-provenance-stale-refill: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-14-booking-flyt-v1, "Slice 1 — myk åpningstidsvalidering"
+// (Daniel-authorized 2026-07-18): parseOpeningHoursText/isSlotWithinOpeningHours/
+// slotBoundsError/bookingMaxDaysAhead/checkBookingSlotAllowed/
+// gardssalgOpeningHoursCoverage in the new services/gardssalg-opening-hours.ts,
+// wired into all 3 booking entry points (POST /api/opplevelser/book, the no-JS
+// SSR fallback in experiences-seo.ts, and the book_gardssalg MCP tool). Own
+// scratch EXPERIENCES_DB_PATH for the read-only coverage-report section (never
+// the real DB) — see that section's own guard assertion. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-14-booking-flyt-v1 slice 1: myk åpningstidsvalidering ──");
+  try {
+    const { runGardssalgOpeningHoursTests } = require("../src/services/gardssalg-opening-hours.test") as
+      typeof import("../src/services/gardssalg-opening-hours.test");
+    const goh = await runGardssalgOpeningHoursTests({ log: false });
+    passed += goh.passed;
+    failed += goh.failed;
+    for (const f of goh.failures) failures.push("gardssalg-opening-hours: " + f);
+    console.log(`  gardssalg-opening-hours: ${goh.passed} passed, ${goh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-opening-hours: unexpected error: " + String(err?.message || err));
   }
 });

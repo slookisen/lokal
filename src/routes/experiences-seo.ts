@@ -165,7 +165,14 @@ import {
   defaultBookingSlotAtDatetimeLocal,
   BOOKING_NOT_ACTIVATED_MSG,
   BOOKING_NOT_ACTIVATED_INTEREST_MSG,
+  // slice 1 ("myk åpningstidsvalidering"): normalise BEFORE
+  // checkBookingSlotAllowed() — see that call site's own comment.
+  normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
+// — the SAME shared choke point POST /api/opplevelser/book and the
+// book_gardssalg MCP tool use, never re-derived here.
+import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
@@ -5927,9 +5934,30 @@ function bookingErrorMessage(code: string): string {
     // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
       return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
+    // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
+    // validering"). The no-JS fallback has no natural place for a "resend
+    // with confirmation" step (see the POST handler below for why this path
+    // is scoped down to a hard explain-and-resubmit rather than the JSON
+    // API's confirm_outside_hours round trip) — this just states the
+    // mismatch plainly so the guest can pick another time from the visible
+    // form fields.
+    case "slot_bounds":
+      return "Det valgte tidspunktet må være i fremtiden og innenfor bookingvinduet. Velg et gyldig tidspunkt og prøv igjen.";
     default:
       return "Noe gikk galt. Prøv igjen.";
   }
+}
+
+// dev-request 2026-07-14-booking-flyt-v1, slice 1: the outside-hours banner
+// needs the provider's raw opening_hours_text interpolated in, which the
+// generic bookingErrorMessage(code) switch above has no slot for — kept as
+// its own tiny helper rather than bolting an optional param onto every other
+// case.
+function bookingOutsideHoursMessage(hoursText: string): string {
+  return (
+    `Det valgte tidspunktet ser ut til å ligge utenfor de oppgitte åpningstidene` +
+    `${hoursText ? ` (${hoursText})` : ""}. Velg et tidspunkt innenfor åpningstidene og prøv igjen.`
+  );
 }
 
 // GET /kategori/gardssalg/book/:providerSlug — reservation panel for one
@@ -5953,8 +5981,17 @@ router.get(
     const url = baseUrl();
     const canonical = `${url}/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
     const errorParam = String(req.query.error || "");
-    const errorBanner = errorParam
-      ? `<div role="alert" style="background:#fdecea;border:1px solid #f3b6ae;color:#8a2f24;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:.9rem">${escapeHtml(bookingErrorMessage(errorParam))}</div>`
+    // Slice 1 ("myk åpningstidsvalidering"): outside_hours carries the
+    // provider's raw hours text as a separate query param so the banner can
+    // quote it back — bookingErrorMessage(code) alone has no room for that.
+    const errorMsg =
+      errorParam === "outside_hours"
+        ? bookingOutsideHoursMessage(String(req.query.hours || ""))
+        : errorParam
+          ? bookingErrorMessage(errorParam)
+          : "";
+    const errorBanner = errorMsg
+      ? `<div role="alert" style="background:#fdecea;border:1px solid #f3b6ae;color:#8a2f24;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:.9rem">${escapeHtml(errorMsg)}</div>`
       : "";
 
     // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — persistent,
@@ -6157,6 +6194,28 @@ router.post(
       return;
     }
 
+    // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
+    // validering"). Scoped down for this no-JS fallback: the JSON API can
+    // ask the guest to resend with confirm_outside_hours:true, but this form
+    // has no equivalent client-side round trip to offer that choice without
+    // JS — so an outside-hours slot here just hard-explains the mismatch
+    // (?error=outside_hours&hours=…) and the guest resubmits via the visible
+    // form fields with a different time. The hard past/too-far-ahead bounds
+    // check is unconditional either way (?error=slot_bounds).
+    const slotCheck = checkBookingSlotAllowed(
+      { opening_hours_text: provider.opening_hours_text },
+      { slot_at: normaliseBookingSlotInput(parsed.data.slot_at) },
+    );
+    if (!slotCheck.ok) {
+      if (slotCheck.status === 400) {
+        res.redirect(303, `${backTo}?error=slot_bounds`);
+        return;
+      }
+      const hours = String((slotCheck.body as { opening_hours_text?: string | null }).opening_hours_text || "");
+      res.redirect(303, `${backTo}?error=outside_hours&hours=${encodeURIComponent(hours)}`);
+      return;
+    }
+
     let booking;
     try {
       booking = createBooking(parsed.data);
@@ -6172,8 +6231,9 @@ router.post(
     );
 
     // Fire-and-forget producer notification — the gate above already
-    // confirmed dispatch is on and this provider is booking_live.
-    sendProducerNotification(booking, provider.epost).catch((e) =>
+    // confirmed dispatch is on and this provider is booking_live. Always
+    // attach the provider's stated opening_hours_text (slice 1) when non-blank.
+    sendProducerNotification(booking, provider.epost, provider.opening_hours_text).catch((e) =>
       console.error("[gardssalg-book] producer notification failed", booking.booking_ref, e),
     );
 

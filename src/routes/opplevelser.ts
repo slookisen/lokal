@@ -750,7 +750,18 @@ import {
   sendProducerNotification,
   // booking-flyt-v1 slice 2: pre-visit reminder + auto-expiry engine
   processBookingFollowups,
+  // slice 1 ("myk åpningstidsvalidering"): the slot-bounds/opening-hours
+  // check must judge the SAME canonical UTC instant createBooking() ends up
+  // storing — a naked datetime-local slot_at is Oslo wall time, not server-
+  // local — so it is normalised BEFORE checkBookingSlotAllowed(), never the
+  // raw request value.
+  normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
+// — the ONE shared choke point for the hard slot-bounds check + the soft
+// opening-hours check, also used by experiences-seo.ts's no-JS fallback and
+// experiences-mcp.ts's book_gardssalg tool. Never re-derive this inline.
+import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
@@ -7979,7 +7990,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
   // Same gate as the public path — a test must not bypass booking_live /
   // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
   const provider = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
     | null;
   if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
     return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id });
@@ -8002,7 +8013,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     sends.push({ kind: "guest_confirmation", ok: false, error: e?.message ?? String(e) });
   }
   try {
-    await sendProducerNotification(booking, provider?.epost ?? null);
+    await sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null);
     sends.push({ kind: "producer_notification", ok: true });
   } catch (e: any) {
     sends.push({ kind: "producer_notification", ok: false, error: e?.message ?? String(e) });
@@ -26286,7 +26297,7 @@ router.post("/book", async (req: Request, res: Response) => {
   // 'reserved' row, never send the guest confirmation, never notify a
   // producer. See isBookingPaused() in services/booking-store.ts.
   const providerBook = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
     | null;
   if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null)) {
     res.status(200).json({
@@ -26294,6 +26305,21 @@ router.post("/book", async (req: Request, res: Response) => {
       paused: true,
       message: BOOKING_NOT_ACTIVATED_MSG,
     });
+    return;
+  }
+
+  // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
+  // validering"): HARD reject a slot in the past/too-far-ahead (400), and
+  // SOFTLY warn (200, no booking created) when the provider has stated
+  // opening_hours_text and the slot falls outside it, unless the caller
+  // already set confirm_outside_hours:true. See checkBookingSlotAllowed()'s
+  // own doc comment.
+  const slotCheck = checkBookingSlotAllowed(
+    { opening_hours_text: providerBook?.opening_hours_text ?? null },
+    { slot_at: normaliseBookingSlotInput(parsed.data.slot_at), confirm_outside_hours: parsed.data.confirm_outside_hours },
+  );
+  if (!slotCheck.ok) {
+    res.status(slotCheck.status).json(slotCheck.body);
     return;
   }
 
@@ -26312,8 +26338,9 @@ router.post("/book", async (req: Request, res: Response) => {
   );
 
   // Fire-and-forget producer notification — the gate above already confirmed
-  // dispatch is on and this provider is booking_live.
-  sendProducerNotification(booking, providerBook?.epost ?? null).catch((e) =>
+  // dispatch is on and this provider is booking_live. Always attach the
+  // provider's stated opening_hours_text (slice 1) when non-blank.
+  sendProducerNotification(booking, providerBook?.epost ?? null, providerBook?.opening_hours_text ?? null).catch((e) =>
     console.error("[booking] producer notification failed", booking.booking_ref, e),
   );
 
