@@ -31098,6 +31098,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of golcr.failures) failures.push("opplevelser-gardssalg-owner-lock-content-refresh: " + f);
     console.log(`  opplevelser-gardssalg-owner-lock-content-refresh: ${golcr.passed} passed, ${golcr.failed} failed`);
 
+    // A2A experiences-enrichment Step 4b-i (Grep 1, dev-request 2026-08-19-
+    // kursjustering-drikkefunnel-llm-og-supply): server-side `cohort: "drink"`
+    // queue for POST /admin/gardssalg-content-refresh — thin+verified drink
+    // producers, oldest-attempted first — replacing the routine's client-side
+    // "full cohort list -> head -8" pattern that re-tried the same already-
+    // complete rows every run. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-drink-cohort-content-refresh: cohort=drink server-side queue for the content-refresh route ──");
+    const { runOpplevelserGardssalgDrinkCohortContentRefreshTests } = require("../src/routes/opplevelser-gardssalg-drink-cohort-content-refresh.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-drink-cohort-content-refresh.test");
+    const gdccr = await runOpplevelserGardssalgDrinkCohortContentRefreshTests({ log: false });
+    passed += gdccr.passed;
+    failed += gdccr.failed;
+    for (const f of gdccr.failures) failures.push("opplevelser-gardssalg-drink-cohort-content-refresh: " + f);
+    console.log(`  opplevelser-gardssalg-drink-cohort-content-refresh: ${gdccr.passed} passed, ${gdccr.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 2: pure matching-logic tests for the gårdssalg producer <->
     // experience/activity cross-table conflict diagnosis
