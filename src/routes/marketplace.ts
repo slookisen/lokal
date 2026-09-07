@@ -726,8 +726,38 @@ router.get("/search", async (req: Request, res: Response) => {
   const MIN_RESULTS = 3;
   const RADIUS_STEPS = [50, 100, 200]; // km
 
-  // Don't expand if we got results from a name-based search — those are exact matches
-  const wasNameMatch = nameQuery && results.length > 0 && results[0]?.matchReasons?.some((r: string) => r.startsWith("Navnematch"));
+  // Don't expand if we got results from a name-based search — those are exact
+  // (or fuzzy-but-already-geo-filtered) matches.
+  //
+  // dev-request 2026-09-06-dedup-sokeendepunkt-geo-fallback-tynt-befolket:
+  // this used to recognise ONLY the strict match's reason prefix
+  // ("Navnematch: …"), not the relaxed/fuzzy layer's ("Mulig navnematch:
+  // …") — so a fuzzy-but-CORRECT single hit (discover()'s own
+  // filterNameCandidatesByGeo already confirmed it is inside the caller's
+  // radius) still counted as "too few results" and fell into the ladder
+  // below. Once inside, the ladder rebuilds a fresh query object at each
+  // step — `_nameQuery` is never part of `parsed` (Zod strips unknown keys)
+  // and, unlike `_productTerms`, was never re-attached — so every
+  // widened/no-geo `discover()` call ran completely NAME-BLIND and could
+  // replace the real fuzzy match with an unrelated nearby producer: measured
+  // live, `q=Gardås Skogen Flesberg` found the real "Gardås Skogen" row
+  // (Lampeland, matchedCount 2/3, well inside a 15 km radius) via the fuzzy
+  // layer, then the ladder — misfiring on this exact prefix check — widened
+  // anyway and returned "Eiker Hjort" (23 km away, zero name overlap)
+  // instead. Recognising "Mulig navnematch" here too means a name match
+  // discover() already confirmed is skipped straight past the ladder, same
+  // as a strict match always was — no widened/no-geo call, so `_nameQuery`
+  // is never at risk of being dropped in the first place. (Re-attaching
+  // `_nameQuery` on the ladder's own rebuilt queries, as routes/seo.ts's
+  // near-identical ladder does, was tried first and reverted: it also lets
+  // an UNAMBIGUOUS in-range fuzzy match — the "0d" `gårdsutsalg i Agder`
+  // case, one real match plus 3 same-word far-away namesakes — survive all
+  // the way to the fully unbounded no-geo call, where the namesakes come
+  // back too, undoing the exact namesake-pollution fix 0d shipped. This
+  // narrower fix — stop the ladder from running at all once discover() has
+  // ALREADY answered inside the radius — has no such failure mode.)
+  const wasNameMatch = nameQuery && results.length > 0 &&
+    results[0]?.matchReasons?.some((r: string) => r.startsWith("Navnematch") || r.startsWith("Mulig navnematch"));
 
   // dev-request 2026-07-25 fix 0b: track what the auto-expand actually did.
   // Before this, the expansion built a NEW query object and never touched

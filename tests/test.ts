@@ -40324,6 +40324,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-06-dedup-sokeendepunkt-geo-fallback-tynt-befolket —
+// `q=Gardås Skogen Flesberg` returned an unrelated 23 km-away producer
+// instead of the real duplicate-candidate row ("Gardås Skogen — Lampeland"),
+// letting real dedup candidates slip past lokal-agent-discovery STEG 2b's
+// per-candidate search check. Root cause: the auto-expand-radius ladder in
+// routes/marketplace.ts dropped `_nameQuery` on every widened/no-geo
+// discover() call (routes/seo.ts's near-identical ladder already carries it
+// through) — a fuzzy ("Mulig navnematch") name hit under MIN_RESULTS got
+// silently replaced by a name-blind geo query. Own in-memory DB + stubbed
+// geocoder fetch, same pattern as marketplace-search-honesty above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-06-dedup-sokeendepunkt-geo-fallback-tynt-befolket (marketplace dedup name/geo fallback) ──");
+  try {
+    const { runMarketplaceDedupNameGeoFallbackTests } = require("../src/routes/marketplace-dedup-name-geo-fallback.test") as
+      typeof import("../src/routes/marketplace-dedup-name-geo-fallback.test");
+    const mdf = await runMarketplaceDedupNameGeoFallbackTests({ log: false });
+    passed += mdf.passed;
+    failed += mdf.failed;
+    for (const f of mdf.failures) failures.push("marketplace-dedup-name-geo-fallback: " + f);
+    console.log(`  marketplace-dedup-name-geo-fallback: ${mdf.passed} passed, ${mdf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-dedup-name-geo-fallback: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil — the OpenAI ChatGPT
 // app rejection (2026-09-05): English reviewer queries selected no category,
 // so the hard category filter never ran.
