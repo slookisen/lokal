@@ -92,6 +92,7 @@ import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmesi
 import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
 import adminDentalCatalogClassSonnetSampleRoutes from "./routes/admin-dental-catalog-class-sonnet-sample";
 import adminDentalBrregAddressSweepRoutes from "./routes/admin-dental-brreg-address-sweep";
+import adminDentalOffentligKlinikkHjemmesideKorrigeringRoutes from "./routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -775,6 +776,23 @@ app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemm
 // research). dry-run by default, dry_run:false writes.
 // POST /admin/dental/mark-inactive
 app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
+// dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning,
+// slice 2d: one-time, safely re-runnable correction pass for
+// catalog_class='offentlig_klinikk' rows whose hjemmeside is actually a
+// fylkeskommune/kommune directory host — discovers the clinic's own real
+// site via the SAME two-tier mechanism hjemmeside-discovery-batch uses
+// (discoverDentalClinicWebsite, admin-dental-hjemmeside-discovery.ts) and,
+// only when verified, moves the old host into directory_url and writes the
+// new one into hjemmeside. dry-run by default, dry_run:false writes.
+// Mounted at its own specific path (NOT the bare "/admin/dental" prefix) —
+// registered here, BEFORE the bare-prefix discovery mount below, so it never
+// falls through that mount's own "register last" rate-limiter constraint.
+// POST /admin/dental/offentlig-klinikk-hjemmeside-korrigering
+app.use(
+  "/admin/dental/offentlig-klinikk-hjemmeside-korrigering",
+  adminLimiter,
+  adminDentalOffentligKlinikkHjemmesideKorrigeringRoutes,
+);
 // dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
 // + repairs dental_agents rows already contaminated by the test/probe
 // fingerprint PR #323's write-path guard now blocks going forward — clears
