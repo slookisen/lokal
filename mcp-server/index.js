@@ -27,7 +27,7 @@ const BASE_URL = process.env.LOKAL_URL || "https://rettfrabonden.com";
 
 async function fetchJSON(url) {
   const res = await fetch(url, {
-    headers: { "Accept": "application/json", "User-Agent": "lokal-mcp/0.2.0" },
+    headers: { "Accept": "application/json", "User-Agent": "lokal-mcp/0.4.0" },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   return res.json();
@@ -39,7 +39,7 @@ async function postJSON(url, body) {
     headers: {
       "Content-Type": "application/json",
       "Accept": "application/json",
-      "User-Agent": "lokal-mcp/0.2.0",
+      "User-Agent": "lokal-mcp/0.4.0",
     },
     body: JSON.stringify(body),
   });
@@ -450,7 +450,7 @@ server.registerTool(
   async ({ place }) => {
     const url = `${BASE_URL}/api/marketplace/geocode?place=${encodeURIComponent(place)}`;
     const res = await fetch(url, {
-      headers: { "Accept": "application/json", "User-Agent": "lokal-mcp/0.2.0" },
+      headers: { "Accept": "application/json", "User-Agent": "lokal-mcp/0.4.0" },
     });
     if (res.status === 404) {
       return { content: [{ type: "text", text: `Fant ikke koordinater for "${place}". Prøv en kjent norsk by, kommune, region eller fylke.` }] };

@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "lokal-mcp",
   "display_name": "Rett fra Bonden — Finn lokal mat i Norge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Find local food producers in Norway. Search for farms, markets and shops by name, category or location. Get contact info and add producers to your contacts with one click.",
-  "long_description": "Rett fra Bonden connects you to 1,405+ local food producers across Norway. Search by natural language in Norwegian or English, filter by category (vegetables, honey, dairy, meat, fish, bread), discover farms near you, and get full contact details including opening hours, payment methods, and delivery options. Every result includes a vCard link so you can add the producer to your phone contacts instantly.\n\nExamples:\n- \"Hvor finner jeg fersk honning i Oslo?\"\n- \"organic vegetables near Grunerloekka\"\n- \"ost Trondheim\"\n- \"gaardsbutikker i Lofoten\"",
+  "long_description": "Rett fra Bonden connects you to more than 1,600 local food producers across Norway. Search by natural language in Norwegian or English, filter by category (vegetables, honey, dairy, meat, fish, bread), discover farms near you, and get full contact details including opening hours, payment methods, and delivery options. Every result includes a vCard link so you can add the producer to your phone contacts instantly.\n\nExamples:\n- \"Hvor finner jeg fersk honning i Oslo?\"\n- \"organic vegetables near Grunerloekka\"\n- \"ost Trondheim\"\n- \"gaardsbutikker i Lofoten\"",
   "author": {
     "name": "Daniel Fredriksen",
     "email": "da.fredriksen@gmail.com",
@@ -16,12 +16,15 @@
   },
   "homepage": "https://rettfrabonden.com",
   "support": "https://github.com/slookisen/lokal/issues",
+  "icon": "icon.png",
   "server": {
     "type": "node",
     "entry_point": "index.js",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/index.js"],
+      "args": [
+        "${__dirname}/index.js"
+      ],
       "env": {}
     }
   },
@@ -55,32 +58,8 @@
       "description": "List the umbrella organizations a specific producer belongs to - which markets they sell at, certifications they hold, or networks they're part of."
     },
     {
-      "name": "lokal_bm_next_markets",
-      "description": "Get upcoming Bondens marked (farmers market) events for a region or a specific venue. Refreshed daily."
-    },
-    {
       "name": "lokal_geocode",
       "description": "Resolve a Norwegian place name (city, region, or kommune) to lat/lng coordinates, for use with lokal_discover's distance filters."
-    },
-    {
-      "name": "lokal_cart_create",
-      "description": "Writes data: creates a new anonymous shopping cart and returns a buyer capability token. First step of placing an order. No payment involved."
-    },
-    {
-      "name": "lokal_cart_add_item",
-      "description": "Writes data: adds a product to an existing cart, or updates its quantity. Requires the cart ID and buyer token from lokal_cart_create."
-    },
-    {
-      "name": "lokal_cart_view",
-      "description": "View the current contents and subtotal of a shopping cart. Read-only."
-    },
-    {
-      "name": "lokal_cart_submit",
-      "description": "Writes data: submits the cart to place pickup orders, one per producer. No payment is charged. Sellers who opted in to notifications are emailed and can confirm or decline the order."
-    },
-    {
-      "name": "lokal_order_status",
-      "description": "Check the status and timeline (pending/confirmed/ready/completed) of an order placed via lokal_cart_submit. Read-only."
     }
   ],
   "keywords": [
@@ -97,10 +76,15 @@
   ],
   "license": "MIT",
   "privacy_policies": [
+    "https://rettfrabonden.com/personvern",
     "https://rettfrabonden.com/privacy"
   ],
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "node": ">=18.0.0"
     }
