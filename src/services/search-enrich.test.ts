@@ -657,11 +657,64 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
   assertEq(hasVisitLlmTrigger(""), false, "hasVisitLlmTrigger: empty string → false");
   assertTrue(hasVisitLlmTrigger("Vi har et lite taproom på gården."), "hasVisitLlmTrigger: A1 keyword hit ('taproom') → true");
   assertTrue(hasVisitLlmTrigger("Vi holder åpent hver mandag hele sommeren."), "hasVisitLlmTrigger: bare weekday name ('mandag'), no time → true");
-  assertTrue(hasVisitLlmTrigger("Se prisliste og annen info her: 10:00 er tidlig nok."), "hasVisitLlmTrigger: bare clock-time token ('10:00'), no weekday/keyword → true");
   assertEq(
     hasVisitLlmTrigger("Vi dyrker epler og lager most av dem hvert år på gården vår."),
     false,
     "hasVisitLlmTrigger: no keyword, no weekday, no time → false",
+  );
+
+  // PR #829 review finding: a bare clock-time-like token ANYWHERE on the
+  // page must NOT fire the LLM path on its own — OPENING_HOURS_TIME_RE
+  // (`\d{1,2}[:.]\d{2}|\d{1,2}-\d{1,2}`) also matches prices, volumes,
+  // aging times, and group sizes, none of which are a visit/hours signal.
+  // The clock-time signal now requires co-location (mirroring
+  // extractOpeningHours()'s own proximity window) with "åpent"/
+  // "åpningstider"/a weekday name — see hasVisitLlmTrigger()'s doc comment.
+  assertEq(
+    hasVisitLlmTrigger("Se prisliste og annen info her: 10:00 er tidlig nok."),
+    false,
+    "hasVisitLlmTrigger: bare clock-time token ('10:00'), no co-located weekday/åpent/åpningstider → false (narrowed, PR #829 finding)",
+  );
+  // Reviewer's five negative-signal example sentences: ordinary Norwegian
+  // farm-producer prose (price, volume, aging duration, group size) that
+  // matches OPENING_HOURS_TIME_RE but has NO genuine visit/hours content —
+  // none of these may trigger the LLM path.
+  const NEGATIVE_SIGNAL_SENTENCES: readonly string[] = [
+    "Eplene selges for 49.90 kr per kilo hele høsten.",
+    "Vi selger flasker på 0.75 liter i butikken.",
+    "Sideren lagres i 3-4 uker før tapping og salg.",
+    "Passer for grupper på 5-10 personer i sommersesongen.",
+    "Ostene modnes i 6-8 måneder før de er klare.",
+  ];
+  for (const sentence of NEGATIVE_SIGNAL_SENTENCES) {
+    assertEq(
+      hasVisitLlmTrigger(sentence),
+      false,
+      `hasVisitLlmTrigger: negative-signal sentence with no genuine visit/hours content → false: "${sentence}"`,
+    );
+  }
+  // Positive co-located cases: the clock-time token IS a genuine trigger
+  // when it sits near "åpent"/"åpningstider" or a weekday name — the
+  // legitimate case the narrowing must NOT break.
+  assertTrue(
+    hasVisitLlmTrigger("Åpningstider: vi har åpent 10:00-18:00 alle hverdager."),
+    "hasVisitLlmTrigger: clock-time co-located with 'åpningstider'/'åpent' → true",
+  );
+  assertTrue(
+    hasVisitLlmTrigger("Kom innom en tirsdag, vi holder butikken åpen fra 09:00."),
+    "hasVisitLlmTrigger: clock-time co-located with a weekday name ('tirsdag') → true",
+  );
+  // A clock-time token FAR from any context word (beyond the 80-char
+  // proximity window) must still be false, even though "åpningstider"
+  // appears elsewhere on the same page.
+  assertEq(
+    hasVisitLlmTrigger(
+      "Åpningstider finner du på oppslagstavla i butikken. " +
+      "X".repeat(120) +
+      " Eplene selges for 49.90 kr per kilo hele høsten.",
+    ),
+    false,
+    "hasVisitLlmTrigger: clock-time-free negative sentence far outside 'åpningstider' proximity window → false",
   );
 
   // ── A4: extractJsonLdOpeningHours + its two parsers. ─────────────────────

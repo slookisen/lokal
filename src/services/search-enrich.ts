@@ -1212,6 +1212,13 @@ const OPENING_HOURS_WEEKDAY_RE = /mandag|tirsdag|onsdag|torsdag|fredag|lørdag|s
 const OPENING_HOURS_WEEKDAY_ABBR_RANGE_RE =
   /\b(?:man|tir|ons|tor|fre|lør|søn)\s?[-–]\s?(?:man|tir|ons|tor|fre|lør|søn)\b/gi;
 const OPENING_HOURS_TIME_RE = /\d{1,2}[:.]\d{2}|\d{1,2}\s?[-–]\s?\d{1,2}/;
+// Global variant of the same pattern, needed only where a caller must walk
+// EVERY match position in the text (matchAll) rather than a single .test()
+// — used by hasVisitLlmTrigger()'s proximity check below. Kept as a
+// separate const (not a `.global`-flag mutation of OPENING_HOURS_TIME_RE)
+// so the non-global regex's callers never trip over shared `g`-flag
+// lastIndex state.
+const OPENING_HOURS_TIME_RE_G = /\d{1,2}[:.]\d{2}|\d{1,2}\s?[-–]\s?\d{1,2}/g;
 const OPENING_HOURS_WORDS_RE = /åpningstider|åpent/gi;
 
 /**
@@ -1287,22 +1294,41 @@ export function extractOpeningHours(text: string): string | null {
 //   - a bare Norwegian weekday name (no time needed — a raw weekday mention
 //     alone is a reasonable signal the page discusses when the place is
 //     open/visitable), OR
-//   - a clock-time-like token (e.g. "10:00" or "10-18") alone.
+//   - a clock-time-like token (e.g. "10:00" or "10-18") CO-LOCATED (within
+//     the same 80-char proximity window extractOpeningHours() itself uses)
+//     with "åpent"/"åpningstider" or a weekday name — NOT a bare clock-time
+//     token anywhere on the page. A standalone `\d{1,2}[:.]\d{2}|\d{1,2}-
+//     \d{1,2}` match is near-universal noise on a commercial producer page
+//     (prices "49.90 kr", volumes "0.75 liter", aging times "6-8 måneder",
+//     group sizes "5-10 personer" all match it) and fired the LLM path on
+//     most real pages with zero actual visit/hours signal — see PR #829
+//     review finding. Requiring co-location mirrors extractOpeningHours()'s
+//     own nearby()-window discipline instead of re-testing the bare regex
+//     as an independent OR-branch.
 // Any ONE of the three is enough — this is a narrower, cheaper gate than
 // extractOpeningHours()'s own snippet-building logic (which requires two
-// signals CO-LOCATED within an 80-char window to build a value); here we
-// only need a single yes/no answer to "is an LLM call worth trying", so a
-// lone signal anywhere in the page is sufficient. PURE — no network, no
-// state (a plain, non-global regex is used for the weekday check
-// specifically so repeated calls never trip over OPENING_HOURS_WEEKDAY_RE's
-// own shared `g`-flag lastIndex state).
+// signals CO-LOCATED within an 80-char window to build a value, and demands
+// BOTH a weekday/time AND the literal "åpningstider"/"åpent" words in some
+// combination); here we only need a single yes/no answer to "is an LLM call
+// worth trying", so a lone VISIT_KEYWORDS/weekday signal anywhere in the
+// page is sufficient, but the clock-time signal alone is NOT (see above).
+// PURE — no network, no state (a plain, non-global regex is used for the
+// weekday check specifically so repeated calls never trip over
+// OPENING_HOURS_WEEKDAY_RE's own shared `g`-flag lastIndex state).
 const VISIT_LLM_WEEKDAY_RE = /mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag/i;
+const VISIT_LLM_TIME_CONTEXT_RE = /åpningstider|åpent|mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag/i;
+const VISIT_LLM_TIME_CONTEXT_WINDOW = 80; // mirrors extractOpeningHours()'s own WINDOW
 export function hasVisitLlmTrigger(text: string): boolean {
   if (!text) return false;
   const lower = text.toLowerCase();
   if (VISIT_KEYWORDS.some((kw) => lower.includes(kw))) return true;
   if (VISIT_LLM_WEEKDAY_RE.test(text)) return true;
-  if (OPENING_HOURS_TIME_RE.test(text)) return true;
+  for (const m of text.matchAll(OPENING_HOURS_TIME_RE_G)) {
+    if (m.index === undefined) continue;
+    const start = Math.max(0, m.index - VISIT_LLM_TIME_CONTEXT_WINDOW);
+    const end = Math.min(text.length, m.index + m[0].length + VISIT_LLM_TIME_CONTEXT_WINDOW);
+    if (VISIT_LLM_TIME_CONTEXT_RE.test(text.slice(start, end))) return true;
+  }
   return false;
 }
 
