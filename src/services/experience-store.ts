@@ -5960,8 +5960,30 @@ export function applyGardssalgSetProducts(
   // invariant silently).
   if (normalized.length === 0) return { ok: false, reason: "value_required" };
 
+  return writeGardssalgProductsColumn(db, providerId, row, normalized, source);
+}
+
+// ── shared write+audit body for the products column ─────────────────────
+//
+// Extracted for dev-request 2026-09-06-produsent-datafjerning-uten-cs-
+// skrivevei (Part 2 of the products write path — see
+// applyGardssalgClearProducts below for the "why"). Both
+// applyGardssalgSetProducts's overwrite path and applyGardssalgClearProducts's
+// clear path reach the exact same UPDATE + field_provenance merge + single
+// gardssalg_content_audit row once their own gates have already run (owner
+// lock is checked by EACH caller before this is reached — this helper does
+// not re-check it) — this is the one place that write happens, so the two
+// callers cannot drift apart on the audit-row shape
+// planGardssalgContentRollback depends on.
+function writeGardssalgProductsColumn(
+  db: ReturnType<typeof getDb>,
+  providerId: string,
+  row: { products: string | null; field_provenance: string | null },
+  normalizedItems: string[],
+  source: string
+): { ok: true; old_value: string | null; new_value: string } {
   const oldValue = row.products;
-  const newValue = JSON.stringify(normalized);
+  const newValue = JSON.stringify(normalizedItems);
 
   // ── field_provenance merge (read-modify-write, preserves other fields) ──
   // Same parse-guard as applyGardssalgSetContentField above: malformed
@@ -6005,6 +6027,59 @@ export function applyGardssalgSetProducts(
   applyWithAudit();
 
   return { ok: true, old_value: oldValue, new_value: newValue };
+}
+
+export type GardssalgClearProductsResult =
+  | { ok: true; old_value: string | null; new_value: string; cleared: true }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" };
+
+/**
+ * CLEAR a gårdssalg provider's `products` column — dev-request
+ * 2026-09-06-produsent-datafjerning-uten-cs-skrivevei. applyGardssalgSetProducts
+ * above deliberately fails closed on an empty/missing list ("value_required"
+ * — correct for "you sent nothing usable"), which is right for THAT
+ * endpoint's own purpose but leaves no lever for a verified owner's explicit
+ * "remove my whole product list" request: CS had no write path to honor it.
+ * Public rendering (experiences-seo.ts) already treats
+ * `JSON.parse(products || "[]")` with a zero-length list as "hide the
+ * 'Produkter' block" — so `products = "[]"` (a JSON empty array, NOT NULL)
+ * is the correct cleared state, matching the wire shape every other
+ * `products` writer already uses (init-experiences.ts, sanitizeProducts).
+ *
+ * SAME gates and side effects as applyGardssalgSetProducts's overwrite path,
+ * minus the per-item Gate 3 (there is nothing to validate about an empty
+ * list):
+ *   1. Owner-lock (isGardssalgFieldOwnerLocked) on the FRESH row — identical
+ *      check, same field key ("products"), so a locked row refuses a clear
+ *      exactly as it refuses an overwrite.
+ *   2. provider_not_found if the row does not exist.
+ *
+ * field_provenance.products is merged (read-modify-write, preserving every
+ * other field's entry, `owner_locks` included) exactly like the overwrite
+ * path, and exactly ONE gardssalg_content_audit row is written (old_value =
+ * the prior JSON or null, new_value = "[]") via the SAME
+ * writeGardssalgProductsColumn helper the overwrite path uses — so
+ * POST /admin/gardssalg-content-rollback (which already reads `products`
+ * via GARDSSALG_ROLLBACKABLE_FIELDS) can revert a clear exactly as it
+ * reverts any other products write, with zero rollback-side changes.
+ */
+export function applyGardssalgClearProducts(providerId: string, source: string): GardssalgClearProductsResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, products, content_source, field_provenance FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | { id: string; products: string | null; content_source: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate 1 — owner lock, on the FRESH row (see doc comment above).
+  if (isGardssalgFieldOwnerLocked(row, "products")) return { ok: false, reason: "owner_locked" };
+
+  const written = writeGardssalgProductsColumn(db, providerId, row, [], source);
+  return { ok: true, old_value: written.old_value, new_value: written.new_value, cleared: true };
 }
 
 export type GardssalgSetAddressResult =
