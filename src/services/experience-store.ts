@@ -1617,10 +1617,21 @@ export function discoverExperiencesRelaxed(
   return { results, originalFilter: original, appliedFilter: working, relaxedKeys };
 }
 
+/**
+ * Human-readable (Norwegian) label list for a set of relaxed filter keys,
+ * e.g. ["season","fylke"] -> "sesong, fylke". Single source of truth for
+ * FILTER_LABELS so callers (buildRelaxationNote below, and the A2A
+ * relaxation-exhausted zero-hit message in experiences-a2a.ts) never
+ * hand-duplicate the label table.
+ */
+export function formatFilterLabels(keys: Array<keyof DiscoverFilter>): string {
+  return keys.map((k) => FILTER_LABELS[k]).join(", ");
+}
+
 /** Bilingual note describing which filters were relaxed to produce results. Null if none were. */
 export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): string | null {
   if (relaxedKeys.length === 0) return null;
-  const labels = relaxedKeys.map((k) => FILTER_LABELS[k]).join(", ");
+  const labels = formatFilterLabels(relaxedKeys);
   return (
     `Ingen treff med de opprinnelige filtrene — løsnet: ${labels}. / ` +
     `No matches with the original filters — relaxed: ${labels}.`

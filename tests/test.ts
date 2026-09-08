@@ -40214,6 +40214,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-06-opplevagent-discovery-nulltreff-standardliste:
+// POST /a2a message/send returned an unfiltered 20-item "standard list" on a
+// zero-hit natural-language discover query instead of count:0 (an
+// unrecognised query, or a filter fully relaxed away by
+// discoverExperiencesRelaxed) — see experiences-a2a-zero-hit.test.ts for the
+// full root-cause writeup. Same in-memory-DB + direct-handler-call pattern
+// as the gårdssalg suite above, runs via runSerial() for the same reason.
+runSerial(async () => {
+  console.log("\n── experiences-a2a (zero-hit): count:0 instead of unfiltered top-20 ──");
+  try {
+    const { runExperiencesA2aZeroHitTests } = require("../src/routes/experiences-a2a-zero-hit.test") as
+      typeof import("../src/routes/experiences-a2a-zero-hit.test");
+    const eazh = await runExperiencesA2aZeroHitTests({ log: false });
+    passed += eazh.passed;
+    failed += eazh.failed;
+    for (const f of eazh.failures) failures.push("experiences-a2a (zero-hit): " + f);
+    console.log(`  experiences-a2a (zero-hit): ${eazh.passed} passed, ${eazh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-a2a (zero-hit): unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-13-proveniens-transparens-side, slice 2
 // (orch-pr-20260725-proveniens-api-provenance): additive `provenance`
 // summary field ({ sources, last_verified }) on the public entity-detail
