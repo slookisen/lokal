@@ -42856,3 +42856,28 @@ runSerial(async () => {
     failures.push("gardssalg-opening-hours: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, PR #823
+// round 4 / round-3 review finding: the A2A message/send discovery flow
+// (src/routes/a2a.ts) called discover() with no DiscoverMeta, so a dropped
+// tag filter (step 4 of discover()) went unreported — unlike
+// /api/marketplace/search, /api/marketplace/discover, /sok and the MCP
+// tools, which already surface it. Own in-memory DB via __setDbForTesting
+// (mirrors marketplace-search-honesty.test.ts's harness), driving the real
+// POST /a2a router through router.handle(). Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── PR #823 round 4: A2A message/send surfaces dropped tag filter ──");
+  try {
+    const { runA2aTagsRelaxedTests } = require("../src/routes/a2a-tags-relaxed.test") as
+      typeof import("../src/routes/a2a-tags-relaxed.test");
+    const atr = await runA2aTagsRelaxedTests({ log: false });
+    passed += atr.passed;
+    failed += atr.failed;
+    for (const f of atr.failures) failures.push("a2a-tags-relaxed: " + f);
+    console.log(`  a2a-tags-relaxed: ${atr.passed} passed, ${atr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("a2a-tags-relaxed: unexpected error: " + String(err?.message || err));
+  }
+});

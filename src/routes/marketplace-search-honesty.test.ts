@@ -60,7 +60,7 @@ interface RouteResult {
 
 function callRoute(
   router: any,
-  opts: { method?: string; url: string; query?: Record<string, string>; headers?: Record<string, string> },
+  opts: { method?: string; url: string; query?: Record<string, string>; headers?: Record<string, string>; body?: any },
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
     const headers = opts.headers || {};
@@ -69,6 +69,10 @@ function callRoute(
       url: opts.url,
       query: opts.query || {},
       headers,
+      // Router.handle() is driven directly here, bypassing express.json() —
+      // POST /discover reads req.body, so a body-bearing call must set it
+      // itself (mirrors what the real json() middleware would have parsed).
+      body: opts.body,
       ip: "127.0.0.1",
       get(name: string) { return headers[name.toLowerCase()]; },
     };
@@ -529,6 +533,64 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
         `tags: relaxed_filters is NOT ["tags"] when categories, not tags, caused the empty set (got ${JSON.stringify(r.body.relaxed_filters)})`);
       assertTrue(!(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note)),
         "tags: no tags-dropped note when tags were never the cause");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // PR #823 round 4 / round-3 review finding: POST /api/marketplace/
+    // discover (structured REST) never read discoverMeta.tagsRelaxed — a
+    // dropped tag filter went unreported here even though the route's own
+    // docstring documents `tags` as caller input. Same fixture, same
+    // dev-request as the /search cases above.
+    // ════════════════════════════════════════════════════════════════
+    {
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["fish"], tags: ["fresh"] },
+      });
+      assertEq(r.status, 200, "discover: {fish, fresh} → 200");
+      assertTrue(r.body.count > 0,
+        `discover: still returns the untagged fish producers even though none carry "fresh" (got ${r.body.count})`);
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Nordfjord Sjømat") && names.includes("Lofoten Fiskeri"),
+        `discover: both untagged fish producers survive (got ${names.join(", ")})`);
+      assertTrue(Array.isArray(r.body.relaxed_filters) && r.body.relaxed_filters.includes("tags"),
+        `discover: relaxed_filters names "tags" as dropped (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note),
+        `discover: the response says explicitly that a word-filter was dropped (got ${JSON.stringify(r.body.note)})`);
+    }
+    {
+      // Control: a tag with real, structured coverage stays a selective
+      // hard filter — no relaxation, no note.
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["dairy"], tags: ["budget"] },
+      });
+      assertEq(r.status, 200, "discover: {dairy, budget} → 200");
+      // Fixture has TWO "budget"-tagged dairy producers (a-meieri-budget,
+      // a-alta-far) plus one untagged (a-meieri-plain) — only the untagged
+      // one must be excluded by a genuinely-applied hard filter.
+      const names: string[] = r.body.results.map((x: any) => x.agent.name).sort();
+      assertEq(names, ["Fjernost Billig", "Rimelig Gårdsost"],
+        `discover: only the genuinely "budget"-tagged dairy producers are returned (got ${names.join(", ")})`);
+      assertEq(r.body.relaxed_filters, undefined,
+        "discover: a tag filter that legitimately narrowed the set reports no relaxation");
+      assertEq(r.body.note, undefined, "discover: …and no note");
+    }
+    {
+      // Control: no `tags` at all in the request → byte-identical to the
+      // pre-round-4 response shape (no relaxed_filters key, no note key).
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["fish"] },
+      });
+      assertEq(r.status, 200, "discover: {fish} with no tags → 200");
+      // Byte-identical control: undefined (and so, over real JSON, an absent
+      // key — same as /search's relaxed_filters/note when nothing relaxed).
+      assertEq(r.body.relaxed_filters, undefined, "discover: no tags in the request → no relaxed_filters");
+      assertEq(r.body.note, undefined, "discover: …and no note");
     }
 
     // ── pure helper: the note builder ────────────────────────────────

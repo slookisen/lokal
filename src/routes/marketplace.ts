@@ -545,7 +545,14 @@ router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
     const query = DiscoveryQuerySchema.parse(req.body);
-    const results = marketplaceRegistry.discover(query);
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
+    // review finding: this route's own docstring documents `tags` as caller
+    // input, but it never read discoverMeta.tagsRelaxed — a dropped tag
+    // filter (step 4 of discover()) went unreported here, unlike every other
+    // discover() caller. See DiscoverMeta for why the drop happens.
+    const discoverMeta: DiscoverMeta = {};
+    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const tagsDropped = !!discoverMeta.tagsRelaxed;
 
     interactionLogger.log("discover", {
       query: JSON.stringify({ categories: query.categories, tags: query.tags }),
@@ -592,6 +599,10 @@ router.post("/discover", (req: Request, res: Response) => {
         tags: query.tags,
         maxDistanceKm: query.maxDistanceKm,
       },
+      // Same shape /search and discoverExperiencesRelaxed() (OpplevAgent) use:
+      // present only when a filter was actually dropped.
+      relaxed_filters: tagsDropped ? ["tags"] : undefined,
+      note: buildSearchNote({ tagsDropped }),
       results: enrichedResults,
       conversations,
     });
