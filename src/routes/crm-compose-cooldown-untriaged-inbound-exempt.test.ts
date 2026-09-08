@@ -58,6 +58,19 @@
  *       throughout this guard.
  *   (5) Isolation: a crm_untriaged row for a DIFFERENT recipient email does
  *       not exempt this contact's cooldown check.
+ *   (6) Dismissed-row regression (CHANGES-REQUESTED finding, fixed in this
+ *       same PR): a crm_untriaged row within the 7-day window that a human
+ *       already DISMISSED as not a genuine reply — markUntriagedResolved(id,
+ *       null, resolvedBy) shape, resolved_at set / resolved_vertical NULL —
+ *       must NOT exempt the cooldown. crm_untriaged rows are never deleted
+ *       (database/init.ts), so without a resolution-state filter a row a
+ *       human explicitly threw out as spam/autoreply/junk would count as
+ *       "mid-conversation" evidence forever. Still 429 cooldown_suppressed.
+ *   (7) Promoted-row positive case: a crm_untriaged row resolved BY
+ *       PROMOTION to a real vertical — markUntriagedResolved(id, "rfb",
+ *       resolvedBy) shape, resolved_at set / resolved_vertical set — is a
+ *       confirmed genuine reply, so it still correctly exempts the cooldown
+ *       just like an open (unresolved) row does in (1). No coverage lost.
  *
  * Harness conventions (matching this repo's established patterns — see
  * rfb-poolgate-stegc.test.ts and crm-max-touch-vern-send-guard.test.ts):
@@ -222,6 +235,34 @@ export function runCrmComposeCooldownUntriagedInboundExemptTests(
         );
       }
 
+      // Same as insertUntriaged, but already CLOSED — mirrors
+      // markUntriagedResolved(id, vertical, resolvedBy)'s two shapes
+      // (crm-triage.ts): resolvedVertical:null is "dismissed as not a
+      // genuine reply" (spam/autoreply/junk); a real vertical string is
+      // "promoted into the CRM proper" (confirmed genuine reply).
+      function insertUntriagedResolved(
+        id: string,
+        fromEmail: string,
+        hoursAgo: number,
+        resolvedVertical: string | null,
+      ): void {
+        db.prepare(
+          `INSERT INTO crm_untriaged
+             (id, thread_id, from_email, subject, snippet, reason, signals, raw_payload,
+              created_at, resolved_at, resolved_vertical, resolved_by)
+           VALUES (?, ?, ?, ?, ?, ?, '{}', '{}', datetime('now', ?), datetime('now'), ?, 'daniel')`,
+        ).run(
+          id,
+          `gmail-thread-${id}`,
+          fromEmail,
+          "Fw: Profil-utkast for Kollerud Gård — Hemnes",
+          "Jeg har nå tatt eierskap til siden…",
+          "test:direct-to-personal-inbox",
+          `-${hoursAgo} hours`,
+          resolvedVertical,
+        );
+      }
+
       // ══ (1) Kollerud repro: prior outreach + recent untriaged reply,
       // NO crm_messages inbound row -> /compose succeeds directly ═══════════
       {
@@ -315,6 +356,50 @@ export function runCrmComposeCooldownUntriagedInboundExemptTests(
 
         assertEq(res.status, 429, "5a: an untriaged row for a different email does not exempt this contact -> still 429");
         assertEq(res.body?.error, "cooldown_suppressed", "5b: error:cooldown_suppressed");
+      }
+
+      // ══ (6) Dismissed-row regression: crm_untriaged row within the 7-day
+      // window but explicitly DISMISSED by a human (markUntriagedResolved
+      // (id, null, resolvedBy) shape — resolved_at set, resolved_vertical
+      // NULL), NO crm_messages inbound -> must NOT exempt the cooldown ════
+      {
+        const email = "dismissed-untriaged@kollerud-test.no";
+        insertPriorOutreach(email, 2);
+        insertUntriagedResolved("untri-dismissed", email, 1, null);
+        sendCalls = [];
+
+        const res = await callRoute(crmRouter, {
+          method: "POST",
+          url: "/compose",
+          headers: { "x-admin-key": ADMIN_KEY },
+          body: baseComposeBody({ to: email }),
+        });
+
+        assertEq(res.status, 429, "6a: dismissed (not-a-reply) crm_untriaged row does NOT exempt -> still 429");
+        assertEq(res.body?.error, "cooldown_suppressed", "6b: error:cooldown_suppressed");
+        assertEq(sendCalls.length, 0, "6c: emailService.sendRaw was NOT called");
+      }
+
+      // ══ (7) Promoted-row positive case: crm_untriaged row resolved BY
+      // PROMOTION to a real vertical (markUntriagedResolved(id, "rfb",
+      // resolvedBy) shape — resolved_at set, resolved_vertical set) is a
+      // confirmed genuine reply -> still exempts the cooldown ════════════
+      {
+        const email = "promoted-untriaged@kollerud-test.no";
+        insertPriorOutreach(email, 2);
+        insertUntriagedResolved("untri-promoted", email, 1, "rfb");
+        sendCalls = [];
+
+        const res = await callRoute(crmRouter, {
+          method: "POST",
+          url: "/compose",
+          headers: { "x-admin-key": ADMIN_KEY },
+          body: baseComposeBody({ to: email }),
+        });
+
+        assertEq(res.status, 200, "7a: crm_untriaged row resolved by promotion still exempts -> /compose succeeds");
+        assertEq(res.body?.success, true, "7b: success:true");
+        assertEq(sendCalls.length, 1, "7c: emailService.sendRaw WAS called");
       }
     } catch (err: any) {
       failed++;

@@ -721,6 +721,19 @@ router.post("/compose", async (req, res) => {
       // check below — a contact with NEITHER a crm_messages inbound NOR a
       // crm_untriaged row (a genuine, unsolicited repeat cold-send) still
       // falls through to it unchanged (Acceptance Criterion 2, non-goal).
+      //
+      // resolved_at/resolved_vertical filter: crm_untriaged rows are never
+      // deleted (see database/init.ts's crm_untriaged comment — "Rows leave
+      // only by an explicit human assignment"), and markUntriagedResolved()
+      // (crm-triage.ts) can close a row two ways: promoted to a real
+      // vertical (resolved_vertical set) or DISMISSED as not a genuine
+      // reply — spam/autoreply/junk — which sets resolved_at but leaves
+      // resolved_vertical NULL. A dismissed row is a human's explicit
+      // verdict that this was never a reply at all, so it must NOT count as
+      // "mid-conversation" evidence forever after. Only an open row
+      // (resolved_at IS NULL, not yet reviewed) or one resolved BY
+      // PROMOTION (resolved_vertical IS NOT NULL, i.e. confirmed as a real
+      // reply) counts as a positive signal here.
       const hasRecentUntriagedInbound = hasRecentInbound
         ? undefined
         : (getDb().prepare(`
@@ -728,6 +741,7 @@ router.post("/compose", async (req, res) => {
             FROM crm_untriaged
             WHERE LOWER(from_email) = LOWER(?)
               AND datetime(created_at) >= datetime(?)
+              AND (resolved_at IS NULL OR resolved_vertical IS NOT NULL)
             LIMIT 1
           `).get(to, lookback7d) as { hit: number } | undefined);
 
