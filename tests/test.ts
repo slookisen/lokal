@@ -42881,3 +42881,64 @@ runSerial(async () => {
     failures.push("a2a-tags-relaxed: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-07-compose-cooldown-suppressed-blokkerer-cs-svar-
+// outreach (slookisen/A2A) — the live "Kollerud" incident: POST
+// /admin/crm/compose's hasRecentInbound guard reads only crm_messages, so a
+// reply that arrives outside the platform's recognized alias (and is
+// therefore parked by parkUntriaged() into crm_untriaged instead of being
+// written through crmService.ingestThread()) was invisible to it, wrongly
+// rejecting a legitimate CS reply with cooldown_suppressed. Own in-memory-db
+// + emailService.sendRaw-mock harness exercising the real POST
+// /admin/crm/compose handler (mirrors rfb-poolgate-stegc.test.ts's and
+// crm-max-touch-vern-send-guard.test.ts's own harnesses). Tail position is
+// the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-07-compose-cooldown-suppressed-blokkerer-cs-svar-outreach: crm_untriaged inbound-exempt fix ──");
+  try {
+    const { runCrmComposeCooldownUntriagedInboundExemptTests } =
+      require("../src/routes/crm-compose-cooldown-untriaged-inbound-exempt.test") as
+        typeof import("../src/routes/crm-compose-cooldown-untriaged-inbound-exempt.test");
+    const ccu = await runCrmComposeCooldownUntriagedInboundExemptTests({ log: false });
+    passed += ccu.passed;
+    failed += ccu.failed;
+    for (const f of ccu.failures) failures.push("crm-compose-cooldown-untriaged-inbound-exempt: " + f);
+    console.log(`  crm-compose-cooldown-untriaged-inbound-exempt: ${ccu.passed} passed, ${ccu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-compose-cooldown-untriaged-inbound-exempt: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-08-drikke-no-yield-backoff, Del B: ports the
+// experiences vertical's content-refresh no-yield backoff (dev-request
+// 2026-07-20-experiences-no-yield-backoff) onto the gårdssalg/drink
+// content-refresh selectors (selectGardssalgProvidersForContentRefresh,
+// selectDrinkProducersForContentRefresh, services/experience-store.ts) and
+// POST /admin/gardssalg-content-refresh (routes/opplevelser.ts): a row that
+// reaches scanned++ but wouldWrite ends up empty now bumps
+// content_no_yield_streak (recordProviderContentYield(id,false), apply-mode
+// only), 3 consecutive strikes rest the row for NO_YIELD_BACKOFF_DAYS from
+// both selectors, a real field write resets the streak, and
+// GARDSSALG_NO_YIELD_BACKOFF_DISABLED=true restores the old no-exclusion
+// selection for these two functions only. Also covers the additive
+// `cohort_resting_total` response field (drink-cohort mode only, null
+// otherwise). Own in-memory-db + globalThis.fetch mock harness (mirrors
+// opplevelser-gardssalg-drink-cohort-content-refresh.test.ts's own harness).
+// Tail position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-08-drikke-no-yield-backoff, Del B: gårdssalg/drink content-refresh no-yield backoff ──");
+  try {
+    const { runOpplevelserGardssalgDrinkNoYieldBackoffTests } =
+      require("../src/routes/opplevelser-gardssalg-drink-no-yield-backoff.test") as
+        typeof import("../src/routes/opplevelser-gardssalg-drink-no-yield-backoff.test");
+    const gdnyb = await runOpplevelserGardssalgDrinkNoYieldBackoffTests({ log: false });
+    passed += gdnyb.passed;
+    failed += gdnyb.failed;
+    for (const f of gdnyb.failures) failures.push("gardssalg-drink-no-yield-backoff: " + f);
+    console.log(`  gardssalg-drink-no-yield-backoff: ${gdnyb.passed} passed, ${gdnyb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-drink-no-yield-backoff: unexpected error: " + String(err?.message || err));
+  }
+});

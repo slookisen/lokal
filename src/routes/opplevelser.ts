@@ -3427,6 +3427,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // this call's `limit` slice (i.e. the queue depth the caller is draining).
   // null for the other two modes, where no such queue exists.
   let cohortEligibleTotal: number | null = null;
+  // drink_cohort only (dev-request 2026-09-08-drikke-no-yield-backoff, Del B,
+  // B3): how many thin+verified drink rows are currently RESTING under the
+  // no-yield backoff (Del B's exclusion, applied inside
+  // selectDrinkProducersForContentRefresh above cohortEligibleTotal's own
+  // call) — i.e. the complement of cohortEligibleTotal within the full
+  // thin+verified drink-producer count. null for the other two modes, same
+  // as cohortEligibleTotal.
+  let cohortRestingTotal: number | null = null;
   const hasProviderIds = Array.isArray(body.providerIds) && body.providerIds.length > 0;
   if (!hasProviderIds && body.cohort !== undefined && body.cohort !== null && body.cohort !== "drink") {
     res.status(400).json({
@@ -3455,6 +3463,17 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       isHjemmesideVerified(t.field_provenance)
     );
     cohortEligibleTotal = eligible.length;
+    // B3: the SAME thin/verified/parked/lock eligibility clause, but with the
+    // no-yield backoff exclusion switched OFF (opts.applyNoYieldBackoff:
+    // false) — this is the full thin+verified drink count, backoff-resting
+    // rows included. cohort_resting_total is the complement:
+    // cohort_eligible_total + cohort_resting_total === this total, always.
+    const totalThinVerified = selectDrinkProducersForContentRefresh(
+      Array.from(DRINK_PRODUCER_TYPES),
+      500,
+      { applyNoYieldBackoff: false }
+    ).filter((t) => isHjemmesideVerified(t.field_provenance));
+    cohortRestingTotal = totalThinVerified.length - cohortEligibleTotal;
     targets = eligible.slice(0, limit);
   } else {
     selection = "auto";
@@ -4201,7 +4220,18 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     });
 
     const wouldWrite = Object.keys(wouldWriteActions);
-    if (wouldWrite.length === 0) return;
+    if (wouldWrite.length === 0) {
+      // Del B (dev-request 2026-09-08-drikke-no-yield-backoff): mirrors the
+      // generic content-refresh route's recordProviderContentYield(id, false)
+      // call at the equivalent "scanned but nothing extractable" point (see
+      // that route ~2503-2509) — this row reached scanned++ (above) but
+      // ended up with zero candidate fields, so bump content_no_yield_streak.
+      // Apply mode only; dry-run stays fully read-only.
+      if (apply) {
+        try { recordProviderContentYield(providerId, false); } catch { /* best-effort */ }
+      }
+      return;
+    }
 
     // Sub-slice 3i (dev-request 2026-07-30-opplevagent-claim-epost-og-
     // perfelt-laas): predict, from THIS target's own row snapshot (t — the
@@ -4276,6 +4306,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             actions[f] = wouldWriteActions[f] ?? "filled";
           }
           changed.push({ provider_id: providerId, fields: written, actions, provenance });
+          // Del B (dev-request 2026-09-08-drikke-no-yield-backoff): mirrors
+          // the generic content-refresh route's recordProviderContentYield(
+          // id, true) call at the equivalent "a real field write happened"
+          // point (see that route ~2618-2622) — resets content_no_yield_streak
+          // to 0. This branch only runs in apply mode (the `else` of the
+          // dryRun/apply split above), so no extra `apply` guard is needed.
+          try { recordProviderContentYield(providerId, true); } catch { /* best-effort */ }
         } else if (lockedCandidateFields.length > 0 && lockedCandidateFields.length === wouldWrite.length) {
           // applyGardssalgProviderContent's own per-field gate agreed with the
           // prediction above: every candidate field for this claim row was
@@ -4301,6 +4338,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // "N thin verified drink rows remain" instead of guessing from `scanned`.
     selection,
     cohort_eligible_total: cohortEligibleTotal,
+    // dev-request 2026-09-08-drikke-no-yield-backoff, Del B, B3: drink_cohort
+    // only — count of thin+verified drink rows currently excluded by the
+    // no-yield backoff. Always null outside drink_cohort mode (see
+    // cohortRestingTotal's own doc comment above). Invariant:
+    // cohort_eligible_total + cohort_resting_total === the full thin+verified
+    // drink-producer count whenever both are non-null.
+    cohort_resting_total: cohortRestingTotal,
     scanned,
     // agents_enriched: the method's PRIMARY success metric (enrichment-metode
     // slice 1) — providers that actually had >=1 field improved this run.
