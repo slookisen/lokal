@@ -522,6 +522,29 @@ export function initDentalSchema(db: Database.Database): void {
     db.exec("ALTER TABLE dental_agents ADD COLUMN brreg_address_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // ─── dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
+  //   (slice 2d): no-retry marker for POST /admin/dental/offentlig-klinikk-
+  //   hjemmeside-korrigering (src/routes/admin-dental-offentlig-klinikk-
+  //   hjemmeside-korrigering.ts) — the ONE-TIME correction pass for the
+  //   ~186-row cohort classified catalog_class='offentlig_klinikk' whose
+  //   hjemmeside was actually enriched from a fylkeskommune/kommune
+  //   directory page (isPublicDentalServiceHost(), dental-catalog-class.ts)
+  //   instead of the clinic's own site. Stamped whether or not a genuine
+  //   replacement site was found for the row — a row this one-off pass
+  //   already tried and found nothing for must not be re-fetched (free
+  //   Brreg lookup + a page fetch, sometimes a Brave search call) on every
+  //   single call. Unlike brreg_address_attempted_at just above (a 90-day
+  //   cooldown for a RECURRING cadence step), this marker has no cooldown /
+  //   TTL at all: this is a one-off backfill over a fixed, already-known
+  //   cohort, not a step that re-runs against fresh data every cycle, so
+  //   there is nothing to gain from ever re-trying a row this pass already
+  //   visited — a human can always re-open a specific row by clearing this
+  //   column by hand if a later Brreg registration makes a retry worthwhile.
+  //   Idempotent ALTER — error = already present.
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN offentlig_klinikk_korrigering_attempted_at TEXT");
+  } catch { /* already present */ }
+
   // ─── dev-request 2026-09-02-dental-verifier-website-ownership ────────────
   //   Dental has NO automated verifier: verification_status='verified' is
   //   today only ever set by hand (92 of 6975 rows, all manual). This adds

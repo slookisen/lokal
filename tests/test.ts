@@ -41897,6 +41897,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning,
+// slice 2d: POST /admin/dental/offentlig-klinikk-hjemmeside-korrigering.
+// Registered as its OWN runSerial() link, immediately after the
+// hjemmeside-discovery block right above (same reasoning as that block's own
+// comment): this route calls discoverDentalClinicWebsite, which reaches into
+// the SAME experience-store.ts / brreg-client.ts shared-per-process state
+// that block's comment documents — running here, right after the block that
+// already established a safe position relative to that state, avoids
+// reintroducing the exact timing hazard described there.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning (slice 2d): POST /admin/dental/offentlig-klinikk-hjemmeside-korrigering ──");
+  try {
+    const { runAdminDentalOffentligKlinikkKorrigeringTests } = require("../src/routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.test") as
+      typeof import("../src/routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.test");
+    const dok = await runAdminDentalOffentligKlinikkKorrigeringTests({ log: false });
+    passed += dok.passed;
+    failed += dok.failed;
+    for (const f of dok.failures) failures.push("admin-dental-offentlig-klinikk-hjemmeside-korrigering: " + f);
+    console.log(`  admin-dental-offentlig-klinikk-hjemmeside-korrigering: ${dok.passed} passed, ${dok.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-offentlig-klinikk-hjemmeside-korrigering: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-08-15 (session, Daniel-observed live bug): the "Ny e-post" compose
 // modal in admin-crm.html never sent `vertical`, so every manual dashboard
 // send 400'd against composeSchema's required-no-default vertical (the
