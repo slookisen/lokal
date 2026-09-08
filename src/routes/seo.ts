@@ -1575,9 +1575,11 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // "Erga Gårdsutsalg": 7 random Trondheim hits instead of the 1 in Kleppe).
     const MIN_RESULTS = 3;
     let geoDropped = !!discoverMeta.geoRelaxed;
-    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: same
-    // out-param as /api/marketplace/search — see the note there.
-    const tagsDropped = !!discoverMeta.tagsRelaxed;
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: seeded
+    // from the first call, but RE-CAPTURED at every ladder step below — see
+    // the matching comment in /api/marketplace/search (marketplace.ts) for
+    // why a stale first-call flag is wrong once the ladder actually widens.
+    let tagsDropped = !!discoverMeta.tagsRelaxed;
     let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
@@ -1590,15 +1592,19 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
         if (productTerms) (expanded as any)._productTerms = productTerms;
         if (nameQuery) (expanded as any)._nameQuery = nameQuery;
-        results = marketplaceRegistry.discover(expanded);
+        const expandedMeta: DiscoverMeta = {};
+        results = marketplaceRegistry.discover(expanded, expandedMeta);
         appliedRadiusKm = radius;
+        tagsDropped = !!expandedMeta.tagsRelaxed;
       }
       if (results.length < MIN_RESULTS) {
         const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
         if (productTerms) (noGeo as any)._productTerms = productTerms;
         if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
-        results = marketplaceRegistry.discover(noGeo);
+        const noGeoMeta: DiscoverMeta = {};
+        results = marketplaceRegistry.discover(noGeo, noGeoMeta);
         geoDropped = true;
+        tagsDropped = !!noGeoMeta.tagsRelaxed;
       }
     }
     if (geoDropped) appliedRadiusKm = undefined;

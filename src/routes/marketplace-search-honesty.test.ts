@@ -117,6 +117,13 @@ const SEED: SeedAgent[] = [
   // Organic — one genuinely tagged, so "økologisk"/"organic" keeps its
   // selective effect where the data is real (AC4).
   { id: "a-fisk-organic", name: "Øko Fiskehus", city: "Kristiansund", lat: null, lng: null, categories: ["fish"], trust: 0.72, tags: ["organic"] },
+  // Independent-review finding on PR #823: the geo auto-expand ladder must
+  // re-capture tagsRelaxed per step, not just the first (narrow) call — an
+  // untagged near producer + a genuinely "budget"-tagged far producer, so
+  // the default-radius call sees only the untagged one (tags dropped) and
+  // the widened ladder call sees both (tags genuinely applied).
+  { id: "a-alta-near",  name: "Alta Nærmeieri",   city: "Alta", lat: 69.9789, lng: 23.2716, categories: ["dairy"], trust: 0.50 },
+  { id: "a-alta-far",   name: "Fjernost Billig",  city: "Alta", lat: 70.3289, lng: 23.2716, categories: ["dairy"], trust: 0.50, tags: ["budget"] },
 ];
 
 function seedAgents(db: Database.Database): void {
@@ -485,6 +492,30 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
       const names: string[] = r.body.results.map((x: any) => x.agent.name);
       assertTrue(!names.includes("Tønsberg Birøkt"),
         `tags: category filter (fish vs honey) is unaffected — a honey producer is still excluded (got ${names.join(", ")})`);
+    }
+
+    // Independent-review finding (PR #823): the geo auto-expand ladder must
+    // re-capture tagsRelaxed at EVERY step, not just the first (narrow) call.
+    // `billig ost` from right next to the untagged near producer, default
+    // radius (30 km): the first call sees only the untagged producer (tags
+    // genuinely dropped), then the ladder widens and finds real
+    // "budget"-tagged producers — the FINAL response must not still claim
+    // "tags" was dropped once a real tag match has been found.
+    {
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "billig ost", lat: "69.9789", lng: "23.2716" },
+      });
+      assertEq(r.status, 200, "tags(ladder): `billig ost` near Alta → 200");
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Fjernost Billig"),
+        `tags(ladder): the genuinely "budget"-tagged far producer is found once the ladder widens (got ${names.join(", ")})`);
+      assertTrue(!names.includes("Alta Nærmeieri"),
+        `tags(ladder): the untagged near producer is correctly excluded once a real tag match exists (got ${names.join(", ")})`);
+      assertTrue(!(Array.isArray(r.body.relaxed_filters) && r.body.relaxed_filters.includes("tags")),
+        `tags(ladder): relaxed_filters must NOT still claim "tags" was dropped — a real tag match was found by the widened call (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(!(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note)),
+        `tags(ladder): no tags-dropped note once the widened call genuinely applied the tag filter (got ${JSON.stringify(r.body.note)})`);
     }
 
     // Regression guard: a query whose CATEGORY filter already emptied the

@@ -769,11 +769,16 @@ router.get("/search", async (req: Request, res: Response) => {
   // Seeded from discover()'s own relaxation (B1) so the name-search path and
   // the auto-expand path report identically.
   let geoDropped = !!discoverMeta.geoRelaxed;
-  // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: discover()
-  // itself decides whether the tag filter had to be dropped (it may run
-  // again below via the geo ladder, but none of those re-runs touch tags —
-  // this first call's meta is authoritative for the whole request).
-  const tagsDropped = !!discoverMeta.tagsRelaxed;
+  // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: seeded from
+  // the first call, but RE-CAPTURED at every ladder step below — tag-filter
+  // membership is monotonic in the candidate set, so a query can legitimately
+  // go from "tags dropped" (narrow radius, zero tag matches) to "tags
+  // genuinely applied" (wider radius, real matches) as the ladder widens.
+  // Independent review (PR #823) caught this stale-flag case live: a query
+  // whose first (narrow) discover() call dropped the tag filter, then found
+  // a genuine tag match only after the ladder widened, still reported
+  // relaxed_filters:["tags"] for a result that WAS honestly tag-filtered.
+  let tagsDropped = !!discoverMeta.tagsRelaxed;
 
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
     // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
@@ -788,8 +793,10 @@ router.get("/search", async (req: Request, res: Response) => {
         offset: 0,
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
-      results = marketplaceRegistry.discover(expandedQuery);
+      const expandedMeta: DiscoverMeta = {};
+      results = marketplaceRegistry.discover(expandedQuery, expandedMeta);
       appliedRadiusKm = expandedRadius;
+      tagsDropped = !!expandedMeta.tagsRelaxed;
     }
 
     // Last resort: no geo filter at all (show whole country)
@@ -802,7 +809,9 @@ router.get("/search", async (req: Request, res: Response) => {
         offset: 0,
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
-      results = marketplaceRegistry.discover(noGeoQuery);
+      const noGeoMeta: DiscoverMeta = {};
+      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta);
+      tagsDropped = !!noGeoMeta.tagsRelaxed;
       geoDropped = true;
       appliedRadiusKm = undefined;
     }
