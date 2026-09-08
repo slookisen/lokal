@@ -66,6 +66,12 @@ export function buildSearchNote(opts: {
   needsLocation?: boolean;
   /** Set when the widened result set came from the name-match branch (review B1). */
   nameQuery?: string;
+  /**
+   * Set when discover()'s tag filter (fersk/billig/sesong/lokal/økologisk …)
+   * was dropped because it would otherwise have emptied the result set.
+   * dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter.
+   */
+  tagsDropped?: boolean;
 }): string | undefined {
   if (opts.needsLocation) {
     return (
@@ -74,21 +80,31 @@ export function buildSearchNote(opts: {
       "results but we have no position — supply lat/lng (or allow browser location)."
     );
   }
+  const notes: string[] = [];
   if (opts.geoDropped) {
     const place = opts.geoPlaceLabel || "stedet du søkte på";
     // A name search that had to be widened says so in its own terms — "no
     // «gårdsutsalg» near you" is a different, and more useful, statement than
     // "nothing near you at all".
     if (opts.nameQuery) {
-      return (
+      notes.push(
         `Ingen treff på «${opts.nameQuery}» nær ${place} — viser navnetreff fra hele Norge. / ` +
         `No «${opts.nameQuery}» matches near ${place} — showing name matches from all of Norway.`
       );
+    } else {
+      notes.push(
+        `Ingen treff nær ${place} — utvidet til hele Norge. / ` +
+        `No matches near ${place} — expanded to all of Norway.`
+      );
     }
-    return (
-      `Ingen treff nær ${place} — utvidet til hele Norge. / ` +
-      `No matches near ${place} — expanded to all of Norway.`
+  }
+  if (opts.tagsDropped) {
+    notes.push(
+      "Et av ordene i søket (f.eks. «fersk», «billig», «sesong») er ikke registrert som data hos " +
+      "nok produsenter til å brukes som filter her — det ble sluppet for å vise treff. / " +
+      "One of the search words (e.g. «fresh», «budget», «seasonal») isn't recorded data for enough " +
+      "producers to filter on here — that filter was dropped to show matches."
     );
   }
-  return undefined;
+  return notes.length > 0 ? notes.join(" ") : undefined;
 }

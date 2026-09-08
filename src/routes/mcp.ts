@@ -18,7 +18,7 @@ import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { addAiUtmParams } from "../utils/url-utm";
@@ -307,12 +307,21 @@ export function registerTools(
         };
       }
 
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
+      // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: this is
+      // the actual live-mounted MCP search tool (the ChatGPT app calls it
+      // directly), so it needs the same honest-drop signal as the REST/web
+      // search surfaces — not just the underlying filter fix.
+      const discoverMeta: DiscoverMeta = {};
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta);
 
       if (!results?.length) {
         const where = hasCoords ? `innenfor ${parsed.maxDistanceKm} km` : `"${q}"`;
         return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
+
+      const tagsRelaxedLine = discoverMeta.tagsRelaxed
+        ? "\u{1F3F7}️ Et av søkeordene (f.eks. «fersk», «billig», «sesong») er ikke registrert som data hos nok produsenter til å brukes som filter — det ble sluppet for å vise treff. / One of the search words (e.g. «fresh», «budget», «seasonal») isn't recorded data for enough producers to filter on — that filter was dropped to show matches.\n\n"
+        : "";
 
       // dev-request 2026-07-25 fix 0g(ii) — SECURITY. This used to call
       // startConversation() for the top 2 matches on EVERY invocation, despite
@@ -375,7 +384,7 @@ export function registerTools(
         }
       });
 
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+      return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
     }
   );
 

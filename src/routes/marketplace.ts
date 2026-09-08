@@ -769,6 +769,11 @@ router.get("/search", async (req: Request, res: Response) => {
   // Seeded from discover()'s own relaxation (B1) so the name-search path and
   // the auto-expand path report identically.
   let geoDropped = !!discoverMeta.geoRelaxed;
+  // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: discover()
+  // itself decides whether the tag filter had to be dropped (it may run
+  // again below via the geo ladder, but none of those re-runs touch tags —
+  // this first call's meta is authoritative for the whole request).
+  const tagsDropped = !!discoverMeta.tagsRelaxed;
 
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
     // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
@@ -928,9 +933,11 @@ router.get("/search", async (req: Request, res: Response) => {
     // because of the auto-expand ladder above).
     geoRadiusKm: geoFiltered ? appliedRadiusKm : undefined,
     // Same shape discoverExperiencesRelaxed() already uses on OpplevAgent.
-    relaxed_filters: geoDropped ? ["geo"] : undefined,
+    relaxed_filters: geoDropped || tagsDropped
+      ? [...(geoDropped ? ["geo"] : []), ...(tagsDropped ? ["tags"] : [])]
+      : undefined,
     needs_location: needsLocation || undefined,
-    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery }),
+    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery, tagsDropped }),
     count: enrichedResults.length,
     results: enrichedResults,
     conversations,
