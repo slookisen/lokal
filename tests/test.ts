@@ -42942,3 +42942,33 @@ runSerial(async () => {
     failures.push("gardssalg-drink-no-yield-backoff: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+// backoff, Del A: drink-producer visit_text/opening_hours_text extraction on
+// top of POST /admin/gardssalg-content-refresh — A1 (extended VISIT_KEYWORDS,
+// covered directly in search-enrich.test.ts), A2 (need-driven fallback-path
+// ordering for products/about-already-filled rows), A3 (LLM-generated
+// visit_text: trigger → generateGardssalgVisitFromSource → sentinel/judge →
+// write, with the additive field_diagnostic "llm_generated" outcome), A4
+// (deterministic JSON-LD openingHours/openingHoursSpecification extraction,
+// tried before the hours LLM), and A5 (GARDSSALG_VISIT_LLM_ENABLED kill
+// switch) — plus the owner-lock/manual-lock guarantee on the new write path.
+// Own in-memory-db + globalThis.fetch mock harness (mirrors opplevelser-
+// gardssalg-opening-hours-llm.test.ts's own harness). Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-backoff, Del A: gårdssalg/drink visit_text + opening-hours extraction ──");
+  try {
+    const { runOpplevelserGardssalgDrinkVisitUttrekkTests } =
+      require("../src/routes/opplevelser-gardssalg-drink-visit-uttrekk.test") as
+        typeof import("../src/routes/opplevelser-gardssalg-drink-visit-uttrekk.test");
+    const gdvu = await runOpplevelserGardssalgDrinkVisitUttrekkTests({ log: false });
+    passed += gdvu.passed;
+    failed += gdvu.failed;
+    for (const f of gdvu.failures) failures.push("gardssalg-drink-visit-uttrekk: " + f);
+    console.log(`  gardssalg-drink-visit-uttrekk: ${gdvu.passed} passed, ${gdvu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-drink-visit-uttrekk: unexpected error: " + String(err?.message || err));
+  }
+});

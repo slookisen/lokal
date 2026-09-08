@@ -58,6 +58,15 @@ import {
   containsMojibake,
   mojibakeSnippet,
   MOJIBAKE_SIGNATURES,
+  // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+  // backoff, Del A: A1's extended VISIT_KEYWORDS (tested indirectly via
+  // summarizeVisit), A3's free LLM-trigger gate, and A4's deterministic
+  // JSON-LD opening-hours extraction (all PURE).
+  hasVisitLlmTrigger,
+  extractOpeningHours,
+  extractJsonLdOpeningHours,
+  parseSchemaOpeningHoursString,
+  parseSchemaOpeningHoursSpecification,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -607,6 +616,135 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(!visit.includes("Hjem") && !visit.includes("Vilkår"), "summarizeVisit: Draopar-shaped fixture — nav/footer junk NOT in visit_text");
   }
   assertEq(summarizeVisit(""), "", "summarizeVisit: empty → empty");
+
+  // ── A1 (dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-
+  //    yield-backoff): one unit test PER new VISIT_KEYWORDS word — a
+  //    sentence containing the word (and nothing else keyword-like) must be
+  //    surfaced by summarizeVisit(). Each fixture sentence is >=40 chars
+  //    (summarizeVisit's own chunk-length floor) and wrapped in a plain
+  //    <p> so extractProseText has no nav/chrome to strip in the first
+  //    place. ──────────────────────────────────────────────────────────
+  {
+    const A1_WORDS: Array<[string, string]> = [
+      ["taproom", "Vi har et koselig taproom hvor du kan smake ølet vårt."],
+      ["tap room", "Kom innom vårt lille tap room og prøv de nyeste bryggene."],
+      ["gårdspub", "Besøk vår gårdspub for en rolig kveld med lokalt øl."],
+      ["bryggeripub", "Vår bryggeripub ligger rett ved siden av bryggeriet selv."],
+      ["utsalg", "Vi driver et lite utsalg der du kan kjøpe med deg flasker hjem."],
+      ["gårdsutsalg", "Kom innom vårt gårdsutsalg for å handle direkte fra produsenten."],
+      ["vinsmaking", "Vi arrangerer vinsmaking hver lørdag i sommersesongen for besøkende."],
+      ["ølsmaking", "Book en ølsmaking hos oss og møt bryggerne som lager ølet."],
+      ["sidersmaking", "Vi tilbyr sidersmaking med utsikt over epletrærne på gården."],
+      ["smaksprøve", "Alle besøkende får en gratis smaksprøve av vårt nyeste produkt."],
+      ["omvisninger", "Vi holder faste omvisninger på gården hver helg gjennom sommeren."],
+      ["besøkssenter", "Vårt besøkssenter er åpent for publikum store deler av året."],
+      ["besøk oss", "Du kan besøk oss når som helst i åpningstiden for en prat."],
+      ["kom innom", "Kom innom for en prat og en smak av det vi lager på gården."],
+      ["drop-in", "Vi har drop-in hver fredag, ingen påmelding nødvendig for besøket."],
+      ["åpen gård", "Vi arrangerer åpen gård en helg hver høst med aktiviteter for alle."],
+    ];
+    for (const [word, sentence] of A1_WORDS) {
+      const html = `<html><body><main><p>${sentence}</p></main></body></html>`;
+      const visit = summarizeVisit(html);
+      assertTrue(
+        visit.toLowerCase().includes(word.toLowerCase()),
+        `A1: VISIT_KEYWORDS word "${word}" — summarizeVisit surfaces a sentence containing it`,
+      );
+    }
+  }
+
+  // ── A3: hasVisitLlmTrigger — free, deterministic yes/no gate. ───────────
+  assertEq(hasVisitLlmTrigger(""), false, "hasVisitLlmTrigger: empty string → false");
+  assertTrue(hasVisitLlmTrigger("Vi har et lite taproom på gården."), "hasVisitLlmTrigger: A1 keyword hit ('taproom') → true");
+  assertTrue(hasVisitLlmTrigger("Vi holder åpent hver mandag hele sommeren."), "hasVisitLlmTrigger: bare weekday name ('mandag'), no time → true");
+  assertTrue(hasVisitLlmTrigger("Se prisliste og annen info her: 10:00 er tidlig nok."), "hasVisitLlmTrigger: bare clock-time token ('10:00'), no weekday/keyword → true");
+  assertEq(
+    hasVisitLlmTrigger("Vi dyrker epler og lager most av dem hvert år på gården vår."),
+    false,
+    "hasVisitLlmTrigger: no keyword, no weekday, no time → false",
+  );
+
+  // ── A4: extractJsonLdOpeningHours + its two parsers. ─────────────────────
+  assertEq(
+    parseSchemaOpeningHoursString("Mo-Fr 09:00-17:00"),
+    "Mandag–Fredag 09:00–17:00",
+    "parseSchemaOpeningHoursString: 'Mo-Fr 09:00-17:00' → Norwegian day-range snippet",
+  );
+  assertEq(
+    parseSchemaOpeningHoursString("Sa 10:00-14:00"),
+    "Lørdag 10:00–14:00",
+    "parseSchemaOpeningHoursString: single-day 'Sa 10:00-14:00' → Norwegian snippet",
+  );
+  assertEq(
+    parseSchemaOpeningHoursString("Mo,We,Fr 08:00-16:00"),
+    "Mandag, Onsdag, Fredag 08:00–16:00",
+    "parseSchemaOpeningHoursString: comma-separated day list → Norwegian snippet",
+  );
+  assertEq(parseSchemaOpeningHoursString("not a valid spec"), null, "parseSchemaOpeningHoursString: unparseable string → null, never guessed");
+  assertEq(
+    parseSchemaOpeningHoursSpecification([{ dayOfWeek: ["Monday", "Tuesday"], opens: "09:00", closes: "17:00" }]),
+    "Mandag, Tirsdag 09:00–17:00",
+    "parseSchemaOpeningHoursSpecification: bare day tokens → Norwegian snippet",
+  );
+  assertEq(
+    parseSchemaOpeningHoursSpecification([
+      { dayOfWeek: "http://schema.org/Saturday", opens: "10:00", closes: "14:00" },
+    ]),
+    "Lørdag 10:00–14:00",
+    "parseSchemaOpeningHoursSpecification: full schema.org URL day form → Norwegian snippet",
+  );
+  assertEq(parseSchemaOpeningHoursSpecification([{ opens: "09:00" }]), null, "parseSchemaOpeningHoursSpecification: missing closes/dayOfWeek → null (skipped, never guessed)");
+  assertEq(parseSchemaOpeningHoursSpecification([]), null, "parseSchemaOpeningHoursSpecification: empty array → null");
+
+  {
+    // openingHoursSpecification form.
+    const htmlSpec =
+      `<html><head><script type="application/ld+json">` +
+      `{"@context":"https://schema.org","@type":"LocalBusiness","name":"Test Gard",` +
+      `"openingHoursSpecification":[{"@type":"OpeningHoursSpecification","dayOfWeek":["Monday","Tuesday","Wednesday","Thursday","Friday"],"opens":"09:00","closes":"17:00"}]}` +
+      `</script></head><body></body></html>`;
+    assertEq(
+      extractJsonLdOpeningHours(htmlSpec),
+      "Mandag, Tirsdag, Onsdag, Torsdag, Fredag 09:00–17:00",
+      "extractJsonLdOpeningHours: openingHoursSpecification form parsed from a real <script> block",
+    );
+  }
+  {
+    // openingHours shorthand form (array of strings).
+    const htmlShorthand =
+      `<html><head><script type="application/ld+json">` +
+      `{"@context":"https://schema.org","@type":"LocalBusiness","name":"Test Gard 2",` +
+      `"openingHours":["Mo-Fr 10:00-18:00","Sa 10:00-14:00"]}` +
+      `</script></head><body></body></html>`;
+    assertEq(
+      extractJsonLdOpeningHours(htmlShorthand),
+      "Mandag–Fredag 10:00–18:00, Lørdag 10:00–14:00",
+      "extractJsonLdOpeningHours: openingHours shorthand array form parsed from a real <script> block",
+    );
+  }
+  assertEq(extractJsonLdOpeningHours(""), null, "extractJsonLdOpeningHours: empty HTML → null");
+  assertEq(
+    extractJsonLdOpeningHours("<html><body><p>No JSON-LD here at all.</p></body></html>"),
+    null,
+    "extractJsonLdOpeningHours: no <script type=application/ld+json> block at all → null",
+  );
+  assertEq(
+    extractJsonLdOpeningHours(`<html><head><script type="application/ld+json">{not valid json</script></head></html>`),
+    null,
+    "extractJsonLdOpeningHours: malformed JSON-LD block → null, never throws",
+  );
+
+  // ── A4 (extended trigger): extractOpeningHours() already fires on
+  //    "åpningstider"/"åpent" co-located with a clock-time token even with
+  //    NO weekday name anywhere on the page (Trigger B in that function) —
+  //    verified here directly so this dev-request's own acceptance
+  //    criterion ("Unit test ... for the extended trigger") has explicit,
+  //    current coverage of that no-weekday case.
+  {
+    const noWeekdayHours = extractOpeningHours("Se våre åpningstider: 10:00-18:00 alle dager i sommersesongen.");
+    assertTrue(noWeekdayHours !== null, "extractOpeningHours: 'åpningstider' + clock-time token, NO weekday named anywhere → still triggers (Trigger B)");
+    assertTrue(!!noWeekdayHours && noWeekdayHours.includes("10:00-18:00"), "extractOpeningHours: no-weekday trigger snippet carries the actual time range");
+  }
 
   // ── PR-24a: mapToPlatformCategories — extractor output → platform vocab ─────
   // Built from the live profile-removal complaints. Each case runs the SAME

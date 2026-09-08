@@ -1159,6 +1159,14 @@ export function looksLikeParkedDomainPage(html: string): boolean {
 const VISIT_KEYWORDS: readonly string[] = [
   "omvisning", "smaking", "besøk", "degustasjon", "tasting",
   "åpent gårdsutsalg", "gårdsbutikk",
+  // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+  // backoff, Del A1: drink-specific visit signals (taproom/utsalg/smaking-
+  // adjacent vocabulary a drink producer's own site actually uses). NO
+  // generic words ("velkommen", "bar" alone) — see the dev-request's own
+  // false-positive warning; every entry here is drink-visit-specific.
+  "taproom", "tap room", "gårdspub", "bryggeripub", "utsalg", "gårdsutsalg",
+  "vinsmaking", "ølsmaking", "sidersmaking", "smaksprøve", "omvisninger",
+  "besøkssenter", "besøk oss", "kom innom", "drop-in", "åpen gård",
 ];
 
 /**
@@ -1263,6 +1271,196 @@ export function extractOpeningHours(text: string): string | null {
     }
   }
 
+  return null;
+}
+
+// ─── hasVisitLlmTrigger (dev-request 2026-09-07-drikke-berikelse-besokstekst-
+//     uttrekk-og-no-yield-backoff, Del A3) ─────────────────────────────────
+// Free, deterministic yes/no gate for whether a page's crawled visible text
+// is worth an LLM call for a GENERATED visit_text at all — mirrors
+// extractOpeningHours()'s own role as "a free trigger, never the written
+// value" (see that function's doc comment / spec C above), but for the
+// visit-text generator (routes/opplevelser.ts's generateGardssalgVisit
+// FromSource) rather than the opening-hours one. Fires on either:
+//   - a VISIT_KEYWORDS hit (the A1 list above — drink-visit-specific, no
+//     generic false-positive-prone words), OR
+//   - a bare Norwegian weekday name (no time needed — a raw weekday mention
+//     alone is a reasonable signal the page discusses when the place is
+//     open/visitable), OR
+//   - a clock-time-like token (e.g. "10:00" or "10-18") alone.
+// Any ONE of the three is enough — this is a narrower, cheaper gate than
+// extractOpeningHours()'s own snippet-building logic (which requires two
+// signals CO-LOCATED within an 80-char window to build a value); here we
+// only need a single yes/no answer to "is an LLM call worth trying", so a
+// lone signal anywhere in the page is sufficient. PURE — no network, no
+// state (a plain, non-global regex is used for the weekday check
+// specifically so repeated calls never trip over OPENING_HOURS_WEEKDAY_RE's
+// own shared `g`-flag lastIndex state).
+const VISIT_LLM_WEEKDAY_RE = /mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag/i;
+export function hasVisitLlmTrigger(text: string): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (VISIT_KEYWORDS.some((kw) => lower.includes(kw))) return true;
+  if (VISIT_LLM_WEEKDAY_RE.test(text)) return true;
+  if (OPENING_HOURS_TIME_RE.test(text)) return true;
+  return false;
+}
+
+// ─── extractJsonLdOpeningHours (dev-request 2026-09-07-drikke-berikelse-
+//     besokstekst-uttrekk-og-no-yield-backoff, Del A4) ─────────────────────
+// Deterministic, zero-LLM-cost extraction of schema.org opening-hours markup
+// from a page's <script type="application/ld+json"> blocks, tried BEFORE
+// the LLM trigger in the caller (routes/opplevelser.ts's processOne) — a hit
+// here means generateGardssalgOpeningHoursFromSource is never called at all.
+// Normalizes into the SAME short-Norwegian-sentence shape that function's
+// own LLM output already takes (e.g. "Mandag–fredag 09:00–17:00"), so the
+// downstream judge/gate/write path treats a JSON-LD hit identically to an
+// LLM-produced value — the caller's field_diagnostic still reports it as
+// the ordinary "filled" outcome (deterministic), never "llm_generated"
+// (reserved for the visit_text LLM path only).
+//
+// Two JSON-LD shapes are recognized, per schema.org's own two documented
+// forms for LocalBusiness.openingHours(Specification):
+//   - `openingHours`: a Google/schema.org shorthand string or string array,
+//     e.g. "Mo-Fr 09:00-17:00" or ["Mo-Fr 09:00-17:00", "Sa 10:00-14:00"].
+//   - `openingHoursSpecification`: an array of OpeningHoursSpecification
+//     objects, e.g. {"@type":"OpeningHoursSpecification","dayOfWeek":
+//     ["Monday","Tuesday"],"opens":"09:00","closes":"17:00"} — dayOfWeek may
+//     be a bare token ("Monday"), a full schema.org URL
+//     ("http://schema.org/Monday"), or an array of either.
+// Fails OPEN (returns null) on anything malformed/ambiguous/unparseable —
+// same never-guess discipline as parseOpeningHoursText (gardssalg-opening-
+// hours.ts): a page with malformed JSON-LD simply falls through to the
+// existing regex-trigger/LLM path, never a wrong deterministic write. PURE
+// — no network; the caller passes already-fetched HTML.
+
+const SCHEMA_DAY_TO_NORSK: Record<string, string> = {
+  Monday: "Mandag", Tuesday: "Tirsdag", Wednesday: "Onsdag", Thursday: "Torsdag",
+  Friday: "Fredag", Saturday: "Lørdag", Sunday: "Søndag",
+  Mo: "Mandag", Tu: "Tirsdag", We: "Onsdag", Th: "Torsdag",
+  Fr: "Fredag", Sa: "Lørdag", Su: "Søndag",
+};
+
+/** schema.org day token → Norwegian day name, accepting a bare token
+ *  ("Monday"/"Mo") or a full "http(s)://schema.org/Monday" URL. Returns null
+ *  on anything else — never guessed. PURE. */
+function schemaDayToNorsk(day: string): string | null {
+  const trimmed = (day || "").trim();
+  const urlMatch = /schema\.org\/(\w+)\s*$/i.exec(trimmed);
+  const token = urlMatch ? urlMatch[1]! : trimmed;
+  return SCHEMA_DAY_TO_NORSK[token] ?? null;
+}
+
+/**
+ * Parses ONE `openingHours` shorthand string (e.g. "Mo-Fr 09:00-17:00" or
+ * "Mo,Tu,We 09:00-17:00") into a Norwegian snippet (e.g.
+ * "Mandag–fredag 09:00–17:00"). Returns null on anything it cannot
+ * confidently parse (multiple time ranges, an unrecognized day token, a
+ * malformed time) — fail-open, never guessed. PURE.
+ */
+export function parseSchemaOpeningHoursString(spec: string): string | null {
+  const m = /^\s*([A-Za-z,\-]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*$/.exec((spec || "").trim());
+  if (!m) return null;
+  const [, daysPart, open, close] = m as unknown as [string, string, string, string];
+  const dayTokens = daysPart.split(",").map((d) => d.trim()).filter(Boolean);
+  if (dayTokens.length === 0) return null;
+  const norskParts: string[] = [];
+  for (const token of dayTokens) {
+    const rangeMatch = /^(\w{2,8})-(\w{2,8})$/.exec(token);
+    if (rangeMatch) {
+      const start = schemaDayToNorsk(rangeMatch[1]!);
+      const end = schemaDayToNorsk(rangeMatch[2]!);
+      if (!start || !end) return null;
+      norskParts.push(start === end ? start : `${start}–${end}`);
+    } else {
+      const single = schemaDayToNorsk(token);
+      if (!single) return null;
+      norskParts.push(single);
+    }
+  }
+  return `${norskParts.join(", ")} ${open}–${close}`;
+}
+
+/** One entry of a schema.org `openingHoursSpecification` array. */
+export interface SchemaOpeningHoursSpecEntry {
+  dayOfWeek?: string | string[];
+  opens?: string;
+  closes?: string;
+}
+
+/**
+ * Parses a schema.org `openingHoursSpecification` array into a Norwegian
+ * snippet (multiple distinct time ranges joined with "; "). Entries missing
+ * opens/closes/dayOfWeek, or naming a day token this module doesn't
+ * recognize, are silently skipped (not guessed) — an empty result after
+ * skipping returns null, never an empty-but-truthy string. PURE.
+ */
+export function parseSchemaOpeningHoursSpecification(
+  specs: readonly SchemaOpeningHoursSpecEntry[]
+): string | null {
+  const parts: string[] = [];
+  for (const s of specs) {
+    if (!s || typeof s !== "object") continue;
+    const opens = typeof s.opens === "string" ? s.opens.trim().slice(0, 5) : null;
+    const closes = typeof s.closes === "string" ? s.closes.trim().slice(0, 5) : null;
+    if (!opens || !closes || !/^\d{1,2}:\d{2}$/.test(opens) || !/^\d{1,2}:\d{2}$/.test(closes)) continue;
+    const daysRaw = Array.isArray(s.dayOfWeek) ? s.dayOfWeek : s.dayOfWeek ? [s.dayOfWeek] : [];
+    const daysNo = daysRaw
+      .map((d) => (typeof d === "string" ? schemaDayToNorsk(d) : null))
+      .filter((d): d is string => !!d);
+    if (daysNo.length === 0) continue;
+    parts.push(`${daysNo.join(", ")} ${opens}–${closes}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : null;
+}
+
+const JSON_LD_SCRIPT_RE = /<script[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+
+/**
+ * Scans a page's HTML for `<script type="application/ld+json">` blocks and
+ * returns the first successfully-parsed opening-hours value, checking
+ * `openingHoursSpecification` before the shorthand `openingHours` on each
+ * JSON-LD node (the specification form is more structured/less ambiguous).
+ * Handles a top-level array of nodes and a `@graph` wrapper, in addition to
+ * a single bare node. A malformed/absent block, or a block with neither
+ * property, is simply skipped — returns null only once every block has been
+ * tried and none yielded anything. PURE — no network.
+ */
+export function extractJsonLdOpeningHours(html: string): string | null {
+  if (!html) return null;
+  JSON_LD_SCRIPT_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = JSON_LD_SCRIPT_RE.exec(html))) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(match[1]!);
+    } catch {
+      continue; // malformed JSON-LD block — skip, never guess
+    }
+    const nodes: unknown[] = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object" && Array.isArray((parsed as any)["@graph"])
+        ? (parsed as any)["@graph"]
+        : [parsed];
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const n = node as Record<string, unknown>;
+      if (n.openingHoursSpecification) {
+        const specs = Array.isArray(n.openingHoursSpecification)
+          ? (n.openingHoursSpecification as SchemaOpeningHoursSpecEntry[])
+          : [n.openingHoursSpecification as SchemaOpeningHoursSpecEntry];
+        const fromSpec = parseSchemaOpeningHoursSpecification(specs);
+        if (fromSpec) return fromSpec;
+      }
+      if (n.openingHours) {
+        const raws = Array.isArray(n.openingHours) ? (n.openingHours as string[]) : [n.openingHours as string];
+        const results = raws
+          .map((r) => (typeof r === "string" ? parseSchemaOpeningHoursString(r) : null))
+          .filter((r): r is string => !!r);
+        if (results.length > 0) return results.join(", ");
+      }
+    }
+  }
   return null;
 }
 

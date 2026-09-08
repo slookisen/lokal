@@ -925,9 +925,28 @@ export function runOpplevelserGardssalgContentAuditTests(
           content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
         });
 
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
           const urlStr = String(url);
           if (urlStr.includes("api.anthropic.com")) {
+            // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-
+            // no-yield-backoff, Del A3: this fixture's one real sentence
+            // genuinely contains "sidersmaking" — an A1 VISIT_KEYWORDS word
+            // — so hasVisitLlmTrigger() now legitimately fires once the #313
+            // dedup guard nulls out candidateVisit below (the exact scenario
+            // A3 exists for: extraction found something, but not a DISTINCT
+            // visit_text). This block's own point is the dedup guard, not
+            // A3, so the visit-generator prompt is answered with its
+            // sentinel here — keeping visit_text genuinely blank (l3/l7/l9
+            // below) for the reason THIS test is about, not because a judge
+            // happened to reject an LLM candidate.
+            const body = init?.body ? JSON.parse(init.body) : {};
+            const prompt: string = body?.messages?.[0]?.content ?? "";
+            if (prompt.includes("hva et besøk hos gårdsprodusenten")) {
+              return {
+                ok: true, status: 200,
+                json: async () => ({ content: [{ type: "text", text: "UTILSTREKKELIG_GRUNNLAG" }] }),
+              } as unknown as Response;
+            }
             return {
               ok: true,
               status: 200,
