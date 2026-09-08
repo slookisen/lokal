@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { agentCardService, store } from "../services";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
+import { buildSearchNote } from "../utils/geo-query";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
@@ -286,7 +287,14 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       offset: discoveryQuery.offset || 0,
     });
 
-    const results = marketplaceRegistry.discover(query);
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
+    // review finding: this A2A discovery flow (Mode 1 via parseNaturalQuery's
+    // tagMap, Modes 2/3 via caller-supplied `tags`) never read
+    // discoverMeta.tagsRelaxed — a dropped tag filter (step 4 of discover())
+    // went unreported here, unlike every other discover() caller.
+    const discoverMeta: DiscoverMeta = {};
+    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const tagsRelaxed = !!discoverMeta.tagsRelaxed;
     const durationMs = Date.now() - startTime;
 
     // Complete the task with results
@@ -340,6 +348,13 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       } catch { /* non-critical — don't break search if conv fails */ }
     }
 
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: same
+    // honest signal /search, /discover and the MCP tools already surface —
+    // present only when the tag filter was actually dropped, so a
+    // tagsRelaxed:false result is byte-identical to before this change.
+    const relaxedFilters = tagsRelaxed ? ["tags"] : undefined;
+    const note = buildSearchNote({ tagsDropped: tagsRelaxed });
+
     // A2A response format — now includes conversation links
     res.json({
       jsonrpc: "2.0",
@@ -357,6 +372,8 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
               agents: results,
               conversations,
               parsedQuery: messageText ? marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
+              relaxed_filters: relaxedFilters,
+              note,
             },
           }),
         ],

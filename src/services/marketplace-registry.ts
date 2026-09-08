@@ -55,6 +55,15 @@ import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/produc
 export interface DiscoverMeta {
   /** True when a name match was kept despite being outside query.maxDistanceKm. */
   geoRelaxed?: boolean;
+  /**
+   * True when the tag filter (step 4 of discover()) was dropped because it
+   * would otherwise have emptied an already-narrowed candidate set.
+   * dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: tagMap
+   * keywords ("fersk", "billig", "sesong" …) are descriptive words a human
+   * writes, not structured data most producers carry — as a hard filter they
+   * wiped 70-100% of otherwise-correct results with no signal that it happened.
+   */
+  tagsRelaxed?: boolean;
 }
 
 class MarketplaceRegistry {
@@ -317,13 +326,39 @@ class MarketplaceRegistry {
       );
     }
 
-    // 4. Filter by tags
-    if (query.tags && query.tags.length > 0) {
-      candidates = candidates.filter(a =>
+    // 4. Filter by tags — SOFT: dropped (not applied) when it would otherwise
+    // empty an already-narrowed candidate set.
+    //
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: unlike
+    // `categories` (step 3, real coverage — every producer has categories),
+    // tagMap's five families ("fersk"/"billig"/"sesong"/"lokal"/"økologisk" …)
+    // are descriptive words a human writes, not structured data most
+    // producers carry. Measured live 2026-09-06: `fersk laks Lofoten` → 0 of
+    // 3 otherwise-correct hits; `billig ost Oslo` → 0 of 10. Keeping the
+    // filter's ranking value when it still leaves candidates (organic/debio
+    // in particular has real, structured coverage — Debio certification — so
+    // it keeps its selective effect whenever it doesn't wipe the set), and
+    // dropping it — never silently — only when it would return nothing.
+    // Every downstream filter (skills/distance/product terms) still applies
+    // to the un-tag-filtered set; only this one step is skipped.
+    //
+    // Guarded on `candidates.length > 0` BEFORE this step: without it, a query
+    // like "billig kjøtt" where `categories` (step 3) already zeroed the set
+    // (no meat producer at all) would filter an already-empty array and still
+    // set `tagsRelaxed:true` — falsely blaming the tag filter, and falsely
+    // telling the caller "tags were dropped" for a result that stayed empty
+    // regardless. Only report a drop when tags are what caused the zero.
+    if (query.tags && query.tags.length > 0 && candidates.length > 0) {
+      const tagFiltered = candidates.filter(a =>
         query.tags!.some(tag =>
           a.tags.some(at => at.toLowerCase().includes(tag.toLowerCase()))
         )
       );
+      if (tagFiltered.length > 0) {
+        candidates = tagFiltered;
+      } else if (meta) {
+        meta.tagsRelaxed = true;
+      }
     }
 
     // 5. Filter by skills

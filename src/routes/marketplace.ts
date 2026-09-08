@@ -545,7 +545,14 @@ router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
     const query = DiscoveryQuerySchema.parse(req.body);
-    const results = marketplaceRegistry.discover(query);
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
+    // review finding: this route's own docstring documents `tags` as caller
+    // input, but it never read discoverMeta.tagsRelaxed — a dropped tag
+    // filter (step 4 of discover()) went unreported here, unlike every other
+    // discover() caller. See DiscoverMeta for why the drop happens.
+    const discoverMeta: DiscoverMeta = {};
+    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const tagsDropped = !!discoverMeta.tagsRelaxed;
 
     interactionLogger.log("discover", {
       query: JSON.stringify({ categories: query.categories, tags: query.tags }),
@@ -592,6 +599,10 @@ router.post("/discover", (req: Request, res: Response) => {
         tags: query.tags,
         maxDistanceKm: query.maxDistanceKm,
       },
+      // Same shape /search and discoverExperiencesRelaxed() (OpplevAgent) use:
+      // present only when a filter was actually dropped.
+      relaxed_filters: tagsDropped ? ["tags"] : undefined,
+      note: buildSearchNote({ tagsDropped }),
       results: enrichedResults,
       conversations,
     });
@@ -769,6 +780,16 @@ router.get("/search", async (req: Request, res: Response) => {
   // Seeded from discover()'s own relaxation (B1) so the name-search path and
   // the auto-expand path report identically.
   let geoDropped = !!discoverMeta.geoRelaxed;
+  // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: seeded from
+  // the first call, but RE-CAPTURED at every ladder step below — tag-filter
+  // membership is monotonic in the candidate set, so a query can legitimately
+  // go from "tags dropped" (narrow radius, zero tag matches) to "tags
+  // genuinely applied" (wider radius, real matches) as the ladder widens.
+  // Independent review (PR #823) caught this stale-flag case live: a query
+  // whose first (narrow) discover() call dropped the tag filter, then found
+  // a genuine tag match only after the ladder widened, still reported
+  // relaxed_filters:["tags"] for a result that WAS honestly tag-filtered.
+  let tagsDropped = !!discoverMeta.tagsRelaxed;
 
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
     // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
@@ -783,8 +804,10 @@ router.get("/search", async (req: Request, res: Response) => {
         offset: 0,
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
-      results = marketplaceRegistry.discover(expandedQuery);
+      const expandedMeta: DiscoverMeta = {};
+      results = marketplaceRegistry.discover(expandedQuery, expandedMeta);
       appliedRadiusKm = expandedRadius;
+      tagsDropped = !!expandedMeta.tagsRelaxed;
     }
 
     // Last resort: no geo filter at all (show whole country)
@@ -797,7 +820,9 @@ router.get("/search", async (req: Request, res: Response) => {
         offset: 0,
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
-      results = marketplaceRegistry.discover(noGeoQuery);
+      const noGeoMeta: DiscoverMeta = {};
+      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta);
+      tagsDropped = !!noGeoMeta.tagsRelaxed;
       geoDropped = true;
       appliedRadiusKm = undefined;
     }
@@ -928,9 +953,11 @@ router.get("/search", async (req: Request, res: Response) => {
     // because of the auto-expand ladder above).
     geoRadiusKm: geoFiltered ? appliedRadiusKm : undefined,
     // Same shape discoverExperiencesRelaxed() already uses on OpplevAgent.
-    relaxed_filters: geoDropped ? ["geo"] : undefined,
+    relaxed_filters: geoDropped || tagsDropped
+      ? [...(geoDropped ? ["geo"] : []), ...(tagsDropped ? ["tags"] : [])]
+      : undefined,
     needs_location: needsLocation || undefined,
-    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery }),
+    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery, tagsDropped }),
     count: enrichedResults.length,
     results: enrichedResults,
     conversations,

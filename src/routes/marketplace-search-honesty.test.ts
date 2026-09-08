@@ -60,7 +60,7 @@ interface RouteResult {
 
 function callRoute(
   router: any,
-  opts: { method?: string; url: string; query?: Record<string, string>; headers?: Record<string, string> },
+  opts: { method?: string; url: string; query?: Record<string, string>; headers?: Record<string, string>; body?: any },
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
     const headers = opts.headers || {};
@@ -69,6 +69,10 @@ function callRoute(
       url: opts.url,
       query: opts.query || {},
       headers,
+      // Router.handle() is driven directly here, bypassing express.json() —
+      // POST /discover reads req.body, so a body-bearing call must set it
+      // itself (mirrors what the real json() middleware would have parsed).
+      body: opts.body,
       ip: "127.0.0.1",
       get(name: string) { return headers[name.toLowerCase()]; },
     };
@@ -92,7 +96,7 @@ const VADSO = { lat: 70.0803, lng: 29.7309 };    // MAJOR_CITIES "vadsø", radiu
 
 interface SeedAgent {
   id: string; name: string; city: string; lat: number | null; lng: number | null;
-  categories: string[]; trust: number;
+  categories: string[]; trust: number; tags?: string[];
 }
 
 const SEED: SeedAgent[] = [
@@ -105,6 +109,25 @@ const SEED: SeedAgent[] = [
   { id: "a-honning-1", name: "Tønsberg Birøkt",       city: "Tønsberg",  lat: 59.2675, lng: 10.4076, categories: ["honey"], trust: 0.80 },
   { id: "a-honning-2", name: "Melhus Honning",        city: "Melhus",    lat: 63.2833, lng: 10.2833, categories: ["honey"], trust: 0.78 },
   { id: "a-honning-3", name: "Røros Honning",         city: "Røros",     lat: 62.5743, lng: 11.3834, categories: ["honey"], trust: 0.76 },
+  // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter — fish
+  // producers, none carrying the "fresh" tag (matches the live measurement:
+  // almost no producer carries these descriptive tags).
+  { id: "a-fisk-1", name: "Nordfjord Sjømat", city: "Nordfjordeid", lat: null, lng: null, categories: ["fish"], trust: 0.70 },
+  { id: "a-fisk-2", name: "Lofoten Fiskeri",  city: "Svolvær",      lat: null, lng: null, categories: ["fish"], trust: 0.65 },
+  // Dairy producers — one genuinely tagged "budget", so the hard filter must
+  // still select it (real coverage, not everyone).
+  { id: "a-meieri-budget", name: "Rimelig Gårdsost", city: "Gausdal", lat: null, lng: null, categories: ["dairy"], trust: 0.55, tags: ["budget"] },
+  { id: "a-meieri-plain",  name: "Fjellgardens Ysteri", city: "Vågå", lat: null, lng: null, categories: ["dairy"], trust: 0.60 },
+  // Organic — one genuinely tagged, so "økologisk"/"organic" keeps its
+  // selective effect where the data is real (AC4).
+  { id: "a-fisk-organic", name: "Øko Fiskehus", city: "Kristiansund", lat: null, lng: null, categories: ["fish"], trust: 0.72, tags: ["organic"] },
+  // Independent-review finding on PR #823: the geo auto-expand ladder must
+  // re-capture tagsRelaxed per step, not just the first (narrow) call — an
+  // untagged near producer + a genuinely "budget"-tagged far producer, so
+  // the default-radius call sees only the untagged one (tags dropped) and
+  // the widened ladder call sees both (tags genuinely applied).
+  { id: "a-alta-near",  name: "Alta Nærmeieri",   city: "Alta", lat: 69.9789, lng: 23.2716, categories: ["dairy"], trust: 0.50 },
+  { id: "a-alta-far",   name: "Fjernost Billig",  city: "Alta", lat: 70.3289, lng: 23.2716, categories: ["dairy"], trust: 0.50, tags: ["budget"] },
 ];
 
 function seedAgents(db: Database.Database): void {
@@ -114,13 +137,13 @@ function seedAgents(db: Database.Database): void {
        lat, lng, city, radius_km, categories, tags, skills, capabilities, languages,
        trust_score, is_active, is_verified, discovery_count, interaction_count,
        total_interactions, created_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, '1.0.0', 'producer', ?, ?, ?, ?, NULL, ?, '[]', '[]', '{}', '["no"]',
+    VALUES (?, ?, ?, ?, ?, ?, '1.0.0', 'producer', ?, ?, ?, ?, NULL, ?, ?, '[]', '{}', '["no"]',
             ?, 1, 0, 0, 0, 0, datetime('now'), datetime('now'))
   `);
   for (const a of SEED) {
     stmt.run(
       a.id, a.name, "Lokal produsent", "test", `${a.id}@example.no`, `https://${a.id}.example.no`,
-      "key-" + a.id, a.lat, a.lng, a.city, JSON.stringify(a.categories), a.trust,
+      "key-" + a.id, a.lat, a.lng, a.city, JSON.stringify(a.categories), JSON.stringify(a.tags || []), a.trust,
     );
   }
 }
@@ -419,12 +442,165 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
         "0g(ii): ?start_conversation=true is still honoured (explicit opt-in preserved)");
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter —
+    // a hverdagslig adjektiv (fersk/billig/sesong/lokal/økologisk) must
+    // never stille tømme et ellers korrekt treffbilde.
+    // ════════════════════════════════════════════════════════════════
+    for (const [q, label] of [
+      ["fersk fisk", "NO"],
+      ["fresh fish", "EN"],
+    ] as const) {
+      const r = await callRoute(router, { url: "/search", query: { q } });
+      assertEq(r.status, 200, `tags(${label}): \`${q}\` → 200`);
+      assertTrue(r.body.count >= 2,
+        `tags(${label}): \`${q}\` still returns the fish producers even though none carry the "fresh" tag (got ${r.body.count})`);
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Nordfjord Sjømat") && names.includes("Lofoten Fiskeri"),
+        `tags(${label}): both untagged fish producers survive (got ${names.join(", ")})`);
+      assertTrue(Array.isArray(r.body.relaxed_filters) && r.body.relaxed_filters.includes("tags"),
+        `tags(${label}): relaxed_filters names "tags" as dropped (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note),
+        `tags(${label}): the response says explicitly that a word-filter was dropped (got ${JSON.stringify(r.body.note)})`);
+    }
+
+    for (const [q, label] of [
+      ["billig ost", "NO"],
+      ["budget cheese", "EN"],
+    ] as const) {
+      const r = await callRoute(router, { url: "/search", query: { q } });
+      assertTrue(r.body.count > 0,
+        `tags(${label}): \`${q}\` no longer returns zero (got ${r.body.count})`);
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Rimelig Gårdsost"),
+        `tags(${label}): the genuinely "budget"-tagged producer is in the result (got ${names.join(", ")})`);
+    }
+
+    // Control: a tag with REAL, structured coverage (organic/Debio) keeps its
+    // SELECTIVE effect — it must not be softened away just because it CAN be.
+    {
+      const r = await callRoute(router, { url: "/search", query: { q: "økologisk fisk" } });
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Øko Fiskehus"),
+        `tags: organic query still finds the organic-tagged fish producer (got ${names.join(", ")})`);
+      assertTrue(!names.includes("Nordfjord Sjømat") && !names.includes("Lofoten Fiskeri"),
+        `tags: …and does NOT fall back to the untagged fish producers — real coverage stays a hard filter (got ${names.join(", ")})`);
+      assertEq(r.body.relaxed_filters, undefined,
+        "tags: a tag filter that legitimately narrowed the set reports no relaxation");
+    }
+
+    // Regression guard: `categories` (real coverage for every producer) must
+    // stay a hard filter — this dev-request only touches `tags`.
+    {
+      const r = await callRoute(router, { url: "/search", query: { q: "fisk", heleNorge: "true" } });
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(!names.includes("Tønsberg Birøkt"),
+        `tags: category filter (fish vs honey) is unaffected — a honey producer is still excluded (got ${names.join(", ")})`);
+    }
+
+    // Independent-review finding (PR #823): the geo auto-expand ladder must
+    // re-capture tagsRelaxed at EVERY step, not just the first (narrow) call.
+    // `billig ost` from right next to the untagged near producer, default
+    // radius (30 km): the first call sees only the untagged producer (tags
+    // genuinely dropped), then the ladder widens and finds real
+    // "budget"-tagged producers — the FINAL response must not still claim
+    // "tags" was dropped once a real tag match has been found.
+    {
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "billig ost", lat: "69.9789", lng: "23.2716" },
+      });
+      assertEq(r.status, 200, "tags(ladder): `billig ost` near Alta → 200");
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Fjernost Billig"),
+        `tags(ladder): the genuinely "budget"-tagged far producer is found once the ladder widens (got ${names.join(", ")})`);
+      assertTrue(!names.includes("Alta Nærmeieri"),
+        `tags(ladder): the untagged near producer is correctly excluded once a real tag match exists (got ${names.join(", ")})`);
+      assertTrue(!(Array.isArray(r.body.relaxed_filters) && r.body.relaxed_filters.includes("tags")),
+        `tags(ladder): relaxed_filters must NOT still claim "tags" was dropped — a real tag match was found by the widened call (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(!(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note)),
+        `tags(ladder): no tags-dropped note once the widened call genuinely applied the tag filter (got ${JSON.stringify(r.body.note)})`);
+    }
+
+    // Regression guard: a query whose CATEGORY filter already emptied the
+    // candidate set (no meat producer in the fixture at all) must not report
+    // tagsRelaxed — the tag filter never even ran on a non-empty set, so it
+    // is not what caused the zero and must not claim to have been dropped.
+    {
+      const r = await callRoute(router, { url: "/search", query: { q: "billig kjøtt", heleNorge: "true" } });
+      assertEq(r.body.count, 0, "tags: `billig kjøtt` still returns 0 (no meat producer exists at all)");
+      assertEq(r.body.relaxed_filters, undefined,
+        `tags: relaxed_filters is NOT ["tags"] when categories, not tags, caused the empty set (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(!(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note)),
+        "tags: no tags-dropped note when tags were never the cause");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // PR #823 round 4 / round-3 review finding: POST /api/marketplace/
+    // discover (structured REST) never read discoverMeta.tagsRelaxed — a
+    // dropped tag filter went unreported here even though the route's own
+    // docstring documents `tags` as caller input. Same fixture, same
+    // dev-request as the /search cases above.
+    // ════════════════════════════════════════════════════════════════
+    {
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["fish"], tags: ["fresh"] },
+      });
+      assertEq(r.status, 200, "discover: {fish, fresh} → 200");
+      assertTrue(r.body.count > 0,
+        `discover: still returns the untagged fish producers even though none carry "fresh" (got ${r.body.count})`);
+      const names: string[] = r.body.results.map((x: any) => x.agent.name);
+      assertTrue(names.includes("Nordfjord Sjømat") && names.includes("Lofoten Fiskeri"),
+        `discover: both untagged fish producers survive (got ${names.join(", ")})`);
+      assertTrue(Array.isArray(r.body.relaxed_filters) && r.body.relaxed_filters.includes("tags"),
+        `discover: relaxed_filters names "tags" as dropped (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note),
+        `discover: the response says explicitly that a word-filter was dropped (got ${JSON.stringify(r.body.note)})`);
+    }
+    {
+      // Control: a tag with real, structured coverage stays a selective
+      // hard filter — no relaxation, no note.
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["dairy"], tags: ["budget"] },
+      });
+      assertEq(r.status, 200, "discover: {dairy, budget} → 200");
+      // Fixture has TWO "budget"-tagged dairy producers (a-meieri-budget,
+      // a-alta-far) plus one untagged (a-meieri-plain) — only the untagged
+      // one must be excluded by a genuinely-applied hard filter.
+      const names: string[] = r.body.results.map((x: any) => x.agent.name).sort();
+      assertEq(names, ["Fjernost Billig", "Rimelig Gårdsost"],
+        `discover: only the genuinely "budget"-tagged dairy producers are returned (got ${names.join(", ")})`);
+      assertEq(r.body.relaxed_filters, undefined,
+        "discover: a tag filter that legitimately narrowed the set reports no relaxation");
+      assertEq(r.body.note, undefined, "discover: …and no note");
+    }
+    {
+      // Control: no `tags` at all in the request → byte-identical to the
+      // pre-round-4 response shape (no relaxed_filters key, no note key).
+      const r = await callRoute(router, {
+        method: "POST",
+        url: "/discover",
+        body: { categories: ["fish"] },
+      });
+      assertEq(r.status, 200, "discover: {fish} with no tags → 200");
+      // Byte-identical control: undefined (and so, over real JSON, an absent
+      // key — same as /search's relaxed_filters/note when nothing relaxed).
+      assertEq(r.body.relaxed_filters, undefined, "discover: no tags in the request → no relaxed_filters");
+      assertEq(r.body.note, undefined, "discover: …and no note");
+    }
+
     // ── pure helper: the note builder ────────────────────────────────
     assertEq(buildSearchNote({}), undefined, "note: nothing to say → undefined");
     assertTrue(/Vadsø/.test(String(buildSearchNote({ geoDropped: true, geoPlaceLabel: "Vadsø" }))),
       "note: geo-dropped note names the place");
     assertTrue(/lat\/lng/.test(String(buildSearchNote({ needsLocation: true }))),
       "note: needs-location note asks for coordinates");
+    assertTrue(/fresh|fersk/i.test(String(buildSearchNote({ tagsDropped: true }))),
+      "note: tags-dropped note explains the dropped word-filter");
   } finally {
     console.log = prevLogLevel;
     __setGeocodingFetchForTesting();

@@ -1566,6 +1566,11 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // "Erga Gårdsutsalg": 7 random Trondheim hits instead of the 1 in Kleppe).
     const MIN_RESULTS = 3;
     let geoDropped = !!discoverMeta.geoRelaxed;
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: seeded
+    // from the first call, but RE-CAPTURED at every ladder step below — see
+    // the matching comment in /api/marketplace/search (marketplace.ts) for
+    // why a stale first-call flag is wrong once the ladder actually widens.
+    let tagsDropped = !!discoverMeta.tagsRelaxed;
     let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
@@ -1578,15 +1583,19 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
         if (productTerms) (expanded as any)._productTerms = productTerms;
         if (nameQuery) (expanded as any)._nameQuery = nameQuery;
-        results = marketplaceRegistry.discover(expanded);
+        const expandedMeta: DiscoverMeta = {};
+        results = marketplaceRegistry.discover(expanded, expandedMeta);
         appliedRadiusKm = radius;
+        tagsDropped = !!expandedMeta.tagsRelaxed;
       }
       if (results.length < MIN_RESULTS) {
         const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
         if (productTerms) (noGeo as any)._productTerms = productTerms;
         if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
-        results = marketplaceRegistry.discover(noGeo);
+        const noGeoMeta: DiscoverMeta = {};
+        results = marketplaceRegistry.discover(noGeo, noGeoMeta);
         geoDropped = true;
+        tagsDropped = !!noGeoMeta.tagsRelaxed;
       }
     }
     if (geoDropped) appliedRadiusKm = undefined;
@@ -1699,6 +1708,15 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       ? `<p id="geoRelaxedNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#fff8e6;border:1px solid #f0d99a;border-radius:8px;">\u{1F30D} ${relaxedBody}</p>`
       : "";
 
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: same
+    // honesty rule as the geo banner above — say so, never widen silently.
+    const tagsRelaxedBody = lang === "en"
+      ? "One of the search words (e.g. «fresh», «budget», «seasonal») isn't recorded data for enough producers to filter on here — that filter was dropped to show matches."
+      : "Et av ordene i søket (f.eks. «fersk», «billig», «sesong») er ikke registrert som data hos nok produsenter til å brukes som filter her — det ble sluppet for å vise treff.";
+    const tagsRelaxedNote = tagsDropped
+      ? `<p id="tagsRelaxedNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#fff8e6;border:1px solid #f0d99a;border-radius:8px;">\u{1F3F7}️ ${tagsRelaxedBody}</p>`
+      : "";
+
     const needsLocationNote = needsLocation
       ? `<p id="needsLocationNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#eef5ff;border:1px solid #b9d3f5;border-radius:8px;">\u{1F4CD} ${lang === "en"
           ? "To show what is near you we need your location — allow it in your browser, or type a place name."
@@ -1769,6 +1787,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         </form>
         ${needsLocationNote}
         ${relaxedNote}
+        ${tagsRelaxedNote}
         ${geoNote}
       </div>
     </section>

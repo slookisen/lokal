@@ -44,9 +44,9 @@ interface CapturedTool {
 const LYNGDAL = { lat: 58.1376, lng: 7.0700 };
 
 const SEED = [
-  { id: "m-near",  name: "Lyngdal Gårdsmat", city: "Lyngdal",  lat: 58.1376, lng: 7.0700,  trust: 0.40 },
-  { id: "m-near2", name: "Mandal Honning",   city: "Mandal",   lat: 58.0268, lng: 7.4535,  trust: 0.50 },
-  { id: "m-far",   name: "Tromsø Sjømat",    city: "Tromsø",   lat: 69.6496, lng: 18.9560, trust: 0.95 },
+  { id: "m-near",  name: "Lyngdal Gårdsmat", city: "Lyngdal",  lat: 58.1376, lng: 7.0700,  trust: 0.40, tags: [] as string[] },
+  { id: "m-near2", name: "Mandal Honning",   city: "Mandal",   lat: 58.0268, lng: 7.4535,  trust: 0.50, tags: [] as string[] },
+  { id: "m-far",   name: "Tromsø Sjømat",    city: "Tromsø",   lat: 69.6496, lng: 18.9560, trust: 0.95, tags: [] as string[] },
 ];
 
 function seedAgents(db: Database.Database): void {
@@ -56,7 +56,7 @@ function seedAgents(db: Database.Database): void {
        lat, lng, city, radius_km, categories, tags, skills, capabilities, languages,
        trust_score, is_active, is_verified, discovery_count, interaction_count,
        total_interactions, created_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, '1.0.0', 'producer', ?, ?, ?, ?, NULL, '["honey"]', '[]', '[]', '{}', '["no"]',
+    VALUES (?, ?, ?, ?, ?, ?, '1.0.0', 'producer', ?, ?, ?, ?, NULL, '["honey"]', ?, '[]', '{}', '["no"]',
             ?, 1, 0, 0, 0, 0, datetime('now'), datetime('now'))
   `);
   const know = db.prepare(`
@@ -65,7 +65,7 @@ function seedAgents(db: Database.Database): void {
   `);
   for (const a of SEED) {
     stmt.run(a.id, a.name, "Lokal produsent", "test", `${a.id}@example.no`,
-      `https://${a.id}.example.no`, "key-" + a.id, a.lat, a.lng, a.city, a.trust);
+      `https://${a.id}.example.no`, "key-" + a.id, a.lat, a.lng, a.city, JSON.stringify(a.tags), a.trust);
     know.run(a.id, `${a.city}veien 1`, `${a.id}@example.no`, `https://${a.id}.example.no`,
       JSON.stringify([{ name: "Honning", price: "99 kr" }, { name: "Egg", price: "45 kr" }]));
   }
@@ -210,6 +210,28 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
         "0g(ii): the output still hands the user the producer's own contact details to act on");
       assertTrue(/lokal_info/.test(txt),
         "0g(ii): …and still points at the follow-up tool for the full price list");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter,
+    // round-2 independent review of PR #823: lokal_discover accepts `tags`
+    // directly and is exposed to the same live ChatGPT app as lokal_search —
+    // it needs the same honest-drop signal when a tag filter is dropped.
+    // ══════════════════════════════════════════════════════════════
+    {
+      const r = await tools.get("lokal_discover")!.handler({ categories: ["honey"], tags: ["budget"], limit: 10 });
+      const txt = textOf(r);
+      assertTrue(/Lyngdal Gårdsmat/.test(txt),
+        `lokal_discover(tags): results are still returned even though no producer carries "budget" (got ${txt.slice(0, 80)})`);
+      assertTrue(/tag-filtrene|tag filters/i.test(txt),
+        `lokal_discover(tags): the response explicitly says a tag filter was dropped (got ${txt.slice(0, 200)})`);
+    }
+    {
+      // Control: no tags requested at all → no honesty note, ever.
+      const r = await tools.get("lokal_discover")!.handler({ categories: ["honey"], limit: 10 });
+      const txt = textOf(r);
+      assertTrue(!/tag-filtrene|tag filters/i.test(txt),
+        "lokal_discover(tags): no tags-dropped note when no tags were requested");
     }
   } finally {
     console.log = prevLog;
