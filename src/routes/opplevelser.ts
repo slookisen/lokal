@@ -168,6 +168,11 @@ import {
   // the `products` write path applyGardssalgSetContentField's own doc
   // comment explicitly excludes (no defect vocabulary exists for it there).
   applyGardssalgSetProducts,
+  // dev-request 2026-09-06-produsent-datafjerning-uten-cs-skrivevei — the
+  // explicit-clear sibling of applyGardssalgSetProducts above (which fails
+  // closed on an empty list; correct there, but leaves no lever to honor a
+  // verified owner's request to remove their whole products list).
+  applyGardssalgClearProducts,
   // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part B —
   // admin-originated field lock/unlock, writing/clearing the SAME
   // field_provenance.owner_locks.<field> structure the owner-claim flow
@@ -10533,12 +10538,33 @@ router.post("/admin/gardssalg-set-provider-name", requireAdmin, (req: Request, r
 // GARDSSALG_ROLLBACKABLE_FIELDS, and the audit row this writes is exactly
 // what POST /admin/gardssalg-content-rollback already reads.
 //
+// ── `clear: true` (dev-request 2026-09-06-produsent-datafjerning-uten-cs-
+// skrivevei) ─────────────────────────────────────────────────────────────
+// The write above fails closed on an empty/missing `value` — correct for
+// "you sent nothing usable", but that made a DELIBERATE "remove my whole
+// products list" request (a verified owner explicitly asked for exactly
+// this) impossible for CS to honor: there was no lever. Optional boolean
+// body field `clear` adds that lever WITHOUT touching the byte-identical
+// behaviour above when it is absent/false:
+//   - clear:true + value omitted or [] -> applyGardssalgClearProducts,
+//     writing products = "[]" (a JSON empty array, matching the wire shape
+//     of every other `products` writer and what the public renderer
+//     already treats as "hide the Produkter block", experiences-seo.ts).
+//   - clear:true + a non-empty value -> 400 clear_conflicts_with_value —
+//     never silently guess which the caller meant.
+//   - clear absent/false -> this comment block's code path is skipped
+//     entirely; everything below is untouched.
+// `source` stays mandatory in both modes. Success response for clear adds
+// `cleared: true`; the non-clear success response below is unchanged (no
+// `cleared: false` added to it).
+//
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 router.post("/admin/gardssalg-set-products", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as {
     provider_id?: unknown;
     value?: unknown;
     source?: unknown;
+    clear?: unknown;
   };
 
   const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
@@ -10548,6 +10574,48 @@ router.post("/admin/gardssalg-set-products", requireAdmin, (req: Request, res: R
   }
 
   const rawValue = body.value;
+  const clear = body.clear === true;
+
+  if (clear) {
+    // clear:true + value omitted or an empty array -> clear; anything else
+    // supplied in `value` is a caller mistake we refuse rather than guess
+    // at (never silently prefer clear over a supplied value, or vice versa).
+    const valueSupplied = rawValue !== undefined && !(Array.isArray(rawValue) && rawValue.length === 0);
+    if (valueSupplied) {
+      res.status(400).json({ error: "clear_conflicts_with_value" });
+      return;
+    }
+
+    const source = typeof body.source === "string" ? body.source.trim() : "";
+    if (!source) {
+      res.status(400).json({ error: "source_required" });
+      return;
+    }
+
+    const clearResult = applyGardssalgClearProducts(providerId, source);
+    if (!clearResult.ok) {
+      if (clearResult.reason === "provider_not_found") {
+        res.status(404).json({ error: "provider_not_found" });
+        return;
+      }
+      // owner_locked: 409, not 403 — same "authorized request, but the
+      // row's STATE conflicts with the write" reasoning as the set path
+      // below (and every other gårdssalg set-* endpoint's 409).
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
+
+    res.json({
+      success: true,
+      provider_id: providerId,
+      field: "products",
+      old_value: clearResult.old_value,
+      new_value: clearResult.new_value,
+      cleared: true,
+    });
+    return;
+  }
+
   // Route-level shape check mirrors gardssalg-set-content-field's own
   // blank-value split: "you sent nothing usable" gets value_required here;
   // a well-shaped-but-defective item is left to the service's Gate 3, which

@@ -170,7 +170,7 @@ server.tool(
         // Fase 1c — same rule as lokal_search above.
         if (a.location?.distanceKm) text += `  Avstand: ${a.location.distanceKm.toFixed(1)} km\n`;
         else if (a.location?.distanceLabel) text += `  Posisjon: ${a.location.distanceLabel} (omtrentlig)\n`;
-        text += `  Trust: ${(a.trustScore * 100).toFixed(0)}% | Verifisert av eier: ${a.isVerified ? "Ja" : "Nei"}\n\n`;
+        text += `  Verifisert av eier: ${a.isVerified ? "Ja" : "Nei"}\n\n`;
       }
 
       return { content: [{ type: "text", text }] };
@@ -223,7 +223,7 @@ server.tool(
       let text = `🧺 **${data.name}** — ${data.count} produsenter\n${data.page_url}\n\n`;
       for (const p of data.producers || []) {
         text += `**${p.name}**${p.city ? ` — ${p.city}` : ""}\n`;
-        text += `  Trust: ${((p.trustScore || 0) * 100).toFixed(0)}% | Verifisert av eier: ${p.isVerified ? "Ja" : "Nei"}\n`;
+        text += `  Verifisert av eier: ${p.isVerified ? "Ja" : "Nei"}\n`;
         text += `  ${p.profile_url}\n`;
       }
       return { content: [{ type: "text", text }] };

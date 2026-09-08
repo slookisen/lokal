@@ -592,32 +592,6 @@
       font-weight: 500;
     }
 
-    .trust-score {
-      margin-top: 0.75rem;
-    }
-
-    .trust-label {
-      font-size: 0.8rem;
-      color: var(--text-gray);
-      margin-bottom: 0.4rem;
-      display: flex;
-      justify-content: space-between;
-    }
-
-    .trust-bar {
-      height: 5px;
-      background: var(--border-gray);
-      border-radius: 3px;
-      overflow: hidden;
-    }
-
-    .trust-fill {
-      height: 100%;
-      background: linear-gradient(90deg, #2D5016 0%, var(--accent-orange) 100%);
-      border-radius: 3px;
-      transition: width 0.5s ease;
-    }
-
     .agent-card-footer {
       margin-top: 0.75rem;
       padding-top: 0.75rem;
@@ -720,32 +694,6 @@
 
     .modal-badge.verified {
       background: rgba(255,255,255,0.35);
-    }
-
-    .modal-trust-row {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      margin-top: 1rem;
-    }
-
-    .modal-trust-bar {
-      flex: 1;
-      height: 6px;
-      background: rgba(255,255,255,0.2);
-      border-radius: 3px;
-      overflow: hidden;
-    }
-
-    .modal-trust-fill {
-      height: 100%;
-      background: white;
-      border-radius: 3px;
-    }
-
-    .modal-trust-label {
-      font-size: 0.85rem;
-      font-weight: 700;
     }
 
     .modal-body {
@@ -1450,7 +1398,7 @@
       <div class="sort-controls">
         <label for="sortSelect">Sorter etter:</label>
         <select id="sortSelect" class="sort-select">
-          <option value="trust">Trust Score</option>
+          <option value="trust">Anbefalt</option>
           <option value="newest">Nyeste</option>
           <option value="name">Navn</option>
         </select>
@@ -1501,7 +1449,7 @@
         </div>
         <div class="benefit-card">
           <div class="benefit-icon">&#x2B50;</div>
-          <h3>Trust Score</h3>
+          <h3>Bedre rangering</h3>
           <p>Verifiserte agenter med komplett profil rangeres høyere. Jo mer du fyller ut, desto flere finner deg.</p>
         </div>
         <div class="benefit-card">
@@ -1556,12 +1504,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         <div class="modal-agent-name" id="modalAgentName"></div>
         <div class="modal-agent-location" id="modalAgentLocation"></div>
         <div class="modal-badges" id="modalBadges"></div>
-        <div class="modal-trust-row">
-          <span class="modal-trust-label" id="modalTrustLabel">0%</span>
-          <div class="modal-trust-bar">
-            <div class="modal-trust-fill" id="modalTrustFill" style="width:0%"></div>
-          </div>
-        </div>
       </div>
       <div class="modal-body" id="modalBody">
         <div class="modal-loading">
@@ -1747,8 +1689,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
           return '<span class="category-tag">' + formatCategory(c) + '</span>';
         }).join('');
 
-        var trustPct = Math.round((agent.trustScore || 0) * 100);
-
         return '<div class="agent-card" data-id="' + agent.id + '">' +
           '<div class="agent-header">' +
             '<div>' +
@@ -1760,10 +1700,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
             (agent.isVerified ? '<span class="verified-badge">Verifisert av eier</span>' : '') +
           '</div>' +
           '<div class="agent-categories">' + cats + '</div>' +
-          '<div class="trust-score">' +
-            '<div class="trust-label"><span>Pålitelighet</span><span>' + trustPct + '%</span></div>' +
-            '<div class="trust-bar"><div class="trust-fill" style="width:' + trustPct + '%"></div></div>' +
-          '</div>' +
           '<div class="agent-card-footer">Vis detaljer &rarr;</div>' +
         '</div>';
       }).join('');
@@ -2038,7 +1974,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       if (!agent) return;
 
       // Show modal immediately with basic info + loading state
-      var trustPct = Math.round((agent.trustScore || 0) * 100);
       document.getElementById('modalAgentName').textContent = agent.name;
       document.getElementById('modalAgentLocation').textContent = (agent.location && agent.location.city ? agent.location.city : 'Norge');
 
@@ -2050,10 +1985,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         badgesHtml += '<span class="modal-badge">' + formatCategory(c) + '</span>';
       });
       document.getElementById('modalBadges').innerHTML = badgesHtml;
-
-      // Trust
-      document.getElementById('modalTrustLabel').textContent = trustPct + '%';
-      document.getElementById('modalTrustFill').style.width = trustPct + '%';
 
       // Loading state
       modalBody.innerHTML = '<div class="modal-loading"><div class="spinner"></div><p style="margin-top:0.75rem">Henter detaljert info...</p></div>';

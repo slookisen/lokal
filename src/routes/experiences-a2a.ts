@@ -35,6 +35,7 @@ import {
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
+  formatFilterLabels,
   // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-
   // inflow slice (2026-08-25): the single-experience-by-UUID intent reads
   // through the PUBLISH-GATED by-id variant — same PUBLISH_GATE_SQL as the
@@ -547,18 +548,107 @@ export function handleExperiencesMessageSend(
 
   // Default: discover
   try {
+    // dev-request 2026-09-06-opplevagent-discovery-nulltreff-standardliste:
+    // an unrecognised NL query (real text, but parseExperiencesIntent() found
+    // NO signal at all — no kommune/fylke/weather/indoor_outdoor/season) must
+    // never silently fall through to discoverExperiencesRelaxed({}, 20), which
+    // is just "the first 20 published rows" — an unfiltered "standard list"
+    // that looks like a real match to a calling agent. This check only fires
+    // for a genuine free-text query with zero parsed keys; the deliberate
+    // structured "browse" path (message.data present, possibly `{}`) never
+    // reaches here with non-empty messageText, so it is unaffected — see the
+    // messageText/filter construction above.
+    if (messageText && messageText.trim().length > 0 && Object.keys(filter).length === 0) {
+      const summaryText =
+        "Fant ingen gjenkjennelige søkekriterier i spørringen (kommune/fylke, sesong, vær, inne/ute) — ingen treff. " +
+        "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
+        "No recognisable search criteria in the query (kommune/fylke, season, weather, indoor/outdoor) — no matches. " +
+        'Try e.g. "what can we do in Tromsø in winter?".';
+
+      try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
+
+      return rpcOk(id, {
+        taskId: `experiences-discover-${Date.now()}`,
+        status: { state: "completed", timestamp: new Date().toISOString() },
+        artifacts: [
+          {
+            artifactId: "discover-summary",
+            name: "experience-discover-summary",
+            parts: [{ kind: "text", text: summaryText }],
+          },
+          {
+            artifactId: "discover-results",
+            name: "experience-discover-results",
+            parts: [{ kind: "data", data: { count: 0, experiences: [] } }],
+          },
+        ],
+        metadata: {
+          skill: "opplevelser_discover",
+          filter,
+          parsedFrom: messageText || null,
+          zero_hit_reason: "unrecognized_query",
+        },
+      });
+    }
+
     const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, 20);
     const relaxationNote = buildRelaxationNote(relaxedKeys);
+
+    // Second path to the same "unfiltered standard list" symptom: the
+    // filter HAD keys, but discoverExperiencesRelaxed() relaxed every single
+    // one of them away (RELAX_ORDER exhausted) — the landed-on result set is
+    // just the unfiltered top-N again, wearing a relaxation note. Every
+    // original constraint present is present again as a dropped key
+    // (relaxedKeys is filter-derived, so this only compares against keys
+    // that were actually in the original filter — lat/lng/radius_km/sort are
+    // never in RELAX_ORDER and so can never spuriously satisfy this).
+    const originalFilterKeyCount = Object.keys(filter).length;
+    const relaxationExhausted =
+      originalFilterKeyCount > 0 && relaxedKeys.length === originalFilterKeyCount;
+
+    const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+
+    try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
+
+    if (relaxationExhausted) {
+      const labels = formatFilterLabels(relaxedKeys);
+      const exhaustedSummary =
+        `Ingen opplevelser funnet med de angitte filtrene — heller ikke etter å ha løsnet: ${labels}. / ` +
+        `No experiences found matching the given filters — not even after relaxing: ${labels}.`;
+
+      return rpcOk(id, {
+        taskId: `experiences-discover-${Date.now()}`,
+        status: { state: "completed", timestamp: new Date().toISOString() },
+        artifacts: [
+          {
+            artifactId: "discover-summary",
+            name: "experience-discover-summary",
+            parts: [{ kind: "text", text: exhaustedSummary }],
+          },
+          {
+            artifactId: "discover-results",
+            name: "experience-discover-results",
+            parts: [{ kind: "data", data: { count: 0, experiences: [] } }],
+          },
+        ],
+        metadata: {
+          skill: "opplevelser_discover",
+          filter,
+          parsedFrom: messageText || null,
+          relaxed_filters: relaxedKeys,
+          zero_hit_reason: "relaxation_exhausted",
+          // Still useful "try kommune=X" hints — computed from the fully-
+          // relaxed result set, which reflects what the DB actually has.
+          suggestions: suggestions.length > 0 ? suggestions : undefined,
+        },
+      });
+    }
 
     let summaryText =
       results.length === 0
         ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
         : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
     if (relaxationNote) summaryText += ` ${relaxationNote}`;
-
-    const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
-
-    try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
 
     // distance_km/geo_precision are only meaningful (and only ever present)
     // when an origin was given — omitting lat/lng must produce byte-identical
