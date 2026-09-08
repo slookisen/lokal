@@ -493,10 +493,7 @@ const CSS = `
   .pc-city { font-size: 0.8rem; color: var(--g500); margin-top: 2px; }
   .pc-desc { font-size: 0.85rem; color: var(--g500); line-height: 1.5; margin-bottom: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .pc-tags { margin-bottom: 12px; }
-  .pc-foot { display: flex; justify-content: space-between; align-items: center; padding-top: 12px; border-top: 1px solid var(--g100); }
-  .trust-m { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--g500); }
-  .trust-bar { width: 60px; height: 4px; background: var(--g200); border-radius: 2px; overflow: hidden; }
-  .trust-fill { height: 100%; background: var(--green-700); border-radius: 2px; }
+  .pc-foot { display: flex; justify-content: flex-end; align-items: center; padding-top: 12px; border-top: 1px solid var(--g100); }
   .pc-link { font-size: 0.8rem; font-weight: 600; color: var(--green-700); }
 
   /* Footer */
@@ -717,7 +714,6 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   const cityText = cardLocationText(a);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
-  const trustPct = Math.round((a.trustScore || 0) * 100);
   let desc = a.description || "";
   if (isJunkDescription(desc)) {
     console.log(`[description-guard] suppressed junk description (producerCard) for ${a.id} (${a.name})`);
@@ -739,7 +735,6 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
     ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
     <div class="pc-tags">${cats}</div>
     <div class="pc-foot">
-      <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
       <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
     </div>
   </a>`;
@@ -778,7 +773,6 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   const cityText = cardLocationText(a, postal);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 5).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
-  const trustPct = Math.round((a.trustScore || 0) * 100);
 
   // Description: prefer knowledge.about, fall back to agent description. Cap at 350 chars.
   let desc = (knowledge?.about && knowledge.about.length > 20) ? knowledge.about : (a.description || "");
@@ -845,7 +839,6 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
     </div>
     <div class="pc-tags">${cats}</div>
     <div class="pc-foot">
-      <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
       <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
     </div>
   </a>`;
@@ -861,7 +854,6 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
   const cityText = cardLocationText(a);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(catLabel(c, lang))}</span>`).join("");
-  const trustPct = Math.round((a.trustScore || 0) * 100);
 
   // Description: keep existing truncation behavior (~180 chars)
   let desc = a.description || "";
@@ -917,7 +909,6 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
     </div>
     <div class="pc-tags">${cats}</div>
     <div class="pc-foot">
-      <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
       <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
     </div>
   </a>`;
@@ -3660,7 +3651,6 @@ const PROFILE_CSS = `
   .pf-stats { display: flex; gap: 22px; margin-top: 18px; flex-wrap: wrap; }
   .pf-stat { display: flex; align-items: center; gap: 8px; }
   .pf-stat-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
-  .pf-stat-icon.t { background: var(--green-100); }
   .pf-stat-icon.r { background: #fef3c7; }
   .pf-stat-icon.h { background: #dbeafe; }
   .pf-stat-icon.a { background: #ede9fe; }
@@ -4481,7 +4471,6 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const info = knowledgeService.getAgentInfo(agent.id);
     const k = (info?.knowledge || {}) as any;
     const meta = (info?.meta || {}) as any;
-    const trustPct = Math.round((agent.trustScore || 0) * 100);
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
     // description must never render (dev-request 2026-07-04-rfb-datakvalitet
@@ -5520,7 +5509,6 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         })()}
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
-          <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
           <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans, last 90 days" : "Sidevisninger fra mennesker, siste 90 dager"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans &middot; 90d" : "mennesker &middot; 90d"}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last 90 days." : "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste 90 dager."}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents &middot; 90d" : "AI-agenter &middot; 90d"}</span></small></div></div>
