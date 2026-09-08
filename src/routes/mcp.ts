@@ -412,11 +412,22 @@ export function registerTools(
     },
     async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
       const body: any = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
-      const results = marketplaceRegistry.discover(body);
+      // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter (round-2
+      // independent review of PR #823): this tool accepts `tags` directly and
+      // is exposed to the same live ChatGPT app as `lokal_search` — it needs
+      // the same honest-drop signal, or a caller filtering on tags:["budget"]
+      // gets back non-budget producers with no indication the filter was
+      // silently dropped.
+      const discoverMeta: DiscoverMeta = {};
+      const results = marketplaceRegistry.discover(body, discoverMeta);
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
       }
+
+      const tagsRelaxedLine = discoverMeta.tagsRelaxed
+        ? "\u{1F3F7}️ Et av tag-filtrene (f.eks. «budget», «fresh», «seasonal») er ikke registrert som data hos nok produsenter til å brukes som filter — det ble sluppet for å vise treff. / One of the tag filters (e.g. «budget», «fresh», «seasonal») isn't recorded data for enough producers to filter on — that filter was dropped to show matches.\n\n"
+        : "";
 
       // dev-request 2026-07-25 fix 0g(ii): read-only means read-only — see
       // the same note on lokal_search above. No conversation is started here.
@@ -433,7 +444,7 @@ export function registerTools(
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+      return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
     }
   );
 
