@@ -341,7 +341,14 @@ class MarketplaceRegistry {
     // dropping it — never silently — only when it would return nothing.
     // Every downstream filter (skills/distance/product terms) still applies
     // to the un-tag-filtered set; only this one step is skipped.
-    if (query.tags && query.tags.length > 0) {
+    //
+    // Guarded on `candidates.length > 0` BEFORE this step: without it, a query
+    // like "billig kjøtt" where `categories` (step 3) already zeroed the set
+    // (no meat producer at all) would filter an already-empty array and still
+    // set `tagsRelaxed:true` — falsely blaming the tag filter, and falsely
+    // telling the caller "tags were dropped" for a result that stayed empty
+    // regardless. Only report a drop when tags are what caused the zero.
+    if (query.tags && query.tags.length > 0 && candidates.length > 0) {
       const tagFiltered = candidates.filter(a =>
         query.tags!.some(tag =>
           a.tags.some(at => at.toLowerCase().includes(tag.toLowerCase()))

@@ -487,6 +487,19 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
         `tags: category filter (fish vs honey) is unaffected — a honey producer is still excluded (got ${names.join(", ")})`);
     }
 
+    // Regression guard: a query whose CATEGORY filter already emptied the
+    // candidate set (no meat producer in the fixture at all) must not report
+    // tagsRelaxed — the tag filter never even ran on a non-empty set, so it
+    // is not what caused the zero and must not claim to have been dropped.
+    {
+      const r = await callRoute(router, { url: "/search", query: { q: "billig kjøtt", heleNorge: "true" } });
+      assertEq(r.body.count, 0, "tags: `billig kjøtt` still returns 0 (no meat producer exists at all)");
+      assertEq(r.body.relaxed_filters, undefined,
+        `tags: relaxed_filters is NOT ["tags"] when categories, not tags, caused the empty set (got ${JSON.stringify(r.body.relaxed_filters)})`);
+      assertTrue(!(typeof r.body.note === "string" && /fresh|fersk/i.test(r.body.note)),
+        "tags: no tags-dropped note when tags were never the cause");
+    }
+
     // ── pure helper: the note builder ────────────────────────────────
     assertEq(buildSearchNote({}), undefined, "note: nothing to say → undefined");
     assertTrue(/Vadsø/.test(String(buildSearchNote({ geoDropped: true, geoPlaceLabel: "Vadsø" }))),
