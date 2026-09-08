@@ -1993,6 +1993,25 @@ export function noYieldBackoffExclusionSql(alias = ""): string {
   );
 }
 
+// dev-request 2026-09-08-drikke-no-yield-backoff, Del B: ports
+// noYieldBackoffExclusionSql above onto the gårdssalg/drink content-refresh
+// selectors (selectGardssalgProvidersForContentRefresh,
+// selectDrinkProducersForContentRefresh) — same 3-strikes/NO_YIELD_BACKOFF_DAYS
+// mechanism, same content_no_yield_streak/last_content_attempt_at columns,
+// reset by the SAME recordProviderContentYield(id, true) call (no separate
+// reset path — that function already resets the shared column regardless of
+// which route called it). Wrapped in its own function (rather than editing
+// noYieldBackoffExclusionSql in place) so GARDSSALG_NO_YIELD_BACKOFF_DISABLED
+// scopes the rollback to these two gårdssalg/drink selections only, mirroring
+// providerParkingExclusionSql's own env-flag-first-line style
+// (EXPERIENCES_HOMEPAGE_PARKING_DISABLED) — the generic experiences route's
+// selectProvidersForContentRefresh() call to noYieldBackoffExclusionSql above
+// is untouched by this flag.
+export function gardssalgNoYieldBackoffExclusionSql(alias = ""): string {
+  if (process.env.GARDSSALG_NO_YIELD_BACKOFF_DISABLED === "true") return "";
+  return noYieldBackoffExclusionSql(alias);
+}
+
 /**
  * Record whether a content-refresh attempt yielded any extractable/writable
  * field for this provider. `yielded=false` increments content_no_yield_streak
@@ -3608,6 +3627,9 @@ export type GardssalgContentRefreshTarget = {
  * selectProvidersForContentRefresh — see that function's doc comment for why
  * last_content_attempt_at rather than a success-only timestamp drives
  * ordering). Hard-capped at 48 — there are only 48 gårdssalg providers total.
+ * Also excludes rows resting under the no-yield backoff (dev-request
+ * 2026-09-08-drikke-no-yield-backoff, Del B — see
+ * gardssalgNoYieldBackoffExclusionSql's doc comment).
  */
 export function selectGardssalgProvidersForContentRefresh(limit = 25): GardssalgContentRefreshTarget[] {
   const db = getDb(VERTICAL);
@@ -3628,6 +3650,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
              OR products IS NULL OR TRIM(products) = '' OR TRIM(products) = '[]'
               )
           ${providerParkingExclusionSql()}
+          ${gardssalgNoYieldBackoffExclusionSql()}
         ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
         LIMIT ?`
     )
@@ -3665,15 +3688,27 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
  * drinkTypes is parameter-bound (never interpolated); an empty list returns
  * [] rather than a degenerate `IN ()` clause. Excludes 'test-gardssalg' by
  * construction (not a drink type).
+ *
+ * Also excludes rows resting under the no-yield backoff (dev-request
+ * 2026-09-08-drikke-no-yield-backoff, Del B), same as
+ * selectGardssalgProvidersForContentRefresh — UNLESS `opts.applyNoYieldBackoff`
+ * is explicitly `false`, which the route uses to compute the FULL
+ * thin+verified drink count (backoff-resting rows included) for
+ * `cohort_resting_total` alongside this function's normal (backoff-applied)
+ * call for `cohort_eligible_total`. GARDSSALG_NO_YIELD_BACKOFF_DISABLED=true
+ * still wins over `opts.applyNoYieldBackoff` either way — see
+ * gardssalgNoYieldBackoffExclusionSql's own doc comment.
  */
 export function selectDrinkProducersForContentRefresh(
   drinkTypes: readonly string[],
-  cap = 500
+  cap = 500,
+  opts?: { applyNoYieldBackoff?: boolean }
 ): GardssalgContentRefreshTarget[] {
   if (drinkTypes.length === 0) return [];
   const db = getDb(VERTICAL);
   const safeCap = Math.max(1, Math.min(2000, Math.floor(cap)));
   const placeholders = drinkTypes.map(() => "?").join(", ");
+  const applyBackoff = opts?.applyNoYieldBackoff !== false;
   return db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
@@ -3689,6 +3724,7 @@ export function selectDrinkProducersForContentRefresh(
              OR products IS NULL OR TRIM(products) = '' OR TRIM(products) = '[]'
               )
           ${providerParkingExclusionSql()}
+          ${applyBackoff ? gardssalgNoYieldBackoffExclusionSql() : ""}
         ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
         LIMIT ?`
     )
