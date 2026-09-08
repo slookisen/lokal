@@ -1,10 +1,13 @@
 /**
  * opplevelser-gardssalg-set-products.test.ts — tests for the missing
  * `products` write path (dev-request 2026-08-29-gardssalg-products-write-
- * and-field-lock, Part A):
+ * and-field-lock, Part A), extended (dev-request 2026-09-06-produsent-
+ * datafjerning-uten-cs-skrivevei) with the explicit `clear: true` sibling:
  *
  *   - applyGardssalgSetProducts() (src/services/experience-store.ts)
- *   - POST /admin/gardssalg-set-products (src/routes/opplevelser.ts)
+ *   - applyGardssalgClearProducts() (src/services/experience-store.ts)
+ *   - POST /admin/gardssalg-set-products (src/routes/opplevelser.ts),
+ *     including its optional `clear: true` body field
  *
  * The gap this closes: gardssalg-set-content-field's own doc comment
  * explicitly rejects `field: "products"` with 400 invalid_field ("no defect
@@ -49,6 +52,25 @@
  *       (c)'s old JSON value — `products` already in
  *       GARDSSALG_ROLLBACKABLE_FIELDS, zero rollback-side changes needed
  *   (k) direct service-function coverage (mirrors route-level assertions)
+ *   (l) clear:true on a filled row -> 200, cleared:true, new_value "[]", DB
+ *       column "[]" (not NULL), exactly one new audit row (old_value = the
+ *       prior JSON, new_value "[]"), field_provenance.products updated,
+ *       other provenance keys preserved
+ *   (m) clear:true on an owner-locked row (content_source='manual') -> 409
+ *       owner_locked, nothing written, no audit row
+ *   (n) clear:true + a non-empty value -> 400 clear_conflicts_with_value,
+ *       nothing written; clear:true + value:[] is NOT a conflict (still
+ *       clears)
+ *   (o) empty `value` WITHOUT clear -> still 400 value_required (regression
+ *       guard: the existing fail-closed behaviour is untouched)
+ *   (p) missing source in clear mode -> 400 source_required, nothing written
+ *   (q) clear rollback round-trip: planGardssalgContentRollback proposes
+ *       restoring the pre-clear JSON, and applying it restores the DB column
+ *       — proves the clear-mode audit row is byte-shape-identical to a
+ *       set-write's row
+ *   (r) direct applyGardssalgClearProducts() coverage: provider_not_found,
+ *       and a clear on an unlocked row with no prior products (old_value
+ *       null already covered by rendering-equivalence with (b))
  */
 
 export interface TestSummary {
@@ -498,6 +520,172 @@ export function runOpplevelserGardssalgSetProductsTests(
         "value_required",
         "k9: direct non-array rejection reports reason value_required",
       );
+
+      // ── (l) clear:true on a filled row ───────────────────────────────────
+      mkProvider({
+        id: "sp-clear-filled",
+        navn: "Clear Filled Gard",
+        products: JSON.stringify(["Frukt", "Urter"]),
+        field_provenance: JSON.stringify({ about_text: { source_url: "https://example.no", fetched_at: "2026-01-01T00:00:00Z" } }),
+        created_at: "2026-01-14 00:00:00",
+      });
+      const clearFilledRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: {
+          provider_id: "sp-clear-filled",
+          clear: true,
+          source: "produsentsvar 2026-09-06: fjern hele produktlisten",
+        },
+      });
+      assertEq(clearFilledRes.status, 200, "l1: clear:true on a filled row -> 200");
+      assertEq(clearFilledRes.body, {
+        success: true,
+        provider_id: "sp-clear-filled",
+        field: "products",
+        old_value: JSON.stringify(["Frukt", "Urter"]),
+        new_value: "[]",
+        cleared: true,
+      }, "l2: response shape matches spec exactly, cleared:true, new_value is the JSON empty array");
+      const clearFilledRow = getProviderRow("sp-clear-filled");
+      assertEq(clearFilledRow.products, "[]", "l3: DB column written as the JSON empty array (NOT NULL)");
+      const clearFilledProv = JSON.parse(clearFilledRow.field_provenance || "{}");
+      assertEq(
+        clearFilledProv.products?.source_url,
+        "produsentsvar 2026-09-06: fjern hele produktlisten",
+        "l4: field_provenance.products.source_url is the request's source verbatim",
+      );
+      assertTrue(!!clearFilledProv.products?.fetched_at, "l5: field_provenance.products has a fresh fetched_at");
+      assertEq(
+        clearFilledProv.about_text?.source_url,
+        "https://example.no",
+        "l6: other field_provenance keys (about_text) are preserved untouched",
+      );
+      const clearFilledAudit = getAuditRows("sp-clear-filled");
+      assertEq(clearFilledAudit.length, 1, "l7: exactly ONE new audit row inserted");
+      assertEq(clearFilledAudit[0].field_name, "products", "l8: audit field_name is products");
+      assertEq(clearFilledAudit[0].old_value, JSON.stringify(["Frukt", "Urter"]), "l9: audit old_value is the true pre-clear JSON");
+      assertEq(clearFilledAudit[0].new_value, "[]", "l10: audit new_value is the JSON empty array");
+      assertEq(clearFilledAudit[0].changed_by, "admin", "l11: audit changed_by is 'admin'");
+      assertEq(clearFilledAudit[0].batch_id, null, "l12: audit batch_id is NULL (single-row admin write)");
+
+      // ── (m) clear:true on an owner-locked row -> 409, nothing written ───
+      mkProvider({
+        id: "sp-clear-locked",
+        navn: "Clear Locked Gard",
+        content_source: "manual",
+        products: JSON.stringify(["Original"]),
+        created_at: "2026-01-15 00:00:00",
+      });
+      const clearLockedRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-clear-locked", clear: true, source: "s" },
+      });
+      assertEq(clearLockedRes.status, 409, "m1: clear:true on content_source='manual' -> 409");
+      assertEq(clearLockedRes.body.error, "owner_locked", "m2: error code is owner_locked");
+      assertEq(getProviderRow("sp-clear-locked").products, JSON.stringify(["Original"]), "m3: locked row UNCHANGED");
+      assertEq(getAuditRows("sp-clear-locked").length, 0, "m4: NO audit row on an owner-locked clear refusal");
+
+      // ── (n) clear:true + a non-empty value -> 400 clear_conflicts_with_value
+      mkProvider({
+        id: "sp-clear-conflict",
+        navn: "Clear Conflict Gard",
+        products: JSON.stringify(["Original"]),
+        created_at: "2026-01-16 00:00:00",
+      });
+      const clearConflictRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-clear-conflict", clear: true, value: ["Sider"], source: "s" },
+      });
+      assertEq(clearConflictRes.status, 400, "n1: clear:true + non-empty value -> 400");
+      assertEq(clearConflictRes.body.error, "clear_conflicts_with_value", "n2: error code is clear_conflicts_with_value");
+      assertEq(getProviderRow("sp-clear-conflict").products, JSON.stringify(["Original"]), "n3: column UNCHANGED on the conflict");
+      assertEq(getAuditRows("sp-clear-conflict").length, 0, "n4: NO audit row on the conflict");
+      // clear:true + value:[] is NOT a conflict — it still clears.
+      const clearEmptyArrayRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-clear-conflict", clear: true, value: [], source: "s" },
+      });
+      assertEq(clearEmptyArrayRes.status, 200, "n5: clear:true + value:[] is NOT a conflict -> 200, still clears");
+      assertEq(clearEmptyArrayRes.body.cleared, true, "n6: cleared:true on the value:[] form too");
+      assertEq(getProviderRow("sp-clear-conflict").products, "[]", "n7: column cleared via the value:[] form");
+
+      // ── (o) regression guard: empty value WITHOUT clear is still 400 ────
+      const stillValueRequiredRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-happy", value: [], source: "s" },
+      });
+      assertEq(stillValueRequiredRes.status, 400, "o1: empty value WITHOUT clear -> still 400 (unchanged)");
+      assertEq(stillValueRequiredRes.body.error, "value_required", "o2: error code is still value_required, not clear-related");
+      const missingValueNoClairRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-happy", source: "s" },
+      });
+      assertEq(missingValueNoClairRes.status, 400, "o3: missing value WITHOUT clear -> still 400 (unchanged)");
+      assertEq(missingValueNoClairRes.body.error, "value_required", "o4: error code is still value_required");
+
+      // ── (p) missing source in clear mode -> 400 source_required ─────────
+      mkProvider({
+        id: "sp-clear-no-source",
+        navn: "Clear No Source Gard",
+        products: JSON.stringify(["Original"]),
+        created_at: "2026-01-17 00:00:00",
+      });
+      const clearNoSourceRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "sp-clear-no-source", clear: true },
+      });
+      assertEq(clearNoSourceRes.status, 400, "p1: clear:true with missing source -> 400");
+      assertEq(clearNoSourceRes.body.error, "source_required", "p2: error code is source_required");
+      assertEq(getProviderRow("sp-clear-no-source").products, JSON.stringify(["Original"]), "p3: column UNCHANGED when source is missing");
+      assertEq(getAuditRows("sp-clear-no-source").length, 0, "p4: NO audit row when source is missing");
+
+      // clear:true on an unknown provider -> 404, same as the set path.
+      const clearNotFoundRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "does-not-exist", clear: true, source: "s" },
+      });
+      assertEq(clearNotFoundRes.status, 404, "p5: clear:true on unknown provider_id -> 404");
+      assertEq(clearNotFoundRes.body.error, "provider_not_found", "p6: error code is provider_not_found");
+
+      // ── (q) clear rollback round-trip ────────────────────────────────────
+      // Uses (l)'s clear write: old_value was ["Frukt","Urter"], new_value "[]".
+      const clearRollbackPlan = store.planGardssalgContentRollback({
+        provider_id: "sp-clear-filled",
+        field_name: "products",
+      });
+      assertEq(clearRollbackPlan.restorable.length, 1, "q1: rollback planner finds exactly one restorable field for the clear");
+      assertEq(clearRollbackPlan.restorable[0]?.field_name, "products", "q2: restorable field is products");
+      assertEq(clearRollbackPlan.restorable[0]?.current_value, "[]", "q3: planner sees the cleared value as current");
+      assertEq(
+        clearRollbackPlan.restorable[0]?.restore_to,
+        JSON.stringify(["Frukt", "Urter"]),
+        "q4: planner proposes restoring the PRE-CLEAR JSON — same audit-row shape as a set-write, zero rollback-side changes needed",
+      );
+      const clearApplied = store.applyGardssalgContentRollback(clearRollbackPlan.restorable);
+      assertEq(clearApplied.length, 1, "q5: rollback applies exactly one restore");
+      assertEq(getProviderRow("sp-clear-filled").products, JSON.stringify(["Frukt", "Urter"]), "q6: DB column restored to the pre-clear JSON");
+
+      // ── (r) direct applyGardssalgClearProducts() service coverage ───────
+      const directClearNotFound = store.applyGardssalgClearProducts("no-such-provider", "s");
+      assertTrue(
+        !directClearNotFound.ok && directClearNotFound.reason === "provider_not_found",
+        "r1: direct clear call reports provider_not_found",
+      );
+
+      mkProvider({
+        id: "sp-clear-direct",
+        navn: "Clear Direct Gard",
+        products: JSON.stringify(["Gammelt Produkt"]),
+        created_at: "2026-01-18 00:00:00",
+      });
+      const directClearResult = store.applyGardssalgClearProducts("sp-clear-direct", "manuell verifisering");
+      assertTrue(directClearResult.ok === true, "r2: direct clear call succeeds");
+      if (directClearResult.ok) {
+        assertEq(directClearResult.old_value, JSON.stringify(["Gammelt Produkt"]), "r3: direct clear returns the correct old_value");
+        assertEq(directClearResult.new_value, "[]", "r4: direct clear returns the JSON empty array as new_value");
+        assertEq(directClearResult.cleared, true, "r5: direct clear result carries cleared:true");
+      }
+      assertEq(getProviderRow("sp-clear-direct").products, "[]", "r6: DB column written as the JSON empty array");
     } finally {
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;
