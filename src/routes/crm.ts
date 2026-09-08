@@ -690,7 +690,62 @@ router.post("/compose", async (req, res) => {
         LIMIT 1
       `).get(to, lookback7d) as { hit: number } | undefined;
 
-      if (!hasRecentInbound) {
+      // ─── crm_untriaged fallback (dev-request 2026-09-07-compose-cooldown-
+      // suppressed-blokkerer-cs-svar-outreach — Kollerud incident) ──────────
+      // Root cause: a reply delivered directly to Daniel's personal inbox
+      // (not via a recognized platform alias — e.g. forwarded, or answered
+      // from an address the recipient typed by hand instead of hitting
+      // Reply) fails deriveVertical()'s header match in POST /ingest and is
+      // parked into crm_untriaged by parkUntriaged() *instead of* being
+      // written through crmService.ingestThread(). parkUntriaged() only
+      // inserts into crm_untriaged — it never touches crm_messages /
+      // crm_threads / crm_contacts (see database/init.ts's crm_untriaged
+      // comment). hasRecentInbound above reads crm_messages exclusively, so
+      // it is structurally blind to a genuine reply that landed here: no
+      // amount of retuning its join or window closes this, because the row
+      // it would need to see was never written. This is exactly what
+      // happened live on 2026-09-07: elinkollerud@hotmail.com replied to the
+      // platform's own outreach thread at 09:06Z (forwarded straight to
+      // Daniel's inbox), POST /ingest parked it 202 untriaged, and the
+      // subsequent /compose reply attempt was wrongly rejected
+      // cooldown_suppressed even though the contact had unmistakably been in
+      // touch since the last outbound.
+      //
+      // crm_untriaged.from_email is the same raw address the mail came
+      // from, so a recent (same 7-day window, same case-insensitive email
+      // match) untriaged row for this recipient is exactly as strong a
+      // signal of "this contact is mid-conversation with us" as a routed
+      // crm_messages row — it just has not been triaged to a thread yet.
+      // Purely additive: this can only ever turn a false 429 into a correct
+      // 200 (Acceptance Criterion 1). It never suppresses the cooldown
+      // check below — a contact with NEITHER a crm_messages inbound NOR a
+      // crm_untriaged row (a genuine, unsolicited repeat cold-send) still
+      // falls through to it unchanged (Acceptance Criterion 2, non-goal).
+      //
+      // resolved_at/resolved_vertical filter: crm_untriaged rows are never
+      // deleted (see database/init.ts's crm_untriaged comment — "Rows leave
+      // only by an explicit human assignment"), and markUntriagedResolved()
+      // (crm-triage.ts) can close a row two ways: promoted to a real
+      // vertical (resolved_vertical set) or DISMISSED as not a genuine
+      // reply — spam/autoreply/junk — which sets resolved_at but leaves
+      // resolved_vertical NULL. A dismissed row is a human's explicit
+      // verdict that this was never a reply at all, so it must NOT count as
+      // "mid-conversation" evidence forever after. Only an open row
+      // (resolved_at IS NULL, not yet reviewed) or one resolved BY
+      // PROMOTION (resolved_vertical IS NOT NULL, i.e. confirmed as a real
+      // reply) counts as a positive signal here.
+      const hasRecentUntriagedInbound = hasRecentInbound
+        ? undefined
+        : (getDb().prepare(`
+            SELECT 1 AS hit
+            FROM crm_untriaged
+            WHERE LOWER(from_email) = LOWER(?)
+              AND datetime(created_at) >= datetime(?)
+              AND (resolved_at IS NULL OR resolved_vertical IS NOT NULL)
+            LIMIT 1
+          `).get(to, lookback7d) as { hit: number } | undefined);
+
+      if (!hasRecentInbound && !hasRecentUntriagedInbound) {
         // ─── Hard cooldown invariant (P0-2026-07-11) ─────────────
         // Belt-and-suspenders on the SEND path: even if a pool leak (like the
         // compose-thread bug) puts an already-contacted producer back into a
@@ -780,7 +835,8 @@ router.post("/compose", async (req, res) => {
           });
         }
       }
-      // If hasRecentInbound: skip rate-limit — legitimate conversation response
+      // If hasRecentInbound or hasRecentUntriagedInbound: skip rate-limit —
+      // legitimate conversation response
     }
 
     // (original flow continues below)

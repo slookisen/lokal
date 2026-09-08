@@ -42856,3 +42856,31 @@ runSerial(async () => {
     failures.push("gardssalg-opening-hours: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-07-compose-cooldown-suppressed-blokkerer-cs-svar-
+// outreach (slookisen/A2A) — the live "Kollerud" incident: POST
+// /admin/crm/compose's hasRecentInbound guard reads only crm_messages, so a
+// reply that arrives outside the platform's recognized alias (and is
+// therefore parked by parkUntriaged() into crm_untriaged instead of being
+// written through crmService.ingestThread()) was invisible to it, wrongly
+// rejecting a legitimate CS reply with cooldown_suppressed. Own in-memory-db
+// + emailService.sendRaw-mock harness exercising the real POST
+// /admin/crm/compose handler (mirrors rfb-poolgate-stegc.test.ts's and
+// crm-max-touch-vern-send-guard.test.ts's own harnesses). Tail position is
+// the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-07-compose-cooldown-suppressed-blokkerer-cs-svar-outreach: crm_untriaged inbound-exempt fix ──");
+  try {
+    const { runCrmComposeCooldownUntriagedInboundExemptTests } =
+      require("../src/routes/crm-compose-cooldown-untriaged-inbound-exempt.test") as
+        typeof import("../src/routes/crm-compose-cooldown-untriaged-inbound-exempt.test");
+    const ccu = await runCrmComposeCooldownUntriagedInboundExemptTests({ log: false });
+    passed += ccu.passed;
+    failed += ccu.failed;
+    for (const f of ccu.failures) failures.push("crm-compose-cooldown-untriaged-inbound-exempt: " + f);
+    console.log(`  crm-compose-cooldown-untriaged-inbound-exempt: ${ccu.passed} passed, ${ccu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-compose-cooldown-untriaged-inbound-exempt: unexpected error: " + String(err?.message || err));
+  }
+});
