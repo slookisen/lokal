@@ -7,10 +7,16 @@
  * enrichment pipelines — pure render-time guards on this one page.
  *
  * Covers:
- *   (a) drivingSted() dedup — adjacent poststed==kommune duplicate collapses
- *       to a single value everywhere sted is derived (hero subtitle,
- *       <title>, meta description, JSON-LD address, map label); the
- *       non-duplicate case and only-one-field-present cases are unaffected.
+ *   (a) drivingSted()/gardssalgPlaceLabel() (updated 2026-09-09, dev-request
+ *       2026-09-09-opplevagent-stedsetikett-poststed-og-kommunesentroide-kart,
+ *       AC1): the "sted"-etikett everywhere it is derived (hero subtitle,
+ *       <title>, meta description, map label) is now a SINGLE value,
+ *       kommune-first — poststed is a postal delivery area, often far from
+ *       the real farm, and must never stand in for or be joined alongside
+ *       kommune. Was: full poststed→kommune→fylke join with adjacent-dedup
+ *       ("Stange, Innlandet", "Skien, Bø, Telemark"). Now: kommune wins
+ *       outright when present; poststed/fylke are fallbacks for a row
+ *       missing kommune, never additions to it.
  *   (b) looksTruncatedMidWord() applied (together with the existing
  *       isJunkDescription()) to opening_hours_text/about_text/visit_text:
  *       a corrupt, cut-mid-word fixture is treated as absent (fact row
@@ -213,21 +219,24 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
 
       const seoRouter = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
 
-      // ── (a1) duplicate poststed==kommune collapses ───────────────────────
+      // ── (a1) poststed==kommune: single value, no duplication ─────────────
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/dupligard-bryggeri");
         assertTrue(r.handled && r.status === 200, `a1: dedup fixture renders (status ${r.status})`);
         assertTrue(!r.body.includes("Stange, Stange"), "a2: 'Stange, Stange' never appears anywhere on the page");
-        assertTrue(r.body.includes("Stange, Innlandet"), "a3: sted collapses to 'Stange, Innlandet'");
-        assertTrue(r.body.includes("<title>Dupligård Bryggeri – Stange, Innlandet | Opplevagent</title>"), "a4: <title> uses the deduped sted");
+        assertTrue(r.body.includes(">Stange<"), "a3: sted is the single value 'Stange' (fylke 'Innlandet' is not appended)");
+        assertTrue(r.body.includes("<title>Dupligård Bryggeri – Stange | Opplevagent</title>"), "a4: <title> uses the single-value kommune sted");
         assertTrue(r.body.includes('addressLocality":"Stange"') && !r.body.includes('"Stange, Stange"'), "a5: JSON-LD address is not polluted by the duplicate");
       }
 
-      // ── (a2) non-duplicate case unaffected ────────────────────────────────
+      // ── (a2) poststed != kommune: kommune wins outright, poststed is
+      // dropped from the display label entirely (AC1 — never show poststed
+      // "Skien" as, or alongside, the place when the real kommune is "Bø") ──
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/ikkedupligard-cideri");
         assertTrue(r.handled && r.status === 200, `b1: non-dup fixture renders (status ${r.status})`);
-        assertTrue(r.body.includes("Skien, Bø, Telemark"), "b2: all three distinct values render in order, comma-joined");
+        assertTrue(r.body.includes("<title>Ikkedupligård Cideri – Bø | Opplevagent</title>"), "b2: <title> shows the kommune ('Bø'), not the poststed ('Skien')");
+        assertTrue(!r.body.includes("Skien, Bø, Telemark"), "b3: the old poststed-first joined label is gone");
       }
 
       // ── (a3) only-one-field-present cases unaffected ──────────────────────

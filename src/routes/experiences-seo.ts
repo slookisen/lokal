@@ -3407,7 +3407,9 @@ function renderOpplevelseDetail(
   // is where the experience is. Same gate, same honesty rule as the
   // approximate-precision labelling above.
   const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
-    ? renderMiniMapSection({ lat, lon, approx: geoIsApprox, label: place || "Posisjon" }, osmLinkHtml)
+    ? (geoIsApprox
+        ? renderApproxPlacementCard(exp.kommune, exp.fylke, osmLinkHtml)
+        : renderMiniMapSection({ lat, lon, approx: false, label: place || "Posisjon" }, osmLinkHtml))
     : `<div class="map-card map-fallback">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -3446,7 +3448,12 @@ function renderOpplevelseDetail(
   // Google as `"geo": {"latitude": 0, "longitude": 0}` — a confident claim
   // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
   // entirely is valid schema.org and says nothing rather than something false.
-  if (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // AC2 (2026-09-09-opplevagent-stedsetikett-…): the same rule now also
+  // applies to a kommune/fylke-centroid point — geoIsApprox means the
+  // coordinate is not the experience's real position either, just its
+  // container municipality, so publishing it as `geo` would be the same
+  // false precision claim in machine-readable form.
+  if (!geoIsApprox && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
   // Offer — only when there is a concrete starting price. Price bands alone are
   // too coarse for a valid schema.org Offer (no numeric price), so band-only
   // rows are intentionally left without an Offer node.
@@ -4197,7 +4204,7 @@ function renderCard(
 // only ever returns rows with a real, non-empty slug (see its own doc
 // comment), so there is no "no link" fallback to handle here.
 function renderSokProducerCard(p: GardssalgSearchByQueryRow): string {
-  const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
+  const sted = gardssalgPlaceLabel(p);
   const badge = drinkBadge(p.producer_type);
   return `<a class="card" href="/kategori/gardssalg/produsent/${encodeURIComponent(p.slug)}">
     <span class="c-title">${escapeHtml(p.navn)}</span>
@@ -4805,7 +4812,7 @@ function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string 
     slug: p.slug,
     navn: p.navn,
     producerTypeLabel: drinkTypeMeta(p.producer_type)?.label ?? null,
-    sted: [p.poststed, p.kommune, p.fylke].find((v) => !!v) ?? null,
+    sted: gardssalgPlaceLabel(p) || null,
     lat: p.lat,
     lon: p.lon,
     approx: isApproxGardssalgConfidence(p.geocode_confidence),
@@ -4953,6 +4960,40 @@ const MINI_MAP_INIT_JS = `(function () {
   }
 })();`;
 
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-kommunesentroide-kart
+// (AC2): a kommune/fylke-CENTROID point (geo_precision==='kommune' /
+// geocode_confidence==='approximate' — Step D's fallback, never a real
+// street-address geocode) must never render as a point-marker on a single-
+// producer profile page, even a visually-distinct dashed one — Rodebakk
+// Gårdsbryggeri's owner read the kommune-centroid pin as "the map thinks
+// we're somewhere else", not as "an approximate area". Renders the SAME
+// map-card shape as the existing "no coordinate at all" fallback below, so
+// only the copy differs, naming the kommune (falling back to fylke, then a
+// bare "omtrentlig" when neither is known) instead of drawing any point.
+// Scoped to the two single-producer mini-maps (/opplevelse/:slug and
+// /kategori/gardssalg/produsent/:slug) — the fylke-wide
+// renderGardssalgMapSection() cluster map is unchanged: it already marks
+// approximate points with a distinct dashed dot + "Ca. posisjon (kommune)"
+// legend rather than claiming an exact position, and collapsing many
+// producers' points into "no marker" there would make that map far less
+// useful for the case it is not the complaint here (Daniel's ask names the
+// single-producer page, "kartet er feil" about ONE farm's own map).
+// `osmLinkHtml` is the caller's pre-existing `<a class="map-card" ...>` OSM
+// link — embedded verbatim inside <noscript>, same discipline as
+// renderMiniMapSection's own osmLinkHtml parameter (acceptance criterion 4
+// from the arbeidspunkt-5 dev-request this reuses): a JS-disabled visitor
+// must not silently lose their only way to open the (real, if coarse)
+// coordinate in OpenStreetMap just because this slice stopped auto-drawing
+// a marker for it.
+function renderApproxPlacementCard(kommune: string | null | undefined, fylke: string | null | undefined, osmLinkHtml: string): string {
+  const sted = (kommune || fylke || "").trim();
+  return `<div class="map-card map-approx">
+         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2"/></svg>
+         <span><strong>${sted ? "Omtrentlig plassering: " + escapeHtml(sted) : "Omtrentlig plassering"}</strong><span class="map-sub">Nøyaktig posisjon er ikke bekreftet ennå — punktet er ikke tegnet inn, siden vi bare vet hvilken kommune produsenten ligger i.</span></span>
+       </div>
+       <noscript>${osmLinkHtml}</noscript>`;
+}
+
 // Renders the "Sted" card's mini-map for a single-entity detail page —
 // legend (only when approx) + map container + attribution + <noscript>
 // fallback + JSON data island + deferred lazy-init script. `osmLinkHtml` is
@@ -4962,7 +5003,11 @@ const MINI_MAP_INIT_JS = `(function () {
 // Callers are responsible for the lat/lon !== null guard — this function
 // assumes it already has a real point (same convention as
 // renderFylkeMapSection/renderGardssalgMapSection assuming a non-empty
-// points array).
+// points array). Since dev-request 2026-09-09-opplevagent-stedsetikett-…
+// (AC2), callers never pass approx:true any more — an approximate point
+// renders via renderApproxPlacementCard() above instead — but the
+// approx-legend branch is left in place rather than deleted: it is still
+// correct code, and removing it is unrelated surface area for this slice.
 function renderMiniMapSection(point: MiniMapPoint, osmLinkHtml: string): string {
   const dataJson = JSON.stringify(point).replace(/<\//g, "<\\/");
   return `<div class="mini-map-wrap">
@@ -5086,7 +5131,10 @@ export function renderGardssalgTypeChips(
 function gardssalgCardTitleAndSted(p: GardssalgProviderRow): { title: string; sted: string } {
   const navn = (p.navn || "").trim();
   const dbFields = [p.poststed, p.kommune, p.fylke];
-  const dbSted = dbFields.find((v): v is string => !!v);
+  // Display label: kommune-first (gardssalgPlaceLabel(), AC1) — NOT the same
+  // as the corroboration check below, which still legitimately scans all
+  // three raw fields for a match against the parsed name-suffix.
+  const dbSted = gardssalgPlaceLabel(p);
   // No real, DB-sourced location data on this row at all -> there is
   // nothing to corroborate a parsed suffix against, so never invent a
   // label from unvalidated parsed text and never strip the title either.
@@ -5412,22 +5460,35 @@ router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: 
 // type-general placeholder as before (not a fabricated specific claim about
 // any one producer — keeps the faithfulness guard's spirit). The
 // practical-info table only ever renders rows it has real data for.
-// 2026-08-12 (arbeidspunkt 5 of dev-request
-// 2026-07-19-opplevagent-forside-seksjoner-design): collapse consecutive
-// duplicate values (case-insensitive, trimmed) so poststed==kommune (a real
-// live bug — e.g. both "Stange") doesn't render "Stange, Stange, Innlandet"
-// on the hero subtitle, <title>, meta description, JSON-LD address, and map
-// label — every one of which derives from this single function. Only
-// ADJACENT duplicates collapse (matching the field order poststed → kommune
-// → fylke, where a real duplicate is always the neighbor), so this stays a
-// narrow fix for the exact observed bug, not a general dedup of the trio.
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-kommunesentroide-kart
+// (AC1): the canonical, single-value "sted"-etikett for a gårdssalg producer —
+// used on the hero subtitle, <title>, meta description, map/mini-map label,
+// search card and catalog card. KOMMUNE FIRST, never poststed alone: poststed
+// is a POSTAL delivery area, often 10-20 km from the actual farm (Odland Sider
+// og Saft's poststed is Aksdal, ~15 km from the real Gismarvikvegen address —
+// producers read the poststed-derived label as "the map/site has the wrong
+// place"). poststed is kept only as the fallback for the rare row with no
+// kommune at all — it is never combined with kommune/fylke into a compound
+// label; Daniel's own worked example ("Tysvær", not "Aksdal, Tysvær" or
+// "Aksdal") asks for exactly one place name.
+//
+// This SUPERSEDES the previous drivingSted() (poststed-first, joined,
+// adjacent-dedup) — see experiences-seo-produsent-render-guards.test.ts's
+// (a) block, updated in the same commit as this function, for the old vs.
+// new expected output on the exact fixtures that exercise this.
+//
+// poststed is NOT removed from the codebase by this change: the LocalBusiness
+// JSON-LD `address.addressLocality` a few hundred lines below (the ACTUAL
+// postal address, `@type: "PostalAddress"`) still legitimately reads
+// `provider.poststed` first — that field literally IS the postal address,
+// which is the one place Daniel's spec says poststed still belongs
+// ("poststed bare som del av selve postadressen").
+function gardssalgPlaceLabel(p: { kommune?: string | null; poststed?: string | null; fylke?: string | null }): string {
+  return (p.kommune || p.poststed || p.fylke || "").trim();
+}
+
 function drivingSted(p: GardssalgProviderRow): string {
-  const parts = [p.poststed, p.kommune, p.fylke].filter(Boolean) as string[];
-  const deduped = parts.filter((part, i) => {
-    if (i === 0) return true;
-    return part.trim().toLowerCase() !== parts[i - 1].trim().toLowerCase();
-  });
-  return deduped.join(", ");
+  return gardssalgPlaceLabel(p);
 }
 
 // Generic, type-general "what a visit typically includes" copy — intentionally
@@ -5664,7 +5725,9 @@ router.get(
     // Same coordinate sanity gate as the /opplevelse/:slug "Sted" card — see
     // its comment (Daniel 2026-08-24, punkt 5).
     const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
-      ? renderMiniMapSection({ lat, lon, approx: geoApprox, label: sted || "Posisjon" }, osmLinkHtml)
+      ? (geoApprox
+          ? renderApproxPlacementCard(provider.kommune, provider.fylke, osmLinkHtml)
+          : renderMiniMapSection({ lat, lon, approx: false, label: sted || "Posisjon" }, osmLinkHtml))
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
            <span><strong>${escapeHtml(sted || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -5704,7 +5767,10 @@ router.get(
   // Google as `"geo": {"latitude": 0, "longitude": 0}` — a confident claim
   // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
   // entirely is valid schema.org and says nothing rather than something false.
-  if (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // AC2 (2026-09-09-opplevagent-stedsetikett-…): same rule for a kommune/
+  // fylke-centroid (geoApprox) — it is Step D's municipality fallback, not
+  // the producer's real position.
+  if (!geoApprox && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
     if (site) ld.sameAs = [site];
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
@@ -5976,7 +6042,7 @@ router.get(
     }
     if (!provider) return next();
 
-    const sted = [provider.poststed, provider.kommune, provider.fylke].filter(Boolean).join(", ");
+    const sted = gardssalgPlaceLabel(provider);
     const badge = drinkBadge(provider.producer_type);
     const url = baseUrl();
     const canonical = `${url}/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
