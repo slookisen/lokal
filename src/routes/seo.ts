@@ -5003,11 +5003,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       : [];
 
     const relatedHtml = related.map((a: any) => {
-      const trust = Math.round((a.trustScore || 0) * 100);
       const cats = (a.categories || []).slice(0, 2).map((c: string) => `<span class="tag" style="font-size:0.66rem;">${escapeHtml(catLabel(c, lang))}</span>`).join("");
       return `<a href="${localizedPath("/produsent/" + slugify(a.name), lang)}" class="rel-card">
         <div class="rel-name">${escapeHtml(a.name)}</div>
-        <div class="rel-meta">${escapeHtml(cityName)} · Trust ${trust}%</div>
+        <div class="rel-meta">${escapeHtml(cityName)}</div>
         <div style="margin-top:6px;">${cats}</div>
       </a>`;
     }).join("");

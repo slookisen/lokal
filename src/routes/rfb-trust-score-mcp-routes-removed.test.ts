@@ -30,8 +30,12 @@
  *     only the ONE match-reason STRING is removed, not the score's
  *     contribution to `relevanceScore`.
  *   - `src/mcp/server.ts` (already fixed by PR #810) and
- *     `src/public/*.html`/`src/routes/seo.ts` (already fixed) — untouched by
- *     this suite and this dev-request.
+ *     `src/public/*.html` (already fixed) — untouched by this suite and this
+ *     dev-request. `src/routes/seo.ts` was NOT already fixed — an independent
+ *     reviewer of this PR found a still-live `Trust ${trust}%` leak in its
+ *     "related producers in same city" widget (missed by #810's narrower
+ *     `/\bTrust Score\b/` regression check); that fix and its strengthened
+ *     test live in rfb-trust-score-public-display-removed.test.ts, not here.
  *
  * Harness: same duck-typed-server pattern as mcp-search-geo.test.ts
  * (`registerTools()` against a fake server that just captures each tool's
