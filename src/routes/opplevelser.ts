@@ -569,6 +569,12 @@ import {
   // gårdssalg multi-page-crawl content enrichment (Fase 1 item 3)
   summarizeVisit,
   extractOpeningHours,
+  // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+  // backoff, Del A: A3's free LLM-worth-trying gate + A4's deterministic
+  // JSON-LD opening-hours extraction (both PURE, both in search-enrich.ts
+  // alongside their sibling extractors above).
+  hasVisitLlmTrigger,
+  extractJsonLdOpeningHours,
   // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4 —
   // the cheap/universal prefilter, reused (not duplicated) as cascade stage
   // 1 of meetsGardssalgAboutQualityBar below.
@@ -2751,8 +2757,59 @@ const GARDSSALG_CONTENT_PATHS: readonly string[] = [
   "/om-oss", "/varer", "/om", "/ol", "/øl",
   "/smaking", "/smaksprover", "/smaksprøver",
   "/apningstider", "/åpningstider",
+  // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+  // backoff, Del A2: drink-producer visit/opening-hours sub-pages — added to
+  // the SAME flat candidate list above (never a second list), and reordered
+  // ahead of the product-ish paths at fetch time by
+  // gardssalgOrderContentPathsForNeed() below ONLY for rows that no longer
+  // need product/about-page discovery (see that function's own doc comment).
+  "/taproom", "/besok-oss", "/besøk-oss", "/visit",
+  "/omvisning", "/omvisninger", "/gardsutsalg", "/gårdsutsalg", "/utsalg",
+  "/smak", "/gardsbutikk", "/gårdsbutikk", "/apningstider-og-besok",
 ];
 const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
+
+// dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-yield-
+// backoff, Del A2: the visit/opening-hours-oriented subset of
+// GARDSSALG_CONTENT_PATHS, used ONLY by gardssalgOrderContentPathsForNeed()
+// below to reorder the fallback candidate list — never a separate fetch
+// list of its own. Includes both the pre-existing visit-ish paths
+// (/besok, /besøk, /smaking, /smaksprover, /smaksprøver, /apningstider,
+// /åpningstider) and this dev-request's new ones.
+const GARDSSALG_VISIT_PATH_SET: ReadonlySet<string> = new Set([
+  "/besok", "/besøk", "/smaking", "/smaksprover", "/smaksprøver",
+  "/apningstider", "/åpningstider",
+  "/taproom", "/besok-oss", "/besøk-oss", "/visit",
+  "/omvisning", "/omvisninger", "/gardsutsalg", "/gårdsutsalg", "/utsalg",
+  "/smak", "/gardsbutikk", "/gårdsbutikk", "/apningstider-og-besok",
+]);
+
+/**
+ * Need-driven fallback-path ordering (Del A2). GARDSSALG_CONTENT_PATHS is
+ * ONLY ever consulted as the FALLBACK when link-driven discovery
+ * (discoverContentLinks, inside crFetchGardssalgContent below) finds nothing
+ * inside the homepage's own section — see that function's own "Link-driven
+ * discovery FIRST, fixed paths only as a fallback" comment. This function
+ * decides the ORDER of that fallback list, never its membership.
+ *
+ * `needsDriven=false` (the default for every pre-existing caller) returns
+ * GARDSSALG_CONTENT_PATHS completely unchanged — today's ordering, byte-
+ * identical. `needsDriven=true` — passed by processOne() below only for a
+ * row whose `products` AND `about_text` are ALREADY filled (today's ~122
+ * verified-drink rows, per the dev-request's own count) — moves every
+ * visit/opening-hours path (GARDSSALG_VISIT_PATH_SET) to the FRONT, ahead of
+ * every product-ish path, while preserving each group's own relative order.
+ * Since GARDSSALG_MAX_PAGES caps the fetch loop at 4 sub-pages, this is what
+ * actually gets those rows' visit_text/opening_hours_text gaps filled
+ * instead of re-fetching /produkter and /nettbutikk yet again on a row that
+ * has no more use for them. PURE.
+ */
+export function gardssalgOrderContentPathsForNeed(needsDriven: boolean): readonly string[] {
+  if (!needsDriven) return GARDSSALG_CONTENT_PATHS;
+  const visitFirst = GARDSSALG_CONTENT_PATHS.filter((p) => GARDSSALG_VISIT_PATH_SET.has(p));
+  const rest = GARDSSALG_CONTENT_PATHS.filter((p) => !GARDSSALG_VISIT_PATH_SET.has(p));
+  return [...visitFirst, ...rest];
+}
 
 /**
  * Fetch a gårdssalg provider's homepage + up to 4 of its content sub-pages
@@ -2792,7 +2849,13 @@ export function __setGardssalgRenderPageImplForTesting(impl?: typeof renderPage 
   gsRenderPageImplForTesting = impl ?? null;
 }
 
-async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutcome> {
+async function crFetchGardssalgContent(
+  homepageUrl: string,
+  // Del A2 — OPTIONAL, additive, defaults to false so every pre-existing
+  // call site keeps today's fallback-path ordering byte-identical. See
+  // gardssalgOrderContentPathsForNeed()'s own doc comment above.
+  needsDrivenOrdering: boolean = false
+): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
   if (!primary.ok) {
@@ -2942,7 +3005,10 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
         ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
           // the products diagnostic already reads.
           discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
-        : GARDSSALG_CONTENT_PATHS.map((p) => ({ url: `${base}${p}`, label: p }));
+        : // Del A2: need-driven ordering of the FALLBACK list only — link
+          // discovery above still always takes priority when it finds
+          // anything inside the section.
+          gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
 
     for (const t of targets) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
@@ -3637,7 +3703,18 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     | "no_candidate_section"
     | "below_quality_bar"
     | "already_present"
-    | "fetch_empty";
+    | "fetch_empty"
+    // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-
+    // yield-backoff, Del A3: ADDITIVE outcome distinguishing a visit_text
+    // write produced by the source-grounded LLM generator+judge from an
+    // ordinary deterministic "filled" (extractive summarizeVisit() candidate,
+    // or the blank-fill generateGardssalgAboutFromSource-shaped path).
+    // opening_hours_text's own JSON-LD (Del A4) vs. LLM-generated writes are
+    // deliberately NOT distinguished this way — both remain "filled", since
+    // that field's LLM path (generateGardssalgOpeningHoursFromSource,
+    // pre-existing) already goes through its own defect-classifier gate and
+    // this dev-request does not touch that field's diagnostic vocabulary.
+    | "llm_generated";
   const fieldDiagnostic: Array<{
     provider_id: string;
     about_text: GardssalgFieldDiagnosticOutcome;
@@ -3758,9 +3835,16 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     }
 
     // Fetch homepage + gårdssalg sub-pages server-side (SSRF-guarded).
+    // Del A2: need-driven fallback ordering — a row whose products AND
+    // about_text are ALREADY filled has no more use for the product-ish
+    // fallback paths, so visit/opening-hours paths go first for it (see
+    // gardssalgOrderContentPathsForNeed's own doc comment). gardssalgProducts
+    // Eligible(t.products) === true means products is still BLANK, so its
+    // negation is "products already filled" here.
+    const gsNeedsDrivenOrdering = !gardssalgProductsEligible(t.products) && !!(t.about_text && t.about_text.trim());
     let fetched: CrFetchOutcome;
     try {
-      fetched = await crFetchGardssalgContent(t.hjemmeside);
+      fetched = await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e), persistence: "internal" });
       // NO parking strike here. fetchPage() never throws — it returns a
@@ -3837,6 +3921,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // output (never this raw snippet) is the only thing that can ever become
     // candidateHours below.
     const hoursTrigger = extractOpeningHours(contentText);
+    // Del A4 (dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-
+    // no-yield-backoff): structured JSON-LD opening hours, tried BEFORE the
+    // LLM trigger above — a hit here means generateGardssalgOpeningHours
+    // FromSource is never even called (see candidateHours below). Scanned
+    // over combinedHtml (homepage + every fetched sub-page), same scope as
+    // the regex trigger.
+    const jsonLdHours = extractJsonLdOpeningHours(combinedHtml);
 
     // Kvalitetsgate-redesign (dev-request 2026-07-20-gardssalg-kvalitetsgate-
     // redesign, slice 2/3/4): about_text/visit_text candidates are judged by
@@ -3885,8 +3976,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // something worth checking; the generator's own sentinel/residual-
     // markdown/classifyGardssalgFieldDefect gates (see its doc comment) are
     // the only thing that can produce a non-null candidateHours here.
-    const candidateHours =
-      hoursTrigger && hoursTrigger.trim()
+    // Del A4: jsonLdHours (deterministic, zero LLM cost) is tried FIRST —
+    // only when it comes back null does the regex-trigger/LLM path run at
+    // all. Either way the result flows into the SAME downstream write/
+    // field_diagnostic handling below ("filled" — deterministic — for both
+    // sources; "llm_generated" is reserved for visit_text's A3 path only).
+    const candidateHours = jsonLdHours
+      ? jsonLdHours
+      : hoursTrigger && hoursTrigger.trim()
         ? await generateGardssalgOpeningHoursFromSource(contentText, t.navn)
         : null;
 
@@ -4041,6 +4138,64 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       if (generatedAbout) {
         wouldWriteActions.about_text = "filled";
         provenance.about_text = { source_url: fetched.fetchUrl, snippet: generatedAbout.slice(0, 120) };
+      }
+    }
+
+    // ── Del A3 (dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-
+    // og-no-yield-backoff): LLM-generated visit_text fill for the drink-
+    // producer cohort — mirrors the blank about_text LLM fill immediately
+    // above (generateGardssalgAboutFromSource: a FILL-shape generator, not a
+    // rewrite/expand of existing text), applied to visit_text instead. Fires
+    // ONLY when:
+    //   - visit_text is completely BLANK (isBlank(t.visit_text)) — same
+    //     "action: filled, never replace" scope as the about_text block
+    //     above; a non-blank-but-thin visit_text stays on the deterministic
+    //     candidateVisit/replace path above, unchanged by this dev-request;
+    //   - the extractive pass above did NOT already produce a
+    //     wouldWriteActions.visit_text entry (!wouldWriteActions.visit_text
+    //     — true exactly when candidateVisit came back null, i.e.
+    //     summarizeVisit() returned "" or its candidate failed
+    //     meetsGardssalgAboutQualityBar, per this dev-request's own trigger
+    //     condition);
+    //   - the A5 kill switch is not set to "false" (GARDSSALG_VISIT_LLM_
+    //     ENABLED, default true — reproduces today's purely deterministic
+    //     behavior when off, no LLM call at all);
+    //   - hasVisitLlmTrigger(contentText) (search-enrich.ts) finds a free,
+    //     deterministic signal FIRST — an A1 VISIT_KEYWORDS hit or a
+    //     weekday/clock-time token — zero LLM calls without one.
+    // Reuses the ALREADY-fetched/extracted contentText — no new fetch. Runs
+    // in BOTH dry-run and apply mode, same convention as every other LLM
+    // path in this route (dry-run still calls the LLM so the preview is
+    // real; dry-run still writes nothing regardless of the LLM's answer).
+    //
+    // The generator's own sentinel (UTILSTREKKELIG_GRUNNLAG) means "no
+    // usable material" -> null candidate here -> no wouldWriteActions entry
+    // -> this row falls through to the wouldWrite.length===0 no-yield path
+    // below exactly like any other no-candidate row (Del B, already
+    // shipped) — no special-casing needed for "sentinel counts as no-yield".
+    // A non-null generator candidate is NEVER trusted on its own: it is
+    // judged against the source text as ground truth by
+    // judgeGardssalgVisitCandidateWithSource (the source-grounded anti-
+    // fabrication judge, mirroring the "kildetro" experience-description
+    // judge further down this file) before it is allowed anywhere near
+    // wouldWriteActions/the write path.
+    let llmGeneratedVisitText: string | null = null;
+    let visitLlmGenerated = false;
+    if (
+      !wouldWriteActions.visit_text &&
+      isBlank(t.visit_text) &&
+      process.env.GARDSSALG_VISIT_LLM_ENABLED !== "false" &&
+      hasVisitLlmTrigger(contentText)
+    ) {
+      const rawVisitCandidate = await generateGardssalgVisitFromSource(contentText, t.navn);
+      if (rawVisitCandidate) {
+        const visitVerdict = await judgeGardssalgVisitCandidateWithSource(rawVisitCandidate, contentText, t.navn);
+        if (visitVerdict.approved) {
+          llmGeneratedVisitText = rawVisitCandidate;
+          wouldWriteActions.visit_text = "filled";
+          provenance.visit_text = { source_url: fetched.fetchUrl, snippet: rawVisitCandidate.slice(0, 120) };
+          visitLlmGenerated = true;
+        }
       }
     }
 
@@ -4211,10 +4366,19 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             // extractiveFieldDiagOutcome above. Reachable now that the trigger
             // firing no longer guarantees a written candidate (spec C).
             : "below_quality_bar";
+    // Del A3: visit_text's diagnostic outcome is "llm_generated" specifically
+    // when THIS run's write came from generateGardssalgVisitFromSource +
+    // judgeGardssalgVisitCandidateWithSource — checked BEFORE falling back to
+    // extractiveFieldDiagOutcome's ordinary vocabulary (which would otherwise
+    // report the exact same write as a plain "filled", indistinguishable
+    // from an extractive summarizeVisit() candidate).
+    const visitFieldDiagOutcome: GardssalgFieldDiagnosticOutcome = visitLlmGenerated
+      ? "llm_generated"
+      : extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text);
     fieldDiagnostic.push({
       provider_id: providerId,
       about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
-      visit_text: extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text),
+      visit_text: visitFieldDiagOutcome,
       opening_hours_text: hoursFieldDiagOutcome,
       products: mapProductsOutcomeToFieldDiagnostic(productsOutcomeForFieldDiag),
     });
@@ -4290,7 +4454,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           providerId,
           {
             about_text: rewriteAbout ?? candidateAbout ?? generatedAbout ?? undefined,
-            visit_text: rewriteVisit ?? candidateVisit ?? undefined,
+            // Del A3: llmGeneratedVisitText only ever has a value when
+            // candidateVisit is null (mutually exclusive by construction —
+            // see the A3 block's own gate above), so this ordering never
+            // silently prefers the LLM candidate over a real extractive one.
+            visit_text: rewriteVisit ?? candidateVisit ?? llmGeneratedVisitText ?? undefined,
             opening_hours_text: candidateHours ?? undefined,
             products: productsCandidate ?? undefined,
           },
@@ -27797,6 +27965,221 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på ukedager, k
   if (defect.defective) return null;
 
   return plain;
+}
+
+// ─── generateGardssalgVisitFromSource / judgeGardssalgVisitCandidateWithSource
+//     (dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-
+//     yield-backoff, Del A3) ───────────────────────────────────────────────
+// LLM-GENERATE-FROM-SCRATCH of visit_text for the drink-producer cohort when
+// the deterministic extractor (summarizeVisit, search-enrich.ts) returned ""
+// or its candidate failed meetsGardssalgAboutQualityBar — the caller
+// (processOne, below) only ever invokes this pair when candidateVisit came
+// back null AND hasVisitLlmTrigger(contentText) found a real, deterministic
+// signal first (an A1 VISIT_KEYWORDS hit or a weekday/clock-time token) —
+// zero LLM calls without one. Structurally the CLOSEST match is
+// generateGardssalgAboutFromSource immediately above (this section's own
+// sibling): a FILL-shape generator (pageText + navn in, sentinel/null out),
+// not an expand-existing-text rewrite — visit_text is blank here by
+// construction (the caller also requires isBlank(t.visit_text)).
+//
+// Two-step generator→sentinel→judge, mirroring the "kildetro" experience-
+// description pattern (enrichOneExperienceDescription /
+// judgeExperienceDescriptionCandidate's groundTruthText branch, further down
+// this file) rather than judgeGardssalgAboutCandidate's prose-only judge
+// immediately above: THIS candidate is GENERATED text, not an extractive
+// quote of the page, so the anti-fabrication judge must check every claim in
+// it against the source text as ground truth ("fasit") — a prose-quality-
+// only judge (real Norwegian, not leaked nav chrome) would happily approve a
+// fluent but invented sentence. The generator's own sentinel
+// (GARDSSALG_VISIT_SENTINEL) — distinct from GARDSSALG_REWRITE_SENTINEL /
+// GARDSSALG_PRODUCTS_SENTINEL, declared separately so the three escape
+// hatches can evolve independently — is the dev-request's own literal
+// "UTILSTREKKELIG_GRUNNLAG" (same string EXP_DESC_SENTINEL below already
+// uses for the same reason: no usable material in the source).
+//
+// Never fabricates: sync fetch to https://api.anthropic.com/v1/messages,
+// ANTHROPIC_API_KEY from env, model claude-haiku-4-5. Returns null — NEVER
+// throws — on missing key / network failure / non-200 / unparseable body /
+// the sentinel / residual markdown / an oversized response. The caller
+// (processOne) runs the returned candidate through
+// judgeGardssalgVisitCandidateWithSource below BEFORE it is allowed into
+// wouldWriteActions/the write path — this generator's own output is never
+// trusted on its own.
+const GARDSSALG_VISIT_SENTINEL = "UTILSTREKKELIG_GRUNNLAG";
+// Safety-valve only (mirrors GARDSSALG_HOURS_CANDIDATE_MAX_LEN's own role
+// above) — NOT the quality gate; the source-grounded judge is the real gate.
+// 1-3 sentences of visit text comfortably fits well under this.
+const GARDSSALG_VISIT_CANDIDATE_MAX_LEN = 500;
+
+export async function generateGardssalgVisitFromSource(
+  pageText: string,
+  navn: string
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (pageText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  const prompt = `Skriv en kort norsk tekst (1–3 setninger, seksjonen "Besøket hos produsenten") om hva et besøk hos gårdsprodusenten "${navn}" faktisk innebærer — for eksempel om de har taproom/utsalg, tar imot besøkende, tilbyr smaking eller omvisning.
+
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på åpningstider, aktiviteter eller andre detaljer som ikke er nevnt der. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke inneholder noe brukbart om å besøke produsenten, svar med nøyaktig ${GARDSSALG_VISIT_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_VISIT_SENTINEL) return null; // explicit "no usable material" escape
+
+  // Strip markdown BEFORE any gate below — same reasoning as the sibling
+  // helpers: every gate must judge the exact string that would land on the
+  // public page, not a version padded/shortened by formatting syntax.
+  const plain = stripMarkdownArtifacts(cleaned);
+
+  // Sentinel embedded/wrapped rather than verbatim — same two-check
+  // discipline as the sibling helpers (checked BEFORE the residual gate
+  // since the sentinel itself contains "_").
+  if (plain.includes(GARDSSALG_VISIT_SENTINEL)) return null;
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
+
+  // Safety valve only — NOT the quality gate (that's the source-grounded
+  // judge below, run by the caller). Guards against a rambling,
+  // non-conforming response.
+  if (!plain || plain.length > GARDSSALG_VISIT_CANDIDATE_MAX_LEN) return null;
+
+  return plain;
+}
+
+/**
+ * The anti-fabrication judge for generateGardssalgVisitFromSource's output —
+ * same fail-closed shape/tokens as judgeGardssalgAboutCandidate above
+ * (GARDSSALG_JUDGE_APPROVE_TOKEN/REJECT_TOKEN, exact-token-on-first-line
+ * verdict, ANY doubt or failure resolves to REJECT, never throws, never
+ * silently approves), but grounds its verdict against the SOURCE TEXT as
+ * fasit — mirrors judgeExperienceDescriptionCandidate's groundTruthText
+ * branch (further down this file) rather than judgeGardssalgAboutCandidate's
+ * own prose-only prompt, because THIS candidate is generated (not
+ * extractive) text: every concrete claim in it must trace back to the
+ * source, not merely read as genuine Norwegian prose about the right
+ * producer.
+ */
+export async function judgeGardssalgVisitCandidateWithSource(
+  candidateText: string,
+  sourceText: string,
+  producerName: string
+): Promise<GardssalgJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reasoning: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const cappedCandidate = (candidateText || "").slice(0, GARDSSALG_JUDGE_CANDIDATE_CHAR_CAP);
+  const cappedSource = (sourceText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  const prompt = `Du er faktakontrollør for produsentprofiler på en norsk markedsplattform for gårdssalg. Kandidatteksten under skal være skrevet UTELUKKENDE på grunnlag av kildeteksten under, som er hentet fra produsenten "${producerName}" sin EGEN nettside og er FASIT for hva som er sant.
+
+Kildetekst (produsentens egen nettside — fasit):
+${cappedSource}
+
+Kandidattekst (seksjonen "Besøket hos produsenten"):
+${cappedCandidate}
+
+Svar ${GARDSSALG_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i kandidatteksten kan spores direkte til kildeteksten over.
+- Kandidatteksten inneholder ingen konkrete opplysninger som IKKE finnes i kildeteksten — ingen oppdiktede åpningstider, aktiviteter, fasiliteter eller detaljer.
+- Teksten handler spesifikt om DENNE produsenten (ikke en paraplyorganisasjon/reiselivslag sine mange medlemmer omtalt samlet).
+- Teksten er sammenhengende, ekte norsk prosa (1–3 setninger) — ikke fyllstoff, ikke gjentatte setninger.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${GARDSSALG_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${GARDSSALG_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${GARDSSALG_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reasoning: "nettverksfeil under dommer-kall — avvist fail-closed" };
+  }
+
+  if (!response.ok) {
+    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reasoning: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reasoning: "uventet svarformat fra dommer-API — avvist fail-closed" };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reasoning = lines.slice(1).join(" ").trim();
+
+  if (verdictToken === GARDSSALG_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === GARDSSALG_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reasoning: "uventet/tvetydig dommersvar — avvist fail-closed" };
 }
 
 // ─── generateGardssalgProductList (dev-request 2026-07-18-gardssalg-
