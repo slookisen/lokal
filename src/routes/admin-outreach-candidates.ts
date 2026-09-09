@@ -378,6 +378,17 @@ router.get("/", (req: Request, res: Response) => {
         WHERE
           k.email IS NOT NULL AND k.email != ''
           AND a.umbrella_type IS NULL
+          -- dev-request 2026-09-09-outreach-profilkvalitet: this query
+          -- re-derives the outreach_ready_pool VIEW's own conditions rather
+          -- than reading the VIEW (mode=second's whole point is to include
+          -- rows the VIEW's NOT EXISTS outreach_sent_log exclusion would
+          -- drop), so the VIEW's new profile-published gate (is_active,
+          -- role, is_vetted — see database/init.ts's outreach_ready_pool
+          -- comment) has to be mirrored here too, or a re-touch send could
+          -- still target a producer whose page 404s.
+          AND a.is_active = 1
+          AND (a.role IS NULL OR a.role = 'producer')
+          AND (a.is_vetted IS NULL OR a.is_vetted = 1)
           AND k.verification_status = 'verified'
           AND k.enrichment_status = 'rich'
           AND k.url_last_status IS NOT NULL
