@@ -29,11 +29,15 @@
 // SOURCE PRIORITY (per dev-request spec, cheapest/most-authoritative first)
 // ───────────────────────────────────────────────────────────────────────
 //   (a) Brreg forretningsadresse `poststed`, keyed on `agents.org_nr` — the
-//       producer's own registered business address. A single Brreg hit is
-//       trusted outright (Brreg is already a Tier-A source elsewhere in this
-//       codebase — brreg-verification-gate, brreg-nace-discovery); reuses
+//       producer's own registered business address; reuses
 //       `fetchBrregBusinessAddress` (services/brreg-client.ts), which never
-//       throws and returns null on any transport/parse failure or 404.
+//       throws and returns null on any transport/parse failure or 404. A
+//       Brreg hit is corroborated, not trusted outright: its own
+//       `postnummer` must literally equal `agent_knowledge.postal_code`
+//       (skipped entirely when no postal_code is on file to corroborate
+//       against), and the tier is gated off when `agents.brreg_flag` is
+//       dissolved/bankrupt/wrong_nace — the same cross-verification
+//       discipline Tiers b/c apply below (post-review fix, PR #842).
 //   (b) The official postal-code registry (Bring's postnummerregister —
 //       postnummer -> poststed is a strict, unambiguous 1:1 official
 //       mapping in Norway, no disambiguation needed), keyed on
@@ -211,15 +215,62 @@ export type CityResolution =
  * throws: any tier's own failure just falls through to the next.
  */
 export async function resolveCityForRow(
-  row: { org_nr: string | null; address: string | null; postal_code: string | null },
+  row: {
+    org_nr: string | null;
+    address: string | null;
+    postal_code: string | null;
+    /**
+     * Optional — only the worker's DB-backed candidate rows carry it (see
+     * runCityBackfillTick's SELECT); tests/callers that omit it are treated
+     * as "no flag on file" (never gates Tier a).
+     */
+    brreg_flag?: string | null;
+  },
   deps: AgentsCityBackfillDeps = {},
 ): Promise<CityResolution> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   // ── (a) Brreg forretningsadresse ────────────────────────────────────
+  // REVIEW (PR #842, code-reviewer CHANGES-REQUESTED): this tier used to
+  // trust a single Brreg hit outright, with zero corroboration — the one
+  // tier that didn't follow this module's own "NEVER WRITE AN
+  // UNCORROBORATED OR AMBIGUOUS CITY" rule that Tiers b/c both already
+  // enforce for their own inputs. Fixed with the SAME two disciplines b/c
+  // already apply:
+  //   1. cross-check: the Brreg hit's own `postnummer` must literally EQUAL
+  //      `row.postal_code` when a postal_code is on file — identical in
+  //      spirit to Tier c's own "resolved hit's own postnummer must
+  //      literally EQUAL the given postal_code" rule below. No postal_code
+  //      on file at all means nothing to corroborate against, so Tier a is
+  //      skipped entirely (same posture Tiers b/c already take when their
+  //      own corroboration input is missing/unusable).
+  //   2. gate: `agents.brreg_flag` of dissolved/bankrupt/wrong_nace (the
+  //      SAME BRREG_SWEEP_REVIEW_FLAGS set routes/admin-agents.ts already
+  //      classifies as review-worthy) skips Tier a — a dissolved/bankrupt
+  //      entity's registered Brreg address is exactly the kind of stale
+  //      signal this worker must not write confidently.
+  // `brreg_verified` is deliberately NOT required here. Per
+  // runBrregVerifyForRegister (routes/admin-agents.ts:155-192) it encodes
+  // "active AND NACE overlaps the vertical's allowlist" — a business-
+  // eligibility check unrelated to whether the registered ADDRESS is
+  // trustworthy — and it defaults to 0 for the many pre-existing org_nr
+  // values captured before the brreg-verification-gate slice existed (0
+  // there means "never checked", not "known-bad"). The rest of this
+  // codebase (registration itself, admin-outreach-pool.ts, etc.) already
+  // treats an org_nr as usable without requiring brreg_verified = 1;
+  // requiring it here would invent a stricter standard than the codebase
+  // applies to org_nr-derived data anywhere else. brreg_flag is a
+  // different, narrower signal — an actual negative Brreg finding, not
+  // merely "never checked" — and is what gates, above.
   const orgNr = (row.org_nr || "").trim();
-  if (orgNr) {
+  const postalCode = (row.postal_code || "").trim();
+  const postalCodeUsable = /^\d{4}$/.test(postalCode);
+  const brregFlag = (row.brreg_flag || "").trim();
+  const brregFlagBlocksTierA =
+    brregFlag === "dissolved" || brregFlag === "bankrupt" || brregFlag === "wrong_nace";
+
+  if (orgNr && !brregFlagBlocksTierA && postalCodeUsable) {
     let brregAddr: BrregAddress | null = null;
     try {
       brregAddr = await fetchBrregBusinessAddress(orgNr, fetchImpl);
@@ -227,21 +278,24 @@ export async function resolveCityForRow(
       brregAddr = null;
     }
     if (brregAddr?.poststed) {
-      const display = normalizeCityLabel(brregAddr.poststed);
-      if (display) {
-        return {
-          status: "resolved",
-          city: display,
-          source: "brreg_forretningsadresse",
-          detail: `brreg org ${orgNr}`,
-        };
+      if (brregAddr.postnummer === postalCode) {
+        const display = normalizeCityLabel(brregAddr.poststed);
+        if (display) {
+          return {
+            status: "resolved",
+            city: display,
+            source: "brreg_forretningsadresse",
+            detail: `brreg org ${orgNr}`,
+          };
+        }
       }
+      // else: postnummer missing/mismatched vs row.postal_code — not
+      // corroborated, never trust it "by coincidence" (same REVIEW B2
+      // posture Tier c documents below) — fall through to Tier b/c.
     }
   }
 
   // ── (b) Official postal-code registry ───────────────────────────────
-  const postalCode = (row.postal_code || "").trim();
-  const postalCodeUsable = /^\d{4}$/.test(postalCode);
   if (postalCodeUsable) {
     let registry: Map<string, string> | null = null;
     try {
@@ -340,6 +394,7 @@ type CandidateRow = {
   org_nr: string | null;
   address: string | null;
   postal_code: string | null;
+  brreg_flag: string | null;
 };
 
 // Strictly-increasing attempt stamps — same reasoning (and the same measured
@@ -452,6 +507,7 @@ async function runCityBackfillTick(
   const candidates = db
     .prepare(
       `SELECT a.id AS agent_id, a.name AS name, a.org_nr AS org_nr,
+              a.brreg_flag AS brreg_flag,
               k.address AS address, k.postal_code AS postal_code
          FROM agents a
          JOIN agent_knowledge k ON k.agent_id = a.id

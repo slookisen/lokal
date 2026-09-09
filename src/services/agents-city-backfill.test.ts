@@ -29,6 +29,12 @@
  *           no house number) -> skip "no_usable_source", no write
  *   g4      a too-small/garbage postal-registry response is never trusted
  *           (falls through to Kartverket or skip, never a wrong-tier write)
+ *   g5      MUTATION-STYLE SAFETY (PR #842 review): Brreg forretningsadresse
+ *           resolves to a postnummer that MISMATCHES row.postal_code -> Tier
+ *           a refuses (falls through), never trusted "outright"
+ *   g6      MUTATION-STYLE SAFETY (PR #842 review): agents.brreg_flag of
+ *           dissolved/bankrupt/wrong_nace skips Tier a entirely, even when
+ *           the Brreg hit's postnummer would otherwise corroborate
  *   w1-w4   the worker (cityBackfillTick): writes agents.city + merges
  *           field_provenance for "city" exactly like PUT /admin/knowledge
  *           does, stamps city_backfill_source/outcome/attempted_at
@@ -269,6 +275,49 @@ export function runAgentsCityBackfillTests(opts: { log?: boolean } = {}): Promis
       }
       postalRegistryText = savedText;
       cb.__clearCityPostalRegistryCacheForTesting();
+
+      // ── g5: MUTATION-STYLE SAFETY (reviewer finding, PR #842) — Brreg
+      // forretningsadresse's own postnummer MISMATCHES the row's known
+      // postal_code -> Tier a refuses (no longer "trusted outright"),
+      // falling through to b/c; with neither able to resolve here (5000 is
+      // outside the fake registry's coverage and there is no address for
+      // Kartverket), the row ends at the terminal skip. Never trust a Brreg
+      // hit whose registered postnummer disagrees with what the producer's
+      // own profile carries.
+      brregRoutes.set("444444444", {
+        organisasjonsnummer: "444444444",
+        navn: "Test Gård Fire AS",
+        forretningsadresse: { postnummer: "1400", poststed: "FEIL-BRREG-STED", adresse: ["Veien 4"] },
+      });
+      {
+        const r = await cb.resolveCityForRow(
+          { org_nr: "444444444", address: null, postal_code: "5000" },
+          deps,
+        );
+        assertTrue(r.status === "skip", "g5a: Brreg postnummer mismatch vs row.postal_code is a SKIP, never a resolve");
+        if (r.status === "skip") assertEq(r.reason, "no_usable_source", "g5b: falls through past Brreg to the terminal skip (no other source available)");
+      }
+
+      // ── g6: MUTATION-STYLE SAFETY (reviewer finding, PR #842) —
+      // agents.brreg_flag of dissolved/bankrupt/wrong_nace skips Tier a
+      // entirely, even when the Brreg hit's postnummer WOULD otherwise
+      // corroborate against row.postal_code — proves the gate fires
+      // independently of (and before) the cross-check, not merely that the
+      // cross-check happens to fail. Mirrors routes/admin-agents.ts's own
+      // BRREG_SWEEP_REVIEW_FLAGS set.
+      brregRoutes.set("666666666", {
+        organisasjonsnummer: "666666666",
+        navn: "Test Gård Seks AS",
+        forretningsadresse: { postnummer: "6000", poststed: "SKULLE-IKKE-BRUKES", adresse: ["Veien 6"] },
+      });
+      for (const flag of ["dissolved", "bankrupt", "wrong_nace"]) {
+        const r = await cb.resolveCityForRow(
+          { org_nr: "666666666", address: null, postal_code: "6000", brreg_flag: flag },
+          deps,
+        );
+        assertTrue(r.status === "skip", `g6a[${flag}]: brreg_flag=${flag} skips Tier a even with a postnummer-matching Brreg hit`);
+        if (r.status === "skip") assertEq(r.reason, "no_usable_source", `g6b[${flag}]: falls through to the terminal skip (no other source available)`);
+      }
 
       // ── w1-w4 / n1 / s1 / d1: the worker, end to end ───────────────────
       const insertAgent = db.prepare(
