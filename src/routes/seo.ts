@@ -4161,7 +4161,13 @@ export function buildProducerAnswerFirstOpening(params: {
     .slice(0, 4);
   const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 3);
   const usingRealProducts = productNames.length > 0 && productsAreSourced;
-  const sellItems = productNames.length ? productNames : catLabels;
+  // Gate the DISPLAYED item list on the same signal as the verb — not just
+  // "is there any productsList at all". An unsourced products array (no
+  // caller-supplied evidence) must fall back to category tags for the
+  // sentence's content too, or an inference-only/wrong product name (the
+  // Bærsentralen "jordbær" class of bug — see cross-source-validator.ts)
+  // would still surface verbatim under the softer "tilbyr" verb.
+  const sellItems = usingRealProducts ? productNames : catLabels;
 
   const hasSellItems = sellItems.length > 0;
   const hasCity = !!params.cityName;
@@ -5411,7 +5417,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
         .get(agent.id) as { field_provenance: string } | undefined;
       const fieldProvenance = fpRow?.field_provenance ? JSON.parse(fpRow.field_provenance) : {};
-      productsAreSourced = productsList.length > 0 && !fieldHasOnlyInferenceSources(fieldProvenance.products);
+      // fieldHasOnlyInferenceSources() returns false both when every source is
+      // real AND when there is no provenance record at all (its documented
+      // "data_insufficient case, handled elsewhere" — correct for its original
+      // quarantine-flag caller, wrong here if merely negated: the primary
+      // products-write path, knowledge-service.ts upsertKnowledge(), never
+      // writes field_provenance at all, so "!fieldHasOnlyInferenceSources(...)"
+      // alone would default to "sourced" for that whole population and
+      // silently reissue the over-claiming bug this dev-request exists to
+      // close. Require an actual non-empty provenance record first.
+      const productProv = fieldProvenance.products;
+      const hasProductProvenance = Array.isArray(productProv) ? productProv.length > 0 : !!productProv;
+      productsAreSourced = productsList.length > 0 && hasProductProvenance && !fieldHasOnlyInferenceSources(productProv);
     } catch (e) {
       console.error(`[seo] /produsent/${slug} field_provenance lookup for products failed:`, e);
       productsAreSourced = false;
