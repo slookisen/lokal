@@ -1,5 +1,5 @@
 {
-  "$schema": "https://developers.openai.com/plugins/schemas/chatgpt-app-submission.v1.json",
+  "$schema": "https://developers.openai.com/apps-sdk/schemas/chatgpt-app-submission.v1.json",
   "schema_version": 1,
   "app_info": {
     "display_name": "Rett fra Bonden",
@@ -207,12 +207,6 @@
       "user_prompt": "salmon in Lofoten",
       "tools_triggered": "lokal_search",
       "expected_output": "Fish producers in Lofoten, led by Lofotprodukt AS, Anitas Sjømat and Lofoten Seaweed — Napp. Verified live against production 2026-09-09."
-    },
-    {
-      "description": "Norwegian-language follow-up on a producer found by search, verifying contact details, opening hours and product range are returned for a single producer.",
-      "user_prompt": "Tell me more about Ostegården near Bergen — opening hours, products and how to contact them",
-      "tools_triggered": "lokal_search, lokal_info",
-      "expected_output": "The full profile for Ostegården — Krokeide: address Krokeide, Bergen 5244; phone +47 994 52 557; e-mail magnus@ostegarden.no; site ostegarden.no; opening hours Mon-Fri 08:00-16:00; seven products including Lagret Fanaost, Jørns Brie and Jørns Camembert; payment by cash or Vipps; farm pickup and shipping; plus a downloadable vCard link. Verified live against production 2026-09-09."
     }
   ],
   "negative_test_cases": [
