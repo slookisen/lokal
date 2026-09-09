@@ -720,5 +720,37 @@ export function initDentalSchema(db: Database.Database): void {
     console.warn("[init-dental] available_specialties bulk backfill warning:", err);
   }
 
+  // ─── dev-request 2026-09-02-dental-permanent-triage-needs-review-drain
+  //   (Skive 3b, 2026-09-09): repeat-park → needs_review triage columns.
+  //   Each of dental_agents' three independent "3 strikes → park for 30
+  //   days" counters (homepage_unreachable_since, extraction_unreachable_
+  //   since, wrong_entity_unreachable_since — see dental-store.ts) treats a
+  //   FIRST-EVER park and a REPEAT park (parking lapsed after 30 days and
+  //   the row hit 3 strikes again) identically today. Behind
+  //   DENTAL_REPEAT_PARK_TO_REVIEW=true, a REPEAT park additionally routes
+  //   the row to verification_status='needs_review' so a permanently-dead
+  //   record eventually drains into human triage instead of being re-parked
+  //   forever. `review_reason` records which repeat-park branch fired
+  //   ('dead_homepage_repeat' | 'insufficient_yield_repeat' |
+  //   'wrong_entity_repeat'); `review_since` is the same stamp timestamp as
+  //   the re-parked `_unreachable_since` column, for provenance/sort.
+  //
+  //   NOT `verifier_review_reason`: that column (dentalVerifierCols block
+  //   above) is a distinct, already-shipped mechanism owned by
+  //   src/services/dental-verifier.ts's automated re-verification sweep —
+  //   this is the separate "review_reason" concept that column's own doc
+  //   comment explicitly reserved for later. The two are never read or
+  //   written by each other's code path.
+  //
+  //   Nullable TEXT, purely additive. Idempotent ALTERs -- error = already
+  //   present.
+  const dentalRepeatParkReviewCols = [
+    "ALTER TABLE dental_agents ADD COLUMN review_reason TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN review_since TEXT",
+  ];
+  for (const stmt of dentalRepeatParkReviewCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[dental] schema initialized");
 }

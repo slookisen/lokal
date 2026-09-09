@@ -230,6 +230,119 @@ export function runDentalWrongEntityStreakTests(opts: { log?: boolean } = {}): T
     ).wrong_entity_streak;
     assertEq(streakAfterRerun, streakBeforeRerun, "wes-40: re-running initDentalSchema() does not reset/clobber an existing wrong_entity_streak value");
 
+    // ── Skive 3b (dev-request 2026-09-02-dental-permanent-triage-needs-
+    // review-drain, 2026-09-09): the wrong_entity branch's repeat-park ->
+    // needs_review, gated by DENTAL_REPEAT_PARK_TO_REVIEW, plus
+    // parkDentalWrongEntity()'s own isRepeat default-false safety for the
+    // retro-sanitize batch call site.
+    const prevRepeatFlagWes = process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+    try {
+      // (a) first-ever wrong_entity park sets NO review_reason/needs_review,
+      // regardless of the flag -- byte-identical to pre-Skive-3b behaviour.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idE = dstore.createDentalAgent({ navn: "Forste Gang Wrong Entity AS", org_nr: "911400555" } as any);
+      dstore.recordDentalExtractionResult(idE, false, "wrong_entity");
+      dstore.recordDentalExtractionResult(idE, false, "wrong_entity");
+      const firstPark = dstore.recordDentalExtractionResult(idE, false, "wrong_entity");
+      assertEq(firstPark.wrong_entity_parked_now, true, "skive3b-we-01 setup: idE first-ever wrong_entity park");
+      let rowE = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idE) as any;
+      assertEq(rowE.verification_status, "pending_verify",
+        "skive3b-we-01: first-ever wrong_entity park leaves verification_status untouched even with flag=true");
+      assertEq(rowE.review_reason, null, "skive3b-we-02: first-ever wrong_entity park sets no review_reason even with flag=true");
+      assertEq(rowE.review_since, null, "skive3b-we-03: first-ever wrong_entity park sets no review_since even with flag=true");
+
+      // (b) repeat park (expired backoff) with flag=true -> needs_review +
+      // mapped review_reason + a fresh review_since.
+      dentalDb.prepare("UPDATE dental_agents SET wrong_entity_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idE);
+      const repeatPark = dstore.recordDentalExtractionResult(idE, false, "wrong_entity");
+      assertEq(repeatPark.wrong_entity_parked_now, true, "skive3b-we-04: repeat wrong_entity park (expired backoff) still parked_now");
+      rowE = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idE) as any;
+      assertEq(rowE.verification_status, "needs_review",
+        "skive3b-we-05: repeat wrong_entity park with flag=true sets verification_status=needs_review");
+      assertEq(rowE.review_reason, "wrong_entity_repeat",
+        "skive3b-we-06: repeat wrong_entity park maps to review_reason='wrong_entity_repeat'");
+      assertTrue(typeof rowE.review_since === "string" && rowE.review_since.length > 0,
+        "skive3b-we-07: repeat wrong_entity park stamps a fresh review_since");
+
+      // (c) flag unset -> repeat wrong_entity park does NOT set
+      // needs_review/review_reason -- behaviour unchanged from before this PR.
+      delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      const idF = dstore.createDentalAgent({ navn: "Wrong Entity Uten Flagg AS", org_nr: "911400666" } as any);
+      dstore.recordDentalExtractionResult(idF, false, "wrong_entity");
+      dstore.recordDentalExtractionResult(idF, false, "wrong_entity");
+      dstore.recordDentalExtractionResult(idF, false, "wrong_entity");
+      dentalDb.prepare("UPDATE dental_agents SET wrong_entity_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idF);
+      const repeatNoFlag = dstore.recordDentalExtractionResult(idF, false, "wrong_entity");
+      assertEq(repeatNoFlag.wrong_entity_parked_now, true, "skive3b-we-08: repeat wrong_entity park without flag still parked_now (unchanged behaviour)");
+      const rowF = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idF) as any;
+      assertEq(rowF.verification_status, "pending_verify", "skive3b-we-09: flag unset -> verification_status unchanged on repeat wrong_entity park");
+      assertEq(rowF.review_reason, null, "skive3b-we-10: flag unset -> no review_reason on repeat wrong_entity park");
+
+      // (d) a row already verification_status='rejected' is left untouched --
+      // never silently overwritten, even on a repeat wrong_entity park with
+      // the flag on.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idG = dstore.createDentalAgent({ navn: "Rejected Wrong Entity AS", org_nr: "911400777" } as any);
+      dentalDb.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(idG);
+      dstore.recordDentalExtractionResult(idG, false, "wrong_entity");
+      dstore.recordDentalExtractionResult(idG, false, "wrong_entity");
+      dstore.recordDentalExtractionResult(idG, false, "wrong_entity");
+      dentalDb.prepare("UPDATE dental_agents SET wrong_entity_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idG);
+      const repeatRejected = dstore.recordDentalExtractionResult(idG, false, "wrong_entity");
+      assertEq(repeatRejected.wrong_entity_parked_now, true, "skive3b-we-11: repeat wrong_entity park on rejected row still parked_now (stamp still re-stamped)");
+      const rowG = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idG) as any;
+      assertEq(rowG.verification_status, "rejected",
+        "skive3b-we-12: rejected verification_status never overwritten by repeat wrong_entity park, even with flag=true");
+      assertEq(rowG.review_reason, null, "skive3b-we-13: rejected row gets no review_reason written");
+
+      // (e) parkDentalWrongEntity()'s own isRepeat default (no 2nd arg) must
+      // NEVER trigger needs_review, even with the flag on and even after
+      // manually pushing the streak past the repeat threshold -- this is
+      // exactly the retro-sanitize batch call site's shape (one-time
+      // non-"repeat" flagging of pre-existing rows), and must stay
+      // byte-identical regardless of DENTAL_REPEAT_PARK_TO_REVIEW.
+      const idH = dstore.createDentalAgent({ navn: "Retro Sanitize Shape AS", org_nr: "911400888" } as any);
+      const defaultArgResult = dstore.parkDentalWrongEntity(idH);
+      assertEq(defaultArgResult.wrong_entity_streak, 3, "skive3b-we-14: parkDentalWrongEntity default call still sets streak to DENTAL_PARK_AFTER_ATTEMPTS");
+      const rowH = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idH) as any;
+      assertEq(rowH.verification_status, "pending_verify",
+        "skive3b-we-15: parkDentalWrongEntity(id) with no 2nd arg never sets needs_review, even with flag=true");
+      assertEq(rowH.review_reason, null, "skive3b-we-16: parkDentalWrongEntity(id) with no 2nd arg never sets review_reason");
+      assertEq(rowH.review_since, null, "skive3b-we-17: parkDentalWrongEntity(id) with no 2nd arg never sets review_since");
+      // explicit isRepeat:false is equally inert.
+      const idI = dstore.createDentalAgent({ navn: "Explicit Non Repeat AS", org_nr: "911400999" } as any);
+      dstore.parkDentalWrongEntity(idI, false);
+      const rowI = dentalDb.prepare(
+        "SELECT verification_status FROM dental_agents WHERE id = ?"
+      ).get(idI) as any;
+      assertEq(rowI.verification_status, "pending_verify", "skive3b-we-18: parkDentalWrongEntity(id, false) never sets needs_review either");
+      // explicit isRepeat:true (mirrors recordDentalExtractionResult's own
+      // repeat call site) DOES set needs_review, with flag=true.
+      const idJ = dstore.createDentalAgent({ navn: "Explicit Repeat AS", org_nr: "911401000" } as any);
+      dstore.parkDentalWrongEntity(idJ, true);
+      const rowJ = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idJ) as any;
+      assertEq(rowJ.verification_status, "needs_review", "skive3b-we-19: parkDentalWrongEntity(id, true) with flag=true sets needs_review");
+      assertEq(rowJ.review_reason, "wrong_entity_repeat", "skive3b-we-20: parkDentalWrongEntity(id, true) maps review_reason='wrong_entity_repeat'");
+    } finally {
+      if (prevRepeatFlagWes === undefined) delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      else process.env.DENTAL_REPEAT_PARK_TO_REVIEW = prevRepeatFlagWes;
+    }
+
     if (log) console.log(`  dental-wrong-entity-streak: OK (${passed} assertions)`);
   } catch (err) {
     failed++;
