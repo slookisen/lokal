@@ -179,34 +179,40 @@
   },
   "test_cases": [
     {
-      "description": "English product-and-place search. Verifies that an English query selects the same food category as its Norwegian twin — the defect that caused the previous rejection.",
+      "description": "English product-and-place search. One of the two cases that failed the 2026-09-05 review; verifies an English query now selects the same food category as its Norwegian twin.",
       "user_prompt": "Show me producers near Bergen that sell cheese",
       "tools_triggered": "lokal_search",
-      "expected_output": "Cheese sellers in and around Bergen, led by Colonialen Fetevare, Møllendal Fetevare and Ostegården — Krokeide (Fanaost, World Cheese Awards winner 2018). Every top result carries the dairy tag; no bakery, fishmonger or butcher appears at the top. Verified live 2026-09-09."
+      "expected_output": "Cheese sellers in and around Bergen, led by Colonialen Fetevare, Møllendal Fetevare and Ostegården — Krokeide (Fanaost, World Cheese Awards winner 2018). Every top result carries the dairy tag; no bakery, fishmonger or butcher appears at the top. Verified live against production 2026-09-09."
     },
     {
-      "description": "English search combining a region with a specific product, checking that the region name does not hijack the result as a producer-name match.",
+      "description": "English search combining a region with a specific product. The second case that failed the 2026-09-05 review; checks the region name does not hijack the result as a producer-name match.",
       "user_prompt": "Find a farm in Vestfold with raw honey",
       "tools_triggered": "lokal_search",
-      "expected_output": "Beekeepers in the Vestfold area, led by TønsbergBier (Tønsberg, 16 hives) and Wenche og Arnes Bigård — Tjøme (Debio-certified). All results carry the honey tag. Verified live 2026-09-09."
+      "expected_output": "Beekeepers in the Vestfold area, led by TønsbergBier, Wenche og Arnes Bigård — Tjøme and Helnora Honning. All results carry the honey tag. Verified live against production 2026-09-09."
     },
     {
-      "description": "English search filtering on a certification and a region, checking that the food category still governs the ranking.",
-      "user_prompt": "Are there any Debio-certified vegetable producers in Trøndelag?",
+      "description": "English search for a meat product in an inland region, checking category selection outside the coastal and dairy vocabulary.",
+      "user_prompt": "Which farms in Innlandet sell lamb",
       "tools_triggered": "lokal_search",
-      "expected_output": "Organic vegetable producers in Trøndelag, including Trondheim Kooperativ (organic co-operative), Vikhammer Andelsgård SA — Malvik (11 daa of organic vegetables) and Etikken. Verified live 2026-09-09."
+      "expected_output": "Meat producers in Innlandet, led by Stølsvidda — Leira, Valdres, Lohnbakken Gård og Gårdsbutikk — Brøttum and Sygard Grytting. Verified live against production 2026-09-09."
     },
     {
-      "description": "Norwegian-language search, confirming the app answers in the user's own language and returns the same quality of match as the English queries.",
-      "user_prompt": "Finn lokal melk i Oslo",
+      "description": "English purchase-intent question phrased as a place query, checking that intent wording does not narrow the result set.",
+      "user_prompt": "Where can I buy eggs in Rogaland",
       "tools_triggered": "lokal_search",
-      "expected_output": "Dairy sellers in Oslo, including Lille Tøyen Kolonial, Maschmanns Matmarked and Baker Nordby, each carrying the dairy tag and dairy products in its product list. Verified live 2026-09-09."
+      "expected_output": "Producers selling eggs in Rogaland, led by Erga Gårdsutsalg, Eimealt — Stavanger and Fisketorget Stavanger. Verified live against production 2026-09-09."
     },
     {
-      "description": "Follow-up detail lookup on a producer found by search, verifying contact details, opening hours and product range are returned for a single producer.",
+      "description": "Short two-word English query, checking that a minimal prompt still resolves both product and place.",
+      "user_prompt": "salmon in Lofoten",
+      "tools_triggered": "lokal_search",
+      "expected_output": "Fish producers in Lofoten, led by Lofotprodukt AS, Anitas Sjømat and Lofoten Seaweed — Napp. Verified live against production 2026-09-09."
+    },
+    {
+      "description": "Norwegian-language follow-up on a producer found by search, verifying contact details, opening hours and product range are returned for a single producer.",
       "user_prompt": "Tell me more about Ostegården near Bergen — opening hours, products and how to contact them",
       "tools_triggered": "lokal_search, lokal_info",
-      "expected_output": "The full profile for Ostegården — Krokeide: address Krokeide, Bergen 5244; phone +47 994 52 557; e-mail magnus@ostegarden.no; site ostegarden.no; opening hours Mon-Fri 08:00-16:00; seven products including Lagret Fanaost, Jørns Brie and Jørns Camembert; payment by cash or Vipps; farm pickup and shipping; plus a downloadable vCard link. Verified live 2026-09-09."
+      "expected_output": "The full profile for Ostegården — Krokeide: address Krokeide, Bergen 5244; phone +47 994 52 557; e-mail magnus@ostegarden.no; site ostegarden.no; opening hours Mon-Fri 08:00-16:00; seven products including Lagret Fanaost, Jørns Brie and Jørns Camembert; payment by cash or Vipps; farm pickup and shipping; plus a downloadable vCard link. Verified live against production 2026-09-09."
     }
   ],
   "negative_test_cases": [
