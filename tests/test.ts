@@ -1013,6 +1013,21 @@ console.log("\n── rfb-producer-en-seo (buildProducerPageTitle / buildProduce
   console.log(`  rfb-producer-en-seo: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-09-09-rfb-profil-intro-setning-selger-bestill-direkte:
+// the producer-page opening sentence must not claim "selger ... bestill
+// direkte" unless there's a real sourced product list AND a confirmed
+// direct-sale-channel signal.
+console.log("\n── rfb-producer-answer-first-opening-sale-signal ──");
+{
+  const { runRfbProducerAnswerFirstOpeningSaleSignalTests } = require("../src/routes/rfb-producer-answer-first-opening-sale-signal.test") as
+    typeof import("../src/routes/rfb-producer-answer-first-opening-sale-signal.test");
+  const r = runRfbProducerAnswerFirstOpeningSaleSignalTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-producer-answer-first-opening-sale-signal: " + f);
+  console.log(`  rfb-producer-answer-first-opening-sale-signal: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
@@ -33038,7 +33053,12 @@ console.log("\n── geo-answer-first-opening: buildProducerAnswerFirstOpening 
       "geo-afo: producer — only 1 real field (products, no city) -> null (below 2-fact gate)"
     );
     {
-      const opening = buildProducerAnswerFirstOpening({ ...prodBase, cityName: "Asker", productsList: ["Honning", "Egg"] });
+      // productsAreSourced: true — this test models a real, non-fabricated product
+      // list (its own assertions say so); dev-request 2026-09-09-rfb-profil-intro-
+      // setning-selger-bestill-direkte gates the displayed item list on that signal
+      // now, falling back to category tags otherwise (never showing an unsourced
+      // products array as if it were catalog fact).
+      const opening = buildProducerAnswerFirstOpening({ ...prodBase, cityName: "Asker", productsList: ["Honning", "Egg"], productsAreSourced: true });
       assertTrue(typeof opening === "string" && opening.includes("Gård AS"), "geo-afo: producer — 2 real fields -> non-null opening includes the real name");
       assertTrue(!!opening && opening.includes("Asker"), "geo-afo: producer — opening includes the real city (not fabricated)");
       assertTrue(!!opening && opening.includes("Honning") && opening.includes("Egg"), "geo-afo: producer — opening includes the real product names (not fabricated)");

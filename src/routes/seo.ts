@@ -43,6 +43,7 @@ import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang,
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
 import { translateProductName, translateDeliveryTerm } from "../i18n/product-glossary";
 import { getPublishedProfileTranslationsBulk } from "../services/profile-translations";
+import { fieldHasOnlyInferenceSources } from "../services/cross-source-validator";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import {
   parseIsoOrSqlite,
@@ -4067,7 +4068,10 @@ export function buildProducerFaqJsonLd(params: {
     .map((p: any) => (typeof p === "string" ? p : p?.name))
     .filter(Boolean)
     .slice(0, 8);
-  const catLabels = (params.categories || []).map((c: string) => formatCat(c)).filter(Boolean);
+  // Cap at 3 to match buildProducerAnswerFirstOpening's fallback cap — same
+  // source, same "maks 3" rule (dev-request 2026-09-09-rfb-profil-intro-
+  // setning-selger-bestill-direkte).
+  const catLabels = (params.categories || []).map((c: string) => formatCat(c)).filter(Boolean).slice(0, 3);
   const sellItems = productNames.length ? productNames : catLabels;
   if (sellItems.length) {
     qas.push({
@@ -4121,6 +4125,36 @@ export function buildProducerFaqJsonLd(params: {
 // existing about/description block untouched, and the caller MUST log the
 // fallback rather than silently swallow it (a silent catch-and-null shipped
 // a feature tests-green but broken in prod once already — PR-149).
+//
+// dev-request 2026-09-09-rfb-profil-intro-setning-selger-bestill-direkte:
+// the sentence used to ALWAYS claim "selger ... bestill direkte", which was
+// false for producers with no direct-sale channel (or whose sellItems were
+// just generic category-tag fallback, not a real catalog) — confirmed wrong
+// live for Smaken av Grimstad, Øverland Andelslandbruk, Soli Brug. Two new
+// optional signals drive a 3-way verb choice; both default false so any
+// existing caller that doesn't pass them gets the conservative wording
+// (never a claim this function can't back up), not the old wrong default:
+//   - category-tag fallback (no real product list)      → "tilbyr"
+//   - real product list, confirmed direct-sale signal    → "selger"
+//   - real product list, no confirmed direct-sale signal → "produserer"
+// "bestill direkte" only appears with a confirmed direct-sale signal;
+// otherwise the closing clause is "finn kontaktinfo".
+//
+// Extracted so the DB-derivation logic used by the /produsent/:slug route
+// handler is directly unit-testable without a DB — round-2 review found two
+// successive malformed-shape bugs here (missing field_provenance entry
+// entirely; present but with no `value` key, the phase51_backfill_
+// provenance_v1 legacy shape) that no test caught because only the pure
+// buildProducerAnswerFirstOpening() itself was tested, always with the two
+// signals hand-supplied as literal booleans.
+export function deriveProductsAreSourced(productsList: any[], fieldProvenanceProducts: unknown): boolean {
+  const provArr: any[] = Array.isArray(fieldProvenanceProducts)
+    ? fieldProvenanceProducts
+    : (fieldProvenanceProducts ? [fieldProvenanceProducts] : []);
+  const hasValidProductProvenance = provArr.some((r) => r && typeof r.value === "string" && r.value.trim() !== "");
+  return (productsList || []).length > 0 && hasValidProductProvenance && !fieldHasOnlyInferenceSources(fieldProvenanceProducts as any);
+}
+
 export function buildProducerAnswerFirstOpening(params: {
   name: string;
   cityName: string;
@@ -4128,26 +4162,44 @@ export function buildProducerAnswerFirstOpening(params: {
   categories: string[];
   /** Page language — Daniel 2026-09-03: this line rendered Norwegian on /en. */
   lang?: Lang;
+  /** Real, sourced product catalog (not inference-only) backs productsList — see cross-source-validator.fieldHasOnlyInferenceSources. */
+  productsAreSourced?: boolean;
+  /** Confirmed direct-sale-channel signal (agent_salgskanal membership, etc). */
+  hasDirectSaleSignal?: boolean;
 }): string | null {
   const lang: Lang = params.lang || "no";
+  const productsAreSourced = params.productsAreSourced ?? false;
+  const hasDirectSaleSignal = params.hasDirectSaleSignal ?? false;
   const productNames = (params.productsList || [])
     .map((p: any) => (typeof p === "string" ? p : p?.name))
     .filter(Boolean)
     .map((n: string) => productLabel(n, lang))
     .slice(0, 4);
-  const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 4);
-  const sellItems = productNames.length ? productNames : catLabels;
+  const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 3);
+  const usingRealProducts = productNames.length > 0 && productsAreSourced;
+  // Gate the DISPLAYED item list on the same signal as the verb — not just
+  // "is there any productsList at all". An unsourced products array (no
+  // caller-supplied evidence) must fall back to category tags for the
+  // sentence's content too, or an inference-only/wrong product name (the
+  // Bærsentralen "jordbær" class of bug — see cross-source-validator.ts)
+  // would still surface verbatim under the softer "tilbyr" verb.
+  const sellItems = usingRealProducts ? productNames : catLabels;
 
   const hasSellItems = sellItems.length > 0;
   const hasCity = !!params.cityName;
   if ((hasSellItems ? 1 : 0) + (hasCity ? 1 : 0) < 2) return null;
 
+  const verbNo = !usingRealProducts ? "tilbyr" : hasDirectSaleSignal ? "selger" : "produserer";
+  const verbEn = !usingRealProducts ? "offers" : hasDirectSaleSignal ? "sells" : "produces";
+  const closingNo = hasDirectSaleSignal ? "finn kontaktinfo og bestill direkte under" : "finn kontaktinfo under";
+  const closingEn = hasDirectSaleSignal ? "find contact details and order directly below" : "find contact details below";
+
   if (lang === "en") {
     const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
-    return `${params.name} in ${params.cityName} sells ${whatPartEn} — find contact details and order directly below.`;
+    return `${params.name} in ${params.cityName} ${verbEn} ${whatPartEn} — ${closingEn}.`;
   }
   const whatPart = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " med mer" : "");
-  return `${params.name} i ${params.cityName} selger ${whatPart} — finn kontaktinfo og bestill direkte under.`;
+  return `${params.name} i ${params.cityName} ${verbNo} ${whatPart} — ${closingNo}.`;
 }
 
 // GEO: FAQPage JSON-LD for city pages (dev-request 2026-06-30-geo-content-structured-data,
@@ -5369,6 +5421,35 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // outcome for thin profiles — logged below (not swallowed) so a
     // regression here is visible in Fly logs, then the page render falls
     // back to the existing about/description block untouched.
+    //
+    // dev-request 2026-09-09-rfb-profil-intro-setning-selger-bestill-direkte:
+    // productsAreSourced/hasDirectSaleSignal drive the "tilbyr"/"selger"/
+    // "produserer" + "bestill direkte"/"finn kontaktinfo" wording choice.
+    // Fail-safe to false/false (most conservative wording) on any lookup
+    // error — never throw, never crash the page render. See
+    // deriveProductsAreSourced()'s own comment for why this needs both a
+    // non-empty AND a valued provenance record, not just "present".
+    let productsAreSourced = false;
+    try {
+      const fpRow = getDb()
+        .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
+        .get(agent.id) as { field_provenance: string } | undefined;
+      const fieldProvenance = fpRow?.field_provenance ? JSON.parse(fpRow.field_provenance) : {};
+      productsAreSourced = deriveProductsAreSourced(productsList, fieldProvenance.products);
+    } catch (e) {
+      console.error(`[seo] /produsent/${slug} field_provenance lookup for products failed:`, e);
+      productsAreSourced = false;
+    }
+    let hasDirectSaleSignal = false;
+    try {
+      hasDirectSaleSignal = !!getDb()
+        .prepare("SELECT 1 FROM agent_salgskanal WHERE agent_id = ? LIMIT 1")
+        .get(agent.id);
+    } catch (e) {
+      console.error(`[seo] /produsent/${slug} agent_salgskanal lookup failed:`, e);
+      hasDirectSaleSignal = false;
+    }
+
     let answerFirstOpening: string | null = null;
     try {
       answerFirstOpening = buildProducerAnswerFirstOpening({
@@ -5376,6 +5457,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         cityName,
         productsList,
         categories: (agent.categories as string[]) || [],
+        productsAreSourced,
+        hasDirectSaleSignal,
         lang,
       });
       if (!answerFirstOpening) {
