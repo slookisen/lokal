@@ -598,6 +598,41 @@ export function recordDentalHomepageFetchResult(
 // buildWhereClause() `excludeParkedExtraction` option — extended to also
 // exclude rows parked by wrong_entity_unreachable_since (excludes if EITHER
 // stamp is actively parking the row).
+// ── Wrong-entity parking (shared write path) ──────────────────────────────
+// dev-request 2026-09-09-dental-non-clinic-retro-sanitize: extracted out of
+// recordDentalExtractionResult()'s own streak-3 stamping branch just below
+// so the retroactive wrong-entity-parking batch endpoint
+// (src/routes/admin-dental-wrong-entity-retro-sanitize.ts) and the normal
+// per-record enrichment flow share exactly ONE write path for "park this row
+// for wrong entity" — they can never drift out of sync.
+//
+// Stamps wrong_entity_unreachable_since = now and raises wrong_entity_streak
+// to at least DENTAL_PARK_AFTER_ATTEMPTS. Uses Math.max rather than a flat
+// assignment so this is a no-op on the streak column when it is already
+// at/above the threshold: recordDentalExtractionResult's own streak keeps
+// incrementing past 3 on repeated wrong_entity failures even while parked,
+// and a RE-STAMP after an expired backoff must preserve that accumulated
+// count (see dental-wrong-entity-streak.test.ts wes-34/35, streak=4 after a
+// 2nd stamp) — the original inline UPDATE this replaces never touched the
+// streak column at all, only the timestamp, so this preserves that exactly.
+// For a never-yet-flagged row (the retro-sanitize batch's case — streak
+// starts at 0) this simply sets it to exactly DENTAL_PARK_AFTER_ATTEMPTS.
+export function parkDentalWrongEntity(id: string): {
+  wrong_entity_streak: number;
+  wrong_entity_unreachable_since: string;
+} {
+  const db = getDb("dental");
+  const since = new Date().toISOString();
+  const row = db
+    .prepare("SELECT wrong_entity_streak FROM dental_agents WHERE id = ?")
+    .get(id) as { wrong_entity_streak: number } | undefined;
+  const streak = Math.max(row?.wrong_entity_streak ?? 0, DENTAL_PARK_AFTER_ATTEMPTS);
+  db.prepare(
+    "UPDATE dental_agents SET wrong_entity_streak = ?, wrong_entity_unreachable_since = ? WHERE id = ?"
+  ).run(streak, since, id);
+  return { wrong_entity_streak: streak, wrong_entity_unreachable_since: since };
+}
+
 export function recordDentalExtractionResult(
   id: string,
   ok: boolean,
@@ -660,8 +695,7 @@ export function recordDentalExtractionResult(
       const since = weRow.wrong_entity_unreachable_since;
       const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
       if (!since || expired) {
-        db.prepare("UPDATE dental_agents SET wrong_entity_unreachable_since = ? WHERE id = ?")
-          .run(new Date().toISOString(), id);
+        parkDentalWrongEntity(id);
         wrongEntityParkedNow = true;
       }
     }

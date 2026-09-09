@@ -34690,6 +34690,35 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-09-dental-non-clinic-retro-sanitize: planning module (pure) ──
+  console.log("\n── dev-request 2026-09-09-dental-non-clinic-retro-sanitize: wrong-entity retro planning (pure) ──");
+  try {
+    const { runDentalWrongEntityRetroTests } = require("../src/services/dental-wrong-entity-retro.test") as
+      typeof import("../src/services/dental-wrong-entity-retro.test");
+    const dwer = runDentalWrongEntityRetroTests({ log: false });
+    passed += dwer.passed;
+    failed += dwer.failed;
+    for (const f of dwer.failures) failures.push("dental-wrong-entity-retro: " + f);
+    console.log(`  dental-wrong-entity-retro: ${dwer.passed} passed, ${dwer.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-wrong-entity-retro: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request 2026-09-09-dental-non-clinic-retro-sanitize: POST /admin/dental/wrong-entity-retro-sanitize ──");
+  try {
+    const { runAdminDentalWrongEntityRetroSanitizeTests } = require("../src/routes/admin-dental-wrong-entity-retro-sanitize.test") as
+      typeof import("../src/routes/admin-dental-wrong-entity-retro-sanitize.test");
+    const adwers = await runAdminDentalWrongEntityRetroSanitizeTests({ log: false });
+    passed += adwers.passed;
+    failed += adwers.failed;
+    for (const f of adwers.failures) failures.push("admin-dental-wrong-entity-retro-sanitize: " + f);
+    console.log(`  admin-dental-wrong-entity-retro-sanitize: ${adwers.passed} passed, ${adwers.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-wrong-entity-retro-sanitize: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-09-02-dental-catalog-class-triage: rule classifier (pure) ──
   console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage: catalog-class classifier (pure) ──");
   try {
