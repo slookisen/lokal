@@ -95,7 +95,7 @@ import adminDentalCatalogClassSonnetSampleRoutes from "./routes/admin-dental-cat
 import adminDentalBrregAddressSweepRoutes from "./routes/admin-dental-brreg-address-sweep";
 import adminDentalOffentligKlinikkHjemmesideKorrigeringRoutes from "./routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
-import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
+import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter, addressNorgeSuffixSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
@@ -841,6 +841,10 @@ app.use("/admin", adminLimiter, homepageContentRefreshRouter);
 // agents.description truncation sweep — GET (read-only diagnostic) + POST
 // (dry-run default) /admin/description-truncation-sweep
 app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
+// dev-request 2026-09-09-outreach-profilkvalitet: agent_knowledge.address
+// trailing ", Norge"/", NORGE" suffix sweep — GET (read-only diagnostic) +
+// POST (dry-run default) /admin/address-norge-suffix-sweep
+app.use("/admin", adminLimiter, addressNorgeSuffixSweepRouter);
 // dev-requests/2026-08-06-rfb-website-discovery-slice.md: candidate-homepage
 // discovery for RFB `agents` rows with no website on file — queues verified
 // proposals into agents_website_review_queue, never writes agents/
