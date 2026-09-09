@@ -165,15 +165,22 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
             products, content_source, booking_live, catalog_hidden, slug, field_provenance,
-            brreg_verified,
+            brreg_verified, geocode_confidence,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
             @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
             @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
-            @brreg_verified,
+            @brreg_verified, @geocode_confidence,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+      // kommunesentroide-kart, Skive 3 (AC4): every fixture below now passes
+      // an explicit geocode_confidence (better-sqlite3 requires every named
+      // param referenced in the statement to be bound, no implicit NULL).
+      // Most fixtures pass null (never geocoded yet -> summary.geo_precision
+      // .ukjent); a handful set 'high'/'medium'/'low'/'sted'/'approximate'/
+      // 'no_match' explicitly to cover all four buckets below (c8-c11).
       // For the dublettkonflikt fixture below — a minimal `experiences` row
       // linked via provider_id (the "provider_link" match basis, which skips
       // all name/host-token genericity gating — see
@@ -210,7 +217,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Sider, cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "klar-gard-as", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: "high",
       });
       // needs_enrichment: has website + email but no about_text/products/
       // brreg_verified at all. Fails before the Steg-4 checks are even
@@ -222,7 +229,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 0,
+        brreg_verified: 0, geocode_confidence: "medium",
       });
       // needs_enrichment (negative case for krav 2's brreg_verified leg):
       // about_text, products, AND opening_hours_text/visit_text are ALL
@@ -236,7 +243,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 0,
+        brreg_verified: 0, geocode_confidence: "low",
       });
       // needs_enrichment (negative case for krav 2's products leg):
       // about_text, brreg_verified, AND opening_hours_text are ALL present --
@@ -250,7 +257,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: "sted",
       });
       // no_website: has a phone (reachable) but no hjemmeside at all.
       // Fails before the Steg-4 checks are even reached -- no slug/provenance.
@@ -261,7 +268,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: null,
         booking_live: null, catalog_hidden: null, slug: null, field_provenance: null,
-        brreg_verified: 0,
+        brreg_verified: 0, geocode_confidence: "approximate",
       });
       // unreachable: no email AND no phone at all, even though it otherwise
       // looks fully content-complete -- unreachable must win regardless.
@@ -273,7 +280,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Lø 10-14",
         products: "Eplemost", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: "no_match",
       });
       // hidden (catalog_hidden=1) row -- must still appear, marked visible:false.
       // Fully content-complete under krav 2 (about_text + products +
@@ -290,7 +297,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Alle dager",
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 1, slug: "skjult-test-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       // manually-claimed row -- must still appear, claim_status carries the
       // raw content_source value ('manual'), never excluded. No slug and no
@@ -304,7 +311,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Skrevet av eier selv.", visit_text: "Kom innom!", opening_hours_text: "Lø-Sø 11-15",
         products: "Eplevin", content_source: "manual",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       // nettsted_uverifisert: content-complete under krav 2, has a slug
       // (searchable), not hidden -- but field_provenance carries no verified
@@ -316,7 +323,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 10-17",
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "uverifisert-gard", field_provenance: null,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       // dublettkonflikt: content-complete under krav 2, searchable,
       // website-verified, not hidden -- but a matching `experiences` row
@@ -330,7 +337,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 09-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "konflikt-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       insertExperience.run({
         id: "exp-konflikt-gard", provider_id: "prov-conflict",
@@ -356,7 +363,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
         products: "Håndverksøl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "fjellbekken-handbryggeri", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       insertExperience.run({
         id: "exp-fjellbekken-kajakk", provider_id: null,
@@ -372,7 +379,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Tekst.", visit_text: "Tekst.", opening_hours_text: "Tekst.",
         products: "Noe", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
 
       // Bug-fix regression fixture (dev-request 2026-09-03-gardssalg-merged-
@@ -392,7 +399,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Sider, cider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "sammenslatt-gard-as", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1,
+        brreg_verified: 1, geocode_confidence: null,
       });
       expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-ready' WHERE id = 'prov-merged'`).run();
 
@@ -449,6 +456,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(ready?.is_searchable, true, "b16a: prov-ready is_searchable true (slug + not hidden)");
       assertEq(ready?.website_verified, true, "b16b: prov-ready website_verified true (verified field_provenance)");
       assertEq(ready?.has_duplicate_conflict, false, "b16c: prov-ready has_duplicate_conflict false (no matching experience)");
+      assertEq(ready?.geocode_confidence, "high", "b16d: prov-ready geocode_confidence passthrough (dev-request 2026-09-09-opplevagent-stedsetikett..., Skive 3)");
 
       const enrich = byId("prov-enrich");
       assertEq(enrich?.readiness_tier, "needs_enrichment", "b17: prov-enrich tiered needs_enrichment");
@@ -492,6 +500,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(hidden?.readiness_tier, "skjult", "b33: prov-hidden tiered skjult despite a slug + verified field_provenance (catalog_hidden checked first)");
       assertEq(hidden?.is_searchable, false, "b33a: prov-hidden is_searchable false (hidden rows are never searchable, even with a slug)");
       assertEq(hidden?.booking_status, "live", "b34: prov-hidden booking_status live (catalog_hidden test provider dispatches regardless of global switch)");
+      assertEq(hidden?.geocode_confidence, null, "b34a: prov-hidden geocode_confidence null passthrough (never geocoded)");
 
       const claimed = byId("prov-claimed");
       assertTrue(!!claimed, "b35: manually-claimed fixture is present, never dropped");
@@ -564,6 +573,25 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(summarySum, ok.body.summary.total, "c6: per-tier summary counts (all 8 tiers) sum to total (every row tiered exactly once)");
       assertEq(ok.body.summary.name_token_conflict_candidates, 1, "c7: summary.name_token_conflict_candidates counts prov-nametoken only (informational, NOT a tier — excluded from the c6 sum)");
 
+      // ── (c8-c11) geo_precision summary (dev-request 2026-09-09-opplevagent-
+      // stedsetikett-poststed-og-kommunesentroide-kart, Skive 3, AC4): a
+      // SECOND, independent bucketing over the same 11 rows — not a tier,
+      // orthogonal to readiness_tier (e.g. prov-ready is both outreach_ready
+      // AND geo_precision.address). high/medium/low (prov-ready/prov-enrich/
+      // prov-no-brreg) -> address; sted (prov-no-products) -> sted;
+      // approximate (prov-noweb) -> kommune; no_match/NULL (the remaining 6:
+      // prov-unreach, prov-hidden, prov-claimed, prov-unverified,
+      // prov-conflict, prov-nametoken) -> ukjent.
+      assertTrue(!!ok.body.summary.geo_precision, "c8: summary.geo_precision is present");
+      assertEq(ok.body.summary.geo_precision.address, 3, "c9: geo_precision.address counts prov-ready(high)+prov-enrich(medium)+prov-no-brreg(low)");
+      assertEq(ok.body.summary.geo_precision.sted, 1, "c10: geo_precision.sted counts prov-no-products");
+      assertEq(ok.body.summary.geo_precision.kommune, 1, "c11: geo_precision.kommune counts prov-noweb(approximate)");
+      assertEq(ok.body.summary.geo_precision.ukjent, 6, "c12: geo_precision.ukjent counts the 6 no_match/NULL rows");
+      const geoPrecisionSum =
+        ok.body.summary.geo_precision.address + ok.body.summary.geo_precision.sted +
+        ok.body.summary.geo_precision.kommune + ok.body.summary.geo_precision.ukjent;
+      assertEq(geoPrecisionSum, ok.body.summary.total, "c13: geo_precision buckets (all four) sum to summary.total, independently of the c6 tier sum");
+
       // ── (e) zero-provider edge case ─────────────────────────────────────
       expDb.prepare("DELETE FROM experiences").run();
       expDb.prepare("DELETE FROM experience_providers").run();
@@ -580,6 +608,10 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(empty.body.summary.nettsted_uverifisert, 0, "e10: summary.nettsted_uverifisert is 0");
       assertEq(empty.body.summary.dublettkonflikt, 0, "e11: summary.dublettkonflikt is 0");
       assertEq(empty.body.summary.name_token_conflict_candidates, 0, "e12: summary.name_token_conflict_candidates is 0");
+      assertEq(empty.body.summary.geo_precision.address, 0, "e13: geo_precision.address is 0");
+      assertEq(empty.body.summary.geo_precision.sted, 0, "e14: geo_precision.sted is 0");
+      assertEq(empty.body.summary.geo_precision.kommune, 0, "e15: geo_precision.kommune is 0");
+      assertEq(empty.body.summary.geo_precision.ukjent, 0, "e16: geo_precision.ukjent is 0");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-readiness: unexpected error: " + String(err?.stack || err?.message || err));

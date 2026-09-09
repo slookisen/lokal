@@ -15254,6 +15254,16 @@ function computeGardssalgReadinessRows(
   // "liten"-via-this-rule (includes every "stor"/"ukjent" row, and every
   // ordinary "liten" row cleared by an actual registered figure).
   size_flag_reason: GardssalgSizeFlagReason;
+  // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+  // kommunesentroide-kart, Skive 3 (AC4): the raw geocode precision tag
+  // (experience_providers.geocode_confidence — 'high'/'medium'/'low' from
+  // Steg A's Kartverket adresse-lookup, 'sted' from Skive 2's stedsnavn
+  // tier, 'approximate' from Steg D's kommune-centroid fallback, 'no_match'
+  // or NULL when nothing has resolved yet), surfaced per-row for the same
+  // reason hjemmeside/epost are above — an operator/report needs to see it
+  // without a separate lookup. The /admin/gardssalg-outreach-readiness
+  // handler below buckets this into summary.geo_precision.
+  geocode_confidence: string | null;
 }> {
   let rows: Array<{
     id: string;
@@ -15275,6 +15285,7 @@ function computeGardssalgReadinessRows(
     brreg_verified: number | null;
     antall_ansatte: number | null;
     terminal_status: string | null;
+    geocode_confidence: string | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -15284,7 +15295,8 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance, brreg_verified, antall_ansatte, terminal_status
+                field_provenance, brreg_verified, antall_ansatte, terminal_status,
+                geocode_confidence
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
             AND ${GARDSSALG_NOT_MERGED_WHERE}`;
@@ -15468,6 +15480,7 @@ function computeGardssalgReadinessRows(
       antall_ansatte: p.antall_ansatte,
       size_flag,
       size_flag_reason,
+      geocode_confidence: p.geocode_confidence,
     };
   });
 }
@@ -15507,13 +15520,32 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     name_token_conflict_candidates: 0,
     total: 0,
   };
+  // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+  // kommunesentroide-kart, Skive 3 (AC4): NOT a tier (like
+  // name_token_conflict_candidates above) — every row lands in exactly one
+  // of these four buckets regardless of its readiness_tier, so this sums to
+  // summary.total independently of the tier sum above. 'high'/'medium'/'low'
+  // are Steg A's address-precision Kartverket adresse-lookup results,
+  // 'sted' is Skive 2's stedsnavn-in-kommune tier, 'approximate' is Steg D's
+  // kommune-centroid fallback, and everything else (NULL — never geocoded
+  // yet — or 'no_match') is genuinely unknown, never guessed into a bucket.
+  const geoPrecision = { address: 0, sted: 0, kommune: 0, ukjent: 0 };
   for (const p of providers) {
     summary[p.readiness_tier]++;
     if (p.name_token_conflict_candidate) summary.name_token_conflict_candidates++;
     summary.total++;
+    if (p.geocode_confidence === "high" || p.geocode_confidence === "medium" || p.geocode_confidence === "low") {
+      geoPrecision.address++;
+    } else if (p.geocode_confidence === "sted") {
+      geoPrecision.sted++;
+    } else if (p.geocode_confidence === "approximate") {
+      geoPrecision.kommune++;
+    } else {
+      geoPrecision.ukjent++;
+    }
   }
 
-  res.json({ providers, summary });
+  res.json({ providers, summary: { ...summary, geo_precision: geoPrecision } });
 });
 
 // ─── POST /admin/gardssalg-second-line-verify (admin) ──────────────────────
