@@ -158,6 +158,15 @@ export type ExperiencesGeocodeResult = {
   providers_no_match: number;
   providers_kommune_fallback: number;
   providers_fallback_unresolved: number;
+  /**
+   * dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+   * kommunesentroide-kart, Skive 2: rows whose place-name `adresse` (no house
+   * number, so Step A/parseAddressLike() can't treat it as a street address)
+   * resolved via Kartverket's Stedsnavn API scoped to the row's own kommune —
+   * geocode_confidence='sted', a real (if approximate) point, distinct from
+   * both a genuine street address and the coarser kommune-centroid fallback.
+   */
+  providers_sted_fallback: number;
   // 2026-08-25: a geocoder answer that cannot be a Norwegian position, refused
   // at the write instead of being stored (see Step A / Step D).
   providers_implausible_rejected: number;
@@ -206,6 +215,7 @@ export async function experiencesGeocodeTick(
     providers_no_match: 0,
     providers_kommune_fallback: 0,
     providers_fallback_unresolved: 0,
+    providers_sted_fallback: 0,
     providers_implausible_rejected: 0,
     providers_coords_reset: 0,
     experiences_coords_reset: 0,
@@ -367,7 +377,7 @@ export async function experiencesGeocodeTick(
   // honest "ca. posisjon" label instead of claiming address precision.
   const providerFallbackRows = db
     .prepare(
-      `SELECT id, kommune, kommunenummer, fylke
+      `SELECT id, adresse, kommune, kommunenummer, fylke
          FROM experience_providers
         WHERE lat IS NULL
           AND (
@@ -381,7 +391,13 @@ export async function experiencesGeocodeTick(
         ORDER BY id
         LIMIT ?`
     )
-    .all(limit) as Array<{ id: string; kommune: string | null; kommunenummer: string | null; fylke: string | null }>;
+    .all(limit) as Array<{
+    id: string;
+    adresse: string | null;
+    kommune: string | null;
+    kommunenummer: string | null;
+    fylke: string | null;
+  }>;
 
   const updateProviderApprox = db.prepare(
     `UPDATE experience_providers
@@ -389,9 +405,39 @@ export async function experiencesGeocodeTick(
             updated_at = datetime('now')
       WHERE id = ?`
   );
+  // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-kommunesentroide-
+  // kart, Skive 2: same shape as updateProviderApprox, distinct
+  // geocode_source/geocode_confidence so the profile page can render this as
+  // an approximate POINT (see experiences-seo.ts's gardssalgMapPresentation())
+  // rather than the kommune tier's no-point card.
+  const updateProviderSted = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'stedsnavn_kommune', geocode_confidence = 'sted',
+            updated_at = datetime('now')
+      WHERE id = ?`
+  );
 
   for (const row of providerFallbackRows) {
     try {
+      // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+      // kommunesentroide-kart, Skive 2: BEFORE falling to the kommune
+      // centroid, try the place name itself when `adresse` holds one.
+      // parseAddressLike() already exists in this file to recognise a real
+      // street address ("<name> <number>"); a place name like "Innset" has no
+      // house number, so it returns null there — which is exactly the signal
+      // used here to mean "this is a place name, not a street". Rows with no
+      // adresse (or a genuine street address, which Step A already tried and
+      // failed) skip straight to the unchanged kommune fallback below.
+      let stedGeo = null as Awaited<ReturnType<typeof geocodingService.geocodeStedInKommune>> | null;
+      if (row.adresse && row.adresse.trim() && !parseAddressLike(row.adresse)) {
+        stedGeo = await geocodingService.geocodeStedInKommune(row.adresse, row.kommunenummer, row.kommune);
+      }
+      if (stedGeo && isPlausibleNorwayCoord(stedGeo.lat, stedGeo.lng)) {
+        updateProviderSted.run(stedGeo.lat, stedGeo.lng, row.id);
+        stats.providers_sted_fallback++;
+        continue;
+      }
+
       // dev-request 2026-07-25 fix 0a: geocodeKommune (Kartverket's kommune
       // REGISTER, keyed on kommunenummer when we have one) instead of the
       // free-text geocode() this used to call. Stedsnavn's fuzzy search
@@ -443,6 +489,13 @@ export async function experiencesGeocodeTick(
   // provider's own profile-page map for now (dev-request gardssalg-go-live-
   // gate slice 3) — propagating it to experiences is a distinct, un-asked-for
   // feature left for a future slice if wanted.
+  // Also excludes 'sted' (dev-request 2026-09-09-opplevagent-stedsetikett-…,
+  // Skive 2's new provider tier) for the exact same reason: a Stedsnavn-in-
+  // kommune point is a real point but still only place-name-scale, not a
+  // street address, so it must not silently become geo_precision='address'
+  // here either. Propagating it to experiences (as its own 'sted' precision,
+  // say) is the same distinct, un-asked-for future-slice feature the
+  // 'approximate' comment above already defers.
   try {
     const propagateRows = db
       .prepare(
@@ -455,7 +508,7 @@ export async function experiencesGeocodeTick(
             AND p.lat IS NOT NULL
             AND p.lon IS NOT NULL
             AND p.geocode_confidence IS NOT NULL
-            AND p.geocode_confidence NOT IN ('no_match', 'approximate')
+            AND p.geocode_confidence NOT IN ('no_match', 'approximate', 'sted')
           ORDER BY e.id
           LIMIT ?`
       )
@@ -553,7 +606,8 @@ export async function experiencesGeocodeTick(
   // position. Step E is the missing re-attempt: same join and the same
   // confidence gate as Step B ('no_match' and Step D's 'approximate' both
   // excluded — only a genuine address-level provider geocode may claim
-  // geo_precision='address'), but for rows already tagged 'kommune'.
+  // geo_precision='address'), but for rows already tagged 'kommune'. Also
+  // excludes 'sted' (Skive 2), same reasoning as Step B's own comment above.
   //
   // Strictly an upgrade: kommune → address. Nothing here can move a row the
   // other way.
@@ -567,7 +621,7 @@ export async function experiencesGeocodeTick(
             AND p.lat IS NOT NULL
             AND p.lon IS NOT NULL
             AND p.geocode_confidence IS NOT NULL
-            AND p.geocode_confidence NOT IN ('no_match', 'approximate')
+            AND p.geocode_confidence NOT IN ('no_match', 'approximate', 'sted')
           ORDER BY e.id
           LIMIT ?`
       )
