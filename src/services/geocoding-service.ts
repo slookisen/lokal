@@ -700,6 +700,94 @@ class GeocodingService {
   }
 
   /**
+   * Resolve a PLACE NAME (not a street address) to coordinates, scoped to a
+   * kommune we already know the row belongs to — the middle tier between
+   * geocode()'s unscoped free-text search and geocodeKommune()'s coarse
+   * whole-municipality centroid.
+   *
+   * dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+   * kommunesentroide-kart, Skive 2. Some gårdssalg addresses are a bare place
+   * name with no house number ("Innset" — a real place in Rennebu kommune) —
+   * geocodeOne()'s Kartverket adresse-API ladder can never place those (there
+   * is no house number to query), and the existing fallback straight to
+   * geocodeKommune()'s municipality centroid can land many km from the real
+   * place. This asks Kartverket's Stedsnavn API for the place NAME, scoped to
+   * the kommune, so "Innset" resolves to the actual hamlet instead of all of
+   * Rennebu.
+   *
+   * QUERY PARAM, VERIFIED LIVE (2026-09-09): the spec that generated this
+   * method named the filter param `kommunenummer`. Checked against
+   * ws.geonorge.no/stedsnavn/v1/openapi.json — the real, documented filter is
+   * `knr` ("Søk innenfor en kommune ved å skrive inn kommunenummeret").
+   * Confirmed live: `sok=Innset&knr=5022` narrows Kartverket's 8 national
+   * "Innset" hits down to the 2 actually in Rennebu (5022); appending
+   * `&kommunenummer=5022` instead changes nothing — the API silently ignores
+   * unknown query params rather than erroring, so this would have shipped as
+   * a silent no-op if taken on faith. `knr` is used below.
+   *
+   * CORROBORATION — same "never an uncorroborated guess" discipline
+   * geocodeKommune()'s own doc comment explains (the Flakstad incident: a
+   * fuzzy free-text kommune lookup returned a same-named farm near Hamar
+   * instead of Flakstad kommune in Lofoten, 780 km off). A `knr`-filtered hit
+   * is corroborated BY CONSTRUCTION — Kartverket itself restricted the result
+   * set to that one kommune. When we have no kommunenummer, or the filtered
+   * query came back with no ACCEPTABLE hit (empty, or every hit rejected by
+   * the type/name filter below), we fall back to the same unfiltered
+   * free-text search geocode()/geocodeKommune() use, and this method
+   * corroborates it ITSELF: at least one of the hit's `kommuner[]` entries
+   * must match the given kommunenummer or kommuneNavn (case-insensitive).
+   * With neither a number nor a name to corroborate against, this refuses to
+   * guess and returns null without making a request.
+   *
+   * TYPE/NAME FILTER — reuses the exact same navneobjekttype tier ladder and
+   * name-similarity guard as lookupKartverket() (PLACE_TYPE_TIERS /
+   * nameMatchesQuery(), via the shared pickBestStedsnavnHit() helper) — a
+   * kommune scope narrows the candidate set, it does not loosen what counts
+   * as an acceptable match.
+   */
+  async geocodeStedInKommune(
+    stedNavn: string | null | undefined,
+    kommunenummer?: string | null,
+    kommuneNavn?: string | null,
+  ): Promise<GeoResult | null> {
+    const sted = (stedNavn || "").trim();
+    if (!sted || sted.length < 2) return null;
+
+    const nr = (kommunenummer || "").trim();
+    const kName = (kommuneNavn || "").trim();
+    // No corroboration possible at all (Flakstad discipline) — never guess.
+    if (!nr && !kName) return null;
+
+    const key = `sted:${nr || kName.toLowerCase()}:${sted.toLowerCase()}`;
+    if (geoCache.has(key)) return geoCache.get(key) || null;
+
+    let result: GeoResult | null = null;
+    try {
+      if (/^\d{4}$/.test(nr)) {
+        const filteredHits = await this.fetchStedsnavnHits(sted, nr);
+        const best = filteredHits.length > 0 ? this.pickBestStedsnavnHit(filteredHits, sted) : null;
+        if (best) result = this.stedsnavnHitToGeoResult(best, sted);
+      }
+      if (!result) {
+        // No usable kommunenummer, or the filtered search had nothing
+        // acceptable — fall back to the unfiltered search and corroborate
+        // ourselves against whichever of kommunenummer/kommuneNavn we have.
+        const hits = await this.fetchStedsnavnHits(sted);
+        const best = hits.length > 0
+          ? this.pickBestStedsnavnHit(hits, sted, (n) => this.stedKommuneMatches(n, nr, kName))
+          : null;
+        if (best) result = this.stedsnavnHitToGeoResult(best, sted);
+      }
+    } catch (err) {
+      console.error(`[geocoding] geocodeStedInKommune failed for "${sted}":`, err);
+      result = null;
+    }
+
+    this.cacheResult(key, result);
+    return result;
+  }
+
+  /**
    * Extract location words from a search query and try to geocode them.
    * Returns the first successful geocode result.
    * Tries multi-word combos first ("mo i rana"), then single words.
@@ -787,52 +875,102 @@ class GeocodingService {
 
   private async lookupKartverket(placeName: string): Promise<GeoResult | null> {
     try {
-      // treffPerSide raised 3 → 10: the acceptable place type is often ranked
-      // below several farms/cabins sharing the name (measured: «Bømlo» has the
-      // Kommune at hit #3, «Dønna» the Poststed at #4). With the strict filter
-      // below, looking at only 3 hits would reject genuine places.
-      const url = `https://ws.geonorge.no/stedsnavn/v1/sted?sok=${encodeURIComponent(placeName)}&treffPerSide=10&utkoordsys=4258`;
+      const navn = await this.fetchStedsnavnHits(placeName);
+      if (navn.length === 0) return null;
 
-      const data: any = await this.getJson(url);
-      if (!data || !Array.isArray(data.navn) || data.navn.length === 0) return null;
-
-      const hasPoint = (n: any) =>
-        n?.representasjonspunkt && n.representasjonspunkt.nord != null && n.representasjonspunkt.øst != null;
-      const typeOf = (n: any) => (n?.navneobjekttype || "").toLowerCase().trim();
-      const pick = (allowed: ReadonlySet<string>) =>
-        data.navn.find((n: any) =>
-          hasPoint(n) && allowed.has(typeOf(n)) && nameMatchesQuery(n, placeName));
-
-      // Tier order: town/city > administrative area > named region > hamlet.
       // NO navn[0] fallback — an unrecognised type means "we do not know
       // where this is", which is strictly better than a confident wrong point.
-      let best: any;
-      for (const tier of PLACE_TYPE_TIERS) {
-        best = pick(tier);
-        if (best) break;
-      }
+      const best = this.pickBestStedsnavnHit(navn, placeName);
       if (!best) {
-        const rejected = data.navn
+        const rejected = navn
           .map((n: any) => `${officialNames(n)[0] || "?"}[${n?.navneobjekttype || "?"}]`)
           .join(", ");
         console.log(`[geocoding] rejected low-confidence Kartverket match for "${placeName}" (candidates: ${rejected || "none"})`);
         return null;
       }
 
-      const punkt = best.representasjonspunkt;
-      return {
-        lat: punkt.nord,
-        lng: punkt.øst,
-        name: officialNames(best)[0] || placeName,
-        radiusKm: radiusForType(best.navneobjekttype || ""),
-        source: "kartverket",
-        placeType: best.navneobjekttype || undefined,
-      };
+      return this.stedsnavnHitToGeoResult(best, placeName);
     } catch (err) {
       // Network error or timeout — fail gracefully
       console.error(`[geocoding] Kartverket lookup failed for "${placeName}":`, err);
       return null;
     }
+  }
+
+  /**
+   * Raw Stedsnavn `/sted` search — shared by lookupKartverket() and
+   * geocodeStedInKommune(). `knr` (verified live 2026-09-09 against
+   * ws.geonorge.no/stedsnavn/v1/openapi.json — the real Kartverket filter
+   * param name, NOT `kommunenummer`) scopes the search server-side to one
+   * kommune when given. treffPerSide=10, not the default 3: the acceptable
+   * place type is often ranked below several farms/cabins sharing the name
+   * (measured: «Bømlo» has the Kommune at hit #3, «Dønna» the Poststed at
+   * #4) — looking at only 3 hits would reject genuine places.
+   */
+  private async fetchStedsnavnHits(placeName: string, knr?: string | null): Promise<any[]> {
+    let url = `https://ws.geonorge.no/stedsnavn/v1/sted?sok=${encodeURIComponent(placeName)}&treffPerSide=10&utkoordsys=4258`;
+    if (knr) url += `&knr=${encodeURIComponent(knr)}`;
+    const data: any = await this.getJson(url);
+    return Array.isArray(data?.navn) ? data.navn : [];
+  }
+
+  /**
+   * Tier order: town/city > administrative area > named region > hamlet
+   * (PLACE_TYPE_TIERS), name-matched (nameMatchesQuery — the Flakstad/Tingnes
+   * name-similarity guard), and — when the caller passes one — corroborated
+   * against a known kommune. Earlier tiers win outright; the first tier with
+   * ANY qualifying hit stops the search. Returns the raw Stedsnavn record
+   * (not a GeoResult) so callers needing a different corroboration/`knr`
+   * strategy (geocodeStedInKommune()) can still share this ladder.
+   */
+  private pickBestStedsnavnHit(
+    navn: any[],
+    placeName: string,
+    corroborate?: (n: any) => boolean,
+  ): any | null {
+    const hasPoint = (n: any) =>
+      n?.representasjonspunkt && n.representasjonspunkt.nord != null && n.representasjonspunkt.øst != null;
+    const typeOf = (n: any) => (n?.navneobjekttype || "").toLowerCase().trim();
+    const pick = (allowed: ReadonlySet<string>) =>
+      navn.find((n: any) =>
+        hasPoint(n) && allowed.has(typeOf(n)) && nameMatchesQuery(n, placeName) && (!corroborate || corroborate(n)));
+
+    for (const tier of PLACE_TYPE_TIERS) {
+      const best = pick(tier);
+      if (best) return best;
+    }
+    return null;
+  }
+
+  /** A raw Stedsnavn hit → the service's common GeoResult shape. */
+  private stedsnavnHitToGeoResult(n: any, placeName: string): GeoResult {
+    const punkt = n.representasjonspunkt;
+    return {
+      lat: punkt.nord,
+      lng: punkt.øst,
+      name: officialNames(n)[0] || placeName,
+      radiusKm: radiusForType(n.navneobjekttype || ""),
+      source: "kartverket",
+      placeType: n.navneobjekttype || undefined,
+    };
+  }
+
+  /**
+   * geocodeStedInKommune()'s own corroboration check: does this Stedsnavn
+   * hit's `kommuner[]` list (Kartverket's own "which municipalities is this
+   * place in" field) include the kommune we already know the row belongs to?
+   * Matches by kommunenummer (exact) or kommunenavn (case-insensitive) —
+   * whichever the caller supplied. Neither supplied → no match, same fail-
+   * closed direction as geocodeKommune()'s ambiguity refusal.
+   */
+  private stedKommuneMatches(n: any, kommunenummer: string, kommuneNavn: string): boolean {
+    const list: any[] = Array.isArray(n?.kommuner) ? n.kommuner : [];
+    const kn = kommuneNavn.toLowerCase();
+    return list.some((k: any) => {
+      const kNr = String(k?.kommunenummer || "").trim();
+      const kNavn = (k?.kommunenavn || "").toLowerCase().trim();
+      return (!!kommunenummer && kNr === kommunenummer) || (!!kn && kNavn === kn);
+    });
   }
 
   // ── Kartverket Kommuneinfo (the kommune register) ────────────────

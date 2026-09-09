@@ -20010,7 +20010,15 @@ console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences)
   const geoIdSQ = expStoreSQ.createExperience({
     title: "Fjordtur med koordinater", provider_id: provIdSQ, provider_match_status: "matched",
     category: "sightseeing_transport", fylke: "Vestland", kommune: "Bergen", indoor_outdoor: "outdoor",
-    loc_lat: 60.39, loc_lon: 5.32, confidence: "high", verification_status: "verified",
+    // geo_precision='address' alongside loc_lat/lon — the invariant
+    // experience-store.ts documents (~L933: "a non-null loc_lat/loc_lon pair
+    // always carries a non-null geo_precision") and that every real write
+    // path (Step B/E of experiences-geocode-worker.ts) upholds. Added
+    // alongside dev-request 2026-09-09-opplevagent-stedsetikett-…, Skive 2:
+    // experiencesMapPresentation() reads geo_precision to decide point vs
+    // no-point, so a fixture that sets a real coordinate without it no longer
+    // matches what this route (or production) would ever actually see.
+    loc_lat: 60.39, loc_lon: 5.32, geo_precision: "address", confidence: "high", verification_status: "verified",
   });
   const geoSlugSQ = (expStoreSQ.getExperienceById(geoIdSQ) as any).slug as string;
   const geoSQ = invokeSeo("/opplevelse/:slug", { slug: geoSlugSQ }, `/opplevelse/${geoSlugSQ}`);
@@ -43274,5 +43282,100 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-drink-visit-uttrekk: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+// kommunesentroide-kart, Skive 2: geocodingService.geocodeStedInKommune() —
+// the middle tier between geocode()'s unscoped free-text search and
+// geocodeKommune()'s coarse whole-municipality centroid. Pure module — the
+// Kartverket fetch is injected via __setGeocodingFetchForTesting, no DB, no
+// network — but registered through runSerial() so its counts fold into the
+// summary the same way as geocoding-honesty's own suite above. Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-opplevagent-stedsetikett: geocodeStedInKommune() ──");
+  try {
+    const { runGeocodingServiceStedTests } = require("../src/services/geocoding-service-sted.test") as
+      typeof import("../src/services/geocoding-service-sted.test");
+    const gss = await runGeocodingServiceStedTests({ log: false });
+    passed += gss.passed;
+    failed += gss.failed;
+    for (const f of gss.failures) failures.push("geocoding-service-sted: " + f);
+    console.log(`  geocoding-service-sted: ${gss.passed} passed, ${gss.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("geocoding-service-sted: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+// kommunesentroide-kart, Skive 2: experiences-geocode-worker.ts Step D's new
+// Stedsnavn-in-kommune branch (geocode_confidence='sted'), inserted before
+// the pre-existing kommune-centroid fallback. Own in-memory experiences DB +
+// two independent injected fetch seams (dental-geocode-worker's Step-A
+// address API, geocodingService's Stedsnavn/Kommuneinfo APIs) — same pattern
+// as experiences-geocode-kommune.test.ts above. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-opplevagent-stedsetikett: Step D sted-fallback (experiences-geocode-worker) ──");
+  try {
+    const { runExperiencesGeocodeStedTests } = require("../src/services/experiences-geocode-sted.test") as
+      typeof import("../src/services/experiences-geocode-sted.test");
+    const egs = await runExperiencesGeocodeStedTests({ log: false });
+    passed += egs.passed;
+    failed += egs.failed;
+    for (const f of egs.failures) failures.push("experiences-geocode-sted: " + f);
+    console.log(`  experiences-geocode-sted: ${egs.passed} passed, ${egs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-sted: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+// kommunesentroide-kart, Skive 2: GET /opplevelse/:slug's three-way map
+// presentation (experiencesMapPresentation() — 'address'/'sted'/'kommune').
+// Own in-memory experiences DB + callHtmlRoute() harness, same convention as
+// experiences-seo-place-geo.test.ts. Tail position is the convention for a
+// new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-opplevagent-stedsetikett: /opplevelse/:slug three-way map presentation ──");
+  try {
+    const { runExperiencesSeoStedsetikettOpplevelseTests } =
+      require("../src/routes/experiences-seo-stedsetikett-opplevelse.test") as
+        typeof import("../src/routes/experiences-seo-stedsetikett-opplevelse.test");
+    const sso = await runExperiencesSeoStedsetikettOpplevelseTests({ log: false });
+    passed += sso.passed;
+    failed += sso.failed;
+    for (const f of sso.failures) failures.push("experiences-seo-stedsetikett-opplevelse: " + f);
+    console.log(`  experiences-seo-stedsetikett-opplevelse: ${sso.passed} passed, ${sso.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-stedsetikett-opplevelse: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+// kommunesentroide-kart, Skive 2: GET /kategori/gardssalg/produsent/:slug's
+// three-way map presentation (gardssalgMapPresentation() —
+// 'high'/'medium'/'low' vs 'sted' vs 'approximate'/'no_match'/null). Own raw-
+// SQL-insert-into-experience_providers + callHtmlRoute() harness, same
+// convention as experiences-seo-produsent-render-guards.test.ts. Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-opplevagent-stedsetikett: /kategori/gardssalg/produsent/:slug three-way map presentation ──");
+  try {
+    const { runExperiencesSeoStedsetikettProdusentTests } =
+      require("../src/routes/experiences-seo-stedsetikett-produsent.test") as
+        typeof import("../src/routes/experiences-seo-stedsetikett-produsent.test");
+    const ssp = await runExperiencesSeoStedsetikettProdusentTests({ log: false });
+    passed += ssp.passed;
+    failed += ssp.failed;
+    for (const f of ssp.failures) failures.push("experiences-seo-stedsetikett-produsent: " + f);
+    console.log(`  experiences-seo-stedsetikett-produsent: ${ssp.passed} passed, ${ssp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-stedsetikett-produsent: unexpected error: " + String(err?.message || err));
   }
 });

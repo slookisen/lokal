@@ -3387,15 +3387,17 @@ function renderOpplevelseDetail(
   const lat = expLat ?? numOrNull(provider ? provider.lat : null);
   const lon = expLon ?? numOrNull(provider ? provider.lon : null);
   // Precision honesty: when the point is the experience's own geocode,
-  // geo_precision already says address/kommune. When it's a provider
+  // geo_precision already says address/kommune/sted. When it's a provider
   // lat/lon fallback (experience has no own geocode yet), reuse the SAME
-  // isApproxGardssalgConfidence() discipline the gardssalg map / produsent-
-  // profil page use for provider-sourced points (defined below) — never
-  // assume a fallback point is exact just because it lacks its own
-  // geo_precision tag.
-  const geoIsApprox = expLat !== null
-    ? exp.geo_precision === "kommune"
-    : isApproxGardssalgConfidence(provider ? ((provider.geocode_confidence as string | null) ?? null) : null);
+  // gardssalgMapPresentation() discipline the produsent-profil page uses for
+  // provider-sourced points (defined above) — never assume a fallback point
+  // is exact just because it lacks its own geo_precision tag. Three-way, not
+  // a boolean (dev-request 2026-09-09-opplevagent-stedsetikett-…, Skive 2):
+  // 'sted' is a real point too, just an approximate one — see
+  // gardssalgMapPresentation()/experiencesMapPresentation()'s own comment.
+  const presentation: MapPresentation = expLat !== null
+    ? experiencesMapPresentation(exp.geo_precision)
+    : gardssalgMapPresentation(provider ? ((provider.geocode_confidence as string | null) ?? null) : null);
   const osmLinkHtml = `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
@@ -3407,9 +3409,9 @@ function renderOpplevelseDetail(
   // is where the experience is. Same gate, same honesty rule as the
   // approximate-precision labelling above.
   const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
-    ? (geoIsApprox
+    ? (presentation === "no-point"
         ? renderApproxPlacementCard(exp.kommune, exp.fylke, osmLinkHtml)
-        : renderMiniMapSection({ lat, lon, approx: false, label: place || "Posisjon" }, osmLinkHtml))
+        : renderMiniMapSection({ lat, lon, approx: presentation === "approx-point", label: place || "Posisjon" }, osmLinkHtml))
     : `<div class="map-card map-fallback">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -3449,11 +3451,12 @@ function renderOpplevelseDetail(
   // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
   // entirely is valid schema.org and says nothing rather than something false.
   // AC2 (2026-09-09-opplevagent-stedsetikett-…): the same rule now also
-  // applies to a kommune/fylke-centroid point — geoIsApprox means the
-  // coordinate is not the experience's real position either, just its
-  // container municipality, so publishing it as `geo` would be the same
-  // false precision claim in machine-readable form.
-  if (!geoIsApprox && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // applies to a kommune/fylke-centroid point — presentation==='no-point'
+  // means the coordinate is not the experience's real position either, just
+  // its container municipality, so publishing it as `geo` would be the same
+  // false precision claim in machine-readable form. 'sted' (Skive 2) IS a
+  // real point, just approximate — it belongs in structured data.
+  if (presentation !== "no-point" && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
   // Offer — only when there is a concrete starting price. Price bands alone are
   // too coarse for a valid schema.org Offer (no numeric price), so band-only
   // rows are intentionally left without an Offer node.
@@ -4666,6 +4669,37 @@ function isApproxGardssalgConfidence(confidence: string | null): boolean {
   return confidence !== "high" && confidence !== "medium" && confidence !== "low";
 }
 
+// dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+// kommunesentroide-kart, Skive 2. isApproxGardssalgConfidence() above is a
+// two-way exact/approx split — right for renderGardssalgMapSection()'s
+// overview map (~L4818), which never distinguishes "point" from "no point",
+// only "exact" from "approximate", so `sted` needs no change there: it IS
+// approximate. The two SINGLE-ENTITY pages need a THIRD state instead:
+// `sted` (experiences-geocode-worker.ts Step D's Stedsnavn-in-kommune
+// fallback) is a real, if approximate, point and should draw one — unlike
+// `kommune`/`approximate`/null, which stay the no-point card
+// renderApproxPlacementCard() added for Skive 1. Two near-identical
+// functions (one per confidence vocabulary — geocode_confidence's
+// high/medium/low/approximate/sted/no_match vs geo_precision's
+// address/kommune/sted) rather than one, because the two columns are not the
+// same enum and unifying them would need a translation layer neither caller
+// asks for.
+type MapPresentation = "exact" | "approx-point" | "no-point";
+
+/** geocode_confidence (experience_providers) → single-entity map presentation. */
+function gardssalgMapPresentation(confidence: string | null | undefined): MapPresentation {
+  if (confidence === "high" || confidence === "medium" || confidence === "low") return "exact";
+  if (confidence === "sted") return "approx-point";
+  return "no-point"; // 'approximate', 'no_match', null, future/unknown — same fail-closed direction as before
+}
+
+/** geo_precision (experiences) → single-entity map presentation. */
+function experiencesMapPresentation(precision: string | null | undefined): MapPresentation {
+  if (precision === "address") return "exact";
+  if (precision === "sted") return "approx-point";
+  return "no-point"; // 'kommune', null
+}
+
 const GARDSSALG_MAP_INIT_JS = `(function () {
   var mapEl = document.getElementById('gardssalg-map');
   var dataEl = document.getElementById('gardssalg-map-data');
@@ -5595,13 +5629,13 @@ router.get(
     const lat = numOrNull(provider.lat);
     const lon = numOrNull(provider.lon);
     // Step D fallback (experiences-geocode-worker.ts): a kommune/fylke
-    // centroid, not a real street-address geocode — label it honestly
-    // rather than implying exact-address precision. Reuses the SAME
-    // isApproxGardssalgConfidence() helper the /kategori/gardssalg map uses
-    // (arbeidspunkt 5) instead of a bespoke equality check — a future/
-    // unrecognized confidence value must default to approximate here too,
-    // not silently render as exact.
-    const geoApprox = isApproxGardssalgConfidence(provider.geocode_confidence);
+    // centroid, or (Skive 2) a Stedsnavn-in-kommune 'sted' point — neither is
+    // a real street-address geocode, so label honestly rather than implying
+    // exact-address precision. gardssalgMapPresentation() (three-way; see its
+    // own comment) replaces the old isApproxGardssalgConfidence() boolean
+    // here — 'sted' draws an approximate POINT, unlike 'approximate'/
+    // 'no_match'/null which draw no point at all.
+    const presentation = gardssalgMapPresentation(provider.geocode_confidence);
 
     const metaDesc = L.gsMeta(provider.navn, sted || "");
 
@@ -5718,16 +5752,25 @@ router.get(
     // renderMiniMapSection helper /opplevelse/:slug uses) when we have a
     // point, with the original OpenStreetMap-link markup preserved verbatim
     // as the <noscript> fallback. The no-geo branch is untouched.
+    // map-sub text is presentation-specific (dev-request 2026-09-09-
+    // opplevagent-stedsetikett-…, Skive 2): 'sted' is a real point but still
+    // an approximate one, so it gets its own "(sted)" wording distinct from
+    // both the exact case and the no-point kommune-centroid case.
+    const mapSubText = presentation === "approx-point"
+      ? "Ca. posisjon (sted) – åpne i kart"
+      : presentation === "no-point"
+      ? "Ca. posisjon (kommune) – åpne i kart"
+      : "Åpne i kart (OpenStreetMap)";
     const osmLinkHtml = `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
-           <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">${geoApprox ? "Ca. posisjon (kommune) – åpne i kart" : "Åpne i kart (OpenStreetMap)"}</span></span>
+           <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">${mapSubText}</span></span>
          </a>`;
     // Same coordinate sanity gate as the /opplevelse/:slug "Sted" card — see
     // its comment (Daniel 2026-08-24, punkt 5).
     const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
-      ? (geoApprox
+      ? (presentation === "no-point"
           ? renderApproxPlacementCard(provider.kommune, provider.fylke, osmLinkHtml)
-          : renderMiniMapSection({ lat, lon, approx: false, label: sted || "Posisjon" }, osmLinkHtml))
+          : renderMiniMapSection({ lat, lon, approx: presentation === "approx-point", label: sted || "Posisjon" }, osmLinkHtml))
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
            <span><strong>${escapeHtml(sted || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -5768,9 +5811,10 @@ router.get(
   // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
   // entirely is valid schema.org and says nothing rather than something false.
   // AC2 (2026-09-09-opplevagent-stedsetikett-…): same rule for a kommune/
-  // fylke-centroid (geoApprox) — it is Step D's municipality fallback, not
-  // the producer's real position.
-  if (!geoApprox && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // fylke-centroid (presentation==='no-point') — it is Step D's municipality
+  // fallback, not the producer's real position. 'sted' (Skive 2) IS a real,
+  // if approximate, point and belongs in structured data.
+  if (presentation !== "no-point" && lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
     if (site) ld.sameAs = [site];
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
