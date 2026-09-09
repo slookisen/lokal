@@ -7629,6 +7629,76 @@ router.post("/admin/agents/postal-backfill", async (req: Request, res: Response)
   }
 });
 
+// ─── POST /admin/agents/city-backfill ────────────────────────────────
+// dev-request 2026-09-09-outreach-profilkvalitet.
+//
+// Manual/routine trigger for services/agents-city-backfill.ts. `agents.city`
+// is often empty, which breaks the seo.ts hero location line, the answer-
+// first opening line, JSON-LD addressLocality, and the contact card — this
+// resolves it via Brreg forretningsadresse > the official postal-code
+// registry > Kartverket (in that priority order), never writing an
+// uncorroborated/ambiguous value.
+//
+// Body (all optional):
+//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//
+// dry_run: true performs the identical resolution and reports every verdict
+// in `planned` — including the skips — but takes no write at all, not even
+// the attempt timestamp. Verify with the `status` block: captured before
+// and after, a dry run must leave it byte-identical.
+//
+// The limit clamp and the STRICT dry_run parser are reused verbatim from the
+// Fase-1a geocode worker (see agents-postal-backfill.ts's own admin route
+// just above for why: `{"dry_run":"true"}` performed a real production
+// write once already).
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/city-backfill", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+
+  const { clampGeocodeBatchLimit, parseDryRunFlag } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+  const { cityBackfillTick, cityBackfillQueueStatus } =
+    require("../services/agents-city-backfill") as typeof import("../services/agents-city-backfill");
+
+  const limit = clampGeocodeBatchLimit(body.limit);
+
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
+
+  try {
+    const before = cityBackfillQueueStatus();
+    const result = await cityBackfillTick(limit, { dryRun });
+    const after = cityBackfillQueueStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        limit,
+        status_before: before,
+        status_after: after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[city-backfill] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "City backfill failed" });
+  }
+});
+
 // ─── POST /admin/agents/geocode-seed-audit ───────────────────────────
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
 // throughput follow-up — review adjudication (c).

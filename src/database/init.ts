@@ -2401,6 +2401,24 @@ function initSchema(db: Database.Database): void {
         k.email IS NOT NULL
         AND k.email != ''
         AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
+        /* dev-request 2026-09-09-outreach-profilkvalitet: a row could be
+           'verified' with a fresh outreach-eligible URL probe and STILL have
+           no actually-published /produsent/:slug page — nothing here checked
+           that before. Reuses the SAME WO-17/role-gate predicate seo.ts's
+           sitemap.xml generator and the /produsent/:slug route itself already
+           enforce (routes/seo.ts's passesRoleGate + the is_active=1 filter
+           marketplaceRegistry.getAgentBySlugIncludingUmbrellas applies)
+           rather than inventing a new mechanism: is_active must be true, and
+           — for a non-umbrella agent, which every row here already is per
+           the umbrella_type filter above — either no role is set or it is
+           explicitly 'producer', and the agent must not be sitting in
+           first-line quarantine (is_vetted defaults to 1; NULL/1 both mean
+           vetted, exactly as passesRoleGate treats it). A row failing any of
+           these would 404 or render a "not found" page if a producer clicked
+           through the outreach email. */
+        AND a.is_active = 1
+        AND (a.role IS NULL OR a.role = 'producer')
+        AND (a.is_vetted IS NULL OR a.is_vetted = 1)
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}
@@ -4586,6 +4604,44 @@ function initSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration profile_translations failed:", err);
   }
+
+  // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
+  // columns (services/agents-city-backfill.ts). `agents.city` itself already
+  // exists (base CREATE TABLE above) — these three columns are the SAME
+  // bookkeeping shape agents-postal-backfill.ts uses for `postal_code`
+  // (postal_code_source / postal_backfill_outcome / postal_backfill_
+  // attempted_at), just for city:
+  //   city_backfill_source        : 'brreg_forretningsadresse' |
+  //                                 'postnummerregister' | 'kartverket_adresse'
+  //                                 — which of the three priority-ordered
+  //                                 sources actually resolved the value.
+  //   city_backfill_outcome       : last attempt's verdict — 'resolved' |
+  //                                 'no_usable_source' | 'kartverket_ambiguous'
+  //                                 | 'skipped_existing' | 'error'.
+  //   city_backfill_attempted_at  : ISO-8601 stamp written on EVERY attempt
+  //                                 whatever the outcome, including skips and
+  //                                 the error path — the ROTATION key the
+  //                                 worker's selector orders by. Same ALWAYS-
+  //                                 STAMP discipline agents-postal-
+  //                                 backfill.ts's own header documents at
+  //                                 length (a worker whose failure path does
+  //                                 not stamp re-picks the identical batch
+  //                                 forever).
+  // Additive + idempotent ALTERs, same defensive try/catch idiom as every
+  // other migration in this file.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN city_backfill_source TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN city_backfill_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN city_backfill_attempted_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_agent_knowledge_city_backfill_attempted_at
+         ON agent_knowledge(city_backfill_attempted_at)`
+    );
+  } catch { /* index already created */ }
 }
 
 export function closeDb(): void {

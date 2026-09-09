@@ -24662,6 +24662,14 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
       is_active INTEGER DEFAULT 1,
       is_verified INTEGER DEFAULT 0,
+      -- dev-request 2026-09-09-outreach-profilkvalitet: admin-outreach-
+      -- candidates.ts's mode=second query now also gates on is_vetted (same
+      -- profile-published predicate the outreach_ready_pool VIEW gained) —
+      -- this minimal schema needs the column too, or that route 500s with
+      -- "no such column: a.is_vetted". Default 1 matches production's
+      -- ALTER TABLE default (database/init.ts), so every existing fixture
+      -- below (which never sets it) is unaffected.
+      is_vetted INTEGER DEFAULT 1,
       trust_score REAL DEFAULT 0.5,
       city TEXT,
       umbrella_type TEXT,
@@ -43377,5 +43385,98 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-stedsetikett-produsent: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-outreach-profilkvalitet: `agents.city` write path
+// (PUT /admin/knowledge) — pure-add always allowed, populated city refused
+// without allow_correct, applied with allow_correct + qualifying evidence
+// over known-bad-legacy provenance, still refused with allow_correct alone
+// when the existing value isn't known-bad legacy. Own in-memory DB +
+// router.handle() harness, same convention as admin-knowledge-website-
+// write-guard.test.ts. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-outreach-profilkvalitet: agents.city write path (PUT /admin/knowledge) ──");
+  try {
+    const { runAdminKnowledgeCityWriteTests } = require("../src/routes/admin-knowledge-city-write.test") as
+      typeof import("../src/routes/admin-knowledge-city-write.test");
+    const akc = await runAdminKnowledgeCityWriteTests({ log: false });
+    passed += akc.passed;
+    failed += akc.failed;
+    for (const f of akc.failures) failures.push("admin-knowledge-city-write: " + f);
+    console.log(`  admin-knowledge-city-write: ${akc.passed} passed, ${akc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-knowledge-city-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill.ts —
+// Brreg poststed > official postnummerregister > Kartverket (in that
+// priority order), never writing an uncorroborated/ambiguous city. Own
+// pure-function + injected-fetch tests, same convention as
+// agents-postal-backfill.test.ts. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──");
+  try {
+    const { runAgentsCityBackfillTests } = require("../src/services/agents-city-backfill.test") as
+      typeof import("../src/services/agents-city-backfill.test");
+    const acb = await runAgentsCityBackfillTests({ log: false });
+    passed += acb.passed;
+    failed += acb.failed;
+    for (const f of acb.failures) failures.push("agents-city-backfill: " + f);
+    console.log(`  agents-city-backfill: ${acb.passed} passed, ${acb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-city-backfill: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-outreach-profilkvalitet: agent_knowledge.address
+// trailing ", Norge"/", NORGE" suffix normalization — pure-function table
+// test + PUT /admin/knowledge write-path integration + the GET/POST sweep
+// router for existing rows. Own in-memory DB + router.handle() harness,
+// same convention as admin-knowledge-website-write-guard.test.ts. Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-outreach-profilkvalitet: address trailing ', Norge' normalization ──");
+  try {
+    const { runAddressNorgeSuffixTests } = require("../src/routes/admin-knowledge-address-norge-suffix.test") as
+      typeof import("../src/routes/admin-knowledge-address-norge-suffix.test");
+    const ans = await runAddressNorgeSuffixTests({ log: false });
+    passed += ans.passed;
+    failed += ans.failed;
+    for (const f of ans.failures) failures.push("admin-knowledge-address-norge-suffix: " + f);
+    console.log(`  admin-knowledge-address-norge-suffix: ${ans.passed} passed, ${ans.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-knowledge-address-norge-suffix: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-outreach-profilkvalitet: outreach_ready_pool VIEW
+// now excludes rows whose /produsent/:slug page would not actually publish
+// (is_active=0, is_vetted=0/quarantined, or a non-producer/non-umbrella
+// role) — reuses the SAME WO-17/role-gate predicate seo.ts's sitemap.xml and
+// /produsent/:slug route already enforce (routes/seo.ts's passesRoleGate),
+// rather than inventing a new mechanism. Own in-memory DB, same convention
+// as admin-outreach-pool-rich-vs-partial.test.ts. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-outreach-profilkvalitet: outreach_ready_pool excludes unpublished profiles ──");
+  try {
+    const { runOutreachPoolProfilePublishedTests } =
+      require("../src/routes/admin-outreach-pool-profile-published.test") as
+        typeof import("../src/routes/admin-outreach-pool-profile-published.test");
+    const opp = await runOutreachPoolProfilePublishedTests({ log: false });
+    passed += opp.passed;
+    failed += opp.failed;
+    for (const f of opp.failures) failures.push("admin-outreach-pool-profile-published: " + f);
+    console.log(`  admin-outreach-pool-profile-published: ${opp.passed} passed, ${opp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-outreach-pool-profile-published: unexpected error: " + String(err?.message || err));
   }
 });

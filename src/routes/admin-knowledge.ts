@@ -331,7 +331,14 @@ export function mergeFieldProvenance(
 
 // Factual fields eligible for correction. Keyed identically in body columns and
 // in field_provenance (address/phone/products/about).
-export const CORRECTABLE_FACTUAL_FIELDS: readonly string[] = ["products", "address", "phone", "about"];
+// dev-request 2026-09-09-outreach-profilkvalitet: "city" added — it lives on
+// the `agents` table (not agent_knowledge), like description/categories, but
+// is a plain factual field (not a CONTENT_FIELD), so it goes through the same
+// tier-A/tier-S correction math as address/phone rather than the homepage-
+// preferred-content path. See the dedicated city write-path block below for
+// why city's gating is NOT limited to `allow_correct && ...` the way the
+// other four fields' is.
+export const CORRECTABLE_FACTUAL_FIELDS: readonly string[] = ["products", "address", "phone", "about", "city"];
 
 // Inference "source_types" that are NOT real evidence (aligned with PR-16's
 // deny-list). Kept local so this guard does not depend on PR-16 being merged.
@@ -539,6 +546,38 @@ export function canCorrectFactualField(opts: {
   };
 }
 
+// ─── Address normalization — trailing ", Norge" / ", NORGE" (dev-request ──
+//     2026-09-09-outreach-profilkvalitet) ─────────────────────────────────
+//
+// Some `agent_knowledge.address` values carry a trailing country token —
+// ", Norge", ", NORGE", ", norge " — left over from a scrape that included
+// the country in the address line. It adds nothing (every producer here is
+// Norwegian) and reads oddly wherever `address` is rendered verbatim (the
+// contact card, JSON-LD). This strips ONLY that trailing token; the rest of
+// the string — including a genuine street name that happens to contain
+// "Norge" mid-string, e.g. "Norgesgata 5, 0155 Oslo" — is left untouched,
+// because the pattern requires the comma-prefixed literal at the very end.
+//
+// A while-loop (bounded) handles the rare doubled case ("…, Norge, Norge")
+// by stripping repeatedly rather than just once.
+const TRAILING_NORGE_SUFFIX_RE = /,\s*norge\s*$/i;
+const TRAILING_NORGE_SUFFIX_MAX_STRIPS = 3;
+
+/**
+ * Strip a trailing ", Norge" / ", NORGE" (any case, any trailing whitespace)
+ * from a free-text address. Pure — exported for unit-testing. Touches ONLY
+ * the trailing token; returns the input unchanged (not even trimmed) when no
+ * such suffix is present. Non-string input is returned as-is.
+ */
+export function stripTrailingNorgeSuffix(address: string): string {
+  if (typeof address !== "string") return address;
+  let out = address;
+  for (let i = 0; i < TRAILING_NORGE_SUFFIX_MAX_STRIPS && TRAILING_NORGE_SUFFIX_RE.test(out); i++) {
+    out = out.replace(TRAILING_NORGE_SUFFIX_RE, "");
+  }
+  return out;
+}
+
 // ─── Column write — body fields → agent_knowledge ──────────────────────
 //
 // We do the provenance update in a single transaction with the column
@@ -554,6 +593,9 @@ type IncomingBody = {
   email?: string;
   postalCode?: string;
   website?: string;
+  // dev-request 2026-09-09-outreach-profilkvalitet: `agents.city` had NO write
+  // path before this — see the dedicated city write-path block below.
+  city?: string;
   // PR-A: CONTENT fields that live on the `agents` table (not agent_knowledge).
   // Additive + backward-compatible — omitting them preserves existing values.
   // `description` is a string; `categories` is a JSON array (string[] preferred;
@@ -640,7 +682,13 @@ router.put("/", (req: Request, res: Response) => {
     }
     columnUpdates.push({ col: "about", val: body.about });
   }
-  if (typeof body.address === "string") columnUpdates.push({ col: "address", val: body.address });
+  // dev-request 2026-09-09-outreach-profilkvalitet: strip a trailing ", Norge"
+  // / ", NORGE" (case-insensitive, any run of trailing whitespace) from every
+  // address written through this route — see stripTrailingNorgeSuffix()
+  // below for the pure function + the GET/POST sweep for existing rows.
+  // Touches ONLY that trailing token; the rest of the string is untouched.
+  if (typeof body.address === "string")
+    columnUpdates.push({ col: "address", val: stripTrailingNorgeSuffix(body.address) });
   if (typeof body.phone === "string") columnUpdates.push({ col: "phone", val: body.phone });
   if (typeof body.email === "string") columnUpdates.push({ col: "email", val: body.email });
   if (typeof body.postalCode === "string")
@@ -779,6 +827,99 @@ router.put("/", (req: Request, res: Response) => {
   // (no existing value) and non-factual columns are never gated, so additive
   // enrichment is unchanged. When allow_correct is OFF this block does nothing.
   const corrections: Array<{ field: string; action: "applied" | "refused" | "added" | "noop"; reason: string }> = [];
+
+  // ── City write path (dev-request 2026-09-09-outreach-profilkvalitet) ──────
+  // `agents.city` had NO write path before this PUT accepted address/
+  // postalCode/about/products/description/categories but not city, so it
+  // could only ever be set once, at POST /admin/agents/register. An empty
+  // city breaks seo.ts's hero location line, buildProducerAnswerFirstOpening
+  // (needs 2 of {products, city}), JSON-LD addressLocality, and the contact
+  // card's postal-code-only fallback.
+  //
+  // Unlike products/address/phone/about above (whose overwrite gating only
+  // runs at all when allow_correct is requested — see the block below), a
+  // populated existing city is refused UNCONDITIONALLY unless allow_correct
+  // is set AND canCorrectFactualField() (the exact same guard those four
+  // fields use once allow_correct IS on) approves the correction. Pure ADDs
+  // (existing city empty) and no-op writes (identical value) are always
+  // allowed, same as the generic gating below. Kept in its own
+  // `cityColumnUpdates` set, merged into `agentColumnUpdates` only AFTER the
+  // generic allow_correct-gated loop below has run, so that loop — which has
+  // no "city" entry in its own existingColVal map — never re-processes city
+  // and double-reports it in `corrections`.
+  const cityColumnUpdates: { col: string; val: unknown }[] = [];
+  let cityRejectedReason: string | undefined;
+  if (typeof body.city === "string") {
+    const newCity = body.city;
+    const existingCityRow = db.prepare("SELECT city FROM agents WHERE id = ?").get(agentId) as
+      | { city?: string | null }
+      | undefined;
+    const oldCity = existingCityRow?.city ?? null;
+    const oldPopulated = typeof oldCity === "string" && oldCity.trim() !== "";
+    if (!oldPopulated || oldCity === newCity) {
+      // Pure ADD, or the incoming value matches what's already there —
+      // nothing is being overwritten, so no gate applies.
+      cityColumnUpdates.push({ col: "city", val: newCity });
+    } else if (!allowCorrect) {
+      cityRejectedReason = "city_populated_allow_correct_required";
+      console.log(
+        `[admin-knowledge] city overwrite for agent ${agentId} REJECTED — existing city is populated and allow_correct was not set; not written`,
+      );
+    } else {
+      // allow_correct is on: run the SAME correction guard products/address/
+      // phone/about use once allow_correct is requested for THEM, so a
+      // genuine city overwrite still needs real evidence, never just an
+      // opt-in flag on its own.
+      const cityProvRow = db
+        .prepare("SELECT field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?")
+        .get(agentId) as { field_provenance?: string | null; curated_fields?: string | null } | undefined;
+      let cityExistingProv: Record<string, unknown> = {};
+      if (cityProvRow?.field_provenance) {
+        try {
+          const parsed = JSON.parse(cityProvRow.field_provenance);
+          if (parsed && typeof parsed === "object") cityExistingProv = parsed as Record<string, unknown>;
+        } catch {
+          /* malformed on-disk provenance — treated as none */
+        }
+      }
+      const cityWoUnverified =
+        !!cityExistingProv.website_ownership &&
+        typeof cityExistingProv.website_ownership === "object" &&
+        (cityExistingProv.website_ownership as Record<string, unknown>).status === "unverified";
+      let cityCurated: Record<string, unknown> = {};
+      if (cityProvRow?.curated_fields) {
+        try {
+          const parsed = JSON.parse(cityProvRow.curated_fields);
+          if (parsed && typeof parsed === "object") cityCurated = parsed as Record<string, unknown>;
+        } catch {
+          /* malformed curated_fields — treated as not curated */
+        }
+      }
+      let cityIncomingProv: Record<string, ProvenanceRecord[]> = {};
+      if (body.field_provenance && typeof body.field_provenance === "object") {
+        try {
+          cityIncomingProv = mergeFieldProvenance({}, body.field_provenance);
+        } catch {
+          /* malformed incoming payload — treated as no incoming provenance */
+        }
+      }
+      const decision = canCorrectFactualField({
+        field: "city",
+        existingFieldProvenance: cityExistingProv["city"],
+        websiteOwnershipUnverified: cityWoUnverified,
+        incomingFieldProvenance: cityIncomingProv["city"],
+        isCurated: !!cityCurated["city"],
+      });
+      if (decision.allowed) {
+        cityColumnUpdates.push({ col: "city", val: newCity });
+        corrections.push({ field: "city", action: "applied", reason: decision.reason });
+      } else {
+        cityRejectedReason = decision.reason;
+        corrections.push({ field: "city", action: "refused", reason: decision.reason });
+      }
+    }
+  }
+
   if (allowCorrect && (columnUpdates.length > 0 || agentColumnUpdates.length > 0)) {
     // Parse existing row: current factual column values + field_provenance + curated_fields.
     const existingRow = db
@@ -928,6 +1069,12 @@ router.put("/", (req: Request, res: Response) => {
     agentColumnUpdates.push(...keptAgentUpdates);
   }
 
+  // Merge in the city write decided above — AFTER the generic allow_correct-
+  // gated loop, which has no "city" entry in its own existingColVal map and
+  // would otherwise treat any city entry it saw as a pure ADD and
+  // double-report it in `corrections`.
+  agentColumnUpdates.push(...cityColumnUpdates);
+
   // ── Apply ─────────────────────────────────────────────────────────────
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
@@ -1002,6 +1149,11 @@ router.put("/", (req: Request, res: Response) => {
     // (not `null`/`undefined`) on every ordinary call, so no existing
     // consumer's shape assertion changes.
     ...(websiteRejectedReason ? { website_rejected_reason: websiteRejectedReason } : {}),
+    // dev-request 2026-09-09-outreach-profilkvalitet: present only when a city
+    // overwrite was actually rejected (existing city populated, allow_correct
+    // absent, or canCorrectFactualField refused it) — absent (not null) on
+    // every ordinary call, same convention as website_rejected_reason above.
+    ...(cityRejectedReason ? { city_rejected_reason: cityRejectedReason } : {}),
   });
 });
 
@@ -2164,3 +2316,117 @@ descriptionTruncationSweepRouter.post(
     });
   },
 );
+
+// ─── GET/POST /admin/address-norge-suffix-sweep (dev-request 2026-09-09- ──
+//     outreach-profilkvalitet) ────────────────────────────────────────────
+//
+// One-time (repeatable) sweep for EXISTING agent_knowledge.address rows that
+// still carry the trailing ", Norge"/", NORGE" token —
+// stripTrailingNorgeSuffix() (above) already keeps this out of every NEW
+// write through PUT /admin/knowledge; this is the backfill for rows written
+// before that. Same GET-diagnostic / POST-dry-run-by-default-then-apply
+// shape as /admin/description-truncation-sweep just above — mirrored
+// deliberately rather than inventing a third sweep convention.
+
+const ADDRESS_SWEEP_RESPONSE_CAP = 200;
+
+type AddressSweepRow = { agent_id: string; address: string };
+
+function findNorgeSuffixAddresses(db: ReturnType<typeof getDb>): AddressSweepRow[] {
+  const rows = db
+    .prepare(`SELECT agent_id, address FROM agent_knowledge WHERE address IS NOT NULL AND TRIM(address) != ''`)
+    .all() as AddressSweepRow[];
+  return rows.filter((r) => stripTrailingNorgeSuffix(r.address) !== r.address);
+}
+
+export const addressNorgeSuffixSweepRouter = Router();
+
+addressNorgeSuffixSweepRouter.get("/address-norge-suffix-sweep", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const candidates = findNorgeSuffixAddresses(db);
+  const preview = candidates.slice(0, ADDRESS_SWEEP_RESPONSE_CAP).map((row) => ({
+    agent_id: row.agent_id,
+    before: row.address,
+    after: stripTrailingNorgeSuffix(row.address),
+  }));
+  res.json({
+    success: true,
+    dry_run: true,
+    matched_count: candidates.length,
+    rows_returned: preview.length,
+    rows_truncated: candidates.length > ADDRESS_SWEEP_RESPONSE_CAP,
+    rows: preview,
+  });
+});
+
+addressNorgeSuffixSweepRouter.post("/address-norge-suffix-sweep", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  // STRICT-FALSE parse (mirrors /admin/description-truncation-sweep above):
+  // writes execute ONLY on the JSON boolean false — anything else (null,
+  // "false", 0, "", undefined) means dry-run.
+  const body = (req.body ?? {}) as { dry_run?: unknown };
+  const dryRun = body.dry_run !== false;
+
+  const db = getDb();
+  const candidates = findNorgeSuffixAddresses(db);
+
+  if (dryRun) {
+    const preview = candidates.slice(0, ADDRESS_SWEEP_RESPONSE_CAP).map((row) => ({
+      agent_id: row.agent_id,
+      before: row.address,
+      after: stripTrailingNorgeSuffix(row.address),
+    }));
+    res.json({
+      success: true,
+      dry_run: true,
+      would_update_count: candidates.length,
+      rows_truncated: candidates.length > ADDRESS_SWEEP_RESPONSE_CAP,
+      would_update: preview,
+    });
+    return;
+  }
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) — mirrors POST /admin/prune-dead-urls above; this
+  // route writes agent_knowledge.address, the same column the enrichment
+  // SKILL's own write path touches. `getDb` as a thunk (see the import
+  // comment at the top of this file).
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, candidates.map((c) => c.agent_id));
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  const getCurrent = db.prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?");
+  const updateAddress = db.prepare("UPDATE agent_knowledge SET address = ?, updated_at = ? WHERE agent_id = ?");
+  const now = new Date().toISOString();
+
+  const updated: Array<{ agent_id: string; before: string; after: string }> = [];
+  const tx = db.transaction(() => {
+    for (const row of candidates) {
+      // Re-check RIGHT BEFORE writing — never clobber a row that was already
+      // fixed (or cleared) since the scan above, same discipline as
+      // /admin/description-truncation-sweep's apply loop.
+      const current = getCurrent.get(row.agent_id) as { address: string | null } | undefined;
+      if (!current || !current.address) continue;
+      const cleaned = stripTrailingNorgeSuffix(current.address);
+      if (cleaned === current.address) continue;
+      updateAddress.run(cleaned, now, row.agent_id);
+      updated.push({ agent_id: row.agent_id, before: current.address, after: cleaned });
+    }
+  });
+  tx();
+
+  res.json({
+    success: true,
+    dry_run: false,
+    scanned: candidates.length,
+    updated_count: updated.length,
+    updated: updated.slice(0, ADDRESS_SWEEP_RESPONSE_CAP),
+    rows_truncated: updated.length > ADDRESS_SWEEP_RESPONSE_CAP,
+  });
+});
