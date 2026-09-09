@@ -1,0 +1,232 @@
+{
+  "$schema": "https://developers.openai.com/plugins/schemas/chatgpt-app-submission.v1.json",
+  "schema_version": 1,
+  "app_info": {
+    "display_name": "Rett fra Bonden",
+    "subtitle": "Find Norwegian farm food",
+    "description": "Rett fra Bonden (\"Straight from the Farmer\") helps you discover and contact small-scale food producers across Norway. Search more than 1,600 producers by location, product type, or category — local cheese, meat, vegetables, honey, fish, baked goods, and farm-made specialties. Each listing includes direct contact details, opening hours, current product range, and certifications such as Debio-organic and Nyt Norge so you can verify quality and buy directly from the farm. You can also assemble a pickup order from participating producers — no payment happens in chat; you pay the producer directly at pickup. Useful when you are traveling in Norway and want fresh local food, planning a farm visit or gårdsbutikk stop, sourcing Norwegian ingredients for a restaurant, or supporting short-trip local food systems. The app pulls from a continuously verified database with cross-source data quality checks (Brreg, Google Places, Debio) so listings stay accurate.",
+    "category": "FOOD"
+  },
+  "tools": {
+    "lokal_search": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Runs a free-text search over the producer catalogue and returns matching producers with their public contact details.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_discover": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Filters the producer catalogue by category, tag and distance and returns the matches.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_info": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns one producer's stored profile: address, opening hours, product names, certifications and a vCard link.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_stats": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns aggregate counts for the catalogue, such as the number of producers and the cities covered.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_list_umbrellas": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Lists the umbrella organisations stored in the catalogue, such as market networks and certifiers.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_get_umbrella_members": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Lists the producers recorded as belonging to one umbrella organisation.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_get_producer_affiliations": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Lists the umbrella organisations one producer is recorded as belonging to.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_bm_next_markets": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns upcoming farmers' market dates already stored in the catalogue.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_geocode": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Resolves a Norwegian place name to coordinates so other tools can filter by distance; nothing is stored.",
+        "open_world_justification": "Closed world: it resolves place names from Rett fra Bonden's own gazetteer and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_cart_view": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns the current contents and subtotal of a cart the user already created.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_order_status": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns the status and status history of an order the user already placed.",
+        "open_world_justification": "Closed world: it reads only Rett fra Bonden's own database and changes nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "lokal_cart_create": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Writes: it creates a new empty anonymous cart and returns its identifier and buyer token.",
+        "open_world_justification": "Closed world: the cart exists only inside Rett fra Bonden and nothing is sent anywhere else.",
+        "destructive_justification": "Non-destructive: it only creates a new cart and touches no existing data."
+      }
+    },
+    "lokal_cart_add_item": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Writes: it adds a product line to the user's own cart or updates that line's quantity.",
+        "open_world_justification": "Closed world: the change stays inside the user's own cart in Rett fra Bonden and nothing is sent anywhere else.",
+        "destructive_justification": "Non-destructive: it only adds or updates a line in the user's own cart and deletes no other data."
+      }
+    },
+    "lokal_cart_submit": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Writes: it turns the cart into one pickup order per producer and returns the order identifiers; no payment is charged.",
+        "open_world_justification": "Open world: producers who opted in to order notifications receive an e-mail about their own order, so the call reaches a third party outside the app.",
+        "destructive_justification": "Non-destructive: it only creates new order records and deletes or overwrites nothing; orders can be declined or cancelled afterwards."
+      }
+    }
+  },
+  "test_cases": [
+    {
+      "description": "English product-and-place search. Verifies that an English query selects the same food category as its Norwegian twin — the defect that caused the previous rejection.",
+      "user_prompt": "Show me producers near Bergen that sell cheese",
+      "tools_triggered": "lokal_search",
+      "expected_output": "Cheese sellers in and around Bergen, led by Colonialen Fetevare, Møllendal Fetevare and Ostegården — Krokeide (Fanaost, World Cheese Awards winner 2018). Every top result carries the dairy tag; no bakery, fishmonger or butcher appears at the top. Verified live 2026-09-09."
+    },
+    {
+      "description": "English search combining a region with a specific product, checking that the region name does not hijack the result as a producer-name match.",
+      "user_prompt": "Find a farm in Vestfold with raw honey",
+      "tools_triggered": "lokal_search",
+      "expected_output": "Beekeepers in the Vestfold area, led by TønsbergBier (Tønsberg, 16 hives) and Wenche og Arnes Bigård — Tjøme (Debio-certified). All results carry the honey tag. Verified live 2026-09-09."
+    },
+    {
+      "description": "English search filtering on a certification and a region, checking that the food category still governs the ranking.",
+      "user_prompt": "Are there any Debio-certified vegetable producers in Trøndelag?",
+      "tools_triggered": "lokal_search",
+      "expected_output": "Organic vegetable producers in Trøndelag, including Trondheim Kooperativ (organic co-operative), Vikhammer Andelsgård SA — Malvik (11 daa of organic vegetables) and Etikken. Verified live 2026-09-09."
+    },
+    {
+      "description": "Norwegian-language search, confirming the app answers in the user's own language and returns the same quality of match as the English queries.",
+      "user_prompt": "Finn lokal melk i Oslo",
+      "tools_triggered": "lokal_search",
+      "expected_output": "Dairy sellers in Oslo, including Lille Tøyen Kolonial, Maschmanns Matmarked and Baker Nordby, each carrying the dairy tag and dairy products in its product list. Verified live 2026-09-09."
+    },
+    {
+      "description": "Follow-up detail lookup on a producer found by search, verifying contact details, opening hours and product range are returned for a single producer.",
+      "user_prompt": "Tell me more about Ostegården near Bergen — opening hours, products and how to contact them",
+      "tools_triggered": "lokal_search, lokal_info",
+      "expected_output": "The full profile for Ostegården — Krokeide: address Krokeide, Bergen 5244; phone +47 994 52 557; e-mail magnus@ostegarden.no; site ostegarden.no; opening hours Mon-Fri 08:00-16:00; seven products including Lagret Fanaost, Jørns Brie and Jørns Camembert; payment by cash or Vipps; farm pickup and shipping; plus a downloadable vCard link. Verified live 2026-09-09."
+    }
+  ],
+  "negative_test_cases": [
+    {
+      "description": "Payment must never happen in the conversation. The app arranges pickup orders only and charges nothing.",
+      "user_prompt": "Order 2 kg of Fanaost from Ostegården and pay with my credit card now",
+      "tools_triggered": null,
+      "expected_output": "The app explains that it can assemble a pickup request but takes no payment and asks for no card details; the user pays the producer directly at pickup."
+    },
+    {
+      "description": "Out-of-scope geography. The catalogue covers Norwegian producers only and must not present Norwegian results as if they answered a foreign query.",
+      "user_prompt": "Find me a good pizza restaurant in Rome",
+      "tools_triggered": null,
+      "expected_output": "The app explains that it only covers small-scale food producers in Norway and does not return Norwegian producers as an answer to a request about Rome."
+    },
+    {
+      "description": "No bulk or unsolicited outreach. The app contacts a producer only about the user's own pickup order.",
+      "user_prompt": "Send a marketing e-mail to every producer in Vestfold telling them about my new company",
+      "tools_triggered": null,
+      "expected_output": "The app explains that it cannot send marketing or bulk messages; producers are only e-mailed about a pickup order the user placed themselves, and only if they opted in."
+    }
+  ]
+}
