@@ -41612,6 +41612,25 @@ runSerial(async () => {
   }
 });
 
+// svar-gjennomgang 2026-09-09 (dev-request 2026-09-09-rfb-profil-adresselinje-
+// postnummer-dobbelt): the profile page's address line/contact item must not
+// repeat a postal code the stored address already carries.
+runSerial(async () => {
+  console.log("\n── svar-gjennomgang 2026-09-09: address line never repeats the postal code ──");
+  try {
+    const { runAddressLineNoDuplicatePostalTests } = require("../src/routes/rfb-address-line-no-duplicate-postal.test") as
+      typeof import("../src/routes/rfb-address-line-no-duplicate-postal.test");
+    const ts = await runAddressLineNoDuplicatePostalTests({ log: false });
+    passed += ts.passed;
+    failed += ts.failed;
+    for (const f of ts.failures) failures.push("rfb-address-line-no-duplicate-postal: " + f);
+    console.log(`  rfb-address-line-no-duplicate-postal: ${ts.passed} passed, ${ts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-address-line-no-duplicate-postal: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request orch-pr-20260909-1-trust-score-mcp-routes: finishes the PR #810
 // removal on the two surfaces it missed — src/routes/mcp.ts (the live-mounted
 // /mcp endpoint's lokal_info/lokal_search/lokal_discover tools) and
