@@ -20692,16 +20692,17 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   assertEq(pointAddrMini?.approx, false, "mini-01g (negative case): an address-precision point is NOT flagged approximate");
   assertTrue(!detailAddrMini.body.includes('class="mini-map-legend"'), "mini-01h: no 'ca. posisjon' legend rendered for an exact-precision point");
 
-  // mini-02: kommune-precision experience -> SAME mini-map, but visually
-  // marked approximate — never rendered as if it were an exact address pin.
+  // mini-02 (updated 2026-09-09, dev-request 2026-09-09-opplevagent-
+  // stedsetikett-poststed-og-kommunesentroide-kart, AC2): a kommune-precision
+  // point must NEVER render as a point-marker at all any more, not even a
+  // visually-distinct "approximate" one — Rodebakk Gårdsbryggeri's owner read
+  // the old dashed pin as "the map thinks we're somewhere else". Renders the
+  // NO-MARKER "Omtrentlig plassering: <kommune>" card instead.
   const detailKommMini = invokeSeo("/opplevelse/:slug", { slug: kommSlugMini }, `/opplevelse/${kommSlugMini}`);
   assertEq(detailKommMini.status, 200, "mini-02a: GET /opplevelse/:slug (kommune precision) -> 200");
-  assertTrue(detailKommMini.body.includes('id="mini-map"'), "mini-02b: kommune-precision detail page also renders the mini-map container");
-  const dataMatchKommMini = detailKommMini.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
-  const pointKommMini = dataMatchKommMini ? JSON.parse(dataMatchKommMini[1]) : null;
-  assertEq(pointKommMini?.approx, true, "mini-02c (positive case): a kommune-precision point IS flagged approximate");
-  assertTrue(detailKommMini.body.includes('class="mini-map-legend"') && detailKommMini.body.includes("Ca. posisjon (kommune)"),
-    "mini-02d: the 'ca. posisjon (kommune)' legend IS rendered for an approximate point");
+  assertTrue(!detailKommMini.body.includes('id="mini-map"'), "mini-02b: kommune-precision detail page never renders the mini-map/marker container");
+  assertTrue(detailKommMini.body.includes("Omtrentlig plassering: Voss"), "mini-02c: the approx-placement card names the real kommune ('Voss'), no point drawn");
+  assertTrue(!detailKommMini.body.includes('class="mini-map-legend"'), "mini-02d: no mini-map legend either — there is no marker to legend");
 
   // mini-03 (acceptance criterion 4): the ORIGINAL OpenStreetMap link markup
   // survives verbatim inside <noscript>, so JS-disabled visitors keep the
@@ -20945,7 +20946,11 @@ console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering 
   const approxSlugKC = (expStoreKC.getExperienceById(approxIdKC) as any).slug as string;
   const miniKC = invokeSeo("/opplevelse/:slug", { slug: approxSlugKC }, `/opplevelse/${approxSlugKC}`);
   assertEq(miniKC.status, 200, "kc-08a: GET /opplevelse/:slug (mini-map page) -> 200");
-  assertTrue(miniKC.body.includes('id="mini-map"'), "kc-08b: mini-map still renders normally");
+  // kc-08b (updated 2026-09-09, AC2): this fixture is kommune-precision, so it
+  // now renders the no-marker approx-placement card, not the mini-map itself
+  // — see mini-02 above for the dedicated coverage of that behavior. This
+  // block's actual point (kc-08c) is unaffected either way.
+  assertTrue(miniKC.body.includes("Omtrentlig plassering: Oslo"), "kc-08b: approx-precision page renders the no-marker placement card");
   assertTrue(!/function clusterMapPoints\(/.test(miniKC.body), "kc-08c: the mini-map page ships NO clustering code (single point never needs it)");
 
   if (prevPathKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
@@ -21341,7 +21346,11 @@ console.log("\n── opplevagent kart-gardssalg-cluster: /kategori/gardssalg ma
   // kgc-06: the produsent-profil mini-map ships NO clustering code.
   const miniKGC = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: approxSlugKGC }, `/kategori/gardssalg/produsent/${approxSlugKGC}`);
   assertEq(miniKGC.status, 200, "kgc-06a: GET produsent-profil (mini-map page) -> 200");
-  assertTrue(miniKGC.body.includes('id="mini-map"'), "kgc-06b: mini-map still renders normally");
+  // kgc-06b (updated 2026-09-09, AC2): this fixture is approximate
+  // (geocode_confidence='approximate'), so it now renders the no-marker
+  // approx-placement card instead of the mini-map — see mini-p01 below for
+  // the dedicated coverage of that behavior.
+  assertTrue(miniKGC.body.includes("Omtrentlig plassering: Bergen"), "kgc-06b: approx-precision produsent page renders the no-marker placement card");
   assertTrue(!/function clusterMapPoints\(/.test(miniKGC.body), "kgc-06c: the produsent-profil mini-map page ships NO clustering code");
 
   if (prevPathKGC === undefined) delete process.env.EXPERIENCES_DB_PATH;
@@ -29907,16 +29916,18 @@ const _geoStepDPromise = runSerial(async () => {
   const profileNoneGEO = invokeSeoGEO("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: String(seededNothingGEO!.slug) }, `/kategori/gardssalg/produsent/${seededNothingGEO!.slug}`);
   assertTrue(profileNoneGEO.body.includes("Nøyaktig posisjon er ikke registrert ennå."), "geo-10: a fully-unresolved position keeps the existing honest 'not registered yet' fallback (no regression)");
 
-  // ── mini-p*: arbeidspunkt 5 — the produsent-profil mini-map. Same three
-  // profiles as geo-08/09/10 above (approximate / exact / none), asserting
-  // the actual Leaflet mini-map markup + precision-honesty discrimination,
-  // not just the <noscript> link copy.
-  assertTrue(profileApproxGEO.body.includes('id="mini-map"'), "mini-p01a: an approximate-position profile renders the mini-map container");
-  const dataMatchApproxMiniP = profileApproxGEO.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
-  assertTrue(!!dataMatchApproxMiniP, "mini-p01b: mini-map data island is present and matchable");
-  const pointApproxMiniP = dataMatchApproxMiniP ? JSON.parse(dataMatchApproxMiniP[1]) : null;
-  assertEq(pointApproxMiniP?.approx, true, "mini-p01c (positive case): an approximate (geocode_confidence='approximate') provider point IS flagged approximate on the mini-map");
-  assertTrue(profileApproxGEO.body.includes('class="mini-map-legend"'), "mini-p01d: the 'ca. posisjon' legend IS rendered for the approximate profile's mini-map");
+  // ── mini-p* (updated 2026-09-09, dev-request 2026-09-09-opplevagent-
+  // stedsetikett-poststed-og-kommunesentroide-kart, AC2): an approximate
+  // (geocode_confidence='approximate') provider point no longer renders the
+  // Leaflet mini-map/marker at all — it renders the no-marker
+  // "Omtrentlig plassering: <kommune>" card instead. The original
+  // <noscript> OpenStreetMap link (with its pre-existing "Ca. posisjon
+  // (kommune)" copy, still checked by geo-08a above) is preserved verbatim
+  // inside it.
+  assertTrue(!profileApproxGEO.body.includes('id="mini-map"'), "mini-p01a: an approximate-position profile never renders the mini-map/marker container");
+  assertTrue(profileApproxGEO.body.includes("Omtrentlig plassering: Kristiansand"), "mini-p01b: the approx-placement card names the real kommune ('Kristiansand'), no point drawn");
+  assertTrue(profileApproxGEO.body.includes("<noscript>") && profileApproxGEO.body.includes("Ca. posisjon (kommune)"), "mini-p01c: the original OSM <noscript> link survives verbatim inside the approx card");
+  assertTrue(!profileApproxGEO.body.includes('class="mini-map-legend"'), "mini-p01d: no mini-map legend either — there is no marker to legend");
 
   assertTrue(profileExactGEO.body.includes('id="mini-map"'), "mini-p02a: an exact-position profile also renders the mini-map container (no regression)");
   const dataMatchExactMiniP = profileExactGEO.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
@@ -29995,6 +30006,16 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
     brreg_verified: 0, verification_status: "pending_verify",
   });
   dbGP.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provIdGP);
+  // dev-request 2026-09-09-opplevagent-stedsetikett-poststed-og-
+  // kommunesentroide-kart, AC2: this fixture represents a real, confirmed
+  // street-address geocode (gp-06b's "Sideriveien 4" + this exact lat/lon)
+  // — without a real geocode_confidence tier it defaulted to the honest
+  // "unknown provenance" bucket (isApproxGardssalgConfidence(null) === true),
+  // which after AC2 correctly suppresses the map marker/JSON-LD geo it never
+  // should have had this "fully-seeded, exact position" fixture emit as
+  // approximate. Tagging it 'high' (Step A's real-address tier) is the fix,
+  // not loosening the honesty rule.
+  dbGP.prepare("UPDATE experience_providers SET geocode_confidence = ? WHERE id = ?").run("high", provIdGP);
   expStGP.backfillProviderSlugs();
 
   // A second, bare-minimum producer — no fylke/kommune/poststed either (so
