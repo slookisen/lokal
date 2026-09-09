@@ -1899,7 +1899,6 @@ class MarketplaceRegistry {
     }
 
     score += 0.05 * agent.trustScore;
-    if (agent.trustScore > 0.8) reasons.push("Høy tillitsscore");
 
     if (agent.isVerified) {
       score += 0.05;

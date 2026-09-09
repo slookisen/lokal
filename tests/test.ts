@@ -41425,6 +41425,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request orch-pr-20260909-1-trust-score-mcp-routes: finishes the PR #810
+// removal on the two surfaces it missed — src/routes/mcp.ts (the live-mounted
+// /mcp endpoint's lokal_info/lokal_search/lokal_discover tools) and
+// marketplace-registry.ts's calculateRelevance() "Høy tillitsscore"
+// match-reason string. Own harness (duck-typed registerTools() server +
+// direct marketplaceRegistry.discover() call) — mirrors mcp-search-geo.test.ts.
+// Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request orch-pr-20260909-1-trust-score-mcp-routes: mcp.ts + marketplace-registry.ts ──");
+  try {
+    const { runTrustScoreMcpRoutesRemovedTests } = require("../src/routes/rfb-trust-score-mcp-routes-removed.test") as
+      typeof import("../src/routes/rfb-trust-score-mcp-routes-removed.test");
+    const mr = await runTrustScoreMcpRoutesRemovedTests({ log: false });
+    passed += mr.passed;
+    failed += mr.failed;
+    for (const f of mr.failures) failures.push("rfb-trust-score-mcp-routes-removed: " + f);
+    console.log(`  rfb-trust-score-mcp-routes-removed: ${mr.passed} passed, ${mr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-trust-score-mcp-routes-removed: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-08-01-rfb-agents-url-skrivespak: `agents.url` write lever.
 // Sister to the contact-email block and the same defect class — the homepage
 // column the catalog serves (and enrichment reads a producer's email off) had

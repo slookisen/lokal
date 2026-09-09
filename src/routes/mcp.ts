@@ -476,7 +476,7 @@ export function registerTools(
       const sections: string[] = [`# ${agent.name}`];
 
       if (agent.city) {
-        sections.push(`📍 ${agent.city}${agent.trustScore ? `  ·  Trust ${Math.round(agent.trustScore * 100)}%` : ""}${agent.isVerified ? "  ·  ✔ Verifisert av eier" : ""}`);
+        sections.push(`📍 ${agent.city}${agent.isVerified ? "  ·  ✔ Verifisert av eier" : ""}`);
       }
 
       if (k.about) {
@@ -1099,7 +1099,6 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
   const meta: string[] = [];
   if ((agent as any).city || agent.location?.city) meta.push(`📍 ${(agent as any).city || agent.location?.city}`);
   if (agent.categories?.length) meta.push(`🏷️ ${agent.categories.join(", ")}`);
-  if (agent.trustScore) meta.push(`✅ Trust ${Math.round(agent.trustScore * 100)}%`);
   if (meta.length) lines.push(`   ${meta.join("  ·  ")}`);
 
   if (contact) {
