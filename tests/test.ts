@@ -38116,13 +38116,102 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     assertEq(dstore.recordDentalHomepageFetchResult("no-such-id", false, "proxy_blocked").found, false,
       "vask-i4-07: unknown id + proxy_blocked → found=false");
 
-    console.log("  enrichment-metode-slice1 (dental): OK (25 assertions)");
+    // (10) Skive 3b (dev-request 2026-09-02-dental-permanent-triage-needs-
+    // review-drain, 2026-09-09): repeat-park -> needs_review, gated by
+    // DENTAL_REPEAT_PARK_TO_REVIEW.
+    const prevRepeatFlag = process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+    try {
+      // (a) first-ever park sets NO review_reason/needs_review, regardless
+      // of the flag -- byte-identical to pre-Skive-3b behaviour.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idD = dstore.createDentalAgent({ navn: "Forste Gang Parkert AS", org_nr: "911000444" } as any);
+      dstore.recordDentalHomepageFetchResult(idD, false);
+      dstore.recordDentalHomepageFetchResult(idD, false);
+      const firstPark = dstore.recordDentalHomepageFetchResult(idD, false);
+      assertEq(firstPark.parked_now, true, "skive3b-hp-01 setup: idD first-ever park");
+      let rowD = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idD) as any;
+      assertEq(rowD.verification_status, "pending_verify",
+        "skive3b-hp-01: first-ever park leaves verification_status untouched even with flag=true");
+      assertEq(rowD.review_reason, null, "skive3b-hp-02: first-ever park sets no review_reason even with flag=true");
+      assertEq(rowD.review_since, null, "skive3b-hp-03: first-ever park sets no review_since even with flag=true");
+
+      // (b) repeat park (expired backoff) with flag=true -> needs_review +
+      // mapped review_reason + a fresh review_since.
+      dentalDb.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idD);
+      const repeatPark = dstore.recordDentalHomepageFetchResult(idD, false);
+      assertEq(repeatPark.parked_now, true, "skive3b-hp-04: repeat park (expired backoff) still parked_now");
+      rowD = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idD) as any;
+      assertEq(rowD.verification_status, "needs_review",
+        "skive3b-hp-05: repeat park with flag=true sets verification_status=needs_review");
+      assertEq(rowD.review_reason, "dead_homepage_repeat",
+        "skive3b-hp-06: repeat park maps to review_reason='dead_homepage_repeat'");
+      assertTrue(typeof rowD.review_since === "string" && rowD.review_since.length > 0,
+        "skive3b-hp-07: repeat park stamps a fresh review_since");
+
+      // (c) flag unset -> repeat park does NOT set needs_review/review_reason
+      // -- behaviour unchanged from before this PR.
+      delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      const idE = dstore.createDentalAgent({ navn: "Repeat Uten Flagg AS", org_nr: "911000555" } as any);
+      dstore.recordDentalHomepageFetchResult(idE, false);
+      dstore.recordDentalHomepageFetchResult(idE, false);
+      dstore.recordDentalHomepageFetchResult(idE, false);
+      dentalDb.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idE);
+      const repeatNoFlag = dstore.recordDentalHomepageFetchResult(idE, false);
+      assertEq(repeatNoFlag.parked_now, true, "skive3b-hp-08: repeat park without flag still parked_now (unchanged behaviour)");
+      let rowE = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idE) as any;
+      assertEq(rowE.verification_status, "pending_verify", "skive3b-hp-09: flag unset -> verification_status unchanged on repeat park");
+      assertEq(rowE.review_reason, null, "skive3b-hp-10: flag unset -> no review_reason on repeat park");
+
+      // any non-"true" value (e.g. "false") behaves the same as unset.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "false";
+      dentalDb.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idE);
+      const repeatFalseFlag = dstore.recordDentalHomepageFetchResult(idE, false);
+      assertEq(repeatFalseFlag.parked_now, true, "skive3b-hp-11: repeat park with flag='false' still parked_now");
+      rowE = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idE) as any;
+      assertEq(rowE.verification_status, "pending_verify", "skive3b-hp-12: flag='false' -> verification_status unchanged on repeat park");
+
+      // (d) a row already verification_status='rejected' is left untouched --
+      // never silently overwritten, even on a repeat park with the flag on.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idG = dstore.createDentalAgent({ navn: "Rejected Klinikk AS", org_nr: "911000666" } as any);
+      dentalDb.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(idG);
+      dstore.recordDentalHomepageFetchResult(idG, false);
+      dstore.recordDentalHomepageFetchResult(idG, false);
+      dstore.recordDentalHomepageFetchResult(idG, false);
+      dentalDb.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idG);
+      const repeatRejected = dstore.recordDentalHomepageFetchResult(idG, false);
+      assertEq(repeatRejected.parked_now, true, "skive3b-hp-13: repeat park on rejected row still parked_now (stamp still re-stamped)");
+      const rowG = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idG) as any;
+      assertEq(rowG.verification_status, "rejected",
+        "skive3b-hp-14: rejected verification_status never overwritten by repeat park, even with flag=true");
+      assertEq(rowG.review_reason, null, "skive3b-hp-15: rejected row gets no review_reason written");
+    } finally {
+      if (prevRepeatFlag === undefined) delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      else process.env.DENTAL_REPEAT_PARK_TO_REVIEW = prevRepeatFlag;
+    }
+
+    console.log("  enrichment-metode-slice1 (dental): OK (41 assertions)");
   } catch (err) {
     failed++;
     failures.push(`enrichment-metode-slice1 dental: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
     if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
     if (prevDentalFlag === undefined) delete process.env.DENTAL_HOMEPAGE_PARKING_DISABLED; else process.env.DENTAL_HOMEPAGE_PARKING_DISABLED = prevDentalFlag;
+    delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
     dbFacEms.__resetDbFactoryForTesting();
   }
 })();
@@ -38305,7 +38394,85 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     assertEq(claimedComposedIds.includes(idA), false, "item2a-15: composition with has_hjemmeside:true still excludes the parked row");
     releaseBatch("item2a-worker3", [idA, idB, idC]);
 
-    console.log("  item2a (dead-extraction parking): OK (15 assertions)");
+    // ── Skive 3b (dev-request 2026-09-02-dental-permanent-triage-needs-
+    // review-drain, 2026-09-09): recordDentalExtractionResult's ordinary
+    // (non-wrong-entity) failure branch repeat-park -> needs_review, gated
+    // by DENTAL_REPEAT_PARK_TO_REVIEW.
+    const prevRepeatFlagI2a = process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+    try {
+      // (a) first-ever park sets NO review_reason/needs_review, regardless
+      // of the flag -- byte-identical to pre-Skive-3b behaviour.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idD = dstore.createDentalAgent({ navn: "Forste Gang Ekstraksjon AS", org_nr: "911100444" } as any);
+      dstore.recordDentalExtractionResult(idD, false);
+      dstore.recordDentalExtractionResult(idD, false);
+      const firstPark = dstore.recordDentalExtractionResult(idD, false);
+      assertEq(firstPark.parked_now, true, "skive3b-ex-01 setup: idD first-ever park");
+      let rowD = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idD) as any;
+      assertEq(rowD.verification_status, "pending_verify",
+        "skive3b-ex-01: first-ever park leaves verification_status untouched even with flag=true");
+      assertEq(rowD.review_reason, null, "skive3b-ex-02: first-ever park sets no review_reason even with flag=true");
+      assertEq(rowD.review_since, null, "skive3b-ex-03: first-ever park sets no review_since even with flag=true");
+
+      // (b) repeat park (expired backoff) with flag=true -> needs_review +
+      // mapped review_reason + a fresh review_since.
+      dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idD);
+      const repeatPark = dstore.recordDentalExtractionResult(idD, false);
+      assertEq(repeatPark.parked_now, true, "skive3b-ex-04: repeat park (expired backoff) still parked_now");
+      rowD = dentalDb.prepare(
+        "SELECT verification_status, review_reason, review_since FROM dental_agents WHERE id = ?"
+      ).get(idD) as any;
+      assertEq(rowD.verification_status, "needs_review",
+        "skive3b-ex-05: repeat park with flag=true sets verification_status=needs_review");
+      assertEq(rowD.review_reason, "insufficient_yield_repeat",
+        "skive3b-ex-06: repeat park maps to review_reason='insufficient_yield_repeat'");
+      assertTrue(typeof rowD.review_since === "string" && rowD.review_since.length > 0,
+        "skive3b-ex-07: repeat park stamps a fresh review_since");
+
+      // (c) flag unset -> repeat park does NOT set needs_review/review_reason
+      // -- behaviour unchanged from before this PR.
+      delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      const idE = dstore.createDentalAgent({ navn: "Ekstraksjon Uten Flagg AS", org_nr: "911100555" } as any);
+      dstore.recordDentalExtractionResult(idE, false);
+      dstore.recordDentalExtractionResult(idE, false);
+      dstore.recordDentalExtractionResult(idE, false);
+      dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idE);
+      const repeatNoFlag = dstore.recordDentalExtractionResult(idE, false);
+      assertEq(repeatNoFlag.parked_now, true, "skive3b-ex-08: repeat park without flag still parked_now (unchanged behaviour)");
+      const rowE = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idE) as any;
+      assertEq(rowE.verification_status, "pending_verify", "skive3b-ex-09: flag unset -> verification_status unchanged on repeat park");
+      assertEq(rowE.review_reason, null, "skive3b-ex-10: flag unset -> no review_reason on repeat park");
+
+      // (d) a row already verification_status='rejected' is left untouched --
+      // never silently overwritten, even on a repeat park with the flag on.
+      process.env.DENTAL_REPEAT_PARK_TO_REVIEW = "true";
+      const idF = dstore.createDentalAgent({ navn: "Rejected Ekstraksjon AS", org_nr: "911100666" } as any);
+      dentalDb.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(idF);
+      dstore.recordDentalExtractionResult(idF, false);
+      dstore.recordDentalExtractionResult(idF, false);
+      dstore.recordDentalExtractionResult(idF, false);
+      dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idF);
+      const repeatRejected = dstore.recordDentalExtractionResult(idF, false);
+      assertEq(repeatRejected.parked_now, true, "skive3b-ex-11: repeat park on rejected row still parked_now (stamp still re-stamped)");
+      const rowF = dentalDb.prepare(
+        "SELECT verification_status, review_reason FROM dental_agents WHERE id = ?"
+      ).get(idF) as any;
+      assertEq(rowF.verification_status, "rejected",
+        "skive3b-ex-12: rejected verification_status never overwritten by repeat park, even with flag=true");
+      assertEq(rowF.review_reason, null, "skive3b-ex-13: rejected row gets no review_reason written");
+    } finally {
+      if (prevRepeatFlagI2a === undefined) delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
+      else process.env.DENTAL_REPEAT_PARK_TO_REVIEW = prevRepeatFlagI2a;
+    }
+
+    console.log("  item2a (dead-extraction parking): OK (29 assertions)");
   } catch (err) {
     failed++;
     failures.push(`item2a dead-extraction parking: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);

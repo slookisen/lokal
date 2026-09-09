@@ -527,16 +527,44 @@ export function recordDentalHomepageFetchResult(
     "UPDATE dental_agents SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE id = ?"
   ).run(id);
   const row = db
-    .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since FROM dental_agents WHERE id = ?")
-    .get(id) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null };
+    .prepare(
+      "SELECT homepage_fetch_attempts, homepage_unreachable_since, verification_status FROM dental_agents WHERE id = ?"
+    )
+    .get(id) as {
+      homepage_fetch_attempts: number;
+      homepage_unreachable_since: string | null;
+      verification_status: string | null;
+    };
 
   let parkedNow = false;
   if (row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS) {
     const since = row.homepage_unreachable_since;
     const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
-    if (!since || expired) {
+    if (!since) {
+      // First-ever park -- byte-identical to pre-Skive-3b behaviour, no
+      // review_reason/needs_review columns touched regardless of the flag.
       db.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
         .run(new Date().toISOString(), id);
+      parkedNow = true;
+    } else if (expired) {
+      // Repeat park (backoff lapsed, 3-strike hit again). dev-request
+      // 2026-09-02-dental-permanent-triage-needs-review-drain (Skive 3b):
+      // behind DENTAL_REPEAT_PARK_TO_REVIEW=true, also route to
+      // needs_review -- unless verification_status is already the terminal
+      // 'rejected' state, which is never silently overwritten.
+      const now = new Date().toISOString();
+      if (
+        process.env.DENTAL_REPEAT_PARK_TO_REVIEW === "true" &&
+        row.verification_status !== "rejected"
+      ) {
+        db.prepare(
+          "UPDATE dental_agents SET homepage_unreachable_since = ?, verification_status = 'needs_review', " +
+          "review_reason = ?, review_since = ? WHERE id = ?"
+        ).run(now, "dead_homepage_repeat", now, id);
+      } else {
+        db.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+          .run(now, id);
+      }
       parkedNow = true;
     }
   }
@@ -617,19 +645,46 @@ export function recordDentalHomepageFetchResult(
 // streak column at all, only the timestamp, so this preserves that exactly.
 // For a never-yet-flagged row (the retro-sanitize batch's case — streak
 // starts at 0) this simply sets it to exactly DENTAL_PARK_AFTER_ATTEMPTS.
-export function parkDentalWrongEntity(id: string): {
+//
+// `isRepeat` (dev-request 2026-09-02-dental-permanent-triage-needs-review-
+// drain, Skive 3b, 2026-09-09): defaults to `false`, which preserves this
+// function's pre-Skive-3b behaviour byte-for-byte -- required for the retro-
+// sanitize route's call site (admin-dental-wrong-entity-retro-sanitize.ts),
+// whose one-time batch flagging of pre-existing non-clinic rows is explicitly
+// NOT a "repeat" under this spec and must never trigger needs_review.
+// recordDentalExtractionResult's own call site passes
+// `isRepeat: since !== null && expired` -- the exact boolean it already
+// computes to decide whether to park at all. When `isRepeat` is true AND
+// DENTAL_REPEAT_PARK_TO_REVIEW=true AND verification_status isn't already
+// the terminal 'rejected' state, the same UPDATE also routes the row to
+// needs_review with review_reason='wrong_entity_repeat'.
+export function parkDentalWrongEntity(
+  id: string,
+  isRepeat: boolean = false
+): {
   wrong_entity_streak: number;
   wrong_entity_unreachable_since: string;
 } {
   const db = getDb("dental");
   const since = new Date().toISOString();
   const row = db
-    .prepare("SELECT wrong_entity_streak FROM dental_agents WHERE id = ?")
-    .get(id) as { wrong_entity_streak: number } | undefined;
+    .prepare("SELECT wrong_entity_streak, verification_status FROM dental_agents WHERE id = ?")
+    .get(id) as { wrong_entity_streak: number; verification_status: string | null } | undefined;
   const streak = Math.max(row?.wrong_entity_streak ?? 0, DENTAL_PARK_AFTER_ATTEMPTS);
-  db.prepare(
-    "UPDATE dental_agents SET wrong_entity_streak = ?, wrong_entity_unreachable_since = ? WHERE id = ?"
-  ).run(streak, since, id);
+  if (
+    isRepeat &&
+    process.env.DENTAL_REPEAT_PARK_TO_REVIEW === "true" &&
+    row?.verification_status !== "rejected"
+  ) {
+    db.prepare(
+      "UPDATE dental_agents SET wrong_entity_streak = ?, wrong_entity_unreachable_since = ?, " +
+      "verification_status = 'needs_review', review_reason = ?, review_since = ? WHERE id = ?"
+    ).run(streak, since, "wrong_entity_repeat", since, id);
+  } else {
+    db.prepare(
+      "UPDATE dental_agents SET wrong_entity_streak = ?, wrong_entity_unreachable_since = ? WHERE id = ?"
+    ).run(streak, since, id);
+  }
   return { wrong_entity_streak: streak, wrong_entity_unreachable_since: since };
 }
 
@@ -694,8 +749,14 @@ export function recordDentalExtractionResult(
     if (weRow.wrong_entity_streak >= DENTAL_PARK_AFTER_ATTEMPTS) {
       const since = weRow.wrong_entity_unreachable_since;
       const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
-      if (!since || expired) {
+      if (!since) {
+        // First-ever park -- unchanged, isRepeat defaults to false.
         parkDentalWrongEntity(id);
+        wrongEntityParkedNow = true;
+      } else if (expired) {
+        // Repeat park -- Skive 3b needs_review routing (see
+        // parkDentalWrongEntity's own doc comment).
+        parkDentalWrongEntity(id, since !== null && expired);
         wrongEntityParkedNow = true;
       }
     }
@@ -717,21 +778,44 @@ export function recordDentalExtractionResult(
   ).run(id);
   const row = db
     .prepare(
-      "SELECT extraction_attempts, extraction_unreachable_since, wrong_entity_streak FROM dental_agents WHERE id = ?"
+      "SELECT extraction_attempts, extraction_unreachable_since, wrong_entity_streak, verification_status FROM dental_agents WHERE id = ?"
     )
     .get(id) as {
       extraction_attempts: number;
       extraction_unreachable_since: string | null;
       wrong_entity_streak: number;
+      verification_status: string | null;
     };
 
   let parkedNow = false;
   if (row.extraction_attempts >= DENTAL_PARK_AFTER_ATTEMPTS) {
     const since = row.extraction_unreachable_since;
     const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
-    if (!since || expired) {
+    if (!since) {
+      // First-ever park -- byte-identical to pre-Skive-3b behaviour, no
+      // review_reason/needs_review columns touched regardless of the flag.
       db.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
         .run(new Date().toISOString(), id);
+      parkedNow = true;
+    } else if (expired) {
+      // Repeat park (backoff lapsed, 3-strike hit again). dev-request
+      // 2026-09-02-dental-permanent-triage-needs-review-drain (Skive 3b):
+      // behind DENTAL_REPEAT_PARK_TO_REVIEW=true, also route to
+      // needs_review -- unless verification_status is already the terminal
+      // 'rejected' state, which is never silently overwritten.
+      const now = new Date().toISOString();
+      if (
+        process.env.DENTAL_REPEAT_PARK_TO_REVIEW === "true" &&
+        row.verification_status !== "rejected"
+      ) {
+        db.prepare(
+          "UPDATE dental_agents SET extraction_unreachable_since = ?, verification_status = 'needs_review', " +
+          "review_reason = ?, review_since = ? WHERE id = ?"
+        ).run(now, "insufficient_yield_repeat", now, id);
+      } else {
+        db.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+          .run(now, id);
+      }
       parkedNow = true;
     }
   }
