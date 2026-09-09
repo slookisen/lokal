@@ -170,17 +170,18 @@ export function runAdminDentalWrongEntityRetroSanitizeTests(
           .get(id);
       }
 
-      // Faithful excerpt of the real production om_oss (per the build spec's
-      // "the real text quoted above OR a faithful excerpt" allowance) — see
-      // the matching comment in dental-wrong-entity-retro.test.ts for why the
-      // full text's "Dette er ikke en tannklinikk" sentence is deliberately
-      // omitted here (its own "tannklinikk" substring would trip "tann").
+      // REAL VERBATIM production om_oss (not an excerpt) — both traps at
+      // once: "orto" (substring of ortoped/ortopediteknisk/ortopediske, in
+      // dental-catalog-class.ts's DENTAL_NAME_WORDS) AND the row's own
+      // denial "ikke en tannklinikk" (whose "tannklinikk" contains "tann",
+      // a word DENTAL_CONTENT_SIGNAL_WORDS correctly includes) — see
+      // dental-wrong-entity-retro.ts's NEGATED_DENTAL_IDENTITY_RE comment.
       const drevelinOmOss =
         "Drevelin Ortopedi sør AS, med avdeling i Kristiansand, ble etablert i 2018 og holder til i " +
-        "lokaler på Lund. Selskapet er en ortopediteknisk virksomhet som produserer og tilpasser " +
-        "ortopediske hjelpemidler, og er en del av Drevelin-konsernet. Tilbudet omfatter ortoser, " +
-        "proteser (arm- og benproteser), ortopedisk sydd fottøy, spesialsko, fotsenger, innleggssåler " +
-        "og konsultasjon hos ortoped.";
+        "lokaler på Lund. Dette er ikke en tannklinikk, men en ortopediteknisk virksomhet som " +
+        "produserer og tilpasser ortopediske hjelpemidler. Selskapet er en del av Drevelin-konsernet... " +
+        "Tilbudet omfatter ortoser, proteser (arm- og benproteser), ortopedisk sydd fottøy, " +
+        "spesialsko, fotsenger, innleggssåler og konsultasjon hos ortoped...";
 
       // (a) DREVELIN-equivalent
       seed({ id: "drevelin", navn: "DREVELIN ORTOPEDI SØR AS", naeringskode: "32.500", om_oss: drevelinOmOss });
@@ -210,6 +211,10 @@ export function runAdminDentalWrongEntityRetroSanitizeTests(
         { id: "den10", navn: "C. PEDERSEN AS", naeringskode: "86.230", om_oss: "Generell klinikk, se treatments for detaljer.", treatments: JSON.stringify(["tannrens", "fylling"]) },
         { id: "den11", navn: "DENTAL CARE VEST AS", naeringskode: "86.221", om_oss: "Dental care and cosmetic dentistry." },
         { id: "den12", navn: "D. JOHANSEN DENT. AS", naeringskode: "86.230", om_oss: "Privatpraktiserende tannlegekontor." },
+        // (c-adversarial) negation-stripping must not overreach: an UNRELATED
+        // "ikke" (not attached to a dental-identity word) must not suppress
+        // the real "tannklinikk" later in the same sentence.
+        { id: "den13", navn: "LØRDAGSTANN AS", naeringskode: "86.230", om_oss: "Vi tilbyr ikke akuttbehandling på lørdager, men er en fullverdig tannklinikk for hele familien." },
       ];
       for (const f of dentalFixtures) seed(f as any);
 
@@ -267,7 +272,7 @@ export function runAdminDentalWrongEntityRetroSanitizeTests(
       assertTrue(!flaggedIds.includes("already-parked"), "e1: actively-parked row excluded from plan (idempotency)");
       assertTrue(!flaggedIds.includes("wrong-nace"), "nace1: non-swept NACE code excluded even with no dental signal");
       assertEq(dry.body.data.would_flag, 3, "g3: would_flag counts exactly the 3 true positives (drevelin, klinikk-forde, expired-parked)");
-      assertEq(dry.body.data.scanned, 2 + dentalFixtures.length + 1, "g4: scanned counts every enriched+swept-NACE+not-actively-parked candidate (drevelin, klinikk-forde, expired-parked, + all 12 genuine dental fixtures, all on swept NACE codes)");
+      assertEq(dry.body.data.scanned, 2 + dentalFixtures.length + 1, "g4: scanned counts every enriched+swept-NACE+not-actively-parked candidate (drevelin, klinikk-forde, expired-parked, + all genuine dental fixtures, all on swept NACE codes)");
       assertEq(dry.body.data.remaining_before, dry.body.data.scanned, "g4b: remaining_before matches scanned when no limit truncation applies");
 
       // zero writes on dry-run.

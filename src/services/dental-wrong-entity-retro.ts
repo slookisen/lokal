@@ -68,6 +68,33 @@ export const DENTAL_CONTENT_SIGNAL_WORDS: readonly string[] = [
   "dent.",
 ];
 
+// ── The "ikke" trap — a SECOND substring collision, separate from the
+// "orto" one above, caught in review. The DREVELIN om_oss text (quoted in
+// full above) doesn't just contain "orto" words; its first sentence is a
+// literal DENIAL of being a dental clinic: "Dette er ikke en tannklinikk,
+// men en ortopediteknisk virksomhet...". That denial's own "tannklinikk"
+// contains "tann" — one of DENTAL_CONTENT_SIGNAL_WORDS's own (correctly
+// included, load-bearing) words. A naive substring scan over the raw text
+// would register a false dental signal from the row's own negation of being
+// a dental clinic, which defeats the entire point of this batch just as
+// badly as the "orto" trap would.
+//
+// Fix: strip out this specific negation CONSTRUCT (the "ikke (en) <dental
+// word>" phrase itself) before scanning — not a general negation detector,
+// just this one Norwegian idiom ("ikke en tannklinikk" / "ikke tannlege" /
+// etc.), and only the matched span. Deliberately narrow: it must NOT eat
+// genuine dental content elsewhere in the same text (e.g. a real clinic
+// saying "Vi tilbyr ikke akuttbehandling på lørdager, men er en fullverdig
+// tannklinikk" — the "ikke" there attaches to "akuttbehandling", not to a
+// dental-identity word, so this regex leaves "tannklinikk" later in that
+// sentence untouched and it is still correctly detected).
+const NEGATED_DENTAL_IDENTITY_RE =
+  /ikke\s+(en\s+)?(tannklinikk|tannlege|tannhelse|tannbehandling)/gi;
+
+function stripNegatedDentalIdentity(text: string): string {
+  return text.replace(NEGATED_DENTAL_IDENTITY_RE, " ");
+}
+
 export interface DentalContentSignalRow {
   navn: string;
   om_oss: string | null;
@@ -77,8 +104,12 @@ export interface DentalContentSignalRow {
 // Lower-cases and substring-checks navn/om_oss/treatments (treatments is the
 // raw JSON-text column — treated as a plain string for substring purposes,
 // no need to JSON.parse it) against DENTAL_CONTENT_SIGNAL_WORDS. Null-safe.
+// Strips the "ikke en tannklinikk"-style negation construct (see
+// NEGATED_DENTAL_IDENTITY_RE above) BEFORE the substring scan, so a row's
+// own denial of being a dental clinic never masquerades as a dental signal.
 export function hasDentalContentSignal(row: DentalContentSignalRow): boolean {
-  const haystack = `${row.navn ?? ""} ${row.om_oss ?? ""} ${row.treatments ?? ""}`.toLowerCase();
+  const raw = `${row.navn ?? ""} ${row.om_oss ?? ""} ${row.treatments ?? ""}`;
+  const haystack = stripNegatedDentalIdentity(raw).toLowerCase();
   return DENTAL_CONTENT_SIGNAL_WORDS.some((word) => haystack.includes(word));
 }
 

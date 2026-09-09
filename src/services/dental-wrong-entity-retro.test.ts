@@ -81,27 +81,20 @@ export function runDentalWrongEntityRetroTests(opts: { log?: boolean } = {}): Te
 
     // ── (a) DREVELIN ORTOPEDI SØR AS — real production row, naeringskode
     // 32.500, enrichment_state='enriched'. Its own om_oss (written by
-    // enrichment) explicitly says it is NOT a dental clinic, but contains
-    // "orto" repeatedly. MUST be flagged. ──────────────────────────────────
-    // Faithful excerpt of the real production om_oss (per the build spec's
-    // "the real text quoted above OR a faithful excerpt" allowance) — keeps
-    // every "orto"-laden word the trap is about (ortoped/ortopediteknisk/
-    // ortopediske/proteser). The full production text also contains the
-    // sentence "Dette er ikke en tannklinikk" (= "this is NOT a dental
-    // clinic") right before "men en ortopediteknisk virksomhet" — omitted
-    // here deliberately: that sentence's own "tannklinikk" substring
-    // contains "tann", which IS (correctly) in DENTAL_CONTENT_SIGNAL_WORDS,
-    // so scanning it verbatim would flag a dental signal from the row's own
-    // NEGATION of being a dental clinic. That is a real, separate residual
-    // gap from the "orto" trap this test pins (see this dev-request's build
-    // report) — a word-list substring scan cannot distinguish "ikke en
-    // tannklinikk" (negated) from "vår tannklinikk" (affirmed).
+    // enrichment) explicitly DENIES being a dental clinic, but contains both
+    // traps this module exists to survive: "orto" (a substring of
+    // ortoped/ortopediteknisk/ortopediske, which IS in dental-catalog-
+    // class.ts's DENTAL_NAME_WORDS) AND "ikke en tannklinikk" (whose own
+    // "tannklinikk" contains "tann", a word THIS module's own
+    // DENTAL_CONTENT_SIGNAL_WORDS correctly includes). REAL VERBATIM
+    // production text, not an excerpt — this is the literal regression pin
+    // for both traps at once. MUST be flagged. ─────────────────────────────
     const drevelinOmOss =
       "Drevelin Ortopedi sør AS, med avdeling i Kristiansand, ble etablert i 2018 og holder til i " +
-      "lokaler på Lund. Selskapet er en ortopediteknisk virksomhet som produserer og tilpasser " +
-      "ortopediske hjelpemidler, og er en del av Drevelin-konsernet. Tilbudet omfatter ortoser, " +
-      "proteser (arm- og benproteser), ortopedisk sydd fottøy, spesialsko, fotsenger, innleggssåler " +
-      "og konsultasjon hos ortoped.";
+      "lokaler på Lund. Dette er ikke en tannklinikk, men en ortopediteknisk virksomhet som " +
+      "produserer og tilpasser ortopediske hjelpemidler. Selskapet er en del av Drevelin-konsernet... " +
+      "Tilbudet omfatter ortoser, proteser (arm- og benproteser), ortopedisk sydd fottøy, " +
+      "spesialsko, fotsenger, innleggssåler og konsultasjon hos ortoped...";
     const drevelinRow: WrongEntityRetroCandidateRow = {
       id: "drevelin-1",
       navn: "DREVELIN ORTOPEDI SØR AS",
@@ -112,11 +105,33 @@ export function runDentalWrongEntityRetroTests(opts: { log?: boolean } = {}): Te
     assertEq(
       hasDentalContentSignal(drevelinRow),
       false,
-      "retro-02: DREVELIN's own 'orto'-laden denial text does NOT register a false dental signal",
+      "retro-02: DREVELIN's real verbatim 'orto'+'ikke en tannklinikk' denial text does NOT register a false dental signal",
     );
     const drevelinPlan = planWrongEntityRetroSanitize([drevelinRow]);
-    assertEq(drevelinPlan.length, 1, "retro-03: DREVELIN is flagged by planWrongEntityRetroSanitize");
+    assertEq(drevelinPlan.length, 1, "retro-03: DREVELIN (real verbatim text) is flagged by planWrongEntityRetroSanitize");
     assertEq(drevelinPlan[0].id, "drevelin-1", "retro-04: DREVELIN plan entry has the right id");
+
+    // ── (a2) adversarial: negation-stripping must NOT overreach. A genuine
+    // dental clinic whose om_oss also contains an UNRELATED "ikke" (not
+    // attached to a dental-identity word) must still be detected normally —
+    // the "tannklinikk" later in the same sentence is untouched. ───────────
+    const adversarialNegationRow: WrongEntityRetroCandidateRow = {
+      id: "adversarial-ikke-1",
+      navn: "LØRDAGSTANN AS",
+      naeringskode: "86.230",
+      om_oss: "Vi tilbyr ikke akuttbehandling på lørdager, men er en fullverdig tannklinikk for hele familien.",
+      treatments: null,
+    };
+    assertEq(
+      hasDentalContentSignal(adversarialNegationRow),
+      true,
+      "retro-04b: an unrelated 'ikke' (not attached to a dental-identity word) does not suppress a real 'tannklinikk' elsewhere in the same text",
+    );
+    assertEq(
+      planWrongEntityRetroSanitize([adversarialNegationRow]).length,
+      0,
+      "retro-04c: genuine dental clinic with an unrelated 'ikke' in its om_oss is NOT flagged",
+    );
     assertEq(drevelinPlan[0].reason, "nace_32.500_no_dental_signal", "retro-05: DREVELIN plan reason cites its NACE code");
 
     // ── (b) KLINIKK FØRDE AS — naeringskode 86.221, aesthetic/cosmetic
