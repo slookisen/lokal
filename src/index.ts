@@ -90,6 +90,7 @@ import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
 import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
+import adminDentalWrongEntityRetroSanitizeRoutes from "./routes/admin-dental-wrong-entity-retro-sanitize";
 import adminDentalCatalogClassSonnetSampleRoutes from "./routes/admin-dental-catalog-class-sonnet-sample";
 import adminDentalBrregAddressSweepRoutes from "./routes/admin-dental-brreg-address-sweep";
 import adminDentalOffentligKlinikkHjemmesideKorrigeringRoutes from "./routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering";
@@ -820,6 +821,11 @@ app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
 // POST /admin/dental/catalog-class-backfill, GET /admin/dental/parking-stats,
 // POST /admin/dental/brreg-address-sweep. Same X-Admin-Key gate, same limiter.
 app.use("/admin/dental", adminLimiter, adminDentalCatalogClassRoutes);
+// dev-request 2026-09-09-dental-non-clinic-retro-sanitize: POST
+// /admin/dental/wrong-entity-retro-sanitize — one-time retroactive batch that
+// parks already-`enriched` non-dental rows (NACE 86.230/86.221/32.500) via
+// the existing wrong-entity parking mechanism. Same gate, same limiter.
+app.use("/admin/dental", adminLimiter, adminDentalWrongEntityRetroSanitizeRoutes);
 // dev-request 2026-09-02-dental-catalog-class-triage (steg 1c): POST
 // /admin/dental/catalog-class-sonnet-sample — LLM second-pass judge over the
 // ambiguous ukjent / company_dental_nace-klinikk cohort. Same gate, limiter.
