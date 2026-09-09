@@ -228,6 +228,15 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
       const r = invoke("/produsent/:slug", { params: { slug }, lang: "no", ip: "127.0.0.1" });
       assertTrue(r.status === 200, `produsent/${slug}: renders 200`);
       assertTrue(!/\bTrust Score\b/.test(r.body), `produsent/${slug}: the "Trust Score" label does not render`);
+      // Stronger digit-pattern guard (same style as
+      // rfb-trust-score-mcp-routes-removed.test.ts's mcp.ts assertions) —
+      // /\bTrust Score\b/ alone missed the "related producers" widget's
+      // `Trust ${trust}%` fragment (no word "Score"), which survived PR #810
+      // undetected. ultra-1/medium-1's same-city related-producer cards
+      // (ultra-2/3, medium-1 for "ultra-gaard-en"; ultra-1/2/3 for
+      // "medium-gaard-fire") all have trustScore > 0, so this exercises the
+      // relatedHtml branch that used to render the leak.
+      assertTrue(!/Trust\s*\d/.test(r.body), `produsent/${slug}: no "Trust <digit>" fragment renders anywhere (related-producers widget included)`);
       assertTrue(!r.body.includes('pf-stat-icon t"'), `produsent/${slug}: the pf-stat trust-score tile is gone`);
       assertTrue(!r.body.includes("trust-m"), `produsent/${slug}: no element carries the trust-m class`);
       // The stats row itself, and its OTHER tiles (page-view counters), must
@@ -235,6 +244,15 @@ export async function runTrustScorePublicDisplayRemovedTests(opts: { log?: boole
       assertTrue(r.body.includes('class="pf-stats"'), `produsent/${slug}: the pf-stats block itself still renders`);
       assertTrue(r.body.includes('data-stat="human"'), `produsent/${slug}: the human page-view tile still renders`);
       assertTrue(r.body.includes('data-stat="ai"'), `produsent/${slug}: the AI page-view tile still renders`);
+      // Sanity check that the related-producers widget (the branch the
+      // "Trust <digit>" guard above targets) actually rendered for the
+      // Oslo-tiered slugs, rather than the assertion above vacuously passing
+      // because relatedHtml was empty. plain-verifisert-gaard is the lone
+      // Bergen agent, so it has no same-city sibling and legitimately
+      // renders none.
+      if (slug !== "plain-verifisert-gaard") {
+        assertTrue(r.body.includes('class="rel-card"'), `produsent/${slug}: the related-producers widget rendered at least one card`);
+      }
     }
     {
       const r = invoke("/produsent/:slug", { params: { slug: "ultra-gaard-en" }, lang: "en", ip: "127.0.0.1" });
