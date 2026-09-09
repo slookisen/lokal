@@ -4139,6 +4139,22 @@ export function buildProducerFaqJsonLd(params: {
 //   - real product list, no confirmed direct-sale signal → "produserer"
 // "bestill direkte" only appears with a confirmed direct-sale signal;
 // otherwise the closing clause is "finn kontaktinfo".
+//
+// Extracted so the DB-derivation logic used by the /produsent/:slug route
+// handler is directly unit-testable without a DB — round-2 review found two
+// successive malformed-shape bugs here (missing field_provenance entry
+// entirely; present but with no `value` key, the phase51_backfill_
+// provenance_v1 legacy shape) that no test caught because only the pure
+// buildProducerAnswerFirstOpening() itself was tested, always with the two
+// signals hand-supplied as literal booleans.
+export function deriveProductsAreSourced(productsList: any[], fieldProvenanceProducts: unknown): boolean {
+  const provArr: any[] = Array.isArray(fieldProvenanceProducts)
+    ? fieldProvenanceProducts
+    : (fieldProvenanceProducts ? [fieldProvenanceProducts] : []);
+  const hasValidProductProvenance = provArr.some((r) => r && typeof r.value === "string" && r.value.trim() !== "");
+  return (productsList || []).length > 0 && hasValidProductProvenance && !fieldHasOnlyInferenceSources(fieldProvenanceProducts as any);
+}
+
 export function buildProducerAnswerFirstOpening(params: {
   name: string;
   cityName: string;
@@ -5410,25 +5426,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // productsAreSourced/hasDirectSaleSignal drive the "tilbyr"/"selger"/
     // "produserer" + "bestill direkte"/"finn kontaktinfo" wording choice.
     // Fail-safe to false/false (most conservative wording) on any lookup
-    // error — never throw, never crash the page render.
+    // error — never throw, never crash the page render. See
+    // deriveProductsAreSourced()'s own comment for why this needs both a
+    // non-empty AND a valued provenance record, not just "present".
     let productsAreSourced = false;
     try {
       const fpRow = getDb()
         .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
         .get(agent.id) as { field_provenance: string } | undefined;
       const fieldProvenance = fpRow?.field_provenance ? JSON.parse(fpRow.field_provenance) : {};
-      // fieldHasOnlyInferenceSources() returns false both when every source is
-      // real AND when there is no provenance record at all (its documented
-      // "data_insufficient case, handled elsewhere" — correct for its original
-      // quarantine-flag caller, wrong here if merely negated: the primary
-      // products-write path, knowledge-service.ts upsertKnowledge(), never
-      // writes field_provenance at all, so "!fieldHasOnlyInferenceSources(...)"
-      // alone would default to "sourced" for that whole population and
-      // silently reissue the over-claiming bug this dev-request exists to
-      // close. Require an actual non-empty provenance record first.
-      const productProv = fieldProvenance.products;
-      const hasProductProvenance = Array.isArray(productProv) ? productProv.length > 0 : !!productProv;
-      productsAreSourced = productsList.length > 0 && hasProductProvenance && !fieldHasOnlyInferenceSources(productProv);
+      productsAreSourced = deriveProductsAreSourced(productsList, fieldProvenance.products);
     } catch (e) {
       console.error(`[seo] /produsent/${slug} field_provenance lookup for products failed:`, e);
       productsAreSourced = false;

@@ -23,7 +23,7 @@
  * Wired into the gate: tests/test.ts imports runRfbProducerAnswerFirstOpeningSaleSignalTests().
  */
 
-import { buildProducerAnswerFirstOpening, buildProducerFaqJsonLd } from "./seo";
+import { buildProducerAnswerFirstOpening, buildProducerFaqJsonLd, deriveProductsAreSourced } from "./seo";
 
 export interface TestSummary {
   passed: number;
@@ -154,6 +154,42 @@ export function runRfbProducerAnswerFirstOpeningSaleSignalTests(opts: { log?: bo
     const itemsPart = answer ? answer.replace(/^Test Gård tilbyr /, "").replace(/\.$/, "") : "";
     const itemCount = itemsPart ? itemsPart.split(",").length : 0;
     assertTrue(itemCount <= 3, `h2: categories-fallback answer lists at most 3 items (got ${itemCount}: "${answer}")`);
+  }
+
+  // ── (i) deriveProductsAreSourced() — the /produsent/:slug route handler's
+  //     DB-derivation logic, extracted so it's testable without a DB. Round-2
+  //     independent review found two successive malformed-shape bugs here
+  //     that no test caught because only buildProducerAnswerFirstOpening()
+  //     itself was ever tested, always with the signal hand-supplied. ──────
+  {
+    const products = [{ name: "syltetøy" }];
+    assertTrue(
+      deriveProductsAreSourced(products, undefined) === false,
+      "i1: no field_provenance.products entry at all -> not sourced (round-1 defect)"
+    );
+    assertTrue(
+      deriveProductsAreSourced(products, []) === false,
+      "i2: empty provenance array -> not sourced"
+    );
+    // The exact legacy shape phase51_backfill_provenance_v1 (database/init.ts)
+    // wrote historically: a real, non-inference source_type, but NO `value`
+    // key at all (round-2 defect — "present" was wrongly treated as "sourced").
+    assertTrue(
+      deriveProductsAreSourced(products, [{ source_type: "website_homepage", source_url: "https://example.com", confidence: 0.7 }]) === false,
+      "i3: provenance record present but with no usable value -> not sourced (round-2 defect)"
+    );
+    assertTrue(
+      deriveProductsAreSourced(products, [{ value: "syltetøy", source_type: "category_inference" }]) === false,
+      "i4: valued but inference-only source -> not sourced"
+    );
+    assertTrue(
+      deriveProductsAreSourced(products, [{ value: "syltetøy", source_type: "website_homepage" }]) === true,
+      "i5: valued, real (non-inference) source -> sourced"
+    );
+    assertTrue(
+      deriveProductsAreSourced([], [{ value: "syltetøy", source_type: "website_homepage" }]) === false,
+      "i6: no products list at all -> never sourced regardless of provenance"
+    );
   }
 
   return { passed, failed, failures };
