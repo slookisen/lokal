@@ -1006,7 +1006,11 @@ export function registerTools(
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
-        openWorldHint: false,
+        // openWorldHint is TRUE because submitting reaches a third party outside
+        // this app: sellers who opted in to order notifications are emailed about
+        // their own order (order-notify-service). Every other tool stays false —
+        // they only read or write Rett fra Bonden's own records.
+        openWorldHint: true,
       },
     },
     async ({ cart_id, buyer_ref }) => {
