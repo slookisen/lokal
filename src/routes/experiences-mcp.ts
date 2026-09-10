@@ -872,7 +872,12 @@ function registerExperienceTools(
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
-        openWorldHint: false,
+        // openWorldHint is TRUE because submitting reaches third parties outside
+        // this app: the producer is notified and the guest receives a
+        // confirmation-of-request email. Same rule as lokal_cart_submit on the
+        // RFB endpoint (slookisen/lokal#836) — an outbound e-mail to someone
+        // outside the app is open-world, whatever the record it writes.
+        openWorldHint: true,
       },
     },
     async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {

@@ -1,0 +1,124 @@
+{
+  "$schema": "https://developers.openai.com/apps-sdk/schemas/chatgpt-app-submission.v1.json",
+  "schema_version": 1,
+  "app_info": {
+    "display_name": "Opplevagent",
+    "subtitle": "Find Norwegian experiences",
+    "description": "Opplevagent is a curated marketplace of Norwegian experiences. Search hundreds of activities across all of Norway by county, municipality, category, season, weather and group size — northern lights cruises, whale and moose safaris, dog sledding, hiking and winter sports, museums and cultural sites, spa and wellness, farm stays, and food and drink experiences. Each listing carries the practical detail you need before you go: where it is, what it costs from, how long it takes, which season it runs in, and a link to the provider's own page. Opplevagent also covers gårdssalg — Norwegian farm-sale drink producers such as breweries, cideries, meaderies and vineyards — so you can find farms that welcome visitors, and send a visit request to the ones that take bookings. A request is never a confirmed booking and no payment happens in the conversation: the producer reviews it and answers by e-mail, and you pay on arrival. Useful when planning a trip to Norway, filling a weekend in the region you already live in, or finding something to do that suits the season and the weather.",
+    "category": "TRAVEL"
+  },
+  "tools": {
+    "discover_experiences": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Read-only: it searches the experience catalogue by county, municipality, category, season and group size and returns the matches.",
+        "open_world_justification": "Open world: the catalogue indexes experiences run by independent Norwegian providers, and each result links out to the provider's own listing.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "list_experience_categories": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Read-only: it returns the list of experience categories and how many experiences each one holds.",
+        "open_world_justification": "Closed world: the category list comes from Opplevagent's own catalogue and touches nothing outside the app.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "get_experience": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Read-only: it returns one experience's stored record — description, place, price, duration, season and provider link.",
+        "open_world_justification": "Open world: the catalogue indexes experiences run by independent Norwegian providers, and each result links out to the provider's own listing.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "discover_gardssalg": {
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Read-only: it searches farm-sale drink producers by county, municipality, type and distance and returns the matches.",
+        "open_world_justification": "Open world: the producers are independent Norwegian farms and each result links to that producer's own profile page.",
+        "destructive_justification": "Non-destructive: it never modifies, overwrites or deletes any record."
+      }
+    },
+    "book_gardssalg": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Writes: it creates a pending visit request for one producer and returns a booking reference; it never creates a confirmed booking and takes no payment.",
+        "open_world_justification": "Open world: the producer is notified and the guest receives a confirmation-of-request e-mail, so the call reaches people outside the app.",
+        "destructive_justification": "Non-destructive: it only creates a new pending request. Nothing is deleted or overwritten, and only the producer can confirm, reschedule or decline it."
+      }
+    }
+  },
+  "test_cases": [
+    {
+      "description": "Norwegian seasonal search in one county. The core discovery flow, and the one that renders the experiences-list card.",
+      "user_prompt": "Hva kan vi finne på i Troms om vinteren?",
+      "tools_triggered": "discover_experiences",
+      "expected_output": "Winter experiences in Troms: Arctic Explorer — Northern Lights Cruise from Tromsø, Arctic Quest — Guided Arctic Wilderness Experiences, Aurora Safari Camp — Fjord Tours Tromsø, Bryggeopplevelse og overnatting på Mefjord Brygge (Senja), Camping og friluftsliv ved Skibotn (Storfjord). The list renders as the experiences-list card, and each entry links to its own page on opplevagent.no. Verified live against production 2026-09-09."
+    },
+    {
+      "description": "Follow-up on a single experience found by search. Renders the experience-detail card.",
+      "user_prompt": "Vis meg detaljer om nordlyscruise fra Tromsø",
+      "tools_triggered": "discover_experiences, get_experience",
+      "expected_output": "The full record for Arctic Explorer — Northern Lights Cruise from Tromsø: county Troms, municipality Tromsø, category sightseeing_transport, from 800 NOK, verification status verified, and a link to the provider at arcticexplorer.no. Verified live against production 2026-09-09."
+    },
+    {
+      "description": "Category overview, so the user can see what kinds of experiences exist before narrowing down.",
+      "user_prompt": "Hvilke kategorier av opplevelser finnes?",
+      "tools_triggered": "list_experience_categories",
+      "expected_output": "Ten categories with a count each, largest first: kultur_historie (162), natur_friluft (87), sightseeing_transport (78), adrenalin_action (73), overnatting_opplevelse (58), dyreliv_safari (58), vinter_sno (45), velvaere_spa (22), mat_drikke (15) and gardssalg_smaking. Verified live against production 2026-09-09."
+    },
+    {
+      "description": "English category search across the whole country, checking that an English prompt returns the same catalogue quality as a Norwegian one.",
+      "user_prompt": "Find wildlife safari experiences in Norway",
+      "tools_triggered": "discover_experiences",
+      "expected_output": "Wildlife experiences spread across the country: Andenes Whale Safari (Nordland), orca diving expeditions in Nærøysund (Trøndelag), Atlanterhavsparken in Ålesund (Møre og Romsdal), dog sledding in Sirdal (Agder) and an evening moose safari at Øyerfjellet (Innlandet). Verified live against production 2026-09-09."
+    },
+    {
+      "description": "The gårdssalg side of the catalogue: farm-sale drink producers, with their booking status shown honestly.",
+      "user_prompt": "Finn gårdssalg og lokale drikkeprodusenter i Vestland",
+      "tools_triggered": "discover_gardssalg",
+      "expected_output": "Farm-sale drink producers in Vestland, including 7 Fjell Bryggeri (brewery, Bergen) and Amble Gård (meadery, Sogndal), each with its municipality, producer type and a link to its profile page. Producers that are not yet open for bookings are shown with booking live false and a note saying to get in touch through the profile page instead. Verified live against production 2026-09-09."
+    }
+  ],
+  "negative_test_cases": [
+    {
+      "description": "No payment ever happens in the conversation. A gårdssalg request is a request, and the guest pays on arrival.",
+      "user_prompt": "Book the northern lights cruise for two people and charge my credit card now",
+      "tools_triggered": null,
+      "expected_output": "The app explains that it does not take payment and asks for no card details. For a listed experience it points to the provider's own booking page; for a gårdssalg producer it can send a visit request that the producer answers by e-mail, paid on arrival."
+    },
+    {
+      "description": "The app cannot confirm a booking. Only the producer can, through their own reply.",
+      "user_prompt": "Just confirm my farm visit for Saturday, don't wait for the producer",
+      "tools_triggered": null,
+      "expected_output": "The app explains that a request always stays pending until the producer responds, and that it has no way to confirm one. It offers to send the request instead."
+    },
+    {
+      "description": "Out-of-scope geography. The catalogue covers Norway only and must not present Norwegian results as an answer about another country.",
+      "user_prompt": "Find me a safari lodge in Kenya for next month",
+      "tools_triggered": null,
+      "expected_output": "The app explains that it only covers experiences and farm-sale producers in Norway, and does not offer Norwegian results as an answer to a request about Kenya."
+    }
+  ]
+}
