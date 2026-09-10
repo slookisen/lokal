@@ -26,6 +26,28 @@
  *   (g) fresh hard bounce on a recent recipient → auto-pause + skip
  *   (h) routes: daily-run needs the admin key and defaults to dry run; the
  *       daily-prep route still returns its unchanged shape after extraction
+ *   (i)-(k) dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-
+ *       plattformjobben: runGardssalgAutosvarApply (extracted from POST
+ *       /admin/gardssalg-autosvar-apply, src/routes/opplevelser.ts) now runs
+ *       INSIDE runGardssalgOutreachDaily, right after Guard 4 and before
+ *       candidate selection —
+ *         (i)  AC1: a domain_match autosvar candidate is reflected in the
+ *              SAME daily run's `autosvar_apply` outcome counts (dry run:
+ *              would_apply > 0)
+ *         (j)  AC2: a domain_mismatch candidate lands in
+ *              gardssalg_autosvar_review_queue, never auto-written to epost,
+ *              on an apply:true daily run
+ *         (k)  AC3: the daily job's own dry run (apply:false) writes NOTHING
+ *              — neither an epost write nor a review-queue row — even though
+ *              autosvar candidates (domain_match + domain_mismatch) exist
+ *       ANTHROPIC_API_KEY is explicitly unset for these three so the shared
+ *       LLM contact gate (only reachable on an apply:true domain_match
+ *       write) fails closed without any network call, same fail-closed
+ *       contract as contact-candidate-judge.ts's own doc comment — none of
+ *       (i)-(k) exercises that combination directly, but a prior section's
+ *       domain_match fixture can be re-scanned by a later apply:true run
+ *       here (the scan pool isn't date-scoped), so this is a deliberate
+ *       belt-and-suspenders rather than a AC requirement.
  */
 
 export interface TestSummary {
@@ -118,6 +140,11 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
     const prevCooldownDays = process.env.OUTREACH_COOLDOWN_DAYS;
     const prevMaxCandidates = process.env.DAILY_PREP_MAX_CANDIDATES;
     const prevDisabled = process.env.GARDSSALG_OUTREACH_DAILY_DISABLED;
+    // (i)-(k) below: unset so the shared LLM contact gate fails closed
+    // without any network call (see the header comment's belt-and-suspenders
+    // note) regardless of what an earlier suite in this same process left
+    // ANTHROPIC_API_KEY set to.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
     const testKey = process.env.ADMIN_KEY || "gardssalg-outreach-daily-run-test-key";
 
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -125,12 +152,25 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
     process.env.OUTREACH_COOLDOWN_DAYS = "60";
     delete process.env.DAILY_PREP_MAX_CANDIDATES; // default cap = 4
     delete process.env.GARDSSALG_OUTREACH_DAILY_DISABLED;
+    delete process.env.ANTHROPIC_API_KEY;
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const emailPath = require.resolve("../services/email-service");
     const blocklistPath = require.resolve("../services/blocklist-service");
+    // dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
+    // runGardssalgOutreachDaily now calls runGardssalgAutosvarApply, which
+    // (for a domain_match/domain_mismatch candidate) writes through
+    // applyGardssalgSetContactEmail / upsertGardssalgAutosvarReviewQueue —
+    // both defined in experience-store, same module opplevelser-gardssalg-
+    // autosvar-apply.test.ts already cache-clears for exactly this reason
+    // (see that file's own comment): left cached, a stale experience-store
+    // from an earlier suite in this same process stays bound to ITS OLD
+    // db-factory instance, and a write against THIS test's fresh :memory:
+    // db then fails with `FOREIGN KEY constraint failed` the moment it looks
+    // up a provider_id that only exists in the other, disconnected db.
+    const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, emailPath, blocklistPath, opplevelserPath];
+    const cachePaths = [dbFactoryPath, emailPath, blocklistPath, experienceStorePath, opplevelserPath];
     for (const p of cachePaths) delete require.cache[p];
 
     let emailSvc: any = null;
@@ -214,6 +254,56 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         rfbDb
           .prepare(`SELECT run_id, agent, status, claims, notes FROM runs WHERE agent = ? ORDER BY rowid`)
           .all(GARDSSALG_OUTREACH_DAILY_AGENT) as Array<{ run_id: string; agent: string; status: string; claims: string; notes: string }>;
+
+      // ── (i)-(k) fixture helpers — same minimal shape as
+      // opplevelser-gardssalg-autosvar-apply.test.ts's own mkProvider/
+      // mkInboundMessage, kept separate from this file's richer
+      // insertProvider above (which fills in the full readiness/verification
+      // columns a real outreach candidate needs) since these autosvar-only
+      // fixtures deliberately stay ineligible for outreach selection itself
+      // — only the SAME run's autosvar_apply outcome is under test here.
+      const insertMinimalProvider = expDb.prepare(
+        `INSERT INTO experience_providers (id, navn, vertical, hjemmeside, epost, created_at)
+         VALUES (@id, @navn, 'experiences', @hjemmeside, @epost, @created_at)`,
+      );
+      function mkAutosvarProvider(p: { id: string; navn: string; hjemmeside?: string | null; epost?: string | null }): void {
+        insertMinimalProvider.run({ hjemmeside: null, epost: null, created_at: "2026-01-01 00:00:00", ...p });
+      }
+      function getAutosvarProviderEpost(id: string): string | null {
+        return (expDb.prepare(`SELECT epost FROM experience_providers WHERE id = ?`).get(id) as { epost: string | null }).epost;
+      }
+      function getAutosvarQueueRow(providerId: string): any {
+        return expDb.prepare(`SELECT * FROM gardssalg_autosvar_review_queue WHERE provider_id = ?`).get(providerId);
+      }
+      function countAutosvarQueueRows(): number {
+        return (expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_autosvar_review_queue`).get() as { n: number }).n;
+      }
+      let autosvarContactIdSeq = 0;
+      function mkAutosvarInboundMessage(o: { providerId: string; contactEmail: string; bodyText: string; sentAt: string }): void {
+        autosvarContactIdSeq++;
+        const contactId = `autosvar-cid-${autosvarContactIdSeq}`;
+        const threadId = `autosvar-tid-${autosvarContactIdSeq}`;
+        const msgId = `autosvar-mid-${autosvarContactIdSeq}`;
+        rfbDb
+          .prepare(
+            `INSERT INTO crm_contacts (id, type, agent_id, provider_id, email, name, status, vertical_id)
+             VALUES (?, 'producer', NULL, ?, ?, 'Test Contact', 'active', 'experiences')`,
+          )
+          .run(contactId, o.providerId, o.contactEmail);
+        rfbDb
+          .prepare(
+            `INSERT INTO crm_threads (id, contact_id, subject, status, category, vertical_id)
+             VALUES (?, ?, 'Re: outreach', 'new', 'innkommende', 'experiences')`,
+          )
+          .run(threadId, contactId);
+        rfbDb
+          .prepare(
+            `INSERT INTO crm_messages
+               (id, thread_id, direction, from_email, to_emails, subject, body_text, sent_at, delivery_status, vertical_id)
+             VALUES (?, ?, 'in', ?, '["outreach@opplevagent.no"]', 'Re: outreach', ?, ?, 'sent', 'experiences')`,
+          )
+          .run(msgId, threadId, o.contactEmail, o.bodyText, o.sentAt);
+      }
 
       // ── (a) scheduling guard ───────────────────────────────────────────
       assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-06T07:59:00Z"), lastRunAt: null }), false, "a1: 07:59Z -> not in window");
@@ -344,6 +434,83 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(pilotDry.status, 200, "h10: pilot-send route still answers after extraction");
       assertEq(pilotDry.body.results[0].status, "skipped", "h11: pilot-send dry run reports the cooldown skip");
       assertEq(pilotDry.body.results[0].reason, "cooldown_suppressed", "h12: ...with the same reason as before");
+
+      // ── (i) AC1: a domain_match autosvar candidate is reflected in the
+      // SAME daily run's outcome counts (dry run: would_apply > 0) ───────
+      setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
+      const ac1Now = new Date("2026-10-15T08:10:00Z"); // fresh calendar day -> full budget; far past (g)'s bounce lookback
+      mkAutosvarProvider({ id: "prov-ac1-match", navn: "AC1 Match Gård", hjemmeside: "https://ac1match.no", epost: "gammel@ac1match.no" });
+      mkAutosvarInboundMessage({
+        providerId: "prov-ac1-match",
+        contactEmail: "gammel@ac1match.no",
+        bodyText: "Vennligst ta kontakt med ny@ac1match.no fremover, takk.",
+        sentAt: "2026-10-01 09:00:00",
+      });
+      const ac1 = await runGardssalgOutreachDaily({ apply: false, trigger: "manual", now: ac1Now });
+      assertTrue(ac1.autosvar_apply !== null, "i1: the daily run's report carries an autosvar_apply outcome");
+      assertEq(ac1.autosvar_apply?.dry_run, true, "i2: autosvar_apply itself ran dry (mirrors the daily job's own apply:false)");
+      assertTrue(
+        (ac1.autosvar_apply?.counts.would_apply ?? 0) > 0,
+        "i3 (AC1): a domain_match candidate shows up as would_apply in THIS SAME run's counts",
+      );
+      assertEq(getAutosvarProviderEpost("prov-ac1-match"), "gammel@ac1match.no", "i4: dry run wrote nothing to the candidate's epost");
+
+      // ── (j) AC2: a domain_mismatch candidate lands in the review queue,
+      // never auto-written to epost, on an apply:true daily run ──────────
+      const ac2Now = new Date("2026-10-16T08:10:00Z");
+      mkAutosvarProvider({ id: "prov-ac2-mismatch", navn: "AC2 Mismatch Gård", hjemmeside: "https://ac2mismatch.no", epost: "post@ac2mismatch.no" });
+      mkAutosvarInboundMessage({
+        providerId: "prov-ac2-mismatch",
+        contactEmail: "post@ac2mismatch.no",
+        bodyText: "Vennligst henvend deg til ny-kontakt@et-helt-annet-domene.no i stedet.",
+        sentAt: "2026-10-02 09:00:00",
+      });
+      // NB: this apply:true run also re-scans (i)'s domain_match fixture
+      // (the autosvar pool isn't date-scoped) — with ANTHROPIC_API_KEY
+      // unset, its contact-gate call fails closed (contact_gate_rejected),
+      // never applied, never queued (domain_match candidates never queue) —
+      // so it cannot leak into this test's assertions either way.
+      const ac2 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual", now: ac2Now });
+      assertEq(ac2.autosvar_apply?.dry_run, false, "j1: apply:true daily run's autosvar_apply also ran for real");
+      const ac2QueueRow = getAutosvarQueueRow("prov-ac2-mismatch");
+      assertTrue(!!ac2QueueRow, "j2 (AC2): domain_mismatch candidate landed in gardssalg_autosvar_review_queue");
+      assertEq(ac2QueueRow?.classification, "domain_mismatch", "j3: queued with the right classification");
+      assertEq(
+        getAutosvarProviderEpost("prov-ac2-mismatch"),
+        "post@ac2mismatch.no",
+        "j4 (AC2): epost NEVER auto-written for a domain_mismatch candidate, even on an apply:true daily run",
+      );
+      assertTrue((ac2.autosvar_apply?.counts.queued ?? 0) > 0, "j5: reflected in this same run's queued count");
+
+      // ── (k) AC3: the daily job's own dry run (apply:false) writes
+      // NOTHING — neither an epost write nor a review-queue row — even
+      // though autosvar candidates (domain_match + domain_mismatch from (i)
+      // and (j)) already exist ───────────────────────────────────────────
+      const ac3Now = new Date("2026-10-17T08:10:00Z");
+      const queueSizeBeforeAc3 = countAutosvarQueueRows();
+      const ac1EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac1-match");
+      const ac2EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac2-mismatch");
+      const ac3 = await runGardssalgOutreachDaily({ apply: false, trigger: "manual", now: ac3Now });
+      assertEq(ac3.autosvar_apply?.dry_run, true, "k1 (AC3): the daily job's own dry run also dry-runs autosvar_apply");
+      assertEq(
+        countAutosvarQueueRows(),
+        queueSizeBeforeAc3,
+        "k2 (AC3): review-queue size UNCHANGED by a dry daily run, even though a domain_mismatch candidate already exists",
+      );
+      assertEq(
+        getAutosvarProviderEpost("prov-ac1-match"),
+        ac1EpostBeforeAc3,
+        "k3 (AC3): domain_match candidate's epost UNCHANGED by a dry daily run",
+      );
+      assertEq(
+        getAutosvarProviderEpost("prov-ac2-mismatch"),
+        ac2EpostBeforeAc3,
+        "k4 (AC3): domain_mismatch candidate's epost UNCHANGED by a dry daily run",
+      );
+      assertTrue(
+        (ac3.autosvar_apply?.counts.would_apply ?? 0) + (ac3.autosvar_apply?.counts.already_set ?? 0) > 0,
+        "k5: autosvar candidates are still genuinely detected in this dry run (not silently empty)",
+      );
     } catch (err) {
       failed++;
       failures.push(`✗ harness error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
@@ -369,6 +536,8 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       else process.env.DAILY_PREP_MAX_CANDIDATES = prevMaxCandidates;
       if (prevDisabled === undefined) delete process.env.GARDSSALG_OUTREACH_DAILY_DISABLED;
       else process.env.GARDSSALG_OUTREACH_DAILY_DISABLED = prevDisabled;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       for (const p of cachePaths) delete require.cache[p];
     }
     return { passed, failed, failures };

@@ -11401,37 +11401,52 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
 // happen and writes nothing anywhere — no epost write, no queue row.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
-router.post("/admin/gardssalg-autosvar-apply", requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const parsed = parseGardssalgAutosvarScanPaging(req.query);
-    if (!parsed.ok) {
-      res.status(400).json({ error: parsed.error });
-      return;
-    }
-    const apply = req.query?.apply === "1" || req.query?.apply === "true";
-    const dryRun = !apply;
+type GardssalgAutosvarApplyOutcome =
+  | "applied"
+  | "would_apply"
+  | "already_set"
+  | "queued"
+  | "would_queue"
+  | "domain_mismatch"
+  | "provider_not_found"
+  | "skipped_no_email_found"
+  // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+  // supply): the candidate cleared the domain-match classification but
+  // was rejected by the shared LLM-judge contact gate (backstop
+  // classifier or the judge itself) — treated exactly like "nothing to
+  // apply" (no epost write, no queue row), but reported under its own
+  // label rather than folded into an unrelated bucket.
+  | "contact_gate_rejected";
 
-    const scan = runGardssalgAutosvarScan(parsed.limit, parsed.offset);
+interface GardssalgAutosvarApplyResult {
+  dry_run: boolean;
+  batch_id: string;
+  scanned: number;
+  scan_summary: Record<GardssalgAutosvarClassification, number>;
+  pagination: GardssalgAutosvarScanResult["pagination"];
+  counts: Record<GardssalgAutosvarApplyOutcome, number>;
+  results: Array<GardssalgAutosvarScanCandidate & { outcome: GardssalgAutosvarApplyOutcome }>;
+  queue_size: number;
+}
+
+/**
+ * Runs the autosvar-apply write-side logic (see the doc comment above) and
+ * returns exactly the shape POST /admin/gardssalg-autosvar-apply below
+ * reports. Extracted so runGardssalgOutreachDaily (further down) can call
+ * the IDENTICAL apply logic on its own daily cadence — it must never
+ * re-implement or drift from what the route does byte-for-byte.
+ */
+async function runGardssalgAutosvarApply(opts: {
+  limit: number | undefined;
+  offset: number | undefined;
+  apply: boolean;
+}): Promise<GardssalgAutosvarApplyResult> {
+    const dryRun = !opts.apply;
+
+    const scan = runGardssalgAutosvarScan(opts.limit, opts.offset);
     const expDb = getExpDb("experiences");
 
     const batchId = `autosvar-apply-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
-
-    type GardssalgAutosvarApplyOutcome =
-      | "applied"
-      | "would_apply"
-      | "already_set"
-      | "queued"
-      | "would_queue"
-      | "domain_mismatch"
-      | "provider_not_found"
-      | "skipped_no_email_found"
-      // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
-      // supply): the candidate cleared the domain-match classification but
-      // was rejected by the shared LLM-judge contact gate (backstop
-      // classifier or the judge itself) — treated exactly like "nothing to
-      // apply" (no epost write, no queue row), but reported under its own
-      // label rather than folded into an unrelated bucket.
-      | "contact_gate_rejected";
 
     const results: Array<GardssalgAutosvarScanCandidate & { outcome: GardssalgAutosvarApplyOutcome }> = [];
     const counts: Record<GardssalgAutosvarApplyOutcome, number> = {
@@ -11552,7 +11567,7 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, async (req: Request
       counts.queued++;
     }
 
-    res.json({
+    return {
       dry_run: dryRun,
       batch_id: batchId,
       scanned: scan.scanned,
@@ -11561,7 +11576,19 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, async (req: Request
       counts,
       results,
       queue_size: listGardssalgAutosvarReviewQueue().length,
-    });
+    };
+}
+
+router.post("/admin/gardssalg-autosvar-apply", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const parsed = parseGardssalgAutosvarScanPaging(req.query);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const apply = req.query?.apply === "1" || req.query?.apply === "true";
+    const result = await runGardssalgAutosvarApply({ limit: parsed.limit, offset: parsed.offset, apply });
+    res.json(result);
   } catch (err: any) {
     console.error("[gardssalg-autosvar-apply] failed:", err);
     res.status(500).json({ error: "Internal error" });
@@ -18025,6 +18052,14 @@ export function setGardssalgOutreachLanePaused(
 export const GARDSSALG_OUTREACH_DAILY_AGENT = "opplevagent-outreach-platform";
 export const GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC = 8;
 const GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS = 48;
+// dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
+// the autosvar-apply pool (runGardssalgAutosvarApply above) is small and
+// cheap per candidate (at most one LLM contact-gate call, on domain_match
+// only), so this just needs to comfortably cover a day's worth of inbound
+// autosvar redirects without ever becoming the daily job's bottleneck — no
+// existing constant sized this, so 20 is a deliberately generous but bounded
+// choice, same spirit as GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT above.
+const GARDSSALG_AUTOSVAR_APPLY_DAILY_BATCH_SIZE = 20;
 
 /** Pure scheduling guard, same shape as analytics-service's shouldRunAutoPrune. */
 export function shouldRunGardssalgOutreachDaily(opts: {
@@ -18116,6 +18151,11 @@ export interface GardssalgOutreachDailyRunReport {
   results: GardssalgOutreachSendResultRow[];
   summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
   envelope_recorded: boolean;
+  // dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
+  // the outcome of the autosvar-apply pass this same run made BEFORE
+  // candidate selection (see the Guard 4 call site below) — null only for
+  // runs that returned before reaching that call (an early guard skip).
+  autosvar_apply: GardssalgAutosvarApplyResult | null;
 }
 
 /**
@@ -18154,6 +18194,7 @@ export async function runGardssalgOutreachDaily(opts: {
     recent_bounces?: GardssalgOutreachDailyRunReport["recent_bounces"];
     candidates?: GardssalgOutreachDailyRunReport["candidates"];
     results?: GardssalgOutreachSendResultRow[];
+    autosvar_apply?: GardssalgAutosvarApplyResult | null;
   }): GardssalgOutreachDailyRunReport => {
     const results = partial.results ?? [];
     const report: GardssalgOutreachDailyRunReport = {
@@ -18174,6 +18215,7 @@ export async function runGardssalgOutreachDaily(opts: {
       results,
       summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
       envelope_recorded: false,
+      autosvar_apply: partial.autosvar_apply ?? null,
     };
     // Envelope: real runs only (a dry run leaves no trace anywhere), and never
     // when the env switch turned the job off entirely.
@@ -18202,7 +18244,11 @@ export async function runGardssalgOutreachDaily(opts: {
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
         `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
-        (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "");
+        (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
+        (report.autosvar_apply
+          ? ` autosvar: applied=${report.autosvar_apply.counts.applied} queued=${report.autosvar_apply.counts.queued} ` +
+            `already_set=${report.autosvar_apply.counts.already_set} queue_size=${report.autosvar_apply.queue_size}`
+          : "");
       try {
         recordRun({
           run_id: report.run_id,
@@ -18273,10 +18319,28 @@ export async function runGardssalgOutreachDaily(opts: {
     return finish({ skipped_reason: "daily_cap_already_sent", sent_today_before: sentToday, budget });
   }
 
+  // dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
+  // run the autosvar-apply pass HERE — after all four guards have cleared,
+  // before candidate selection — so a same-day autosvar address correction
+  // (domain_match -> epost write) is visible to computeGardssalgOutreachDailyPrep
+  // in this SAME run. Mirrors opts.apply exactly: a dry run of the daily job
+  // runs this in dry-run mode too (apply:false), writing nothing (no epost
+  // write, no queue row) — same dry_run semantics as the route itself.
+  const autosvarApply = await runGardssalgAutosvarApply({
+    limit: GARDSSALG_AUTOSVAR_APPLY_DAILY_BATCH_SIZE,
+    offset: 0,
+    apply: opts.apply,
+  });
+
   const prep = computeGardssalgOutreachDailyPrep(expDb);
   const selected = prep.selected.slice(0, budget);
   if (selected.length === 0) {
-    return finish({ skipped_reason: "no_candidates", sent_today_before: sentToday, budget });
+    return finish({
+      skipped_reason: "no_candidates",
+      sent_today_before: sentToday,
+      budget,
+      autosvar_apply: autosvarApply,
+    });
   }
   const hasPriorSend = expDb.prepare(
     `SELECT 1 FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0 LIMIT 1`,
@@ -18302,7 +18366,14 @@ export async function runGardssalgOutreachDaily(opts: {
       }),
     );
   }
-  return finish({ skipped_reason: null, sent_today_before: sentToday, budget, candidates, results });
+  return finish({
+    skipped_reason: null,
+    sent_today_before: sentToday,
+    budget,
+    candidates,
+    results,
+    autosvar_apply: autosvarApply,
+  });
 }
 
 // ─── GET/POST /api/opplevelser/admin/gardssalg-outreach-lane (admin) ────────
