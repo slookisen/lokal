@@ -131,6 +131,25 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
           "p23: …including a house-letter suffix");
         assertEq(parse("Møtested: Havnegata 7, 8006 Bodø")?.street, "Havnegata 7",
           "p24: …behind a real «Møtested:» label");
+
+        // ── dev-request 2026-09-11 fix 2: "c/o <name>," / "v/ <name>," prefix ──
+        // Left unstripped, parts[0] is the person's name (no trailing number),
+        // so the real street line one comma over was never even tested against
+        // the street-shape regex — measured live: ~46 of 50 sampled backlog
+        // rows misclassified as place names this way.
+        assertEq(parse("c/o Josef Flatlandsmo, Åbyfaret 12B")?.street, "Åbyfaret 12B",
+          "p25: a «c/o <name>,» prefix is stripped and the real street line behind it is recognised");
+        assertEq(parse("v/ Bjørn Ola Bakken, Dalvegen 13")?.street, "Dalvegen 13",
+          "p26: …same for a «v/ <name>,» prefix");
+        assertEq(parse("c/o G. Eggen, Håkon Herdebreis veg 2")?.street, "Håkon Herdebreis veg 2",
+          "p27: …including a three-word street name behind the prefix");
+        assertEq(parse("Vi møtes ved kaia, ring når dere kommer"), null,
+          "p28: a plain non-address sentence with a comma is still refused — the c/o fix does not weaken the street-shape test itself");
+        // …and the existing bare-street rejection is untouched: no c/o/v/
+        // prefix, no postnummer -> still refused (p6 above, restated to make
+        // the boundary explicit next to the new prefix cases).
+        assertEq(parse("Storgata 5"), null,
+          "p29: a bare street with no postnummer and no care-of prefix is still refused");
       }
 
       // ── Seed: a Bodø provider WITH a street address ──────────────

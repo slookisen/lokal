@@ -98,13 +98,27 @@ export function parseAddressLike(
   // parsed as a street (review follow-up 5). A label is a word like «Oppmøte»,
   // «Møtested», «Sted», «Adresse» — not an arbitrary ≤20-char prefix.
   const delabelled = raw.replace(/^(oppm(ø|o)te|m(ø|o)tested|m(ø|o)teplass|sted|adresse|hvor)\s*:\s*/i, "");
-  const parts = delabelled.split(",").map((p) => p.trim()).filter(Boolean);
+
+  // dev-request 2026-09-11 fix 2 — "c/o <name>, " / "v/ <name>, " prefix.
+  // "c/o Josef Flatlandsmo, Åbyfaret 12B" names a CARE-OF recipient before the
+  // real street line. Left in place, parts[0] below is the person's name (no
+  // trailing number), so the street shape test never even sees the real
+  // address one comma over — measured live: ~46 of 50 sampled backlog rows
+  // misclassified as place names this way. Stripped from the string BEFORE
+  // the comma split (not just parts[0] swapped out) so every downstream
+  // guard — postnummer scan, NON_STREET_HEAD, foreign-country check, length
+  // caps — sees the address exactly as if the care-of segment had never been
+  // there. `<name>` is free text up to the next comma, per spec.
+  const careOfMatch = delabelled.match(/^(?:c\s?\/\s?o|v\s?\/)\s+[^,]+,\s*/i);
+  const addressPart = careOfMatch ? delabelled.slice(careOfMatch[0].length) : delabelled;
+
+  const parts = addressPart.split(",").map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return null;
 
   // A 4-digit group anywhere in the string is a postnummer candidate. Guarded
   // against year-like numbers by requiring it to be followed by a word (the
   // poststed) or to end the string, and to not be part of a longer number.
-  const postMatch = delabelled.match(/(?:^|[\s,])(\d{4})(?=[\s,]|$)/);
+  const postMatch = addressPart.match(/(?:^|[\s,])(\d{4})(?=[\s,]|$)/);
   const postnummer = postMatch ? postMatch[1] : null;
 
   // "<name…> <number><optional letter>" — the shape of a Norwegian street
@@ -139,13 +153,19 @@ export function parseAddressLike(
   // postnummer too (Trondheim) — the only signal that it is not ours is the
   // country. Kartverket only knows Norway, so this would silently place a
   // Danish meeting point in Trøndelag if the numbers happened to line up.
-  if (/\b(danmark|denmark|sverige|sweden|finland|island|iceland|deutschland|germany|tyskland|nederland|holland|storbritannia|england|scotland|skottland)\b/i.test(delabelled)) {
+  if (/\b(danmark|denmark|sverige|sweden|finland|island|iceland|deutschland|germany|tyskland|nederland|holland|storbritannia|england|scotland|skottland)\b/i.test(addressPart)) {
     return null;
   }
 
   // A street with no postnummer anywhere is too weak: "Storgata 5" exists in
   // dozens of kommuner and geocodeOne would happily return the first one.
-  if (!postnummer) return null;
+  // EXCEPT when a care-of prefix was stripped above: "c/o <name>," / "v/
+  // <name>," is a specific, named-individual signal a bare street name is
+  // not, and every caller of this function already knows the row's own
+  // kommune — the disambiguation the postnummer exists for is available from
+  // context instead. Existing bare-street rejections (no prefix) are
+  // unaffected — "Storgata 5" alone is still refused.
+  if (!postnummer && !careOfMatch) return null;
 
   return { street, postnummer };
 }
@@ -778,10 +798,34 @@ export async function experiencesGeocodeTick(
 // Step B/E's own comments already document that propagating a 'sted'-tier
 // provider point down to experiences is a distinct, un-asked-for future
 // slice, and this backlog pass inherits that same boundary unchanged.
+//
+// dev-request 2026-09-11 fix 3 — a row parseAddressLike() now (correctly,
+// since fix 2 above) recognises as street-address-shaped gets a REAL shot at
+// the address tier instead of being skipped outright: geocodeOne() (the same
+// Step A entry point, same GeocodeDeps test-injection seam threaded through
+// as `opts.deps`) is tried against the CLEANED street parseAddressLike()
+// already extracted. A confirmed hit upgrades the row past 'approximate' at
+// address precision (geocode_source='kartverket_backlog'); no match or an
+// implausible coordinate falls back to the exact same skipped_address_shaped
+// counter/action as before — "tried and still couldn't confirm" rather than
+// "never tried". Still never writes a coordinate this pass cannot corroborate.
+//
+// Pagination (dev-request 2026-09-11-geo-pagination) — an `after` cursor
+// (last-seen id) threads through selectBacklogCandidates()'s WHERE clause so
+// a row that is scanned but SKIPPED (no match / already correct / ambiguous)
+// does not sort right back to the top of the very next call's window: it
+// keeps the exact same column values, so a bare `ORDER BY id LIMIT ?` with no
+// cursor re-selects it forever and the tail of the backlog past `limit` is
+// never reached. `next_after` (the id of the last row this call scanned, or
+// null once a page comes back shorter than `limit` — the backlog is
+// exhausted) is the caller's cue to pass `after: next_after` on the next call,
+// same keyset-pagination contract as GET /admin/providers/all.
 
 export type ExperiencesGeocodeBacklogAction =
   | "upgraded"
+  | "upgraded_address"
   | "would_upgrade"
+  | "would_upgrade_address"
   | "skipped_address_shaped"
   | "skipped_ambiguous"
   | "skipped_no_match"
@@ -796,7 +840,7 @@ export type ExperiencesGeocodeBacklogRowOutcome = {
   before: { lat: number | null; lon: number | null; geocode_confidence: string | null };
   action: ExperiencesGeocodeBacklogAction;
   reason?: string;
-  /** Only set for "upgraded"/"would_upgrade" — the sted-tier point and its Kartverket place name. */
+  /** Only set for "upgraded"/"would_upgrade"/"upgraded_address"/"would_upgrade_address" — the planned point and its source label (Stedsnavn place name, or the cleaned street for the address tier). */
   planned?: { lat: number; lon: number; place_name: string };
 };
 
@@ -805,7 +849,11 @@ export type ExperiencesGeocodeBacklogResult = {
   limit: number;
   candidates_scanned: number;
   upgraded: number;
+  /** Fix 3 — address-tier upgrades (parseAddressLike() + geocodeOne()), counted separately from the sted-tier `upgraded` above. */
+  upgraded_address: number;
   would_upgrade: number;
+  /** Fix 3 — dry-run twin of `upgraded_address`. */
+  would_upgrade_address: number;
   skipped_address_shaped: number;
   skipped_ambiguous: number;
   skipped_no_match: number;
@@ -813,6 +861,8 @@ export type ExperiencesGeocodeBacklogResult = {
   errors: number;
   rows: ExperiencesGeocodeBacklogRowOutcome[];
   duration_ms: number;
+  /** Keyset pagination cursor — the id of the last row scanned this call, or null once the page came back shorter than `limit` (backlog exhausted). Pass back as `opts.after` on the next call. */
+  next_after: string | null;
 };
 
 // Smaller ceiling than agents-geocode-worker.ts's clampGeocodeBatchLimit
@@ -877,7 +927,8 @@ type BacklogCandidateRow = {
 
 function selectBacklogCandidates(
   db: ReturnType<typeof getDb>,
-  limit: number
+  limit: number,
+  after: string
 ): BacklogCandidateRow[] {
   return db
     .prepare(
@@ -886,10 +937,11 @@ function selectBacklogCandidates(
         WHERE geocode_confidence = 'approximate'
           AND lat IS NOT NULL AND lon IS NOT NULL
           AND adresse IS NOT NULL AND adresse <> ''
+          AND id > ?
         ORDER BY id
         LIMIT ?`
     )
-    .all(limit) as BacklogCandidateRow[];
+    .all(after, limit) as BacklogCandidateRow[];
 }
 
 /** Same WHERE clause as the pass's own SELECT, no LIMIT — cheap status check for the admin route's before/after block. */
@@ -908,19 +960,27 @@ export function experiencesGeocodeBacklogQueueStatus(): { pending: number } {
 }
 
 /**
- * Backlog re-geocode pass. Chunked (bounded by `limit`), resumable (a row
- * this call upgrades past 'approximate' is excluded from the very next
- * call's SELECT by the WHERE clause itself — the same idempotence-by-query
- * shape as the ordinary tick's own steps, no separate "already processed"
- * bookkeeping needed), and dry-run-safe by default (see
- * parseExperiencesGeocodeBacklogDryRunFlag() above).
+ * Backlog re-geocode pass. Chunked (bounded by `limit`), resumable two ways —
+ * a row this call upgrades past 'approximate' is excluded from the very next
+ * call's SELECT by the WHERE clause itself (no separate "already processed"
+ * bookkeeping needed), AND a row this call scans but leaves 'approximate'
+ * (skipped/ambiguous/no_match) is excluded from the NEXT call by the `after`
+ * keyset cursor (`opts.after`, echoed back as `result.next_after`) — without
+ * it, a byte-identical skipped row sorts right back to the top of the very
+ * next `ORDER BY id LIMIT ?` window and the tail of the backlog past `limit`
+ * is never reached. And dry-run-safe by default (see
+ * parseExperiencesGeocodeBacklogDryRunFlag() above). `opts.deps` threads the
+ * same GeocodeDeps test-injection seam experiencesGeocodeTick() itself uses,
+ * for the fix-3 address-tier geocodeOne() call below.
  */
 export async function runExperiencesGeocodeBacklogPass(
   limit: number = EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT,
-  opts: { dryRun?: boolean } = {}
+  opts: { dryRun?: boolean; after?: string; deps?: GeocodeDeps } = {}
 ): Promise<ExperiencesGeocodeBacklogResult> {
   const start = Date.now();
   const dryRun = opts.dryRun !== false;
+  const after = typeof opts.after === "string" ? opts.after : "";
+  const deps: GeocodeDeps = opts.deps ?? {};
   const db = getDb(VERTICAL);
 
   const result: ExperiencesGeocodeBacklogResult = {
@@ -928,7 +988,9 @@ export async function runExperiencesGeocodeBacklogPass(
     limit,
     candidates_scanned: 0,
     upgraded: 0,
+    upgraded_address: 0,
     would_upgrade: 0,
+    would_upgrade_address: 0,
     skipped_address_shaped: 0,
     skipped_ambiguous: 0,
     skipped_no_match: 0,
@@ -936,13 +998,30 @@ export async function runExperiencesGeocodeBacklogPass(
     errors: 0,
     rows: [],
     duration_ms: 0,
+    next_after: null,
   };
 
-  const rows = selectBacklogCandidates(db, limit);
+  const rows = selectBacklogCandidates(db, limit, after);
+  // Keyset cursor for the NEXT call — the last id this call scanned, or null
+  // once a page comes back shorter than `limit` (nothing left to scan). Set
+  // up front from the SELECT itself so it reflects what was scanned even if
+  // an individual row's processing throws below.
+  result.next_after = rows.length === limit && rows.length > 0 ? rows[rows.length - 1].id : null;
 
   const updateSted = db.prepare(
     `UPDATE experience_providers
         SET lat = ?, lon = ?, geocode_source = 'stedsnavn_kommune_backlog', geocode_confidence = 'sted',
+            updated_at = datetime('now')
+      WHERE id = ? AND geocode_confidence = 'approximate'`
+  );
+  // Fix 3 — the address-tier upgrade. Same compare-and-swap guard as
+  // updateSted above: never overwrite a row that moved off 'approximate'
+  // between this call's SELECT and its UPDATE. geocode_confidence is written
+  // from geocodeOne()'s OWN confidence tier (high/medium/low) — the same
+  // honest propagation Step A itself does — rather than a hardcoded value.
+  const updateAddress = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'kartverket_backlog', geocode_confidence = ?,
             updated_at = datetime('now')
       WHERE id = ? AND geocode_confidence = 'approximate'`
   );
@@ -954,15 +1033,55 @@ export async function runExperiencesGeocodeBacklogPass(
 
     try {
       // Step D's OWN gate, reused verbatim: an address-SHAPED adresse is not
-      // what this tier is for (a dead STREET address is Step A's problem, not
-      // this pass's) — parseAddressLike() returning non-null means "this
-      // looks like a street", exactly Step D's own signal to skip straight to
-      // the (already-applied) kommune fallback instead of trying Stedsnavn.
-      if (parseAddressLike(row.adresse)) {
+      // what the STEDSNAVN tier below is for (a dead STREET address is Step
+      // A's problem, not the sted lookup's) — parseAddressLike() returning
+      // non-null means "this looks like a street". Fix 3 (dev-request
+      // 2026-09-11): rather than skip it outright, give it the real address
+      // tier's own shot first — reusing the CLEANED street parseAddressLike()
+      // already extracted, never re-derived.
+      const parsedAddress = parseAddressLike(row.adresse);
+      if (parsedAddress) {
+        const addressResult = await geocodeOne(
+          parsedAddress.street,
+          parsedAddress.postnummer ?? "",
+          row.kommune ?? row.fylke ?? "",
+          deps
+        );
+
+        if (
+          addressResult.confidence !== "no_match" &&
+          isPlausibleNorwayCoord(addressResult.lat, addressResult.lng)
+        ) {
+          const planned = { lat: addressResult.lat, lon: addressResult.lng, place_name: parsedAddress.street };
+
+          if (dryRun) {
+            result.would_upgrade_address++;
+            result.rows.push({ ...base, action: "would_upgrade_address", planned });
+            continue;
+          }
+
+          const write = updateAddress.run(addressResult.lat, addressResult.lng, addressResult.confidence, row.id);
+          if (write.changes > 0) {
+            result.upgraded_address++;
+            result.rows.push({ ...base, action: "upgraded_address", planned });
+          } else {
+            // Same concurrent-race guard as updateSted below.
+            result.skipped_race++;
+            result.rows.push({
+              ...base, action: "skipped_race",
+              reason: "row's geocode_confidence changed since selection (concurrent run?) — left untouched",
+            });
+          }
+          continue;
+        }
+
+        // Tried the address tier and it could not confirm a point — same
+        // counter/action as before fix 3, but now honestly "attempted and
+        // still unconfirmed" rather than "never attempted".
         result.skipped_address_shaped++;
         result.rows.push({
           ...base, action: "skipped_address_shaped",
-          reason: "adresse is street-address-shaped, not a place name — outside this tier's scope",
+          reason: "adresse is street-address-shaped; address-tier geocode attempted but returned no confirmable Norwegian match",
         });
         continue;
       }

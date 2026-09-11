@@ -118,6 +118,16 @@ export const IMPLAUSIBLE_DISTANCE_KM_THRESHOLD = 50;
 export type InvalidateBackfillDeps = GeocodeDeps & {
   /** Report what would change; write nothing. */
   dryRun?: boolean;
+  /**
+   * Keyset pagination cursor (dev-request 2026-09-11-geo-pagination) — the
+   * last id the PREVIOUS call reported as `InvalidateBackfillResult.next_after`.
+   * Without it, a row this call CONFIRMS PLAUSIBLE or REJECTS AS UNCERTAIN
+   * keeps the exact same geo_precision='address' state, so a bare
+   * `ORDER BY id LIMIT ?` re-selects it at the top of every subsequent call
+   * forever and the tail of the eligible set past `limit` is never reached.
+   * Absent/undefined means "start from the beginning".
+   */
+  after?: string;
 };
 
 export type InvalidateBackfillPlannedChange = {
@@ -145,6 +155,8 @@ export type InvalidateBackfillResult = {
   errors: number;
   duration_ms: number;
   planned: InvalidateBackfillPlannedChange[];
+  /** Keyset pagination cursor — the id of the last row scanned this call, or null once the page came back shorter than `limit` (nothing left eligible). Pass back as `deps.after` on the next call. */
+  next_after: string | null;
 };
 
 type CandidateRow = {
@@ -190,6 +202,7 @@ function emptyStats(dryRun: boolean): InvalidateBackfillResult {
     errors: 0,
     duration_ms: 0,
     planned: [],
+    next_after: null,
   };
 }
 
@@ -208,6 +221,7 @@ export async function agentsGeocodeInvalidateBackfillTick(
   const db = getDb();
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const stats = emptyStats(dryRun);
+  const after = typeof deps.after === "string" ? deps.after : "";
 
   const candidates = db
     .prepare(
@@ -216,10 +230,15 @@ export async function agentsGeocodeInvalidateBackfillTick(
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE ${CANDIDATE_WHERE}
+          AND a.id > ?
         ORDER BY a.id ASC
         LIMIT ?`
     )
-    .all(limit) as CandidateRow[];
+    .all(after, limit) as CandidateRow[];
+  // Keyset cursor for the NEXT call — see InvalidateBackfillDeps.after's own
+  // comment for why a plain `ORDER BY id LIMIT ?` re-selects an unchanged row
+  // forever without it.
+  stats.next_after = candidates.length === limit && candidates.length > 0 ? candidates[candidates.length - 1].id : null;
 
   // Same reset PUT /admin/knowledge's own invalidation performs — guarded by
   // `geo_precision = 'address'` so a concurrent change between SELECT and

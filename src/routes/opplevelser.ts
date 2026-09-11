@@ -8350,7 +8350,7 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
 // Auth: X-Admin-Key via this file's own requireAdmin (same as every other
 // admin route here, including gardssalg-address-enrichment just above).
 router.post("/admin/gardssalg-geocode-backlog-sweep", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { limit?: unknown; dry_run?: unknown };
+  const body = (req.body ?? {}) as { limit?: unknown; dry_run?: unknown; after?: unknown };
 
   const {
     runExperiencesGeocodeBacklogPass,
@@ -8360,6 +8360,11 @@ router.post("/admin/gardssalg-geocode-backlog-sweep", requireAdmin, async (req: 
   } = require("../services/experiences-geocode-worker") as typeof import("../services/experiences-geocode-worker");
 
   const limit = clampExperiencesGeocodeBacklogLimit(body.limit);
+  // Keyset pagination cursor (dev-request 2026-09-11-geo-pagination) — the
+  // last id the PREVIOUS call reported as `next_after`. Same JSON-body
+  // convention as `limit`/`dry_run` above (this route has no query-param
+  // inputs). Absent/non-string means "start from the beginning".
+  const after = typeof body.after === "string" ? body.after : undefined;
 
   const dry = parseExperiencesGeocodeBacklogDryRunFlag(body.dry_run);
   if (!dry.ok) {
@@ -8370,14 +8375,16 @@ router.post("/admin/gardssalg-geocode-backlog-sweep", requireAdmin, async (req: 
 
   try {
     const status_before = experiencesGeocodeBacklogQueueStatus();
-    const result = await runExperiencesGeocodeBacklogPass(limit, { dryRun });
+    const result = await runExperiencesGeocodeBacklogPass(limit, { dryRun, after });
     const status_after = experiencesGeocodeBacklogQueueStatus();
 
     console.log(
-      `[gardssalg-geocode-backlog-sweep] dry_run=${dryRun} limit=${limit} ` +
-      `scanned=${result.candidates_scanned} upgraded=${result.upgraded} would_upgrade=${result.would_upgrade} ` +
+      `[gardssalg-geocode-backlog-sweep] dry_run=${dryRun} limit=${limit} after=${after ?? "(start)"} ` +
+      `scanned=${result.candidates_scanned} upgraded=${result.upgraded} upgraded_address=${result.upgraded_address} ` +
+      `would_upgrade=${result.would_upgrade} would_upgrade_address=${result.would_upgrade_address} ` +
       `ambiguous=${result.skipped_ambiguous} no_match=${result.skipped_no_match} ` +
-      `address_shaped=${result.skipped_address_shaped} race=${result.skipped_race} errors=${result.errors}`
+      `address_shaped=${result.skipped_address_shaped} race=${result.skipped_race} errors=${result.errors} ` +
+      `next_after=${result.next_after ?? "(exhausted)"}`
     );
 
     res.json({
