@@ -8211,6 +8211,101 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-geocode-backlog-sweep (admin) ────
+//
+// dev-request 2026-09-10-gardssalg-geocode-backlog-sted-retry.
+//
+// PRs #840/#841 shipped experiences-geocode-worker.ts Step D's Stedsnavn-in-
+// kommune tier (geocode_confidence='sted', see that file's own doc comment),
+// but measured live 2026-09-10 via GET /admin/gardssalg-outreach-readiness it
+// has hit ZERO rows: Step D's SELECT requires `lat IS NULL`, which is exactly
+// right for the ordinary hourly tick's documented idempotence ("never
+// re-hammers a dead address") but means the 85 providers already sitting at
+// geocode_confidence='approximate' (a kommune-centroid point stored BEFORE
+// Skive 2 shipped) are invisible to it forever — they already have a lat/lon.
+//
+// This route is the deliberate, EXPLICIT, BOUNDED exception: it calls
+// services/experiences-geocode-worker.ts's runExperiencesGeocodeBacklogPass(),
+// which re-attempts ONLY rows already at geocode_confidence='approximate',
+// via the SAME corroborated Stedsnavn-in-kommune lookup Step D itself uses
+// (no lookup logic reimplemented) — never writes anything it cannot
+// corroborate to the row's own kommune (an honest kommune centroid always
+// beats a wrong precise point), and never touches anything the ordinary tick
+// itself selects or writes (that SELECT/WHERE clause is completely
+// unmodified). See runExperiencesGeocodeBacklogPass()'s own doc comment for
+// the full reasoning.
+//
+// Pattern-matched to this codebase's two existing STRICT-dry_run admin batch
+// routes rather than this file's own apply=true convention (this route
+// REWRITES rows that already carry a value, unlike most of this file's own
+// admin levers, which fill in previously-blank fields):
+//   - POST /admin/agents/city-backfill (routes/marketplace.ts) — limit clamp
+//     + STRICT dry_run parsing (a quoted "true"/"false" is REJECTED, not
+//     coerced — review B4's own lesson: a misparsed dry_run on a mutation-
+//     rehearsal switch would otherwise perform a real write) + status
+//     before/after block.
+//   - GET/POST /admin/address-norge-suffix-sweep (routes/admin-knowledge.ts)
+//     — default-SAFE dry_run (absent/non-false means read-only) — the
+//     direction this route needs, since (unlike city-backfill's target rows,
+//     which start out empty) every candidate row here already has a stored
+//     point.
+// parseExperiencesGeocodeBacklogDryRunFlag() combines both: STRICT typing,
+// safe-by-default.
+//
+// Chunked/resumable: `limit` bounds each call (clampExperiencesGeocodeBacklogLimit,
+// [1, 50], default 40 — see that function's own comment for why this route's
+// ceiling is smaller than city-backfill's), and a row this call upgrades past
+// 'approximate' is excluded from the very next call's SELECT by the WHERE
+// clause itself — safely re-callable without double-writing, no separate
+// "already processed" bookkeeping needed.
+//
+// Auth: X-Admin-Key via this file's own requireAdmin (same as every other
+// admin route here, including gardssalg-address-enrichment just above).
+router.post("/admin/gardssalg-geocode-backlog-sweep", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown; dry_run?: unknown };
+
+  const {
+    runExperiencesGeocodeBacklogPass,
+    experiencesGeocodeBacklogQueueStatus,
+    clampExperiencesGeocodeBacklogLimit,
+    parseExperiencesGeocodeBacklogDryRunFlag,
+  } = require("../services/experiences-geocode-worker") as typeof import("../services/experiences-geocode-worker");
+
+  const limit = clampExperiencesGeocodeBacklogLimit(body.limit);
+
+  const dry = parseExperiencesGeocodeBacklogDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
+
+  try {
+    const status_before = experiencesGeocodeBacklogQueueStatus();
+    const result = await runExperiencesGeocodeBacklogPass(limit, { dryRun });
+    const status_after = experiencesGeocodeBacklogQueueStatus();
+
+    console.log(
+      `[gardssalg-geocode-backlog-sweep] dry_run=${dryRun} limit=${limit} ` +
+      `scanned=${result.candidates_scanned} upgraded=${result.upgraded} would_upgrade=${result.would_upgrade} ` +
+      `ambiguous=${result.skipped_ambiguous} no_match=${result.skipped_no_match} ` +
+      `address_shaped=${result.skipped_address_shaped} race=${result.skipped_race} errors=${result.errors}`
+    );
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        status_before,
+        status_after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[gardssalg-geocode-backlog-sweep] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Geocode backlog sweep failed" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/booking-test-send (admin) ─────────────────
 // ─── POST /api/opplevelser/admin/claim-test-send   (admin) ─────────────────
 //

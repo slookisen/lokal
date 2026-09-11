@@ -22,6 +22,18 @@ export interface GeoResult {
   placeType?: string;
 }
 
+/**
+ * Outcome of geocodeStedInKommuneDiagnostic() — see that method's own doc
+ * comment. `"resolved"` is produced by the exact same corroborated path
+ * geocodeStedInKommune() itself uses; `"ambiguous"` and `"no_match"` are both
+ * a refusal to write (never a guess), differing only in WHY, for a caller
+ * that has to report a reason to a human.
+ */
+export type StedLookupOutcome =
+  | { status: "resolved"; geo: GeoResult }
+  | { status: "ambiguous"; reason: string }
+  | { status: "no_match"; reason: string };
+
 // ── In-memory cache (survives request cycle, clears on restart) ──
 const geoCache = new Map<string, GeoResult | null>();
 const CACHE_MAX = 500;
@@ -785,6 +797,83 @@ class GeocodingService {
 
     this.cacheResult(key, result);
     return result;
+  }
+
+  /**
+   * Diagnostic twin of geocodeStedInKommune(), for the backlog re-geocode
+   * pass (experiences-geocode-worker.ts's runExperiencesGeocodeBacklogPass(),
+   * dev-request 2026-09-10-gardssalg-geocode-backlog-sted-retry). A bare
+   * `null` is enough for the live tick (Step D falls through to the kommune
+   * centroid either way, no report to write), but the backlog admin route has
+   * to tell a human WHY a row was left alone — "no Stedsnavn record exists at
+   * all for this name" and "the name exists, just not corroborated to this
+   * row's own kommune" call for different follow-up, and the acceptance
+   * criteria for the backlog pass require both to be distinguishable.
+   *
+   * This does NOT re-implement the HTTP call, the type/name filter, or the
+   * corroboration rule — it calls the exact same private helpers
+   * geocodeStedInKommune() itself calls (fetchStedsnavnHits /
+   * pickBestStedsnavnHit / stedKommuneMatches / stedsnavnHitToGeoResult), in
+   * the same order, with the same knr-filtered-then-unfiltered-corroborated
+   * ladder. `status: "resolved"` is produced by exactly that corroborated
+   * path, so this can never cause a write geocodeStedInKommune() itself would
+   * not have made. The ONE addition is a second, UNCORROBORATED lookup over
+   * the SAME already-fetched hits, made only when the corroborated attempt
+   * came back empty, purely to classify the `null` for reporting: a
+   * type/name-acceptable hit that exists in some OTHER kommune is
+   * "ambiguous" (a human may want to look at it), while no acceptable hit at
+   * all is "no_match" (there is nothing to look at).
+   */
+  async geocodeStedInKommuneDiagnostic(
+    stedNavn: string | null | undefined,
+    kommunenummer?: string | null,
+    kommuneNavn?: string | null,
+  ): Promise<StedLookupOutcome> {
+    const sted = (stedNavn || "").trim();
+    if (!sted || sted.length < 2) return { status: "no_match", reason: "empty place name" };
+
+    const nr = (kommunenummer || "").trim();
+    const kName = (kommuneNavn || "").trim();
+    if (!nr && !kName) return { status: "no_match", reason: "row has no kommune to corroborate against" };
+
+    try {
+      if (/^\d{4}$/.test(nr)) {
+        const filteredHits = await this.fetchStedsnavnHits(sted, nr);
+        const best = filteredHits.length > 0 ? this.pickBestStedsnavnHit(filteredHits, sted) : null;
+        if (best) return { status: "resolved", geo: this.stedsnavnHitToGeoResult(best, sted) };
+      }
+
+      const hits = await this.fetchStedsnavnHits(sted);
+      const corroborated = hits.length > 0
+        ? this.pickBestStedsnavnHit(hits, sted, (n) => this.stedKommuneMatches(n, nr, kName))
+        : null;
+      if (corroborated) return { status: "resolved", geo: this.stedsnavnHitToGeoResult(corroborated, sted) };
+
+      // Not corroborated. Same type/name filter as the accepted path, just
+      // WITHOUT the corroboration predicate — this can only ever CLASSIFY a
+      // null, never accept anything geocodeStedInKommune() itself refuses.
+      const uncorroborated = hits.length > 0 ? this.pickBestStedsnavnHit(hits, sted) : null;
+      if (uncorroborated) {
+        const otherKommuner = new Set<string>();
+        for (const n of hits) {
+          const list: any[] = Array.isArray(n?.kommuner) ? n.kommuner : [];
+          for (const k of list) {
+            const label = k?.kommunenavn || k?.kommunenummer;
+            if (label) otherKommuner.add(String(label));
+          }
+        }
+        return {
+          status: "ambiguous",
+          reason: otherKommuner.size > 0
+            ? `"${sted}" matches a Stedsnavn record not corroborated to this row's kommune (candidate kommuner: ${[...otherKommuner].join(", ")})`
+            : `"${sted}" matches a Stedsnavn record that could not be corroborated to this row's kommune`,
+        };
+      }
+      return { status: "no_match", reason: `no acceptable Stedsnavn record for "${sted}"` };
+    } catch (err) {
+      console.error(`[geocoding] geocodeStedInKommuneDiagnostic failed for "${sted}":`, err);
+      return { status: "no_match", reason: "lookup failed" };
+    }
   }
 
   /**
