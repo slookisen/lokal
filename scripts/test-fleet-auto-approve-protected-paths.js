@@ -119,11 +119,76 @@ function patchLines(patch, prefix) {
 // from "harmless", and this is a security-relevant surface, so it stays
 // unconditionally flagged rather than guessed at.
 //
+// Gap check (dev-request 2026-09-11-fleet-auto-approve-requireadmin-
+// falsk-positiv, reviewer-found gap): a same-requireAdmin-token-
+// sequence pair is NOT automatically collateral — a reviewer showed
+// `if (!requireAdmin(req, res)) return;` -> `if (isDevMode ||
+// !requireAdmin(req, res)) return;` has an identical token sequence
+// (["requireAdmin"] both sides) yet obviously must stay flagged: a
+// new `||`/`&&`/`!` conjoined directly onto the guard's own
+// invocation changes whether/when it gets evaluated. Token-sequence
+// equality alone can't distinguish that from the PR-646 case (an
+// unrelated `async` inserted elsewhere on the line), so
+// requireAdminChangeIsCollateral() below additionally locates the
+// single edited span on the line (longest common prefix/suffix
+// between the removed/added content) and requires every
+// requireAdmin occurrence to be separated from that span by a
+// structural boundary character — the call/statement has closed
+// (`,` `;` `}` `)`) — before treating the pair as collateral.
 // Mirrored (duplicated intentionally — the workflow runner has no checkout
 // step, so this logic must stay inline there) in
 // .github/workflows/fleet-auto-approve.yml — keep both in sync (AC3/AC7).
 const REQUIRE_ADMIN_TOKEN_RE = /\brequireAdmin\w*\b/g;
 const REQUIRE_ADMIN_DEF_RE = /function\s+requireAdmin\w*\s*\(/;
+// Boundary characters that, found strictly between a requireAdmin
+// occurrence and the line's single edited span, mark the edit as
+// structurally separate from the guard's own invocation — the call/
+// argument-list/statement has closed. Deliberately EXCLUDES `(`
+// (a changed argument list starts right after `requireAdmin(` and
+// must stay flagged) and all boolean/negation operator characters
+// `!` `&` `|` (a newly inserted `isDevMode ||` or bare `!` sits
+// directly against the guard's own invocation with nothing
+// structural between them, so it must never read as a safe stop).
+const REQUIRE_ADMIN_GAP_BOUNDARY_RE = /[,;{})]/;
+// requireAdminChangeIsCollateral(rContent, aContent) — true only when
+// every requireAdmin occurrence in rContent is separated from the
+// line's single edited span (found via longest common prefix/suffix
+// between rContent and aContent — cheap and sufficient since callers
+// already confirmed the requireAdmin token sequence itself matches)
+// by a boundary character. The prefix/suffix region is byte-identical
+// on both sides by construction, so checking rContent's occurrences
+// against it is enough — no need to separately re-check aContent. Any
+// occurrence that overlaps the edited span itself, or whose gap has
+// no boundary character, fails the WHOLE pair closed (conservative:
+// one unexplained occurrence is enough to keep it flagged).
+function requireAdminChangeIsCollateral(rContent, aContent) {
+  if (rContent === aContent) return true;
+  const minLen = Math.min(rContent.length, aContent.length);
+  let prefixLen = 0;
+  while (prefixLen < minLen && rContent[prefixLen] === aContent[prefixLen]) prefixLen++;
+  let suffixLen = 0;
+  const maxSuffix = minLen - prefixLen;
+  while (
+    suffixLen < maxSuffix &&
+    rContent[rContent.length - 1 - suffixLen] === aContent[aContent.length - 1 - suffixLen]
+  ) suffixLen++;
+  const changeStart = prefixLen;
+  const changeEnd = rContent.length - suffixLen;
+  REQUIRE_ADMIN_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = REQUIRE_ADMIN_TOKEN_RE.exec(rContent))) {
+    const ts = m.index;
+    const te = ts + m[0].length;
+    if (te <= changeStart) {
+      if (!REQUIRE_ADMIN_GAP_BOUNDARY_RE.test(rContent.slice(te, changeStart))) return false;
+    } else if (ts >= changeEnd) {
+      if (!REQUIRE_ADMIN_GAP_BOUNDARY_RE.test(rContent.slice(changeEnd, ts))) return false;
+    } else {
+      return false; // occurrence overlaps the edited span itself
+    }
+  }
+  return true;
+}
 function requireAdminEditMatch(patch) {
   const lines = (patch || '').split('\n');
   const maskRemoved = new Map();
@@ -143,7 +208,7 @@ function requireAdminEditMatch(patch) {
           const rMatches = rContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
           const aMatches = aContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
           const sameSeq = rMatches.length === aMatches.length && rMatches.every((m, idx2) => m === aMatches[idx2]);
-          if (rMatches.length > 0 && sameSeq) {
+          if (rMatches.length > 0 && sameSeq && requireAdminChangeIsCollateral(rContent, aContent)) {
             maskRemoved.set(removedIdx[k], rContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
             maskAdded.set(addedIdx[k], aContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
           }
@@ -336,6 +401,32 @@ checkContent(
     '+});',
   ].join('\n'),
   false,
+);
+
+// Reviewer-found gap fix (dev-request 2026-09-11-fleet-auto-approve-
+// requireadmin-falsk-positiv, post-merge review round): the requireAdmin
+// token sequence is IDENTICAL on both sides of these pairs (["requireAdmin"]
+// both times), so the token-sequence-only check alone would wrongly treat
+// them as collateral like the PR-646 `async` case — but here a new boolean
+// operator is conjoined DIRECTLY onto the guard's own invocation, changing
+// whether/when it actually gets evaluated. Must stay flagged.
+checkContent(
+  'reviewer gap: requireAdmin guard short-circuited by a newly-inserted `isDevMode ||` is flagged',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-  if (!requireAdmin(req, res)) return;',
+    '+  if (isDevMode || !requireAdmin(req, res)) return;',
+  ].join('\n'),
+  true,
+);
+checkContent(
+  'reviewer gap: requireAdmin guard short-circuited by a newly-inserted `featureFlagOff &&` is flagged',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-  if (!requireAdmin(req, res)) return;',
+    '+  if (featureFlagOff && !requireAdmin(req, res)) return;',
+  ].join('\n'),
+  true,
 );
 
 // AC1: a PR that edits requireAdmin's OWN implementation (its definition
