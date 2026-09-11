@@ -50,6 +50,18 @@
  *   (i) pagination: a page where every row stays still_unresolved (no state
  *       change) still ADVANCES via `next_after` on the next call, instead of
  *       a bare `ORDER BY id LIMIT ?` re-selecting the same rows forever.
+ *   (m) org_nr-collision guard (independent-review fix-up, post-approval
+ *       defect on this file's own initial commit): a fresh Brreg lookup for
+ *       a brreg_active IS NULL row can resolve to an org_nr ANOTHER existing
+ *       row already holds (experience_providers.org_nr is UNIQUE) — the
+ *       exact duplicate/near-duplicate-provider scenario bulk-load's own
+ *       resolve-or-create logic already guards against via
+ *       getProviderByOrgnr(). Asserts: the write is fail-closed (brreg_active
+ *       stays NULL, exactly as an ordinary still_unresolved row), EXACTLY
+ *       ONE `planned` entry is emitted for that provider_id (never a
+ *       resolved_active entry AND a contradictory still_unresolved entry for
+ *       the same row), and resolved_active + resolved_inactive +
+ *       still_unresolved === processed holds (no double counting).
  *   (j) enrichment write-pause fence: apply blocked 423 under a live
  *       'experiences' pause (paused:true, vertical:'experiences'), ZERO
  *       writes; dry-run under the same pause is NEVER blocked; clearing the
@@ -386,6 +398,53 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
         // (a per-provider isolation, mirroring bulk-load's own per-provider try/catch).
         assertEq(byId.get("prov-h2-active")?.outcome, "resolved_active", "brb-h5: a sibling row after the throwing one is still processed correctly");
         assertEq(providerRow("prov-h2-active").brreg_active, 1, "brb-h6: …and actually written");
+      }
+
+      // ═══ (m) org_nr-collision guard (independent-review fix-up) ════════
+      {
+        // Two providers where a fresh Brreg lookup for the brreg_active IS
+        // NULL one (navnDup) resolves to an org_nr that ANOTHER existing row
+        // (prov-zc1-collide-existing) already holds. Before the fix,
+        // setBrregVerification() would throw SQLITE_CONSTRAINT (org_nr is
+        // UNIQUE); the outer catch would ALSO increment
+        // still_unresolved/errors and push a SECOND, contradictory `planned`
+        // entry for the SAME provider_id (a resolved_active entry already
+        // having been pushed BEFORE the write attempt).
+        const navnDup = "Aktiv KollisjonDuplikat AS";
+        const collidingOrgNr = orgNrFor(navnDup);
+        seedProvider({
+          id: "prov-zc1-collide-existing", navn: "Aktiv KollisjonEksisterende AS",
+          brreg_active: 1, brreg_verified: 1, org_nr: collidingOrgNr,
+        });
+        // NULL -> a true candidate; the Brreg stub resolves this navn to
+        // collidingOrgNr, already held by prov-zc1-collide-existing above.
+        seedProvider({ id: "prov-zc2-collide-dup", navn: navnDup });
+
+        const dupBefore = providerRow("prov-zc2-collide-dup");
+        const existingBefore = providerRow("prov-zc1-collide-existing");
+
+        // `after: "prov-uz"` isolates this section from every candidate
+        // seeded earlier (same convention as section (i) below) — the only
+        // NULL row with an id sorting after it at this point is
+        // prov-zc2-collide-dup itself.
+        const r = await callRoute(opplevelserRouter, {
+          url: ROUTE, headers: adminHeaders,
+          body: { dry_run: false, limit: 10, after: "prov-uz" },
+        });
+        assertEq(r.status, 200, "brb-m1: an org_nr collision does not 500 the route");
+
+        const dupPlanned = (r.body.planned as any[]).filter((p) => p.provider_id === "prov-zc2-collide-dup");
+        assertEq(dupPlanned.length, 1, "brb-m2: EXACTLY ONE planned entry for the colliding row — never two contradictory entries for one provider_id");
+        assertEq(dupPlanned[0]?.outcome, "still_unresolved", "brb-m3: the colliding row's single planned entry is still_unresolved (or an equally single, non-contradictory terminal outcome)");
+
+        assertEq(
+          r.body.resolved_active + r.body.resolved_inactive + r.body.still_unresolved,
+          r.body.processed,
+          "brb-m4: resolved_active + resolved_inactive + still_unresolved === processed — no double counting from the collision",
+        );
+
+        assertEq(providerRow("prov-zc2-collide-dup"), dupBefore, "brb-m5: fail-closed — ZERO write to the colliding row; brreg_active stays NULL exactly as before");
+        assertEq(providerRow("prov-zc1-collide-existing"), existingBefore, "brb-m6: the row that already legitimately holds the org_nr is completely untouched");
       }
 
       // ═══ (i) pagination: still_unresolved rows still ADVANCE ══════════

@@ -78,7 +78,7 @@
 
 import { getDb } from "../database/db-factory";
 import { classifyProvider, sleep as defaultSleep, type BrregClass } from "./experience-brreg";
-import { setBrregVerification } from "./experience-store";
+import { getProviderByOrgnr, setBrregVerification } from "./experience-store";
 
 const VERTICAL = "experiences";
 
@@ -211,34 +211,86 @@ export async function experienceBrregRecheckBackfillTick(
     try {
       const verdict = await classifyProvider({ name: row.navn, kommune: row.kommune });
 
-      if (verdict.classification === "verified_active") {
-        result.resolved_active++;
+      // org_nr-collision guard (independent-review fix-up): experience_providers.org_nr
+      // is UNIQUE. A fresh Brreg lookup can resolve to an org_nr ANOTHER row already
+      // holds (a duplicate/near-duplicate provider) — the exact scenario bulk-load's own
+      // resolve-or-create logic already guards against by resolving identity through
+      // getProviderByOrgnr() BEFORE ever writing (routes/opplevelser.ts). Checking here,
+      // before calling setBrregVerification(), keeps this file's own invariant intact:
+      // exactly ONE `planned` entry per row, and resolved_active + resolved_inactive +
+      // still_unresolved === processed, always — even for a collision. (Without this
+      // guard, the write below would throw SQLITE_CONSTRAINT and the outer catch would
+      // push a SECOND, contradictory planned entry for the same provider_id.)
+      const orgNrHeldByAnotherRow =
+        !!verdict.org_nr &&
+        (() => {
+          const holder = getProviderByOrgnr(verdict.org_nr as string);
+          return holder !== null && (holder.id as string) !== row.id;
+        })();
+
+      if (orgNrHeldByAnotherRow) {
+        result.still_unresolved++;
         result.planned.push({
           provider_id: row.id,
           navn: row.navn,
           kommune: row.kommune,
-          outcome: "resolved_active",
-          org_nr: verdict.org_nr,
+          outcome: "still_unresolved",
+          org_nr: null,
           classification: verdict.classification,
-          detail: "fresh Brreg lookup found a confident active match this run — brreg_active -> 1",
+          detail: `fresh Brreg lookup resolved org_nr ${verdict.org_nr} but it is already held by a different provider row — left untouched, brreg_active stays NULL (org_nr collision, not a guess)`,
         });
-        if (!dryRun) {
-          setBrregVerification(row.id, 1, verdict.org_nr ?? undefined);
-        }
-      } else if (verdict.classification === "inactive") {
-        result.resolved_inactive++;
-        result.planned.push({
-          provider_id: row.id,
-          navn: row.navn,
-          kommune: row.kommune,
-          outcome: "resolved_inactive",
-          org_nr: verdict.org_nr,
-          classification: verdict.classification,
-          detail:
-            "fresh Brreg lookup found a confident match but the entity is konkurs/under avvikling/slettet — brreg_active -> 0 (a confirmed answer, not a guess)",
-        });
-        if (!dryRun) {
-          setBrregVerification(row.id, 0, verdict.org_nr ?? undefined);
+      } else if (verdict.classification === "verified_active" || verdict.classification === "inactive") {
+        // Dedicated try/catch around JUST the write (independent-review fix-up):
+        // the org_nr-collision guard above catches the known, expected collision
+        // case BEFORE attempting the write, but a write can still fail for an
+        // unrelated reason (e.g. a DB lock, or a race against another writer
+        // between the check above and this UPDATE). Either way, counters/planned
+        // must reflect the write's ACTUAL outcome exactly once — never increment
+        // resolved_active/resolved_inactive (or push that planned entry) before
+        // a real (non-dry-run) write has actually succeeded, and never let this
+        // fall through to the outer catch, which would double-count the row.
+        const active = verdict.classification === "verified_active" ? 1 : 0;
+        try {
+          if (!dryRun) {
+            setBrregVerification(row.id, active, verdict.org_nr ?? undefined);
+          }
+          if (active === 1) {
+            result.resolved_active++;
+            result.planned.push({
+              provider_id: row.id,
+              navn: row.navn,
+              kommune: row.kommune,
+              outcome: "resolved_active",
+              org_nr: verdict.org_nr,
+              classification: verdict.classification,
+              detail: "fresh Brreg lookup found a confident active match this run — brreg_active -> 1",
+            });
+          } else {
+            result.resolved_inactive++;
+            result.planned.push({
+              provider_id: row.id,
+              navn: row.navn,
+              kommune: row.kommune,
+              outcome: "resolved_inactive",
+              org_nr: verdict.org_nr,
+              classification: verdict.classification,
+              detail:
+                "fresh Brreg lookup found a confident match but the entity is konkurs/under avvikling/slettet — brreg_active -> 0 (a confirmed answer, not a guess)",
+            });
+          }
+        } catch (writeErr) {
+          result.errors++;
+          result.still_unresolved++;
+          result.planned.push({
+            provider_id: row.id,
+            navn: row.navn,
+            kommune: row.kommune,
+            outcome: "still_unresolved",
+            org_nr: null,
+            classification: verdict.classification,
+            detail: `Brreg verdict was confident but the write failed (${writeErr instanceof Error ? writeErr.message : String(writeErr)}) — left untouched, brreg_active stays NULL, never guessed`,
+          });
+          console.error(`[experience-brreg-recheck-backfill] write failed for ${row.id}:`, writeErr);
         }
       } else {
         result.still_unresolved++;
