@@ -26,6 +26,11 @@
  *   b21-b23 dry_run: reports the SAME flagged outcome, writes NOTHING
  *   b24     agentsGeocodeInvalidateBackfillQueueStatus() counts exactly the
  *           eligible rows
+ *   b25-b30 dev-request 2026-09-11-geo-pagination: a page where EVERY row is
+ *           left unchanged (confirmed_plausible / rejected_uncertain — no
+ *           geo_precision write either way) still ADVANCES on the next call
+ *           via the `next_after` cursor, instead of the plain
+ *           `ORDER BY id LIMIT ?` re-selecting the exact same rows forever
  *
  * Every scenario asserts the geocode-field RESET is the exact same
  * seven-field shape PUT /admin/knowledge's own invalidation uses (geo_
@@ -236,6 +241,47 @@ export function runAgentsGeocodeInvalidateBackfillTests(
       assertEq(dryPlanned?.outcome, "re_geocode_flagged", "b21: dry run still IDENTIFIES the flagged row");
       assertEq(afterDry.geo_precision, beforeDry.geo_precision, "b22: …but geo_precision is byte-identical (nothing written)");
       assertEq(afterDry.lat, beforeDry.lat, "b23: …and lat is byte-identical");
+
+      // ── b25-b30: pagination — a fully-unchanged page still ADVANCES ──
+      // Explicit ids that sort AFTER every id used above ('z' > any of
+      // v/f/n/u/s/d), so `after: "zz-cursor-00"` isolates this section from
+      // however many rows above are still eligible, regardless of their ids.
+      seed({
+        id: "zz-cursor-01", name: "Cursor Gård 1", lat: 60.0, lng: 10.0,
+        geo_precision: "address", address: "Uncertainveien 5", postal_code: "9990",
+      });
+      seed({
+        id: "zz-cursor-02", name: "Cursor Gård 2", lat: 60.0, lng: 10.0,
+        geo_precision: "address", address: "Uncertainveien 5", postal_code: "9990",
+      });
+      seed({
+        id: "zz-cursor-03", name: "Cursor Gård 3", lat: 60.0, lng: 10.0,
+        geo_precision: "address", address: "Uncertainveien 5", postal_code: "9990",
+      });
+
+      const cursorPage1 = await worker.agentsGeocodeInvalidateBackfillTick(2, { ...deps, after: "zz-cursor-00" });
+      assertEq(cursorPage1.processed, 2, "b25: page 1 processes exactly `limit` rows");
+      assertEq(cursorPage1.next_after, "zz-cursor-02", "b26: next_after is the id of the LAST row this call processed");
+      const cursorPage1Ids = cursorPage1.planned.map((p) => p.agent_id);
+      assertTrue(
+        cursorPage1Ids.includes("zz-cursor-01") && cursorPage1Ids.includes("zz-cursor-02") && !cursorPage1Ids.includes("zz-cursor-03"),
+        `b27: page 1 covers rows 1-2, not row 3 (got ${JSON.stringify(cursorPage1Ids)})`
+      );
+      // Neither row changed (fresh re-check misses -> rejected_uncertain, no
+      // write) — both STILL eligible, exactly the condition that made a
+      // cursor-less call re-select the same rows forever.
+      assertEq(rowOf("zz-cursor-01").geo_precision, "address", "b28: row 1 left unchanged (rejected_uncertain, never guessed)");
+
+      const cursorPage2 = await worker.agentsGeocodeInvalidateBackfillTick(2, { ...deps, after: cursorPage1.next_after ?? undefined });
+      const cursorPage2Ids = cursorPage2.planned.map((p) => p.agent_id);
+      assertTrue(
+        !cursorPage2Ids.includes("zz-cursor-01") && !cursorPage2Ids.includes("zz-cursor-02"),
+        `b29: page 2 does NOT re-process the rows page 1 already processed, even though neither changed (got ${JSON.stringify(cursorPage2Ids)})`
+      );
+      assertTrue(
+        cursorPage2Ids.includes("zz-cursor-03") && cursorPage2.next_after === null,
+        `b30: page 2 reaches row 3, and next_after is null once the page comes back shorter than \`limit\` — backlog exhausted (ids=${JSON.stringify(cursorPage2Ids)}, next_after=${cursorPage2.next_after})`
+      );
     } finally {
       initMod.__setDbForTesting(prevDb);
       try {

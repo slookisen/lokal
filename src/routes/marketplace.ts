@@ -7745,7 +7745,7 @@ router.post("/admin/agents/geocode-invalidate-backfill", async (req: Request, re
     return;
   }
 
-  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown; after?: unknown };
 
   const { clampGeocodeBatchLimit, parseDryRunFlag } =
     require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
@@ -7754,6 +7754,11 @@ router.post("/admin/agents/geocode-invalidate-backfill", async (req: Request, re
       typeof import("../services/agents-geocode-invalidate-backfill");
 
   const limit = clampGeocodeBatchLimit(body.limit);
+  // Keyset pagination cursor (dev-request 2026-09-11-geo-pagination) — the
+  // last id the PREVIOUS call reported as `next_after`. Same JSON-body
+  // convention as `limit`/`dry_run` above. Absent/non-string means "start
+  // from the beginning".
+  const cursorAfter = typeof body.after === "string" ? body.after : undefined;
 
   const dry = parseDryRunFlag(body.dry_run);
   if (!dry.ok) {
@@ -7764,7 +7769,7 @@ router.post("/admin/agents/geocode-invalidate-backfill", async (req: Request, re
 
   try {
     const before = agentsGeocodeInvalidateBackfillQueueStatus();
-    const result = await agentsGeocodeInvalidateBackfillTick(limit, { dryRun });
+    const result = await agentsGeocodeInvalidateBackfillTick(limit, { dryRun, after: cursorAfter });
     const after = agentsGeocodeInvalidateBackfillQueueStatus();
 
     res.json({
