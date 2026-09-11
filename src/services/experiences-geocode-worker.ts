@@ -742,7 +742,7 @@ export async function experiencesGeocodeTick(
       }
       const result = await geocodeOne(
         parsed.street,
-        parsed.postnummer as string,
+        parsed.postnummer ?? "",
         row.poststed ?? row.kommune ?? "",
         deps
       );

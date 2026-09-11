@@ -43,6 +43,7 @@ export interface TestSummary {
 // produced the stored position.
 const PROVIDER_POINT = { lat: 67.2804, lon: 14.4049 };  // provider street address
 const MEETING_POINT = { lat: 67.2900, lon: 14.3800 };   // meeting_point address
+const CARE_OF_MEETING_POINT = { lat: 67.2950, lon: 14.3700 };  // care-of meeting_point, no postnummer anywhere
 
 export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -191,6 +192,20 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
         verification_status: "verified", confidence: "high",
       });
 
+      // …and one whose meeting_point is a care-of-prefixed street address with
+      // NO postnummer anywhere in the string — p25's shape, but exercised
+      // through Step F (not just parseAddressLike() in isolation). Regression
+      // for the review-round-1 finding: parsed.postnummer was cast `as string`
+      // and, once the care-of exception let parseAddressLike() return
+      // {postnummer: null}, the literal string "null" was interpolated
+      // straight into the Kartverket query template.
+      const expCareOfMeetingPoint = expStore.createExperience({
+        title: "Brygga hos Kari", provider_id: withoutAddress,
+        provider_match_status: "matched", kommune: "Bodø", fylke: "Nordland",
+        meeting_point: "c/o Kari Nordmann, Fjellveien 8",
+        verification_status: "verified", confidence: "high",
+      });
+
       // Put the world in the state the live catalogue is actually in: every
       // experience at kommune precision, the address-bearing provider already
       // geocoded, the address-less provider placed at 'approximate'.
@@ -211,8 +226,17 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
         sleep: async () => {},
         fetchImpl: (async (input: any) => {
           const url = decodeURIComponent(String(input));
+          // Regression guard for the review-round-1 finding: a literal "null"
+          // token must never reach the Kartverket query string. Fail loudly
+          // (throw, not a silently-empty result) rather than let a corrupted
+          // query merely happen to return no hits and pass by accident.
+          if (/\bnull\b/i.test(url)) {
+            throw new Error(`fetchImpl received a query containing a literal "null" token: ${url}`);
+          }
           const body = /havnegata/i.test(url)
             ? { adresser: [{ representasjonspunkt: MEETING_POINT }] }
+            : /fjellveien/i.test(url)
+            ? { adresser: [{ representasjonspunkt: CARE_OF_MEETING_POINT }] }
             : { adresser: [] };
           return { ok: true, status: 200, json: async () => body } as unknown as Response;
         }) as unknown as typeof fetch,
@@ -261,6 +285,16 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
           "f3: «ved brygga» is not an address — the row stays honestly at kommune precision");
         assertEq(vague.loc_lat, 67.2804,
           "f4: …with its kommune-centroid position untouched (no guessed point)");
+
+        // f5-f6: a care-of-prefixed meeting_point with NO postnummer anywhere
+        // still resolves via Step F (the fetchImpl mock above already asserts
+        // no literal "null" reached the query — if it had, this tick would
+        // have thrown instead of writing a position).
+        const careOf = rowOf(expCareOfMeetingPoint);
+        assertEq(careOf.geo_precision, "address",
+          "f5: a care-of-prefixed, postnummer-less meeting_point still resolves through Step F");
+        assertEq(careOf.loc_lat, CARE_OF_MEETING_POINT.lat,
+          "f6: …at the position Kartverket returned for the cleaned street line");
       }
 
       // ── B2: Step F must ROTATE, not re-select the same residue forever ──
