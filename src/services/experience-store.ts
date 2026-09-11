@@ -1406,19 +1406,20 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
 
 
 /**
- * Intent-discovery query — the heart of "Hva kan vi finne på i [sted]".
- *
- * Only surfaces rows that are publishable: verified experience whose provider
- * is brreg_active, confidence >= medium. Weather/season/group/age narrow the
- * set; final fine-ranking is left to the MCP/agent layer.
+ * Builds the WHERE-clause fragments + bound params shared by
+ * discoverExperiences() and countDiscoverExperiences() — factored out so the
+ * two can NEVER drift apart (see countDiscoverExperiences()'s doc comment for
+ * why that guarantee matters). `f` must already be DiscoverFilterSchema-parsed.
+ * Pure — no DB access, no LIMIT/params.limit (that's caller-specific: a page
+ * query needs it, a COUNT(*) doesn't).
  */
-export function discoverExperiences(
-  filter: DiscoverFilter = {},
-  limit = 20
-): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
-  const f = DiscoverFilterSchema.parse(filter);
-  const db = getDb(VERTICAL);
-
+function buildDiscoverWhere(f: DiscoverFilter): {
+  where: string[];
+  params: Record<string, unknown>;
+  hasGeo: boolean;
+  originLat: number | undefined;
+  originLng: number | undefined;
+} {
   // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
   // high/medium + provider brreg_active + canonical (never a dedup-merged
   // duplicate, dev-request 2026-07-04-opplevagent-dedup-og-norske-titler
@@ -1481,6 +1482,66 @@ export function discoverExperiences(
   if (typeof f.max_price === "number") { where.push("(e.price_from IS NULL OR e.price_from <= @maxp)"); params.maxp = f.max_price; }
   if (typeof f.duration_max === "number") { where.push("(e.duration_min IS NULL OR e.duration_min <= @dmax)"); params.dmax = f.duration_max; }
   if (f.language) { where.push("(e.languages IS NULL OR e.languages LIKE @lang)"); params.lang = `%"${f.language}"%`; }
+
+  return { where, params, hasGeo, originLat, originLng };
+}
+
+/**
+ * True count of PUBLISHED experiences matching `filter` — independent of any
+ * page size. Companion to discoverExperiences()/discoverExperiencesRelaxed().
+ *
+ * Root cause this closes (dev-request 2026-09-11-discover-apply-sync): GET
+ * /discover's JSON `count` field was always `results.length`, and
+ * discoverExperiences()'s SQL always ends `LIMIT @limit` (default 20, hard-
+ * capped at 100) — so once a fylke/category slice already had ≥ limit
+ * published rows, `count` could never increase again no matter how many more
+ * matching rows a bulk-load/content-refresh apply call went on to insert and
+ * publish. Confirmed live: apply:true bulk-loads kept reporting real
+ * inserted-row counts while GET /discover?fylke=<X> (or ?category=<Y>)
+ * stayed flat for days. This was never a caching/stale-index problem —
+ * discoverExperiences() already reads the live `experiences` table fresh on
+ * every call, through the SAME sqlite connection every write goes through
+ * (see db-factory.ts) — the endpoint simply never exposed an UNbounded
+ * count. countDiscoverExperiences() reuses buildDiscoverWhere() — the EXACT
+ * same WHERE/PUBLISH_GATE_SQL predicate discoverExperiences() itself builds
+ * — so this total can never drift from what a page of results would agree
+ * with.
+ *
+ * Caveat: when both a geo origin AND radius_km are given, this counts the
+ * cheap SQL bounding-box candidates (the same pre-filter discoverExperiences()
+ * uses before its exact in-JS haversine cut), so it can slightly overcount at
+ * the box's corners for that one filter combination. Every other filter
+ * combination — including the fylke/category case this fix targets — is exact.
+ */
+export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
+  const f = DiscoverFilterSchema.parse(filter);
+  const db = getDb(VERTICAL);
+  const { where, params } = buildDiscoverWhere(f);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS total FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${where.join(" AND ")}`
+    )
+    .get(params) as { total: number } | undefined;
+  return row?.total ?? 0;
+}
+
+/**
+ * Intent-discovery query — the heart of "Hva kan vi finne på i [sted]".
+ *
+ * Only surfaces rows that are publishable: verified experience whose provider
+ * is brreg_active, confidence >= medium. Weather/season/group/age narrow the
+ * set; final fine-ranking is left to the MCP/agent layer.
+ */
+export function discoverExperiences(
+  filter: DiscoverFilter = {},
+  limit = 20
+): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
+  const f = DiscoverFilterSchema.parse(filter);
+  const db = getDb(VERTICAL);
+
+  const { where, params, hasGeo, originLat, originLng } = buildDiscoverWhere(f);
 
   // When a geo origin is given, the true top-N-by-distance can't be decided
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous

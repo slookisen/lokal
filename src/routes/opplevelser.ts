@@ -26,6 +26,7 @@ import {
   // Same slice: bulk-load admission-gate verdict stamp.
   stampExperienceAdmissionVerdict,
   discoverExperiencesRelaxed,
+  countDiscoverExperiences,
   buildRelaxationNote,
   buildNarrowingSuggestions,
   listCategories,
@@ -1008,17 +1009,27 @@ router.get("/discover", (req: Request, res: Response) => {
       return;
     }
 
-    const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit);
+    const { results, relaxedKeys, appliedFilter } = discoverExperiencesRelaxed(filter, limit);
     const note = buildRelaxationNote(relaxedKeys);
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
     // distance_km/geo_precision are only meaningful (and only ever present)
     // when an origin was given — omitting lat/lng must produce byte-identical
     // rows to before this feature existed.
     const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+    // `count` is (and always was) just `results.length` — the size of THIS
+    // page, silently bounded by `limit` (default 20, hard cap 100). `total`
+    // is the true, unbounded count of published rows matching the filter
+    // that was actually applied (appliedFilter — after any zero-hit
+    // relaxation above), so a caller polling growth after an apply:true
+    // bulk-load/content-refresh call has a number that isn't pinned at the
+    // page size. See countDiscoverExperiences()'s doc comment
+    // (experience-store.ts) for the bug this closes.
+    const total = countDiscoverExperiences(appliedFilter);
     res.json({
       vertical: "experiences",
       query: filter,
       count: results.length,
+      total,
       relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
       note: note ?? undefined,
       suggestions: suggestions.length > 0 ? suggestions : undefined,
