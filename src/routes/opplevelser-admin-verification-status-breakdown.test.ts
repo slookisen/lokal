@@ -26,7 +26,20 @@
  *   (4) category filter: only rows for that category are counted
  *   (5) fylke + category together AND, not OR
  *   (6) a filter matching zero rows returns total 0, empty breakdown, not
- *       an error
+ *       an error (uses a nonsense fylke name that cannot land in ANY
+ *       fylke-reform equivalence class — see (7)'s comment for why a real
+ *       fylke like "Finnmark" is no longer a safe zero-match example here)
+ *   (7) round-3 fix-up regression (independent reviewer, round 2
+ *       CHANGES-REQUESTED): the endpoint's fylke filter must bridge
+ *       2020/2024 fylke-reform spellings via fylkeEquivalents() — the SAME
+ *       way buildDiscoverWhere() does for /discover — not do a bare
+ *       `fylke = @fylke` literal match. A row stored as the pre-2024
+ *       DB spelling "Troms og Finnmark" must be counted when queried as
+ *       ?fylke=Troms. (This is also why (6)'s zero-match case moved off
+ *       "Finnmark": fylkeEquivalents("Finnmark") includes "Troms og
+ *       Finnmark", so once this fixture row exists, ?fylke=Finnmark
+ *       correctly matches it too — asserting 0 there would no longer be
+ *       testing "zero matches", it'd be re-testing this same bridging.)
  */
 
 export interface TestSummary {
@@ -171,6 +184,17 @@ export function runOpplevelserAdminVerificationStatusBreakdownTests(
         fylke: "Vestland", category: "mat_drikke", confidence: "high",
         verification_status: "verified",
       });
+      // Round-3 fix-up regression fixture (7): stored under the pre-2024
+      // merged DB spelling "Troms og Finnmark" — a ?fylke=Troms query MUST
+      // still count it (fylkeEquivalents("Troms") includes "Troms og
+      // Finnmark"). category is deliberately NOT mat_drikke/overnatting so
+      // this fixture can't accidentally shift the Rogaland/category totals
+      // the other test cases above already assert.
+      expStore.createExperience({
+        title: "Troms og Finnmark regresjon", provider_match_status: "unmatched",
+        fylke: "Troms og Finnmark", category: "natur", confidence: "high",
+        verification_status: "verified",
+      });
 
       // ── (1) unauthenticated -> 403 ───────────────────────────────────────
       const unauth = await callRoute(router, {
@@ -185,8 +209,8 @@ export function runOpplevelserAdminVerificationStatusBreakdownTests(
         path: "/admin/verification-status-breakdown", headers: authHeaders,
       });
       assertEq(all.status, 200, "no-filter request succeeds");
-      assertEq(all.body.total, 7, "no-filter total counts every row");
-      assertEq(all.body.breakdown.verified, 3, "no-filter verified count (2 Rogaland + 1 Vestland)");
+      assertEq(all.body.total, 8, "no-filter total counts every row");
+      assertEq(all.body.breakdown.verified, 4, "no-filter verified count (2 Rogaland + 1 Vestland + 1 Troms og Finnmark)");
       assertEq(all.body.breakdown.needs_review, 3, "no-filter needs_review count");
       assertEq(all.body.breakdown.pending_verify, 1, "no-filter pending_verify count");
       assertEq(all.body.filter, { fylke: null, category: null }, "no-filter echoes null filter");
@@ -226,14 +250,35 @@ export function runOpplevelserAdminVerificationStatusBreakdownTests(
       assertEq(both.body.breakdown.pending_verify, undefined, "fylke=Rogaland&category=mat_drikke has no pending_verify row");
 
       // ── (6) filter matching zero rows -> total 0, empty breakdown, not
-      // an error ────────────────────────────────────────────────────────────
+      // an error. NOTE: this used to query ?fylke=Finnmark, but "Finnmark"
+      // is itself a fylke-reform-era name (fylkeEquivalents("Finnmark")
+      // includes "Troms og Finnmark") — after the round-3 fix that bridges
+      // reform spellings, that query would correctly start matching the
+      // "Troms og Finnmark" fixture added for (7) below, so it's no longer
+      // a valid "definitely zero" example. Use a nonsense fylke name
+      // instead: fylkeEquivalents() falls back to literal-only matching for
+      // anything it doesn't recognise, so this is guaranteed zero
+      // regardless of fixture data. ─────────────────────────────────────
       const empty = await callRoute(router, {
         path: "/admin/verification-status-breakdown", headers: authHeaders,
-        query: { fylke: "Finnmark" },
+        query: { fylke: "Ikke-En-Fylke" },
       });
       assertEq(empty.status, 200, "zero-match request still succeeds");
       assertEq(empty.body.total, 0, "zero-match total is 0");
       assertEq(empty.body.breakdown, {}, "zero-match breakdown is empty, not an error");
+
+      // ── (7) round-3 fix-up regression: fylke-equivalence bridging.
+      // ?fylke=Troms must count the row stored as "Troms og Finnmark" —
+      // the exact case a bare `fylke = @fylke` literal match would miss
+      // (round-2 independent-reviewer finding) ────────────────────────────
+      const byTroms = await callRoute(router, {
+        path: "/admin/verification-status-breakdown", headers: authHeaders,
+        query: { fylke: "Troms" },
+      });
+      assertEq(byTroms.status, 200, "fylke=Troms request succeeds");
+      assertEq(byTroms.body.total, 1, "fylke=Troms counts the 'Troms og Finnmark'-stored row");
+      assertEq(byTroms.body.breakdown.verified, 1, "fylke=Troms verified count");
+      assertEq(byTroms.body.filter, { fylke: "Troms", category: null }, "fylke=Troms echoes the queried (not resolved) fylke value");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-admin-verification-status-breakdown: unexpected error: " + String(err?.stack || err?.message || err));

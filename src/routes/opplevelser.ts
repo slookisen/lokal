@@ -27,6 +27,11 @@ import {
   stampExperienceAdmissionVerdict,
   discoverExperiencesRelaxed,
   countDiscoverExperiences,
+  // fix-up round 3 (dev-request 2026-09-11-experiences-discover-filter-
+  // viser-ikke-nye-rader): shared fylke-equivalence IN-clause builder, so
+  // the admin verification-status-breakdown diagnostic's fylke filter can
+  // never drift from /discover's real (reform-era-bridged) matching.
+  buildFylkeInClause,
   buildRelaxationNote,
   buildNarrowingSuggestions,
   listCategories,
@@ -1095,7 +1100,19 @@ router.get("/admin/verification-status-breakdown", requireAdmin, (req: Request, 
     const expDb = getExpDb("experiences");
     const where: string[] = [];
     const params: Record<string, string> = {};
-    if (fylke) { where.push("fylke = @fylke"); params.fylke = fylke; }
+    if (fylke) {
+      // Bridge pre-2024/2020 fylke-reform era spellings the SAME way
+      // buildDiscoverWhere() does for /discover — a bare `fylke = @fylke`
+      // equality here would silently under/over-count any fylke in a
+      // reform equivalence class (e.g. Troms/"Troms og Finnmark"),
+      // undermining this endpoint's whole purpose as a trustworthy
+      // cross-check against what /discover actually shows (round-2 review
+      // finding, dev-request 2026-09-11-experiences-discover-filter-viser-
+      // ikke-nye-rader).
+      const { sql, params: fylkeParams } = buildFylkeInClause(fylke, "fylke");
+      where.push(sql);
+      Object.assign(params, fylkeParams);
+    }
     if (category) { where.push("category = @category"); params.category = category; }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 

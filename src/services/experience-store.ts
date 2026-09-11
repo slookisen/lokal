@@ -1406,6 +1406,37 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
 
 
 /**
+ * Builds a `<column> IN (@p0, @p1, ...)` fragment + bound params for a fylke
+ * filter, bridging pre-2024/2020 fylke-reform-era spellings via
+ * fylkeEquivalents() (see norway-fylke.ts) — a caller-supplied "Troms" must
+ * still match a DB row stored as the pre-2024 "Troms og Finnmark", and vice
+ * versa. This is the SAME bridging buildDiscoverWhere() applies to
+ * /discover's fylke filter, factored out so any other fylke-filtered query
+ * (e.g. the admin verification-status-breakdown diagnostic in
+ * routes/opplevelser.ts) reuses it directly instead of risking a bare
+ * `fylke = @fylke` copy that silently drifts from /discover's real matching
+ * semantics (dev-request 2026-09-11-experiences-discover-filter-viser-ikke-
+ * nye-rader, round-3 fix-up).
+ *
+ * `paramPrefix` lets two calls in the same query (there are none today, but
+ * future-proofing costs nothing) bind non-colliding placeholder names.
+ */
+export function buildFylkeInClause(
+  fylke: string,
+  column = "fylke",
+  paramPrefix = "fylke"
+): { sql: string; params: Record<string, string> } {
+  const equivalents = fylkeEquivalents(fylke);
+  const params: Record<string, string> = {};
+  const placeholders = equivalents.map((v, i) => {
+    const key = `${paramPrefix}${i}`;
+    params[key] = v;
+    return `@${key}`;
+  });
+  return { sql: `${column} IN (${placeholders.join(", ")})`, params };
+}
+
+/**
  * Builds the WHERE-clause fragments + bound params shared by
  * discoverExperiences() and countDiscoverExperiences() — factored out so the
  * two can NEVER drift apart (see countDiscoverExperiences()'s doc comment for
@@ -1461,10 +1492,9 @@ function buildDiscoverWhere(f: DiscoverFilter): {
     // the DB row's fylke column happens to be in (see norway-fylke.ts) —
     // a caller-supplied "Troms" must still match a DB row stored as the
     // pre-2024 "Troms og Finnmark", and vice versa.
-    const equivalents = fylkeEquivalents(f.fylke);
-    const placeholders = equivalents.map((_, i) => `@fylke${i}`);
-    where.push(`e.fylke IN (${placeholders.join(", ")})`);
-    equivalents.forEach((v, i) => { params[`fylke${i}`] = v; });
+    const { sql, params: fylkeParams } = buildFylkeInClause(f.fylke, "e.fylke");
+    where.push(sql);
+    Object.assign(params, fylkeParams);
   }
   if (f.kommune) { where.push("e.kommune = @kommune"); params.kommune = f.kommune; }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
