@@ -746,3 +746,284 @@ export async function experiencesGeocodeTick(
   stats.duration_ms = Date.now() - start;
   return stats;
 }
+
+// ─── Backlog re-geocode pass — dev-request 2026-09-10-gardssalg-geocode-
+// backlog-sted-retry ──────────────────────────────────────────────────────
+//
+// PRs #840/#841 shipped Step D's Stedsnavn-in-kommune tier just above
+// (providers_sted_fallback), but measured live 2026-09-10 it has hit ZERO
+// rows in production. The cause is Step D's own SELECT — `WHERE lat IS NULL
+// AND (geocode_confidence = 'no_match' OR …)` — which is exactly right for
+// the ordinary tick's documented idempotence ("never re-hammers a dead
+// address"), but has the side effect that the 85 rows already sitting at
+// geocode_confidence='approximate' (a real lat/lon already stored, from
+// BEFORE Skive 2 shipped) are invisible to it forever: they already have a
+// lat/lon, so `lat IS NULL` excludes them on every future tick, no matter how
+// long the worker runs.
+//
+// This is a deliberate, EXPLICIT, BOUNDED exception to that idempotence rule
+// — a distinct entry point, never folded into experiencesGeocodeTick()/Step D
+// itself, so the ordinary tick's own SELECT (and its idempotence contract for
+// dead addresses) stays completely untouched. It only ever looks at rows
+// already at geocode_confidence='approximate' (the readiness report's
+// "kommune" bucket — see GET /admin/gardssalg-outreach-readiness's own
+// bucketing, which treats 'approximate' as the sole provider-level "kommune
+// precision" value), only ever attempts the SAME stedsnavn-in-kommune lookup
+// Step D uses (geocodeStedInKommuneDiagnostic(), the diagnostic twin of
+// geocodeStedInKommune() in geocoding-service.ts — no lookup logic
+// reimplemented here), and — like Step D — REFUSES to write anything it
+// cannot corroborate to the row's own kommune: an honest kommune centroid
+// always beats a wrong precise point, so an ambiguous or no-match lookup
+// leaves the row byte-identical. Never touches `experiences.geo_precision` —
+// Step B/E's own comments already document that propagating a 'sted'-tier
+// provider point down to experiences is a distinct, un-asked-for future
+// slice, and this backlog pass inherits that same boundary unchanged.
+
+export type ExperiencesGeocodeBacklogAction =
+  | "upgraded"
+  | "would_upgrade"
+  | "skipped_address_shaped"
+  | "skipped_ambiguous"
+  | "skipped_no_match"
+  | "skipped_race"
+  | "error";
+
+export type ExperiencesGeocodeBacklogRowOutcome = {
+  provider_id: string;
+  navn: string | null;
+  kommune: string | null;
+  adresse: string;
+  before: { lat: number | null; lon: number | null; geocode_confidence: string | null };
+  action: ExperiencesGeocodeBacklogAction;
+  reason?: string;
+  /** Only set for "upgraded"/"would_upgrade" — the sted-tier point and its Kartverket place name. */
+  planned?: { lat: number; lon: number; place_name: string };
+};
+
+export type ExperiencesGeocodeBacklogResult = {
+  dry_run: boolean;
+  limit: number;
+  candidates_scanned: number;
+  upgraded: number;
+  would_upgrade: number;
+  skipped_address_shaped: number;
+  skipped_ambiguous: number;
+  skipped_no_match: number;
+  skipped_race: number;
+  errors: number;
+  rows: ExperiencesGeocodeBacklogRowOutcome[];
+  duration_ms: number;
+};
+
+// Smaller ceiling than agents-geocode-worker.ts's clampGeocodeBatchLimit
+// (max 200) — this route deliberately re-attempts rows that already have a
+// stored value, so a bounded, resumable chunk matters more here than a big
+// single call. Same "cap style" as LH_DISCOVERY_BATCH_CAP (opplevelser.ts)
+// and this file's own `limit` param, just with its own name/default per the
+// spec's own "30-50 rows per call" instruction.
+export const EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT = 40;
+export const EXPERIENCES_GEOCODE_BACKLOG_LIMIT_MAX = 50;
+
+/** Clamp a caller-supplied batch limit into [1, 50]; non-numbers -> default (mirrors clampGeocodeBatchLimit's shape). */
+export function clampExperiencesGeocodeBacklogLimit(raw: unknown): number {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT;
+  return Math.max(1, Math.min(EXPERIENCES_GEOCODE_BACKLOG_LIMIT_MAX, n));
+}
+
+/**
+ * STRICT dry_run parser — same non-negotiable-boolean discipline as
+ * agents-geocode-worker.ts's parseDryRunFlag() (review B4: a quoted
+ * "true"/"false" is REJECTED rather than silently misread, because a
+ * misparsed dry_run on a mutation-rehearsal switch would otherwise perform a
+ * real write). The default is flipped relative to that function, though:
+ * parseDryRunFlag()'s caller (city-backfill) writes rows that start out
+ * EMPTY, so its safe default is "no dry_run field = apply". This route
+ * REWRITES rows that already carry a geocoded point, so the safe default has
+ * to be the other way — no dry_run field = read-only — matching
+ * admin-knowledge.ts's address-norge-suffix-sweep default-safe convention
+ * (`dry_run !== false`).
+ */
+export function parseExperiencesGeocodeBacklogDryRunFlag(
+  raw: unknown
+): { ok: true; dryRun: boolean } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, dryRun: true };
+  if (typeof raw === "boolean") return { ok: true, dryRun: raw };
+  return {
+    ok: false,
+    error:
+      `dry_run må være en boolsk verdi (true/false uten anførselstegn) — fikk ${JSON.stringify(raw)}. ` +
+      `Avvist i stedet for tolket: denne ruten skriver over rader som allerede har et geokodet punkt.`,
+  };
+}
+
+/**
+ * The backlog SELECT, as its own function so the admin route's queue-status
+ * check (before/after, same shape as city-backfill's own
+ * cityBackfillQueueStatus()) can share the exact same WHERE clause as the
+ * pass itself — the same "one source of truth for eligibility" discipline
+ * agents-geocode-worker.ts's own module comment documents for its selector.
+ */
+type BacklogCandidateRow = {
+  id: string;
+  navn: string | null;
+  adresse: string;
+  kommune: string | null;
+  kommunenummer: string | null;
+  fylke: string | null;
+  lat: number;
+  lon: number;
+  geocode_confidence: string | null;
+};
+
+function selectBacklogCandidates(
+  db: ReturnType<typeof getDb>,
+  limit: number
+): BacklogCandidateRow[] {
+  return db
+    .prepare(
+      `SELECT id, navn, adresse, kommune, kommunenummer, fylke, lat, lon, geocode_confidence
+         FROM experience_providers
+        WHERE geocode_confidence = 'approximate'
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND adresse IS NOT NULL AND adresse <> ''
+        ORDER BY id
+        LIMIT ?`
+    )
+    .all(limit) as BacklogCandidateRow[];
+}
+
+/** Same WHERE clause as the pass's own SELECT, no LIMIT — cheap status check for the admin route's before/after block. */
+export function experiencesGeocodeBacklogQueueStatus(): { pending: number } {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM experience_providers
+        WHERE geocode_confidence = 'approximate'
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND adresse IS NOT NULL AND adresse <> ''`
+    )
+    .get() as { n: number };
+  return { pending: row?.n ?? 0 };
+}
+
+/**
+ * Backlog re-geocode pass. Chunked (bounded by `limit`), resumable (a row
+ * this call upgrades past 'approximate' is excluded from the very next
+ * call's SELECT by the WHERE clause itself — the same idempotence-by-query
+ * shape as the ordinary tick's own steps, no separate "already processed"
+ * bookkeeping needed), and dry-run-safe by default (see
+ * parseExperiencesGeocodeBacklogDryRunFlag() above).
+ */
+export async function runExperiencesGeocodeBacklogPass(
+  limit: number = EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT,
+  opts: { dryRun?: boolean } = {}
+): Promise<ExperiencesGeocodeBacklogResult> {
+  const start = Date.now();
+  const dryRun = opts.dryRun !== false;
+  const db = getDb(VERTICAL);
+
+  const result: ExperiencesGeocodeBacklogResult = {
+    dry_run: dryRun,
+    limit,
+    candidates_scanned: 0,
+    upgraded: 0,
+    would_upgrade: 0,
+    skipped_address_shaped: 0,
+    skipped_ambiguous: 0,
+    skipped_no_match: 0,
+    skipped_race: 0,
+    errors: 0,
+    rows: [],
+    duration_ms: 0,
+  };
+
+  const rows = selectBacklogCandidates(db, limit);
+
+  const updateSted = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'stedsnavn_kommune_backlog', geocode_confidence = 'sted',
+            updated_at = datetime('now')
+      WHERE id = ? AND geocode_confidence = 'approximate'`
+  );
+
+  for (const row of rows) {
+    result.candidates_scanned++;
+    const before = { lat: row.lat, lon: row.lon, geocode_confidence: row.geocode_confidence };
+    const base = { provider_id: row.id, navn: row.navn, kommune: row.kommune, adresse: row.adresse, before };
+
+    try {
+      // Step D's OWN gate, reused verbatim: an address-SHAPED adresse is not
+      // what this tier is for (a dead STREET address is Step A's problem, not
+      // this pass's) — parseAddressLike() returning non-null means "this
+      // looks like a street", exactly Step D's own signal to skip straight to
+      // the (already-applied) kommune fallback instead of trying Stedsnavn.
+      if (parseAddressLike(row.adresse)) {
+        result.skipped_address_shaped++;
+        result.rows.push({
+          ...base, action: "skipped_address_shaped",
+          reason: "adresse is street-address-shaped, not a place name — outside this tier's scope",
+        });
+        continue;
+      }
+
+      const outcome = await geocodingService.geocodeStedInKommuneDiagnostic(row.adresse, row.kommunenummer, row.kommune);
+
+      if (outcome.status === "ambiguous") {
+        result.skipped_ambiguous++;
+        result.rows.push({ ...base, action: "skipped_ambiguous", reason: outcome.reason });
+        continue;
+      }
+      if (outcome.status === "no_match") {
+        result.skipped_no_match++;
+        result.rows.push({ ...base, action: "skipped_no_match", reason: outcome.reason });
+        continue;
+      }
+
+      // resolved — but never trust a geocoder answer that cannot be a
+      // Norwegian position, the exact same sanity gate as Step A/D above.
+      if (!isPlausibleNorwayCoord(outcome.geo.lat, outcome.geo.lng)) {
+        result.skipped_no_match++;
+        result.rows.push({
+          ...base, action: "skipped_no_match",
+          reason: `Stedsnavn hit (${outcome.geo.lat}/${outcome.geo.lng}) is not a plausible Norwegian position`,
+        });
+        continue;
+      }
+
+      const planned = { lat: outcome.geo.lat, lon: outcome.geo.lng, place_name: outcome.geo.name };
+
+      if (dryRun) {
+        result.would_upgrade++;
+        result.rows.push({ ...base, action: "would_upgrade", planned });
+        continue;
+      }
+
+      const write = updateSted.run(outcome.geo.lat, outcome.geo.lng, row.id);
+      if (write.changes > 0) {
+        result.upgraded++;
+        result.rows.push({ ...base, action: "upgraded", planned });
+      } else {
+        // Compare-and-swap missed: the row moved off geocode_confidence=
+        // 'approximate' between this call's SELECT and its UPDATE (e.g. the
+        // ordinary tick ran concurrently, or a prior chunk in the same call
+        // already… no, `id` rows are only visited once per call — this is the
+        // concurrent-process case). Never double-write; report it plainly
+        // rather than silently dropping it (review discipline: a resumable
+        // batch must never look like it did nothing when it actually raced).
+        result.skipped_race++;
+        result.rows.push({
+          ...base, action: "skipped_race",
+          reason: "row's geocode_confidence changed since selection (concurrent run?) — left untouched",
+        });
+      }
+    } catch (err) {
+      result.errors++;
+      result.rows.push({ ...base, action: "error", reason: String((err as any)?.message || err) });
+      console.error(`[experiences-geocode-backlog] row ${row.id} failed:`, err);
+    }
+  }
+
+  result.duration_ms = Date.now() - start;
+  return result;
+}

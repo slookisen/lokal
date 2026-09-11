@@ -43480,3 +43480,29 @@ runSerial(async () => {
     failures.push("admin-outreach-pool-profile-published: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-10-gardssalg-geocode-backlog-sted-retry:
+// runExperiencesGeocodeBacklogPass() (the deliberate, bounded re-attempt of
+// rows already at geocode_confidence='approximate' via the same corroborated
+// Stedsnavn-in-kommune lookup PRs #840/#841 shipped for NEW rows) + POST
+// /admin/gardssalg-geocode-backlog-sweep (routes/opplevelser.ts). Own
+// in-memory experiences DB, geocodingService's injected fetch seam, and
+// router.handle() for the route section — same conventions as
+// experiences-geocode-sted.test.ts / opplevelser-listing-homepage-
+// discovery.test.ts respectively. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-10-gardssalg-geocode-backlog-sted-retry: backlog re-geocode pass + admin route ──");
+  try {
+    const { runExperiencesGeocodeBacklogTests } = require("../src/services/experiences-geocode-backlog.test") as
+      typeof import("../src/services/experiences-geocode-backlog.test");
+    const egb = await runExperiencesGeocodeBacklogTests({ log: false });
+    passed += egb.passed;
+    failed += egb.failed;
+    for (const f of egb.failures) failures.push("experiences-geocode-backlog: " + f);
+    console.log(`  experiences-geocode-backlog: ${egb.passed} passed, ${egb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-backlog: unexpected error: " + String(err?.message || err));
+  }
+});
