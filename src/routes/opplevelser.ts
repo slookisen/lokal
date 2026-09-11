@@ -649,6 +649,19 @@ import {
   type HoldoutExperienceRow,
 } from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
+// dev-request: providers stuck at brreg_active IS NULL forever (classifyProvider
+// only ever classifies a name ONCE, at bulk-load insert time) can never clear
+// POST /admin/experiences-content-judge-sweep's brreg_active===1 promotion
+// requirement below — this periodic backfill re-runs the SAME classifyProvider()
+// lookup for those rows only. See services/experience-brreg-recheck-backfill.ts's
+// header for the full rationale. POST /admin/experiences-provider-brreg-recheck-
+// backfill below.
+import {
+  experienceBrregRecheckBackfillTick,
+  experienceBrregRecheckBackfillQueueStatus,
+  BRREG_RECHECK_BACKFILL_DEFAULT_LIMIT,
+  BRREG_RECHECK_BACKFILL_MAX_LIMIT,
+} from "../services/experience-brreg-recheck-backfill";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
 // endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
@@ -853,7 +866,7 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
  * Call it AFTER the route has parsed its apply/dry_run flag and ONLY on the
  * path that will actually write — a dry-run must never be blocked.
  *
- * ── Gated (18 routes) ────────────────────────────────────────────────────
+ * ── Gated (19 routes) ────────────────────────────────────────────────────
  * The routine-called enrichment writers: bulk-load, content-refresh,
  * gardssalg-content-refresh, experiences-description-enrichment,
  * experiences-title-no-backfill, experiences-content-judge-sweep,
@@ -863,8 +876,11 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
  * gardssalg-website-verification-remediation, gardssalg-website-discovery,
  * listing-homepage-discovery, brreg-website-discovery,
  * gardssalg-orgnr-backfill, gardssalg-contact-backfill,
- * gardssalg-website-review-approve. Proven per route in
- * opplevelser-write-pause-gate.test.ts.
+ * gardssalg-website-review-approve, and
+ * experiences-provider-brreg-recheck-backfill (services/experience-brreg-
+ * recheck-backfill.ts). Proven per route in
+ * opplevelser-write-pause-gate.test.ts (pre-existing routes) and, for the
+ * newest one, experience-brreg-recheck-backfill.test.ts.
  *
  * ── Disclosed, out-of-scope gaps (PR #765 review round 2) ────────────────
  * Still UNGATED, documented rather than claimed covered — same discipline as
@@ -2047,6 +2063,104 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
+
+// ─── POST /api/opplevelser/admin/experiences-provider-brreg-recheck-backfill ──
+//
+// A provider bulk-load classified `unverified` (no confident Brreg name
+// match AT INSERT TIME — see classifyProvider()'s own header above) is left
+// at brreg_active=NULL forever: bulk-load only classifies a given provider
+// name ONCE, and nothing else in this codebase ever revisits it. Downstream,
+// POST /admin/experiences-content-judge-sweep's quarantine-exit promotion
+// logic requires provider.brreg_active === 1 — so a provider stuck at NULL
+// can NEVER be promoted out of needs_review, even after a fresh
+// content-judge re-check confirms the row's content is a correct MATCH. See
+// services/experience-brreg-recheck-backfill.ts's header for the full
+// background (including the measured 100%-of-sample / 49%-freshly-reconfirmed
+// numbers this backfill exists to unblock) and decision rule.
+//
+// Re-runs the EXACT SAME classifyProvider() Brreg lookup (zero second
+// Brreg-calling code path) for providers with brreg_active IS NULL, and
+// writes brreg_active/brreg_verified/org_nr via the EXACT SAME
+// setBrregVerification() ONLY when THIS run's classifyProvider() call itself
+// returns a confident verdict:
+//   - verified_active -> brreg_active -> 1 (resolved_active)
+//   - inactive        -> brreg_active -> 0 (resolved_inactive; a confirmed
+//     answer, not a guess)
+//   - unverified, or the lookup itself throws -> still_unresolved. NO
+//     WRITE — brreg_active stays exactly NULL, never guessed either way.
+//
+// This endpoint does NOT touch experiences-content-judge-sweep's promotion
+// requirement, the content-judge, or the admission gate — it only ever feeds
+// brreg_active a fresh, confirmed answer for providers currently stuck at
+// NULL.
+//
+// Dry-run-default, admin-key-gated (requireAdmin), STRICT `dry_run` parse —
+// only the literal JSON boolean `false` runs apply mode (same idiom as
+// /admin/experiences-title-no-backfill and every other STRICT-FALSE sweep in
+// this file; `null`/`"false"`/`0`/absent all mean dry run). `limit` clamped
+// to [1, BRREG_RECHECK_BACKFILL_MAX_LIMIT] (default
+// BRREG_RECHECK_BACKFILL_DEFAULT_LIMIT) — same order-of-magnitude batch
+// discipline as agents-geocode-invalidate-backfill.ts / the content-judge
+// sweep's own SWEEP_MAX_LIMIT. `after` is the keyset pagination cursor (same
+// convention as agents-geocode-invalidate-backfill.ts) — pass back the
+// previous call's `next_after` so a repeat call converges across the backlog
+// instead of re-selecting the same still_unresolved rows forever.
+//
+// Enrichment write-pause fence: apply (dry_run:false) only; dry-run is never
+// blocked (same convention as every other apply-mode writer in this file).
+//
+// Response: { success, dry_run, limit, status_before:{eligible},
+// status_after:{eligible}, processed, resolved_active, resolved_inactive,
+// still_unresolved, errors, next_after, planned:[{provider_id, navn,
+// kommune, outcome, org_nr, classification, detail}] }.
+router.post(
+  "/admin/experiences-provider-brreg-recheck-backfill",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as { dry_run?: unknown; limit?: unknown; after?: unknown };
+      // STRICT-FALSE parse (same idiom as /admin/experiences-title-no-backfill
+      // above): writes execute ONLY on the JSON boolean false.
+      const dryRun = body.dry_run !== false;
+
+      // Enrichment write-pause fence (del 1) — apply (dry_run:false) only;
+      // dry-run is never blocked. Placed BEFORE any Brreg lookup.
+      if (!dryRun) {
+        const pauseBlock = experiencesWritePauseBlock();
+        if (pauseBlock) {
+          res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+          return;
+        }
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          BRREG_RECHECK_BACKFILL_MAX_LIMIT,
+          typeof body.limit === "number" && Number.isFinite(body.limit)
+            ? Math.floor(body.limit)
+            : BRREG_RECHECK_BACKFILL_DEFAULT_LIMIT
+        )
+      );
+      const after = typeof body.after === "string" ? body.after : undefined;
+
+      const statusBefore = experienceBrregRecheckBackfillQueueStatus();
+      const result = await experienceBrregRecheckBackfillTick(limit, { dryRun, after });
+      const statusAfter = experienceBrregRecheckBackfillQueueStatus();
+
+      res.json({
+        success: true,
+        limit,
+        status_before: statusBefore,
+        status_after: statusAfter,
+        ...result,
+      });
+    } catch (err) {
+      console.error("[opplevelser] admin/experiences-provider-brreg-recheck-backfill failed", err);
+      res.status(500).json({ success: false, error: "Internal error" });
+    }
+  }
+);
 
 // ─── POST /api/opplevelser/admin/content-refresh (admin) ────────────
 //
