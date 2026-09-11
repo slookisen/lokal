@@ -1069,6 +1069,66 @@ router.get("/discover", (req: Request, res: Response) => {
   }
 });
 
+// ─── GET /api/opplevelser/admin/verification-status-breakdown ─────────
+// Read-only diagnostic (dev-request 2026-09-11-experiences-discover-filter-
+// viser-ikke-nye-rader, root-cause follow-up round 2): quantifies how many
+// rows in a fylke/category slice sit at each `verification_status` value.
+// Built to answer, with real numbers instead of guesswork, whether newly
+// inserted rows that an apply:true bulk-load self-reports as "inserted" are
+// actually landing in `verified` (the only status PUBLISH_GATE_SQL lets
+// /discover show) or being quarantined as `needs_review` by the bulk-load
+// admission gate (PR #721's content-judge) — which is what the numbers this
+// endpoint produced turned out to show is the PRIMARY driver of "apply says
+// +19, discover moves +1", not a count-display bug (see the dev-request's
+// Build & deploy log for the traced Rogaland/mat_drikke numbers).
+// GROUP BY only, no writes. Both filters are optional and AND together;
+// with neither given it reports the whole `experiences` table's
+// verification_status distribution. Admin-key gated like every other
+// /admin/* route in this file — this is a diagnostic, not a public stat.
+router.get("/admin/verification-status-breakdown", requireAdmin, (req: Request, res: Response) => {
+  const fylke =
+    typeof req.query.fylke === "string" && req.query.fylke.trim() ? req.query.fylke.trim() : undefined;
+  const category =
+    typeof req.query.category === "string" && req.query.category.trim() ? req.query.category.trim() : undefined;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = [];
+    const params: Record<string, string> = {};
+    if (fylke) { where.push("fylke = @fylke"); params.fylke = fylke; }
+    if (category) { where.push("category = @category"); params.category = category; }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const rows = expDb
+      .prepare(
+        `SELECT verification_status, COUNT(*) AS n
+           FROM experiences
+           ${whereSql}
+          GROUP BY verification_status
+          ORDER BY n DESC`
+      )
+      .all(params) as Array<{ verification_status: string | null; n: number }>;
+
+    const breakdown: Record<string, number> = {};
+    let total = 0;
+    for (const r of rows) {
+      const key = r.verification_status ?? "(null)";
+      breakdown[key] = r.n;
+      total += r.n;
+    }
+
+    res.json({
+      success: true,
+      filter: { fylke: fylke ?? null, category: category ?? null },
+      total,
+      breakdown,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/verification-status-breakdown failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/categories ────────────────────────────────
 router.get("/categories", (_req: Request, res: Response) => {
   res.json({ categories: listCategories() });
