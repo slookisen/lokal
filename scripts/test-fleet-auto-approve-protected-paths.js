@@ -120,7 +120,7 @@ function patchLines(patch, prefix) {
 // unconditionally flagged rather than guessed at.
 //
 // Gap check (dev-request 2026-09-11-fleet-auto-approve-requireadmin-
-// falsk-positiv, reviewer-found gap): a same-requireAdmin-token-
+// falsk-positiv, reviewer-found gap, round 1): a same-requireAdmin-token-
 // sequence pair is NOT automatically collateral — a reviewer showed
 // `if (!requireAdmin(req, res)) return;` -> `if (isDevMode ||
 // !requireAdmin(req, res)) return;` has an identical token sequence
@@ -130,11 +130,13 @@ function patchLines(patch, prefix) {
 // equality alone can't distinguish that from the PR-646 case (an
 // unrelated `async` inserted elsewhere on the line), so
 // requireAdminChangeIsCollateral() below additionally locates the
-// single edited span on the line (longest common prefix/suffix
-// between the removed/added content) and requires every
-// requireAdmin occurrence to be separated from that span by a
-// structural boundary character — the call/statement has closed
-// (`,` `;` `}` `)`) — before treating the pair as collateral.
+// single edited span on the line (longest common prefix/suffix between
+// the removed/added content) and requires every requireAdmin occurrence
+// to be structurally separated from that span — see the bracket-depth
+// mechanism documented directly above requireAdminChangeIsCollateral()
+// below (round 2 replaced round 1's plain "boundary character anywhere
+// in the gap" test, which had its own gap — same dev-request, round-2
+// reviewer-found).
 // Mirrored (duplicated intentionally — the workflow runner has no checkout
 // step, so this logic must stay inline there) in
 // .github/workflows/fleet-auto-approve.yml — keep both in sync (AC3/AC7).
@@ -149,18 +151,87 @@ const REQUIRE_ADMIN_DEF_RE = /function\s+requireAdmin\w*\s*\(/;
 // `!` `&` `|` (a newly inserted `isDevMode ||` or bare `!` sits
 // directly against the guard's own invocation with nothing
 // structural between them, so it must never read as a safe stop).
-const REQUIRE_ADMIN_GAP_BOUNDARY_RE = /[,;{})]/;
-// requireAdminChangeIsCollateral(rContent, aContent) — true only when
-// every requireAdmin occurrence in rContent is separated from the
-// line's single edited span (found via longest common prefix/suffix
-// between rContent and aContent — cheap and sufficient since callers
-// already confirmed the requireAdmin token sequence itself matches)
-// by a boundary character. The prefix/suffix region is byte-identical
-// on both sides by construction, so checking rContent's occurrences
-// against it is enough — no need to separately re-check aContent. Any
-// occurrence that overlaps the edited span itself, or whose gap has
-// no boundary character, fails the WHOLE pair closed (conservative:
-// one unexplained occurrence is enough to keep it flagged).
+// String-literal-aware bracket depth: count of unmatched ( [ { in s[0..i),
+// NOT counting brackets that occur inside a quoted string/template literal
+// (handles simple backslash-escapes) — so a route-path string containing a
+// stray paren can't desync the count.
+function depthAt(s, i) {
+  let d = 0;
+  let quote = null;
+  for (let j = 0; j < i; j++) {
+    const c = s[j];
+    if (quote) {
+      if (c === '\\') { j++; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') d++;
+    else if (c === ')' || c === ']' || c === '}') d--;
+  }
+  return d;
+}
+// Is there a comma/semicolon strictly between [from,to) sitting AT
+// baseDepth — a sibling-argument or statement separator at the exact
+// nesting level shared by the token and the edited span — as opposed to a
+// closing bracket that merely happens to land back on baseDepth (that's
+// how the gap-substring check below used to misread requireAdmin's OWN
+// closing paren as a safe stop for an edit conjoined right after it, still
+// inside the same if-condition: see gap-adjacency note above).
+function hasSameDepthSeparator(s, from, to, baseDepth) {
+  let d = baseDepth;
+  let quote = null;
+  for (let j = from; j < to; j++) {
+    const c = s[j];
+    if (quote) {
+      if (c === '\\') { j++; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') { d++; continue; }
+    if (c === ')' || c === ']' || c === '}') { d--; continue; }
+    if (d === baseDepth && (c === ',' || c === ';')) return true;
+  }
+  return false;
+}
+// requireAdminChangeIsCollateral(rContent, aContent) — true only when every
+// requireAdmin occurrence in rContent is PROVABLY separated from the line's
+// single edited span (located via longest common prefix/suffix between
+// rContent and aContent — cheap and sufficient since callers already
+// confirmed the requireAdmin token sequence itself matches). "Provably
+// separated" means one of:
+//   (a) editDepth < occDepth — the edit sits at a strictly shallower/outer
+//       bracket-nesting level than the token's own immediate context, i.e.
+//       genuinely outside whatever group (call args, if-condition, …)
+//       scopes the token; or
+//   (b) editDepth === occDepth AND a comma/semicolon separator exists
+//       between token and edit AT that exact shared depth — the two are
+//       siblings (e.g. `router.post(path, requireAdmin, handler)`, PR-646's
+//       real shape), not connected within the same sub-expression.
+// editDepth > occDepth (edit nested inside/deeper than the token's own
+// call, e.g. its own argument list) is never collateral: fails closed.
+//
+// This SUPERSEDES an earlier version of this fix that instead tested for
+// ANY boundary character `[,;{})]` occurring anywhere in the raw gap
+// substring between token and edit. That was gap-position-only, not
+// depth-aware, so a same-length replace-block pairing like
+// `if (!requireAdmin(req, res)) return;` -> `if (!requireAdmin(req, res)
+// && !bypassFlag) return;` slipped through: the gap substring
+// `(req, res)` (requireAdmin's own, UNEDITED argument list) trivially
+// contains `,` and `)`, even though the edit is a zero-width insertion
+// sitting immediately inside the still-open if-condition, right between
+// requireAdmin's own closing paren and the if's closing paren — a genuine
+// fail-open bypass, not collateral (round-2 review gap; dev-request
+// 2026-09-11-fleet-auto-approve-requireadmin-falsk-positiv). Depth-aware
+// separation closes this: at the edit's position here, editDepth === 1 ===
+// occDepth (still inside the if's own paren), and no comma/semicolon sits
+// at that depth between the token and the edit (the only comma is nested
+// one level deeper, inside requireAdmin's own now-closed arg list) — so it
+// correctly stays flagged.
+// Mirrored (duplicated intentionally — the workflow runner has no checkout
+// step, so this logic must stay inline there) in
+// .github/workflows/fleet-auto-approve.yml — keep both in sync (AC3/AC7).
 function requireAdminChangeIsCollateral(rContent, aContent) {
   if (rContent === aContent) return true;
   const minLen = Math.min(rContent.length, aContent.length);
@@ -174,15 +245,22 @@ function requireAdminChangeIsCollateral(rContent, aContent) {
   ) suffixLen++;
   const changeStart = prefixLen;
   const changeEnd = rContent.length - suffixLen;
+  const editDepth = depthAt(rContent, changeStart);
   REQUIRE_ADMIN_TOKEN_RE.lastIndex = 0;
   let m;
   while ((m = REQUIRE_ADMIN_TOKEN_RE.exec(rContent))) {
     const ts = m.index;
     const te = ts + m[0].length;
     if (te <= changeStart) {
-      if (!REQUIRE_ADMIN_GAP_BOUNDARY_RE.test(rContent.slice(te, changeStart))) return false;
+      const occDepth = depthAt(rContent, ts);
+      if (editDepth < occDepth) continue;
+      if (editDepth === occDepth && hasSameDepthSeparator(rContent, te, changeStart, occDepth)) continue;
+      return false;
     } else if (ts >= changeEnd) {
-      if (!REQUIRE_ADMIN_GAP_BOUNDARY_RE.test(rContent.slice(changeEnd, ts))) return false;
+      const occDepth = depthAt(rContent, ts);
+      if (editDepth < occDepth) continue;
+      if (editDepth === occDepth && hasSameDepthSeparator(rContent, changeEnd, ts, occDepth)) continue;
+      return false;
     } else {
       return false; // occurrence overlaps the edited span itself
     }
@@ -425,6 +503,83 @@ checkContent(
     '@@ -10,3 +10,3 @@',
     '-  if (!requireAdmin(req, res)) return;',
     '+  if (featureFlagOff && !requireAdmin(req, res)) return;',
+  ].join('\n'),
+  true,
+);
+
+// Round-2 reviewer-found gap (same dev-request, post-merge review round 2):
+// the round-1 fix above (a plain boundary-character-anywhere-in-the-gap
+// test) still had a hole — a bypass conjoined AFTER the guard's own call,
+// still inside the same if-condition, produces a ZERO-WIDTH edited span
+// sitting right at the position of the original line's closing `)`. The
+// gap between the requireAdmin token and that span is `(req, res)` —
+// requireAdmin's own, UNEDITED argument list — which trivially contains
+// `,` and `)` regardless of what actually changed, so the old check read
+// it as "the call has closed" and wrongly exempted a genuine fail-open.
+// Must stay flagged.
+checkContent(
+  'round-2 gap: requireAdmin guard bypassed by `&& !bypassFlag` appended right after the call is flagged',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-  if (!requireAdmin(req, res)) return;',
+    '+  if (!requireAdmin(req, res) && !bypassFlag) return;',
+  ].join('\n'),
+  true,
+);
+checkContent(
+  'round-2 gap: requireAdmin guard bypassed by `|| bypassFlag` appended right after the call is flagged (mirror-image of the && case)',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-  if (!requireAdmin(req, res)) return;',
+    '+  if (!requireAdmin(req, res) || bypassFlag) return;',
+  ].join('\n'),
+  true,
+);
+
+// Round-2 adversarial follow-ups (tried against the new depth-aware
+// mechanism itself, the way the round-1/round-2 reviewers tried against
+// its predecessors — dev-request 2026-09-11-fleet-auto-approve-
+// requireadmin-falsk-positiv).
+checkContent(
+  'round-2 adversarial: bypass condition split across a ternary is flagged',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-  if (!requireAdmin(req, res)) return;',
+    '+  if (bypassFlag ? false : !requireAdmin(req, res)) return;',
+  ].join('\n'),
+  true,
+);
+checkContent(
+  'round-2 adversarial: a boundary character planted inside a string literal near the token does not fool the depth count',
+  [
+    '@@ -10,3 +10,3 @@',
+    '-if (!requireAdmin(req, res, "))")) return;',
+    '+if (!requireAdmin(req, res, "))") && !bypassFlag) return;',
+  ].join('\n'),
+  true,
+);
+checkContent(
+  'round-2 regression guard: a route-path string containing an unmatched paren does not break the still-valid PR-646-shaped async-insertion exemption (requireAdmin as a comma-separated middleware sibling)',
+  [
+    '@@ -10,1 +10,1 @@',
+    '-router.post("/admin/foo(bar)", requireAdmin, (req, res) => {',
+    '+router.post("/admin/foo(bar)", requireAdmin, async (req, res) => {',
+  ].join('\n'),
+  false,
+);
+checkContent(
+  'round-2 regression guard: requireAdmin moved to cover a different route (pure removal in one hunk + pure addition in another) is still flagged — never reaches the pairing/collateral logic at all',
+  [
+    '@@ -12,4 +12,3 @@',
+    ' router.post("/admin/route-a", requireAdmin, (req, res) => {',
+    '-  if (!requireAdmin(req, res)) return;',
+    '   doThing();',
+    ' });',
+    '@@ -40,3 +39,5 @@',
+    ' router.post("/admin/route-b", (req, res) => {',
+    '+  if (!requireAdmin(req, res)) return;',
+    '   doOtherThing();',
+    ' });',
   ].join('\n'),
   true,
 );
