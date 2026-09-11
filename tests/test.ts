@@ -6866,7 +6866,20 @@ const _pr24Promise = (async function runPr24Tests() {
         -- ALTER) before it does anything else, and that guard fails CLOSED —
         -- without this column the lookup throws and every pr24 PUT correctly
         -- answers 423 instead of ever reaching the route body.
-        vertical_id TEXT NOT NULL DEFAULT 'rfb'
+        vertical_id TEXT NOT NULL DEFAULT 'rfb',
+        -- dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet:
+        -- PUT /admin/knowledge now resets these seven columns whenever it
+        -- actually changes address/postal_code (see that route's "Geocode
+        -- invalidation" block) — same hand-roll-every-touched-column
+        -- discipline as vertical_id above; without them, pr24-5's address
+        -- write throws "no such column" instead of ever returning 200.
+        geo_precision TEXT,
+        lat REAL,
+        lng REAL,
+        geocode_source TEXT,
+        geocode_outcome TEXT,
+        geocode_attempts INTEGER DEFAULT 0,
+        geocode_attempted_at TEXT
       );
       -- Same reason: the write-pause guard SELECTs this table on every gated
       -- write. Absence of a ROW means "not paused" (the designed default —
@@ -43559,6 +43572,59 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-outreach-pool-profile-published: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: PUT
+// /admin/knowledge now resets agents.geo_precision/lat/lng/geocode_source/
+// geocode_outcome/geocode_attempts/geocode_attempted_at whenever it actually
+// changes address/postal_code to a new value — the write path never told the
+// geocode side its input had changed, so a row already at 'address'
+// precision from the OLD address kept a stale coordinate forever (the
+// "Valens heimelaga" case: corrected to Nordagutu, map pin stayed ~210 km
+// away near Haugesund). Own in-memory DB + router.handle() harness, same
+// convention as admin-knowledge-city-write.test.ts. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: geocode invalidation on address change ──");
+  try {
+    const { runAdminKnowledgeGeocodeInvalidateTests } =
+      require("../src/routes/admin-knowledge-geocode-invalidate.test") as
+        typeof import("../src/routes/admin-knowledge-geocode-invalidate.test");
+    const gci = await runAdminKnowledgeGeocodeInvalidateTests({ log: false });
+    passed += gci.passed;
+    failed += gci.failed;
+    for (const f of gci.failures) failures.push("admin-knowledge-geocode-invalidate: " + f);
+    console.log(`  admin-knowledge-geocode-invalidate: ${gci.passed} passed, ${gci.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-knowledge-geocode-invalidate: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: the
+// one-time backfill batch for the pre-existing backlog (rows corrected
+// BEFORE the invalidation above shipped) — POST /admin/agents/geocode-
+// invalidate-backfill. Never geocodes/writes a new coordinate; only clears
+// the 'address'-precision rows a fresh re-check finds implausibly far from
+// the current address, and reports flagged-for-regeocode vs.
+// rejected-as-uncertain counts. Own in-memory DB + injected Kartverket
+// fetch, same convention as agents-postal-backfill.test.ts. Tail position is
+// the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: geocode-invalidate-backfill ──");
+  try {
+    const { runAgentsGeocodeInvalidateBackfillTests } =
+      require("../src/services/agents-geocode-invalidate-backfill.test") as
+        typeof import("../src/services/agents-geocode-invalidate-backfill.test");
+    const gib = await runAgentsGeocodeInvalidateBackfillTests({ log: false });
+    passed += gib.passed;
+    failed += gib.failed;
+    for (const f of gib.failures) failures.push("agents-geocode-invalidate-backfill: " + f);
+    console.log(`  agents-geocode-invalidate-backfill: ${gib.passed} passed, ${gib.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-geocode-invalidate-backfill: unexpected error: " + String(err?.message || err));
   }
 });
 

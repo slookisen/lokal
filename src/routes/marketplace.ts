@@ -7699,6 +7699,89 @@ router.post("/admin/agents/city-backfill", async (req: Request, res: Response) =
   }
 });
 
+// ─── POST /admin/agents/geocode-invalidate-backfill ──────────────────
+// dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet, item 2.
+//
+// One-time backfill for rows whose address was corrected BEFORE PUT
+// /admin/knowledge's own invalidation (see that route) shipped — those rows
+// are stuck at `geo_precision='address'` with a coordinate computed from an
+// address that no longer exists, and agents-geocode-worker.ts's selector
+// will never revisit an 'address'-precision row on its own. Concrete case:
+// "Valens heimelaga" — address corrected to Nordagutu, stored point stayed
+// ~210 km away near Haugesund.
+//
+// For each eligible row (active, geo_precision='address', has a current
+// street address + postal_code), re-runs the SAME Tier-A Kartverket lookup
+// the geocode worker uses against the row's CURRENT address and compares the
+// result to the STORED point:
+//   • fresh lookup misses           -> rejected_uncertain (never guessed at)
+//   • agrees within 50 km           -> confirmed_plausible (left alone)
+//   • disagrees by more than 50 km  -> re_geocode_flagged (geocode fields
+//     CLEARED — never a new coordinate written here; the geocode worker
+//     writes the real one on its next tick)
+//
+// See services/agents-geocode-invalidate-backfill.ts's header for why a
+// generic "postal-code centroid" table was not used (no such dataset exists
+// in this codebase; re-checking the row's own current address is strictly
+// more precise) and for why this is a one-time batch with no new schema
+// column rather than a scheduled worker.
+//
+// Body (all optional):
+//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//
+// The limit clamp and the STRICT dry_run parser are reused verbatim from the
+// Fase-1a geocode worker (see agents-postal-backfill.ts's own admin route
+// above for why: `{"dry_run":"true"}` performed a real production write
+// once already).
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-invalidate-backfill", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+
+  const { clampGeocodeBatchLimit, parseDryRunFlag } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+  const { agentsGeocodeInvalidateBackfillTick, agentsGeocodeInvalidateBackfillQueueStatus } =
+    require("../services/agents-geocode-invalidate-backfill") as
+      typeof import("../services/agents-geocode-invalidate-backfill");
+
+  const limit = clampGeocodeBatchLimit(body.limit);
+
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
+
+  try {
+    const before = agentsGeocodeInvalidateBackfillQueueStatus();
+    const result = await agentsGeocodeInvalidateBackfillTick(limit, { dryRun });
+    const after = agentsGeocodeInvalidateBackfillQueueStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        limit,
+        status_before: before,
+        status_after: after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[geocode-invalidate-backfill] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Geocode invalidate backfill failed" });
+  }
+});
+
 // ─── POST /admin/agents/geocode-seed-audit ───────────────────────────
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
 // throughput follow-up — review adjudication (c).
