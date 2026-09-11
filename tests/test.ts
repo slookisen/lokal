@@ -43698,3 +43698,33 @@ runSerial(async () => {
     failures.push("admin-db-backup: unexpected error: " + String(err?.message || err));
   }
 });
+
+// POST /admin/experiences-provider-brreg-recheck-backfill (routes/opplevelser.ts)
+// + services/experience-brreg-recheck-backfill.ts. A provider bulk-load
+// classified `unverified` (no confident Brreg name match AT INSERT TIME) is
+// left at brreg_active=NULL forever — nothing else ever revisits it — which
+// permanently blocks POST /admin/experiences-content-judge-sweep's
+// quarantine-exit promotion logic (requires provider.brreg_active===1). This
+// periodic backfill re-runs the SAME classifyProvider() Brreg lookup for
+// those rows only, writing brreg_active/brreg_verified/org_nr ONLY on a
+// fresh confident verdict. Own in-memory experiences DB, the SAME
+// __setBrregFetchForTesting seam classifyProvider()'s own tests use, and
+// router.handle() for both this route and (composition block) the existing
+// content-judge-sweep route. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experiences-provider-brreg-recheck-backfill: re-check backfill for brreg_active IS NULL providers ──");
+  try {
+    const { runOpplevelserExperienceBrregRecheckBackfillTests } =
+      require("../src/routes/opplevelser-experience-brreg-recheck-backfill.test") as
+        typeof import("../src/routes/opplevelser-experience-brreg-recheck-backfill.test");
+    const brb = await runOpplevelserExperienceBrregRecheckBackfillTests({ log: false });
+    passed += brb.passed;
+    failed += brb.failed;
+    for (const f of brb.failures) failures.push("experience-brreg-recheck-backfill: " + f);
+    console.log(`  experience-brreg-recheck-backfill: ${brb.passed} passed, ${brb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-brreg-recheck-backfill: unexpected error: " + String(err?.message || err));
+  }
+});

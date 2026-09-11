@@ -628,6 +628,13 @@ export async function runAdminEnrichmentWritePauseTests(
         // (routes/opplevelser.ts, one shared helper) plus their own test file.
         "routes/opplevelser-write-pause-gate.test.ts",
         "routes/opplevelser.ts",
+        // experiences-provider-brreg-recheck-backfill (brreg_active IS NULL
+        // re-check backfill): a 19th route gated by the SAME shared
+        // opplevelser.ts helper, plus its own test file, which sets up pause
+        // state directly via the service to prove the wiring (same
+        // convention as the description-code-artifact sweep's own test file
+        // above).
+        "routes/opplevelser-experience-brreg-recheck-backfill.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );
