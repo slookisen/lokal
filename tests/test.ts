@@ -43587,3 +43587,29 @@ runSerial(async () => {
     failures.push("experiences-geocode-backlog: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-11-experiences-retro-opprydding-db-backup-lever:
+// POST/GET /admin/db/backup — better-sqlite3's built-in async online-backup
+// API to a timestamped file under <dirname(DB_PATH)>/backups/, returning
+// {backup_path, size_bytes, sha256, row_counts, created_at}, with a
+// keep-10-newest retention pass. Own in-memory DB (__setDbForTesting +
+// __initSchemaForTesting) + router.handle() harness, same convention as
+// admin-db-table-sizes.test.ts; DB_PATH is pointed at a scratch temp
+// directory for the duration of the test so backups/ never lands under the
+// real repo. Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-11-experiences-retro-opprydding-db-backup-lever: POST/GET /admin/db/backup ──");
+  try {
+    const { runAdminDbBackupTests } = require("../src/routes/admin-db-backup.test") as
+      typeof import("../src/routes/admin-db-backup.test");
+    const adb = await runAdminDbBackupTests({ log: false });
+    passed += adb.passed;
+    failed += adb.failed;
+    for (const f of adb.failures) failures.push("admin-db-backup: " + f);
+    console.log(`  admin-db-backup: ${adb.passed} passed, ${adb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-db-backup: unexpected error: " + String(err?.message || err));
+  }
+});
