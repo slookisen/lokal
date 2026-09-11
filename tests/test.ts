@@ -39165,7 +39165,6 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   const dbPV = dbFacPV.getDb("experiences");
 
   const emailSvcModPV = require("../src/services/email-service") as typeof import("../src/services/email-service");
-  const origSendPV = emailSvcModPV.emailService.sendEmail.bind(emailSvcModPV.emailService);
   let emailCallsPV: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
   (emailSvcModPV.emailService as any).sendEmail = async (opts: {
     to: string; subject: string; htmlContent?: string; textContent?: string;
@@ -39186,6 +39185,39 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   dbPV.prepare("UPDATE experience_providers SET producer_type = ?, booking_live = 1, epost = ? WHERE id = ?")
     .run("bryggeri", PRODUCER_EMAIL_PV, provIdPV);
   expStPV.backfillProviderSlugs();
+
+  // P0 CI fix (2026-09-11): this block's booking fixtures used to hardcode
+  // an absolute 2026-09 calendar date. That date eventually falls behind
+  // the real clock and gets HARD-rejected by the public route's past-slot_at
+  // gate (gardssalg-opening-hours.ts's slotBoundsError(), "now HARD-rejects
+  // a past slot_at at the PUBLIC route") — every downstream assertion that
+  // depends on bookPV()'s booking actually having been created then
+  // cascades from that one 400. Compute the base slot, and every slot
+  // DERIVED from it, RELATIVE TO NOW instead, so the fixture never goes
+  // stale again. `days` is measured in Oslo calendar days from "now" (never
+  // crosses the Oct 2026 DST boundary at these small offsets, and stays
+  // comfortably inside BOOKING_MAX_DAYS_AHEAD's 90-day default) — this
+  // reproduces the ORIGINAL fixture's day math exactly: base, base+2d@15:00
+  // (first "foreslå"), base+3d@11:00 (re-suggest / guest-accepted slot).
+  function pvOsloNakedNDaysFromNow(days: number, hhmm: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date(Date.now() + days * 24 * 3600_000));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}T${hhmm}`;
+  }
+  const PV_BASE_DAYS_AHEAD = 7; // comfortably future regardless of what hour the suite runs at
+  const pvBaseSlotWallPV = pvOsloNakedNDaysFromNow(PV_BASE_DAYS_AHEAD, "13:00");
+  const pvSuggest1WallPV = pvOsloNakedNDaysFromNow(PV_BASE_DAYS_AHEAD + 2, "15:00");
+  const pvSuggest2WallPV = pvOsloNakedNDaysFromNow(PV_BASE_DAYS_AHEAD + 3, "11:00");
+  // Expected UTC instants: the SAME Oslo->UTC conversion the app itself
+  // uses (osloDatetimeLocalToUtcIso, independently exercised by tz-1..tz-9
+  // below against fixed, never-stale instants) applied to the fixture's own
+  // wall-clock inputs — this is what "correctly recompute the derived
+  // expectation" means here, not a second hand-rolled DST calculation.
+  const pvBaseSlotUtcPV = String(bookStPV.osloDatetimeLocalToUtcIso(pvBaseSlotWallPV));
+  const pvSuggest1UtcPV = String(bookStPV.osloDatetimeLocalToUtcIso(pvSuggest1WallPV));
+  const pvSuggest2UtcPV = String(bookStPV.osloDatetimeLocalToUtcIso(pvSuggest2WallPV));
 
   async function invokeSeoPV(
     method: "get" | "post",
@@ -39241,7 +39273,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
 
   async function bookPV(extra: Record<string, unknown> = {}): Promise<ReturnType<typeof bookStPV.getBookingByRef>> {
     const r = await invokeOppPV("post", "/book", {}, {
-      provider_id: provIdPV, slot_at: "2026-09-10T13:00", party_size: 2,
+      provider_id: provIdPV, slot_at: pvBaseSlotWallPV, party_size: 2,
       guest_name: "Gjest Previsit", guest_email: "gjest-pv@example.no", ...extra,
     });
     assertEq(r.status, 201, "pv-book: booking created (201)");
@@ -39377,11 +39409,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   // Valid suggestion.
   const suggestPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2026-09-12T15:00" } });
+    { body: { action: "foresla", suggested_slot: pvSuggest1WallPV } });
   assertTrue((suggestPostPV.redirectTo || "").includes("done=foreslatt"), "pv-08a: suggestion accepted");
   let b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "time_suggested", "pv-08b: pre_status → time_suggested");
-  assertEq(b3RowPV?.suggested_slot_at, "2026-09-12T13:00:00.000Z",
+  assertEq(b3RowPV?.suggested_slot_at, pvSuggest1UtcPV,
     "pv-08c: suggested_slot_at persisted as the UTC INSTANT — the naked form value is Oslo wall time (15:00 CEST = 13:00Z), tz-fix 2026-07-30");
   assertTrue(!!b3RowPV?.guest_decision_token, "pv-08d: guest_decision_token generated");
   assertEq(b3RowPV?.respond_token_used_at, null, "pv-08e: suggest is NOT terminal — respond token not consumed");
@@ -39396,9 +39428,9 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   emailCallsPV = [];
   await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2026-09-13T11:00" } });
+    { body: { action: "foresla", suggested_slot: pvSuggest2WallPV } });
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
-  assertEq(b3RowPV?.suggested_slot_at, "2026-09-13T09:00:00.000Z",
+  assertEq(b3RowPV?.suggested_slot_at, pvSuggest2UtcPV,
     "pv-09a: re-suggest replaces the slot (stored as UTC instant, 11:00 CEST = 09:00Z)");
   assertTrue(b3RowPV?.guest_decision_token !== firstDecisionTokenPV, "pv-09b: re-suggest rotates the guest token");
   const staleDecisionPV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
@@ -39498,7 +39530,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertTrue((acceptPostPV.redirectTo || "").includes("done=akseptert"), "pv-11a: accept POST → PRG done=akseptert");
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "provider_confirmed", "pv-11b: accept → provider_confirmed");
-  assertEq(b3RowPV?.slot_at, "2026-09-13T09:00:00.000Z",
+  assertEq(b3RowPV?.slot_at, pvSuggest2UtcPV,
     "pv-11c: slot_at REPLACED by the accepted suggestion (kanonisk UTC-instant, tz-fix 2026-07-30)");
   assertTrue(!!b3RowPV?.respond_token_used_at, "pv-11d: respond token consumed by the terminal outcome");
   assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv3@example.no" && c.subject.includes("bekreftet")),
@@ -39699,11 +39731,14 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   const b9 = await bookPV({ guest_email: "gjest-pv9@example.no" });
   await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
     { token: String(b9!.respond_token) }, `/kategori/gardssalg/svar/${b9!.respond_token}`,
-    { body: { action: "foresla", suggested_slot: "2026-09-12T15:00" } });
+    { body: { action: "foresla", suggested_slot: pvSuggest1WallPV } });
   dbPV.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = '2099-01-01T00:00:00.000Z' WHERE booking_ref = ?")
     .run(String(b9!.booking_ref));
   emailCallsPV = [];
-  fu = await bookStPV.processBookingFollowups(new Date("2026-09-13T00:00:00Z"));
+  // A clock comfortably (24h) after the suggested instant — same relative
+  // relationship the original hardcoded pair encoded (clock strictly after
+  // suggested_slot_at, well before the live respond_token_expires_at above).
+  fu = await bookStPV.processBookingFollowups(new Date(Date.parse(pvSuggest1UtcPV) + 24 * 3600_000));
   assertEq(fu.expired, 1, "pv-23a: a PASSED suggested time expires the loop even with a live token");
   assertEq(bookStPV.getBookingByRef(String(b9!.booking_ref))?.pre_status, "expired",
     "pv-23b: pre_status → expired");
@@ -39726,7 +39761,7 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     "pv-24c: decline is bounded by the same window (followups own the closure)");
   let b12CheckPV = bookStPV.getBookingByRef(String(b12!.booking_ref));
   assertEq(b12CheckPV?.pre_status, "time_suggested", "pv-24d: refused decisions mutate nothing");
-  assertEq(b12CheckPV?.slot_at, "2026-09-10T11:00:00.000Z",
+  assertEq(b12CheckPV?.slot_at, pvBaseSlotUtcPV,
     "pv-24e: slot_at untouched (fortsatt den kanoniske UTC-instanten fra opprettelsen)");
 
   // (d) truthful expired page: deadline passed but the followup engine has
