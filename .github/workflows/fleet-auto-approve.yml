@@ -243,10 +243,11 @@ jobs:
             // catching all three real incidents (#455/#499/#583 — each is a genuine
             // edit of a pre-existing ADMIN_KEY/ANALYTICS_ADMIN_KEY/sessionFromRequest
             // line, never a new file).
+            const REQUIRE_ADMIN_RE = /\brequireAdmin\w*\b/;
             const PROTECTED_CONTENT = [
               /\bADMIN_KEY\b/,
               /\bANALYTICS_ADMIN_KEY\b/,
-              /\brequireAdmin\w*\b/,
+              REQUIRE_ADMIN_RE,
               /\bsessionFromRequest\b/,
               /\bverifyOwnerSession\b/,
               /\breadSessionCookie\b/,
@@ -272,11 +273,104 @@ jobs:
                 .split('\n')
                 .filter(l => l.startsWith(prefix))
                 .join('\n');
+            // requireAdminEditMatch(patch) — dev-request 2026-09-11-fleet-auto-approve-
+            // requireadmin-falsk-positiv. Scoped to the requireAdmin pattern ONLY; every
+            // other PROTECTED_CONTENT pattern still goes through the plain whole-pool
+            // added&&removed test in contentEditMatch below, untouched (AC6).
+            //
+            // Root cause this fixes (lokal PR #626, #646): the whole-pool test flags a
+            // file whenever *some* added line and *some* removed line anywhere in the
+            // file's patch each merely CONTAIN "requireAdmin" — even when the one line
+            // that actually changed left requireAdmin byte-identical and only touched
+            // something else on that line (e.g. `(req` -> `async (req`), and the pool
+            // only has a requireAdmin "removed" hit at all because of that same untouched
+            // call. A file that separately adds a brand-new, ordinary requireAdmin-
+            // guarded route (routine boilerplate — a pure ADDITION, no removed
+            // counterpart) then makes the added/removed pools intersect on pure
+            // coincidence, not because anything auth-relevant changed.
+            //
+            // Fix: parse the patch into "replace blocks" — a maximal run of removed (-)
+            // lines immediately followed by a maximal run of added (+) lines (the
+            // standard unified-diff "these lines were modified" shape). When a block's
+            // removed-run and added-run have the SAME length, pair them positionally.
+            // For each paired (removed, added) line that is NOT a requireAdmin
+            // *definition* line on either side, if the sequence of requireAdmin-pattern
+            // tokens matched on the removed line is IDENTICAL (same tokens, same order)
+            // to the sequence matched on the added line, that pair's requireAdmin
+            // occurrences are "explained" — the guard itself didn't change, something
+            // else on the line did — and are masked out of the pool for this pattern
+            // only before the final added/removed test. Anything NOT covered by such an
+            // exempted pair (unpaired hunks, unequal-length replace blocks, pure
+            // single-sided add/remove, or any definition-line edit) is left in the pool
+            // exactly as before: fail-closed by construction, we only ever SUBTRACT
+            // signal we can positively explain, never add leniency anywhere else (AC9).
+            //
+            // Definition lines are NEVER eligible for the exemption (AC1's "editing
+            // requireAdmin's own implementation IS still flagged", suggested-approach
+            // point 4): a line matching `function requireAdmin\w*(` on EITHER side of the
+            // pair always counts as a genuine hit, even if the requireAdmin token
+            // sequence on that line happens to be identical (e.g. only a parameter type
+            // changed) — a token-sequence match alone can't tell "narrow signature tweak"
+            // from "harmless", and this is a security-relevant surface, so it stays
+            // unconditionally flagged rather than guessed at.
+            //
+            // Mirrored (duplicated intentionally — this runner has no checkout step, so
+            // this logic must stay inline) in
+            // scripts/test-fleet-auto-approve-protected-paths.js — keep both in sync
+            // (AC3/AC7).
+            const REQUIRE_ADMIN_TOKEN_RE = /\brequireAdmin\w*\b/g;
+            const REQUIRE_ADMIN_DEF_RE = /function\s+requireAdmin\w*\s*\(/;
+            const requireAdminEditMatch = (patch) => {
+              const lines = (patch || '').split('\n');
+              const maskRemoved = new Map();
+              const maskAdded = new Map();
+              let i = 0;
+              while (i < lines.length) {
+                if (lines[i].startsWith('-')) {
+                  const removedIdx = [];
+                  while (i < lines.length && lines[i].startsWith('-')) { removedIdx.push(i); i++; }
+                  const addedIdx = [];
+                  while (i < lines.length && lines[i].startsWith('+')) { addedIdx.push(i); i++; }
+                  if (removedIdx.length === addedIdx.length) {
+                    for (let k = 0; k < removedIdx.length; k++) {
+                      const rContent = lines[removedIdx[k]].slice(1);
+                      const aContent = lines[addedIdx[k]].slice(1);
+                      if (REQUIRE_ADMIN_DEF_RE.test(rContent) || REQUIRE_ADMIN_DEF_RE.test(aContent)) continue;
+                      const rMatches = rContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
+                      const aMatches = aContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
+                      const sameSeq = rMatches.length === aMatches.length && rMatches.every((m, idx2) => m === aMatches[idx2]);
+                      if (rMatches.length > 0 && sameSeq) {
+                        maskRemoved.set(removedIdx[k], rContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
+                        maskAdded.set(addedIdx[k], aContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
+                      }
+                    }
+                  }
+                } else {
+                  i++;
+                }
+              }
+              const addedPool = lines
+                .map((l, idx) => (l.startsWith('+') ? (maskAdded.has(idx) ? maskAdded.get(idx) : l.slice(1)) : null))
+                .filter(x => x !== null)
+                .join('\n');
+              const removedPool = lines
+                .map((l, idx) => (l.startsWith('-') ? (maskRemoved.has(idx) ? maskRemoved.get(idx) : l.slice(1)) : null))
+                .filter(x => x !== null)
+                .join('\n');
+              return REQUIRE_ADMIN_RE.test(addedPool) && REQUIRE_ADMIN_RE.test(removedPool);
+            };
             const contentEditMatch = (f) => {
               if (!f.patch) return null;
               const added = patchLines(f.patch, '+');
               const removed = patchLines(f.patch, '-');
-              return PROTECTED_CONTENT.find(re => re.test(added) && re.test(removed)) || null;
+              for (const re of PROTECTED_CONTENT) {
+                if (re === REQUIRE_ADMIN_RE) {
+                  if (requireAdminEditMatch(f.patch)) return re;
+                  continue;
+                }
+                if (re.test(added) && re.test(removed)) return re;
+              }
+              return null;
             };
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner, repo, pull_number: prNumber, per_page: 100,

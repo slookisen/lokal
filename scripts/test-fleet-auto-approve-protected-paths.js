@@ -44,10 +44,11 @@ const PROTECTED = [
   /secret/i,
 ];
 
+const REQUIRE_ADMIN_RE = /\brequireAdmin\w*\b/;
 const PROTECTED_CONTENT = [
   /\bADMIN_KEY\b/,
   /\bANALYTICS_ADMIN_KEY\b/,
-  /\brequireAdmin\w*\b/,
+  REQUIRE_ADMIN_RE,
   /\bsessionFromRequest\b/,
   /\bverifyOwnerSession\b/,
   /\breadSessionCookie\b/,
@@ -77,14 +78,110 @@ function patchLines(patch, prefix) {
     .join('\n');
 }
 
+// requireAdminEditMatch(patch) — dev-request 2026-09-11-fleet-auto-approve-
+// requireadmin-falsk-positiv. Scoped to the requireAdmin pattern ONLY; every
+// other PROTECTED_CONTENT pattern still goes through the plain whole-pool
+// added&&removed test in contentEditMatch below, untouched (AC6).
+//
+// Root cause this fixes (lokal PR #626, #646): the whole-pool test flags a
+// file whenever *some* added line and *some* removed line anywhere in the
+// file's patch each merely CONTAIN "requireAdmin" — even when the one line
+// that actually changed left requireAdmin byte-identical and only touched
+// something else on that line (e.g. `(req` -> `async (req`), and the pool
+// only has a requireAdmin "removed" hit at all because of that same untouched
+// call. A file that separately adds a brand-new, ordinary requireAdmin-
+// guarded route (routine boilerplate — a pure ADDITION, no removed
+// counterpart) then makes the added/removed pools intersect on pure
+// coincidence, not because anything auth-relevant changed.
+//
+// Fix: parse the patch into "replace blocks" — a maximal run of removed (-)
+// lines immediately followed by a maximal run of added (+) lines (the
+// standard unified-diff "these lines were modified" shape). When a block's
+// removed-run and added-run have the SAME length, pair them positionally.
+// For each paired (removed, added) line that is NOT a requireAdmin
+// *definition* line on either side, if the sequence of requireAdmin-pattern
+// tokens matched on the removed line is IDENTICAL (same tokens, same order)
+// to the sequence matched on the added line, that pair's requireAdmin
+// occurrences are "explained" — the guard itself didn't change, something
+// else on the line did — and are masked out of the pool for this pattern
+// only before the final added/removed test. Anything NOT covered by such an
+// exempted pair (unpaired hunks, unequal-length replace blocks, pure
+// single-sided add/remove, or any definition-line edit) is left in the pool
+// exactly as before: fail-closed by construction, we only ever SUBTRACT
+// signal we can positively explain, never add leniency anywhere else (AC9).
+//
+// Definition lines are NEVER eligible for the exemption (AC1's "editing
+// requireAdmin's own implementation IS still flagged", suggested-approach
+// point 4): a line matching `function requireAdmin\w*(` on EITHER side of the
+// pair always counts as a genuine hit, even if the requireAdmin token
+// sequence on that line happens to be identical (e.g. only a parameter type
+// changed) — a token-sequence match alone can't tell "narrow signature tweak"
+// from "harmless", and this is a security-relevant surface, so it stays
+// unconditionally flagged rather than guessed at.
+//
+// Mirrored (duplicated intentionally — the workflow runner has no checkout
+// step, so this logic must stay inline there) in
+// .github/workflows/fleet-auto-approve.yml — keep both in sync (AC3/AC7).
+const REQUIRE_ADMIN_TOKEN_RE = /\brequireAdmin\w*\b/g;
+const REQUIRE_ADMIN_DEF_RE = /function\s+requireAdmin\w*\s*\(/;
+function requireAdminEditMatch(patch) {
+  const lines = (patch || '').split('\n');
+  const maskRemoved = new Map();
+  const maskAdded = new Map();
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith('-')) {
+      const removedIdx = [];
+      while (i < lines.length && lines[i].startsWith('-')) { removedIdx.push(i); i++; }
+      const addedIdx = [];
+      while (i < lines.length && lines[i].startsWith('+')) { addedIdx.push(i); i++; }
+      if (removedIdx.length === addedIdx.length) {
+        for (let k = 0; k < removedIdx.length; k++) {
+          const rContent = lines[removedIdx[k]].slice(1);
+          const aContent = lines[addedIdx[k]].slice(1);
+          if (REQUIRE_ADMIN_DEF_RE.test(rContent) || REQUIRE_ADMIN_DEF_RE.test(aContent)) continue;
+          const rMatches = rContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
+          const aMatches = aContent.match(REQUIRE_ADMIN_TOKEN_RE) || [];
+          const sameSeq = rMatches.length === aMatches.length && rMatches.every((m, idx2) => m === aMatches[idx2]);
+          if (rMatches.length > 0 && sameSeq) {
+            maskRemoved.set(removedIdx[k], rContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
+            maskAdded.set(addedIdx[k], aContent.replace(REQUIRE_ADMIN_TOKEN_RE, ''));
+          }
+        }
+      }
+    } else {
+      i++;
+    }
+  }
+  const addedPool = lines
+    .map((l, idx) => (l.startsWith('+') ? (maskAdded.has(idx) ? maskAdded.get(idx) : l.slice(1)) : null))
+    .filter((x) => x !== null)
+    .join('\n');
+  const removedPool = lines
+    .map((l, idx) => (l.startsWith('-') ? (maskRemoved.has(idx) ? maskRemoved.get(idx) : l.slice(1)) : null))
+    .filter((x) => x !== null)
+    .join('\n');
+  return REQUIRE_ADMIN_RE.test(addedPool) && REQUIRE_ADMIN_RE.test(removedPool);
+}
+
 // Mirrors contentEditMatch() in the workflow: a pattern must match on BOTH
 // an added and a removed line of the SAME file's patch to count — i.e. the
 // diff EDITS existing matching code, not just adds a brand-new admin route
 // that follows the repo's own standard requireAdmin()/ADMIN_KEY boilerplate.
+// The requireAdmin pattern is the one exception: it routes through the
+// line-pair-aware requireAdminEditMatch() above instead of the plain
+// whole-pool test (AC6 — every other pattern here is untouched).
 function contentEditMatch(patch) {
   const added = patchLines(patch, '+');
   const removed = patchLines(patch, '-');
-  return PROTECTED_CONTENT.find((re) => re.test(added) && re.test(removed)) || null;
+  for (const re of PROTECTED_CONTENT) {
+    if (re === REQUIRE_ADMIN_RE) {
+      if (requireAdminEditMatch(patch)) return re;
+      continue;
+    }
+    if (re.test(added) && re.test(removed)) return re;
+  }
+  return null;
 }
 
 let passed = 0;
@@ -212,6 +309,63 @@ checkContent(
   'a purely unrelated diff is not flagged',
   ['@@ -1,3 +1,3 @@', '-const x = 1;', '+const x = 2;'].join('\n'),
   false,
+);
+
+// ── dev-request 2026-09-11-fleet-auto-approve-requireadmin-falsk-positiv ──
+// AC1/AC4: PR #646 reproduction — an EXISTING route-registration line is
+// edited for a reason wholly unrelated to auth (`(req` -> `async (req`);
+// `requireAdmin` itself is byte-identical on both sides of that line. The
+// file's patch ALSO adds a brand-new route elsewhere that itself calls
+// requireAdmin (ordinary boilerplate) — a pure addition with no removed
+// counterpart. Before this fix, the file-wide added-pool AND removed-pool
+// both ended up containing "requireAdmin" matches (the untouched call on
+// the edited line supplies the removed-side hit, the new route supplies the
+// added-side hit) purely by coincidence — must resolve NOT flagged now.
+checkContent(
+  'PR #646 reproduction: requireAdmin unchanged on a modified route-registration line, only `async` inserted, is NOT flagged',
+  [
+    '@@ -40,7 +40,7 @@',
+    '-router.post("/admin/gardssalg-website-review-approve", requireAdmin, (req: Request, res: Response) => {',
+    '+router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req: Request, res: Response) => {',
+    '   // existing handler body, unchanged',
+    ' });',
+    '@@ -80,6 +80,17 @@',
+    ' // unrelated context further down the same file',
+    '+router.post("/admin/gardssalg-website-review-new", requireAdmin, (req: Request, res: Response) => {',
+    '+  res.json({ ok: true });',
+    '+});',
+  ].join('\n'),
+  false,
+);
+
+// AC1: a PR that edits requireAdmin's OWN implementation (its definition
+// line) must still be flagged — even though the requireAdmin token itself
+// is textually identical on both sides of that line (only the parameter
+// list narrowed), the definition-line carve-out in the suggested approach
+// (point 4) makes this unconditional: definition lines are never eligible
+// for the "unchanged, so exempt" treatment the #646 case above relies on.
+checkContent(
+  'editing requireAdmin\'s own definition line IS still flagged, even with an identical requireAdmin token on both sides',
+  [
+    '@@ -5,3 +5,3 @@',
+    '-function requireAdmin(req: Request, res: Response): boolean {',
+    '+function requireAdmin(req, res): boolean {',
+    '   const expected = process.env.ADMIN_KEY || "";',
+  ].join('\n'),
+  true,
+);
+
+// AC1 (a second angle on the same requirement): a genuine body-level edit to
+// requireAdmin's implementation — the signature line itself changes and
+// still mentions requireAdmin on both sides — must be flagged too.
+checkContent(
+  'a real edit to requireAdmin\'s implementation (signature widened) is flagged',
+  [
+    '@@ -5,3 +5,3 @@',
+    '-function requireAdmin(req: Request, res: Response): boolean {',
+    '+function requireAdminV2(req: Request, res: Response, opts: { strict?: boolean }): boolean {',
+  ].join('\n'),
+  true,
 );
 
 // Regression (caught in review before merge): patchLines() must NOT drop a
