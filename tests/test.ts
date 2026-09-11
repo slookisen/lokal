@@ -3,6 +3,23 @@
  * Exits with code 1 on any failure, 0 on success.
  */
 
+// P0 CI fix (2026-09-11): force every email send in this suite through
+// EmailService's dry-run path, regardless of whether the real SMTP_HOST/
+// SMTP_PORT/SMTP_USER/SMTP_PASS env vars happen to be set in this process
+// (see src/services/email-service.ts's isEmailForceDryRun() doc comment for
+// the full story and the production-leak guard). Both flags are read
+// LAZILY, at send time, inside EmailService — never baked into the
+// `emailService` singleton's construction-time state — so it does not
+// matter that `email-service.ts` (and therefore the singleton) is almost
+// certainly imported, transitively, by something else in this file's own
+// module graph before this line ever runs; what matters is that it is set
+// long before any test's async body calls sendEmail()/sendRaw(), which is
+// always true here. NODE_ENV=test is this file's own signal that it's
+// running as the test suite (nothing else in this repo sets it); Fly.io
+// production config never does.
+process.env.NODE_ENV = 'test';
+process.env.EMAIL_FORCE_DRY_RUN = 'true';
+
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
 import { computeWakeList, fireTextFor, resolveActiveWindowHour, resolveTickIntervalMin, resolveWindowMin } from "../src/services/loop-dispatch";
@@ -39104,6 +39121,29 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
   delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
 
+  // P0 CI fix (2026-09-11): this block used to have no top-level try/finally,
+  // so any assertion failure that THROWS (rather than merely recording a
+  // failed assertEq/assertTrue) — e.g. a stale hardcoded fixture date
+  // rejected by the booking route, then a null booking dereferenced further
+  // down — left process.env.EXPERIENCES_DB_PATH / BOOKING_DISPATCH_ENABLED /
+  // BOOKING_PREVISIT_REMINDER_HOURS / BOOKING_PREVISIT_EXPIRE_HOURS AND
+  // emailService.sendEmail permanently stubbed for the rest of the suite's
+  // process lifetime — corrupting every LATER block that depends on
+  // emailService's real dry-run behaviour. Observed: crm-platform-identity's
+  // pi16f-pi16p and marketplace-quarantine-gates' a7/a8/a10/b7/b8/
+  // gate2-control all failed, unrelated to either suite's own logic, purely
+  // because this block's sendEmail override was never undone. Restoring in
+  // `finally` — independent of whether THIS block's own assertions pass — is
+  // exactly the "Isolation contract for any new block: restore-in-finally,
+  // always" this file's own SHARED GLOBAL STATE comment (top of file)
+  // already documents; this block just wasn't following it. A pre-existing
+  // fixture-date bug in this block's own bookings can still make ITS OWN
+  // assertions fail (tracked separately, out of scope here); it must no
+  // longer be able to take any OTHER suite down with it.
+  const emailSvcRestorePV = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendRestorePV = emailSvcRestorePV.emailService.sendEmail.bind(emailSvcRestorePV.emailService);
+  try {
+
   const dbFacPathPV = require.resolve("../src/database/db-factory");
   const expStPathPV = require.resolve("../src/services/experience-store");
   const bookStPathPV = require.resolve("../src/services/booking-store");
@@ -39850,17 +39890,23 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertEq(bookStPV.getBookingByRef(String(b14!.booking_ref))?.pre_status, "awaiting_provider",
     "pv-28i: and mutates nothing");
 
-  (emailSvcModPV.emailService as any).sendEmail = origSendPV;
-  if (prevPathPV === undefined) delete process.env.EXPERIENCES_DB_PATH;
-  else process.env.EXPERIENCES_DB_PATH = prevPathPV;
-  if (prevDispatchPV === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
-  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchPV;
-  if (prevReminderPV === undefined) delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
-  else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
-  if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
-  else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
-  dbFacPV.__resetDbFactoryForTesting();
   console.log("  gardssalg-previsit-svarsloyfe: OK (token-hygiene begge veier, engangs+utløp negativtester, PRG-GET-muterer-ikke, foreslå→gjestesvar-løkke m/ rotasjon, klokkejustert purring/utløp + idempotens, gate-av-suppresjon m/ recovery, legacy-rader immune, admin-endepunkt; review-fixes: time_suggested-utløp begge veier + fortids-aksept avvist + sannferdige sider, samtidighets-sikre claims, post-visit-resolvete utenfor løyfen, ankret slot-regex + stemplet frist)");
+  } finally {
+    // See the P0 CI fix comment above this try — restoration MUST happen
+    // even if the block above threw partway through, or every later block in
+    // the process that depends on emailService's real dry-run behaviour gets
+    // silently corrupted.
+    (emailSvcRestorePV.emailService as any).sendEmail = origSendRestorePV;
+    if (prevPathPV === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathPV;
+    if (prevDispatchPV === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+    else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchPV;
+    if (prevReminderPV === undefined) delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
+    else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
+    if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+    else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+  }
 });
 
 // ── dev-request 2026-07-19-verifier-drain-persistens-og-throughput: the new
