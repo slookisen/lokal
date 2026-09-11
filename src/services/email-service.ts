@@ -57,9 +57,78 @@ export interface EmailOptions {
   from?: string;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// P0 CI fix (2026-09-11): main's CI is RED because the real SMTP_HOST/
+// SMTP_PORT/SMTP_USER/SMTP_PASS env vars are now set in this environment
+// (an operator-side change on Daniel's infra, outside this repo), which
+// flips setupTransporter() out of dry-run and makes sendEmail()/sendRaw()
+// attempt REAL network sends during the test suite. Several tests depend on
+// dry-run's `messageId === "DRY_RUN"` behaviour — either to read back a
+// verification code that a real send never exposes
+// (marketplace-quarantine-gates.test.ts a7/a8/a10), or simply to avoid
+// attempting genuine outbound delivery from seven crm-platform-identity
+// booking-sender code paths during a test run.
+//
+// `emailService` below is a MODULE-LEVEL SINGLETON constructed exactly once
+// on first import — `isConfigured`/`this.transporter` are baked in by the
+// constructor and never re-evaluated later. So deleting the SMTP_* env vars
+// in a test's beforeEach/try block would not reliably help: by the time any
+// individual test runs, this module has almost certainly already been
+// imported (and the singleton already constructed) by something else in the
+// same process, and unsetting env vars afterward has no effect on an
+// already-built nodemailer transporter.
+//
+// isEmailForceDryRun() sidesteps that entirely by being read at SEND TIME
+// (inside sendEmail()/sendRaw(), on every call) rather than being folded
+// into `isConfigured` at construction time — so it does not matter when the
+// flag is set relative to module import order; it only has to be set before
+// the actual send call happens, which in this suite is always true (the
+// bootstrap sets it as one of the first things tests/test.ts does, long
+// before any test body runs).
+//
+// Guarded so it can NEVER take effect in production — both conditions must
+// hold, not just one:
+//   1. NODE_ENV === 'test' exactly (set by tests/test.ts's own bootstrap;
+//      Fly.io production config never sets NODE_ENV to this value).
+//   2. EMAIL_FORCE_DRY_RUN === 'true' — a name no real production env
+//      config plausibly sets, and even if it somehow were set, condition 1
+//      still has to hold too.
+// A production deploy that has NODE_ENV=test would be a much larger,
+// independently-alarming misconfiguration than this flag; this is not the
+// only thing that would break in that scenario.
+//
+// isEmailForceDryRun() must NEVER defeat a test that has deliberately
+// substituted its OWN transporter to exercise the real sendEmail()/sendRaw()
+// logic without a live network call — that is an established, repo-wide
+// pattern (grep `\.isConfigured = true` together with `\.transporter = {` —
+// crm-platform-identity.test.ts and 8 opplevelser-*.test.ts files all do
+// `emailSvc.isConfigured = true; emailSvc.transporter = { sendMail: ... };`,
+// restored in a `finally`) used to assert on exactly what would land on the
+// wire (e.g. the From header). A blanket "every send is forced dry-run"
+// would silently break every one of those assertions (verified: it does —
+// 16 crm-platform-identity tests alone). See EmailService.envTransporter
+// below for how the two are told apart.
+// ─────────────────────────────────────────────────────────────────
+function isEmailForceDryRun(): boolean {
+  return process.env.NODE_ENV === 'test' && process.env.EMAIL_FORCE_DRY_RUN === 'true';
+}
+
 export class EmailService {
   private transporter!: Transporter;
   private isConfigured: boolean;
+  // Captured ONCE, immediately after setupTransporter() runs in the
+  // constructor: the actual environment-derived transporter (a real
+  // nodemailer client, or `null` if SMTP_* wasn't fully set). Used at send
+  // time only to tell apart "this.transporter is still the one built from
+  // real env" from "a test has since substituted its own stub" — see the
+  // isEmailForceDryRun() doc comment above. Comparing by IDENTITY (rather
+  // than a sticky "was this ever overridden" boolean) matters: every test
+  // that overrides `transporter` restores the ORIGINAL reference afterwards
+  // (in a `finally`), so identity correctly re-arms forced dry-run for
+  // whatever runs later in the same process — a sticky flag would instead
+  // disable forced dry-run for the rest of the suite the first time any ONE
+  // of those ~9 files' blocks ran, regardless of what ran after it.
+  private readonly envTransporter: Transporter;
 
   // ─── Vertical-config accessors (Phase 4.2) ───────────────────────
   // Read display_name + entity_plural_long + support email lazily on
@@ -84,6 +153,7 @@ export class EmailService {
 
   constructor() {
     this.isConfigured = this.setupTransporter();
+    this.envTransporter = this.transporter;
   }
 
   private setupTransporter(): boolean {
@@ -259,7 +329,10 @@ export class EmailService {
       }
     }
 
-    if (!this.isConfigured) {
+    // See isEmailForceDryRun()'s doc comment: forced dry-run only ever steps
+    // in front of the environment-derived transporter, never one a test has
+    // substituted for its own inspection.
+    if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send email', {
         to: options.to,
         subject: options.subject,
@@ -440,7 +513,8 @@ export class EmailService {
      */
     replyTo?: string;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
-    if (!this.isConfigured) {
+    // See isEmailForceDryRun()'s doc comment above sendEmail() — same rule.
+    if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send raw email', { to: options.to, subject: options.subject });
       return { success: true, messageId: 'DRY_RUN' };
     }
