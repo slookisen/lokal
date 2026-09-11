@@ -578,6 +578,32 @@ export function stripTrailingNorgeSuffix(address: string): string {
   return out;
 }
 
+// ─── Geocode invalidation on a real address/postal_code change ─────────
+// dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: this
+// route writes `agent_knowledge.address` / `.postal_code` but never told the
+// geocode side (`agents.geo_precision`/`lat`/`lng`/…) that its input just
+// changed — a row already at `geo_precision='address'` from the OLD address
+// is a CEILING for agents-geocode-worker.ts's selector (see that file's
+// `IMPROVABLE` predicate: "geo_precision IS NULL OR <> 'address'"), so it is
+// never re-attempted no matter how many times the address text is corrected
+// afterward. Concrete case: "Valens heimelaga" — address corrected to
+// Nordagutu, map pin stayed at the old Haugesund-area coordinate, ~210 km
+// off, across two customer complaints.
+//
+// `valueChanged` treats a null/undefined stored value the same as "" (empty
+// string), matching the convention the allow_correct gating below already
+// uses for comparing an old column value to an incoming write (`oldVal`
+// coerced via `String(oldVal) === newStr`) — so going from "no address at
+// all" to a real one counts as a change (worth invalidating whatever stale
+// centroid/city guess might be sitting there), while re-submitting the exact
+// same string (a repeat enrichment run, or a PUT that only touches a sibling
+// field) never resets a good geocode.
+export function valueChanged(oldVal: string | null | undefined, newVal: unknown): boolean {
+  const oldStr = typeof oldVal === "string" ? oldVal : "";
+  const newStr = newVal == null ? "" : String(newVal);
+  return oldStr !== newStr;
+}
+
 // ─── Column write — body fields → agent_knowledge ──────────────────────
 //
 // We do the provenance update in a single transaction with the column
@@ -1075,6 +1101,54 @@ router.put("/", (req: Request, res: Response) => {
   // double-report it in `corrections`.
   agentColumnUpdates.push(...cityColumnUpdates);
 
+  // ── Geocode invalidation on a real address/postal_code change ──────────
+  // dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet. Runs
+  // AFTER every gate above (allow_correct corrections, the city write path)
+  // has finished deciding what actually lands in `columnUpdates`, so a
+  // REFUSED overwrite (the old value is kept — see the allow_correct gating
+  // loop above) never triggers an invalidation it has no business causing.
+  // Compares the OLD stored value to the value that is about to be written
+  // (address is compared post-normalisation — stripTrailingNorgeSuffix has
+  // already run on it above — since that is what will actually land in the
+  // column) so a write that merely re-submits the same address/postal_code
+  // (a repeat enrichment run, or a PUT that only touches a sibling field)
+  // never resets a good geocode — see valueChanged()'s own header.
+  //
+  // Reset fields are the exact set the dev-request specifies: geo_precision/
+  // lat/lng/geocode_source/geocode_outcome to NULL, geocode_attempts to 0,
+  // geocode_attempted_at to NULL — which is precisely what makes the row
+  // selectable again under agents-geocode-worker.ts's IMPROVABLE/NOT_PARKED
+  // predicates. Applied via `agentColumnUpdates` so it lands in the SAME
+  // `UPDATE agents` statement as any description/categories/city write this
+  // request also made (single statement, same transaction as the
+  // agent_knowledge column write below).
+  const finalAddressWrite = columnUpdates.find((u) => u.col === "address");
+  const finalPostalWrite = columnUpdates.find((u) => u.col === "postal_code");
+  let geocodeInvalidated = false;
+  if (finalAddressWrite || finalPostalWrite) {
+    const geoOldRow = db
+      .prepare("SELECT address, postal_code FROM agent_knowledge WHERE agent_id = ?")
+      .get(agentId) as { address?: string | null; postal_code?: string | null } | undefined;
+    const addressChanged = !!finalAddressWrite && valueChanged(geoOldRow?.address, finalAddressWrite.val);
+    const postalChanged = !!finalPostalWrite && valueChanged(geoOldRow?.postal_code, finalPostalWrite.val);
+    if (addressChanged || postalChanged) {
+      geocodeInvalidated = true;
+      agentColumnUpdates.push(
+        { col: "geo_precision", val: null },
+        { col: "lat", val: null },
+        { col: "lng", val: null },
+        { col: "geocode_source", val: null },
+        { col: "geocode_outcome", val: null },
+        { col: "geocode_attempts", val: 0 },
+        { col: "geocode_attempted_at", val: null },
+      );
+      console.log(
+        `[admin-knowledge] geocode invalidated for agent ${agentId} — ` +
+        `address_changed=${addressChanged} postal_changed=${postalChanged}`,
+      );
+    }
+  }
+
   // ── Apply ─────────────────────────────────────────────────────────────
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
@@ -1141,6 +1215,12 @@ router.put("/", (req: Request, res: Response) => {
     // echoed set alongside the agent_knowledge columns.
     columns_updated: [...columnUpdates.map((u) => u.col), ...agentColumnUpdates.map((u) => u.col)],
     field_provenance_counts: summary,
+    // dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet:
+    // present only when this write actually changed address/postal_code and
+    // therefore reset the geocode fields (see the block above) — absent (not
+    // `false`) on every ordinary call, same convention as the other
+    // present-only-when-it-happened flags below.
+    ...(geocodeInvalidated ? { geocode_invalidated: true } : {}),
     // orch-pr-17: present only when allow_correct was on — per-field outcome of
     // the correct-not-just-add guard (applied / refused / added / noop).
     ...(allowCorrect ? { allow_correct: true, corrections } : {}),
