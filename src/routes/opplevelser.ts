@@ -26,6 +26,12 @@ import {
   // Same slice: bulk-load admission-gate verdict stamp.
   stampExperienceAdmissionVerdict,
   discoverExperiencesRelaxed,
+  countDiscoverExperiences,
+  // fix-up round 3 (dev-request 2026-09-11-experiences-discover-filter-
+  // viser-ikke-nye-rader): shared fylke-equivalence IN-clause builder, so
+  // the admin verification-status-breakdown diagnostic's fylke filter can
+  // never drift from /discover's real (reform-era-bridged) matching.
+  buildFylkeInClause,
   buildRelaxationNote,
   buildNarrowingSuggestions,
   listCategories,
@@ -1008,17 +1014,27 @@ router.get("/discover", (req: Request, res: Response) => {
       return;
     }
 
-    const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit);
+    const { results, relaxedKeys, appliedFilter } = discoverExperiencesRelaxed(filter, limit);
     const note = buildRelaxationNote(relaxedKeys);
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
     // distance_km/geo_precision are only meaningful (and only ever present)
     // when an origin was given — omitting lat/lng must produce byte-identical
     // rows to before this feature existed.
     const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+    // `count` is (and always was) just `results.length` — the size of THIS
+    // page, silently bounded by `limit` (default 20, hard cap 100). `total`
+    // is the true, unbounded count of published rows matching the filter
+    // that was actually applied (appliedFilter — after any zero-hit
+    // relaxation above), so a caller polling growth after an apply:true
+    // bulk-load/content-refresh call has a number that isn't pinned at the
+    // page size. See countDiscoverExperiences()'s doc comment
+    // (experience-store.ts) for the bug this closes.
+    const total = countDiscoverExperiences(appliedFilter);
     res.json({
       vertical: "experiences",
       query: filter,
       count: results.length,
+      total,
       relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
       note: note ?? undefined,
       suggestions: suggestions.length > 0 ? suggestions : undefined,
@@ -1054,6 +1070,78 @@ router.get("/discover", (req: Request, res: Response) => {
       return;
     }
     console.error("[opplevelser] /discover failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/verification-status-breakdown ─────────
+// Read-only diagnostic (dev-request 2026-09-11-experiences-discover-filter-
+// viser-ikke-nye-rader, root-cause follow-up round 2): quantifies how many
+// rows in a fylke/category slice sit at each `verification_status` value.
+// Built to answer, with real numbers instead of guesswork, whether newly
+// inserted rows that an apply:true bulk-load self-reports as "inserted" are
+// actually landing in `verified` (the only status PUBLISH_GATE_SQL lets
+// /discover show) or being quarantined as `needs_review` by the bulk-load
+// admission gate (PR #721's content-judge) — which is what the numbers this
+// endpoint produced turned out to show is the PRIMARY driver of "apply says
+// +19, discover moves +1", not a count-display bug (see the dev-request's
+// Build & deploy log for the traced Rogaland/mat_drikke numbers).
+// GROUP BY only, no writes. Both filters are optional and AND together;
+// with neither given it reports the whole `experiences` table's
+// verification_status distribution. Admin-key gated like every other
+// /admin/* route in this file — this is a diagnostic, not a public stat.
+router.get("/admin/verification-status-breakdown", requireAdmin, (req: Request, res: Response) => {
+  const fylke =
+    typeof req.query.fylke === "string" && req.query.fylke.trim() ? req.query.fylke.trim() : undefined;
+  const category =
+    typeof req.query.category === "string" && req.query.category.trim() ? req.query.category.trim() : undefined;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = [];
+    const params: Record<string, string> = {};
+    if (fylke) {
+      // Bridge pre-2024/2020 fylke-reform era spellings the SAME way
+      // buildDiscoverWhere() does for /discover — a bare `fylke = @fylke`
+      // equality here would silently under/over-count any fylke in a
+      // reform equivalence class (e.g. Troms/"Troms og Finnmark"),
+      // undermining this endpoint's whole purpose as a trustworthy
+      // cross-check against what /discover actually shows (round-2 review
+      // finding, dev-request 2026-09-11-experiences-discover-filter-viser-
+      // ikke-nye-rader).
+      const { sql, params: fylkeParams } = buildFylkeInClause(fylke, "fylke");
+      where.push(sql);
+      Object.assign(params, fylkeParams);
+    }
+    if (category) { where.push("category = @category"); params.category = category; }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const rows = expDb
+      .prepare(
+        `SELECT verification_status, COUNT(*) AS n
+           FROM experiences
+           ${whereSql}
+          GROUP BY verification_status
+          ORDER BY n DESC`
+      )
+      .all(params) as Array<{ verification_status: string | null; n: number }>;
+
+    const breakdown: Record<string, number> = {};
+    let total = 0;
+    for (const r of rows) {
+      const key = r.verification_status ?? "(null)";
+      breakdown[key] = r.n;
+      total += r.n;
+    }
+
+    res.json({
+      success: true,
+      filter: { fylke: fylke ?? null, category: category ?? null },
+      total,
+      breakdown,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/verification-status-breakdown failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

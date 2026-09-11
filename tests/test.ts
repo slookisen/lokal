@@ -35070,6 +35070,25 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-admin-providers-content-triage: unexpected error: " + String(err?.message || err));
   }
 
+  // dev-request 2026-09-11-experiences-discover-filter-viser-ikke-nye-rader,
+  // root-cause investigation round 2: GET admin/verification-status-breakdown
+  // — read-only diagnostic quantifying how many rows in a fylke/category
+  // slice sit at each verification_status, added to replace guesswork about
+  // the bulk-load admission gate's quarantine rate with real numbers.
+  console.log("\n── dev-request 2026-09-11-experiences-discover-filter-viser-ikke-nye-rader (round 2): GET admin/verification-status-breakdown ──");
+  try {
+    const { runOpplevelserAdminVerificationStatusBreakdownTests } = require("../src/routes/opplevelser-admin-verification-status-breakdown.test") as
+      typeof import("../src/routes/opplevelser-admin-verification-status-breakdown.test");
+    const avsb = await runOpplevelserAdminVerificationStatusBreakdownTests({ log: false });
+    passed += avsb.passed;
+    failed += avsb.failed;
+    for (const f of avsb.failures) failures.push("opplevelser-admin-verification-status-breakdown: " + f);
+    console.log(`  opplevelser-admin-verification-status-breakdown: ${avsb.passed} passed, ${avsb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-admin-verification-status-breakdown: unexpected error: " + String(err?.message || err));
+  }
+
   // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2:
   // integration proof that selectProvidersForContentRefresh()'s "thin" gate
   // now respects per-field content_field_evidence provenance — an
