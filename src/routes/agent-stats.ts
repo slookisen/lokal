@@ -40,8 +40,19 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { slugify } from "../utils/slug";
+import { getPrunedChatgptClaudeCounts } from "../services/analytics-rollup-reads";
 
 const router = Router();
+
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated) —
+// mirrors the JS-side cutoff used elsewhere (analytics-service.ts,
+// routes/analytics.ts) so getPrunedChatgptClaudeCounts's day-string
+// comparison lines up with the `datetime('now', '-90 days')` used in the SQL
+// below (sub-second clock skew between the two evaluations is immaterial at
+// day granularity).
+function sqliteDatetime(date: Date): string {
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
 
 // ─── AI bot UA markers stored in session_id (`${ipHash}:${userAgent}`) ─
 // Each marker is a substring we LIKE-match against session_id. Aligned with
@@ -141,8 +152,28 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
       `).get(path, ...params) as { count: number } | undefined;
       return row?.count ?? 0;
     }
-    const aiChatgpt = countAiBucket(AI_MARKERS.chatgpt);
-    const aiClaude = countAiBucket(AI_MARKERS.claude);
+    // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+    // foer-retention): the 90-day PERIOD_CUTOFF above already reaches PAST
+    // the default 60-day auto-prune retention window (RFB_AUTO_PRUNE_DAYS),
+    // so this PUBLIC endpoint was already silently missing up to 30 days of
+    // real history for every producer before this slice — not a hypothetical
+    // edge case. chatgpt/claude are blended exactly (page_view_daily's
+    // bot_type token sets are byte-identical to AI_MARKERS.chatgpt/.claude —
+    // see getPrunedChatgptClaudeCounts's doc comment). `aiOther` and
+    // `humanViews` are NOT blended: rollup's bot_type classifier uses a
+    // different, coarser token match than AI_MARKERS.other (e.g. Gemini,
+    // Perplexity-User, YandexAdditional, NotHumanSearch all land in rollup
+    // bot_type='human' instead) and than "not curl/python/node either" — a
+    // partial blend there would silently change WHICH sessions count as
+    // human, not just how far back the count reaches. Documented known gap:
+    // both stay raw-only, exactly as before Skive 3 (never crash, never drop
+    // to a fabricated zero — they simply keep reflecting only the
+    // still-in-raw portion of the 90-day window).
+    const cutoffIso = sqliteDatetime(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
+    const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path });
+
+    const aiChatgpt = countAiBucket(AI_MARKERS.chatgpt) + prunedAi.chatgpt;
+    const aiClaude = countAiBucket(AI_MARKERS.claude) + prunedAi.claude;
     const aiOther = countAiBucket(AI_MARKERS.other);
     const aiViews = aiChatgpt + aiClaude + aiOther;
 

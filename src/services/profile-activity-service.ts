@@ -41,6 +41,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
 
 // ─── AI bot UA markers ────────────────────────────────────────────────
 // Same technique + marker lists as src/routes/agent-stats.ts's per-agent
@@ -119,8 +120,18 @@ function getViews30(db: Database.Database, path: string): ProfileActivityViews {
     return row?.c ?? 0;
   }
 
-  const chatgpt = bucket(AI_MARKERS.chatgpt);
-  const claude = bucket(AI_MARKERS.claude);
+  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
+  // retention): 30-day window — safely inside the DEFAULT 60-day retention,
+  // but RFB_AUTO_PRUNE_DAYS can be configured down to a minimum of 7 days
+  // (src/index.ts), which would push part of this window past the raw-table
+  // boundary. Blend chatgpt/claude exactly, same reasoning (and same
+  // documented `other`/`human` gap) as agent-stats.ts and owner-stats-
+  // service.ts — see getPrunedChatgptClaudeCounts's doc comment.
+  const cutoffIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
+  const chatgpt = bucket(AI_MARKERS.chatgpt) + prunedAi.chatgpt;
+  const claude = bucket(AI_MARKERS.claude) + prunedAi.claude;
   const other = bucket(AI_MARKERS.other);
 
   return { human, ai: chatgpt + claude + other, aiBreakdown: { chatgpt, claude, other } };

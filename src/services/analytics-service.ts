@@ -3,6 +3,18 @@ import crypto from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
 import { classifyUA, uaFromSessionId } from "./traffic-classifier";
+import {
+  getPrunedPageViewCount,
+  getPrunedPageViewsBySource,
+  getPrunedSessionsTotal,
+  getPrunedQueryCount,
+  getPrunedTopQueryTerms,
+  getPrunedChatgptClaudeCounts,
+  getPrunedQueryCountsByAgent,
+  getPrunedAgentViewRows,
+  getPrunedAgentViewCountsByCity,
+  getPrunedQueryCountsByCity,
+} from "./analytics-rollup-reads";
 
 /**
  * Lightweight Analytics Service for Lokal
@@ -583,7 +595,14 @@ export class AnalyticsService {
       const result = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
       `).get(cutoff, ...vp) as any;
-      const count = result.count as number;
+      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+      // foer-retention): raw count above only ever sees whatever's still in
+      // analytics_page_views — once auto-prune rolls a day up and deletes it,
+      // this silently dropped that day's views with no error. Add back the
+      // pruned-day portion from page_view_daily (a no-op, +0, when the window
+      // hasn't reached the retention boundary, or when ANALYTICS_ROLLUP_READ
+      // is explicitly set to "false").
+      const count = (result.count as number) + getPrunedPageViewCount(cutoff, vertical);
       this._summaryCache.set(cacheKey, { data: count, time: Date.now() });
       return count;
     } catch (err) {
@@ -621,10 +640,21 @@ export class AnalyticsService {
       const vp: string[] = vertical ? [vertical] : [];
 
       // Page views (excluding owner)
+      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+      // foer-retention): every raw COUNT()/GROUP BY below only sees whatever
+      // auto-prune hasn't yet rolled up + deleted. Each is blended with its
+      // pruned-day rollup portion from analytics-rollup-reads.ts — a no-op
+      // (+0 / unchanged) when the window is entirely still in raw, or when
+      // ANALYTICS_ROLLUP_READ=false (instant-rollback path). ownerPageViews/
+      // ownerQueries and avgTimeOnSite below are NOT blended — owner (is_owner=1)
+      // rows are excluded from every rollup write by design (retention-
+      // service.ts), so their pruned-day history is genuinely gone forever;
+      // and avgTimeOnSite needs per-session first/last-seen timestamps rollup
+      // tables never captured. Both are documented known gaps, not oversights.
       const pvResult = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
       `).get(cutoff, ...vp) as any;
-      const pageViews = pvResult.count;
+      const pageViews = (pvResult.count as number) + getPrunedPageViewCount(cutoff, vertical);
 
       // Owner page views
       const ownerPvResult = db.prepare(`
@@ -636,7 +666,7 @@ export class AnalyticsService {
       const uvResult = db.prepare(`
         SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
       `).get(cutoff, ...vp) as any;
-      const uniqueVisitors = uvResult.count;
+      const uniqueVisitors = (uvResult.count as number) + getPrunedSessionsTotal(cutoff, vertical);
 
       // Traffic by source (excluding owner)
       const sourceResult = db.prepare(`
@@ -647,12 +677,16 @@ export class AnalyticsService {
       sourceResult.forEach(row => {
         trafficBySource[row.source] = row.count;
       });
+      const prunedBySource = getPrunedPageViewsBySource(cutoff, vertical);
+      for (const [source, count] of Object.entries(prunedBySource)) {
+        trafficBySource[source] = (trafficBySource[source] || 0) + count;
+      }
 
       // Total queries (excluding owner)
       const qResult = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
       `).get(cutoff, ...vp) as any;
-      const totalQueries = qResult.count;
+      const totalQueries = (qResult.count as number) + getPrunedQueryCount(cutoff, vertical);
 
       // Owner queries
       const ownerQResult = db.prepare(`
@@ -671,7 +705,18 @@ export class AnalyticsService {
         ORDER BY count DESC
         LIMIT 10
       `).all(cutoff, ...vp) as any[];
-      const topSearchTerms = topQueriesResult.map(r => ({ query: r.query, count: r.count }));
+      // Blend in the pruned-day portion (query_text_daily has no <2-char
+      // filter to replicate — trackSearchQuery() never wrote single-char
+      // rows in the first place, see the skip-autocomplete-noise comment at
+      // the insert site — so nothing here can reintroduce that noise), then
+      // re-sort/re-limit exactly like the raw-only query already does.
+      const termTotals = new Map<string, number>();
+      for (const r of topQueriesResult) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
+      for (const r of getPrunedTopQueryTerms(cutoff, vertical)) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
+      const topSearchTerms = [...termTotals.entries()]
+        .map(([query, count]) => ({ query, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
 
       // AI agent traffic breakdown
       // WHY: bots overwhelmingly produce page views, not search queries, so the
@@ -700,6 +745,15 @@ export class AnalyticsService {
         else if (/Claude|anthropic/i.test(ua)) agentTraffic.claude += row.count;
         else agentTraffic.other += row.count;
       }
+      // Skive 3: blend in the pruned-day chatgpt/claude portion from
+      // page_view_daily's bot_type dimension — the token sets are identical
+      // to the regexes just above. `other` is NOT blended: rollup's
+      // 'other_bot' bucket uses a different, broader UA match than this
+      // classifier's ai_search/ai_crawler "other" residue (see
+      // getPrunedChatgptClaudeCounts's doc comment) — documented known gap.
+      const prunedAgentTraffic = getPrunedChatgptClaudeCounts(cutoff, { vertical });
+      agentTraffic.chatgpt += prunedAgentTraffic.chatgpt;
+      agentTraffic.claude += prunedAgentTraffic.claude;
 
       // Back-compat: if the analytics_queries table has search-query hits from
       // explicitly named agents (ChatGPT/Claude), fold those in too so we don't
@@ -710,6 +764,14 @@ export class AnalyticsService {
         GROUP BY agent_id
       `).all(cutoff, ...vp) as any[];
       agentQueryResult.forEach(row => {
+        if (row.agent_id === "ChatGPT") agentTraffic.chatgpt += row.count;
+        else if (row.agent_id === "Claude") agentTraffic.claude += row.count;
+        else agentTraffic.other += row.count;
+      });
+      // Skive 3: same back-compat fold, for the pruned-day portion of
+      // analytics_queries (query_daily.agent_id is an exact string match,
+      // same as the raw column, so this reproduces the loop above exactly).
+      getPrunedQueryCountsByAgent(cutoff, vertical).forEach(row => {
         if (row.agent_id === "ChatGPT") agentTraffic.chatgpt += row.count;
         else if (row.agent_id === "Claude") agentTraffic.claude += row.count;
         else agentTraffic.other += row.count;
@@ -798,7 +860,15 @@ export class AnalyticsService {
       const V = vertical ? " AND vertical_id = ?" : "";
       const vp: string[] = vertical ? [vertical] : [];
 
-      const results = db.prepare(`
+      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+      // foer-retention): check the pruned-day portion FIRST. When it's empty
+      // (ANALYTICS_ROLLUP_READ=false, or the window hasn't reached the
+      // retention boundary) the raw-only query below runs with its ORIGINAL
+      // SQL-level LIMIT and reproduces the exact pre-Skive-3 output byte-for-
+      // byte — no re-ranking risk on that (fast, common) path.
+      const prunedRows = getPrunedAgentViewRows(cutoff, vertical);
+
+      const rawQuery = `
         SELECT
           agent_id,
           agent_name,
@@ -813,16 +883,76 @@ export class AnalyticsService {
         WHERE created_at > ?${V}
         GROUP BY agent_id, agent_name, city
         ORDER BY view_count DESC
-        LIMIT ?
-      `).all(cutoff, ...vp, limit) as any[];
+      `;
 
-      return results.map(r => ({
-        agentId: r.agent_id,
-        agentName: r.agent_name,
-        city: r.city,
-        viewCount: r.view_count,
-        topSource: r.top_source || "unknown",
-      }));
+      if (prunedRows.length === 0) {
+        const results = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...vp, limit) as any[];
+        return results.map(r => ({
+          agentId: r.agent_id,
+          agentName: r.agent_name,
+          city: r.city,
+          viewCount: r.view_count,
+          topSource: r.top_source || "unknown",
+        }));
+      }
+
+      // Blending path: a pruned-day contribution could promote an agent past
+      // the raw-only top N, so fetch ALL raw groups (no LIMIT) and re-rank in
+      // JS after merging.
+      const rawResults = db.prepare(rawQuery).all(cutoff, ...vp) as any[];
+
+      interface Acc { agentId: string; agentName: string; city: string | null; viewCount: number; topSource: string; }
+      const byKey = new Map<string, Acc>();
+      const keyOf = (agentId: string, city: string | null | undefined) => `${agentId}::${city || ""}`;
+
+      for (const r of rawResults) {
+        byKey.set(keyOf(r.agent_id, r.city), {
+          agentId: r.agent_id,
+          agentName: r.agent_name,
+          city: r.city,
+          viewCount: r.view_count,
+          topSource: r.top_source || "unknown",
+        });
+      }
+
+      // agent_view_daily has no agent_name column (see its doc comment in
+      // analytics-rollup-reads.ts), so an agent that only shows up via the
+      // pruned rollup (no surviving raw row this window) needs its display
+      // name resolved from the `agents` table, falling back to the bare
+      // agent_id if that lookup fails or the agent no longer exists.
+      const nameById = new Map<string, string>();
+      try {
+        for (const row of db.prepare(`SELECT id, name FROM agents`).all() as Array<{ id: string; name: string }>) {
+          nameById.set(row.id, row.name);
+        }
+      } catch { /* agents table unavailable in some minimal contexts */ }
+
+      for (const p of prunedRows) {
+        const key = keyOf(p.agent_id, p.city);
+        const existing = byKey.get(key);
+        if (existing) {
+          existing.viewCount += p.view_count;
+        } else {
+          byKey.set(key, {
+            agentId: p.agent_id,
+            agentName: nameById.get(p.agent_id) || p.agent_id,
+            city: p.city || null,
+            viewCount: p.view_count,
+            // Known gap: topSource for a rollup-only agent is left "unknown"
+            // rather than reconstructed from agent_view_daily's view_source
+            // breakdown — the raw subquery's semantics (ALL-TIME, no date
+            // filter at all) are a pre-existing quirk this slice does not
+            // also replicate for the rollup side. Display-only secondary
+            // field; the sort key (viewCount) IS blended correctly.
+            topSource: "unknown",
+          });
+        }
+      }
+
+      return [...byKey.values()]
+        .sort((a, b) => b.viewCount - a.viewCount)
+        .slice(0, limit)
+        .map(v => ({ agentId: v.agentId, agentName: v.agentName, city: v.city ?? undefined, viewCount: v.viewCount, topSource: v.topSource }));
     } catch (err) {
       console.error("[analytics] Failed to get top producers:", err);
       return [];
@@ -914,12 +1044,47 @@ export class AnalyticsService {
         ORDER BY view_count DESC
       `).all(cutoff, cutoff, cutoff) as any[];
 
-      return results.map(r => ({
-        city: r.city,
-        viewCount: r.view_count,
-        searchQueries: r.search_queries || 0,
-        topCategory: r.top_category,
-      }));
+      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+      // foer-retention): blend in the pruned-day portion of viewCount
+      // (agent_view_daily) and searchQueries (query_daily). When both are
+      // empty (flag off, or the window hasn't reached the retention
+      // boundary) this is a fast, byte-identical no-op over the raw-only
+      // result above.
+      const prunedViewByCity = getPrunedAgentViewCountsByCity(cutoff, vertical);
+      const prunedQueryByCity = getPrunedQueryCountsByCity(cutoff, vertical);
+
+      if (Object.keys(prunedViewByCity).length === 0 && Object.keys(prunedQueryByCity).length === 0) {
+        return results.map(r => ({
+          city: r.city,
+          viewCount: r.view_count,
+          searchQueries: r.search_queries || 0,
+          topCategory: r.top_category,
+        }));
+      }
+
+      interface CityAcc { city: string; viewCount: number; searchQueries: number; topCategory: string | null; }
+      const byCity = new Map<string, CityAcc>();
+      for (const r of results) {
+        byCity.set(r.city, { city: r.city, viewCount: r.view_count, searchQueries: r.search_queries || 0, topCategory: r.top_category });
+      }
+      for (const [city, addViews] of Object.entries(prunedViewByCity)) {
+        const existing = byCity.get(city);
+        if (existing) existing.viewCount += addViews;
+        else byCity.set(city, { city, viewCount: addViews, searchQueries: 0, topCategory: null });
+      }
+      for (const [city, addQueries] of Object.entries(prunedQueryByCity)) {
+        const existing = byCity.get(city);
+        if (existing) existing.searchQueries += addQueries;
+        else byCity.set(city, { city, viewCount: 0, searchQueries: addQueries, topCategory: null });
+      }
+
+      // Known gap: topCategory is NOT blended. query_daily/query_text_daily
+      // never preserved the raw `categories` JSON column (Skive 2 didn't roll
+      // it up — out of scope to add now), so a pruned day's category signal
+      // is genuinely unavailable, not merely unqueried. A city whose entire
+      // signal has been pruned reports topCategory: null rather than a
+      // fabricated guess.
+      return [...byCity.values()].sort((a, b) => b.viewCount - a.viewCount);
     } catch (err) {
       console.error("[analytics] Failed to get city stats:", err);
       return [];
