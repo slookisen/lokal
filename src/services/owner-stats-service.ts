@@ -65,6 +65,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
 
 // ─── AI bot UA markers ────────────────────────────────────────────────
 // Same technique + marker lists as agent-stats.ts / profile-activity-
@@ -196,8 +197,18 @@ function getAiPlatforms(db: Database.Database, path: string): OwnerStatsAiPlatfo
       .get(path, ...params) as { c: number } | undefined;
     return row?.c ?? 0;
   }
-  const chatgpt = bucket(AI_MARKERS.chatgpt);
-  const claude = bucket(AI_MARKERS.claude);
+  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
+  // retention): same 90-day window as agent-stats.ts, same reasoning — blend
+  // chatgpt/claude exactly (page_view_daily's bot_type token sets match
+  // AI_MARKERS.chatgpt/.claude byte-for-byte), leave `other` raw-only
+  // (rollup's bot_type classifier doesn't line up 1:1 with AI_MARKERS.other —
+  // see getPrunedChatgptClaudeCounts's doc comment in analytics-rollup-
+  // reads.ts). Documented known gap, not an oversight.
+  const cutoffIso = new Date(Date.now() - OWNER_STATS_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
+  const chatgpt = bucket(AI_MARKERS.chatgpt) + prunedAi.chatgpt;
+  const claude = bucket(AI_MARKERS.claude) + prunedAi.claude;
   const other = bucket(AI_MARKERS.other);
   return { chatgpt, claude, other, total: chatgpt + claude + other };
 }

@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { analyticsService, VerticalId } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
+import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
 // JS .toISOString() uses "T" separator which breaks SQLite string comparison.
@@ -584,7 +585,16 @@ router.get("/pages", (req: Request, res: Response) => {
     ];
     const scannerExclusion = SCANNER_PATTERNS.map(() => "path NOT LIKE ?").join(" AND ");
 
-    const pages = db.prepare(`
+    // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+    // foer-retention): check the pruned-day portion FIRST (same scanner-path
+    // exclusion, so a pruned scanner hit can't leak back in). When it's empty
+    // (ANALYTICS_ROLLUP_READ=false, or the window hasn't reached the
+    // retention boundary) the raw-only query below runs with its ORIGINAL
+    // SQL-level LIMIT and reproduces the exact pre-Skive-3 output byte-for-
+    // byte — no re-ranking risk on that (fast, common) path.
+    const prunedPages = getPrunedPageViewsByPath(cutoff, verticalFilter(req).params[0] as VerticalId | undefined, SCANNER_PATTERNS);
+
+    const rawQuery = `
       SELECT
         path,
         COUNT(*) as views,
@@ -594,8 +604,28 @@ router.get("/pages", (req: Request, res: Response) => {
         AND (${scannerExclusion})
       GROUP BY path
       ORDER BY views DESC
-      LIMIT ?
-    `).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS, limit) as any[];
+    `;
+
+    let pages: Array<{ path: string; views: number; visitors: number }>;
+    if (prunedPages.length === 0) {
+      pages = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS, limit) as any[];
+    } else {
+      // Blending path: a pruned-day contribution could promote a path past
+      // the raw-only top N, so fetch ALL raw groups (no LIMIT) and re-rank.
+      const rawPages = db.prepare(rawQuery).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS) as any[];
+      const byPath = new Map<string, { path: string; views: number; visitors: number }>();
+      for (const p of rawPages) byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
+      for (const p of prunedPages) {
+        const existing = byPath.get(p.path);
+        if (existing) {
+          existing.views += p.views;
+          existing.visitors += p.visitors; // approximation — see helper's doc comment
+        } else {
+          byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
+        }
+      }
+      pages = [...byPath.values()].sort((a, b) => b.views - a.views).slice(0, limit);
+    }
 
     res.json({ pages });
   } catch (err) {
@@ -1629,7 +1659,12 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
           AND created_at > ?
           AND (is_owner IS NULL OR is_owner = 0)
       `).get(umbrellaPath, cutoff) as { c: number };
-      const pageViews_via_profile = profileRow.c;
+      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
+      // foer-retention): page_view_daily's `path` column matches these exact
+      // paths 1:1, so via_profile/via_members/search_referrals blend cleanly
+      // with the pruned-day rollup portion (+0, unchanged, when the flag is
+      // off or the window hasn't reached the retention boundary).
+      const pageViews_via_profile = profileRow.c + getPrunedExactPathViewCount([umbrellaPath], cutoff);
 
       // pageViews_via_members — hits on any member's /produsent/<slug>
       let pageViews_via_members = 0;
@@ -1641,10 +1676,18 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
             AND created_at > ?
             AND (is_owner IS NULL OR is_owner = 0)
         `).get(...memberPaths, cutoff) as { c: number };
-        pageViews_via_members = memberRow.c;
+        pageViews_via_members = memberRow.c + getPrunedExactPathViewCount(memberPaths, cutoff);
       }
 
-      // ai_bot_pageviews — either channel, UA matches known bot token
+      // ai_bot_pageviews — either channel, UA matches known bot token.
+      // NOT blended: this AI_TOKENS allow-list (Googlebot, Gemini,
+      // PerplexityBot, …) does not line up 1:1 with rollup's bot_type
+      // buckets beyond chatgpt/claude (see getPrunedChatgptClaudeCounts's
+      // doc comment in analytics-rollup-reads.ts for why) — a partial blend
+      // here would silently change WHICH bots count, not just how far back
+      // the count reaches. Documented known gap: stays raw-only, same as
+      // pre-Skive-3 (undercounts once the window reaches past the retention
+      // boundary, but never crashes or drops to a fabricated zero).
       const allPaths = [umbrellaPath, ...memberPaths];
       const pathPlaceholders = allPaths.map(() => "?").join(",");
       const aiRow = db.prepare(`
@@ -1664,7 +1707,7 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
           AND (is_owner IS NULL OR is_owner = 0)
           AND source = 'search'
       `).get(...allPaths, cutoff) as { c: number };
-      const search_referrals = searchRow.c;
+      const search_referrals = searchRow.c + getPrunedExactPathViewCount(allPaths, cutoff, { source: "search" });
 
       out.push({
         id: u.id,

@@ -34383,6 +34383,39 @@ const _rollupSlice2Promise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+// Skive 3: every stats reader that queried ONLY the raw analytics tables now
+// falls back to the rollup tables (page_view_daily/sessions_daily/
+// query_daily/query_text_daily/agent_view_daily) for the pruned-day portion
+// of its window, gated by ANALYTICS_ROLLUP_READ (default true). Swaps the
+// shared getDb() singleton -> strictly after rollup-slice2.
+let _rollupReadBlendResolve: () => void = () => {};
+const _rollupReadBlendPromise: Promise<void> = new Promise<void>(r => {
+  _rollupReadBlendResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_rollupSlice2Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention, Skive 3: rollup read blend ──");
+  try {
+    const { runAnalyticsRollupReadBlendTests } = require("../src/services/analytics-rollup-read-blend.test") as
+      typeof import("../src/services/analytics-rollup-read-blend.test");
+    const rrb = await runAnalyticsRollupReadBlendTests({ log: false });
+    passed += rrb.passed;
+    failed += rrb.failed;
+    for (const f of rrb.failures) failures.push("analytics-rollup-read-blend: " + f);
+    console.log(`  analytics-rollup-read-blend: ${rrb.passed} passed, ${rrb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-rollup-read-blend: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rollupReadBlendResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
 // buildPageEvidence (src/services/search-enrich.ts) now also crawls the
 // same-host /produkter page (alongside the existing /kontakt, /om-oss),
@@ -34398,7 +34431,7 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_rollupSlice2Promise]);
+  await Promise.allSettled([_rollupReadBlendPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");

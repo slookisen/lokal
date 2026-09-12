@@ -38,6 +38,7 @@
 // Read-only; never writes.
 
 import { getDb as getRfbDb } from "../database/init";
+import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
 
 // Same UA-marker technique + lists as owner-stats-service.ts / agent-stats.ts
 // (session_id = "<ipHash>:<userAgent>", LIKE-matched). Duplicated rather than
@@ -90,11 +91,24 @@ export function getGardssalgOwnerStats(path: string): GardssalgOwnerStats {
     .prepare(`SELECT COUNT(*) as c FROM analytics_page_views WHERE ${baseWhere} AND (${aiClause})`)
     .get(path, ...aiParams) as { c: number } | undefined;
 
+  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
+  // retention): same 90-day window as RFB's owner-stats-service.ts. Blend
+  // the chatgpt/claude portion of aiBotViews exactly (page_view_daily's
+  // bot_type token sets match ALL_AI_MARKERS' chatgpt/claude entries
+  // byte-for-byte — see getPrunedChatgptClaudeCounts's doc comment in
+  // analytics-rollup-reads.ts); the remaining "other" AI markers (Gemini,
+  // Perplexity-User, YandexAdditional, NotHumanSearch, …) and humanViews stay
+  // raw-only — same documented, pre-existing classification-scheme mismatch
+  // as every other reader here, not fixed in this slice.
+  const cutoffIso = new Date(Date.now() - GARDSSALG_OWNER_STATS_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, vertical: "experiences" });
+
   return {
     windowDays: GARDSSALG_OWNER_STATS_WINDOW_DAYS,
     path,
     humanViews: human?.c ?? 0,
-    aiBotViews: bot?.c ?? 0,
+    aiBotViews: (bot?.c ?? 0) + prunedAi.chatgpt + prunedAi.claude,
     notAvailable: NOT_AVAILABLE,
   };
 }
