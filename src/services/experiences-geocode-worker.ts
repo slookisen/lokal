@@ -86,9 +86,22 @@ function nextMeetingPointStamp(): string {
   return new Date(lastMeetingPointStampMs).toISOString();
 }
 
-export function parseAddressLike(
+type StreetShapeCore = { street: string; postnummer: string | null; careOfMatch: boolean };
+
+/**
+ * Shared core for parseAddressLike() and parseStreetShapeWithoutPostnummer()
+ * (dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer). Runs
+ * every guard parseAddressLike() has always run — delabel, care-of strip,
+ * street-shape regex, NON_STREET_HEAD, "number is secretly the postnummer",
+ * name-word-count cap, foreign-country check — MINUS the final
+ * postnummer-required guard, which is the ONE guard the two functions
+ * disagree on. Factored out so they can never drift apart on what counts as
+ * "street-shaped and not obviously bogus" (both are still governed by the
+ * exact same acceptance logic for everything up to that point).
+ */
+function parseStreetShapeCore(
   meetingPoint: string | null | undefined
-): { street: string; postnummer: string | null } | null {
+): StreetShapeCore | null {
   const raw = (meetingPoint || "").trim();
   if (!raw || raw.length > 120) return null;
 
@@ -157,6 +170,15 @@ export function parseAddressLike(
     return null;
   }
 
+  return { street, postnummer, careOfMatch: !!careOfMatch };
+}
+
+export function parseAddressLike(
+  meetingPoint: string | null | undefined
+): { street: string; postnummer: string | null } | null {
+  const core = parseStreetShapeCore(meetingPoint);
+  if (!core) return null;
+
   // A street with no postnummer anywhere is too weak: "Storgata 5" exists in
   // dozens of kommuner and geocodeOne would happily return the first one.
   // EXCEPT when a care-of prefix was stripped above: "c/o <name>," / "v/
@@ -165,9 +187,189 @@ export function parseAddressLike(
   // kommune — the disambiguation the postnummer exists for is available from
   // context instead. Existing bare-street rejections (no prefix) are
   // unaffected — "Storgata 5" alone is still refused.
-  if (!postnummer && !careOfMatch) return null;
+  if (!core.postnummer && !core.careOfMatch) return null;
 
-  return { street, postnummer };
+  return { street: core.street, postnummer: core.postnummer };
+}
+
+/**
+ * dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer. Measured
+ * 2026-09-12: rows like "Brennerivegen 10" (kommune Løten), "Havsjøveien 309"
+ * (kommune Røros) are street-shaped and pass every guard above EXCEPT the
+ * final postnummer-required one — parseAddressLike() rejects them and they
+ * get misclassified as place names, routed to the Stedsnavn tier, which
+ * never matches a street address. This is the "same match, minus the
+ * postnummer requirement" twin of parseAddressLike(): it returns the parsed
+ * street ONLY when a missing postnummer (and no care-of prefix) is the SOLE
+ * reason parseAddressLike() would reject — never a looser matcher. If a
+ * postnummer WAS found, or a care-of prefix WAS present, parseAddressLike()
+ * already accepts (or rejects for an unrelated reason) and this function
+ * must not double-handle it, so both return null in that case.
+ */
+export function parseStreetShapeWithoutPostnummer(
+  meetingPointOrAddress: string | null | undefined
+): { street: string } | null {
+  const core = parseStreetShapeCore(meetingPointOrAddress);
+  if (!core) return null;
+  if (core.postnummer || core.careOfMatch) return null;
+  return { street: core.street };
+}
+
+// ─── Kommune-disambiguated address fallback — dev-request 2026-09-12-
+// opplevagent-gateadresse-uten-postnummer ───────────────────────────────────
+// 22-23 of 43 sampled backlog rows shaped like parseStreetShapeWithoutPostnummer()
+// above ARE resolvable via Kartverket's address search when the row's OWN
+// `kommune` column is passed as `kommunenavn` disambiguation instead of a
+// postnummer — Kartverket's address index accepts a kommunenavn filter, and a
+// bare street name is often unique WITHIN one kommune even though it exists
+// in dozens nationally (exactly the ambiguity parseAddressLike() itself
+// refuses to guess through). dental-geocode-worker.ts's geocodeOne()/
+// kartverketQuery() cannot express "kommunenavn instead of postnummer" or
+// "tell me if there's more than one hit" (always treffPerSide=1) and must NOT
+// be changed (other verticals depend on its exact behavior) — so this is a
+// small, LOCAL query helper, never imported elsewhere. Same URL base, 8s
+// timeout, User-Agent and swallow-all-errors-to-empty discipline as
+// kartverketQuery().
+const KARTVERKET_ADRESSE_BASE = "https://ws.geonorge.no/adresser/v1/sok";
+
+export type KartverketAddressHit = {
+  lat: number;
+  lng: number;
+  adressekode: string | number | null;
+  postnummer: string | null;
+  poststed: string | null;
+};
+
+type RawKartverketAdresseResponse = {
+  adresser?: Array<{
+    representasjonspunkt?: { lat: number; lon: number };
+    adressekode?: string | number | null;
+    postnummer?: string | null;
+    poststed?: string | null;
+  }>;
+};
+
+function parseKartverketAddressHits(data: RawKartverketAdresseResponse): KartverketAddressHit[] {
+  const raw = Array.isArray(data?.adresser) ? data.adresser : [];
+  const hits: KartverketAddressHit[] = [];
+  for (const a of raw) {
+    const p = a?.representasjonspunkt;
+    if (!p || typeof p.lat !== "number" || typeof p.lon !== "number") continue;
+    hits.push({
+      lat: p.lat,
+      lng: p.lon,
+      adressekode: a?.adressekode ?? null,
+      postnummer: typeof a?.postnummer === "string" ? a.postnummer : null,
+      poststed: typeof a?.poststed === "string" ? a.poststed : null,
+    });
+  }
+  return hits;
+}
+
+async function fetchKartverketAddressHits(
+  url: string,
+  fetchImpl: typeof fetch
+): Promise<{ hits: KartverketAddressHit[] }> {
+  try {
+    const res = await fetchImpl(url, {
+      headers: { "User-Agent": "RFBBot/1.0 (https://rettfrabonden.com)" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return { hits: [] };
+    const data = (await res.json()) as RawKartverketAdresseResponse;
+    return { hits: parseKartverketAddressHits(data) };
+  } catch {
+    return { hits: [] };
+  }
+}
+
+/**
+ * `street` scoped to `kommunenavn` via Kartverket's own kommunenavn filter —
+ * the disambiguation a postnummer normally provides. treffPerSide=5 (not
+ * dental-geocode-worker.ts's 1): the caller needs to know whether there is
+ * MORE than one hit, not just the first. Never throws — any network/HTTP/
+ * parse problem resolves to an empty hit list, same discipline as
+ * kartverketQuery(): a failed probe is never evidence for anything.
+ */
+export async function queryKartverketByStreetAndKommune(
+  street: string,
+  kommunenavn: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ hits: KartverketAddressHit[] }> {
+  const url =
+    `${KARTVERKET_ADRESSE_BASE}?sok=${encodeURIComponent(`${street} ${kommunenavn}`)}` +
+    `&kommunenavn=${encodeURIComponent(kommunenavn)}&treffPerSide=5&utkoordsys=4258`;
+  return fetchKartverketAddressHits(url, fetchImpl);
+}
+
+/** Fallback for a `kommune` value that isn't a real Kartverket kommunenavn: plain free text, no kommunenavn param, letting Kartverket's own analyzer handle it. */
+async function queryKartverketFreeTextAddress(
+  query: string,
+  fetchImpl: typeof fetch
+): Promise<{ hits: KartverketAddressHit[] }> {
+  const url = `${KARTVERKET_ADRESSE_BASE}?sok=${encodeURIComponent(query)}&treffPerSide=5&utkoordsys=4258`;
+  return fetchKartverketAddressHits(url, fetchImpl);
+}
+
+/** Equirectangular approximation — fine at the <1km scale the 50m check below needs; no existing distance helper in this file to reuse. */
+function metersBetween(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const meanLatRad = toRad((a.lat + b.lat) / 2);
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const x = dLng * Math.cos(meanLatRad);
+  return Math.sqrt(x * x + dLat * dLat) * R;
+}
+
+type KommuneDisambiguationResult =
+  | { status: "hit"; lat: number; lng: number; postnummer: string | null; poststed: string | null }
+  | { status: "ambiguous" }
+  | { status: "no_match" };
+
+/**
+ * Accept only on an unambiguous hit: exactly one hit, OR several hits that
+ * all share one `adressekode` AND sit within 50m of each other (Kartverket
+ * sometimes returns near-duplicate records for the same real-world address
+ * point). Anything else is `ambiguous` — never guessed at.
+ */
+function pickUnambiguousKartverketHit(hits: KartverketAddressHit[]): KommuneDisambiguationResult {
+  if (hits.length === 0) return { status: "no_match" };
+  if (hits.length === 1) {
+    const h = hits[0];
+    return { status: "hit", lat: h.lat, lng: h.lng, postnummer: h.postnummer, poststed: h.poststed };
+  }
+  const codes = new Set(hits.map((h) => (h.adressekode == null ? null : String(h.adressekode))));
+  const sameCode = codes.size === 1 && hits[0].adressekode != null;
+  let allWithin50m = true;
+  outer:
+  for (let i = 0; i < hits.length; i++) {
+    for (let j = i + 1; j < hits.length; j++) {
+      if (metersBetween(hits[i], hits[j]) > 50) { allWithin50m = false; break outer; }
+    }
+  }
+  if (sameCode && allWithin50m) {
+    const h = hits[0];
+    return { status: "hit", lat: h.lat, lng: h.lng, postnummer: h.postnummer, poststed: h.poststed };
+  }
+  return { status: "ambiguous" };
+}
+
+/**
+ * The missing-postnummer resolution: kommunenavn-scoped query first, and
+ * ONLY when that comes back with ZERO hits (the row's `kommune` value isn't
+ * a real Kartverket kommunenavn) one plain free-text retry. At most 2
+ * Kartverket calls total per row for this path.
+ */
+async function resolveMissingPostnummerViaKommune(
+  street: string,
+  kommune: string,
+  fetchImpl: typeof fetch
+): Promise<KommuneDisambiguationResult> {
+  const scoped = await queryKartverketByStreetAndKommune(street, kommune, fetchImpl);
+  if (scoped.hits.length > 0) return pickUnambiguousKartverketHit(scoped.hits);
+  const freeText = await queryKartverketFreeTextAddress(`${street}, ${kommune}`, fetchImpl);
+  return pickUnambiguousKartverketHit(freeText.hits);
 }
 
 export type ExperiencesGeocodeResult = {
@@ -187,6 +389,28 @@ export type ExperiencesGeocodeResult = {
    * both a genuine street address and the coarser kommune-centroid fallback.
    */
   providers_sted_fallback: number;
+  /**
+   * dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer: Step D
+   * rows that are street-shaped (parseStreetShapeWithoutPostnummer()) with
+   * NO postnummer stored at all, resolved via the kommune-disambiguated
+   * Kartverket address query instead of being misrouted to the Stedsnavn
+   * tier. geocode_confidence='high', geocode_source=
+   * 'kartverket_kommune_fallback' — the same address tier as Step A, just
+   * reached via a kommune filter instead of a postnummer.
+   */
+  providers_kommune_fallback_upgraded: number;
+  /**
+   * dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer, the
+   * "Harstad pattern": Step A's own geocodeOne() call already had a STORED
+   * postnummer and still came back no_match (the stored postnummer disagrees
+   * with Kartverket's index for that street). Step D's kommune-disambiguated
+   * retry resolved it anyway — the coordinate is written but the row's
+   * already-stored postnummer/poststed are left untouched (never proven
+   * wrong, just unconfirmed), so this is counted distinctly from
+   * providers_kommune_fallback_upgraded above rather than silently folded
+   * into it.
+   */
+  providers_postal_mismatch: number;
   // 2026-08-25: a geocoder answer that cannot be a Norwegian position, refused
   // at the write instead of being stored (see Step A / Step D).
   providers_implausible_rejected: number;
@@ -236,6 +460,8 @@ export async function experiencesGeocodeTick(
     providers_kommune_fallback: 0,
     providers_fallback_unresolved: 0,
     providers_sted_fallback: 0,
+    providers_kommune_fallback_upgraded: 0,
+    providers_postal_mismatch: 0,
     providers_implausible_rejected: 0,
     providers_coords_reset: 0,
     experiences_coords_reset: 0,
@@ -397,7 +623,7 @@ export async function experiencesGeocodeTick(
   // honest "ca. posisjon" label instead of claiming address precision.
   const providerFallbackRows = db
     .prepare(
-      `SELECT id, adresse, kommune, kommunenummer, fylke
+      `SELECT id, adresse, kommune, kommunenummer, fylke, postnummer, poststed
          FROM experience_providers
         WHERE lat IS NULL
           AND (
@@ -417,6 +643,8 @@ export async function experiencesGeocodeTick(
     kommune: string | null;
     kommunenummer: string | null;
     fylke: string | null;
+    postnummer: string | null;
+    poststed: string | null;
   }>;
 
   const updateProviderApprox = db.prepare(
@@ -436,6 +664,18 @@ export async function experiencesGeocodeTick(
             updated_at = datetime('now')
       WHERE id = ?`
   );
+  // dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer: the same
+  // "high" address-tier write Step A itself does, reached via a
+  // kommune-disambiguated Kartverket query instead of a postnummer. postnummer/
+  // poststed are passed in pre-resolved (fill-only-if-currently-empty — see
+  // the call site below) so a populated value on the row is NEVER overwritten.
+  const updateProviderKommuneDisambiguated = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'kartverket_kommune_fallback', geocode_confidence = 'high',
+            postnummer = ?, poststed = ?,
+            updated_at = datetime('now')
+      WHERE id = ?`
+  );
 
   for (const row of providerFallbackRows) {
     try {
@@ -444,13 +684,42 @@ export async function experiencesGeocodeTick(
       // centroid, try the place name itself when `adresse` holds one.
       // parseAddressLike() already exists in this file to recognise a real
       // street address ("<name> <number>"); a place name like "Innset" has no
-      // house number, so it returns null there — which is exactly the signal
-      // used here to mean "this is a place name, not a street". Rows with no
-      // adresse (or a genuine street address, which Step A already tried and
-      // failed) skip straight to the unchanged kommune fallback below.
+      // house number, so it returns null there — which used to be treated as
+      // meaning "this is a place name, not a street" outright. dev-request
+      // 2026-09-12 fix: that conflated two different reasons parseAddressLike()
+      // can return null — a genuine place name (no house number at all) AND a
+      // real street address that is merely missing its postnummer. Only the
+      // former is a place name; parseStreetShapeWithoutPostnummer() tells them
+      // apart. Rows with no adresse (or a genuine street address WITH a
+      // postnummer, which Step A already tried and failed) skip straight to
+      // the unchanged kommune fallback below.
       let stedGeo = null as Awaited<ReturnType<typeof geocodingService.geocodeStedInKommune>> | null;
       if (row.adresse && row.adresse.trim() && !parseAddressLike(row.adresse)) {
-        stedGeo = await geocodingService.geocodeStedInKommune(row.adresse, row.kommunenummer, row.kommune);
+        const streetShape = parseStreetShapeWithoutPostnummer(row.adresse);
+        if (streetShape && row.kommune && row.kommune.trim()) {
+          // A real street, just missing its postnummer (or — if row.postnummer
+          // IS already stored — Step A's own geocodeOne() call already tried
+          // that EXACT stored postnummer and it came back no_match: the
+          // "Harstad pattern" postnummer-mismatch case). Either way this is
+          // NOT a place name, so the Stedsnavn lookup below would be the wrong
+          // API for it; try the kommune-disambiguated address query instead.
+          const kd = await resolveMissingPostnummerViaKommune(streetShape.street, row.kommune, deps.fetchImpl ?? fetch);
+          if (kd.status === "hit" && isPlausibleNorwayCoord(kd.lat, kd.lng)) {
+            const hadStoredPostnummer = !!(row.postnummer && row.postnummer.trim());
+            const finalPostnummer = hadStoredPostnummer ? row.postnummer : kd.postnummer;
+            const finalPoststed = row.poststed && row.poststed.trim() ? row.poststed : kd.poststed;
+            updateProviderKommuneDisambiguated.run(kd.lat, kd.lng, finalPostnummer, finalPoststed, row.id);
+            if (hadStoredPostnummer) stats.providers_postal_mismatch++;
+            else stats.providers_kommune_fallback_upgraded++;
+            continue;
+          }
+          // Ambiguous or still no match after the free-text retry — leave
+          // stedGeo null (never query Stedsnavn for a real street) and fall
+          // through to the ordinary kommune/fylke centroid below, same as any
+          // other row this tier cannot confidently place.
+        } else if (!streetShape) {
+          stedGeo = await geocodingService.geocodeStedInKommune(row.adresse, row.kommunenummer, row.kommune);
+        }
       }
       if (stedGeo && isPlausibleNorwayCoord(stedGeo.lat, stedGeo.lng)) {
         updateProviderSted.run(stedGeo.lat, stedGeo.lng, row.id);
@@ -923,6 +1192,8 @@ type BacklogCandidateRow = {
   lat: number;
   lon: number;
   geocode_confidence: string | null;
+  postnummer: string | null;
+  poststed: string | null;
 };
 
 function selectBacklogCandidates(
@@ -932,7 +1203,7 @@ function selectBacklogCandidates(
 ): BacklogCandidateRow[] {
   return db
     .prepare(
-      `SELECT id, navn, adresse, kommune, kommunenummer, fylke, lat, lon, geocode_confidence
+      `SELECT id, navn, adresse, kommune, kommunenummer, fylke, lat, lon, geocode_confidence, postnummer, poststed
          FROM experience_providers
         WHERE geocode_confidence = 'approximate'
           AND lat IS NOT NULL AND lon IS NOT NULL
@@ -1025,6 +1296,21 @@ export async function runExperiencesGeocodeBacklogPass(
             updated_at = datetime('now')
       WHERE id = ? AND geocode_confidence = 'approximate'`
   );
+  // dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer: same
+  // compare-and-swap guard, same address-tier write shape as updateAddress
+  // above, for a row reached via the kommune-disambiguated query instead of
+  // geocodeOne()'s postnummer ladder. Fixed geocode_confidence='high' (a
+  // single unambiguous Kartverket hit, not a 4-step ladder tier) and its own
+  // geocode_source for provenance, while still clearly an address-tier/
+  // high-confidence source. postnummer/poststed are passed in pre-resolved
+  // (fill-only-if-currently-empty), so a populated value is never overwritten.
+  const updateAddressKommuneFallback = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'kartverket_backlog_kommune', geocode_confidence = 'high',
+            postnummer = ?, poststed = ?,
+            updated_at = datetime('now')
+      WHERE id = ? AND geocode_confidence = 'approximate'`
+  );
 
   for (const row of rows) {
     result.candidates_scanned++;
@@ -1082,6 +1368,65 @@ export async function runExperiencesGeocodeBacklogPass(
         result.rows.push({
           ...base, action: "skipped_address_shaped",
           reason: "adresse is street-address-shaped; address-tier geocode attempted but returned no confirmable Norwegian match",
+        });
+        continue;
+      }
+
+      // parseAddressLike() returned null — either a genuine place name (no
+      // house number at all) or, dev-request 2026-09-12-opplevagent-
+      // gateadresse-uten-postnummer, a real street address that is missing
+      // ONLY its postnummer. parseStreetShapeWithoutPostnummer() tells the
+      // two apart; only the latter gets a real address-tier shot here — a
+      // genuine place name still falls straight to the Stedsnavn diagnostic
+      // below, unchanged.
+      const streetShape = parseStreetShapeWithoutPostnummer(row.adresse);
+      if (streetShape && row.kommune && row.kommune.trim()) {
+        const kd = await resolveMissingPostnummerViaKommune(streetShape.street, row.kommune, deps.fetchImpl ?? fetch);
+
+        if (kd.status === "hit" && isPlausibleNorwayCoord(kd.lat, kd.lng)) {
+          const planned = { lat: kd.lat, lon: kd.lng, place_name: streetShape.street };
+          const finalPostnummer = row.postnummer && row.postnummer.trim() ? row.postnummer : kd.postnummer;
+          const finalPoststed = row.poststed && row.poststed.trim() ? row.poststed : kd.poststed;
+
+          if (dryRun) {
+            result.would_upgrade_address++;
+            result.rows.push({ ...base, action: "would_upgrade_address", planned });
+            continue;
+          }
+
+          const write = updateAddressKommuneFallback.run(kd.lat, kd.lng, finalPostnummer, finalPoststed, row.id);
+          if (write.changes > 0) {
+            result.upgraded_address++;
+            result.rows.push({ ...base, action: "upgraded_address", planned });
+          } else {
+            // Same concurrent-race guard as updateSted/updateAddress above.
+            result.skipped_race++;
+            result.rows.push({
+              ...base, action: "skipped_race",
+              reason: "row's geocode_confidence changed since selection (concurrent run?) — left untouched",
+            });
+          }
+          continue;
+        }
+
+        if (kd.status === "ambiguous") {
+          result.skipped_ambiguous++;
+          result.rows.push({
+            ...base, action: "skipped_ambiguous",
+            reason: "kommune-disambiguated address query returned multiple non-corroborating hits",
+          });
+          continue;
+        }
+
+        // no_match after both the kommunenavn-scoped query and the free-text
+        // retry — this genuinely is a street address, so the Stedsnavn
+        // diagnostic below (place names only) would be the wrong API for it.
+        // Same "tried, couldn't confirm" outcome as the parsedAddress branch
+        // above, just for the missing-postnummer path.
+        result.skipped_address_shaped++;
+        result.rows.push({
+          ...base, action: "skipped_address_shaped",
+          reason: "adresse is street-address-shaped but missing a postnummer; kommune-disambiguated address-tier geocode attempted but returned no confirmable Norwegian match",
         });
         continue;
       }
