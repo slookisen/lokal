@@ -43673,6 +43673,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer:
+// parseStreetShapeWithoutPostnummer() + queryKartverketByStreetAndKommune()
+// (experiences-geocode-worker.ts) — a kommune-disambiguated Kartverket
+// address-tier fallback for street-shaped addresses missing a postnummer,
+// wired into both Step D (experiencesGeocodeTick()) and the backlog pass
+// (runExperiencesGeocodeBacklogPass()). Same conventions as
+// experiences-geocode-backlog.test.ts. Tail position is the convention for a
+// new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer: kommune-disambiguated address fallback ──");
+  try {
+    const { runExperiencesGeocodeKommuneFallbackTests } = require("../src/services/experiences-geocode-kommune-fallback.test") as
+      typeof import("../src/services/experiences-geocode-kommune-fallback.test");
+    const egkf = await runExperiencesGeocodeKommuneFallbackTests({ log: false });
+    passed += egkf.passed;
+    failed += egkf.failed;
+    for (const f of egkf.failures) failures.push("experiences-geocode-kommune-fallback: " + f);
+    console.log(`  experiences-geocode-kommune-fallback: ${egkf.passed} passed, ${egkf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-kommune-fallback: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-11-experiences-retro-opprydding-db-backup-lever:
 // POST/GET /admin/db/backup — better-sqlite3's built-in async online-backup
 // API to a timestamped file under <dirname(DB_PATH)>/backups/, returning
