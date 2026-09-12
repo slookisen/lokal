@@ -37,6 +37,37 @@
  *       postnummer at all) -> providers_kommune_fallback_upgraded, proving
  *       Step D's own wiring independently of the backlog's.
  *
+ * Post-deploy live-verification fix-up round (2026-09-12, 3 bugs found
+ * against production after PR #854 shipped):
+ *   G — Bug 1: 4 hits sharing one `adressekode` but different `nummer` (10,
+ *       100, 69A, 69B, per the live Kartverket response for "Brennerivegen
+ *       10" scoped to kommune Løten) -> upgraded via the hit matching the
+ *       REQUESTED number (10), not rejected as ambiguous.
+ *   H — Bug 1: filtering down to the requested house number leaves ZERO hits
+ *       (Kartverket has the street but not that exact number) -> no_match,
+ *       reported as skipped_address_shaped (an honest miss), never
+ *       skipped_ambiguous.
+ *   I — Bug 2: parseStreetShapeWithoutPostnummer() rescues a street address
+ *       whose house number collides with the postnummer scan ("Vinjevegen
+ *       1075, Vinje") — unit-level, plus a live-style integration test
+ *       through the backlog path proving the row actually gets upgraded.
+ *   J — Bug 2 regression: parseAddressLike() on the SAME input, and on the
+ *       existing "Gården vår i Vestre Slidre 2966" prose input, still
+ *       returns exactly what it returned before this fix-up (null both
+ *       times) — the guard-2/3 reordering must not change parseAddressLike()'s
+ *       observable behavior at all.
+ *   K — Bug 2 regression: parseStreetShapeWithoutPostnummer() still rejects
+ *       the genuine prose case ("Gården vår i Vestre Slidre 2966") — its
+ *       word-count guard fires independently of the postnummer/housenumber
+ *       collision routing, so prose is never accidentally rescued.
+ *   L — Bug 3: backlog pass, the "Harstad pattern" retry that Step D already
+ *       had but the backlog's own address-tier branch was missing — a row
+ *       with a street-shaped `adresse` carrying its OWN (wrong) embedded
+ *       postnummer, geocodeOne() mocked to no_match on it, kommune-
+ *       disambiguated retry mocked to one hit -> row upgraded, the row's
+ *       stored postnummer is NOT overwritten, a NEW postal-mismatch counter
+ *       increments, and skipped_address_shaped does NOT also fire for it.
+ *
  * Same two independent HTTP seams as experiences-geocode-backlog.test.ts:
  * `deps.fetchImpl` (dental-geocode-worker's kartverketQuery AND this file's
  * new queryKartverketByStreetAndKommune/free-text helper — both are plain
@@ -131,7 +162,7 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
           if (/kommunenavn=L.?ten/i.test(url) && /sok=Brennerivegen 10/i.test(url)) {
             return jsonResponse({
               adresser: [{
-                representasjonspunkt: HIT, adressekode: 12345,
+                representasjonspunkt: HIT, adressekode: 12345, nummer: 10, bokstav: "",
                 postnummer: "2340", poststed: "Løten",
               }],
             });
@@ -171,7 +202,7 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
           if (/kommunenavn=Harstad/i.test(url) && /treffPerSide=5/.test(url)) {
             return jsonResponse({
               adresser: [{
-                representasjonspunkt: HIT, adressekode: 987,
+                representasjonspunkt: HIT, adressekode: 987, nummer: 9, bokstav: "",
                 postnummer: "9406", poststed: "Harstad",
               }],
             });
@@ -214,7 +245,7 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
           calls.push(url);
           if (/kommunenavn=Sekse/i.test(url)) return jsonResponse(EMPTY_ADRESSER); // not a real kommunenavn -> zero hits
           if (/sok=Seksevegen 62, Sekse/i.test(url)) {
-            return jsonResponse({ adresser: [{ representasjonspunkt: HIT, adressekode: 55, postnummer: "5780", poststed: "Sekse" }] });
+            return jsonResponse({ adresser: [{ representasjonspunkt: HIT, adressekode: 55, nummer: 62, bokstav: "", postnummer: "5780", poststed: "Sekse" }] });
           }
           return jsonResponse(EMPTY_ADRESSER);
         }) as unknown as typeof fetch;
@@ -278,9 +309,13 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
           if (/kommunenavn=Elverum/i.test(url)) {
             return jsonResponse({
               adresser: [
-                { representasjonspunkt: { lat: 60.8807, lon: 11.5623 }, adressekode: 111, postnummer: "2408", poststed: "Elverum" },
+                // Bug-1 regression: BOTH hits are for the SAME requested house
+                // number (8) — the ambiguity is genuine (different
+                // adressekode, >50m apart), not an artifact of Kartverket
+                // returning other house numbers on the same street.
+                { representasjonspunkt: { lat: 60.8807, lon: 11.5623 }, adressekode: 111, nummer: 8, bokstav: "", postnummer: "2408", poststed: "Elverum" },
                 // >50m away (roughly 0.01deg lat ~= 1.1km) AND a DIFFERENT adressekode.
-                { representasjonspunkt: { lat: 60.8907, lon: 11.5623 }, adressekode: 222, postnummer: "2408", poststed: "Elverum" },
+                { representasjonspunkt: { lat: 60.8907, lon: 11.5623 }, adressekode: 222, nummer: 8, bokstav: "", postnummer: "2408", poststed: "Elverum" },
               ],
             });
           }
@@ -310,7 +345,7 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
         const fetchImpl = (async (input: any) => {
           const url = decodeURIComponent(String(input));
           if (/kommunenavn=R.?ros/i.test(url) && /treffPerSide=5/.test(url)) {
-            return jsonResponse({ adresser: [{ representasjonspunkt: HIT, adressekode: 71, postnummer: "7374", poststed: "Røros" }] });
+            return jsonResponse({ adresser: [{ representasjonspunkt: HIT, adressekode: 71, nummer: 309, bokstav: "", postnummer: "7374", poststed: "Røros" }] });
           }
           return jsonResponse(EMPTY_ADRESSER); // Step A's own ladder never hits
         }) as unknown as typeof fetch;
@@ -323,6 +358,191 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
         assertEq(row?.postnummer, "7374", "F4: postnummer filled in (was empty, no prior stored value)");
         assertEq(result.providers_kommune_fallback_upgraded, 1, "F5: result.providers_kommune_fallback_upgraded counts it");
         assertEq(result.providers_postal_mismatch, 0, "F6: NOT counted as a postal mismatch — there was no prior stored postnummer to conflict with");
+      }
+
+      // ═══ G — Bug 1: same adressekode, DIFFERENT house numbers -> filter to the requested one ═══
+      {
+        const id = expStore.createProvider({
+          navn: "Brenneri Gårdsutsalg 2", fylke: "Innlandet", kommune: "Løten",
+          kommunenummer: "3403", adresse: "Brennerivegen 10",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 60.85, lon = 11.35, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(id);
+
+        // Live Kartverket shape (measured 2026-09-12): 4 hits, ONE adressekode,
+        // house numbers 10 / 100 / 69A / 69B — pre-fix code treated this whole
+        // set as ambiguous; the fix must pick out house number 10 specifically.
+        const HIT10 = { lat: 60.8267, lon: 11.3055 };
+        const fetchImpl = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=L.?ten/i.test(url) && /sok=Brennerivegen 10/i.test(url)) {
+            return jsonResponse({
+              adresser: [
+                { representasjonspunkt: HIT10, adressekode: 5024, nummer: 10, bokstav: "", postnummer: "2340", poststed: "Løten" },
+                { representasjonspunkt: { lat: 60.83, lon: 11.31 }, adressekode: 5024, nummer: 100, bokstav: "", postnummer: "2340", poststed: "Løten" },
+                { representasjonspunkt: { lat: 60.84, lon: 11.32 }, adressekode: 5024, nummer: 69, bokstav: "A", postnummer: "2340", poststed: "Løten" },
+                { representasjonspunkt: { lat: 60.845, lon: 11.325 }, adressekode: 5024, nummer: 69, bokstav: "B", postnummer: "2340", poststed: "Løten" },
+              ],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+
+        const result = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl, sleep: async () => {} },
+        });
+        const row = readProvider(id);
+        assertTrue(
+          row?.lat != null && Math.abs(row.lat - HIT10.lat) < 1e-6 && Math.abs((row.lon ?? 0) - HIT10.lon) < 1e-6,
+          `G1: row upgraded to the house-number-10 hit specifically, not rejected as ambiguous (got ${row?.lat}, ${row?.lon})`
+        );
+        assertEq(row?.geocode_confidence, "high", "G2: geocode_confidence='high' (resolved, not ambiguous)");
+        assertEq(result.upgraded_address, 1, "G3: result.upgraded_address counts it");
+        assertEq(result.skipped_ambiguous, 0, "G4: NOT counted as ambiguous — same adressekode + different house numbers is not real ambiguity");
+        const rowReport = result.rows.find((r) => r.provider_id === id);
+        assertEq(rowReport?.action, "upgraded_address", "G5: per-row action='upgraded_address'");
+      }
+
+      // ═══ H — Bug 1: filtered-to-requested-number set is EMPTY -> no_match, not ambiguous ═══
+      {
+        const id = expStore.createProvider({
+          navn: "Brenneri Gårdsutsalg 3", fylke: "Innlandet", kommune: "Løten",
+          kommunenummer: "3403", adresse: "Brennerivegen 25",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 60.85, lon = 11.35, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(id);
+
+        // Kartverket has the street (house numbers 10 and 100) but NOT house
+        // number 25 — an honest miss, not the same thing as ambiguity.
+        const fetchImpl = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=L.?ten/i.test(url) && /sok=Brennerivegen 25/i.test(url)) {
+            return jsonResponse({
+              adresser: [
+                { representasjonspunkt: { lat: 60.8267, lon: 11.3055 }, adressekode: 5024, nummer: 10, bokstav: "", postnummer: "2340", poststed: "Løten" },
+                { representasjonspunkt: { lat: 60.83, lon: 11.31 }, adressekode: 5024, nummer: 100, bokstav: "", postnummer: "2340", poststed: "Løten" },
+              ],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+
+        const result = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl, sleep: async () => {} },
+        });
+        const row = readProvider(id);
+        assertEq(row?.geocode_confidence, "approximate", "H1: row left untouched — Kartverket has the street but not house number 25");
+        assertTrue(result.skipped_address_shaped >= 1, "H2: result.skipped_address_shaped counts it (honest miss, not ambiguity)");
+        assertEq(result.skipped_ambiguous, 0, "H3: NOT counted as ambiguous");
+        const rowReport = result.rows.find((r) => r.provider_id === id);
+        assertEq(rowReport?.action, "skipped_address_shaped", "H4: per-row action='skipped_address_shaped', not 'skipped_ambiguous'");
+      }
+
+      // ═══ I — Bug 2: postnummer/housenumber collision is rescued, not rejected ═══
+      {
+        const parsed = worker.parseStreetShapeWithoutPostnummer("Vinjevegen 1075, Vinje");
+        assertEq(parsed?.street, "Vinjevegen 1075",
+          "I1: 'Vinjevegen 1075, Vinje' is rescued (the 1075/postnummer collision is not a real postnummer)");
+
+        // Live-style integration through the backlog path: the row must
+        // actually reach the kommune-disambiguated Kartverket call and get
+        // upgraded, not just parse correctly in isolation.
+        const id = expStore.createProvider({
+          navn: "Vinjevegen Gårdsutsalg", fylke: "Vestfold og Telemark", kommune: "Vinje",
+          adresse: "Vinjevegen 1075, Vinje",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 59.6, lon = 7.9, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(id);
+
+        const HIT = { lat: 59.615, lon: 7.8882 };
+        const fetchImpl = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=Vinje/i.test(url) && /sok=Vinjevegen 1075/i.test(url)) {
+            return jsonResponse({
+              adresser: [{ representasjonspunkt: HIT, adressekode: 3890, nummer: 1075, bokstav: "", postnummer: "3890", poststed: "Vinje" }],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+
+        const result = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl, sleep: async () => {} },
+        });
+        const row = readProvider(id);
+        assertTrue(row?.lat != null && Math.abs(row.lat - HIT.lat) < 1e-6,
+          `I2: row upgraded via the postnummer/housenumber-collision rescue (got ${row?.lat})`);
+        assertEq(row?.geocode_confidence, "high", "I3: geocode_confidence='high'");
+        assertEq(result.upgraded_address, 1, "I4: result.upgraded_address counts it (missing-postnummer tier, not postal-mismatch)");
+      }
+
+      // ═══ J — Bug 2 regression: parseAddressLike() unchanged ═══
+      {
+        assertEq(worker.parseAddressLike("Vinjevegen 1075, Vinje"), null,
+          "J1: parseAddressLike() still rejects 'Vinjevegen 1075, Vinje' outright (unchanged — guard 3's collision always returned null here)");
+        assertEq(worker.parseAddressLike("Gården vår i Vestre Slidre 2966"), null,
+          "J2: parseAddressLike() still rejects the existing prose case (unchanged)");
+      }
+
+      // ═══ K — Bug 2 regression: genuine prose is still rejected, not rescued ═══
+      {
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Gården vår i Vestre Slidre 2966"), null,
+          "K1: prose with a 5-word name part is still rejected — the word-count guard fires independently of the postnummer/housenumber collision routing");
+      }
+
+      // ═══ L — Bug 3: backlog pass "Harstad pattern" retry (was missing) ═══
+      {
+        const id = expStore.createProvider({
+          navn: "Andreas Linds Gårdsutsalg 2", fylke: "Troms og Finnmark", kommune: "Harstad",
+          kommunenummer: "5054", adresse: "Andreas Linds gate 9, 9405 Harstad", postnummer: "9405",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        // Backlog only re-attempts rows already at geocode_confidence='approximate'.
+        db.prepare(
+          `UPDATE experience_providers SET lat = 68.5, lon = 16.0, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(id);
+
+        const HIT = { lat: 68.7985, lon: 16.5416 };
+        const calls: string[] = [];
+        const fetchImpl = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          calls.push(url);
+          // The kommune-disambiguated retry: treffPerSide=5 + kommunenavn param.
+          if (/kommunenavn=Harstad/i.test(url) && /treffPerSide=5/.test(url)) {
+            return jsonResponse({
+              adresser: [{ representasjonspunkt: HIT, adressekode: 4433, nummer: 9, bokstav: "", postnummer: "9406", poststed: "Harstad" }],
+            });
+          }
+          // The address-tier geocodeOne() ladder (treffPerSide=1) — the
+          // embedded postnummer "9405" never resolves, by design (the mismatch).
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+
+        const result = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl, sleep: async () => {} },
+        });
+        const row = readProvider(id);
+
+        assertTrue(row?.lat != null && Math.abs(row.lat - HIT.lat) < 1e-6 && Math.abs((row.lon ?? 0) - HIT.lon) < 1e-6,
+          `L1: row upgraded via the kommune-disambiguated retry (got ${row?.lat}, ${row?.lon})`);
+        assertEq(row?.geocode_confidence, "high", "L2: geocode_confidence='high'");
+        assertEq(row?.geocode_source, "kartverket_backlog_kommune", "L3: geocode_source tags this as the kommune-fallback backlog path");
+        assertEq(row?.postnummer, "9405", "L4: the row's already-stored postnummer is NOT overwritten, even though the hit disagrees (9406)");
+        assertEq(row?.poststed, "Harstad", "L5: poststed WAS empty, so it IS filled in from the hit");
+        assertTrue(result.upgraded_postal_mismatch >= 1, "L6: result.upgraded_postal_mismatch counts it (NEW counter)");
+        assertTrue(calls.some((u) => /treffPerSide=1/.test(u)), "L9: the address-tier geocodeOne() attempt actually ran first");
+        const rowReport = result.rows.find((r) => r.provider_id === id);
+        assertEq(rowReport?.action, "upgraded_postal_mismatch",
+          "L7+L8: per-row action='upgraded_postal_mismatch' — NOT double-counted under the plain address-tier counter, and skipped_address_shaped does not also fire for THIS row (leftover 'approximate' rows from earlier sections may contribute their own skipped_address_shaped counts to the shared in-memory DB's totals, so this is checked per-row rather than against the global counter)");
       }
     } catch (err: any) {
       failed++;

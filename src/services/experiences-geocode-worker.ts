@@ -89,11 +89,33 @@ function nextMeetingPointStamp(): string {
 type StreetShapeCore = { street: string; postnummer: string | null; careOfMatch: boolean };
 
 /**
+ * Result of parseStreetShapeCore(). `ok: true` carries the same fields as the
+ * old bare-object return. `ok: false` carries a `reason` so the two callers
+ * can tell guard-2's specific failure ("postnummer_is_housenumber" — the
+ * house number and the only postnummer-shaped token in the string are the
+ * SAME digits, e.g. "Vinjevegen 1075" where 1075 is both the house number and
+ * what the postnummer scan finds) apart from every other rejection ("other" —
+ * NON_STREET_HEAD, the word-count cap, foreign-country, not street-shaped at
+ * all, etc). Bug fix 2026-09-12 (post-deploy live verification of PR #854):
+ * guard 2 used to return a bare `null` indistinguishable from every other
+ * guard, so a genuine street address whose house number simply happens to be
+ * 4 digits (and therefore collides with the postnummer scan) was rejected
+ * OUTRIGHT by parseStreetShapeWithoutPostnummer() too — even though this
+ * collision means "there is no genuine postnummer here", exactly the
+ * condition that function already treats as a green light to try the
+ * kommune-fallback tier for every OTHER "postnummer absent" row.
+ */
+type StreetShapeCoreResult =
+  | { ok: true; street: string; postnummer: string | null; careOfMatch: boolean }
+  | { ok: false; reason: "postnummer_is_housenumber"; street: string }
+  | { ok: false; reason: "other" };
+
+/**
  * Shared core for parseAddressLike() and parseStreetShapeWithoutPostnummer()
  * (dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer). Runs
  * every guard parseAddressLike() has always run — delabel, care-of strip,
- * street-shape regex, NON_STREET_HEAD, "number is secretly the postnummer",
- * name-word-count cap, foreign-country check — MINUS the final
+ * street-shape regex, NON_STREET_HEAD, name-word-count cap, "number is
+ * secretly the postnummer", foreign-country check — MINUS the final
  * postnummer-required guard, which is the ONE guard the two functions
  * disagree on. Factored out so they can never drift apart on what counts as
  * "street-shaped and not obviously bogus" (both are still governed by the
@@ -101,9 +123,9 @@ type StreetShapeCore = { street: string; postnummer: string | null; careOfMatch:
  */
 function parseStreetShapeCore(
   meetingPoint: string | null | undefined
-): StreetShapeCore | null {
+): StreetShapeCoreResult {
   const raw = (meetingPoint || "").trim();
-  if (!raw || raw.length > 120) return null;
+  if (!raw || raw.length > 120) return { ok: false, reason: "other" };
 
   // Drop a leading label ("Oppmøte: …", "Møtested: …"). Bounded to a SHORT
   // single word plus an optional qualifier so it cannot eat a real place name:
@@ -126,7 +148,7 @@ function parseStreetShapeCore(
   const addressPart = careOfMatch ? delabelled.slice(careOfMatch[0].length) : delabelled;
 
   const parts = addressPart.split(",").map((p) => p.trim()).filter(Boolean);
-  if (parts.length === 0) return null;
+  if (parts.length === 0) return { ok: false, reason: "other" };
 
   // A 4-digit group anywhere in the string is a postnummer candidate. Guarded
   // against year-like numbers by requiring it to be followed by a word (the
@@ -138,7 +160,7 @@ function parseStreetShapeCore(
   // address. The name part must contain a letter and must not itself be the
   // postnummer segment.
   const streetMatch = parts[0].match(/^([\p{L}][\p{L}\s.'’-]{1,40}?)\s+(\d{1,4}\s?[A-Za-z]?)$/u);
-  if (!streetMatch) return null;
+  if (!streetMatch) return { ok: false, reason: "other" };
   const namePart = streetMatch[1].trim();
   const numberPart = streetMatch[2].replace(/\s+/g, "");
   const street = `${namePart} ${numberPart}`;
@@ -148,18 +170,37 @@ function parseStreetShapeCore(
   // «Inngang 2», «Rv 7». Compared on the LAST word of the name part, so
   // «Nedre Postboks» is rejected but «Postboksgata» (a real street) is not.
   const headWord = namePart.split(/\s+/).pop() || "";
-  if (NON_STREET_HEAD.test(headWord)) return null;
+  if (NON_STREET_HEAD.test(headWord)) return { ok: false, reason: "other" };
 
-  // Guard 2: the "house number" must not BE the postnummer. «Gården vår i
+  // Guard 2 (word count) is checked BEFORE guard 3 (postnummer collision)
+  // below — bug fix 2026-09-12: «Gården vår i Vestre Slidre 2966» must be
+  // rejected as prose regardless of guard 3's collision check, since it fires
+  // for BOTH reasons simultaneously (5-word name part AND its trailing number
+  // collides with the postnummer scan) and the caller-visible "why" has to be
+  // the prose rejection, not the (also true, but not the relevant) collision
+  // one — see parseStreetShapeWithoutPostnummer()'s doc comment below. A
+  // street name is at most a few words: «Gården vår i Vestre Slidre» is
+  // prose; a real Norwegian street name is 1-3 words («Nedre Slottsgate»,
+  // «Kong Oscars gate»).
+  if (namePart.split(/\s+/).length > 3) return { ok: false, reason: "other" };
+
+  // Guard 3: the "house number" must not BE the postnummer. «Gården vår i
   // Vestre Slidre 2966» parsed as street «Gården vår i Vestre Slidre» + number
   // 2966, with 2966 simultaneously read as the postnummer — a whole sentence
-  // masquerading as an address.
-  if (postMatch && numberPart.replace(/[^\d]/g, "") === postMatch[1]) return null;
-
-  // Guard 3: a street name is at most a few words. «Gården vår i Vestre
-  // Slidre» is prose; a real Norwegian street name is 1-3 words («Nedre
-  // Slottsgate», «Kong Oscars gate»).
-  if (namePart.split(/\s+/).length > 3) return null;
+  // masquerading as an address (caught by guard 2 above before this even
+  // runs). Bug fix 2026-09-12: this ALSO fires for a genuine street address
+  // whose house number simply happens to be 4 digits — "Vinjevegen 1075" —
+  // because the postnummer-scan regex above finds that SAME trailing number
+  // token. That is a real address, not prose, so this returns a discriminated
+  // `postnummer_is_housenumber` result instead of a bare rejection:
+  // parseAddressLike() still treats it as an unconditional reject (unchanged
+  // behavior — every existing test result stays byte-identical), but
+  // parseStreetShapeWithoutPostnummer() can recognise "the ONLY postnummer
+  // candidate here is actually the house number" as equivalent to "there is
+  // no genuine postnummer" and rescue the row into the kommune-fallback tier.
+  if (postMatch && numberPart.replace(/[^\d]/g, "") === postMatch[1]) {
+    return { ok: false, reason: "postnummer_is_housenumber", street };
+  }
 
   // Guard 4: an explicitly FOREIGN address. «Vestergade 5, 8000 Aarhus,
   // Danmark» is perfectly address-shaped and its 8000 is a valid Norwegian
@@ -167,17 +208,21 @@ function parseStreetShapeCore(
   // country. Kartverket only knows Norway, so this would silently place a
   // Danish meeting point in Trøndelag if the numbers happened to line up.
   if (/\b(danmark|denmark|sverige|sweden|finland|island|iceland|deutschland|germany|tyskland|nederland|holland|storbritannia|england|scotland|skottland)\b/i.test(addressPart)) {
-    return null;
+    return { ok: false, reason: "other" };
   }
 
-  return { street, postnummer, careOfMatch: !!careOfMatch };
+  return { ok: true, street, postnummer, careOfMatch: !!careOfMatch };
 }
 
 export function parseAddressLike(
   meetingPoint: string | null | undefined
 ): { street: string; postnummer: string | null } | null {
   const core = parseStreetShapeCore(meetingPoint);
-  if (!core) return null;
+  // Every non-ok outcome — including the new "postnummer_is_housenumber"
+  // discriminated reason — maps to null here exactly as a bare `null` return
+  // always did: guard 3 above always rejected this case outright for
+  // parseAddressLike(), so this is unchanged behavior, not a new rule.
+  if (!core.ok) return null;
 
   // A street with no postnummer anywhere is too weak: "Storgata 5" exists in
   // dozens of kommuner and geocodeOne would happily return the first one.
@@ -205,12 +250,26 @@ export function parseAddressLike(
  * postnummer WAS found, or a care-of prefix WAS present, parseAddressLike()
  * already accepts (or rejects for an unrelated reason) and this function
  * must not double-handle it, so both return null in that case.
+ *
+ * Bug fix 2026-09-12 (post-deploy live verification of PR #854): a
+ * `postnummer_is_housenumber` core result — guard 3's "the house number
+ * happens to collide with the only postnummer-shaped token in the string"
+ * case, e.g. "Vinjevegen 1075" — is ALSO treated as "no genuine postnummer",
+ * the same green light as the core simply finding no 4-digit group at all.
+ * That collision is the sole thing wrong with the row, and it isn't a real
+ * postnummer, so this rescues it into the kommune-fallback tier exactly like
+ * any other missing-postnummer street address. Every other rejection reason
+ * ("other" — prose, NON_STREET_HEAD, foreign-country, not street-shaped)
+ * still returns null here, unchanged.
  */
 export function parseStreetShapeWithoutPostnummer(
   meetingPointOrAddress: string | null | undefined
 ): { street: string } | null {
   const core = parseStreetShapeCore(meetingPointOrAddress);
-  if (!core) return null;
+  if (!core.ok) {
+    if (core.reason === "postnummer_is_housenumber") return { street: core.street };
+    return null;
+  }
   if (core.postnummer || core.careOfMatch) return null;
   return { street: core.street };
 }
@@ -238,6 +297,19 @@ export type KartverketAddressHit = {
   adressekode: string | number | null;
   postnummer: string | null;
   poststed: string | null;
+  /**
+   * Bug fix 2026-09-12 (post-deploy live verification of PR #854): the house
+   * number and its optional letter suffix, e.g. `nummer: 10, bokstav: null`
+   * for "Brennerivegen 10" or `nummer: 69, bokstav: "A"` for "Brennerivegen
+   * 69A". `adressekode` identifies the STREET, not an individual address
+   * point — Kartverket's own live response for "Brennerivegen 10" scoped to
+   * kommune Løten returns 4 hits (house numbers 10, 100, 69A, 69B) ALL sharing
+   * one `adressekode`, so pickUnambiguousKartverketHit() needs `nummer`/
+   * `bokstav` to filter down to the house number actually requested BEFORE
+   * applying the adressekode/50m clustering check below.
+   */
+  nummer: number | null;
+  bokstav: string | null;
 };
 
 type RawKartverketAdresseResponse = {
@@ -246,6 +318,8 @@ type RawKartverketAdresseResponse = {
     adressekode?: string | number | null;
     postnummer?: string | null;
     poststed?: string | null;
+    nummer?: number | null;
+    bokstav?: string | null;
   }>;
 };
 
@@ -261,6 +335,8 @@ function parseKartverketAddressHits(data: RawKartverketAdresseResponse): Kartver
       adressekode: a?.adressekode ?? null,
       postnummer: typeof a?.postnummer === "string" ? a.postnummer : null,
       poststed: typeof a?.poststed === "string" ? a.poststed : null,
+      nummer: typeof a?.nummer === "number" ? a.nummer : null,
+      bokstav: typeof a?.bokstav === "string" ? a.bokstav : null,
     });
   }
   return hits;
@@ -328,28 +404,70 @@ type KommuneDisambiguationResult =
   | { status: "no_match" };
 
 /**
- * Accept only on an unambiguous hit: exactly one hit, OR several hits that
- * all share one `adressekode` AND sit within 50m of each other (Kartverket
- * sometimes returns near-duplicate records for the same real-world address
- * point). Anything else is `ambiguous` — never guessed at.
+ * Bug fix 2026-09-12 (post-deploy live verification of PR #854): the TARGET
+ * house number (and optional single-letter suffix) actually requested, parsed
+ * off the trailing "<digits><optional letter>" of `street` — the exact same
+ * shape parseStreetShapeCore()'s own `streetMatch` regex already extracts
+ * (e.g. "10" out of "Brennerivegen 10", "69A" out of "Brennerivegen 69A").
+ * `street` is always constructed by this file in that shape, so a failed
+ * match here (defensive only) falls back to "no filtering" in the caller.
  */
-function pickUnambiguousKartverketHit(hits: KartverketAddressHit[]): KommuneDisambiguationResult {
-  if (hits.length === 0) return { status: "no_match" };
-  if (hits.length === 1) {
-    const h = hits[0];
+function parseTargetHouseNumber(street: string): { nummer: number; bokstav: string | null } | null {
+  const m = street.trim().match(/(\d{1,4})\s?([A-Za-z]?)$/);
+  if (!m) return null;
+  return { nummer: parseInt(m[1], 10), bokstav: m[2] ? m[2].toUpperCase() : null };
+}
+
+/**
+ * Accept only on an unambiguous hit for the REQUESTED house number. A
+ * Norwegian `adressekode` identifies the STREET, not an individual address
+ * point — Kartverket's live response for "Brennerivegen 10" scoped to
+ * kommune Løten returns 4 hits (house numbers 10, 100, 69A, 69B) ALL sharing
+ * one `adressekode`, and the old code (pre this fix) treated that as
+ * ambiguous even though house number 10 has exactly one matching hit. So
+ * `hits` is FIRST filtered down to those whose `nummer` (and `bokstav`,
+ * case-insensitively — an absent/empty `bokstav` on either side matches only
+ * an absent/empty one, never wildcarded) matches the house number parsed out
+ * of `street`. Only THEN is the existing accept/ambiguous logic applied, to
+ * the filtered set:
+ *   - 0 filtered hits -> `no_match` (Kartverket found the street but not that
+ *     exact house number — an honest miss, not ambiguity).
+ *   - 1 filtered hit -> `hit`.
+ *   - >1 filtered hits -> `hit` only if they all share one `adressekode` AND
+ *     sit within 50m of each other (Kartverket sometimes returns
+ *     near-duplicate records for the very same address point); otherwise
+ *     `ambiguous` — never guessed at.
+ * If `street`'s trailing number can't be parsed (should not happen — this
+ * file always constructs `street` in that shape), filtering is skipped and
+ * every hit is considered, matching the pre-fix behavior as a safety net.
+ */
+function pickUnambiguousKartverketHit(hits: KartverketAddressHit[], street: string): KommuneDisambiguationResult {
+  const target = parseTargetHouseNumber(street);
+  const candidates = target
+    ? hits.filter((h) => {
+        if (h.nummer !== target.nummer) return false;
+        const hitLetter = (h.bokstav || "").trim().toUpperCase();
+        const targetLetter = target.bokstav || "";
+        return hitLetter === targetLetter;
+      })
+    : hits;
+
+  if (candidates.length === 0) return { status: "no_match" };
+  if (candidates.length === 1) {
+    const h = candidates[0];
     return { status: "hit", lat: h.lat, lng: h.lng, postnummer: h.postnummer, poststed: h.poststed };
   }
-  const codes = new Set(hits.map((h) => (h.adressekode == null ? null : String(h.adressekode))));
-  const sameCode = codes.size === 1 && hits[0].adressekode != null;
+  const codes = new Set(candidates.map((h) => (h.adressekode == null ? null : String(h.adressekode))));
+  const sameCode = codes.size === 1 && candidates[0].adressekode != null;
   let allWithin50m = true;
   outer:
-  for (let i = 0; i < hits.length; i++) {
-    for (let j = i + 1; j < hits.length; j++) {
-      if (metersBetween(hits[i], hits[j]) > 50) { allWithin50m = false; break outer; }
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (metersBetween(candidates[i], candidates[j]) > 50) { allWithin50m = false; break outer; }
     }
   }
   if (sameCode && allWithin50m) {
-    const h = hits[0];
+    const h = candidates[0];
     return { status: "hit", lat: h.lat, lng: h.lng, postnummer: h.postnummer, poststed: h.poststed };
   }
   return { status: "ambiguous" };
@@ -367,9 +485,9 @@ async function resolveMissingPostnummerViaKommune(
   fetchImpl: typeof fetch
 ): Promise<KommuneDisambiguationResult> {
   const scoped = await queryKartverketByStreetAndKommune(street, kommune, fetchImpl);
-  if (scoped.hits.length > 0) return pickUnambiguousKartverketHit(scoped.hits);
+  if (scoped.hits.length > 0) return pickUnambiguousKartverketHit(scoped.hits, street);
   const freeText = await queryKartverketFreeTextAddress(`${street}, ${kommune}`, fetchImpl);
-  return pickUnambiguousKartverketHit(freeText.hits);
+  return pickUnambiguousKartverketHit(freeText.hits, street);
 }
 
 export type ExperiencesGeocodeResult = {
@@ -1093,8 +1211,12 @@ export async function experiencesGeocodeTick(
 export type ExperiencesGeocodeBacklogAction =
   | "upgraded"
   | "upgraded_address"
+  /** Bug fix 2026-09-12 — the "Harstad pattern" twin of "upgraded_address": the address-tier geocodeOne() call's own (embedded-in-adresse) postnummer came back no_match, but the kommune-disambiguated retry resolved it anyway. */
+  | "upgraded_postal_mismatch"
   | "would_upgrade"
   | "would_upgrade_address"
+  /** Dry-run twin of "upgraded_postal_mismatch". */
+  | "would_upgrade_postal_mismatch"
   | "skipped_address_shaped"
   | "skipped_ambiguous"
   | "skipped_no_match"
@@ -1109,7 +1231,7 @@ export type ExperiencesGeocodeBacklogRowOutcome = {
   before: { lat: number | null; lon: number | null; geocode_confidence: string | null };
   action: ExperiencesGeocodeBacklogAction;
   reason?: string;
-  /** Only set for "upgraded"/"would_upgrade"/"upgraded_address"/"would_upgrade_address" — the planned point and its source label (Stedsnavn place name, or the cleaned street for the address tier). */
+  /** Only set for "upgraded"/"would_upgrade"/"upgraded_address"/"would_upgrade_address"/"upgraded_postal_mismatch"/"would_upgrade_postal_mismatch" — the planned point and its source label (Stedsnavn place name, or the cleaned street for the address tier). */
   planned?: { lat: number; lon: number; place_name: string };
 };
 
@@ -1120,9 +1242,26 @@ export type ExperiencesGeocodeBacklogResult = {
   upgraded: number;
   /** Fix 3 — address-tier upgrades (parseAddressLike() + geocodeOne()), counted separately from the sted-tier `upgraded` above. */
   upgraded_address: number;
+  /**
+   * Bug fix 2026-09-12 (post-deploy live verification of PR #854): the
+   * backlog-pass twin of experiencesGeocodeTick()'s Step D
+   * `providers_postal_mismatch` — the address-tier geocodeOne() call above
+   * already had a postnummer embedded in `adresse` and still came back
+   * no_match (the embedded postnummer disagrees with Kartverket's index for
+   * that street). The kommune-disambiguated retry (same
+   * resolveMissingPostnummerViaKommune() helper Step D uses) resolved it
+   * anyway — the coordinate is written but the row's own stored postnummer/
+   * poststed are left untouched (never proven wrong, just unconfirmed), so
+   * this is counted distinctly from `upgraded_address` rather than folded
+   * into it, exactly like Step D keeps it distinct from
+   * `providers_kommune_fallback_upgraded`.
+   */
+  upgraded_postal_mismatch: number;
   would_upgrade: number;
   /** Fix 3 — dry-run twin of `upgraded_address`. */
   would_upgrade_address: number;
+  /** Dry-run twin of `upgraded_postal_mismatch`. */
+  would_upgrade_postal_mismatch: number;
   skipped_address_shaped: number;
   skipped_ambiguous: number;
   skipped_no_match: number;
@@ -1260,8 +1399,10 @@ export async function runExperiencesGeocodeBacklogPass(
     candidates_scanned: 0,
     upgraded: 0,
     upgraded_address: 0,
+    upgraded_postal_mismatch: 0,
     would_upgrade: 0,
     would_upgrade_address: 0,
+    would_upgrade_postal_mismatch: 0,
     skipped_address_shaped: 0,
     skipped_ambiguous: 0,
     skipped_no_match: 0,
@@ -1361,7 +1502,61 @@ export async function runExperiencesGeocodeBacklogPass(
           continue;
         }
 
-        // Tried the address tier and it could not confirm a point — same
+        // Bug fix 2026-09-12 (post-deploy live verification of PR #854, "the
+        // Harstad pattern"): the address-tier call above already had a
+        // postnummer embedded in `adresse` and still came back no_match — the
+        // embedded postnummer may simply disagree with Kartverket's own index
+        // for that street. Step D already retries this exact case via
+        // resolveMissingPostnummerViaKommune() (providers_postal_mismatch);
+        // this was the one place that retry was missing. One retry only, and
+        // only when a kommune is known to scope it — never overwrites the
+        // row's own already-stored postnummer/poststed (mirrors Step D's
+        // discipline exactly: it "won't be empty" here, since a stored
+        // postnummer is what caused this address-tier attempt in the first
+        // place, but the fill-only-if-empty guard is kept for parity anyway).
+        if (row.kommune && row.kommune.trim()) {
+          const kd = await resolveMissingPostnummerViaKommune(parsedAddress.street, row.kommune, deps.fetchImpl ?? fetch);
+
+          if (kd.status === "hit" && isPlausibleNorwayCoord(kd.lat, kd.lng)) {
+            const finalPostnummer = row.postnummer && row.postnummer.trim() ? row.postnummer : kd.postnummer;
+            const finalPoststed = row.poststed && row.poststed.trim() ? row.poststed : kd.poststed;
+            const planned = { lat: kd.lat, lon: kd.lng, place_name: parsedAddress.street };
+
+            if (dryRun) {
+              result.would_upgrade_postal_mismatch++;
+              result.rows.push({ ...base, action: "would_upgrade_postal_mismatch", planned });
+              continue;
+            }
+
+            const write = updateAddressKommuneFallback.run(kd.lat, kd.lng, finalPostnummer, finalPoststed, row.id);
+            if (write.changes > 0) {
+              result.upgraded_postal_mismatch++;
+              result.rows.push({ ...base, action: "upgraded_postal_mismatch", planned });
+            } else {
+              // Same concurrent-race guard as updateSted/updateAddress above.
+              result.skipped_race++;
+              result.rows.push({
+                ...base, action: "skipped_race",
+                reason: "row's geocode_confidence changed since selection (concurrent run?) — left untouched",
+              });
+            }
+            continue;
+          }
+
+          if (kd.status === "ambiguous") {
+            result.skipped_ambiguous++;
+            result.rows.push({
+              ...base, action: "skipped_ambiguous",
+              reason: "kommune-disambiguated postal-mismatch retry returned multiple non-corroborating hits",
+            });
+            continue;
+          }
+          // kd.status === "no_match" — falls through to the unchanged
+          // skipped_address_shaped outcome below, same as before this fix.
+        }
+
+        // Tried the address tier (and, if a kommune was known, the
+        // postal-mismatch retry too) and it could not confirm a point — same
         // counter/action as before fix 3, but now honestly "attempted and
         // still unconfirmed" rather than "never attempted".
         result.skipped_address_shaped++;
