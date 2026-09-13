@@ -805,6 +805,20 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
   } catch { /* already present */ }
 
+  // ─── Navnekollisjon Brreg-gate (dev-request 2026-09-13-navnekollisjon-
+  // brreg-gate) ────────────────────────────────────────────────────────────
+  // classifyProvider() (services/experience-brreg.ts) now refuses to accept
+  // a Brreg match when >=2 candidates share the provider's name AND kommune
+  // didn't disambiguate the best one, rather than risk attaching contact
+  // data/description from the WRONG entity (Moland Gård, Bakke Gårdsbakeri,
+  // Romstad Gård, Grana Bryggeri incident). name_collision flags a provider
+  // row the recheck backfill (experience-brreg-recheck-backfill.ts) stamped
+  // as an unresolved collision, for CS/manual disambiguation. Defaults 0 so
+  // every existing row is unaffected the instant this column exists.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN name_collision INTEGER DEFAULT 0");
+  } catch { /* already present */ }
+
   // ─── Booking-flyt-v1 slice 2 — pre-visit e-post-svarsløyfe (dev-request
   // 2026-07-14-booking-flyt-v1, slice 2) ─────────────────────────────────────
   // The existing status/confirm_token pair is strictly POST-visit (attendance

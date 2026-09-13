@@ -122,6 +122,8 @@ export interface BrregVerdict {
   matched_navn?: string | null;
   naeringskode?: string | null;
   match_confidence?: "high" | "medium" | null;
+  /** True when >=2 Brreg candidates share the provider's (normalized) name AND the best-scoring one's kommune doesn't match the provider's — accept was refused rather than risk matching the WRONG entity (see the name_collision branch in classifyProvider()). */
+  name_collision: boolean;
   reason: string;
 }
 
@@ -160,6 +162,27 @@ export async function classifyProvider(
     }
   }
 
+  // Name-collision gate: multiple Brreg entities share (roughly) the same
+  // name and the best-scoring candidate's kommune does NOT match the
+  // provider's — kommune failed to disambiguate, so accepting the top hit
+  // risks attaching data (phone/email/description) from the WRONG entity.
+  // Refuse to guess: fall through to `unverified` instead of force-matching.
+  const collisionCandidates = candidates.filter((c) => nameSimilarity(provider.name, c.navn || "") >= 0.6);
+  if (collisionCandidates.length >= 2 && best && best.kommuneOk === false) {
+    return {
+      provider_name: provider.name,
+      classification: "unverified",
+      org_nr: null,
+      brreg_verified: 0,
+      brreg_active: null,
+      matched_navn: null,
+      naeringskode: null,
+      match_confidence: null,
+      name_collision: true,
+      reason: "name_collision_kommune_mismatch",
+    };
+  }
+
   if (best && best.sim >= 0.6 && naceOk(best.nace)) {
     const active = isActive(best.e);
     return {
@@ -171,6 +194,7 @@ export async function classifyProvider(
       matched_navn: best.e.navn ?? null,
       naeringskode: best.nace ?? null,
       match_confidence: best.sim >= 0.85 && best.kommuneOk ? "high" : "medium",
+      name_collision: false,
       reason: active ? "ok" : "matched_but_inactive",
     };
   }
@@ -185,6 +209,7 @@ export async function classifyProvider(
     matched_navn: null,
     naeringskode: null,
     match_confidence: null,
+    name_collision: false,
     reason: "no_confident_brreg_match",
   };
 }

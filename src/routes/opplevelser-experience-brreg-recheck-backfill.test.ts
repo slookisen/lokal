@@ -267,18 +267,48 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
             }),
           } as any;
         }
+        // "Kollisjon …" -> two candidates sharing the same normalized name,
+        // in municipalities that DON'T match the seeded provider's kommune
+        // (name-collision gate, dev-request 2026-09-13-navnekollisjon-brreg-
+        // gate) — see section (n) below.
+        if (lc.startsWith("kollisjon")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              _embedded: {
+                enheter: [
+                  {
+                    organisasjonsnummer: orgNr,
+                    navn: navn.toUpperCase() + " AS",
+                    naeringskode1: { kode: "93.291" },
+                    forretningsadresse: { kommune: "Kristiansand" },
+                    konkurs: false, underAvvikling: false, underTvangsavviklingEllerTvangsopplosning: false, slettedato: null,
+                  },
+                  {
+                    organisasjonsnummer: "8" + orgNr.slice(1), // distinct from orgNr, still 9 digits
+                    navn: navn.toUpperCase() + " DA",
+                    naeringskode1: { kode: "93.291" },
+                    forretningsadresse: { kommune: "Trondheim" },
+                    konkurs: false, underAvvikling: false, underTvangsavviklingEllerTvangsopplosning: false, slettedato: null,
+                  },
+                ],
+              },
+            }),
+          } as any;
+        }
         // "Ukjent …" and anything unrecognised -> no candidate at all.
         return { ok: true, status: 200, json: async () => ({ _embedded: { enheter: [] } }) } as any;
       });
 
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, brreg_active, brreg_verified, org_nr, content_source, catalog_hidden)
-         VALUES (@id, @navn, @brreg_active, @brreg_verified, @org_nr, @content_source, @catalog_hidden)`,
+           (id, navn, brreg_active, brreg_verified, org_nr, content_source, catalog_hidden, kommune)
+         VALUES (@id, @navn, @brreg_active, @brreg_verified, @org_nr, @content_source, @catalog_hidden, @kommune)`,
       );
       const seedProvider = (o: {
         id: string; navn: string; brreg_active?: number | null; brreg_verified?: number; org_nr?: string | null;
-        content_source?: string | null; catalog_hidden?: number | null;
+        content_source?: string | null; catalog_hidden?: number | null; kommune?: string | null;
       }) => {
         insertProvider.run({
           id: o.id, navn: o.navn,
@@ -287,6 +317,7 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
           org_nr: o.org_nr ?? null,
           content_source: o.content_source ?? null,
           catalog_hidden: o.catalog_hidden ?? null,
+          kommune: o.kommune ?? null,
         });
       };
       const providerRow = (id: string) =>
@@ -595,6 +626,50 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
         assertEq(postRow?.promotion?.brreg_active, true, "brb-l11: promotion.brreg_active=true now");
         assertEq(postRow?.promotion?.status, "promoted", "brb-l12: promotion.status='promoted' — the existing, UNCHANGED gate now passes");
         assertEq(sweepStatus("exp-compose-01").verification_status, "verified", "brb-l13: verification_status -> verified");
+      }
+
+      // ═══ (n) name_collision gate (dev-request 2026-09-13-navnekollisjon-
+      // brreg-gate): classifyProvider() returns name_collision:true when
+      // >=2 Brreg candidates share the provider's name and neither matches
+      // its kommune — this row must NOT be resolved either way; it is left
+      // still_unresolved AND stamped name_collision=1 for CS/manual
+      // disambiguation, reported as outcome:"flagged_name_collision". ══════
+      {
+        const nameCollisionRow = (id: string) =>
+          expDb
+            .prepare(`SELECT brreg_active, brreg_verified, org_nr, name_collision FROM experience_providers WHERE id = ?`)
+            .get(id) as { brreg_active: number | null; brreg_verified: number; org_nr: string | null; name_collision: number | null };
+
+        // id deliberately sorts AFTER every other id seeded anywhere else in
+        // this file ("zzzz-" > "zzc-", "prov-", etc.) — several earlier
+        // sections (pagination's zzc-*, the org_nr-collision guard's
+        // prov-zc2-collide-dup) leave rows genuinely still eligible
+        // (brreg_active IS NULL) forever, so a tight `after` cursor is the
+        // only way to isolate this section's own candidate deterministically,
+        // same convention section (m)/(i) already use for themselves.
+        seedProvider({ id: "zzzz-n1-kollisjon", navn: "Kollisjon Duplikat", kommune: "Bergen" });
+        const before = nameCollisionRow("zzzz-n1-kollisjon");
+        assertEq(before.name_collision, 0, "brb-n0: seeded row starts at name_collision=0 (column default)");
+
+        const r = await callRoute(opplevelserRouter, {
+          url: ROUTE, headers: adminHeaders,
+          body: { dry_run: false, limit: 10, after: "zzzz-n0" },
+        });
+        assertEq(r.status, 200, "brb-n1: a name-collision verdict does not 500 the route");
+
+        const planned = (r.body.planned as any[]).find((p) => p.provider_id === "zzzz-n1-kollisjon");
+        assertTrue(!!planned, "brb-n2: the colliding row appears in planned");
+        assertEq(planned?.outcome, "flagged_name_collision", "brb-n3: outcome is flagged_name_collision");
+        assertEq(planned?.org_nr, null, "brb-n4: planned org_nr is null — neither candidate's org_nr is attached");
+
+        const after = nameCollisionRow("zzzz-n1-kollisjon");
+        assertEq(after.name_collision, 1, "brb-n5: the DB row is ACTUALLY stamped name_collision=1, not just claimed in the report");
+        assertEq(after.org_nr, before.org_nr, "brb-n6: org_nr left untouched (still null)");
+        assertEq(after.brreg_active, before.brreg_active, "brb-n7: brreg_active left untouched (still null, never guessed)");
+        assertEq(after.brreg_verified, before.brreg_verified, "brb-n8: brreg_verified left untouched");
+
+        // still_unresolved (not a new/duplicate counter) carries this row.
+        assertTrue(r.body.still_unresolved >= 1, "brb-n9: counted under the existing still_unresolved tally, no new counter field");
       }
     } catch (err: any) {
       failed++;
