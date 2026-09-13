@@ -43785,3 +43785,28 @@ runSerial(async () => {
     failures.push("experience-brreg-recheck-backfill: unexpected error: " + String(err?.message || err));
   }
 });
+
+// classifyProvider() (services/experience-brreg.ts) name-collision gate
+// (dev-request 2026-09-13-navnekollisjon-brreg-gate): several producer
+// profiles (Moland Gård, Bakke Gårdsbakeri, Romstad Gård, Grana Bryggeri)
+// got contact data/description attached from the WRONG Brreg entity because
+// the old accept gate never actually required kommune to match when >=2
+// candidates shared a similar name. Pure unit test — no DB, no HTTP, just
+// the SAME __setBrregFetchForTesting seam every other Brreg test in this
+// file uses. Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── experience-brreg: classifyProvider() name-collision gate ──");
+  try {
+    const { runExperienceBrregTests } = require("../src/services/experience-brreg.test") as
+      typeof import("../src/services/experience-brreg.test");
+    const ebr = await runExperienceBrregTests({ log: false });
+    passed += ebr.passed;
+    failed += ebr.failed;
+    for (const f of ebr.failures) failures.push("experience-brreg: " + f);
+    console.log(`  experience-brreg: ${ebr.passed} passed, ${ebr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-brreg: unexpected error: " + String(err?.message || err));
+  }
+});

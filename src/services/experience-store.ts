@@ -399,6 +399,17 @@ export function setBrregVerification(providerId: string, active: 0 | 1, orgnr?: 
   return res.changes > 0;
 }
 
+/** Stamp a provider as having an unresolved Brreg name collision (verifier role). */
+export function flagNameCollision(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const res = db.prepare(`
+    UPDATE experience_providers
+    SET name_collision = 1, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(providerId);
+  return res.changes > 0;
+}
+
 // ─── Experiences ────────────────────────────────────────────────────
 export function createExperience(input: Experience): string {
   const e = ExperienceSchema.parse(input);

@@ -78,7 +78,7 @@
 
 import { getDb } from "../database/db-factory";
 import { classifyProvider, sleep as defaultSleep, type BrregClass } from "./experience-brreg";
-import { getProviderByOrgnr, setBrregVerification } from "./experience-store";
+import { getProviderByOrgnr, setBrregVerification, flagNameCollision } from "./experience-store";
 
 const VERTICAL = "experiences";
 
@@ -89,7 +89,7 @@ export const BRREG_RECHECK_BACKFILL_MAX_LIMIT = 50;
 /** Politeness window between Brreg calls — byte-identical value to routes/opplevelser.ts's own BRREG_PACE_MS (bulk-load's classifyProvider loop). */
 export const BRREG_RECHECK_PACE_MS = 200;
 
-export type BrregRecheckOutcome = "resolved_active" | "resolved_inactive" | "still_unresolved";
+export type BrregRecheckOutcome = "resolved_active" | "resolved_inactive" | "still_unresolved" | "flagged_name_collision";
 
 export type BrregRecheckBackfillDeps = {
   /** Report what would change; write nothing. */
@@ -292,6 +292,25 @@ export async function experienceBrregRecheckBackfillTick(
           });
           console.error(`[experience-brreg-recheck-backfill] write failed for ${row.id}:`, writeErr);
         }
+      } else if (verdict.name_collision) {
+        // Multiple Brreg entities share this provider's name and kommune did
+        // NOT disambiguate the best one (classifyProvider()'s own
+        // name-collision gate) — accepting would risk attaching contact
+        // data/description from the WRONG entity, so this row is left
+        // unresolved AND stamped for CS/manual disambiguation.
+        if (!dryRun) {
+          flagNameCollision(row.id);
+        }
+        result.still_unresolved++;
+        result.planned.push({
+          provider_id: row.id,
+          navn: row.navn,
+          kommune: row.kommune,
+          outcome: "flagged_name_collision",
+          org_nr: null,
+          classification: verdict.classification,
+          detail: "flere Brreg-enheter deler navn og ingen matcher kommunen -- IKKE koblet, raden stemplet name_collision for CS/menneskelig avklaring",
+        });
       } else {
         result.still_unresolved++;
         result.planned.push({
