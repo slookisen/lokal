@@ -155,6 +155,35 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Any-failure parking (dev-request 2026-09-11-dental-completion-mode-
+  // filter-mangler-parkerings-eksklusjon, 2026-09-13): a FOURTH, independent
+  // streak, layered on top of the three reason-specific ones above rather
+  // than replacing or merging them (that "counters never interact" invariant
+  // stays exactly as documented on wrong_entity_streak above). Root cause
+  // (verified by reading the current code + prod data, not assumed from the
+  // filed report text): `excludeParkedExtraction` in dental-claim-service.ts
+  // already gates the claim pool UNCONDITIONALLY on `enrichment_state` -- it
+  // was NOT missing from the completion-mode path as the filed report
+  // (dental-enrichment-runs/2026-09-11.md's FUNN, repeated 10x since
+  // 2026-08-31) claimed. The REAL bug: a record whose enrichment sub-agent
+  // classifies its daily failure DIFFERENTLY from one cycle to the next
+  // (e.g. "insufficient_yield" one day, "dead homepage" the next, "wrong_
+  // entity" the day after) never accumulates 3 CONSECUTIVE strikes on any
+  // ONE of the three existing counters, so none of them ever trips --
+  // confirmed against prod for the report's own 4 named clinics (Hareid,
+  // Åmot Tannklinikk: homepage_fetch_attempts and extraction_attempts each
+  // sit at 1-2, never 3, because the two failure classes alternate). This
+  // counter tracks "ANY failure, any reason" instead, so a record that keeps
+  // failing for a genuinely mixed set of reasons still gets parked after 3
+  // consecutive failed cycles. Idempotent ALTERs -- error = already present.
+  const dentalAnyFailureParkingCols = [
+    "ALTER TABLE dental_agents ADD COLUMN any_failure_streak INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN any_failure_unreachable_since TEXT",
+  ];
+  for (const stmt of dentalAnyFailureParkingCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ── Stage V helfo_agreement auto-correction (dev-request 2026-07-12-dental-
   // enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a, 2026-07-20):
   // Stage V re-fetches a sample of clinics each cycle and checks the site's

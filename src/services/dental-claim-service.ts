@@ -254,6 +254,16 @@ export function buildWhereClause(
     conditions.push(
       "(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))"
     );
+    // dev-request 2026-09-11-dental-completion-mode-filter-mangler-parkerings-
+    // eksklusjon (2026-09-13): a FOURTH stamp, independent of the three above
+    // (see dental-store.ts's bumpAnyFailureStreak() doc comment for the full
+    // root-cause writeup) -- covers a record whose failure classification
+    // varies cycle-to-cycle and so never trips any ONE of the three
+    // reason-specific streaks on its own. Same 30-day window, same gating
+    // flag/env var (no new flag) as the other three.
+    conditions.push(
+      "(any_failure_unreachable_since IS NULL OR any_failure_unreachable_since <= datetime('now','-30 days'))"
+    );
   }
 
   // dev-request 2026-09-02-dental-catalog-class-triage (steg 1): default-ON
