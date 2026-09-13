@@ -549,7 +549,15 @@ router.post("/admin/homepage-fetch-result", requireAdmin, (req: Request, res: Re
       res.status(404).json({ error: "Not found" });
       return;
     }
-    res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+    res.json({
+      agent_id: agentId.trim(),
+      attempts: r.attempts,
+      parked: r.parked,
+      parked_now: r.parked_now,
+      any_failure_streak: r.any_failure_streak,
+      any_failure_parked: r.any_failure_parked,
+      any_failure_parked_now: r.any_failure_parked_now,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });
   }
@@ -605,6 +613,9 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
       wrong_entity_streak: r.wrong_entity_streak,
       wrong_entity_parked: r.wrong_entity_parked,
       wrong_entity_parked_now: r.wrong_entity_parked_now,
+      any_failure_streak: r.any_failure_streak,
+      any_failure_parked: r.any_failure_parked,
+      any_failure_parked_now: r.any_failure_parked_now,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });

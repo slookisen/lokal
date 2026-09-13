@@ -38492,8 +38492,15 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     dstore.recordDentalExtractionResult(idC, false);
     dstore.recordDentalExtractionResult(idC, false);
     // Backdate idC's park past the 30d backoff -- it should be reclaimable again.
-    dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
-      .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idC);
+    // Also backdate any_failure_unreachable_since (dev-request 2026-09-11-
+    // dental-completion-mode-filter-mangler-parkerings-eksklusjon, 2026-09-13):
+    // the same 3 ordinary failures above also trip the new, independent
+    // any-failure streak (every failure call bumps it alongside its own
+    // reason-specific counter) -- in reality the same past failures would
+    // age both stamps out together, so the test must backdate both to
+    // reproduce "the whole 30d backoff genuinely expired".
+    dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ?, any_failure_unreachable_since = ? WHERE id = ?")
+      .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), new Date(Date.now() - 31 * 86_400_000).toISOString(), idC);
 
     const claimedExcluding = claimBatch("item2a-worker", 10, { excludeParkedExtraction: true });
     const claimedIds = claimedExcluding.map((c: any) => c.id);
@@ -38634,6 +38641,21 @@ console.log("\n── dental-wrong-entity-streak (independent wrong_entity backo
   failed += wes.failed;
   for (const f of wes.failures) failures.push("dental-wrong-entity-streak: " + f);
   console.log(`  dental-wrong-entity-streak: ${wes.passed} passed, ${wes.failed} failed`);
+}
+
+// ── dev-request 2026-09-11-dental-completion-mode-filter-mangler-parkerings-
+// eksklusjon (2026-09-13) ──────────────────────────────────────────────────
+// Fourth, independent any_failure_streak / any_failure_unreachable_since
+// backoff, wired in like the wrong-entity-streak suite immediately above.
+console.log("\n── dental-any-failure-streak (mixed-reason failure backoff) ──");
+{
+  const { runDentalAnyFailureStreakTests } = require("../src/services/dental-any-failure-streak.test") as
+    typeof import("../src/services/dental-any-failure-streak.test");
+  const afs = runDentalAnyFailureStreakTests({ log: false });
+  passed += afs.passed;
+  failed += afs.failed;
+  for (const f of afs.failures) failures.push("dental-any-failure-streak: " + f);
+  console.log(`  dental-any-failure-streak: ${afs.passed} passed, ${afs.failed} failed`);
 }
 
 // ── slice 4a: Stage V helfo_agreement auto-correction (dev-request 2026-07-12-

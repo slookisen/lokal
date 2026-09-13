@@ -495,33 +495,107 @@ export const DENTAL_PARK_BACKOFF_MS = 30 * 86_400_000;
 // unreachable-since stamp are left untouched (neither incremented nor reset)
 // so the clinic stays exactly as retry-eligible as it was before this call —
 // re-queued on the next pass, never parked on egress-allowlist noise alone.
+// ── Any-failure parking (dev-request 2026-09-11-dental-completion-mode-
+// filter-mangler-parkerings-eksklusjon, 2026-09-13) ──────────────────────
+// A FOURTH, independent streak layered on top of homepage_fetch_attempts /
+// extraction_attempts / wrong_entity_streak above: those three each require
+// 3 CONSECUTIVE failures of the SAME specific kind to trip, so a record
+// whose failure classification varies cycle-to-cycle (dead homepage one day,
+// insufficient yield the next, wrong entity the day after) never trips any
+// single one of them and is never excluded from the claim pool -- confirmed
+// against prod for the report this dev-request is based on (see
+// init-dental.ts's column-comment for the full root-cause writeup). This
+// helper mirrors the existing park-at-3/RE-STAMP-after-expired-backoff idiom
+// exactly, but deliberately does NOT add a needs_review escalation path --
+// that already happens via whichever reason-specific counter also trips.
+// `bump=false` (proxy_blocked) is a genuine no-op here too, same as the
+// reason-specific counters: an egress-allowlist rejection is not a fact
+// about the clinic's own site.
+function bumpAnyFailureStreak(
+  db: ReturnType<typeof getDb>,
+  id: string
+): { any_failure_streak: number; any_failure_parked: boolean; any_failure_parked_now: boolean } {
+  db.prepare("UPDATE dental_agents SET any_failure_streak = any_failure_streak + 1 WHERE id = ?").run(id);
+  const row = db
+    .prepare("SELECT any_failure_streak, any_failure_unreachable_since FROM dental_agents WHERE id = ?")
+    .get(id) as { any_failure_streak: number; any_failure_unreachable_since: string | null };
+
+  let parkedNow = false;
+  if (row.any_failure_streak >= DENTAL_PARK_AFTER_ATTEMPTS) {
+    const since = row.any_failure_unreachable_since;
+    const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
+    if (!since || expired) {
+      db.prepare("UPDATE dental_agents SET any_failure_unreachable_since = ? WHERE id = ?")
+        .run(new Date().toISOString(), id);
+      parkedNow = true;
+    }
+  }
+  return {
+    any_failure_streak: row.any_failure_streak,
+    any_failure_parked: row.any_failure_streak >= DENTAL_PARK_AFTER_ATTEMPTS,
+    any_failure_parked_now: parkedNow,
+  };
+}
+
 export function recordDentalHomepageFetchResult(
   id: string,
   ok: boolean,
   reason?: string,
-): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
+): {
+  found: boolean;
+  attempts: number;
+  parked: boolean;
+  parked_now: boolean;
+  any_failure_streak: number;
+  any_failure_parked: boolean;
+  any_failure_parked_now: boolean;
+} {
   const db = getDb("dental");
   const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
-  if (!exists) return { found: false, attempts: 0, parked: false, parked_now: false };
+  if (!exists) {
+    return {
+      found: false,
+      attempts: 0,
+      parked: false,
+      parked_now: false,
+      any_failure_streak: 0,
+      any_failure_parked: false,
+      any_failure_parked_now: false,
+    };
+  }
 
   if (ok) {
     db.prepare(
-      "UPDATE dental_agents SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE id = ?"
+      "UPDATE dental_agents SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL, " +
+      "any_failure_streak = 0, any_failure_unreachable_since = NULL WHERE id = ?"
     ).run(id);
-    return { found: true, attempts: 0, parked: false, parked_now: false };
+    return {
+      found: true,
+      attempts: 0,
+      parked: false,
+      parked_now: false,
+      any_failure_streak: 0,
+      any_failure_parked: false,
+      any_failure_parked_now: false,
+    };
   }
 
   if (reason === "proxy_blocked") {
     const row = db
-      .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since FROM dental_agents WHERE id = ?")
-      .get(id) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null };
+      .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since, any_failure_streak FROM dental_agents WHERE id = ?")
+      .get(id) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null; any_failure_streak: number };
     return {
       found: true,
       attempts: row.homepage_fetch_attempts,
       parked: row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS,
       parked_now: false,
+      any_failure_streak: row.any_failure_streak,
+      any_failure_parked: row.any_failure_streak >= DENTAL_PARK_AFTER_ATTEMPTS,
+      any_failure_parked_now: false,
     };
   }
+
+  const anyFailure = bumpAnyFailureStreak(db, id);
 
   db.prepare(
     "UPDATE dental_agents SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE id = ?"
@@ -569,7 +643,15 @@ export function recordDentalHomepageFetchResult(
     }
   }
   const parked = row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS;
-  return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
+  return {
+    found: true,
+    attempts: row.homepage_fetch_attempts,
+    parked,
+    parked_now: parkedNow,
+    any_failure_streak: anyFailure.any_failure_streak,
+    any_failure_parked: anyFailure.any_failure_parked,
+    any_failure_parked_now: anyFailure.any_failure_parked_now,
+  };
 }
 
 // ── Dead-extraction parking (dev-request 2026-07-12-dental-enrichment-
@@ -700,6 +782,9 @@ export function recordDentalExtractionResult(
   wrong_entity_streak: number;
   wrong_entity_parked: boolean;
   wrong_entity_parked_now: boolean;
+  any_failure_streak: number;
+  any_failure_parked: boolean;
+  any_failure_parked_now: boolean;
 } {
   const db = getDb("dental");
   const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
@@ -712,13 +797,17 @@ export function recordDentalExtractionResult(
       wrong_entity_streak: 0,
       wrong_entity_parked: false,
       wrong_entity_parked_now: false,
+      any_failure_streak: 0,
+      any_failure_parked: false,
+      any_failure_parked_now: false,
     };
   }
 
   if (ok) {
     db.prepare(
       "UPDATE dental_agents SET extraction_attempts = 0, extraction_unreachable_since = NULL, " +
-      "wrong_entity_streak = 0, wrong_entity_unreachable_since = NULL WHERE id = ?"
+      "wrong_entity_streak = 0, wrong_entity_unreachable_since = NULL, " +
+      "any_failure_streak = 0, any_failure_unreachable_since = NULL WHERE id = ?"
     ).run(id);
     return {
       found: true,
@@ -728,10 +817,14 @@ export function recordDentalExtractionResult(
       wrong_entity_streak: 0,
       wrong_entity_parked: false,
       wrong_entity_parked_now: false,
+      any_failure_streak: 0,
+      any_failure_parked: false,
+      any_failure_parked_now: false,
     };
   }
 
   if (reason === "wrong_entity") {
+    const anyFailureWe = bumpAnyFailureStreak(db, id);
     db.prepare(
       "UPDATE dental_agents SET wrong_entity_streak = wrong_entity_streak + 1 WHERE id = ?"
     ).run(id);
@@ -770,8 +863,13 @@ export function recordDentalExtractionResult(
       wrong_entity_streak: weRow.wrong_entity_streak,
       wrong_entity_parked: wrongEntityParked,
       wrong_entity_parked_now: wrongEntityParkedNow,
+      any_failure_streak: anyFailureWe.any_failure_streak,
+      any_failure_parked: anyFailureWe.any_failure_parked,
+      any_failure_parked_now: anyFailureWe.any_failure_parked_now,
     };
   }
+
+  const anyFailureOrdinary = bumpAnyFailureStreak(db, id);
 
   db.prepare(
     "UPDATE dental_agents SET extraction_attempts = extraction_attempts + 1 WHERE id = ?"
@@ -831,6 +929,9 @@ export function recordDentalExtractionResult(
     wrong_entity_streak: row.wrong_entity_streak,
     wrong_entity_parked: row.wrong_entity_streak >= DENTAL_PARK_AFTER_ATTEMPTS,
     wrong_entity_parked_now: false,
+    any_failure_streak: anyFailureOrdinary.any_failure_streak,
+    any_failure_parked: anyFailureOrdinary.any_failure_parked,
+    any_failure_parked_now: anyFailureOrdinary.any_failure_parked_now,
   };
 }
 
