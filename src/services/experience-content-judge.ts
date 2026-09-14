@@ -65,6 +65,12 @@
 
 import type Database from "better-sqlite3";
 import { parseContentFieldEvidence, PUBLISH_GATE_SQL } from "./experience-store";
+import { fetchPage, visibleTextOf, type FetchPageOptions } from "./fetch-page";
+// Reused, not reinvented (dev-request 2026-09-14-opplevagent-falske-
+// karantener-doede-sider-gjenopprett, spec item 1): the SAME hostname-list
+// "parked domain" classification dental_agents.hjemmeside cleanup already
+// uses (KNOWN_PARKING_HOSTNAMES). See judgeExperienceEvidencePage() below.
+import { classifyHjemmeside } from "./dental-hjemmeside-classifier";
 
 export interface HoldoutExperienceRow {
   id: string;
@@ -371,4 +377,103 @@ Ved minste tvil, svar ${JUDGE_MISMATCH_TOKEN}.`;
     return { ok: true, verdict: "MISMATCH", reasoning: reasoning || "vurdert som avvik av LLM-dommer" };
   }
   return { ok: false, reasoning: "uventet/tvetydig dommersvar — avvist fail-closed" };
+}
+
+/**
+ * FIX (2026-09-14, dev-request 2026-09-14-opplevagent-falske-karantener-
+ * doede-sider-gjenopprett): root cause of the 2026-09-13 mass-apply's false
+ * quarantines. Both callers of judgeExperienceContentMatch that re-check an
+ * EXISTING row's evidence_url (POST /admin/experiences-content-judge-sweep
+ * and, before this fix, nowhere else re-judges existing rows) used to fetch
+ * the page and, on ANY successful fetch — including a page that is DEAD in
+ * substance but not in HTTP terms (a lapsed domain now serving a registrar's
+ * parking lander, HTTP 200) — hand the page straight to the LLM judge, whose
+ * own prompt says "ved minste tvil, svar MISMATCH". A parking lander's text
+ * has nothing to do with the stored experience, so the judge reliably (and,
+ * per its own fail-closed contract, "correctly" given what it was shown)
+ * answered MISMATCH — a content-quality verdict about a page that carries NO
+ * content-quality signal at all. A hard fetch failure (4xx/5xx/timeout/DNS)
+ * was already routed to `unresolved` by both callers' own fetchPage()-result
+ * check (fetchPage() never throws — see fetch-page.ts), so that half of the
+ * bug was actually a pre-existing UNRESOLVED path, not a MISMATCH path; this
+ * function still classifies it explicitly (`evidence_page_dead`) so BOTH
+ * halves of the fix live in the SAME place with the SAME machine-readable
+ * reason-code contract, and so a future caller cannot reintroduce the parked-
+ * page half by fetching+judging inline again the way the sweep used to.
+ *
+ * This is the ONE place a caller should go from "I have a row and an
+ * evidence_url" to "I have a verdict" from now on — it owns fetch, the two
+ * unresolved classifications, and the LLM call, in that order, and NEVER
+ * calls the LLM for a dead or parked page (stated acceptance criterion —
+ * saves judge budget, not just correctness). A live page with genuinely
+ * wrong content still reaches the LLM and can still come back MISMATCH
+ * exactly as before — this function changes NOTHING about that path.
+ *
+ * Parked-page detection reuses classifyHjemmeside() (dental-hjemmeside-
+ * classifier.ts) UNCHANGED — same KNOWN_PARKING_HOSTNAMES list, same
+ * hostname-suffix match — checked against BOTH the requested evidenceUrl and
+ * fetchPage()'s post-redirect finalUrl, since the common real-world shape is
+ * a lapsed producer domain whose DNS/redirect now lands on the registrar's
+ * own parking domain (finalUrl) rather than the evidence_url's own hostname
+ * literally being a parking host.
+ *
+ * `pageText` is returned on every non-dead outcome (parked included is
+ * `null`, since there is no genuine page content to hand back) so a caller
+ * that also needs the raw page text for something unrelated to the judge
+ * verdict (the sweep's boilerplate-description check) does not have to
+ * fetch the same URL twice.
+ */
+export type EvidencePageUnresolvedReason = "evidence_page_dead" | "evidence_page_parked" | "judge_failed";
+
+export type EvidenceJudgeOutcome =
+  | { verdict: "MATCH" | "MISMATCH"; reason: string; pageText: string }
+  | { verdict: "unresolved"; reason: string; unresolvedReason: EvidencePageUnresolvedReason; pageText: string | null };
+
+export async function judgeExperienceEvidencePage(
+  row: HoldoutExperienceRow,
+  evidenceUrl: string,
+  fetchOpts: FetchPageOptions,
+): Promise<EvidenceJudgeOutcome> {
+  const trimmed = (evidenceUrl || "").trim();
+  if (!trimmed) {
+    // Row selection at every call site guarantees evidence_url IS NOT NULL,
+    // but never trust a stored value to be non-blank sight-unseen — an empty
+    // STRING (distinct from NULL) must fail closed exactly like a genuine
+    // dead page, never silently skip the row or crash the caller. Filed
+    // under `evidence_page_dead`: there is nothing fetchable either way.
+    return {
+      verdict: "unresolved",
+      reason: "evidence_url er en tom streng — ingenting å hente, avvist fail-closed",
+      unresolvedReason: "evidence_page_dead",
+      pageText: null,
+    };
+  }
+
+  const fetchResult = await fetchPage(trimmed, fetchOpts);
+  if (!fetchResult.ok) {
+    return {
+      verdict: "unresolved",
+      reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+      unresolvedReason: "evidence_page_dead",
+      pageText: null,
+    };
+  }
+
+  const parkedByRequestedUrl = classifyHjemmeside(trimmed).reason === "parked";
+  const parkedByFinalUrl = classifyHjemmeside(fetchResult.finalUrl).reason === "parked";
+  if (parkedByRequestedUrl || parkedByFinalUrl) {
+    return {
+      verdict: "unresolved",
+      reason: `evidenssiden er en parkert domeneside (${fetchResult.finalUrl})`,
+      unresolvedReason: "evidence_page_parked",
+      pageText: null,
+    };
+  }
+
+  const pageText = visibleTextOf(fetchResult.html);
+  const judged = await judgeExperienceContentMatch(row, pageText);
+  if (!judged.ok) {
+    return { verdict: "unresolved", reason: judged.reasoning, unresolvedReason: "judge_failed", pageText };
+  }
+  return { verdict: judged.verdict, reason: judged.reasoning, pageText };
 }
