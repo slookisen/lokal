@@ -43832,3 +43832,59 @@ runSerial(async () => {
     failures.push("experience-brreg: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec item 1: judgeExperienceEvidencePage() (experience-
+// content-judge.ts) — the fetch+classify+judge entry point that fixes the
+// 2026-09-13 mass-apply's root cause (a dead OR parked evidence page used to
+// reach the LLM judge and come back MISMATCH; now both short-circuit to
+// `unresolved` BEFORE the LLM call, saving judge budget, while a live page
+// with genuinely wrong content still reaches the LLM and still comes back
+// MISMATCH exactly as before). Pure unit test — no DB, no HTTP router; only
+// the two fetch surfaces the function itself uses (an injected fetchImpl for
+// the page fetch, a mocked globalThis.fetch for the Anthropic judge call) are
+// stubbed. Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-gjenopprett: judgeExperienceEvidencePage ──");
+  try {
+    const { runExperienceContentJudgeEvidencePageTests } = require("../src/services/experience-content-judge-evidence-page.test") as
+      typeof import("../src/services/experience-content-judge-evidence-page.test");
+    const ecj = await runExperienceContentJudgeEvidencePageTests({ log: false });
+    passed += ecj.passed;
+    failed += ecj.failed;
+    for (const f of ecj.failures) failures.push("experience-content-judge-evidence-page: " + f);
+    console.log(`  experience-content-judge-evidence-page: ${ecj.passed} passed, ${ecj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-content-judge-evidence-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec items 2+3: GET /admin/experiences-status-transitions
+// (lists rows the content-judge sweep mismatch-stamped verified->needs_review
+// in a given window) and POST /admin/experiences-requarantine-rejudge
+// (re-judges those rows with the FIXED classifier above and restores to
+// `verified` a row whose new verdict is MATCH or unresolved-for-dead/parked-
+// reasons AND satisfies PUBLISH_GATE_SQL_EXCEPT_STATUS — this route's
+// reconstruction of "was actually verified/published before the sweep
+// touched it", since this schema keeps no per-row status history). Own
+// dedicated in-memory-db harness (mirrors opplevelser-experiences-content-
+// judge-sweep.test.ts's harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-gjenopprett: status-transitions + requarantine-rejudge ──");
+  try {
+    const { runOpplevelserExperiencesRequarantineRejudgeTests } = require("../src/routes/opplevelser-experiences-requarantine-rejudge.test") as
+      typeof import("../src/routes/opplevelser-experiences-requarantine-rejudge.test");
+    const rq = await runOpplevelserExperiencesRequarantineRejudgeTests({ log: false });
+    passed += rq.passed;
+    failed += rq.failed;
+    for (const f of rq.failures) failures.push("opplevelser-experiences-requarantine-rejudge: " + f);
+    console.log(`  opplevelser-experiences-requarantine-rejudge: ${rq.passed} passed, ${rq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-requarantine-rejudge: unexpected error: " + String(err?.message || err));
+  }
+});

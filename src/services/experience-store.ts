@@ -677,12 +677,42 @@ export function getPublishedExperienceById(
 // `(catalog_hidden IS NULL OR catalog_hidden != 1)` form every gårdssalg
 // query in this file already uses. discoverExperiences() reuses this exact
 // constant (single source of truth) rather than carrying its own copy.
-export const PUBLISH_GATE_SQL =
-  "e.verification_status = 'verified' " +
-  "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
-  "AND (p.id IS NULL OR p.brreg_active = 1) " +
-  "AND e.canonical_id IS NULL " +
-  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
+// Split into named clauses (2026-09-14, dev-request 2026-09-14-opplevagent-
+// falske-karantener-doede-sider-gjenopprett) so PUBLISH_GATE_SQL_EXCEPT_
+// STATUS below can reuse every clause EXCEPT the verification_status one
+// without restating them — PUBLISH_GATE_SQL's own exported STRING VALUE is
+// unchanged (same clauses, same " AND " join), so every existing caller
+// keeps behaving byte-for-byte identically.
+const PUBLISH_GATE_STATUS_CLAUSE = "e.verification_status = 'verified'";
+const PUBLISH_GATE_OTHER_CLAUSES = [
+  "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
+  "(p.id IS NULL OR p.brreg_active = 1)",
+  "e.canonical_id IS NULL",
+  "(p.catalog_hidden IS NULL OR p.catalog_hidden != 1)",
+];
+export const PUBLISH_GATE_SQL = [PUBLISH_GATE_STATUS_CLAUSE, ...PUBLISH_GATE_OTHER_CLAUSES].join(" AND ");
+
+// Every PUBLISH_GATE_SQL clause EXCEPT verification_status — "would this row
+// be published right now if its verification_status alone were 'verified'".
+// Used by POST /admin/experiences-requarantine-rejudge (routes/opplevelser.ts,
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett) as the reconstruction of "was this row verified/published
+// before the 2026-09-13 mass-apply sweep wrongly demoted it": the sweep
+// touches ONLY verification_status (+ admission_verdict/admission_checked_at
+// + occasionally description) on a row it judges MISMATCH, never confidence/
+// brreg_active/canonical_id/catalog_hidden — so a needs_review row that still
+// satisfies every OTHER publish-gate clause today is, with very high
+// confidence, a row that passed the FULL gate (hence was published) right up
+// until the sweep flipped verification_status out from under it. There is no
+// per-row history of verification_status in this schema (the sweep's own
+// demotion path writes no audit trail — only its rarer promotion path does,
+// via experience_admission_promotion_audit), so this is a reconstruction, not
+// a stored fact; see that route's own doc comment for the full reasoning and
+// the acknowledged edge case (a row that was needs_review for an unrelated
+// reason AND happens to satisfy every other clause today would also pass
+// this check — believed rare, since PUBLISH_GATE_SQL's own four other
+// clauses are exactly the "would already be showing" bar).
+export const PUBLISH_GATE_SQL_EXCEPT_STATUS = PUBLISH_GATE_OTHER_CLAUSES.join(" AND ");
 
 export function getPublishedExperienceBySlug(
   slug: string
