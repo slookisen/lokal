@@ -16,6 +16,14 @@
 //     shared email (e.g. an accounting office serving multiple producers)
 //     must never produce a false cross-vertical link via name similarity —
 //     exact email is the only safe join key here.
+//   - ACTIVE rows only — each vertical's own liveness convention is applied
+//     as a WHERE-clause predicate, since a deactivated/terminal row must
+//     never produce a false "still active" signal for the opt-out flow this
+//     module backs. Each vertical spells "active" differently, so the
+//     predicate is per-table, not a shared generic "status" check:
+//       rfb          agents               is_active = 1
+//       dental       dental_agents        (is_inactive IS NULL OR is_inactive = 0)
+//       experiences  experience_providers terminal_status IS NULL
 //   - Strictly read-only. Zero INSERT/UPDATE/DELETE/ALTER in this file.
 //
 // Each vertical's own producer/agent table + email column:
@@ -37,19 +45,50 @@ interface VerticalTableSpec {
   table: string;
   emailColumn: string;
   nameColumn: string;
+  // WHERE-clause fragment (ANDed onto the email match) that selects only
+  // LIVE/ACTIVE rows, in this table's own liveness convention — see the
+  // file-header comment for why this is per-table rather than shared.
+  activePredicate: string;
 }
 
 // One entry per CrmVertical — kept as a Record so TypeScript flags it if a
 // future vertical is added to CRM_VERTICALS without a matching spec here.
 const VERTICAL_TABLE_SPECS: Record<CrmVertical, VerticalTableSpec> = {
-  rfb: { table: "agents", emailColumn: "contact_email", nameColumn: "name" },
-  dental: { table: "dental_agents", emailColumn: "epost", nameColumn: "navn" },
-  experiences: { table: "experience_providers", emailColumn: "epost", nameColumn: "navn" },
+  rfb: {
+    table: "agents",
+    emailColumn: "contact_email",
+    nameColumn: "name",
+    // Same convention as crm-service.ts:228,242,253; is_active flipped to 0
+    // by admin-agents-deactivate.ts on opt-out/deactivation.
+    activePredicate: "is_active = 1",
+  },
+  dental: {
+    table: "dental_agents",
+    emailColumn: "epost",
+    nameColumn: "navn",
+    // Same convention as dental-store.ts:1236, dental-claim-service.ts:201,
+    // admin-dental-hjemmeside-discovery.ts:273.
+    activePredicate: "(is_inactive IS NULL OR is_inactive = 0)",
+  },
+  experiences: {
+    table: "experience_providers",
+    emailColumn: "epost",
+    nameColumn: "navn",
+    // terminal_status is NULL by default; a non-NULL value ("krever_eier" /
+    // "dod_kilde") marks the row permanently dead — see
+    // init-experiences.ts:1707 and opplevelser.ts's
+    // computeGardssalgReadinessTier for the write path.
+    activePredicate: "terminal_status IS NULL",
+  },
 };
 
 /**
- * Look up whether the given email has an active entry on any CRM vertical
+ * Look up whether the given email has an ACTIVE entry on any CRM vertical
  * OTHER than `excludeVertical`, by EXACT (case-insensitive) email match.
+ * A deactivated rfb agent (is_active = 0), an is_inactive dental_agents row,
+ * or an experience_providers row with a non-NULL terminal_status is treated
+ * as gone and never appears in the result — see VERTICAL_TABLE_SPECS'
+ * per-table activePredicate for the exact convention each vertical uses.
  *
  * Read-only diagnostic — never fuzzy-matches on name/organization, never
  * writes anything.
@@ -74,7 +113,8 @@ export function findCrossVerticalEntriesByEmail(
 
     const rows = db
       .prepare(
-        `SELECT id, ${spec.nameColumn} AS name FROM ${spec.table} WHERE lower(${spec.emailColumn}) = ?`,
+        `SELECT id, ${spec.nameColumn} AS name FROM ${spec.table} ` +
+          `WHERE trim(lower(${spec.emailColumn})) = ? AND ${spec.activePredicate}`,
       )
       .all(normalized) as Array<{ id: string; name: string }>;
 

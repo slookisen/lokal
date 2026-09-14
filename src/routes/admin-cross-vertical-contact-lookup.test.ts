@@ -35,6 +35,15 @@
  *   (e) missing/invalid `exclude_vertical` -> 400
  *   (f) no X-Admin-Key / wrong key -> 403
  *   (g) a genuinely unmatched email -> 200, hits:[], hit_count:0
+ *   (h) round-1 review fix-up (PR #860): a deactivated/terminal row for the
+ *       target email is EXCLUDED from hits, while an active row for the same
+ *       email in the same table IS included — one pair per vertical
+ *         - rfb agents.is_active: 0 excluded, 1 included
+ *         - dental_agents.is_inactive: 1 excluded, NULL/0 included
+ *         - experience_providers.terminal_status: 'krever_eier' excluded,
+ *           NULL included
+ *   (i) whitespace-trim regression: a stored email with incidental
+ *       leading/trailing whitespace still matches a clean query-side email
  */
 
 import Database from "better-sqlite3";
@@ -253,6 +262,81 @@ export function runAdminCrossVerticalContactLookupTests(
       assertEq(unmatched.status, 200, "(g) unmatched email: status 200 (not an error)");
       assertEq(unmatched.body?.hit_count, 0, "(g) unmatched email: hit_count 0");
       assertEq(unmatched.body?.hits, [], "(g) unmatched email: hits []");
+
+      // ── (h) round-1 review fix-up (PR #860): liveness filter per vertical ──
+      // rfb: is_active = 0 excluded, is_active = 1 included
+      insertAgent.run("rfb-inactive-1", "RFB Inaktiv", "rfb-liveness@example.com", "key-rfb-2");
+      db.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").run("rfb-inactive-1");
+      insertAgent.run("rfb-active-1", "RFB Aktiv", "rfb-liveness@example.com", "key-rfb-3");
+      const rfbLiveness = await callRoute(router, {
+        url: "/cross-vertical-contact-lookup?email=rfb-liveness%40example.com&exclude_vertical=dental",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(rfbLiveness.status, 200, "(h) rfb liveness query: status 200");
+      const rfbLivenessIds = (rfbLiveness.body?.hits || [])
+        .filter((h: any) => h.vertical === "rfb")
+        .map((h: any) => h.id);
+      assertEq(
+        rfbLivenessIds,
+        ["rfb-active-1"],
+        "(h) rfb: is_active=0 row excluded, is_active=1 row for same email included",
+      );
+
+      // dental: is_inactive = 1 excluded, is_inactive = 0 included
+      dentalDb
+        .prepare(`INSERT INTO dental_agents (id, navn, epost, is_inactive) VALUES (?, ?, ?, 1)`)
+        .run("dental-inactive-1", "Dental Inaktiv", "dental-liveness@example.com");
+      dentalDb
+        .prepare(`INSERT INTO dental_agents (id, navn, epost, is_inactive) VALUES (?, ?, ?, 0)`)
+        .run("dental-active-1", "Dental Aktiv", "dental-liveness@example.com");
+      const dentalLiveness = await callRoute(router, {
+        url: "/cross-vertical-contact-lookup?email=dental-liveness%40example.com&exclude_vertical=rfb",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(dentalLiveness.status, 200, "(h) dental liveness query: status 200");
+      const dentalLivenessIds = (dentalLiveness.body?.hits || [])
+        .filter((h: any) => h.vertical === "dental")
+        .map((h: any) => h.id);
+      assertEq(
+        dentalLivenessIds,
+        ["dental-active-1"],
+        "(h) dental: is_inactive=1 row excluded, is_inactive=0 row for same email included",
+      );
+
+      // experiences: terminal_status='krever_eier' excluded, terminal_status=NULL included
+      experiencesDb
+        .prepare(
+          `INSERT INTO experience_providers (id, navn, epost, terminal_status) VALUES (?, ?, ?, 'krever_eier')`,
+        )
+        .run("exp-terminal-1", "Opplevelse Krever Eier", "exp-liveness@example.com");
+      experiencesDb
+        .prepare(`INSERT INTO experience_providers (id, navn, epost) VALUES (?, ?, ?)`)
+        .run("exp-active-1", "Opplevelse Aktiv", "exp-liveness@example.com");
+      const expLiveness = await callRoute(router, {
+        url: "/cross-vertical-contact-lookup?email=exp-liveness%40example.com&exclude_vertical=rfb",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(expLiveness.status, 200, "(h) experiences liveness query: status 200");
+      const expLivenessIds = (expLiveness.body?.hits || [])
+        .filter((h: any) => h.vertical === "experiences")
+        .map((h: any) => h.id);
+      assertEq(
+        expLivenessIds,
+        ["exp-active-1"],
+        "(h) experiences: terminal_status='krever_eier' row excluded, terminal_status=NULL row for same email included",
+      );
+
+      // ── (i) whitespace-trim regression ───────────────────────────────
+      insertAgent.run("rfb-whitespace-1", "RFB Whitespace", "  whitespace@example.com  ", "key-rfb-4");
+      const whitespaceResult = await callRoute(router, {
+        url: "/cross-vertical-contact-lookup?email=whitespace%40example.com&exclude_vertical=dental",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(whitespaceResult.status, 200, "(i) whitespace-trim query: status 200");
+      assertTrue(
+        (whitespaceResult.body?.hits || []).some((h: any) => h.id === "rfb-whitespace-1"),
+        "(i) stored email with incidental leading/trailing whitespace still matches a clean query-side email",
+      );
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
