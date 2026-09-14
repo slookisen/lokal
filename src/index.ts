@@ -45,6 +45,7 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminDbBackupRoutes from "./routes/admin-db-backup";
+import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
@@ -942,6 +943,15 @@ if (process.env.CRM_ENABLED !== "0") {
     res.sendFile(path.join(__dirname, "public", "admin-sent-log.html"));
   });
 }
+
+// dev-requests/2026-09-13-fjern-svar-kobles-ikke-paa-tvers-av-vertikaler.md:
+// READ-ONLY cross-vertical contact lookup — given a contact email and the
+// vertical it was just found/removed on, does that SAME exact email have an
+// active entry on another vertical (rfb/dental/experiences each run their
+// own DB, no shared identity layer today). Building block for the
+// customer-service "fjern" flow; exact-email-match only, never fuzzy name
+// matching. GET /admin/cross-vertical-contact-lookup.
+app.use("/admin", adminLimiter, adminCrossVerticalContactLookupRoutes);
 
 // Billing skeleton (Produsent-Premium, test-mode Stripe) — dev-request
 // 2026-07-13-billing-skjelett-moerkt. Feature-flagged via BILLING_ENABLED
