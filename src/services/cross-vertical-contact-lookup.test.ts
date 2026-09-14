@@ -29,6 +29,15 @@
  *           included
  *   (f) whitespace-trim regression: a stored email with incidental
  *       leading/trailing whitespace still matches a clean query-side email
+ *   (g) round-2 review fix-up (PR #860): the two liveness predicates that
+ *       were too narrow are now fuller, proven discriminating (not just
+ *       absent) with one excluded/included pair each:
+ *         - dental_agents.verification_status: 'rejected' excluded,
+ *           'verified' included (both rows also is_inactive-clear, so this
+ *           isolates the verification_status half specifically)
+ *         - experience_providers.catalog_hidden: 1 excluded, NULL included
+ *           (both rows also terminal_status-clear, so this isolates the
+ *           catalog_hidden half specifically)
  */
 
 import Database from "better-sqlite3";
@@ -174,6 +183,51 @@ export function runCrossVerticalContactLookupTests(
         expLiveness.filter((h) => h.vertical === "experiences").map((h) => h.id),
         ["exp-active-1"],
         "(e) experiences: terminal_status='dod_kilde' row excluded, terminal_status=NULL row for same email included",
+      );
+
+      // ── (g) round-2 review fix-up (PR #860): fuller liveness predicates ──
+      // dental: verification_status='rejected' excluded, 'verified' included
+      // (both rows is_inactive-clear, so this isolates the
+      // verification_status half of the predicate specifically).
+      dentalDb
+        .prepare(
+          `INSERT INTO dental_agents (id, navn, epost, verification_status) VALUES (?, ?, ?, 'rejected')`,
+        )
+        .run("dental-rejected-1", "Dental Avvist", "dental-verification@example.com");
+      dentalDb
+        .prepare(
+          `INSERT INTO dental_agents (id, navn, epost, verification_status) VALUES (?, ?, ?, 'verified')`,
+        )
+        .run("dental-verified-1", "Dental Verifisert", "dental-verification@example.com");
+      const dentalVerification = mod.findCrossVerticalEntriesByEmail(
+        "dental-verification@example.com",
+        "rfb",
+      );
+      assertEq(
+        dentalVerification.filter((h) => h.vertical === "dental").map((h) => h.id),
+        ["dental-verified-1"],
+        "(g) dental: verification_status='rejected' row excluded, 'verified' row for same email included",
+      );
+
+      // experiences: catalog_hidden=1 excluded, catalog_hidden IS NULL included
+      // (both rows terminal_status-clear, so this isolates the
+      // catalog_hidden half of the predicate specifically).
+      experiencesDb
+        .prepare(
+          `INSERT INTO experience_providers (id, navn, epost, catalog_hidden) VALUES (?, ?, ?, 1)`,
+        )
+        .run("exp-hidden-1", "Opplevelse Skjult", "exp-catalog-hidden@example.com");
+      experiencesDb
+        .prepare(`INSERT INTO experience_providers (id, navn, epost) VALUES (?, ?, ?)`)
+        .run("exp-visible-1", "Opplevelse Synlig", "exp-catalog-hidden@example.com");
+      const expCatalogHidden = mod.findCrossVerticalEntriesByEmail(
+        "exp-catalog-hidden@example.com",
+        "rfb",
+      );
+      assertEq(
+        expCatalogHidden.filter((h) => h.vertical === "experiences").map((h) => h.id),
+        ["exp-visible-1"],
+        "(g) experiences: catalog_hidden=1 row excluded, catalog_hidden IS NULL row for same email included",
       );
 
       // ── (f) whitespace-trim regression ───────────────────────────────
