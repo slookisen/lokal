@@ -1218,6 +1218,51 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE gardssalg_website_verification_audit ADD COLUMN promoted_from_evidence_url TEXT");
   } catch { /* already present */ }
 
+  // ─── gardssalg_website_verification_sweep_state (dev-request
+  // 2026-09-15-website-verification-sweep-offset-persistence) ────────────────
+  // Fixes the M0 enrichment sweep's stuck-at-0 pagination: each scheduled
+  // enrichment run (scheduled-agents/experiences-enrichment.md Step 3f) is a
+  // fresh, memoryless caller that pages POST .../gardssalg-website-
+  // verification-remediation with cohort=all starting from offset 0 every
+  // time — it paginates fine WITHIN one run (0->12->24->36) but the NEXT
+  // run's own first call starts at 0 again, so the sweep re-scans the same
+  // ~48-row window forever and never reaches the rest of the ~598-row
+  // cohort=all population. This table is the server-side memory the route
+  // itself now keeps: one row per cohort ('gardssalg' | 'all' |
+  // 'non_gardssalg'), holding the offset the NEXT call (that omits `offset`
+  // in its request body) should resume from. See getGardssalgWebsite
+  // VerificationSweepOffset / setGardssalgWebsiteVerificationSweepOffset
+  // (services/gardssalg-website-verification.ts) for the read/write contract
+  // and the route's own doc comment (routes/opplevelser.ts, POST
+  // .../gardssalg-website-verification-remediation) for exactly when each is
+  // called. ABSENCE of a row (fresh DB, or a cohort never yet swept via the
+  // omitted-offset path) means "resume from 0" — same "absence = default"
+  // convention as gardssalg_outreach_size_gate_config above, so no seed
+  // migration is needed and every existing deployment is unaffected the
+  // instant this table exists. next_offset is persisted as 0 (not left at
+  // whatever the last page's offset was) once pagination.next_offset comes
+  // back null — i.e. the cohort was exhausted — so the FOLLOWING call starts
+  // a fresh pass through the cohort instead of being permanently stuck
+  // reporting "nothing left" forever.
+  //
+  // Deliberately a NEW small table, not a generic settings/KV table: this
+  // codebase has no existing generic key-value settings table to reuse (only
+  // narrow, purpose-built config/state tables like the one named above), and
+  // this row's own PRIMARY KEY (cohort) is exactly GsWvCohort's own value
+  // space — a bespoke, self-describing shape a generic KV blob would only
+  // obscure.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_verification_sweep_state (
+        cohort TEXT PRIMARY KEY,
+        next_offset INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_website_verification_sweep_state failed:", err);
+  }
+
   // ─── gardssalg_field_concordance_review_queue (orchestrator dev-request
   // 2026-08-03-gardssalg-field-concordance, write-side slice) ────────────────
   // The review queue for `avvik` verdicts produced by the field-concordance

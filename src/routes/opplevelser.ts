@@ -515,6 +515,8 @@ import {
   scanGardssalgWebsiteVerificationRows,
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
+  getGardssalgWebsiteVerificationSweepOffset,
+  setGardssalgWebsiteVerificationSweepOffset,
   GS_WV_SCOPES,
   GS_WV_COHORTS,
   type GsWvFetchFn,
@@ -23010,14 +23012,35 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // requested page ever incurs a live outbound fetch, and (for apply=true)
     // only the paged rows are ever written — the blast radius of a single
     // call is bounded by `limit`, never the full (possibly cohort=all) set.
+    //
+    // Offset-persistence (dev-request 2026-09-15-website-verification-sweep-
+    // offset-persistence): a caller that supplies `offset` explicitly is
+    // UNCHANGED — purely request-driven, byte-for-byte the same as before
+    // this dev-request, and never reads or clobbers the persisted cohort
+    // state. Only when `offset` is OMITTED from the request body (the
+    // pre-existing `offset === undefined` case, which used to always mean
+    // "start at 0") does this route now resume from the offset the PREVIOUS
+    // omitted-offset call for this cohort left off at — so repeated,
+    // memoryless callers (each scheduled enrichment run) actually rotate
+    // through the whole cohort over time instead of re-scanning the same
+    // leading window every run. `usePersistedOffset` also gates the write
+    // below: only the omitted-offset path ever reads or writes
+    // gardssalg_website_verification_sweep_state.
+    const usePersistedOffset = limit !== undefined && offset === undefined;
     const total = cohort.length;
     let pageOffset: number | undefined;
     if (limit !== undefined) {
-      pageOffset = offset ?? 0;
+      pageOffset = usePersistedOffset ? getGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam) : (offset as number);
       cohort = cohort.slice(pageOffset, pageOffset + limit);
     }
 
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    const nextOffset =
+      limit === undefined
+        ? undefined
+        : (pageOffset as number) + rows.length < total
+          ? (pageOffset as number) + rows.length
+          : null;
     const pagination =
       limit === undefined
         ? undefined
@@ -23026,8 +23049,24 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
             offset: pageOffset as number,
             limit,
             returned: rows.length,
-            next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
+            next_offset: nextOffset as number | null,
           };
+
+    // Persist AFTER a successful scan, and only on the omitted-offset path
+    // (see usePersistedOffset above) — an explicit-offset caller never
+    // touches this state, in either direction. Wraps to 0 (rather than
+    // persisting the exhausted `null`) when the cohort is exhausted, so the
+    // NEXT omitted-offset call starts a fresh pass instead of getting stuck
+    // reporting "nothing left" forever. Best-effort: a persistence failure
+    // must not fail a scan/apply that otherwise succeeded, so it's logged and
+    // swallowed rather than thrown.
+    if (usePersistedOffset) {
+      try {
+        setGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam, nextOffset as number | null);
+      } catch (err) {
+        console.error("[gardssalg-website-verification-remediation] failed to persist sweep offset:", err);
+      }
+    }
 
     // Per-row diagnostics. This route reported COUNTS only — an operator who
     // ran it and got `unverified: 1` had no way to tell "we read the whole
