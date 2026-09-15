@@ -65,6 +65,22 @@
  *       the dry-run and apply responses, apply+cohort=all+limit writes
  *       provenance for exactly the paged rows (bounded blast radius), and the
  *       providerIds-only/no-cohort-body case stays byte-for-byte unchanged
+ *   (p) POST .../gardssalg-website-verification-remediation offset
+ *       persistence (dev-request 2026-09-15-website-verification-sweep-
+ *       offset-persistence): repeated calls that OMIT `offset` resume from
+ *       the previous omitted-offset call's `next_offset` instead of always
+ *       restarting at 0 (the M0 enrichment sweep's stuck-at-0 bug), an
+ *       explicit `offset` stays purely request-driven and never reads/
+ *       writes the persisted cursor, and the cursor wraps to 0 (a fresh
+ *       pass) rather than getting stuck once the cohort is exhausted
+ *       (`next_offset: null`)
+ *   (q) real-caller regression guard: a NON-ZERO persisted cursor + explicit
+ *       `offset: 0` (today's actual production-caller shape on run-start,
+ *       per scheduled-agents/experiences-enrichment.md Step 3f) still starts
+ *       from 0, not the persisted value — documents TODAY's contract (this
+ *       test passes now; a companion caller-side change to drop the
+ *       explicit offset:0, out of this repo's scope, is what will let
+ *       production actually benefit from section (p)'s mechanism)
  */
 
 export interface TestSummary {
@@ -1563,6 +1579,197 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       );
 
       globalThis.fetch = prevFetchForCandidateHost;
+
+      // ── (p) offset persistence (dev-request 2026-09-15-website-
+      //     verification-sweep-offset-persistence) — the M0 enrichment
+      //     sweep's fix. Every scheduled enrichment run is a fresh,
+      //     memoryless caller that starts its own local offset at 0 each
+      //     run, so without this fix a repeat run re-sweeps the same
+      //     leading window forever and never reaches the rest of the
+      //     cohort. Three NEW providerIds-scoped fixtures (producer_type
+      //     set, blank hjemmeside -> missing_source, zero outbound fetches)
+      //     isolate this section's own `total` to exactly 3 regardless of
+      //     every other gårdssalg-cohort row sections (b)-(o) above already
+      //     seeded — providerIds narrows the cohort BEFORE pagination
+      //     slices it (see the route's own `cohort.filter(...)` then
+      //     `cohort.slice(...)` order), and `ORDER BY id` in
+      //     loadGardssalgWebsiteVerificationCohort makes the 3-row walk
+      //     order deterministic (prov-persist-a, -b, -c). Every call below
+      //     omits `cohort` (defaults to 'gardssalg', a key no earlier valid
+      //     limit+omitted-offset call in this file has ever exercised — l3/
+      //     l5/l6 above only ever hit the default cohort with an INVALID
+      //     limit, rejected at 400 before any persisted-offset read/write),
+      //     so this section owns a virgin persisted-offset key going in. ──
+      insertProvider.run({
+        id: "prov-persist-a", navn: "Persist Sweep A", hjemmeside: null,
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "test-persist", rfb_seed_source: null, content_source: null,
+      });
+      insertProvider.run({
+        id: "prov-persist-b", navn: "Persist Sweep B", hjemmeside: null,
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "test-persist", rfb_seed_source: null, content_source: null,
+      });
+      insertProvider.run({
+        id: "prov-persist-c", navn: "Persist Sweep C", hjemmeside: null,
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "test-persist", rfb_seed_source: null, content_source: null,
+      });
+      const persistProviderIds = ["prov-persist-a", "prov-persist-b", "prov-persist-c"];
+
+      // p1-p3: three successive omitted-offset dry-run calls (limit=1) walk
+      // the 3-row cohort one row at a time, in id order, WITHOUT ever
+      // repeating a row — each call's `pagination.offset` reflects the
+      // PREVIOUS call's `next_offset`, proving the server persisted it
+      // server-side between two calls that (per the SKILL caller's own
+      // memoryless-per-run shape) carry no state of their own.
+      const persistCall1 = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1 },
+      });
+      assertEq(persistCall1.status, 200, "p1: first omitted-offset call -> 200");
+      assertEq(
+        persistCall1.body.pagination,
+        { total: 3, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "p1b: first omitted-offset call starts at offset 0 (virgin persisted state) and reports next_offset:1",
+      );
+      assertEq(
+        persistCall1.body.would_enqueue.length === 0 && persistCall1.body.summary.total,
+        1,
+        "p1c: sanity — exactly one row scanned (missing_source is never would_enqueue-eligible)",
+      );
+
+      const persistCall2 = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1 },
+      });
+      assertEq(persistCall2.status, 200, "p2: second omitted-offset call (simulating the NEXT day's fresh, memoryless run) -> 200");
+      assertEq(
+        persistCall2.body.pagination,
+        { total: 3, offset: 1, limit: 1, returned: 1, next_offset: 2 },
+        "p2b: the acceptance-criteria assertion — this call resumes at offset 1, the SAME 0->48-style window is NOT swept twice",
+      );
+
+      const persistCall3 = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1 },
+      });
+      assertEq(persistCall3.status, 200, "p3: third omitted-offset call -> 200");
+      assertEq(
+        persistCall3.body.pagination,
+        { total: 3, offset: 2, limit: 1, returned: 1, next_offset: null },
+        "p3b: third call resumes at offset 2 (the cohort's last row) and reports next_offset:null — cohort exhausted",
+      );
+
+      // p4: explicit `offset` is completely unaffected by (and never reads)
+      // the persisted state above — passing offset:0 explicitly returns to
+      // the FIRST row, even though the persisted cursor is currently
+      // exhausted (about to wrap to 0 from call 3's null above). This is the
+      // "existing callers that pass an explicit offset keep working exactly
+      // as today" contract requirement.
+      const persistExplicit = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1, offset: 0 },
+      });
+      assertEq(
+        persistExplicit.body.pagination,
+        { total: 3, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "p4: explicit offset:0 returns the first row regardless of persisted cursor state — purely request-driven, as before",
+      );
+
+      // p5: the NEXT omitted-offset call proves p4 (the explicit-offset call)
+      // neither read nor wrote the persisted cursor — it still resumes at
+      // whatever call 3 (p3, the last OMITTED-offset call) left behind, i.e.
+      // wrapped to 0 (next_offset was null -> persisted as 0, not left
+      // "stuck" reporting nothing left forever), NOT at 1 (which is what a
+      // buggy implementation reading/writing persisted state from p4 would
+      // produce instead).
+      const persistCall4Wrapped = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1 },
+      });
+      assertEq(
+        persistCall4Wrapped.body.pagination,
+        { total: 3, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "p5: wrap-to-zero — the exhausted cohort (p3's next_offset:null) resumes a FRESH pass at offset 0, and the intervening " +
+          "explicit-offset call (p4) did not disturb this — proving explicit-offset calls are pure passthroughs",
+      );
+
+      // p6: over the repeated calls above (p1/p2/p3/p5), the sweep's offset
+      // progressed through every row of the 3-row cohort — the second
+      // acceptance-criteria assertion, generalized: more than just the first
+      // page was ever reached across repeated omitted-offset calls.
+      const persistOffsetsSeen = [
+        persistCall1.body.pagination.offset,
+        persistCall2.body.pagination.offset,
+        persistCall3.body.pagination.offset,
+        persistCall4Wrapped.body.pagination.offset,
+      ];
+      assertEq(persistOffsetsSeen, [0, 1, 2, 0], "p6: the offset progresses across repeated omitted-offset calls instead of re-reading 0 every time");
+
+      // ── (q) real-caller regression guard: explicit `offset:0` over a
+      //     NON-ZERO persisted cursor — documents TODAY's actual contract,
+      //     not a proposed fix. The real production caller (scheduled-
+      //     agents/experiences-enrichment.md Step 3f, see the
+      //     `usePersistedOffset` doc comment in routes/opplevelser.ts)
+      //     currently sends `offset: 0` EXPLICITLY on every run's FIRST
+      //     call, simulating a fresh run — which takes the purely-request-
+      //     driven branch, NOT the persisted-offset branch section (p)
+      //     above exercises, even once a prior run has genuinely advanced
+      //     the cohort's persisted cursor past 0. Nothing above catches
+      //     this exact real-world shape: p4 above lands on a persisted
+      //     cursor that is ALREADY 0 (p3 just wrapped it there), so it
+      //     can't tell "ignored the persisted value" apart from
+      //     "coincidentally the same value". This test PASSES today and
+      //     is meant to start failing only if a future change reinterprets
+      //     explicit offset:0 as "use persisted state" — silently changing
+      //     a contract every OTHER explicit-offset caller (l4-l19 above)
+      //     already relies on. The companion fix that will actually let
+      //     production benefit from section (p)'s mechanism — dropping the
+      //     explicit offset:0 on run-start — is a separate A2A-repo SKILL-
+      //     file change, out of this repo's scope; tracked as its own
+      //     follow-up. ────────────────────────────────────────────────────
+      const wvServiceForOffsetSeed = require("../services/gardssalg-website-verification") as typeof import("../services/gardssalg-website-verification");
+      wvServiceForOffsetSeed.setGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg", 7);
+      assertEq(
+        wvServiceForOffsetSeed.getGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg"),
+        7,
+        "q1: sanity — the persisted cursor for cohort=gardssalg is genuinely non-zero (simulating a prior run having advanced it) going into this call",
+      );
+
+      const explicitZeroOverPersisted = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1, offset: 0 },
+      });
+      assertEq(explicitZeroOverPersisted.status, 200, "q2: explicit offset:0 over a non-zero persisted cursor -> 200");
+      assertEq(
+        explicitZeroOverPersisted.body.pagination,
+        { total: 3, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "q3: today's real production-caller shape (limit + explicit offset:0 on run-start) starts from offset 0, NOT the " +
+          "persisted value (7) — proves the persisted-offset mechanism does not yet help the real caller as it sends the " +
+          "request today (see the companion, out-of-scope caller-side fix noted above)",
+      );
+
+      // q4: the explicit-offset call above must not have disturbed the
+      // persisted cursor either — same one-way-street contract p4/p5 above
+      // establish, pinned here specifically against a non-zero seed.
+      assertEq(
+        wvServiceForOffsetSeed.getGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg"),
+        7,
+        "q4: the persisted cursor is untouched by the explicit-offset call — still 7, exactly as seeded",
+      );
     } catch (err: any) {
       failed++;
       failures.push(
