@@ -73,6 +73,9 @@ export type VerifierTickResult =
       status_transitions: number;
       transitioned: number;
       by_new_status: Record<string, number>;
+      by_transition: Record<string, number>;
+      pending_verify_processed: number;
+      pending_verify_outcomes: Record<string, number>;
       persisted: true;
       envelope_recorded: boolean;
       reprocess_review_queue: boolean;
@@ -210,6 +213,30 @@ export async function runVerifierTick(opts: {
     if (r.prior_verification_status === r.new_verification_status) continue;
     byNewStatus[r.new_verification_status] = (byNewStatus[r.new_verification_status] ?? 0) + 1;
   }
+  // dev-request-derived instrumentation (2026-09-15, verified-regression
+  // observability): `by_new_status` above only counts rows whose status
+  // CHANGED, so it can't show a "no-op" transition (e.g. verified->verified)
+  // and it can't isolate what happens specifically to pending_verify-origin
+  // rows. `by_transition` counts every processed row (changed or not) keyed
+  // by its full from->to pair; `pending_verify_processed`/
+  // `pending_verify_outcomes` isolate the pending_verify-origin subset so an
+  // operator can tell, from a real batch run, whether pending_verify agents
+  // are even being picked up by the batch selector, and if so what they
+  // become. Pure read-side aggregation over the same `results` array — no
+  // change to selection, gating or persistence.
+  const byTransition: Record<string, number> = {};
+  const pendingVerifyOutcomes: Record<string, number> = {};
+  let pendingVerifyProcessed = 0;
+  for (const r of results) {
+    const prior = r.prior_verification_status ?? "unknown";
+    const key = `${prior}->${r.new_verification_status}`;
+    byTransition[key] = (byTransition[key] ?? 0) + 1;
+    if (r.prior_verification_status === "pending_verify") {
+      pendingVerifyProcessed++;
+      pendingVerifyOutcomes[r.new_verification_status] =
+        (pendingVerifyOutcomes[r.new_verification_status] ?? 0) + 1;
+    }
+  }
 
   // Build envelope and record directly via service (no HTTP roundtrip)
   const envelope: any = buildRunEnvelope({
@@ -246,6 +273,9 @@ export async function runVerifierTick(opts: {
     status_transitions: statusTransitions,
     transitioned,
     by_new_status: byNewStatus,
+    by_transition: byTransition,
+    pending_verify_processed: pendingVerifyProcessed,
+    pending_verify_outcomes: pendingVerifyOutcomes,
     persisted: true,
     envelope_recorded: envelopeRecorded,
     reprocess_review_queue: reprocessReviewQueue,
@@ -349,6 +379,9 @@ router.post("/", async (req: Request, res: Response) => {
       status_transitions: tick.status_transitions,
       transitioned: tick.transitioned,
       by_new_status: tick.by_new_status,
+      by_transition: tick.by_transition,
+      pending_verify_processed: tick.pending_verify_processed,
+      pending_verify_outcomes: tick.pending_verify_outcomes,
       persisted: tick.persisted,
       envelope_recorded: tick.envelope_recorded,
       hour_utc: hourUTC,
