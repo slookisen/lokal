@@ -23026,6 +23026,12 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // leading window every run. `usePersistedOffset` also gates the write
     // below: only the omitted-offset path ever reads or writes
     // gardssalg_website_verification_sweep_state.
+    // NOTE (see route test section (q)): the real caller currently sends
+    // `offset: 0` EXPLICITLY on every run's first call, so it does not yet
+    // take this branch — a companion caller-side change (dropping that
+    // explicit offset:0 on run-start, in a separate A2A-repo SKILL file,
+    // out of this repo's scope) is what will actually let production
+    // benefit from this mechanism; tracked as its own follow-up.
     const usePersistedOffset = limit !== undefined && offset === undefined;
     const total = cohort.length;
     let pageOffset: number | undefined;

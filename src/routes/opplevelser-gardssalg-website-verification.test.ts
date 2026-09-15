@@ -74,6 +74,13 @@
  *       writes the persisted cursor, and the cursor wraps to 0 (a fresh
  *       pass) rather than getting stuck once the cohort is exhausted
  *       (`next_offset: null`)
+ *   (q) real-caller regression guard: a NON-ZERO persisted cursor + explicit
+ *       `offset: 0` (today's actual production-caller shape on run-start,
+ *       per scheduled-agents/experiences-enrichment.md Step 3f) still starts
+ *       from 0, not the persisted value — documents TODAY's contract (this
+ *       test passes now; a companion caller-side change to drop the
+ *       explicit offset:0, out of this repo's scope, is what will let
+ *       production actually benefit from section (p)'s mechanism)
  */
 
 export interface TestSummary {
@@ -1709,6 +1716,60 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         persistCall4Wrapped.body.pagination.offset,
       ];
       assertEq(persistOffsetsSeen, [0, 1, 2, 0], "p6: the offset progresses across repeated omitted-offset calls instead of re-reading 0 every time");
+
+      // ── (q) real-caller regression guard: explicit `offset:0` over a
+      //     NON-ZERO persisted cursor — documents TODAY's actual contract,
+      //     not a proposed fix. The real production caller (scheduled-
+      //     agents/experiences-enrichment.md Step 3f, see the
+      //     `usePersistedOffset` doc comment in routes/opplevelser.ts)
+      //     currently sends `offset: 0` EXPLICITLY on every run's FIRST
+      //     call, simulating a fresh run — which takes the purely-request-
+      //     driven branch, NOT the persisted-offset branch section (p)
+      //     above exercises, even once a prior run has genuinely advanced
+      //     the cohort's persisted cursor past 0. Nothing above catches
+      //     this exact real-world shape: p4 above lands on a persisted
+      //     cursor that is ALREADY 0 (p3 just wrapped it there), so it
+      //     can't tell "ignored the persisted value" apart from
+      //     "coincidentally the same value". This test PASSES today and
+      //     is meant to start failing only if a future change reinterprets
+      //     explicit offset:0 as "use persisted state" — silently changing
+      //     a contract every OTHER explicit-offset caller (l4-l19 above)
+      //     already relies on. The companion fix that will actually let
+      //     production benefit from section (p)'s mechanism — dropping the
+      //     explicit offset:0 on run-start — is a separate A2A-repo SKILL-
+      //     file change, out of this repo's scope; tracked as its own
+      //     follow-up. ────────────────────────────────────────────────────
+      const wvServiceForOffsetSeed = require("../services/gardssalg-website-verification") as typeof import("../services/gardssalg-website-verification");
+      wvServiceForOffsetSeed.setGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg", 7);
+      assertEq(
+        wvServiceForOffsetSeed.getGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg"),
+        7,
+        "q1: sanity — the persisted cursor for cohort=gardssalg is genuinely non-zero (simulating a prior run having advanced it) going into this call",
+      );
+
+      const explicitZeroOverPersisted = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: persistProviderIds, limit: 1, offset: 0 },
+      });
+      assertEq(explicitZeroOverPersisted.status, 200, "q2: explicit offset:0 over a non-zero persisted cursor -> 200");
+      assertEq(
+        explicitZeroOverPersisted.body.pagination,
+        { total: 3, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "q3: today's real production-caller shape (limit + explicit offset:0 on run-start) starts from offset 0, NOT the " +
+          "persisted value (7) — proves the persisted-offset mechanism does not yet help the real caller as it sends the " +
+          "request today (see the companion, out-of-scope caller-side fix noted above)",
+      );
+
+      // q4: the explicit-offset call above must not have disturbed the
+      // persisted cursor either — same one-way-street contract p4/p5 above
+      // establish, pinned here specifically against a non-zero seed.
+      assertEq(
+        wvServiceForOffsetSeed.getGardssalgWebsiteVerificationSweepOffset(expDb, "gardssalg"),
+        7,
+        "q4: the persisted cursor is untouched by the explicit-offset call — still 7, exactly as seeded",
+      );
     } catch (err: any) {
       failed++;
       failures.push(
