@@ -44015,3 +44015,29 @@ runSerial(async () => {
     failures.push("crm-ingest-alias-gate-autoroute: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier
+// (slookisen/A2A): POST /admin/crm/threads/:id/status and GET
+// /admin/crm/threads?status= both 400'd on the two B3 opt-out statuses
+// (awaiting_confirmation, awaiting_grace) that scheduled-agents/rfb-
+// customer-service.md has always prescribed (line 664/670) -- the
+// crm_threads.status CHECK constraint and both route-level closed sets
+// never accepted them. Own in-memory-db harness (mirrors
+// crm-max-touch-vern-send-guard.test.ts's and crm-compose-cooldown-
+// untriaged-inbound-exempt.test.ts's router-dispatch shape). Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier: B3 opt-out status values ──");
+  try {
+    const { runCrmThreadStatusEnumB3OptOutTests } = require("../src/routes/crm-thread-status-enum-b3-opt-out.test") as
+      typeof import("../src/routes/crm-thread-status-enum-b3-opt-out.test");
+    const cts = await runCrmThreadStatusEnumB3OptOutTests({ log: false });
+    passed += cts.passed;
+    failed += cts.failed;
+    for (const f of cts.failures) failures.push("crm-thread-status-enum-b3-opt-out: " + f);
+    console.log(`  crm-thread-status-enum-b3-opt-out: ${cts.passed} passed, ${cts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-thread-status-enum-b3-opt-out: unexpected error: " + String(err?.message || err));
+  }
+});

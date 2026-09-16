@@ -267,7 +267,7 @@ router.post("/contacts/:id/notes", (req, res) => {
 router.get("/threads", (req, res) => {
   const contactEmail = (req.query.contact_email as string | undefined)?.trim() || undefined;
   const explicitStatus = req.query.status as string | undefined;
-  const allowed = ["new", "in_progress", "awaiting_review", "done", "archived"] as const;
+  const allowed = ["new", "in_progress", "awaiting_review", "awaiting_confirmation", "awaiting_grace", "done", "archived"] as const;
 
   let status: string | undefined;
   if (explicitStatus) {
@@ -300,7 +300,13 @@ router.get("/threads/:id", (req, res) => {
 // ─── POST /admin/crm/threads/:id/status ──────────────────────
 router.post("/threads/:id/status", (req, res) => {
   const schema = z.object({
-    status: z.enum(["new", "in_progress", "awaiting_review", "done", "archived"]),
+    // awaiting_confirmation/awaiting_grace: the two B3 opt-out steps
+    // (scheduled-agents/rfb-customer-service.md line 664/670) — added
+    // 2026-09-16, dev-request 2026-09-14-crm-thread-status-enum-mangler-
+    // b3-opt-out-verdier. Until then the SKILL prescribed these two values
+    // but this endpoint 400'd on both, so B3 always fell back to
+    // awaiting_review.
+    status: z.enum(["new", "in_progress", "awaiting_review", "awaiting_confirmation", "awaiting_grace", "done", "archived"]),
     actor: z.enum(["claude", "daniel", "system"]).optional(),
   });
   const parsed = schema.safeParse(req.body);

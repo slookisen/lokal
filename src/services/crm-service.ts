@@ -56,7 +56,7 @@ function vSql(column: string, vertical?: CrmVertical): string {
   // in the type system would flag it. Cost of the check: one Array.includes.
   return ` AND ${column} = '${assertVertical(vertical, "vSql")}'`;
 }
-export type ThreadStatus = "new" | "in_progress" | "awaiting_review" | "done" | "archived";
+export type ThreadStatus = "new" | "in_progress" | "awaiting_review" | "awaiting_confirmation" | "awaiting_grace" | "done" | "archived";
 export type ThreadCategory = "innkommende" | "system" | "marketing" | "leverandor" | "unknown";
 export type AssignedTo = "unassigned" | "claude" | "daniel";
 export type Severity = "p0" | "p1" | "p2" | "normal";
