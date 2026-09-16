@@ -44041,3 +44041,27 @@ runSerial(async () => {
     failures.push("crm-thread-status-enum-b3-opt-out: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier,
+// post-review fix-up: the crm_threads.status CHECK-widening rebuild
+// migration cascade-deleted crm_messages/crm_actions rows and nulled
+// crm_outbox.thread_id on any database booting with foreign_keys=ON
+// (getDb()'s real boot order) -- an independent reviewer caught this with
+// a live repro, since every existing harness (including the suite
+// registered just above) sets foreign_keys=OFF and so never exercised
+// this path. Own dedicated migration test, synchronous like
+// init-dental.test.ts's runInitDentalBackfillTests (drives initSchema()
+// directly against an already-open handle to simulate a redeploy).
+console.log("\n── dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier: crm_threads rebuild FK-cascade safety ──");
+try {
+  const { runInitCrmThreadsB3StatusMigrationTests } = require("../src/database/init-crm-threads-b3-status-migration.test") as
+    typeof import("../src/database/init-crm-threads-b3-status-migration.test");
+  const ctm = runInitCrmThreadsB3StatusMigrationTests({ log: false });
+  passed += ctm.passed;
+  failed += ctm.failed;
+  for (const f of ctm.failures) failures.push("init-crm-threads-b3-status-migration: " + f);
+  console.log(`  init-crm-threads-b3-status-migration: ${ctm.passed} passed, ${ctm.failed} failed`);
+} catch (err: any) {
+  failed++;
+  failures.push("init-crm-threads-b3-status-migration: unexpected error: " + String(err?.message || err));
+}

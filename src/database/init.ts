@@ -1137,11 +1137,27 @@ function initSchema(db: Database.Database): void {
   // crm_outbox migration above (SQLite can't ALTER a CHECK in place);
   // idempotent — only runs when the current CHECK doesn't already include
   // 'awaiting_grace'. crm_threads is a PARENT table (crm_messages/
-  // crm_outbox/crm_untriaged reference it) — DROP TABLE never triggers FK
-  // action processing in SQLite (that only happens for DELETE/UPDATE/
-  // INSERT), and the new table is renamed back to the same name with every
-  // existing id preserved before COMMIT, so referencing rows resolve
-  // correctly again by the time the transaction ends; no row is rewritten.
+  // crm_actions ON DELETE CASCADE, crm_outbox ON DELETE SET NULL all
+  // reference it).
+  //
+  // CORRECTION (post-review, this same PR): an earlier version of this
+  // comment claimed "DROP TABLE never triggers FK action processing in
+  // SQLite (that only happens for DELETE/UPDATE/INSERT)" and skipped
+  // disabling the `foreign_keys` pragma on that basis. That claim is WRONG
+  // and was caught by an independent reviewer with a live repro against
+  // this exact migration: `getDb()` (this file, ~line 108) sets
+  // `foreign_keys = ON` before ever calling initSchema(), and with
+  // foreign_keys ON, SQLite's DROP TABLE on a table that is the target of
+  // other tables' FK constraints DOES perform an implicit cascade — every
+  // crm_messages/crm_actions row pointing at a dropped crm_threads row was
+  // being deleted (ON DELETE CASCADE) and every crm_outbox row nulled out
+  // (ON DELETE SET NULL) the moment `DROP TABLE crm_threads` ran below,
+  // silently wiping CRM message/action history on the first boot against
+  // any real existing database. Fix: `foreign_keys` is pragma'd OFF for the
+  // duration of the rebuild transaction and back ON immediately after
+  // (SQLite refuses to toggle this pragma mid-transaction, so both calls
+  // sit outside `tx()`, guarded by try/finally so a mid-rebuild exception
+  // can never leave the connection running with FK enforcement off).
   //
   // vertical_id (same near-miss the crm_outbox migration above already
   // flagged for itself): this file's own CREATE TABLE for crm_threads
@@ -1166,6 +1182,12 @@ function initSchema(db: Database.Database): void {
     ).get() as { sql: string } | undefined;
     const needsRebuild = schemaRow && !/'awaiting_grace'/.test(schemaRow.sql);
     if (needsRebuild) {
+      // foreign_keys OFF for the rebuild — see the CORRECTION comment
+      // above. Both pragma calls sit OUTSIDE tx() on purpose: SQLite is a
+      // documented no-op if you try to toggle `foreign_keys` while a
+      // transaction is active, so doing this inside `db.transaction()`
+      // would silently fail to protect anything.
+      db.pragma("foreign_keys = OFF");
       const tx = db.transaction(() => {
         // Three crm_messages triggers reference crm_threads by name in
         // their bodies (trg_update_thread_outbound_at,
@@ -1226,8 +1248,15 @@ function initSchema(db: Database.Database): void {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_category ON crm_threads(category)`);
         db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_last_message ON crm_threads(last_message_at)`);
       });
-      tx();
-      console.log("[init][crm-thread-status-b3] crm_threads.status CHECK widened to include 'awaiting_confirmation'/'awaiting_grace'");
+      try {
+        tx();
+        console.log("[init][crm-thread-status-b3] crm_threads.status CHECK widened to include 'awaiting_confirmation'/'awaiting_grace'");
+      } finally {
+        // Always restore, even if tx() threw mid-rebuild — a connection
+        // left running with FK enforcement off would silently accept
+        // dangling references on every write for the rest of this process.
+        db.pragma("foreign_keys = ON");
+      }
     }
   } catch (e) {
     console.warn("[init][crm-thread-status-b3] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
