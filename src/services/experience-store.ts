@@ -3531,7 +3531,62 @@ export type GardssalgSearchFilter = {
   lat?: number;
   lng?: number;
   radius_km?: number;
+  // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-text
+  // name/place query («Fjordgard», «Egge gård», «bryggeri Bergen»). Every
+  // whitespace-separated term (max 8) must match navn, slug, poststed or
+  // kommune (case-insensitive LIKE). Results are ranked exact-name match →
+  // name-prefix match → everything else (then navn), so a one-shot booking
+  // request that names a producer resolves to the obvious row first. This is
+  // what lets an AI assistant go from «book et møte hos X» straight to X
+  // without paging through a fylke — before this, discover_gardssalg had no
+  // way to look a producer up by name at all.
+  q?: string;
 };
+
+// Tokenise a free-text gårdssalg query the same way
+// searchGardssalgProvidersByQuery() below does (whitespace split, ≤8 terms,
+// lower-cased). Exported for the booking-resolution service + tests.
+export function gardssalgQueryTerms(q: string | null | undefined): string[] {
+  return String(q ?? "")
+    .trim()
+    .split(/\s+/)
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length > 0)
+    .slice(0, 8);
+}
+
+// One already-lower-cased query term -> a SQLite LIKE pattern body (no
+// surrounding %): LIKE metacharacters escaped with `\`, every non-ASCII
+// character replaced by `_` (see searchGardssalgProviders()'s q comment).
+export function gardssalgLikePattern(term: string): string {
+  let out = "";
+  for (const ch of term) {
+    if (ch === "%" || ch === "_" || ch === "\\") out += "\\" + ch;
+    else if (ch.charCodeAt(0) > 0x7f) out += "_";
+    else out += ch;
+  }
+  return out;
+}
+
+// Precision match + rank for the q filter (JS side, Unicode-aware). Returns
+// null when the row does not actually contain every term; otherwise a rank
+// (0 = exact whole-name match, 1 = name starts with the query, 2 = other).
+export function gardssalgQueryRank(
+  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null },
+  qTerms: string[],
+): number | null {
+  if (qTerms.length === 0) return 2;
+  const navn = (row.navn ?? "").toLocaleLowerCase("nb-NO");
+  const hay = [navn, row.slug ?? "", row.poststed ?? "", row.kommune ?? ""]
+    .map((v) => String(v).toLocaleLowerCase("nb-NO"));
+  for (const t of qTerms) {
+    if (!hay.some((h) => h.includes(t))) return null;
+  }
+  const whole = qTerms.join(" ");
+  if (navn === whole) return 0;
+  if (navn.startsWith(whole)) return 1;
+  return 2;
+}
 
 export function searchGardssalgProviders(
   filter: GardssalgSearchFilter = {},
@@ -3554,6 +3609,30 @@ export function searchGardssalgProviders(
   // Only the "show me the live ones" case is a real filter; omitted/false
   // means no filter on this column (not "show me the paused ones").
   if (filter.booking_live === true) { where.push("booking_live = 1"); }
+
+  // Free-text name/place query (see GardssalgSearchFilter.q). Two stages:
+  //   1. SQL prefilter — every term must LIKE-match navn/slug/poststed/
+  //      kommune. SQLite's lower()/LIKE only case-fold ASCII, so a term
+  //      containing æ/ø/å (or any non-ASCII letter) has that character
+  //      replaced by the single-character wildcard `_` — «Ægir» and «ægir»
+  //      then both match the stored "Ægir Bryggeri". The `%`/`_`/`\`
+  //      wildcards in the user's own text are escaped first so a query can
+  //      never widen itself into a match-everything pattern.
+  //   2. JS precision pass (below, after the query) — toLocaleLowerCase()
+  //      includes() on the same four fields removes the rare wildcard over-
+  //      match, then ranks exact whole-name match → name-prefix → rest.
+  // A whitespace-only q is a no-op (no filter), exactly like an omitted one.
+  const qTerms = gardssalgQueryTerms(filter.q);
+  if (qTerms.length > 0) {
+    qTerms.forEach((t, i) => {
+      const key = `q${i}`;
+      params[key] = `%${gardssalgLikePattern(t)}%`;
+      where.push(
+        `(lower(navn) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(slug,'')) LIKE @${key} ESCAPE '\\'` +
+        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\')`,
+      );
+    });
+  }
 
   const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
   const originLat = filter.lat;
@@ -3585,10 +3664,12 @@ export function searchGardssalgProviders(
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
   // candidate cap and the real cut to `clampedLimit` happens after the exact
   // distance is computed + sorted in JS below — mirrors discoverExperiences().
+  // The same widening applies to a q query (its precision pass + ranking is
+  // JS-side too — see the q comment above).
   const GEO_CANDIDATE_CAP = 2000;
-  params.limit = hasGeo ? GEO_CANDIDATE_CAP : clampedLimit;
+  params.limit = hasGeo || qTerms.length > 0 ? GEO_CANDIDATE_CAP : clampedLimit;
 
-  const rows = db
+  let rows = db
     .prepare(
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
@@ -3597,6 +3678,16 @@ export function searchGardssalgProviders(
         LIMIT @limit`
     )
     .all(params) as GardssalgProviderRow[];
+
+  if (qTerms.length > 0) {
+    // Precision pass + rank (stable: ties keep the SQL navn order).
+    const ranked = rows
+      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms) }))
+      .filter((x): x is { r: GardssalgProviderRow; i: number; rank: number } => x.rank !== null)
+      .sort((a, b) => a.rank - b.rank || a.i - b.i);
+    rows = ranked.map((x) => x.r);
+    if (!hasGeo) rows = rows.slice(0, clampedLimit);
+  }
 
   if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") {
     return rows;

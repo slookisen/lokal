@@ -2847,19 +2847,40 @@ REST (samme søkeflate, uten MCP-håndtrykk):
 
 Gårdssalg-spesifikke filtre (i tillegg til fylke/kommune/lat/lng/radius_km fra
 Discovery-API-seksjonen over): producer_type, booking_live=true (kun literalen
-"true" filtrerer — utelatt betyr «ingen filter på denne kolonnen»).
+"true" filtrerer — utelatt betyr «ingen filter på denne kolonnen»), og q
+(fritekst navn/sted-oppslag av ÉN bestemt produsent, f.eks. q=Fjordgard%20Bryggeri
+— alle ord må treffe navn/slug/poststed/kommune; eksakt navnetreff rangeres
+først). I MCP-verktøyet discover_gardssalg heter den samme parameteren \`query\`.
 
 Respons: JSON med { vertical:"gardssalg", query, count, results[] }, der hver
-rad har navn/fylke/kommune/producer_type/lat/lon/geocode_confidence/profile_url
-og et \`booking\`-felt ({live, mode, note}) som ærlig speiler dark-launch-status
-— aldri en påstått aktiv booking før reservasjoner faktisk er åpnet.
+rad har id (= provider_id for booking)/navn/fylke/kommune/producer_type/lat/lon/
+geocode_confidence/profile_url og et \`booking\`-felt ({live, mode, note}) som
+ærlig speiler dark-launch-status — aldri en påstått aktiv booking før
+reservasjoner faktisk er åpnet.
 
-### Booking via MCP (book_gardssalg)
+### Booking via MCP (book_gardssalg) — én setning, ett kall
 
 MCP-verktøy: book_gardssalg — send inn en reservasjonsforespørsel for en
-gårdssalg-produsent (provider_id fra discover_gardssalg), samme to-stegs
-håndtrykk som over. Krever provider_id, slot_at, party_size, guest_name,
-guest_email (guest_phone og notes valgfritt).
+gårdssalg-produsent, samme to-stegs håndtrykk som over. Produsenten oppgis
+ENTEN som provider_id (id-feltet fra discover_gardssalg) ELLER som
+provider_query (produsentens navn slik gjesten sa det, f.eks. "Fjordgard
+Bryggeri"). Krever i tillegg slot_at (YYYY-MM-DDTHH:MM, Europe/Oslo),
+party_size, guest_name, guest_email (gjestens egne — spør gjesten, finn aldri
+på). Valgfritt: requested_weekday (ukedagen gjesten sa, f.eks. "fredag"),
+guest_phone, notes, confirm_outside_hours.
+
+«Book et møte hos X fredag den 20. oktober klokken 10» er dermed ETT kall:
+provider_query="X", slot_at="2026-10-20T10:00", requested_weekday="fredag",
+party_size, guest_name, guest_email. Verktøyet løser X til nøyaktig én
+produsent (flere treff → reason "provider_ambiguous" med candidates[] du kan
+legge fram for gjesten; ingen treff → "provider_not_found"; ingen booking
+opprettes i noen av tilfellene), sjekker at datoen faktisk er en fredag
+(20. oktober 2026 er en tirsdag → weekday_mismatch:true med de nærmeste
+fredagene i suggestions[], ingen booking opprettet), og sender så
+forespørselen til produsenten. Svaret ved suksess bærer provider.navn og
+slot_at_local ("fredag 23. oktober 2026 kl. 10:00") — les begge tilbake til
+gjesten. Samme flyt og samme svar via REST: POST ${url}/api/opplevelser/book
+med de samme feltene i JSON-body.
 
 VIKTIG: verktøyet oppretter ALDRI en bekreftet booking — kun samme avventende
 ("reserved"/pending) rad som nettskjemaet på produsentens profilside
