@@ -26338,6 +26338,170 @@ router.get("/admin/experiences/:id/provenance", requireAdmin, (req: Request, res
   }
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-geo-marker-diagnostic ─────────────
+//
+// dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler, AC4
+// spot-check slice: the batch geocode-backlog sweep (POST .../gardssalg-
+// geocode-backlog-sweep above) upgraded coarse kommune-centroid geocodes to
+// real place-points where a corroborated Kartverket stedsnavn match exists.
+// AC4 asks for a 20-random-profile spot-check confirming (a) no
+// geocode_confidence='kommune'-class row ever renders a point-marker on any
+// public map (only address/sted precision should) and (b) no row's `sted`
+// place-label is a poststed that actually sits in a different kommune than
+// the farm. Neither was checkable before this route: there was no read-only
+// way to see, per row, its geocode_confidence AND what the frontend would
+// actually render for it — this is that missing read surface, same class as
+// GET /admin/experiences/:id/provenance just above (X-Admin-Key via
+// requireAdmin, read-only, single SELECT, 404 for an unknown id).
+//
+// `would_render_point_marker` is computed via gardssalgMapPresentation()
+// (routes/experiences-seo.ts) — the EXACT function the gårdssalg produsent-
+// profil page's own mini-map block calls to decide exact/approx-point/
+// no-point. Reused, not reinvented: a hand-rolled copy of the
+// high/medium/low/sted/approximate/no_match/null split here could silently
+// drift from what actually renders. Loaded via an in-handler require(), not
+// a top-level import — experiences-seo.ts already imports FROM this file
+// (isGardssalgContactEmailFlaggedForReview), so a top-level import back
+// would be circular; every other admin route in this file that reaches
+// across a similar boundary (e.g. the geocode-backlog-sweep route's
+// require("../services/experiences-geocode-worker") above) uses the same
+// in-handler require() for exactly this reason.
+//
+// `sted` is gardssalgPlaceLabel() (also routes/experiences-seo.ts) — the
+// SAME kommune-first label the profile page's hero/meta/map actually show,
+// so AC4b's "is the label a poststed that disagrees with the row's own
+// kommune" check can be done by eye against the raw `kommune`/`poststed`
+// columns this response also includes, without re-deriving the label rule.
+//
+// Scope: the same "official gårdssalg catalog" gate every sibling gårdssalg
+// admin report in this file uses (GARDSSALG_DEDUP_CATALOG_WHERE — the
+// IFNULL-safe producer_type/rfb_seed_source OR, see its own doc comment
+// above for why the bare `rfb_seed_source = 'rfb-seed'` form is NOT safe to
+// re-derive here), plus the same catalog_hidden exclusion
+// listGardssalgProviders()/countGardssalgProviders() layer on top — a
+// catalog_hidden=1 row has no reachable public profile page at all, so it is
+// out of scope for "what would the public map render" and an unknown/hidden
+// `provider_id` both come back 404 the same way.
+//
+// READ-ONLY — a single SELECT (plus an optional COUNT(*) for `total`), zero
+// writes, no side effects. Never touches locked/owner/Brreg/contact fields —
+// it has no reason to, the diagnostic is geo-only.
+//
+// Two modes, same shape per row:
+//   - `provider_id` query param -> single-row lookup, 404 if it doesn't
+//     resolve to a gårdssalg row in scope.
+//   - otherwise -> keyset-paginated batch listing, same `limit`/`after`
+//     (last-seen id) contract as GET /admin/providers/all above (id is the
+//     stable, immutable, unique PRIMARY KEY, so an OFFSET-free cursor is
+//     safe even if rows are deleted mid-walk — see that route's own comment
+//     for the full reasoning).
+const GARDSSALG_GEO_DIAGNOSTIC_DEFAULT_LIMIT = 50;
+const GARDSSALG_GEO_DIAGNOSTIC_MAX_LIMIT = 200;
+// Same catalog-visibility gate as listGardssalgProviders()/
+// countGardssalgProviders() (experience-store.ts): the official catalog scope
+// WHERE, plus the catalog_hidden=1 exclusion those callers layer on top.
+const GARDSSALG_GEO_DIAGNOSTIC_WHERE =
+  `${GARDSSALG_DEDUP_CATALOG_WHERE} AND (catalog_hidden IS NULL OR catalog_hidden != 1)`;
+
+type GardssalgGeoDiagnosticDbRow = {
+  id: string;
+  navn: string;
+  kommune: string | null;
+  poststed: string | null;
+  fylke: string | null;
+  lat: number | null;
+  lon: number | null;
+  geocode_confidence: string | null;
+};
+
+function buildGardssalgGeoDiagnosticRow(row: GardssalgGeoDiagnosticDbRow) {
+  // In-handler require (see the route's own doc comment above for why: a
+  // top-level import from experiences-seo.ts into this file would be
+  // circular, since experiences-seo.ts already imports FROM opplevelser.ts).
+  const { gardssalgMapPresentation, gardssalgPlaceLabel } =
+    require("./experiences-seo") as typeof import("./experiences-seo");
+
+  const presentation = gardssalgMapPresentation(row.geocode_confidence);
+  return {
+    provider_id: row.id,
+    navn: row.navn,
+    geocode_confidence: row.geocode_confidence,
+    lat: row.lat,
+    lon: row.lon,
+    sted: gardssalgPlaceLabel(row) || null,
+    kommune: row.kommune,
+    poststed: row.poststed,
+    fylke: row.fylke,
+    // The SAME three-way classification the produsent-profil mini-map uses
+    // ("exact" | "approx-point" | "no-point") — kept alongside the boolean
+    // below so a spot-check can also tell "sted-tier approx point" apart
+    // from "a real address", not just point-vs-no-point.
+    map_presentation: presentation,
+    would_render_point_marker: presentation !== "no-point",
+  };
+}
+
+router.get("/admin/gardssalg-geo-marker-diagnostic", requireAdmin, (req: Request, res: Response) => {
+  const providerId = typeof req.query.provider_id === "string" ? req.query.provider_id.trim() : "";
+
+  try {
+    const expDb = getExpDb("experiences");
+
+    if (providerId) {
+      const row = expDb
+        .prepare(
+          `SELECT id, navn, kommune, poststed, fylke, lat, lon, geocode_confidence
+             FROM experience_providers
+            WHERE id = ? AND ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}`,
+        )
+        .get(providerId) as GardssalgGeoDiagnosticDbRow | undefined;
+
+      if (!row) {
+        res.status(404).json({ error: "gardssalg_provider_not_found", provider_id: providerId });
+        return;
+      }
+
+      res.json({ success: true, provider: buildGardssalgGeoDiagnosticRow(row) });
+      return;
+    }
+
+    let limit = parseInt((req.query.limit as string) || "", 10);
+    if (!Number.isFinite(limit)) limit = GARDSSALG_GEO_DIAGNOSTIC_DEFAULT_LIMIT;
+    limit = Math.min(GARDSSALG_GEO_DIAGNOSTIC_MAX_LIMIT, Math.max(1, limit));
+
+    const after = typeof req.query.after === "string" ? req.query.after : "";
+
+    const rows = expDb
+      .prepare(
+        `SELECT id, navn, kommune, poststed, fylke, lat, lon, geocode_confidence
+           FROM experience_providers
+          WHERE ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}
+            AND id > ?
+          ORDER BY id ASC
+          LIMIT ?`,
+      )
+      .all(after, limit) as GardssalgGeoDiagnosticDbRow[];
+
+    const totalRow = expDb
+      .prepare(`SELECT COUNT(*) AS total FROM experience_providers WHERE ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}`)
+      .get() as { total: number };
+
+    const next_after = rows.length > 0 ? rows[rows.length - 1].id : null;
+
+    res.json({
+      success: true,
+      count: rows.length,
+      total: totalRow.total,
+      next_after,
+      limit,
+      providers: rows.map(buildGardssalgGeoDiagnosticRow),
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-geo-marker-diagnostic failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/providers/all ────────────────────────────────
 //
 // dev-request 2026-07-30-experience-providers-enumerate: the routine's

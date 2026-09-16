@@ -30805,6 +30805,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorr.failures) failures.push("opplevelser-gardssalg-outreach-readiness: " + f);
     console.log(`  opplevelser-gardssalg-outreach-readiness: ${gorr.passed} passed, ${gorr.failed} failed`);
 
+    // dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler, AC4:
+    // GET /admin/gardssalg-geo-marker-diagnostic — read-only per-row
+    // geocode_confidence + would_render_point_marker report, reused by the
+    // AC4 20-random-profile spot-check. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-geo-marker-diagnostic: admin geo marker diagnostic ──");
+    const { runOpplevelserGardssalgGeoMarkerDiagnosticTests } = require("../src/routes/opplevelser-gardssalg-geo-marker-diagnostic.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-geo-marker-diagnostic.test");
+    const ggmd = await runOpplevelserGardssalgGeoMarkerDiagnosticTests({ log: false });
+    passed += ggmd.passed;
+    failed += ggmd.failed;
+    for (const f of ggmd.failures) failures.push("opplevelser-gardssalg-geo-marker-diagnostic: " + f);
+    console.log(`  opplevelser-gardssalg-geo-marker-diagnostic: ${ggmd.passed} passed, ${ggmd.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-
     // outreach, Steg 5: POST /admin/gardssalg-outreach-preflight — read-only
     // GO/NO-GO pre-flight over a caller-supplied batch of provider ids,
