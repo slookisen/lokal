@@ -38,6 +38,11 @@ import {
   createProvider,
   getProviderByOrgnr,
   getProviderByName,
+  // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+  // varianter: THIRD resolve-or-create fallback (after org_nr/name both
+  // miss) in the bulk-load handler below — see the `existing` lookup and
+  // getProviderByDomain's own doc comment (experience-store.ts).
+  getProviderByDomain,
   setBrregVerification,
   ExperienceSchema,
   DiscoverFilterSchema,
@@ -1840,6 +1845,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   let providersInserted = 0;
   let experiencesInserted = 0;
   let skipped = 0; // providers/experiences skipped as already-present or non-evidence unverified
+  // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+  // varianter: providers resolved to an ALREADY-EXISTING row via the domain
+  // fallback (org_nr miss + name miss, website's registrable domain matches
+  // an existing provider's hjemmeside) — reported so a re-run's "no new
+  // duplicate created" is observable, mirroring how rejected_blocklisted_*
+  // reports the blocklist gate's own matches below.
+  let providersMatchedByDomain = 0;
+  const providersMatchedByDomainNames: string[] = [];
   // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
   // utfoerelse): a producer whose org_nr, hjemmeside, or name matches a
   // removed producer (agent_blocklist) must not be (re-)created here — and,
@@ -1912,10 +1925,23 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       }
 
       // ── apply: resolve-or-create the provider (idempotent). ─────────
+      // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+      // varianter: THIRD fallback after org_nr/name both miss — matches on
+      // the candidate's website domain against an existing provider's
+      // hjemmeside (e.g. "Smakfulle Rom" vs a harvested "Smakfulle Rom –
+      // Konferanse, Event & Catering" row for the same producer/domain).
+      // Runs through the EXACT SAME "found existing" branch below as an
+      // org_nr/name hit — no special-casing.
       let providerId: string;
-      const existing =
+      const byOrgnrOrName =
         (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
+      const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite, verdict.org_nr);
+      const existing = byOrgnrOrName ?? byDomain;
       if (existing) {
+        if (byDomain) {
+          providersMatchedByDomain++;
+          providersMatchedByDomainNames.push(name);
+        }
         providerId = existing.id as string;
         // keep Brreg stamp fresh on a re-run for already-present providers
         if (verdict.brreg_verified === 1) {
@@ -2089,6 +2115,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     experiences_inserted: experiencesInserted,
     providers_inserted: providersInserted,
     skipped,
+    // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+    // varianter: providers resolved to an existing row via the domain
+    // fallback (see the `existing`/`byDomain` lookup above) — 0/empty when
+    // the fallback never fired this call (today's behavior, unchanged).
+    providers_matched_by_domain: providersMatchedByDomain,
+    providers_matched_by_domain_names: providersMatchedByDomainNames,
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,

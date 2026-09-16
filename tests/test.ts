@@ -813,6 +813,32 @@ runSerial(() => {
   }
 });
 
+// ── dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+// varianter: bulk-load's resolve-or-create logic gained a THIRD fallback
+// (getProviderByDomain, after org_nr/name both miss) so a harvested listing
+// name for an already-onboarded provider ("Smakfulle Rom" vs "Smakfulle Rom
+// – Konferanse, Event & Catering", same website) dedupes instead of
+// inserting a second `experience_providers` row. Own dedicated test file
+// (own in-memory experiences DB + pinned RFB db, no shared globalThis.fetch
+// stub needed — no evidence_url in any row, so the LLM admission gate never
+// fires) — runSerial() so it never races the shared db-factory/RFB-db
+// singletons other blocks in this file touch.
+runSerial(async () => {
+  console.log("\n── bulk-load: provider domain dedup (getProviderByDomain fallback) ──");
+  try {
+    const { runOpplevelserBulkLoadProviderDomainDedupTests } = require("../src/routes/opplevelser-bulk-load-provider-domain-dedup.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-provider-domain-dedup.test");
+    const r = await runOpplevelserBulkLoadProviderDomainDedupTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-provider-domain-dedup: " + f);
+    console.log(`  bulk-load-provider-domain-dedup: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-provider-domain-dedup: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request rfb-kvalitetsgate-parity: RFB's LLM-judge quality-gate
 // cascade (judgeRfbAboutCandidate/meetsRfbAboutQualityBar/
 // isRfbJudgeInfraFailure, routes/admin-agents.ts) — sentinel/fail-closed
