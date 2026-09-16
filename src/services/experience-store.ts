@@ -2012,8 +2012,24 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
  * Null/empty/unparseable input (and a candidate site with no domain-bearing
  * providers on file) returns null rather than throwing — this is a
  * best-effort dedup lookup, not a validator.
+ *
+ * `candidateOrgNr` (dev-request 2026-09-16 CHANGES-REQUESTED fix-up, PR #872
+ * review): a shared domain is NOT proof of shared identity when both sides
+ * carry a KNOWN, DIFFERENT org_nr — e.g. two franchise/underenhet legal
+ * entities sharing one corporate/parking domain. That combination
+ * (candidate has its own resolved org_nr AND the domain-matched row already
+ * has a non-null org_nr that differs from it) is affirmative proof of two
+ * DISTINCT legal entities, so the domain signal must never override two
+ * known-different org_nrs — the row is skipped and the scan continues as if
+ * it were never a match, same "don't guess when two real entities are both
+ * visible" precedent as flagNameCollision/name_collision in
+ * experience-brreg.ts. A row with a NULL org_nr (never Brreg-verified) is
+ * unaffected and still matches, exactly as before this fix.
  */
-export function getProviderByDomain(website: string | null | undefined): Record<string, unknown> | null {
+export function getProviderByDomain(
+  website: string | null | undefined,
+  candidateOrgNr?: string | null,
+): Record<string, unknown> | null {
   if (!website) return null;
   const candidateHost = hostFromUrlLike(website);
   if (!candidateHost) return null;
@@ -2030,7 +2046,10 @@ export function getProviderByDomain(website: string | null | undefined): Record<
     const rowHost = hostFromUrlLike(row.hjemmeside as string);
     if (!rowHost) continue;
     const rowDomain = collapseDomain(registrableDomain(rowHost));
-    if (rowDomain === candidateDomain) return row;
+    if (rowDomain !== candidateDomain) continue;
+    const rowOrgNr = row.org_nr as string | null | undefined;
+    if (candidateOrgNr && rowOrgNr && rowOrgNr !== candidateOrgNr) continue;
+    return row;
   }
   return null;
 }

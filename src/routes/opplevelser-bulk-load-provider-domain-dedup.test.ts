@@ -42,6 +42,19 @@
  *       website domain does NOT match that provider, still creates a NEW
  *       provider row — this fix is domain-only, never fuzzy/substring name
  *       matching.
+ *   (c) differing-org_nr guard (CHANGES-REQUESTED fix-up, PR #872 review):
+ *       an existing provider that is ALREADY brreg_verified with a KNOWN
+ *       org_nr, sharing a domain with a bulk-load candidate whose OWN Brreg
+ *       resolution yields a DIFFERENT, non-null org_nr ("Underenhet A
+ *       Kaffe AS" / '333333333' vs a candidate "Underenhet B Kaffe AS"
+ *       resolving to '444444444' — a real franchise/shared-domain shape,
+ *       not a hypothetical). Must NOT dedup by domain: the existing
+ *       provider's org_nr must be UNCHANGED (proven via a direct DB read,
+ *       not just the response body — this is exactly the field
+ *       setBrregVerification's `COALESCE(@orgnr, org_nr)` would otherwise
+ *       silently overwrite), and a NEW, separate provider row must be
+ *       created for the candidate instead — two distinct legal entities
+ *       sharing a domain must both exist as separate rows.
  */
 
 export interface TestSummary {
@@ -171,6 +184,7 @@ export function runOpplevelserBulkLoadProviderDomainDedupTests(
         let orgNr: string | null = null;
         if (lc.includes("smakfulle rom")) orgNr = "911111111";
         else if (lc.includes("kaffebrenneriet")) orgNr = "922222222";
+        else if (lc.includes("underenhet b kaffe")) orgNr = "444444444";
         if (!orgNr) return { ok: true, status: 200, json: async () => ({ _embedded: { enheter: [] } }) };
         const enheter = [{
           organisasjonsnummer: orgNr,
@@ -298,6 +312,75 @@ export function runOpplevelserBulkLoadProviderDomainDedupTests(
       assertTrue(
         !!existingKaffeStillAlone && existingKaffeStillAlone.id === kaffebrennerietId,
         "dd-2g: the pre-existing 'Kaffebrenneriet AS' row is untouched",
+      );
+
+      // ── (c) differing-org_nr guard: existing provider is ALREADY
+      //    brreg_verified with a KNOWN org_nr, sharing a domain with a
+      //    bulk-load candidate whose OWN Brreg resolution yields a
+      //    DIFFERENT, non-null org_nr. Reproduces the reviewer's exact
+      //    CHANGES-REQUESTED scenario for PR #872: without the guard,
+      //    setBrregVerification's `org_nr = COALESCE(@orgnr, org_nr)` would
+      //    silently overwrite the existing row's org_nr under the ORIGINAL
+      //    provider's name — corrupting two genuinely distinct legal
+      //    entities that merely share a domain (franchise / shared
+      //    corporate-parking-page shape). ─────────────────────────────────
+      const underenhetAId = expStore.createProvider({
+        navn: "Underenhet A Kaffe AS",
+        hjemmeside: "https://kaffefranchise.no/lokal-a",
+        org_nr: "333333333",
+        brreg_verified: 1,
+        brreg_active: 1,
+        source: "seed",
+      });
+      const beforeCountC = providerCount();
+      const rC = await callRoute(opplevelserRouter, {
+        headers: adminHeaders,
+        body: {
+          apply: true,
+          experiences: [
+            {
+              title: "Kaffekurs i franchiselokalet",
+              provider_name: "Underenhet B Kaffe AS",
+              category: "mat_drikke",
+              website: "https://www.kaffefranchise.no/lokal-b",
+            },
+          ],
+        },
+      });
+      assertEq(rC.status, 200, "dd-3a: apply -> 200");
+      assertEq(
+        rC.body.providers_inserted,
+        1,
+        "dd-3b: a NEW provider IS inserted — a shared domain must never win over two KNOWN, DIFFERENT org_nrs",
+      );
+      assertEq(
+        rC.body.providers_matched_by_domain ?? 0,
+        0,
+        "dd-3c: no domain match reported — the differing-org_nr guard fired, so the domain fallback never matched",
+      );
+      assertEq(
+        providerCount(),
+        beforeCountC + 1,
+        "dd-3d: exactly one new experience_providers row created — two distinct legal entities, two rows",
+      );
+      const underenhetARowAfter = expDb
+        .prepare("SELECT * FROM experience_providers WHERE id = ?")
+        .get(underenhetAId) as { org_nr: string | null; navn: string } | undefined;
+      assertEq(
+        underenhetARowAfter?.org_nr,
+        "333333333",
+        "dd-3e: REGRESSION — the EXISTING provider's org_nr is UNCHANGED after the bulk-load call (read straight from the DB, not the response body)",
+      );
+      const underenhetBRow = providerByNavn("Underenhet B Kaffe AS");
+      assertTrue(!!underenhetBRow, "dd-3f: a NEW provider row exists under the candidate's own name");
+      assertEq(
+        underenhetBRow?.org_nr,
+        "444444444",
+        "dd-3g: the new row carries the candidate's OWN (different) org_nr",
+      );
+      assertTrue(
+        !!underenhetBRow && underenhetBRow.id !== underenhetAId,
+        "dd-3h: the new row is a DIFFERENT id from the existing 'Underenhet A Kaffe AS' provider",
       );
     } catch (err: any) {
       failed++;

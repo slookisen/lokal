@@ -1935,7 +1935,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       let providerId: string;
       const byOrgnrOrName =
         (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
-      const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite);
+      const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite, verdict.org_nr);
       const existing = byOrgnrOrName ?? byDomain;
       if (existing) {
         if (byDomain) {
