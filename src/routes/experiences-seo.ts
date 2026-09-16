@@ -4684,10 +4684,21 @@ function isApproxGardssalgConfidence(confidence: string | null): boolean {
 // address/kommune/sted) rather than one, because the two columns are not the
 // same enum and unifying them would need a translation layer neither caller
 // asks for.
-type MapPresentation = "exact" | "approx-point" | "no-point";
+// Exported (dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler,
+// AC4 diagnostic slice): GET /admin/gardssalg-geo-marker-diagnostic
+// (routes/opplevelser.ts) needs this SAME predicate to report
+// `would_render_point_marker` per row — reusing it here (rather than
+// re-deriving the high/medium/low/sted/approximate/no_match/null split a
+// second time in opplevelser.ts) is the whole point of that diagnostic: a
+// second, hand-rolled copy of this rule could silently drift from what the
+// produsent-profil page below actually renders. Pulled in via an in-handler
+// `require()` there, not a top-level import — this module already imports
+// FROM opplevelser.ts (isGardssalgContactEmailFlaggedForReview above), so a
+// top-level import the other way would be circular.
+export type MapPresentation = "exact" | "approx-point" | "no-point";
 
 /** geocode_confidence (experience_providers) → single-entity map presentation. */
-function gardssalgMapPresentation(confidence: string | null | undefined): MapPresentation {
+export function gardssalgMapPresentation(confidence: string | null | undefined): MapPresentation {
   if (confidence === "high" || confidence === "medium" || confidence === "low") return "exact";
   if (confidence === "sted") return "approx-point";
   return "no-point"; // 'approximate', 'no_match', null, future/unknown — same fail-closed direction as before
@@ -5517,7 +5528,12 @@ router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: 
 // `provider.poststed` first — that field literally IS the postal address,
 // which is the one place Daniel's spec says poststed still belongs
 // ("poststed bare som del av selve postadressen").
-function gardssalgPlaceLabel(p: { kommune?: string | null; poststed?: string | null; fylke?: string | null }): string {
+// Exported alongside gardssalgMapPresentation() above, same reuse rationale
+// (GET /admin/gardssalg-geo-marker-diagnostic, routes/opplevelser.ts, AC4b:
+// surfacing the SAME `sted` label the profile page renders, not a
+// re-derived one, so a diagnostic-vs-render mismatch can't hide a real
+// poststed/kommune drift).
+export function gardssalgPlaceLabel(p: { kommune?: string | null; poststed?: string | null; fylke?: string | null }): string {
   return (p.kommune || p.poststed || p.fylke || "").trim();
 }
 
