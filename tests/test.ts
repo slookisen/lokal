@@ -31713,6 +31713,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmbk.failures) failures.push("opplevelser-gardssalg-mcp-booking: " + f);
     console.log(`  opplevelser-gardssalg-mcp-booking: ${gmbk.passed} passed, ${gmbk.failed} failed`);
 
+    // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai («book et
+    // møte hos X fredag den 20. okt klokken 10.00» → one call): provider
+    // resolution by NAME (provider_query / discover query), the `id` field
+    // discover_gardssalg had been missing, the requested_weekday guard, and
+    // the shared honest-outcome payloads — on the MCP tool AND POST
+    // /api/opplevelser/book (src/services/gardssalg-booking-resolve.ts,
+    // src/routes/experiences-mcp.ts, src/routes/opplevelser.ts). Same
+    // in-memory-DB + real-MCP-session-over-HTTP pattern as the block above,
+    // runs sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-one-shot-booking: «hos X» → provider, weekday guard, id in discover ──");
+    const { runOpplevelserGardssalgOneShotBookingTests } = require("../src/routes/opplevelser-gardssalg-one-shot-booking.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-one-shot-booking.test");
+    const gosb = await runOpplevelserGardssalgOneShotBookingTests({ log: false });
+    passed += gosb.passed;
+    failed += gosb.failed;
+    for (const f of gosb.failures) failures.push("opplevelser-gardssalg-one-shot-booking: " + f);
+    console.log(`  opplevelser-gardssalg-one-shot-booking: ${gosb.passed} passed, ${gosb.failed} failed`);
+
     // dev-request 2026-07-19-gardssalg-agent-flater: REST GET /api/opplevelser/
     // discover?category=gardssalg_smaking always got zero direct hits (gårdssalg
     // rows live in experience_providers, not `experiences`), and its zero-hit

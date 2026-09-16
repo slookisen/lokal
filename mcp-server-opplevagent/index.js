@@ -320,9 +320,13 @@ server.registerTool(
       "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
       "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
       "rounded distance_km and are sorted nearest-first, and rows with no geocoded location are excluded " +
-      "(never a fabricated distance). Returns name, location, producer type, and an honest booking status " +
+      "(never a fabricated distance). Returns id (the provider_id for book_gardssalg), name, location, producer " +
+      "type, and an honest booking status " +
       "(live direct booking vs. a dark-launch 'coming soon' note — never overclaims booking availability). " +
-      "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking'.",
+      "To look up ONE specific producer by name (e.g. when the guest says 'book hos Fjordgard Bryggeri'), " +
+      "pass `query`. " +
+      "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking', " +
+      "query: 'Fjordgard Bryggeri'.",
     inputSchema: {
       fylke: z.string().optional().describe(
         "Norwegian county (fylke) of the producer. Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
@@ -332,6 +336,11 @@ server.registerTool(
       ),
       producer_type: z.string().optional().describe(
         "Type of drink producer. Examples: 'bryggeri' (brewery), 'cideri' (cidery), 'vingård' (vineyard), 'destilleri' (distillery), 'mjøderi' (meadery), 'seltzeri'"
+      ),
+      // Mirrors the remote tool's `query` (experiences-mcp.ts) — proxied as
+      // the REST `q` parameter.
+      query: z.string().max(200).optional().describe(
+        "Free-text lookup of a specific producer by name and/or place, e.g. 'Fjordgard Bryggeri', 'Egge gård', 'sideri Hardanger'. Every word must match the producer's name, URL slug, place (poststed) or municipality; exact name matches rank first. Use this to get the `id` (provider_id) for book_gardssalg when the guest names a producer."
       ),
       booking_live: z.boolean().optional().describe(
         "When true, only return producers that currently accept direct bookings. Omit to include producers regardless of booking status."
@@ -357,12 +366,13 @@ server.registerTool(
       openWorldHint: true,
     },
   },
-  async ({ fylke, kommune, producer_type, booking_live, lat, lng, radius_km, limit }) => {
+  async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }) => {
     const params = new URLSearchParams();
     params.append("category", "gardssalg_smaking");
     if (fylke) params.append("fylke", fylke);
     if (kommune) params.append("kommune", kommune);
     if (producer_type) params.append("producer_type", producer_type);
+    if (typeof query === "string" && query.trim()) params.append("q", query.trim());
     // Only the literal string "true" is a real filter server-side (see
     // opplevelser.ts's req.query.booking_live === "true" check) — omitting a
     // false value here matches that "no filter" semantics exactly.
@@ -413,13 +423,37 @@ server.registerTool(
       "producer is rejected with a clear message, never a silent failure. " +
       "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; produsenten " +
       "mottar forespørselen og svarer (bekrefter, foreslår nytt tidspunkt eller avslår). " +
-      "Required: provider_id (from discover_gardssalg), slot_at (requested date/time), party_size, " +
-      "guest_name, guest_email. Optional: experience_id, guest_phone, notes. " +
-      "Example: book a table for 4 at provider '3f1b2c4d-...' for '2026-08-15T13:00' for " +
-      "'Kari Nordmann' <kari@example.no>.",
+      "ONE-SENTENCE FLOW («book et møte hos X fredag 20. oktober kl. 10 for 4 personer»): call this ONCE with " +
+      "provider_query='X' (the producer's name — no discover_gardssalg round-trip needed), slot_at, party_size, " +
+      "guest_name, guest_email and requested_weekday='fredag'. The tool resolves X to exactly one producer " +
+      "(or returns candidates / not-found with NO booking created), checks that the date really is a Friday " +
+      "(or returns weekday_mismatch:true with the nearest Fridays, NO booking created), then submits the request " +
+      "and notifies the producer by email. guest_name and guest_email are the HUMAN guest's own — ask the guest " +
+      "for them if you do not have them; never invent or reuse someone else's. " +
+      "Required: provider_id OR provider_query, slot_at (requested date/time, 'YYYY-MM-DDTHH:MM' Europe/Oslo), " +
+      "party_size, guest_name, guest_email. Optional: requested_weekday, experience_id, guest_phone, notes, " +
+      "confirm_outside_hours. " +
+      "The requested slot_at is ALWAYS hard-rejected if it's in the past or too far ahead. If the " +
+      "producer has stated opening hours and slot_at falls outside them, this returns " +
+      "outside_hours:true (not an error) instead of creating the booking — retry once with " +
+      "confirm_outside_hours:true if the exact requested time should be kept anyway. " +
+      "On success the response carries the resolved producer (provider.navn) and slot_at_local " +
+      "(e.g. 'fredag 23. oktober 2026 kl. 10:00') — read both back to the guest. " +
+      "Example: provider_query 'Fjordgard Bryggeri', slot_at '2026-10-23T10:00', requested_weekday 'fredag', " +
+      "party_size 4, guest_name 'Kari Nordmann', guest_email 'kari@example.no'.",
     inputSchema: {
-      provider_id: z.string().describe(
-        "The gårdssalg producer's id, from a discover_gardssalg result (NOT the profile slug). Example: '3f1b2c4d-...'"
+      // Mirrors the remote tool 1:1 (experiences-mcp.ts BookGardssalgInputSchema,
+      // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai): the
+      // name resolution + weekday guard run server-side in POST
+      // /api/opplevelser/book, so this proxy only passes the fields through.
+      provider_id: z.string().optional().describe(
+        "The gårdssalg producer's id — the `id` field of a discover_gardssalg result (NOT the profile slug). Example: '3f1b2c4d-...'. Either provider_id or provider_query is required; provider_id wins when both are given."
+      ),
+      provider_query: z.string().max(200).optional().describe(
+        "Alternative to provider_id: the producer's name as the guest said it, optionally with a place, e.g. 'Fjordgard Bryggeri' or 'Egge gård Steinkjer'. Resolved to exactly ONE producer; if several match, the tool returns the candidates (no booking created) so you can ask the guest which one; if none match, it says so."
+      ),
+      requested_weekday: z.string().max(20).optional().describe(
+        "Safety check — the weekday the guest actually said, e.g. 'fredag' or 'Friday'. If slot_at does not fall on that weekday (Europe/Oslo) the tool returns weekday_mismatch:true with the nearest dates that do, instead of booking the wrong day. Always pass it when the guest named a weekday."
       ),
       experience_id: z.string().optional().describe(
         "Optional experience UUID if this booking is for a specific listed experience rather than a general gårdssalg visit."
@@ -442,26 +476,41 @@ server.registerTool(
       notes: z.string().optional().describe(
         "Optional free-text note to the producer (e.g. dietary needs, arrival details)."
       ),
+      confirm_outside_hours: z.boolean().optional().describe(
+        "Set to true only when RETRYING after a previous call to this tool returned outside_hours:true and the requested time should be kept anyway, despite falling outside the producer's stated opening hours. Omit on a first attempt."
+      ),
     },
     annotations: {
       title: "Request a gårdssalg booking",
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
-      openWorldHint: false,
+      // Submitting reaches third parties outside this app (producer notified,
+      // guest emailed) — open-world, same as the remote tool.
+      openWorldHint: true,
     },
   },
-  async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes }) => {
-    const body = { provider_id, slot_at, party_size, guest_name, guest_email };
+  async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {
+    const body = { slot_at, party_size, guest_name, guest_email };
+    if (provider_id) body.provider_id = provider_id;
+    if (provider_query) body.provider_query = provider_query;
+    if (requested_weekday) body.requested_weekday = requested_weekday;
     if (experience_id) body.experience_id = experience_id;
     if (guest_phone) body.guest_phone = guest_phone;
     if (notes) body.notes = notes;
+    if (confirm_outside_hours === true) body.confirm_outside_hours = true;
 
     const { ok, status, data } = await postJSON(`${BASE_URL}/api/opplevelser/book`, body);
 
     // 400: BookingInputSchema rejected the input (same validation POST
     // /api/opplevelser/book runs) -- surface the field-level issues.
     if (status === 400) {
+      // The one-sentence-flow pre-checks (missing provider_id/provider_query,
+      // unknown requested_weekday word) answer 400 with a ready bilingual
+      // `message` — surface it verbatim; schema errors keep the field list.
+      if (data && typeof data.message === "string" && data.message) {
+        return { content: [{ type: "text", text: data.message }], isError: true };
+      }
       const details = Array.isArray(data.details)
         ? data.details.map((d) => `${(d.path || []).join(".") || "(root)"}: ${d.message}`).join("; ")
         : (data.error || "ugyldig forespørsel");
@@ -471,25 +520,36 @@ server.registerTool(
       };
     }
 
-    // 200 + paused:true: the dark-launch-stop gate rejected a not-yet-live
-    // producer -- not an HTTP error, a normal honest "not bookable yet" reply.
-    if (data && data.paused === true) {
+    // 200 + success:false: an HONEST non-success outcome, never an error —
+    // paused (booking not activated for this producer), outside_hours (retry
+    // with confirm_outside_hours), provider_not_found / provider_ambiguous
+    // (name resolution: ask the guest which producer), weekday_mismatch (the
+    // stated weekday and the date disagree: candidates in `suggestions`).
+    // The full payload is returned so the assistant sees the candidates and
+    // suggestions exactly as the remote tool would show them.
+    if (ok && data && data.success === false) {
       return {
-        content: [{ type: "text", text: data.message || "Booking er ikke aktivert for denne produsenten ennå. / Booking is not activated for this producer yet." }],
+        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
       };
     }
 
-    if (!ok || data.success !== true) {
+    if (!ok || !data || data.success !== true) {
       return {
         content: [{ type: "text", text: "Kunne ikke opprette påmelding. / Could not create the booking request." }],
         isError: true,
       };
     }
 
+    const who = data.provider && data.provider.navn ? ` Produsent: ${data.provider.navn}.` : "";
+    const when = data.slot_at_local ? ` Tidspunkt: ${data.slot_at_local}.` : "";
     return {
       content: [{
         type: "text",
-        text: `✅ Forespørsel registrert (${data.booking_ref}, status: ${data.status}). ${data.message}`,
+        text:
+          `✅ Forespørsel registrert (${data.booking_ref}, status: ${data.status}).${who}${when} ${data.message} ` +
+          `Reservasjonen er IKKE endelig før produsenten har svart (bekrefter, foreslår nytt tidspunkt eller avslår). / ` +
+          `The booking is NOT final until the producer responds.\n` +
+          JSON.stringify(data, null, 2),
       }],
     };
   }

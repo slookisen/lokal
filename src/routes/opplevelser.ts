@@ -814,6 +814,23 @@ import {
 // opening-hours check, also used by experiences-seo.ts's no-JS fallback and
 // experiences-mcp.ts's book_gardssalg tool. Never re-derive this inline.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
+// provider resolution + requested-weekday guard + the shared honest-outcome
+// payloads, applied to POST /book BEFORE the unchanged BookingInputSchema →
+// isBookingPaused → checkBookingSlotAllowed → createBooking chain — identical
+// to the book_gardssalg MCP tool (experiences-mcp.ts), so the npm stdio server
+// (which proxies this route) gets the exact same one-sentence flow.
+import {
+  resolveGardssalgProviderByQuery,
+  checkRequestedWeekday,
+  formatSlotOslo,
+  gardssalgProfileUrl,
+  providerNotFoundPayload,
+  providerAmbiguousPayload,
+  providerQueryMissingPayload,
+  unknownWeekdayPayload,
+  weekdayMismatchPayload,
+} from "../services/gardssalg-booking-resolve";
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
@@ -1001,6 +1018,10 @@ router.get("/discover", (req: Request, res: Response) => {
       // so it's read directly off the raw query, same as booking_live below.
       const producerType = req.query.producer_type as string | undefined;
       if (producerType) gsFilter.producer_type = producerType;
+      // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-
+      // text name/place lookup (`q`), same semantics as the MCP tool's `query`.
+      const gsQuery = typeof req.query.q === "string" ? req.query.q.trim() : "";
+      if (gsQuery) gsFilter.q = gsQuery;
       // Only the literal string "true" is a real filter — omitted/false means
       // "no filter on this column" (matches discover_gardssalg's own
       // isBookingPaused-adjacent semantics, NOT "show only paused ones").
@@ -1021,6 +1042,9 @@ router.get("/discover", (req: Request, res: Response) => {
           // so an agent gets the same honest booking status either surface.
           const live = !isBookingPaused(row.booking_live);
           return {
+            // provider_id for POST /book / book_gardssalg — was missing until
+            // 2026-09-16 (see the MCP tool's own comment).
+            id: row.id,
             navn: row.navn,
             fylke: row.fylke ?? null,
             kommune: row.kommune ?? null,
@@ -27676,9 +27700,52 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
 
 // ─── POST /api/opplevelser/book ──────────────────────────────────────
 router.post("/book", async (req: Request, res: Response) => {
-  const parsed = BookingInputSchema.safeParse(req.body);
+  // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai):
+  // «hos X» → provider_id. A caller that sends provider_id is untouched (the
+  // web form always does). Otherwise provider_query (the producer's name) is
+  // resolved to exactly ONE producer, or answered with the same honest
+  // not-found / ambiguous payloads the MCP tool returns — NO booking created.
+  const rawBody = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+  const rawProviderId = typeof rawBody.provider_id === "string" ? rawBody.provider_id.trim() : "";
+  const rawProviderQuery = typeof rawBody.provider_query === "string" ? rawBody.provider_query.trim() : "";
+  let bodyForSchema: Record<string, unknown> = rawBody;
+  let resolvedFromQuery: string | null = null;
+  if (!rawProviderId) {
+    if (!rawProviderQuery) {
+      res.status(400).json(providerQueryMissingPayload());
+      return;
+    }
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery);
+    if (resolution.kind === "none") {
+      res.status(200).json(providerNotFoundPayload(rawProviderQuery));
+      return;
+    }
+    if (resolution.kind === "ambiguous") {
+      res.status(200).json(providerAmbiguousPayload(rawProviderQuery, resolution.candidates));
+      return;
+    }
+    bodyForSchema = { ...rawBody, provider_id: resolution.provider.id };
+    resolvedFromQuery = rawProviderQuery;
+  }
+
+  const parsed = BookingInputSchema.safeParse(bodyForSchema);
   if (!parsed.success) {
     res.status(400).json({ error: "Ugyldig forespørsel", details: parsed.error.issues });
+    return;
+  }
+
+  // ─── Step 0b: stated weekday («fredag») must agree with slot_at in Oslo
+  // time — otherwise answer with the nearest matching dates, create nothing.
+  const weekdayCheck = checkRequestedWeekday(
+    parsed.data.slot_at,
+    typeof rawBody.requested_weekday === "string" ? rawBody.requested_weekday : undefined,
+  );
+  if (!weekdayCheck.ok) {
+    if (weekdayCheck.reason === "unknown_weekday") {
+      res.status(400).json(unknownWeekdayPayload(weekdayCheck.requested_weekday));
+      return;
+    }
+    res.status(200).json(weekdayMismatchPayload(weekdayCheck.mismatch));
     return;
   }
 
@@ -27690,12 +27757,25 @@ router.post("/book", async (req: Request, res: Response) => {
   // 'reserved' row, never send the guest confirmation, never notify a
   // producer. See isBookingPaused() in services/booking-store.ts.
   const providerBook = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
     | null;
+  // Echoed on the paused + success responses (2026-09-16) so a caller that
+  // resolved by name can tell the guest WHICH producer it acted on. Never
+  // epost/telefon.
+  const providerInfo = providerBook
+    ? {
+        id: parsed.data.provider_id,
+        navn: String(providerBook.navn ?? ""),
+        profile_url: gardssalgProfileUrl(providerBook.slug ?? null),
+        ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
+      }
+    : null;
+  const slotLocal = formatSlotOslo(parsed.data.slot_at);
   if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null)) {
     res.status(200).json({
       success: false,
       paused: true,
+      provider: providerInfo,
       message: BOOKING_NOT_ACTIVATED_MSG,
     });
     return;
@@ -27747,6 +27827,11 @@ router.post("/book", async (req: Request, res: Response) => {
     booking_ref: booking.booking_ref,
     status: booking.status,
     source: booking.source,
+    // dev-request 2026-09-16: what was booked, in words a caller can read
+    // straight back to the guest (same fields as the MCP tool's response).
+    provider: providerInfo,
+    slot_at_local: slotLocal,
+    party_size: booking.party_size,
     message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
   });
 });
