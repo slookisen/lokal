@@ -26347,6 +26347,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbContactJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _contactCandidateJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _orgnrIdentityJudgePromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteBlocklistEmailSurvivorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteBlocklistNameSurvivorPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -35897,6 +35899,74 @@ const _orgnrIdentityJudgePromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// PR #813 (2026-09-05): survivor-EMAIL guard on DELETE /api/marketplace/
+// agents/:id (src/routes/marketplace.ts). Its test file's header says it is
+// wired into this gate, but the #813 commit only touched marketplace.ts +
+// the test file — it never was. Wired in here alongside its name-guard
+// sibling below (dev-request 2026-09-16-delete-agent-collateral-name-
+// blocklist). Swaps the shared getDb() singleton (own dedicated test file,
+// in-memory prod-schema DB) — so it is chained after
+// _orgnrIdentityJudgePromise, the current tail of this serial chain.
+let _deleteBlocklistEmailSurvivorResolve: () => void = () => {};
+const _deleteBlocklistEmailSurvivorPromise: Promise<void> = new Promise<void>(r => {
+  _deleteBlocklistEmailSurvivorResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orgnrIdentityJudgePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── PR #813: DELETE /api/marketplace/agents/:id survivor-email blocklist guard ──");
+  try {
+    const { runMarketplaceAgentDeleteBlocklistSurvivorTests } = require("../src/routes/marketplace-agent-delete-blocklist-survivor.test") as
+      typeof import("../src/routes/marketplace-agent-delete-blocklist-survivor.test");
+    const dbes = await runMarketplaceAgentDeleteBlocklistSurvivorTests({ log: false });
+    passed += dbes.passed;
+    failed += dbes.failed;
+    for (const f of dbes.failures) failures.push("marketplace-agent-delete-blocklist-survivor: " + f);
+    console.log(`  marketplace-agent-delete-blocklist-survivor: ${dbes.passed} passed, ${dbes.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-blocklist-survivor: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteBlocklistEmailSurvivorResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-16-delete-agent-collateral-name-blocklist: survivor-
+// NAME guard on DELETE /api/marketplace/agents/:id (src/routes/
+// marketplace.ts) — mirror of the #813 email guard, one identifier over.
+// Same DB-singleton-swapping test-file convention as the block immediately
+// above, so it must run strictly after it; _deleteBlocklistEmailSurvivor
+// Promise is the current tail of this serial chain.
+let _deleteBlocklistNameSurvivorResolve: () => void = () => {};
+const _deleteBlocklistNameSurvivorPromise: Promise<void> = new Promise<void>(r => {
+  _deleteBlocklistNameSurvivorResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_deleteBlocklistEmailSurvivorPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-09-16-delete-agent-collateral-name-blocklist: survivor-name blocklist guard ──");
+  try {
+    const { runMarketplaceAgentDeleteBlocklistNameSurvivorTests } = require("../src/routes/marketplace-agent-delete-blocklist-name-survivor.test") as
+      typeof import("../src/routes/marketplace-agent-delete-blocklist-name-survivor.test");
+    const dbns = await runMarketplaceAgentDeleteBlocklistNameSurvivorTests({ log: false });
+    passed += dbns.passed;
+    failed += dbns.failed;
+    for (const f of dbns.failures) failures.push("marketplace-agent-delete-blocklist-name-survivor: " + f);
+    console.log(`  marketplace-agent-delete-blocklist-name-survivor: ${dbns.passed} passed, ${dbns.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-blocklist-name-survivor: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteBlocklistNameSurvivorResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
 // Dette er barrieren filheaderens "NOT yet fixed"-punkt 2 beskriver: frem til
@@ -35954,6 +36024,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
   _rfbContactJudgePromise, _contactCandidateJudgePromise, _orgnrIdentityJudgePromise,
+  _deleteBlocklistEmailSurvivorPromise, _deleteBlocklistNameSurvivorPromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);
