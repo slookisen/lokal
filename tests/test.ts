@@ -43917,3 +43917,30 @@ runSerial(async () => {
     failures.push("opplevelser-experiences-requarantine-rejudge: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-16-crm-ingest-alias-gate-autoroute (slookisen/A2A), FUNN
+// crm-ingest-alias-gate-blokkerer-ekte-eierrettelser: POST /admin/crm/ingest
+// parked a known contact's reply as untriaged whenever it landed outside the
+// two platform aliases, even when the sender was an unambiguous match to
+// exactly one vertical's own entity table (agents/agent_knowledge/
+// experience_providers) — verified owner corrections then sat unsent for
+// days waiting on Daniel's manual assignment. Own in-memory-db + fresh
+// db-factory harness (mirrors crm-contact-provider-link.test.ts's
+// EXPERIENCES_DB_PATH redirect and crm-compose-cooldown-untriaged-inbound-
+// exempt.test.ts's router-dispatch shape). Tail position is the convention
+// for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-crm-ingest-alias-gate-autoroute: known-contact auto-route fallback ──");
+  try {
+    const { runCrmIngestAliasGateAutorouteTests } = require("../src/routes/crm-ingest-alias-gate-autoroute.test") as
+      typeof import("../src/routes/crm-ingest-alias-gate-autoroute.test");
+    const iag = await runCrmIngestAliasGateAutorouteTests({ log: false });
+    passed += iag.passed;
+    failed += iag.failed;
+    for (const f of iag.failures) failures.push("crm-ingest-alias-gate-autoroute: " + f);
+    console.log(`  crm-ingest-alias-gate-autoroute: ${iag.passed} passed, ${iag.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-ingest-alias-gate-autoroute: unexpected error: " + String(err?.message || err));
+  }
+});
