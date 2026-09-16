@@ -233,7 +233,7 @@
         if(section)section.classList.remove('hidden');
         setTimeout(function(){
             var map=L.map('map').setView([lat,lng],14);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'OpenStreetMap',maxZoom:18}).addTo(map);
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere',maxZoom:18,referrerPolicy:'strict-origin-when-cross-origin'}).addTo(map);
             L.marker([lat,lng]).bindPopup(esc(name||'')).addTo(map);
         },100);
     }

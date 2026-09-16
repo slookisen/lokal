@@ -30819,6 +30819,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ggmd.failures) failures.push("opplevelser-gardssalg-geo-marker-diagnostic: " + f);
     console.log(`  opplevelser-gardssalg-geo-marker-diagnostic: ${ggmd.passed} passed, ${ggmd.failed} failed`);
 
+    // 2026-09-16 (Daniel: «alle kart er ødelagt»): every Leaflet map on
+    // opplevagent.no must render the shared OSM tile contract — canonical
+    // tile.openstreetmap.org URL + referrerPolicy on the tile layer — because
+    // the tile server blocks referer-less browser requests and the site-wide
+    // Helmet no-referrer header strips the Referer from every tile <img>.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── experiences-seo-map-tiles: OSM tile URL + referrerPolicy on every Leaflet map ──");
+    const { runExperiencesSeoMapTilesTests } = require("../src/routes/experiences-seo-map-tiles.test") as
+      typeof import("../src/routes/experiences-seo-map-tiles.test");
+    const emt = await runExperiencesSeoMapTilesTests({ log: false });
+    passed += emt.passed;
+    failed += emt.failed;
+    for (const f of emt.failures) failures.push("experiences-seo-map-tiles: " + f);
+    console.log(`  experiences-seo-map-tiles: ${emt.passed} passed, ${emt.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-
     // outreach, Steg 5: POST /admin/gardssalg-outreach-preflight — read-only
     // GO/NO-GO pre-flight over a caller-supplied batch of provider ids,

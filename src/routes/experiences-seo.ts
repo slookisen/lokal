@@ -3919,6 +3919,51 @@ type FylkeMapMarker = {
   precision: "address" | "kommune";
 };
 
+// ─── OpenStreetMap raster tile source — ONE definition for every Leaflet map
+// on the site. The /fylke/:fylke and /kategori/gardssalg cluster maps and the
+// single-point mini-maps below all interpolate OSM_TILE_LAYER_JS; nothing else
+// in this file names the tile host. ───────────────────────────────────────
+// Why this exists (2026-09-16, Daniel: «alle kart er ødelagt»): every tile on
+// opplevagent.no rendered OSM's "403 Access blocked — App is not following the
+// tile usage policy" image, on the category map and on every profile page.
+// Root cause, verified directly against the tile server: tile.openstreetmap.org
+// refuses browser requests that carry NO Referer header (its "Misidentification"
+// rule, https://wiki.openstreetmap.org/wiki/Blocked — "all tile requests must be
+// identifiable to a particular website"), and this app's global Helmet config
+// (src/middleware/security.ts) sends `Referrer-Policy: no-referrer` on every
+// page, so browsers stripped the Referer from every tile <img>. The very same
+// tile URL fetched with `Referer: https://opplevagent.no/` returns a real tile.
+// Two rules of the tile usage policy
+// (https://operations.osmfoundation.org/policies/tiles/) are enforced here:
+//   1. `referrerPolicy: 'strict-origin-when-cross-origin'` — Leaflet (≥1.8;
+//      we vendor 1.9.4) sets it as the tile <img>'s referrerpolicy attribute,
+//      which per the Referrer Policy spec OVERRIDES the document-level header
+//      for that element only. Tiles are therefore requested with
+//      `Referer: https://opplevagent.no/` (origin only — never the page path),
+//      while the site-wide no-referrer header stays exactly as it is for
+//      everything else (outbound links to producer websites etc.). The policy's
+//      own words: "Do not set a restrictive Referrer-Policy that prevents the
+//      HTTP Referer header being sent."
+//   2. The canonical `https://tile.openstreetmap.org/{z}/{x}/{y}.png` URL — the
+//      policy's "Correct tile URL" rule. The old `{s}.tile.…` a/b/c subdomains
+//      are deprecated ("may be slower or withdrawn without notice").
+// Visible, linked attribution ("© OpenStreetMap-bidragsytere") is the policy's
+// third hard requirement and is unchanged. Keep this the ONLY place the tile
+// source lives — the policy recommends being able to switch provider (e.g. to
+// Kartverket's open WMTS cache) without touching every map.
+export const OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+export const OSM_TILE_REFERRER_POLICY = "strict-origin-when-cross-origin";
+export const OSM_TILE_ATTRIBUTION_HTML =
+  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere';
+// A JS *statement*, not a function: interpolated verbatim into the three
+// inline init scripts below, at the point where `map` is the freshly created
+// L.map instance.
+export const OSM_TILE_LAYER_JS = `L.tileLayer('${OSM_TILE_URL}', {
+        maxZoom: 19,
+        referrerPolicy: '${OSM_TILE_REFERRER_POLICY}',
+        attribution: '${OSM_TILE_ATTRIBUTION_HTML}'
+      }).addTo(map);`;
+
 // Lazy-init script for the /fylke/:fylke map — fires once #fylke-map nears
 // the viewport (IntersectionObserver; falls back to eager init on ancient
 // browsers without it), fetching self-hosted Leaflet (/leaflet/leaflet.js +
@@ -3969,10 +4014,7 @@ const FYLKE_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var addressIcon = L.icon({
         iconUrl: '/leaflet/images/marker-icon.png',
@@ -4069,13 +4111,14 @@ const FYLKE_MAP_INIT_JS = `(function () {
 // + <noscript> OSM fallback + a JSON data island + the deferred lazy-init
 // script above. Returns "" when there are no geocoded points (honest
 // omission — same discipline as productsBlock/mapBlock elsewhere in this
-// file — never an empty/broken map). Tile source: OSM's standard
-// {s}.tile.openstreetmap.org XYZ raster tiles (see final report for why —
-// short version: simpler/more reliably reachable than Kartverket's WMTS from
-// this sandbox, and Leaflet requests tiles as plain <img> tags, which the
-// existing global CSP imgSrc "https:" already allows — zero CSP changes
-// needed). Correct OSM attribution is rendered both under the map and inside
-// the tile layer itself (attribution control, bottom-right of the map).
+// file — never an empty/broken map). Tile source: OSM's standard XYZ raster
+// tiles via the shared OSM_TILE_LAYER_JS above (canonical tile.openstreetmap.org
+// URL + per-tile referrerPolicy — see its comment for the 2026-09-16 "Access
+// blocked" incident; originally chosen over Kartverket's WMTS because Leaflet
+// requests tiles as plain <img> tags, which the existing global CSP imgSrc
+// "https:" already allows — zero CSP changes needed). Correct OSM attribution
+// is rendered both under the map and inside the tile layer itself
+// (attribution control, bottom-right of the map).
 function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang: Lang): string {
   if (points.length === 0) return "";
   const markers: FylkeMapMarker[] = points.map((p) => ({
@@ -4749,10 +4792,7 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var addressIcon = L.icon({
         iconUrl: '/leaflet/images/marker-icon.png',
@@ -4849,8 +4889,8 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
 // lazy-init script, same shape/discipline as renderFylkeMapSection(). Returns
 // "" when there are no geocoded providers (honest omission — never an empty/
 // broken map, same as the fylke map's zero-points case). Tile source: the
-// SAME OSM {s}.tile.openstreetmap.org raster tiles the fylke map already
-// uses (no new third-party network host).
+// SAME OSM raster tiles the fylke map already uses (shared OSM_TILE_LAYER_JS —
+// no new third-party network host).
 function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string {
   if (points.length === 0) return "";
   const markers: GardssalgMapMarker[] = points.map((p) => ({
@@ -4962,10 +5002,7 @@ const MINI_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var marker;
       if (point.approx) {
