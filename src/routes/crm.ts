@@ -18,6 +18,7 @@ import {
   isAutoDismissedSender,
 } from "../services/crm-triage";
 import { emailService } from "../services/email-service";
+import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
@@ -479,7 +480,7 @@ router.post("/threads/:id/send", async (req, res) => {
         cc: ccEmails?.join(", "),
         subject,
         textContent: bodyText,
-        htmlContent: bodyHtml ?? bodyText,
+        htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
         inReplyToMessageId: replyToMessageId ?? undefined,
         from: crmFromHeader(thread.vertical_id),
         replyTo: identity.replyTo,
@@ -884,7 +885,7 @@ router.post("/compose", async (req, res) => {
           to,
           subject,
           textContent: bodyText,
-          htmlContent: bodyHtml ?? bodyText,
+          htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
           from: crmFromHeader(vertical),
           replyTo: composeIdentity.replyTo,
         });

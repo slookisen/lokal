@@ -41042,6 +41042,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-crm-utgaaende-html-body-kollapser-linjeskift ──");
+  try {
+    const { runCrmOutboundHtmlBodyTests } = require("../src/routes/crm-outbound-html-body.test") as
+      typeof import("../src/routes/crm-outbound-html-body.test");
+    const hb = await runCrmOutboundHtmlBodyTests({ log: false });
+    passed += hb.passed;
+    failed += hb.failed;
+    for (const f of hb.failures) failures.push("crm-outbound-html-body: " + f);
+    console.log(`  crm-outbound-html-body: ${hb.passed} passed, ${hb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-outbound-html-body: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-outbound-html-body: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 1+2 (vertical fail-closed + adskilte kontakter) ──");
   try {
     const { runCrmVerticalTests } = require("../src/services/crm-vertical.test") as
