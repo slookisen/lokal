@@ -43926,6 +43926,36 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/experiences-orgnr-from-website (routes/opplevelser.ts) +
+// services/experience-orgnr-from-website.ts. dev-request 2026-09-14-
+// opplevagent-karantene-utgang-brreg-krav, Trinn A: the recheck-backfill
+// above is a Brreg NAME search, which only resolves a small fraction of the
+// 1774-row brreg_active IS NULL backlog. This route is a second, independent
+// path for the same backlog — extract the provider's OWN labeled org.nr from
+// its OWN website, then look THAT org.nr up directly in Brreg, corroborating
+// the hit before ever writing. globalThis.fetch stubbed (fetchPage() and
+// brreg-client.ts's verifyOrgNumber()/fetchBrregBusinessAddress() have no
+// injected-fetchImpl call site here — same convention the gårdssalg
+// org_nr-backfill route and the RFB/dental website-discovery routes already
+// use). Tail position (right after its nearest sibling) is the convention
+// for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experiences-orgnr-from-website: Trinn A org.nr-from-website backfill ──");
+  try {
+    const { runOpplevelserExperienceOrgnrFromWebsiteTests } =
+      require("../src/routes/opplevelser-experience-orgnr-from-website.test") as
+        typeof import("../src/routes/opplevelser-experience-orgnr-from-website.test");
+    const owf = await runOpplevelserExperienceOrgnrFromWebsiteTests({ log: false });
+    passed += owf.passed;
+    failed += owf.failed;
+    for (const f of owf.failures) failures.push("experience-orgnr-from-website: " + f);
+    console.log(`  experience-orgnr-from-website: ${owf.passed} passed, ${owf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-from-website: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // classifyProvider() (services/experience-brreg.ts) name-collision gate
 // (dev-request 2026-09-13-navnekollisjon-brreg-gate): several producer
 // profiles (Moland Gård, Bakke Gårdsbakeri, Romstad Gård, Grana Bryggeri)
