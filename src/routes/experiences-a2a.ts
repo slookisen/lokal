@@ -495,6 +495,10 @@ export function handleExperiencesMessageSend(
       const producers = results.map((row) => {
         const live = !isBookingPaused(row.booking_live);
         return {
+          // provider_id for book_gardssalg / POST /api/opplevelser/book (added
+          // 2026-09-16, dev-request …-en-setning-booking-via-ai — same
+          // additive field as discover_gardssalg + REST /discover).
+          id: row.id,
           navn: row.navn,
           fylke: row.fylke ?? null,
           kommune: row.kommune ?? null,

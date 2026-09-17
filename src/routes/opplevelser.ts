@@ -38,6 +38,11 @@ import {
   createProvider,
   getProviderByOrgnr,
   getProviderByName,
+  // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+  // varianter: THIRD resolve-or-create fallback (after org_nr/name both
+  // miss) in the bulk-load handler below — see the `existing` lookup and
+  // getProviderByDomain's own doc comment (experience-store.ts).
+  getProviderByDomain,
   setBrregVerification,
   ExperienceSchema,
   DiscoverFilterSchema,
@@ -289,6 +294,13 @@ import {
   // page/`/discover` use, reused by the new catalog-wide coverage report
   // below rather than redefined.
   PUBLISH_GATE_SQL,
+  // dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+  // gjenopprett: every PUBLISH_GATE_SQL clause EXCEPT verification_status —
+  // the "was this row verified/published before the sweep touched it"
+  // reconstruction GET .../experiences-status-transitions and POST
+  // .../experiences-requarantine-rejudge both use. See its own doc comment,
+  // experience-store.ts, for the full reasoning.
+  PUBLISH_GATE_SQL_EXCEPT_STATUS,
   // dev-request 2026-06-23-experiences-richer-profiles, slice F2 — the SAME
   // defensive content_field_evidence parser the holdout resolver uses,
   // reused by GET /admin/experiences/:id/provenance below so the endpoint
@@ -508,6 +520,8 @@ import {
   scanGardssalgWebsiteVerificationRows,
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
+  getGardssalgWebsiteVerificationSweepOffset,
+  setGardssalgWebsiteVerificationSweepOffset,
   GS_WV_SCOPES,
   GS_WV_COHORTS,
   type GsWvFetchFn,
@@ -647,6 +661,15 @@ import {
   // slice (2026-08-25): the bulk-load admission gate below reuses the SAME
   // judge, shaping a not-yet-inserted harvest candidate into this row type.
   type HoldoutExperienceRow,
+  // dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+  // gjenopprett: the ONE fetch+classify+judge entry point for re-checking an
+  // EXISTING row's evidence_url (content-judge-sweep, requarantine-rejudge
+  // below) — owns the dead/parked-page short-circuit that skips the LLM
+  // call entirely, so no caller can reintroduce the parked-page-goes-to-LLM
+  // bug by fetching+judging inline again.
+  judgeExperienceEvidencePage,
+  type EvidenceJudgeOutcome,
+  type EvidencePageUnresolvedReason,
 } from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request: providers stuck at brreg_active IS NULL forever (classifyProvider
@@ -796,6 +819,23 @@ import {
 // opening-hours check, also used by experiences-seo.ts's no-JS fallback and
 // experiences-mcp.ts's book_gardssalg tool. Never re-derive this inline.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
+// provider resolution + requested-weekday guard + the shared honest-outcome
+// payloads, applied to POST /book BEFORE the unchanged BookingInputSchema →
+// isBookingPaused → checkBookingSlotAllowed → createBooking chain — identical
+// to the book_gardssalg MCP tool (experiences-mcp.ts), so the npm stdio server
+// (which proxies this route) gets the exact same one-sentence flow.
+import {
+  resolveGardssalgProviderByQuery,
+  checkRequestedWeekday,
+  formatSlotOslo,
+  gardssalgProfileUrl,
+  providerNotFoundPayload,
+  providerAmbiguousPayload,
+  providerQueryMissingPayload,
+  unknownWeekdayPayload,
+  weekdayMismatchPayload,
+} from "../services/gardssalg-booking-resolve";
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
@@ -983,6 +1023,10 @@ router.get("/discover", (req: Request, res: Response) => {
       // so it's read directly off the raw query, same as booking_live below.
       const producerType = req.query.producer_type as string | undefined;
       if (producerType) gsFilter.producer_type = producerType;
+      // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-
+      // text name/place lookup (`q`), same semantics as the MCP tool's `query`.
+      const gsQuery = typeof req.query.q === "string" ? req.query.q.trim() : "";
+      if (gsQuery) gsFilter.q = gsQuery;
       // Only the literal string "true" is a real filter — omitted/false means
       // "no filter on this column" (matches discover_gardssalg's own
       // isBookingPaused-adjacent semantics, NOT "show only paused ones").
@@ -1003,6 +1047,9 @@ router.get("/discover", (req: Request, res: Response) => {
           // so an agent gets the same honest booking status either surface.
           const live = !isBookingPaused(row.booking_live);
           return {
+            // provider_id for POST /book / book_gardssalg — was missing until
+            // 2026-09-16 (see the MCP tool's own comment).
+            id: row.id,
             navn: row.navn,
             fylke: row.fylke ?? null,
             kommune: row.kommune ?? null,
@@ -1798,6 +1845,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   let providersInserted = 0;
   let experiencesInserted = 0;
   let skipped = 0; // providers/experiences skipped as already-present or non-evidence unverified
+  // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+  // varianter: providers resolved to an ALREADY-EXISTING row via the domain
+  // fallback (org_nr miss + name miss, website's registrable domain matches
+  // an existing provider's hjemmeside) — reported so a re-run's "no new
+  // duplicate created" is observable, mirroring how rejected_blocklisted_*
+  // reports the blocklist gate's own matches below.
+  let providersMatchedByDomain = 0;
+  const providersMatchedByDomainNames: string[] = [];
   // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
   // utfoerelse): a producer whose org_nr, hjemmeside, or name matches a
   // removed producer (agent_blocklist) must not be (re-)created here — and,
@@ -1870,10 +1925,23 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       }
 
       // ── apply: resolve-or-create the provider (idempotent). ─────────
+      // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+      // varianter: THIRD fallback after org_nr/name both miss — matches on
+      // the candidate's website domain against an existing provider's
+      // hjemmeside (e.g. "Smakfulle Rom" vs a harvested "Smakfulle Rom –
+      // Konferanse, Event & Catering" row for the same producer/domain).
+      // Runs through the EXACT SAME "found existing" branch below as an
+      // org_nr/name hit — no special-casing.
       let providerId: string;
-      const existing =
+      const byOrgnrOrName =
         (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
+      const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite, verdict.org_nr);
+      const existing = byOrgnrOrName ?? byDomain;
       if (existing) {
+        if (byDomain) {
+          providersMatchedByDomain++;
+          providersMatchedByDomainNames.push(name);
+        }
         providerId = existing.id as string;
         // keep Brreg stamp fresh on a re-run for already-present providers
         if (verdict.brreg_verified === 1) {
@@ -2047,6 +2115,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     experiences_inserted: experiencesInserted,
     providers_inserted: providersInserted,
     skipped,
+    // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+    // varianter: providers resolved to an existing row via the domain
+    // fallback (see the `existing`/`byDomain` lookup above) — 0/empty when
+    // the fallback never fired this call (today's behavior, unchanged).
+    providers_matched_by_domain: providersMatchedByDomain,
+    providers_matched_by_domain_names: providersMatchedByDomainNames,
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
@@ -22994,14 +23068,41 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // requested page ever incurs a live outbound fetch, and (for apply=true)
     // only the paged rows are ever written — the blast radius of a single
     // call is bounded by `limit`, never the full (possibly cohort=all) set.
+    //
+    // Offset-persistence (dev-request 2026-09-15-website-verification-sweep-
+    // offset-persistence): a caller that supplies `offset` explicitly is
+    // UNCHANGED — purely request-driven, byte-for-byte the same as before
+    // this dev-request, and never reads or clobbers the persisted cohort
+    // state. Only when `offset` is OMITTED from the request body (the
+    // pre-existing `offset === undefined` case, which used to always mean
+    // "start at 0") does this route now resume from the offset the PREVIOUS
+    // omitted-offset call for this cohort left off at — so repeated,
+    // memoryless callers (each scheduled enrichment run) actually rotate
+    // through the whole cohort over time instead of re-scanning the same
+    // leading window every run. `usePersistedOffset` also gates the write
+    // below: only the omitted-offset path ever reads or writes
+    // gardssalg_website_verification_sweep_state.
+    // NOTE (see route test section (q)): the real caller currently sends
+    // `offset: 0` EXPLICITLY on every run's first call, so it does not yet
+    // take this branch — a companion caller-side change (dropping that
+    // explicit offset:0 on run-start, in a separate A2A-repo SKILL file,
+    // out of this repo's scope) is what will actually let production
+    // benefit from this mechanism; tracked as its own follow-up.
+    const usePersistedOffset = limit !== undefined && offset === undefined;
     const total = cohort.length;
     let pageOffset: number | undefined;
     if (limit !== undefined) {
-      pageOffset = offset ?? 0;
+      pageOffset = usePersistedOffset ? getGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam) : (offset as number);
       cohort = cohort.slice(pageOffset, pageOffset + limit);
     }
 
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    const nextOffset =
+      limit === undefined
+        ? undefined
+        : (pageOffset as number) + rows.length < total
+          ? (pageOffset as number) + rows.length
+          : null;
     const pagination =
       limit === undefined
         ? undefined
@@ -23010,8 +23111,24 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
             offset: pageOffset as number,
             limit,
             returned: rows.length,
-            next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
+            next_offset: nextOffset as number | null,
           };
+
+    // Persist AFTER a successful scan, and only on the omitted-offset path
+    // (see usePersistedOffset above) — an explicit-offset caller never
+    // touches this state, in either direction. Wraps to 0 (rather than
+    // persisting the exhausted `null`) when the cohort is exhausted, so the
+    // NEXT omitted-offset call starts a fresh pass instead of getting stuck
+    // reporting "nothing left" forever. Best-effort: a persistence failure
+    // must not fail a scan/apply that otherwise succeeded, so it's logged and
+    // swallowed rather than thrown.
+    if (usePersistedOffset) {
+      try {
+        setGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam, nextOffset as number | null);
+      } catch (err) {
+        console.error("[gardssalg-website-verification-remediation] failed to persist sweep offset:", err);
+      }
+    }
 
     // Per-row diagnostics. This route reported COUNTS only — an operator who
     // ran it and got `unverified: 1` had no way to tell "we read the whole
@@ -25477,40 +25594,35 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
 
-      let outcome: { verdict: "MATCH" | "MISMATCH" | "unresolved"; reason: string };
-      let pageText: string | null = null;
-
-      if (!evidenceUrl) {
-        // Row selection guarantees evidence_url IS NOT NULL, but never trust
-        // a stored value to be non-blank sight-unseen — an empty STRING
-        // (distinct from NULL) must fail closed exactly like a genuine fetch
-        // failure, never silently skip the row or crash the batch.
-        outcome = { verdict: "unresolved", reason: "evidence_url er en tom streng — ingenting å hente, avvist fail-closed" };
-      } else {
-        const fetchResult = await fetchPage(evidenceUrl, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
-        if (!fetchResult.ok) {
-          outcome = {
-            verdict: "unresolved",
-            reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
-          };
-        } else {
-          pageText = visibleTextOf(fetchResult.html);
-          const judgeRow: HoldoutExperienceRow = {
-            id: row.id,
-            title: row.title,
-            description: row.description,
-            category: row.category,
-            price_band: row.price_band,
-            price_from: row.price_from,
-            evidence_url: row.evidence_url,
-            content_field_evidence: row.content_field_evidence,
-          };
-          const judged = await judgeExperienceContentMatch(judgeRow, pageText);
-          outcome = judged.ok
-            ? { verdict: judged.verdict, reason: judged.reasoning }
-            : { verdict: "unresolved", reason: judged.reasoning };
-        }
-      }
+      // dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+      // gjenopprett: fetch+dead/parked-classify+judge is now ONE call
+      // (judgeExperienceEvidencePage, experience-content-judge.ts) instead
+      // of inline fetchPage()+judgeExperienceContentMatch() — a dead OR
+      // parked evidence page is now `unresolved` (evidence_page_dead /
+      // evidence_page_parked) WITHOUT ever reaching the LLM, fixing the
+      // false-MISMATCH-on-parked-domain root cause of the 2026-09-13
+      // mass-apply's false quarantines. A live page with genuinely wrong
+      // content is completely unaffected — still reaches the LLM, still
+      // comes back MISMATCH exactly as before.
+      const judgeRow: HoldoutExperienceRow = {
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        category: row.category,
+        price_band: row.price_band,
+        price_from: row.price_from,
+        evidence_url: row.evidence_url,
+        content_field_evidence: row.content_field_evidence,
+      };
+      const evidenceOutcome: EvidenceJudgeOutcome = await judgeExperienceEvidencePage(judgeRow, evidenceUrl, {
+        userAgent: CR_UA,
+        timeoutMs: CR_FETCH_TIMEOUT_MS,
+      });
+      const outcome: { verdict: "MATCH" | "MISMATCH" | "unresolved"; reason: string } = {
+        verdict: evidenceOutcome.verdict,
+        reason: evidenceOutcome.reason,
+      };
+      const pageText: string | null = evidenceOutcome.pageText;
 
       // Boilerplate-description check: SEPARATE from the judge verdict above,
       // only meaningful when a real fetch actually happened (pageText !==
@@ -25741,6 +25853,436 @@ router.post("/admin/experiences-admission-promotion-rollback", requireAdmin, (re
   }
 });
 
+// ─── GET /api/opplevelser/admin/experiences-status-transitions ──────────────
+//
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec item 2 (FUNN `ingen-liste-over-nylig-karantenesatte-
+// rader`, known since the 2026-09-13 mass-apply): the content-judge sweep
+// stamps admission_verdict/admission_checked_at per row it visits, but there
+// has never been a query surface for "which rows did a specific sweep call
+// (or window) move OUT of the published catalog" — the 2026-09-14 root-cause
+// writeup had to reconstruct the 57-row delta by hand from before/after
+// catalog counts. READ-ONLY — a single SELECT, zero writes.
+//
+// Reconstructs the transition from the ONLY two columns the sweep actually
+// stamps: a row currently `verification_status = 'needs_review'` whose
+// `admission_verdict` starts with the sweep's own `"mismatch: "` prefix
+// (stampExperienceAdmissionVerdict call in the sweep above) and whose
+// `admission_checked_at` falls in [since, until) is, with certainty, a row
+// the sweep judged MISMATCH within that window. `from`/`to` are query params
+// rather than hardcoded literals so the route's contract is explicit at the
+// call site, but only the one combination this reconstruction can actually
+// support (`from=verified&to=needs_review`) is accepted — anything else is
+// a 400, not a silently-wrong empty result, since this schema has no
+// standing history of every status value a row has ever held (this is the
+// SAME schema gap the requarantine-rejudge route's own doc comment below
+// discusses at length: verification_status has no audit trail on the
+// DEMOTE side, only the promote side via experience_admission_promotion_
+// audit).
+//
+// `would_publish_if_verified` (additive, informational — NOT filtered on
+// here) reuses PUBLISH_GATE_SQL_EXCEPT_STATUS (experience-store.ts) so a
+// caller can see, per row, whether it satisfies every OTHER publish-gate
+// clause today — the same signal POST .../experiences-requarantine-rejudge
+// uses to decide whether a row was actually verified/published before the
+// sweep touched it, surfaced here too so this list and that route's
+// eligibility never have to be cross-checked by hand.
+//
+// Query params: `from` (must be "verified"), `to` (must be "needs_review"),
+// `since` (required, ISO-8601), `until` (optional, ISO-8601, default now).
+router.get("/admin/experiences-status-transitions", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const from = typeof req.query.from === "string" ? req.query.from : "";
+    const to = typeof req.query.to === "string" ? req.query.to : "";
+    if (from !== "verified" || to !== "needs_review") {
+      res.status(400).json({
+        error:
+          "only from=verified&to=needs_review is supported — this schema has no standing history of any other status transition",
+      });
+      return;
+    }
+
+    const sinceParam = typeof req.query.since === "string" ? req.query.since : "";
+    const sinceDate = sinceParam ? new Date(sinceParam) : null;
+    if (!sinceDate || isNaN(sinceDate.getTime())) {
+      res.status(400).json({ error: "Query param 'since' (ISO-8601) is required" });
+      return;
+    }
+    const untilParam = typeof req.query.until === "string" ? req.query.until : "";
+    const untilDate = untilParam ? new Date(untilParam) : new Date();
+    if (isNaN(untilDate.getTime())) {
+      res.status(400).json({ error: "Query param 'until', when given, must be ISO-8601" });
+      return;
+    }
+
+    // admission_checked_at is written as SQLite `datetime('now')` —
+    // "2026-09-13 10:38:00", a SPACE separator, never 'T'/'Z'/milliseconds
+    // (same mismatch GET /admin/providers/recently-enriched's own since-param
+    // handling above already documents and fixes for last_enriched_at) — a
+    // bare ISO string's 'T' would string-compare wrong against it.
+    const toSqliteDatetime = (d: Date): string => d.toISOString().slice(0, 19).replace("T", " ");
+    const since = toSqliteDatetime(sinceDate);
+    const until = toSqliteDatetime(untilDate);
+
+    const expDb = getExpDb("experiences");
+    const rows = expDb
+      .prepare(
+        `SELECT e.id, e.title, e.verification_status, e.admission_verdict, e.admission_checked_at,
+                e.confidence, e.provider_id,
+                (CASE WHEN ${PUBLISH_GATE_SQL_EXCEPT_STATUS} THEN 1 ELSE 0 END) AS would_publish_if_verified
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
+          WHERE e.verification_status = 'needs_review'
+            AND e.admission_verdict LIKE 'mismatch:%'
+            AND e.admission_checked_at >= ?
+            AND e.admission_checked_at <= ?
+          ORDER BY e.admission_checked_at ASC`,
+      )
+      .all(since, until) as Array<{
+      id: string;
+      title: string;
+      verification_status: string;
+      admission_verdict: string | null;
+      admission_checked_at: string | null;
+      confidence: string | null;
+      provider_id: string | null;
+      would_publish_if_verified: number;
+    }>;
+
+    res.json({
+      success: true,
+      from,
+      to,
+      since,
+      until,
+      count: rows.length,
+      rows: rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        verification_status: r.verification_status,
+        admission_verdict: r.admission_verdict,
+        admission_checked_at: r.admission_checked_at,
+        confidence: r.confidence,
+        provider_id: r.provider_id,
+        would_publish_if_verified: r.would_publish_if_verified === 1,
+      })),
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-status-transitions failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-requarantine-rejudge ───────────
+//
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec item 3: undoes the FALSE quarantines the 2026-09-13
+// mass-apply sweep produced by MISMATCH-ing dead/parked evidence pages (fixed
+// above — judgeExperienceEvidencePage). Re-judges exactly the candidate
+// rows GET .../experiences-status-transitions would list for the same
+// {since, until} window (same WHERE clause, not restated as a second query —
+// see selectStatusTransitionCandidates below) using the FIXED classification,
+// and restores a row to `verified` only when ALL of the following hold:
+//
+//   1. its NEW verdict is `unresolved` for `evidence_page_dead` or
+//      `evidence_page_parked`, OR its new verdict is `MATCH`. A row that
+//      re-judges MISMATCH again on a genuinely LIVE page is left exactly
+//      where it is — this route never second-guesses a real content-quality
+//      verdict, only the dead/parked-page false positive.
+//   2. `would_publish_if_verified` (PUBLISH_GATE_SQL_EXCEPT_STATUS) is true —
+//      this route's reconstruction of "was this row actually verified/
+//      published before the sweep touched it", not just "is currently
+//      needs_review with a mismatch stamp in this window" (see that
+//      constant's own doc comment, experience-store.ts, for the full
+//      reasoning and its one acknowledged edge case). This is the ONLY thing
+//      standing between this route and the quarantine-exit promotion path's
+//      four-requirement gate above (POST .../experiences-content-judge-sweep's
+//      brreg_active/source_verified/confidence check) — WITHOUT it, this
+//      route would happily promote any needs_review row that merely re-
+//      judges MATCH/unresolved, which is a materially LOOSER bar than
+//      quarantine-exit's and explicitly a non-goal here (spec item 4: this
+//      task fixes the classification bug and restores WRONGLY-quarantined
+//      rows, it does not relitigate quarantine-exit).
+//
+// KNOWN GAP, stated rather than papered over (this codebase's own "say so
+// explicitly" convention): this schema has NO per-row history of
+// verification_status (the sweep's demote path writes no audit trail at
+// all — only its promote path does, via experience_admission_promotion_
+// audit). "Was verified before 2026-09-13" is therefore a RECONSTRUCTION
+// (requirement 2 above), not a stored fact, and carries one acknowledged
+// false-positive risk: a row that was needs_review for a wholly unrelated
+// reason AND happens to satisfy every other publish-gate clause today would
+// also pass. Believed rare — those four clauses are exactly the bar
+// PUBLISH_GATE_SQL itself uses to decide what is "otherwise ready to
+// publish" — but a bare "mismatch-stamped in this window" filter alone
+// (dropping requirement 2) would restore the vast majority of the 420
+// 2026-09-13 MISMATCH stamps, when the incident's own analysis
+// (verification-pilot/2026-09-14-opplevagent-katalog-krymp-forklart.md)
+// puts the actually-published delta at 57 — so requirement 2 is load-
+// bearing, not a nice-to-have.
+//
+// `dry_run` (STRICT — per spec, default true; apply requires the caller to
+// pass EXACTLY boolean `false`, mirroring this file's `apply` conventions
+// but inverted-and-named per the dev-request's own body shape): computes and
+// reports the SAME fetch+reclassify+judge work in both modes (same "dry-run
+// is a trustworthy preview" discipline as the sweep above) — only the DB
+// WRITES are apply-mode-only.
+//
+// On a restore (apply, eligible): verification_status -> 'verified';
+// admission_verdict re-stamped `requarantine_verified: <reasoning>` (a
+// prefix distinct from the sweep's own match:/mismatch:/unresolved:/
+// promoted: vocabulary, so this route's writes are unambiguous in the same
+// column); ONE row inserted into experience_admission_promotion_audit
+// (reused, not a new table — same shape POST .../experiences-content-judge-
+// sweep's own quarantine-exit promotion writes) with `reason:
+// "requarantine_rejudge: <new verdict>: <reasoning>"`, batch_id = this
+// call's own batchId, from_status='needs_review', to_status='verified' — so
+// a bad restore is revertible via the EXISTING POST .../experiences-
+// admission-promotion-rollback route (batch_id-scoped, no new rollback
+// mechanism needed).
+//
+// A candidate that is NOT restored (re-judged MISMATCH on a live page,
+// re-judged unresolved for `judge_failed`, or eligible-by-verdict but held
+// by requirement 2) is STILL re-stamped in apply mode (admission_checked_at
+// advances, admission_verdict reflects the fresh verdict using the sweep's
+// OWN match:/mismatch:/unresolved: vocabulary) — for the identical "never
+// let a re-visited row block the queue forever" reason the sweep's own doc
+// comment gives, and so a row this route determines is NOT a false
+// quarantine naturally drops out of a later, wider-window call to this same
+// route or to GET .../experiences-status-transitions (its admission_verdict
+// no longer starts with `mismatch:`).
+//
+// Per-call cap (REQUARANTINE_MAX_LIMIT=50, mirrors SWEEP_MAX_LIMIT above —
+// one fetchPage()+judge call per row): `remaining` reports how many
+// candidate rows in the window are still unprocessed past this call's cap.
+const REQUARANTINE_DEFAULT_LIMIT = 50;
+const REQUARANTINE_MAX_LIMIT = 50;
+
+type RequarantineCandidateRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  price_band: string | null;
+  price_from: number | null;
+  evidence_url: string | null;
+  content_field_evidence: string | null;
+  admission_verdict: string | null;
+  would_publish_if_verified: number;
+};
+
+/**
+ * The ONE selection query GET .../experiences-status-transitions and POST
+ * .../experiences-requarantine-rejudge both need — never restated twice, per
+ * this file's own established convention (PUBLISH_GATE_SQL etc.). Returns
+ * candidates ordered oldest-checked-first so repeated capped calls over a
+ * wide window sweep forward instead of re-hitting the same head rows.
+ */
+function selectStatusTransitionCandidates(
+  expDb: Database.Database,
+  since: string,
+  until: string,
+  limit: number,
+): RequarantineCandidateRow[] {
+  return expDb
+    .prepare(
+      `SELECT e.id, e.title, e.description, e.category, e.price_band, e.price_from,
+              e.evidence_url, e.content_field_evidence, e.admission_verdict,
+              (CASE WHEN ${PUBLISH_GATE_SQL_EXCEPT_STATUS} THEN 1 ELSE 0 END) AS would_publish_if_verified
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE e.verification_status = 'needs_review'
+          AND e.admission_verdict LIKE 'mismatch:%'
+          AND e.admission_checked_at >= ?
+          AND e.admission_checked_at <= ?
+        ORDER BY e.admission_checked_at ASC
+        LIMIT ?`,
+    )
+    .all(since, until, limit) as RequarantineCandidateRow[];
+}
+
+router.post("/admin/experiences-requarantine-rejudge", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { since?: unknown; until?: unknown; dry_run?: unknown; limit?: unknown };
+
+    // STRICT per spec: only an EXPLICIT `dry_run: false` applies anything.
+    // Absent, `true`, or any other value is a dry-run.
+    const applyMode = body.dry_run === false;
+    const dryRun = !applyMode;
+
+    if (applyMode) {
+      const pauseBlock = experiencesWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
+
+    const sinceParam = typeof body.since === "string" ? body.since : "";
+    const sinceDate = sinceParam ? new Date(sinceParam) : null;
+    if (!sinceDate || isNaN(sinceDate.getTime())) {
+      res.status(400).json({ error: "Body field 'since' (ISO-8601) is required" });
+      return;
+    }
+    const untilParam = typeof body.until === "string" ? body.until : "";
+    const untilDate = untilParam ? new Date(untilParam) : new Date();
+    if (isNaN(untilDate.getTime())) {
+      res.status(400).json({ error: "Body field 'until', when given, must be ISO-8601" });
+      return;
+    }
+
+    let requestedLimit = REQUARANTINE_DEFAULT_LIMIT;
+    if (typeof body.limit === "number" && Number.isFinite(body.limit) && body.limit > 0) {
+      requestedLimit = Math.floor(body.limit);
+    }
+    const limit = Math.min(REQUARANTINE_MAX_LIMIT, requestedLimit);
+
+    const toSqliteDatetime = (d: Date): string => d.toISOString().slice(0, 19).replace("T", " ");
+    const since = toSqliteDatetime(sinceDate);
+    const until = toSqliteDatetime(untilDate);
+
+    const expDb = getExpDb("experiences");
+
+    const totalEligible = (
+      expDb
+        .prepare(
+          `SELECT COUNT(*) AS n FROM experiences e
+            WHERE e.verification_status = 'needs_review'
+              AND e.admission_verdict LIKE 'mismatch:%'
+              AND e.admission_checked_at >= ?
+              AND e.admission_checked_at <= ?`,
+        )
+        .get(since, until) as { n: number }
+    ).n;
+
+    const candidates = selectStatusTransitionCandidates(expDb, since, until, limit);
+
+    const batchId = `requarantine-rejudge-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+
+    const insertPromotionAudit = expDb.prepare(
+      `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
+    );
+
+    const counts = {
+      total: candidates.length,
+      evidence_page_dead: 0,
+      evidence_page_parked: 0,
+      match: 0,
+      mismatch: 0,
+      judge_failed: 0,
+      restored: 0,
+      held_not_previously_verified: 0,
+    };
+
+    const results: Array<{
+      id: string;
+      previous_admission_verdict: string | null;
+      new_verdict: "MATCH" | "MISMATCH" | "unresolved";
+      unresolved_reason?: EvidencePageUnresolvedReason;
+      reason: string;
+      would_publish_if_verified: boolean;
+      eligible: boolean;
+      would_be_action?: string;
+      action_taken?: string;
+    }> = [];
+
+    for (const row of candidates) {
+      const judgeRow: HoldoutExperienceRow = {
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        category: row.category,
+        price_band: row.price_band,
+        price_from: row.price_from,
+        evidence_url: row.evidence_url,
+        content_field_evidence: row.content_field_evidence,
+      };
+      const outcome: EvidenceJudgeOutcome = await judgeExperienceEvidencePage(judgeRow, row.evidence_url ?? "", {
+        userAgent: CR_UA,
+        timeoutMs: CR_FETCH_TIMEOUT_MS,
+      });
+
+      if (outcome.verdict === "unresolved") {
+        if (outcome.unresolvedReason === "evidence_page_dead") counts.evidence_page_dead++;
+        else if (outcome.unresolvedReason === "evidence_page_parked") counts.evidence_page_parked++;
+        else counts.judge_failed++;
+      } else if (outcome.verdict === "MATCH") {
+        counts.match++;
+      } else {
+        counts.mismatch++;
+      }
+
+      const restoreEligibleByVerdict =
+        outcome.verdict === "MATCH" ||
+        (outcome.verdict === "unresolved" &&
+          (outcome.unresolvedReason === "evidence_page_dead" || outcome.unresolvedReason === "evidence_page_parked"));
+      const wasLikelyVerifiedBefore = row.would_publish_if_verified === 1;
+      const eligible = restoreEligibleByVerdict && wasLikelyVerifiedBefore;
+
+      if (restoreEligibleByVerdict && !wasLikelyVerifiedBefore) counts.held_not_previously_verified++;
+      if (eligible) counts.restored++;
+
+      const verdictKey =
+        outcome.verdict === "MATCH" ? "match" : outcome.verdict === "MISMATCH" ? "mismatch" : "unresolved";
+
+      let actionText: string;
+      if (eligible) {
+        actionText = "verification_status -> verified (requarantine_rejudge); admission_verdict stemplet (requarantine_verified)";
+      } else if (restoreEligibleByVerdict) {
+        actionText =
+          "ingen statusendring (var trolig ikke verified/publisert før sveipen — mangler would_publish_if_verified); admission_verdict stemplet (" +
+          verdictKey +
+          ")";
+      } else {
+        actionText = `ingen statusendring; admission_verdict stemplet (${verdictKey})`;
+      }
+
+      if (applyMode) {
+        if (eligible) {
+          const info = expDb
+            .prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ? AND verification_status = 'needs_review'`)
+            .run(row.id);
+          if (info.changes > 0) {
+            insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, `requarantine_rejudge: ${verdictKey}: ${outcome.reason}`);
+            stampExperienceAdmissionVerdict(row.id, `requarantine_verified: ${outcome.reason}`);
+          }
+        } else {
+          stampExperienceAdmissionVerdict(row.id, `${verdictKey}: ${outcome.reason}`);
+        }
+      }
+
+      results.push({
+        id: row.id,
+        previous_admission_verdict: row.admission_verdict,
+        new_verdict: outcome.verdict,
+        ...(outcome.verdict === "unresolved" ? { unresolved_reason: outcome.unresolvedReason } : {}),
+        reason: outcome.reason,
+        would_publish_if_verified: wasLikelyVerifiedBefore,
+        eligible,
+        ...(dryRun ? { would_be_action: `[dry-run] ${actionText}` } : { action_taken: actionText }),
+      });
+    }
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      since,
+      until,
+      scanned: candidates.length,
+      counts,
+      results,
+      remaining: Math.max(0, totalEligible - candidates.length),
+    });
+  } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
+    console.error("[opplevelser] admin/experiences-requarantine-rejudge failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/experiences/:id/provenance ──────────────────
 //
 // dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
@@ -25848,6 +26390,170 @@ router.get("/admin/experiences/:id/provenance", requireAdmin, (req: Request, res
     });
   } catch (err) {
     console.error("[opplevelser] admin/experiences/:id/provenance failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-geo-marker-diagnostic ─────────────
+//
+// dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler, AC4
+// spot-check slice: the batch geocode-backlog sweep (POST .../gardssalg-
+// geocode-backlog-sweep above) upgraded coarse kommune-centroid geocodes to
+// real place-points where a corroborated Kartverket stedsnavn match exists.
+// AC4 asks for a 20-random-profile spot-check confirming (a) no
+// geocode_confidence='kommune'-class row ever renders a point-marker on any
+// public map (only address/sted precision should) and (b) no row's `sted`
+// place-label is a poststed that actually sits in a different kommune than
+// the farm. Neither was checkable before this route: there was no read-only
+// way to see, per row, its geocode_confidence AND what the frontend would
+// actually render for it — this is that missing read surface, same class as
+// GET /admin/experiences/:id/provenance just above (X-Admin-Key via
+// requireAdmin, read-only, single SELECT, 404 for an unknown id).
+//
+// `would_render_point_marker` is computed via gardssalgMapPresentation()
+// (routes/experiences-seo.ts) — the EXACT function the gårdssalg produsent-
+// profil page's own mini-map block calls to decide exact/approx-point/
+// no-point. Reused, not reinvented: a hand-rolled copy of the
+// high/medium/low/sted/approximate/no_match/null split here could silently
+// drift from what actually renders. Loaded via an in-handler require(), not
+// a top-level import — experiences-seo.ts already imports FROM this file
+// (isGardssalgContactEmailFlaggedForReview), so a top-level import back
+// would be circular; every other admin route in this file that reaches
+// across a similar boundary (e.g. the geocode-backlog-sweep route's
+// require("../services/experiences-geocode-worker") above) uses the same
+// in-handler require() for exactly this reason.
+//
+// `sted` is gardssalgPlaceLabel() (also routes/experiences-seo.ts) — the
+// SAME kommune-first label the profile page's hero/meta/map actually show,
+// so AC4b's "is the label a poststed that disagrees with the row's own
+// kommune" check can be done by eye against the raw `kommune`/`poststed`
+// columns this response also includes, without re-deriving the label rule.
+//
+// Scope: the same "official gårdssalg catalog" gate every sibling gårdssalg
+// admin report in this file uses (GARDSSALG_DEDUP_CATALOG_WHERE — the
+// IFNULL-safe producer_type/rfb_seed_source OR, see its own doc comment
+// above for why the bare `rfb_seed_source = 'rfb-seed'` form is NOT safe to
+// re-derive here), plus the same catalog_hidden exclusion
+// listGardssalgProviders()/countGardssalgProviders() layer on top — a
+// catalog_hidden=1 row has no reachable public profile page at all, so it is
+// out of scope for "what would the public map render" and an unknown/hidden
+// `provider_id` both come back 404 the same way.
+//
+// READ-ONLY — a single SELECT (plus an optional COUNT(*) for `total`), zero
+// writes, no side effects. Never touches locked/owner/Brreg/contact fields —
+// it has no reason to, the diagnostic is geo-only.
+//
+// Two modes, same shape per row:
+//   - `provider_id` query param -> single-row lookup, 404 if it doesn't
+//     resolve to a gårdssalg row in scope.
+//   - otherwise -> keyset-paginated batch listing, same `limit`/`after`
+//     (last-seen id) contract as GET /admin/providers/all above (id is the
+//     stable, immutable, unique PRIMARY KEY, so an OFFSET-free cursor is
+//     safe even if rows are deleted mid-walk — see that route's own comment
+//     for the full reasoning).
+const GARDSSALG_GEO_DIAGNOSTIC_DEFAULT_LIMIT = 50;
+const GARDSSALG_GEO_DIAGNOSTIC_MAX_LIMIT = 200;
+// Same catalog-visibility gate as listGardssalgProviders()/
+// countGardssalgProviders() (experience-store.ts): the official catalog scope
+// WHERE, plus the catalog_hidden=1 exclusion those callers layer on top.
+const GARDSSALG_GEO_DIAGNOSTIC_WHERE =
+  `${GARDSSALG_DEDUP_CATALOG_WHERE} AND (catalog_hidden IS NULL OR catalog_hidden != 1)`;
+
+type GardssalgGeoDiagnosticDbRow = {
+  id: string;
+  navn: string;
+  kommune: string | null;
+  poststed: string | null;
+  fylke: string | null;
+  lat: number | null;
+  lon: number | null;
+  geocode_confidence: string | null;
+};
+
+function buildGardssalgGeoDiagnosticRow(row: GardssalgGeoDiagnosticDbRow) {
+  // In-handler require (see the route's own doc comment above for why: a
+  // top-level import from experiences-seo.ts into this file would be
+  // circular, since experiences-seo.ts already imports FROM opplevelser.ts).
+  const { gardssalgMapPresentation, gardssalgPlaceLabel } =
+    require("./experiences-seo") as typeof import("./experiences-seo");
+
+  const presentation = gardssalgMapPresentation(row.geocode_confidence);
+  return {
+    provider_id: row.id,
+    navn: row.navn,
+    geocode_confidence: row.geocode_confidence,
+    lat: row.lat,
+    lon: row.lon,
+    sted: gardssalgPlaceLabel(row) || null,
+    kommune: row.kommune,
+    poststed: row.poststed,
+    fylke: row.fylke,
+    // The SAME three-way classification the produsent-profil mini-map uses
+    // ("exact" | "approx-point" | "no-point") — kept alongside the boolean
+    // below so a spot-check can also tell "sted-tier approx point" apart
+    // from "a real address", not just point-vs-no-point.
+    map_presentation: presentation,
+    would_render_point_marker: presentation !== "no-point",
+  };
+}
+
+router.get("/admin/gardssalg-geo-marker-diagnostic", requireAdmin, (req: Request, res: Response) => {
+  const providerId = typeof req.query.provider_id === "string" ? req.query.provider_id.trim() : "";
+
+  try {
+    const expDb = getExpDb("experiences");
+
+    if (providerId) {
+      const row = expDb
+        .prepare(
+          `SELECT id, navn, kommune, poststed, fylke, lat, lon, geocode_confidence
+             FROM experience_providers
+            WHERE id = ? AND ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}`,
+        )
+        .get(providerId) as GardssalgGeoDiagnosticDbRow | undefined;
+
+      if (!row) {
+        res.status(404).json({ error: "gardssalg_provider_not_found", provider_id: providerId });
+        return;
+      }
+
+      res.json({ success: true, provider: buildGardssalgGeoDiagnosticRow(row) });
+      return;
+    }
+
+    let limit = parseInt((req.query.limit as string) || "", 10);
+    if (!Number.isFinite(limit)) limit = GARDSSALG_GEO_DIAGNOSTIC_DEFAULT_LIMIT;
+    limit = Math.min(GARDSSALG_GEO_DIAGNOSTIC_MAX_LIMIT, Math.max(1, limit));
+
+    const after = typeof req.query.after === "string" ? req.query.after : "";
+
+    const rows = expDb
+      .prepare(
+        `SELECT id, navn, kommune, poststed, fylke, lat, lon, geocode_confidence
+           FROM experience_providers
+          WHERE ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}
+            AND id > ?
+          ORDER BY id ASC
+          LIMIT ?`,
+      )
+      .all(after, limit) as GardssalgGeoDiagnosticDbRow[];
+
+    const totalRow = expDb
+      .prepare(`SELECT COUNT(*) AS total FROM experience_providers WHERE ${GARDSSALG_GEO_DIAGNOSTIC_WHERE}`)
+      .get() as { total: number };
+
+    const next_after = rows.length > 0 ? rows[rows.length - 1].id : null;
+
+    res.json({
+      success: true,
+      count: rows.length,
+      total: totalRow.total,
+      next_after,
+      limit,
+      providers: rows.map(buildGardssalgGeoDiagnosticRow),
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-geo-marker-diagnostic failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
@@ -27026,9 +27732,52 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
 
 // ─── POST /api/opplevelser/book ──────────────────────────────────────
 router.post("/book", async (req: Request, res: Response) => {
-  const parsed = BookingInputSchema.safeParse(req.body);
+  // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai):
+  // «hos X» → provider_id. A caller that sends provider_id is untouched (the
+  // web form always does). Otherwise provider_query (the producer's name) is
+  // resolved to exactly ONE producer, or answered with the same honest
+  // not-found / ambiguous payloads the MCP tool returns — NO booking created.
+  const rawBody = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+  const rawProviderId = typeof rawBody.provider_id === "string" ? rawBody.provider_id.trim() : "";
+  const rawProviderQuery = typeof rawBody.provider_query === "string" ? rawBody.provider_query.trim() : "";
+  let bodyForSchema: Record<string, unknown> = rawBody;
+  let resolvedFromQuery: string | null = null;
+  if (!rawProviderId) {
+    if (!rawProviderQuery) {
+      res.status(400).json(providerQueryMissingPayload());
+      return;
+    }
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery);
+    if (resolution.kind === "none") {
+      res.status(200).json(providerNotFoundPayload(rawProviderQuery));
+      return;
+    }
+    if (resolution.kind === "ambiguous") {
+      res.status(200).json(providerAmbiguousPayload(rawProviderQuery, resolution.candidates));
+      return;
+    }
+    bodyForSchema = { ...rawBody, provider_id: resolution.provider.id };
+    resolvedFromQuery = rawProviderQuery;
+  }
+
+  const parsed = BookingInputSchema.safeParse(bodyForSchema);
   if (!parsed.success) {
     res.status(400).json({ error: "Ugyldig forespørsel", details: parsed.error.issues });
+    return;
+  }
+
+  // ─── Step 0b: stated weekday («fredag») must agree with slot_at in Oslo
+  // time — otherwise answer with the nearest matching dates, create nothing.
+  const weekdayCheck = checkRequestedWeekday(
+    parsed.data.slot_at,
+    typeof rawBody.requested_weekday === "string" ? rawBody.requested_weekday : undefined,
+  );
+  if (!weekdayCheck.ok) {
+    if (weekdayCheck.reason === "unknown_weekday") {
+      res.status(400).json(unknownWeekdayPayload(weekdayCheck.requested_weekday));
+      return;
+    }
+    res.status(200).json(weekdayMismatchPayload(weekdayCheck.mismatch));
     return;
   }
 
@@ -27040,12 +27789,25 @@ router.post("/book", async (req: Request, res: Response) => {
   // 'reserved' row, never send the guest confirmation, never notify a
   // producer. See isBookingPaused() in services/booking-store.ts.
   const providerBook = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
     | null;
+  // Echoed on the paused + success responses (2026-09-16) so a caller that
+  // resolved by name can tell the guest WHICH producer it acted on. Never
+  // epost/telefon.
+  const providerInfo = providerBook
+    ? {
+        id: parsed.data.provider_id,
+        navn: String(providerBook.navn ?? ""),
+        profile_url: gardssalgProfileUrl(providerBook.slug ?? null),
+        ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
+      }
+    : null;
+  const slotLocal = formatSlotOslo(parsed.data.slot_at);
   if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null)) {
     res.status(200).json({
       success: false,
       paused: true,
+      provider: providerInfo,
       message: BOOKING_NOT_ACTIVATED_MSG,
     });
     return;
@@ -27097,6 +27859,11 @@ router.post("/book", async (req: Request, res: Response) => {
     booking_ref: booking.booking_ref,
     status: booking.status,
     source: booking.source,
+    // dev-request 2026-09-16: what was booked, in words a caller can read
+    // straight back to the guest (same fields as the MCP tool's response).
+    provider: providerInfo,
+    slot_at_local: slotLocal,
+    party_size: booking.party_size,
     message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
   });
 });

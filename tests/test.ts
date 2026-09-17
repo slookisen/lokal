@@ -813,6 +813,32 @@ runSerial(() => {
   }
 });
 
+// ── dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
+// varianter: bulk-load's resolve-or-create logic gained a THIRD fallback
+// (getProviderByDomain, after org_nr/name both miss) so a harvested listing
+// name for an already-onboarded provider ("Smakfulle Rom" vs "Smakfulle Rom
+// – Konferanse, Event & Catering", same website) dedupes instead of
+// inserting a second `experience_providers` row. Own dedicated test file
+// (own in-memory experiences DB + pinned RFB db, no shared globalThis.fetch
+// stub needed — no evidence_url in any row, so the LLM admission gate never
+// fires) — runSerial() so it never races the shared db-factory/RFB-db
+// singletons other blocks in this file touch.
+runSerial(async () => {
+  console.log("\n── bulk-load: provider domain dedup (getProviderByDomain fallback) ──");
+  try {
+    const { runOpplevelserBulkLoadProviderDomainDedupTests } = require("../src/routes/opplevelser-bulk-load-provider-domain-dedup.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-provider-domain-dedup.test");
+    const r = await runOpplevelserBulkLoadProviderDomainDedupTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-provider-domain-dedup: " + f);
+    console.log(`  bulk-load-provider-domain-dedup: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-provider-domain-dedup: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request rfb-kvalitetsgate-parity: RFB's LLM-judge quality-gate
 // cascade (judgeRfbAboutCandidate/meetsRfbAboutQualityBar/
 // isRfbJudgeInfraFailure, routes/admin-agents.ts) — sentinel/fail-closed
@@ -26347,6 +26373,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbContactJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _contactCandidateJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _orgnrIdentityJudgePromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteBlocklistEmailSurvivorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteBlocklistNameSurvivorPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -30805,6 +30833,35 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorr.failures) failures.push("opplevelser-gardssalg-outreach-readiness: " + f);
     console.log(`  opplevelser-gardssalg-outreach-readiness: ${gorr.passed} passed, ${gorr.failed} failed`);
 
+    // dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler, AC4:
+    // GET /admin/gardssalg-geo-marker-diagnostic — read-only per-row
+    // geocode_confidence + would_render_point_marker report, reused by the
+    // AC4 20-random-profile spot-check. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-geo-marker-diagnostic: admin geo marker diagnostic ──");
+    const { runOpplevelserGardssalgGeoMarkerDiagnosticTests } = require("../src/routes/opplevelser-gardssalg-geo-marker-diagnostic.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-geo-marker-diagnostic.test");
+    const ggmd = await runOpplevelserGardssalgGeoMarkerDiagnosticTests({ log: false });
+    passed += ggmd.passed;
+    failed += ggmd.failed;
+    for (const f of ggmd.failures) failures.push("opplevelser-gardssalg-geo-marker-diagnostic: " + f);
+    console.log(`  opplevelser-gardssalg-geo-marker-diagnostic: ${ggmd.passed} passed, ${ggmd.failed} failed`);
+
+    // 2026-09-16 (Daniel: «alle kart er ødelagt»): every Leaflet map on
+    // opplevagent.no must render the shared OSM tile contract — canonical
+    // tile.openstreetmap.org URL + referrerPolicy on the tile layer — because
+    // the tile server blocks referer-less browser requests and the site-wide
+    // Helmet no-referrer header strips the Referer from every tile <img>.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── experiences-seo-map-tiles: OSM tile URL + referrerPolicy on every Leaflet map ──");
+    const { runExperiencesSeoMapTilesTests } = require("../src/routes/experiences-seo-map-tiles.test") as
+      typeof import("../src/routes/experiences-seo-map-tiles.test");
+    const emt = await runExperiencesSeoMapTilesTests({ log: false });
+    passed += emt.passed;
+    failed += emt.failed;
+    for (const f of emt.failures) failures.push("experiences-seo-map-tiles: " + f);
+    console.log(`  experiences-seo-map-tiles: ${emt.passed} passed, ${emt.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-
     // outreach, Steg 5: POST /admin/gardssalg-outreach-preflight — read-only
     // GO/NO-GO pre-flight over a caller-supplied batch of provider ids,
@@ -31698,6 +31755,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gmbk.failed;
     for (const f of gmbk.failures) failures.push("opplevelser-gardssalg-mcp-booking: " + f);
     console.log(`  opplevelser-gardssalg-mcp-booking: ${gmbk.passed} passed, ${gmbk.failed} failed`);
+
+    // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai («book et
+    // møte hos X fredag den 20. okt klokken 10.00» → one call): provider
+    // resolution by NAME (provider_query / discover query), the `id` field
+    // discover_gardssalg had been missing, the requested_weekday guard, and
+    // the shared honest-outcome payloads — on the MCP tool AND POST
+    // /api/opplevelser/book (src/services/gardssalg-booking-resolve.ts,
+    // src/routes/experiences-mcp.ts, src/routes/opplevelser.ts). Same
+    // in-memory-DB + real-MCP-session-over-HTTP pattern as the block above,
+    // runs sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-one-shot-booking: «hos X» → provider, weekday guard, id in discover ──");
+    const { runOpplevelserGardssalgOneShotBookingTests } = require("../src/routes/opplevelser-gardssalg-one-shot-booking.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-one-shot-booking.test");
+    const gosb = await runOpplevelserGardssalgOneShotBookingTests({ log: false });
+    passed += gosb.passed;
+    failed += gosb.failed;
+    for (const f of gosb.failures) failures.push("opplevelser-gardssalg-one-shot-booking: " + f);
+    console.log(`  opplevelser-gardssalg-one-shot-booking: ${gosb.passed} passed, ${gosb.failed} failed`);
 
     // dev-request 2026-07-19-gardssalg-agent-flater: REST GET /api/opplevelser/
     // discover?category=gardssalg_smaking always got zero direct hits (gårdssalg
@@ -35868,6 +35943,74 @@ const _orgnrIdentityJudgePromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// PR #813 (2026-09-05): survivor-EMAIL guard on DELETE /api/marketplace/
+// agents/:id (src/routes/marketplace.ts). Its test file's header says it is
+// wired into this gate, but the #813 commit only touched marketplace.ts +
+// the test file — it never was. Wired in here alongside its name-guard
+// sibling below (dev-request 2026-09-16-delete-agent-collateral-name-
+// blocklist). Swaps the shared getDb() singleton (own dedicated test file,
+// in-memory prod-schema DB) — so it is chained after
+// _orgnrIdentityJudgePromise, the current tail of this serial chain.
+let _deleteBlocklistEmailSurvivorResolve: () => void = () => {};
+const _deleteBlocklistEmailSurvivorPromise: Promise<void> = new Promise<void>(r => {
+  _deleteBlocklistEmailSurvivorResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orgnrIdentityJudgePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── PR #813: DELETE /api/marketplace/agents/:id survivor-email blocklist guard ──");
+  try {
+    const { runMarketplaceAgentDeleteBlocklistSurvivorTests } = require("../src/routes/marketplace-agent-delete-blocklist-survivor.test") as
+      typeof import("../src/routes/marketplace-agent-delete-blocklist-survivor.test");
+    const dbes = await runMarketplaceAgentDeleteBlocklistSurvivorTests({ log: false });
+    passed += dbes.passed;
+    failed += dbes.failed;
+    for (const f of dbes.failures) failures.push("marketplace-agent-delete-blocklist-survivor: " + f);
+    console.log(`  marketplace-agent-delete-blocklist-survivor: ${dbes.passed} passed, ${dbes.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-blocklist-survivor: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteBlocklistEmailSurvivorResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-09-16-delete-agent-collateral-name-blocklist: survivor-
+// NAME guard on DELETE /api/marketplace/agents/:id (src/routes/
+// marketplace.ts) — mirror of the #813 email guard, one identifier over.
+// Same DB-singleton-swapping test-file convention as the block immediately
+// above, so it must run strictly after it; _deleteBlocklistEmailSurvivor
+// Promise is the current tail of this serial chain.
+let _deleteBlocklistNameSurvivorResolve: () => void = () => {};
+const _deleteBlocklistNameSurvivorPromise: Promise<void> = new Promise<void>(r => {
+  _deleteBlocklistNameSurvivorResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_deleteBlocklistEmailSurvivorPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-09-16-delete-agent-collateral-name-blocklist: survivor-name blocklist guard ──");
+  try {
+    const { runMarketplaceAgentDeleteBlocklistNameSurvivorTests } = require("../src/routes/marketplace-agent-delete-blocklist-name-survivor.test") as
+      typeof import("../src/routes/marketplace-agent-delete-blocklist-name-survivor.test");
+    const dbns = await runMarketplaceAgentDeleteBlocklistNameSurvivorTests({ log: false });
+    passed += dbns.passed;
+    failed += dbns.failed;
+    for (const f of dbns.failures) failures.push("marketplace-agent-delete-blocklist-name-survivor: " + f);
+    console.log(`  marketplace-agent-delete-blocklist-name-survivor: ${dbns.passed} passed, ${dbns.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-blocklist-name-survivor: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteBlocklistNameSurvivorResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
 // Dette er barrieren filheaderens "NOT yet fixed"-punkt 2 beskriver: frem til
@@ -35925,6 +36068,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
   _rfbContactJudgePromise, _contactCandidateJudgePromise, _orgnrIdentityJudgePromise,
+  _deleteBlocklistEmailSurvivorPromise, _deleteBlocklistNameSurvivorPromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);
@@ -43877,3 +44021,136 @@ runSerial(async () => {
     failures.push("admin-cross-vertical-contact-lookup: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec item 1: judgeExperienceEvidencePage() (experience-
+// content-judge.ts) — the fetch+classify+judge entry point that fixes the
+// 2026-09-13 mass-apply's root cause (a dead OR parked evidence page used to
+// reach the LLM judge and come back MISMATCH; now both short-circuit to
+// `unresolved` BEFORE the LLM call, saving judge budget, while a live page
+// with genuinely wrong content still reaches the LLM and still comes back
+// MISMATCH exactly as before). Pure unit test — no DB, no HTTP router; only
+// the two fetch surfaces the function itself uses (an injected fetchImpl for
+// the page fetch, a mocked globalThis.fetch for the Anthropic judge call) are
+// stubbed. Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-gjenopprett: judgeExperienceEvidencePage ──");
+  try {
+    const { runExperienceContentJudgeEvidencePageTests } = require("../src/services/experience-content-judge-evidence-page.test") as
+      typeof import("../src/services/experience-content-judge-evidence-page.test");
+    const ecj = await runExperienceContentJudgeEvidencePageTests({ log: false });
+    passed += ecj.passed;
+    failed += ecj.failed;
+    for (const f of ecj.failures) failures.push("experience-content-judge-evidence-page: " + f);
+    console.log(`  experience-content-judge-evidence-page: ${ecj.passed} passed, ${ecj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-content-judge-evidence-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett, spec items 2+3: GET /admin/experiences-status-transitions
+// (lists rows the content-judge sweep mismatch-stamped verified->needs_review
+// in a given window) and POST /admin/experiences-requarantine-rejudge
+// (re-judges those rows with the FIXED classifier above and restores to
+// `verified` a row whose new verdict is MATCH or unresolved-for-dead/parked-
+// reasons AND satisfies PUBLISH_GATE_SQL_EXCEPT_STATUS — this route's
+// reconstruction of "was actually verified/published before the sweep
+// touched it", since this schema keeps no per-row status history). Own
+// dedicated in-memory-db harness (mirrors opplevelser-experiences-content-
+// judge-sweep.test.ts's harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-gjenopprett: status-transitions + requarantine-rejudge ──");
+  try {
+    const { runOpplevelserExperiencesRequarantineRejudgeTests } = require("../src/routes/opplevelser-experiences-requarantine-rejudge.test") as
+      typeof import("../src/routes/opplevelser-experiences-requarantine-rejudge.test");
+    const rq = await runOpplevelserExperiencesRequarantineRejudgeTests({ log: false });
+    passed += rq.passed;
+    failed += rq.failed;
+    for (const f of rq.failures) failures.push("opplevelser-experiences-requarantine-rejudge: " + f);
+    console.log(`  opplevelser-experiences-requarantine-rejudge: ${rq.passed} passed, ${rq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-requarantine-rejudge: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-crm-ingest-alias-gate-autoroute (slookisen/A2A), FUNN
+// crm-ingest-alias-gate-blokkerer-ekte-eierrettelser: POST /admin/crm/ingest
+// parked a known contact's reply as untriaged whenever it landed outside the
+// two platform aliases, even when the sender was an unambiguous match to
+// exactly one vertical's own entity table (agents/agent_knowledge/
+// experience_providers) — verified owner corrections then sat unsent for
+// days waiting on Daniel's manual assignment. Own in-memory-db + fresh
+// db-factory harness (mirrors crm-contact-provider-link.test.ts's
+// EXPERIENCES_DB_PATH redirect and crm-compose-cooldown-untriaged-inbound-
+// exempt.test.ts's router-dispatch shape). Tail position is the convention
+// for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-crm-ingest-alias-gate-autoroute: known-contact auto-route fallback ──");
+  try {
+    const { runCrmIngestAliasGateAutorouteTests } = require("../src/routes/crm-ingest-alias-gate-autoroute.test") as
+      typeof import("../src/routes/crm-ingest-alias-gate-autoroute.test");
+    const iag = await runCrmIngestAliasGateAutorouteTests({ log: false });
+    passed += iag.passed;
+    failed += iag.failed;
+    for (const f of iag.failures) failures.push("crm-ingest-alias-gate-autoroute: " + f);
+    console.log(`  crm-ingest-alias-gate-autoroute: ${iag.passed} passed, ${iag.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-ingest-alias-gate-autoroute: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier
+// (slookisen/A2A): POST /admin/crm/threads/:id/status and GET
+// /admin/crm/threads?status= both 400'd on the two B3 opt-out statuses
+// (awaiting_confirmation, awaiting_grace) that scheduled-agents/rfb-
+// customer-service.md has always prescribed (line 664/670) -- the
+// crm_threads.status CHECK constraint and both route-level closed sets
+// never accepted them. Own in-memory-db harness (mirrors
+// crm-max-touch-vern-send-guard.test.ts's and crm-compose-cooldown-
+// untriaged-inbound-exempt.test.ts's router-dispatch shape). Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier: B3 opt-out status values ──");
+  try {
+    const { runCrmThreadStatusEnumB3OptOutTests } = require("../src/routes/crm-thread-status-enum-b3-opt-out.test") as
+      typeof import("../src/routes/crm-thread-status-enum-b3-opt-out.test");
+    const cts = await runCrmThreadStatusEnumB3OptOutTests({ log: false });
+    passed += cts.passed;
+    failed += cts.failed;
+    for (const f of cts.failures) failures.push("crm-thread-status-enum-b3-opt-out: " + f);
+    console.log(`  crm-thread-status-enum-b3-opt-out: ${cts.passed} passed, ${cts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-thread-status-enum-b3-opt-out: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier,
+// post-review fix-up: the crm_threads.status CHECK-widening rebuild
+// migration cascade-deleted crm_messages/crm_actions rows and nulled
+// crm_outbox.thread_id on any database booting with foreign_keys=ON
+// (getDb()'s real boot order) -- an independent reviewer caught this with
+// a live repro, since every existing harness (including the suite
+// registered just above) sets foreign_keys=OFF and so never exercised
+// this path. Own dedicated migration test, synchronous like
+// init-dental.test.ts's runInitDentalBackfillTests (drives initSchema()
+// directly against an already-open handle to simulate a redeploy).
+console.log("\n── dev-request 2026-09-14-crm-thread-status-enum-mangler-b3-opt-out-verdier: crm_threads rebuild FK-cascade safety ──");
+try {
+  const { runInitCrmThreadsB3StatusMigrationTests } = require("../src/database/init-crm-threads-b3-status-migration.test") as
+    typeof import("../src/database/init-crm-threads-b3-status-migration.test");
+  const ctm = runInitCrmThreadsB3StatusMigrationTests({ log: false });
+  passed += ctm.passed;
+  failed += ctm.failed;
+  for (const f of ctm.failures) failures.push("init-crm-threads-b3-status-migration: " + f);
+  console.log(`  init-crm-threads-b3-status-migration: ${ctm.passed} passed, ${ctm.failed} failed`);
+} catch (err: any) {
+  failed++;
+  failures.push("init-crm-threads-b3-status-migration: unexpected error: " + String(err?.message || err));
+}

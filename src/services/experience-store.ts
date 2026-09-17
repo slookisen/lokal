@@ -95,7 +95,11 @@ import { normaliseName } from "./brreg-client";
 // (isContentFieldHomepageSourced below) needs the SAME eTLD+1 comparison
 // GET /admin/providers/recently-enriched already uses, not a second
 // reimplementation.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
+// collapseDomain: dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
+// listenavn-varianter — getProviderByDomain() (below) needs the SAME
+// hyphen-insensitive eTLD+1 comparison PR-126 already established for
+// cross-source domain equivalence, not a second reimplementation.
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, collapseDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 1: the shared provider_work_queue hand-off table between the
 // sweep/berikelse/discovery gårdssalg pipelines — used here only to
@@ -677,12 +681,42 @@ export function getPublishedExperienceById(
 // `(catalog_hidden IS NULL OR catalog_hidden != 1)` form every gårdssalg
 // query in this file already uses. discoverExperiences() reuses this exact
 // constant (single source of truth) rather than carrying its own copy.
-export const PUBLISH_GATE_SQL =
-  "e.verification_status = 'verified' " +
-  "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
-  "AND (p.id IS NULL OR p.brreg_active = 1) " +
-  "AND e.canonical_id IS NULL " +
-  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
+// Split into named clauses (2026-09-14, dev-request 2026-09-14-opplevagent-
+// falske-karantener-doede-sider-gjenopprett) so PUBLISH_GATE_SQL_EXCEPT_
+// STATUS below can reuse every clause EXCEPT the verification_status one
+// without restating them — PUBLISH_GATE_SQL's own exported STRING VALUE is
+// unchanged (same clauses, same " AND " join), so every existing caller
+// keeps behaving byte-for-byte identically.
+const PUBLISH_GATE_STATUS_CLAUSE = "e.verification_status = 'verified'";
+const PUBLISH_GATE_OTHER_CLAUSES = [
+  "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
+  "(p.id IS NULL OR p.brreg_active = 1)",
+  "e.canonical_id IS NULL",
+  "(p.catalog_hidden IS NULL OR p.catalog_hidden != 1)",
+];
+export const PUBLISH_GATE_SQL = [PUBLISH_GATE_STATUS_CLAUSE, ...PUBLISH_GATE_OTHER_CLAUSES].join(" AND ");
+
+// Every PUBLISH_GATE_SQL clause EXCEPT verification_status — "would this row
+// be published right now if its verification_status alone were 'verified'".
+// Used by POST /admin/experiences-requarantine-rejudge (routes/opplevelser.ts,
+// dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
+// gjenopprett) as the reconstruction of "was this row verified/published
+// before the 2026-09-13 mass-apply sweep wrongly demoted it": the sweep
+// touches ONLY verification_status (+ admission_verdict/admission_checked_at
+// + occasionally description) on a row it judges MISMATCH, never confidence/
+// brreg_active/canonical_id/catalog_hidden — so a needs_review row that still
+// satisfies every OTHER publish-gate clause today is, with very high
+// confidence, a row that passed the FULL gate (hence was published) right up
+// until the sweep flipped verification_status out from under it. There is no
+// per-row history of verification_status in this schema (the sweep's own
+// demotion path writes no audit trail — only its rarer promotion path does,
+// via experience_admission_promotion_audit), so this is a reconstruction, not
+// a stored fact; see that route's own doc comment for the full reasoning and
+// the acknowledged edge case (a row that was needs_review for an unrelated
+// reason AND happens to satisfy every other clause today would also pass
+// this check — believed rare, since PUBLISH_GATE_SQL's own four other
+// clauses are exactly the "would already be showing" bar).
+export const PUBLISH_GATE_SQL_EXCEPT_STATUS = PUBLISH_GATE_OTHER_CLAUSES.join(" AND ");
 
 export function getPublishedExperienceBySlug(
   slug: string
@@ -1956,6 +1990,68 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
       .prepare("SELECT * FROM experience_providers WHERE lower(trim(navn)) = lower(trim(?)) LIMIT 1")
       .get(navn) as Record<string, unknown>) ?? null
   );
+}
+
+/**
+ * Find a provider by domain (registrable eTLD+1, hyphen-insensitive). Used
+ * by bulk-load (dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
+ * listenavn-varianter) as a THIRD dedup fallback after org_nr/name both
+ * miss: the production incident this closes is two rows for the same
+ * producer — "Smakfulle Rom" (existing) vs "Smakfulle Rom – Konferanse,
+ * Event & Catering" (a harvested variant of the same listing name) — sharing
+ * one website but never matching by exact name or org_nr.
+ *
+ * Uses the SAME eTLD+1 comparison pipeline as the rest of this file
+ * (hostFromUrlLike + registrableDomain), plus collapseDomain() for
+ * hyphen-insensitivity (PR-126: `lia-gard.no` vs `liagard.no` is one
+ * company, not two) — never a third domain-normalization helper. Iterates
+ * rows with a non-blank hjemmeside and compares in JS (same pattern as
+ * gardssalgContentExclusionReason's host-count scan above), since the
+ * registrable domain isn't a column SQL can compute directly.
+ *
+ * Null/empty/unparseable input (and a candidate site with no domain-bearing
+ * providers on file) returns null rather than throwing — this is a
+ * best-effort dedup lookup, not a validator.
+ *
+ * `candidateOrgNr` (dev-request 2026-09-16 CHANGES-REQUESTED fix-up, PR #872
+ * review): a shared domain is NOT proof of shared identity when both sides
+ * carry a KNOWN, DIFFERENT org_nr — e.g. two franchise/underenhet legal
+ * entities sharing one corporate/parking domain. That combination
+ * (candidate has its own resolved org_nr AND the domain-matched row already
+ * has a non-null org_nr that differs from it) is affirmative proof of two
+ * DISTINCT legal entities, so the domain signal must never override two
+ * known-different org_nrs — the row is skipped and the scan continues as if
+ * it were never a match, same "don't guess when two real entities are both
+ * visible" precedent as flagNameCollision/name_collision in
+ * experience-brreg.ts. A row with a NULL org_nr (never Brreg-verified) is
+ * unaffected and still matches, exactly as before this fix.
+ */
+export function getProviderByDomain(
+  website: string | null | undefined,
+  candidateOrgNr?: string | null,
+): Record<string, unknown> | null {
+  if (!website) return null;
+  const candidateHost = hostFromUrlLike(website);
+  if (!candidateHost) return null;
+  const candidateDomain = collapseDomain(registrableDomain(candidateHost));
+
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare(
+      `SELECT * FROM experience_providers
+        WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`
+    )
+    .all() as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const rowHost = hostFromUrlLike(row.hjemmeside as string);
+    if (!rowHost) continue;
+    const rowDomain = collapseDomain(registrableDomain(rowHost));
+    if (rowDomain !== candidateDomain) continue;
+    const rowOrgNr = row.org_nr as string | null | undefined;
+    if (candidateOrgNr && rowOrgNr && rowOrgNr !== candidateOrgNr) continue;
+    return row;
+  }
+  return null;
 }
 
 // ─── Homepage-content enrichment (orch-experiences-content-refresh) ──
@@ -3501,7 +3597,62 @@ export type GardssalgSearchFilter = {
   lat?: number;
   lng?: number;
   radius_km?: number;
+  // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-text
+  // name/place query («Fjordgard», «Egge gård», «bryggeri Bergen»). Every
+  // whitespace-separated term (max 8) must match navn, slug, poststed or
+  // kommune (case-insensitive LIKE). Results are ranked exact-name match →
+  // name-prefix match → everything else (then navn), so a one-shot booking
+  // request that names a producer resolves to the obvious row first. This is
+  // what lets an AI assistant go from «book et møte hos X» straight to X
+  // without paging through a fylke — before this, discover_gardssalg had no
+  // way to look a producer up by name at all.
+  q?: string;
 };
+
+// Tokenise a free-text gårdssalg query the same way
+// searchGardssalgProvidersByQuery() below does (whitespace split, ≤8 terms,
+// lower-cased). Exported for the booking-resolution service + tests.
+export function gardssalgQueryTerms(q: string | null | undefined): string[] {
+  return String(q ?? "")
+    .trim()
+    .split(/\s+/)
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length > 0)
+    .slice(0, 8);
+}
+
+// One already-lower-cased query term -> a SQLite LIKE pattern body (no
+// surrounding %): LIKE metacharacters escaped with `\`, every non-ASCII
+// character replaced by `_` (see searchGardssalgProviders()'s q comment).
+export function gardssalgLikePattern(term: string): string {
+  let out = "";
+  for (const ch of term) {
+    if (ch === "%" || ch === "_" || ch === "\\") out += "\\" + ch;
+    else if (ch.charCodeAt(0) > 0x7f) out += "_";
+    else out += ch;
+  }
+  return out;
+}
+
+// Precision match + rank for the q filter (JS side, Unicode-aware). Returns
+// null when the row does not actually contain every term; otherwise a rank
+// (0 = exact whole-name match, 1 = name starts with the query, 2 = other).
+export function gardssalgQueryRank(
+  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null },
+  qTerms: string[],
+): number | null {
+  if (qTerms.length === 0) return 2;
+  const navn = (row.navn ?? "").toLocaleLowerCase("nb-NO");
+  const hay = [navn, row.slug ?? "", row.poststed ?? "", row.kommune ?? ""]
+    .map((v) => String(v).toLocaleLowerCase("nb-NO"));
+  for (const t of qTerms) {
+    if (!hay.some((h) => h.includes(t))) return null;
+  }
+  const whole = qTerms.join(" ");
+  if (navn === whole) return 0;
+  if (navn.startsWith(whole)) return 1;
+  return 2;
+}
 
 export function searchGardssalgProviders(
   filter: GardssalgSearchFilter = {},
@@ -3524,6 +3675,30 @@ export function searchGardssalgProviders(
   // Only the "show me the live ones" case is a real filter; omitted/false
   // means no filter on this column (not "show me the paused ones").
   if (filter.booking_live === true) { where.push("booking_live = 1"); }
+
+  // Free-text name/place query (see GardssalgSearchFilter.q). Two stages:
+  //   1. SQL prefilter — every term must LIKE-match navn/slug/poststed/
+  //      kommune. SQLite's lower()/LIKE only case-fold ASCII, so a term
+  //      containing æ/ø/å (or any non-ASCII letter) has that character
+  //      replaced by the single-character wildcard `_` — «Ægir» and «ægir»
+  //      then both match the stored "Ægir Bryggeri". The `%`/`_`/`\`
+  //      wildcards in the user's own text are escaped first so a query can
+  //      never widen itself into a match-everything pattern.
+  //   2. JS precision pass (below, after the query) — toLocaleLowerCase()
+  //      includes() on the same four fields removes the rare wildcard over-
+  //      match, then ranks exact whole-name match → name-prefix → rest.
+  // A whitespace-only q is a no-op (no filter), exactly like an omitted one.
+  const qTerms = gardssalgQueryTerms(filter.q);
+  if (qTerms.length > 0) {
+    qTerms.forEach((t, i) => {
+      const key = `q${i}`;
+      params[key] = `%${gardssalgLikePattern(t)}%`;
+      where.push(
+        `(lower(navn) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(slug,'')) LIKE @${key} ESCAPE '\\'` +
+        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\')`,
+      );
+    });
+  }
 
   const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
   const originLat = filter.lat;
@@ -3555,10 +3730,12 @@ export function searchGardssalgProviders(
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
   // candidate cap and the real cut to `clampedLimit` happens after the exact
   // distance is computed + sorted in JS below — mirrors discoverExperiences().
+  // The same widening applies to a q query (its precision pass + ranking is
+  // JS-side too — see the q comment above).
   const GEO_CANDIDATE_CAP = 2000;
-  params.limit = hasGeo ? GEO_CANDIDATE_CAP : clampedLimit;
+  params.limit = hasGeo || qTerms.length > 0 ? GEO_CANDIDATE_CAP : clampedLimit;
 
-  const rows = db
+  let rows = db
     .prepare(
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
@@ -3567,6 +3744,16 @@ export function searchGardssalgProviders(
         LIMIT @limit`
     )
     .all(params) as GardssalgProviderRow[];
+
+  if (qTerms.length > 0) {
+    // Precision pass + rank (stable: ties keep the SQL navn order).
+    const ranked = rows
+      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms) }))
+      .filter((x): x is { r: GardssalgProviderRow; i: number; rank: number } => x.rank !== null)
+      .sort((a, b) => a.rank - b.rank || a.i - b.i);
+    rows = ranked.map((x) => x.r);
+    if (!hasGeo) rows = rows.slice(0, clampedLimit);
+  }
 
   if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") {
     return rows;

@@ -69,6 +69,16 @@ export function getExperiencesOpenapi(): object {
               description: "Gårdssalg-only: pass literal `true` to only return producers with live direct booking (omitted = no filter on this column, NOT «only paused»). Ignored outside `category=gardssalg_smaking`.",
               schema: { type: "boolean" },
             },
+            {
+              name: "q",
+              in: "query",
+              description:
+                "Gårdssalg-only: free-text lookup of ONE specific producer by name and/or place (e.g. «Fjordgard Bryggeri», " +
+                "«Egge gård Steinkjer»). Every word must match the producer's name, URL slug, place (poststed) or municipality; " +
+                "exact name matches rank first. Use the returned `id` as `provider_id` when booking. Ignored outside `category=gardssalg_smaking`.",
+              schema: { type: "string", maxLength: 200 },
+              example: "Fjordgard Bryggeri",
+            },
             { name: "indoor_outdoor", in: "query", description: "Indoor / outdoor preference", schema: { type: "string", enum: ["indoor", "outdoor", "both"] } },
             { name: "weather", in: "query", description: "Weather hint — rain/snow prefer indoor & weather-independent", schema: { type: "string", enum: ["rain", "snow", "clear", "any"] } },
             { name: "season", in: "query", description: "Season (e.g. «summer», «winter»)", schema: { type: "string" }, example: "winter" },
@@ -296,6 +306,10 @@ export function getExperiencesOpenapi(): object {
             "A gårdssalg (farm-sale drink producer) row — returned by `/api/opplevelser/discover?category=gardssalg_smaking` " +
             "and the `discover_gardssalg` MCP tool. Stored in `experience_providers`, not `experiences` — never mix with the Experience schema.",
           properties: {
+            id: {
+              type: "string",
+              description: "The producer's id — the `provider_id` for `POST /api/opplevelser/book` and the `book_gardssalg` MCP tool.",
+            },
             navn: { type: "string" },
             fylke: { type: "string", nullable: true },
             kommune: { type: "string", nullable: true },

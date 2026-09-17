@@ -25,6 +25,12 @@
  * type-coercion slip. Section (g) below is a dedicated negative control for
  * exactly that.
  *
+ * Section (ee) is likewise DB-backed-but-network-free: pure unit coverage of
+ * getGardssalgWebsiteVerificationSweepOffset/
+ * setGardssalgWebsiteVerificationSweepOffset (dev-request 2026-09-15-
+ * website-verification-sweep-offset-persistence) against a minimal in-memory
+ * DB holding only their own table.
+ *
  * Run standalone: npx tsx src/services/gardssalg-website-verification.test.ts
  */
 
@@ -35,6 +41,8 @@ import {
   summarizeGardssalgWebsiteVerification,
   planGardssalgWebsiteVerificationRemediation,
   loadGardssalgWebsiteVerificationCohort,
+  getGardssalgWebsiteVerificationSweepOffset,
+  setGardssalgWebsiteVerificationSweepOffset,
   GS_WV_COHORTS,
   type GsWvProducerRow,
   type GsWvFetchFn,
@@ -942,6 +950,74 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
         "dd2: post-fetch host does not corroborate -> missing_source, NOT verified (the candidate host alone would have incorrectly promoted)"
       );
       assertEq(row.promoted_from_evidence_url, undefined, "dd3: no promotion marker — nothing gets written to hjemmeside");
+    }
+
+    // ── (ee) sweep-offset persistence (dev-request 2026-09-15-website-
+    //     verification-sweep-offset-persistence) — pure unit coverage of
+    //     getGardssalgWebsiteVerificationSweepOffset/
+    //     setGardssalgWebsiteVerificationSweepOffset against a minimal
+    //     in-memory DB holding only gardssalg_website_verification_sweep_
+    //     state (no experience_providers/experiences needed — these two
+    //     functions never touch either table). Route-level, end-to-end
+    //     coverage through the real POST .../gardssalg-website-verification-
+    //     remediation endpoint lives in section (p) of
+    //     routes/opplevelser-gardssalg-website-verification.test.ts — this
+    //     section is the narrower, DB-free-of-network, HTTP-free complement.
+    {
+      const db = new Database(":memory:");
+      db.exec(`
+        CREATE TABLE gardssalg_website_verification_sweep_state (
+          cohort TEXT PRIMARY KEY,
+          next_offset INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT
+        )
+      `);
+
+      assertEq(
+        getGardssalgWebsiteVerificationSweepOffset(db, "gardssalg"),
+        0,
+        "ee1: absence of a row (fresh DB, never swept) reads as offset 0 — the pre-existing default, not an error/throw"
+      );
+
+      setGardssalgWebsiteVerificationSweepOffset(db, "gardssalg", 12);
+      assertEq(
+        getGardssalgWebsiteVerificationSweepOffset(db, "gardssalg"),
+        12,
+        "ee2: a set is immediately visible to a get — first-write-ever path (INSERT branch of the ON CONFLICT upsert)"
+      );
+
+      setGardssalgWebsiteVerificationSweepOffset(db, "gardssalg", 24);
+      assertEq(
+        getGardssalgWebsiteVerificationSweepOffset(db, "gardssalg"),
+        24,
+        "ee3: a second set for the SAME cohort overwrites (not duplicates) — the UPDATE branch of the ON CONFLICT upsert"
+      );
+      assertEq(
+        db.prepare(`SELECT COUNT(*) AS n FROM gardssalg_website_verification_sweep_state`).get(),
+        { n: 1 },
+        "ee4: still exactly one row for 'gardssalg' — ee2/ee3 upserted the same PRIMARY KEY, never inserted a second row"
+      );
+
+      // ee5-ee6: cohorts are independent — writing 'all' never disturbs the
+      // already-set 'gardssalg' row, and a cohort never explicitly set
+      // still reads as 0 (same as ee1).
+      setGardssalgWebsiteVerificationSweepOffset(db, "all", 36);
+      assertEq(getGardssalgWebsiteVerificationSweepOffset(db, "all"), 36, "ee5: a different cohort key gets its own independent value");
+      assertEq(getGardssalgWebsiteVerificationSweepOffset(db, "gardssalg"), 24, "ee5b: ...and does not disturb 'gardssalg's own value");
+      assertEq(getGardssalgWebsiteVerificationSweepOffset(db, "non_gardssalg"), 0, "ee6: a cohort never written still reads as 0");
+
+      // ee7: wrap-to-zero — passing `null` (the exact shape `pagination.
+      // next_offset` itself uses once a cohort is exhausted) persists 0, not
+      // `null`/NaN and not "leave the previous value alone" — the contract
+      // that makes the NEXT call start a fresh pass instead of getting stuck.
+      setGardssalgWebsiteVerificationSweepOffset(db, "gardssalg", null);
+      assertEq(
+        getGardssalgWebsiteVerificationSweepOffset(db, "gardssalg"),
+        0,
+        "ee7: setting next_offset=null (cohort exhausted) persists as 0, ready for a fresh pass on the next call"
+      );
+
+      db.close();
     }
   })().then(() => ({ passed, failed, failures }));
 }

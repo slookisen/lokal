@@ -2847,19 +2847,40 @@ REST (samme søkeflate, uten MCP-håndtrykk):
 
 Gårdssalg-spesifikke filtre (i tillegg til fylke/kommune/lat/lng/radius_km fra
 Discovery-API-seksjonen over): producer_type, booking_live=true (kun literalen
-"true" filtrerer — utelatt betyr «ingen filter på denne kolonnen»).
+"true" filtrerer — utelatt betyr «ingen filter på denne kolonnen»), og q
+(fritekst navn/sted-oppslag av ÉN bestemt produsent, f.eks. q=Fjordgard%20Bryggeri
+— alle ord må treffe navn/slug/poststed/kommune; eksakt navnetreff rangeres
+først). I MCP-verktøyet discover_gardssalg heter den samme parameteren \`query\`.
 
 Respons: JSON med { vertical:"gardssalg", query, count, results[] }, der hver
-rad har navn/fylke/kommune/producer_type/lat/lon/geocode_confidence/profile_url
-og et \`booking\`-felt ({live, mode, note}) som ærlig speiler dark-launch-status
-— aldri en påstått aktiv booking før reservasjoner faktisk er åpnet.
+rad har id (= provider_id for booking)/navn/fylke/kommune/producer_type/lat/lon/
+geocode_confidence/profile_url og et \`booking\`-felt ({live, mode, note}) som
+ærlig speiler dark-launch-status — aldri en påstått aktiv booking før
+reservasjoner faktisk er åpnet.
 
-### Booking via MCP (book_gardssalg)
+### Booking via MCP (book_gardssalg) — én setning, ett kall
 
 MCP-verktøy: book_gardssalg — send inn en reservasjonsforespørsel for en
-gårdssalg-produsent (provider_id fra discover_gardssalg), samme to-stegs
-håndtrykk som over. Krever provider_id, slot_at, party_size, guest_name,
-guest_email (guest_phone og notes valgfritt).
+gårdssalg-produsent, samme to-stegs håndtrykk som over. Produsenten oppgis
+ENTEN som provider_id (id-feltet fra discover_gardssalg) ELLER som
+provider_query (produsentens navn slik gjesten sa det, f.eks. "Fjordgard
+Bryggeri"). Krever i tillegg slot_at (YYYY-MM-DDTHH:MM, Europe/Oslo),
+party_size, guest_name, guest_email (gjestens egne — spør gjesten, finn aldri
+på). Valgfritt: requested_weekday (ukedagen gjesten sa, f.eks. "fredag"),
+guest_phone, notes, confirm_outside_hours.
+
+«Book et møte hos X fredag den 20. oktober klokken 10» er dermed ETT kall:
+provider_query="X", slot_at="2026-10-20T10:00", requested_weekday="fredag",
+party_size, guest_name, guest_email. Verktøyet løser X til nøyaktig én
+produsent (flere treff → reason "provider_ambiguous" med candidates[] du kan
+legge fram for gjesten; ingen treff → "provider_not_found"; ingen booking
+opprettes i noen av tilfellene), sjekker at datoen faktisk er en fredag
+(20. oktober 2026 er en tirsdag → weekday_mismatch:true med de nærmeste
+fredagene i suggestions[], ingen booking opprettet), og sender så
+forespørselen til produsenten. Svaret ved suksess bærer provider.navn og
+slot_at_local ("fredag 23. oktober 2026 kl. 10:00") — les begge tilbake til
+gjesten. Samme flyt og samme svar via REST: POST ${url}/api/opplevelser/book
+med de samme feltene i JSON-body.
 
 VIKTIG: verktøyet oppretter ALDRI en bekreftet booking — kun samme avventende
 ("reserved"/pending) rad som nettskjemaet på produsentens profilside
@@ -3919,6 +3940,51 @@ type FylkeMapMarker = {
   precision: "address" | "kommune";
 };
 
+// ─── OpenStreetMap raster tile source — ONE definition for every Leaflet map
+// on the site. The /fylke/:fylke and /kategori/gardssalg cluster maps and the
+// single-point mini-maps below all interpolate OSM_TILE_LAYER_JS; nothing else
+// in this file names the tile host. ───────────────────────────────────────
+// Why this exists (2026-09-16, Daniel: «alle kart er ødelagt»): every tile on
+// opplevagent.no rendered OSM's "403 Access blocked — App is not following the
+// tile usage policy" image, on the category map and on every profile page.
+// Root cause, verified directly against the tile server: tile.openstreetmap.org
+// refuses browser requests that carry NO Referer header (its "Misidentification"
+// rule, https://wiki.openstreetmap.org/wiki/Blocked — "all tile requests must be
+// identifiable to a particular website"), and this app's global Helmet config
+// (src/middleware/security.ts) sends `Referrer-Policy: no-referrer` on every
+// page, so browsers stripped the Referer from every tile <img>. The very same
+// tile URL fetched with `Referer: https://opplevagent.no/` returns a real tile.
+// Two rules of the tile usage policy
+// (https://operations.osmfoundation.org/policies/tiles/) are enforced here:
+//   1. `referrerPolicy: 'strict-origin-when-cross-origin'` — Leaflet (≥1.8;
+//      we vendor 1.9.4) sets it as the tile <img>'s referrerpolicy attribute,
+//      which per the Referrer Policy spec OVERRIDES the document-level header
+//      for that element only. Tiles are therefore requested with
+//      `Referer: https://opplevagent.no/` (origin only — never the page path),
+//      while the site-wide no-referrer header stays exactly as it is for
+//      everything else (outbound links to producer websites etc.). The policy's
+//      own words: "Do not set a restrictive Referrer-Policy that prevents the
+//      HTTP Referer header being sent."
+//   2. The canonical `https://tile.openstreetmap.org/{z}/{x}/{y}.png` URL — the
+//      policy's "Correct tile URL" rule. The old `{s}.tile.…` a/b/c subdomains
+//      are deprecated ("may be slower or withdrawn without notice").
+// Visible, linked attribution ("© OpenStreetMap-bidragsytere") is the policy's
+// third hard requirement and is unchanged. Keep this the ONLY place the tile
+// source lives — the policy recommends being able to switch provider (e.g. to
+// Kartverket's open WMTS cache) without touching every map.
+export const OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+export const OSM_TILE_REFERRER_POLICY = "strict-origin-when-cross-origin";
+export const OSM_TILE_ATTRIBUTION_HTML =
+  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere';
+// A JS *statement*, not a function: interpolated verbatim into the three
+// inline init scripts below, at the point where `map` is the freshly created
+// L.map instance.
+export const OSM_TILE_LAYER_JS = `L.tileLayer('${OSM_TILE_URL}', {
+        maxZoom: 19,
+        referrerPolicy: '${OSM_TILE_REFERRER_POLICY}',
+        attribution: '${OSM_TILE_ATTRIBUTION_HTML}'
+      }).addTo(map);`;
+
 // Lazy-init script for the /fylke/:fylke map — fires once #fylke-map nears
 // the viewport (IntersectionObserver; falls back to eager init on ancient
 // browsers without it), fetching self-hosted Leaflet (/leaflet/leaflet.js +
@@ -3969,10 +4035,7 @@ const FYLKE_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var addressIcon = L.icon({
         iconUrl: '/leaflet/images/marker-icon.png',
@@ -4069,13 +4132,14 @@ const FYLKE_MAP_INIT_JS = `(function () {
 // + <noscript> OSM fallback + a JSON data island + the deferred lazy-init
 // script above. Returns "" when there are no geocoded points (honest
 // omission — same discipline as productsBlock/mapBlock elsewhere in this
-// file — never an empty/broken map). Tile source: OSM's standard
-// {s}.tile.openstreetmap.org XYZ raster tiles (see final report for why —
-// short version: simpler/more reliably reachable than Kartverket's WMTS from
-// this sandbox, and Leaflet requests tiles as plain <img> tags, which the
-// existing global CSP imgSrc "https:" already allows — zero CSP changes
-// needed). Correct OSM attribution is rendered both under the map and inside
-// the tile layer itself (attribution control, bottom-right of the map).
+// file — never an empty/broken map). Tile source: OSM's standard XYZ raster
+// tiles via the shared OSM_TILE_LAYER_JS above (canonical tile.openstreetmap.org
+// URL + per-tile referrerPolicy — see its comment for the 2026-09-16 "Access
+// blocked" incident; originally chosen over Kartverket's WMTS because Leaflet
+// requests tiles as plain <img> tags, which the existing global CSP imgSrc
+// "https:" already allows — zero CSP changes needed). Correct OSM attribution
+// is rendered both under the map and inside the tile layer itself
+// (attribution control, bottom-right of the map).
 function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang: Lang): string {
   if (points.length === 0) return "";
   const markers: FylkeMapMarker[] = points.map((p) => ({
@@ -4684,10 +4748,21 @@ function isApproxGardssalgConfidence(confidence: string | null): boolean {
 // address/kommune/sted) rather than one, because the two columns are not the
 // same enum and unifying them would need a translation layer neither caller
 // asks for.
-type MapPresentation = "exact" | "approx-point" | "no-point";
+// Exported (dev-request 2026-09-09-opplevagent-geo-batch-over-alle-profiler,
+// AC4 diagnostic slice): GET /admin/gardssalg-geo-marker-diagnostic
+// (routes/opplevelser.ts) needs this SAME predicate to report
+// `would_render_point_marker` per row — reusing it here (rather than
+// re-deriving the high/medium/low/sted/approximate/no_match/null split a
+// second time in opplevelser.ts) is the whole point of that diagnostic: a
+// second, hand-rolled copy of this rule could silently drift from what the
+// produsent-profil page below actually renders. Pulled in via an in-handler
+// `require()` there, not a top-level import — this module already imports
+// FROM opplevelser.ts (isGardssalgContactEmailFlaggedForReview above), so a
+// top-level import the other way would be circular.
+export type MapPresentation = "exact" | "approx-point" | "no-point";
 
 /** geocode_confidence (experience_providers) → single-entity map presentation. */
-function gardssalgMapPresentation(confidence: string | null | undefined): MapPresentation {
+export function gardssalgMapPresentation(confidence: string | null | undefined): MapPresentation {
   if (confidence === "high" || confidence === "medium" || confidence === "low") return "exact";
   if (confidence === "sted") return "approx-point";
   return "no-point"; // 'approximate', 'no_match', null, future/unknown — same fail-closed direction as before
@@ -4738,10 +4813,7 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var addressIcon = L.icon({
         iconUrl: '/leaflet/images/marker-icon.png',
@@ -4838,8 +4910,8 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
 // lazy-init script, same shape/discipline as renderFylkeMapSection(). Returns
 // "" when there are no geocoded providers (honest omission — never an empty/
 // broken map, same as the fylke map's zero-points case). Tile source: the
-// SAME OSM {s}.tile.openstreetmap.org raster tiles the fylke map already
-// uses (no new third-party network host).
+// SAME OSM raster tiles the fylke map already uses (shared OSM_TILE_LAYER_JS —
+// no new third-party network host).
 function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string {
   if (points.length === 0) return "";
   const markers: GardssalgMapMarker[] = points.map((p) => ({
@@ -4951,10 +5023,7 @@ const MINI_MAP_INIT_JS = `(function () {
       if (typeof L === 'undefined') return;
       mapEl.textContent = '';
       var map = L.map(mapEl);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
-      }).addTo(map);
+      ${OSM_TILE_LAYER_JS}
 
       var marker;
       if (point.approx) {
@@ -5517,7 +5586,12 @@ router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: 
 // `provider.poststed` first — that field literally IS the postal address,
 // which is the one place Daniel's spec says poststed still belongs
 // ("poststed bare som del av selve postadressen").
-function gardssalgPlaceLabel(p: { kommune?: string | null; poststed?: string | null; fylke?: string | null }): string {
+// Exported alongside gardssalgMapPresentation() above, same reuse rationale
+// (GET /admin/gardssalg-geo-marker-diagnostic, routes/opplevelser.ts, AC4b:
+// surfacing the SAME `sted` label the profile page renders, not a
+// re-derived one, so a diagnostic-vs-render mismatch can't hide a real
+// poststed/kommune drift).
+export function gardssalgPlaceLabel(p: { kommune?: string | null; poststed?: string | null; fylke?: string | null }): string {
   return (p.kommune || p.poststed || p.fylke || "").trim();
 }
 

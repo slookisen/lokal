@@ -232,6 +232,16 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round1.body.transitioned, 1, "obs-6b: transitioned mirrors status_transitions (Skive B)");
       assertEq(round1.body.by_new_status?.pending_verify, 1, "obs-6c: by_new_status names the resulting status of the one real transition");
 
+      // dev-request-derived (2026-09-15, verified-regression observability):
+      // `by_transition` / `pending_verify_processed` / `pending_verify_outcomes`.
+      // Round 1's one processed row started at review_required (NOT
+      // pending_verify), so pending_verify_processed/outcomes must be empty
+      // here even though a real transition happened — proving these two new
+      // fields track prior status specifically, not "any transition".
+      assertEq(round1.body.by_transition, { "review_required->pending_verify": 1 }, "trans-1: by_transition keys the one processed row by its full from->to pair");
+      assertEq(round1.body.pending_verify_processed, 0, "trans-2: round 1's processed row started at review_required, not pending_verify, so pending_verify_processed=0");
+      assertEq(round1.body.pending_verify_outcomes, {}, "trans-3: pending_verify_outcomes empty when no pending_verify-origin row was processed");
+
       // dev-request 2026-08-17-verifier-tick-lock, requirement (c): the
       // non-skipped response shape must be byte-identical to what this
       // route returned before the lock was added — no field silently
@@ -242,8 +252,10 @@ export function runAdminRunVerifierDrainObservabilityTests(
         "pending_verify", "data_insufficient", "http_unreachable",
         "brreg_inactive", "domain_incoherent", "email_domain_mismatch",
         "thin_content", "pool_added", "status_transitions", "transitioned",
-        "by_new_status", "persisted", "envelope_recorded", "hour_utc",
-        "forced", "tick_lock_skipped", "reprocess_review_queue", "bias_growth",
+        "by_new_status", "by_transition", "pending_verify_processed",
+        "pending_verify_outcomes", "persisted", "envelope_recorded",
+        "hour_utc", "forced", "tick_lock_skipped", "reprocess_review_queue",
+        "bias_growth",
       ].sort();
       assertEq(
         Object.keys(round1.body).sort(),
@@ -276,6 +288,19 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round2.body.pool_added, 0, "obs-10: round 2 pool_added=0 (no first-time promotion — consistent with status_transitions=0)");
       assertEq(round2.body.transitioned, 0, "obs-9b: transitioned=0 on a re-confirmation round (this is the exact case the dev-request's root-cause report was misled by when it read `passed` instead)");
       assertEq(Object.keys(round2.body.by_new_status ?? {}).length, 0, "obs-9c: by_new_status is empty when nothing transitioned");
+
+      // Round 2 re-processes the SAME agent, now prior=pending_verify (round
+      // 1's real transition), and it re-confirms pending_verify again
+      // (status_transitions=0 per obs-9 above). This is exactly the
+      // "no-op" case by_new_status cannot represent (it only counts
+      // CHANGED rows) but by_transition/pending_verify_* must: proves
+      // by_transition surfaces a same->same pair that by_new_status omits,
+      // and that pending_verify_processed/outcomes correctly picks up a
+      // pending_verify-origin row even when nothing changed.
+      assertEq(round2.body.by_transition, { "pending_verify->pending_verify": 1 }, "trans-4: by_transition records the pending_verify->pending_verify no-op pair");
+      assertEq(round2.body.by_new_status, {}, "trans-5: by_new_status stays empty for that SAME no-op row (genuinely different semantics from by_transition, not a duplicate field)");
+      assertEq(round2.body.pending_verify_processed, 1, "trans-6: round 2's one row WAS pending_verify-origin, so pending_verify_processed=1 despite status_transitions=0");
+      assertEq(round2.body.pending_verify_outcomes, { pending_verify: 1 }, "trans-7: pending_verify_outcomes shows the row landed back on pending_verify");
 
       const row2 = db
         .prepare(`SELECT last_verified_at FROM agent_knowledge WHERE agent_id = ?`)
@@ -447,6 +472,165 @@ export function runAdminRunVerifierDrainObservabilityTests(
         { success: true, skipped: true, reason: `already ran this hour (locked by ${lockRowBefore?.run_id} at ${lockRowBefore?.started_at})` },
         "skip-lock-9: round 6 (plain force=1, no skip_tick_lock) is still correctly blocked by the still-held lock — unaffected by round 5's bypass",
       );
+      // ── by_transition / pending_verify_processed / pending_verify_outcomes
+      // — mixed-outcome coverage (2026-09-15, verified-regression
+      // observability). Fresh, isolated in-memory DB so the batch selector
+      // picks up EXACTLY the fixtures below — no interference from the
+      // pending_verify/review_required agents rounds 1-6 above left behind
+      // in `db`.
+      //
+      // Both fixtures avoid `website` (no live HTTP HEAD-fetch) and rely on
+      // TWO deterministic, network-independent outcomes:
+      //   - a free-mail contact email (gmail.com) is coherence-exempt, so
+      //     the basic gate's failure (no website) alone decides the
+      //     outcome: pending_verify (deriveVerificationStatus's default
+      //     when the gate fails and no Brreg/NACE flags are present — and
+      //     Brreg lookups fail closed/null offline in this sandbox, same as
+      //     rounds 1-6 above).
+      //   - a NON-free-mail contact email whose host does not match
+      //     agents.url's host (and has no homepage-provenance rescue) makes
+      //     domainCoherenceCheck return coherent:false, which
+      //     unconditionally forces review_required regardless of the basic
+      //     gate's own result (src/agents/lokal-agent-verifier.ts, the
+      //     `if (!coherence.coherent) newVerification = "review_required"`
+      //     override) — this is what gives us a SECOND, distinct new_status
+      //     without needing any live network call.
+      const db2 = new Database(":memory:");
+      try {
+        initMod.__setDbForTesting(db2 as any);
+        initMod.__initSchemaForTesting(db2 as any);
+
+        const insertAgent2 = db2.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_verified)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.com', 'https://example.no', 'producer', ?, 0)`,
+        );
+        const insertKnowledge2 = db2.prepare(
+          `INSERT INTO agent_knowledge
+             (agent_id, address, phone, website, email, about, products, field_provenance, verification_status)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+        );
+
+        // Stays pending_verify (free-mail email, coherence-exempt; basic
+        // gate fails on the missing website; no override applies) — this
+        // is the "no-op" outcome by_new_status cannot show.
+        insertAgent2.run("agent-pv-stays", "PV Stays AS", "key-pv-stays");
+        insertKnowledge2.run(
+          "agent-pv-stays",
+          "Testveien 4, 1400 Ski",
+          "91234570",
+          "info@gmail.com",
+          "Kort tekst.",
+          "[]",
+          JSON.stringify({}),
+          "pending_verify",
+        );
+
+        // Flips to review_required (non-free-mail email host mismatched
+        // against agents.url's host -> domain-incoherence override) — a
+        // genuine pending_verify -> review_required transition, distinct
+        // from the first fixture's outcome.
+        insertAgent2.run("agent-pv-flips", "PV Flips AS", "key-pv-flips");
+        insertKnowledge2.run(
+          "agent-pv-flips",
+          "Testveien 5, 1400 Ski",
+          "91234571",
+          "kontakt@totallyunrelated-pvflips.no",
+          "Kort tekst.",
+          "[]",
+          JSON.stringify({}),
+          "pending_verify",
+        );
+
+        const { default: router2 } = require("./admin-run-verifier") as { default: any };
+        const mixedRound = await callRoute(router2, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: { force: "1", reprocess_review_queue: "0", batchSize: "5", bias_growth: "0" },
+          body: {},
+        });
+
+        assertEq(mixedRound.status, 200, "mix-1: mixed-outcome round responds 200");
+        assertEq(mixedRound.body.processed, 2, "mix-2: mixed-outcome round processed exactly the 2 seeded pending_verify agents");
+        assertEq(
+          mixedRound.body.pending_verify_processed,
+          2,
+          "mix-3: pending_verify_processed counts both pending_verify-origin rows",
+        );
+        assertEq(
+          mixedRound.body.pending_verify_outcomes,
+          { pending_verify: 1, review_required: 1 },
+          "mix-4: pending_verify_outcomes breaks the 2 pending_verify-origin rows down by resulting status",
+        );
+        assertEq(
+          mixedRound.body.by_transition,
+          { "pending_verify->pending_verify": 1, "pending_verify->review_required": 1 },
+          "mix-5: by_transition has the right pending_verify->X keys with the right counts",
+        );
+        // by_new_status only counts CHANGED rows — the pending_verify->pending_verify
+        // no-op must NOT appear there, proving by_transition and by_new_status carry
+        // genuinely different information rather than duplicating one another.
+        assertEq(
+          mixedRound.body.by_new_status,
+          { review_required: 1 },
+          "mix-6: by_new_status omits the no-op pending_verify->pending_verify row (only counts the real transition)",
+        );
+      } finally {
+        initMod.__setDbForTesting(db as any);
+      }
+
+      // ── Zero pending_verify rows in the batch ──────────────────────────
+      const db3 = new Database(":memory:");
+      try {
+        initMod.__setDbForTesting(db3 as any);
+        initMod.__initSchemaForTesting(db3 as any);
+
+        const insertAgent3 = db3.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_verified)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.com', 'https://example.no', 'producer', ?, 0)`,
+        );
+        const insertKnowledge3 = db3.prepare(
+          `INSERT INTO agent_knowledge
+             (agent_id, address, phone, website, email, about, products, field_provenance, verification_status)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+        );
+
+        // prior=unverified (NOT pending_verify) — domain-incoherent email
+        // forces review_required, same mechanism as agent-pv-flips above,
+        // just starting from a different prior status so this batch
+        // contains zero pending_verify-origin rows.
+        insertAgent3.run("agent-zero-pv", "Zero PV AS", "key-zero-pv");
+        insertKnowledge3.run(
+          "agent-zero-pv",
+          "Testveien 6, 1400 Ski",
+          "91234572",
+          "kontakt@totallyunrelated-zeropv.no",
+          "Kort tekst.",
+          "[]",
+          JSON.stringify({}),
+          "unverified",
+        );
+
+        const { default: router3 } = require("./admin-run-verifier") as { default: any };
+        const zeroRound = await callRoute(router3, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: { force: "1", reprocess_review_queue: "0", batchSize: "5", bias_growth: "0" },
+          body: {},
+        });
+
+        assertEq(zeroRound.status, 200, "zero-1: zero-pending_verify round responds 200");
+        assertEq(zeroRound.body.processed, 1, "zero-2: zero-pending_verify round processed the 1 seeded (non-pending_verify) agent");
+        assertEq(zeroRound.body.pending_verify_processed, 0, "zero-3: pending_verify_processed=0 when no pending_verify rows were in the batch");
+        assertEq(zeroRound.body.pending_verify_outcomes, {}, "zero-4: pending_verify_outcomes={} when no pending_verify rows were in the batch");
+        assertTrue(
+          Object.keys(zeroRound.body.by_transition ?? {}).length >= 1,
+          "zero-5: by_transition is still populated for the non-pending_verify row that WAS processed",
+        );
+      } finally {
+        initMod.__setDbForTesting(db as any);
+      }
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

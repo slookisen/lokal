@@ -635,6 +635,51 @@ export async function runGardssalgWebsiteVerificationScan(
   return scanGardssalgWebsiteVerificationRows(producers, fetchFn, concurrency);
 }
 
+// ─── Sweep offset persistence (dev-request 2026-09-15-website-verification-
+// sweep-offset-persistence) ─────────────────────────────────────────────────
+//
+// Every scheduled enrichment run (scheduled-agents/experiences-enrichment.md
+// Step 3f) is a fresh, memoryless caller: it pages POST .../gardssalg-
+// website-verification-remediation starting its own local offset variable at
+// 0 every run. That paginates fine WITHIN one run, but each NEW run starts
+// over at 0 too, so the sweep re-scans the same ~48-row window forever and
+// never reaches the rest of the (potentially ~598-row, cohort=all)
+// population. These two functions are the persisted memory the route itself
+// now keeps, keyed by cohort — see gardssalg_website_verification_sweep_state
+// (database/init-experiences.ts) for the table and the POST route's own doc
+// comment for exactly when each is called (only on the omitted-`offset`
+// path — an explicit `offset` in the request stays purely request-driven,
+// unchanged from before this dev-request).
+
+/** Absence of a row (fresh DB, or a cohort never swept via the omitted-
+ *  offset path yet) means "resume from 0" — never throws. */
+export function getGardssalgWebsiteVerificationSweepOffset(db: Database.Database, cohort: GsWvCohort): number {
+  const row = db
+    .prepare(`SELECT next_offset FROM gardssalg_website_verification_sweep_state WHERE cohort = ?`)
+    .get(cohort) as { next_offset: number } | undefined;
+  return row?.next_offset ?? 0;
+}
+
+/** Persist where the NEXT omitted-offset call for this cohort should resume.
+ *  Pass `null` (the shape `pagination.next_offset` itself uses) when the
+ *  cohort was exhausted this call — persisted as 0, so the FOLLOWING call
+ *  starts a fresh pass through the cohort rather than being stuck reporting
+ *  "nothing left" forever. */
+export function setGardssalgWebsiteVerificationSweepOffset(
+  db: Database.Database,
+  cohort: GsWvCohort,
+  nextOffset: number | null
+): void {
+  const value = nextOffset ?? 0;
+  db.prepare(
+    `INSERT INTO gardssalg_website_verification_sweep_state (cohort, next_offset, updated_at)
+     VALUES (@cohort, @next_offset, datetime('now'))
+     ON CONFLICT(cohort) DO UPDATE SET
+       next_offset = excluded.next_offset,
+       updated_at = excluded.updated_at`
+  ).run({ cohort, next_offset: value });
+}
+
 // ─── Plan (Part B — read-only) ──────────────────────────────────────────────
 
 /**
