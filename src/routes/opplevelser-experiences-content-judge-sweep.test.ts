@@ -56,6 +56,12 @@
  *       to RANDOM() (asserted on SQL mechanism via a db.prepare() spy, never
  *       on probabilistic output difference); sample:"random" combined with
  *       apply:true is rejected 400 BEFORE any SELECT or write runs.
+ *   (j) dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-
+ *       innhold: `never_checked_remaining` (count of eligible rows with
+ *       admission_checked_at IS NULL, measured before this call's writes)
+ *       and `queue_exhausted` (true only for sample:"queue" once that count
+ *       is 0 — this batch is a re-pass, not a first pass; always false for
+ *       sample:"random").
  */
 
 export interface TestSummary {
@@ -561,6 +567,43 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         } finally {
           (expDb as any).prepare = originalPrepare;
         }
+      }
+
+      // ── (j) dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-
+      //      innhold (queue_exhausted-flagg-skiven): `never_checked_remaining`
+      //      / `queue_exhausted` — additive, read-only, computed BEFORE this
+      //      call's own writes. State entering this block (from (f) above):
+      //      61 total eligible, 56 already checked (6 main cohort + 50 of the
+      //      55 cap rows), 5 never-checked (cjs-cap-50..54). ────────────────
+      {
+        // (j-1) queue mode, never-checked rows still remain -> not exhausted.
+        const r1 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { limit: 1 } });
+        assertEq(r1.body.never_checked_remaining, 5, "cjs-j1: 5 never-checked rows remain (5 unprocessed cap rows)");
+        assertEq(r1.body.queue_exhausted, false, "cjs-j2: sample:'queue' with never-checked rows remaining -> not exhausted");
+
+        // (j-2) sample:"random" reports the same count but is NEVER "exhausted"
+        // — the concept doesn't apply to random evidence-gathering sampling.
+        const r2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "random", limit: 1 } });
+        assertEq(r2.body.never_checked_remaining, 5, "cjs-j3: sample:'random' reports the same never_checked_remaining count");
+        assertEq(r2.body.queue_exhausted, false, "cjs-j4: sample:'random' is always queue_exhausted:false, regardless of admission_checked_at state");
+
+        // (j-3) drive the remaining 5 never-checked rows to checked (default
+        // limit 50 >= 5, never-checked-first ordering picks them up first).
+        const r3 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true } });
+        assertEq(r3.body.never_checked_remaining, 5, "cjs-j5: this call's OWN flag reflects state BEFORE its writes — still 5, not 0, even though this call's writes just consumed them");
+        assertEq(r3.body.queue_exhausted, false, "cjs-j6: same call -> still not exhausted (pre-write measurement)");
+
+        // (j-4) the NEXT call now sees zero never-checked rows -> exhausted.
+        const r4 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { limit: 1 } });
+        assertEq(r4.body.never_checked_remaining, 0, "cjs-j7: after (j-3)'s apply, zero never-checked rows remain");
+        assertEq(r4.body.queue_exhausted, true, "cjs-j8: sample:'queue' with zero never-checked rows -> exhausted (this batch is a re-pass)");
+        assertTrue(r4.body.scanned > 0, "cjs-j9: an exhausted queue still scans rows (re-pass over already-checked rows), scanned is never forced to 0");
+
+        // (j-5) sample:"random" remains false even once the queue is genuinely
+        // exhausted — the field is queue-mode-specific by definition.
+        const r5 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "random", limit: 1 } });
+        assertEq(r5.body.never_checked_remaining, 0, "cjs-j10: sample:'random' reports the now-zero count too");
+        assertEq(r5.body.queue_exhausted, false, "cjs-j11: sample:'random' is still queue_exhausted:false even though the queue is genuinely exhausted");
       }
     } catch (err: any) {
       failed++;

@@ -25568,8 +25568,24 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
 // { success, dry_run, batch_id, scanned, counts:{match,mismatch,unresolved,
 // description_nulled,published_in_sample}, results:[{id,verdict,reason,
 // verification_status,description_nulled,would_be_action|action_taken}],
-// remaining }. `remaining` = rows still eligible by the same WHERE clause
-// past this call's `limit` cap.
+// remaining, never_checked_remaining, queue_exhausted }. `remaining` = rows
+// still eligible by the same WHERE clause past this call's `limit` cap.
+//
+// `never_checked_remaining` / `queue_exhausted` (dev-request 2026-08-25-
+// experiences-retro-opprydding-boilerplate-innhold, queue_exhausted-flagg-
+// skiven): `never_checked_remaining` is the count of eligible rows with
+// `admission_checked_at IS NULL`, measured BEFORE this call's own writes.
+// `queue_exhausted` is `true` only when `sample:"queue"` AND that count is
+// 0 — i.e. this batch (and every batch since the last never-checked row
+// was consumed) is a RE-pass over already-judged rows, not a first-pass
+// sweep. Always `false` for `sample:"random"` (the "one full pass done"
+// concept does not apply to random evidence-gathering sampling). Neither
+// field changes row selection, ordering, or any write — read-only
+// observability so a caller looping `apply:true` calls can stop once a
+// pass genuinely completes instead of re-judging already-checked rows
+// forever (see the 2026-09-13 mass-apply build-log entry: >1000 rows were
+// re-judged unnecessarily before this was noticed via manual id-uniqueness
+// counting).
 //
 // `sample` (optional, "queue" | "random", body or query — query wins,
 // mirrors `limit` above): dev-request 2026-08-31-content-judge-sweep-sampling.
@@ -25717,6 +25733,24 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
 
     const totalEligible = (
       expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE}`).get() as { n: number }
+    ).n;
+
+    // dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold
+    // (queue_exhausted-flagg-skiven, 2026-09-17): `sample:"queue"` has no
+    // "done" signal of its own — once every never-checked row has been
+    // judged at least once, the ordering below silently falls back to
+    // re-serving the oldest-checked rows (`scanned` stays at `limit`
+    // forever, never 0). Measured BEFORE this call's own writes (same
+    // "state going into this call" discipline `wasNeedsReview`/
+    // `published_in_sample` use below), so a caller looping apply:true
+    // calls can tell "this batch is a first-pass batch" from "this batch
+    // is already a re-pass" without counting row ids across calls itself
+    // (which is how the 2026-09-13 mass-apply run discovered >1000
+    // unnecessary re-judgements after the fact).
+    const neverCheckedRemaining = (
+      expDb
+        .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND admission_checked_at IS NULL`)
+        .get() as { n: number }
     ).n;
 
     const sweepOrderBy =
@@ -25958,6 +25992,8 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       remaining: Math.max(0, totalEligible - rows.length),
       needs_review_before: needsReviewBefore,
       needs_review_after: needsReviewAfter,
+      never_checked_remaining: neverCheckedRemaining,
+      queue_exhausted: sampleMode === "queue" && neverCheckedRemaining === 0,
     });
   } catch (err) {
     if (sendEnrichmentWritePausedIfPaused(err, res)) return;
