@@ -76,6 +76,13 @@ export type VerifierTickResult =
       by_transition: Record<string, number>;
       pending_verify_processed: number;
       pending_verify_outcomes: Record<string, number>;
+      // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+      // forklaring-og-uten-reevaluering, punkt 3: mirrors
+      // pending_verify_processed's own shape/naming convention exactly,
+      // just scoped to review_required-origin rows instead. See the
+      // derivation next to pendingVerifyProcessed below for why.
+      review_required_reevaluated: number;
+      review_required_promoted: number;
       persisted: true;
       envelope_recorded: boolean;
       reprocess_review_queue: boolean;
@@ -156,12 +163,22 @@ export async function runVerifierTick(opts: {
   // still uses pickReviewQueueBatch).
   const biasGrowth = opts.biasGrowth === undefined ? true : !!opts.biasGrowth;
 
+  // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+  // og-uten-reevaluering, punkt 2: the daily/hourly tick (this function,
+  // NOT the manual reprocess_review_queue=1 admin drain — that path
+  // already selects ALL review_required rows via pickReviewQueueBatch, so
+  // adding the stale-only picker there would be pure redundancy) also
+  // additively re-checks up to 40 review_required rows whose
+  // verifier_verdict_as_of is older than 7 days, oldest first — see
+  // pickStaleReviewRequiredBatch's own doc comment in lokal-agent-
+  // verifier.ts. Additive only: candidates pickFn already returned are
+  // never duplicated (runVerifierBatch dedupes by agent id).
   const batchResult = await runVerifierBatch(
     reprocessReviewQueue
       ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup }
       : biasGrowth
-        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup }
-        : { batchSize, brregLookup: resolveBrregLookup }
+        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true }
+        : { batchSize, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true }
   );
   const results = batchResult.results;
 
@@ -238,6 +255,21 @@ export async function runVerifierTick(opts: {
     }
   }
 
+  // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+  // og-uten-reevaluering, punkt 3: same derivation shape as
+  // pendingVerifyProcessed above, over review_required-origin rows instead
+  // — counts EVERY row this run processed that started at review_required
+  // (whether picked up via the stale-review_required merge above or via
+  // pickFn's own normal selection, e.g. pickReviewQueueBatch/pickBatchBiased
+  // already touching a review_required row), and how many of those this
+  // run promoted all the way to `verified`.
+  const reviewRequiredReevaluated = results.filter(
+    (r) => r.prior_verification_status === "review_required"
+  ).length;
+  const reviewRequiredPromoted = results.filter(
+    (r) => r.prior_verification_status === "review_required" && r.new_verification_status === "verified"
+  ).length;
+
   // Build envelope and record directly via service (no HTTP roundtrip)
   const envelope: any = buildRunEnvelope({
     run_id: batchResult.run_id,
@@ -276,6 +308,8 @@ export async function runVerifierTick(opts: {
     by_transition: byTransition,
     pending_verify_processed: pendingVerifyProcessed,
     pending_verify_outcomes: pendingVerifyOutcomes,
+    review_required_reevaluated: reviewRequiredReevaluated,
+    review_required_promoted: reviewRequiredPromoted,
     persisted: true,
     envelope_recorded: envelopeRecorded,
     reprocess_review_queue: reprocessReviewQueue,
@@ -382,6 +416,8 @@ router.post("/", async (req: Request, res: Response) => {
       by_transition: tick.by_transition,
       pending_verify_processed: tick.pending_verify_processed,
       pending_verify_outcomes: tick.pending_verify_outcomes,
+      review_required_reevaluated: tick.review_required_reevaluated,
+      review_required_promoted: tick.review_required_promoted,
       persisted: tick.persisted,
       envelope_recorded: tick.envelope_recorded,
       hour_utc: hourUTC,

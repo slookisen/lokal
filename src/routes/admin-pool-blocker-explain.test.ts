@@ -435,6 +435,164 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       assertEq(a.in_pool, false, "l2: VIEW excludes the under-threshold partial row");
     }
 
+    // ── (m) dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+    //     forklaring-og-uten-reevaluering, punkt 1: quarantine:* reason
+    //     mapping for review_required rows. --
+    {
+      // m1: inference_only_fields (array, from the stored verdict) -> one
+      // quarantine:inference_only_fields(<field>) blocker per field.
+      insertAgent({
+        id: "pbe-inf",
+        name: "Inferensgard",
+        website: "https://inferensgard.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@inferensgard.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-inf'`,
+      ).run(JSON.stringify({ inference_only_fields: ["address", "phone"] }));
+
+      const rInf = await callExplain({ agentId: "pbe-inf" });
+      const aInf = rInf.body.agents[0];
+      assertTrue(
+        aInf.pool_blockers.includes("quarantine:inference_only_fields(address)"),
+        "m1a: names the inference-only address field",
+      );
+      assertTrue(
+        aInf.pool_blockers.includes("quarantine:inference_only_fields(phone)"),
+        "m1b: names the inference-only phone field",
+      );
+
+      // m2: website_ownership_unverified read DIRECTLY from field_provenance
+      // (the historical-coverage path — the verifier only started
+      // persisting this onto the stored verdict as of this same
+      // dev-request, so pre-existing quarantined rows only have the
+      // field_provenance trace).
+      insertAgent({
+        id: "pbe-wou-fp",
+        name: "Feilanker Gard",
+        website: "https://feilanker.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@feilanker.no",
+        fieldProvenance: JSON.stringify({ website_ownership: { status: "unverified" } }),
+      });
+      const rWouFp = await callExplain({ agentId: "pbe-wou-fp" });
+      assertTrue(
+        rWouFp.body.agents[0].pool_blockers.includes("quarantine:website_ownership_unverified"),
+        "m2: website_ownership_unverified read straight from field_provenance",
+      );
+
+      // m3: website_ownership_unverified via the (new) stored-verdict flag —
+      // the path future verifier runs will use.
+      insertAgent({
+        id: "pbe-wou-verdict",
+        name: "Feilanker Gard 2",
+        website: "https://feilanker2.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@feilanker2.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-wou-verdict'`,
+      ).run(JSON.stringify({ website_ownership_unverified: true }));
+      const rWouVerdict = await callExplain({ agentId: "pbe-wou-verdict" });
+      assertTrue(
+        rWouVerdict.body.agents[0].pool_blockers.includes("quarantine:website_ownership_unverified"),
+        "m3: website_ownership_unverified read from the stored verdict flag",
+      );
+
+      // m4: domain_incoherent gets the quarantine:-prefixed blocker TOO,
+      // alongside the pre-existing (unprefixed) domain_incoherent blocker
+      // from block (i) — reuses that same pbe-dc fixture.
+      const rDc = await callExplain({ agentId: "pbe-dc" });
+      assertTrue(
+        rDc.body.agents[0].pool_blockers.some((b: string) =>
+          b.startsWith("quarantine:domain_incoherent(") && b.includes("egetdomene.no")
+        ),
+        "m4: quarantine:domain_incoherent(...) carries the verifier's own reason text",
+      );
+
+      // m5: corroborated_email_missing read from the pre-existing, always-
+      // persisted email_website_gate.corroborated_email boolean.
+      insertAgent({
+        id: "pbe-cem-gate",
+        name: "Uverifisert Epost Gard",
+        website: "https://uverifisertepost.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@uverifisertepost.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-cem-gate'`,
+      ).run(JSON.stringify({ email_website_gate: { corroborated_email: false } }));
+      const rCemGate = await callExplain({ agentId: "pbe-cem-gate" });
+      assertTrue(
+        rCemGate.body.agents[0].pool_blockers.includes("quarantine:corroborated_email_missing"),
+        "m5: corroborated_email_missing read from email_website_gate.corroborated_email=false",
+      );
+
+      // m6: corroborated_email_missing via the (new) explicit top-level flag.
+      insertAgent({
+        id: "pbe-cem-flag",
+        name: "Uverifisert Epost Gard 2",
+        website: "https://uverifisertepost2.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@uverifisertepost2.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-cem-flag'`,
+      ).run(JSON.stringify({ corroborated_email_missing: true }));
+      const rCemFlag = await callExplain({ agentId: "pbe-cem-flag" });
+      assertTrue(
+        rCemFlag.body.agents[0].pool_blockers.includes("quarantine:corroborated_email_missing"),
+        "m6: corroborated_email_missing read from the explicit top-level flag",
+      );
+
+      // m7: reason_missing fallback — review_required, clean stored verdict
+      // AND clean field_provenance -> the route must NEVER silently report
+      // zero quarantine blockers for a review_required row.
+      insertAgent({
+        id: "pbe-unknown-reason",
+        name: "Ukjent Årsak Gard",
+        website: "https://ukjentarsak.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@ukjentarsak.no",
+        fieldProvenance: "{}",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-unknown-reason'`,
+      ).run(JSON.stringify({}));
+      const rUnknown = await callExplain({ agentId: "pbe-unknown-reason" });
+      assertTrue(
+        rUnknown.body.agents[0].pool_blockers.includes("quarantine:reason_missing"),
+        "m7: an unrecognized/empty stored verdict falls back to quarantine:reason_missing, never a silent empty list",
+      );
+
+      // m8: quarantine:* reasons are ONLY emitted for review_required rows —
+      // a pending_verify row with the SAME stored-verdict shapes must get
+      // NONE of them (even though the JSON parses fine).
+      insertAgent({
+        id: "pbe-not-review",
+        name: "Ikke Review Gard",
+        website: "https://ikkereview.no",
+        about: "Gard i test.",
+        verificationStatus: "pending_verify",
+        email: "post@ikkereview.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-not-review'`,
+      ).run(JSON.stringify({ inference_only_fields: ["address"], corroborated_email_missing: true }));
+      const rNotReview = await callExplain({ agentId: "pbe-not-review" });
+      assertTrue(
+        !rNotReview.body.agents[0].pool_blockers.some((b: string) => b.startsWith("quarantine:")),
+        "m8: quarantine:* blockers are scoped to review_required rows only",
+      );
+    }
+
     // ── (h) read-only: no writes happen --
     {
       const before = testDb.prepare("SELECT * FROM agent_knowledge WHERE agent_id = 'pbe-f1'").get();
