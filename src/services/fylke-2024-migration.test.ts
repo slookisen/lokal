@@ -19,12 +19,18 @@
  *      Gáivuotna/Kárášjohka/Guovdageaidnu), plus regression checks that the
  *      canonical Sami names and the kommunenummer-based path both still
  *      resolve unaffected
+ *   9. resolveKommunenummerForName() (dev-request 2026-09-14-opplevagent-
+ *      karantene-utgang-brreg-krav, Trinn B) — reuses the SAME loadRows()/
+ *      kommuneKey()/KOMMUNE_NAME_ALIASES machinery as resolveFylke2024()
+ *      above: unambiguous name -> {kommunenummer}, the Herøy/Våler
+ *      collisions -> needs_review, unknown/blank name -> needs_review,
+ *      Sami-name aliases resolve.
  *
  * Run standalone: npx tsx src/services/fylke-2024-migration.test.ts
  * Wired into tests/test.ts via runFylke2024MigrationTests().
  */
 
-import { resolveFylke2024 } from "./fylke-2024-migration";
+import { resolveFylke2024, resolveKommunenummerForName } from "./fylke-2024-migration";
 
 export interface TestSummary {
   passed: number;
@@ -206,6 +212,69 @@ export function runFylke2024MigrationTests(opts: { log?: boolean } = {}): TestSu
     resolveFylke2024({ kommunenummer: "5612" }),
     { fylke: "Finnmark" },
     "8j: kommunenummer 5612 (Guovdageaidnu/Kautokeino) resolves to {fylke: 'Finnmark'} — kommunenummer path unaffected"
+  );
+
+  // ── 9. resolveKommunenummerForName() (Trinn B) ───────────────────────
+  assertEq(
+    resolveKommunenummerForName("Oslo"),
+    { kommunenummer: "0301" },
+    "9a: unambiguous kommune name 'Oslo' resolves to {kommunenummer: '0301'}",
+  );
+  assertEq(
+    resolveKommunenummerForName("tromso"),
+    { kommunenummer: "5501" },
+    "9b: case/diacritic-insensitive ('tromso' -> Tromsø's 5501)",
+  );
+  assertEq(
+    resolveKommunenummerForName("  Oslo  "),
+    { kommunenummer: "0301" },
+    "9c: trims surrounding whitespace",
+  );
+  const heroyKnrResult = resolveKommunenummerForName("Herøy");
+  assertTrue(
+    "needs_review" in heroyKnrResult && heroyKnrResult.needs_review.startsWith("ambiguous_or_unknown_kommune:"),
+    "9d: the same 'Herøy' name collision as resolveFylke2024() -> needs_review, never guessed",
+  );
+  const valerKnrResult = resolveKommunenummerForName("Våler");
+  assertTrue(
+    "needs_review" in valerKnrResult && valerKnrResult.needs_review.startsWith("ambiguous_or_unknown_kommune:"),
+    "9e: the same 'Våler' name collision as resolveFylke2024() -> needs_review, never guessed",
+  );
+  assertEq(
+    resolveKommunenummerForName("Ikke-En-Ekte-Kommune-Xyz"),
+    { needs_review: "ambiguous_or_unknown_kommune:Ikke-En-Ekte-Kommune-Xyz" },
+    "9f: an unrecognised kommune name -> needs_review:ambiguous_or_unknown_kommune:<value>",
+  );
+  assertEq(
+    resolveKommunenummerForName(""),
+    { needs_review: "ambiguous_or_unknown_kommune:" },
+    "9g: blank name -> needs_review (never a guess)",
+  );
+  assertEq(
+    resolveKommunenummerForName("   "),
+    { needs_review: "ambiguous_or_unknown_kommune:" },
+    "9h: whitespace-only name -> needs_review (never a guess)",
+  );
+  // Sami-name aliases, mirroring §8 above.
+  assertEq(
+    resolveKommunenummerForName("Kåfjord"),
+    { kommunenummer: "5540" },
+    "9i: Norwegian name 'Kåfjord' (vendored table only has Sami 'Gáivuotna') resolves to {kommunenummer: '5540'}",
+  );
+  assertEq(
+    resolveKommunenummerForName("Karasjok"),
+    { kommunenummer: "5610" },
+    "9j: Norwegian name 'Karasjok' resolves to {kommunenummer: '5610'}",
+  );
+  assertEq(
+    resolveKommunenummerForName("Kautokeino"),
+    { kommunenummer: "5612" },
+    "9k: Norwegian name 'Kautokeino' resolves to {kommunenummer: '5612'}",
+  );
+  assertEq(
+    resolveKommunenummerForName("Gáivuotna"),
+    { kommunenummer: "5540" },
+    "9l: canonical Sami name 'Gáivuotna' still resolves directly, unaffected by the alias",
   );
 
   return { passed, failed, failures };

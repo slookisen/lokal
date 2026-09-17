@@ -685,6 +685,21 @@ import {
   BRREG_RECHECK_BACKFILL_DEFAULT_LIMIT,
   BRREG_RECHECK_BACKFILL_MAX_LIMIT,
 } from "../services/experience-brreg-recheck-backfill";
+// dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav, Trinn B —
+// the fuzzy name-search recheck above (and Trinn A, a separate not-yet-
+// merged slice extracting a labeled org.nr from the provider's own website)
+// still leave many providers stuck at brreg_active IS NULL. This third,
+// independent path searches Brreg by NAME restricted to the provider's own
+// KOMMUNE, accepting a hit only on exactly-one-hit or an address/domain
+// corroboration among several — see services/experience-orgnr-from-name-
+// kommune.ts's own header for the full decision rule. POST
+// /admin/experiences-orgnr-from-name-kommune below.
+import {
+  experienceOrgnrFromNameKommuneTick,
+  experienceOrgnrFromNameKommuneQueueStatus,
+  EXPERIENCE_ORGNR_NAME_KOMMUNE_DEFAULT_LIMIT,
+  EXPERIENCE_ORGNR_NAME_KOMMUNE_MAX_LIMIT,
+} from "../services/experience-orgnr-from-name-kommune";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
 // endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
@@ -2231,6 +2246,90 @@ router.post(
       });
     } catch (err) {
       console.error("[opplevelser] admin/experiences-provider-brreg-recheck-backfill failed", err);
+      res.status(500).json({ success: false, error: "Internal error" });
+    }
+  }
+);
+
+// ─── POST /api/opplevelser/admin/experiences-orgnr-from-name-kommune (admin) ──
+//
+// dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav, Trinn B.
+// The sibling route immediately above re-runs classifyProvider()'s Brreg
+// NAME search for brreg_active IS NULL providers, and Trinn A (a separate,
+// not-yet-merged slice) extracts a labeled org.nr straight off a provider's
+// own website — but both still leave many providers stuck at brreg_active
+// IS NULL (a common/ambiguous name with no website org.nr label). This
+// route is a third, independent path: Brreg's `GET /enheter?navn=<navn>&
+// kommunenummer=<knr>` search, restricted to the provider's own kommune.
+// Daniel's exact confirmation rule (see services/experience-orgnr-from-
+// name-kommune.ts's own header for the full rationale): accept a hit only
+// when there is exactly ONE hit, OR one of several hits is corroborated by
+// a matching forretningsadresse (street+house-number) or a matching
+// Brreg-registered website domain. Several hits with no such corroboration
+// (or several INDEPENDENTLY corroborated hits) are left unresolved —
+// `ambiguous_name` — never guessed.
+//
+// Dry-run-default, admin-key-gated (requireAdmin), STRICT `dry_run` parse —
+// only the literal JSON boolean `false` runs apply mode (same idiom as the
+// sibling routes above). `limit` clamped to
+// [1, EXPERIENCE_ORGNR_NAME_KOMMUNE_MAX_LIMIT] (default
+// EXPERIENCE_ORGNR_NAME_KOMMUNE_DEFAULT_LIMIT). `after` is the keyset
+// pagination cursor (same convention as the sibling routes) — pass back the
+// previous call's `next_after` so a repeat call converges across the
+// backlog.
+//
+// Enrichment write-pause fence: apply (dry_run:false) only; dry-run is never
+// blocked (same convention as every other apply-mode writer in this file).
+//
+// Response: { success, dry_run, limit, status_before:{eligible},
+// status_after:{eligible}, processed, resolved_active, resolved_inactive,
+// no_kommune_match, no_brreg_hits, ambiguous_name, orgnr_collision, errors,
+// skipped_due_to_time_budget, duration_ms, next_after,
+// planned:[{provider_id, navn, outcome, org_nr, detail}] }.
+router.post(
+  "/admin/experiences-orgnr-from-name-kommune",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as { dry_run?: unknown; limit?: unknown; after?: unknown };
+      // STRICT-FALSE parse (same idiom as the sibling routes above): writes
+      // execute ONLY on the JSON boolean false.
+      const dryRun = body.dry_run !== false;
+
+      // Enrichment write-pause fence — apply (dry_run:false) only; dry-run is
+      // never blocked. Placed BEFORE any Brreg lookup.
+      if (!dryRun) {
+        const pauseBlock = experiencesWritePauseBlock();
+        if (pauseBlock) {
+          res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+          return;
+        }
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          EXPERIENCE_ORGNR_NAME_KOMMUNE_MAX_LIMIT,
+          typeof body.limit === "number" && Number.isFinite(body.limit)
+            ? Math.floor(body.limit)
+            : EXPERIENCE_ORGNR_NAME_KOMMUNE_DEFAULT_LIMIT
+        )
+      );
+      const after = typeof body.after === "string" ? body.after : undefined;
+
+      const statusBefore = experienceOrgnrFromNameKommuneQueueStatus();
+      const result = await experienceOrgnrFromNameKommuneTick(limit, { dryRun, after });
+      const statusAfter = experienceOrgnrFromNameKommuneQueueStatus();
+
+      res.json({
+        success: true,
+        limit,
+        status_before: statusBefore,
+        status_after: statusAfter,
+        ...result,
+      });
+    } catch (err) {
+      console.error("[opplevelser] admin/experiences-orgnr-from-name-kommune failed", err);
       res.status(500).json({ success: false, error: "Internal error" });
     }
   }
