@@ -17,6 +17,7 @@ import { knowledgeService } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { getConfig } from "../config/vertical-config";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { isJunkDescription } from "../services/description-quality";
 
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -376,7 +377,12 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
         // here is the difference between Perplexity citing hommegaard.no vs.
         // rettfrabonden.com/produsent/homme-gard-ovrebo.
         parts.push(`Profil: ${BASE_URL}/produsent/${slugify(a.name)}`);
-        if (k?.about) {
+        // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+        // beskrivelser: this dump bypassed the render-time description guard
+        // every other surface consults, so gambling copy from a hijacked
+        // domain (and nav junk, code artifacts, internal notes) reached AI
+        // engines verbatim. Same guard, same suppression as GET /agents.
+        if (k?.about && !isJunkDescription(k.about)) {
           // Redact PII from about text before including in AI-readable dump.
           // Emails and Norwegian phone numbers must not appear in /llms-full.txt.
           // Take extra chars before redaction so truncation doesn't expose a partial address.

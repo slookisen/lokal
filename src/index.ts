@@ -74,6 +74,7 @@ import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminAgentsDescriptionCodeArtifactSweepRoutes from "./routes/admin-agents-description-code-artifact-sweep";
 import adminAgentsInternalNoteSweepRoutes from "./routes/admin-agents-internal-note-sweep";
 import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-correction";
+import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
@@ -665,6 +666,11 @@ app.use(
 // siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/internal-note-sweep", adminLimiter, adminAgentsInternalNoteSweepRoutes);
 app.use("/admin/agents/content-correction", adminLimiter, adminAgentsContentCorrectionRoutes);
+// POST /admin/agents/theme-spam-sweep (dev-request 2026-09-16-kaprede-
+// produsentdomener-kasino-spam-i-beskrivelser): clears gambling copy scraped
+// off hijacked/lapsed producer domains + the hijacked website itself. Same
+// ordering rule as the siblings above — mount BEFORE /admin/agents.
+app.use("/admin/agents/theme-spam-sweep", adminLimiter, adminAgentsThemeSpamSweepRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
 // state that services/enrichment-write-pause.ts enforces on every enrichment

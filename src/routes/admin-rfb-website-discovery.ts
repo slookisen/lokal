@@ -64,7 +64,7 @@ import { renderPage, shouldEscalateToRender } from "../services/render-page";
 // Norwegian transliterator -- read-only reuse, not reimplemented -- for the
 // IDN-host marker-check normalization in rfbWdPageReferencesOwnHost below.
 import { decodePunycodeLabel, transliterateNorwegian } from "../services/cross-source-validator";
-import { braveSearch, type BraveResult } from "../services/search-enrich";
+import { braveSearch, pageLooksLikeThemeSpam, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
@@ -699,6 +699,15 @@ async function tryRfbWebsiteCandidateHost(
   // etc.), so this is a real, site-side diagnostic, not a guess.
   if (!result.ok) {
     excludedHere.push({ host, reason: `fetch_failed:${result.reason}` });
+    return null;
+  }
+  // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser:
+  // a candidate host that serves online-casino copy is a hijacked/lapsed
+  // domain, never the producer's site — exclude it BEFORE the evidence match
+  // and the LLM judge ever see it, so a squatter page that still carries the
+  // old brand name in its title cannot be GODKJENT back onto the profile.
+  if (pageLooksLikeThemeSpam(result.html)) {
+    excludedHere.push({ host, reason: "theme_spam_page" });
     return null;
   }
 

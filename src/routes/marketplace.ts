@@ -26,7 +26,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
-import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote } from "../services/description-quality";
+import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
@@ -471,6 +471,11 @@ router.post("/register", (req: Request, res: Response) => {
     // shape, for an enrichment routine's own verification note.
     if (hasInternalNote(registration.description)) {
       res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
+      return;
+    }
+    // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser.
+    if (looksLikeThemeSpam(registration.description)) {
+      res.status(400).json({ success: false, error: "description looks like gambling/theme spam (hijacked domain) — rejected" });
       return;
     }
 
@@ -1231,6 +1236,12 @@ function descriptionWriteGuardError(description: unknown): { status: number; bod
   }
   if (hasInternalNote(description as string | null | undefined)) {
     return { status: 400, body: { error: "description contains an internal pipeline note — rejected" } };
+  }
+  // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser:
+  // gambling copy scraped off a hijacked/lapsed producer domain — same door,
+  // same shape as the two gates above.
+  if (looksLikeThemeSpam(description as string | null | undefined)) {
+    return { status: 400, body: { error: "description looks like gambling/theme spam (hijacked domain) — rejected" } };
   }
   return null;
 }
@@ -2227,6 +2238,11 @@ router.post("/admin/register", (req: Request, res: Response) => {
     // shape, for an enrichment routine's own verification note.
     if (hasInternalNote(registration.description)) {
       res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
+      return;
+    }
+    // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser.
+    if (looksLikeThemeSpam(registration.description)) {
+      res.status(400).json({ success: false, error: "description looks like gambling/theme spam (hijacked domain) — rejected" });
       return;
     }
 

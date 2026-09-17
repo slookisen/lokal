@@ -114,6 +114,7 @@ import {
   summarizeAbout,
   mapToPlatformCategories,
   meetsAboutQualityBar,
+  pageLooksLikeThemeSpam,
 } from "../services/search-enrich";
 import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
 // dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
@@ -131,7 +132,7 @@ import { checkAboutCandidateSubstantiatedBySource } from "../services/about-sour
 // had zero content validation on `description` before this. Same detector,
 // same rejection message shape as marketplace.ts's three gates; see the
 // write site below (agentColumnUpdates) for the call.
-import { looksLikeCodeArtifact, hasInternalNote } from "../services/description-quality";
+import { looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 
 const router = Router();
 
@@ -706,6 +707,13 @@ router.put("/", (req: Request, res: Response) => {
       res.status(400).json({ error: "about contains code/script artifacts — rejected" });
       return;
     }
+    // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+    // beskrivelser: same door, same shape, for gambling copy scraped off a
+    // hijacked/lapsed producer domain.
+    if (looksLikeThemeSpam(body.about)) {
+      res.status(400).json({ error: "about looks like gambling/theme spam (hijacked domain) — rejected" });
+      return;
+    }
     columnUpdates.push({ col: "about", val: body.about });
   }
   // dev-request 2026-09-09-outreach-profilkvalitet: strip a trailing ", Norge"
@@ -798,6 +806,13 @@ router.put("/", (req: Request, res: Response) => {
     // for existing rows rather than the only defence.
     if (hasInternalNote(body.description)) {
       res.status(400).json({ error: "description contains an internal pipeline note — rejected" });
+      return;
+    }
+    // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+    // beskrivelser: gambling copy from a hijacked/lapsed domain, same gate
+    // shape as the two above.
+    if (looksLikeThemeSpam(body.description)) {
+      res.status(400).json({ error: "description looks like gambling/theme spam (hijacked domain) — rejected" });
       return;
     }
     agentColumnUpdates.push({ col: "description", val: body.description });
@@ -1851,6 +1866,20 @@ homepageContentRefreshRouter.post(
       }
       if (!dryRun) recordHcrFetchSuccess(agentId);
       const { primaryHtml, combinedHtml, fetchUrl } = fetched;
+      // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+      // beskrivelser: THIS loop is the path that wrote the live casino copy
+      // (provenance last_verified 2026-09-11..16 on all four hijacked
+      // profiles) — the stored website still answers 200, so the fetch
+      // "succeeds", and summarizeAbout() dutifully extracts the casino site's
+      // meta description. A hijacked/lapsed domain is not a source: skip the
+      // agent entirely, write nothing, and say so in the run output.
+      if (pageLooksLikeThemeSpam(primaryHtml)) {
+        console.log(
+          `[homepage-content-refresh] ${agentId} SKIPPED — ${fetchUrl} looks like gambling/theme spam (hijacked or lapsed domain); nothing written`,
+        );
+        errors.push({ agent_id: agentId, error: `theme_spam_page for ${fetchUrl}` });
+        return;
+      }
 
       // Run the PR-22 extractors on the fetched HTML.
       const contentText = extractVisibleText(combinedHtml);
@@ -1901,6 +1930,18 @@ homepageContentRefreshRouter.post(
             });
             console.log(
               `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
+            );
+          } else if (looksLikeThemeSpam(aboutSummary)) {
+            // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+            // beskrivelser: belt-and-braces behind the page-level skip above —
+            // a summary that reads like gambling copy never becomes a
+            // candidate, whatever the page looked like as a whole.
+            skippedUnsubstantiated.push({
+              agent_id: agentId,
+              reason: "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)",
+            });
+            console.log(
+              `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
             );
           } else {
             candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
