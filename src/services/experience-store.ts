@@ -95,7 +95,11 @@ import { normaliseName } from "./brreg-client";
 // (isContentFieldHomepageSourced below) needs the SAME eTLD+1 comparison
 // GET /admin/providers/recently-enriched already uses, not a second
 // reimplementation.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
+// collapseDomain: dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
+// listenavn-varianter — getProviderByDomain() (below) needs the SAME
+// hyphen-insensitive eTLD+1 comparison PR-126 already established for
+// cross-source domain equivalence, not a second reimplementation.
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, collapseDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 1: the shared provider_work_queue hand-off table between the
 // sweep/berikelse/discovery gårdssalg pipelines — used here only to
@@ -1986,6 +1990,68 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
       .prepare("SELECT * FROM experience_providers WHERE lower(trim(navn)) = lower(trim(?)) LIMIT 1")
       .get(navn) as Record<string, unknown>) ?? null
   );
+}
+
+/**
+ * Find a provider by domain (registrable eTLD+1, hyphen-insensitive). Used
+ * by bulk-load (dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
+ * listenavn-varianter) as a THIRD dedup fallback after org_nr/name both
+ * miss: the production incident this closes is two rows for the same
+ * producer — "Smakfulle Rom" (existing) vs "Smakfulle Rom – Konferanse,
+ * Event & Catering" (a harvested variant of the same listing name) — sharing
+ * one website but never matching by exact name or org_nr.
+ *
+ * Uses the SAME eTLD+1 comparison pipeline as the rest of this file
+ * (hostFromUrlLike + registrableDomain), plus collapseDomain() for
+ * hyphen-insensitivity (PR-126: `lia-gard.no` vs `liagard.no` is one
+ * company, not two) — never a third domain-normalization helper. Iterates
+ * rows with a non-blank hjemmeside and compares in JS (same pattern as
+ * gardssalgContentExclusionReason's host-count scan above), since the
+ * registrable domain isn't a column SQL can compute directly.
+ *
+ * Null/empty/unparseable input (and a candidate site with no domain-bearing
+ * providers on file) returns null rather than throwing — this is a
+ * best-effort dedup lookup, not a validator.
+ *
+ * `candidateOrgNr` (dev-request 2026-09-16 CHANGES-REQUESTED fix-up, PR #872
+ * review): a shared domain is NOT proof of shared identity when both sides
+ * carry a KNOWN, DIFFERENT org_nr — e.g. two franchise/underenhet legal
+ * entities sharing one corporate/parking domain. That combination
+ * (candidate has its own resolved org_nr AND the domain-matched row already
+ * has a non-null org_nr that differs from it) is affirmative proof of two
+ * DISTINCT legal entities, so the domain signal must never override two
+ * known-different org_nrs — the row is skipped and the scan continues as if
+ * it were never a match, same "don't guess when two real entities are both
+ * visible" precedent as flagNameCollision/name_collision in
+ * experience-brreg.ts. A row with a NULL org_nr (never Brreg-verified) is
+ * unaffected and still matches, exactly as before this fix.
+ */
+export function getProviderByDomain(
+  website: string | null | undefined,
+  candidateOrgNr?: string | null,
+): Record<string, unknown> | null {
+  if (!website) return null;
+  const candidateHost = hostFromUrlLike(website);
+  if (!candidateHost) return null;
+  const candidateDomain = collapseDomain(registrableDomain(candidateHost));
+
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare(
+      `SELECT * FROM experience_providers
+        WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`
+    )
+    .all() as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const rowHost = hostFromUrlLike(row.hjemmeside as string);
+    if (!rowHost) continue;
+    const rowDomain = collapseDomain(registrableDomain(rowHost));
+    if (rowDomain !== candidateDomain) continue;
+    const rowOrgNr = row.org_nr as string | null | undefined;
+    if (candidateOrgNr && rowOrgNr && rowOrgNr !== candidateOrgNr) continue;
+    return row;
+  }
+  return null;
 }
 
 // ─── Homepage-content enrichment (orch-experiences-content-refresh) ──

@@ -16,7 +16,10 @@ import {
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
-import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail } from "../services/blocklist-service";
+// normalizeName is aliased: this file already has its own local
+// normalizeName() (fuzzy-match helper for /find-match, further down) with
+// DIFFERENT rules — the blocklist guard below must use the blocklist's own.
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -3243,9 +3246,42 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
           }
         }
 
+        // Survivor-name guard (dev-request 2026-09-16-delete-agent-collateral-
+        // name-blocklist — the exact same collateral as the email guard above,
+        // one identifier over). blocklistAdd() derives a `name_normalized` row
+        // from the deleted agent's name; when a duplicate row is deleted, the
+        // surviving verified row with the SAME normalized name (different
+        // agent_id) is then suppressed at the outreach gate — measured in prod
+        // 2026-09-16: 11 of 20 raw-pool candidates blocked by legacy rows.
+        // Same reasoning as the email guard: the just-deleted row is already
+        // gone from `agents`, so every remaining is_active=1 row with the same
+        // normalized name is by definition a different agent — no agentId
+        // exclusion needed. Only the name identifier is skipped when a
+        // survivor exists; agentId/website/email are handled exactly as before
+        // (email keeps its own guard above) and agentNameForAudit still
+        // records the name so original_agent_name stays populated.
+        //
+        // Deliberately NOT reimplemented in SQL: normalizeName() transliterates
+        // æ/ø/å and strips punctuation, so any LOWER(name) = / LIKE pre-filter
+        // would drift from it (e.g. "Øvre-Eide Gård" vs "ovre eide gard" share
+        // no raw LOWER() prefix). Instead select every active row's name and
+        // compare with the SAME exported function in JS. That is a full scan
+        // of `agents` (~1.7k rows) — acceptable on a low-frequency admin
+        // DELETE, and it cannot disagree with what blocklistAdd() will write.
+        let nameHasActiveSurvivor = false;
+        const normalizedNameToBlock = blocklistNormalizeName(agent.name);
+        if (normalizedNameToBlock) {
+          const activeNames = db.prepare(
+            "SELECT name FROM agents WHERE is_active = 1 AND name IS NOT NULL"
+          ).all() as Array<{ name: string }>;
+          nameHasActiveSurvivor = activeNames.some(
+            (row) => blocklistNormalizeName(row.name) === normalizedNameToBlock
+          );
+        }
+
         blocklistResult = blocklistAdd({
           agentId,
-          name: agent.name,
+          name: nameHasActiveSurvivor ? undefined : agent.name,
           website: fromRegistry?.url,
           email: emailHasActiveSurvivor ? undefined : fromRegistry?.contactEmail,
           reason: req.body?.reason || "auto-blocklisted on admin DELETE",

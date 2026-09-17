@@ -148,3 +148,61 @@ export function resolveFylke2024(opts: {
 
   return { needs_review: "no_kommune_data" };
 }
+
+/**
+ * isKnownKommunenummer(kommunenummer) — true iff the given kommunenummer is
+ * an exact match against the vendored table's `kommunenummer` field (same
+ * lookup resolveFylke2024() already does for its own kommunenummer branch).
+ * Blank/whitespace-only -> false, never a lookup. No normalization/fuzzy
+ * matching — kommunenummer is a structured code, not free text, so unlike
+ * the kommune-NAME matching above there is nothing to fold/alias here.
+ *
+ * Added for dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav,
+ * Trinn B fix-up (independent-reviewer finding on
+ * services/experience-orgnr-from-name-kommune.ts's
+ * resolveCandidateKommunenummer(): a candidate row's OWN kommunenummer
+ * column was being trusted with zero validation, unlike the sibling
+ * name-fallback branch — this closes that gap so a typo'd/stale/wrong
+ * kommunenummer can no longer silently restrict a Brreg search to the
+ * wrong kommune).
+ */
+export function isKnownKommunenummer(kommunenummer: string): boolean {
+  const nr = (kommunenummer || "").trim();
+  if (!nr) return false;
+  return loadRows().some((r) => r && typeof r.kommunenummer === "string" && r.kommunenummer.trim() === nr);
+}
+
+export type ResolveKommunenummerResult = { kommunenummer: string } | { needs_review: string };
+
+/**
+ * resolveKommunenummerForName(kommune) — resolve a free-text kommune NAME to
+ * its kommunenummer, reusing the SAME loadRows()/kommuneKey()/
+ * KOMMUNE_NAME_ALIASES machinery resolveFylke2024() already uses above (no
+ * duplicated alias table, no duplicated disambiguator regex).
+ *
+ * Added for dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav,
+ * Trinn B (navn + kommune Brreg search) — that slice's own service
+ * (services/experience-orgnr-from-name-kommune.ts) needs a provider's own
+ * free-text `kommune` column turned into a `kommunenummer` for Brreg's
+ * `enheter?navn=…&kommunenummer=…` query param, for the (minority of) rows
+ * whose own `kommunenummer` column is blank.
+ *
+ * Same never-guess convention as resolveFylke2024(): zero or more than one
+ * name match (blank/unknown kommune, or one of the vendored table's own
+ * genuine name collisions, e.g. Herøy/Våler) -> `{needs_review: "ambiguous_
+ * or_unknown_kommune:<value>"}` — exactly Trinn B's own spec wording ("rader
+ * der kommune ikke er en kommune hoppes over og telles"). Never picks a
+ * "best" match among 2+.
+ */
+export function resolveKommunenummerForName(kommune: string): ResolveKommunenummerResult {
+  const value = typeof kommune === "string" ? kommune.trim() : "";
+  if (!value) return { needs_review: "ambiguous_or_unknown_kommune:" };
+
+  const rows = loadRows();
+  let qKey = kommuneKey(value);
+  if (!qKey) return { needs_review: `ambiguous_or_unknown_kommune:${value}` };
+  if (qKey in KOMMUNE_NAME_ALIASES) qKey = KOMMUNE_NAME_ALIASES[qKey];
+  const matches = rows.filter((r) => r && typeof r.kommunenavn === "string" && kommuneKey(r.kommunenavn) === qKey);
+  if (matches.length === 1) return { kommunenummer: matches[0].kommunenummer };
+  return { needs_review: `ambiguous_or_unknown_kommune:${value}` };
+}

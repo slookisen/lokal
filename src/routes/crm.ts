@@ -267,7 +267,7 @@ router.post("/contacts/:id/notes", (req, res) => {
 router.get("/threads", (req, res) => {
   const contactEmail = (req.query.contact_email as string | undefined)?.trim() || undefined;
   const explicitStatus = req.query.status as string | undefined;
-  const allowed = ["new", "in_progress", "awaiting_review", "done", "archived"] as const;
+  const allowed = ["new", "in_progress", "awaiting_review", "awaiting_confirmation", "awaiting_grace", "done", "archived"] as const;
 
   let status: string | undefined;
   if (explicitStatus) {
@@ -300,7 +300,13 @@ router.get("/threads/:id", (req, res) => {
 // ─── POST /admin/crm/threads/:id/status ──────────────────────
 router.post("/threads/:id/status", (req, res) => {
   const schema = z.object({
-    status: z.enum(["new", "in_progress", "awaiting_review", "done", "archived"]),
+    // awaiting_confirmation/awaiting_grace: the two B3 opt-out steps
+    // (scheduled-agents/rfb-customer-service.md line 664/670) — added
+    // 2026-09-16, dev-request 2026-09-14-crm-thread-status-enum-mangler-
+    // b3-opt-out-verdier. Until then the SKILL prescribed these two values
+    // but this endpoint 400'd on both, so B3 always fell back to
+    // awaiting_review.
+    status: z.enum(["new", "in_progress", "awaiting_review", "awaiting_confirmation", "awaiting_grace", "done", "archived"]),
     actor: z.enum(["claude", "daniel", "system"]).optional(),
   });
   const parsed = schema.safeParse(req.body);
@@ -944,6 +950,26 @@ router.post("/compose", async (req, res) => {
   }
 });
 
+/**
+ * dev-request 2026-09-16-crm-ingest-alias-gate-autoroute (FUNN
+ * crm-ingest-alias-gate-blokkerer-ekte-eierrettelser): a reply from a sender
+ * already on file as a known contact of exactly ONE vertical is not the same
+ * kind of "cannot tell" as a message with no recognizable recipient at all —
+ * it just arrived somewhere other than a platform alias (forwarded, replied
+ * to Daniel's personal inbox, cc-only, etc). classifyEmail() already has the
+ * exact/domain matching this needs, dispatched per vertical (dental has no
+ * entity table and is deliberately not tried). Returns the single vertical to
+ * auto-route to, or null if neither/both verticals produced a producer match
+ * — the same "a coin flip is not a decision" discipline
+ * ambiguous_platform_addresses already applies to header conflicts.
+ */
+function autoRouteByKnownContact(fromEmail: string): CrmVertical | null {
+  const rfbHit = crmService.classifyEmail(fromEmail, "rfb").type === "producer";
+  const experiencesHit = crmService.classifyEmail(fromEmail, "experiences").type === "producer";
+  if (rfbHit === experiencesHit) return null; // neither, or both — stay parked, don't guess
+  return rfbHit ? "rfb" : "experiences";
+}
+
 // ─── POST /admin/crm/ingest ──────────────────────────────────
 // Called by the CS-agent each run with new/updated threads.
 router.post("/ingest", (req, res) => {
@@ -976,7 +1002,35 @@ router.post("/ingest", (req, res) => {
           `refusing to let an asserted value override the headers`
         : null;
 
-    if (refusal !== null || !outcome.routed) {
+    // Contact-match fallback — ONLY for the specific "no recipient header names
+    // a platform alias" refusal, never for no_signals, ambiguous_platform_addresses,
+    // or the asserted-vertical-mismatch refusal above: those three are genuinely
+    // undecidable and must keep parking exactly as before. This one case is
+    // different — a known contact's own address is unambiguous evidence of
+    // which vertical they belong to, even though it didn't arrive at an alias.
+    const autoRoutedVertical =
+      !outcome.routed && outcome.code === "no_platform_address"
+        ? autoRouteByKnownContact(parsed.data.primaryFromEmail)
+        : null;
+
+    if (autoRoutedVertical !== null) {
+      // Distinct from a header-derived route so a human can tell them apart
+      // later (contactId is unknown here — the contact/thread rows are
+      // created below by ingestThread — so this logs against neither, same
+      // as classifyEmail's own null-contactId convention for a not-yet-
+      // existing row).
+      crmService.logAction({
+        type: "crm_ingest_auto_routed_by_contact_match",
+        actor: "system",
+        payload: {
+          threadId: parsed.data.threadId,
+          fromEmail: parsed.data.primaryFromEmail,
+          vertical: autoRoutedVertical,
+          refusalReason: refusal,
+        },
+      });
+      vertical = autoRoutedVertical;
+    } else if (refusal !== null || !outcome.routed) {
       const first = parsed.data.messages[0];
       const parked = parkUntriaged({
         threadId: parsed.data.threadId,
@@ -1017,9 +1071,9 @@ router.post("/ingest", (req, res) => {
         reason: refusal ?? "unroutable",
         openUntriaged: countOpenUntriaged(),
       });
+    } else {
+      vertical = outcome.vertical;
     }
-
-    vertical = outcome.vertical;
   } else {
     // superRefine guarantees this branch has a vertical.
     vertical = parsed.data.vertical as CrmVertical;

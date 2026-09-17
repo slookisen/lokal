@@ -745,3 +745,99 @@ export async function findOrgnumberByName(
   lookupCache.set(cacheKey, result);
   return result;
 }
+
+// ─── Name+kommune search, raw hits (dev-request 2026-09-14-opplevagent- ──
+//     karantene-utgang-brreg-krav, Trinn B) ───────────────────────────────
+//
+// findOrgnumberByName() above collapses to a single best-SCORED hit and has
+// no kommunenummer param — not usable for Trinn B, whose own decision rule
+// (services/experience-orgnr-from-name-kommune.ts) is exact-one-hit-vs-
+// ambiguous, never "highest score wins". This is a second, independent
+// search entry point: GET /enheter?navn=<navn>&kommunenummer=<knr>&size=5,
+// returning the RAW hits, unscored — Trinn B applies its OWN corroboration
+// rule (exact-one-hit / address-match / domain-match) on top of these, not
+// this file's score>=0.9 rule (that rule stays exactly as-is for every
+// existing findOrgnumberByName caller — nothing here changes it).
+//
+// Empirically verified (2026-09-17, manual curl against the real Brreg API)
+// that `kommunenummer` is honoured as a genuine server-side filter, not
+// ignored: a kommune with no matching entity returns 0 hits, not the
+// unfiltered name-only count.
+//
+// Same fetch/timeout/error-handling/JSON-parsing shape as findOrgnumberByName
+// above (fetchWithTimeout, BRREG_BASE_URL/BRREG_SEARCH_PATH, try/catch-
+// returns-empty-array-never-throws) — deliberately not merged into that
+// function, which has its own callers relying on its existing single-best-
+// hit/scored-threshold return shape.
+export type BrregNameKommuneHit = {
+  orgnumber: string;
+  name: string;
+  address: string | null;
+};
+
+// Own small per-process cache, keyed "<name>|<kommunenummer>" — mirrors
+// lookupCache's convention above. Caching here is a nice-to-have (Trinn B's
+// batches are small and each row is looked up at most once per tick), not a
+// requirement — kept simple and separate from lookupCache/verifyCache/etc.
+const nameKommuneCache: Map<string, BrregNameKommuneHit[]> = new Map();
+
+export function __clearBrregNameKommuneCacheForTesting(): void {
+  nameKommuneCache.clear();
+}
+
+/**
+ * searchBrregByNameAndKommune(navn, kommunenummer) — GET /enheter?navn=
+ * <navn>&kommunenummer=<knr>&size=5, returning the raw hits (orgnumber,
+ * name, formatted address), completely UNSCORED. Never throws: any network/
+ * parse error resolves to an empty array (same convention as
+ * findOrgnumberByName's own try/catch-returns-null, adapted to this
+ * function's array return shape) — a caller must treat an empty array as
+ * "no hits found", indistinguishable from a genuine zero-hit Brreg response.
+ */
+export async function searchBrregByNameAndKommune(
+  navn: string,
+  kommunenummer: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregNameKommuneHit[]> {
+  const cleanName = (navn || "").trim();
+  const cleanKommunenummer = (kommunenummer || "").trim();
+  if (!cleanName || !cleanKommunenummer) return [];
+
+  const cacheKey = `${normaliseName(cleanName)}|${cleanKommunenummer}`;
+  if (nameKommuneCache.has(cacheKey)) return nameKommuneCache.get(cacheKey) ?? [];
+
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}?navn=${encodeURIComponent(cleanName)}&kommunenummer=${encodeURIComponent(cleanKommunenummer)}&size=5`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    console.warn("[brreg-client] searchBrregByNameAndKommune fetch failed:", err instanceof Error ? err.message : err);
+    return [];
+  }
+  if (!res.ok) return [];
+
+  let json: any;
+  try {
+    json = await res.json();
+  } catch {
+    return [];
+  }
+
+  const enheter: RawEnhet[] =
+    (json && json._embedded && Array.isArray(json._embedded.enheter))
+      ? json._embedded.enheter as RawEnhet[]
+      : [];
+
+  const hits: BrregNameKommuneHit[] = [];
+  for (const h of enheter) {
+    if (!h || typeof h.organisasjonsnummer !== "string" || typeof h.navn !== "string") continue;
+    hits.push({
+      orgnumber: h.organisasjonsnummer,
+      name: h.navn,
+      address: formatBrregAddress(h.forretningsadresse ?? h.postadresse ?? null),
+    });
+  }
+
+  nameKommuneCache.set(cacheKey, hits);
+  return hits;
+}

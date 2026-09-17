@@ -820,7 +820,12 @@ export function registrableDomain(host: string): string {
 // `lia-gard.no` and `liagard.no` as the same registrable entity, while
 // genuinely different domains (slakthuset.no vs eidsmokjott.no — the Eidsmo
 // case) remain non-equivalent and stay gated.
-function collapseDomain(root: string): string {
+//
+// Exported (dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
+// listenavn-varianter) so experience-store.ts's getProviderByDomain() can
+// reuse this SAME hyphen-insensitive comparison instead of duplicating it —
+// see that function's doc comment.
+export function collapseDomain(root: string): string {
   // Strip hyphens from labels; keep dots (label/TLD separators) intact.
   return root.replace(/-/g, "");
 }

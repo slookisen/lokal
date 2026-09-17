@@ -635,6 +635,18 @@ export async function runAdminEnrichmentWritePauseTests(
         // convention as the description-code-artifact sweep's own test file
         // above).
         "routes/opplevelser-experience-brreg-recheck-backfill.test.ts",
+        // experiences-orgnr-from-website (dev-request 2026-09-14-opplevagent-
+        // karantene-utgang-brreg-krav, Trinn A): a 20th route gated by the
+        // SAME shared opplevelser.ts helper, plus its own test file, which
+        // sets up pause state directly via the service to prove the wiring
+        // (same convention as its sibling recheck-backfill's own test file
+        // immediately above).
+        "routes/opplevelser-experience-orgnr-from-website.test.ts",
+        // experiences-orgnr-from-name-kommune (same dev-request, Trinn B): a
+        // 21st route gated by the SAME shared helper, plus its own test file,
+        // same convention as Trinn A immediately above. Both trinn landed
+        // independently; the merge keeps both entries.
+        "routes/opplevelser-experience-orgnr-from-name-kommune.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

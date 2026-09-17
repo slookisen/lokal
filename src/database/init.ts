@@ -931,7 +931,7 @@ function initSchema(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       contact_id TEXT NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
       subject TEXT,
-      status TEXT DEFAULT 'new' CHECK(status IN ('new','in_progress','awaiting_review','done','archived')),
+      status TEXT DEFAULT 'new' CHECK(status IN ('new','in_progress','awaiting_review','awaiting_confirmation','awaiting_grace','done','archived')),
       assigned_to TEXT DEFAULT 'unassigned' CHECK(assigned_to IN ('unassigned','claude','daniel')),
       category TEXT CHECK(category IN ('innkommende','system','marketing','leverandor','unknown')),
       severity TEXT DEFAULT 'normal' CHECK(severity IN ('p0','p1','p2','normal')),
@@ -1125,6 +1125,141 @@ function initSchema(db: Database.Database): void {
     }
   } catch (e) {
     console.warn("[init][cs-outbox-superseded] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  // crm_threads.status CHECK widened to include 'awaiting_confirmation' and
+  // 'awaiting_grace' — dev-request 2026-09-14-crm-thread-status-enum-mangler-
+  // b3-opt-out-verdier. The B3 opt-out flow (scheduled-agents/rfb-customer-
+  // service.md line 664/670) has always prescribed these two thread
+  // statuses, but the CHECK constraint here (and the route-level Zod enum
+  // in routes/crm.ts, fixed in the same PR) never accepted them — B3 always
+  // fell back to 'awaiting_review'. Same rebuild-table pattern as the
+  // crm_outbox migration above (SQLite can't ALTER a CHECK in place);
+  // idempotent — only runs when the current CHECK doesn't already include
+  // 'awaiting_grace'. crm_threads is a PARENT table (crm_messages/
+  // crm_actions ON DELETE CASCADE, crm_outbox ON DELETE SET NULL all
+  // reference it).
+  //
+  // CORRECTION (post-review, this same PR): an earlier version of this
+  // comment claimed "DROP TABLE never triggers FK action processing in
+  // SQLite (that only happens for DELETE/UPDATE/INSERT)" and skipped
+  // disabling the `foreign_keys` pragma on that basis. That claim is WRONG
+  // and was caught by an independent reviewer with a live repro against
+  // this exact migration: `getDb()` (this file, ~line 108) sets
+  // `foreign_keys = ON` before ever calling initSchema(), and with
+  // foreign_keys ON, SQLite's DROP TABLE on a table that is the target of
+  // other tables' FK constraints DOES perform an implicit cascade — every
+  // crm_messages/crm_actions row pointing at a dropped crm_threads row was
+  // being deleted (ON DELETE CASCADE) and every crm_outbox row nulled out
+  // (ON DELETE SET NULL) the moment `DROP TABLE crm_threads` ran below,
+  // silently wiping CRM message/action history on the first boot against
+  // any real existing database. Fix: `foreign_keys` is pragma'd OFF for the
+  // duration of the rebuild transaction and back ON immediately after
+  // (SQLite refuses to toggle this pragma mid-transaction, so both calls
+  // sit outside `tx()`, guarded by try/finally so a mid-rebuild exception
+  // can never leave the connection running with FK enforcement off).
+  //
+  // vertical_id (same near-miss the crm_outbox migration above already
+  // flagged for itself): this file's own CREATE TABLE for crm_threads
+  // (~line 930) predates Phase 4.6a and does NOT list vertical_id — that
+  // column only exists on any real/current database via the Phase 4.6a
+  // ALTER loop further below, which by now carries real per-vertical
+  // values ('dental', 'experiences', ...), not just 'rfb'. A rebuild whose
+  // column list omitted it would DROP the column entirely; the Phase 4.6a
+  // loop's `ADD COLUMN ... DEFAULT 'rfb'` would then re-add it fresh and
+  // silently reclassify every existing non-rfb thread as 'rfb'. Guard with
+  // its own ALTER first (idempotent, mirrors crm_outbox's vertical_id guard
+  // above) so the column is guaranteed present before the rebuild reads it,
+  // then carry it through explicitly in both the new table and the copy.
+  try {
+    db.exec("ALTER TABLE crm_threads ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'");
+  } catch (e) {
+    // column already exists — fine (expected: Phase 4.6a already added it)
+  }
+  try {
+    const schemaRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_threads'"
+    ).get() as { sql: string } | undefined;
+    const needsRebuild = schemaRow && !/'awaiting_grace'/.test(schemaRow.sql);
+    if (needsRebuild) {
+      // foreign_keys OFF for the rebuild — see the CORRECTION comment
+      // above. Both pragma calls sit OUTSIDE tx() on purpose: SQLite is a
+      // documented no-op if you try to toggle `foreign_keys` while a
+      // transaction is active, so doing this inside `db.transaction()`
+      // would silently fail to protect anything.
+      db.pragma("foreign_keys = OFF");
+      const tx = db.transaction(() => {
+        // Three crm_messages triggers reference crm_threads by name in
+        // their bodies (trg_update_thread_outbound_at,
+        // trg_log_cold_outreach_to_sent_log_v2,
+        // trg_log_cold_outreach_on_send_confirm_v2, all defined further
+        // below in this file). On any DB that already booted once before —
+        // exactly the case this migration exists for — those triggers
+        // already exist, and `ALTER TABLE ... RENAME TO crm_threads` fails
+        // ("no such table: main.crm_threads") while crm_threads is
+        // momentarily absent between the DROP and the RENAME below, because
+        // SQLite re-validates every schema object that references the
+        // renamed table as part of processing the RENAME itself. Drop them
+        // first; each is unconditionally recreated later in this same
+        // initSchema() boot pass (DROP TRIGGER IF EXISTS + CREATE TRIGGER,
+        // or CREATE TRIGGER IF NOT EXISTS), so no gap survives past this
+        // one boot, and the drop is idempotent (IF EXISTS) on a DB where
+        // they don't exist yet (a fresh install skips this branch entirely
+        // via the CHECK-already-widened needsRebuild guard, so IF EXISTS is
+        // pure insurance here).
+        db.exec(`DROP TRIGGER IF EXISTS trg_update_thread_outbound_at`);
+        db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_to_sent_log_v2`);
+        db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_on_send_confirm_v2`);
+        db.exec(`
+          CREATE TABLE crm_threads__b3_status_new (
+            id TEXT PRIMARY KEY,
+            contact_id TEXT NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+            subject TEXT,
+            status TEXT DEFAULT 'new' CHECK(status IN ('new','in_progress','awaiting_review','awaiting_confirmation','awaiting_grace','done','archived')),
+            assigned_to TEXT DEFAULT 'unassigned' CHECK(assigned_to IN ('unassigned','claude','daniel')),
+            category TEXT CHECK(category IN ('innkommende','system','marketing','leverandor','unknown')),
+            severity TEXT DEFAULT 'normal' CHECK(severity IN ('p0','p1','p2','normal')),
+            message_count INTEGER DEFAULT 0,
+            last_message_at TEXT,
+            last_inbound_at TEXT,
+            last_outbound_at TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            vertical_id TEXT NOT NULL DEFAULT 'rfb'
+          )
+        `);
+        db.exec(`
+          INSERT INTO crm_threads__b3_status_new
+            (id, contact_id, subject, status, assigned_to, category, severity,
+             message_count, last_message_at, last_inbound_at, last_outbound_at,
+             notes, created_at, updated_at, vertical_id)
+          SELECT id, contact_id, subject, status, assigned_to, category, severity,
+                 message_count, last_message_at, last_inbound_at, last_outbound_at,
+                 notes, created_at, updated_at, vertical_id
+          FROM crm_threads
+        `);
+        db.exec(`DROP TABLE crm_threads`);
+        db.exec(`ALTER TABLE crm_threads__b3_status_new RENAME TO crm_threads`);
+        // Indexes were dropped with the old table — recreate them now so
+        // the same boot doesn't leave them missing.
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_contact ON crm_threads(contact_id)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_status ON crm_threads(status)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_category ON crm_threads(category)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_threads_last_message ON crm_threads(last_message_at)`);
+      });
+      try {
+        tx();
+        console.log("[init][crm-thread-status-b3] crm_threads.status CHECK widened to include 'awaiting_confirmation'/'awaiting_grace'");
+      } finally {
+        // Always restore, even if tx() threw mid-rebuild — a connection
+        // left running with FK enforcement off would silently accept
+        // dangling references on every write for the rest of this process.
+        db.pragma("foreign_keys = ON");
+      }
+    }
+  } catch (e) {
+    console.warn("[init][crm-thread-status-b3] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
