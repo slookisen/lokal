@@ -3607,6 +3607,14 @@ export type GardssalgSearchFilter = {
   // without paging through a fylke — before this, discover_gardssalg had no
   // way to look a producer up by name at all.
   q?: string;
+  // ADMIN-ONLY (2026-09-17, follow-up to the dev-request above): when true,
+  // catalog_hidden=1 rows are NOT excluded. The single caller is the
+  // admin-key-gated POST /api/opplevelser/admin/booking-test-send, whose
+  // whole purpose is to hit the hidden, email-pinned test producer by name.
+  // Every public surface (discover_gardssalg, REST /discover, A2A,
+  // book_gardssalg, POST /book) leaves this unset and keeps the exclusion —
+  // opplevelser-gardssalg-one-shot-booking.test.ts pins that.
+  include_hidden?: boolean;
 };
 
 // Tokenise a free-text gårdssalg query the same way
@@ -3665,8 +3673,12 @@ export function searchGardssalgProviders(
   // rows must never surface here, regardless of what else is filtered.
   const where: string[] = [
     "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')",
-    "(catalog_hidden IS NULL OR catalog_hidden != 1)",
   ];
+  // See GardssalgSearchFilter.include_hidden — only the admin test-send route
+  // ever sets it; the public default keeps hidden rows out unconditionally.
+  if (filter.include_hidden !== true) {
+    where.push("(catalog_hidden IS NULL OR catalog_hidden != 1)");
+  }
   const params: Record<string, unknown> = {};
 
   if (filter.fylke) { where.push("fylke = @fylke"); params.fylke = filter.fylke; }
