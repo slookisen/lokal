@@ -29,6 +29,7 @@ import {
   BENIGN_BUSINESS_TOKENS,
 } from "./cross-source-validator";
 import { fetchPage, discoverContentLinks, type FetchPageResult } from "./fetch-page";
+import { looksLikeThemeSpam, countThemeSpamStrongHits } from "./description-quality";
 
 // ─── name stemming ───────────────────────────────────────────────────────────
 
@@ -1150,6 +1151,39 @@ export function looksLikeParkedDomainPage(html: string): boolean {
   if (visible.length >= PARKED_PAGE_MAX_VISIBLE_CHARS) return false;
   const hay = stripNorwegianAccents(visible.toLowerCase());
   return PARKED_PAGE_PHRASES.some((phrase) => hay.includes(phrase));
+}
+
+// ─── Theme-spam (hijacked-domain) page detector ─────────────────────────────
+// dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser.
+// Sibling of looksLikeParkedDomainPage above, for the OTHER thing a lapsed
+// producer domain turns into: an online-casino affiliate site. Live
+// 2026-09-16: mollerensylvia.no, mosboengaard.no, valdresvilt.com and
+// halaas-gardsutsalg.com all answer HTTP 200 with titles like «Beste casino
+// på nett i 2026» and 64–270 gambling words on the front page. Such a page
+// passes every liveness check, and its meta description is exactly what
+// summarizeAbout() extracts — which is how the copy reached
+// agent_knowledge.about and, from there, every public surface.
+//
+// Rule (PURE, conservative — a false positive costs a real producer its
+// enrichment fetch, a false negative puts gambling copy on a food profile):
+//   1. the <title> or a meta description trips looksLikeThemeSpam(), OR
+//   2. the opening visible text (first THEME_SPAM_PAGE_TEXT_CHARS chars)
+//      carries >= THEME_SPAM_PAGE_MIN_STRONG_HITS STRONG gambling phrases.
+// A real producer page that mentions "casino" once in a blog post fails
+// both. Callers treat a spam page exactly like a FAILED fetch: extract
+// nothing, write nothing.
+export const THEME_SPAM_PAGE_TEXT_CHARS = 5000;
+export const THEME_SPAM_PAGE_MIN_STRONG_HITS = 3;
+
+export function pageLooksLikeThemeSpam(html: string): boolean {
+  if (!html) return false;
+  const title = extractTitle(html);
+  if (title && looksLikeThemeSpam(title)) return true;
+  for (const meta of extractMetaDescriptions(html)) {
+    if (looksLikeThemeSpam(meta)) return true;
+  }
+  const visible = extractVisibleText(html).slice(0, THEME_SPAM_PAGE_TEXT_CHARS);
+  return countThemeSpamStrongHits(visible) >= THEME_SPAM_PAGE_MIN_STRONG_HITS;
 }
 
 // Norwegian visit/tasting keywords used by summarizeVisit() below — a page
@@ -2327,6 +2361,15 @@ export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidenc
   const primary = await fetchPageClassified(primaryUrl);
   if (!primary.ok) return null;
   const primaryHtml = primary.html;
+  // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser:
+  // a hijacked/lapsed domain serving gambling spam is NOT a usable source —
+  // treat it exactly like a failed fetch (extract nothing, write nothing), so
+  // every caller (enrichOneAgent, tynne-profiler generation, the opplevagent
+  // hjemmeside checks) refuses it with no per-caller wiring.
+  if (pageLooksLikeThemeSpam(primaryHtml)) {
+    console.log(`[theme-spam-gate] rejected ${primaryUrl} — page looks like gambling/theme spam (hijacked or lapsed domain); no evidence extracted`);
+    return null;
+  }
 
   const emails = new Set<string>(extractEmails(primaryHtml));
   const phones = new Set<string>(extractPhones(primaryHtml));

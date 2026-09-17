@@ -124,6 +124,14 @@ export function isJunkDescription(text: string | null | undefined): boolean {
   // comment further down this file for the full rationale/signal classes).
   if (looksLikeCodeArtifact(trimmed)) return true;
 
+  // Rule 0b: gambling/"theme spam" copied from a hijacked or lapsed producer
+  // domain (dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+  // beskrivelser) — see looksLikeThemeSpam's doc comment at the end of this
+  // file. Checked here, before the nav rules, so every existing display call
+  // site (lokal_search/lokal_info, producer pages, GET /agents, llms-full)
+  // suppresses it with no new wiring.
+  if (looksLikeThemeSpam(trimmed)) return true;
+
   const lower = trimmed.toLowerCase();
   const opening200 = lower.slice(0, 200);
   const opening150 = lower.slice(0, 150);
@@ -759,4 +767,102 @@ function safeFromCodePoint(cp: number): string {
  */
 export function normalizeProse(text: string | null | undefined): string {
   return stripInternalNotes(decodeHtmlEntities(text));
+}
+
+// ─── looksLikeThemeSpam — gambling/"theme spam" from a hijacked domain ───────
+//
+// dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser.
+// A FOURTH failure mode in this module, distinct from nav boilerplate (rules
+// 1–4), scraped code (looksLikeCodeArtifact) and internal notes: a producer's
+// domain lapsed or was hijacked and now serves an online-casino affiliate
+// site, and the homepage-content-refresh copied that site's meta description
+// into `agent_knowledge.about` (and from there into every public surface).
+// Live 2026-09-16, four producers (mollerensylvia.no, mosboengaard.no,
+// valdresvilt.com, halaas-gardsutsalg.com — all HTTP 200): «Se vår guide til
+// beste casino på nett i 2026 …», «Casino med Paysafecard lar deg gjøre
+// trygge innskudd uten kort …», «Hvorfor free spins er nøkkelen til de beste
+// casinoer …», «Ginja Casino i Norge tilbyr et profesjonelt nettcasino …».
+//
+// SAFETY POSTURE (same spirit as the rules above, read before editing):
+// a phrase LEXICON with word boundaries — never a bare substring on a common
+// word. Two signal classes:
+//   STRONG — ONE hit is enough: gambling vocabulary that has no place in a
+//            farm/producer self-description. Word-boundary anchored with the
+//            usual Norwegian inflections/compounds, so a street name like
+//            «Kasinoveien» does NOT match while «casinoer», «nettcasino»,
+//            «casinobonus» do.
+//   WEAK   — THREE distinct hits required: words gambling copy leans on but
+//            that also occur in ordinary prose one at a time (bonus,
+//            innskudd, uttak, odds, gevinst, spillere, lisensiert,
+//            spilltilbud). «spill» on its own is deliberately in NEITHER
+//            list — «spillbryggeri», «spill for barna» are normal producer
+//            text.
+// Validated 2026-09-17 against every live producer description/about
+// (1 616 non-empty rows): fires on exactly the four hijacked profiles and on
+// nothing else. A false positive here only costs a description its render
+// (same fallback as a missing one); a false negative leaves gambling copy on
+// a food-producer profile — so the bar sits at "high precision, decent
+// recall", with the page-level detector in search-enrich.ts
+// (pageLooksLikeThemeSpam) adding recall at the SOURCE.
+
+const THEME_SPAM_STRONG_RE: readonly RegExp[] = [
+  /\b(?:nett|live|online|mobil)?(?:casino|kasino)(?:er|et|ene|a|s|bonus|bonuser|guide|guiden|spill|side|sider|sidene|tilbud|anmeldelse|anmeldelser)?\b/i,
+  /\bspilleautomat(?:er|en|ene)?\b/i,
+  /\bfree ?spins?\b/i,
+  /\bgratis ?spinn\b/i,
+  /\bgambling\b/i,
+  /\bbookmaker(?:e|en|s|ne)?\b/i,
+  /\bpengespill(?:et|ene)?\b/i,
+  /\b(?:innskudds|velkomst)bonus(?:er|en|ene)?\b/i,
+  /\b(?:sports)?betting\b/i,
+  /\bpaysafecard\b/i,
+  /\bspillelisens(?:en|er)?\b/i,
+  /\bbankid-?uttak\b/i,
+];
+
+const THEME_SPAM_WEAK_RE: readonly RegExp[] = [
+  /\bbonus(?:er|en|ene)?\b/i,
+  /\binnskudd(?:et|ene)?\b/i,
+  /\buttak(?:et|ene)?\b/i,
+  /\bodds(?:en)?\b/i,
+  /\bgevinst(?:er|en|ene)?\b/i,
+  /\bspillere?\b/i,
+  /\blisensierte?\b/i,
+  /\bspilltilbud(?:et)?\b/i,
+];
+
+/** Distinct WEAK-list hits needed when no STRONG phrase is present. */
+export const THEME_SPAM_WEAK_MIN_DISTINCT = 3;
+
+/**
+ * True when `text` reads like online-gambling marketing copy — the content a
+ * hijacked/lapsed producer domain serves — rather than a producer
+ * description. PURE; see the doc comment above for the two-class rule.
+ */
+export function looksLikeThemeSpam(text: string | null | undefined): boolean {
+  if (!text || typeof text !== "string") return false;
+  const t = text.trim();
+  if (!t) return false;
+  if (THEME_SPAM_STRONG_RE.some((re) => re.test(t))) return true;
+  let weak = 0;
+  for (const re of THEME_SPAM_WEAK_RE) if (re.test(t)) weak++;
+  return weak >= THEME_SPAM_WEAK_MIN_DISTINCT;
+}
+
+/**
+ * Number of STRONG gambling-phrase occurrences in `text` (all matches, not
+ * distinct patterns). Used by the page-level detector in search-enrich.ts to
+ * require a DENSITY of gambling vocabulary in a fetched page's visible text
+ * before calling the whole page spam — one incidental mention never counts.
+ * PURE.
+ */
+export function countThemeSpamStrongHits(text: string | null | undefined): number {
+  if (!text || typeof text !== "string") return 0;
+  let n = 0;
+  for (const re of THEME_SPAM_STRONG_RE) {
+    const g = new RegExp(re.source, "gi");
+    const m = text.match(g);
+    if (m) n += m.length;
+  }
+  return n;
 }

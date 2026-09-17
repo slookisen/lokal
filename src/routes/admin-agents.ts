@@ -106,7 +106,7 @@ import { gateContactCandidates } from "../services/contact-candidate-judge";
 // the call site's own comment for why this is safe to add here (candidate
 // text is LLM-generated, not raw scraped markup, so this is defense-in-depth
 // rather than the primary gate for this write path).
-import { looksLikeCodeArtifact } from "../services/description-quality";
+import { looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
 
 const router = Router();
 
@@ -498,6 +498,15 @@ router.post("/register", async (req: Request, res: Response) => {
     res.status(400).json({
       error: "description contains code/script artifacts — rejected",
       detail: "description contains code/script artifacts — rejected",
+    });
+    return;
+  }
+  // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser:
+  // same door, same shape, for gambling copy off a hijacked/lapsed domain.
+  if (typeof description === "string" && description.trim() && looksLikeThemeSpam(description)) {
+    res.status(400).json({
+      error: "description looks like gambling/theme spam (hijacked domain) — rejected",
+      detail: "description looks like gambling/theme spam (hijacked domain) — rejected",
     });
     return;
   }
@@ -4449,6 +4458,18 @@ async function processTynneProfilerRow(
                 field: f,
                 outcome: "generation_failed_cheap_bar",
                 reasoning: "fails the cheap bar (code artifact)",
+              };
+              continue;
+            }
+            // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+            // beskrivelser: the source page is already refused by
+            // buildPageEvidence when it is gambling spam; this is the same
+            // free backstop on the GENERATED text.
+            if (looksLikeThemeSpam(candidate)) {
+              fieldResults[f] = {
+                field: f,
+                outcome: "generation_failed_cheap_bar",
+                reasoning: "fails the cheap bar (gambling/theme spam)",
               };
               continue;
             }

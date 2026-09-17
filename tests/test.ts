@@ -36472,6 +36472,74 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       /let desc = a\.description \|\| "";\s*\n\s*if \(isJunkDescription\(desc\)\)/.test(seoSrcDescJunk),
       "descjunk: producerCard() runs the raw agent.description through isJunkDescription before rendering .pc-desc"
     );
+
+    // ── Rule 0b (dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-
+    // i-beskrivelser): gambling/"theme spam" copied off a hijacked or lapsed
+    // producer domain. The four fixtures below are the EXACT live
+    // agent_knowledge.about values found in production 2026-09-16 (Mølleren
+    // Sylvia, Mosbøen Gård, Valdres Vilt, Halås Gårdsutsalg). ──
+    assertTrue(typeof dq.looksLikeThemeSpam === "function", "themespam: description-quality.ts exports looksLikeThemeSpam");
+    const liveThemeSpam = [
+      "Se vår guide til beste casino på nett i 2026: bonuser, spilltilbud, betalingsmetoder og sikkerhet. Vi hjelper deg å finne riktig nettcasino.",
+      "Casino med Paysafecard lar deg gjøre trygge innskudd uten kort, få umiddelbare bonuser og raske BankID-uttak hos lisensierte norske nettcasinoer.",
+      "Hvorfor free spins er nøkkelen til de beste casinoer Når norske spillere leter etter de beste casinoer på nett, er antallet free spins som tilbys avgjørende.",
+      "Ginja Casino i Norge tilbyr et profesjonelt nettcasino med mange spill, raske betalinger, kampanjer, live casino og trygg innlogging for norske spillere.",
+    ];
+    for (const t of liveThemeSpam) {
+      assertTrue(dq.looksLikeThemeSpam(t) === true, `themespam: live hijacked-domain text -> looksLikeThemeSpam true ("${t.slice(0, 38)}…")`);
+      assertTrue(dq.isJunkDescription(t) === true, `themespam: same text -> isJunkDescription true via rule 0b ("${t.slice(0, 38)}…")`);
+    }
+    // Negatives — ordinary producer prose that shares a word with gambling
+    // copy must NOT flag (word boundaries + the weak-list threshold).
+    const themeSpamNegatives = [
+      "Vi driver et lite spillbryggeri med økologisk øl og gårdsutsalg hver lørdag.",
+      "Kasinoveien 12, 4000 Stavanger — gårdsbutikk med egg og honning.",
+      "Medlemmer får bonus på kjøp over 500 kr, og vi tar innskudd av tomflasker.",
+      "Odds for godt vær er gode i juli — kom på selvplukk av jordbær!",
+      "Spill for barna, dyr å klappe og ferske jordbær rett fra åkeren.",
+      "Vi driver med økologisk grønnsaksdyrking og selger direkte fra gården hver lørdag.",
+    ];
+    for (const t of themeSpamNegatives) {
+      assertTrue(dq.looksLikeThemeSpam(t) === false, `themespam: ordinary prose -> false ("${t.slice(0, 40)}…")`);
+      assertTrue(dq.isJunkDescription(t) === false, `themespam: ordinary prose -> isJunkDescription still false ("${t.slice(0, 40)}…")`);
+    }
+    // Weak-list threshold: >=3 DISTINCT weak words flag, 2 do not.
+    assertTrue(
+      dq.looksLikeThemeSpam("Registrer deg og få bonus ved første innskudd, raske uttak og gode odds hver dag.") === true,
+      "themespam: 4 distinct weak words (bonus/innskudd/uttak/odds), no strong phrase -> true",
+    );
+    assertTrue(
+      dq.looksLikeThemeSpam("Bonus for medlemmer og innskudd av tomflasker i gårdsbutikken.") === false,
+      "themespam: only 2 distinct weak words -> false (below THEME_SPAM_WEAK_MIN_DISTINCT)",
+    );
+    assertEq(dq.THEME_SPAM_WEAK_MIN_DISTINCT, 3, "themespam: weak-list threshold is 3 distinct words");
+    // Empty / absent input never flags.
+    assertTrue(dq.looksLikeThemeSpam("") === false && dq.looksLikeThemeSpam(null) === false && dq.looksLikeThemeSpam(undefined) === false,
+      "themespam: empty/null/undefined -> false");
+    // Strong-hit counter (density input for the page-level detector).
+    assertEq(dq.countThemeSpamStrongHits("casino casino kasinoer free spins"), 4, "themespam: countThemeSpamStrongHits counts every strong occurrence");
+    assertEq(dq.countThemeSpamStrongHits("Vi selger egg og honning."), 0, "themespam: countThemeSpamStrongHits -> 0 on ordinary prose");
+
+    // ── pageLooksLikeThemeSpam (search-enrich.ts): the SOURCE-side detector
+    // buildPageEvidence / homepage-content-refresh / website-discovery consult
+    // before treating a fetched page as the producer's own. ──
+    {
+      const se = require("../src/services/search-enrich") as typeof import("../src/services/search-enrich");
+      assertTrue(typeof se.pageLooksLikeThemeSpam === "function", "themespam-page: search-enrich.ts exports pageLooksLikeThemeSpam");
+      const casinoTitlePage =
+        '<html><head><title>Beste casino på nett i 2026 – vår komplette guide</title><meta name="description" content="Se vår guide til beste casino på nett i 2026"></head><body><h1>Velkommen</h1><p>Her finner du alt om bonuser.</p></body></html>';
+      assertTrue(se.pageLooksLikeThemeSpam(casinoTitlePage) === true, "themespam-page: casino <title>/meta -> true (rule 1)");
+      const farmPage =
+        '<html><head><title>Homme Gård — gårdsutsalg i Øvrebø</title><meta name="description" content="Egg, honning og grønnsaker rett fra gården."></head><body><p>Vi selger egg, honning og grønnsaker. Åpent lørdager 10–16.</p></body></html>';
+      assertTrue(se.pageLooksLikeThemeSpam(farmPage) === false, "themespam-page: ordinary producer page -> false");
+      const oneMentionPage =
+        '<html><head><title>Fjellgården blogg</title></head><body><p>På turen til Monaco så vi et casino, men vi holdt oss til ostene våre. Vi selger ost, smør og rømme fra egne kyr.</p></body></html>';
+      assertTrue(se.pageLooksLikeThemeSpam(oneMentionPage) === false, "themespam-page: ONE incidental casino mention in body prose -> false (below density threshold)");
+      const densePage =
+        '<html><head><title>Fjellgården</title></head><body><p>Beste casinoer for slots. Nye casino bonuser hver uke. Spilleautomater og free spins for norske spillere.</p></body></html>';
+      assertTrue(se.pageLooksLikeThemeSpam(densePage) === true, "themespam-page: neutral title but >=3 strong hits in body -> true (rule 2)");
+      assertTrue(se.pageLooksLikeThemeSpam("") === false, "themespam-page: empty html -> false");
+    }
   } catch (err) {
     failed++;
     failures.push(`descjunk: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
@@ -42087,6 +42155,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("description-code-artifact-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser:
+// POST /admin/agents/theme-spam-sweep. Same DB-swap discipline as the two
+// sibling sweeps above — runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser: theme-spam-sweep ──");
+  try {
+    const { runAdminAgentsThemeSpamSweepTests } = require("../src/routes/admin-agents-theme-spam-sweep.test") as
+      typeof import("../src/routes/admin-agents-theme-spam-sweep.test");
+    const ts = await runAdminAgentsThemeSpamSweepTests({ log: false });
+    passed += ts.passed;
+    failed += ts.failed;
+    for (const f of ts.failures) failures.push("theme-spam-sweep: " + f);
+    console.log(`  theme-spam-sweep: ${ts.passed} passed, ${ts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("theme-spam-sweep: unexpected error: " + String(err?.message || err));
   }
 });
 

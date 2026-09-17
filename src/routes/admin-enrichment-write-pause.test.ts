@@ -623,6 +623,8 @@ export async function runAdminEnrichmentWritePauseTests(
       "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
       "routes/admin-agents-internal-note-sweep.ts",
+      "routes/admin-agents-theme-spam-sweep.test.ts",
+      "routes/admin-agents-theme-spam-sweep.ts",
         // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
         // rapportspraak, del 1: the experiences vertical's admin write routes
         // (routes/opplevelser.ts, one shared helper) plus their own test file.

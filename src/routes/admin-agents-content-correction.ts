@@ -43,7 +43,7 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { hasInternalNote, looksLikeCodeArtifact } from "../services/description-quality";
+import { hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
 import {
   enrichmentWritePauseBlockForAgents,
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
@@ -169,6 +169,8 @@ function validateItem(raw: unknown): { ok: true; item: ValidItem } | { ok: false
   // every other description/about door.
   if (looksLikeCodeArtifact(text)) return { ok: false, outcome: "refused_junk_text", detail: "text looks like a code artifact", agent_id: agentId };
   if (hasInternalNote(text)) return { ok: false, outcome: "refused_junk_text", detail: "text contains an internal pipeline note", agent_id: agentId };
+  // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-beskrivelser.
+  if (looksLikeThemeSpam(text)) return { ok: false, outcome: "refused_junk_text", detail: "text looks like gambling/theme spam (hijacked domain)", agent_id: agentId };
   return { ok: true, item: { agent_id: agentId, field, text } };
 }
 
