@@ -44206,3 +44206,33 @@ runSerial(async () => {
     failures.push("lokal-agent-verifier-review-required-reevaluation: unexpected error: " + String(err?.message || err));
   }
 });
+
+// POST /admin/experiences-orgnr-from-name-kommune (routes/opplevelser.ts) +
+// services/experience-orgnr-from-name-kommune.ts. dev-request 2026-09-14-
+// opplevagent-karantene-utgang-brreg-krav, Trinn B: a third, independent path
+// (alongside the recheck-backfill above and Trinn A, a separate not-yet-
+// merged website-org.nr slice) for the brreg_active IS NULL backlog — Brreg
+// name+kommune search, accepting a hit only on exactly-one-hit or an
+// address/domain corroboration among several, never guessing among
+// ambiguous ties. globalThis.fetch stubbed (searchBrregByNameAndKommune/
+// verifyOrgNumber/fetchBrregWebsite have no injected-fetchImpl call site
+// here — same convention Trinn A's own test file uses for
+// verifyOrgNumber/fetchBrregBusinessAddress). Tail position (right after
+// its nearest sibling-in-spirit) is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── experiences-orgnr-from-name-kommune: Trinn B org.nr-from-name+kommune backfill ──");
+  try {
+    const { runOpplevelserExperienceOrgnrFromNameKommuneTests } =
+      require("../src/routes/opplevelser-experience-orgnr-from-name-kommune.test") as
+        typeof import("../src/routes/opplevelser-experience-orgnr-from-name-kommune.test");
+    const onk = await runOpplevelserExperienceOrgnrFromNameKommuneTests({ log: false });
+    passed += onk.passed;
+    failed += onk.failed;
+    for (const f of onk.failures) failures.push("experience-orgnr-from-name-kommune: " + f);
+    console.log(`  experience-orgnr-from-name-kommune: ${onk.passed} passed, ${onk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-from-name-kommune: unexpected error: " + String(err?.message || err));
+  }
+});

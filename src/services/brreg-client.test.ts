@@ -20,6 +20,8 @@ import {
   __clearBrregActivityDescriptionCacheForTesting,
   fetchBrregBusinessAddress,
   __clearBrregAddressCacheForTesting,
+  searchBrregByNameAndKommune,
+  __clearBrregNameKommuneCacheForTesting,
   type BrregVerifyResult,
 } from "./brreg-client";
 
@@ -401,6 +403,100 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
       { adresse: "Bare Gate 1", postnummer: null, poststed: null },
       "address: usable street line with no postnummer/poststed -> those default to null",
     );
+  }
+
+  // ── searchBrregByNameAndKommune (dev-request 2026-09-14-opplevagent-
+  //    karantene-utgang-brreg-krav, Trinn B) ─────────────────────────────
+  {
+    // (a) URL includes both navn and kommunenummer query params, raw
+    //     unscored hits returned (no confidence field at all).
+    __clearBrregNameKommuneCacheForTesting();
+    const fetchImplTwoHits = makeFetch((url) => {
+      assertTrue(url.includes("/enheter?navn="), "nk-a1: URL hits the /enheter?navn=… search endpoint");
+      assertTrue(url.includes("navn=Gaardsbutikken"), "nk-a2: URL carries the encoded navn param");
+      assertTrue(url.includes("kommunenummer=1001"), "nk-a3: URL carries the kommunenummer param");
+      return jsonResponse(200, {
+        _embedded: {
+          enheter: [
+            {
+              organisasjonsnummer: "910244132",
+              navn: "Gaardsbutikken Test AS",
+              forretningsadresse: { adresse: ["Testveien 1"], postnummer: "2600", poststed: "Lillehammer" },
+            },
+            {
+              organisasjonsnummer: "910244133",
+              navn: "Gaardsbutikken Test ENK",
+              forretningsadresse: null,
+            },
+          ],
+        },
+      });
+    });
+    const twoHits = await searchBrregByNameAndKommune("Gaardsbutikken Test", "1001", fetchImplTwoHits);
+    assertEq(twoHits.length, 2, "nk-a4: both raw hits returned, unfiltered");
+    assertEq(
+      twoHits[0],
+      { orgnumber: "910244132", name: "Gaardsbutikken Test AS", address: "Testveien 1, 2600 Lillehammer" },
+      "nk-a5: first hit shape — orgnumber/name/formatted address, NO confidence field",
+    );
+    assertEq(
+      twoHits[1],
+      { orgnumber: "910244133", name: "Gaardsbutikken Test ENK", address: null },
+      "nk-a6: second hit's forretningsadresse is null -> address:null (no usable street line)",
+    );
+    assertTrue(!("confidence" in (twoHits[0] as any)), "nk-a7: hits carry no confidence/score field at all — Trinn B applies its own corroboration rule, not this file's score>=0.9 rule");
+
+    // (b) zero hits -> empty array (a genuine zero-hit Brreg response).
+    __clearBrregNameKommuneCacheForTesting();
+    const fetchImplZeroHits = makeFetch(() => jsonResponse(200, { _embedded: { enheter: [] } }));
+    const zeroHits = await searchBrregByNameAndKommune("Ingen Treff AS", "1001", fetchImplZeroHits);
+    assertEq(zeroHits, [], "nk-b1: zero-hit Brreg response -> empty array");
+
+    // (c) blank navn or blank kommunenummer -> empty array, no fetch call.
+    __clearBrregNameKommuneCacheForTesting();
+    let fetchCalledForBlank = false;
+    const fetchImplBlank = makeFetch(() => {
+      fetchCalledForBlank = true;
+      return jsonResponse(200, { _embedded: { enheter: [] } });
+    });
+    const blankNavn = await searchBrregByNameAndKommune("", "1001", fetchImplBlank);
+    const blankKnr = await searchBrregByNameAndKommune("Et Navn AS", "", fetchImplBlank);
+    assertEq(blankNavn, [], "nk-c1: blank navn -> empty array");
+    assertEq(blankKnr, [], "nk-c2: blank kommunenummer -> empty array");
+    assertTrue(!fetchCalledForBlank, "nk-c3: neither blank-input case ever calls fetch");
+
+    // (d) network error -> empty array, never throws.
+    __clearBrregNameKommuneCacheForTesting();
+    const fetchImplErr = (async () => {
+      throw new Error("simulated network failure");
+    }) as unknown as typeof fetch;
+    const errHits = await searchBrregByNameAndKommune("Et Navn AS", "1001", fetchImplErr);
+    assertEq(errHits, [], "nk-d1: network error -> empty array (never throws)");
+
+    // (e) non-ok HTTP status -> empty array.
+    __clearBrregNameKommuneCacheForTesting();
+    const fetchImpl500 = makeFetch(() => jsonResponse(500, { message: "boom" }));
+    const err500Hits = await searchBrregByNameAndKommune("Et Navn AS", "1001", fetchImpl500);
+    assertEq(err500Hits, [], "nk-e1: non-ok HTTP status -> empty array");
+
+    // (f) per-process cache — a second call with the SAME navn+kommunenummer
+    //     does not call fetch again.
+    __clearBrregNameKommuneCacheForTesting();
+    let fetchCallCount = 0;
+    const fetchImplCache = makeFetch(() => {
+      fetchCallCount++;
+      return jsonResponse(200, {
+        _embedded: { enheter: [{ organisasjonsnummer: "910244140", navn: "Cachet AS", forretningsadresse: null }] },
+      });
+    });
+    await searchBrregByNameAndKommune("Cachet Navn", "1001", fetchImplCache);
+    await searchBrregByNameAndKommune("Cachet Navn", "1001", fetchImplCache);
+    assertEq(fetchCallCount, 1, "nk-f1: second call with the same navn+kommunenummer is served from the per-process cache, not a second fetch");
+
+    // (g) findOrgnumberByName's own existing behavior/scoring is untouched —
+    //     both functions independently exist side by side (spot-checked via
+    //     the exported symbol still being present with its original shape,
+    //     covered exhaustively by this file's OTHER test blocks above).
   }
 
   return { passed, failed, failures };
