@@ -24,8 +24,10 @@
 //       rfb          agents               is_active = 1
 //       dental       dental_agents        verification_status != 'rejected'
 //                                          AND (is_inactive IS NULL OR is_inactive = 0)
+//                                          AND DENTAL_CLINIC_CLASS_SQL
 //       experiences  experience_providers terminal_status IS NULL
 //                                          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+//                                          AND (name_collision IS NULL OR name_collision != 1)
 //     round-2 review fix-up (PR #860): dental's predicate was missing the
 //     verification_status != 'rejected' half (a row a human/prior sweep
 //     determined was never actually a dental clinic, e.g. a misclassified
@@ -37,6 +39,14 @@
 //     atomically blocklists org_nr/website/epost) since the 2026-08-17 fix
 //     documented in init-experiences.ts. Both are now the fuller predicate
 //     the rest of the codebase already uses for these two tables.
+//     round-3 review fix-up (PR #860): dental also ANDs in
+//     DENTAL_CLINIC_CLASS_SQL (dental-catalog-class.ts) — excludes rows
+//     positively classified as non-clinics (lab_leverandor/holding/
+//     person_enk), orthogonal to verification_status/is_inactive — and
+//     experiences also ANDs in `(name_collision IS NULL OR name_collision
+//     != 1)` — excludes rows whose Brreg identity/email ownership is still
+//     unresolved (init-experiences.ts:819). See each spec's own comment
+//     below for the full rationale.
 //   - Strictly read-only. Zero INSERT/UPDATE/DELETE/ALTER in this file.
 //
 // Each vertical's own producer/agent table + email column:
@@ -47,6 +57,7 @@
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { CRM_VERTICALS, CrmVertical } from "./crm-service";
+import { DENTAL_CLINIC_CLASS_SQL } from "./dental-catalog-class";
 
 export interface CrossVerticalHit {
   vertical: CrmVertical;
@@ -86,7 +97,19 @@ const VERTICAL_TABLE_SPECS: Record<CrmVertical, VerticalTableSpec> = {
     // closed (is_inactive IS NULL OR is_inactive = 0). Round-1's fix-up
     // only carried the is_inactive half over; round-2 adds the
     // verification_status half that the cited precedent lines actually use.
-    activePredicate: "verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)",
+    // round-3 review fix-up (PR #860): also AND in DENTAL_CLINIC_CLASS_SQL
+    // (services/dental-catalog-class.ts), the SAME "is this row actually a
+    // clinic" gate ANDed onto this table everywhere else it's queried
+    // (dental-store.ts:1150,1251,1324, init-dental.ts:726) -- it excludes
+    // rows a classifier positively determined are NOT a patient-facing
+    // clinic (lab_leverandor/holding/person_enk), which is orthogonal to
+    // both verification_status and is_inactive: a misclassified supplier/
+    // holding/individual can be neither rejected nor is_inactive and still
+    // be the wrong kind of row to ever surface as a live "clinic contact"
+    // for this module's cross-vertical check.
+    activePredicate:
+      "verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0) AND " +
+      DENTAL_CLINIC_CLASS_SQL,
   },
   experiences: {
     table: "experience_providers",
@@ -105,17 +128,30 @@ const VERTICAL_TABLE_SPECS: Record<CrmVertical, VerticalTableSpec> = {
     // exists to detect cross-vertical exposure for. Same NULL-safe
     // `(catalog_hidden IS NULL OR catalog_hidden != 1)` form used
     // throughout experience-store.ts (e.g. its PUBLISH_GATE_SQL).
-    activePredicate: "terminal_status IS NULL AND (catalog_hidden IS NULL OR catalog_hidden != 1)",
+    // round-3 review fix-up (PR #860): also AND in
+    // `(name_collision IS NULL OR name_collision != 1)`. name_collision is
+    // an experience_providers column (init-experiences.ts:819,
+    // dev-request 2026-09-13-navnekollisjon-brreg-gate) set when a Brreg
+    // org-number lookup found >=2 candidates sharing the provider's name
+    // with no kommune match to disambiguate them -- the row's own identity
+    // (and therefore whose email this actually is) is UNRESOLVED, so it
+    // must never count as a confirmed live match for the "same contact,
+    // different vertical" cross-check this module backs, independent of
+    // terminal_status/catalog_hidden.
+    activePredicate:
+      "terminal_status IS NULL AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND " +
+      "(name_collision IS NULL OR name_collision != 1)",
   },
 };
 
 /**
  * Look up whether the given email has an ACTIVE entry on any CRM vertical
  * OTHER than `excludeVertical`, by EXACT (case-insensitive) email match.
- * A deactivated rfb agent (is_active = 0), a rejected or is_inactive
- * dental_agents row, or an experience_providers row with a non-NULL
- * terminal_status or catalog_hidden = 1 is treated as gone and never
- * appears in the result — see VERTICAL_TABLE_SPECS' per-table
+ * A deactivated rfb agent (is_active = 0), a rejected/is_inactive/
+ * non-clinic-classed dental_agents row, or an experience_providers row with
+ * a non-NULL terminal_status, catalog_hidden = 1 or name_collision = 1 is
+ * treated as gone and never appears in the result — see
+ * VERTICAL_TABLE_SPECS' per-table
  * activePredicate for the exact convention each vertical uses.
  *
  * Read-only diagnostic — never fuzzy-matches on name/organization, never

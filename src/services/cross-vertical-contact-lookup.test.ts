@@ -38,6 +38,16 @@
  *         - experience_providers.catalog_hidden: 1 excluded, NULL included
  *           (both rows also terminal_status-clear, so this isolates the
  *           catalog_hidden half specifically)
+ *   (h) round-3 review fix-up (PR #860): two more predicate halves, again
+ *       proven discriminating with one excluded/included pair each:
+ *         - dental_agents: a row that passes verification_status/
+ *           is_inactive but is classified catalog_class='lab_leverandor'
+ *           (fails DENTAL_CLINIC_CLASS_SQL) is excluded, while a sibling row
+ *           with the same email and catalog_class='klinikk' is included
+ *         - experience_providers: a row that passes terminal_status/
+ *           catalog_hidden but has name_collision=1 is excluded, while a
+ *           sibling row with the same email and name_collision=0 is
+ *           included
  */
 
 import Database from "better-sqlite3";
@@ -228,6 +238,55 @@ export function runCrossVerticalContactLookupTests(
         expCatalogHidden.filter((h) => h.vertical === "experiences").map((h) => h.id),
         ["exp-visible-1"],
         "(g) experiences: catalog_hidden=1 row excluded, catalog_hidden IS NULL row for same email included",
+      );
+
+      // ── (h) round-3 review fix-up (PR #860): DENTAL_CLINIC_CLASS_SQL /
+      // name_collision predicate halves ────────────────────────────────
+      // dental: catalog_class='lab_leverandor' (fails DENTAL_CLINIC_CLASS_SQL)
+      // excluded, catalog_class='klinikk' included (both rows also pass
+      // verification_status/is_inactive, so this isolates the
+      // DENTAL_CLINIC_CLASS_SQL half specifically).
+      dentalDb
+        .prepare(
+          `INSERT INTO dental_agents (id, navn, epost, catalog_class) VALUES (?, ?, ?, 'lab_leverandor')`,
+        )
+        .run("dental-lab-1", "Dental Lab", "dental-catalog-class@example.com");
+      dentalDb
+        .prepare(
+          `INSERT INTO dental_agents (id, navn, epost, catalog_class) VALUES (?, ?, ?, 'klinikk')`,
+        )
+        .run("dental-clinic-1", "Dental Klinikk", "dental-catalog-class@example.com");
+      const dentalCatalogClass = mod.findCrossVerticalEntriesByEmail(
+        "dental-catalog-class@example.com",
+        "rfb",
+      );
+      assertEq(
+        dentalCatalogClass.filter((h) => h.vertical === "dental").map((h) => h.id),
+        ["dental-clinic-1"],
+        "(h) dental: catalog_class='lab_leverandor' row excluded (fails DENTAL_CLINIC_CLASS_SQL), 'klinikk' row for same email included",
+      );
+
+      // experiences: name_collision=1 excluded, name_collision=0 included
+      // (both rows also terminal_status/catalog_hidden-clear, so this
+      // isolates the name_collision half specifically).
+      experiencesDb
+        .prepare(
+          `INSERT INTO experience_providers (id, navn, epost, name_collision) VALUES (?, ?, ?, 1)`,
+        )
+        .run("exp-collision-1", "Opplevelse Kollisjon", "exp-name-collision@example.com");
+      experiencesDb
+        .prepare(
+          `INSERT INTO experience_providers (id, navn, epost, name_collision) VALUES (?, ?, ?, 0)`,
+        )
+        .run("exp-resolved-1", "Opplevelse Avklart", "exp-name-collision@example.com");
+      const expNameCollision = mod.findCrossVerticalEntriesByEmail(
+        "exp-name-collision@example.com",
+        "rfb",
+      );
+      assertEq(
+        expNameCollision.filter((h) => h.vertical === "experiences").map((h) => h.id),
+        ["exp-resolved-1"],
+        "(h) experiences: name_collision=1 row excluded, name_collision=0 row for same email included",
       );
 
       // ── (f) whitespace-trim regression ───────────────────────────────
