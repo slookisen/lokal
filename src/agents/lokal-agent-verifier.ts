@@ -472,6 +472,62 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
     .all(limit);
 }
 
+// ─── dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+//     og-uten-reevaluering, punkt 2: stale review_required re-evaluation ──
+//
+// The daily verifier loop's existing pickers (pickBatch/pickBatchBiased) DO
+// touch review_required rows, but with no dedicated freshness guarantee —
+// a census (2026-09-17) found ~74-75 review_required rows stuck for a full
+// week with verifier throughput to `verified` of only 2,3,1,0/day (5 rows
+// even regressed 2026-09-15), and 35 of those 74 already appear to satisfy
+// every VISIBLE requirement. Whatever the cause, a row that has genuinely
+// gained new corroborating evidence since its last verdict (e.g. a fresh
+// homepage-provenance crawl, a DNS check that cleared) has no guaranteed
+// path back through the gate. This picker gives review_required rows an
+// explicit, bounded, oldest-first re-check: verifier_verdict_as_of (=
+// agent_knowledge.last_verified_at, the same column
+// admin-pool-blocker-explain.ts already surfaces under that name) older
+// than 7 days, oldest first, capped at 40 rows. A NULL last_verified_at
+// (never verified — should not normally occur for review_required, but
+// defensively treated as "definitely stale") is included.
+//
+// Purely additive: this is a SELECTION function only. The rows it returns
+// go through runVerifierBatch's normal loop and the EXACT SAME gate/guards
+// as every other candidate — a row that still fails a real requirement is
+// re-derived to review_required again, unchanged. No threshold here, no
+// leniency; see runVerifierBatch's `includeStaleReviewRequired` merge.
+//
+// Both sides of the comparison are wrapped in SQLite's own datetime(...) —
+// same footgun this codebase has already hit twice (admin-domain-
+// coherence.ts's stampParking() precedent, admin-verifier-claim-counts.ts's
+// file-header comment): last_verified_at is written as full JS-ISO
+// ('T'/ms/'Z', via new Date().toISOString() in applyVerifierOutcome), while
+// a raw 'datetime('now','-7 days')' bound is SQLite-native
+// ("YYYY-MM-DD HH:MM:SS"). A plain string comparison between those two
+// formats sorts incorrectly (SQLite's default collation puts 'T' above
+// ' '); datetime(...) on both sides normalizes to the same canonical form
+// before comparing, regardless of which format the column's own value is
+// in.
+export function pickStaleReviewRequiredBatch(db: any, cap = 40): any[] {
+  return db
+    .prepare(
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
+              k.email, k.phone, k.address,
+              k.website, k.about, k.products, k.field_provenance,
+              k.verification_status, k.enrichment_status,
+              k.last_verified_at, k.last_http_check_at, k.last_http_status
+         FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.verification_status = 'review_required'
+          AND (
+            k.last_verified_at IS NULL
+            OR datetime(k.last_verified_at) <= datetime('now', '-7 days')
+          )
+     ORDER BY datetime(COALESCE(k.last_verified_at, '1970-01-01')) ASC
+        LIMIT ?`
+    )
+    .all(cap);
+}
 
 // ─── orch-pr-20260614-2: bulk pending_verify picker ────────────────────────
 //
@@ -1611,6 +1667,18 @@ export async function runVerifierBatch(opts: {
   // route this reuses search-attempt logic from). Defaults to the real
   // global `fetch` — production always hits the live Brreg API.
   terminalDeathCheckFetch?: typeof fetch;
+  // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+  // og-uten-reevaluering, punkt 2: opt-in (default false/undefined — every
+  // EXISTING caller and test is byte-identical unless it explicitly turns
+  // this on). When true, this run's candidate set is `pickFn`'s own result
+  // PLUS up to 40 stale review_required rows from
+  // pickStaleReviewRequiredBatch (verifier_verdict_as_of older than 7 days,
+  // oldest first), deduplicated by agent id so a row `pickFn` already
+  // selected is never processed twice in the same run. Additive selection
+  // only — every merged-in row runs through the identical loop below (same
+  // gate, same guards, same applyVerifierOutcome persistence) as every
+  // other candidate.
+  includeStaleReviewRequired?: boolean;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -1635,6 +1703,18 @@ export async function runVerifierBatch(opts: {
 
   const pickFn = opts.pickFn ?? pickBatch;
   const candidates = pickFn(db, limit);
+
+  // Additive stale-review_required merge (see includeStaleReviewRequired's
+  // doc comment above) — dedup by id against whatever `pickFn` already
+  // returned so no candidate is ever processed twice in the same run.
+  if (opts.includeStaleReviewRequired) {
+    const haveIds = new Set(candidates.map((r: any) => r.id));
+    const staleReviewRequired = pickStaleReviewRequiredBatch(db, 40).filter(
+      (r: any) => !haveIds.has(r.id)
+    );
+    candidates.push(...staleReviewRequired);
+  }
+
   const results: VerifierResult[] = [];
 
   for (const agent of candidates) {
@@ -1717,6 +1797,15 @@ export async function runVerifierBatch(opts: {
       if (wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified") {
         websiteOwnershipUnverified = true;
         gate.flags.push("website_ownership_unverified");
+        // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+        // forklaring-og-uten-reevaluering: this used to be advisory-only
+        // (gate.flags, never persisted) — /admin/pool-blocker-explain had
+        // no stored trace to read, so a row quarantined for this reason
+        // alone showed up as an unexplained blocker. Stamp it onto the
+        // SAME persisted verdict object the other guards below already use
+        // (inference_only_fields, domain_coherence) so it survives into
+        // agent_knowledge.verification_review_reason.
+        (crossSourceResults as Record<string, unknown>).website_ownership_unverified = true;
       }
     }
 
@@ -2002,6 +2091,13 @@ export async function runVerifierBatch(opts: {
     if (!corroboratedEmail) {
       if (newVerification === "verified") newVerification = "review_required";
       gate.flags.push("corroborated_email_missing");
+      // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+      // forklaring-og-uten-reevaluering: explicit top-level flag alongside
+      // the pre-existing email_website_gate.corroborated_email boolean
+      // (already persisted above, unconditionally) — named to match this
+      // guard's own flag exactly, so /admin/pool-blocker-explain can read
+      // it directly instead of re-deriving it from the nested gate object.
+      (crossSourceResults as Record<string, unknown>).corroborated_email_missing = true;
       console.log(
         `[verifier] ${agent.id} (${agent.name ?? "?"}) corroborated_email_missing ` +
         `(agent_knowledge.email present=${hasKnowledgeEmail}, syntactically_valid=${knowledgeEmailSyntacticallyValid}, ` +

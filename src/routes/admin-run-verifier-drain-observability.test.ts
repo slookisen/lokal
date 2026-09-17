@@ -242,6 +242,15 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round1.body.pending_verify_processed, 0, "trans-2: round 1's processed row started at review_required, not pending_verify, so pending_verify_processed=0");
       assertEq(round1.body.pending_verify_outcomes, {}, "trans-3: pending_verify_outcomes empty when no pending_verify-origin row was processed");
 
+      // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+      // forklaring-og-uten-reevaluering, punkt 3: round 1's one processed
+      // row started at review_required (agent-stable-review, seeded
+      // directly above) and landed on pending_verify (obs-6), NOT verified
+      // — proving review_required_reevaluated counts it while
+      // review_required_promoted correctly stays 0.
+      assertEq(round1.body.review_required_reevaluated, 1, "rrr-1: round 1's one processed row started at review_required, so review_required_reevaluated=1");
+      assertEq(round1.body.review_required_promoted, 0, "rrr-2: that row did NOT reach verified this round, so review_required_promoted=0");
+
       // dev-request 2026-08-17-verifier-tick-lock, requirement (c): the
       // non-skipped response shape must be byte-identical to what this
       // route returned before the lock was added — no field silently
@@ -253,14 +262,21 @@ export function runAdminRunVerifierDrainObservabilityTests(
         "brreg_inactive", "domain_incoherent", "email_domain_mismatch",
         "thin_content", "pool_added", "status_transitions", "transitioned",
         "by_new_status", "by_transition", "pending_verify_processed",
-        "pending_verify_outcomes", "persisted", "envelope_recorded",
+        "pending_verify_outcomes",
+        // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-
+        // forklaring-og-uten-reevaluering, punkt 3: two new fields, added
+        // deliberately (mirroring pending_verify_processed/_outcomes'
+        // shape) — this pin is updated on purpose, not a dropped/renamed
+        // field.
+        "review_required_reevaluated", "review_required_promoted",
+        "persisted", "envelope_recorded",
         "hour_utc", "forced", "tick_lock_skipped", "reprocess_review_queue",
         "bias_growth",
       ].sort();
       assertEq(
         Object.keys(round1.body).sort(),
         expectedNonSkippedKeys,
-        "lock-1: round 1 (non-skipped) response has EXACTLY the pre-existing field set — nothing dropped, nothing added",
+        "lock-1: round 1 (non-skipped) response has EXACTLY the pre-existing field set plus the two new review_required_* fields — nothing else dropped or added",
       );
       assertEq(round1.body.skipped, undefined, "lock-2: non-skipped response has no `skipped` key at all (matches pre-lock shape exactly)");
 
@@ -301,6 +317,12 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round2.body.by_new_status, {}, "trans-5: by_new_status stays empty for that SAME no-op row (genuinely different semantics from by_transition, not a duplicate field)");
       assertEq(round2.body.pending_verify_processed, 1, "trans-6: round 2's one row WAS pending_verify-origin, so pending_verify_processed=1 despite status_transitions=0");
       assertEq(round2.body.pending_verify_outcomes, { pending_verify: 1 }, "trans-7: pending_verify_outcomes shows the row landed back on pending_verify");
+      // No review_required rows exist in the DB at this point (round 1
+      // moved the only one to pending_verify) — proves the
+      // includeStaleReviewRequired merge (active on this non-reprocess
+      // round) adds nothing when there is nothing stale to add.
+      assertEq(round2.body.review_required_reevaluated, 0, "rrr-3: no review_required rows exist at round 2, so review_required_reevaluated=0");
+      assertEq(round2.body.review_required_promoted, 0, "rrr-4: review_required_promoted=0 alongside it");
 
       const row2 = db
         .prepare(`SELECT last_verified_at FROM agent_knowledge WHERE agent_id = ?`)

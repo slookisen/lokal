@@ -148,6 +148,15 @@ function provenanceSourceCounts(raw: string | null): Record<string, number> {
 interface VerifierStoredVerdict {
   domain_coherence?: { coherent?: boolean; reason?: string } | null;
   email_ownership_unproven?: boolean | null;
+  // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+  // og-uten-reevaluering, punkt 1 — the additional shapes
+  // lokal-agent-verifier.ts's crossSourceResults can carry, read here so
+  // quarantineReasons() below can name the real quarantine reason instead
+  // of the route's old generic verification_status_not_verified(=…).
+  inference_only_fields?: unknown;
+  website_ownership_unverified?: boolean | null;
+  corroborated_email_missing?: boolean | null;
+  email_website_gate?: { corroborated_email?: boolean } | null;
   [key: string]: unknown;
 }
 
@@ -169,6 +178,97 @@ function withinDays(iso: string | null, days: number, nowMs: number): boolean {
   const t = Date.parse(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
   if (Number.isNaN(t)) return false;
   return nowMs - t < days * 24 * 60 * 60 * 1000;
+}
+
+// ── Quarantine-reason mapping (dev-request 2026-09-17-rfb-review-required-
+//    poolblokker-uten-forklaring-og-uten-reevaluering, punkt 1) ────────────
+//
+// This route used to report ONLY the generic
+// `verification_status_not_verified (=review_required)` blocker for a
+// review_required row — the ACTUAL reason the verifier quarantined it
+// (inference-only field, unverified site ownership, domain incoherence,
+// missing corroborated email) was computed and, for most of these, already
+// persisted in the verifier's own stored verdict
+// (`agent_knowledge.verification_review_reason`, the same JSON the
+// verifier calls `cross_source_reason` — see lokal-agent-verifier.ts) but
+// never surfaced here. A census (2026-09-17) found 35 of ~74 stuck
+// review_required rows already satisfying every VISIBLE requirement while
+// staying quarantined for exactly this class of invisible reason.
+//
+// Naming (per spec): one `quarantine:<reason>` element per ACTUAL reason
+// found, never a silent empty list —
+//   quarantine:inference_only_fields(<field>)   — one per field
+//   quarantine:website_ownership_unverified
+//   quarantine:domain_incoherent(<reason>)
+//   quarantine:corroborated_email_missing
+//   quarantine:reason_missing                   — explicit fallback when
+//                                                  none of the above match
+//
+// READ-ONLY: this only parses data already stored on the row
+// (verification_review_reason + field_provenance) — it writes nothing.
+//
+// website_ownership_unverified is read from field_provenance DIRECTLY
+// (mirroring the exact check lokal-agent-verifier.ts's Guard #1 makes:
+// `field_provenance.website_ownership.status === "unverified"`), not only
+// from the stored verdict: until this same dev-request, the verifier
+// computed this flag but only ever pushed it to its in-memory gate.flags,
+// never persisted it onto the stored verdict JSON — so historical
+// review_required rows quarantined for this reason (before the verifier
+// fix above) have no trace of it in verification_review_reason at all,
+// only in field_provenance (which the crawl always wrote). Re-deriving it
+// here from field_provenance covers both those historical rows and any
+// future ones. corroborated_email_missing is likewise read from the
+// PRE-EXISTING, always-persisted `email_website_gate.corroborated_email`
+// object (unconditionally stamped by the verifier for every row it
+// processes) in addition to the new explicit top-level flag, for the same
+// historical-coverage reason.
+function quarantineReasons(
+  fieldProvenanceRaw: string | null,
+  storedVerdict: VerifierStoredVerdict | null,
+): string[] {
+  const reasons: string[] = [];
+
+  const inferenceFields = storedVerdict?.inference_only_fields;
+  if (Array.isArray(inferenceFields)) {
+    for (const f of inferenceFields) {
+      if (typeof f === "string" && f) {
+        reasons.push(`quarantine:inference_only_fields(${f})`);
+      }
+    }
+  }
+
+  let websiteOwnershipUnverified = storedVerdict?.website_ownership_unverified === true;
+  if (!websiteOwnershipUnverified && fieldProvenanceRaw) {
+    try {
+      const fieldProv = JSON.parse(fieldProvenanceRaw);
+      const wo = fieldProv && typeof fieldProv === "object" ? (fieldProv as Record<string, unknown>).website_ownership : null;
+      if (wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified") {
+        websiteOwnershipUnverified = true;
+      }
+    } catch {
+      /* malformed field_provenance → not a website-ownership signal */
+    }
+  }
+  if (websiteOwnershipUnverified) {
+    reasons.push("quarantine:website_ownership_unverified");
+  }
+
+  const domainCoherence = storedVerdict?.domain_coherence;
+  if (domainCoherence && domainCoherence.coherent === false) {
+    reasons.push(`quarantine:domain_incoherent(${domainCoherence.reason ?? "unknown"})`);
+  }
+
+  const corroboratedEmailMissing =
+    storedVerdict?.corroborated_email_missing === true ||
+    storedVerdict?.email_website_gate?.corroborated_email === false;
+  if (corroboratedEmailMissing) {
+    reasons.push("quarantine:corroborated_email_missing");
+  }
+
+  if (reasons.length === 0) {
+    reasons.push("quarantine:reason_missing");
+  }
+  return reasons;
 }
 
 router.get("/", (req: Request, res: Response) => {
@@ -297,6 +397,15 @@ router.get("/", (req: Request, res: Response) => {
     // was held back (observed live on Eimealt). The signal stays available as
     // `signals.email_ownership_unproven` for anyone watching wrong contacts —
     // it is just no longer an answer to "what is blocking this agent".
+
+    // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
+    // og-uten-reevaluering, punkt 1: name the ACTUAL quarantine reason(s) for
+    // a review_required row instead of leaving the generic
+    // verification_status_not_verified(=review_required) blocker above as
+    // the only signal. See quarantineReasons()'s own doc comment.
+    if (row.verification_status === "review_required") {
+      poolBlockers.push(...quarantineReasons(row.field_provenance, storedVerdict));
+    }
 
     // ── Funnel B: homepage-provenance-batch default auto-select legs
     //    (routes/marketplace.ts selector, same order) ─────────────────────

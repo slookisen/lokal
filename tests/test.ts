@@ -44154,3 +44154,25 @@ try {
   failed++;
   failures.push("init-crm-threads-b3-status-migration: unexpected error: " + String(err?.message || err));
 }
+
+// dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-og-
+// uten-reevaluering: pickStaleReviewRequiredBatch (lokal-agent-verifier.ts,
+// punkt 2) and the review_required_reevaluated/review_required_promoted
+// run counts (admin-run-verifier.ts, punkt 3). Own dedicated in-memory-db
+// harness (mirrors lokal-agent-verifier-second-line.test.ts's shape). Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-og-uten-reevaluering: stale review_required re-evaluation ──");
+  try {
+    const { runLokalAgentVerifierReviewRequiredReevaluationTests } = require("../src/agents/lokal-agent-verifier-review-required-reevaluation.test") as
+      typeof import("../src/agents/lokal-agent-verifier-review-required-reevaluation.test");
+    const rrr = await runLokalAgentVerifierReviewRequiredReevaluationTests({ log: false });
+    passed += rrr.passed;
+    failed += rrr.failed;
+    for (const f of rrr.failures) failures.push("lokal-agent-verifier-review-required-reevaluation: " + f);
+    console.log(`  lokal-agent-verifier-review-required-reevaluation: ${rrr.passed} passed, ${rrr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-review-required-reevaluation: unexpected error: " + String(err?.message || err));
+  }
+});
