@@ -25,12 +25,16 @@
  *      above: unambiguous name -> {kommunenummer}, the Herøy/Våler
  *      collisions -> needs_review, unknown/blank name -> needs_review,
  *      Sami-name aliases resolve.
+ *  10. isKnownKommunenummer() (Trinn B fix-up, independent-reviewer finding
+ *      on experience-orgnr-from-name-kommune.ts's own-column kommunenummer
+ *      branch going unvalidated) — a real vendored-table code -> true, an
+ *      unknown/garbage code -> false, blank/whitespace-only -> false.
  *
  * Run standalone: npx tsx src/services/fylke-2024-migration.test.ts
  * Wired into tests/test.ts via runFylke2024MigrationTests().
  */
 
-import { resolveFylke2024, resolveKommunenummerForName } from "./fylke-2024-migration";
+import { isKnownKommunenummer, resolveFylke2024, resolveKommunenummerForName } from "./fylke-2024-migration";
 
 export interface TestSummary {
   passed: number;
@@ -275,6 +279,30 @@ export function runFylke2024MigrationTests(opts: { log?: boolean } = {}): TestSu
     resolveKommunenummerForName("Gáivuotna"),
     { kommunenummer: "5540" },
     "9l: canonical Sami name 'Gáivuotna' still resolves directly, unaffected by the alias",
+  );
+
+  // ── 10. isKnownKommunenummer() (Trinn B fix-up) ──────────────────────
+  assertTrue(
+    isKnownKommunenummer("0301") === true,
+    "10a: '0301' (Oslo, a real vendored-table code) -> true",
+  );
+  assertTrue(
+    isKnownKommunenummer("5001") === true,
+    "10b: '5001' (Trondheim, a real vendored-table code) -> true",
+  );
+  assertTrue(
+    isKnownKommunenummer("9999") === false,
+    "10c: '9999' (not in the vendored table) -> false",
+  );
+  assertTrue(
+    isKnownKommunenummer("0000") === false,
+    "10d: '0000' (garbage/placeholder code, not in the vendored table) -> false",
+  );
+  assertTrue(isKnownKommunenummer("") === false, "10e: blank string -> false (no lookup attempted)");
+  assertTrue(isKnownKommunenummer("   ") === false, "10f: whitespace-only string -> false (no lookup attempted)");
+  assertTrue(
+    isKnownKommunenummer("  0301  ") === true,
+    "10g: surrounding whitespace is trimmed before the lookup ('  0301  ' -> true)",
   );
 
   return { passed, failed, failures };

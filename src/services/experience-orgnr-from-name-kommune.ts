@@ -74,7 +74,7 @@ import { getDb } from "../database/db-factory";
 import { getProviderByOrgnr, setBrregVerification, homepageRegistrableDomain } from "./experience-store";
 import { addressesMatch } from "./contact-normalizer";
 import { domainsEquivalent } from "./cross-source-validator";
-import { resolveKommunenummerForName } from "./fylke-2024-migration";
+import { isKnownKommunenummer, resolveKommunenummerForName } from "./fylke-2024-migration";
 import { searchBrregByNameAndKommune, verifyOrgNumber, fetchBrregWebsite, type BrregNameKommuneHit } from "./brreg-client";
 
 const VERTICAL = "experiences";
@@ -242,13 +242,26 @@ function emptyResult(dryRun: boolean): ExperienceOrgnrFromNameKommuneResult {
 
 /**
  * Resolve one candidate row's kommunenummer — the row's OWN column when
- * non-blank, else resolveKommunenummerForName(row.kommune). Never guesses:
- * returns null (caller reports no_kommune_match) when neither source yields
+ * non-blank AND known (validated against the vendored kommune-fylke-2024
+ * table via isKnownKommunenummer(), the same table resolveFylke2024()
+ * validates its own kommunenummer branch against), else
+ * resolveKommunenummerForName(row.kommune). Never guesses: returns
+ * `{detail}` (caller reports no_kommune_match) when neither source yields
  * exactly one valid kommunenummer.
+ *
+ * A non-blank but UNKNOWN own-column value (typo'd digit, stale pre-2024
+ * code, upstream geocode error) does NOT fall through to name-resolution —
+ * that would just substitute one unvalidated guess (a wrong name-resolved
+ * kommune) for another (a wrong own-column kommune), equally capable of
+ * silently restricting the Brreg search to the wrong place. Reported as
+ * `kommunenummer_not_found:<value>` instead, consistent with "never guess".
  */
 function resolveCandidateKommunenummer(row: CandidateRow): { kommunenummer: string } | { detail: string } {
   const ownKommunenummer = typeof row.kommunenummer === "string" ? row.kommunenummer.trim() : "";
-  if (ownKommunenummer) return { kommunenummer: ownKommunenummer };
+  if (ownKommunenummer) {
+    if (isKnownKommunenummer(ownKommunenummer)) return { kommunenummer: ownKommunenummer };
+    return { detail: `kommunenummer_not_found:${ownKommunenummer}` };
+  }
 
   const resolved = resolveKommunenummerForName(row.kommune ?? "");
   if ("kommunenummer" in resolved) return { kommunenummer: resolved.kommunenummer };

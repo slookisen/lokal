@@ -32,10 +32,14 @@
  *       NO hjemmeside at all is STILL selected (Trinn B is deliberately
  *       wider than Trinn A here).
  *   (c) kommunenummer resolution: row's own kommunenummer column used
- *       directly (name resolution skipped); row's kommune NAME resolved via
- *       resolveKommunenummerForName() when kommunenummer is blank; blank
- *       kommune+kommunenummer AND an unresolvable kommune name both ->
- *       no_kommune_match, never a Brreg call for these rows.
+ *       directly (name resolution skipped) WHEN VALID; row's kommune NAME
+ *       resolved via resolveKommunenummerForName() when kommunenummer is
+ *       blank; blank kommune+kommunenummer, an unresolvable kommune name,
+ *       AND a non-blank own kommunenummer that ISN'T in the vendored table
+ *       (typo'd/stale/wrong code) all -> no_kommune_match, never a Brreg
+ *       call for these rows — the invalid-own-column case also proves there
+ *       is NO silent fallback to name-resolution even when the row's
+ *       kommune NAME would otherwise have resolved fine.
  *   (d) exactly one Brreg hit -> accepted (resolved_active / resolved_inactive),
  *       no corroboration attempted.
  *   (e) zero Brreg hits -> no_brreg_hits.
@@ -352,6 +356,21 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
       // ── (c) no_kommune_match: unresolvable kommune name ─────────────────
       seedProvider({ id: "prov-unknown-kommune", navn: "Ukjent Kommune AS", kommunenummer: null, kommune: "Ikke En Ekte Kommune" });
 
+      // ── (c) no_kommune_match: own kommunenummer column is non-blank but
+      //    NOT in the vendored table (typo'd digit / stale pre-2024 code /
+      //    upstream geocode error) — independent-reviewer finding on Trinn B.
+      //    kommune ALSO carries a name that WOULD resolve fine on its own
+      //    ("Testkommune To" -> 1002), to prove the invalid own-column value
+      //    does NOT silently fall back to name-resolution (that would just
+      //    substitute one unvalidated guess for another). No searchFixtures
+      //    entry for EITHER "9999" or "1002" under this row's name — if
+      //    either got searched, the assertions below (outcome + fetchCalls)
+      //    would catch it.
+      seedProvider({
+        id: "prov-invalid-own-knr", navn: "Ugyldig Kommunenummer AS",
+        kommunenummer: "9999", kommune: "Testkommune To",
+      });
+
       // ── (e) no_brreg_hits ────────────────────────────────────────────────
       seedProvider({ id: "prov-nohits", navn: "Uten Treff AS", kommunenummer: "1001" });
       // Deliberately no searchFixtures entry -> falls through to
@@ -433,7 +452,7 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
       {
         const trackedIds = [
           "prov-no-website", "prov-own-knr", "prov-name-resolved", "prov-blank-kommune",
-          "prov-unknown-kommune", "prov-nohits", "prov-ambig", "prov-addr-confirm",
+          "prov-unknown-kommune", "prov-invalid-own-knr", "prov-nohits", "prov-ambig", "prov-addr-confirm",
           "prov-domain-confirm", "prov-multi-confirm", "prov-collide-new", "prov-unconfirmed",
         ];
         const beforeRows: Record<string, any> = {};
@@ -450,6 +469,15 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
         assertEq(byId.get("prov-name-resolved")?.outcome, "resolved_inactive", "onk-l5: blank kommunenummer -> resolved via resolveKommunenummerForName(kommune)");
         assertEq(byId.get("prov-blank-kommune")?.outcome, "no_kommune_match", "onk-l6: blank kommune+kommunenummer -> no_kommune_match");
         assertEq(byId.get("prov-unknown-kommune")?.outcome, "no_kommune_match", "onk-l7: unresolvable kommune name -> no_kommune_match");
+        assertEq(
+          byId.get("prov-invalid-own-knr")?.outcome,
+          "no_kommune_match",
+          "onk-l7b: own kommunenummer column holds a non-blank, UNKNOWN code (not in the vendored table) -> no_kommune_match, NOT no_brreg_hits, and NOT a silent fallback to the row's (otherwise-resolvable) kommune name",
+        );
+        assertTrue(
+          !fetchCalls.some((u) => u.includes("Ugyldig") || u.includes("kommunenummer=9999")),
+          "onk-l7c: NO Brreg search call was made for the invalid-own-kommunenummer row (neither for its own '9999' nor for its name at all) — proves the wrong-kommune search this finding warns about can no longer even be attempted",
+        );
         assertEq(byId.get("prov-nohits")?.outcome, "no_brreg_hits", "onk-l8: zero Brreg hits -> no_brreg_hits");
         assertEq(byId.get("prov-ambig")?.outcome, "ambiguous_name", "onk-l9: 2+ hits, no corroboration -> ambiguous_name");
         assertEq(byId.get("prov-addr-confirm")?.outcome, "resolved_active", "onk-l10: 2+ hits, exactly one address-corroborated -> accepted");
@@ -460,10 +488,10 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
         assertEq(byId.get("prov-collide-new")?.outcome, "orgnr_collision", "onk-l13: confirmed org.nr already held by a different row");
         assertEq(byId.get("prov-unconfirmed")?.outcome, "error", "onk-l14: search returned an org.nr the direct verify lookup didn't confirm -> error, never guessed");
 
-        assertEq(dryRes.body.processed, 12, "onk-l15: processed = exactly the 12 tracked candidates (the 5 selection-exclusion rows + prov-collide-existing are never selected)");
+        assertEq(dryRes.body.processed, 13, "onk-l15: processed = exactly the 13 tracked candidates (the 5 selection-exclusion rows + prov-collide-existing are never selected)");
         assertEq(dryRes.body.resolved_active, 4, "onk-l16: aggregate resolved_active (no-website + own-knr + addr-confirm + domain-confirm)");
         assertEq(dryRes.body.resolved_inactive, 1, "onk-l17: aggregate resolved_inactive (name-resolved)");
-        assertEq(dryRes.body.no_kommune_match, 2, "onk-l18: aggregate no_kommune_match");
+        assertEq(dryRes.body.no_kommune_match, 3, "onk-l18: aggregate no_kommune_match (blank-kommune + unknown-kommune-name + invalid-own-knr)");
         assertEq(dryRes.body.no_brreg_hits, 1, "onk-l19: aggregate no_brreg_hits");
         assertEq(dryRes.body.ambiguous_name, 2, "onk-l20: aggregate ambiguous_name (prov-ambig + prov-multi-confirm)");
         assertEq(dryRes.body.orgnr_collision, 1, "onk-l21: aggregate orgnr_collision");
@@ -533,6 +561,7 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
         // Every non-resolved bucket stays byte-identical — NEVER guessed.
         assertEq(providerRow("prov-blank-kommune").brreg_active, null, "onk-m18: prov-blank-kommune STILL NULL");
         assertEq(providerRow("prov-unknown-kommune").brreg_active, null, "onk-m19: prov-unknown-kommune STILL NULL");
+        assertEq(providerRow("prov-invalid-own-knr").brreg_active, null, "onk-m19b: prov-invalid-own-knr STILL NULL — invalid own kommunenummer never guessed, never fell back to name-resolution");
         assertEq(providerRow("prov-nohits").brreg_active, null, "onk-m20: prov-nohits STILL NULL");
         assertEq(providerRow("prov-ambig").brreg_active, null, "onk-m21: prov-ambig STILL NULL — never guessed among ambiguous ties");
         assertEq(providerRow("prov-multi-confirm").brreg_active, null, "onk-m22: prov-multi-confirm STILL NULL — never picks one among multiple confirmed hits");

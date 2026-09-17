@@ -149,6 +149,29 @@ export function resolveFylke2024(opts: {
   return { needs_review: "no_kommune_data" };
 }
 
+/**
+ * isKnownKommunenummer(kommunenummer) — true iff the given kommunenummer is
+ * an exact match against the vendored table's `kommunenummer` field (same
+ * lookup resolveFylke2024() already does for its own kommunenummer branch).
+ * Blank/whitespace-only -> false, never a lookup. No normalization/fuzzy
+ * matching — kommunenummer is a structured code, not free text, so unlike
+ * the kommune-NAME matching above there is nothing to fold/alias here.
+ *
+ * Added for dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav,
+ * Trinn B fix-up (independent-reviewer finding on
+ * services/experience-orgnr-from-name-kommune.ts's
+ * resolveCandidateKommunenummer(): a candidate row's OWN kommunenummer
+ * column was being trusted with zero validation, unlike the sibling
+ * name-fallback branch — this closes that gap so a typo'd/stale/wrong
+ * kommunenummer can no longer silently restrict a Brreg search to the
+ * wrong kommune).
+ */
+export function isKnownKommunenummer(kommunenummer: string): boolean {
+  const nr = (kommunenummer || "").trim();
+  if (!nr) return false;
+  return loadRows().some((r) => r && typeof r.kommunenummer === "string" && r.kommunenummer.trim() === nr);
+}
+
 export type ResolveKommunenummerResult = { kommunenummer: string } | { needs_review: string };
 
 /**
