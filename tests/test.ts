@@ -43977,6 +43977,51 @@ runSerial(async () => {
   }
 });
 
+// dev-requests/2026-09-13-fjern-svar-kobles-ikke-paa-tvers-av-vertikaler.md:
+// findCrossVerticalEntriesByEmail() (services/cross-vertical-contact-lookup.ts)
+// — pure unit tests for the exact-email-match cross-vertical lookup itself.
+// Own in-memory rfb DB (__setDbForTesting + __initSchemaForTesting) +
+// scratch-path dental/experiences DBs via db-factory.ts's getDb() +
+// __resetDbFactoryForTesting(), same seam admin-db-backup.test.ts uses. Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-13-fjern-svar-kobles-ikke-paa-tvers-av-vertikaler: findCrossVerticalEntriesByEmail() ──");
+  try {
+    const { runCrossVerticalContactLookupTests } = require("../src/services/cross-vertical-contact-lookup.test") as
+      typeof import("../src/services/cross-vertical-contact-lookup.test");
+    const cvcl = await runCrossVerticalContactLookupTests({ log: false });
+    passed += cvcl.passed;
+    failed += cvcl.failed;
+    for (const f of cvcl.failures) failures.push("cross-vertical-contact-lookup: " + f);
+    console.log(`  cross-vertical-contact-lookup: ${cvcl.passed} passed, ${cvcl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cross-vertical-contact-lookup: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-requests/2026-09-13-fjern-svar-kobles-ikke-paa-tvers-av-vertikaler.md:
+// GET /admin/cross-vertical-contact-lookup (routes/admin-cross-vertical-
+// contact-lookup.ts) — the admin diagnostic route: query-param validation,
+// X-Admin-Key auth, and response shape. Same router.handle() harness +
+// scratch-DB seams as the service-level block above. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-13-fjern-svar-kobles-ikke-paa-tvers-av-vertikaler: GET /admin/cross-vertical-contact-lookup ──");
+  try {
+    const { runAdminCrossVerticalContactLookupTests } = require("../src/routes/admin-cross-vertical-contact-lookup.test") as
+      typeof import("../src/routes/admin-cross-vertical-contact-lookup.test");
+    const acvcl = await runAdminCrossVerticalContactLookupTests({ log: false });
+    passed += acvcl.passed;
+    failed += acvcl.failed;
+    for (const f of acvcl.failures) failures.push("admin-cross-vertical-contact-lookup: " + f);
+    console.log(`  admin-cross-vertical-contact-lookup: ${acvcl.passed} passed, ${acvcl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-cross-vertical-contact-lookup: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-
 // gjenopprett, spec item 1: judgeExperienceEvidencePage() (experience-
 // content-judge.ts) — the fetch+classify+judge entry point that fixes the
