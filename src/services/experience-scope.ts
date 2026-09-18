@@ -106,19 +106,30 @@ export function isExperienceInScope(input: {
 
 /** SQL fragment: true when `categoryCol` (a comma-separated category string
  * column/expression, or a single category) includes `mat_drikke` among its
- * values — the SQL counterpart of categoryIncludesMatDrikke(). Tolerates a
- * single space after a separating comma (a common harvest-agent style) in
- * addition to the no-space form; never string-interpolates caller input,
- * only ever called with a fixed column/expression name. */
+ * values — the SQL counterpart of categoryIncludesMatDrikke(). Review
+ * finding (2026-09-18, independent review of this PR): the original 6-LIKE-
+ * pattern version only tolerated a space AFTER a separating comma, not
+ * BEFORE — categoryIncludesMatDrikke() (JS) trims each token regardless of
+ * which side the whitespace is on, so a category like "kultur_historie ,
+ * mat_drikke" was correctly in-scope for the JS-side check (bulk-load
+ * insert decision) but silently missed by this SQL fragment (judge-sweep/
+ * org.nr candidate selection) — a starvation edge case where harvest could
+ * insert a row this fragment would then never select for judging/
+ * enrichment. Fixed by normalizing away a single space on EITHER side of a
+ * comma before matching, so both sides agree on the same set of composite
+ * forms (still only a single adjacent space, same proportionate scope as
+ * the original — not a fully general whitespace-arbitrary regex, matching
+ * categoryIncludesMatDrikke()'s trim() only up to that same single-space-
+ * in-practice case this file has ever needed). Never string-interpolates
+ * caller input, only ever called with a fixed column/expression name. */
 export function matDrikkeCategorySql(categoryCol: string): string {
-  const c = `lower(trim(COALESCE(${categoryCol}, '')))`;
+  const raw = `trim(COALESCE(${categoryCol}, ''))`;
+  const normalized = `lower(replace(replace(${raw}, ' ,', ','), ', ', ','))`;
   return (
-    `(${c} = '${MAT_DRIKKE}'` +
-    ` OR ${c} LIKE '${MAT_DRIKKE},%'` +
-    ` OR ${c} LIKE '%,${MAT_DRIKKE}'` +
-    ` OR ${c} LIKE '%,${MAT_DRIKKE},%'` +
-    ` OR ${c} LIKE '%, ${MAT_DRIKKE},%'` +
-    ` OR ${c} LIKE '%, ${MAT_DRIKKE}')`
+    `(${normalized} = '${MAT_DRIKKE}'` +
+    ` OR ${normalized} LIKE '${MAT_DRIKKE},%'` +
+    ` OR ${normalized} LIKE '%,${MAT_DRIKKE}'` +
+    ` OR ${normalized} LIKE '%,${MAT_DRIKKE},%')`
   );
 }
 

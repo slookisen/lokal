@@ -306,6 +306,55 @@ export function runOpplevelserBulkLoadScopeGateTests(
         assertTrue(!!row && row.provider_id === cohortProviderId, "sg-3d: the row attached to the existing cohort provider, no duplicate provider created");
         assertEq(row?.category, "kultur_historie", "sg-3e: the row's own category is untouched — it entered scope via its PROVIDER, not its category");
       }
+
+      // ═══ (e) composite (comma-separated) category values — review finding ═
+      // (2026-09-18): the PR originally claimed multi-category rows were
+      // "in-scope, verified by tests" with ZERO actual composite-category
+      // test coverage anywhere. This closes that gap and specifically
+      // proves the JS predicate (categoryIncludesMatDrikke, used by
+      // bulk-load's insert decision) and the SQL predicate
+      // (matDrikkeCategorySql, used by judge-sweep/org.nr candidate
+      // selection — NOT exercised by this route, checked directly against
+      // expDb here) agree on the SAME set of composite forms, including a
+      // space BEFORE the comma (the specific mismatch the review found: the
+      // original SQL fragment only tolerated a space AFTER the comma).
+      {
+        const { categoryIncludesMatDrikke, matDrikkeCategorySql } =
+          require("../services/experience-scope") as typeof import("../services/experience-scope");
+
+        const composites: Array<[string, boolean, string]> = [
+          ["mat_drikke,kultur_historie", true, "no space, mat_drikke first"],
+          ["kultur_historie,mat_drikke", true, "no space, mat_drikke last"],
+          ["kultur_historie, mat_drikke", true, "space AFTER comma (pre-existing coverage)"],
+          ["kultur_historie , mat_drikke", true, "space BEFORE comma (the review's finding)"],
+          ["kultur_historie , mat_drikke , velvaere_spa", true, "space both sides, mat_drikke in the middle"],
+          ["kultur_historie,velvaere_spa", false, "composite with no mat_drikke at all"],
+        ];
+
+        expDb.exec(`CREATE TEMP TABLE IF NOT EXISTS scope_composite_probe (id INTEGER PRIMARY KEY, category TEXT)`);
+        expDb.exec(`DELETE FROM scope_composite_probe`);
+        const insertProbe = expDb.prepare(`INSERT INTO scope_composite_probe (id, category) VALUES (?, ?)`);
+        composites.forEach(([category], i) => insertProbe.run(i, category));
+
+        const sqlInScope = expDb
+          .prepare(`SELECT id, (${matDrikkeCategorySql("category")}) AS in_scope FROM scope_composite_probe ORDER BY id`)
+          .all() as Array<{ id: number; in_scope: number }>;
+
+        composites.forEach(([category, expected, label], i) => {
+          assertEq(
+            categoryIncludesMatDrikke(category),
+            expected,
+            `sg-4${String.fromCharCode(97 + i)}-js: categoryIncludesMatDrikke("${category}") [${label}] -> ${expected}`,
+          );
+          assertEq(
+            !!sqlInScope[i]?.in_scope,
+            expected,
+            `sg-4${String.fromCharCode(97 + i)}-sql: matDrikkeCategorySql over "${category}" [${label}] -> ${expected}`,
+          );
+        });
+
+        expDb.exec(`DROP TABLE IF EXISTS scope_composite_probe`);
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-bulk-load-scope-gate: unexpected error: " + String(err?.stack || err?.message || err));
