@@ -4761,7 +4761,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // if no contact fields are set. Maps search always falls back to
       // "<name>, <city>, Norge" even if address is missing.
       const umbContactItems: string[] = [];
-      if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode))}</div></div></div>`);
+      if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode, cityName))}</div></div></div>`);
       if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
       if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
       if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
@@ -4988,7 +4988,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Contact items
     const contactItems: string[] = [];
-    if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode))}</div></div></div>`);
+    if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode, cityName))}</div></div></div>`);
     // ─── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
     // (work item 3): mailto:/tel: get a data-track-kind hook (beacon fired
     // by a delegated click listener at the bottom of this page — see the
@@ -5583,7 +5583,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="pf-badges">${badges.join("")}</div>
         ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">${escapeHtml(t(lang, "producer.updated_prefix"))} ${escapeHtml(formatUpdatedPretty(updatedAtDate, lang))}</time></p>` : ""}
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
-        ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(formatAddressLine(k.address || cityName, k.postalCode))}</div>` : ""}
+        ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(formatAddressLine(k.address || cityName, k.postalCode, k.address ? cityName : undefined))}</div>` : ""}
         ${answerFirstOpening ? `<p class="pf-answer">${escapeHtml(answerFirstOpening)}</p>` : ""}
         ${(() => {
           const desc = displayDescription;

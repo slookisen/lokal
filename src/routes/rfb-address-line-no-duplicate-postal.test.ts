@@ -4,7 +4,11 @@
  * 2026-09-09-rfb-profil-adresselinje-postnummer-dobbelt, extended by
  * dev-request 2026-09-09-dobbelt-postnummer-mcp-og-samtaletjeneste (same
  * defect on the MCP tool and the conversation service, outside PR #834's
- * original scope).
+ * original scope), and by dev-request 2026-09-17-rfb-adresselinje-uten-
+ * poststed-i-profil-og-epost (postal CITY was never passed to
+ * formatAddressLine() at all, so the line stopped after the postal code even
+ * when `agents.city` was known — "Kvernelandsvegen 580, 4346" instead of
+ * "Kvernelandsvegen 580, 4346 Bryne").
  *
  * `agent_knowledge.address` very often already carries the postal code and
  * city ("Bergemoveien 42, 4886 GRIMSTAD"). The profile page appended
@@ -12,7 +16,8 @@
  * rendered "…, 4886 GRIMSTAD, 4886" (Smaken av Grimstad's reply 2026-09-09:
  * «postkoden er skrevet to ganger»). formatAddressLine() (now shared from
  * utils/address-format.ts, re-exported by ./seo for backward compat) appends
- * the postal code only when the address string does not already contain it.
+ * the postal code and/or city only when the address string does not already
+ * contain them.
  *
  * Same synthetic router.handle() harness + in-memory-DB pattern as
  * rfb-trust-score-public-display-removed.test.ts, including its
@@ -60,6 +65,26 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
     "unit: whitespace around the postal code is tolerated");
   assertTrue(formatAddressLine("Ringveien 5", "4614") === "Ringveien 5, 4614",
     "unit: different house number does not count as the postal code");
+
+  // ── (1b) Unit: formatAddressLine's new third `city` argument ────────────
+  assertTrue(formatAddressLine("Kvernelandsvegen 580", "4346", "Bryne") === "Kvernelandsvegen 580, 4346 Bryne",
+    "unit: postal code + city both absent from address are both appended, code before city");
+  assertTrue(formatAddressLine("Klommesteinveien 52", "1449", "Ås") === "Klommesteinveien 52, 1449 Ås",
+    "unit: second real example from the dev-request renders the same way");
+  assertTrue(formatAddressLine("Mellomriksvegen 2658, 7525 Flornes", "7525", "Flornes") === "Mellomriksvegen 2658, 7525 Flornes",
+    "unit: idempotent when the address text already carries both the code and the city");
+  assertTrue(formatAddressLine("Bergemoveien 42, 4886 GRIMSTAD", "4886", "Grimstad") === "Bergemoveien 42, 4886 GRIMSTAD",
+    "unit: city match is case-insensitive (stored 'Grimstad' vs. address text 'GRIMSTAD')");
+  assertTrue(formatAddressLine("Kvernelandsvegen 580", undefined, "Bryne") === "Kvernelandsvegen 580, Bryne",
+    "unit: missing postal code -> '<address>, <city>' (no stray leading comma/space)");
+  assertTrue(formatAddressLine("Kvernelandsvegen 580", "4346", undefined) === "Kvernelandsvegen 580, 4346",
+    "unit: missing city -> unchanged two-argument behavior");
+  assertTrue(formatAddressLine("Kvernelandsvegen 580", undefined, undefined) === "Kvernelandsvegen 580",
+    "unit: neither postal code nor city -> address unchanged");
+  assertTrue(formatAddressLine("", "4346", "Bryne") === "4346 Bryne",
+    "unit: empty address -> postal code + city alone, space-joined");
+  assertTrue(formatAddressLine("Storgata 1", "4614", "Storgata") === "Storgata 1, 4614",
+    "unit: city name that only appears as a street-name substring inside the address is still treated as 'already there' (word-boundary match), not appended a second time");
 
   // ── (2) Route: GET /produsent/:slug renders the line without duplication ─
   const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../database/init") as
@@ -116,6 +141,12 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
     seedKnowledge("dup-1", "Bergemoveien 42, 4886 GRIMSTAD", "4886");
     seedAgent({ id: "nodup-1", name: "Storgata Bakeri Test", city: "Oslo" });
     seedKnowledge("nodup-1", "Storgata 1", "0150");
+    // dev-request 2026-09-17: the two real profiles named in the dev-request's
+    // own diagnosis table.
+    seedAgent({ id: "city-1", name: "Drivhuset Bageri Test", city: "Bryne" });
+    seedKnowledge("city-1", "Kvernelandsvegen 580", "4346");
+    seedAgent({ id: "city-2", name: "Mellomriks Test", city: "Flornes" });
+    seedKnowledge("city-2", "Mellomriksvegen 2658, 7525 Flornes", "7525");
     resetRegistryCache();
 
     {
@@ -128,7 +159,19 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
     {
       const r = invoke("/produsent/:slug", { params: { slug: "storgata-bakeri-test" }, lang: "no", ip: "127.0.0.1" });
       assertTrue(r.status === 200, "produsent (address without postal code): renders 200");
-      assertTrue(r.body.includes("Storgata 1, 0150"), "produsent: postal code is still appended when the address lacks it");
+      assertTrue(r.body.includes("Storgata 1, 0150 Oslo"), "produsent: postal code AND agents.city are both appended when the address lacks them");
+    }
+    // ── (2b) dev-request 2026-09-17: the two real profiles from the diagnosis table ──
+    {
+      const r = invoke("/produsent/:slug", { params: { slug: "drivhuset-bageri-test" }, lang: "no", ip: "127.0.0.1" });
+      assertTrue(r.status === 200, "produsent (Drivhuset, missing poststed): renders 200");
+      assertTrue(r.body.includes("Kvernelandsvegen 580, 4346 Bryne"), "produsent: poststed is no longer missing from the visible address line");
+    }
+    {
+      const r = invoke("/produsent/:slug", { params: { slug: "mellomriks-test" }, lang: "no", ip: "127.0.0.1" });
+      assertTrue(r.status === 200, "produsent (address already carries code+city): renders 200");
+      assertTrue(r.body.includes("Mellomriksvegen 2658, 7525 Flornes"), "produsent: the stored line renders");
+      assertTrue(!r.body.includes("Flornes, 7525 Flornes") && !r.body.includes("7525 Flornes, 7525"), "produsent: idempotent — neither the code nor the city is repeated");
     }
 
     // ── (3) MCP tool lokal_info — dev-request 2026-09-09-dobbelt-postnummer-mcp-og-samtaletjeneste ──
@@ -156,7 +199,11 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
 
         const nodupResult = await info.handler({ agentId: "nodup-1" });
         const nodupText = textOf(nodupResult);
-        assertTrue(nodupText.includes("Storgata 1, 0150"), "lokal_info: postal code is still appended when the address lacks it");
+        assertTrue(nodupText.includes("Storgata 1, 0150 Oslo"), "lokal_info: postal code AND agents.city are still appended when the address lacks them");
+
+        const cityResult = await info.handler({ agentId: "city-1" });
+        const cityText = textOf(cityResult);
+        assertTrue(cityText.includes("Kvernelandsvegen 580, 4346 Bryne"), "lokal_info: dev-request 2026-09-17 — poststed no longer missing on the MCP tool either");
       }
       try { delete require.cache[require.resolve("./mcp")]; } catch { /* ignore */ }
     }
@@ -176,7 +223,12 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
       const nodupResponse = conversationService.generateSellerResponse("nodup-1", "adresse");
       assertTrue(!!nodupResponse, "conversation-service: generateSellerResponse returns a response for nodup-1");
       if (nodupResponse) {
-        assertTrue(nodupResponse.text.includes("Storgata 1, 0150"), "conversation-service: postal code is still appended when the address lacks it");
+        assertTrue(nodupResponse.text.includes("Storgata 1, 0150 Oslo"), "conversation-service: postal code AND agents.city are still appended when the address lacks them");
+      }
+      const cityResponse = conversationService.generateSellerResponse("city-1", "adresse");
+      assertTrue(!!cityResponse, "conversation-service: generateSellerResponse returns a response for city-1");
+      if (cityResponse) {
+        assertTrue(cityResponse.text.includes("Kvernelandsvegen 580, 4346 Bryne"), "conversation-service: dev-request 2026-09-17 — poststed no longer missing on the conversation service either");
       }
       try { delete require.cache[require.resolve("../services/conversation-service")]; } catch { /* ignore */ }
     }
