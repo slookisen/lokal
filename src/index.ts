@@ -26,6 +26,7 @@ import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from "./routes/marketplace-catalog";
+import { runProductCatalogSync } from "./services/product-catalog-sync";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
 import dentalRoutes from "./routes/dental";
@@ -1333,6 +1334,48 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
       lastSalgskanalSyncAt = now;
     } catch (err) {
       console.error("[salgskanal-sync] failed:", err);
+    }
+  }, 60 * 60_000); // hourly check
+}
+
+// ─── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: daily automatic product-catalog sync ──────────────────────────
+//
+// Runs the SAME upsert runProductCatalogSync() (src/services/
+// product-catalog-sync.ts) that POST /admin/products/backfill has always
+// run — only difference is *when* it runs: once a day instead of only when
+// an admin remembers to trigger it. Implementation pattern mirrors PR-95's
+// debio-sync / the salgskanal-sync scheduler immediately above: hourly
+// wakeup, only fires inside the target UTC hour, debounced by the 23-hour
+// gap so a restart inside that hour doesn't double-run. 07:00 UTC — right
+// after the 22:00-06:00 verifier window closes, so this sync's writes never
+// overlap the verifier's.
+//
+// Never touches `availability` (see product-catalog-sync.ts's module doc
+// comment for the exact guarantee that gives producer_dashboard-sourced
+// rows) — this is a NEW job, so unlike RFB_DISABLE_* siblings above it is
+// OPT-IN (default OFF, same posture as VERIFIER_SCHEDULER_ENABLED below):
+// it ships inert in code until a human sets
+// CATALOG_SYNC_SCHEDULER_ENABLED=true in fly.toml.
+let lastCatalogSyncAt: Date | null = null;
+if (process.env.CATALOG_SYNC_SCHEDULER_ENABLED === "true") {
+  setInterval(() => {
+    const now = new Date();
+    if (now.getUTCHours() !== 7) return; // fire only during 07:00 UTC window
+    if (lastCatalogSyncAt && (now.getTime() - lastCatalogSyncAt.getTime()) < 23 * 3600_000) return;
+    try {
+      const result = runProductCatalogSync();
+      if (result.success) {
+        console.log(
+          `[catalog-sync] agents_processed=${result.agents_processed} inserted=${result.inserted} ` +
+          `updated=${result.updated} skipped=${result.skipped}`,
+        );
+      } else {
+        console.error(`[catalog-sync] failed: ${result.error}`);
+      }
+      lastCatalogSyncAt = now;
+    } catch (err) {
+      console.error("[catalog-sync] failed:", err);
     }
   }, 60 * 60_000); // hourly check
 }

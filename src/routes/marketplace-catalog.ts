@@ -7,6 +7,7 @@
 //   GET   /api/marketplace/catalog/feed     — public ACP feed (verified producers)
 //   GET   /api/marketplace/catalog/acp-feed.csv — public ACP non-Ads CSV product feed
 //   GET   /api/marketplace/catalog/agents/:id/products — public per-agent product list
+//   GET   /api/marketplace/catalog/offers   — public per-item multi-producer offer lookup
 //
 // Route-path collision analysis (checked against src/routes/marketplace.ts):
 //   - `/feed` — DOES NOT EXIST in marketplace.ts; safe to use as `/catalog/feed`
@@ -16,14 +17,22 @@
 //     we use the prefix `/catalog/` for all new public endpoints:
 //       GET /api/marketplace/catalog/feed
 //       GET /api/marketplace/catalog/agents/:id/products
+//       GET /api/marketplace/catalog/offers
 //   - The admin backfill is mounted separately under /admin/products (no collision).
+//
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: GET /offers is a NEW public read endpoint (no admin-key gate — same
+// public posture as /feed and the underlying lokal_search REST route). Its
+// filtering/geo/can_order logic lives in ../services/catalog-offers.ts, shared
+// with the lokal_find_offers MCP tool (src/routes/mcp.ts).
 
 import { Router, Request, Response } from "express";
-import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { computeEffectiveAvailability } from "../services/supply-graph";
+import { runProductCatalogSync } from "../services/product-catalog-sync";
+import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
+import { isValidLatLng } from "../utils/geo-query";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
 export const catalogRouter = Router();
@@ -52,116 +61,26 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
-// ─── Price string → numeric NOK ──────────────────────────────────────────────
-// Parses "kr 275/kg", "kr 275", "275" → 275.0; null if unparseable.
-function parsePriceNok(priceStr: string | null | undefined): number | null {
-  if (!priceStr) return null;
-  // Strip "kr", "kr.", currency symbols, and unit suffixes like "/kg"
-  const digits = priceStr.replace(/kr\.?\s*/gi, "").replace(/[^0-9,.]/g, "").replace(/,/g, ".").trim();
-  const val = parseFloat(digits);
-  return isFinite(val) && val > 0 ? val : null;
-}
-
-// ─── Name normalization for dedupe ───────────────────────────────────────────
-function normalizeName(name: string): string {
-  return name.toLowerCase().trim().replace(/\s+/g, " ");
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // POST /admin/products/backfill
 // Admin-gated. Upserts every agent_knowledge.products row into `products`.
 // Idempotent: insert new rows, update price/category/updated_at on conflict.
+//
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: the actual upsert logic now lives in
+// src/services/product-catalog-sync.ts (runProductCatalogSync) so the daily
+// automatic sync (src/index.ts, CATALOG_SYNC_SCHEDULER_ENABLED) can call the
+// exact same code path instead of a re-implementation. This handler's
+// request/response contract is unchanged.
 // ────────────────────────────────────────────────────────────────────────────
 adminCatalogRouter.post("/backfill", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const db = getDb();
-
-  // Fetch all agent_knowledge rows that have a non-empty products array.
-  // We also join agents so we can confirm the agent exists (FK safety).
-  const rows = db.prepare(`
-    SELECT k.agent_id, k.products
-    FROM agent_knowledge k
-    INNER JOIN agents a ON a.id = k.agent_id
-    WHERE k.products IS NOT NULL AND k.products != '[]' AND k.products != ''
-  `).all() as Array<{ agent_id: string; products: string }>;
-
-  // Prepared statements for upsert
-  const insert = db.prepare(`
-    INSERT INTO products
-      (id, agent_id, name, name_norm, category, price_nok, currency,
-       availability, source, created_at, updated_at)
-    VALUES
-      (@id, @agent_id, @name, @name_norm, @category, @price_nok, 'NOK',
-       'in_stock', 'enrichment', datetime('now'), datetime('now'))
-    ON CONFLICT(agent_id, name_norm) DO UPDATE SET
-      price_nok  = CASE WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END,
-      category   = CASE WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END,
-      updated_at = datetime('now')
-  `);
-
-  // Wrap everything in a single transaction for speed
-  let agents_processed = 0;
-  let inserted = 0;
-  let updated = 0;
-  let skipped = 0;
-
-  const tx = db.transaction(() => {
-    for (const row of rows) {
-      let products: any[];
-      try {
-        products = JSON.parse(row.products);
-        if (!Array.isArray(products)) continue;
-      } catch {
-        continue;
-      }
-
-      agents_processed++;
-      const seen = new Set<string>(); // dedupe within this agent in this run
-
-      for (const p of products) {
-        const rawName = (p.name || "").trim();
-        if (!rawName) { skipped++; continue; }
-        if (isProductHeader(rawName)) { skipped++; continue; }
-        if (isProductNoise(rawName)) { skipped++; continue; }
-
-        const { cleanName, price: priceStr } = parseProductPrice(p);
-        if (!cleanName) { skipped++; continue; }
-
-        const name_norm = normalizeName(cleanName);
-        if (!name_norm) { skipped++; continue; }
-        if (seen.has(name_norm)) { skipped++; continue; } // in-batch dedupe
-        seen.add(name_norm);
-
-        const price_nok = parsePriceNok(priceStr) ?? parsePriceNok(p.price);
-        const category = p.category && p.category !== "other" ? p.category : null;
-
-        // Count insert vs update by checking pre-existence
-        const existed = db.prepare(
-          "SELECT 1 FROM products WHERE agent_id = ? AND name_norm = ?"
-        ).get(row.agent_id, name_norm);
-
-        insert.run({
-          id: randomUUID(),
-          agent_id: row.agent_id,
-          name: cleanName,
-          name_norm,
-          category,
-          price_nok,
-        });
-
-        if (existed) updated++;
-        else inserted++;
-      }
-    }
-  });
-
-  try {
-    tx();
-    res.json({ success: true, agents_processed, inserted, updated, skipped });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ success: false, error: msg });
+  const result = runProductCatalogSync();
+  if (result.success) {
+    res.json(result);
+  } else {
+    res.status(500).json({ success: false, error: result.error });
   }
 });
 
@@ -466,4 +385,59 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
     count: products.length,
     products,
   });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/marketplace/catalog/offers
+// Public — no auth (same posture as /feed above). Multi-producer offer lookup
+// for one search term ("handleliste" item), sorted by distance, capped at
+// `limit` (default/max 5).
+//
+// Query params:
+//   q          — required. Product/item search term.
+//   near       — free-text Norwegian place name (geocoded the same way
+//                lokal_geocode / lokal_search resolve a place name).
+//   lat, lng   — explicit coordinates; take priority over `near` when both
+//                are given valid (same priority as lokal_search fix 0g(i)).
+//   radius_km  — default 50.
+//   limit      — default 5, capped at 5 ("vis flere" is a later slice).
+//
+// `near` or `lat`+`lng` is required — this is a proximity lookup, there is no
+// nationwide fallback. Response shape: { term, offers: [...] } — see
+// ../services/catalog-offers.ts for the full field-by-field contract.
+// ────────────────────────────────────────────────────────────────────────────
+catalogRouter.get("/offers", async (req: Request, res: Response) => {
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (!q) {
+    res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
+    return;
+  }
+
+  const lat = parseFloat(String(req.query.lat ?? ""));
+  const lng = parseFloat(String(req.query.lng ?? ""));
+  const hasCoords = isValidLatLng(lat, lng);
+  const near = typeof req.query.near === "string" ? req.query.near.trim() : "";
+
+  if (!hasCoords && !near) {
+    res.status(400).json({
+      success: false,
+      error: "Oppgi enten ?near= (stedsnavn) eller ?lat=&lng= (koordinater)",
+    });
+    return;
+  }
+
+  try {
+    const result = await findOffers({
+      q,
+      near: near || undefined,
+      lat: hasCoords ? lat : undefined,
+      lng: hasCoords ? lng : undefined,
+      radiusKm: resolveOffersRadiusKm(req.query.radius_km),
+      limit: resolveOffersLimit(req.query.limit),
+    });
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
 });

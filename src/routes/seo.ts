@@ -2373,7 +2373,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "What tools does the lokal MCP server expose?",
-      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's full price list and contact details; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
+      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's full price list and contact details; lokal_find_offers looks up, per shopping-list item, which nearby producers sell it and whether an order can be placed with them; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
     },
     {
       q: "Does it cost anything to use the MCP server?",
@@ -2394,7 +2394,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "Hvilke verktøy har lokal MCP-serveren?",
-      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer full prisliste og kontaktinfo for én produsent; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
+      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer full prisliste og kontaktinfo for én produsent; lokal_find_offers finner, for hver vare på en handleliste, hvilke produsenter i nærheten som selger den og om du kan bestille hos dem; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
     },
     {
       q: "Koster det noe å bruke MCP-serveren?",
