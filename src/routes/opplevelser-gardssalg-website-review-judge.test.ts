@@ -4,11 +4,16 @@
  * dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror (RFB's
  * shipped POST /admin/rfb-website-review-judge, PR lokal#... — see
  * admin-rfb-website-discovery.test.ts's own `jg-*` block) applied to
- * gardssalg_website_review_queue's own [0.90, 0.95) confidence band.
+ * gardssalg_website_review_queue's own confidence band, originally [0.90,
+ * 0.95) and widened to [0.90, 1.0] inclusive by dev-request 2026-09-14-
+ * opplevagent-needs-review-drenering ("grep 3 + grep 4").
  *
  * Covers:
- *   a1/a2  Confidence-band boundary: a 0.90 row and a 0.92 row qualify; a
- *          0.95 row and a 1.0 row do NOT (never even reach the judge).
+ *   a      Confidence-band boundary (widened): 0.90/0.92/0.95 rows AND a
+ *          not-yet-drained 1.0 row all qualify; a row the SEPARATE
+ *          deterministic auto-approve mechanism (gardssalg-website-review-
+ *          approve's `auto: true` mode) already drained does not reappear —
+ *          the two mechanisms are independent and non-conflicting.
  *   b      Structural backstop (classifyContactCandidateDefect) rejects a
  *          favicon-path candidate BEFORE any LLM call — a fetch stub that
  *          throws if invoked proves the LLM is never reached.
@@ -171,8 +176,48 @@ export function runOpplevelserGardssalgWebsiteReviewJudgeTests(opts: { log?: boo
         assertEq(r.status, 403, "auth: POST without X-Admin-Key -> 403");
       }
 
-      // ═══ a: confidence-band boundary ═══════════════════════════════════
+      // ═══ a: confidence-band boundary — widened by dev-request 2026-09-14-
+      //        opplevagent-needs-review-drenering ("grep 3 + grep 4") from
+      //        [0.90, 0.95) to [0.90, 1.0] inclusive
+      //        (GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE raised from 0.95
+      //        to 1.01): this route now ALSO covers the org_nr_found (>=1.0)
+      //        tier, for whatever the SEPARATE deterministic auto-approve
+      //        mechanism (gardssalg-website-review-approve's own
+      //        `auto: true` mode, default min_confidence: 1.0, a DIFFERENT
+      //        route/query, untouched by this constant) hasn't already
+      //        drained. Proves both halves: (a1-a3) the deterministic
+      //        mechanism's own behavior is completely unaffected — it still
+      //        drains an exactly-1.0 row exactly as before widening; (a4-a9)
+      //        a 0.95 row (previously excluded by the old ceiling) and a
+      //        SEPARATE, NOT-yet-drained 1.0 row are now included by this
+      //        route's own widened query — while the row the deterministic
+      //        mechanism already drained is correctly gone and never
+      //        reappears here. The two mechanisms read the same queue by
+      //        different, independent, non-conflicting criteria. ═══════════
       {
+        // a1-a3: the deterministic mechanism, run FIRST and in isolation, on
+        // its own default (>=1.0) tier — unaffected by the judge route's
+        // widened constant, which this block hasn't touched yet.
+        insertProvider.run({ id: "a-100-drained", navn: "Drenert Terskel Gard", org_nr: "910900099", kommune: null, poststed: null, hjemmeside: null, content_source: "provider_site" });
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "a-100-drained", provider_name: "Drenert Terskel Gard",
+          candidate_url: "https://drenertterskel.no", confidence: 1.0,
+          evidence: JSON.stringify({ org_nr_found: true }),
+        });
+        const autoApprove = await callRoute(opplevelserRouter, "/admin/gardssalg-website-review-approve", {
+          headers: { "x-admin-key": testKey }, body: { auto: true, apply: true },
+        });
+        assertEq(autoApprove.body.mode, "auto", "a1: the deterministic auto-approve mode is still available, unaffected by the judge's widened constant");
+        assertEq(autoApprove.body.min_confidence, 1.0, "a2: its own default min_confidence is still exactly 1.0 — a DIFFERENT constant, untouched by this dev-request");
+        assertTrue(
+          (autoApprove.body.written as any[]).some((w: any) => w.provider_id === "a-100-drained"),
+          "a3: the exactly-1.0 row is deterministically drained exactly as before widening",
+        );
+
+        // a4-a9: NOW populate the judge route's own band, including a 0.95
+        // row (previously excluded) and a SEPARATE 1.0 row this run does
+        // NOT run the deterministic mechanism on first — proving the
+        // widened judge query alone reaches it.
         insertProvider.run({ id: "a-090", navn: "Nedre Terskel Gard", org_nr: null, kommune: null, poststed: null, hjemmeside: null, content_source: "provider_site" });
         expStore.upsertGardssalgWebsiteReviewQueue({
           provider_id: "a-090", provider_name: "Nedre Terskel Gard",
@@ -200,18 +245,20 @@ export function runOpplevelserGardssalgWebsiteReviewJudgeTests(opts: { log?: boo
 
         globalThis.fetch = anthropicJudgeFetch("AVVIS\nIkke nok bevis, avvist for testens skyld.");
         const r = await callRoute(opplevelserRouter, PATH, { headers: { "x-admin-key": testKey }, body: { limit: 30 } });
-        assertEq(r.body.processed, 2, "a1: exactly the two in-band rows (0.90, 0.92) are processed");
+        assertEq(r.body.processed, 4, "a4: all four rows in the widened [0.90, 1.0] band are processed — 0.90, 0.92, 0.95 AND the not-yet-drained 1.0 row");
         const ids = (r.body.results as any[]).map((x) => x.provider_id).sort();
-        assertEq(ids, ["a-090", "a-092"], "a2: the 0.95 and 1.0 rows never appear in results");
-        assertEq(r.body.still_pending, 0, "a2b: still_pending is 0 — both in-band rows were reached within the limit");
+        assertEq(ids, ["a-090", "a-092", "a-095", "a-100"], "a5: exactly these four — the ALREADY-DRAINED a-100-drained never reappears (its queue row is gone)");
+        assertEq(r.body.still_pending, 0, "a6: still_pending is 0 — all four in-band rows were reached within the limit");
 
         const q095 = expDb.prepare(`SELECT reason FROM gardssalg_website_review_queue WHERE provider_id = ?`).get("a-095") as { reason: string };
-        assertEq(q095.reason, "website_discovery_candidate", "a3: the 0.95 row's reason is untouched");
+        assertTrue(q095.reason.includes("LLM judge AVVIS"), "a7: the 0.95 row — previously EXCLUDED by the old 0.95 ceiling — was actually judged (not just untouched)");
         const q100 = expDb.prepare(`SELECT reason FROM gardssalg_website_review_queue WHERE provider_id = ?`).get("a-100") as { reason: string };
-        assertEq(q100.reason, "website_discovery_candidate", "a4: the 1.0 row's reason is untouched");
+        assertTrue(q100.reason.includes("LLM judge AVVIS"), "a8: the not-yet-drained 1.0 row was also actually judged by the widened band");
+        const qDrained = expDb.prepare(`SELECT * FROM gardssalg_website_review_queue WHERE provider_id = ?`).get("a-100-drained");
+        assertEq(qDrained, undefined, "a9: the deterministically-drained row's queue entry stays gone — the judge run never recreated or touched it");
 
-        assertEq(opplevelserModule.GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, 0.9, "a5: band floor is 0.90 (inclusive)");
-        assertEq(opplevelserModule.GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, 0.95, "a6: band ceiling is 0.95 (exclusive)");
+        assertEq(opplevelserModule.GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, 0.9, "a10: band floor is 0.90 (inclusive), unchanged");
+        assertEq(opplevelserModule.GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, 1.01, "a11: band ceiling widened to 1.01 — i.e. [0.90, 1.0] inclusive");
       }
 
       // ═══ b: structural backstop short-circuit ══════════════════════════

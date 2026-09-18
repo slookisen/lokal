@@ -31892,6 +31892,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gwrqp.failures) failures.push("opplevelser-gardssalg-website-review-queue-park: " + f);
     console.log(`  opplevelser-gardssalg-website-review-queue-park: ${gwrqp.passed} passed, ${gwrqp.failed} failed`);
 
+    // dev-request 2026-09-14-opplevagent-needs-review-drenering ("grep 3 +
+    // grep 4"): POST /admin/listing-homepage-review-judge — LLM-judge tier
+    // for experience_homepage_review_queue's two no-resolution-path reasons
+    // (brreg_website_candidate, web_search_candidate), mirroring gardssalg-
+    // website-review-judge above but adapted to this table's own `status`
+    // column and its own apply-boolean dry-run mode. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-listing-homepage-review-judge: LLM-judge tier for the homepage review queue ──");
+    const { runOpplevelserListingHomepageReviewJudgeTests } = require("../src/routes/opplevelser-listing-homepage-review-judge.test") as
+      typeof import("../src/routes/opplevelser-listing-homepage-review-judge.test");
+    const lhrj = await runOpplevelserListingHomepageReviewJudgeTests({ log: false });
+    passed += lhrj.passed;
+    failed += lhrj.failed;
+    for (const f of lhrj.failures) failures.push("opplevelser-listing-homepage-review-judge: " + f);
+    console.log(`  opplevelser-listing-homepage-review-judge: ${lhrj.passed} passed, ${lhrj.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and

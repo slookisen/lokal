@@ -7028,15 +7028,20 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
 // dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror (the
 // route directly above, `gardssalg-website-review-approve`'s `auto: true`
 // mode, only ever drains this queue at its default `min_confidence: 1.0` —
-// the org_nr_found tier). The [0.90, 0.95) band below that bar — the
-// phone_found (0.95 is the FLOOR of the next tier up, so this route's own
-// ceiling is exclusive at 0.95), address_found (0.92), and name+place (0.90,
-// the v1 floor) confidence tiers assigned in the scan branch above (search
-// `hit.evidence.org_nr_found` above) — currently just sits `pending`
-// (reason = 'website_discovery_candidate') forever: not confident enough for
-// the deterministic auto-approve bar, but too costly to review by hand at
-// gårdssalg's own scale. This route adds an LLM-judge tier for EXACTLY that
-// band, mirroring RFB's shipped POST /admin/rfb-website-review-judge
+// the org_nr_found tier). Originally this route covered only the [0.90,
+// 0.95) band below that bar — the phone_found (0.95), address_found (0.92),
+// and name+place (0.90, the v1 floor) confidence tiers assigned in the scan
+// branch above (search `hit.evidence.org_nr_found` above). As of dev-request
+// 2026-09-14-opplevagent-needs-review-drenering (see the "SUPERSEDED" note
+// on GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE below), the band is [0.90,
+// 1.0] inclusive — i.e. also the org_nr_found tier itself, for whatever the
+// deterministic auto-approve mode above hasn't already claimed. Any row in
+// this band — not confident enough to have been claimed by the deterministic
+// auto-approve bar, but too costly to review by hand at gårdssalg's own
+// scale — currently just sits `pending` (reason =
+// 'website_discovery_candidate') forever without this route. This route
+// adds an LLM-judge tier for EXACTLY that band, mirroring RFB's shipped
+// POST /admin/rfb-website-review-judge
 // (admin-rfb-website-discovery.ts) in shape/ordering (backstop -> synthetic
 // Norwegian source-context sentence built from the stored evidence flags,
 // since the raw fetched page text is never persisted -> LLM judge -> write
@@ -7064,16 +7069,33 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
 //
 // Explicitly out of scope (per the byggspec): part (iii) of the parent
 // dev-request (parking error rows — an unrelated table/mechanism); any
-// change to the >=1.0 auto-approve tier above or to the separate
-// experience_homepage_review_queue / Del B confidence===0.8 route (see that
-// route's own large doc comment nearby for why ITS threshold is likewise
-// fixed, not caller-supplied); a caller-supplied confidence-threshold
-// parameter here — deliberate, same reasoning: this queue's confidence scale
-// is not simply monotone across all tiers, so a caller-adjustable threshold
-// would be unsafe; wiring this route into any scheduled-agents/*.md charter
-// file (a separate, later slice).
+// change to the separate experience_homepage_review_queue / Del B
+// confidence===0.8 route (see that route's own large doc comment nearby for
+// why ITS threshold is likewise fixed, not caller-supplied); a caller-
+// supplied confidence-threshold parameter here — deliberate, same reasoning:
+// this queue's confidence scale is not simply monotone across all tiers, so
+// a caller-adjustable threshold would be unsafe; wiring this route into any
+// scheduled-agents/*.md charter file (a separate, later slice).
+//
+// SUPERSEDED for the >=1.0 (org_nr_found) tier by dev-request 2026-09-14-
+// opplevagent-needs-review-drenering ("grep 3 + grep 4"), Daniel-approved
+// live: the line above used to read "any change to the >=1.0 auto-approve
+// tier above" as out of scope — that was written for the EARLIER, narrower
+// dev-request this route originally shipped under. THIS dev-request
+// explicitly widens GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE to 1.01
+// below, on Daniel's own authorization, so the org_nr_found tier (>=1.0) is
+// now ALSO eligible for this LLM-judge route — but only for whatever the
+// separate deterministic auto-approve mechanism (gardssalg-website-review-
+// approve's own `auto: true` mode, default `min_confidence: 1.0`, still
+// completely unchanged) hasn't already auto-approved/resolved first: that
+// mechanism drains via its OWN query (reason = 'website_discovery_candidate'
+// AND confidence >= 1.0, unaffected by this constant), so a row it already
+// wrote through leaves this table (or its `reason` no longer matches) before
+// this route's SELECT would ever see it. The two mechanisms read the same
+// queue by different, independent criteria and never race on the same row's
+// write.
 export const GARDSSALG_WD_JUDGE_MIN_CONFIDENCE = 0.9;
-export const GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
+export const GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 1.01;
 
 interface GardssalgWdJudgeQueueRow {
   id: string;
@@ -7984,6 +8006,344 @@ router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Reques
     written,
     rejected,
     ...(auto ? { mode: "auto" as const, candidates_considered: candidatesConsidered } : {}),
+  });
+});
+
+// ─── POST /admin/listing-homepage-review-judge ──────────────────────────────
+//
+// dev-request 2026-09-14-opplevagent-needs-review-drenering ("grep 3 + grep
+// 4"), Daniel-approved live ("GO på grep 3 og 4"). This queue
+// (experience_homepage_review_queue) has THREE proposal reasons: leg (a)'s
+// 'listing_page_link_candidate' (confidence 0.8, page-verified — the ONLY
+// tier the `auto: true` mode on the approve route above ever drains, exact
+// equality, see that route's own large doc comment for why 1.0 is NOT
+// stronger evidence than 0.8 in THIS queue), leg (b)'s
+// 'brreg_website_candidate' (confidence 1.0, an UNVERIFIED Brreg registry
+// `hjemmeside` field lookup — the page itself is never fetched/read for this
+// tier), and leg (d)'s 'web_search_candidate' (confidence 0.6, an externally
+// -researched candidate submitted through .../homepage-review-queue/submit).
+// The latter two currently have NO path to resolution at all — the auto
+// mode's exact `confidence === 0.8` never matches either of them, and
+// nothing else drains this queue — so they just sit 'pending' forever. This
+// route adds an LLM-judge tier for EXACTLY those two reasons, mirroring
+// gardssalg-website-review-judge above (this same file) in shape/ordering:
+// backstop -> synthetic Norwegian source-context sentence built from the
+// stored evidence flags (the raw fetched page text is never persisted for
+// either of these two tiers, same constraint as the gårdssalg sibling) ->
+// LLM judge -> write through the EXISTING listing-homepage-review-approve
+// lever in-process (callGardssalgAdminRouteInProcess — that helper is
+// generic over any route on this router despite its gårdssalg-flavoured
+// name, see its own doc comment above), never a second write path.
+//
+// Selection is scoped by `reason IN ('brreg_website_candidate',
+// 'web_search_candidate')`, DELIBERATELY NOT a confidence range — per the
+// approve route's own doc comment, this queue's confidence scale is NOT
+// monotone evidence strength (1.0 is weaker-verified than 0.8), so a
+// confidence-range selector could silently widen into the 0.8
+// listing_page_link_candidate tier (or any future tier) the moment a
+// confidence value ever changed. Scoping by `reason` instead means this
+// route can never touch that tier or its exact-equality auto-approve logic,
+// which are both left completely untouched here.
+//
+// Bookkeeping: UNLIKE gardssalg_website_review_queue, this table DOES have
+// its own `status` column (default 'pending', also used for 'approved' by
+// the approve route above — see its CREATE TABLE in
+// database/init-experiences.ts). "Already judged" is therefore recorded on
+// AVVIS by setting `status = 'rejected'` (a new terminal value, parallel to
+// 'approved') AND overwriting `reason` with the judge's note for audit
+// visibility (same note-in-reason convention as the gårdssalg sibling,
+// harmless here since nothing downstream keys off 'brreg_website_candidate'/
+// 'web_search_candidate' surviving past 'pending' — the approve route's own
+// queue-adoption queries all filter on `status`, never on `reason`). Both
+// columns are updated by ONE guarded UPDATE keyed on the ORIGINAL `reason`
+// value AND `status = 'pending'`, so a row that changed underneath this run
+// (re-upserted by a concurrent discovery/submit scan — which always resets
+// `status` back to 'pending', see upsertListingHomepageReviewQueue's ON
+// CONFLICT clause — or resolved by a concurrent approve call) is never
+// clobbered: the guard fails to match, the concurrent value survives
+// untouched, and the reported reason honestly says the note wasn't
+// persisted. A rejected row's `status = 'rejected'` also means a later
+// discovery/submit re-scan for that same provider is free to re-propose (the
+// `ownPendingOrApproved` guards on the three discovery/submit routes above
+// all check `status IN ('pending','approved')`, which excludes 'rejected').
+//
+// On GODKJENN: writes through POST /admin/listing-homepage-review-approve
+// in-process — the SAME guarded write path (fill-only + lock re-check
+// immediately before writing, queue row moved to 'approved' on success)
+// leg (a)/(b)/(d)'s own adoption already goes through. A write-time guard
+// rejection on that inner call (hjemmeside filled or locked since queueing,
+// mismatch, not-pending, …) is counted as REJECTED here, never silently
+// miscounted as an approval.
+//
+// Explicitly out of scope: the separate `listing_page_link_candidate`
+// (confidence 0.8) tier and its exact-equality auto-approve logic (untouched
+// — see the hard constraint in this route's own dev-request); a caller-
+// supplied confidence-threshold parameter (this route ignores confidence
+// entirely, scoping by `reason` only, for the same non-monotone-scale reason
+// the approve route's `auto` mode gives); wiring this route into any
+// scheduled-agents/*.md charter file (a separate, later slice).
+const LISTING_HOMEPAGE_JUDGE_REASONS = ["brreg_website_candidate", "web_search_candidate"] as const;
+
+interface HomepageReviewQueueJudgeRow {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string;
+}
+
+/** Mirrors gardssalgWdJudgeSourceContext above, adapted to this queue's two
+ *  different evidence JSON shapes (see upsertListingHomepageReviewQueue's
+ *  callers above): 'brreg_website_candidate' evidence is
+ *  `{host, org_nr, source: "brreg_hjemmeside"}` (an unverified registry
+ *  lookup — the candidate page itself was never fetched for this tier), and
+ *  'web_search_candidate' evidence is `{source: "web_search", host}` (an
+ *  externally-researched candidate, also no page text persisted here). Parses
+ *  `evidence` defensively — malformed/missing JSON never throws, the judge
+ *  still gets the URL, reason and confidence either way. */
+function homepageReviewQueueJudgeSourceContext(row: {
+  final_url: string | null;
+  candidate_url: string;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string;
+}): string {
+  const url = row.final_url || row.candidate_url;
+  let evidence: { host?: unknown; org_nr?: unknown; source?: unknown } = {};
+  try {
+    const parsed = JSON.parse(row.evidence || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) evidence = parsed;
+  } catch {
+    // malformed/missing evidence JSON -> no structured detail; the judge
+    // still gets the url/reason/confidence below.
+  }
+  const host = typeof evidence.host === "string" ? evidence.host : null;
+  const confidenceText = typeof row.confidence === "number" ? row.confidence.toFixed(2) : "ukjent";
+
+  if (row.reason === "brreg_website_candidate") {
+    const orgNr = typeof evidence.org_nr === "string" ? evidence.org_nr : "ukjent organisasjonsnummer";
+    return (
+      `Automatisk hjemmeside-oppdagelse fant kandidat-URL-en ${url}${host ? ` (vert ${host})` : ""} via et ` +
+      `UVERIFISERT oppslag i Brønnøysundregistrene (Brreg) sitt registrerte "hjemmeside"-felt for ` +
+      `organisasjonsnummer ${orgNr}. Siden selv er IKKE besøkt eller lest av systemet for dette funnet — ` +
+      `dette er kun et registeroppslag, ingen sideinnhold er verifisert mot produsentens navn ` +
+      `(evidensbasert konfidens: ${confidenceText}).`
+    );
+  }
+  return (
+    `Automatisk hjemmeside-oppdagelse fant kandidat-URL-en ${url}${host ? ` (vert ${host})` : ""} via et ` +
+    `eksternt utført websøk (research gjort utenfor denne appens egen kode, deretter innsendt til ` +
+    `gjennomgangskøen). Ingen strukturert registerdata bekrefter denne kandidaten, og selve sidens rå ` +
+    `tekstinnhold er ikke lagret her — kun at innsenderen oppga at produsentnavnet var verifisert på siden ` +
+    `(evidensbasert konfidens: ${confidenceText}).`
+  );
+}
+
+/** Mirrors gardssalgWdJudgeAppendReason above, adapted to this table's real
+ *  `status` column: guarded on BOTH the original `reason` value AND
+ *  `status = 'pending'`, so a row re-upserted (reason and/or status changed)
+ *  or resolved (status no longer 'pending') by a concurrent process is never
+ *  clobbered. Sets `status = 'rejected'` (a new terminal value alongside the
+ *  approve route's own 'approved') and stamps `resolved_at`, mirroring how
+ *  the approve route marks a row resolved on success. Returns the number of
+ *  rows the guarded UPDATE actually matched (0 or 1). */
+function homepageReviewQueueJudgeReject(
+  db: Database.Database,
+  providerId: string,
+  originalReason: string,
+  note: string,
+): number {
+  const result = db
+    .prepare(
+      `UPDATE experience_homepage_review_queue
+          SET reason = ?, status = 'rejected', resolved_at = datetime('now')
+        WHERE provider_id = ? AND status = 'pending' AND reason = ?`,
+    )
+    .run(note, providerId, originalReason);
+  return result.changes;
+}
+
+/** Mirrors gardssalgWdJudgeReportedReason above: if the guarded UPDATE
+ *  matched zero rows, the reported reason must say so honestly instead of
+ *  silently claiming the note landed. */
+function homepageReviewQueueJudgeReportedReason(note: string, changes: number): string {
+  return changes > 0 ? note : `${note} (queue row changed concurrently, note not persisted)`;
+}
+
+router.post("/admin/listing-homepage-review-judge", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown; apply?: unknown };
+  // Dry-run by default, same apply-boolean convention as every other admin
+  // route on this table (listing-homepage-discovery/brreg-website-discovery/
+  // homepage-review-queue/submit/listing-homepage-review-approve, all above)
+  // — UNLIKE gardssalg-website-review-judge (this same file), which has no
+  // dry-run mode at all. A dry-run call still runs the real backstop + LLM
+  // judge (a genuine preview of what an apply call would decide, same
+  // "dry-run still does the real read-side work" convention the discovery
+  // routes on this table use for their own network fetches) but persists
+  // NOTHING: no guarded reason/status UPDATE on AVVIS, and the inner
+  // approve-route call is itself made with `apply: false` so it previews
+  // (`approved`) rather than writes (`written`). Apply mode persists exactly
+  // as described in this route's own doc comment above.
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  let limit = GARDSSALG_AUTO_APPROVE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, GARDSSALG_AUTO_APPROVE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ dry_run: dryRun, processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getExpDb("experiences");
+  const pending = db
+    .prepare(
+      `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason
+         FROM experience_homepage_review_queue
+        WHERE status = 'pending' AND reason IN (${LISTING_HOMEPAGE_JUDGE_REASONS.map(() => "?").join(",")})
+        ORDER BY created_at ASC
+        LIMIT ?`,
+    )
+    .all(...LISTING_HOMEPAGE_JUDGE_REASONS, limit) as HomepageReviewQueueJudgeRow[];
+
+  // Enrichment write-pause gate — apply only; a dry-run preview is never
+  // blocked (same discipline as every other apply-boolean route on this
+  // table). Gated over the WHOLE selected batch before any write, so a
+  // paused vertical blocks the batch whole: zero writes, never a
+  // partially-applied one.
+  if (apply && pending.length > 0) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ provider_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  // Records an AVVIS outcome: persists the guarded reason/status UPDATE in
+  // apply mode (reported honestly if a concurrent process already moved the
+  // row), or just previews the verdict — no write of any kind — in dry-run.
+  // The UPDATE itself is best-effort (mirrors the fail-closed per-row
+  // discipline elsewhere in this loop): if it throws, `changes` stays 0 so
+  // the reported reason honestly notes the note didn't land, but this row's
+  // outcome is still correctly counted and the batch continues.
+  const recordAvvis = (q: HomepageReviewQueueJudgeRow, note: string): void => {
+    rejected++;
+    if (apply) {
+      let changes = 0;
+      try {
+        changes = homepageReviewQueueJudgeReject(db, q.provider_id, q.reason, note);
+      } catch {
+        /* best-effort — see comment above */
+      }
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: homepageReviewQueueJudgeReportedReason(note, changes) });
+    } else {
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+    }
+  };
+
+  for (const q of pending) {
+    // Cheap structural backstop first — same cost-control ordering as
+    // gardssalg-website-review-judge above: a structurally-defective
+    // candidate never spends an LLM call.
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    if (defect.defective) {
+      recordAvvis(q, `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`);
+      continue;
+    }
+
+    let verdict: { approved: boolean; reason?: string };
+    try {
+      verdict = await judgeContactCandidate({
+        fieldType: "website",
+        candidate: q.candidate_url,
+        sourceContext: homepageReviewQueueJudgeSourceContext(q),
+        businessName: q.provider_name || q.provider_id,
+      });
+    } catch (err: any) {
+      // judgeContactCandidate's own contract never throws, but this loop
+      // must fail-closed even if that contract is ever violated — never let
+      // one row's unexpected error crash the rest of the batch.
+      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+    }
+
+    if (!verdict.approved) {
+      recordAvvis(q, `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`);
+      continue;
+    }
+
+    // GODKJENN — reuse listing-homepage-review-approve's FULL guarded write
+    // path in-process (fill-only + lock re-check immediately before writing,
+    // queue-row status flip to 'approved' on success), never a second write
+    // path. The SAME `apply` flag this route received is passed straight
+    // through, so a dry-run call previews via the inner route's own
+    // `approved` list (no write, guards not re-checked) and an apply call
+    // writes via its `written` list (guards re-checked immediately before
+    // writing).
+    try {
+      const approveResp = await callGardssalgAdminRouteInProcess("/admin/listing-homepage-review-approve", {
+        approvals: [{ provider_id: q.provider_id, url: q.candidate_url }],
+        apply,
+      });
+      const matchList = Array.isArray(approveResp.body?.[apply ? "written" : "approved"])
+        ? approveResp.body[apply ? "written" : "approved"]
+        : [];
+      const matched = matchList.some((w: any) => w?.provider_id === q.provider_id);
+      if (matched) {
+        approved++;
+        results.push({ provider_id: q.provider_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but the inner approve call didn't confirm
+        // it — a write-time guard (hjemmeside filled/locked since queueing,
+        // …) in apply mode, or a structural rejection (mismatch, not-
+        // pending, …) that would apply in either mode — never silently
+        // miscounted as an approval.
+        const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
+        const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
+        recordAvvis(q, `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`);
+      }
+    } catch (err: any) {
+      // Never let one row's unexpected error crash the rest of the batch —
+      // fail THAT row closed, continue with the rest.
+      recordAvvis(q, `uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM experience_homepage_review_queue
+        WHERE status = 'pending' AND reason IN (${LISTING_HOMEPAGE_JUDGE_REASONS.map(() => "?").join(",")})`,
+    )
+    .get(...LISTING_HOMEPAGE_JUDGE_REASONS) as { c: number };
+
+  res.json({
+    dry_run: dryRun,
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
   });
 });
 
