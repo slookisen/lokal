@@ -363,16 +363,36 @@ export function runExperiencesGeocodeBacklogTests(opts: { log?: boolean } = {}):
       // ═══ G — resumable: an upgraded row is excluded from the very next call ═══
       {
         const statusBefore = worker.experiencesGeocodeBacklogQueueStatus();
-        assertTrue(statusBefore.pending >= 3, "G1: queue status still sees the un-upgraded backlog rows (B/C/D/E cohort)");
+        // idDryRun (section B) is 'approximate' with adresse "Innset" — the
+        // SAME real Stedsnavn hit as section A's own row — so section C's
+        // own full-limit-50 dryRun:false call already swept it up and wrote
+        // it to 'sted' as an incidental side effect, same as it would have
+        // before this change (not something this PR alters). idAmbiguous
+        // (section C) is still 'approximate' AND still outside any
+        // cooldown — skipped_ambiguous is deliberately NEVER cooled down
+        // (ambiguity needs a human, not a rotation — see section K's own
+        // module-comment reference), so queue status still sees it.
+        // idNoMatch/idAddressShaped (sections D/E, both real dryRun:false
+        // apply calls) are STILL 'approximate' too but are now correctly
+        // EXCLUDED from `pending` — this dev-request's own cooldown rotation
+        // (section K) means a row just skipped in apply mode is not
+        // re-offered as "pending work" again within the cooldown window.
+        assertTrue(statusBefore.pending >= 1, "G1: queue status still sees the never-cooled-down backlog row (skipped_ambiguous, section C)");
 
         const result2 = await worker.runExperiencesGeocodeBacklogPass(50, { dryRun: false, deps: NO_ADDRESS_HIT_DEPS });
         const reAttempted = result2.rows.find((r) => r.provider_id === idResolved);
         assertTrue(reAttempted === undefined, "G2: the row Section A already upgraded is NOT re-selected/re-reported");
-        // idNoMatch/idAmbiguous/idAddressShaped remain 'approximate' and so ARE
-        // re-scanned (idempotent, byte-identical outcome) — proving "resumable"
-        // means "safe to re-call", not "the SELECT remembers who it skipped".
+        // idNoMatch is NOT re-scanned here either — section D's own
+        // dryRun:false call already cooled it down. That is the fix this
+        // dev-request ships (see section K), not a regression of this
+        // section's original "resumable" claim: idAmbiguous, which the
+        // cooldown deliberately never touches, demonstrates the same
+        // "still-approximate row is safely re-scanned with the SAME verdict,
+        // no double-write risk" property section G originally asserted.
         const reNoMatch = result2.rows.find((r) => r.provider_id === idNoMatch);
-        assertEq(reNoMatch?.action, "skipped_no_match", "G3: a still-approximate row is re-scanned with the SAME verdict, no double-write risk");
+        assertTrue(reNoMatch === undefined, "G3: idNoMatch is EXCLUDED this call — section D's apply call already cooled it down (the fix, not a regression)");
+        const reAmbiguous = result2.rows.find((r) => r.provider_id === idAmbiguous);
+        assertEq(reAmbiguous?.action, "skipped_ambiguous", "G4: idAmbiguous (never cooled down) is still safely re-scanned with the SAME verdict, no double-write risk");
       }
 
       // ═══ I — dev-request 2026-09-11 fix 3: the address tier gets a REAL confirmed hit ═══
@@ -444,6 +464,121 @@ export function runExperiencesGeocodeBacklogTests(opts: { log?: boolean } = {}):
         assertTrue(page2Ids.includes(idJ3),
           `J7: page 2 reaches row 3 — the tail past page 1's LIMIT is no longer permanently unreachable (got ${JSON.stringify(page2Ids)})`);
         assertEq(page2.next_after, null, "J8: page 2 is short (1 row < limit 2) — next_after is null, backlog exhausted");
+      }
+
+      // ═══ K — dev-request 2026-09-11-geocode-backlog-sweep-mangler-cursor-
+      //         rekkevidde: caller-independent cooldown rotation ═══
+      {
+        function backlogAttemptedAt(id: string): string | null {
+          return (db.prepare("SELECT backlog_sweep_attempted_at FROM experience_providers WHERE id = ?").get(id) as
+            { backlog_sweep_attempted_at: string | null } | undefined)?.backlog_sweep_attempted_at ?? null;
+        }
+        function ageCooldown(id: string, sqlOffset: string): void {
+          db.prepare(`UPDATE experience_providers SET backlog_sweep_attempted_at = datetime('now', ?) WHERE id = ?`)
+            .run(sqlOffset, id);
+        }
+
+        // K1-K5 — a skipped_no_match row is stamped, and the stamp excludes
+        // it from the SELECT with NO `after` cursor at all (the caller-
+        // independent rotation the M0-sweep's own persisted-cursor mechanism
+        // does NOT give this route, since this route has no such state of
+        // its own — see the module comment).
+        const idK1 = seedApproximateProvider("Kalveskaret Gård", "Kalveskaret", "zz-cooldown-01");
+        const idK2 = seedApproximateProvider("Skarvatn Gård", "Skarvatn", "zz-cooldown-02");
+
+        assertEq(backlogAttemptedAt(idK1), null, "K1: freshly seeded row has no cooldown stamp yet");
+
+        const call1 = await worker.runExperiencesGeocodeBacklogPass(2, {
+          dryRun: false, after: "zz-cooldown-00", deps: NO_ADDRESS_HIT_DEPS,
+        });
+        const call1Ids = call1.rows.map((r) => r.provider_id);
+        assertTrue(call1Ids.includes(idK1) && call1Ids.includes(idK2), "K2: call 1 (apply, no after tracked) scans both rows");
+        assertTrue(backlogAttemptedAt(idK1) !== null, "K3: skipped_no_match stamps backlog_sweep_attempted_at (apply mode)");
+
+        // Same `limit`, same starting cursor as call 1 (a caller that does
+        // NOT track `after` between wakes — the exact scenario this dev-
+        // request measured) — AC1: the second call must NOT be byte-
+        // identical to the first; the two just-stamped rows are excluded by
+        // the cooldown and DIFFERENT (not-yet-tried) rows surface instead.
+        const idK3 = seedApproximateProvider("Bjørkedalen Gård", "Bjørkedalen", "zz-cooldown-03");
+        const idK4 = seedApproximateProvider("Lonvatnet Gård", "Lonvatnet", "zz-cooldown-04");
+        const call2 = await worker.runExperiencesGeocodeBacklogPass(2, {
+          dryRun: false, after: "zz-cooldown-00", deps: NO_ADDRESS_HIT_DEPS,
+        });
+        const call2Ids = call2.rows.map((r) => r.provider_id);
+        assertTrue(!call2Ids.includes(idK1) && !call2Ids.includes(idK2),
+          `K4 (AC1): call 2, same limit/cursor as call 1, no intervening upgrades — does NOT re-scan either row call 1 already skipped (got ${JSON.stringify(call2Ids)})`);
+        assertTrue(call2Ids.includes(idK3) && call2Ids.includes(idK4),
+          `K5 (AC1): call 2 reaches DIFFERENT, not-yet-tried candidates instead — at least partial non-overlap in provider_id lists (got ${JSON.stringify(call2Ids)})`);
+
+        // K6-K7 — dry_run never stamps the cooldown (same "a rehearsal has no
+        // side effects" rule the row UPDATEs themselves already follow).
+        const idK5 = seedApproximateProvider("Fjordbotn Gård", "Fjordbotn", "zz-cooldown-05");
+        await worker.runExperiencesGeocodeBacklogPass(1, { dryRun: true, after: "zz-cooldown-04", deps: NO_ADDRESS_HIT_DEPS });
+        assertEq(backlogAttemptedAt(idK5), null, "K6: dry_run scanning+skipping a row writes NO cooldown stamp");
+        const dryCall2 = await worker.runExperiencesGeocodeBacklogPass(1, { dryRun: true, after: "zz-cooldown-04", deps: NO_ADDRESS_HIT_DEPS });
+        assertTrue(dryCall2.rows.some((r) => r.provider_id === idK5),
+          "K7: …so a second dry_run call with the identical cursor DOES re-scan it (no unwanted side effect from rehearsal)");
+
+        // K8-K10 (AC2) — a row that got skipped_no_match reappears once the
+        // cooldown window has genuinely elapsed. Manipulate the stamp
+        // directly (fast-forward), same technique this file already uses
+        // nowhere else but the established fleet idiom for testing a
+        // datetime('now', '-N …') cooldown boundary (see e.g.
+        // lokal-agent-verifier-pending-verify-parking.test.ts).
+        assertTrue(backlogAttemptedAt(idK1) !== null, "K8: idK1 still carries call 1's cooldown stamp");
+        ageCooldown(idK1, `-${worker.EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS + 1} hours`);
+        const call3 = await worker.runExperiencesGeocodeBacklogPass(50, { dryRun: false, after: "zz-cooldown-00", deps: NO_ADDRESS_HIT_DEPS });
+        const call3Ids = call3.rows.map((r) => r.provider_id);
+        assertTrue(call3Ids.includes(idK1),
+          `K9 (AC2): idK1 — cooldown window elapsed (stamp aged past ${worker.EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS}h) — is scanned again (got ${JSON.stringify(call3Ids)})`);
+        // Still WITHIN the window (aged 1h, cooldown is 24h) — idK2 must NOT reappear.
+        ageCooldown(idK2, "-1 hours");
+        const call4 = await worker.runExperiencesGeocodeBacklogPass(50, { dryRun: false, after: "zz-cooldown-00", deps: NO_ADDRESS_HIT_DEPS });
+        assertTrue(!call4.rows.map((r) => r.provider_id).includes(idK2),
+          "K10: idK2 — stamp aged only 1h of a 24h cooldown — is still excluded");
+
+        // K11 (AC3, boundedness) — queue status (the same WHERE clause the
+        // pass itself uses) reflects the cooldown too: a row within its
+        // cooldown window does not count as "pending" either, so status and
+        // pass never drift apart.
+        const idK6 = seedApproximateProvider("Reinsvatnet Gård", "Reinsvatnet", "zz-cooldown-06");
+        const beforeStatus = worker.experiencesGeocodeBacklogQueueStatus().pending;
+        await worker.runExperiencesGeocodeBacklogPass(50, { dryRun: false, after: "zz-cooldown-05", deps: NO_ADDRESS_HIT_DEPS });
+        const afterStatus = worker.experiencesGeocodeBacklogQueueStatus().pending;
+        assertTrue(afterStatus < beforeStatus,
+          `K11: experiencesGeocodeBacklogQueueStatus().pending falls once a freshly-skipped row (${idK6}) is cooled down (before=${beforeStatus} after=${afterStatus})`);
+
+        // K12-K13 (AC3) — a full sweep over an entire cohort is achievable in
+        // a bounded number of calls. Scoped to a FRESH, dedicated cohort
+        // (rather than the whole accumulated test-run pool, which by design
+        // also carries this section's own skipped_ambiguous/skipped_race
+        // rows from EARLIER sections — those are deliberately never cooled
+        // down, since ambiguity needs a human, not a rotation, so the global
+        // `pending` count alone never reaches 0 and is the wrong signal
+        // here): SWEEP_N no-match rows, one `after`-cursor-fixed call per
+        // loop iteration (limit:1 — worst case, one row reached per call,
+        // the exact shape this dev-request measured), until every row in the
+        // cohort has been reached and cooled down at least once. Pre-fix,
+        // this loop would never terminate at all — the same first row (or
+        // first `limit`) would be re-selected identically forever.
+        const SWEEP_N = 5;
+        const sweepIds: string[] = [];
+        for (let i = 1; i <= SWEEP_N; i++) {
+          sweepIds.push(seedApproximateProvider(`Sveip Gård ${i}`, "Fjellsprek", `zz-sweep-0${i}`));
+        }
+        let guardCalls = 0;
+        const MAX_CALLS = SWEEP_N * 3; // generous bound — 1 call/row is the expected case
+        while (sweepIds.some((id) => backlogAttemptedAt(id) === null) && guardCalls < MAX_CALLS) {
+          await worker.runExperiencesGeocodeBacklogPass(1, {
+            dryRun: false, after: "zz-sweep-00", deps: NO_ADDRESS_HIT_DEPS,
+          });
+          guardCalls++;
+        }
+        assertTrue(guardCalls < MAX_CALLS,
+          `K12 (AC3): a full sweep over a ${SWEEP_N}-row cohort completes in a bounded number of calls (${guardCalls} < ${MAX_CALLS}), not infinite repetition of the same rows`);
+        assertTrue(sweepIds.every((id) => backlogAttemptedAt(id) !== null),
+          "K13: every row in the cohort was eventually reached and cooled down — none is permanently stuck behind the window");
       }
 
       // ═══ H — route: POST /admin/gardssalg-geocode-backlog-sweep ═══

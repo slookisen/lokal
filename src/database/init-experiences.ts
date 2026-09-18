@@ -885,6 +885,46 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN website_discovery_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // ─── gardssalg-geocode-backlog-sweep cooldown rotation (dev-request
+  // 2026-09-11-geocode-backlog-sweep-mangler-cursor-rekkevidde) ─────────────
+  // PR #852 (dev-request 2026-09-11-backfill-sveip-kan-ikke-paginere-forbi-
+  // forste-vindu) already gave POST /admin/gardssalg-geocode-backlog-sweep a
+  // keyset `after`/`next_after` cursor, which rotates a page of skipped rows
+  // out of the WINDOW for any single caller that threads `after` through its
+  // own successive calls. That cursor is caller-tracked, though — this route
+  // has no scheduled/automated caller of its own (unlike the M0 verification
+  // sweep's server-persisted `next_offset`, gardssalg_website_
+  // verification_sweep_state); it is called ad hoc, wake to wake, by
+  // whichever orchestrator session reaches for it, and a wake that calls it
+  // with no `after` (the common shape — see this dev-request's own "two
+  // identical dry_run/apply calls" measurement) starts at the top of the id
+  // order every time regardless of the cursor mechanism's existence.
+  //
+  // backlog_sweep_attempted_at is a SECOND, caller-independent layer: stamped
+  // on every `skipped_no_match`/`skipped_address_shaped` outcome (never on an
+  // upgrade — an upgraded row already leaves geocode_confidence='approximate'
+  // and so leaves the pool through the SELECT's own WHERE clause, same as
+  // today) and excluded from the next call's SELECT for
+  // EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS. Same WHERE-based cooldown-
+  // exclusion shape as the fleet's own already-reviewed precedent for this
+  // exact problem — admin-dental-brreg-address-sweep.ts's
+  // brreg_address_attempted_at / routes/dental.ts's places_attempted_at
+  // (`col IS NULL OR col < datetime('now', '-N days/hours')`), including that
+  // precedent's own rule: a transport/error outcome is never stamped, only a
+  // genuine "tried, got an answer, could not confirm" one. Written via SQL's
+  // own `datetime('now')` (not a JS-side ISO string) so every value in this
+  // column and every comparison against it shares one format — the two never
+  // silently drift apart at hour-level granularity the way a mixed
+  // JS-ISO/SQL-datetime pair could.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN backlog_sweep_attempted_at TEXT");
+  } catch { /* already present */ }
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_experience_providers_backlog_sweep_attempted_at ON experience_providers(backlog_sweep_attempted_at)"
+    );
+  } catch { /* already present */ }
+
   // ─── Gårdssalg dark-launch-stop (dev-request 2026-07-12-gardssalg-dark-
   // launch-stop, slice 0) ────────────────────────────────────────────────────
   // The gårdssalg booking flow has been live on prod since 2026-07-03 but no

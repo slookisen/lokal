@@ -1254,16 +1254,49 @@ export async function experiencesGeocodeTick(
 // counter/action as before — "tried and still couldn't confirm" rather than
 // "never tried". Still never writes a coordinate this pass cannot corroborate.
 //
-// Pagination (dev-request 2026-09-11-geo-pagination) — an `after` cursor
-// (last-seen id) threads through selectBacklogCandidates()'s WHERE clause so
-// a row that is scanned but SKIPPED (no match / already correct / ambiguous)
-// does not sort right back to the top of the very next call's window: it
-// keeps the exact same column values, so a bare `ORDER BY id LIMIT ?` with no
-// cursor re-selects it forever and the tail of the backlog past `limit` is
-// never reached. `next_after` (the id of the last row this call scanned, or
-// null once a page comes back shorter than `limit` — the backlog is
-// exhausted) is the caller's cue to pass `after: next_after` on the next call,
-// same keyset-pagination contract as GET /admin/providers/all.
+// Pagination (dev-request 2026-09-11-backfill-sveip-kan-ikke-paginere-forbi-
+// forste-vindu, PR #852) — an `after` cursor (last-seen id) threads through
+// selectBacklogCandidates()'s WHERE clause so a row that is scanned but
+// SKIPPED (no match / already correct / ambiguous) does not sort right back
+// to the top of the very next call's window: it keeps the exact same column
+// values, so a bare `ORDER BY id LIMIT ?` with no cursor re-selects it
+// forever and the tail of the backlog past `limit` is never reached.
+// `next_after` (the id of the last row this call scanned, or null once a
+// page comes back shorter than `limit` — the backlog is exhausted) is the
+// caller's cue to pass `after: next_after` on the next call, same
+// keyset-pagination contract as GET /admin/providers/all.
+//
+// Cooldown rotation (dev-request 2026-09-11-geocode-backlog-sweep-mangler-
+// cursor-rekkevidde) — the `after` cursor above only rotates within ONE
+// caller's own tracked sequence of calls. This route has no automated
+// scheduled caller of its own (unlike the M0 verification sweep's
+// server-persisted next_offset — gardssalg_website_verification_sweep_state);
+// it is invoked ad hoc, wake to wake, and a wake that does not thread
+// `after` through (the common shape this dev-request's own measurement used)
+// is right back to scanning the same top-of-order rows every time regardless
+// of the cursor's existence. `backlog_sweep_attempted_at` is a second,
+// caller-independent rotation: selectBacklogCandidates()'s WHERE clause
+// additionally excludes any row stamped within the last
+// EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS by a `skipped_no_match`/
+// `skipped_address_shaped` outcome, so even a bare, cursor-less call
+// naturally reaches un-tried rows instead of the identical top slice.
+//
+// This deliberately deviates from the dev-request's own literal spec text on
+// one point: it originally described `skipped_address_shaped` rows as
+// structurally OUT of this tier's scope and asked for them to be excluded
+// from the SELECT entirely (never cooled down, never retried) — true when
+// that dev-request was written, but stale by the time this was built. PR
+// #852 (fix 3, shipped the SAME day) gave an address-shaped adresse a real
+// geocodeOne() address-tier attempt instead of skipping it outright, and
+// that is now this backlog pass's single largest source of real upgrades
+// (36 of 79 rows in the 2026-09-11 apply run). Permanently excluding those
+// rows from the SELECT would silently regress that capability. So
+// `skipped_address_shaped` gets the exact same cooldown stamp as
+// `skipped_no_match` instead — both are "tried, got an answer, could not
+// confirm" outcomes that benefit from rotating out of the window, neither is
+// out of scope. `skipped_ambiguous`/`skipped_race`/`error` are never
+// stamped, same "a transport failure is not a no-signal answer" rule
+// admin-dental-brreg-address-sweep.ts's own cooldown column follows.
 
 export type ExperiencesGeocodeBacklogAction =
   | "upgraded"
@@ -1339,6 +1372,9 @@ export type ExperiencesGeocodeBacklogResult = {
 export const EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT = 40;
 export const EXPERIENCES_GEOCODE_BACKLOG_LIMIT_MAX = 50;
 
+/** Cooldown window (see the module comment above) — a row stamped by a `skipped_no_match`/`skipped_address_shaped` outcome is excluded from the SELECT until this many hours have passed. */
+export const EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS = 24;
+
 /** Clamp a caller-supplied batch limit into [1, 50]; non-numbers -> default (mirrors clampGeocodeBatchLimit's shape). */
 export function clampExperiencesGeocodeBacklogLimit(raw: unknown): number {
   const n = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : EXPERIENCES_GEOCODE_BACKLOG_LIMIT_DEFAULT;
@@ -1392,6 +1428,22 @@ type BacklogCandidateRow = {
   poststed: string | null;
 };
 
+/**
+ * Base eligibility — no `id > ?` cursor, no LIMIT — shared by
+ * selectBacklogCandidates() and experiencesGeocodeBacklogQueueStatus() so
+ * "pending" always means exactly what the pass would select next (same "one
+ * source of truth for eligibility" discipline this file's own module comment
+ * documents for agents-geocode-worker.ts's SELECTABLE). The cooldown clause
+ * is the module comment's rotation mechanism: a row stamped within the last
+ * EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS by a skipped_no_match/
+ * skipped_address_shaped outcome is excluded until the window elapses.
+ */
+const BACKLOG_ELIGIBLE_SQL = `geocode_confidence = 'approximate'
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND adresse IS NOT NULL AND adresse <> ''
+          AND (backlog_sweep_attempted_at IS NULL
+               OR backlog_sweep_attempted_at < datetime('now', '-${EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS} hours'))`;
+
 function selectBacklogCandidates(
   db: ReturnType<typeof getDb>,
   limit: number,
@@ -1401,9 +1453,7 @@ function selectBacklogCandidates(
     .prepare(
       `SELECT id, navn, adresse, kommune, kommunenummer, fylke, lat, lon, geocode_confidence, postnummer, poststed
          FROM experience_providers
-        WHERE geocode_confidence = 'approximate'
-          AND lat IS NOT NULL AND lon IS NOT NULL
-          AND adresse IS NOT NULL AND adresse <> ''
+        WHERE ${BACKLOG_ELIGIBLE_SQL}
           AND id > ?
         ORDER BY id
         LIMIT ?`
@@ -1411,31 +1461,35 @@ function selectBacklogCandidates(
     .all(after, limit) as BacklogCandidateRow[];
 }
 
-/** Same WHERE clause as the pass's own SELECT, no LIMIT — cheap status check for the admin route's before/after block. */
+/** Same base eligibility as the pass's own SELECT (BACKLOG_ELIGIBLE_SQL), no cursor/LIMIT — cheap status check for the admin route's before/after block. */
 export function experiencesGeocodeBacklogQueueStatus(): { pending: number } {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n
          FROM experience_providers
-        WHERE geocode_confidence = 'approximate'
-          AND lat IS NOT NULL AND lon IS NOT NULL
-          AND adresse IS NOT NULL AND adresse <> ''`
+        WHERE ${BACKLOG_ELIGIBLE_SQL}`
     )
     .get() as { n: number };
   return { pending: row?.n ?? 0 };
 }
 
 /**
- * Backlog re-geocode pass. Chunked (bounded by `limit`), resumable two ways —
- * a row this call upgrades past 'approximate' is excluded from the very next
- * call's SELECT by the WHERE clause itself (no separate "already processed"
- * bookkeeping needed), AND a row this call scans but leaves 'approximate'
- * (skipped/ambiguous/no_match) is excluded from the NEXT call by the `after`
- * keyset cursor (`opts.after`, echoed back as `result.next_after`) — without
- * it, a byte-identical skipped row sorts right back to the top of the very
- * next `ORDER BY id LIMIT ?` window and the tail of the backlog past `limit`
- * is never reached. And dry-run-safe by default (see
+ * Backlog re-geocode pass. Chunked (bounded by `limit`), resumable three ways
+ * — a row this call upgrades past 'approximate' is excluded from the very
+ * next call's SELECT by the WHERE clause itself (no separate "already
+ * processed" bookkeeping needed); a row this call scans but leaves
+ * 'approximate' (skipped/ambiguous/no_match) is excluded from the NEXT call
+ * by the `after` keyset cursor (`opts.after`, echoed back as
+ * `result.next_after`) IF the caller threads it through — without it, a
+ * byte-identical skipped row sorts right back to the top of the very next
+ * `ORDER BY id LIMIT ?` window and the tail of the backlog past `limit` is
+ * never reached; and, independent of whether any caller ever passes `after`
+ * at all, a `skipped_no_match`/`skipped_address_shaped` row is additionally
+ * excluded from the SELECT for EXPERIENCES_GEOCODE_BACKLOG_COOLDOWN_HOURS via
+ * `backlog_sweep_attempted_at` (see the module comment above) — the
+ * caller-independent rotation a bare, cursor-less call still benefits from.
+ * And dry-run-safe by default (see
  * parseExperiencesGeocodeBacklogDryRunFlag() above). `opts.deps` threads the
  * same GeocodeDeps test-injection seam experiencesGeocodeTick() itself uses,
  * for the fix-3 address-tier geocodeOne() call below.
@@ -1509,6 +1563,19 @@ export async function runExperiencesGeocodeBacklogPass(
             updated_at = datetime('now')
       WHERE id = ? AND geocode_confidence = 'approximate'`
   );
+  // Cooldown rotation stamp (see module comment above) — written for a
+  // skipped_no_match/skipped_address_shaped outcome ONLY, and only outside
+  // dry_run (same "a rehearsal never has side effects" rule the row updates
+  // above already follow, and the same "only a real write stamps the
+  // attempt" convention admin-dental-brreg-address-sweep.ts's own
+  // brreg_address_attempted_at follows). SQL-side datetime('now') — see the
+  // migration's own comment on why this is not a JS-side ISO string.
+  const stampCooldown = db.prepare(
+    `UPDATE experience_providers SET backlog_sweep_attempted_at = datetime('now') WHERE id = ?`
+  );
+  function markCooldown(id: string): void {
+    if (!dryRun) stampCooldown.run(id);
+  }
 
   for (const row of rows) {
     result.candidates_scanned++;
@@ -1617,6 +1684,7 @@ export async function runExperiencesGeocodeBacklogPass(
         // counter/action as before fix 3, but now honestly "attempted and
         // still unconfirmed" rather than "never attempted".
         result.skipped_address_shaped++;
+        markCooldown(row.id);
         result.rows.push({
           ...base, action: "skipped_address_shaped",
           reason: "adresse is street-address-shaped; address-tier geocode attempted but returned no confirmable Norwegian match",
@@ -1676,6 +1744,7 @@ export async function runExperiencesGeocodeBacklogPass(
         // Same "tried, couldn't confirm" outcome as the parsedAddress branch
         // above, just for the missing-postnummer path.
         result.skipped_address_shaped++;
+        markCooldown(row.id);
         result.rows.push({
           ...base, action: "skipped_address_shaped",
           reason: "adresse is street-address-shaped but missing a postnummer; kommune-disambiguated address-tier geocode attempted but returned no confirmable Norwegian match",
@@ -1692,6 +1761,7 @@ export async function runExperiencesGeocodeBacklogPass(
       }
       if (outcome.status === "no_match") {
         result.skipped_no_match++;
+        markCooldown(row.id);
         result.rows.push({ ...base, action: "skipped_no_match", reason: outcome.reason });
         continue;
       }
@@ -1700,6 +1770,7 @@ export async function runExperiencesGeocodeBacklogPass(
       // Norwegian position, the exact same sanity gate as Step A/D above.
       if (!isPlausibleNorwayCoord(outcome.geo.lat, outcome.geo.lng)) {
         result.skipped_no_match++;
+        markCooldown(row.id);
         result.rows.push({
           ...base, action: "skipped_no_match",
           reason: `Stedsnavn hit (${outcome.geo.lat}/${outcome.geo.lng}) is not a plausible Norwegian position`,
