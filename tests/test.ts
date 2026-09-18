@@ -44391,3 +44391,28 @@ runSerial(async () => {
     failures.push("opplevelser-experiences-needs-review-triage: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-18-verifier-by-transition-ikke-persistert: buildRunEnvelope's
+// new `verified_demoted` claim (count of results where prior_verification_status
+// was "verified" and new_verification_status is anything else) — persists the one
+// aggregate regression-detection number that was previously visible only in the
+// raw HTTP response of a forced /admin/run-verifier diagnostic call. Pure-function
+// suite (no DB), mirrors the synthetic-batch pattern in the sibling
+// lokal-agent-verifier-email-ownership-provenance.test.ts. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-18-verifier-by-transition-ikke-persistert: buildRunEnvelope verified_demoted claim ──");
+  try {
+    const { runLokalAgentVerifierVerifiedDemotedClaimTests } =
+      require("../src/agents/lokal-agent-verifier-verified-demoted-claim.test") as
+        typeof import("../src/agents/lokal-agent-verifier-verified-demoted-claim.test");
+    const vdc = await runLokalAgentVerifierVerifiedDemotedClaimTests({ log: false });
+    passed += vdc.passed;
+    failed += vdc.failed;
+    for (const f of vdc.failures) failures.push("lokal-agent-verifier-verified-demoted-claim: " + f);
+    console.log(`  lokal-agent-verifier-verified-demoted-claim: ${vdc.passed} passed, ${vdc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-verified-demoted-claim: unexpected error: " + String(err?.message || err));
+  }
+});
