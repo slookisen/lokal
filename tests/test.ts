@@ -32052,6 +32052,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorj.failures) failures.push("opplevelser-gardssalg-orgnr-review-judge: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-review-judge: ${gorj.passed} passed, ${gorj.failed} failed`);
 
+    // dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+    // avvist: splits the old generic write_refused_filled_locked_or_conflict
+    // reason into three distinct, logged reasons (filled/locked/conflict),
+    // auto-closes a "filled + identical" row without a write, and triggers
+    // the existing Brreg-verify flow once an org_nr actually lands or is
+    // confirmed identical. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-orgnr-review-filled-locked-conflict: differentiated write-blocker reasons ──");
+    const { runOpplevelserGardssalgOrgnrReviewFilledLockedConflictTests } = require("../src/routes/opplevelser-gardssalg-orgnr-review-filled-locked-conflict.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-orgnr-review-filled-locked-conflict.test");
+    const gorflc = await runOpplevelserGardssalgOrgnrReviewFilledLockedConflictTests({ log: false });
+    passed += gorflc.passed;
+    failed += gorflc.failed;
+    for (const f of gorflc.failures) failures.push("opplevelser-gardssalg-orgnr-review-filled-locked-conflict: " + f);
+    console.log(`  opplevelser-gardssalg-orgnr-review-filled-locked-conflict: ${gorflc.passed} passed, ${gorflc.failed} failed`);
+
     // dev-request 2026-08-24-grep3-website-judge-tier's gårdssalg mirror:
     // POST /admin/gardssalg-website-review-judge — LLM-judge tier for the
     // website-discovery review queue's [0.90, 0.95) confidence band,

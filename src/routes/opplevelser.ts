@@ -221,6 +221,11 @@ import {
   getGardssalgProviderOrgnrTarget,
   applyGardssalgProviderOrgnr,
   getGardssalgOrgnrWriteBlocker,
+  // dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+  // avvist — differentiates a write-blocker's WHY (filled/locked/conflict)
+  // for the gardssalg-orgnr-review-approve route below; see its own doc
+  // comment (experience-store.ts) for the full taxonomy.
+  classifyGardssalgOrgnrWriteBlock,
   gardssalgOrgnrAutoWriteEligible,
   // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2
   // — the heuristic-derived-candidate corroboration veto below calls this
@@ -13685,6 +13690,41 @@ export function brregNameOverlapsProviderName(
   return false;
 }
 
+// dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+// avvist, spec item 6: once an org_nr write actually lands OR is confirmed
+// identical to what a provider already stores (the one non-write resolution
+// — see the "filled + identical" branch below), the EXISTING Brreg
+// verification flow runs for that SAME provider in the SAME pass. This
+// reuses POST /admin/gardssalg-brreg-verify's full guarded logic in-process
+// (callGardssalgAdminRouteInProcess — the SAME idiom
+// gardssalg-orgnr-review-judge already uses to reuse THIS route, and
+// gardssalg-veien-til-pool already uses to reuse gardssalg-brreg-verify
+// itself) — never a second/duplicate Brreg-verification implementation.
+//
+// Best-effort and non-blocking of the org_nr outcome itself: a 409 (another
+// gardssalg-brreg-verify run already in flight — that route holds a single
+// in-process run-lock) or any other non-2xx/thrown error is swallowed and
+// logged, never re-thrown. The org_nr approval this function is called from
+// has, by the time it calls this, already fully and durably succeeded —
+// brreg_verified is a SEPARATE flag on a SEPARATE field, and a transient
+// miss triggering it must never fail or roll back the org_nr write/auto-
+// close that already happened.
+async function triggerGardssalgBrregVerifyAfterOrgnrLanded(providerId: string): Promise<void> {
+  try {
+    const resp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-brreg-verify", {
+      providerIds: [providerId],
+      apply: true,
+    });
+    if (resp.status !== 200) {
+      console.error(
+        `[gardssalg-orgnr-review-approve] brreg-verify trigger non-200 for ${providerId}: status=${resp.status}`
+      );
+    }
+  } catch (err) {
+    console.error(`[gardssalg-orgnr-review-approve] brreg-verify trigger failed for ${providerId}:`, err);
+  }
+}
+
 router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
   const apply =
@@ -13704,9 +13744,110 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
   const queue = listGardssalgOrgnrReviewQueue();
   const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
 
-  const approved: Array<{ provider_id: string; org_nr: string; manual_verified?: true; brreg_name?: string }> = [];
-  const rejected: Array<{ provider_id: string; reason: string; brreg_name?: string }> = [];
+  const approved: Array<{
+    provider_id: string;
+    org_nr: string;
+    manual_verified?: true;
+    brreg_name?: string;
+    // dev-request 2026-09-16-…: set instead of writing anything when the
+    // "filled + identical" auto-close resolves the row without an UPDATE.
+    already_confirmed?: true;
+  }> = [];
+  const rejected: Array<{
+    provider_id: string;
+    reason: string;
+    brreg_name?: string;
+    manual_verified?: true;
+    // dev-request 2026-09-16-…: populated for the differentiated
+    // "locked"/"conflict" outcomes so a caller/queue-reader gets the values
+    // it needs without a second lookup.
+    stored_org_nr?: string;
+    candidate_org_nr?: string;
+  }> = [];
   const seen = new Set<string>();
+
+  // dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+  // avvist: the single shared APPLY-mode write attempt for all three
+  // approval branches below (no-queue-row manual_verified, queue-entry
+  // manual_verified, and the plain queued-candidate-match). Replaces each
+  // branch's own "attempt the write, collapse any refusal into
+  // write_refused_filled_locked_or_conflict" with a pre-check
+  // (getGardssalgOrgnrWriteBlocker, UNCHANGED — still the sole authority on
+  // whether a write may proceed) followed by classifyGardssalgOrgnrWriteBlock
+  // when that pre-check blocks specifically on THIS row's own fill/lock
+  // state, so the real reason is differentiated and logged instead of
+  // collapsed:
+  //   - locked            -> kept in queue, reason "locked", NEVER written
+  //                          (the owner-lock always wins).
+  //   - conflict          -> kept in queue, reason "conflict", stored AND
+  //                          candidate values both reported, NEVER
+  //                          auto-written.
+  //   - filled + identical -> the ONE behavior change (spec item 2): no
+  //                          write needed (the value already matches), so
+  //                          the row is marked done and removed from the
+  //                          queue WITHOUT calling applyGardssalgProviderOrgnr
+  //                          at all — then the existing Brreg-verify flow is
+  //                          triggered for the provider (spec item 6), same
+  //                          as a genuine write below.
+  // Any OTHER pre-check block (invalid format / provider not found / the
+  // cross-provider UNIQUE org_nr_conflict) is unrelated to this row's own
+  // filled/locked/conflict state and keeps its existing raw reason string.
+  async function attemptGardssalgOrgnrWrite(
+    providerId: string,
+    orgNr: string,
+    evidenceUrl: string,
+    extra: { manual_verified?: true; brreg_name?: string } = {}
+  ): Promise<void> {
+    const blocker = getGardssalgOrgnrWriteBlocker(providerId, orgNr);
+    if (blocker !== null) {
+      if (blocker === "already_filled" || blocker === "owner_locked") {
+        const detail = classifyGardssalgOrgnrWriteBlock(providerId, orgNr);
+        if (detail && detail.reason === "filled" && detail.identical) {
+          // No write needed — the stored value already matches. Mark the
+          // row done by removing it from the queue (a DELETE on the QUEUE
+          // table only — applyGardssalgProviderOrgnr, the org_nr UPDATE, is
+          // never called on this path), then run the same Brreg-verify
+          // trigger a genuine write below would.
+          clearGardssalgOrgnrReviewQueueEntry(providerId);
+          await triggerGardssalgBrregVerifyAfterOrgnrLanded(providerId);
+          approved.push({ provider_id: providerId, org_nr: orgNr, already_confirmed: true, ...extra });
+          return;
+        }
+        if (detail) {
+          rejected.push({
+            provider_id: providerId,
+            reason: detail.reason, // "locked" or "conflict"
+            stored_org_nr: detail.stored_org_nr ?? undefined,
+            candidate_org_nr: detail.candidate_org_nr,
+            ...extra,
+          });
+          return;
+        }
+      }
+      // Not this row's own fill/lock state (invalid format / provider not
+      // found / cross-provider UNIQUE org_nr_conflict) — unchanged.
+      rejected.push({ provider_id: providerId, reason: blocker, ...extra });
+      return;
+    }
+    try {
+      const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
+      if (written.length > 0) {
+        clearGardssalgOrgnrReviewQueueEntry(providerId);
+        await triggerGardssalgBrregVerifyAfterOrgnrLanded(providerId);
+        approved.push({ provider_id: providerId, org_nr: orgNr, ...extra });
+      } else {
+        // The pre-check above found no blocker, yet the write itself still
+        // no-op'd — a genuine concurrent race between the pre-check and the
+        // write (another request filled/locked the row in between). Rare;
+        // reported honestly as a race rather than folded into
+        // "locked"/"conflict", which would misreport a transient race as
+        // the durable state those two are meant to describe.
+        rejected.push({ provider_id: providerId, reason: "write_refused_race_condition", ...extra });
+      }
+    } catch (err: any) {
+      rejected.push({ provider_id: providerId, reason: `write_failed: ${err?.message ?? String(err)}`, ...extra });
+    }
+  }
 
   for (const raw of body.approvals as unknown[]) {
     const a = (raw ?? {}) as { provider_id?: unknown; org_nr?: unknown; manual_verified?: unknown };
@@ -13784,18 +13925,12 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
         }
         continue;
       }
-      try {
+      {
         const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
-        const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
-        if (written.length > 0) {
-          clearGardssalgOrgnrReviewQueueEntry(providerId);
-          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
-        } else {
-          rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
-        }
-      } catch (err) {
-        console.error("[gardssalg-orgnr-review-approve] manual_verified write failed (no queue row):", err);
-        rejected.push({ provider_id: providerId, reason: "write_failed" });
+        await attemptGardssalgOrgnrWrite(providerId, orgNr, evidenceUrl, {
+          manual_verified: true,
+          brreg_name: verdict.name ?? undefined,
+        });
       }
       continue;
     }
@@ -13854,18 +13989,12 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
         }
         continue;
       }
-      try {
+      {
         const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
-        const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
-        if (written.length > 0) {
-          clearGardssalgOrgnrReviewQueueEntry(providerId);
-          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
-        } else {
-          rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
-        }
-      } catch (err) {
-        console.error("[gardssalg-orgnr-review-approve] manual_verified write failed:", err);
-        rejected.push({ provider_id: providerId, reason: "write_failed" });
+        await attemptGardssalgOrgnrWrite(providerId, orgNr, evidenceUrl, {
+          manual_verified: true,
+          brreg_name: verdict.name ?? undefined,
+        });
       }
       continue;
     }
@@ -13879,17 +14008,9 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
       }
       continue;
     }
-    try {
+    {
       const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
-      const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
-      if (written.length > 0) {
-        clearGardssalgOrgnrReviewQueueEntry(providerId);
-        approved.push({ provider_id: providerId, org_nr: orgNr });
-      } else {
-        rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
-      }
-    } catch (e: any) {
-      rejected.push({ provider_id: providerId, reason: `write_failed: ${e?.message ?? String(e)}` });
+      await attemptGardssalgOrgnrWrite(providerId, orgNr, evidenceUrl);
     }
   }
 
@@ -14060,10 +14181,19 @@ router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Req
       } else {
         // The judge said GODKJENN, but a write-time guard on the approve
         // route (fill-only race, owner claim, org_nr conflict, …) still
-        // blocked the write.
+        // blocked the write. dev-request 2026-09-16-…: the approve route now
+        // differentiates WHY into "locked"/"conflict" (instead of the old
+        // collapsed write_refused_filled_locked_or_conflict) — that reason
+        // flows straight through here into the persisted queue-row note, and
+        // for "conflict" the stored/candidate values it needs ride along too.
         const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
-        const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
-        const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`;
+        const innerRejected = rejectedList.find((r: any) => r?.provider_id === q.provider_id);
+        const innerReason = innerRejected?.reason;
+        const detailSuffix =
+          innerRejected?.stored_org_nr !== undefined || innerRejected?.candidate_org_nr !== undefined
+            ? ` (stored=${innerRejected?.stored_org_nr ?? "null"}, candidate=${innerRejected?.candidate_org_nr ?? q.candidate_orgnr})`
+            : "";
+        const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}${detailSuffix}`;
         const changes = gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
         rejected++;
         results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgOrgnrJudgeReportedReason(note, changes) });
@@ -19775,6 +19905,15 @@ export interface GsVtpQueueAgeRow {
   reason: string | null;
   age_days: number;
   stale: boolean;
+  // dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+  // avvist, AC1: additive, only populated for queues whose entries actually
+  // carry these (today: only gardssalg_orgnr_review_queue, via
+  // listGardssalgOrgnrReviewQueue's candidate_orgnr column + its
+  // stored_org_nr join) — "the values it needs" for a filled/locked/conflict
+  // row, surfaced right on the staleness report instead of requiring a
+  // second call to the full (unfiltered-by-staleness) queue listing.
+  candidate_org_nr?: string | null;
+  stored_org_nr?: string | null;
 }
 
 /**
@@ -19809,7 +19948,14 @@ export function gardssalgQueueP95AgeDays(sortedAscendingAges: number[]): number 
  * working unchanged, they simply now also receive this extra key.
  */
 export function computeGardssalgQueueAgeReport(
-  entries: Array<{ provider_id: string; provider_name?: string | null; created_at: string; reason?: string | null }>,
+  entries: Array<{
+    provider_id: string;
+    provider_name?: string | null;
+    created_at: string;
+    reason?: string | null;
+    candidate_orgnr?: string | null;
+    stored_org_nr?: string | null;
+  }>,
   nowMs: number = Date.now()
 ): {
   count: number;
@@ -19821,13 +19967,18 @@ export function computeGardssalgQueueAgeReport(
   const rows: GsVtpQueueAgeRow[] = entries.map((e) => {
     const createdMs = gsVtpParseSqliteUtcMs(e.created_at);
     const ageDays = Number.isFinite(createdMs) ? Math.max(0, Math.floor((nowMs - createdMs) / 86_400_000)) : 0;
-    return {
+    const row: GsVtpQueueAgeRow = {
       provider_id: e.provider_id,
       name: e.provider_name ?? null,
       reason: e.reason ?? null,
       age_days: ageDays,
       stale: ageDays > GS_VTP_QUEUE_STALE_DAYS,
     };
+    // Additive — only present when the source entry actually carries these
+    // (see GsVtpQueueAgeRow's own doc comment).
+    if (e.candidate_orgnr !== undefined) row.candidate_org_nr = e.candidate_orgnr ?? null;
+    if (e.stored_org_nr !== undefined) row.stored_org_nr = e.stored_org_nr ?? null;
+    return row;
   });
   const ascendingAges = rows.map((r) => r.age_days).sort((a, b) => a - b);
   rows.sort((a, b) => b.age_days - a.age_days);
