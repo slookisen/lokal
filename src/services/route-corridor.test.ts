@@ -23,7 +23,10 @@
  *   g1-g5    approximate grouping: no numbers, ordered by the place
  *   r1-r7    routing providers: mapbox/osrm shape, no-token degradation
  *   k1-k4    polyline cache: hit, TTL expiry, key normalisation
- *   d1-d6    drink taxonomy
+ *   d1-d18   drink taxonomy — d1-d8 the flat `beverages` category (Fase 5a/
+ *            5b original slice); d9-d18 the six-value SUBCATEGORY taxonomy
+ *            (drink-taxonomy.ts) reaching parseNaturalQuery, discover() and
+ *            corridorSearch (this slice)
  *
  * No network: the RouteProvider seam is injected in every case, and the
  * geocoder's fetch is stubbed via __setGeocodingFetchForTesting. The RFB DB is
@@ -66,6 +69,7 @@ import {
   formatCorridorLabel,
   resolveSeparationKm,
   isGardssalgDrinkType,
+  classifyCandidateDrinkSubcategory,
   CORRIDOR_TARGET_STOPS,
   type RouteProvider,
   type CorridorCandidate,
@@ -697,6 +701,8 @@ export async function runRouteCorridorTests(opts: { log?: boolean } = {}): Promi
       seedAgents(db, [
         { id: "p-beer", name: "Ruteøl Bryggeri", city: "Ringsaker", lat: 59.35, lng: 10.02,
           precision: "address", categories: ["beverages"] },
+        { id: "p-wine", name: "Rutevin Vingård", city: "Hamar", lat: 59.65, lng: 10.05,
+          precision: "address", categories: ["beverages"] },
       ]);
       __clearRouteCacheForTesting();
       const { provider } = stubProvider(straightNorthRoute());
@@ -704,8 +710,84 @@ export async function runRouteCorridorTests(opts: { log?: boolean } = {}): Promi
         from: "Oslo", to: "Trondheim", provider, rfbDb: db,
         maxDetourKm: 20, minSeparationKm: 0, drinkOnly: true, sources: ["rfb"],
       });
-      eq(r.stops.map((s) => s.id), ["p-beer"],
-        "d8: drinkOnly narrows the corridor to drink producers");
+      eq(r.stops.map((s) => s.id).sort(), ["p-beer", "p-wine"],
+        "d8: drinkOnly narrows the corridor to drink producers (both, no subcategory filter)");
+
+      // ── Fase 5a/5b: the six-value SUBCATEGORY taxonomy ─────────────────
+      //
+      // parseNaturalQuery: WHICH of the six, not just "beverages".
+      eq(marketplaceRegistry.parseNaturalQuery("bryggeri i agder").drinkSubcategory, "bryggeri",
+        "d9: «bryggeri i agder» (the dev-request's own example query) -> drinkSubcategory: bryggeri");
+      eq(marketplaceRegistry.parseNaturalQuery("cideri i Hardanger").drinkSubcategory, "cideri",
+        "d9b: «cideri i Hardanger» -> cideri");
+      eq(marketplaceRegistry.parseNaturalQuery("vingård Sørlandet").drinkSubcategory, "vingård",
+        "d9c: «vingård Sørlandet» -> vingård");
+      eq(marketplaceRegistry.parseNaturalQuery("mjød fra Hedmark").drinkSubcategory, "mjød",
+        "d9d: «mjød fra Hedmark» -> mjød");
+      const drikkesteder = marketplaceRegistry.parseNaturalQuery("drikkesteder");
+      ok((drikkesteder.categories || []).includes("beverages"),
+        "d10: «drikkesteder» (the dev-request's other example query) still resolves to beverages");
+      eq(drikkesteder.drinkSubcategory, undefined,
+        "d10b: …but carries NO drinkSubcategory — «drikkesteder» alone names no specific one of the six");
+      eq(marketplaceRegistry.parseNaturalQuery("honning fra Vadsø").drinkSubcategory, undefined,
+        "d11: a non-drink query never carries a drinkSubcategory field at all");
+
+      // discover(): the REST/MCP-facing filter, against real seeded rows.
+      const onlyBryggeri = marketplaceRegistry.discover({
+        role: "producer", categories: ["beverages"], drinkSubcategory: "bryggeri",
+      } as any);
+      eq(onlyBryggeri.map((x) => x.agent.id), ["p-beer"],
+        "d12: discover({drinkSubcategory:'bryggeri'}) returns only the brewery, not the winery");
+      const onlyVingard = marketplaceRegistry.discover({
+        role: "producer", categories: ["beverages"], drinkSubcategory: "vingård",
+      } as any);
+      eq(onlyVingard.map((x) => x.agent.id), ["p-wine"],
+        "d13: …and 'vingård' returns only the winery");
+
+      // corridorSearch: the drinkSubcategory option end to end (Fase 5b, /reise).
+      __clearRouteCacheForTesting();
+      const { provider: provider2 } = stubProvider(straightNorthRoute());
+      const rBryggeri = await corridorSearch({
+        from: "Oslo", to: "Trondheim", provider: provider2, rfbDb: db,
+        maxDetourKm: 20, minSeparationKm: 0, drinkSubcategory: "bryggeri", sources: ["rfb"],
+      });
+      eq(rBryggeri.stops.map((s) => s.id), ["p-beer"],
+        "d14: corridorSearch({drinkSubcategory:'bryggeri'}) narrows the corridor to only the brewery");
+
+      __clearRouteCacheForTesting();
+      const { provider: provider3 } = stubProvider(straightNorthRoute());
+      const rMjod = await corridorSearch({
+        from: "Oslo", to: "Trondheim", provider: provider3, rfbDb: db,
+        maxDetourKm: 20, minSeparationKm: 0, drinkSubcategory: "mjød", sources: ["rfb"],
+      });
+      eq(rMjod.stops, [], "d15: a subcategory with zero real matches on the route returns an empty (not erroring) stop list");
+
+      // classifyCandidateDrinkSubcategory: gårdssalg candidates key off
+      // producer_type FIRST (the closed DB vocabulary), not text.
+      eq(
+        classifyCandidateDrinkSubcategory({
+          id: "gs-1", source: "gardssalg", name: "Et Sted", lat: 0, lng: 0,
+          precision: "address", place: null, categories: ["mjøderi"], url: "https://x",
+        } as any),
+        "mjød",
+        "d16: a gårdssalg candidate classifies off producer_type (categories[0]) — 'mjøderi' -> mjød",
+      );
+      eq(
+        classifyCandidateDrinkSubcategory({
+          id: "gs-2", source: "gardssalg", name: "Et Bryggeri-Navn", lat: 0, lng: 0,
+          precision: "address", place: null, categories: ["gardsbutikk"], url: "https://x",
+        } as any),
+        null,
+        "d17: …a KNOWN non-drink producer_type ('gardsbutikk') -> null, even though the NAME says bryggeri (producer_type wins for gårdssalg)",
+      );
+      eq(
+        classifyCandidateDrinkSubcategory({
+          id: "rfb-1", source: "rfb", name: "Fjellro Vingård", lat: 0, lng: 0,
+          precision: "address", place: null, categories: ["beverages"], description: null, url: "https://x",
+        } as any),
+        "vingård",
+        "d18: an RFB candidate (no producer_type) falls back to name+description text",
+      );
     }
 
     // ══ Loader honesty: what the SQL actually returns ═════════════════

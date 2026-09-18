@@ -82,6 +82,11 @@ import {
   type Polyline,
   type PreparedRoute,
 } from "./route-geometry";
+import {
+  classifyDrinkSubcategoryFromProducerType,
+  classifyDrinkSubcategoryFromText,
+  type DrinkSubcategory,
+} from "./drink-taxonomy";
 
 // ── Routing providers ────────────────────────────────────────────────
 
@@ -612,6 +617,32 @@ function isDrinkRow(source: CorridorSource, categories: string[], producerType?:
   return false;
 }
 
+/**
+ * Fase 5a/5b: which of the six canonical drink subcategories (drink-
+ * taxonomy.ts) a corridor candidate belongs to, or null when it is not one of
+ * the six (it may still be `isDrink` via the broader beverages/mat_drikke
+ * buckets above — those two questions are deliberately separate, see
+ * classifyDrinkSubcategoryFromProducerType's own doc comment).
+ *
+ * gårdssalg rows carry their exact `producer_type` in `categories[0]`
+ * (loadGardssalgCandidates above) — checked first because it is a closed,
+ * curated DB value, the most reliable source available. Every other row
+ * (RFB, experience) falls back to a text match over name + description, the
+ * same signal the search-field parser uses.
+ */
+export function classifyCandidateDrinkSubcategory(c: CorridorCandidate): DrinkSubcategory | null {
+  // gårdssalg: producer_type is the closed, curated DB vocabulary and is
+  // AUTHORITATIVE — never fall through to guessing from the name/description
+  // text. A row whose producer_type is a known non-drink type (or NULL/
+  // unknown, or a drink type outside the six like "seltzeri") returns null
+  // here rather than risk a false positive off a name that happens to
+  // contain a keyword (e.g. a "gardsbutikk" called "Fjell Bryggeri Utsalg").
+  if (c.source === "gardssalg") {
+    return classifyDrinkSubcategoryFromProducerType(c.categories[0]);
+  }
+  return classifyDrinkSubcategoryFromText(`${c.name} ${c.description ?? ""}`);
+}
+
 const RFB_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 const EXPERIENCES_BASE_URL = process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
 
@@ -877,6 +908,12 @@ export interface CorridorSearchOptions {
   maxDetourKm?: number;
   /** Only drink producers (Fase 5). */
   drinkOnly?: boolean;
+  /**
+   * Fase 5b: narrow further to exactly one of the six canonical drink
+   * subcategories (drink-taxonomy.ts). Implies drinkOnly — a candidate that
+   * is not a drink row at all can never match a specific subcategory.
+   */
+  drinkSubcategory?: DrinkSubcategory;
   /** Restrict to these catalogues. Default: all available. */
   sources?: CorridorSource[];
   /** Max suggestions in the ordered list. Default 25, clamped 1-100. */
@@ -1030,6 +1067,10 @@ export async function corridorSearch(opts: CorridorSearchOptions): Promise<Corri
 
   const scanned = candidates.length;
   if (opts.drinkOnly) candidates = candidates.filter((c) => c.isDrink);
+  if (opts.drinkSubcategory) {
+    const wanted = opts.drinkSubcategory;
+    candidates = candidates.filter((c) => c.isDrink && classifyCandidateDrinkSubcategory(c) === wanted);
+  }
 
   const precise: CorridorStop[] = [];
   const imprecise: Array<{ candidate: CorridorCandidate; alongKm: number }> = [];

@@ -30,6 +30,7 @@ import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
+import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
   createCart as svcCreateCart,
   checkCartToken as svcCheckCartToken,
@@ -254,7 +255,7 @@ export function registerTools(
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
       // answered from a place NAME or not at all.
-      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf.",
+      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Drink venues are a first-class category (Fase 5): queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -397,8 +398,21 @@ export function registerTools(
       title: "Discover producers by filter",
       description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.",
       inputSchema: {
-        categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+        // Fase 5b (dev-request 2026-07-25-reisesok…): "beverages" was already
+        // a real, filterable category — 133 producers carry it — but was
+        // missing from this list entirely, so an agent reading only this
+        // description had no way to know drink venues were searchable here.
+        categories: z.array(z.string()).optional().describe(
+          "Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs, beverages " +
+          "(beverages = all drink venues: breweries, cideries, wineries, distilleries, farm cafés, meaderies — " +
+          "use drinkSubcategory below to narrow to exactly one kind)",
+        ),
         tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        drinkSubcategory: z.enum(DRINK_SUBCATEGORIES).optional().describe(
+          "Narrow 'beverages' results to exactly one drink venue kind: bryggeri (brewery), cideri (cidery), " +
+          "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
+          "Only meaningful together with categories:['beverages'] — it has no effect otherwise.",
+        ),
         lat: z.number().optional().describe("Latitude for distance filtering"),
         lng: z.number().optional().describe("Longitude for distance filtering"),
         maxDistanceKm: z.number().optional().describe("Max distance in km"),
@@ -412,8 +426,8 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
-      const body: any = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
+    async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }) => {
+      const body: any = { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
       // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter (round-2
       // independent review of PR #823): this tool accepts `tags` directly and
       // is exposed to the same live ChatGPT app as `lokal_search` — it needs

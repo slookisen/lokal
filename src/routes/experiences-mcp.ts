@@ -44,6 +44,7 @@
  */
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -255,8 +256,18 @@ export const DiscoverGardssalgInputSchema = {
   kommune: z.string().optional().describe(
     "Norwegian municipality (kommune) of the producer. Examples: 'Tromsø', 'Bergen', 'Stavanger'"
   ),
+  // Fase 5a/5b (dev-request 2026-07-25-reisesok…): the six canonical drink
+  // subcategories are drink-taxonomy.ts's DRINK_SUBCATEGORIES, shared with
+  // RFB's lokal_discover tool. Kept as z.string() (not a strict z.enum) —
+  // the DB's producer_type column also carries values this filter must keep
+  // accepting: alternate spellings (vingard/vingaard, mjoderi), non-drink
+  // gårdssalg types (gardsbutikk, bakeri, …), and future values — a strict
+  // enum here would 400 a caller passing any of those instead of matching
+  // nothing, which is what an unrecognised filter value should do.
   producer_type: z.string().optional().describe(
-    "Type of drink producer. Examples: 'bryggeri' (brewery), 'cideri' (cidery), 'vingård' (vineyard), 'destilleri' (distillery), 'mjøderi' (meadery), 'seltzeri'"
+    "Type of drink producer — one of the six canonical drink venue kinds: 'bryggeri' (brewery), " +
+    "'cideri' (cidery), 'vingård' (winery), 'destilleri' (distillery), 'gårdskafé' (farm café), " +
+    "'mjød'/'mjøderi' (meadery). 'seltzeri' also occurs in the data."
   ),
   // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: look a
   // SPECIFIC producer up by name/place — the step «book et møte hos X» needs.
@@ -781,7 +792,7 @@ function registerExperienceTools(
       title: "Discover Norwegian farm-sale drink producers (gårdssalg)",
       description:
         "Search opplevagent.no's gårdssalg (farm-sale) vertical — Brreg-registered Norwegian drink " +
-        "producers (bryggeri/cideri/vingård/destilleri/mjøderi/seltzeri) selling directly from the farm. " +
+        "producers (bryggeri/cideri/vingård/destilleri/gårdskafé/mjød/seltzeri) selling directly from the farm. " +
         "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
         "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
         "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
@@ -807,7 +818,11 @@ function registerExperienceTools(
         const filter: GardssalgSearchFilter = {};
         if (fylke) filter.fylke = fylke;
         if (kommune) filter.kommune = kommune;
-        if (producer_type) filter.producer_type = producer_type;
+        // Fase 5a/5b: resolveGardssalgProducerTypeFilter (drink-taxonomy.ts)
+        // expands one of the six canonical spellings (e.g. the spec's own
+        // "mjød") to every known DB spelling of that type; any other value
+        // passes through unchanged. See that function's own doc comment.
+        if (producer_type) filter.producer_type = resolveGardssalgProducerTypeFilter(producer_type);
         if (typeof query === "string" && query.trim()) filter.q = query.trim();
         if (typeof booking_live === "boolean") filter.booking_live = booking_live;
         if (typeof lat === "number") filter.lat = lat;

@@ -77,6 +77,7 @@ import adminAgentsInternalNoteSweepRoutes from "./routes/admin-agents-internal-n
 import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-correction";
 import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
 import adminAgentsCategoryDescriptionProvenanceAuditRoutes from "./routes/admin-agents-category-description-provenance-audit";
+import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
@@ -684,6 +685,11 @@ app.use(
   adminLimiter,
   adminAgentsCategoryDescriptionProvenanceAuditRoutes,
 );
+// GET /admin/agents/drink-coverage (dev-request 2026-07-25-reisesok-korridor-
+// discovery-og-naerhetssok, Fase 5c): read-only drink-venue coverage report
+// over RFB producers, by canonical subcategory + city. Same ordering rule as
+// the siblings above — mount BEFORE /admin/agents.
+app.use("/admin/agents/drink-coverage", adminLimiter, adminDrinkCoverageRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
 // state that services/enrichment-write-pause.ts enforces on every enrichment

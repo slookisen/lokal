@@ -184,6 +184,16 @@ export const DiscoveryQuerySchema = z.object({
   categories: z.array(z.string()).optional(), // ["vegetables", "fruit"]
   tags: z.array(z.string()).optional(),       // ["organic", "local"]
   skills: z.array(z.string()).optional(),     // ["inventory-check", "delivery"]
+  // Fase 5b (dev-request 2026-07-25-reisesok…): one of the six canonical
+  // drink subcategories (services/drink-taxonomy.ts) — "bryggeri", "cideri",
+  // "vingård", "destilleri", "gårdskafé" or "mjød". Kept as a loose string
+  // here (not an imported z.enum) for the same reason `categories` above is
+  // a loose string array: this schema is the wire contract, and validating
+  // against the closed vocabulary happens where the request is decided
+  // (marketplaceRegistry.discover()'s own filter step), not here — an
+  // unrecognised value simply matches nothing, exactly like an unrecognised
+  // category already does.
+  drinkSubcategory: z.string().optional(),
 
   // Geo filter
   location: z.object({

@@ -29,6 +29,10 @@ import {
 // does not breach this file's rfb-vertical isolation — same rule as
 // geo-distance.ts above.
 import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/product-glossary";
+// dev-request 2026-07-25-reisesok…, Fase 5a/5b: the shared six-value drink
+// subcategory taxonomy. PURE (drink-taxonomy.ts has zero imports), same
+// isolation rule as geo-distance.ts and product-glossary.ts above.
+import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink-taxonomy";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -323,6 +327,24 @@ class MarketplaceRegistry {
         query.categories!.some(cat =>
           a.categories.some(ac => ac.toLowerCase().includes(cat.toLowerCase()))
         )
+      );
+    }
+
+    // 3b. Fase 5b: narrow further to ONE of the six canonical drink
+    // subcategories. There is no per-subcategory column on `agents` — the
+    // signal is the same name+description text match the search-field
+    // parser uses (drink-taxonomy.ts), so this reads honestly as "producers
+    // whose own text says bryggeri/vingård/…", not a curated DB field.
+    //
+    // Deliberately NOT guarded by isDrinkSubcategory(): an unrecognised
+    // value (typo, or a caller testing the filter) must match ZERO
+    // candidates, the same way an unrecognised `categories` entry already
+    // does at step 3 above — never silently ignored, which would make a
+    // narrowing filter accidentally widen the result set instead.
+    if (query.drinkSubcategory) {
+      const wanted = query.drinkSubcategory;
+      candidates = candidates.filter(a =>
+        classifyDrinkSubcategoryFromText(`${a.name} ${a.description || ""}`) === wanted
       );
     }
 
@@ -646,7 +668,12 @@ class MarketplaceRegistry {
 
   // ─── Natural language query parsing ───────────────────────
 
-  parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } {
+  parseNaturalQuery(query: string): Partial<DiscoveryQuery> & {
+    _productTerms?: string[];
+    _proximityIntent?: boolean;
+    /** Fase 5b: one of drink-taxonomy.ts's six values, present only alongside categories:["beverages"]. */
+    drinkSubcategory?: DrinkSubcategory;
+  } {
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
 
     // ── English queries (dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil) ──
@@ -667,7 +694,11 @@ class MarketplaceRegistry {
     // what the user typed — only category/tag detection gets the extra words.
     const englishTerms = norwegianTermsForEnglishQuery(query);
     const qTerms = englishTerms.length ? `${q} ${englishTerms.join(" ")}` : q;
-    const parsed: Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } = {};
+    const parsed: Partial<DiscoveryQuery> & {
+      _productTerms?: string[];
+      _proximityIntent?: boolean;
+      drinkSubcategory?: DrinkSubcategory;
+    } = {};
 
     // ── Proximity intent (dev-request 2026-07-25 fix 0e) ──────────────
     // «nær», «nærme», «nærmeste», «meg», «her» and «hvor» are all in the
@@ -815,6 +846,18 @@ class MarketplaceRegistry {
     }
     if (detectedCategories.length > 0) parsed.categories = detectedCategories;
     if (productTerms.length > 0) parsed._productTerms = productTerms;
+
+    // Fase 5b: WHICH of the six canonical drink subcategories, when the
+    // query landed on `beverages` at all. Runs over the same `qTerms` the
+    // category matcher just read (English-food-word-expanded query text),
+    // so an English query gets the same subcategory precision a Norwegian
+    // one does. Absent (not null) when no specific subcategory keyword
+    // matched — "drikkesteder"/"beverages" alone means "some drink venue",
+    // not any one of the six, and this must not guess.
+    if (detectedCategories.includes("beverages")) {
+      const sub = classifyDrinkSubcategoryFromText(qTerms);
+      if (sub) parsed.drinkSubcategory = sub;
+    }
 
     const tagMap: Record<string, string[]> = {
       "organic": ["økologisk", "organic", "øko", "debio"],

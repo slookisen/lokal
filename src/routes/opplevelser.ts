@@ -15806,6 +15806,130 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
   });
 });
 
+// ─── GET /api/opplevelser/admin/drink-coverage ────────────────────────────────
+//
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5c:
+// «Datadekning måles og rapporteres (hvor mange drikkesteder finnes faktisk
+// per fylke).» A read-only measurement over BOTH of this vertical's own drink
+// signals:
+//   - gårdssalg (experience_providers.producer_type) — classified into the
+//     six canonical drink-taxonomy.ts subcategories where the producer_type
+//     is one of them; `unclassified_but_drink` counts rows
+//     isGardssalgDrinkType() still treats as drink (the "unknown
+//     producer_type counts as drink" rule — see route-corridor-service.ts)
+//     but that are not one of the six.
+//   - experiences (experiences.category IN DRINK_EXPERIENCE_CATEGORIES) — the
+//     broader "food/drink experience" bucket, which is not one of the six
+//     either (it is a different taxonomy axis: experience TYPE, not drink
+//     VENUE kind) and is reported separately, by category.
+// Both are grouped by `fylke`, which — unlike RFB's `agents` table — this
+// vertical's own tables genuinely have as a real column (see
+// admin-drink-coverage.ts's RFB sibling for why RFB's own report is grouped
+// by `city` instead).
+//
+// Read-only — two SELECTs, no writes.
+router.get("/admin/drink-coverage", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  // Local, scoped imports — same convention this file already uses for
+  // route-corridor-service.ts symbols elsewhere (grep NON_DRINK_PRODUCER_TYPES/
+  // isGardssalgDrinkType/DRINK_PRODUCER_TYPES above): the module is large and
+  // each report imports only the symbols it needs, right where it uses them.
+  const {
+    DRINK_SUBCATEGORIES,
+    classifyDrinkSubcategoryFromProducerType,
+  } = require("../services/drink-taxonomy") as typeof import("../services/drink-taxonomy");
+  const {
+    isGardssalgDrinkType,
+    DRINK_EXPERIENCE_CATEGORIES,
+  } = require("../services/route-corridor-service") as typeof import("../services/route-corridor-service");
+
+  interface GardssalgRow { fylke: string | null; producer_type: string | null }
+  interface ExperienceRow { fylke: string | null; category: string | null }
+
+  let gardssalgRows: GardssalgRow[] = [];
+  let experienceRows: ExperienceRow[] = [];
+  try {
+    gardssalgRows = expDb
+      .prepare(
+        `SELECT fylke, producer_type
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+      )
+      .all() as GardssalgRow[];
+    experienceRows = expDb
+      .prepare(
+        `SELECT fylke, category
+           FROM experiences
+          WHERE verification_status = 'verified'
+            AND confidence IN ('high','medium')
+            AND canonical_id IS NULL
+            AND category IN (${Array.from(DRINK_EXPERIENCE_CATEGORIES).map(() => "?").join(",")})`,
+      )
+      .all(...(Array.from(DRINK_EXPERIENCE_CATEGORIES) as string[])) as ExperienceRow[];
+  } catch (err: any) {
+    res.status(500).json({ error: "drink-coverage query failed", detail: err.message });
+    return;
+  }
+
+  const fylkeKey = (f: string | null) => (f || "").trim() || "(ukjent fylke)";
+
+  const gardssalgByFylke = new Map<string, Record<string, number>>();
+  let gardssalgDrinkTotal = 0;
+  const gardssalgBySubcategory: Record<string, number> = { unclassified_but_drink: 0 };
+  for (const sub of DRINK_SUBCATEGORIES as readonly string[]) gardssalgBySubcategory[sub] = 0;
+
+  for (const r of gardssalgRows) {
+    if (!isGardssalgDrinkType(r.producer_type)) continue; // a KNOWN non-drink type — excluded
+    gardssalgDrinkTotal++;
+    const sub = classifyDrinkSubcategoryFromProducerType(r.producer_type) ?? "unclassified_but_drink";
+    gardssalgBySubcategory[sub] = (gardssalgBySubcategory[sub] || 0) + 1;
+    const key = fylkeKey(r.fylke);
+    let bucket = gardssalgByFylke.get(key);
+    if (!bucket) { bucket = {}; gardssalgByFylke.set(key, bucket); }
+    bucket[sub] = (bucket[sub] || 0) + 1;
+  }
+
+  const experienceByFylke = new Map<string, Record<string, number>>();
+  const experienceByCategory: Record<string, number> = {};
+  for (const r of experienceRows) {
+    const cat = r.category || "(ukjent kategori)";
+    experienceByCategory[cat] = (experienceByCategory[cat] || 0) + 1;
+    const key = fylkeKey(r.fylke);
+    let bucket = experienceByFylke.get(key);
+    if (!bucket) { bucket = {}; experienceByFylke.set(key, bucket); }
+    bucket[cat] = (bucket[cat] || 0) + 1;
+  }
+
+  const toSortedFylkeArray = (m: Map<string, Record<string, number>>) =>
+    Array.from(m.entries())
+      .map(([fylke, counts]) => ({
+        fylke,
+        total: Object.values(counts).reduce((a, b) => a + b, 0),
+        counts,
+      }))
+      .sort((a, b) => b.total - a.total || a.fylke.localeCompare(b.fylke, "nb-NO"));
+
+  res.json({
+    success: true,
+    grouped_by: "fylke",
+    gardssalg: {
+      subcategories: DRINK_SUBCATEGORIES,
+      scanned: gardssalgRows.length,
+      drink_total: gardssalgDrinkTotal,
+      by_subcategory: gardssalgBySubcategory,
+      by_fylke: toSortedFylkeArray(gardssalgByFylke),
+    },
+    experiences: {
+      categories: Array.from(DRINK_EXPERIENCE_CATEGORIES),
+      total: experienceRows.length,
+      by_category: experienceByCategory,
+      by_fylke: toSortedFylkeArray(experienceByFylke),
+    },
+  });
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-outreach-readiness ─────────────────
 //
 // dev-request 2026-07-21-gardssalg-outreach-beredskapsrapport: an outreach-
