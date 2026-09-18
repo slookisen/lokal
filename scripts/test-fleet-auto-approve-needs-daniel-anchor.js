@@ -66,12 +66,31 @@
  * PR labels are exact short tags, not prose, so the workflow's label check
  * is intentionally left on the original plain substring test — this
  * function is for free-form text only (PR body + review doc).
+ *
+ * Predictive/epistemic framing (2026-09-18, dev-request 2026-09-17-fleet-
+ * auto-approve-pr-tekst-som-spaar-gaten-blokkerer-seg-selv): a clause can
+ * also be a non-flag not because it is NEGATED but because it merely
+ * PREDICTS what the gate will do — "the gate's protected-path string match
+ * will likely flag it `needs_daniel`" (lokal#871) and "Expected to route to
+ * `needs_daniel`/manual merge" (lokal#874) both tripped the hard stop even
+ * though nobody was actually flagging the PR — the text forecast the gate's
+ * own future verdict about itself, and the forecast became self-fulfilling.
+ * Same clause-scoped approach as the negation check: a bare epistemic
+ * marker word, or a future/conditional modal (will/vil/kommer til å) paired
+ * with an outcome verb (flag/route/block/flagge/rute/blokkere) within a
+ * short span, anywhere in the clause, means this occurrence is prose ABOUT
+ * the gate's behavior, not a flag FROM a reviewer.
  */
 function hasGenuineNeedsDanielFlag(text) {
   if (!text) return false;
   const NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
   const CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
   const PUNCT_TOKENS = ['--', '—', '–', '\n', '.', '!', '?', ',', ';', ':', '('];
+  const PREDICTIVE_WORD_RE = /\b(likely|probably|anticipat(?:e|es|ed)|predict(?:s|ed)?|expect(?:s|ed)?|antagelig|trolig|sannsynligvis)\b/i;
+  const PREDICTIVE_MODAL_RE = /\b(?:will|vil|kommer\s+til\s+å)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+  function hasPredictiveFraming(clause) {
+    return PREDICTIVE_WORD_RE.test(clause) || PREDICTIVE_MODAL_RE.test(clause);
+  }
   function clauseStart(preceding) {
     let best = 0;
     for (const t of PUNCT_TOKENS) {
@@ -95,7 +114,7 @@ function hasGenuineNeedsDanielFlag(text) {
     const windowStart = Math.max(0, m.index - 80);
     const preceding = text.slice(windowStart, m.index);
     const clause = preceding.slice(clauseStart(preceding));
-    if (!NEGATION_RE.test(clause)) {
+    if (!NEGATION_RE.test(clause) && !hasPredictiveFraming(clause)) {
       return true;
     }
   }
@@ -289,6 +308,49 @@ check(
   'case23 (negative control, however+not in same clause): not flagged',
   'Style nit only, however not needs_daniel in the strict sense',
   false
+);
+
+// 24-27 (AC1/AC4, dev-request 2026-09-17-fleet-auto-approve-pr-tekst-som-
+// spaar-gaten-blokkerer-seg-selv): predictive/epistemic framing — a clause
+// that merely FORECASTS the gate's own future behavior must not trip the
+// hard stop, even with zero negation words present.
+
+// 24. Verbatim shape of the sentence from lokal#871's PR body that tripped
+// the gate on 2026-09-16/17 despite nobody actually flagging the PR.
+check(
+  'case24 (AC1, real, PR #871): "...will likely flag it `needs_daniel`" -> not flagged',
+  "This diff touches `requireAdmin`-gated routes in `src/routes/opplevelser.ts`, so the " +
+  'auto-approve gate\'s protected-path string match will likely flag it `needs_daniel` ' +
+  '(same known false-positive class already logged against PR #626/#646).',
+  false
+);
+
+// 25. Verbatim shape from lokal#874's PR body — a different predictive
+// modal ("Expected to route to") on the same underlying pattern.
+check(
+  'case25 (AC1, real, PR #874): "Expected to route to `needs_daniel`/manual merge" -> not flagged',
+  'This diff touches the `requireAdmin` string (new admin route) — same known false-positive ' +
+  "protected-path class as PR #626/#646/#871. Expected to route to `needs_daniel`/manual merge " +
+  'rather than gate auto-merge.',
+  false
+);
+
+// 26 (AC1). The reviewer-side echo of the same forecasting shape quoted in
+// the dev-request ("expect this to route to `needs_daniel`").
+check(
+  'case26 (AC1, real, PR #871 reviewer comment): "...expect this to route to `needs_daniel`" -> not flagged',
+  'Confirmed the protected-path match is correct; expect this to route to `needs_daniel` per the usual policy.',
+  false
+);
+
+// 27 (negative control). A genuine flag must still trip even when "will" is
+// in the SAME clause, as long as it isn't paired with a gate outcome verb
+// (flag/route/block/...) — the predictive-modal check must not become "any
+// use of will suppresses", only the specific forecasting shape.
+check(
+  'case27 (negative control): "will" in-clause but not paired with an outcome verb -> still flagged',
+  'This change will require genuine needs_daniel review before merge.',
+  true
 );
 
 // ── Summary ─────────────────────────────────────────────────────────────

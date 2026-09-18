@@ -148,6 +148,28 @@ jobs:
             // sentence parsing. This does not weaken the fail-closed direction for
             // any of the historical incidents or the recurring bug this check
             // exists to catch; it narrows an already-narrow theoretical edge case.
+            //
+            // Predictive/epistemic framing (2026-09-18, dev-request 2026-09-17-
+            // fleet-auto-approve-pr-tekst-som-spaar-gaten-blokkerer-seg-selv):
+            // a clause can also fail to be a genuine flag not because it is
+            // NEGATED but because it merely PREDICTS what the gate itself will
+            // do — "the gate's protected-path string match will likely flag it
+            // `needs_daniel`" (lokal#871) and "Expected to route to
+            // `needs_daniel`/manual merge" (lokal#874) both tripped the hard
+            // stop even though neither PR was actually being flagged by anyone;
+            // the text was forecasting the gate's own future verdict about
+            // itself, and that forecast became self-fulfilling. Same
+            // clause-scoped approach as the negation check above: a modal/
+            // epistemic marker anywhere in the clause (a bare marker word, or a
+            // future/conditional modal — will/vil/kommer til å — paired with an
+            // outcome verb — flag/route/block/flagge/rute/blokkere — within a
+            // short span) means this occurrence is prose ABOUT the gate's
+            // behavior, not a flag FROM a reviewer, and does not trip the stop.
+            const NEEDS_DANIEL_PREDICTIVE_WORD_RE = /\b(likely|probably|anticipat(?:e|es|ed)|predict(?:s|ed)?|expect(?:s|ed)?|antagelig|trolig|sannsynligvis)\b/i;
+            const NEEDS_DANIEL_PREDICTIVE_MODAL_RE = /\b(?:will|vil|kommer\s+til\s+å)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+            function hasPredictiveFraming(clause) {
+              return NEEDS_DANIEL_PREDICTIVE_WORD_RE.test(clause) || NEEDS_DANIEL_PREDICTIVE_MODAL_RE.test(clause);
+            }
             const NEEDS_DANIEL_NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
             const NEEDS_DANIEL_CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
             const NEEDS_DANIEL_PUNCT_TOKENS = ['--', '—', '–', '\n', '.', '!', '?', ',', ';', ':', '('];
@@ -176,7 +198,7 @@ jobs:
                 const windowStart = Math.max(0, m.index - 80);
                 const preceding = text.slice(windowStart, m.index);
                 const clause = preceding.slice(needsDanielClauseStart(preceding));
-                if (!NEEDS_DANIEL_NEGATION_RE.test(clause)) {
+                if (!NEEDS_DANIEL_NEGATION_RE.test(clause) && !hasPredictiveFraming(clause)) {
                   return true;
                 }
               }
