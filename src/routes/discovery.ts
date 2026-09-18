@@ -217,8 +217,8 @@ Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
 1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
    tilgjengelige skills (\`lokal_search\`, \`lokal_discover\`, \`lokal_info\`,
-   \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`, \`lokal_stats\`,
-   \`lokal_list_umbrellas\`, \`lokal_bm_next_markets\`).
+   \`lokal_find_offers\`, \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`,
+   \`lokal_stats\`, \`lokal_list_umbrellas\`, \`lokal_bm_next_markets\`).
 2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
