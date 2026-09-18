@@ -23431,6 +23431,19 @@ const _seoDentalPromise = (async () => {
   assertEq(llms.status, 200, "seo-dental: /llms.txt returns 200");
   assertTrue(llms.body.includes("/klinikk/"), "seo-dental: llms.txt documents the clinic profile URL pattern");
 
+  // ── dev-request 2026-09-16-glama-claim-well-known-finn-tannlege ─────────────
+  const glama = await get("/.well-known/glama.json");
+  assertEq(glama.status, 200, "glama-claim: /.well-known/glama.json returns 200");
+  assertTrue(/application\/json/.test(glama.headers["content-type"] || ""),
+    "glama-claim: /.well-known/glama.json Content-Type is application/json");
+  const glamaParsed = JSON.parse(glama.body);
+  assertEq(glamaParsed["$schema"], "https://glama.ai/mcp/schemas/connector.json",
+    "glama-claim: $schema matches Glama's connector schema URL");
+  assertEq(glamaParsed.claim, "glama_claim_8ro-LSuSmnjqfP0rV9lTbWMyXHtxKp0q",
+    "glama-claim: claim token matches Daniel's claim-dialog value verbatim (character-for-character)");
+  assertEq(Object.keys(glamaParsed).sort().join(","), "$schema,claim",
+    "glama-claim: response has exactly the two documented fields, nothing extra");
+
   // ── orch-PR-20260613: description builder unit tests ────────────────────────
   // Import the helpers from the already-loaded dental-seo module.
   const {
