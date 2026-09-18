@@ -28,6 +28,7 @@ import { isJunkDescription, normalizeProse } from "../services/description-quali
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { computeEffectiveAvailability } from "../services/supply-graph";
+import { formatAddressLine } from "../utils/address-format";
 import {
   createCart as svcCreateCart,
   checkCartToken as svcCheckCartToken,
@@ -491,7 +492,7 @@ export function registerTools(
 
       // Contact
       const contact: string[] = [];
-      if (k.address) contact.push(`📍 ${k.address}${k.postalCode ? `, ${k.postalCode}` : ""}`);
+      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode)}`);
       if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
       if (k.email) contact.push(`✉️ ${k.email}`);
       if (k.website) contact.push(`🌐 ${k.website}`);

@@ -4,6 +4,7 @@ import { interactionLogger } from "./interaction-logger";
 import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
 import { slugify } from "../utils/slug";
+import { formatAddressLine } from "../utils/address-format";
 
 // ─── Conversation Service ───────────────────────────────────
 // This is what makes Lokal an OPERATOR, not just a registry.
@@ -346,7 +347,7 @@ class ConversationService {
 
     // Contact info
     const contact: string[] = [];
-    if (k.address) contact.push(`📍 ${k.address}${k.postalCode ? `, ${k.postalCode}` : ""}`);
+    if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode)}`);
     if (k.phone) contact.push(`📞 ${k.phone}`);
     if (k.email) contact.push(`✉️ ${k.email}`);
     if (k.website) contact.push(`🌐 ${k.website}`);
