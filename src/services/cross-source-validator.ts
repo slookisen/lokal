@@ -1709,6 +1709,88 @@ export function factualFieldsWithOnlyInference(
   return out;
 }
 
+// ─── Website-corroboration gap — dev-request 2026-09-09-rfb-kategori-og-
+// beskrivelse-provenance-audit ──────────────────────────────────────────────
+//
+// Daniel's 14-day reply-review found CONTENT fields (categories most visibly
+// — "Soli Brug", an art gallery/café, got category "fish" + product "Fisk")
+// that were NEVER checked against the producer's own website: a bare NACE-
+// code/harvest guess, sent straight to outreach. The dev-request's own text
+// asks for this to use "samme mekanisme som held-for-reenrichment" — THAT
+// NAME DOES NOT EXIST ANYWHERE IN THIS CODEBASE (grepped the whole src/ tree,
+// zero matches). The real, analogous mechanism this codebase already has for
+// "don't trust a fabricated value" is the inference-only-factual-field guard
+// immediately above (fieldHasOnlyInferenceSources / factualFieldsWithOnlyInference,
+// orchestrator-pr-16, consumed by admin-outreach-candidates.ts's suppression
+// gate) — this helper extends that same family with the ONE broadening it is
+// missing for this dev-request's exact claim.
+//
+// fieldHasOnlyInferenceSources() only fires when a field HAS provenance
+// records and EVERY one of them is inference-typed (category_inference /
+// seasonal_knowledge / ...). That undercounts here: a NACE-seeded `agents.
+// categories` row from before this dev-request typically has NO
+// field_provenance.categories entry at all (categories predates per-field
+// provenance entirely — see PR-A / admin-knowledge.ts CONTENT_FIELDS comment;
+// nothing back-filled it the way Phase 5.1 back-filled address/phone/about/
+// products). "No evidence" and "only-fabricated evidence" are the SAME claim
+// from outreach's point of view — the value was never corroborated from the
+// producer's own site — so this predicate fires on BOTH shapes, using the
+// SAME "preferred content source" bar PR-A already defined for CONTENT fields
+// (isPreferredContentSource: website_homepage or owner) instead of the
+// narrower inference-deny-list test.
+//
+// Pure. `hasValue` lets the caller decide what "the field has a value worth
+// gating" means for its own column shape (JSON array length, non-empty
+// string, ...) without this module needing to know every field's on-disk
+// representation.
+export function fieldLacksWebsiteCorroboration(
+  hasValue: boolean,
+  fieldRecords: ProvenanceRecord[] | ProvenanceRecord | unknown
+): boolean {
+  if (!hasValue) return false; // nothing to gate — empty is data_insufficient, a different claim
+  let arr: ProvenanceRecord[];
+  if (!fieldRecords) arr = [];
+  else if (Array.isArray(fieldRecords)) arr = fieldRecords as ProvenanceRecord[];
+  else if (typeof fieldRecords === "object") arr = [fieldRecords as ProvenanceRecord];
+  else arr = [];
+  return !arr.some((r) => r && typeof r === "object" && isPreferredContentSource(r.source_type));
+}
+
+/**
+ * Convenience wrapper for the one write site that currently needs this at
+ * the raw-JSON-column boundary: `agents.categories` (a JSON array on the
+ * `agents` table) cross-referenced against `agent_knowledge.field_provenance`
+ * (a JSON object on a DIFFERENT table, keyed by agent_id — the two are read
+ * together by every call site, never independently). Malformed JSON in
+ * either column is treated as absent (defensive — never throws, matching
+ * websiteOwnershipUnverified / hasInferenceOnlyFactualField's posture in
+ * admin-outreach-candidates.ts).
+ */
+export function categoriesLackWebsiteCorroboration(
+  categoriesJson: string | null | undefined,
+  fieldProvenanceJson: string | null | undefined
+): boolean {
+  let categories: unknown;
+  try {
+    categories = categoriesJson ? JSON.parse(categoriesJson) : [];
+  } catch {
+    categories = [];
+  }
+  const hasValue = Array.isArray(categories) && categories.length > 0;
+
+  let fieldProv: unknown;
+  try {
+    fieldProv = fieldProvenanceJson ? JSON.parse(fieldProvenanceJson) : {};
+  } catch {
+    fieldProv = {};
+  }
+  const coerced =
+    fieldProv && typeof fieldProv === "object" && !Array.isArray(fieldProv)
+      ? coerceProvenanceToArrayShape(fieldProv as Record<string, unknown>)
+      : {};
+  return fieldLacksWebsiteCorroboration(hasValue, coerced.categories);
+}
+
 // ─── Public provenance summary (dev-request 2026-07-13-proveniens-transparens-
 // side, slice 2 — orch-pr-20260725-proveniens-api-provenance) ───────────────
 //
