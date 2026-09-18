@@ -280,14 +280,22 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
            (id, navn, brreg_active, brreg_verified, org_nr, content_source, catalog_hidden,
-            kommune, kommunenummer, adresse, hjemmeside)
+            kommune, kommunenummer, adresse, hjemmeside, producer_type)
          VALUES (@id, @navn, @brreg_active, @brreg_verified, @org_nr, @content_source, @catalog_hidden,
-                 @kommune, @kommunenummer, @adresse, @hjemmeside)`,
+                 @kommune, @kommunenummer, @adresse, @hjemmeside, @producer_type)`,
       );
       const seedProvider = (o: {
         id: string; navn: string; brreg_active?: number | null; brreg_verified?: number; org_nr?: string | null;
         content_source?: string | null; catalog_hidden?: number | null; kommune?: string | null;
         kommunenummer?: string | null; adresse?: string | null; hjemmeside?: string | null;
+        // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+        // drikke, del 1: defaults to 'bryggeri' so every fixture in this file
+        // (whose subject — Trinn B org.nr-from-name+kommune — is unrelated to
+        // the scope gate) is, by construction, in the gårdssalg cohort per
+        // experience-scope.ts's isProviderInGardssalgCohort(). Pass
+        // `producer_type: null` explicitly to seed a genuinely OUT-OF-SCOPE
+        // provider for the dedicated scope-gate cases below.
+        producer_type?: string | null;
       }) => {
         insertProvider.run({
           id: o.id, navn: o.navn,
@@ -300,6 +308,7 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
           kommunenummer: o.kommunenummer ?? null,
           adresse: o.adresse ?? null,
           hjemmeside: o.hjemmeside ?? null,
+          producer_type: o.producer_type === undefined ? "bryggeri" : o.producer_type,
         });
       };
       const providerRow = (id: string) =>
@@ -670,6 +679,51 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
 
         initMod.__setDbForTesting(prevMainDb);
         try { mainDb.close(); } catch { /* ignore */ }
+      }
+
+      // ═══ (r) dev-request 2026-09-18-opplevagent-skop-katalogen-til-
+      //      gardssalg-og-drikke, del 1: the in-scope gate. An out-of-scope
+      //      provider (producer_type:null, no mat_drikke experience) is
+      //      NEVER selected/searched — proven on the fetchCalls log, not
+      //      just a response counter. A provider IN the gårdssalg cohort is
+      //      still resolved even with zero mat_drikke experiences (OR
+      //      rule). ═══════════════════════════════════════════════════════
+      {
+        const fetchCallsBefore = fetchCalls.length;
+
+        seedProvider({
+          id: "prov-scope-outofscope", navn: "Ukjent Museum AS",
+          kommunenummer: "1001", producer_type: null,
+        });
+        // Deliberately no searchFixtures/detailFixtures entry — if this row
+        // were ever searched it would see zero hits and stay unresolved
+        // either way, so the real proof below is that no Brreg call for it
+        // (by name) ever fires at all.
+
+        seedProvider({
+          id: "prov-scope-viacohort", navn: "Gaardsdrikke Cohort AS",
+          kommunenummer: "1001", producer_type: "bryggeri",
+        });
+        const orgNrCohort = orgNrFor("scopecohort1");
+        searchFixtures.set(searchKey("Gaardsdrikke Cohort AS", "1001"), enheterSearchResponse([{ orgNr: orgNrCohort, navn: "GAARDSDRIKKE COHORT AS" }]));
+        detailFixtures.set(orgNrCohort, brregEnhetDetailResponse({ orgNr: orgNrCohort, navn: "GAARDSDRIKKE COHORT AS" }));
+
+        // `after` scoped past every earlier fixture id in this file (all
+        // "prov-…" < "prov-scope-000" alphabetically) so this call's
+        // candidate set is exactly these 2 new rows (+ the harmless already-
+        // exercised zz*-prefixed pagination/time-budget fixtures, which sort
+        // after "prov-scope-…" and are idempotent either way).
+        const r = await callRoute(opplevelserRouter, {
+          url: ROUTE, headers: adminHeaders, body: { dry_run: false, limit: 10, after: "prov-scope-000" },
+        });
+        assertEq(r.status, 200, "onk-r1: apply -> 200");
+        assertTrue(
+          !fetchCalls.slice(fetchCallsBefore).some((u) => u.includes("Ukjent") || u.includes("museum")),
+          "onk-r2: the out-of-scope provider was NEVER searched (no Brreg call names it)",
+        );
+        assertEq(providerRow("prov-scope-outofscope").brreg_active, null, "onk-r3: out-of-scope provider's brreg_active left untouched (still NULL)");
+        assertEq(providerRow("prov-scope-viacohort").brreg_active, 1, "onk-r4: the gårdssalg-cohort provider (zero mat_drikke experiences) WAS resolved and written");
+        assertTrue((r.body.skipped_out_of_scope as number) >= 1, "onk-r5: response reports skipped_out_of_scope >= 1 (additive field, on top of every pre-existing field)");
       }
     } catch (err: any) {
       failed++;

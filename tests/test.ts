@@ -18287,19 +18287,19 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     // 1 unverified WITHOUT evidence (1 experience).
     const PAYLOAD = {
       experiences: [
-        { title: "Hvalsafari fra Tromsø", provider_name: "Tromsø Opplevelser AS", category: "dyreliv_safari",
+        { title: "Hvalsafari fra Tromsø", provider_name: "Tromsø Opplevelser AS", category: "mat_drikke",
           kommune: "Tromsø", fylke: "Troms", indoor_outdoor: "outdoor", price_from: 1290,
           evidence_url: "https://tromso-opplevelser.no/hvalsafari", confidence: "high" },
-        { title: "Nordlystur med RIB", provider_name: "Tromsø Opplevelser AS", category: "natur_friluft",
+        { title: "Nordlystur med RIB", provider_name: "Tromsø Opplevelser AS", category: "mat_drikke",
           kommune: "Tromsø", fylke: "Troms", indoor_outdoor: "outdoor", price_from: 1490,
           evidence_url: "https://tromso-opplevelser.no/nordlys", confidence: "high" },
-        { title: "Brevandring på Folgefonna", provider_name: "Glaciertour AS", category: "natur_friluft",
+        { title: "Brevandring på Folgefonna", provider_name: "Glaciertour AS", category: "mat_drikke",
           kommune: "Luster", fylke: "Vestland", indoor_outdoor: "outdoor", price_from: 990,
           evidence_url: "https://glaciertour.no/bre", confidence: "medium" },
-        { title: "Guidet byvandring", provider_name: "Mystery Trade Co", category: "kultur_historie",
+        { title: "Guidet byvandring", provider_name: "Mystery Trade Co", category: "mat_drikke",
           kommune: "Bergen", fylke: "Vestland", indoor_outdoor: "outdoor",
           evidence_url: "https://mysterytrade.example/tour", confidence: "medium" },
-        { title: "Hemmelig tur uten kilde", provider_name: "No Evidence Provider", category: "annet",
+        { title: "Hemmelig tur uten kilde", provider_name: "No Evidence Provider", category: "mat_drikke",
           kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
       ],
     };
@@ -18462,7 +18462,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
             {
               title: "Aggregator-Only Opplevelse",
               provider_name: "Aggregator Only Provider AS",
-              category: "annet",
+              category: "mat_drikke",
               kommune: "Lillehammer",
               fylke: "Innlandet",
               indoor_outdoor: "both",
@@ -18493,7 +18493,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
             {
               title: "Mixed Website Opplevelse A",
               provider_name: "Mixed Website Provider AS",
-              category: "annet",
+              category: "mat_drikke",
               kommune: "Bergen",
               fylke: "Vestland",
               indoor_outdoor: "both",
@@ -18504,7 +18504,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
             {
               title: "Mixed Website Opplevelse B",
               provider_name: "Mixed Website Provider AS",
-              category: "annet",
+              category: "mat_drikke",
               kommune: "Bergen",
               fylke: "Vestland",
               indoor_outdoor: "both",
@@ -18537,7 +18537,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
             {
               title: "Real Website Opplevelse",
               provider_name: "Real Website Provider AS",
-              category: "annet",
+              category: "mat_drikke",
               kommune: "Trondheim",
               fylke: "Trøndelag",
               indoor_outdoor: "both",
@@ -18575,7 +18575,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
             {
               title: "Innlandet Aggregator Opplevelse",
               provider_name: "Innlandet Aggregator Provider AS",
-              category: "annet",
+              category: "mat_drikke",
               kommune: "Lillehammer",
               fylke: "Innlandet",
               indoor_outdoor: "both",
@@ -18696,9 +18696,9 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       const rBlk1 = await bulkReqBl(
         {
           experiences: [
-            { title: "Blokkert Opplevelse", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet",
+            { title: "Blokkert Opplevelse", provider_name: "Blokkert Orgnr Bryggeri AS", category: "mat_drikke",
               kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
-            { title: "Ren Opplevelse", provider_name: "Ren Bryggeri AS", category: "annet",
+            { title: "Ren Opplevelse", provider_name: "Ren Bryggeri AS", category: "mat_drikke",
               kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
           ],
           apply: true,
@@ -18726,7 +18726,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       const rBlk2 = await bulkReqBl(
         {
           experiences: [
-            { title: "Domeneblokkert Opplevelse", provider_name: "Domeneblokkert Provider AS", category: "annet",
+            { title: "Domeneblokkert Opplevelse", provider_name: "Domeneblokkert Provider AS", category: "mat_drikke",
               kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both",
               evidence_url: "https://kilde.example/domeneblokkert", website: "https://blokkert-domene-bl.no", confidence: "low" },
           ],
@@ -18745,7 +18745,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       // brief preview), writes nothing.
       const beforeCnt = (dbExp18.prepare("SELECT COUNT(*) AS n FROM experience_providers").get() as { n: number }).n;
       const rBlk3 = await bulkReqBl(
-        { experiences: [{ title: "Blokkert Opplevelse 2", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet", kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" }] },
+        { experiences: [{ title: "Blokkert Opplevelse 2", provider_name: "Blokkert Orgnr Bryggeri AS", category: "mat_drikke", kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" }] },
         ADMIN_KEY_18
       );
       assertEq(rBlk3.body.dry_run, true, "bl-block-3a: dry-run");
@@ -44321,5 +44321,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experience-orgnr-from-name-kommune: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
+// del 1 ("stop the inflow"): the in-scope gate on POST /admin/bulk-load — a
+// row is in scope when its provider is in the gårdssalg cohort OR its own
+// category includes mat_drikke (src/services/experience-scope.ts). Own
+// dedicated test file (opplevelser-bulk-load-scope-gate.test.ts), same
+// router.handle()-over-fake-req/res harness as the sibling bulk-load test
+// files. Tail position (runSerial) is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke: bulk-load in-scope gate ──");
+  try {
+    const { runOpplevelserBulkLoadScopeGateTests } = require("../src/routes/opplevelser-bulk-load-scope-gate.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-scope-gate.test");
+    const blsg = await runOpplevelserBulkLoadScopeGateTests({ log: false });
+    passed += blsg.passed;
+    failed += blsg.failed;
+    for (const f of blsg.failures) failures.push("opplevelser-bulk-load-scope-gate: " + f);
+    console.log(`  opplevelser-bulk-load-scope-gate: ${blsg.passed} passed, ${blsg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-bulk-load-scope-gate: unexpected error: " + String(err?.message || err));
   }
 });

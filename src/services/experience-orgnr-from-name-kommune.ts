@@ -76,6 +76,10 @@ import { addressesMatch } from "./contact-normalizer";
 import { domainsEquivalent } from "./cross-source-validator";
 import { isKnownKommunenummer, resolveKommunenummerForName } from "./fylke-2024-migration";
 import { searchBrregByNameAndKommune, verifyOrgNumber, fetchBrregWebsite, type BrregNameKommuneHit } from "./brreg-client";
+// dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
+// del 1: only spend Brreg budget on providers IN SCOPE (gårdssalg cohort, or
+// having a mat_drikke experience) — see experience-scope.ts.
+import { providerInScopeSql } from "./experience-scope";
 
 const VERTICAL = "experiences";
 
@@ -129,14 +133,26 @@ const CANDIDATE_WHERE = `
   AND (catalog_hidden IS NULL OR catalog_hidden != 1)
 `;
 
+// dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
+// del 1: on top of CANDIDATE_WHERE above, only providers IN SCOPE are
+// actually searched/verified — see experience-scope.ts's providerInScopeSql().
+// An out-of-scope provider is still COUNTED (skipped_out_of_scope on the
+// tick result / out_of_scope on the queue-status denominator) but never
+// selected, never searched, never written.
+const CANDIDATE_IN_SCOPE_WHERE = providerInScopeSql("id");
+
 /** Denominator for the admin endpoint — how many providers this batch could
- * still re-check. */
-export function experienceOrgnrFromNameKommuneQueueStatus(): { eligible: number } {
+ * still re-check (in scope), and how many otherwise-eligible providers are
+ * being skipped purely because they're out of scope. */
+export function experienceOrgnrFromNameKommuneQueueStatus(): { eligible: number; out_of_scope: number } {
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${CANDIDATE_WHERE}`)
+    .prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${CANDIDATE_WHERE} AND ${CANDIDATE_IN_SCOPE_WHERE}`)
     .get() as { n: number } | undefined;
-  return { eligible: row?.n ?? 0 };
+  const outOfScopeRow = db
+    .prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${CANDIDATE_WHERE} AND NOT (${CANDIDATE_IN_SCOPE_WHERE})`)
+    .get() as { n: number } | undefined;
+  return { eligible: row?.n ?? 0, out_of_scope: outOfScopeRow?.n ?? 0 };
 }
 
 type CandidateRow = {
@@ -203,6 +219,12 @@ export type ExperienceOrgnrFromNameKommuneResult = {
    * batch's wall-clock time budget was already exhausted — NOT counted in
    * `processed` (they were never attempted). */
   skipped_due_to_time_budget: string[];
+  /** dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+   * drikke, del 1: otherwise-CANDIDATE_WHERE-eligible providers that were
+   * NEVER selected/searched/verified this call because they're out of scope
+   * (see experience-scope.ts) — a fresh global snapshot each call, additive,
+   * never affects `processed`/`next_after`/any write. */
+  skipped_out_of_scope: number;
   duration_ms: number;
   planned: ExperienceOrgnrFromNameKommunePlannedRow[];
   /** Keyset pagination cursor — id of the last row SCANNED (selected from the
@@ -234,6 +256,7 @@ function emptyResult(dryRun: boolean): ExperienceOrgnrFromNameKommuneResult {
     orgnr_collision: 0,
     errors: 0,
     skipped_due_to_time_budget: [],
+    skipped_out_of_scope: 0,
     duration_ms: 0,
     planned: [],
     next_after: null,
@@ -318,11 +341,22 @@ export async function experienceOrgnrFromNameKommuneTick(
 
   const budgetStartMs = effectiveNowMs(deps.now);
 
+  // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+  // drikke, del 1: a fresh global snapshot of how many otherwise-eligible
+  // providers this call's own SELECT below will never touch, purely because
+  // they're out of scope.
+  result.skipped_out_of_scope = (
+    db
+      .prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${CANDIDATE_WHERE} AND NOT (${CANDIDATE_IN_SCOPE_WHERE})`)
+      .get() as { n: number }
+  ).n;
+
   const candidates = db
     .prepare(
       `SELECT id, navn, kommune, kommunenummer, postnummer, poststed, adresse, hjemmeside
          FROM experience_providers
         WHERE ${CANDIDATE_WHERE}
+          AND ${CANDIDATE_IN_SCOPE_WHERE}
           AND id > ?
         ORDER BY id ASC
         LIMIT ?`

@@ -569,7 +569,7 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
         insertExperience.run({
           id: "exp-compose-01", provider_id: "prov-compose-01",
           title: composeTitle, slug: "exp-compose-01",
-          description: "Kort om fjordsafarien.", category: "aktivitet", price_band: "standard", price_from: 890,
+          description: "Kort om fjordsafarien.", category: "mat_drikke", price_band: "standard", price_from: 890,
           evidence_url: composeUrl,
           evidence_url_verification: JSON.stringify({ verified: true, classification: "verified" }),
           verification_status: "needs_review", confidence: "high",

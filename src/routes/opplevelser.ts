@@ -12,6 +12,14 @@
 // Admin POST requires X-Admin-Key (same env var as rfb/dental).
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+// dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
+// del 1: the shared in-scope gate (gårdssalg-cohort provider OR mat_drikke
+// category) — see experience-scope.ts's own header for the full rule.
+import {
+  isProviderInGardssalgCohort,
+  isExperienceInScope,
+  experienceInScopeSql,
+} from "../services/experience-scope";
 import { Router, Request, Response, NextFunction } from "express";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -1873,6 +1881,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   let providersInserted = 0;
   let experiencesInserted = 0;
   let skipped = 0; // providers/experiences skipped as already-present or non-evidence unverified
+  // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+  // drikke, del 1: experience rows this call would otherwise have inserted
+  // but skipped because neither in-scope rule holds (see experience-scope.ts)
+  // — the row's provider is not in the gårdssalg cohort AND its category
+  // doesn't include mat_drikke. Counted in BOTH dry-run and apply so the
+  // effect is visible before anyone flips apply:true. NEVER an existing-row
+  // status change — this only ever suppresses a NEW insert.
+  let skippedOutOfScope = 0;
   // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
   // varianter: providers resolved to an ALREADY-EXISTING row via the domain
   // fallback (org_nr miss + name miss, website's registrable domain matches
@@ -1947,7 +1963,25 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
         // Dry-run: count what WOULD be inserted, write nothing.
         // (every row whose (provider,title) we'd create — all rows here,
         // since dry-run has no DB state to dedup against.)
-        experiencesInserted += rows.length;
+        //
+        // Scope gate (dev-request 2026-09-18-opplevagent-skop-katalogen):
+        // read-only lookup of an EXISTING provider by this call's own fresh
+        // org_nr/name — the SAME signals apply-mode's own byOrgnrOrName
+        // resolution below uses — purely to answer "is this provider
+        // already in the gårdssalg cohort", never to decide create-vs-reuse
+        // (that dedup decision stays exactly as before this dev-request: a
+        // dry-run still never resolves-or-creates a provider row). A row
+        // whose provider isn't (yet) in the cohort still counts as in-scope
+        // when ITS OWN category includes mat_drikke.
+        const existingForScope = (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
+        const dryProviderInCohort = isProviderInGardssalgCohort(existingForScope);
+        for (const r of rows) {
+          if (isExperienceInScope({ providerInCohort: dryProviderInCohort, category: r.category ?? null })) {
+            experiencesInserted += 1;
+          } else {
+            skippedOutOfScope += 1;
+          }
+        }
         providersInserted += 1;
         continue;
       }
@@ -1965,6 +1999,13 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
         (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
       const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite, verdict.org_nr);
       const existing = byOrgnrOrName ?? byDomain;
+      // Scope gate (dev-request 2026-09-18-opplevagent-skop-katalogen): an
+      // EXISTING provider's cohort membership (producer_type set OR seeded
+      // via RFB) is known now; a BRAND-NEW provider (created below) is never
+      // in the cohort at creation time — it only becomes cohort-eligible via
+      // a LATER classification pass, so a genuinely new provider only puts
+      // its rows in scope via their own mat_drikke category, below.
+      const providerInCohort = isProviderInGardssalgCohort(existing);
       if (existing) {
         if (byDomain) {
           providersMatchedByDomain++;
@@ -2005,6 +2046,16 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       // duplicate row, and must never resurrect a row already merged away by
       // the dedup pass (findExistingExperienceMatch only looks at unmerged rows).
       for (const r of rows) {
+        // Scope gate (dev-request 2026-09-18-opplevagent-skop-katalogen-til-
+        // gardssalg-og-drikke, del 1): stop the inflow of out-of-scope rows
+        // BEFORE any dedup lookup / admission-gate judge call / insert for
+        // this row — genuinely skipped, not inserted with a different
+        // status, and never touching any EXISTING row (this is a brand-new
+        // row that was never in the DB to begin with).
+        if (!isExperienceInScope({ providerInCohort, category: r.category ?? null })) {
+          skippedOutOfScope++;
+          continue;
+        }
         const rowKommune = r.kommune ?? kommune;
         const match = findExistingExperienceMatch({
           provider_id: providerId,
@@ -2143,6 +2194,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     experiences_inserted: experiencesInserted,
     providers_inserted: providersInserted,
     skipped,
+    // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+    // drikke, del 1: rows this call would otherwise have inserted but
+    // skipped because neither in-scope rule holds (see experience-scope.ts)
+    // — additive, reported in BOTH dry-run and apply so the freed-up
+    // judge/Brreg budget is visible from the very first run after deploy.
+    skipped_out_of_scope: skippedOutOfScope,
     // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
     // varianter: providers resolved to an existing row via the domain
     // fallback (see the `existing`/`byDomain` lookup above) — 0/empty when
@@ -25609,6 +25666,19 @@ const SWEEP_DEFAULT_LIMIT = 50;
 const SWEEP_MAX_LIMIT = 50;
 const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL";
 
+// dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
+// del 1: on top of SWEEP_ELIGIBLE_WHERE above, only rows IN SCOPE (provider
+// in the gårdssalg cohort, OR the row's own category includes mat_drikke —
+// see experience-scope.ts) are actually judged. An out-of-scope row is still
+// COUNTED (see `skipped_out_of_scope` in the response below) but never
+// selected into `rows`, never fetched, never judged, and therefore never
+// written — its verification_status/admission_verdict/admission_checked_at
+// stay byte-identical. Unaliased column names (`category`/`provider_id`) so
+// this fragment works verbatim in both the aliased main SELECT (with "e."
+// prefixes passed explicitly below) and the unaliased COUNT(*) queries.
+const SWEEP_IN_SCOPE_WHERE = experienceInScopeSql("category", "provider_id");
+const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provider_id");
+
 // ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
 // karantene-utgang-match-til-verified) ──────────────────────────────────────
 // The sweep above only ever DEMOTES (MISMATCH -> needs_review); MATCH never
@@ -25732,7 +25802,22 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     const expDb = getExpDb("experiences");
 
     const totalEligible = (
-      expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE}`).get() as { n: number }
+      expDb
+        .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE}`)
+        .get() as { n: number }
+    ).n;
+
+    // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+    // drikke, del 1: how many otherwise-eligible rows this call's own
+    // SELECT below will NEVER touch purely because they're out of scope —
+    // a fresh snapshot every call (same "measured now" convention as
+    // totalEligible/neverCheckedRemaining), surfaced additively so the
+    // morning brief can see the freed-up judge budget from the first run
+    // after deploy.
+    const skippedOutOfScopeEligible = (
+      expDb
+        .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE})`)
+        .get() as { n: number }
     ).n;
 
     // dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold
@@ -25749,7 +25834,9 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     // unnecessary re-judgements after the fact).
     const neverCheckedRemaining = (
       expDb
-        .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND admission_checked_at IS NULL`)
+        .prepare(
+          `SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND admission_checked_at IS NULL`,
+        )
         .get() as { n: number }
     ).n;
 
@@ -25764,7 +25851,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
                 p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
            FROM experiences e
            LEFT JOIN experience_providers p ON p.id = e.provider_id
-          WHERE ${SWEEP_ELIGIBLE_WHERE}
+          WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED}
           ORDER BY ${sweepOrderBy}
           LIMIT ?`,
       )
@@ -25994,6 +26081,11 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       needs_review_after: needsReviewAfter,
       never_checked_remaining: neverCheckedRemaining,
       queue_exhausted: sampleMode === "queue" && neverCheckedRemaining === 0,
+      // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-
+      // drikke, del 1: otherwise-eligible rows never selected/judged this
+      // call because they're out of scope (see SWEEP_IN_SCOPE_WHERE above)
+      // — additive, never removes/renames an existing field.
+      skipped_out_of_scope: skippedOutOfScopeEligible,
     });
   } catch (err) {
     if (sendEnrichmentWritePausedIfPaused(err, res)) return;

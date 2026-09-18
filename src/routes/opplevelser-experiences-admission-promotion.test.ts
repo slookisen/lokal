@@ -196,9 +196,14 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
       const adminHeaders = { "x-admin-key": testKey };
 
+      // producer_type is hardcoded (not a bound param) so EVERY provider this
+      // file seeds is, by construction, in the gårdssalg cohort per
+      // experience-scope.ts's isProviderInGardssalgCohort() — this file's own
+      // subject (quarantine-exit promotion) is unrelated to the 2026-09-18
+      // scope gate, so its fixtures stay in scope rather than tripping it.
       const insertProvider = expDb.prepare(
-        `INSERT INTO experience_providers (id, navn, hjemmeside, brreg_active, field_provenance)
-         VALUES (@id, @navn, @hjemmeside, @brreg_active, @field_provenance)`,
+        `INSERT INTO experience_providers (id, navn, hjemmeside, brreg_active, field_provenance, producer_type)
+         VALUES (@id, @navn, @hjemmeside, @brreg_active, @field_provenance, 'bryggeri')`,
       );
       const insertExperience = expDb.prepare(
         `INSERT INTO experiences
