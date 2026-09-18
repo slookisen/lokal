@@ -213,6 +213,11 @@ import {
   // org_nr backfill via Brreg name-search + exact-name/postal corroboration
   // (auto-write only when both agree; otherwise the review queue).
   selectGardssalgProvidersForOrgnrBackfill,
+  // dev-request 2026-09-18-gardssalg-orgnr-backfill-statisk-batch — rotating
+  // (persisted keyset cursor) counterpart used by the route's auto-selected
+  // (non-providerIds) path below; selectGardssalgProvidersForOrgnrBackfill
+  // itself stays byte-for-byte unchanged and is no longer called by this route.
+  selectGardssalgProvidersForOrgnrBackfillRotating,
   getGardssalgProviderOrgnrTarget,
   applyGardssalgProviderOrgnr,
   getGardssalgOrgnrWriteBlocker,
@@ -13228,7 +13233,16 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
       .map((id) => getGardssalgProviderOrgnrTarget(id))
       .filter((t): t is GardssalgOrgnrBackfillTarget => t !== null);
   } else {
-    targets = selectGardssalgProvidersForOrgnrBackfill(limit);
+    // dev-request 2026-09-18-gardssalg-orgnr-backfill-statisk-batch: the
+    // auto-selected (non-providerIds) path now reads/advances a persisted
+    // rotating cursor (gardssalg_orgnr_backfill_sweep_state) unconditionally
+    // — this endpoint has no explicit offset/cursor param any caller passes
+    // (grepped; only `limit` and the unrelated `providerIds` override
+    // exist), so there is no explicit-override contract to special-case the
+    // way PR #863's offset-accepting endpoint had to. The `providerIds`
+    // override above returns BEFORE this branch and never touches the
+    // cursor either way.
+    targets = selectGardssalgProvidersForOrgnrBackfillRotating(limit);
   }
 
   let scanned = 0;

@@ -7058,7 +7058,25 @@ export type GardssalgOrgnrBackfillTarget = {
   // has something to work with. experience_providers.hjemmeside already
   // exists (no migration needed) — this only widens the two SELECTs below.
   hjemmeside: string | null;
+  // dev-request 2026-09-18-gardssalg-orgnr-backfill-statisk-batch — additive:
+  // selectGardssalgProvidersForOrgnrBackfillRotating's keyset cursor is keyed
+  // on (created_at, id), so both SELECTs below now carry it too, keeping this
+  // one shared type honest for either selector's return value.
+  created_at: string;
 };
+
+// Shared eligibility predicate for BOTH the legacy static selector
+// (selectGardssalgProvidersForOrgnrBackfill, unchanged below) and the
+// rotating selector (selectGardssalgProvidersForOrgnrBackfillRotating,
+// dev-request 2026-09-18-gardssalg-orgnr-backfill-statisk-batch) — a single
+// place for this WHERE clause so the two selectors' eligible-row SET can
+// never silently drift apart from each other.
+const GARDSSALG_ORGNR_BACKFILL_ELIGIBLE_WHERE = `
+    (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+    AND (org_nr IS NULL OR TRIM(org_nr) = '')
+    AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+    AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+`;
 
 /**
  * Auto-select gårdssalg providers eligible for an org_nr backfill attempt:
@@ -7073,16 +7091,144 @@ export function selectGardssalgProvidersForOrgnrBackfill(limit = 48): GardssalgO
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside, created_at
          FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (org_nr IS NULL OR TRIM(org_nr) = '')
-          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+        WHERE ${GARDSSALG_ORGNR_BACKFILL_ELIGIBLE_WHERE}
         ORDER BY created_at ASC
         LIMIT ?`
     )
     .all(cap) as GardssalgOrgnrBackfillTarget[];
+}
+
+// ─── Rotating cursor (dev-request 2026-09-18-gardssalg-orgnr-backfill-
+// statisk-batch) ─────────────────────────────────────────────────────────────
+// The selector above is a static `ORDER BY created_at ASC LIMIT ?` with no
+// cursor — every scheduled call with no override re-scans the SAME oldest-N
+// rows forever once those rows land on one of the four structurally-
+// permanent unresolved outcomes (no_brreg_candidate,
+// heuristic_name_requires_postal_match, stripped_name_requires_postal_match,
+// needs_human_review), since none of them self-resolve on a bare retry and
+// there is nothing here to make the next call start anywhere else. See
+// gardssalg_orgnr_backfill_sweep_state's own doc comment
+// (database/init-experiences.ts) for the full incident context and why this
+// is a KEYSET cursor (last-seen created_at+id tuple), not a plain integer
+// offset (PR #863's own website-verification-sweep fix used a plain offset,
+// but that sweep's cohort doesn't shrink mid-rotation the way this one does
+// — a row leaving the eligible set here, because its org_nr just resolved,
+// must never shift a keyset cursor the way it would silently shift an
+// offset).
+//
+// Kept as a SEPARATE function from selectGardssalgProvidersForOrgnrBackfill
+// above (which stays byte-for-byte unchanged, including its own pre-existing
+// test coverage) rather than folding cursor logic into it — this endpoint
+// has no existing caller anywhere (grepped this repo, including test files)
+// that passes anything resembling an offset/cursor to
+// POST /admin/gardssalg-orgnr-backfill, so there is no explicit-override
+// contract to preserve dual-path complexity for, unlike PR #863's
+// offset-accepting endpoint. The persisted cursor is used UNCONDITIONALLY
+// for the route's auto-selected path; the route's separate `providerIds`
+// override bypasses this function entirely (calls
+// getGardssalgProviderOrgnrTarget per id instead) and so can never read or
+// advance this cursor either way — see the route body,
+// routes/opplevelser.ts, POST /admin/gardssalg-orgnr-backfill.
+function getGardssalgOrgnrBackfillSweepCursorRow(db: ReturnType<typeof getDb>): { cursor_created_at: string | null; cursor_id: string | null } | undefined {
+  return db
+    .prepare(`SELECT cursor_created_at, cursor_id FROM gardssalg_orgnr_backfill_sweep_state WHERE id = 'singleton'`)
+    .get() as { cursor_created_at: string | null; cursor_id: string | null } | undefined;
+}
+
+/** Absence of a row, or a NULL cursor (fresh DB, or a rotation that just
+ *  wrapped after exhausting the eligible set), means "start from the
+ *  beginning" — never throws. */
+export function getGardssalgOrgnrBackfillSweepCursor(): { created_at: string; id: string } | null {
+  const db = getDb(VERTICAL);
+  const row = getGardssalgOrgnrBackfillSweepCursorRow(db);
+  if (!row || row.cursor_created_at === null || row.cursor_id === null) return null;
+  return { created_at: row.cursor_created_at, id: row.cursor_id };
+}
+
+/** Persist where the NEXT auto-selector call should resume. Pass `null` to
+ *  wrap the rotation back to the beginning (the eligible set was exhausted
+ *  this call, or as a defensive reset — see
+ *  selectGardssalgProvidersForOrgnrBackfillRotating below). */
+export function setGardssalgOrgnrBackfillSweepCursor(cursor: { created_at: string; id: string } | null): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `INSERT INTO gardssalg_orgnr_backfill_sweep_state (id, cursor_created_at, cursor_id, updated_at)
+     VALUES ('singleton', @cursor_created_at, @cursor_id, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       cursor_created_at = excluded.cursor_created_at,
+       cursor_id = excluded.cursor_id,
+       updated_at = excluded.updated_at`
+  ).run({
+    cursor_created_at: cursor?.created_at ?? null,
+    cursor_id: cursor?.id ?? null,
+  });
+}
+
+/**
+ * Rotating counterpart to selectGardssalgProvidersForOrgnrBackfill: same
+ * eligibility predicate (GARDSSALG_ORGNR_BACKFILL_ELIGIBLE_WHERE, shared —
+ * can never drift from the static selector's own eligible-row set), same
+ * oldest-first tiebreak-stable ordering (created_at ASC, id ASC — the id
+ * tiebreak matters here specifically because the keyset cursor below keys
+ * off this exact tuple), but reads a persisted (created_at, id) cursor
+ * first and only returns rows strictly AFTER it — so repeated, memoryless
+ * callers (each scheduled enrichment run) advance through the whole
+ * eligible set over time instead of re-scanning the same leading window
+ * every run.
+ *
+ * Fetches `limit + 1` rows (a one-row lookahead) so it can tell "there ARE
+ * more eligible rows after this page" (persist the page's last row as the
+ * next cursor) apart from "this page reached the end of the eligible set"
+ * (persist `null` — wrap to the beginning) WITHOUT an extra COUNT(*) query
+ * and without ever leaving the persisted cursor sitting exactly on the last
+ * row with nothing after it (which would otherwise cost the FOLLOWING call
+ * a wasted empty page before it could detect end-of-set and wrap itself).
+ *
+ * Defensive self-heal: if a persisted cursor is present but yields ZERO
+ * rows (the row it pointed to left the eligible set — e.g. it just got its
+ * org_nr resolved — and nothing else exists after it either, a legitimate
+ * mid-rotation race, not a bug), this wraps to the beginning and retries
+ * ONCE rather than returning an empty batch and silently going quiet for a
+ * whole scheduled run.
+ */
+export function selectGardssalgProvidersForOrgnrBackfillRotating(limit = 48): GardssalgOrgnrBackfillTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  const cursor = getGardssalgOrgnrBackfillSweepCursor();
+
+  const rows = db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside, created_at
+         FROM experience_providers
+        WHERE ${GARDSSALG_ORGNR_BACKFILL_ELIGIBLE_WHERE}
+          AND (
+            @cursor_created_at IS NULL
+            OR created_at > @cursor_created_at
+            OR (created_at = @cursor_created_at AND id > @cursor_id)
+          )
+        ORDER BY created_at ASC, id ASC
+        LIMIT @fetch_limit`
+    )
+    .all({
+      cursor_created_at: cursor?.created_at ?? null,
+      cursor_id: cursor?.id ?? null,
+      fetch_limit: cap + 1,
+    }) as GardssalgOrgnrBackfillTarget[];
+
+  if (rows.length === 0 && cursor) {
+    setGardssalgOrgnrBackfillSweepCursor(null);
+    return selectGardssalgProvidersForOrgnrBackfillRotating(limit);
+  }
+
+  const page = rows.slice(0, cap);
+  const hasMore = rows.length > cap;
+  const last = page[page.length - 1];
+  const nextCursor = hasMore && last ? { created_at: last.created_at, id: last.id } : null;
+  setGardssalgOrgnrBackfillSweepCursor(nextCursor);
+
+  return page;
 }
 
 /**
@@ -7097,7 +7243,7 @@ export function getGardssalgProviderOrgnrTarget(providerId: string): GardssalgOr
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside, created_at
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`

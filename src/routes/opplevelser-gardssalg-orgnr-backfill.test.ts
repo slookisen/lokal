@@ -67,6 +67,17 @@
  *       applyGardssalgProviderOrgnr is rollback-eligible via
  *       planGardssalgContentRollback/applyGardssalgContentRollback, same as
  *       every other gårdssalg-pipeline field
+ *
+ * Rotating cursor (dev-request 2026-09-18-gardssalg-orgnr-backfill-statisk-
+ * batch — fixes the static "same oldest-N rows forever" batch selector):
+ *   (ac) selectGardssalgProvidersForOrgnrBackfillRotating: fresh cursor is
+ *        null; successive calls advance PAST the previous page (second call's
+ *        target set differs from the first); the rotation wraps back to the
+ *        beginning once the eligible set is exhausted (a later call returns
+ *        the SAME page as the very first call, proving wraparound)
+ *   (ad) POST /admin/gardssalg-orgnr-backfill: the `providerIds` override
+ *        returns exactly the requested ids and never reads or advances the
+ *        persisted cursor, in ANY rotation phase
  */
 
 export interface TestSummary {
@@ -901,6 +912,131 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       assertEq(rbApplied, [{ provider_id: "rollback-orgnr", field_name: "org_nr", restored_to: null }], "v5: applyGardssalgContentRollback restores org_nr to null");
       const rowRBAfter = expDb2.prepare(`SELECT org_nr FROM experience_providers WHERE id = 'rollback-orgnr'`).get() as any;
       assertEq(rowRBAfter.org_nr, null, "v6: org_nr restored to its exact original blank value");
+
+      // ── (ac)-(ad) rotating cursor (dev-request 2026-09-18-gardssalg-orgnr-
+      // backfill-statisk-batch) ────────────────────────────────────────────
+      // Isolated fresh DB section (same reasoning as (v) above): a clean
+      // slate with ONLY the 5 purpose-built rot-* rows as the eligible set,
+      // so the rotation's page contents are exactly predictable — several
+      // OTHER fixture rows inserted earlier in this file are STILL
+      // eligible (blank org_nr, e.g. heur-domain-uncorrob, route-write-fail,
+      // route-review, route-no-candidate, route-poststed-collision, …) and
+      // would otherwise pollute the auto-selector's own eligible set.
+      for (const p of cachePaths) delete require.cache[p];
+      const dbFactory3 = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory3.__resetDbFactoryForTesting();
+      const store3 = require("../services/experience-store") as typeof import("../services/experience-store");
+      const opplevelserRouter3 = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const brregClient3 = require("../services/brreg-client") as typeof import("../services/brreg-client");
+      const localCandidates3 = require("../services/local-orgnr-candidates") as typeof import("../services/local-orgnr-candidates");
+      brregClient3.__clearBrregCacheForTesting();
+      localCandidates3.__setLocalOrgnrCandidatesForTesting([]);
+      const expDb3 = dbFactory3.getDb("experiences");
+      const insertProvider3 = expDb3.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, org_nr, content_source, postnummer, poststed,
+            producer_type, enrichment_state, verification_status, source, confidence,
+            catalog_hidden, created_at)
+         VALUES
+           (@id, @navn, 'experiences', @org_nr, @content_source, @postnummer, @poststed,
+            'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium',
+            @catalog_hidden, @created_at)`,
+      );
+      for (let i = 1; i <= 5; i++) {
+        insertProvider3.run({
+          id: `rot-${i}`, navn: `Rot Gard ${i}`, org_nr: null,
+          content_source: null, postnummer: null, poststed: null,
+          catalog_hidden: null, created_at: `2026-04-0${i} 00:00:00`,
+        });
+      }
+
+      assertTrue(store3.getGardssalgOrgnrBackfillSweepCursor() === null, "ac1: fresh DB -> no persisted cursor yet (start from the beginning)");
+
+      const rotCall1 = store3.selectGardssalgProvidersForOrgnrBackfillRotating(2);
+      assertEq(rotCall1.map((t: any) => t.id), ["rot-1", "rot-2"], "ac2: first call (limit 2) returns the oldest 2 eligible rows");
+      const cursorAfter1 = store3.getGardssalgOrgnrBackfillSweepCursor();
+      assertEq(cursorAfter1, { created_at: "2026-04-02 00:00:00", id: "rot-2" }, "ac3: cursor persisted at the last row of page 1 (more eligible rows remain)");
+
+      const rotCall2 = store3.selectGardssalgProvidersForOrgnrBackfillRotating(2);
+      assertEq(rotCall2.map((t: any) => t.id), ["rot-3", "rot-4"], "ac4: second call resumes AFTER the persisted cursor, not from the start");
+      assertTrue(
+        JSON.stringify(rotCall2.map((t: any) => t.id)) !== JSON.stringify(rotCall1.map((t: any) => t.id)),
+        "ac5: second call's target set is NOT identical to the first call's — the rotation actually progressed",
+      );
+
+      const rotCall3 = store3.selectGardssalgProvidersForOrgnrBackfillRotating(2);
+      assertEq(rotCall3.map((t: any) => t.id), ["rot-5"], "ac6: third call returns only the final remaining row (partial page — end of the eligible set)");
+      assertTrue(store3.getGardssalgOrgnrBackfillSweepCursor() === null, "ac7: cursor wraps to null once the eligible set is exhausted");
+
+      const rotCall4 = store3.selectGardssalgProvidersForOrgnrBackfillRotating(2);
+      assertEq(
+        rotCall4.map((t: any) => t.id),
+        rotCall1.map((t: any) => t.id),
+        "ac8: fourth call (after wraparound) returns the SAME page as the first call — the rotation wrapped back to the beginning after exceeding the eligible-row count",
+      );
+
+      // (ad) providerIds override is completely unaffected by cursor state —
+      // same targets whichever rotation phase the cursor happens to be in,
+      // and it never reads or advances the cursor either way (the route's
+      // providerIds branch calls getGardssalgProviderOrgnrTarget per id, and
+      // returns before the auto-selector branch is ever reached — see the
+      // route body, routes/opplevelser.ts).
+      const cursorBeforeOverride1 = store3.getGardssalgOrgnrBackfillSweepCursor();
+      assertTrue(cursorBeforeOverride1 !== null, "ad0a: sanity — cursor is non-null (mid-rotation) going into the first override check");
+
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const u = String(url);
+        const dm = u.match(/\/enheter\/(\d{9})$/);
+        if (dm) {
+          return { ok: true, status: 200, json: async () => ({ organisasjonsnummer: dm[1], navn: "SUNN TESTENHET AS" }) } as unknown as Response;
+        }
+        // No Brreg name-search hit for any rot-* provider — irrelevant here:
+        // this test only asserts WHICH targets are processed and whether the
+        // cursor moves, never on resolution outcomes.
+        return { ok: true, status: 200, json: async () => ({ _embedded: { enheter: [] } }) } as unknown as Response;
+      }) as typeof fetch;
+
+      function overrideTargetIds(body: any): string[] {
+        return [
+          ...body.changed.map((c: any) => c.provider_id),
+          ...body.unresolved.map((u: any) => u.provider_id),
+          ...body.errors.map((e: any) => e.provider_id),
+        ].sort();
+      }
+
+      const overrideRes1 = await callRoute(opplevelserRouter3, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["rot-1", "rot-3"], apply: false },
+      });
+      assertEq(overrideRes1.status, 200, "ad1: providerIds override -> 200");
+      const overrideTargets1 = overrideTargetIds(overrideRes1.body);
+      assertEq(overrideTargets1, ["rot-1", "rot-3"], "ad2: providerIds override processes EXACTLY the requested ids, regardless of cursor phase");
+      assertEq(
+        store3.getGardssalgOrgnrBackfillSweepCursor(),
+        cursorBeforeOverride1,
+        "ad3: the providerIds override call does NOT move the persisted cursor at all",
+      );
+
+      // Advance the rotation to a DIFFERENT phase, then repeat the same
+      // override call — the target set must be identical either way, since
+      // it depends only on the ids passed, never on rotation state.
+      store3.selectGardssalgProvidersForOrgnrBackfillRotating(2);
+      const cursorBeforeOverride2 = store3.getGardssalgOrgnrBackfillSweepCursor();
+      assertTrue(
+        JSON.stringify(cursorBeforeOverride2) !== JSON.stringify(cursorBeforeOverride1),
+        "ad4: sanity — the cursor phase actually changed between the two override checks",
+      );
+      const overrideRes2 = await callRoute(opplevelserRouter3, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["rot-1", "rot-3"], apply: false },
+      });
+      const overrideTargets2 = overrideTargetIds(overrideRes2.body);
+      assertEq(overrideTargets2, overrideTargets1, "ad5: providerIds override returns the SAME target set as before — unaffected by the cursor phase change");
+      assertEq(
+        store3.getGardssalgOrgnrBackfillSweepCursor(),
+        cursorBeforeOverride2,
+        "ad6: the second providerIds override call still does not move the cursor",
+      );
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-orgnr-backfill: unexpected error: " + String(err?.stack || err?.message || err));
