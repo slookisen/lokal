@@ -26189,6 +26189,384 @@ router.post("/admin/experiences-admission-promotion-rollback", requireAdmin, (re
   }
 });
 
+// ─── POST /api/opplevelser/admin/experiences-needs-review-triage ────────────
+//
+// dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: `needs_review`
+// (~2993 rows) has no terminal state today — a canonical duplicate, a
+// provider confirmed deleted/bankrupt in Brreg, a row with no evidence_url
+// and no provider website, or a row judged MISMATCH twice on a LIVE page,
+// sits in the quarantine queue forever (nothing ever moves it OUT the other
+// side, unlike the content-judge-sweep's promotion path above). This route
+// closes that gap by terminally REJECTing a row when ANY ONE of four
+// independent, conservative rules fires:
+//
+//   (a) provider.brreg_active = 0 — confirmed deleted/bankrupt in Brreg.
+//   (b) e.canonical_id IS NOT NULL — canonical duplicate, already merged
+//       away by dedup; every read surface already filters these out, so
+//       leaving them in needs_review forever serves no purpose.
+//   (c) e.evidence_url IS NULL AND the provider has no website: hjemmeside
+//       empty/null AND not independently ownership-verified. There is no
+//       plain `website_verified` boolean column anywhere in this schema
+//       (grepped `website_verified`/nearby before writing this) — the real
+//       signal is the SAME derived, fail-closed predicate the promotion
+//       gate above already trusts: isHjemmesideVerified(provider.
+//       field_provenance) (this file, above), true only when
+//       field_provenance.hjemmeside_verification.verified === true.
+//   (d) the row's last TWO judge verdicts were both `mismatch:` on a LIVE
+//       page (checking `admission_verdict LIKE 'mismatch:%'` already
+//       excludes dead/parked pages, which stamp `unresolved:` — see
+//       judgeExperienceEvidencePage), at least TRIAGE_MISMATCH_GAP_DAYS
+//       apart. Needs the ADDITIVE admission_verdict_prev/
+//       admission_checked_at_prev columns (init-experiences.ts) — the only
+//       history stampExperienceAdmissionVerdict() (experience-store.ts) now
+//       keeps. CONSEQUENCE (documented, not a bug): a row judged MISMATCH
+//       once before this migration landed and once after will NOT qualify
+//       yet (only one post-deploy verdict is tracked) — rule (d)'s real
+//       yield ramps up as rows get re-judged, it does not spike on first
+//       run. Fail-closed by construction, never fail-open.
+//
+// Rows with an owner lock (content_source IN ('manual','claim') — the SAME
+// isExperienceOwnerLocked() predicate applyExperienceContent uses, inlined
+// in SQL here since the candidate SELECT already needs a WHERE) are NEVER
+// touched by ANY rule — filtered out of the candidate set entirely, never
+// even evaluated.
+//
+// Rule PRIORITY when more than one fires for the same row (rare but
+// possible — e.g. a canonical duplicate whose provider also went Brreg-
+// inactive): evaluated in spec order (a) -> (b) -> (c) -> (d) by
+// evaluateTriageRule(), first match wins. One stamp, one audit row, one rule
+// counted per row — counts.a+b+c+d === total, always.
+//
+// STRICT `dry_run` (default true; only the literal JSON boolean `false`
+// applies anything — same idiom as every other apply-mode writer in this
+// file), keyset (`after`) id-cursor pagination (same convention as
+// experience-brreg-recheck-backfill.ts / the orgnr-from-website routes
+// above: `id > ?  ORDER BY id ASC LIMIT ?`, `next_after` set only when the
+// page came back exactly `limit` long). requireAdmin, same as every other
+// admin route in this file.
+//
+// No external I/O at all here (pure SQL reads + in-process JS predicates —
+// unlike the judge-sweep/brreg-recheck siblings, which pay a network round-
+// trip per row), so TRIAGE_MAX_LIMIT is accordingly much larger than
+// SWEEP_MAX_LIMIT/BRREG_RECHECK_BACKFILL_MAX_LIMIT — still a real batch cap
+// (bounded transaction + response payload per call), not "unbounded".
+//
+// On an actual rejection (apply mode): verification_status -> 'rejected';
+// admission_verdict gets a `rejected: <rule>` stamp via
+// stampExperienceAdmissionVerdict (same shared writer every other admission-
+// gate mechanism in this file uses — never a bespoke UPDATE); and ONE row is
+// inserted into experience_admission_promotion_audit (init-experiences.ts —
+// the SAME table the promotion mechanism above uses; `from_status`/
+// `to_status` are plain columns, not hardcoded literals, so this reuse needs
+// no new table), batch_id = this call's own batchId, reversible via POST
+// /admin/experiences-needs-review-triage-rollback below.
+//
+// Response: { success, dry_run, batch_id, scanned, counts:{a,b,c,d}, total,
+// results:[{id, rule, action_taken|would_be_action}], remaining, next_after }.
+// `remaining` mirrors the content-judge-sweep route's own field exactly
+// (`Math.max(0, totalEligible - rows.length)`).
+const TRIAGE_DEFAULT_LIMIT = 200;
+const TRIAGE_MAX_LIMIT = 1000;
+
+// Minimum gap (days) rule (d) requires between the two most recent mismatch
+// verdicts — Daniel's spec figure ("at least 7 days apart").
+const TRIAGE_MISMATCH_GAP_DAYS = 7;
+
+type TriageCandidateRow = {
+  id: string;
+  canonical_id: string | null;
+  evidence_url: string | null;
+  admission_verdict: string | null;
+  admission_verdict_prev: string | null;
+  admission_checked_at: string | null;
+  admission_checked_at_prev: string | null;
+  p_brreg_active: number | null;
+  p_hjemmeside: string | null;
+  p_field_provenance: string | null;
+};
+
+type TriageRule = "a" | "b" | "c" | "d";
+
+const TRIAGE_RULE_REASON: Record<TriageRule, string> = {
+  a: "brreg_inactive",
+  b: "canonical_duplicate",
+  c: "no_evidence_no_website",
+  d: "repeat_mismatch_live_page",
+};
+
+/**
+ * SQLite `datetime('now')` text ("YYYY-MM-DD HH:MM:SS", a SPACE separator,
+ * never 'T'/'Z'/milliseconds — same format GET /admin/experiences-status-
+ * transitions' own toSqliteDatetime() produces, here parsed back the other
+ * direction) -> ms since epoch (UTC), or null if unparsable/absent.
+ */
+function parseSqliteDatetimeMs(raw: string | null): number | null {
+  if (!raw) return null;
+  const iso = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const ms = Date.parse(iso.endsWith("Z") ? iso : `${iso}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Evaluate rules (a)-(d) for one candidate row, IN SPEC ORDER, returning the
+ * first rule that fires (or null when none do). See the route's own doc
+ * comment above for the "first match wins" discipline this backs.
+ */
+function evaluateTriageRule(row: TriageCandidateRow): TriageRule | null {
+  // (a) provider confirmed deleted/bankrupt in Brreg.
+  if (row.p_brreg_active === 0) return "a";
+
+  // (b) canonical duplicate — already merged away by dedup.
+  if (row.canonical_id !== null) return "b";
+
+  // (c) no evidence_url AND provider has no website (hjemmeside empty/null
+  //     AND not independently ownership-verified via field_provenance).
+  const hasEvidenceUrl = !!(row.evidence_url && row.evidence_url.trim());
+  if (!hasEvidenceUrl) {
+    const hjemmeside = (row.p_hjemmeside ?? "").trim();
+    const providerWebsiteVerified = isHjemmesideVerified(row.p_field_provenance);
+    if (!hjemmeside && !providerWebsiteVerified) return "c";
+  }
+
+  // (d) last TWO judge verdicts both `mismatch:` on a LIVE page (the LIKE
+  //     check itself excludes dead/parked pages, which stamp `unresolved:`),
+  //     at least TRIAGE_MISMATCH_GAP_DAYS apart.
+  const currentIsMismatch = !!row.admission_verdict && row.admission_verdict.startsWith("mismatch:");
+  const prevIsMismatch = !!row.admission_verdict_prev && row.admission_verdict_prev.startsWith("mismatch:");
+  if (currentIsMismatch && prevIsMismatch) {
+    const currentMs = parseSqliteDatetimeMs(row.admission_checked_at);
+    const prevMs = parseSqliteDatetimeMs(row.admission_checked_at_prev);
+    if (currentMs !== null && prevMs !== null) {
+      const gapDays = Math.abs(currentMs - prevMs) / (24 * 60 * 60 * 1000);
+      if (gapDays >= TRIAGE_MISMATCH_GAP_DAYS) return "d";
+    }
+  }
+
+  return null;
+}
+
+router.post("/admin/experiences-needs-review-triage", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { dry_run?: unknown; limit?: unknown; after?: unknown };
+    // STRICT: only the literal JSON boolean false applies anything — absent,
+    // true, or any other value is a dry-run (same idiom as every other
+    // STRICT-FALSE apply-mode writer in this file).
+    const applyMode = body.dry_run === false;
+    const dryRun = !applyMode;
+
+    // Enrichment write-pause fence — apply (dry_run:false) only; dry-run is
+    // never blocked (same convention as every other apply-mode writer here).
+    if (applyMode) {
+      const pauseBlock = experiencesWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
+
+    const requestedLimit =
+      typeof body.limit === "number" && Number.isFinite(body.limit) && body.limit > 0
+        ? Math.floor(body.limit)
+        : TRIAGE_DEFAULT_LIMIT;
+    const limit = Math.min(TRIAGE_MAX_LIMIT, requestedLimit);
+    const after = typeof body.after === "string" ? body.after : "";
+
+    const expDb = getExpDb("experiences");
+
+    // Owner-locked rows (isExperienceOwnerLocked's own predicate, inlined —
+    // the candidate SELECT already needs a WHERE) are excluded from the
+    // candidate set entirely, so no rule below is ever even evaluated for
+    // one.
+    const CANDIDATE_WHERE = `
+      e.verification_status = 'needs_review'
+      AND (e.content_source IS NULL OR e.content_source NOT IN ('manual', 'claim'))
+    `;
+
+    const totalEligible = (
+      expDb.prepare(`SELECT COUNT(*) AS n FROM experiences e WHERE ${CANDIDATE_WHERE}`).get() as { n: number }
+    ).n;
+
+    const rows = expDb
+      .prepare(
+        `SELECT e.id, e.canonical_id, e.evidence_url,
+                e.admission_verdict, e.admission_verdict_prev,
+                e.admission_checked_at, e.admission_checked_at_prev,
+                p.brreg_active AS p_brreg_active, p.hjemmeside AS p_hjemmeside,
+                p.field_provenance AS p_field_provenance
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
+          WHERE ${CANDIDATE_WHERE}
+            AND e.id > ?
+          ORDER BY e.id ASC
+          LIMIT ?`,
+      )
+      .all(after, limit) as TriageCandidateRow[];
+
+    // Keyset cursor for the next call — same "set only when the page came
+    // back exactly `limit` long" discipline as experience-brreg-recheck-
+    // backfill.ts's own next_after.
+    const nextAfter = rows.length === limit && rows.length > 0 ? rows[rows.length - 1].id : null;
+
+    const counts = { a: 0, b: 0, c: 0, d: 0 };
+    const results: Array<{
+      id: string;
+      rule: TriageRule | null;
+      action_taken?: string;
+      would_be_action?: string;
+    }> = [];
+
+    const batchId = `needs-review-triage-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+
+    const rejectStmt = expDb.prepare(
+      `UPDATE experiences SET verification_status = 'rejected' WHERE id = ? AND verification_status = 'needs_review'`,
+    );
+    const insertAudit = expDb.prepare(
+      `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'rejected', ?, datetime('now'))`,
+    );
+
+    // Whole batch in one transaction — no async I/O in this loop (unlike the
+    // judge-sweep/brreg-recheck siblings, which await a network call per
+    // row), so a single db.transaction() around the full scan+write is safe
+    // and keeps a crash mid-batch from ever leaving the reject half-applied.
+    const tx = expDb.transaction(() => {
+      for (const row of rows) {
+        const rule = evaluateTriageRule(row);
+        if (rule === null) {
+          results.push({ id: row.id, rule: null });
+          continue;
+        }
+        counts[rule]++;
+        const reason = `rejected: ${TRIAGE_RULE_REASON[rule]}`;
+        if (applyMode) {
+          const info = rejectStmt.run(row.id);
+          if (info.changes > 0) {
+            stampExperienceAdmissionVerdict(row.id, reason);
+            insertAudit.run(crypto.randomUUID(), row.id, batchId, reason);
+            results.push({ id: row.id, rule, action_taken: reason });
+          } else {
+            // Row moved on (concurrent write) between the SELECT above and
+            // this UPDATE — never double-count, never stamp/audit a row this
+            // call did not actually change.
+            results.push({ id: row.id, rule, action_taken: "skipped_no_longer_needs_review" });
+          }
+        } else {
+          results.push({ id: row.id, rule, would_be_action: `[dry-run] ${reason}` });
+        }
+      }
+    });
+    tx();
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      scanned: rows.length,
+      counts,
+      total: counts.a + counts.b + counts.c + counts.d,
+      results,
+      remaining: Math.max(0, totalEligible - rows.length),
+      next_after: nextAfter,
+    });
+  } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
+    console.error("[opplevelser] admin/experiences-needs-review-triage failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-needs-review-triage-rollback ──
+//
+// dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: batch-
+// level revert for POST /admin/experiences-needs-review-triage's apply-mode
+// writes — a close structural mirror of POST /admin/experiences-admission-
+// promotion-rollback (above), adapted for the OPPOSITE transition (reject ->
+// needs_review instead of promote -> verified). Reuses the SAME
+// experience_admission_promotion_audit table (this route's own INSERT above
+// writes `to_status = 'rejected'` rows into it, keyed on THIS route's own
+// batch_id) — no new audit table needed.
+//
+// Body: { batch_id: string }. requireAdmin, same as every other admin route
+// in this file. Reverts EVERY row this batch set to 'rejected' back to
+// 'needs_review' — but ONLY a row that is:
+//   (a) still traceable to this batch via the audit table (an audit row
+//       exists for it under this batch_id), AND
+//   (b) that audit row is this row's MOST RECENT audit entry of ANY KIND —
+//       i.e. no LATER audit row (by rowid) exists for the same
+//       experience_id, whether from a later triage batch OR a later
+//       promotion batch (the two mechanisms share this one table). Same
+//       unfiltered-by-to_status MAX(rowid) subquery as the mirror route —
+//       deliberately NOT scoped to this route's own writes, for the exact
+//       same reason the mirror route's own doc comment gives: without it, a
+//       stale batch_id's rollback could find its own now-superseded audit
+//       row and wrongly revert a row a LATER, more-informed batch (of
+//       either kind) actually touched.
+//   (c) STILL verification_status='rejected' right now.
+// A row that moved on since (re-reviewed by an admin, re-promoted by a later
+// mechanism, merged/superseded, etc.) is NEVER touched — reverting it here
+// would silently clobber whatever that later, more-informed change did.
+//
+// An unknown or empty batch_id is a no-op (0 rows reverted), reported as
+// `success:true, reverted: []` — same graceful-empty-result convention as
+// the mirror route — UNLESS batch_id is missing/blank entirely, which IS a
+// genuine caller error (400). There is no "revert everything" mode.
+//
+// Read-only lookup + one UPDATE per row, wrapped in a single db.transaction()
+// so a crash mid-batch never leaves the revert half-applied — same as the
+// mirror route.
+router.post(
+  "/admin/experiences-needs-review-triage-rollback",
+  requireAdmin,
+  (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as { batch_id?: unknown };
+      const batchId = typeof body.batch_id === "string" ? body.batch_id.trim() : "";
+      if (!batchId) {
+        res.status(400).json({ error: "batch_id (non-empty string) is required" });
+        return;
+      }
+
+      const expDb = getExpDb("experiences");
+
+      const auditRows = expDb
+        .prepare(
+          `SELECT a.experience_id AS experience_id, a.from_status AS from_status
+             FROM experience_admission_promotion_audit a
+             JOIN experiences e ON e.id = a.experience_id
+            WHERE a.batch_id = ?
+              AND e.verification_status = 'rejected'
+              AND a.rowid = (
+                SELECT MAX(a2.rowid)
+                  FROM experience_admission_promotion_audit a2
+                 WHERE a2.experience_id = a.experience_id
+              )`,
+        )
+        .all(batchId) as Array<{ experience_id: string; from_status: string }>;
+
+      const revertStmt = expDb.prepare(
+        `UPDATE experiences SET verification_status = ? WHERE id = ? AND verification_status = 'rejected'`,
+      );
+
+      const reverted: Array<{ experience_id: string; reverted_to: string }> = [];
+      const tx = expDb.transaction(() => {
+        for (const row of auditRows) {
+          const info = revertStmt.run(row.from_status, row.experience_id);
+          if (info.changes > 0) {
+            reverted.push({ experience_id: row.experience_id, reverted_to: row.from_status });
+          }
+        }
+      });
+      tx();
+
+      res.json({ success: true, batch_id: batchId, reverted });
+    } catch (err) {
+      console.error("[opplevelser] admin/experiences-needs-review-triage-rollback failed", err);
+      res.status(500).json({ error: "Internal error" });
+    }
+  },
+);
+
 // ─── GET /api/opplevelser/admin/experiences-status-transitions ──────────────
 //
 // dev-request 2026-09-14-opplevagent-falske-karantener-doede-sider-

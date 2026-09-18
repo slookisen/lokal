@@ -44347,3 +44347,31 @@ runSerial(async () => {
     failures.push("opplevelser-bulk-load-scope-gate: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: POST
+// /admin/experiences-needs-review-triage (rules a-d, owner-lock exemption,
+// dry-run/apply) + POST /admin/experiences-needs-review-triage-rollback
+// (batch_id-scoped revert, mirrors experiences-admission-promotion-rollback's
+// own "still in the terminal state, latest audit row" discipline) +
+// stampExperienceAdmissionVerdict()'s new admission_verdict_prev/
+// admission_checked_at_prev shift (rule (d)'s one step of verdict history).
+// Own dedicated in-memory-db harness (mirrors opplevelser-experiences-
+// admission-promotion.test.ts's harness), no fetch mocking needed — this
+// route makes no network/LLM calls. Tail position is the convention for a
+// new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: needs-review triage + rollback ──");
+  try {
+    const { runOpplevelserExperiencesNeedsReviewTriageTests } =
+      require("../src/routes/opplevelser-experiences-needs-review-triage.test") as
+        typeof import("../src/routes/opplevelser-experiences-needs-review-triage.test");
+    const nrt = await runOpplevelserExperiencesNeedsReviewTriageTests({ log: false });
+    passed += nrt.passed;
+    failed += nrt.failed;
+    for (const f of nrt.failures) failures.push("opplevelser-experiences-needs-review-triage: " + f);
+    console.log(`  opplevelser-experiences-needs-review-triage: ${nrt.passed} passed, ${nrt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-needs-review-triage: unexpected error: " + String(err?.message || err));
+  }
+});
