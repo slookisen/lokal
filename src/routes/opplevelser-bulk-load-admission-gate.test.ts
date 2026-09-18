@@ -235,23 +235,23 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
 
       const PAYLOAD = {
         experiences: [
-          { title: "Hvalsafari fra kaia", provider_name: "Aktiv Opplevelser AS", category: "dyreliv_safari",
+          { title: "Hvalsafari fra kaia", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
             kommune: "Tromsø", fylke: "Troms", price_from: 1290, confidence: "high",
             evidence_url: "https://evidens.example/hvalsafari" },
-          { title: "Mismatch nordlystur", provider_name: "Aktiv Opplevelser AS", category: "natur_friluft",
+          { title: "Mismatch nordlystur", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
             kommune: "Tromsø", fylke: "Troms", price_from: 1490, confidence: "high",
             evidence_url: "https://evidens.example/nordlys" },
-          { title: "Dommerfeil skitur", provider_name: "Aktiv Opplevelser AS", category: "natur_friluft",
+          { title: "Dommerfeil skitur", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
             kommune: "Tromsø", fylke: "Troms", price_from: 990, confidence: "high",
             evidence_url: "https://evidens.example/skitur" },
           // SSRF-blocked before any network call (same deterministic-failure
           // technique as wcr-3's fetchfail row) → fetch failure → unresolved.
-          { title: "Blokkert fisketur", provider_name: "Aktiv Opplevelser AS", category: "natur_friluft",
+          { title: "Blokkert fisketur", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
             kommune: "Tromsø", fylke: "Troms", price_from: 790, confidence: "high",
             evidence_url: "http://localhost/fisketur" },
           // No evidence_url at all → never judged, today's rule unchanged
           // (verified under a verified_active provider).
-          { title: "Uten evidens byvandring", provider_name: "Aktiv Opplevelser AS", category: "kultur_historie",
+          { title: "Uten evidens byvandring", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
             kommune: "Tromsø", fylke: "Troms", price_from: 290, confidence: "high" },
         ],
       };
@@ -326,7 +326,7 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
         const capRows = Array.from({ length: 51 }, (_, i) => ({
           title: `Kapasitetstur ${i}`,
           provider_name: "Aktiv Kapasitet AS",
-          category: "natur_friluft",
+          category: "mat_drikke",
           kommune: `Kommune${i}`,
           fylke: "Troms",
           confidence: "medium",

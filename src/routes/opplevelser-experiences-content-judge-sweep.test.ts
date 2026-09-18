@@ -227,47 +227,47 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
       // ── seed the main mixed cohort ───────────────────────────────────────
       insertExperience.run({
         id: "cjs-match", title: "Fjelltur med guide", slug: "cjs-match",
-        description: "Kort om fjellturen.", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "Kort om fjellturen.", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: "https://good.no/fjelltur", verification_status: "verified", confidence: "high", canonical_id: null,
       });
       insertExperience.run({
         id: "cjs-mismatch", title: "Kajakktur", slug: "cjs-mismatch",
-        description: "En kajakktur langs kysten.", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "En kajakktur langs kysten.", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: "https://mismatch.no/kajakk", verification_status: "verified", confidence: "high", canonical_id: null,
       });
       insertExperience.run({
         id: "cjs-judgefail", title: "Skitur", slug: "cjs-judgefail",
-        description: "En skitur i fjellet.", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "En skitur i fjellet.", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: "https://judgefail.no/ski", verification_status: "pending_verify", confidence: null, canonical_id: null,
       });
       insertExperience.run({
         id: "cjs-fetchfail", title: "Fisketur", slug: "cjs-fetchfail",
-        description: "En fisketur.", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "En fisketur.", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: "http://localhost/fisk", verification_status: "pending_verify", confidence: null, canonical_id: null,
       });
       const boilerplateHtml = "<html><body>Hagevandring i vakker natur, perfekt for hele familien.</body></html>";
       const boilerplateText = "Hagevandring i vakker natur, perfekt for hele familien.";
       insertExperience.run({
         id: "cjs-boilerplate", title: "Hagevandring", slug: "cjs-boilerplate",
-        description: boilerplateText, category: "aktivitet", price_band: "standard", price_from: 300,
+        description: boilerplateText, category: "mat_drikke", price_band: "standard", price_from: 300,
         evidence_url: "https://good.no/hagevandring", verification_status: "verified", confidence: "high", canonical_id: null,
       });
       insertExperience.run({
         id: "cjs-ownsummary", title: "Brevandring", slug: "cjs-ownsummary",
-        description: "En fin tur i naturen, egen oppsummering.", category: "aktivitet", price_band: "standard", price_from: 700,
+        description: "En fin tur i naturen, egen oppsummering.", category: "mat_drikke", price_band: "standard", price_from: 700,
         evidence_url: "https://good.no/brevandring", verification_status: "verified", confidence: "high", canonical_id: null,
       });
       // Not eligible: canonical_id set (superseded/hidden) — must never be
       // scanned by this sweep even though it carries an evidence_url.
       insertExperience.run({
         id: "cjs-superseded", title: "Duplisert tur", slug: "cjs-superseded",
-        description: "d", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "d", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: "https://good.no/duplisert", verification_status: "verified", confidence: "high", canonical_id: "cjs-match",
       });
       // Not eligible: no evidence_url at all.
       insertExperience.run({
         id: "cjs-noevidence", title: "Uten evidens", slug: "cjs-noevidence",
-        description: "d", category: "aktivitet", price_band: "standard", price_from: 500,
+        description: "d", category: "mat_drikke", price_band: "standard", price_from: 500,
         evidence_url: null, verification_status: "verified", confidence: "high", canonical_id: null,
       });
 
@@ -463,7 +463,7 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         for (let i = 0; i < 55; i++) {
           insertExperience.run({
             id: `cjs-cap-${i}`, title: `Kapasitetstur ${i}`, slug: `cjs-cap-${i}`,
-            description: "d", category: "aktivitet", price_band: "standard", price_from: 500,
+            description: "d", category: "mat_drikke", price_band: "standard", price_from: 500,
             evidence_url: `http://localhost/cap-${i}`, verification_status: "pending_verify", confidence: null, canonical_id: null,
           });
         }
@@ -604,6 +604,82 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         const r5 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "random", limit: 1 } });
         assertEq(r5.body.never_checked_remaining, 0, "cjs-j10: sample:'random' reports the now-zero count too");
         assertEq(r5.body.queue_exhausted, false, "cjs-j11: sample:'random' is still queue_exhausted:false even though the queue is genuinely exhausted");
+      }
+
+      // ── (k) dev-request 2026-09-18-opplevagent-skop-katalogen-til-
+      //      gardssalg-og-drikke, del 1: the in-scope gate. An out-of-scope
+      //      row (non-mat_drikke category, no gårdssalg-cohort provider) is
+      //      counted but NEVER selected/fetched/judged/written; a row whose
+      //      PROVIDER is in the gårdssalg cohort is still swept even with a
+      //      non-mat_drikke category (the OR rule). ────────────────────────
+      {
+        let scopeGateFetches = 0;
+        expDb
+          .prepare(`INSERT INTO experience_providers (id, navn, producer_type) VALUES (@id, @navn, @producer_type)`)
+          .run({ id: "cjs-scope-cohort-prov", navn: "Gaardsdrikke AS", producer_type: "bryggeri" });
+
+        // Out of scope: category is NOT mat_drikke, and no provider at all
+        // (provider_id NULL — never in the gårdssalg cohort).
+        insertExperience.run({
+          id: "cjs-scope-outofscope", title: "Museumsbesøk", slug: "cjs-scope-outofscope",
+          description: "d", category: "kultur_historie", price_band: "standard", price_from: 200,
+          evidence_url: "https://scope.example/never-fetched", verification_status: "verified", confidence: "high", canonical_id: null,
+        });
+        // In scope via provider cohort ALONE — category deliberately still
+        // non-mat_drikke, proving the OR rule (not requiring BOTH).
+        expDb
+          .prepare(
+            `INSERT INTO experiences
+               (id, provider_id, title, slug, description, category, price_band, price_from, evidence_url,
+                verification_status, confidence, canonical_id, content_source, enrichment_state)
+             VALUES
+               (@id, @provider_id, @title, @slug, @description, @category, @price_band, @price_from, @evidence_url,
+                @verification_status, @confidence, @canonical_id, 'provider_site', 'enriched')`,
+          )
+          .run({
+            id: "cjs-scope-viaprovider", provider_id: "cjs-scope-cohort-prov",
+            title: "Gårdsbesøk", slug: "cjs-scope-viaprovider",
+            description: "d", category: "kultur_historie", price_band: "standard", price_from: 300,
+            evidence_url: "https://good.no/gaardsbesok", verification_status: "verified", confidence: "high", canonical_id: null,
+          });
+
+        const beforeSnapshot = snapshot("cjs-scope-outofscope")!;
+        const prevFetchScope = globalThis.fetch;
+        globalThis.fetch = (async (url: any, init: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://scope.example/never-fetched") {
+            scopeGateFetches++;
+            throw new Error("scope-gate test: this out-of-scope row's evidence_url must NEVER be fetched");
+          }
+          if (urlStr === "https://api.anthropic.com/v1/messages") {
+            return mkAnthropicResponse("MATCH\nStemmer med kilden.");
+          }
+          if (urlStr === "https://good.no/gaardsbesok") {
+            return mkPageResponse("<html><body>Gårdsbesøk med omvisning og smaksprøver.</body></html>", urlStr);
+          }
+          throw new Error("content-judge-sweep scope test: unexpected fetch URL: " + urlStr);
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true, limit: 50 } });
+          assertEq(r.status, 200, "cjs-k1: scope-gate apply call -> 200");
+          assertEq(scopeGateFetches, 0, "cjs-k2: the out-of-scope row's evidence_url was NEVER fetched");
+
+          const ids = new Set((r.body.results as any[]).map((x: any) => x.id));
+          assertTrue(!ids.has("cjs-scope-outofscope"), "cjs-k3: the out-of-scope row never appears in results (never selected/judged)");
+          assertTrue(ids.has("cjs-scope-viaprovider"), "cjs-k4: the in-scope-via-provider-cohort row WAS swept despite a non-mat_drikke category");
+
+          assertTrue((r.body.skipped_out_of_scope as number) >= 1, "cjs-k5: response reports skipped_out_of_scope >= 1 (additive field)");
+
+          const afterSnapshot = snapshot("cjs-scope-outofscope")!;
+          assertEq(
+            afterSnapshot,
+            beforeSnapshot,
+            "cjs-k6: the out-of-scope row's verification_status/admission_verdict/admission_checked_at/description are BYTE-IDENTICAL before/after apply:true — no status change from this gate",
+          );
+        } finally {
+          globalThis.fetch = prevFetchScope;
+        }
       }
     } catch (err: any) {
       failed++;
