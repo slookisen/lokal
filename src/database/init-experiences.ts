@@ -628,6 +628,66 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_orgnr_review_queue failed:", err);
   }
 
+  // ─── gardssalg_orgnr_backfill_sweep_state (dev-request 2026-09-18-
+  // gardssalg-orgnr-backfill-statisk-batch) ───────────────────────────────────
+  // POST /admin/gardssalg-orgnr-backfill's auto-selector
+  // (selectGardssalgProvidersForOrgnrBackfillRotating,
+  // services/experience-store.ts) was a static `ORDER BY created_at ASC
+  // LIMIT ?` with no cursor — every scheduled enrichment run (scheduled-
+  // agents/experiences-enrichment.md Step 3a) is a fresh, memoryless caller
+  // with no offset/limit override, so the SAME oldest ~9 unresolved rows
+  // came back first on every single call, forever (11 consecutive daily
+  // runs reported a numerically identical outcome distribution — confirming
+  // rows created since those oldest 9 were never reached). Four of the five
+  // possible per-row outcomes (no_brreg_candidate,
+  // heuristic_name_requires_postal_match, stripped_name_requires_postal_
+  // match, needs_human_review) are structurally permanent for a given row
+  // — they don't self-resolve on a bare retry — so a static batch was
+  // structurally stuck.
+  //
+  // Same failure class, same fix shape, as PR #863's
+  // gardssalg_website_verification_sweep_state (offset persistence for the
+  // website-verification sweep) — but this table stores a KEYSET cursor
+  // (last-seen created_at + id tuple), not a plain integer offset. A plain
+  // offset is unsafe here: once a row's org_nr resolves (or a row is
+  // otherwise no longer eligible), it drops OUT of the eligible set, which
+  // shifts every later row's offset — an integer offset would silently skip
+  // or re-serve rows across that shift. A keyset cursor doesn't have this
+  // problem: "give me eligible rows after (created_at, id) X" stays correct
+  // no matter how many earlier rows enter or leave the eligible set.
+  //
+  // Single row (id='singleton') — this route has no cohort/scope axis (only
+  // `limit` and the unrelated `providerIds` manual override), so there is
+  // exactly one rotation to track, unlike PR #863's per-cohort table. ABSENT
+  // row, or NULL cursor_created_at/cursor_id (fresh DB, or a rotation that
+  // just wrapped after exhausting the eligible set), means "start from the
+  // beginning" — same "absence = default" convention as
+  // gardssalg_outreach_size_gate_config, so no seed migration is needed and
+  // every existing deployment is unaffected the instant this table exists.
+  // See getGardssalgOrgnrBackfillSweepCursor / setGardssalgOrgnrBackfillSweepCursor
+  // and selectGardssalgProvidersForOrgnrBackfillRotating
+  // (services/experience-store.ts) for the read/query/wrap/persist contract.
+  //
+  // The route's pre-existing `providerIds` override (a manual, targeted
+  // call) bypasses this cursor entirely — it never calls
+  // selectGardssalgProvidersForOrgnrBackfillRotating at all, so it can never
+  // read or advance this state either way. The OLD static selector
+  // (selectGardssalgProvidersForOrgnrBackfill) is left byte-for-byte
+  // unchanged and still exported — only the route's own auto-selected
+  // (non-providerIds) path was switched to the rotating selector.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_orgnr_backfill_sweep_state (
+        id TEXT PRIMARY KEY,
+        cursor_created_at TEXT,
+        cursor_id TEXT,
+        updated_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_orgnr_backfill_sweep_state failed:", err);
+  }
+
   // ─── gardssalg_website_review_queue (dev-request 2026-07-19-gardssalg-
   // nye-agenter-komplett-foer-synlig, skive B) ───────────────────────────────
   // Website-discovery candidates for gårdssalg providers whose hjemmeside is
