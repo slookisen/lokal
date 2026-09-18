@@ -16,10 +16,19 @@
  * Covers, per vertical (RFB + dental):
  *   (a) GET /mcp with Accept: text/html, no session header -> 200, HTML,
  *       vertical-branded title, links to agent-card/openapi/llms.txt.
- *   (b) GET /mcp with Accept: application/json (no session header) -> the
- *       ORIGINAL 400 JSON error, completely unchanged — this is the
- *       regression guard: a real MCP client (or any non-browser caller) must
- *       see exactly the same behavior as before this dev-request.
+ *   (b) GET /mcp with Accept: application/json (no session header) -> a
+ *       JSON error, completely unrelated to the landing-page branch — this
+ *       is the regression guard: a real MCP client (or any non-browser
+ *       caller) must not get the HTML page.
+ *
+ *       UPDATE (dev-request mcp-session-404-on-unknown-id): this used to be
+ *       a bare `400 {"error":"Missing or invalid mcp-session-id header"}`.
+ *       Per the MCP spec, "no valid session + non-HTML Accept" on GET is a
+ *       404 (same JSON-RPC-shaped body the SDK's own transport would use
+ *       for "Session not found"), not a 400 — see
+ *       src/services/mcp-session-protocol.ts. This file's (b)/(b3) cases
+ *       assert the NEW 404, not the old 400; the HTML branch (a) and the
+ *       POST handshake (c) are unaffected by that change and still hold.
  *   (c) POST /mcp (the actual JSON-RPC handshake) is untouched by this
  *       change — a real initialize call still succeeds and returns a session
  *       id, proving the new branch is GET-only and additive.
@@ -104,19 +113,20 @@ export function runMcpBrowserLandingPageTests(opts: { log?: boolean } = {}): Pro
         assertTrue(htmlBody.includes("openapi.json"), `${v.label} a6: body links the OpenAPI doc`);
         assertTrue(htmlBody.includes("llms.txt"), `${v.label} a7: body links llms.txt`);
 
-        // (b) Non-browser GET, no session header, Accept: application/json -> unchanged 400 JSON
+        // (b) Non-browser GET, no session header, Accept: application/json -> 404 JSON-RPC error
+        // (dev-request mcp-session-404-on-unknown-id: was a bare 400; see file header)
         const jsonRes = await fetch(`${base}/mcp`, { headers: { Accept: "application/json" } });
-        assertTrue(jsonRes.status === 400, `${v.label} b1: non-browser GET (no session) still returns 400 (got ${jsonRes.status})`);
+        assertTrue(jsonRes.status === 404, `${v.label} b1: non-browser GET (no session) returns 404 (got ${jsonRes.status})`);
         const jsonBody = await jsonRes.json().catch(() => null);
         assertTrue(
-          jsonBody && jsonBody.error === "Missing or invalid mcp-session-id header",
-          `${v.label} b2: 400 body is the original unchanged error shape (got ${JSON.stringify(jsonBody)})`
+          jsonBody && jsonBody.jsonrpc === "2.0" && jsonBody.error && jsonBody.error.code === -32001,
+          `${v.label} b2: 404 body is the JSON-RPC "Session not found" shape (got ${JSON.stringify(jsonBody)})`
         );
 
         // (b2) A totally bare GET (no Accept header at all, e.g. curl default) must also
-        // still fall through to the JSON 400 — only an explicit text/html Accept gets the page.
+        // still fall through to the JSON 404 — only an explicit text/html Accept gets the page.
         const bareRes = await fetch(`${base}/mcp`);
-        assertTrue(bareRes.status === 400, `${v.label} b3: GET with no Accept header returns 400 (got ${bareRes.status})`);
+        assertTrue(bareRes.status === 404, `${v.label} b3: GET with no Accept header returns 404 (got ${bareRes.status})`);
 
         // (c) POST /mcp (real initialize handshake) is completely unaffected
         const initRes = await fetch(`${base}/mcp`, {
