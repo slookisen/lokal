@@ -11229,9 +11229,12 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   // (3) Tool registrations: 9 original + 5 cart tools added in Phase 1 (orch-pr-20260614-6)
   // Updated from 9 → 14: lokal_cart_create, lokal_cart_add_item, lokal_cart_view,
   // lokal_cart_submit, lokal_order_status.
+  // Updated from 14 → 15: dev-request
+  // 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt, Slice 0 adds
+  // lokal_find_offers.
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 14,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 9 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76)");
+  assertEq(toolCount, 15,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 15 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -44417,5 +44420,71 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("lokal-agent-verifier-verified-demoted-claim: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: daily automatic catalog sync (runProductCatalogSync, extracted
+// from POST /admin/products/backfill) — proves the availability-preservation
+// guarantee survives the extraction. Own db-passed-directly harness (mirrors
+// marketplace-catalog-supply-graph.test.ts's in-memory-schema convention, but
+// skips __setDbForTesting entirely since runProductCatalogSync(db) takes the
+// db directly). Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-slice0: product-catalog-sync (extracted upsert + availability guard) ──");
+  try {
+    const { runProductCatalogSyncTests } = require("../src/services/product-catalog-sync.test") as
+      typeof import("../src/services/product-catalog-sync.test");
+    const pcs = await runProductCatalogSyncTests({ log: false });
+    passed += pcs.passed;
+    failed += pcs.failed;
+    for (const f of pcs.failures) failures.push("product-catalog-sync: " + f);
+    console.log(`  product-catalog-sync: ${pcs.passed} passed, ${pcs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-catalog-sync: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: GET /api/marketplace/catalog/offers — visibility filter, distance
+// sort + 5-cap, can_order gate, response shape. Harness mirrors
+// marketplace-catalog-supply-graph.test.ts. Tail position is the convention
+// for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-slice0: GET /api/marketplace/catalog/offers ──");
+  try {
+    const { runMarketplaceCatalogOffersTests } = require("../src/routes/marketplace-catalog-offers.test") as
+      typeof import("../src/routes/marketplace-catalog-offers.test");
+    const mco = await runMarketplaceCatalogOffersTests({ log: false });
+    passed += mco.passed;
+    failed += mco.failed;
+    for (const f of mco.failures) failures.push("marketplace-catalog-offers: " + f);
+    console.log(`  marketplace-catalog-offers: ${mco.passed} passed, ${mco.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-catalog-offers: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 0: lokal_find_offers MCP tool — registered, read-only, one
+// findOffers() result per item, same shape as the REST endpoint. Harness
+// mirrors mcp-search-geo.test.ts's duck-typed-server convention. Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-slice0: lokal_find_offers MCP tool ──");
+  try {
+    const { runMcpFindOffersTests } = require("../src/routes/mcp-find-offers.test") as
+      typeof import("../src/routes/mcp-find-offers.test");
+    const mfo = await runMcpFindOffersTests({ log: false });
+    passed += mfo.passed;
+    failed += mfo.failed;
+    for (const f of mfo.failures) failures.push("mcp-find-offers: " + f);
+    console.log(`  mcp-find-offers: ${mfo.passed} passed, ${mfo.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-find-offers: unexpected error: " + String(err?.message || err));
   }
 });

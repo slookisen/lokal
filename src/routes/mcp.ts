@@ -28,6 +28,7 @@ import { isJunkDescription, normalizeProse } from "../services/description-quali
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { computeEffectiveAvailability } from "../services/supply-graph";
+import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
 import {
   createCart as svcCreateCart,
@@ -886,6 +887,63 @@ export function registerTools(
     }
   );
 
+  // Tool: lokal_find_offers — dev-request 2026-09-16-handleliste-med-
+  // produsentvalg-og-bestillingsflyt, Slice 0. Per-item multi-producer offer
+  // lookup: for each search term in `items`, finds up to 5 nearby eligible
+  // producers selling it, nearest first. Calls the exact same
+  // findOffers() logic as GET /api/marketplace/catalog/offers — see
+  // ../services/catalog-offers.ts for the full field contract (this is the
+  // "which producer has X near me, and can I order from them" tool a future
+  // shopping-list flow (later slice) will build on).
+  server.registerTool(
+    "lokal_find_offers",
+    {
+      title: "Find offers for shopping-list items",
+      description: "For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). Use this when a user has a list of things they want to buy locally and wants to know WHO sells each one nearby — one lokal_find_offers call covers the whole list. Read-only.",
+      inputSchema: {
+        items: z.array(z.string()).min(1).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
+        near: z.string().optional().describe("Norwegian place name to search near (geocoded automatically). Supply this OR lat/lng."),
+        lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply together with lng."),
+        lng: z.number().min(-180).max(180).optional().describe("User's longitude (WGS84). Must be supplied together with lat."),
+        radius_km: z.number().min(1).max(500).optional().describe("Search radius in km. Default 50."),
+      },
+      annotations: {
+        title: "Find offers for shopping-list items",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ items, near, lat, lng, radius_km }) => {
+      const hasCoords = isValidLatLng(lat as number, lng as number);
+      if (!hasCoords && !(near && near.trim())) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Oppgi enten `near` (stedsnavn) eller `lat` + `lng`. / Supply either `near` or `lat` + `lng`.",
+          }],
+        };
+      }
+
+      const radiusKm = resolveOffersRadiusKm(radius_km);
+      const results = [];
+      for (const q of items) {
+        const result = await findOffers({
+          q,
+          near: hasCoords ? undefined : near,
+          lat: hasCoords ? (lat as number) : undefined,
+          lng: hasCoords ? (lng as number) : undefined,
+          radiusKm,
+          limit: resolveOffersLimit(undefined),
+        });
+        results.push(result);
+      }
+
+      return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
+    }
+  );
+
   // ─── Cart tools (Phase 1) ────────────────────────────────────
   // Tools 10-14: shopping cart ("handleliste") for local food pickup orders.
   // No payment. No seller notification. Anonymous buyer (buyer_ref token).
@@ -1265,6 +1323,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 <li><code>lokal_list_umbrellas</code> / <code>lokal_get_umbrella_members</code> / <code>lokal_get_producer_affiliations</code> — paraplyorganisasjoner</li>
 <li><code>lokal_bm_next_markets</code> — neste bondens marked</li>
 <li><code>lokal_geocode</code> — stedsnavn → koordinater</li>
+<li><code>lokal_find_offers</code> — finn produsenter som selger hver vare på en handleliste, nærmest først</li>
 <li><code>lokal_cart_create</code> / <code>lokal_cart_add_item</code> / <code>lokal_cart_view</code> / <code>lokal_cart_submit</code> — handlekurv hos produsent</li>
 <li><code>lokal_order_status</code> — status på en avgitt bestilling</li>
 </ul>
