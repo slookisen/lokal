@@ -3343,7 +3343,17 @@ async function rfbRetroScanShouldNull(
  * an agent with nothing to null across the requested fields writes nothing
  * and returns [].
  */
-function applyRfbRetroScanNull(
+// Exported (2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit) so the
+// new admin-agents-category-description-provenance-audit.ts route can reuse
+// the SAME null-and-requeue-for-re-enrichment mechanism the retro-scan above
+// already uses, instead of duplicating this write/provenance/audit-log logic
+// — see that route's own header comment for why: nulling `description`
+// (clearing field_provenance.description at the same time) is what actually
+// makes a row re-enter the re-enrichment candidate set elsewhere in this
+// codebase (brreg-description-fallback's own candidate WHERE clause is
+// `TRIM(description) = ''`), so it IS the real "route back to re-enrichment"
+// trigger for this field — not a new mechanism.
+export function applyRfbRetroScanNull(
   db: ReturnType<typeof getDb>,
   agentId: string,
   fields: Array<"description" | "about">,

@@ -76,6 +76,7 @@ import adminAgentsDescriptionCodeArtifactSweepRoutes from "./routes/admin-agents
 import adminAgentsInternalNoteSweepRoutes from "./routes/admin-agents-internal-note-sweep";
 import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-correction";
 import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
+import adminAgentsCategoryDescriptionProvenanceAuditRoutes from "./routes/admin-agents-category-description-provenance-audit";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
@@ -672,6 +673,17 @@ app.use("/admin/agents/content-correction", adminLimiter, adminAgentsContentCorr
 // off hijacked/lapsed producer domains + the hijacked website itself. Same
 // ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/theme-spam-sweep", adminLimiter, adminAgentsThemeSpamSweepRoutes);
+// GET /admin/agents/category-description-provenance-audit + POST .../route-
+// boilerplate-to-reenrichment (dev-request 2026-09-09-rfb-kategori-og-
+// beskrivelse-provenance-audit): NACE-default-only categories/products +
+// scraped-boilerplate-description audit report, and the opt-in routing of
+// confirmed boilerplate descriptions back to re-enrichment. Same ordering
+// rule as the siblings above — mount BEFORE /admin/agents.
+app.use(
+  "/admin/agents/category-description-provenance-audit",
+  adminLimiter,
+  adminAgentsCategoryDescriptionProvenanceAuditRoutes,
+);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
 // state that services/enrichment-write-pause.ts enforces on every enrichment

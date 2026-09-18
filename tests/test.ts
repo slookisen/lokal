@@ -24736,6 +24736,14 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       city TEXT,
       umbrella_type TEXT,
       claimed_at TEXT,
+      -- dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit:
+      -- admin-outreach-candidates.ts's suppressionCols now also reads
+      -- a.categories (categoriesLackWebsiteCorroboration) — same "minimal
+      -- schema needs the column too" pattern as is_vetted above. Default
+      -- '[]' matches production's column default (database/init.ts), so
+      -- every existing fixture below (which never sets it) is unaffected —
+      -- an empty categories array is never suppressed (nothing to gate).
+      categories TEXT DEFAULT '[]',
       created_at TEXT DEFAULT (datetime('now')),
       last_seen_at TEXT DEFAULT (datetime('now'))
     );
@@ -41828,6 +41836,34 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("category-sanity-report: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit:
+// GET/POST /admin/agents/category-description-provenance-audit
+// (src/routes/admin-agents-category-description-provenance-audit.ts) — NACE-
+// default-only categories/products + scraped-boilerplate-description audit
+// report, the real outreach-candidates gate extension
+// (categoriesLackWebsiteCorroboration, cross-source-validator.ts), and the
+// opt-in routing of confirmed boilerplate descriptions back to re-enrichment
+// via the existing applyRfbRetroScanNull mechanism. Own in-memory DB via
+// __setDbForTesting/__initSchemaForTesting, own require of both this route's
+// router and admin-outreach-candidates.ts's router (AC2 proves the real
+// gate, not just this report). Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit ──");
+  try {
+    const { runAdminAgentsCategoryDescriptionProvenanceAuditTests } =
+      require("../src/routes/admin-agents-category-description-provenance-audit.test") as
+        typeof import("../src/routes/admin-agents-category-description-provenance-audit.test");
+    const cdpa = await runAdminAgentsCategoryDescriptionProvenanceAuditTests({ log: false });
+    passed += cdpa.passed;
+    failed += cdpa.failed;
+    for (const f of cdpa.failures) failures.push("category-description-provenance-audit: " + f);
+    console.log(`  category-description-provenance-audit: ${cdpa.passed} passed, ${cdpa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("category-description-provenance-audit: unexpected error: " + String(err?.message || err));
   }
 });
 

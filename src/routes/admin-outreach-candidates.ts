@@ -41,6 +41,7 @@ import { Router, Request, Response } from "express";
 import { getDb, isContentQualified } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { dedupeByEmail } from "../services/marketing-dedupe";
+import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 import {
   getOutreachMaxTouchVernConfig,
   getMaxTouchStatusForEmail,
@@ -107,6 +108,24 @@ export function isOutreachPaused(): boolean {
 // suppressing on. (products/address/phone per orch-pr-17; "about" is descriptive
 // prose, not a factual claim that mis-targets outreach, so it is excluded here.)
 const FACTUAL_INFERENCE_FIELDS: ReadonlySet<string> = new Set(["products", "address", "phone"]);
+
+// ── dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit ──────
+//
+// A THIRD data-quality suppression reason, same ADVISORY/defensive family as
+// #1/#2 above: `agents.categories` that has never been corroborated from the
+// producer's own website. Real failure: "Soli Brug" (an art gallery/café) got
+// category "fish" from a bare NACE-code guess, never checked against the real
+// site, and outreach mailed them as a fish producer. The dev-request's own
+// text names this gate "samme mekanisme som held-for-reenrichment" — that
+// name does not exist anywhere in this codebase (grepped src/ — zero
+// matches). This is the REAL analogous mechanism: the SAME suppression family
+// #1/#2 already use, just with a THIRD read-only signal
+// (categoriesLackWebsiteCorroboration, cross-source-validator.ts) —
+// deliberately broader than #2's inference-only test (it also fires when
+// field_provenance.categories has NO record at all, the common shape for a
+// legacy/NACE-seeded row — see that function's own doc comment for why "no
+// evidence" and "only-fabricated evidence" are the same claim here).
+// suppressed_counts.categories_not_corroborated.
 
 // True iff field_provenance.website_ownership.status === "unverified".
 // `fieldProvenanceJson` is the raw agent_knowledge.field_provenance TEXT column.
@@ -306,7 +325,10 @@ router.get("/", (req: Request, res: Response) => {
       -- carries PR-16's inference_only_fields. Both default to '{}' so they are
       -- always present; the JS helpers treat any non-matching shape as "absent".
       k.field_provenance AS field_provenance,
-      k.verification_review_reason AS verification_review_reason
+      k.verification_review_reason AS verification_review_reason,
+      -- dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit:
+      -- raw column read by categoriesLackWebsiteCorroboration below.
+      a.categories AS categories
     `;
 
     type PoolRow = {
@@ -321,6 +343,7 @@ router.get("/", (req: Request, res: Response) => {
       is_hard_bounced: number;
       field_provenance: string | null;
       verification_review_reason: string | null;
+      categories: string | null;
       // Fix 1 (gate-integrity dedupe tiebreak parity, 2026-07-15): these three
       // mirror admin-outreach-pool.ts exactly so dedupeByEmail()'s tiebreak sees
       // real engagement/rating data here too, instead of silently defaulting to
@@ -577,6 +600,7 @@ router.get("/", (req: Request, res: Response) => {
     // orch-pr-17 data-quality counters
     let websiteUnverifiedCount = 0;
     let inferenceOnlyCount = 0;
+    let categoriesNotCorroboratedCount = 0;
     // Step 2b belt-and-suspenders counter
     let recentCrmSendCount = 0;
     // dev-request 2026-08-29-outreach-max-touch-vern counter + detail list
@@ -660,6 +684,16 @@ router.get("/", (req: Request, res: Response) => {
       // Read-only on PR-16's verification_review_reason.inference_only_fields;
       // absent/malformed → false. Free-mail is NEVER a reason here.
       const suppressedForInferenceOnly = hasInferenceOnlyFactualField(row.verification_review_reason);
+      // ── dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit ──
+      // Categories present but never corroborated from the producer's own
+      // website (no website_homepage/owner record in field_provenance.categories
+      // — see categoriesLackWebsiteCorroboration's own doc comment for why this
+      // is broader than suppressedForInferenceOnly above). Read-only, advisory,
+      // defensive: absent/malformed columns → false → never suppresses.
+      const suppressedForCategoriesNotCorroborated = categoriesLackWebsiteCorroboration(
+        row.categories,
+        row.field_provenance,
+      );
       // Belt-and-suspenders (Step 2b) — see comment above. Independent of
       // agent_id/outreach_sent_log; catches a producer we already emailed even if
       // that send's agent_id link is broken/missing.
@@ -699,6 +733,7 @@ router.get("/", (req: Request, res: Response) => {
       if (suppressedForBlocklist) blocklistedCount++;
       if (suppressedForWebsiteUnverified) websiteUnverifiedCount++;
       if (suppressedForInferenceOnly) inferenceOnlyCount++;
+      if (suppressedForCategoriesNotCorroborated) categoriesNotCorroboratedCount++;
       if (suppressedForRecentCrmSend) recentCrmSendCount++;
       if (suppressedForMaxTouch) maxTouchSuppressedCount++;
 
@@ -711,6 +746,7 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForBlocklist &&
         !suppressedForWebsiteUnverified &&
         !suppressedForInferenceOnly &&
+        !suppressedForCategoriesNotCorroborated &&
         !suppressedForRecentCrmSend &&
         !suppressedForCrossPlatform &&
         !suppressedForMaxTouch
@@ -844,6 +880,8 @@ router.get("/", (req: Request, res: Response) => {
         // orch-pr-17: new data-quality suppression reasons
         website_unverified: websiteUnverifiedCount,
         inference_only: inferenceOnlyCount,
+        // dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit
+        categories_not_corroborated: categoriesNotCorroboratedCount,
         // Step 2b: belt-and-suspenders recipient-email match (agent_id-independent)
         recent_crm_send_email_match: recentCrmSendCount,
         // dev-request 2026-08-29-outreach-max-touch-vern
