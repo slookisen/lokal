@@ -9948,14 +9948,17 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: lokal_get_producer_affiliations calls /api/marketplace/producers/:id/affiliations"
   );
 
-  // Test 4.15: server.json + package.json versions bumped to 0.4.0
+  // Test 4.15: server.json + package.json versions bumped to 0.4.0, then to
+  // 0.4.1 (dev-request 2026-09-08-lokal-mcp-0-4-1-remotes-og-oppdatert-beskrivelse) —
+  // asserting the two files stay in lockstep with each other, not a frozen
+  // literal, so this doesn't go stale again on the next metadata release.
   assertTrue(
-    serverJson.version === "0.4.0",
-    "phase5.11-a2.5: server.json version bumped to 0.4.0 (minor — adds capabilities)"
+    serverJson.version === pkgJson.version,
+    "phase5.11-a2.5: server.json and mcp-server/package.json versions stay in lockstep"
   );
   assertTrue(
-    pkgJson.version === "0.4.0",
-    "phase5.11-a2.5: mcp-server/package.json version bumped to 0.4.0"
+    serverJson.version === "0.4.1",
+    "phase5.11-a2.5: server.json version bumped to 0.4.1 (remotes + websiteUrl + updated description)"
   );
 
   // Test 4.16: server.json description mentions umbrella organizations
@@ -11252,8 +11255,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
   const serverParsed = JSON.parse(serverJsonRoot);
   assertTrue(
-    serverParsed.version === "0.4.0",
-    "pr-56: server.json bumped to v0.4.0 (was 0.3.3)"
+    serverParsed.version === "0.4.1",
+    "pr-56: server.json bumped to v0.4.1 (was 0.3.3, then 0.4.0)"
   );
   assertTrue(
     Array.isArray(serverParsed.remotes) &&

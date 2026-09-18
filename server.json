@@ -1,18 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.slookisen/lokal-mcp",
-  "description": "Norwegian local-food MCP: 1,431+ farms, shops, markets + umbrellas (Bondens marked, Hanen, REKO).",
+  "description": "Norwegian local-food MCP: 1,700+ farms, shops, markets + umbrellas (Bondens marked, Hanen, REKO).",
+  "websiteUrl": "https://rettfrabonden.com",
   "repository": {
     "url": "https://github.com/slookisen/lokal",
     "source": "github",
     "subfolder": "mcp-server"
   },
-  "version": "0.4.0",
+  "version": "0.4.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "lokal-mcp",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "transport": {
         "type": "stdio"
       },
