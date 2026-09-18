@@ -1,17 +1,24 @@
 /**
  * rfb-address-line-no-duplicate-postal.test.ts — svar-gjennomgang 2026-09-09
  * (Daniel: «gå gjennom svarene … finn feilene og utbedre dem»), dev-request
- * 2026-09-09-rfb-profil-adresselinje-postnummer-dobbelt.
+ * 2026-09-09-rfb-profil-adresselinje-postnummer-dobbelt, extended by
+ * dev-request 2026-09-09-dobbelt-postnummer-mcp-og-samtaletjeneste (same
+ * defect on the MCP tool and the conversation service, outside PR #834's
+ * original scope).
  *
  * `agent_knowledge.address` very often already carries the postal code and
  * city ("Bergemoveien 42, 4886 GRIMSTAD"). The profile page appended
  * `, ${postalCode}` unconditionally, so 17 of 42 sampled live profiles
  * rendered "…, 4886 GRIMSTAD, 4886" (Smaken av Grimstad's reply 2026-09-09:
- * «postkoden er skrevet to ganger»). formatAddressLine() appends the postal
- * code only when the address string does not already contain it.
+ * «postkoden er skrevet to ganger»). formatAddressLine() (now shared from
+ * utils/address-format.ts, re-exported by ./seo for backward compat) appends
+ * the postal code only when the address string does not already contain it.
  *
  * Same synthetic router.handle() harness + in-memory-DB pattern as
- * rfb-trust-score-public-display-removed.test.ts.
+ * rfb-trust-score-public-display-removed.test.ts, including its
+ * registry-cache-reset convention in `finally` (2026-09-09 independent
+ * review of PR #834 found this suite leaked two synthetic agents in
+ * `marketplaceRegistry`'s module-level cache by never resetting it).
  */
 import Database from "better-sqlite3";
 
@@ -38,7 +45,7 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
   }
 
   // ── (1) Unit: formatAddressLine ─────────────────────────────────────────
-  const { formatAddressLine } = require("./seo") as typeof import("./seo");
+  const { formatAddressLine } = require("../utils/address-format") as typeof import("../utils/address-format");
   assertTrue(formatAddressLine("Bergemoveien 42, 4886 GRIMSTAD", "4886") === "Bergemoveien 42, 4886 GRIMSTAD",
     "unit: postal code already in address (Brreg-style line) is not appended again");
   assertTrue(formatAddressLine("Storgata 1", "0150") === "Storgata 1, 0150",
@@ -123,8 +130,63 @@ export async function runAddressLineNoDuplicatePostalTests(opts: { log?: boolean
       assertTrue(r.status === 200, "produsent (address without postal code): renders 200");
       assertTrue(r.body.includes("Storgata 1, 0150"), "produsent: postal code is still appended when the address lacks it");
     }
+
+    // ── (3) MCP tool lokal_info — dev-request 2026-09-09-dobbelt-postnummer-mcp-og-samtaletjeneste ──
+    {
+      const mcpRoutePath = require.resolve("./mcp");
+      delete require.cache[mcpRoutePath];
+      const { registerTools } = require("./mcp") as typeof import("./mcp");
+      const tools = new Map<string, { config: any; handler: (args: any, extra?: any) => Promise<any> }>();
+      const fakeServer: any = {
+        registerTool(name: string, config: any, handler: any) { tools.set(name, { config, handler }); },
+        resource() { /* no-op */ },
+        prompt() { /* no-op */ },
+        registerResource() { /* no-op */ },
+        registerPrompt() { /* no-op */ },
+      };
+      registerTools(fakeServer, () => "test-client", () => undefined);
+      const info = tools.get("lokal_info");
+      assertTrue(!!info, "setup: lokal_info tool is registered");
+      if (info) {
+        const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
+        const dupResult = await info.handler({ agentId: "dup-1" });
+        const dupText = textOf(dupResult);
+        assertTrue(dupText.includes("Bergemoveien 42, 4886 GRIMSTAD"), "lokal_info: the stored address line renders");
+        assertTrue(!dupText.includes("4886 GRIMSTAD, 4886"), "lokal_info: does not repeat the postal code after the city");
+
+        const nodupResult = await info.handler({ agentId: "nodup-1" });
+        const nodupText = textOf(nodupResult);
+        assertTrue(nodupText.includes("Storgata 1, 0150"), "lokal_info: postal code is still appended when the address lacks it");
+      }
+      try { delete require.cache[require.resolve("./mcp")]; } catch { /* ignore */ }
+    }
+
+    // ── (4) Conversation service — dev-request 2026-09-09-dobbelt-postnummer-mcp-og-samtaletjeneste ──
+    {
+      const convPath = require.resolve("../services/conversation-service");
+      delete require.cache[convPath];
+      const { conversationService } = require("../services/conversation-service") as
+        typeof import("../services/conversation-service");
+      const dupResponse = conversationService.generateSellerResponse("dup-1", "adresse");
+      assertTrue(!!dupResponse, "conversation-service: generateSellerResponse returns a response for dup-1");
+      if (dupResponse) {
+        assertTrue(dupResponse.text.includes("Bergemoveien 42, 4886 GRIMSTAD"), "conversation-service: the stored address line renders");
+        assertTrue(!dupResponse.text.includes("4886 GRIMSTAD, 4886"), "conversation-service: does not repeat the postal code after the city");
+      }
+      const nodupResponse = conversationService.generateSellerResponse("nodup-1", "adresse");
+      assertTrue(!!nodupResponse, "conversation-service: generateSellerResponse returns a response for nodup-1");
+      if (nodupResponse) {
+        assertTrue(nodupResponse.text.includes("Storgata 1, 0150"), "conversation-service: postal code is still appended when the address lacks it");
+      }
+      try { delete require.cache[require.resolve("../services/conversation-service")]; } catch { /* ignore */ }
+    }
   } finally {
     try { __setDbForTesting(prevDb as any); } catch { /* ignore */ }
+    try {
+      const regModCleanup = require("../services/marketplace-registry");
+      regModCleanup.marketplaceRegistry._agentsCache = null;
+      regModCleanup.marketplaceRegistry._statsCache = null;
+    } catch { /* ignore */ }
     try { testDb.close(); } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./seo")]; } catch { /* ignore */ }
   }
