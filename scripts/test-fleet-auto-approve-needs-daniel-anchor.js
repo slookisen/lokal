@@ -86,10 +86,20 @@ function hasGenuineNeedsDanielFlag(text) {
   const NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
   const CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
   const PUNCT_TOKENS = ['--', '—', '–', '\n', '.', '!', '?', ',', ';', ':', '('];
-  const PREDICTIVE_WORD_RE = /\b(likely|probably|anticipat(?:e|es|ed)|predict(?:s|ed)?|expect(?:s|ed)?|antagelig|trolig|sannsynligvis)\b/i;
-  const PREDICTIVE_MODAL_RE = /\b(?:will|vil|kommer\s+til\s+å)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+  // Review finding (2026-09-18, independent fresh-context review of this fix):
+  // an EARLIER version fired on a bare epistemic word (e.g. "expect") anywhere
+  // in the clause, with no requirement that it actually be a forecast ABOUT
+  // THE GATE. That silently suppressed real escalations using ordinary
+  // phrasing — "I expect this needs_daniel review given the admin route
+  // change" is a genuine flag, not a prediction of the gate's own verdict — a
+  // false negative in a hard-stop security gate. Fixed: the epistemic marker
+  // (word OR modal) must now itself be paired with a gate-outcome verb
+  // (flag/route/block/...) within a short span, same as the modal case
+  // always required — a bare marker with no nearby outcome-verb reference
+  // never suppresses. See cases 28-29 (adversarial, from the review) below.
+  const PREDICTIVE_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
   function hasPredictiveFraming(clause) {
-    return PREDICTIVE_WORD_RE.test(clause) || PREDICTIVE_MODAL_RE.test(clause);
+    return PREDICTIVE_RE.test(clause);
   }
   function clauseStart(preceding) {
     let best = 0;
@@ -350,6 +360,22 @@ check(
 check(
   'case27 (negative control): "will" in-clause but not paired with an outcome verb -> still flagged',
   'This change will require genuine needs_daniel review before merge.',
+  true
+);
+
+// 28-29 (adversarial, found in independent review of this fix, 2026-09-18):
+// a bare epistemic word ("expect") with NO nearby gate-outcome verb must
+// still flag — this is ordinary phrasing for a genuine human escalation,
+// not a forecast about the gate's own behavior, and the fix must not
+// swallow it.
+check(
+  'case28 (adversarial, review finding): "I expect this needs_daniel review..." (no outcome verb nearby) -> still flagged',
+  'I expect this needs_daniel review given the admin route change; please route to Daniel before merge.',
+  true
+);
+check(
+  'case29 (adversarial, review finding): "We expect reviewers to note this needs_daniel escalation..." -> still flagged',
+  'We expect reviewers to note this needs_daniel escalation immediately, this is not optional.',
   true
 );
 

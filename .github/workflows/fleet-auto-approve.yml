@@ -165,10 +165,20 @@ jobs:
             // outcome verb — flag/route/block/flagge/rute/blokkere — within a
             // short span) means this occurrence is prose ABOUT the gate's
             // behavior, not a flag FROM a reviewer, and does not trip the stop.
-            const NEEDS_DANIEL_PREDICTIVE_WORD_RE = /\b(likely|probably|anticipat(?:e|es|ed)|predict(?:s|ed)?|expect(?:s|ed)?|antagelig|trolig|sannsynligvis)\b/i;
-            const NEEDS_DANIEL_PREDICTIVE_MODAL_RE = /\b(?:will|vil|kommer\s+til\s+å)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+            // Review finding (2026-09-18, independent fresh-context review of this
+            // fix): an EARLIER version of this check fired on a bare epistemic word
+            // (e.g. "expect") anywhere in the clause, with no requirement that it
+            // actually be a forecast ABOUT THE GATE. That silently suppressed real
+            // escalations using ordinary phrasing — "I expect this needs_daniel
+            // review given the admin route change" is a genuine flag, not a
+            // prediction of the gate's own verdict — a false negative in a hard-stop
+            // security gate. Fixed: the epistemic marker (word OR modal) must now
+            // itself be paired with a gate-outcome verb (flag/route/block/...)
+            // within a short span, same as the modal case always required — a bare
+            // marker with no nearby outcome-verb reference never suppresses.
+            const NEEDS_DANIEL_PREDICTIVE_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
             function hasPredictiveFraming(clause) {
-              return NEEDS_DANIEL_PREDICTIVE_WORD_RE.test(clause) || NEEDS_DANIEL_PREDICTIVE_MODAL_RE.test(clause);
+              return NEEDS_DANIEL_PREDICTIVE_RE.test(clause);
             }
             const NEEDS_DANIEL_NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
             const NEEDS_DANIEL_CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
