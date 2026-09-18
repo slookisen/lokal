@@ -7371,6 +7371,79 @@ export function getGardssalgOrgnrWriteBlocker(providerId: string, orgNr: string)
   return null;
 }
 
+// dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+// avvist: getGardssalgOrgnrWriteBlocker's `already_filled`/`owner_locked`
+// outcomes used to collapse into ONE generic
+// `write_refused_filled_locked_or_conflict` reason at the write callsite
+// (routes/opplevelser.ts's gardssalg-orgnr-review-approve), with no record
+// of WHICH of the two applied, and — for `already_filled` specifically — no
+// distinction between "already holds this EXACT candidate value" (nothing to
+// do, safe to close out) and "holds a genuinely DIFFERENT value" (a real
+// conflict that must never be silently overwritten). Measured live
+// 2026-09-16: 2 of 15 stale gardssalg_orgnr_review_queue rows (Små Vesen
+// Bryggeri, Atlungstad Brenneri) sat forever behind exactly this collapsed
+// reason after the LLM judge had already said GODKJENN.
+//
+// This is a PURE, read-only differentiator — it changes NOTHING about
+// whether a write happens (that is still getGardssalgOrgnrWriteBlocker's
+// job, unchanged, still consulted first by every caller). It answers, for a
+// row getGardssalgOrgnrWriteBlocker has already blocked, WHICH of the three
+// distinct reasons the spec names actually applies:
+//   "locked"   — owner-lock (content_source manual/claim) — the write must
+//                NEVER be bypassed, full stop, regardless of any value.
+//   "filled"   — the field already holds a value. `identical: true` when
+//                that stored value is the EXACT same candidate being
+//                approved (nothing to write, safe to treat as already
+//                resolved); `identical: false` downgrades this, per the
+//                dev-request's own taxonomy, to...
+//   "conflict" — the field holds a value that genuinely DIFFERS from the
+//                candidate — a real disagreement, never auto-resolved.
+//
+// Returns null when the row has neither an owner-lock nor an existing org_nr
+// (i.e. getGardssalgOrgnrWriteBlocker's block, if any, is something OTHER
+// than these two — invalid format, provider not found, or the cross-provider
+// UNIQUE `org_nr_conflict` a DIFFERENT provider already holding this exact
+// number — deliberately out of scope for this taxonomy, which is only about
+// THIS row's own target-field fill/lock state; callers keep using
+// getGardssalgOrgnrWriteBlocker's raw reason string for those).
+export interface GardssalgOrgnrWriteBlockDetail {
+  reason: "filled" | "locked" | "conflict";
+  stored_org_nr: string | null;
+  candidate_org_nr: string;
+  /** Only meaningful when reason === "filled": true iff stored_org_nr === candidate_org_nr. */
+  identical: boolean;
+}
+
+export function classifyGardssalgOrgnrWriteBlock(
+  providerId: string,
+  orgNr: string
+): GardssalgOrgnrWriteBlockDetail | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT content_source, org_nr FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { content_source: string | null; org_nr: string | null } | undefined;
+  if (!row) return null;
+  const cleanOrgNr = (orgNr || "").trim();
+
+  // Owner-lock checked FIRST, exactly like getGardssalgOrgnrWriteBlocker —
+  // an owner-locked row is reported as locked regardless of its current
+  // org_nr value (blank or filled), because the lock is what vetoes the
+  // write, not the field's content.
+  if (row.content_source === "manual" || row.content_source === "claim") {
+    return { reason: "locked", stored_org_nr: row.org_nr ?? null, candidate_org_nr: cleanOrgNr, identical: false };
+  }
+
+  const stored = row.org_nr && row.org_nr.trim() !== "" ? row.org_nr.trim() : null;
+  if (stored === null) return null; // not filled, not locked -> not this taxonomy's concern
+  const identical = stored === cleanOrgNr;
+  return {
+    reason: identical ? "filled" : "conflict",
+    stored_org_nr: stored,
+    candidate_org_nr: cleanOrgNr,
+    identical,
+  };
+}
+
 export function applyGardssalgProviderOrgnr(
   providerId: string,
   orgNr: string,
@@ -7792,16 +7865,38 @@ export function clearGardssalgOrgnrReviewQueueEntry(providerId: string): void {
 }
 
 /** Lists all current review-queue entries, newest-updated first. Read-only,
- * backs GET /admin/gardssalg-orgnr-review-queue. */
+ * backs GET /admin/gardssalg-orgnr-review-queue.
+ *
+ * dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+ * avvist, AC1: a `conflict`/`locked` row must surface BOTH values it needs
+ * a human to weigh — the candidate (already a column on this table,
+ * `candidate_orgnr`) and the CURRENTLY STORED value on the provider's own
+ * row, which this table itself never carries. `stored_org_nr` is therefore
+ * a fresh LEFT JOIN against experience_providers on every call — never
+ * cached on the queue row itself, so it always reflects the provider's
+ * live org_nr rather than a snapshot that could go stale the moment
+ * anything else writes that field. Additive: every pre-existing caller of
+ * this function ignores the extra key and is unaffected. */
 export function listGardssalgOrgnrReviewQueue(): (GardssalgOrgnrReviewQueueEntry & {
   id: string;
   created_at: string;
   updated_at: string;
+  stored_org_nr: string | null;
 })[] {
   const db = getDb(VERTICAL);
   return db
-    .prepare(`SELECT * FROM gardssalg_orgnr_review_queue ORDER BY updated_at DESC`)
-    .all() as (GardssalgOrgnrReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+    .prepare(
+      `SELECT q.*, ep.org_nr AS stored_org_nr
+         FROM gardssalg_orgnr_review_queue q
+         LEFT JOIN experience_providers ep ON ep.id = q.provider_id
+        ORDER BY q.updated_at DESC`
+    )
+    .all() as (GardssalgOrgnrReviewQueueEntry & {
+    id: string;
+    created_at: string;
+    updated_at: string;
+    stored_org_nr: string | null;
+  })[];
 }
 
 // The catalog's display names often carry a "— Sted" suffix ("Ægir Bryggeri —
