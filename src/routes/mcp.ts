@@ -493,7 +493,7 @@ export function registerTools(
 
       // Contact
       const contact: string[] = [];
-      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode)}`);
+      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
       if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
       if (k.email) contact.push(`✉️ ${k.email}`);
       if (k.website) contact.push(`🌐 ${k.website}`);
