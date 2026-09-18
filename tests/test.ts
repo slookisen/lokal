@@ -28824,6 +28824,14 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   const prevDispatchGB = process.env.BOOKING_DISPATCH_ENABLED;
   process.env.BOOKING_DISPATCH_ENABLED = "true";
 
+  // Isolation contract for any new block: restore-in-finally, always (see the
+  // SHARED GLOBAL STATE comment at the top of this file, and the P0 CI fix
+  // applied to the gardssalg-previsit-svarsloyfe block) — a thrown assertion
+  // failure partway through must not leave EXPERIENCES_DB_PATH/
+  // BOOKING_DISPATCH_ENABLED permanently overridden for later blocks in this
+  // same process.
+  try {
+
   const dbFacPathGB = require.resolve("../src/database/db-factory");
   const expStPathGB = require.resolve("../src/services/experience-store");
   const bookStPathGB = require.resolve("../src/services/booking-store");
@@ -28860,6 +28868,25 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   // purposes of this regression block (see comment above).
   dbGB.prepare("UPDATE experience_providers SET booking_live = 1 WHERE id = ?").run(provIdGB);
   expStGB.backfillProviderSlugs();
+
+  // P0 CI fix (2026-09-18, dev-request 2026-09-11-flere-hardkodede-fremtidsdatoer-
+  // vil-ga-stale — same class as PR #848's previsit fix): gb-05's slot_at used to
+  // hardcode an absolute 2026-10 calendar date, which eventually falls behind the
+  // real clock and gets HARD-rejected by the public route's past-slot_at gate
+  // (gardssalg-opening-hours.ts's slotBoundsError()). Compute it relative to now
+  // instead so the fixture never goes stale again. This booking's slot_at is never
+  // asserted against a specific value downstream (only party_size/guest_name/
+  // status are), so no osloDatetimeLocalToUtcIso()-derived expectation is needed
+  // here — just a comfortably-future wall-clock value.
+  function gbOsloNakedNDaysFromNow(days: number, hhmm: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date(Date.now() + days * 24 * 3600_000));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}T${hhmm}`;
+  }
+  const GB_SLOT_DAYS_AHEAD = 7; // comfortably future regardless of what hour the suite runs at
+  const goodSlotWallGB = gbOsloNakedNDaysFromNow(GB_SLOT_DAYS_AHEAD, "14:00");
 
   // invokeSeo — same shape as the p2/sq-caticon helpers, generalized to pick
   // GET or POST (Express gives each method its own Route/layer even when the
@@ -28950,7 +28977,7 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
     { providerSlug: slugGB }, `/kategori/gardssalg/book/${slugGB}`,
     {
       body: {
-        slot_at: "2026-10-15T14:00", party_size: "3",
+        slot_at: goodSlotWallGB, party_size: "3",
         guest_name: "Kari Nordmann", guest_email: "kari@example.no", guest_phone: "12345678",
       },
     });
@@ -28991,12 +29018,19 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   assertTrue(!!otherRowGB && listGB.body.includes(`/kategori/gardssalg/book/${otherRowGB.slug}`),
     "gb-08e: CTA gate is now slug-based, not hjemmeside-based (shows for a producer with no website)");
 
-  if (prevPathGB === undefined) delete process.env.EXPERIENCES_DB_PATH;
-  else process.env.EXPERIENCES_DB_PATH = prevPathGB;
-  if (prevDispatchGB === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
-  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGB;
-  dbFacGB.__resetDbFactoryForTesting();
   console.log("  gardssalg-book: OK (panel render, unknown-slug 404, no-JS POST create+redirect, provider ownership, CTA fix)");
+  } finally {
+    // See the P0 CI fix comment above this try — restoration MUST happen even
+    // if the block above threw partway through (e.g. a stale hardcoded
+    // fixture date rejected by the booking route), or a later block in this
+    // same process inherits a corrupted EXPERIENCES_DB_PATH/
+    // BOOKING_DISPATCH_ENABLED.
+    if (prevPathGB === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathGB;
+    if (prevDispatchGB === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+    else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGB;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+  }
 })();
 
 // ─── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / booking_live gate
@@ -29025,6 +29059,21 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   const prevPathGDL = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevDispatchGDL = process.env.BOOKING_DISPATCH_ENABLED;
+
+  // Isolation contract for any new block: restore-in-finally, always (see the
+  // SHARED GLOBAL STATE comment at the top of this file, and the P0 CI fix
+  // applied to the gardssalg-previsit-svarsloyfe block) — a thrown assertion
+  // failure partway through (e.g. a stale hardcoded fixture date rejected by
+  // the booking route) must not leave EXPERIENCES_DB_PATH/
+  // BOOKING_DISPATCH_ENABLED/emailService.sendEmail permanently overridden
+  // for later blocks in this same process. Captured before the try (same
+  // singleton module instance the in-block override further down patches,
+  // since email-service's require.cache is never cleared in this block) so
+  // `finally` can restore it regardless of where inside the try a throw
+  // happens.
+  const emailSvcRestoreGDL = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendRestoreGDL = emailSvcRestoreGDL.emailService.sendEmail.bind(emailSvcRestoreGDL.emailService);
+  try {
 
   const dbFacPathGDL = require.resolve("../src/database/db-factory");
   const expStPathGDL = require.resolve("../src/services/experience-store");
@@ -29232,6 +29281,32 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   process.env.BOOKING_DISPATCH_ENABLED = "true";
   dbGDL.prepare("UPDATE experience_providers SET booking_live = 1 WHERE id = ?").run(provIdGDL);
 
+  // P0 CI fix (2026-09-18, dev-request 2026-09-11-flere-hardkodede-fremtidsdatoer-
+  // vil-ga-stale — same class as PR #848's previsit fix, and out-of-scope follow-up
+  // #2 named in that PR): gdl-11/12/13's slot_at fixtures used to hardcode absolute
+  // 2026-10 calendar dates, which eventually fall behind the real clock and get
+  // HARD-rejected by the public route's past-slot_at gate (once the pause gate
+  // above is satisfied, checkBookingSlotAllowed() in gardssalg-opening-hours.ts is
+  // the very next thing evaluated). Compute them relative to now instead. None of
+  // these three bookings has a downstream UTC-instant assertion on its own slot_at
+  // (only status/ref/email-recipient are checked), so a plain Oslo wall-clock
+  // value is enough — no osloDatetimeLocalToUtcIso() conversion needed. The
+  // ORIGINAL fixture used three consecutive calendar days (Oct 21/22/23, 1 day
+  // apart each) purely to give each of the three independent bookings its own
+  // distinct slot; that day-gap is preserved here (base, base+1, base+2), it is
+  // not load-bearing test logic (unlike the previsit block's derived-slot math).
+  function gdlOsloNakedNDaysFromNow(days: number, hhmm: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date(Date.now() + days * 24 * 3600_000));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}T${hhmm}`;
+  }
+  const GDL_BASE_DAYS_AHEAD = 10; // comfortably future regardless of what hour the suite runs at
+  const liveSlotWallGDL = gdlOsloNakedNDaysFromNow(GDL_BASE_DAYS_AHEAD, "15:00");
+  const liveSlot2WallGDL = gdlOsloNakedNDaysFromNow(GDL_BASE_DAYS_AHEAD + 1, "10:00");
+  const liveSlot3WallGDL = gdlOsloNakedNDaysFromNow(GDL_BASE_DAYS_AHEAD + 2, "11:00");
+
   // gdl-09: booking panel notice gone, original microcopy restored.
   const panelLiveGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`);
@@ -29253,7 +29328,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   emailCallsGDL = [];
   const postLiveGDL = invokeSeoGDL("post", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`,
-    { body: { slot_at: "2026-10-21T15:00", party_size: "4", guest_name: "Lise Berg", guest_email: "lise@example.no" } });
+    { body: { slot_at: liveSlotWallGDL, party_size: "4", guest_name: "Lise Berg", guest_email: "lise@example.no" } });
   assertEq(postLiveGDL.status, 303, "gdl-11a: valid no-JS submission while live → 303 redirect (unchanged)");
   const redirLiveGDL = postLiveGDL.redirectTo || "";
   assertTrue(redirLiveGDL.includes("/confirm/"), "gdl-11b: redirects to the confirm sub-path (unchanged)");
@@ -29268,7 +29343,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   // gdl-12: JSON API while live → 201 created, real booking, both emails.
   emailCallsGDL = [];
   const jsonLiveGDL = invokeOppGDL({
-    provider_id: provIdGDL, slot_at: "2026-10-22T10:00", party_size: 1,
+    provider_id: provIdGDL, slot_at: liveSlot2WallGDL, party_size: 1,
     guest_name: "Jon Dahl", guest_email: "jon@example.no",
   });
   assertEq(jsonLiveGDL.status, 201, "gdl-12a: POST /api/opplevelser/book while live → 201 (unchanged)");
@@ -29288,20 +29363,26 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
     .run("sideri", provNoEmailGDL);
   emailCallsGDL = [];
   const jsonNoEpostGDL = invokeOppGDL({
-    provider_id: provNoEmailGDL, slot_at: "2026-10-23T11:00", party_size: 2,
+    provider_id: provNoEmailGDL, slot_at: liveSlot3WallGDL, party_size: 2,
     guest_name: "Silje Vik", guest_email: "silje@example.no",
   });
   assertEq(jsonNoEpostGDL.status, 201, "gdl-13a: booking still succeeds when the provider has no epost on file");
   assertEq(emailCallsGDL.length, 1, "gdl-13b: only the guest confirmation is attempted (producer send skipped, not thrown)");
   assertTrue(emailCallsGDL.some((c) => c.to === "silje@example.no"), "gdl-13c: guest still gets their confirmation");
 
-  (emailSvcModGDL.emailService as any).sendEmail = origSendGDL;
-  if (prevPathGDL === undefined) delete process.env.EXPERIENCES_DB_PATH;
-  else process.env.EXPERIENCES_DB_PATH = prevPathGDL;
-  if (prevDispatchGDL === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
-  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGDL;
-  dbFacGDL.__resetDbFactoryForTesting();
   console.log("  gardssalg-dark-launch-stop: OK (fail-safe flag default, SSR notices x3, hard stop on both entry points incl. no-row/no-email guarantees, flag-on+booking_live full-chain regression, producer dispatch + missing-epost safety)");
+  } finally {
+    // See the P0 CI fix comment above this try — restoration MUST happen
+    // even if the block above threw partway through, or every later block in
+    // the process that depends on emailService's real dry-run behaviour gets
+    // silently corrupted.
+    (emailSvcRestoreGDL.emailService as any).sendEmail = origSendRestoreGDL;
+    if (prevPathGDL === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathGDL;
+    if (prevDispatchGDL === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+    else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGDL;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+  }
 })();
 
 // ─── gardssalg-test-provider-slice0: hidden-but-bookable test provider
@@ -29325,6 +29406,21 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   const prevPathTP = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevDispatchTP = process.env.BOOKING_DISPATCH_ENABLED;
+
+  // Isolation contract for any new block: restore-in-finally, always (see the
+  // SHARED GLOBAL STATE comment at the top of this file, and the P0 CI fix
+  // applied to the gardssalg-previsit-svarsloyfe block) — a thrown assertion
+  // failure partway through (e.g. a stale hardcoded fixture date rejected by
+  // the booking route) must not leave EXPERIENCES_DB_PATH/
+  // BOOKING_DISPATCH_ENABLED/emailService.sendEmail permanently overridden
+  // for later blocks in this same process. Captured before the try (same
+  // singleton module instance the in-block override further down patches,
+  // since email-service's require.cache is never cleared in this block) so
+  // `finally` can restore it regardless of where inside the try a throw
+  // happens.
+  const emailSvcRestoreTP = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendRestoreTP = emailSvcRestoreTP.emailService.sendEmail.bind(emailSvcRestoreTP.emailService);
+  try {
 
   const dbFacPathTP = require.resolve("../src/database/db-factory");
   const expStPathTP = require.resolve("../src/services/experience-store");
@@ -29473,6 +29569,33 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
     .get(TEST_ORG_NR_TP) as { c: number }).c;
   assertEq(testRowCountTP, 1, "tp-05c: exactly ONE test-provider row after two upserts");
 
+  // P0 CI fix (2026-09-18, dev-request 2026-09-11-flere-hardkodede-fremtidsdatoer-
+  // vil-ga-stale — same class as PR #848's previsit fix, and out-of-scope follow-up
+  // #3 named in that PR): tp-06a/tp-08c's slot_at fixtures used to hardcode
+  // absolute 2026-10/11 calendar dates, which eventually fall behind the real
+  // clock and get HARD-rejected by the public route's past-slot_at gate (once
+  // isBookingPaused() is satisfied, checkBookingSlotAllowed() in
+  // gardssalg-opening-hours.ts is the very next thing evaluated). Compute them
+  // relative to now instead. Neither booking has a downstream UTC-instant
+  // assertion on its own slot_at (only status/count/email-recipient are
+  // checked), so a plain Oslo wall-clock value is enough. The ORIGINAL fixture
+  // used tp-06a=Oct 31 and tp-08c=Nov 2 — a 2-day gap between the two
+  // independent bookings, purely so each got its own distinct slot; not
+  // load-bearing test logic, but preserved here anyway (TP_BASE_DAYS_AHEAD for
+  // tp-06a, +2 for tp-08c) even though tp-08c happens to run FIRST in file
+  // order (the carve-out section, "(e)", precedes "(b) booking dispatch" in
+  // this block's own body).
+  function tpOsloNakedNDaysFromNow(days: number, hhmm: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date(Date.now() + days * 24 * 3600_000));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}T${hhmm}`;
+  }
+  const TP_BASE_DAYS_AHEAD = 10; // comfortably future regardless of what hour the suite runs at
+  const bookTPSlotWallTP = tpOsloNakedNDaysFromNow(TP_BASE_DAYS_AHEAD, "13:00"); // tp-06a (was Oct 31)
+  const bookOffTPSlotWallTP = tpOsloNakedNDaysFromNow(TP_BASE_DAYS_AHEAD + 2, "13:00"); // tp-08c (was Nov 2)
+
   // ═══ (e) THE CARVE-OUT — hidden test provider dispatches with the global
   //     master switch OFF (isBookingPaused catalog_hidden=1 carve-out) ═══
   // Fly [env] could not turn BOOKING_DISPATCH_ENABLED on at runtime for this app,
@@ -29485,7 +29608,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   emailCallsTP = [];
   const beforeBookOffTP = countBookingsTP();
   const bookOffTP = invokeBookTP({
-    provider_id: testIdTP, slot_at: "2026-11-02T13:00", party_size: 3,
+    provider_id: testIdTP, slot_at: bookOffTPSlotWallTP, party_size: 3,
     guest_name: "Testgjest Off", guest_email: "gjest-off@example.no",
   });
   assertEq(bookOffTP.status, 201, "tp-08c: hidden test provider books (201) even with the global flag OFF");
@@ -29510,7 +29633,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   emailCallsTP = [];
   const beforeBookTP = countBookingsTP();
   const bookTP = invokeBookTP({
-    provider_id: testIdTP, slot_at: "2026-10-31T13:00", party_size: 2,
+    provider_id: testIdTP, slot_at: bookTPSlotWallTP, party_size: 2,
     guest_name: "Testgjest", guest_email: "gjest@example.no",
   });
   assertEq(bookTP.status, 201, "tp-06a: booking against the hidden test provider is NOT paused → 201");
@@ -29538,13 +29661,19 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   assertEq(countBookingsTP(), beforeBook2TP, "tp-07c: no booking row created for the paused ordinary provider");
   assertEq(emailCallsTP.length, 0, "tp-07d: no emails attempted for the paused ordinary provider");
 
-  (emailSvcModTP.emailService as any).sendEmail = origSendTP;
-  if (prevPathTP === undefined) delete process.env.EXPERIENCES_DB_PATH;
-  else process.env.EXPERIENCES_DB_PATH = prevPathTP;
-  if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
-  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
-  dbFacTP.__resetDbFactoryForTesting();
   console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count+slug lookup, still bookable by provider_id, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
+  } finally {
+    // See the P0 CI fix comment above this try — restoration MUST happen
+    // even if the block above threw partway through, or every later block in
+    // the process that depends on emailService's real dry-run behaviour gets
+    // silently corrupted.
+    (emailSvcRestoreTP.emailService as any).sendEmail = origSendRestoreTP;
+    if (prevPathTP === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathTP;
+    if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+    else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+  }
 })();
 
 // ─── gardssalg booking: kundekommentar + produsentens bekreft-løkke
@@ -29574,6 +29703,21 @@ const _bekreftLoekkePromise = runSerial(async () => {
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevDispatchBKC = process.env.BOOKING_DISPATCH_ENABLED;
   process.env.BOOKING_DISPATCH_ENABLED = "true";
+
+  // Isolation contract for any new block: restore-in-finally, always (see the
+  // SHARED GLOBAL STATE comment at the top of this file, and the P0 CI fix
+  // applied to the gardssalg-previsit-svarsloyfe block) — a thrown assertion
+  // failure partway through (e.g. a stale hardcoded fixture date rejected by
+  // the booking route) must not leave EXPERIENCES_DB_PATH/
+  // BOOKING_DISPATCH_ENABLED/emailService.sendEmail permanently overridden
+  // for later blocks in this same process. Captured before the try (same
+  // singleton module instance the in-block override further down patches,
+  // since email-service's require.cache is never cleared in this block) so
+  // `finally` can restore it regardless of where inside the try a throw
+  // happens.
+  const emailSvcRestoreBKC = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendRestoreBKC = emailSvcRestoreBKC.emailService.sendEmail.bind(emailSvcRestoreBKC.emailService);
+  try {
 
   const dbFacPathBKC = require.resolve("../src/database/db-factory");
   const expStPathBKC = require.resolve("../src/services/experience-store");
@@ -29679,6 +29823,31 @@ const _bekreftLoekkePromise = runSerial(async () => {
     return { status, json: jsonBody, redirectTo };
   }
 
+  // P0 CI fix (2026-09-18, dev-request 2026-09-11-flere-hardkodede-fremtidsdatoer-
+  // vil-ga-stale — same class as PR #848's previsit fix): bkc-02/bkc-04's
+  // slot_at fixtures used to hardcode absolute 2026-10 calendar dates, which
+  // eventually fall behind the real clock and get HARD-rejected by the public
+  // route's past-slot_at gate (checkBookingSlotAllowed() in
+  // gardssalg-opening-hours.ts). Compute them relative to now instead. Neither
+  // booking has a downstream UTC-instant assertion on its own slot_at (only
+  // notes/status/email-content are checked — the later pre-visit-window checks
+  // in (2b)/(2c) only need slot_at to still be somewhere in the future, not any
+  // exact instant), so a plain Oslo wall-clock value is enough. The ORIGINAL
+  // fixture used bkc-02=Oct 15 and bkc-04=Oct 16 — a 1-day gap between the two
+  // independent bookings (SSR form vs. JSON API, different guests), purely so
+  // each got its own distinct slot; not load-bearing test logic, but preserved
+  // here anyway (BKC_BASE_DAYS_AHEAD, then +1).
+  function bkcOsloNakedNDaysFromNow(days: number, hhmm: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date(Date.now() + days * 24 * 3600_000));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}T${hhmm}`;
+  }
+  const BKC_BASE_DAYS_AHEAD = 7; // comfortably future regardless of what hour the suite runs at
+  const formSlotWallBKC = bkcOsloNakedNDaysFromNow(BKC_BASE_DAYS_AHEAD, "14:00"); // bkc-02 (was Oct 15)
+  const jsonSlotWallBKC = bkcOsloNakedNDaysFromNow(BKC_BASE_DAYS_AHEAD + 1, "11:00"); // bkc-04 (was Oct 16)
+
   // ═══ (1a) form renders the comment field ═══
   const panelBKC = await invokeSeoBKC("get", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`);
@@ -29693,7 +29862,7 @@ const _bekreftLoekkePromise = runSerial(async () => {
   emailCallsBKC = [];
   const postFormBKC = await invokeSeoBKC("post", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`,
-    { body: { slot_at: "2026-10-15T14:00", party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
+    { body: { slot_at: formSlotWallBKC, party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
   assertEq(postFormBKC.status, 303, "bkc-02a: no-JS submission with a note → 303");
   const refFormBKC = decodeURIComponent((postFormBKC.redirectTo || "").split("/confirm/")[1] || "");
   const bookingFormBKC = bookStBKC.getBookingByRef(refFormBKC);
@@ -29730,7 +29899,7 @@ const _bekreftLoekkePromise = runSerial(async () => {
 
   // ═══ (1d) JSON API: notes persist; confirm_url no longer leaks to guest ═══
   const jsonBookBKC = await invokeOppBKC("post", "/book", {}, {
-    provider_id: provIdBKC, slot_at: "2026-10-16T11:00", party_size: 4,
+    provider_id: provIdBKC, slot_at: jsonSlotWallBKC, party_size: 4,
     guest_name: "Jon Agent", guest_email: "jon-agent@example.no", notes: "Betaler med kort — går det?",
   });
   assertEq(jsonBookBKC.status, 201, "bkc-04a: JSON API booking with notes → 201");
@@ -29832,13 +30001,19 @@ const _bekreftLoekkePromise = runSerial(async () => {
   assertEq(bookStBKC.visitTimeReached({ slot_at: "ikke-en-dato" }), true,
     "bkc-13c: unparseable slot_at fails OPEN so a broken row can still be resolved");
 
-  (emailSvcModBKC.emailService as any).sendEmail = origSendBKC;
-  if (prevPathBKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
-  else process.env.EXPERIENCES_DB_PATH = prevPathBKC;
-  if (prevDispatchBKC === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
-  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchBKC;
-  dbFacBKC.__resetDbFactoryForTesting();
   console.log("  gardssalg-bekreftloekke: OK (notes felt→row→begge e-poster escaped, token aldri i gjeste-e-post, confirm_url fjernet fra API-svar, legacy GET redirect-only, POST-basert bekreft med tidsvakt, korreksjon + angre m/ billable, idempotens, ukjent token/handling)");
+  } finally {
+    // See the P0 CI fix comment above this try — restoration MUST happen
+    // even if the block above threw partway through, or every later block in
+    // the process that depends on emailService's real dry-run behaviour gets
+    // silently corrupted.
+    (emailSvcRestoreBKC.emailService as any).sendEmail = origSendRestoreBKC;
+    if (prevPathBKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathBKC;
+    if (prevDispatchBKC === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+    else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchBKC;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+  }
 });
 
 // ─── gardssalg-go-live-gate slice 3: provider kommune/fylke geocode fallback
