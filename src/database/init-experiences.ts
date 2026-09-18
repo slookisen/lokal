@@ -1418,6 +1418,59 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_verification_sweep_state failed:", err);
   }
 
+  // ─── experience_orgnr_sweep_state (dev-request 2026-09-14-opplevagent-
+  // karantene-utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-kommune-
+  // mangler-cron-kobling-og-persistert-cursor") ───────────────────────────
+  // Same failure class, same fix shape, as gardssalg_website_verification_
+  // sweep_state above: POST /admin/experiences-orgnr-from-website (Trinn A)
+  // and POST /admin/experiences-orgnr-from-name-kommune (Trinn B) each take
+  // an optional `after` keyset-pagination cursor, but a naive periodic
+  // caller that always omits it would re-scan the same unresolvable leading
+  // window of the brreg_active IS NULL backlog (985+ rows for Trinn A,
+  // 1845+ for Trinn B) forever and never progress. This table is the
+  // server-side memory both routes now keep, one row per route, holding the
+  // cursor the NEXT call (that omits `after` in its request body) should
+  // resume from.
+  //
+  // Unlike gardssalg_website_verification_sweep_state's plain INTEGER
+  // next_offset, this table stores a TEXT keyset cursor (the last-scanned
+  // provider id, per experience-orgnr-from-website.ts's/experience-orgnr-
+  // from-name-kommune.ts's own `next_after` — see their shared header
+  // comment on why a keyset cursor, not a plain offset, is required once
+  // rows can drop out of the eligible set mid-sweep). ONE shared table, not
+  // two, keyed by `route` ('orgnr_from_website' | 'orgnr_from_name_kommune')
+  // — the two services are otherwise fully independent, but this cursor
+  // bookkeeping is identical, so a shared table avoids duplicating the same
+  // three columns twice. See getExperienceOrgnrSweepAfter/
+  // setExperienceOrgnrSweepAfter (services/experience-orgnr-sweep-state.ts)
+  // for the read/write contract, and each route's own doc comment
+  // (routes/opplevelser.ts) for exactly when each is called — only on the
+  // OMITTED-`after` path; an explicit `after` in the request body stays
+  // purely request-driven, exactly as before this dev-request, and never
+  // reads or writes this table either way.
+  //
+  // ABSENCE of a row (fresh DB, or a route never swept via the omitted-
+  // `after` path yet) means "resume from the start" (next_after =
+  // undefined) — same "absence = default" convention as
+  // gardssalg_website_verification_sweep_state above, so no seed migration
+  // is needed and every existing deployment is unaffected the instant this
+  // table exists. next_after is persisted as NULL (not left at whatever the
+  // last page's cursor was) once a tick's own next_after comes back null —
+  // i.e. that route's backlog was exhausted this pass — so the FOLLOWING
+  // omitted-`after` call starts a fresh pass instead of being permanently
+  // stuck reporting "nothing left" forever.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_orgnr_sweep_state (
+        route TEXT PRIMARY KEY,
+        next_after TEXT,
+        updated_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_orgnr_sweep_state failed:", err);
+  }
+
   // ─── gardssalg_field_concordance_review_queue (orchestrator dev-request
   // 2026-08-03-gardssalg-field-concordance, write-side slice) ────────────────
   // The review queue for `avvik` verdicts produced by the field-concordance
