@@ -3611,7 +3611,13 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
 export type GardssalgSearchFilter = {
   fylke?: string;
   kommune?: string;
-  producer_type?: string;
+  // Fase 5a/5b (dev-request 2026-07-25-reisesok…): a string[] lets a caller
+  // (discover_gardssalg, resolving a canonical drink-taxonomy.ts subcategory
+  // like "mjød") match every known DB spelling of one drink type at once —
+  // e.g. producer_type is stored as EITHER 'mjøderi' or 'mjoderi' in
+  // experience_providers, and an exact-string filter on just "mjød" (the
+  // spec's own canonical spelling) would otherwise match zero rows.
+  producer_type?: string | string[];
   booking_live?: boolean;
   lat?: number;
   lng?: number;
@@ -3690,7 +3696,18 @@ export function searchGardssalgProviders(
 
   if (filter.fylke) { where.push("fylke = @fylke"); params.fylke = filter.fylke; }
   if (filter.kommune) { where.push("kommune = @kommune"); params.kommune = filter.kommune; }
-  if (filter.producer_type) { where.push("producer_type = @producer_type"); params.producer_type = filter.producer_type; }
+  if (filter.producer_type) {
+    if (Array.isArray(filter.producer_type)) {
+      if (filter.producer_type.length > 0) {
+        const placeholders = filter.producer_type.map((_, i) => `@producer_type_${i}`);
+        where.push(`producer_type IN (${placeholders.join(",")})`);
+        filter.producer_type.forEach((v, i) => { params[`producer_type_${i}`] = v; });
+      }
+    } else {
+      where.push("producer_type = @producer_type");
+      params.producer_type = filter.producer_type;
+    }
+  }
   // Only the "show me the live ones" case is a real filter; omitted/false
   // means no filter on this column (not "show me the paused ones").
   if (filter.booking_live === true) { where.push("booking_live = 1"); }

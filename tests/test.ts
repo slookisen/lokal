@@ -44720,3 +44720,105 @@ runSerial(async () => {
     failures.push("rfb-verification-no-platform-badge-claim: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5a:
+// services/drink-taxonomy.ts — the shared six-value drink subcategory
+// taxonomy (bryggeri/cideri/vingård/destilleri/gårdskafé/mjød). Pure module,
+// no DB/network. Tail position is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok, Fase 5a: drink-taxonomy ──");
+  try {
+    const { runDrinkTaxonomyTests } = require("../src/services/drink-taxonomy.test") as
+      typeof import("../src/services/drink-taxonomy.test");
+    const dt = runDrinkTaxonomyTests({ log: false });
+    passed += dt.passed;
+    failed += dt.failed;
+    for (const f of dt.failures) failures.push("drink-taxonomy: " + f);
+    console.log(`  drink-taxonomy: ${dt.passed} passed, ${dt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("drink-taxonomy: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5b:
+// RFB's lokal_discover MCP tool + marketplaceRegistry.discover()'s
+// drinkSubcategory filter, exercised end to end against a real seeded
+// in-memory RFB DB. Tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok, Fase 5b: RFB drink-subcategory MCP + discover() ──");
+  try {
+    const { runDrinkSubcategoryMcpTests } = require("../src/routes/drink-subcategory-mcp.test") as
+      typeof import("../src/routes/drink-subcategory-mcp.test");
+    const dsm = await runDrinkSubcategoryMcpTests({ log: false });
+    passed += dsm.passed;
+    failed += dsm.failed;
+    for (const f of dsm.failures) failures.push("drink-subcategory-mcp: " + f);
+    console.log(`  drink-subcategory-mcp: ${dsm.passed} passed, ${dsm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("drink-subcategory-mcp: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5b:
+// OpplevAgent's discover_gardssalg producer_type canonical-alias expansion
+// (drink-taxonomy.ts -> GardssalgSearchFilter.producer_type string[]),
+// exercised end to end against a real seeded in-memory experiences DB. Tail
+// position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok, Fase 5b: OpplevAgent drink-subcategory MCP ──");
+  try {
+    const { runOpplevagentDrinkSubcategoryMcpTests } = require("../src/routes/opplevagent-drink-subcategory-mcp.test") as
+      typeof import("../src/routes/opplevagent-drink-subcategory-mcp.test");
+    const odsm = await runOpplevagentDrinkSubcategoryMcpTests({ log: false });
+    passed += odsm.passed;
+    failed += odsm.failed;
+    for (const f of odsm.failures) failures.push("opplevagent-drink-subcategory-mcp: " + f);
+    console.log(`  opplevagent-drink-subcategory-mcp: ${odsm.passed} passed, ${odsm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevagent-drink-subcategory-mcp: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5c:
+// GET /admin/agents/drink-coverage (RFB) — read-only drink-venue coverage
+// report, against a real seeded in-memory RFB DB. Tail position, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok, Fase 5c: RFB /admin/agents/drink-coverage ──");
+  try {
+    const { runAdminDrinkCoverageTests } = require("../src/routes/admin-drink-coverage.test") as
+      typeof import("../src/routes/admin-drink-coverage.test");
+    const adc = await runAdminDrinkCoverageTests({ log: false });
+    passed += adc.passed;
+    failed += adc.failed;
+    for (const f of adc.failures) failures.push("admin-drink-coverage: " + f);
+    console.log(`  admin-drink-coverage: ${adc.passed} passed, ${adc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-drink-coverage: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 5c:
+// GET /api/opplevelser/admin/drink-coverage (OpplevAgent gårdssalg +
+// experiences) — read-only drink-venue coverage report, against a real
+// seeded in-memory experiences DB. Tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok, Fase 5c: OpplevAgent /admin/drink-coverage ──");
+  try {
+    const { runOpplevelserDrinkCoverageTests } = require("../src/routes/opplevelser-drink-coverage.test") as
+      typeof import("../src/routes/opplevelser-drink-coverage.test");
+    const odc = await runOpplevelserDrinkCoverageTests({ log: false });
+    passed += odc.passed;
+    failed += odc.failed;
+    for (const f of odc.failures) failures.push("opplevelser-drink-coverage: " + f);
+    console.log(`  opplevelser-drink-coverage: ${odc.passed} passed, ${odc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-drink-coverage: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -36,12 +36,14 @@
 import { Router, type Request, type Response } from "express";
 import {
   corridorSearch,
+  classifyCandidateDrinkSubcategory,
   DEFAULT_MAX_DETOUR_KM,
   DEFAULT_MAX_PER_PLACE,
   DEFAULT_MIN_SEPARATION_KM,
   type CorridorSource,
   type CorridorSearchResult,
 } from "../services/route-corridor-service";
+import { isDrinkSubcategory } from "../services/drink-taxonomy";
 
 /** Round for output. Nothing downstream reads finer than 0.1 km. */
 function round1(n: number | null | undefined): number | null {
@@ -114,6 +116,8 @@ export function serialiseCorridor(r: CorridorSearchResult) {
       label: s.label,
       categories: s.categories,
       is_drink: !!s.isDrink,
+      /** Fase 5b: one of drink-taxonomy.ts's six canonical values, or null. */
+      drink_subcategory: s.isDrink ? classifyCandidateDrinkSubcategory(s) : null,
       url: s.url,
     })),
     /**
@@ -132,6 +136,7 @@ export function serialiseCorridor(r: CorridorSearchResult) {
         label: i.label,
         categories: i.categories,
         is_drink: !!i.isDrink,
+        drink_subcategory: i.isDrink ? classifyCandidateDrinkSubcategory(i) : null,
         url: i.url,
       })),
     })),
@@ -174,6 +179,14 @@ export function buildReiseApiRouter(opts: ReiseApiOptions): Router {
 
     const dbs = opts.databases();
 
+    // Fase 5b: ?drink_type=bryggeri|cideri|vingård|destilleri|gårdskafé|mjød —
+    // one of the six canonical subcategories (drink-taxonomy.ts). An
+    // unrecognised value is IGNORED (not 400ed) — this is a filter, not a
+    // required contract field, same forgiving treatment ?detour_max_km etc.
+    // already get from parseIntParam's fallback-on-NaN.
+    const drinkTypeRaw = typeof req.query.drink_type === "string" ? req.query.drink_type.trim() : "";
+    const drinkSubcategory = isDrinkSubcategory(drinkTypeRaw) ? drinkTypeRaw : undefined;
+
     let result: CorridorSearchResult;
     try {
       result = await corridorSearch({
@@ -184,7 +197,8 @@ export function buildReiseApiRouter(opts: ReiseApiOptions): Router {
         limit: parseIntParam(req.query.limit, 25),
         maxPerPlace: parseIntParam(req.query.max_per_place, DEFAULT_MAX_PER_PLACE),
         minSeparationKm: parseIntParam(req.query.min_separation_km, DEFAULT_MIN_SEPARATION_KM),
-        drinkOnly: req.query.drink === "true" || req.query.interests === "drikke",
+        drinkOnly: req.query.drink === "true" || req.query.interests === "drikke" || !!drinkSubcategory,
+        drinkSubcategory,
         sources: opts.sources,
         rfbDb: dbs.rfbDb,
         experiencesDb: dbs.experiencesDb,
