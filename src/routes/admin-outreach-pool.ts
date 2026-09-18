@@ -158,6 +158,32 @@ router.get("/stats", (req: Request, res: Response) => {
       )
       .get() as { c: number };
 
+    // dev-request 2026-09-16-rfb-pool-delta-null-tross-berikelse: the VIEW
+    // (database/init.ts) applies THREE more gates after url_fresh_and_ok
+    // before a row is actually visible in outreach_ready_pool —
+    // a.is_active=1, the role gate (NULL or 'producer'), and is_vetted
+    // (quarantine) — none of which this funnel previously counted on their
+    // own step. That made a run where newly-verified agents pass every
+    // counted stage but pool_size doesn't move indistinguishable from "5
+    // already-contacted agents" (the VIEW's final, uncounted
+    // outreach_sent_log NOT EXISTS gate) — operators had no way to tell
+    // "real gate loss" apart from "already sent" without a live DB probe.
+    // This mirrors the VIEW's active/role/vetted conditions verbatim so the
+    // gap to `not_yet_contacted_final` (which already equals the VIEW's own
+    // count, i.e. after the sent-log exclusion too) now isolates the
+    // sent-log exclusion specifically. Purely additive — no existing field's
+    // name or value changes, no gate's behavior changes.
+    const activeProducerVetted = db
+      .prepare(
+        `SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''
+           AND k.url_last_status IS NOT NULL AND k.url_last_status >= 200 AND k.url_last_status < 400
+           AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now', '-30 days')
+           AND a.is_active = 1
+           AND (a.role IS NULL OR a.role = 'producer')
+           AND (a.is_vetted IS NULL OR a.is_vetted = 1)`
+      )
+      .get() as { c: number };
+
     const parking = db
       .prepare(
         `SELECT
@@ -405,6 +431,16 @@ router.get("/stats", (req: Request, res: Response) => {
         verified_and_rich_or_partial: verifiedRichOrPartial?.c ?? 0,
         with_email: withEmail?.c ?? 0,
         url_fresh_and_ok: urlFreshAndOk?.c ?? 0,
+        // new stage (dev-request 2026-09-16-rfb-pool-delta-null-tross-berikelse):
+        // isolates the VIEW's is_active/role/is_vetted gates as their own step —
+        // a gap here vs. url_fresh_and_ok is a REAL gate loss (inactive, non-
+        // producer, or quarantined), distinct from the already-sent exclusion
+        // below.
+        active_producer_and_vetted: activeProducerVetted?.c ?? 0,
+        // any remaining gap vs. active_producer_and_vetted is the VIEW's
+        // outreach_sent_log NOT EXISTS exclusion (already contacted) — this
+        // field's own value is unchanged from before (still the VIEW's live
+        // count), only its neighbor above is new.
         not_yet_contacted_final: total?.c ?? 0,
       },
       homepage_parking: {
