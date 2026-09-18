@@ -1859,6 +1859,43 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── experiences.admission_verdict_prev / admission_checked_at_prev
+  // (dev-request 2026-09-17-opplevagent-needs-review-terminal-triage) ───────
+  // `experiences.admission_verdict`/`admission_checked_at` (block above) are
+  // a single CURRENT snapshot, overwritten in place on every judge run by
+  // the ONE shared writer, stampExperienceAdmissionVerdict()
+  // (experience-store.ts) — there has never been any history of a row's
+  // PRIOR verdict anywhere in this schema. POST
+  // /admin/experiences-needs-review-triage's rule (d) (routes/opplevelser.ts)
+  // needs to compare the last TWO judge verdicts (both `mismatch:` on a live
+  // page, at least 7 days apart) before concluding a needs_review row is a
+  // dead end worth terminally rejecting — so this pair of NEW, ADDITIVE,
+  // NULLABLE columns gives it exactly one step of history.
+  //
+  // admission_verdict_prev / admission_checked_at_prev: the value
+  //   admission_verdict/admission_checked_at held immediately BEFORE the
+  //   most recent stampExperienceAdmissionVerdict() call shifted them here.
+  //   NULL for every pre-existing row until it is judged at least once AFTER
+  //   this migration lands — a row judged MISMATCH once before this deploy
+  //   and once after will NOT yet have two tracked verdicts (the pre-deploy
+  //   one is lost), so rule (d) fails closed on it rather than firing on
+  //   incomplete history. This is expected to ramp up, not spike, as rows
+  //   get re-judged — see stampExperienceAdmissionVerdict()'s own comment.
+  // Same additive/idempotent ALTER idiom as every other migration block in
+  // this file; both columns are shifted-into ONLY by
+  // stampExperienceAdmissionVerdict() (the sole writer of
+  // admission_verdict/admission_checked_at — verified via grep), in the SAME
+  // atomic UPDATE that overwrites the current columns, so there is no
+  // SELECT-then-UPDATE race window. No index: read only by rule (d)'s own
+  // per-row JS evaluation, never by a query-layer filter.
+  const admissionGatePrevCols = [
+    "ALTER TABLE experiences ADD COLUMN admission_verdict_prev TEXT",
+    "ALTER TABLE experiences ADD COLUMN admission_checked_at_prev TEXT",
+  ];
+  for (const stmt of admissionGatePrevCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV
   // translations of experience + gårdssalg-provider prose, staged

@@ -521,17 +521,36 @@ export function createExperience(input: Experience): string {
  * slice, 2026-08-25). `verdict` is the inspectable outcome text the
  * bulk-load gate composes ("<match|mismatch|unresolved>: <judge reasoning>")
  * — see init-experiences.ts's admission-gate column block for the column
- * semantics. Write-once in practice (called only right after
- * createExperience() in the bulk-load apply path), but idempotent-safe:
+ * semantics. Called on every judge run for a row (content-judge-sweep,
+ * requarantine-rejudge, bulk-load), not just once — idempotent-safe:
  * re-stamping simply records the newest gate run. Never touches any other
  * column — updated_at deliberately NOT bumped, since the gate verdict is
  * metadata about the insert, not a content change.
+ *
+ * dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: before
+ * overwriting, this SAME UPDATE now shifts the CURRENT
+ * admission_verdict/admission_checked_at into the additive
+ * admission_verdict_prev/admission_checked_at_prev columns (init-
+ * experiences.ts) — one step of verdict history, read by rule (d) of POST
+ * /admin/experiences-needs-review-triage (routes/opplevelser.ts) to tell "two
+ * separate mismatch verdicts, N days apart" from a single stamp. Read via SQL
+ * (`admission_verdict_prev = admission_verdict`, not a JS-held value from a
+ * prior SELECT) in the SAME atomic UPDATE as the overwrite, deliberately
+ * never a separate SELECT-then-UPDATE — that would leave a race window where
+ * a concurrent stamp for the same row could be silently dropped from the
+ * history. This is the ONLY function anywhere in this codebase that writes
+ * admission_verdict/admission_checked_at (verified via grep for
+ * `admission_verdict = ` / `admission_checked_at = `), so this one change is
+ * enough to make the _prev columns correct for every future call site.
  */
 export function stampExperienceAdmissionVerdict(experienceId: string, verdict: string): void {
   const db = getDb(VERTICAL);
   db.prepare(
     `UPDATE experiences
-        SET admission_verdict = @verdict, admission_checked_at = datetime('now')
+        SET admission_verdict_prev = admission_verdict,
+            admission_checked_at_prev = admission_checked_at,
+            admission_verdict = @verdict,
+            admission_checked_at = datetime('now')
       WHERE id = @id`
   ).run({ id: experienceId, verdict });
 }
