@@ -5,8 +5,10 @@
  * Proves GET /api/marketplace/catalog/offers:
  *   - visibility filter (umbrella excluded, unverified excluded,
  *     verified_second_line excluded, inactive excluded, out-of-radius
- *     excluded — mirrors cart-service.ts's isAgentCartEligible() /
- *     the GET /feed filter, the "eligible for real checkout" bar).
+ *     excluded — based on cart-service.ts's isProducerEligible() /
+ *     the GET /feed filter, the "eligible for real checkout" bar; is_active
+ *     is checked here even though neither of those two currently check it,
+ *     a deliberately stricter bar, see catalog-offers.ts's own note).
  *   - sorted ascending by distance_km, capped at limit (default/max 5).
  *   - can_order = is_verified AND order_notifications_opt_in AND NOT
  *     blocklisted — each clause independently provable false.

@@ -5,13 +5,18 @@
 // (src/routes/mcp.ts) — one implementation, two callers, so the two
 // surfaces can never drift on filtering, sorting, or the can_order gate.
 //
-// Visibility filter mirrors cart-service.ts's isAgentCartEligible() /
+// Visibility filter is based on cart-service.ts's isProducerEligible() /
 // marketplace-catalog.ts's GET /feed — the same "eligible for real customer
 // checkout" bar used elsewhere on this exact `products` table: non-umbrella,
-// active, has coordinates, verification_status='verified', and NOT
+// has coordinates, verification_status='verified', and NOT
 // verified_second_line (that bar unlocks outreach/contact only, per
 // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel — never
-// real checkout).
+// real checkout). This filter additionally requires is_active=1, which
+// neither isProducerEligible() nor GET /feed currently check — a
+// deliberately STRICTER bar here (never show/offer a deactivated producer),
+// not a functional divergence from those two in the other direction; if
+// is_active ever needs to widen to match them exactly, that's a decision
+// for whoever owns this filter, not an oversight in this comment.
 //
 // Geo: bounding-box pre-filter + haversine, using the ONE shared
 // implementation in geo-distance.ts (the same helper lokal_search's
