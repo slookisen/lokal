@@ -111,6 +111,55 @@ type StreetShapeCoreResult =
   | { ok: false; reason: "other" };
 
 /**
+ * Guards 1+2 against a SINGLE comma segment: does it have the shape of a
+ * Norwegian street address ("<name…> <number><optional letter>"), and is
+ * that name not itself a NON_STREET_HEAD / longer than 3 words? Factored out
+ * of parseStreetShapeCore() (dev-request
+ * 2026-09-12-opplevagent-gaardsnavn-foran-gateadressen) so
+ * parseStreetShapeWithoutPostnummer() can run it against MULTIPLE segments in
+ * order — a farm/place name segment before the real street line ("Nedre
+ * Røhne Gård, Jernbanegata 287") — while parseAddressLike() keeps testing
+ * only `parts[0]`, unchanged. Returns null on ANY guard failure (no
+ * street-shape match, NON_STREET_HEAD, or >3 name words); guard 3
+ * (postnummer-collision) and guard 4 (foreign-country) are downstream of
+ * this and unchanged — they still apply to whichever segment this function
+ * picks, exactly as before for `parts[0]`.
+ */
+function evaluateSegmentStreetShape(
+  segment: string
+): { street: string; numberPart: string } | null {
+  // "<name…> <number><optional letter>" — the shape of a Norwegian street
+  // address. The name part must contain a letter and must not itself be the
+  // postnummer segment.
+  const streetMatch = segment.match(/^([\p{L}][\p{L}\s.'’-]{1,40}?)\s+(\d{1,4}\s?[A-Za-z]?)$/u);
+  if (!streetMatch) return null;
+  const namePart = streetMatch[1].trim();
+  const numberPart = streetMatch[2].replace(/\s+/g, "");
+  const street = `${namePart} ${numberPart}`;
+
+  // Review follow-up 5, guard 1: reject heads that take a number but are not a
+  // street — «Postboks 123», «P.b. 22», «Kai 4», «Bygg 3», «Sal 2», «Rom 12»,
+  // «Inngang 2», «Rv 7». Compared on the LAST word of the name part, so
+  // «Nedre Postboks» is rejected but «Postboksgata» (a real street) is not.
+  const headWord = namePart.split(/\s+/).pop() || "";
+  if (NON_STREET_HEAD.test(headWord)) return null;
+
+  // Guard 2 (word count) is checked BEFORE guard 3 (postnummer collision) in
+  // the caller — bug fix 2026-09-12: «Gården vår i Vestre Slidre 2966» must
+  // be rejected as prose regardless of guard 3's collision check, since it
+  // fires for BOTH reasons simultaneously (5-word name part AND its trailing
+  // number collides with the postnummer scan) and the caller-visible "why"
+  // has to be the prose rejection, not the (also true, but not the relevant)
+  // collision one — see parseStreetShapeWithoutPostnummer()'s doc comment
+  // below. A street name is at most a few words: «Gården vår i Vestre
+  // Slidre» is prose; a real Norwegian street name is 1-3 words («Nedre
+  // Slottsgate», «Kong Oscars gate»).
+  if (namePart.split(/\s+/).length > 3) return null;
+
+  return { street, numberPart };
+}
+
+/**
  * Shared core for parseAddressLike() and parseStreetShapeWithoutPostnummer()
  * (dev-request 2026-09-12-opplevagent-gateadresse-uten-postnummer). Runs
  * every guard parseAddressLike() has always run — delabel, care-of strip,
@@ -120,9 +169,25 @@ type StreetShapeCoreResult =
  * disagree on. Factored out so they can never drift apart on what counts as
  * "street-shaped and not obviously bogus" (both are still governed by the
  * exact same acceptance logic for everything up to that point).
+ *
+ * `opts.trySubsequentSegments` (dev-request
+ * 2026-09-12-opplevagent-gaardsnavn-foran-gateadressen, parseStreetShapeWithoutPostnummer()
+ * ONLY — parseAddressLike() never passes this, so it keeps testing `parts[0]`
+ * alone, byte-identical to before): when `parts[0]` does not have street
+ * shape (evaluateSegmentStreetShape() rejects it), try each SUBSEQUENT comma
+ * segment in order — same guards, same function — and use the first one that
+ * does. "Nedre Røhne Gård, Jernbanegata 287" -> parts[0] "Nedre Røhne Gård"
+ * fails (no trailing number); parts[1] "Jernbanegata 287" passes and becomes
+ * `street`. The segment(s) before the matched one are simply not looked at
+ * again — they are never written back into `adresse` (that text is real,
+ * useful information for visitors) and never appear in the Kartverket query
+ * built from `street`. Guard 3 (postnummer-collision) and guard 4
+ * (foreign-country) below still apply only to the ONE segment that matched
+ * guards 1+2, exactly as they always applied to `parts[0]`.
  */
 function parseStreetShapeCore(
-  meetingPoint: string | null | undefined
+  meetingPoint: string | null | undefined,
+  opts: { trySubsequentSegments?: boolean } = {}
 ): StreetShapeCoreResult {
   const raw = (meetingPoint || "").trim();
   if (!raw || raw.length > 120) return { ok: false, reason: "other" };
@@ -156,33 +221,17 @@ function parseStreetShapeCore(
   const postMatch = addressPart.match(/(?:^|[\s,])(\d{4})(?=[\s,]|$)/);
   const postnummer = postMatch ? postMatch[1] : null;
 
-  // "<name…> <number><optional letter>" — the shape of a Norwegian street
-  // address. The name part must contain a letter and must not itself be the
-  // postnummer segment.
-  const streetMatch = parts[0].match(/^([\p{L}][\p{L}\s.'’-]{1,40}?)\s+(\d{1,4}\s?[A-Za-z]?)$/u);
-  if (!streetMatch) return { ok: false, reason: "other" };
-  const namePart = streetMatch[1].trim();
-  const numberPart = streetMatch[2].replace(/\s+/g, "");
-  const street = `${namePart} ${numberPart}`;
-
-  // Review follow-up 5, guard 1: reject heads that take a number but are not a
-  // street — «Postboks 123», «P.b. 22», «Kai 4», «Bygg 3», «Sal 2», «Rom 12»,
-  // «Inngang 2», «Rv 7». Compared on the LAST word of the name part, so
-  // «Nedre Postboks» is rejected but «Postboksgata» (a real street) is not.
-  const headWord = namePart.split(/\s+/).pop() || "";
-  if (NON_STREET_HEAD.test(headWord)) return { ok: false, reason: "other" };
-
-  // Guard 2 (word count) is checked BEFORE guard 3 (postnummer collision)
-  // below — bug fix 2026-09-12: «Gården vår i Vestre Slidre 2966» must be
-  // rejected as prose regardless of guard 3's collision check, since it fires
-  // for BOTH reasons simultaneously (5-word name part AND its trailing number
-  // collides with the postnummer scan) and the caller-visible "why" has to be
-  // the prose rejection, not the (also true, but not the relevant) collision
-  // one — see parseStreetShapeWithoutPostnummer()'s doc comment below. A
-  // street name is at most a few words: «Gården vår i Vestre Slidre» is
-  // prose; a real Norwegian street name is 1-3 words («Nedre Slottsgate»,
-  // «Kong Oscars gate»).
-  if (namePart.split(/\s+/).length > 3) return { ok: false, reason: "other" };
+  // Guards 1+2, against parts[0] alone (parseAddressLike()'s unchanged
+  // behavior), or against each part in order until one matches
+  // (parseStreetShapeWithoutPostnummer() only).
+  const candidateParts = opts.trySubsequentSegments ? parts : [parts[0]];
+  let matched: { street: string; numberPart: string } | null = null;
+  for (const part of candidateParts) {
+    matched = evaluateSegmentStreetShape(part);
+    if (matched) break;
+  }
+  if (!matched) return { ok: false, reason: "other" };
+  const { street, numberPart } = matched;
 
   // Guard 3: the "house number" must not BE the postnummer. «Gården vår i
   // Vestre Slidre 2966» parsed as street «Gården vår i Vestre Slidre» + number
@@ -261,11 +310,19 @@ export function parseAddressLike(
  * any other missing-postnummer street address. Every other rejection reason
  * ("other" — prose, NON_STREET_HEAD, foreign-country, not street-shaped)
  * still returns null here, unchanged.
+ *
+ * dev-request 2026-09-12-opplevagent-gaardsnavn-foran-gateadressen: passes
+ * `trySubsequentSegments: true` to the shared core — the ONE behavioral
+ * difference this dev-request adds on top of the above. "Nedre Røhne Gård,
+ * Jernbanegata 287" has no street shape in `parts[0]` ("Nedre Røhne Gård" —
+ * no trailing house number) but does in `parts[1]` ("Jernbanegata 287");
+ * parseAddressLike() is never called with this option and so still tests
+ * `parts[0]` alone, unchanged.
  */
 export function parseStreetShapeWithoutPostnummer(
   meetingPointOrAddress: string | null | undefined
 ): { street: string } | null {
-  const core = parseStreetShapeCore(meetingPointOrAddress);
+  const core = parseStreetShapeCore(meetingPointOrAddress, { trySubsequentSegments: true });
   if (!core.ok) {
     if (core.reason === "postnummer_is_housenumber") return { street: core.street };
     return null;
