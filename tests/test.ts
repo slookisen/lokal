@@ -44586,6 +44586,32 @@ runSerial(async () => {
   }
 });
 
+// getExperienceOrgnrSweepAfter/setExperienceOrgnrSweepAfter
+// (services/experience-orgnr-sweep-state.ts). dev-request 2026-09-14-
+// opplevagent-karantene-utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-
+// kommune-mangler-cron-kobling-og-persistert-cursor": the persisted `after`-
+// cursor shared by the two routes above, so a periodic caller that always
+// omits `after` still converges across the backlog. Pure, DB-backed-but-
+// network-free unit coverage of the get/set helpers alone — route-level
+// coverage of the omitted-vs-explicit `after` behavior lives in the two
+// route test files above. Tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experience-orgnr-sweep-state: persisted after-cursor helpers ──");
+  try {
+    const { runExperienceOrgnrSweepStateTests } =
+      require("../src/services/experience-orgnr-sweep-state.test") as
+        typeof import("../src/services/experience-orgnr-sweep-state.test");
+    const eoss = await runExperienceOrgnrSweepStateTests({ log: false });
+    passed += eoss.passed;
+    failed += eoss.failed;
+    for (const f of eoss.failures) failures.push("experience-orgnr-sweep-state: " + f);
+    console.log(`  experience-orgnr-sweep-state: ${eoss.passed} passed, ${eoss.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-sweep-state: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke,
 // del 1 ("stop the inflow"): the in-scope gate on POST /admin/bulk-load — a
 // row is in scope when its provider is in the gårdssalg cohort OR its own

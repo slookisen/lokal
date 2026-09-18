@@ -58,6 +58,13 @@
  *       still advances (never re-selects the same rows forever).
  *   (q) enrichment write-pause fence: blocks apply (423), never blocks
  *       dry-run.
+ *   (s) persisted after-cursor (dev-request 2026-09-14-opplevagent-
+ *       karantene-utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-
+ *       kommune-mangler-cron-kobling-og-persistert-cursor"): an omitted
+ *       `after` resumes from (and, on success, persists) the cursor in
+ *       experience_orgnr_sweep_state; an explicit `after` stays purely
+ *       request-driven and never reads or writes that state; a dry-run
+ *       call still advances the persisted cursor exactly like apply.
  */
 
 export interface TestSummary {
@@ -635,6 +642,68 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
         assertEq(providerRow("prov-scope-outofscope").brreg_active, null, "owf-r3: out-of-scope provider's brreg_active left untouched (still NULL)");
         assertEq(providerRow("prov-scope-viacohort").brreg_active, 1, "owf-r4: the gårdssalg-cohort provider (zero mat_drikke experiences) WAS resolved and written");
         assertTrue((r.body.skipped_out_of_scope as number) >= 1, "owf-r5: response reports skipped_out_of_scope >= 1 (additive field, on top of every pre-existing field)");
+      }
+
+      // ═══ (s) persisted after-cursor (dev-request 2026-09-14-opplevagent-
+      //      karantene-utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-
+      //      kommune-mangler-cron-kobling-og-persistert-cursor") ══════════
+      {
+        const sweepState = require("../services/experience-orgnr-sweep-state") as
+          typeof import("../services/experience-orgnr-sweep-state");
+        // Prime this route's own persisted cursor to a known value just
+        // BEFORE the fixtures below (rather than relying on "absence of a
+        // row = resume from the true start", which earlier sections' own
+        // still-unresolved leftover candidates — prov-notfound,
+        // prov-mismatch, prov-collide-new, prov-noorgnr, prov-fetchfail —
+        // would otherwise intercept first, since they sort before "zzz-*").
+        sweepState.setExperienceOrgnrSweepAfter(expDb, "orgnr_from_website", "zzz-00");
+
+        seedProvider({ id: "zzz-01", navn: "Cursor Ett AS", hjemmeside: "https://zzzcursor01.test" });
+        seedProvider({ id: "zzz-02", navn: "Cursor To AS", hjemmeside: "https://zzzcursor02.test" });
+        seedProvider({ id: "zzz-03", navn: "Cursor Tre AS", hjemmeside: "https://zzzcursor03.test" });
+        for (const host of ["zzzcursor01", "zzzcursor02", "zzzcursor03"]) {
+          pageFixtures.set(`https://${host}.test`, htmlResponse("<html><body>Ingenting her.</body></html>", `https://${host}.test`));
+        }
+
+        // s1: OMITTED `after` (key not present at all) -> resumes from the
+        // primed persisted cursor (zzz-00), processes zzz-01, and (dry-run
+        // included) persists next_after.
+        const s1 = await callRoute(opplevelserRouter, { url: ROUTE, headers: adminHeaders, body: { limit: 1 } });
+        const s1Ids = (s1.body.planned as any[]).map((p: any) => p.provider_id);
+        assertEq(s1.body.dry_run, true, "owf-s1: apply omitted -> dry_run:true");
+        assertTrue(s1Ids.includes("zzz-01") && !s1Ids.includes("zzz-02"), `owf-s1b: omitted-after resumes from the primed persisted cursor (got ${JSON.stringify(s1Ids)})`);
+        assertEq(
+          sweepState.getExperienceOrgnrSweepAfter(expDb, "orgnr_from_website"),
+          s1.body.next_after,
+          "owf-s2: a DRY-RUN call with omitted `after` still PERSISTS its own next_after (mirrors gardssalg-website-verification-remediation's own dry-run persistence)",
+        );
+        assertEq(s1.body.next_after, "zzz-01", "owf-s2b: next_after is the last id this call scanned");
+
+        // s2: OMITTED `after` again -> resumes from the persisted cursor
+        // (zzz-01), processes zzz-02, not zzz-01 again.
+        const s2 = await callRoute(opplevelserRouter, { url: ROUTE, headers: adminHeaders, body: { limit: 1 } });
+        const s2Ids = (s2.body.planned as any[]).map((p: any) => p.provider_id);
+        assertTrue(s2Ids.includes("zzz-02") && !s2Ids.includes("zzz-01"), `owf-s3: second omitted-after call resumes from the persisted cursor, not the start (got ${JSON.stringify(s2Ids)})`);
+        assertEq(sweepState.getExperienceOrgnrSweepAfter(expDb, "orgnr_from_website"), "zzz-02", "owf-s3b: persisted cursor now advanced to zzz-02");
+
+        // s3: EXPLICIT `after` (pointing before zzz-01) -> purely
+        // request-driven: re-scans zzz-01 regardless of the persisted
+        // cursor (zzz-02) — and must NOT read OR write persisted state.
+        const s3 = await callRoute(opplevelserRouter, { url: ROUTE, headers: adminHeaders, body: { limit: 1, after: "zzz-00" } });
+        const s3Ids = (s3.body.planned as any[]).map((p: any) => p.provider_id);
+        assertTrue(s3Ids.includes("zzz-01"), `owf-s4: explicit \`after\` is purely request-driven — ignores the persisted cursor entirely (got ${JSON.stringify(s3Ids)})`);
+        assertEq(
+          sweepState.getExperienceOrgnrSweepAfter(expDb, "orgnr_from_website"),
+          "zzz-02",
+          "owf-s5: explicit `after` call left the persisted cursor UNCHANGED (still zzz-02, not overwritten with zzz-01)",
+        );
+
+        // s4: OMITTED `after` again -> proves s3's explicit call never
+        // clobbered the persisted cursor; resumes from zzz-02, reaching
+        // zzz-03.
+        const s4 = await callRoute(opplevelserRouter, { url: ROUTE, headers: adminHeaders, body: { limit: 1 } });
+        const s4Ids = (s4.body.planned as any[]).map((p: any) => p.provider_id);
+        assertTrue(s4Ids.includes("zzz-03"), `owf-s6: omitted-after call after the explicit one correctly resumed from zzz-02, reaching zzz-03 (got ${JSON.stringify(s4Ids)})`);
       }
     } catch (err: any) {
       failed++;

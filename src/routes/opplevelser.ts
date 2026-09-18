@@ -731,6 +731,18 @@ import {
   EXPERIENCE_ORGNR_NAME_KOMMUNE_DEFAULT_LIMIT,
   EXPERIENCE_ORGNR_NAME_KOMMUNE_MAX_LIMIT,
 } from "../services/experience-orgnr-from-name-kommune";
+// dev-request 2026-09-14-opplevagent-karantene-utgang-brreg-krav, FUNN
+// "orgnr-fra-webside-og-navn-kommune-mangler-cron-kobling-og-persistert-
+// cursor": persisted `after`-cursor for the two routes above, so a periodic
+// caller that always omits `after` still converges across the backlog
+// instead of re-scanning the same leading window forever. Read/written ONLY
+// on each route's own omitted-`after` path — see
+// services/experience-orgnr-sweep-state.ts's own header for the full
+// contract.
+import {
+  getExperienceOrgnrSweepAfter,
+  setExperienceOrgnrSweepAfter,
+} from "../services/experience-orgnr-sweep-state";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
 // endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
@@ -2407,11 +2419,46 @@ router.post(
             : EXPERIENCE_ORGNR_WEBSITE_DEFAULT_LIMIT
         )
       );
-      const after = typeof body.after === "string" ? body.after : undefined;
+      // Offset-persistence (dev-request 2026-09-14-opplevagent-karantene-
+      // utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-kommune-mangler-
+      // cron-kobling-og-persistert-cursor"): a caller that supplies `after`
+      // explicitly is UNCHANGED — purely request-driven, byte-for-byte the
+      // same as before this dev-request, and never reads or clobbers the
+      // persisted cursor. Only when `after` is OMITTED from the request body
+      // does this route now resume from the cursor the PREVIOUS omitted-
+      // `after` call left off at — same convention as POST .../gardssalg-
+      // website-verification-remediation's own usePersistedOffset (see that
+      // route's doc comment). `usePersistedAfter` also gates the write
+      // below: only the omitted-`after` path ever reads or writes
+      // experience_orgnr_sweep_state.
+      const usePersistedAfter = typeof body.after !== "string";
+      const expDb = getExpDb("experiences");
+      const after = usePersistedAfter
+        ? getExperienceOrgnrSweepAfter(expDb, "orgnr_from_website")
+        : (body.after as string);
 
       const statusBefore = experienceOrgnrFromWebsiteQueueStatus();
       const result = await experienceOrgnrFromWebsiteTick(limit, { dryRun, after });
       const statusAfter = experienceOrgnrFromWebsiteQueueStatus();
+
+      // Persist AFTER a successful tick, and only on the omitted-`after`
+      // path (see usePersistedAfter above) — an explicit-`after` caller
+      // never touches this state, in either direction. Persisted
+      // REGARDLESS of dry_run — persisting where the sweep has scanned to is
+      // not itself a data write to opplevelser/providers, and dry-run must
+      // converge across the backlog exactly like apply mode (the entire
+      // point of this fix) — same convention as the gardssalg-website-
+      // verification-remediation route's own offset persistence, which also
+      // persists on dry-run calls. Best-effort: a persistence failure must
+      // not fail a tick that otherwise succeeded, so it's logged and
+      // swallowed rather than thrown.
+      if (usePersistedAfter) {
+        try {
+          setExperienceOrgnrSweepAfter(expDb, "orgnr_from_website", result.next_after);
+        } catch (err) {
+          console.error("[opplevelser] admin/experiences-orgnr-from-website failed to persist sweep cursor:", err);
+        }
+      }
 
       res.json({
         success: true,
@@ -2491,11 +2538,36 @@ router.post(
             : EXPERIENCE_ORGNR_NAME_KOMMUNE_DEFAULT_LIMIT
         )
       );
-      const after = typeof body.after === "string" ? body.after : undefined;
+      // Offset-persistence (dev-request 2026-09-14-opplevagent-karantene-
+      // utgang-brreg-krav, FUNN "orgnr-fra-webside-og-navn-kommune-mangler-
+      // cron-kobling-og-persistert-cursor"): same contract as the sibling
+      // route above — an explicit `after` stays purely request-driven;
+      // omitted `after` resumes from (and, on success, persists) the cursor
+      // in experience_orgnr_sweep_state, under this route's OWN key
+      // ('orgnr_from_name_kommune'), fully independent of the sibling
+      // route's own cursor.
+      const usePersistedAfter = typeof body.after !== "string";
+      const expDb = getExpDb("experiences");
+      const after = usePersistedAfter
+        ? getExperienceOrgnrSweepAfter(expDb, "orgnr_from_name_kommune")
+        : (body.after as string);
 
       const statusBefore = experienceOrgnrFromNameKommuneQueueStatus();
       const result = await experienceOrgnrFromNameKommuneTick(limit, { dryRun, after });
       const statusAfter = experienceOrgnrFromNameKommuneQueueStatus();
+
+      // Persist AFTER a successful tick, only on the omitted-`after` path,
+      // regardless of dry_run — see the sibling route's own doc comment
+      // above for the full rationale (mirrors gardssalg-website-
+      // verification-remediation's own offset persistence). Best-effort:
+      // logged and swallowed, never fails an otherwise-successful tick.
+      if (usePersistedAfter) {
+        try {
+          setExperienceOrgnrSweepAfter(expDb, "orgnr_from_name_kommune", result.next_after);
+        } catch (err) {
+          console.error("[opplevelser] admin/experiences-orgnr-from-name-kommune failed to persist sweep cursor:", err);
+        }
+      }
 
       res.json({
         success: true,
