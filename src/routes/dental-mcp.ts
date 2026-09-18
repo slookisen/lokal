@@ -30,6 +30,7 @@ import {
 import { slugifyClinic } from "./dental-seo";
 import { dentalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 
 const router = Router();
 
@@ -430,15 +431,34 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 async function getOrCreateDentalSession(
-  sessionId?: string
-): Promise<{ id: string; session: DentalMcpSession }> {
+  sessionId: string | undefined,
+  isInitialize: boolean
+): Promise<{ id: string; session: DentalMcpSession } | { notFound: true }> {
   if (sessionId && dentalSessions.has(sessionId)) {
     const session = dentalSessions.get(sessionId)!;
     session.lastActivity = Date.now();
     return { id: sessionId, session };
   }
 
-  const id = sessionId || randomUUID();
+  if (sessionId && !isInitialize) {
+    // A session id was PROVIDED but is unknown/expired (e.g. the in-memory
+    // map was wiped by a deploy/restart) on a non-initialize call. Per the
+    // MCP spec this is a 404, not a silently-created new session under the
+    // client's id — creating one here would leave a phantom, never
+    // properly-negotiated session that still fails every subsequent call
+    // (the SDK's own transport would reject it with a misleading 400
+    // "Server not initialized" the moment a real request reached it, since
+    // this fresh transport instance never actually ran `initialize`).
+    // Nothing is inserted into dentalSessions on this branch.
+    return { notFound: true };
+  }
+
+  // Either no session id was sent at all (a legitimate fresh `initialize`),
+  // or the client sent `initialize` together with a stale/foreign
+  // `mcp-session-id` header (e.g. retrying after a 404, or after this
+  // process restarted and wiped the map). Either way, `initialize` ALWAYS
+  // mints the server's own id — a client-supplied id is never adopted here.
+  const id = randomUUID();
 
   const server = new McpServer({
     name: "finn-tannlege",
@@ -477,8 +497,12 @@ async function getOrCreateDentalSession(
 router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const { session } = await getOrCreateDentalSession(sessionId);
-    await session.transport.handleRequest(req, res, req.body);
+    const result = await getOrCreateDentalSession(sessionId, isMcpInitializeRequestBody(req.body));
+    if ("notFound" in result) {
+      sendMcpSessionNotFound(res);
+      return;
+    }
+    await result.session.transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("[dental-mcp] POST error:", err.message);
     if (!res.headersSent) {
@@ -527,7 +551,11 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 </body></html>`);
       return;
     }
-    res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
+    // Non-browser caller with no valid session (never sent one, or sent an
+    // unknown/expired one) on a GET: same premise as the POST-side 404 —
+    // this must never have created a session, so there is nothing to clean
+    // up here either.
+    sendMcpSessionNotFound(res);
     return;
   }
   const session = dentalSessions.get(sessionId)!;
