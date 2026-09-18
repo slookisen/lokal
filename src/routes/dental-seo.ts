@@ -2616,6 +2616,19 @@ router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) 
   res.json([dentalMcpServerCard()]);
 });
 
+// dev-request 2026-09-16-glama-claim-well-known-finn-tannlege: Glama's HTTP-challenge
+// connector claim. The token is not a secret — Glama states it's account-bound,
+// contains no personal data, and is *meant* to be published at exactly this URL, so
+// it lives in code like any other well-known content, not in Fly secrets.
+router.get("/.well-known/glama.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json({
+    "$schema": "https://glama.ai/mcp/schemas/connector.json",
+    claim: "glama_claim_8ro-LSuSmnjqfP0rV9lTbWMyXHtxKp0q",
+  });
+});
+
 // ═══════════════════════════════════════════════════════════
 // GET /kontakt — public contact form (finn-tannlege.com)
 // ═══════════════════════════════════════════════════════════
