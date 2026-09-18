@@ -628,6 +628,61 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_orgnr_review_queue failed:", err);
   }
 
+  // ─── gardssalg_orgnr_review_queue: reset stale old-generic-reason rows
+  // (dev-request 2026-09-16-opplevagent-orgnr-review-godkjent-men-skriving-
+  // avvist, follow-up fix requested by independent PR review on lokal#896)
+  // ─────────────────────────────────────────────────────────────────────
+  // Before this dev-request, gardssalg-orgnr-review-judge's GODKJENN
+  // verdicts that hit the approve route's write guard all collapsed into
+  // ONE generic reason string — `write_refused_filled_locked_or_conflict`
+  // (the old, undifferentiated code above this comment used to write that
+  // literal string into `rejected[].reason`, which the judge route then
+  // persisted verbatim as
+  // `judge GODKJENN but write blocked: write_refused_filled_locked_or_conflict`
+  // onto the queue row's `reason` column) — with no record of WHICH of the
+  // three causes applied, and no way for the row to ever resolve, because
+  // gardssalg-orgnr-review-judge only ever re-selects
+  // `WHERE reason = 'needs_human_review'` (routes/opplevelser.ts).
+  //
+  // The two real, live rows this shipped for (Små Vesen Bryggeri,
+  // Atlungstad Brenneri) already have `reason` stuck on that OLD generic
+  // string from a prior judge run — deployed code alone (the differentiated
+  // "locked"/"conflict" reasons above) never touches an EXISTING row's
+  // `reason` column, only new blocked writes going forward. Without this
+  // reset those two rows would stay wedged forever even after this fix
+  // ships, and AC1 ("after deploy, the staleness endpoint shows 0 rows with
+  // the undifferentiated reason") would not actually be satisfied for them.
+  //
+  // Reset: any row whose `reason` still contains the old literal generic
+  // string goes back to 'needs_human_review' — the judge route's own
+  // re-select condition — so the NEXT judge run naturally re-processes it
+  // and persists a real, differentiated reason
+  // ("locked"/"conflict"/removed-from-queue-as-"filled") this time.
+  //
+  // Deliberately narrow match (`LIKE '%write_refused_filled_locked_or_
+  // conflict%'`), NOT a broad "judge GODKJENN but write blocked:%" prefix
+  // match: the NEW code (above) persists that SAME prefix for genuinely
+  // differentiated "locked"/"conflict" verdicts too, and those ARE meant to
+  // be terminal (owner-lock never bypassed; a genuine stored/candidate
+  // conflict is never auto-resolved) — a broad prefix match would wrongly
+  // re-open those every startup and loop them through the judge forever.
+  // The old literal substring never appears in anything the new code writes
+  // (its differentiated reasons are exactly "locked" or "conflict"), so this
+  // match is precise and naturally idempotent: once a row is reset here it
+  // picks up a differentiated reason on its next judge pass and never
+  // matches this WHERE clause again. No `migrations`-table guard needed —
+  // same idempotent-by-condition idiom this table's own CREATE TABLE IF NOT
+  // EXISTS / CREATE INDEX IF NOT EXISTS above already use.
+  try {
+    db.exec(`
+      UPDATE gardssalg_orgnr_review_queue
+         SET reason = 'needs_human_review', updated_at = datetime('now')
+       WHERE reason LIKE '%write_refused_filled_locked_or_conflict%'
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_orgnr_review_queue_reset_old_generic_blocked_reason failed:", err);
+  }
+
   // ─── gardssalg_orgnr_backfill_sweep_state (dev-request 2026-09-18-
   // gardssalg-orgnr-backfill-statisk-batch) ───────────────────────────────────
   // POST /admin/gardssalg-orgnr-backfill's auto-selector

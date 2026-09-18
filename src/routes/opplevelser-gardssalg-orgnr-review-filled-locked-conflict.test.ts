@@ -47,6 +47,22 @@
  *       reason string.
  *   f6  GET /admin/gardssalg-orgnr-review-queue (the full listing) carries
  *       the new stored_org_nr field via listGardssalgOrgnrReviewQueue's join.
+ *   f7  Independent-review follow-up fix: the two REAL live rows (Små Vesen
+ *       Bryggeri, Atlungstad Brenneri) are already stuck with `reason`
+ *       overwritten to the OLD generic string by a PRIOR (pre-fix) judge
+ *       run, so the judge route's `WHERE reason = 'needs_human_review'`
+ *       re-select would never touch them again under the new code alone.
+ *       init-experiences.ts's initExperiencesSchema() now resets any row
+ *       whose reason still matches the old generic pattern back to
+ *       'needs_human_review' on every schema init (== every boot/redeploy,
+ *       idempotent, no `migrations`-table guard needed — same idiom as this
+ *       table's own CREATE TABLE IF NOT EXISTS). f7 reproduces the exact
+ *       stuck string, re-runs initExperiencesSchema() against the
+ *       already-populated db handle (redeploy-reboot simulation, twice —
+ *       proving idempotency), then runs an actual judge pass and asserts
+ *       the row lands on a real, differentiated reason — and finally checks
+ *       GET /admin/gardssalg-review-queues-staleness end-to-end for AC1's
+ *       literal observable outcome: 0 rows anywhere with the old string.
  *
  * Harness: in-memory "experiences" DB + fresh require-cache purge +
  * Router.handle() dispatch, same convention as every sibling gardssalg-orgnr-
@@ -414,6 +430,108 @@ export function runOpplevelserGardssalgOrgnrReviewFilledLockedConflictTests(
         assertTrue(!!entry, "f6b: the conflict row is listed");
         assertEq(entry?.stored_org_nr, "910200500", "f6c: the full listing now carries stored_org_nr via the join");
         assertEq(entry?.candidate_orgnr, "910200501", "f6d: candidate_orgnr is still the pre-existing column, unaffected");
+      }
+
+      // ═══ f7: the OLD generic-reason backfill/reset migration
+      //         (init-experiences.ts) — a row stuck on the pre-fix collapsed
+      //         reason string gets reset back to 'needs_human_review' on the
+      //         next schema init (== a redeploy reboot), and THEN, on the
+      //         next judge pass, is re-processed into a real, differentiated
+      //         reason — proving AC1's actual observable outcome (0 rows
+      //         anywhere still carrying the old undifferentiated reason
+      //         after deploy), not just that the reset UPDATE runs. ═══════
+      {
+        // Simulate a live row exactly as it was left by a PRE-fix judge run:
+        // stuck on the old collapsed string, no stored/candidate detail
+        // suffix (the old code never had it), "Små Vesen Bryggeri" flavor —
+        // the actual live row this dev-request is about.
+        insertProvider.run({
+          id: "flc-stale-generic", navn: "Små Vesen Bryggeri (stale, test)", org_nr: null,
+          content_source: "manual", producer_type: "bryggeri", brreg_verified: 0,
+        });
+        expStore.upsertGardssalgOrgnrReviewQueue({
+          provider_id: "flc-stale-generic",
+          provider_name: "Små Vesen Bryggeri (stale, test)",
+          candidate_orgnr: "910200600",
+          candidate_name: "SMAA VESEN BRYGGERI AS",
+          candidate_address: "Ein tredje adresse, 5000 Bergen",
+          reason: "needs_human_review",
+        });
+        // Overwrite the reason directly to the OLD stuck state — this is
+        // what a prior (pre-fix) judge run actually left on disk; nothing in
+        // the current diff's normal call paths produces this string anymore,
+        // so it must be written directly to reproduce the stuck condition.
+        expDb.prepare(
+          `UPDATE gardssalg_orgnr_review_queue SET reason = ? WHERE provider_id = ?`,
+        ).run("judge GODKJENN but write blocked: write_refused_filled_locked_or_conflict", "flc-stale-generic");
+
+        const beforeReset = expDb
+          .prepare(`SELECT reason FROM gardssalg_orgnr_review_queue WHERE provider_id = 'flc-stale-generic'`)
+          .get() as { reason: string };
+        assertEq(
+          beforeReset.reason,
+          "judge GODKJENN but write blocked: write_refused_filled_locked_or_conflict",
+          "f7a: fixture reproduces the real stuck pre-fix reason string",
+        );
+
+        // Redeploy reboot == re-running initExperiencesSchema() against the
+        // ALREADY-populated db handle (same "re-run on redeploy" pattern as
+        // init-dental.test.ts / init-crm-threads-b3-status-migration.test.ts).
+        const { initExperiencesSchema } = require("../database/init-experiences") as typeof import("../database/init-experiences");
+        initExperiencesSchema(expDb);
+
+        const afterReset = expDb
+          .prepare(`SELECT reason FROM gardssalg_orgnr_review_queue WHERE provider_id = 'flc-stale-generic'`)
+          .get() as { reason: string };
+        assertEq(afterReset.reason, "needs_human_review",
+          "f7b: the migration resets the stale generic reason back to 'needs_human_review' — the judge route's own re-select condition");
+
+        // Idempotency: a second re-run changes nothing further and doesn't error.
+        initExperiencesSchema(expDb);
+        const afterSecondRun = expDb
+          .prepare(`SELECT reason FROM gardssalg_orgnr_review_queue WHERE provider_id = 'flc-stale-generic'`)
+          .get() as { reason: string };
+        assertEq(afterSecondRun.reason, "needs_human_review", "f7c: idempotent — a second schema re-run is a no-op for this row");
+
+        // Now the NEXT judge pass naturally re-selects and re-processes it
+        // (owner-locked provider, so GODKJENN still hits the write guard —
+        // but now with the DIFFERENTIATED "locked" reason, never the old
+        // generic string).
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+        globalThis.fetch = anthropicJudgeFetch("GODKJENN\nSamme produsent — navn og sted stemmer overens.");
+        const judgeRes = await callRoute(opplevelserRouter, "/admin/gardssalg-orgnr-review-judge", {
+          headers: { "x-admin-key": testKey },
+          body: { limit: 30 },
+        });
+        assertEq(judgeRes.status, 200, "f7d: judge run 200");
+
+        const afterJudge = expDb
+          .prepare(`SELECT reason FROM gardssalg_orgnr_review_queue WHERE provider_id = 'flc-stale-generic'`)
+          .get() as { reason: string } | undefined;
+        assertTrue(!!afterJudge, "f7e: the row still exists (locked, not auto-closed)");
+        assertTrue(/locked/i.test(afterJudge?.reason ?? ""),
+          "f7f: re-classified into the real, differentiated 'locked' reason on the very next judge pass");
+        assertTrue(
+          !/write_refused_filled_locked_or_conflict/.test(afterJudge?.reason ?? ""),
+          "f7g: the old undifferentiated reason string is gone for this row",
+        );
+
+        // AC1's actual observable outcome, end-to-end: the staleness endpoint
+        // shows ZERO rows anywhere carrying the old undifferentiated reason.
+        const staleRes = await callRoute(opplevelserRouter, "/admin/gardssalg-review-queues-staleness", {
+          method: "GET",
+          headers: { "x-admin-key": testKey },
+        });
+        assertEq(staleRes.status, 200, "f7h: staleness 200");
+        const allRows = (staleRes.body?.orgnr_review_queue?.oldest_first as any[]) ?? [];
+        const staleCount = allRows.filter((x) =>
+          /write_refused_filled_locked_or_conflict/.test(String(x.reason ?? "")),
+        ).length;
+        assertEq(staleCount, 0,
+          "f7i: AC1 — 0 rows anywhere in the staleness report still carry the old undifferentiated reason, achieved end-to-end (reset -> re-judge -> differentiated)");
+
+        const providerRow = expDb.prepare(`SELECT org_nr FROM experience_providers WHERE id = 'flc-stale-generic'`).get() as { org_nr: string | null };
+        assertEq(providerRow.org_nr, null, "f7j: owner-locked provider's org_nr still untouched — the reset never bypasses the write guard itself");
       }
 
       return { passed, failed, failures };
