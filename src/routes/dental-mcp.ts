@@ -440,15 +440,18 @@ async function getOrCreateDentalSession(
     return { id: sessionId, session };
   }
 
-  if (sessionId && !isInitialize) {
-    // A session id was PROVIDED but is unknown/expired (e.g. the in-memory
-    // map was wiped by a deploy/restart) on a non-initialize call. Per the
-    // MCP spec this is a 404, not a silently-created new session under the
-    // client's id — creating one here would leave a phantom, never
-    // properly-negotiated session that still fails every subsequent call
-    // (the SDK's own transport would reject it with a misleading 400
-    // "Server not initialized" the moment a real request reached it, since
-    // this fresh transport instance never actually ran `initialize`).
+  if (!isInitialize) {
+    // Not an initialize call, and the top guard above didn't find (or
+    // wasn't given) a live session — either a session id was PROVIDED but
+    // is unknown/expired (e.g. the in-memory map was wiped by a
+    // deploy/restart), or NO session id was sent at all. Per the MCP spec
+    // both are a 404, not a silently-created new session — creating one
+    // here would leave a phantom, never properly-negotiated session that
+    // still fails every subsequent call (the SDK's own transport would
+    // reject it with a misleading 400 "Server not initialized" the moment
+    // a real request reached it, since this fresh transport instance never
+    // actually ran `initialize`). This is AC2 of the filed dev-request:
+    // "tools/list uten sesjon og uten forutgående initialize -> 404".
     // Nothing is inserted into dentalSessions on this branch.
     return { notFound: true };
   }

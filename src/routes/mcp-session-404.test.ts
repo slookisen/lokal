@@ -198,6 +198,26 @@ export function runMcpSession404Tests(opts: { log?: boolean } = {}): Promise<Tes
         );
         await reinitRes.text();
 
+        // ── (a2) tools/list with NO mcp-session-id header at all (never
+        // sent one), and no prior initialize on this connection -> 404,
+        // not a silently-created session. This is the filed dev-request's
+        // own AC2 ("tools/list uten sesjon og uten forutgående initialize
+        // -> 404 (ikke 400)") — a distinct input from (a) above (which
+        // sends an unknown id; this sends none at all), and pre-fix this
+        // path fell all the way through to the create branch since the
+        // original guard was `sessionId && !isInitialize` (false when
+        // sessionId is undefined).
+        const noHeaderRes = await post({ jsonrpc: "2.0", method: "tools/list", params: {}, id: "nh1" });
+        assertTrue(
+          noHeaderRes.status === 404,
+          `${v.label} a6: tools/list with NO session header and no prior initialize returns 404 (got ${noHeaderRes.status})`
+        );
+        const noHeaderBody = await noHeaderRes.json().catch(() => null);
+        assertTrue(
+          !!noHeaderBody && noHeaderBody.jsonrpc === "2.0" && noHeaderBody.error?.code === -32001,
+          `${v.label} a7: that 404 body is JSON-RPC shaped with error.code -32001 (got ${JSON.stringify(noHeaderBody)})`
+        );
+
         // ── (b) initialize with no session id at all -> 200 + header ──────
         const freshInitRes = await post({
           jsonrpc: "2.0", method: "initialize",
