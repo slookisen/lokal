@@ -44663,3 +44663,24 @@ runSerial(async () => {
     failures.push("mcp-find-offers: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-09-om-verifisering-side-omtaler-merke-som-ikke-finnes:
+// /proveniens and /llms.txt no longer claim the platform's own cross-check
+// yields a "✓ Verified"/"✓ Verifisert" badge — only owner-claim
+// (agents.is_verified) does. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-om-verifisering-side-omtaler-merke-som-ikke-finnes: no platform-verification badge claim ──");
+  try {
+    const { runRfbVerificationNoPlatformBadgeClaimTests } = require("../src/routes/rfb-verification-no-platform-badge-claim.test") as
+      typeof import("../src/routes/rfb-verification-no-platform-badge-claim.test");
+    const vb = await runRfbVerificationNoPlatformBadgeClaimTests({ log: false });
+    passed += vb.passed;
+    failed += vb.failed;
+    for (const f of vb.failures) failures.push("rfb-verification-no-platform-badge-claim: " + f);
+    console.log(`  rfb-verification-no-platform-badge-claim: ${vb.passed} passed, ${vb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-verification-no-platform-badge-claim: unexpected error: " + String(err?.message || err));
+  }
+});
