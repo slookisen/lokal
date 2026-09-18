@@ -176,9 +176,20 @@ jobs:
             // itself be paired with a gate-outcome verb (flag/route/block/...)
             // within a short span, same as the modal case always required — a bare
             // marker with no nearby outcome-verb reference never suppresses.
-            const NEEDS_DANIEL_PREDICTIVE_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+            // Review round 2 finding (2026-09-18): pairing the marker with an
+            // outcome verb ANYWHERE within 40 chars of the marker still let an
+            // unrelated genuine escalation slip through — "This will block the
+            // deploy pipeline so needs_daniel review is required" pairs "will"
+            // with "block", but "block" describes the deploy pipeline, not the
+            // gate's verdict on THIS occurrence of needs_daniel. The outcome verb
+            // must instead directly GOVERN this specific occurrence — i.e. sit
+            // immediately before it ("flag it `needs_daniel`", "route to
+            // `needs_daniel`"), not merely co-occur somewhere in the clause. The
+            // marker itself can still be anywhere earlier in the clause.
+            const NEEDS_DANIEL_PREDICTIVE_MARKER_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b/i;
+            const NEEDS_DANIEL_PREDICTIVE_VERB_ADJACENT_RE = /\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b[\s\S]{0,15}$/i;
             function hasPredictiveFraming(clause) {
-              return NEEDS_DANIEL_PREDICTIVE_RE.test(clause);
+              return NEEDS_DANIEL_PREDICTIVE_MARKER_RE.test(clause) && NEEDS_DANIEL_PREDICTIVE_VERB_ADJACENT_RE.test(clause);
             }
             const NEEDS_DANIEL_NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
             const NEEDS_DANIEL_CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;

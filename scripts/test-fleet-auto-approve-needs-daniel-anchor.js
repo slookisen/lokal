@@ -97,9 +97,20 @@ function hasGenuineNeedsDanielFlag(text) {
   // (flag/route/block/...) within a short span, same as the modal case
   // always required — a bare marker with no nearby outcome-verb reference
   // never suppresses. See cases 28-29 (adversarial, from the review) below.
-  const PREDICTIVE_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b[\s\S]{0,40}?\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b/i;
+  // Review round 2 finding (2026-09-18): pairing the marker with an outcome
+  // verb ANYWHERE within 40 chars of the marker still let an unrelated
+  // genuine escalation slip through — "This will block the deploy pipeline
+  // so needs_daniel review is required" pairs "will" with "block", but
+  // "block" describes the deploy pipeline, not the gate's verdict on THIS
+  // occurrence of needs_daniel. The outcome verb must instead directly
+  // GOVERN this specific occurrence — sit immediately before it ("flag it
+  // `needs_daniel`", "route to `needs_daniel`") — not merely co-occur
+  // somewhere in the clause. The marker itself can still be anywhere
+  // earlier in the clause. See cases 30-32 below.
+  const PREDICTIVE_MARKER_RE = /\b(?:will|vil|kommer\s+til\s+å|expect(?:s|ed)?|anticipat(?:e|es|ed)|predict(?:s|ed)?|likely|probably|antagelig|trolig|sannsynligvis)\b/i;
+  const PREDICTIVE_VERB_ADJACENT_RE = /\b(?:flag\w*|rout\w*|block\w*|flagg\w*|rute\w*|blokker\w*)\b[\s\S]{0,15}$/i;
   function hasPredictiveFraming(clause) {
-    return PREDICTIVE_RE.test(clause);
+    return PREDICTIVE_MARKER_RE.test(clause) && PREDICTIVE_VERB_ADJACENT_RE.test(clause);
   }
   function clauseStart(preceding) {
     let best = 0;
@@ -376,6 +387,28 @@ check(
 check(
   'case29 (adversarial, review finding): "We expect reviewers to note this needs_daniel escalation..." -> still flagged',
   'We expect reviewers to note this needs_daniel escalation immediately, this is not optional.',
+  true
+);
+
+// 30-32 (adversarial, found in a SECOND independent review round, 2026-09-18):
+// a genuine marker+verb pair elsewhere in the clause, unrelated to THIS
+// needs_daniel occurrence, must not suppress it — the outcome verb has to
+// directly govern the needs_daniel mention itself (sit immediately before
+// it), not just share a clause with an unrelated marker+verb pairing about
+// some other subject (a deploy pipeline, legacy sessions, a migration).
+check(
+  'case30 (adversarial, review round 2): "will block the deploy pipeline so needs_daniel review is required" -> still flagged',
+  'This will block the deploy pipeline so needs_daniel review is required before merge.',
+  true
+);
+check(
+  'case31 (adversarial, review round 2): "will likely block legacy sessions needs_daniel" -> still flagged',
+  'The admin route change will likely block legacy sessions needs_daniel.',
+  true
+);
+check(
+  'case32 (adversarial, review round 2): "will flag stale rows ... and genuinely needs_daniel to review" -> still flagged',
+  'This migration will flag stale rows for cleanup and genuinely needs_daniel to review the data-loss risk.',
   true
 );
 
