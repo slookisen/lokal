@@ -29015,7 +29015,6 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   assertTrue(!!otherRowGB && listGB.body.includes(`/kategori/gardssalg/book/${otherRowGB.slug}`),
     "gb-08e: CTA gate is now slug-based, not hjemmeside-based (shows for a producer with no website)");
 
-  dbFacGB.__resetDbFactoryForTesting();
   console.log("  gardssalg-book: OK (panel render, unknown-slug 404, no-JS POST create+redirect, provider ownership, CTA fix)");
   } finally {
     // See the P0 CI fix comment above this try — restoration MUST happen even
@@ -29027,6 +29026,7 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
     else process.env.EXPERIENCES_DB_PATH = prevPathGB;
     if (prevDispatchGB === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGB;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
 })();
 
@@ -29367,7 +29367,6 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   assertEq(emailCallsGDL.length, 1, "gdl-13b: only the guest confirmation is attempted (producer send skipped, not thrown)");
   assertTrue(emailCallsGDL.some((c) => c.to === "silje@example.no"), "gdl-13c: guest still gets their confirmation");
 
-  dbFacGDL.__resetDbFactoryForTesting();
   console.log("  gardssalg-dark-launch-stop: OK (fail-safe flag default, SSR notices x3, hard stop on both entry points incl. no-row/no-email guarantees, flag-on+booking_live full-chain regression, producer dispatch + missing-epost safety)");
   } finally {
     // See the P0 CI fix comment above this try — restoration MUST happen
@@ -29379,6 +29378,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
     else process.env.EXPERIENCES_DB_PATH = prevPathGDL;
     if (prevDispatchGDL === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGDL;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
 })();
 
@@ -29658,7 +29658,6 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   assertEq(countBookingsTP(), beforeBook2TP, "tp-07c: no booking row created for the paused ordinary provider");
   assertEq(emailCallsTP.length, 0, "tp-07d: no emails attempted for the paused ordinary provider");
 
-  dbFacTP.__resetDbFactoryForTesting();
   console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count+slug lookup, still bookable by provider_id, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
   } finally {
     // See the P0 CI fix comment above this try — restoration MUST happen
@@ -29670,6 +29669,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
     else process.env.EXPERIENCES_DB_PATH = prevPathTP;
     if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
 })();
 
@@ -29998,7 +29998,6 @@ const _bekreftLoekkePromise = runSerial(async () => {
   assertEq(bookStBKC.visitTimeReached({ slot_at: "ikke-en-dato" }), true,
     "bkc-13c: unparseable slot_at fails OPEN so a broken row can still be resolved");
 
-  dbFacBKC.__resetDbFactoryForTesting();
   console.log("  gardssalg-bekreftloekke: OK (notes felt→row→begge e-poster escaped, token aldri i gjeste-e-post, confirm_url fjernet fra API-svar, legacy GET redirect-only, POST-basert bekreft med tidsvakt, korreksjon + angre m/ billable, idempotens, ukjent token/handling)");
   } finally {
     // See the P0 CI fix comment above this try — restoration MUST happen
@@ -30010,6 +30009,7 @@ const _bekreftLoekkePromise = runSerial(async () => {
     else process.env.EXPERIENCES_DB_PATH = prevPathBKC;
     if (prevDispatchBKC === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchBKC;
+    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
 });
 
