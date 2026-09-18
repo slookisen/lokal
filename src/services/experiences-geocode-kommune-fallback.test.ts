@@ -544,6 +544,233 @@ export function runExperiencesGeocodeKommuneFallbackTests(opts: { log?: boolean 
         assertEq(rowReport?.action, "upgraded_postal_mismatch",
           "L7+L8: per-row action='upgraded_postal_mismatch' — NOT double-counted under the plain address-tier counter, and skipped_address_shaped does not also fire for THIS row (leftover 'approximate' rows from earlier sections may contribute their own skipped_address_shaped counts to the shared in-memory DB's totals, so this is checked per-row rather than against the global counter)");
       }
+
+      // ═══ M — dev-request 2026-09-12-opplevagent-gaardsnavn-foran-
+      // gateadressen: a farm/place name BEFORE the real street segment
+      // ("Nedre Røhne Gård, Jernbanegata 287") — `parts[0]` has no street
+      // shape, but `parts[1]` does. parseStreetShapeWithoutPostnummer() now
+      // tries subsequent comma segments in order (parseAddressLike() never
+      // does — see M0 / M9 below). ═══
+      {
+        // ── M0: parser unit-level — the 3 measured positive rows, plus the
+        // 3 explicitly-listed non-matching cases (no overmatching). ──
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Nedre Røhne Gård, Jernbanegata 287")?.street, "Jernbanegata 287",
+          "M0a: farm name in parts[0], street in parts[1] — the street segment is found and used");
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Innsia Bryggeri, Hestvikveien 55")?.street, "Hestvikveien 55",
+          "M0b: …second measured row");
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Jæren Gard, Hetlandsgata 9")?.street, "Hetlandsgata 9",
+          "M0c: …third measured row");
+
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Agnes Torg Sjøparken Larvik"), null,
+          "M0d: no comma segment has street shape at all — stays null, no overmatching");
+        assertEq(worker.parseStreetShapeWithoutPostnummer("Olden Sentrum"), null,
+          "M0e: a bare place name — stays null");
+        assertEq(worker.parseStreetShapeWithoutPostnummer("c/o Servicebrygga AS"), null,
+          "M0f: a care-of address with no street line anywhere — stays null");
+
+        // ── M9: parseAddressLike() regression — untouched by this change.
+        // It is NEVER called with trySubsequentSegments, so it must still
+        // test parts[0] alone and reject every one of the M0 inputs above,
+        // even the 3 that parseStreetShapeWithoutPostnummer() now accepts. ──
+        assertEq(worker.parseAddressLike("Nedre Røhne Gård, Jernbanegata 287"), null,
+          "M9a: parseAddressLike() still only tests parts[0] ('Nedre Røhne Gård' — no street shape) — unaffected by the fallback");
+        assertEq(worker.parseAddressLike("Innsia Bryggeri, Hestvikveien 55"), null, "M9b: …second row");
+        assertEq(worker.parseAddressLike("Jæren Gard, Hetlandsgata 9"), null, "M9c: …third row");
+        assertEq(worker.parseAddressLike("Agnes Torg Sjøparken Larvik"), null, "M9d: …negative case, still null");
+        assertEq(worker.parseAddressLike("Olden Sentrum"), null, "M9e: …still null");
+        assertEq(worker.parseAddressLike("c/o Servicebrygga AS"), null, "M9f: …still null");
+        // …and its own pre-existing test inputs are still byte-identical
+        // (full breadth already covered by experiences-address-upgrade.test.ts's
+        // p1-p29; spot-checked here too since this file is what changed).
+        assertEq(worker.parseAddressLike("Sjøgata 21, 8006 Bodø")?.street, "Sjøgata 21", "M9g: a real address still parses exactly as before");
+        assertEq(worker.parseAddressLike("Vinjevegen 1075, Vinje"), null, "M9h: the guard-3 collision case still rejects exactly as before");
+        assertEq(worker.parseAddressLike("Gården vår i Vestre Slidre 2966"), null, "M9i: the prose case still rejects exactly as before");
+        assertEq(worker.parseAddressLike("c/o Josef Flatlandsmo, Åbyfaret 12B")?.street, "Åbyfaret 12B", "M9j: the c/o-prefix case still parses exactly as before");
+
+        // ── M1-M3: full integration — 3 positive rows via the backlog pass,
+        // mocked Kartverket, resolve within the measured coordinates. ──
+        const ROHNE_HIT = { lat: 60.6932, lon: 11.2028 };
+        const idRohne = expStore.createProvider({
+          navn: "Røhne Bryggerhus", fylke: "Innlandet", kommune: "Stange",
+          adresse: "Nedre Røhne Gård, Jernbanegata 287",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 60.7, lon = 11.2, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idRohne);
+        const rohneFetch = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=Stange/i.test(url) && /sok=Jernbanegata 287/i.test(url)) {
+            return jsonResponse({
+              adresser: [{ representasjonspunkt: ROHNE_HIT, adressekode: 601, nummer: 287, bokstav: "", postnummer: "2335", poststed: "Stange" }],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+        const rohneResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl: rohneFetch, sleep: async () => {} },
+        });
+        const rohneRow = readProvider(idRohne);
+        assertTrue(
+          rohneRow?.lat != null && Math.abs(rohneRow.lat - ROHNE_HIT.lat) < 0.001 && Math.abs((rohneRow.lon ?? 0) - ROHNE_HIT.lon) < 0.001,
+          `M1: Røhne Bryggerhus resolves within 100m of (60.6932, 11.2028) — got (${rohneRow?.lat}, ${rohneRow?.lon})`
+        );
+        assertEq(rohneRow?.geocode_confidence, "high", "M1b: geocode_confidence='high'");
+        const rohneAdresse = (db.prepare("SELECT adresse FROM experience_providers WHERE id = ?").get(idRohne) as any)?.adresse;
+        assertEq(rohneAdresse, "Nedre Røhne Gård, Jernbanegata 287", "M1c: the original `adresse` text is NOT rewritten — the farm name stays");
+        const rohneReport = rohneResult.rows.find((r) => r.provider_id === idRohne);
+        assertEq(rohneReport?.action, "upgraded_address", "M1d: per-row action='upgraded_address'");
+        assertEq(rohneReport?.planned?.place_name, "Jernbanegata 287", "M1e: planned place_name is the STREET segment only, farm name dropped from the lookup");
+
+        const HITRA_HIT = { lat: 63.5444, lon: 9.1548 };
+        const idHitra = expStore.createProvider({
+          navn: "Innsia Kulturbryggeri", fylke: "Trøndelag", kommune: "Hitra",
+          adresse: "Innsia Bryggeri, Hestvikveien 55",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 63.5, lon = 9.1, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idHitra);
+        const hitraFetch = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=Hitra/i.test(url) && /sok=Hestvikveien 55/i.test(url)) {
+            return jsonResponse({
+              adresser: [{ representasjonspunkt: HITRA_HIT, adressekode: 602, nummer: 55, bokstav: "", postnummer: "7247", poststed: "Hestvika" }],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+        const hitraResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl: hitraFetch, sleep: async () => {} },
+        });
+        const hitraRow = readProvider(idHitra);
+        assertTrue(
+          hitraRow?.lat != null && Math.abs(hitraRow.lat - HITRA_HIT.lat) < 0.001 && Math.abs((hitraRow.lon ?? 0) - HITRA_HIT.lon) < 0.001,
+          `M2: Innsia Kulturbryggeri resolves within 100m of (63.5444, 9.1548) — got (${hitraRow?.lat}, ${hitraRow?.lon})`
+        );
+        const hitraReport = hitraResult.rows.find((r) => r.provider_id === idHitra);
+        assertEq(hitraReport?.action, "upgraded_address", "M2b: per-row action='upgraded_address'");
+
+        const JAREN_HIT = { lat: 58.7343, lon: 5.6503 };
+        const idJaren = expStore.createProvider({
+          navn: "Jærakevitt", fylke: "Rogaland", kommune: "Time",
+          adresse: "Jæren Gard, Hetlandsgata 9",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 58.7, lon = 5.6, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idJaren);
+        const jarenFetch = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=Time/i.test(url) && /sok=Hetlandsgata 9/i.test(url)) {
+            return jsonResponse({
+              adresser: [{ representasjonspunkt: JAREN_HIT, adressekode: 603, nummer: 9, bokstav: "", postnummer: "4344", poststed: "Bryne" }],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+        const jarenResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl: jarenFetch, sleep: async () => {} },
+        });
+        const jarenRow = readProvider(idJaren);
+        assertTrue(
+          jarenRow?.lat != null && Math.abs(jarenRow.lat - JAREN_HIT.lat) < 0.001 && Math.abs((jarenRow.lon ?? 0) - JAREN_HIT.lon) < 0.001,
+          `M3: Jærakevitt resolves within 100m of (58.7343, 5.6503) — got (${jarenRow?.lat}, ${jarenRow?.lon})`
+        );
+        const jarenReport = jarenResult.rows.find((r) => r.provider_id === idJaren);
+        assertEq(jarenReport?.action, "upgraded_address", "M3b: per-row action='upgraded_address'");
+
+        // ── M4: negative — NO segment has street shape, stays skipped_no_match ──
+        const idNegative = expStore.createProvider({
+          navn: "Agnes Torg Sjøparken", fylke: "Vestfold og Telemark", kommune: "Larvik",
+          adresse: "Agnes Torg Sjøparken Larvik",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 59.05, lon = 10.03, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idNegative);
+        // Other still-'approximate' rows left over from earlier sections (e.g.
+        // section D's "Postboks 12", section E's/H's own rows) are ALSO
+        // re-scanned by this call (it re-attempts every 'approximate' row up
+        // to `limit`, not just the one just created) and may legitimately
+        // reach this fetchImpl for THEIR OWN street. So M4b checks specifically
+        // that no call was made for THIS row's (non-)address, not that the
+        // fetch was never called at all.
+        const negativeCalls: string[] = [];
+        const negativeFetch = (async (input: any) => {
+          negativeCalls.push(decodeURIComponent(String(input)));
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+        const negativeResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl: negativeFetch, sleep: async () => {} },
+        });
+        const negativeRow = readProvider(idNegative);
+        assertEq(negativeRow?.geocode_confidence, "approximate", "M4: 'Agnes Torg Sjøparken Larvik' left COMPLETELY unchanged — no street shape anywhere");
+        assertTrue(
+          !negativeCalls.some((u) => /agnes|sjøparken|sjoparken/i.test(u)),
+          `M4b: the address-tier Kartverket call was never even attempted FOR THIS ROW (no street shape found in any segment) — calls: ${JSON.stringify(negativeCalls)}`
+        );
+        const negativeReport = negativeResult.rows.find((r) => r.provider_id === idNegative);
+        assertEq(negativeReport?.action, "skipped_no_match", "M4c: reported as skipped_no_match (routed to the Stedsnavn tier, which this file's stub always misses)");
+
+        // ── M5: segment two IS street-shaped, but the Kartverket lookup is
+        // ambiguous -> skipped_ambiguous, no write (same shape as section E,
+        // but exercised through the multi-segment fallback path). ──
+        const idAmbiguous = expStore.createProvider({
+          navn: "Nystrand Gårdsutsalg", fylke: "Innlandet", kommune: "Elverum",
+          adresse: "Nystrand Gård, Vollgata 8",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 60.88, lon = 11.56, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idAmbiguous);
+        const ambiguousFetch = (async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (/kommunenavn=Elverum/i.test(url) && /sok=Vollgata 8/i.test(url)) {
+            return jsonResponse({
+              adresser: [
+                { representasjonspunkt: { lat: 60.8807, lon: 11.5623 }, adressekode: 111, nummer: 8, bokstav: "", postnummer: "2408", poststed: "Elverum" },
+                { representasjonspunkt: { lat: 60.8907, lon: 11.5623 }, adressekode: 222, nummer: 8, bokstav: "", postnummer: "2408", poststed: "Elverum" },
+              ],
+            });
+          }
+          return jsonResponse(EMPTY_ADRESSER);
+        }) as unknown as typeof fetch;
+        const ambiguousResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: false, deps: { fetchImpl: ambiguousFetch, sleep: async () => {} },
+        });
+        const ambiguousRow = readProvider(idAmbiguous);
+        assertEq(ambiguousRow?.geocode_confidence, "approximate", "M5: ambiguous segment-two match — row left COMPLETELY unchanged, no write");
+        assertEq(ambiguousRow?.lat, 60.88, "M5b: …coordinate untouched");
+        const ambiguousReport = ambiguousResult.rows.find((r) => r.provider_id === idAmbiguous);
+        assertEq(ambiguousReport?.action, "skipped_ambiguous", "M5c: reported as skipped_ambiguous");
+        assertTrue(ambiguousResult.skipped_ambiguous >= 1, "M5d: result.skipped_ambiguous counts it");
+
+        // ── M6: dry-run twin of M1 — reported as would_upgrade_address,
+        // nothing written. ──
+        const idDry = expStore.createProvider({
+          navn: "Røhne Bryggerhus Dry", fylke: "Innlandet", kommune: "Stange",
+          adresse: "Nedre Røhne Gård, Jernbanegata 287",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        } as any);
+        db.prepare(
+          `UPDATE experience_providers SET lat = 60.7, lon = 11.2, geocode_source = 'kommune_fallback',
+                  geocode_confidence = 'approximate', updated_at = datetime('now') WHERE id = ?`
+        ).run(idDry);
+        const dryResult = await worker.runExperiencesGeocodeBacklogPass(50, {
+          dryRun: true, deps: { fetchImpl: rohneFetch, sleep: async () => {} },
+        });
+        const dryRow = readProvider(idDry);
+        assertEq(dryRow?.geocode_confidence, "approximate", "M6: dry_run does not write");
+        const dryReport = dryResult.rows.find((r) => r.provider_id === idDry);
+        assertEq(dryReport?.action, "would_upgrade_address", "M6b: reported as would_upgrade_address");
+        assertTrue(dryResult.would_upgrade_address >= 1, "M6c: result.would_upgrade_address counts it");
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-geocode-kommune-fallback: unexpected error: " + String(err?.message || err) + (err?.stack ? `\n${err.stack}` : ""));
