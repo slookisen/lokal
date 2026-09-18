@@ -2318,6 +2318,16 @@ export function buildRunEnvelope(input: {
   // 0 when the flag is off (verified_second_line is only ever true when
   // secondLineEnabled). Lets the daily brief show the new pool growth.
   const verifiedSecondLineResults = r.filter((x) => x.verified_second_line);
+  // dev-request 2026-09-18-verifier-by-transition-ikke-persistert: the raw
+  // per-tick by_transition map (admin-run-verifier.ts) is response-only and
+  // never reaches a persisted envelope, so a future observer has no way to
+  // see "did a verified agent regress this run" without forcing a fresh
+  // diagnostic batch. This is the one aggregate number that answers that —
+  // any row that WAS verified going in and is NOT verified coming out — kept
+  // in every envelope instead of only visible in one forced call's response.
+  const verifiedDemoted = r.filter(
+    (x) => x.prior_verification_status === "verified" && x.new_verification_status !== "verified"
+  ).length;
   const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
   // dev-request 2026-08-23-terminal-unconfirmable: always 0 when
   // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
@@ -2366,6 +2376,7 @@ export function buildRunEnvelope(input: {
           examples: verifiedSecondLineResults.slice(0, 5).map((x) => ({ agent_id: x.agent_id, name: x.agent_name })),
         },
       },
+      { type: "db_state_change", value: verifiedDemoted, meta: { kind: "verified_demoted" } },
       { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
       { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
       ...(input.reportPath
