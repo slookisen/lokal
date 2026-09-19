@@ -180,6 +180,12 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
       INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
       VALUES ('prod-a', 'agent-a', 'Poteter', 'poteter', 20, 'kg', 'in_stock', 'enrichment')
     `).run();
+    // orch-pr-20260919-handleliste-slice2: submitCart()'s order/handoff
+    // split now ALSO requires opt_in=1 OR is_verified=1 (isEligibleForRealOrder,
+    // cart-service.ts) — set here so this file's "one order (the eligible
+    // producer's chosen offer)" assertion below keeps testing the wishes
+    // route wiring it was written for, unentangled from that separate gate.
+    db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'agent-a'`).run();
 
     db.prepare(`
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
