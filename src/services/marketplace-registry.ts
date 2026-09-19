@@ -2076,6 +2076,44 @@ export const DRINK_KEYWORDS = [
   "most", "eplemost", "saft", "juice", "eplejuice",
   "kombucha", "seltzer", "seltzeri",
   "kaffe", "kaffebrenneri", "gårdskafé", "gardskafe", "gårdskafe",
+  // Te (dev-request 2026-09-19-rfb-mcp-te-drikkekategori): confirmed live —
+  // `te`/`tea`/`urtete`/`herbal tea` all resolved `categories: null` and fell
+  // back to the nationwide trust-ranked list, surfacing Homme Gård
+  // (categories: fruit, eggs — no beverages, no herbs) at the top for a tea
+  // search. `te` was simply never in this list, in either language, exactly
+  // the same class of gap `øl`/`drikke` had before Fase 5a/5b. Routed to
+  // `beverages` (not `herbs`): tea is a drink a producer SELLS, and
+  // `beverages` is the category the hard filter already uses for every other
+  // drink word here — `herbs` is for herb/spice PLANTS (urter, krydder,
+  // dill…), a different, unrelated producer category.
+  //
+  // `tea`/`herbal tea` are added directly here (the English path), NOT via
+  // product-glossary.ts's reverse index: PRODUCT_WORDS["te"] is deliberately
+  // excluded from that index by AMBIGUOUS_EN (added 2026-09-05, guards
+  // against English filler words being mistaken for short Norwegian food
+  // words — the same class of false-friend guard as the «and»/duck case
+  // documented above). Reusing that path for `te` would mean touching
+  // AMBIGUOUS_EN's protection to unblock one specific entry, for no gain:
+  // `q` (the raw, lower-cased query) already reaches this same keyword list
+  // directly, so an English "tea"/"herbal tea" query matches here with zero
+  // glossary involvement — no risk to the guard the exhaustive reverse-index
+  // collision test (marketplace-search-english-queries.test.ts, section C3)
+  // already covers. This mirrors how `beverages`/`drinks`/`ale`/`cider`/
+  // `gin`/`whisky`/`juice` above are already bare English words sitting
+  // directly in this Norwegian-labelled list.
+  //
+  // Word-boundary safety (the exact trap `øl` hit — see REVIEW N2 above):
+  // `te` is a 2-letter substring of many unrelated Norwegian words
+  // («Potet», «Vinterepler», «Spekemat» all contain "te"). It is protected
+  // the same way `øl` is: (1) matched via norwegianWordBoundary(), not a
+  // bare substring, so it only fires on the standalone word (verified:
+  // "potet"/"vinterepler"/"spekemat" contain "te" only with a WORD
+  // character on both sides, so the boundary never matches); and (2)
+  // included in PRODUCT_TERM_EXCLUSIONS via the `...DRINK_KEYWORDS` spread
+  // below, so `te` can never become a `_productTerms` entry and is never
+  // tested as a NAME substring at all (the mechanism that let old `øl` match
+  // "Pølser").
+  "te", "urtete", "tea", "herbal tea",
 ];
 
 // Keywords that identify a CATEGORY but must never be searched as a product
