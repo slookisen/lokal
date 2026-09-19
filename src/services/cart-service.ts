@@ -129,22 +129,37 @@ export function isProducerEligible(agentId: string): boolean {
 // isEligibleForRealOrder() answers a narrower, submit-time-only question:
 // "will this producer actually receive a real order + email, or does the
 // buyer get a contact-handoff instead" — used ONLY in submitCart()'s
-// per-producer order/handoff split below. Mirrors order-notify-service.ts's
-// resolveOrderNotificationRecipient() Gate 1 exactly (order_notifications_
-// opt_in = 1 OR is_verified = 1 — an owner-claimed profile counts as
-// sufficient consent on its own, the claim flow already verified the email
-// by code) so the two can never drift: a producer that will get order-vs-
-// handoff split into "order" is now, by construction, exactly the same set
-// that order-notify-service.ts's send-gate will accept (modulo its own
-// recipient/verified-contact/blocklist clauses, which are about the EMAIL
-// SEND, not the cart-side order-line decision).
+// per-producer order/handoff split below.
+//
+// CORRECTED (fix-up on this branch): opt-in (order-notify-service.ts's Gate
+// 1, order_notifications_opt_in = 1) is MANDATORY and INDEPENDENT — it is
+// NEVER satisfied by is_verified alone. Only Gate 3 (verified contact OR
+// admin override) gets the Slice 2 `OR a.is_verified = 1` alternative (dev-
+// request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt line
+// 160-161: "Gate-klausul 3 ... utvides med `OR a.is_verified = 1`" — this
+// extends ONLY that one clause; AC4 requires `is_verified = 1 AND
+// order_notifications_opt_in = 1` together). An earlier pass on this branch
+// wrongly OR'd opt_in with is_verified across the WHOLE gate — corrected.
+//
+// The Gate-3-equivalent check is deliberately NOT re-implemented here: this
+// function is layered on TOP of isProducerEligible() above, which already
+// requires `agent_knowledge.verification_status = 'verified'` for every
+// caller that reaches this point — i.e. the "verified contact" side of Gate
+// 3 already holds by construction before is_verified is even considered.
+// So the one ADDITIONAL condition this function needs is Gate 1 (opt-in),
+// mandatory, full stop. (Gate 2 — a recipient email exists — and Gate 4 —
+// not blocklisted — are deliberately NOT checked here either, same as
+// before this slice: they are order-notify-service.ts's job at actual SEND
+// time, decoupled from order-row creation, e.g. a "pending" order can still
+// exist with its confirm_token generated even when no notification goes
+// out — pre-existing behavior, unchanged.)
 export function isEligibleForRealOrder(agentId: string): boolean {
   if (!isProducerEligible(agentId)) return false;
   const db = _cartTestDb ?? getDb();
   const row = db.prepare(`
     SELECT 1 FROM agents a
     WHERE a.id = ?
-      AND (a.order_notifications_opt_in = 1 OR a.is_verified = 1)
+      AND a.order_notifications_opt_in = 1
   `).get(agentId);
   return !!row;
 }

@@ -3,22 +3,27 @@
  * dev-request 2026-07-13-pilot-ordre-loop.
  *
  * Send-guard (L4 condition, Daniel-approved — every clause is mandatory):
- *   1. agents.order_notifications_opt_in = 1 OR agents.is_verified = 1
- *      (default 0/0 → NEVER send). Slice 2 of dev-request 2026-09-16-
- *      handleliste-med-produsentvalg-og-bestillingsflyt ("hybrid
- *      utsending") added the `OR is_verified = 1` alternative: an
- *      owner-claimed profile (agents.is_verified, NOT the internal
- *      verification_status cross-check gate 3 reads below) is itself
- *      sufficient consent to be emailed about orders — the claim flow
- *      already verifies the owner's email by code — WITHOUT also
- *      requiring the separate, admin-only opt-in toggle. Gates 2-4 are
- *      UNCHANGED and still fully mandatory.
+ *   1. agents.order_notifications_opt_in = 1 (default 0 → NEVER send).
+ *      UNCHANGED and still fully mandatory — Slice 2 of dev-request
+ *      2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt
+ *      ("hybrid utsending") does NOT touch this clause. Per that dev-
+ *      request's own AC4, "bare produsenter med `is_verified = 1 AND
+ *      order_notifications_opt_in = 1` og ikke blokkert får e-post" — opt-in
+ *      is explicitly required TOGETHER WITH is_verified, not as an
+ *      alternative to it. (An earlier pass on this branch OR'd opt-in with
+ *      is_verified across the whole gate — corrected; see git history.)
  *   2. A recipient email exists: order_notification_email (admin-set
  *      override) wins; otherwise contact_email.
- *   3. Verified contact: agent_knowledge.verification_status = 'verified',
- *      OR the recipient is an explicit admin-set order_notification_email
- *      (this is how test notifications go ONLY to Daniel's own inbox —
- *      same pattern as the booking test provider).
+ *   3. Verified contact, OR an owner-claimed profile, OR an explicit
+ *      admin-set recipient: agent_knowledge.verification_status =
+ *      'verified', OR agents.is_verified = 1 (Slice 2's actual addition,
+ *      per dev-request line 160-161: "Gate-klausul 3 ... utvides med `OR
+ *      a.is_verified = 1`" — this extends ONLY this one clause, an
+ *      owner-claimed profile is itself sufficient proof of a real,
+ *      reachable contact since the claim flow already verified the email
+ *      by code), OR the recipient is an explicit admin-set
+ *      order_notification_email (this is how test notifications go ONLY to
+ *      Daniel's own inbox — same pattern as the booking test provider).
  *   4. The recipient email is not blocklisted (blocklist-service.isBlocked,
  *      the same suppression gate the outreach paths use).
  *
@@ -59,7 +64,7 @@ export function __setOrderNotifySendForTesting(fn: SendFn | null): void { _sendO
 // ─── Recipient resolution (the gate) ────────────────────────────────────────
 
 export type RecipientResolution =
-  | { eligible: true; email: string; via: "admin_override" | "verified_contact" }
+  | { eligible: true; email: string; via: "admin_override" | "verified_contact" | "owner_verified" }
   | { eligible: false; reason: "agent_not_found" | "not_opted_in" | "no_email" | "unverified_contact" | "blocklisted" };
 
 export function resolveOrderNotificationRecipient(agentId: string): RecipientResolution {
@@ -81,22 +86,22 @@ export function resolveOrderNotificationRecipient(agentId: string): RecipientRes
     | undefined;
 
   if (!row) return { eligible: false, reason: "agent_not_found" };
-  // Gate 1: explicit opt-in OR an owner-claimed (is_verified) profile.
-  // Default 0/0 → never send. Reason stays "not_opted_in" even though it
-  // now also covers "not is_verified" — this is the single "neither consent
-  // path is satisfied" deny, and every existing caller matches on this
-  // exact reason string.
-  if (row.opt_in !== 1 && row.is_verified !== 1) {
-    return { eligible: false, reason: "not_opted_in" };
-  }
+  // Gate 1: explicit opt-in. Default 0 → never send. MANDATORY and
+  // INDEPENDENT of is_verified — Slice 2 does not touch this clause (see
+  // module doc comment / dev-request AC4). A producer that is is_verified=1
+  // but has NOT opted in must still be denied here.
+  if (row.opt_in !== 1) return { eligible: false, reason: "not_opted_in" };
 
   // Gate 2: a recipient exists. Admin override wins over contact_email.
   const overrideEmail = (row.override_email || "").trim();
   const email = overrideEmail || (row.contact_email || "").trim();
   if (!email) return { eligible: false, reason: "no_email" };
 
-  // Gate 3: verified contact, unless the admin explicitly set the recipient.
-  if (!overrideEmail && row.verification_status !== "verified") {
+  // Gate 3: verified contact, OR an owner-claimed (is_verified) profile,
+  // unless the admin explicitly set the recipient. Slice 2's `OR
+  // a.is_verified = 1` addition lives HERE ONLY — it is an alternative way
+  // to satisfy this one clause, never a substitute for Gate 1's opt-in.
+  if (!overrideEmail && row.verification_status !== "verified" && row.is_verified !== 1) {
     return { eligible: false, reason: "unverified_contact" };
   }
 
@@ -104,7 +109,12 @@ export function resolveOrderNotificationRecipient(agentId: string): RecipientRes
   const bl = isBlocked({ email });
   if (bl.blocked) return { eligible: false, reason: "blocklisted" };
 
-  return { eligible: true, email, via: overrideEmail ? "admin_override" : "verified_contact" };
+  const via = overrideEmail
+    ? "admin_override"
+    : row.verification_status === "verified"
+      ? "verified_contact"
+      : "owner_verified";
+  return { eligible: true, email, via };
 }
 
 // ─── Notification send ──────────────────────────────────────────────────────

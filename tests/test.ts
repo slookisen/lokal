@@ -25883,10 +25883,12 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   // orch-pr-20260919-handleliste-slice2: this suite is about phase-1 cart
   // mechanics (grouping, totals, admin lifecycle) — order1Id/order2Id below
   // assume submitCart() creates a REAL order for both, so both are opted in
-  // (isEligibleForRealOrder now also requires opt_in=1 OR is_verified=1 —
-  // unrelated to what this suite actually tests, so opt-in is set here
-  // purely to keep that precondition true, same rationale as pilot-ordre-
-  // loop's own ag-optin fixture).
+  // (isEligibleForRealOrder now also requires the full order-notify send-
+  // gate: opt_in=1 is mandatory, and their verification_status='verified'
+  // already satisfies the separate gate-3 clause — unrelated to what this
+  // suite actually tests, so opt-in is set here purely to keep that
+  // precondition true, same rationale as pilot-ordre-loop's own ag-optin
+  // fixture).
   cartDb.prepare("INSERT INTO agents (id, name, city, order_notifications_opt_in) VALUES (?, ?, ?, 1)").run("ag-carrot", "Gangstad Gård", "Trondheim");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
   cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(

@@ -181,10 +181,12 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
       VALUES ('prod-a', 'agent-a', 'Poteter', 'poteter', 20, 'kg', 'in_stock', 'enrichment')
     `).run();
     // orch-pr-20260919-handleliste-slice2: submitCart()'s order/handoff
-    // split now ALSO requires opt_in=1 OR is_verified=1 (isEligibleForRealOrder,
-    // cart-service.ts) — set here so this file's "one order (the eligible
-    // producer's chosen offer)" assertion below keeps testing the wishes
-    // route wiring it was written for, unentangled from that separate gate.
+    // split now ALSO requires the full order-notify send-gate (opt_in=1 is
+    // mandatory; a verified-contact-or-is_verified profile satisfies the
+    // separate gate-3 clause — see isEligibleForRealOrder(), cart-service.ts)
+    // — set opt_in here so this file's "one order (the eligible producer's
+    // chosen offer)" assertion below keeps testing the wishes route wiring
+    // it was written for, unentangled from that separate gate.
     db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'agent-a'`).run();
 
     db.prepare(`
