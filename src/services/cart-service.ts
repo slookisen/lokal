@@ -18,6 +18,8 @@ import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
 import { computeEffectiveAvailability } from "./supply-graph";
+import { knowledgeService } from "./knowledge-service";
+import { slugify } from "../utils/slug";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -310,6 +312,174 @@ export function deleteCartItem(
   return { success: true, deleted: true };
 }
 
+// ─── Wishes (cart_wishes) ─────────────────────────────────────────────────────
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 1: a wish is "I want X" before a concrete offer is chosen. Choosing
+// an offer either (a) links a `can_order`-eligible product, which mirrors a
+// real cart_items row via the EXISTING addCartItem() machinery — so
+// submitCart()'s per-producer order path needs no changes to find it — or
+// (b) links a "contact this producer myself" producer with no cart_items
+// row at all. submitCart() (below) reads mode='contact' wishes directly to
+// build contact_handoffs.
+
+export interface CartWish {
+  id: string;
+  cart_id: string;
+  term: string;
+  qty: number;
+  unit_hint: string | null;
+  chosen_product_id: string | null;
+  chosen_agent_id: string | null;
+  mode: "order" | "contact" | null;
+  created_at: string;
+}
+
+export type WishResult =
+  | { success: true; wish: CartWish }
+  | { success: false; status: number; error: string };
+
+function loadOpenCart(db: any, cartId: string): { id: string; status: string } | undefined {
+  return db.prepare("SELECT id, status FROM carts WHERE id = ?").get(cartId) as
+    | { id: string; status: string }
+    | undefined;
+}
+
+export function addCartWish(
+  cartId: string,
+  term: string,
+  qty: number,
+  unitHint?: string | null
+): WishResult {
+  const trimmed = (term ?? "").trim();
+  if (!trimmed) {
+    return { success: false, status: 400, error: "term is required" };
+  }
+  if (!Number.isInteger(qty) || qty <= 0) {
+    return { success: false, status: 400, error: "qty must be a positive integer" };
+  }
+
+  const db = _cartTestDb ?? getDb();
+
+  const cart = loadOpenCart(db, cartId);
+  if (!cart) return { success: false, status: 404, error: "Cart not found" };
+  if (cart.status !== "open") {
+    return { success: false, status: 409, error: `Cart is ${cart.status}, cannot add wishes` };
+  }
+
+  const id = randomUUID();
+  db.prepare(`
+    INSERT INTO cart_wishes (id, cart_id, term, qty, unit_hint, created_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'))
+  `).run(id, cartId, trimmed, qty, unitHint?.trim() || null);
+
+  db.prepare("UPDATE carts SET updated_at = datetime('now') WHERE id = ?").run(cartId);
+
+  const wish = db.prepare("SELECT * FROM cart_wishes WHERE id = ?").get(id) as CartWish;
+  return { success: true, wish };
+}
+
+export interface ChooseWishOfferInput {
+  productId?: string | null;
+  qty?: number | null;
+  agentId?: string | null;
+  mode?: string | null;
+}
+
+/**
+ * Choose an offer for an existing wish: either a concrete product
+ * (`productId` — upserts a mirroring cart_items row via addCartItem(), same
+ * eligibility/availability gates as adding directly) or a "contact this
+ * producer myself" producer (`agentId` + mode='contact', no cart_items row).
+ * Exactly one of the two must be provided.
+ *
+ * Switching a wish's choice (product → product, product → contact, or
+ * simply re-picking) always cleans up any PREVIOUSLY-linked cart_items row
+ * for this wish first — otherwise a stale order-mode line item would keep
+ * creating a real order at submit even after the buyer switched away from
+ * it (dangling-row bug this function exists specifically to avoid).
+ */
+export function chooseCartWishOffer(
+  cartId: string,
+  wishId: string,
+  input: ChooseWishOfferInput
+): WishResult {
+  const db = _cartTestDb ?? getDb();
+
+  const cart = loadOpenCart(db, cartId);
+  if (!cart) return { success: false, status: 404, error: "Cart not found" };
+  if (cart.status !== "open") {
+    return { success: false, status: 409, error: `Cart is ${cart.status}, cannot change wishes` };
+  }
+
+  const wish = db.prepare("SELECT * FROM cart_wishes WHERE id = ? AND cart_id = ?").get(wishId, cartId) as
+    | CartWish
+    | undefined;
+  if (!wish) return { success: false, status: 404, error: "Wish not found in cart" };
+
+  const productId = (input.productId ?? "").toString().trim() || null;
+  const agentId = (input.agentId ?? "").toString().trim() || null;
+
+  if (!productId && !agentId) {
+    return { success: false, status: 400, error: "Provide either product_id or agent_id" };
+  }
+  if (productId && agentId) {
+    return { success: false, status: 400, error: "Provide only one of product_id or agent_id, not both" };
+  }
+
+  // Clean up a previously-linked cart_items row before switching — see
+  // doc comment above. No-op if the wish had no prior order-mode choice, or
+  // if re-choosing the SAME product (addCartItem below upserts it anyway).
+  if (wish.chosen_product_id && wish.chosen_product_id !== productId) {
+    db.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cartId, wish.chosen_product_id);
+  }
+
+  if (productId) {
+    const qty = Number.isInteger(input.qty) && (input.qty as number) > 0 ? (input.qty as number) : wish.qty;
+    const added = addCartItem(cartId, productId, qty);
+    if (!added.success) {
+      return { success: false, status: added.status, error: added.error };
+    }
+    db.prepare(`
+      UPDATE cart_wishes SET chosen_product_id = ?, chosen_agent_id = NULL, mode = 'order' WHERE id = ?
+    `).run(productId, wishId);
+  } else {
+    if (input.mode && input.mode !== "contact") {
+      return { success: false, status: 400, error: "mode must be 'contact' when choosing agent_id" };
+    }
+    const agent = db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId);
+    if (!agent) return { success: false, status: 404, error: "Producer not found" };
+
+    db.prepare(`
+      UPDATE cart_wishes SET chosen_agent_id = ?, chosen_product_id = NULL, mode = 'contact' WHERE id = ?
+    `).run(agentId, wishId);
+  }
+
+  db.prepare("UPDATE carts SET updated_at = datetime('now') WHERE id = ?").run(cartId);
+  const updated = db.prepare("SELECT * FROM cart_wishes WHERE id = ?").get(wishId) as CartWish;
+  return { success: true, wish: updated };
+}
+
+export function deleteCartWish(cartId: string, wishId: string): UpdateItemResult {
+  const db = _cartTestDb ?? getDb();
+
+  const wish = db.prepare("SELECT * FROM cart_wishes WHERE id = ? AND cart_id = ?").get(wishId, cartId) as
+    | CartWish
+    | undefined;
+  if (!wish) return { success: false, status: 404, error: "Wish not found in cart" };
+
+  const cart = db.prepare("SELECT status FROM carts WHERE id = ?").get(cartId) as { status: string } | undefined;
+  if (cart && cart.status !== "open") {
+    return { success: false, status: 409, error: `Cart is ${cart.status}; wishes can only be changed while open` };
+  }
+
+  if (wish.chosen_product_id) {
+    db.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cartId, wish.chosen_product_id);
+  }
+  db.prepare("DELETE FROM cart_wishes WHERE id = ?").run(wishId);
+  db.prepare("UPDATE carts SET updated_at = datetime('now') WHERE id = ?").run(cartId);
+  return { success: true, deleted: true };
+}
+
 // ─── View cart ───────────────────────────────────────────────────────────────
 
 export function viewCart(cartId: string): CartView | null {
@@ -386,11 +556,56 @@ export function viewCart(cartId: string): CartView | null {
 
 // ─── Submit cart ─────────────────────────────────────────────────────────────
 
+export interface SubmitContactInput {
+  buyer_name?: string | null;
+  buyer_email?: string | null;
+  buyer_phone?: string | null;
+  delivery_note?: string | null;
+  contact_consent?: boolean;
+}
+
+export interface ContactHandoff {
+  agent_id: string;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  profile_url: string;
+  message: string;
+}
+
 export type SubmitResult =
-  | { success: true; orders: OrderSummary[] }
+  | { success: true; orders: OrderSummary[]; contact_handoffs: ContactHandoff[] }
   | { success: false; status: number; error: string; unavailable?: Array<{ product_id: string; product_name: string; availability: string }> };
 
-export function submitCart(cartId: string): SubmitResult {
+const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+
+/** Norwegian prefilled "contact yourself" message — never includes buyer contact info. */
+function buildHandoffMessage(lines: Array<{ name: string; qty: number; unit?: string | null }>): string {
+  const itemText = lines
+    .map((l) => `${l.qty}${l.unit ? " " + l.unit : ""} ${l.name}`)
+    .join(", ");
+  return `Hei! Jeg fant deg på Rett fra Bonden og ønsker å bestille: ${itemText}. Har du dette tilgjengelig, og hvordan kan jeg få hentet det?`;
+}
+
+/** Builds a ContactHandoff for one producer from a merged item/wish list. Never throws. */
+function buildContactHandoff(
+  agentId: string,
+  agentName: string,
+  lines: Array<{ name: string; qty: number; unit?: string | null }>
+): ContactHandoff {
+  const info = knowledgeService.getAgentInfo(agentId);
+  const k = info?.knowledge;
+  return {
+    agent_id: agentId,
+    name: agentName,
+    phone: k?.phone ?? null,
+    email: k?.email ?? null,
+    profile_url: `${HANDOFF_BASE_URL}/produsent/${slugify(agentName)}`,
+    message: buildHandoffMessage(lines),
+  };
+}
+
+export function submitCart(cartId: string, contact?: SubmitContactInput): SubmitResult {
   const db = _cartTestDb ?? getDb();
 
   const cart = db.prepare("SELECT id, status FROM carts WHERE id = ?").get(cartId) as
@@ -400,6 +615,15 @@ export function submitCart(cartId: string): SubmitResult {
   if (cart.status !== "open") {
     return { success: false, status: 409, error: `Cart is already ${cart.status}` };
   }
+
+  // mode='contact' wishes — no cart_items row, never touched by the
+  // availability re-check below. Grouped into contact_handoffs, per agent,
+  // further down.
+  const contactWishes = db.prepare(`
+    SELECT id, term, qty, unit_hint, chosen_agent_id
+    FROM cart_wishes
+    WHERE cart_id = ? AND mode = 'contact' AND chosen_agent_id IS NOT NULL
+  `).all(cartId) as Array<{ id: string; term: string; qty: number; unit_hint: string | null; chosen_agent_id: string }>;
 
   const items = db.prepare(`
     SELECT
@@ -434,7 +658,7 @@ export function submitCart(cartId: string): SubmitResult {
     producer_name: string;
   }>;
 
-  if (!items.length) {
+  if (!items.length && !contactWishes.length) {
     return { success: false, status: 400, error: "Cart is empty" };
   }
 
@@ -475,16 +699,89 @@ export function submitCart(cartId: string): SubmitResult {
     byAgent.get(item.agent_id)!.push(item);
   }
 
+  // Producers eligible for a real order RIGHT NOW — re-checked here at
+  // submit (defense-in-depth; addCartItem() already required this at add
+  // time, so in the common case nothing changes — it only matters if
+  // eligibility changed between add and submit). Reuses isProducerEligible()
+  // COMPLETELY UNCHANGED, per this slice's own scope: its gating logic is
+  // not touched here.
+  const eligibleAgentIds = new Set<string>();
+  const ineligibleAgentIds = new Set<string>();
+  for (const agent_id of byAgent.keys()) {
+    (isProducerEligible(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+  }
+
+  // Everything that will NOT become a real order — mode='contact' wishes
+  // AND any cart_items producer that turned out ineligible at submit time
+  // ("chosen via mode:'contact', or an ineligible producer") — merged one
+  // entry per producer so a producer chosen both ways in the same cart
+  // still gets exactly one contact_handoffs entry.
+  const handoffByAgent = new Map<
+    string,
+    { name: string; lines: Array<{ name: string; qty: number; unit?: string | null }> }
+  >();
+  for (const agent_id of ineligibleAgentIds) {
+    const agentItems = byAgent.get(agent_id)!;
+    handoffByAgent.set(agent_id, {
+      name: agentItems[0]!.producer_name,
+      lines: agentItems.map((i) => ({ name: i.product_name, qty: i.qty, unit: i.unit })),
+    });
+  }
+  for (const w of contactWishes) {
+    const agentRow = db.prepare("SELECT name FROM agents WHERE id = ?").get(w.chosen_agent_id) as
+      | { name: string }
+      | undefined;
+    // A contact-mode wish pointing at a deleted/unknown agent is dropped
+    // silently rather than failing the whole submit — same defensive
+    // posture as the availability re-check's "never throw" contract.
+    if (!agentRow) continue;
+    const line = { name: w.term, qty: w.qty, unit: w.unit_hint };
+    const existing = handoffByAgent.get(w.chosen_agent_id);
+    if (existing) {
+      existing.lines.push(line);
+    } else {
+      handoffByAgent.set(w.chosen_agent_id, { name: agentRow.name, lines: [line] });
+    }
+  }
+
   const buyer_ref = (db.prepare("SELECT buyer_ref FROM carts WHERE id = ?").get(cartId) as any).buyer_ref;
 
   const orderSummaries: OrderSummary[] = [];
   const pendingNotifications: OrderNotificationInput[] = [];
+  const consentNow = contact?.contact_consent === true;
 
-  // Transaction: set cart submitted + create one order per producer
+  // Transaction: set cart submitted (+ contact fields) + create one order
+  // per ELIGIBLE producer + one cart_handoffs analytics row per handoff
+  // (agent_id/cart_id/item_count only — no buyer contact fields, ever).
   const tx = db.transaction(() => {
-    db.prepare("UPDATE carts SET status = 'submitted', updated_at = datetime('now') WHERE id = ?").run(cartId);
+    db.prepare(`
+      UPDATE carts
+      SET status = 'submitted',
+          buyer_name = ?,
+          buyer_email = ?,
+          buyer_phone = ?,
+          delivery_note = ?,
+          contact_consent_at = CASE WHEN ? THEN datetime('now') ELSE contact_consent_at END,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `).run(
+      contact?.buyer_name ?? null,
+      contact?.buyer_email ?? null,
+      contact?.buyer_phone ?? null,
+      contact?.delivery_note ?? null,
+      consentNow ? 1 : 0,
+      cartId
+    );
 
-    for (const [agent_id, agentItems] of byAgent) {
+    for (const [agent_id, lines] of handoffByAgent) {
+      db.prepare(`
+        INSERT INTO cart_handoffs (id, agent_id, cart_id, item_count, created_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+      `).run(randomUUID(), agent_id, cartId, lines.lines.length);
+    }
+
+    for (const agent_id of eligibleAgentIds) {
+      const agentItems = byAgent.get(agent_id)!;
       const order_id = randomUUID();
       const confirm_token = generateConfirmToken();
       const total_nok = agentItems.reduce((s, i) => {
@@ -559,7 +856,13 @@ export function submitCart(cartId: string): SubmitResult {
     });
   }
 
-  return { success: true, orders: orderSummaries };
+  // Built AFTER the transaction committed (cart_handoffs rows already
+  // written inside it) — this only reads agent contact info, no writes.
+  const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) =>
+    buildContactHandoff(agent_id, v.name, v.lines)
+  );
+
+  return { success: true, orders: orderSummaries, contact_handoffs };
 }
 
 // ─── Get order ───────────────────────────────────────────────────────────────

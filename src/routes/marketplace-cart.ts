@@ -40,7 +40,11 @@ import {
   getOrder,
   transitionOrder,
   getOrderByConfirmToken,
+  addCartWish,
+  chooseCartWishOffer,
+  deleteCartWish,
 } from "../services/cart-service";
+import { cartWishesLimiter } from "../middleware/security";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
 export const cartRouter = Router();
@@ -82,6 +86,11 @@ function cartId(req: Request): string {
 
 function itemId(req: Request): string {
   const v = req.params["itemId"];
+  return Array.isArray(v) ? v[0]! : (v as string);
+}
+
+function wishId(req: Request): string {
+  const v = req.params["wid"];
   return Array.isArray(v) ? v[0]! : (v as string);
 }
 
@@ -204,6 +213,92 @@ cartRouter.delete("/cart/:id/items/:itemId", (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Wishes ("handleliste" — dev-request 2026-09-16-handleliste-med-
+// produsentvalg-og-bestillingsflyt, Slice 1). A wish is "I want X" before a
+// concrete offer is chosen; PATCH picks either a can_order product (mirrors
+// a real cart_items row) or a contact-only producer (chosen_agent_id,
+// mode='contact', no cart_items row). Same token gate as everything else on
+// this router, plus cartWishesLimiter (defense-in-depth against an open,
+// unauthenticated POST triggering downstream side effects at submit).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/marketplace/cart/:id/wishes
+// Body: { term: string, qty: number, unit_hint?: string, buyer_ref?: string }
+cartRouter.post("/cart/:id/wishes", cartWishesLimiter, (req: Request, res: Response) => {
+  const token = extractToken(req);
+  const check = checkCartToken(cartId(req), token);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error });
+    return;
+  }
+
+  const { term, qty, unit_hint } = req.body ?? {};
+  if (typeof term !== "string" || !term.trim()) {
+    res.status(400).json({ success: false, error: "term is required" });
+    return;
+  }
+  if (typeof qty !== "number" || !Number.isInteger(qty) || qty <= 0) {
+    res.status(400).json({ success: false, error: "qty must be a positive integer" });
+    return;
+  }
+
+  const result = addCartWish(cartId(req), term, qty, typeof unit_hint === "string" ? unit_hint : null);
+  if (!result.success) {
+    res.status(result.status).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.status(201).json({ success: true, wish: result.wish });
+});
+
+// PATCH /api/marketplace/cart/:id/wishes/:wid
+// Body: { product_id?: string, qty?: number, agent_id?: string, mode?: 'contact', buyer_ref?: string }
+// Exactly one of product_id / agent_id is required.
+cartRouter.patch("/cart/:id/wishes/:wid", cartWishesLimiter, (req: Request, res: Response) => {
+  const token = extractToken(req);
+  const check = checkCartToken(cartId(req), token);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error });
+    return;
+  }
+
+  const { product_id, qty, agent_id, mode } = req.body ?? {};
+  const result = chooseCartWishOffer(cartId(req), wishId(req), {
+    productId: typeof product_id === "string" ? product_id : null,
+    qty: typeof qty === "number" ? qty : null,
+    agentId: typeof agent_id === "string" ? agent_id : null,
+    mode: typeof mode === "string" ? mode : null,
+  });
+  if (!result.success) {
+    res.status(result.status).json({ success: false, error: result.error });
+    return;
+  }
+
+  const cart = viewCart(cartId(req));
+  res.json({ success: true, wish: result.wish, cart });
+});
+
+// DELETE /api/marketplace/cart/:id/wishes/:wid
+// Token from header X-Cart-Token or query param buyer_ref (DELETE has no body convention here).
+cartRouter.delete("/cart/:id/wishes/:wid", cartWishesLimiter, (req: Request, res: Response) => {
+  const token = queryToken(req);
+  const check = checkCartToken(cartId(req), token);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error });
+    return;
+  }
+
+  const result = deleteCartWish(cartId(req), wishId(req));
+  if (!result.success) {
+    res.status(result.status).json({ success: false, error: result.error });
+    return;
+  }
+
+  const cart = viewCart(cartId(req));
+  res.json({ success: true, cart });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/marketplace/cart/:id
 // View cart grouped by producer. Token required.
 // Returns { success, cart_id, status, groups, total_nok, item_count }.
@@ -227,11 +322,33 @@ cartRouter.get("/cart/:id", (req: Request, res: Response) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/marketplace/cart/:id/submit
-// Submit the cart. Re-checks availability of every item. Splits into one order
-// per producer. No charge. No seller notification (Phase 1).
-// Token required. Body: { buyer_ref?: string }
+// Submit the cart. Re-checks availability of every item. Creates a real order
+// per producer eligible to receive one right now; every OTHER chosen producer
+// (contact-mode wishes, or one that turned out ineligible) comes back as a
+// contact_handoffs[] entry instead — no order row, no email.
+// Token required. Body: { buyer_ref?: string, buyer_name?, buyer_email?,
+// buyer_phone?, delivery_note?, contact_consent?: boolean, website?: string }
+//
+// `website` is a honeypot: a real browser never fills it (hidden field), so
+// any non-empty value means an automated submission — rejected before any
+// DB write. Rate-limited (cartWishesLimiter) — an unauthenticated POST that
+// can trigger a seller-notification email and a contact-handoff message is
+// exactly the "open form → spam" shape that limiter exists for.
+//
+// Privacy: buyer_name/buyer_email/buyer_phone/delivery_note are personal
+// data — NEVER logged (no console.log/error touches req.body here or in
+// cart-service.submitCart). Swept 30 days after terminal order status by
+// services/cart-contact-sweep.ts.
 // ─────────────────────────────────────────────────────────────────────────────
-cartRouter.post("/cart/:id/submit", (req: Request, res: Response) => {
+cartRouter.post("/cart/:id/submit", cartWishesLimiter, (req: Request, res: Response) => {
+  const body = req.body ?? {};
+
+  // Honeypot — silently accepted as a field, rejected only if filled in.
+  if (typeof body.website === "string" && body.website.trim() !== "") {
+    res.status(400).json({ success: false, error: "Submission rejected" });
+    return;
+  }
+
   const token = extractToken(req);
   const check = checkCartToken(cartId(req), token);
   if (!check.ok) {
@@ -239,7 +356,15 @@ cartRouter.post("/cart/:id/submit", (req: Request, res: Response) => {
     return;
   }
 
-  const result = submitCart(cartId(req));
+  const contact = {
+    buyer_name: typeof body.buyer_name === "string" ? body.buyer_name.trim() || null : null,
+    buyer_email: typeof body.buyer_email === "string" ? body.buyer_email.trim() || null : null,
+    buyer_phone: typeof body.buyer_phone === "string" ? body.buyer_phone.trim() || null : null,
+    delivery_note: typeof body.delivery_note === "string" ? body.delivery_note.trim() || null : null,
+    contact_consent: body.contact_consent === true,
+  };
+
+  const result = submitCart(cartId(req), contact);
   if (!result.success) {
     res.status(result.status).json(result);
     return;
