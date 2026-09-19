@@ -47,7 +47,7 @@
  */
 
 import Database from "better-sqlite3";
-import { marketplaceRegistry } from "./marketplace-registry";
+import { marketplaceRegistry, norwegianWordBoundary } from "./marketplace-registry";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import {
   norwegianTermsForEnglishQuery,
@@ -288,6 +288,82 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
     ok(isEnglishFoodWord("cheese") && isEnglishFoodWord("goat"), `isEnglishFoodWord covers words and phrase modifiers`);
     ok(!isEnglishFoodWord("bergen"), `isEnglishFoodWord does not claim place names`);
     ok(reverseGlossarySize() > 300, `reverse glossary covers >300 English words (${reverseGlossarySize()})`);
+
+    // ════════════════════════════════════════════════════════════════════
+    // G — Te / tea (dev-request 2026-09-19-rfb-mcp-te-drikkekategori)
+    // ════════════════════════════════════════════════════════════════════
+    // Confirmed live before this fix: `te`/`tea`/`urtete`/`herbal tea` all
+    // resolved `categories: null` — DRINK_KEYWORDS had 41 drink words and not
+    // one of them was a tea word — so the hard category filter never ran and
+    // the search fell back to the nationwide trust-ranked list, surfacing
+    // Homme Gård (categories: fruit, eggs — neither beverages nor herbs) at
+    // the top for a tea search.
+
+    // AC2: EN/NO twin pairs, both landing on the SAME category (`beverages`
+    // — tea is a drink a producer sells; `herbs` is the separate
+    // plant/spice category and is deliberately not reused here).
+    parity("tea", "te", "beverages");
+    parity("herbal tea", "urtete", "beverages");
+
+    // AC4: no regression to the neighbouring, already-working cases.
+    parity("coffee", "kaffe", "beverages");
+    ok(cats("urter").includes("herbs"), `NO "urter" → herbs, unchanged by the tea addition`);
+    ok(cats("herbs").includes("herbs"), `EN "herbs" → herbs, unchanged by the tea addition`);
+
+    // AC3: the exact substring trap `øl` hit before — `te` is a 2-letter
+    // substring of many unrelated Norwegian words. An ACTUAL negative test
+    // against norwegianWordBoundary() (the real word-boundary mechanism
+    // DRINK_KEYWORDS matching uses), not an assumption.
+    ok(!norwegianWordBoundary("te").test("potet"), `word-boundary: "te" does not match inside "potet"`);
+    ok(!norwegianWordBoundary("te").test("vinterepler"), `word-boundary: "te" does not match inside "vinterepler"`);
+    ok(!norwegianWordBoundary("te").test("spekemat"), `word-boundary: "te" does not match inside "spekemat"`);
+    ok(norwegianWordBoundary("te").test("te"), `word-boundary: "te" DOES match the standalone word "te"`);
+    ok(norwegianWordBoundary("te").test("grønn te"), `word-boundary: "te" DOES match as a standalone word inside a sentence`);
+    // …and the same, end-to-end, through the real parser: none of these
+    // compound/unrelated product names select `beverages`.
+    ok(!cats("Potet").includes("beverages"), `EN/NO "Potet" does NOT select beverages (substring trap)`);
+    ok(!cats("Vinterepler").includes("beverages"), `NO "Vinterepler" does NOT select beverages (substring trap)`);
+    ok(!cats("Spekemat").includes("beverages"), `NO "Spekemat" does NOT select beverages (substring trap)`);
+    // `te` is excluded from `_productTerms` exactly like every other drink
+    // keyword (PRODUCT_TERM_EXCLUSIONS), so it can never be tested as a NAME
+    // substring either — the mechanism that let old `øl` match "Pølser".
+    ok(!((marketplaceRegistry.parseNaturalQuery("te") as any)._productTerms ?? []).includes("te"),
+      `"te" is excluded from _productTerms, same protection as every other drink keyword`);
+
+    // AC1: `categories` is a HARD filter — a fixture producer that does NOT
+    // carry `beverages` (tagged only fruit/eggs, mirroring the live Homme
+    // Gård case) must not appear when a `te` search's detected category is
+    // applied through the real discover() filter.
+    {
+      const seedAgent = (row: { id: string; name: string; categories: string[] }) => {
+        db.prepare(
+          `INSERT INTO agents (
+            id, name, description, provider, contact_email, url, role, api_key,
+            categories, tags, skills, capabilities, languages,
+            trust_score, is_active, is_verified, discovery_count, interaction_count,
+            total_interactions, created_at, last_seen_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'producer', ?,
+            ?, '[]', '[]', '{}', '["no"]',
+            0.5, 1, 0, 0, 0, 0, datetime('now'), datetime('now'))`,
+        ).run(
+          row.id, row.name, "En beskrivelse", row.name, `${row.id}@example.no`, `https://${row.id}.example.no`,
+          `key-${row.id}`, JSON.stringify(row.categories),
+        );
+      };
+      seedAgent({ id: "te-beverages", name: "Fjellheim Teri", categories: ["beverages"] });
+      // Mirrors the live Homme Gård case exactly: fruit + eggs, no beverages
+      // and no herbs.
+      seedAgent({ id: "te-fruit-eggs", name: "Homme Gård Fixture", categories: ["fruit", "eggs"] });
+
+      const parsed = marketplaceRegistry.parseNaturalQuery("te");
+      ok((parsed.categories || []).includes("beverages"), `te1: "te" selects the beverages category at all`);
+
+      const results = marketplaceRegistry.discover({ categories: parsed.categories });
+      const ids = results.map(r => r.agent.id);
+      ok(ids.includes("te-beverages"), `te2: the beverages-tagged fixture producer IS returned for "te"`);
+      ok(!ids.includes("te-fruit-eggs"),
+        `te3: the fruit/eggs-only fixture producer (Homme Gård case) is NOT returned for "te"`);
+    }
 
   } finally {
     console.log = prevLog;
