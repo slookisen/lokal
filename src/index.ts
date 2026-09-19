@@ -27,6 +27,7 @@ import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from "./routes/marketplace-catalog";
 import { runProductCatalogSync } from "./services/product-catalog-sync";
+import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
 import dentalRoutes from "./routes/dental";
@@ -1394,6 +1395,45 @@ if (process.env.CATALOG_SYNC_SCHEDULER_ENABLED === "true") {
       lastCatalogSyncAt = now;
     } catch (err) {
       console.error("[catalog-sync] failed:", err);
+    }
+  }, 60 * 60_000); // hourly check
+}
+
+// ─── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 2: daily 30-day buyer-contact-data sweep ─────────────────────────
+//
+// Calls the SAME sweepExpiredCartContactData() (src/services/
+// cart-contact-sweep.ts, built+unit-tested in Slice 1) that nulls the 5
+// buyer-contact columns on `carts` and `orders` once their order lifecycle
+// has been terminal for 30+ days. Never logs a buyer_name/buyer_email/
+// buyer_phone/delivery_note value — only the counts below.
+//
+// Fires at 08:00 UTC — after both the 22:00-06:00 verifier window and the
+// 07:00 catalog-sync tick, so this sweep's writes never overlap either.
+// Same hourly-wakeup / fire-once-in-the-target-hour / 23h-debounce pattern
+// as the catalog-sync block immediately above.
+//
+// OPT-IN (default OFF, same posture as CATALOG_SYNC_SCHEDULER_ENABLED /
+// VERIFIER_SCHEDULER_ENABLED — every NEW scheduled job in this file ships
+// inert until a human flips its own flag in fly.toml) via
+// CART_CONTACT_SWEEP_SCHEDULER_ENABLED=true. Deliberately NOT gated behind
+// HANDLELISTE_ENABLED: that flag will gate the customer-facing /handleliste
+// page (Slice 3, not yet built) — a pure data-hygiene deletion sweep must
+// keep running (and deleting already-collected contact data) even while
+// the customer-facing surface itself is disabled or not yet launched;
+// tying deletion to a UI feature flag would be backwards.
+let lastCartContactSweepAt: Date | null = null;
+if (process.env.CART_CONTACT_SWEEP_SCHEDULER_ENABLED === "true") {
+  setInterval(() => {
+    const now = new Date();
+    if (now.getUTCHours() !== 8) return; // fire only during 08:00 UTC window
+    if (lastCartContactSweepAt && (now.getTime() - lastCartContactSweepAt.getTime()) < 23 * 3600_000) return;
+    try {
+      const result = sweepExpiredCartContactData();
+      console.log(`[cart-contact-sweep] carts=${result.sweptCount} orders=${result.sweptOrderCount}`);
+      lastCartContactSweepAt = now;
+    } catch (err) {
+      console.error("[cart-contact-sweep] failed:", err);
     }
   }, 60 * 60_000); // hourly check
 }

@@ -523,6 +523,22 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
     )
     .join("\n      ");
 
+  // Slice 2 (hybrid utsending): buyer contact fields + delivery wish, when
+  // present on the order — read-only display, no new actions on this page.
+  // Omitted entirely (not shown as blank rows) once absent, e.g. after
+  // cart-contact-sweep.ts's 30-day sweep has nulled them.
+  const buyerRowsHtml = [
+    order.buyer_name ? `<div><strong>Navn:</strong> ${escapePageHtml(order.buyer_name)}</div>` : "",
+    order.buyer_phone ? `<div><strong>Telefon:</strong> ${escapePageHtml(order.buyer_phone)}</div>` : "",
+    order.buyer_email ? `<div><strong>E-post:</strong> ${escapePageHtml(order.buyer_email)}</div>` : "",
+    order.delivery_note ? `<div><strong>Leveringsønske:</strong> ${escapePageHtml(order.delivery_note)}</div>` : "",
+  ]
+    .filter(Boolean)
+    .join("\n      ");
+  const buyerBlockHtml = buyerRowsHtml
+    ? `<div class="recap"><strong>Kunde:</strong>\n      ${buyerRowsHtml}\n    </div>`
+    : "";
+
   const timelineHtml = order.timeline.length
     ? `<div class="recap"><strong>Tidslinje:</strong>\n      ${order.timeline
         .map((e) => `<div>${escapePageHtml(e.created_at)}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
@@ -566,6 +582,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
       ${order.total_nok != null ? `<div><strong>Sum:</strong> ${order.total_nok} kr</div>` : ""}
       ${itemsHtml}
     </div>
+    ${buyerBlockHtml}
     ${timelineHtml}
     ${actionsHtml}
     <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. Ingen betaling skjer via plattformen.</p>
