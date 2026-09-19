@@ -58,10 +58,10 @@ interface RouteResult {
 
 function callRouteSync(
   router: any,
-  opts: { query?: Record<string, string>; headers?: Record<string, string> } = {},
+  opts: { url?: string; query?: Record<string, string>; headers?: Record<string, string> } = {},
 ): RouteResult {
   let result: RouteResult = { status: 200, body: undefined };
-  const req: any = { method: "GET", url: "/", query: opts.query || {}, headers: opts.headers || {} };
+  const req: any = { method: "GET", url: opts.url || "/", query: opts.query || {}, headers: opts.headers || {} };
   const res: any = {
     statusCode: 200,
     status(code: number) { this.statusCode = code; return this; },
@@ -161,6 +161,31 @@ export function runOutreachPoolProfilePublishedTests(opts: { log?: boolean } = {
       assertTrue(!viewIds.includes("opp-unvetted"), "p2: is_vetted=0 (quarantined) -> excluded from outreach_ready_pool");
       assertTrue(!viewIds.includes("opp-logistics"), "p3: role='logistics' (non-producer, non-umbrella) -> excluded from outreach_ready_pool");
       assertTrue(viewIds.includes("opp-control"), "p4: a fully-qualified control row still appears — no regression");
+
+      // ── p4b: /stats pool_funnel.active_producer_and_vetted (dev-request
+      // 2026-09-16-rfb-pool-delta-null-tross-berikelse) isolates exactly the
+      // is_active/role/is_vetted gates as their own funnel step. All 4 rows
+      // above (opp-inactive, opp-unvetted, opp-logistics, opp-control) are
+      // otherwise fully pool-qualified (verified/rich/fresh-URL/emailed), so
+      // url_fresh_and_ok counts all 4 while active_producer_and_vetted must
+      // count only opp-control — proving the new stage's gap from
+      // url_fresh_and_ok isolates real gate loss, not sent-log suppression
+      // (none of these 4 have been sent to yet).
+      delete require.cache[require.resolve("./admin-outreach-pool")];
+      const statsMod = require("./admin-outreach-pool");
+      const statsRouter = statsMod.default;
+      const statsRes = callRouteSync(statsRouter, { url: "/stats", headers: { "x-admin-key": testKey } });
+      assertEq(statsRes.status, 200, "p4b1: GET /admin/outreach-ready-pool/stats -> 200");
+      assertEq(
+        statsRes.body?.pool_funnel?.url_fresh_and_ok,
+        4,
+        "p4b2: url_fresh_and_ok counts all 4 rows (is_active/role/is_vetted not yet applied)",
+      );
+      assertEq(
+        statsRes.body?.pool_funnel?.active_producer_and_vetted,
+        1,
+        "p4b3: active_producer_and_vetted counts ONLY opp-control — the 3 inactive/unvetted/non-producer rows are excluded, matching outreach_ready_pool itself",
+      );
 
       // ── p5: role=NULL (legacy) is tolerated, same as passesRoleGate ─────────
       db.prepare(`
