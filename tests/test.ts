@@ -31935,6 +31935,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of mblp.failures) failures.push("mcp-browser-landing-page: " + f);
     console.log(`  mcp-browser-landing-page: ${mblp.passed} passed, ${mblp.failed} failed`);
 
+    // Bug fix: unknown/expired mcp-session-id on a non-initialize MCP
+    // request must 404 (MCP spec), not silently spin up a brand-new
+    // uninitialized session under the client's id — which then failed the
+    // triggering call anyway with a misleading 400 "Server not
+    // initialized" (the false-positive Glama reported against
+    // finn-tannlege right after a deploy wiped the in-memory session map).
+    // Covers both routers: src/routes/mcp.ts (rfb) and
+    // src/routes/dental-mcp.ts (dental), via the shared helpers in
+    // src/services/mcp-session-protocol.ts.
+    console.log("\n── mcp-session-404: unknown session id → 404, initialize never adopts client id (rfb + dental) ──");
+    const { runMcpSession404Tests } = require("../src/routes/mcp-session-404.test") as
+      typeof import("../src/routes/mcp-session-404.test");
+    const ms404 = await runMcpSession404Tests({ log: false });
+    passed += ms404.passed;
+    failed += ms404.failed;
+    for (const f of ms404.failures) failures.push("mcp-session-404: " + f);
+    console.log(`  mcp-session-404: ${ms404.passed} passed, ${ms404.failed} failed`);
+
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
     // wrapper over the EXISTING booking chain (BookingInputSchema,
