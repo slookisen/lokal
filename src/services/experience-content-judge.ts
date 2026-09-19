@@ -66,6 +66,7 @@
 import type Database from "better-sqlite3";
 import { parseContentFieldEvidence, PUBLISH_GATE_SQL } from "./experience-store";
 import { fetchPage, visibleTextOf, type FetchPageOptions } from "./fetch-page";
+import { summarizeAbout } from "./search-enrich";
 // Reused, not reinvented (dev-request 2026-09-14-opplevagent-falske-
 // karantener-doede-sider-gjenopprett, spec item 1): the SAME hostname-list
 // "parked domain" classification dental_agents.hjemmeside cleanup already
@@ -422,12 +423,30 @@ Ved minste tvil, svar ${JUDGE_MISMATCH_TOKEN}.`;
  * that also needs the raw page text for something unrelated to the judge
  * verdict (the sweep's boilerplate-description check) does not have to
  * fetch the same URL twice.
+ *
+ * `currentSummary` is the same idea for a different unrelated need: it is
+ * `summarizeAbout(fetchResult.html)` — the SAME extractive summary
+ * (meta-description-first, capped ~300 chars) that the content-refresh
+ * writer would store as `row.description` for this page today — computed
+ * from the html already in scope, no re-fetch. It is present whenever a
+ * real page was fetched and `null` for the dead/parked/empty-url branches,
+ * exactly like `pageText`. A caller comparing `row.description` (which is
+ * ALWAYS meta-derived-or-capped-paragraph, never the full page body) against
+ * "would this page currently produce the same description" must compare
+ * against `currentSummary`, not `pageText` — `pageText` is the full visible
+ * body and is a different shape entirely.
  */
 export type EvidencePageUnresolvedReason = "evidence_page_dead" | "evidence_page_parked" | "judge_failed";
 
 export type EvidenceJudgeOutcome =
-  | { verdict: "MATCH" | "MISMATCH"; reason: string; pageText: string }
-  | { verdict: "unresolved"; reason: string; unresolvedReason: EvidencePageUnresolvedReason; pageText: string | null };
+  | { verdict: "MATCH" | "MISMATCH"; reason: string; pageText: string; currentSummary: string | null }
+  | {
+      verdict: "unresolved";
+      reason: string;
+      unresolvedReason: EvidencePageUnresolvedReason;
+      pageText: string | null;
+      currentSummary: string | null;
+    };
 
 export async function judgeExperienceEvidencePage(
   row: HoldoutExperienceRow,
@@ -446,6 +465,7 @@ export async function judgeExperienceEvidencePage(
       reason: "evidence_url er en tom streng — ingenting å hente, avvist fail-closed",
       unresolvedReason: "evidence_page_dead",
       pageText: null,
+      currentSummary: null,
     };
   }
 
@@ -456,6 +476,7 @@ export async function judgeExperienceEvidencePage(
       reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
       unresolvedReason: "evidence_page_dead",
       pageText: null,
+      currentSummary: null,
     };
   }
 
@@ -467,13 +488,15 @@ export async function judgeExperienceEvidencePage(
       reason: `evidenssiden er en parkert domeneside (${fetchResult.finalUrl})`,
       unresolvedReason: "evidence_page_parked",
       pageText: null,
+      currentSummary: null,
     };
   }
 
   const pageText = visibleTextOf(fetchResult.html);
+  const currentSummary = summarizeAbout(fetchResult.html);
   const judged = await judgeExperienceContentMatch(row, pageText);
   if (!judged.ok) {
-    return { verdict: "unresolved", reason: judged.reasoning, unresolvedReason: "judge_failed", pageText };
+    return { verdict: "unresolved", reason: judged.reasoning, unresolvedReason: "judge_failed", pageText, currentSummary };
   }
-  return { verdict: judged.verdict, reason: judged.reasoning, pageText };
+  return { verdict: judged.verdict, reason: judged.reasoning, pageText, currentSummary };
 }
