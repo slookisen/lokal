@@ -1,4 +1,4 @@
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import helmet from "helmet";
 import { Request, Response, NextFunction } from "express";
 
@@ -280,6 +280,38 @@ export const adminLimiter = rateLimit({
   legacyHeaders: false,
   validate: sharedValidate,
   message: { success: false, error: "Admin rate limit nådd. Maks 100 admin-operasjoner per time." },
+});
+
+// ─── Cart wishes / submit limiter ────────────────────────────
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 1: the anonymous cart's wishes + submit endpoints can trigger a
+// real outbound side effect (a seller-notification email for opt-in
+// producers, and a contact-handoff message surfaced to the caller) from an
+// unauthenticated, token-only POST — the same "open form → spam" shape
+// registrationLimiter/consumerKeyIssuanceLimiter already defend against on
+// their own endpoints, reused here rather than inventing a new mechanism.
+// Keyed on IP + the caller's own cart capability token (buyer_ref) — not
+// IP alone — so a single IP juggling many buyer_refs, or one buyer_ref
+// hopping IPs (mobile networks), is still bounded on the OTHER dimension.
+// ipKeyGenerator() (not raw req.ip) is required by express-rate-limit v8+
+// for a custom keyGenerator to normalize IPv6 addresses safely — see its
+// own runtime warning if this is skipped.
+function cartBuyerRefKey(req: Request): string {
+  const hdr = req.headers["x-cart-token"];
+  const headerToken = Array.isArray(hdr) ? hdr[0] : hdr;
+  const bodyRef = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>)["buyer_ref"] : undefined;
+  const ref = headerToken || (typeof bodyRef === "string" ? bodyRef : "");
+  return `${ipKeyGenerator(req.ip ?? "")}:${ref}`;
+}
+
+export const cartWishesLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: sharedValidate,
+  keyGenerator: cartBuyerRefKey,
+  message: { success: false, error: "For mange forespørsler. Prøv igjen om litt." },
 });
 
 // ─── AI-crawler allowlist ─────────────────────────────────────

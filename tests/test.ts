@@ -25744,7 +25744,17 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       currency TEXT NOT NULL DEFAULT 'NOK',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      expires_at TEXT
+      expires_at TEXT,
+      -- Slice 1 (dev-request 2026-09-16-handleliste-med-produsentvalg-og-
+      -- bestillingsflyt) additive contact columns — submitCart() writes
+      -- these unconditionally (NULL when not supplied), so this legacy
+      -- hand-rolled schema needs them present too, same as the
+      -- pilot-ordre-loop additive tables below.
+      buyer_name TEXT,
+      buyer_email TEXT,
+      buyer_phone TEXT,
+      delivery_note TEXT,
+      contact_consent_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_carts_buyer_ref ON carts(buyer_ref);
     CREATE TABLE cart_items (
@@ -25808,6 +25818,32 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id);
+    -- Slice 1 (dev-request 2026-09-16-handleliste-med-produsentvalg-og-
+    -- bestillingsflyt) additive tables: submitCart() unconditionally reads
+    -- cart_wishes (mode='contact' rows) and writes cart_handoffs, so both
+    -- must exist even for this legacy fase-1-only regression block, which
+    -- never itself creates a wish.
+    CREATE TABLE cart_wishes (
+      id TEXT PRIMARY KEY,
+      cart_id TEXT NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
+      term TEXT NOT NULL,
+      qty INTEGER NOT NULL CHECK(qty > 0),
+      unit_hint TEXT,
+      chosen_product_id TEXT,
+      chosen_agent_id TEXT,
+      mode TEXT CHECK(mode IS NULL OR mode IN ('order','contact')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_cart_wishes_cart_id ON cart_wishes(cart_id);
+    CREATE TABLE cart_handoffs (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      cart_id TEXT NOT NULL,
+      item_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_cart_handoffs_agent_id ON cart_handoffs(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_cart_handoffs_cart_id ON cart_handoffs(cart_id);
   `);
 
   // Set the shared DB singleton to our test DB
@@ -43208,6 +43244,64 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("cart-service-second-line: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+// Slice 1: cart_wishes model (addCartWish/chooseCartWishOffer/deleteCartWish)
+// + submitCart()'s contact_handoffs path. Own harness: same seam as
+// cart-service-supply-graph.test.ts / cart-service-second-line.test.ts,
+// restored in `finally`.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 1): cart_wishes + contact_handoffs ──");
+  try {
+    const { runCartServiceWishesTests } = require("../src/services/cart-service-wishes.test") as
+      typeof import("../src/services/cart-service-wishes.test");
+    const csw = runCartServiceWishesTests({ log: false });
+    passed += csw.passed;
+    failed += csw.failed;
+    for (const f of csw.failures) failures.push("cart-service-wishes: " + f);
+    console.log(`  cart-service-wishes: ${csw.passed} passed, ${csw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-service-wishes: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, Slice 1: route-level coverage for the wishes endpoints +
+// the extended submit endpoint, including honeypot rejection and a real
+// (request-driven, not just by-reference) cartWishesLimiter trip.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 1): wishes routes + rate-limit/honeypot ──");
+  try {
+    const { runMarketplaceCartWishesTests } = require("../src/routes/marketplace-cart-wishes.test") as
+      typeof import("../src/routes/marketplace-cart-wishes.test");
+    const mcw = await runMarketplaceCartWishesTests({ log: false });
+    passed += mcw.passed;
+    failed += mcw.failed;
+    for (const f of mcw.failures) failures.push("marketplace-cart-wishes: " + f);
+    console.log(`  marketplace-cart-wishes: ${mcw.passed} passed, ${mcw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-cart-wishes: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, Slice 1: the 30-day buyer-contact-data sweep
+// (sweepExpiredCartContactData) on a fixture DB.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 1): cart contact-data sweep ──");
+  try {
+    const { runCartContactSweepTests } = require("../src/services/cart-contact-sweep.test") as
+      typeof import("../src/services/cart-contact-sweep.test");
+    const ccs = runCartContactSweepTests({ log: false });
+    passed += ccs.passed;
+    failed += ccs.failed;
+    for (const f of ccs.failures) failures.push("cart-contact-sweep: " + f);
+    console.log(`  cart-contact-sweep: ${ccs.passed} passed, ${ccs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-contact-sweep: unexpected error: " + String(err?.message || err));
   }
 });
 

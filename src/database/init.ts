@@ -3691,6 +3691,99 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id)`);
 
+  // ─── dev-request 2026-09-16-handleliste-med-produsentvalg-og- ───────────
+  // bestillingsflyt, Slice 1: cart_wishes (handleliste-modell) + contact
+  // fields on carts + cart_handoffs (analytics only, no PII). Purely
+  // additive — same idempotent try/catch ALTER idiom as the pilot-ordre-loop
+  // block above, plain CREATE TABLE IF NOT EXISTS for the two brand-new
+  // tables. Slice 0 (catalog-offers.ts / lokal_find_offers) already shipped;
+  // this slice adds the wish/offer-choice model + submit's contact_handoffs
+  // path. Does NOT touch `orders`/`order_items` schema or
+  // order-notify-service.ts's gating — that's Slice 2.
+  //
+  //   cart_wishes          : "I want X" before a concrete offer is chosen.
+  //       chosen_product_id : set when the buyer picks a can_order offer —
+  //         cart-service.chooseCartWishOffer() ALSO upserts a mirroring
+  //         cart_items row via the existing addCartItem() machinery, so
+  //         submitCart()'s per-producer order path needs no changes to find
+  //         it. mode='order' in that case.
+  //       chosen_agent_id   : set when the buyer picks a "contact producer
+  //         myself" producer instead — no cart_items row, mode='contact'.
+  //       Both are mutually exclusive per wish (submit-time logic assumes
+  //       at most one is non-NULL) but the CHECK stays permissive (NULL/NULL
+  //       is the pre-choice state); the exclusivity is enforced in code.
+  //   carts.buyer_name/buyer_email/buyer_phone/delivery_note : optional
+  //       contact fields collected at submit — personal data, minimal,
+  //       never logged (see routes/marketplace-cart.ts), swept 30 days
+  //       after terminal order status (services/cart-contact-sweep.ts).
+  //   carts.contact_consent_at : server timestamp, set ONLY when the
+  //       submit caller explicitly passed contact_consent=true — never
+  //       inferred from the mere presence of contact fields.
+  //   cart_handoffs         : analytics-only event — "a contact-producer
+  //       handoff happened" — agent_id + cart_id + item_count + created_at.
+  //       Deliberately NO buyer contact fields (that's the whole point: the
+  //       platform never learns who the buyer is for a contact producer,
+  //       only that a handoff occurred, for outreach signal).
+  for (const stmt of [
+    `ALTER TABLE carts ADD COLUMN buyer_name TEXT`,
+    `ALTER TABLE carts ADD COLUMN buyer_email TEXT`,
+    `ALTER TABLE carts ADD COLUMN buyer_phone TEXT`,
+    `ALTER TABLE carts ADD COLUMN delivery_note TEXT`,
+    `ALTER TABLE carts ADD COLUMN contact_consent_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cart_wishes (
+      id                 TEXT PRIMARY KEY,
+      cart_id            TEXT NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
+      term               TEXT NOT NULL,
+      qty                INTEGER NOT NULL CHECK(qty > 0),
+      unit_hint          TEXT,
+      chosen_product_id  TEXT,
+      chosen_agent_id    TEXT,
+      mode               TEXT CHECK(mode IS NULL OR mode IN ('order','contact')),
+      created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_wishes_cart_id ON cart_wishes(cart_id)`);
+
+  // ─── orch-pr-20260919-handleliste-slice1 fix-up (reviewer CHANGES- ─────
+  // REQUESTED, must-fix) ───────────────────────────────────────────────────
+  // cart_items.wish_id: nullable, additive — scopes a wish's mirrored
+  // cart_items row to THAT SPECIFIC WISH instead of the row being
+  // addressable only by (cart_id, product_id). Without this, two different
+  // cart_wishes rows choosing the SAME product_id (duplicate search terms
+  // resolving to one catalog product, a retried PATCH, a bumped-qty second
+  // wish line — all normal) could silently clobber or delete each other's
+  // cart_items row via the old cart_id+product_id-only DELETE/upsert in
+  // chooseCartWishOffer()/deleteCartWish() — up to silent order/data loss
+  // at submitCart() with no error. NULL for cart_items rows added directly
+  // (not via a wish) — does not disturb that flow. Same idempotent
+  // try/catch ALTER idiom as every other additive column in this file.
+  // Placed after cart_wishes so the REFERENCES target already exists.
+  for (const stmt of [
+    `ALTER TABLE cart_items ADD COLUMN wish_id TEXT REFERENCES cart_wishes(id)`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_items_wish_id ON cart_items(wish_id) WHERE wish_id IS NOT NULL`);
+  } catch { /* partial index unsupported or already created */ }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cart_handoffs (
+      id           TEXT PRIMARY KEY,
+      agent_id     TEXT NOT NULL,
+      cart_id      TEXT NOT NULL,
+      item_count   INTEGER NOT NULL DEFAULT 0,
+      created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_handoffs_agent_id ON cart_handoffs(agent_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_handoffs_cart_id ON cart_handoffs(cart_id)`);
+
   // ─── Slice 1 of dev-request 2026-06-30-brreg-verification-gate ─────────
   // Schema + lookup-function ONLY. This slice does NOT wire org-nr
   // verification into any registration/enrichment endpoint — that's
