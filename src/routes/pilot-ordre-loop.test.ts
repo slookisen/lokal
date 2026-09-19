@@ -92,7 +92,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
   const DANIEL_EMAIL = "da.fredriksen@gmail.com";
 
   // Captured notification sends (stubbed transport).
-  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
+  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string; replyTo?: string }> = [];
 
   let server: http.Server | null = null;
 
@@ -105,7 +105,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     notifySvc.__setOrderNotifyTestDb(testDb as any);
     adminOrdersMod.__setAdminOrdersTestDb(testDb as any);
     notifySvc.__setOrderNotifySendForTesting(async (o) => {
-      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent });
+      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent, replyTo: o.replyTo });
       return { success: true, messageId: "stub" };
     });
     process.env.ADMIN_KEY = ADMIN_KEY;
@@ -139,6 +139,15 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     insertAgent.run("ag-daniel", "Daniels Testgård", "gard@example.no", "key-daniel");
     insertKnowledge.run("ag-daniel", "verified");
     insertProduct.run("prod-daniel", "ag-daniel", "Honning", "honning", 120, "glass");
+
+    // orch-pr-20260919-handleliste-slice2 (Gate expansion): owner-claimed
+    // (agents.is_verified=1) producer WITHOUT the separate opt-in toggle —
+    // the whole point of the OR-gate is that this producer now gets a real
+    // order + email on its own, without ALSO needing an admin/self opt-in.
+    insertAgent.run("ag-verified-noopt", "Eierverifisert Gård", "verifisert@example.no", "key-verified-noopt");
+    insertKnowledge.run("ag-verified-noopt", "verified");
+    testDb.prepare("UPDATE agents SET is_verified = 1 WHERE id = 'ag-verified-noopt'").run();
+    insertProduct.run("prod-verified-noopt", "ag-verified-noopt", "Gulrøtter", "gulrøtter", 25, "kg");
 
     // Gate-matrix-only agents (not orderable through the cart; exercised via
     // resolveOrderNotificationRecipient directly).
@@ -242,18 +251,33 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // (a) Opt-in gate NEGATIVE: default agent gets NO notification. Ever.
+    // (a) Gate NEGATIVE: a producer with NEITHER opt-in NOR is_verified gets
+    // NO real order at all now (orch-pr-20260919-handleliste-slice2 — Gate
+    // expansion closed the old "dead pending order nobody sees" gap, AC4's
+    // own negative test: "opt-in = 0 → ingen send, ingen ordrerad, handoff i
+    // svaret"). No email, ever, either.
     // ════════════════════════════════════════════════════════════════════════
     {
       sent.length = 0;
-      const { orderId } = await submitCartFor("prod-optout");
-      assertTrue(!!orderId, "optin-neg-01: submit against non-opted-in producer still creates the order");
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-optout", qty: 2, buyer_ref: buyerRef },
+      });
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
+        body: { buyer_ref: buyerRef },
+      });
+      assertEq(s.status, 201, "optin-neg-00: submit itself still succeeds (empty orders is not a submit failure)");
+      assertEq(s.body?.orders?.length, 0,
+        "optin-neg-01: NO order row for a producer with neither opt-in nor is_verified — closes the dead-pending-order gap");
+      assertEq(s.body?.contact_handoffs?.length, 1,
+        "optin-neg-01b: the producer surfaces as a contact_handoff instead");
+      assertEq(s.body?.contact_handoffs?.[0]?.agent_id, "ag-optout",
+        "optin-neg-01c: handoff is for the correct producer");
       // Give the fire-and-forget path ample time to (wrongly) send.
       await new Promise((r) => setTimeout(r, 150));
-      assertEq(sent.length, 0, "optin-neg-02: NO email sent to a producer with default opt_in=0 (the never-send default)");
-      const row = testDb.prepare("SELECT confirm_token FROM orders WHERE id = ?").get(orderId) as any;
-      assertTrue(typeof row?.confirm_token === "string" && row.confirm_token.startsWith("ctok_"),
-        "optin-neg-03: confirm_token is generated at order creation even when no notification goes out");
+      assertEq(sent.length, 0, "optin-neg-02: NO email sent to a producer with default opt_in=0/is_verified=0 (the never-send default)");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -296,6 +320,100 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // (b2) orch-pr-20260919-handleliste-slice2: gate expansion end-to-end +
+    // email v2 content (buyer fields + dynamic Reply-To) + v1 rollback flag
+    // + PRG page showing the buyer's contact fields.
+    // ════════════════════════════════════════════════════════════════════════
+    let verifiedNoOptToken = "";
+    {
+      sent.length = 0;
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-verified-noopt", qty: 3, buyer_ref: buyerRef },
+      });
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
+        body: {
+          buyer_ref: buyerRef,
+          buyer_name: "Kari Nordmann",
+          buyer_email: "kari@example.com",
+          buyer_phone: "+47 91234567",
+          delivery_note: "Ring på døra, hunden bjeffer",
+          contact_consent: true,
+        },
+      });
+      assertEq(s.status, 201, "gate-expand-01: submit succeeds");
+      assertEq(s.body?.orders?.length, 1,
+        "gate-expand-02: is_verified=1 alone (opt_in=0) is enough for a REAL order — the gate-expansion's whole point");
+      assertEq(s.body?.contact_handoffs?.length, 0, "gate-expand-03: no contact_handoffs — this went through as a real order");
+      const orderId = s.body.orders[0].order_id as string;
+
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "gate-expand-04: exactly one email sent, via the new is_verified path");
+      const mail = sent[0]!;
+      assertEq(mail.to, "verifisert@example.no", "gate-expand-05: recipient is the producer's verified contact_email");
+
+      // ── Email v2 (default) content: buyer fields + delivery note ──────────
+      assertTrue(mail.textContent.includes("Kari Nordmann"), "email-v2-01: text content includes buyer_name");
+      assertTrue(mail.textContent.includes("+47 91234567"), "email-v2-02: text content includes buyer_phone");
+      assertTrue(mail.textContent.includes("kari@example.com"), "email-v2-03: text content includes buyer_email");
+      assertTrue(mail.textContent.includes("Ring på døra"), "email-v2-04: text content includes delivery_note");
+      assertTrue(mail.htmlContent.includes("Kari Nordmann") && mail.htmlContent.includes("Ring på døra"),
+        "email-v2-05: HTML content also includes the buyer block");
+      assertEq(mail.replyTo, "kari@example.com", "email-v2-06: Reply-To is the buyer's email when given");
+
+      const dbTok = (testDb.prepare("SELECT confirm_token FROM orders WHERE id = ?").get(orderId) as any)?.confirm_token;
+      verifiedNoOptToken = dbTok;
+
+      // ── PRG page displays the buyer's contact fields (read-only) ──────────
+      const page = await req("GET", `/produsent/ordre/${verifiedNoOptToken}`);
+      assertEq(page.status, 200, "prg-buyer-01: page loads");
+      assertTrue(page.text.includes("Kari Nordmann"), "prg-buyer-02: page shows buyer_name");
+      assertTrue(page.text.includes("+47 91234567"), "prg-buyer-03: page shows buyer_phone");
+      assertTrue(page.text.includes("kari@example.com"), "prg-buyer-04: page shows buyer_email");
+      assertTrue(page.text.includes("Ring på døra"), "prg-buyer-05: page shows delivery_note");
+
+      // ── PRG page shows NOTHING when the order has no buyer fields (the
+      // earlier ag-optin order from block (b), submitted with no contact) ──
+      const pageNoContact = await req("GET", `/produsent/ordre/${optinToken}`);
+      assertTrue(!pageNoContact.text.includes("Leveringsønske:"),
+        "prg-buyer-06: no buyer block rendered at all when the order carries no contact fields");
+
+      // ── v1 rollback flag: byte-identical to the pre-Slice-2 template, no
+      // buyer fields, default Reply-To — even though the ORDER still carries
+      // the buyer fields (the flag governs rendering, not data retention) ──
+      const prevVersionFlag = process.env.ORDER_NOTIFY_EMAIL_VERSION;
+      process.env.ORDER_NOTIFY_EMAIL_VERSION = "v1";
+      try {
+        sent.length = 0;
+        const c2 = await req("POST", "/api/marketplace/cart");
+        const cartId2 = c2.body.cart_id as string;
+        const buyerRef2 = c2.body.buyer_ref as string;
+        await req("POST", `/api/marketplace/cart/${cartId2}/items`, {
+          body: { product_id: "prod-verified-noopt", qty: 1, buyer_ref: buyerRef2 },
+        });
+        await req("POST", `/api/marketplace/cart/${cartId2}/submit`, {
+          body: {
+            buyer_ref: buyerRef2,
+            buyer_name: "Ola Buyer",
+            buyer_email: "ola@example.com",
+            contact_consent: true,
+          },
+        });
+        await waitFor(() => sent.length >= 1);
+        const v1Mail = sent[0]!;
+        assertTrue(!v1Mail.textContent.includes("Ola Buyer") && !v1Mail.htmlContent.includes("Ola Buyer"),
+          "email-v1-01: ORDER_NOTIFY_EMAIL_VERSION=v1 suppresses the buyer block entirely, even though the order has the data");
+        assertEq(v1Mail.replyTo, "kontakt@rettfrabonden.com",
+          "email-v1-02: v1 keeps the fixed platform Reply-To, never the buyer's email");
+      } finally {
+        if (prevVersionFlag === undefined) delete process.env.ORDER_NOTIFY_EMAIL_VERSION;
+        else process.env.ORDER_NOTIFY_EMAIL_VERSION = prevVersionFlag;
+      }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // (c) Recipient-gate unit matrix
     // ════════════════════════════════════════════════════════════════════════
     {
@@ -321,6 +439,20 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(r7.eligible && r7.email === DANIEL_EMAIL && r7.via === "admin_override",
         "gate-07: admin-set order_notification_email overrides the verified-contact requirement");
       testDb.prepare("UPDATE agents SET order_notification_email = NULL WHERE id = 'ag-unverif'").run();
+
+      // orch-pr-20260919-handleliste-slice2: gate expansion (opt_in=1 OR
+      // is_verified=1). ag-verified-noopt has is_verified=1, opt_in=0 (the
+      // agents-table default) and a verified contact — must be ADMITTED.
+      const r8 = notifySvc.resolveOrderNotificationRecipient("ag-verified-noopt");
+      assertTrue(r8.eligible && r8.email === "verifisert@example.no" && r8.via === "verified_contact",
+        "gate-08: is_verified=1 alone (opt_in=0) is now sufficient — admitted via the new OR clause");
+
+      // Sanity: is_verified=0 AND opt_in=0 (ag-optout, seeded above) is still
+      // denied — the OR-gate only ADDS an admission path, it never widens
+      // to "neither flag set".
+      const r9 = notifySvc.resolveOrderNotificationRecipient("ag-optout");
+      assertTrue(!r9.eligible && r9.reason === "not_opted_in",
+        "gate-09: neither opt_in nor is_verified set → still denied (gate-02's assertion still holds after the expansion)");
     }
 
     // ════════════════════════════════════════════════════════════════════════
