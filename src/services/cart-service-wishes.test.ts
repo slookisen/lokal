@@ -233,6 +233,119 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       assertTrue(missing.success === false && missing.status === 404, "deleteCartWish: 404 for unknown wish");
     }
 
+    // ═══════════ REGRESSION (orch-pr-20260919-handleliste-slice1 fix-up): ═
+    // ═══════════ reviewer's exact repro — two wishes choosing the SAME ════
+    // ═══════════ product_id must NEVER silently clobber/delete each ═══════
+    // ═══════════ other's cart_items row ════════════════════════════════════
+    //
+    // Reviewer's original repro (pre-fix): wish #1 = 2kg poteter, wish #2 =
+    // 3kg poteter (same product), wish #1 switched to a different product →
+    // cart_items ended up with only the new product, wish #2's 3kg poteter
+    // line silently vanished even though cart_wishes still claimed it was
+    // chosen — submitCart() would then succeed with that order line missing
+    // entirely. Post-fix, the SECOND wish's attempt to choose an
+    // already-claimed product_id is rejected outright (409) — the row can
+    // never come to be "owned" by two wishes at once, so there is nothing
+    // left for a later switch/delete to silently destroy.
+
+    {
+      const cart = cartSvc.createCart();
+      const w1 = cartSvc.addCartWish(cart.cart_id, "Poteter", 2, "kg");
+      const w2 = cartSvc.addCartWish(cart.cart_id, "Poteter", 3, "kg");
+      if (!w1.success || !w2.success) throw new Error("setup failed");
+
+      const chosen1 = cartSvc.chooseCartWishOffer(cart.cart_id, w1.wish.id, { productId: "prod-potet" });
+      assertTrue(chosen1.success === true, "repro: wish #1 chooses prod-potet — succeeds");
+
+      // The exact reviewer repro step: wish #2 independently chooses the
+      // SAME product_id. Pre-fix this silently upserted, clobbering wish
+      // #1's cart_items row. Post-fix it must be a clean 409, not a clobber.
+      const chosen2 = cartSvc.chooseCartWishOffer(cart.cart_id, w2.wish.id, { productId: "prod-potet" });
+      assertTrue(
+        chosen2.success === false && chosen2.status === 409,
+        "repro FIX: wish #2 choosing a product already claimed by wish #1 is rejected with 409, not silently upserted"
+      );
+
+      // wish #1's row must be completely untouched by wish #2's rejected attempt.
+      const rowsAfterReject = db.prepare("SELECT id, wish_id, qty FROM cart_items WHERE cart_id = ?").all(cart.cart_id) as any[];
+      assertEq(rowsAfterReject.length, 1, "repro FIX: exactly one cart_items row exists after the rejected second choice (no clobber, no duplicate)");
+      assertEq(rowsAfterReject[0]?.wish_id, w1.wish.id, "repro FIX: the surviving row still belongs to wish #1");
+      assertEq(rowsAfterReject[0]?.qty, 2, "repro FIX: wish #1's original qty (2) is unchanged — wish #2's qty (3) never overwrote it");
+
+      // wish #2 itself must be untouched by its own rejected attempt (no
+      // dangling chosen_product_id/mode despite the 409).
+      const w2Row = db.prepare("SELECT chosen_product_id, mode FROM cart_wishes WHERE id = ?").get(w2.wish.id) as any;
+      assertEq(w2Row?.chosen_product_id, null, "repro FIX: wish #2's chosen_product_id stays NULL after its rejected choice");
+      assertEq(w2Row?.mode, null, "repro FIX: wish #2's mode stays NULL after its rejected choice");
+
+      // Now perform the reviewer's actual "switch away" step: wish #1
+      // switches to a different product. This must delete ONLY wish #1's
+      // own row (by wish_id) — there is no wish #2 row to endanger, because
+      // it was never created.
+      const switched = cartSvc.chooseCartWishOffer(cart.cart_id, w1.wish.id, { productId: "prod-egg" });
+      assertTrue(switched.success === true, "repro FIX: wish #1 switching away to prod-egg succeeds");
+
+      const rowsAfterSwitch = db.prepare("SELECT id, wish_id, product_id, qty FROM cart_items WHERE cart_id = ?").all(cart.cart_id) as any[];
+      assertEq(rowsAfterSwitch.length, 1, "repro FIX: exactly one cart_items row after wish #1 switches away (old prod-potet row removed, no dangling wish #2 row was ever there to lose)");
+      assertEq(rowsAfterSwitch[0]?.product_id, "prod-egg", "repro FIX: surviving row is wish #1's new product");
+      assertEq(rowsAfterSwitch[0]?.wish_id, w1.wish.id, "repro FIX: surviving row is still tagged to wish #1");
+
+      // A cart submit at this point must produce exactly one order line
+      // (2kg prod-egg for wish #1) — no missing/lost line, matching the
+      // reviewer's concern that submitCart() would otherwise silently
+      // succeed with an order line missing entirely.
+      const sub = cartSvc.submitCart(cart.cart_id);
+      assertTrue(sub.success === true, "repro FIX: submitCart succeeds after the switch");
+      if (sub.success) {
+        assertEq(sub.orders.length, 1, "repro FIX: exactly one order created");
+        assertEq(sub.orders[0]?.total_nok, 60, "repro FIX: order total reflects wish #1's 2 qty * 30 price only — nothing silently lost or duplicated");
+      }
+    }
+
+    // ═══════════ REGRESSION: two wishes on DIFFERENT products are fully ═══
+    // ═══════════ independent — deleting one never touches the other's ═════
+    // ═══════════ mirrored cart_items row (wish_id-scoped delete, not a ═════
+    // ═══════════ bare product match) ════════════════════════════════════════
+
+    {
+      const cart = cartSvc.createCart();
+      const wA = cartSvc.addCartWish(cart.cart_id, "Poteter", 2);
+      const wB = cartSvc.addCartWish(cart.cart_id, "Egg", 5);
+      if (!wA.success || !wB.success) throw new Error("setup failed");
+
+      const chosenA = cartSvc.chooseCartWishOffer(cart.cart_id, wA.wish.id, { productId: "prod-potet" });
+      const chosenB = cartSvc.chooseCartWishOffer(cart.cart_id, wB.wish.id, { productId: "prod-egg" });
+      assertTrue(chosenA.success === true && chosenB.success === true, "independence setup: two wishes on different products both succeed");
+
+      const del = cartSvc.deleteCartWish(cart.cart_id, wA.wish.id);
+      assertTrue(del.success === true, "independence: deleting wish A succeeds");
+
+      const remaining = db.prepare("SELECT wish_id, product_id, qty FROM cart_items WHERE cart_id = ?").all(cart.cart_id) as any[];
+      assertEq(remaining.length, 1, "independence: exactly one cart_items row remains after deleting wish A");
+      assertEq(remaining[0]?.wish_id, wB.wish.id, "independence: the remaining row belongs to wish B, untouched by wish A's deletion");
+      assertEq(remaining[0]?.product_id, "prod-egg", "independence: wish B's product (egg) is unaffected");
+      assertEq(remaining[0]?.qty, 5, "independence: wish B's qty (5) is unaffected");
+    }
+
+    // ═══════════ REGRESSION: a directly-added (non-wish) cart_items row is ═
+    // ═══════════ also protected — a wish cannot silently steal it either ══
+
+    {
+      const cart = cartSvc.createCart();
+      const direct = cartSvc.addCartItem(cart.cart_id, "prod-potet", 4);
+      assertTrue(direct.success === true, "direct-item setup: plain addCartItem succeeds");
+
+      const w = cartSvc.addCartWish(cart.cart_id, "Poteter", 1);
+      if (!w.success) throw new Error("setup failed");
+      const chosen = cartSvc.chooseCartWishOffer(cart.cart_id, w.wish.id, { productId: "prod-potet" });
+      assertTrue(chosen.success === false && chosen.status === 409, "direct-item protection: a wish choosing a product already directly in the cart is rejected (409), not silently merged/overwritten");
+
+      const rows = db.prepare("SELECT wish_id, qty FROM cart_items WHERE cart_id = ?").all(cart.cart_id) as any[];
+      assertEq(rows.length, 1, "direct-item protection: still exactly one cart_items row");
+      assertEq(rows[0]?.wish_id, null, "direct-item protection: the directly-added row's wish_id is still NULL — untouched");
+      assertEq(rows[0]?.qty, 4, "direct-item protection: the directly-added row's qty (4) is unchanged");
+    }
+
     // ═══════════ submitCart: eligible producer's chosen offer → real order ═
 
     {

@@ -40,6 +40,10 @@ export interface CartItem {
   unit_price_snapshot: number | null;
   line_note: string | null;
   added_at: string;
+  // orch-pr-20260919-handleliste-slice1 fix-up: NULL for items added
+  // directly (not via a wish). Set/read only by the cart_wishes machinery
+  // below — see chooseCartWishOffer()/deleteCartWish().
+  wish_id?: string | null;
   // Joined from products/agents for view
   product_name?: string;
   unit?: string | null;
@@ -397,6 +401,19 @@ export interface ChooseWishOfferInput {
  * for this wish first — otherwise a stale order-mode line item would keep
  * creating a real order at submit even after the buyer switched away from
  * it (dangling-row bug this function exists specifically to avoid).
+ *
+ * orch-pr-20260919-handleliste-slice1 fix-up (reviewer CHANGES-REQUESTED):
+ * the previously-linked row is now located and removed by `wish_id` (this
+ * wish's OWN row, addressed by id), never by a bare (cart_id, product_id)
+ * match — the old match-by-product approach could hit and delete a
+ * DIFFERENT wish's mirrored row whenever two wishes independently chose the
+ * same product_id (cart_items has UNIQUE(cart_id, product_id), so only one
+ * row can exist per product). For the same reason, choosing a product_id
+ * that's already claimed by another wish (or already a direct, non-wish
+ * cart_items row) is rejected with 409 rather than silently merged or
+ * clobbered — simplest option that cannot reintroduce the silent-data-loss
+ * bug; a rejected buyer just sees "already chosen" and can bump qty on the
+ * existing wish/line instead.
  */
 export function chooseCartWishOffer(
   cartId: string,
@@ -426,19 +443,45 @@ export function chooseCartWishOffer(
     return { success: false, status: 400, error: "Provide only one of product_id or agent_id, not both" };
   }
 
-  // Clean up a previously-linked cart_items row before switching — see
-  // doc comment above. No-op if the wish had no prior order-mode choice, or
-  // if re-choosing the SAME product (addCartItem below upserts it anyway).
-  if (wish.chosen_product_id && wish.chosen_product_id !== productId) {
-    db.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cartId, wish.chosen_product_id);
-  }
+  // THIS wish's own currently-linked cart_items row, if any — located by
+  // wish_id (a specific row, by id), never by product match.
+  const ownRow = db.prepare("SELECT id, product_id FROM cart_items WHERE wish_id = ?").get(wishId) as
+    | { id: string; product_id: string }
+    | undefined;
 
   if (productId) {
+    // Reject if a DIFFERENT wish (or a directly-added, non-wish item)
+    // already owns the cart_items row for this exact product in this cart —
+    // see doc comment above for why this is rejected rather than merged.
+    const existingForProduct = db.prepare(
+      "SELECT id FROM cart_items WHERE cart_id = ? AND product_id = ?"
+    ).get(cartId, productId) as { id: string } | undefined;
+    if (existingForProduct && existingForProduct.id !== ownRow?.id) {
+      return {
+        success: false,
+        status: 409,
+        error: "This product is already chosen by another wish (or already in the cart) — change or remove that one first",
+      };
+    }
+
+    // Clean up THIS wish's own previously-linked row (by id) before
+    // switching to a different product. No-op if the wish had no prior
+    // order-mode choice, or if re-choosing the SAME product (addCartItem
+    // below upserts that row in place).
+    if (ownRow && ownRow.product_id !== productId) {
+      db.prepare("DELETE FROM cart_items WHERE id = ?").run(ownRow.id);
+    }
+
     const qty = Number.isInteger(input.qty) && (input.qty as number) > 0 ? (input.qty as number) : wish.qty;
     const added = addCartItem(cartId, productId, qty);
     if (!added.success) {
       return { success: false, status: added.status, error: added.error };
     }
+    // Tag the upserted row as owned by this wish. Safe: the conflict check
+    // above already proved no OTHER wish/row owns this product, so this
+    // can only ever (re-)tag this wish's own row.
+    db.prepare("UPDATE cart_items SET wish_id = ? WHERE cart_id = ? AND product_id = ?").run(wishId, cartId, productId);
+
     db.prepare(`
       UPDATE cart_wishes SET chosen_product_id = ?, chosen_agent_id = NULL, mode = 'order' WHERE id = ?
     `).run(productId, wishId);
@@ -448,6 +491,12 @@ export function chooseCartWishOffer(
     }
     const agent = db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId);
     if (!agent) return { success: false, status: 404, error: "Producer not found" };
+
+    // Switching to contact mode: drop this wish's own previously-linked
+    // cart_items row (by id), if any.
+    if (ownRow) {
+      db.prepare("DELETE FROM cart_items WHERE id = ?").run(ownRow.id);
+    }
 
     db.prepare(`
       UPDATE cart_wishes SET chosen_agent_id = ?, chosen_product_id = NULL, mode = 'contact' WHERE id = ?
@@ -472,9 +521,13 @@ export function deleteCartWish(cartId: string, wishId: string): UpdateItemResult
     return { success: false, status: 409, error: `Cart is ${cart.status}; wishes can only be changed while open` };
   }
 
-  if (wish.chosen_product_id) {
-    db.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cartId, wish.chosen_product_id);
-  }
+  // orch-pr-20260919-handleliste-slice1 fix-up: delete THIS wish's own
+  // mirrored cart_items row by wish_id (a specific row, by id) — never by
+  // bare (cart_id, product_id) match, which could otherwise delete a
+  // DIFFERENT wish's row that happens to share the same chosen product_id
+  // (the silent-data-loss bug this fix-up addresses). No-op if the wish
+  // never had an order-mode choice.
+  db.prepare("DELETE FROM cart_items WHERE wish_id = ?").run(wishId);
   db.prepare("DELETE FROM cart_wishes WHERE id = ?").run(wishId);
   db.prepare("UPDATE carts SET updated_at = datetime('now') WHERE id = ?").run(cartId);
   return { success: true, deleted: true };

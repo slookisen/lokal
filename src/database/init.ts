@@ -3749,6 +3749,29 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_wishes_cart_id ON cart_wishes(cart_id)`);
 
+  // ─── orch-pr-20260919-handleliste-slice1 fix-up (reviewer CHANGES- ─────
+  // REQUESTED, must-fix) ───────────────────────────────────────────────────
+  // cart_items.wish_id: nullable, additive — scopes a wish's mirrored
+  // cart_items row to THAT SPECIFIC WISH instead of the row being
+  // addressable only by (cart_id, product_id). Without this, two different
+  // cart_wishes rows choosing the SAME product_id (duplicate search terms
+  // resolving to one catalog product, a retried PATCH, a bumped-qty second
+  // wish line — all normal) could silently clobber or delete each other's
+  // cart_items row via the old cart_id+product_id-only DELETE/upsert in
+  // chooseCartWishOffer()/deleteCartWish() — up to silent order/data loss
+  // at submitCart() with no error. NULL for cart_items rows added directly
+  // (not via a wish) — does not disturb that flow. Same idempotent
+  // try/catch ALTER idiom as every other additive column in this file.
+  // Placed after cart_wishes so the REFERENCES target already exists.
+  for (const stmt of [
+    `ALTER TABLE cart_items ADD COLUMN wish_id TEXT REFERENCES cart_wishes(id)`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_items_wish_id ON cart_items(wish_id) WHERE wish_id IS NOT NULL`);
+  } catch { /* partial index unsupported or already created */ }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS cart_handoffs (
       id           TEXT PRIMARY KEY,
