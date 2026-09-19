@@ -81,13 +81,16 @@ export interface TestSummary {
 interface VerticalCase {
   label: string;
   routerPath: string;
-  toolListLength: number;
+  // Lower bound, not an exact count: an exact number couples this session-
+  // handling test to every unrelated tool addition (lokal#887 adding
+  // lokal_find_offers turned main red on d5 twice in one morning).
+  toolListMin: number;
   sampleToolName: string;
 }
 
 const VERTICALS: VerticalCase[] = [
-  { label: "rfb", routerPath: "./mcp", toolListLength: 14, sampleToolName: "lokal_search" },
-  { label: "dental", routerPath: "./dental-mcp", toolListLength: 5, sampleToolName: "tannlege_search" },
+  { label: "rfb", routerPath: "./mcp", toolListMin: 14, sampleToolName: "lokal_search" },
+  { label: "dental", routerPath: "./dental-mcp", toolListMin: 5, sampleToolName: "tannlege_search" },
 ];
 
 // Parses a JSON-RPC response body that may be a raw JSON object or an SSE
@@ -255,7 +258,10 @@ export function runMcpSession404Tests(opts: { log?: boolean } = {}): Promise<Tes
         assertTrue(!("error" in listBody), `${v.label} d3: tools/list has no top-level JSON-RPC error (got ${JSON.stringify(listBody.error)})`);
         const tools = listBody.result?.tools;
         assertTrue(Array.isArray(tools), `${v.label} d4: tools/list result.tools is an array`);
-        assertEq(tools?.length, v.toolListLength, `${v.label} d5: tool catalog length is unchanged by this fix`);
+        assertTrue(
+          Array.isArray(tools) && tools.length >= v.toolListMin,
+          `${v.label} d5: tool catalog is not truncated by this fix (expected >= ${v.toolListMin}, got ${tools?.length})`
+        );
         assertTrue(
           Array.isArray(tools) && tools.some((t: any) => t.name === v.sampleToolName),
           `${v.label} d6: tool catalog still includes ${v.sampleToolName}`
