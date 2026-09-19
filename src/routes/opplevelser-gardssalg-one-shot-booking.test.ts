@@ -230,6 +230,10 @@ export function runOpplevelserGardssalgOneShotBookingTests(opts: { log?: boolean
       assertEq(resolve.resolveGardssalgProviderByQuery("Finnes Ikke Gård").kind, "none", "u3: unknown name -> none");
       assertEq(resolve.resolveGardssalgProviderByQuery("   ").kind, "none", "u3b: blank query -> none (never a match-everything search)");
       assertEq(resolve.resolveGardssalgProviderByQuery("Skjult Testgard").kind, "none", "u3c: a catalog_hidden=1 row can never be resolved by name");
+      const rHidden = resolve.resolveGardssalgProviderByQuery("Skjult Testgard", { includeHidden: true });
+      assertEq(rHidden.kind === "one" ? rHidden.provider.id : rHidden.kind, "os-hidden", "u3c2: …unless the ADMIN-only includeHidden opt-in is set (booking-test-send)");
+      assertEq(store.searchGardssalgProviders({ q: "Skjult" }, 20).length, 0, "u3c3: the store's default q search excludes hidden rows");
+      assertEq(store.searchGardssalgProviders({ q: "Skjult", include_hidden: true }, 20).map((r) => r.id), ["os-hidden"], "u3c4: …and include_hidden is the only way in");
       assertEq(resolve.resolveGardssalgProviderByQuery("%").kind, "none", "u3d: LIKE wildcard in the query is literal, not a match-everything pattern");
       assertEq(resolve.resolveGardssalgProviderByQuery("_").kind, "none", "u3e: LIKE single-char wildcard in the query is literal too");
 

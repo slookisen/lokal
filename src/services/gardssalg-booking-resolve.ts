@@ -71,9 +71,11 @@ export type ProviderResolution =
 /** Same compact, PII-free shape discover_gardssalg rows use for the fields an
  *  assistant needs to disambiguate (never epost/telefon). */
 export function toProviderCandidate(row: GardssalgProviderRow): ProviderCandidate {
-  // searchGardssalgProviders() never returns catalog_hidden=1 rows, so the
-  // real/non-hidden gate applies — same call shape as discover_gardssalg.
-  const live = !isBookingPaused(row.booking_live);
+  // Public callers never see catalog_hidden=1 rows (searchGardssalgProviders'
+  // default exclusion), so this is the plain gate — same as discover_gardssalg.
+  // The admin test-send route CAN resolve a hidden row (includeHidden), and
+  // for that row the hidden carve-out in isBookingPaused() is what decides.
+  const live = !isBookingPaused(row.booking_live, row.catalog_hidden ?? null);
   return {
     provider_id: row.id,
     navn: row.navn,
@@ -101,7 +103,10 @@ export function toProviderCandidate(row: GardssalgProviderRow): ProviderCandidat
  */
 export function resolveGardssalgProviderByQuery(
   query: string,
-  opts: { kommune?: string; fylke?: string } = {},
+  // includeHidden: ADMIN-ONLY (POST /admin/booking-test-send) — lets the
+  // hidden, email-pinned test producer be resolved by name. Never set from a
+  // public entry point; see GardssalgSearchFilter.include_hidden.
+  opts: { kommune?: string; fylke?: string; includeHidden?: boolean } = {},
 ): ProviderResolution {
   // Same 200-char cap as the MCP input schema, applied here too so the REST
   // path (and any other caller) can never hand the store an unbounded query.
@@ -109,9 +114,10 @@ export function resolveGardssalgProviderByQuery(
   const terms = gardssalgQueryTerms(q);
   if (terms.length === 0) return { kind: "none", query: q };
 
-  const filter: { q: string; kommune?: string; fylke?: string } = { q };
+  const filter: { q: string; kommune?: string; fylke?: string; include_hidden?: boolean } = { q };
   if (opts.kommune && opts.kommune.trim()) filter.kommune = opts.kommune.trim();
   if (opts.fylke && opts.fylke.trim()) filter.fylke = opts.fylke.trim();
+  if (opts.includeHidden === true) filter.include_hidden = true;
 
   const rows = searchGardssalgProviders(filter, PROVIDER_QUERY_MAX_CANDIDATES + 1);
   if (rows.length === 0) return { kind: "none", query: q };
