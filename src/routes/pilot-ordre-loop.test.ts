@@ -92,7 +92,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
   const DANIEL_EMAIL = "da.fredriksen@gmail.com";
 
   // Captured notification sends (stubbed transport).
-  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
+  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string; replyTo?: string }> = [];
 
   let server: http.Server | null = null;
 
@@ -105,7 +105,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     notifySvc.__setOrderNotifyTestDb(testDb as any);
     adminOrdersMod.__setAdminOrdersTestDb(testDb as any);
     notifySvc.__setOrderNotifySendForTesting(async (o) => {
-      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent });
+      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent, replyTo: o.replyTo });
       return { success: true, messageId: "stub" };
     });
     process.env.ADMIN_KEY = ADMIN_KEY;
@@ -139,6 +139,55 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     insertAgent.run("ag-daniel", "Daniels Testgård", "gard@example.no", "key-daniel");
     insertKnowledge.run("ag-daniel", "verified");
     insertProduct.run("prod-daniel", "ag-daniel", "Honning", "honning", 120, "glass");
+
+    // orch-pr-20260919-handleliste-slice2 (Gate expansion, CORRECTED): the
+    // dev-request extends gate-klausul 3 ONLY ("Gate-klausul 3 i
+    // order-notify-service.ts utvides med `OR a.is_verified = 1`", line
+    // 160-161) — opt-in (gate 1) stays mandatory and independent, per AC4
+    // ("bare produsenter med is_verified = 1 AND order_notifications_opt_in
+    // = 1 ... får e-post"). This agent proves the CORE REGRESSION a prior
+    // pass on this branch got wrong: is_verified=1 alone, WITHOUT opt-in,
+    // must still get NO real order and NO email.
+    insertAgent.run("ag-verified-noopt", "Eierverifisert Gård Uten Optin", "verifisert@example.no", "key-verified-noopt");
+    insertKnowledge.run("ag-verified-noopt", "verified");
+    testDb.prepare("UPDATE agents SET is_verified = 1 WHERE id = 'ag-verified-noopt'").run();
+    insertProduct.run("prod-verified-noopt", "ag-verified-noopt", "Gulrøtter", "gulrøtter", 25, "kg");
+
+    // The actual gate-expansion admission path (AC4's exact positive case):
+    // BOTH is_verified=1 AND order_notifications_opt_in=1. verification_status
+    // is 'verified' too, since cart-admission (isProducerEligible(), used by
+    // addCartItem() — deliberately UNCHANGED by this slice, see cart-service.ts
+    // doc comment) requires it independently of is_verified; this agent
+    // exercises the full end-to-end cart→order→email path with realistic data.
+    insertAgent.run("ag-verified-optin", "Eierverifisert Gård Med Optin", "verifisertoptin@example.no", "key-verified-optin");
+    insertKnowledge.run("ag-verified-optin", "verified");
+    testDb.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'ag-verified-optin'").run();
+    insertProduct.run("prod-verified-optin", "ag-verified-optin", "Gulrøtter", "gulrøtter", 25, "kg");
+
+    // is_verified=1 AND opt_in=1, but verification_status='unverified' —
+    // isolates the is_verified alternative on gate 3 in
+    // resolveOrderNotificationRecipient() AND on isEligibleForRealOrder()
+    // precisely, since it cannot be admitted via the pre-existing
+    // verified_contact path.
+    //
+    // orch-pr-20260919-handleliste-slice2 fix-up (independent code-reviewer,
+    // CHANGES-REQUESTED): this agent used to be "never added to a cart" here
+    // because isEligibleForRealOrder() delegated to isProducerEligible(),
+    // which hard-requires verification_status='verified' with no is_verified
+    // alternative — the exact bug this fix-up corrects. It IS now addable
+    // and end-to-end order-able — see block (b3)/(b4) below, which flip
+    // verification_status to 'verified' just long enough to pass
+    // addCartItem()'s UNCHANGED admission gate (mirrors a real add-time state
+    // preceding a later cross-check change), then back to 'unverified'
+    // before submit to reproduce "owner-verified but not internally
+    // cross-checked" at the moment submitCart() re-checks eligibility. Both
+    // blocks restore this agent to its declared seed state (verification_
+    // status='unverified', opt_in=1) afterward, which the (c) gate matrix
+    // below still relies on.
+    insertAgent.run("ag-owner-verified-only", "Kun Eierverifisert Gård", "eierverifisertkun@example.no", "key-owner-verified-only");
+    insertKnowledge.run("ag-owner-verified-only", "unverified");
+    testDb.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+    insertProduct.run("prod-owner-verified-only", "ag-owner-verified-only", "Poteter", "poteter-eierverifisert", 30, "kg");
 
     // Gate-matrix-only agents (not orderable through the cart; exercised via
     // resolveOrderNotificationRecipient directly).
@@ -242,18 +291,62 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // (a) Opt-in gate NEGATIVE: default agent gets NO notification. Ever.
+    // (a) Gate NEGATIVE: a producer with NEITHER opt-in NOR is_verified gets
+    // NO real order at all now (orch-pr-20260919-handleliste-slice2 — Gate
+    // expansion closed the old "dead pending order nobody sees" gap, AC4's
+    // own negative test: "opt-in = 0 → ingen send, ingen ordrerad, handoff i
+    // svaret"). No email, ever, either.
     // ════════════════════════════════════════════════════════════════════════
     {
       sent.length = 0;
-      const { orderId } = await submitCartFor("prod-optout");
-      assertTrue(!!orderId, "optin-neg-01: submit against non-opted-in producer still creates the order");
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-optout", qty: 2, buyer_ref: buyerRef },
+      });
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
+        body: { buyer_ref: buyerRef },
+      });
+      assertEq(s.status, 201, "optin-neg-00: submit itself still succeeds (empty orders is not a submit failure)");
+      assertEq(s.body?.orders?.length, 0,
+        "optin-neg-01: NO order row for a producer with neither opt-in nor is_verified — closes the dead-pending-order gap");
+      assertEq(s.body?.contact_handoffs?.length, 1,
+        "optin-neg-01b: the producer surfaces as a contact_handoff instead");
+      assertEq(s.body?.contact_handoffs?.[0]?.agent_id, "ag-optout",
+        "optin-neg-01c: handoff is for the correct producer");
       // Give the fire-and-forget path ample time to (wrongly) send.
       await new Promise((r) => setTimeout(r, 150));
-      assertEq(sent.length, 0, "optin-neg-02: NO email sent to a producer with default opt_in=0 (the never-send default)");
-      const row = testDb.prepare("SELECT confirm_token FROM orders WHERE id = ?").get(orderId) as any;
-      assertTrue(typeof row?.confirm_token === "string" && row.confirm_token.startsWith("ctok_"),
-        "optin-neg-03: confirm_token is generated at order creation even when no notification goes out");
+      assertEq(sent.length, 0, "optin-neg-02: NO email sent to a producer with default opt_in=0/is_verified=0 (the never-send default)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (a2) orch-pr-20260919-handleliste-slice2 CORE REGRESSION test: a
+    // producer with is_verified=1 but opt_in=0 (ag-verified-noopt) must
+    // STILL get NO real order and NO email. A prior pass on this branch
+    // wrongly treated opt_in and is_verified as interchangeable alternatives
+    // for the WHOLE gate; per the dev-request (line 160-161 + AC4), opt-in
+    // is mandatory and is_verified is only an alternative way to satisfy the
+    // separate verified-contact/admin-override clause (gate 3).
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      sent.length = 0;
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-verified-noopt", qty: 1, buyer_ref: buyerRef },
+      });
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
+        body: { buyer_ref: buyerRef },
+      });
+      assertEq(s.status, 201, "regression-01: submit itself still succeeds");
+      assertEq(s.body?.orders?.length, 0,
+        "regression-02: is_verified=1 WITHOUT opt_in=1 creates NO real order — opt-in stays mandatory (the core regression)");
+      assertEq(s.body?.contact_handoffs?.length, 1,
+        "regression-03: producer surfaces as a contact_handoff instead, exactly like any other non-opted-in producer");
+      await new Promise((r) => setTimeout(r, 150));
+      assertEq(sent.length, 0, "regression-04: NO email sent — is_verified=1 alone never substitutes for opt-in");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -296,6 +389,235 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // (b2) orch-pr-20260919-handleliste-slice2: gate expansion end-to-end
+    // (opt_in=1 AND is_verified=1 together, on realistic verified-contact
+    // data — AC4's exact positive case; the OR-clause on gate 3 is isolated
+    // separately at the unit level by gate-08c below, and end-to-end through
+    // submitCart() itself by (b3)/(b4) further down, both using
+    // ag-owner-verified-only) + email v2 content (buyer fields + dynamic
+    // Reply-To) + v1 rollback flag + PRG page showing the buyer's contact
+    // fields.
+    // ════════════════════════════════════════════════════════════════════════
+    let verifiedNoOptToken = "";
+    {
+      sent.length = 0;
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-verified-optin", qty: 3, buyer_ref: buyerRef },
+      });
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
+        body: {
+          buyer_ref: buyerRef,
+          buyer_name: "Kari Nordmann",
+          buyer_email: "kari@example.com",
+          buyer_phone: "+47 91234567",
+          delivery_note: "Ring på døra, hunden bjeffer",
+          contact_consent: true,
+        },
+      });
+      assertEq(s.status, 201, "gate-expand-01: submit succeeds");
+      assertEq(s.body?.orders?.length, 1,
+        "gate-expand-02: is_verified=1 AND opt_in=1 together create a REAL order (AC4's exact positive case)");
+      assertEq(s.body?.contact_handoffs?.length, 0, "gate-expand-03: no contact_handoffs — this went through as a real order");
+      const orderId = s.body.orders[0].order_id as string;
+
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "gate-expand-04: exactly one email sent, via the new is_verified path");
+      const mail = sent[0]!;
+      assertEq(mail.to, "verifisertoptin@example.no", "gate-expand-05: recipient is the producer's contact_email");
+
+      // ── Email v2 (default) content: buyer fields + delivery note ──────────
+      assertTrue(mail.textContent.includes("Kari Nordmann"), "email-v2-01: text content includes buyer_name");
+      assertTrue(mail.textContent.includes("+47 91234567"), "email-v2-02: text content includes buyer_phone");
+      assertTrue(mail.textContent.includes("kari@example.com"), "email-v2-03: text content includes buyer_email");
+      assertTrue(mail.textContent.includes("Ring på døra"), "email-v2-04: text content includes delivery_note");
+      assertTrue(mail.htmlContent.includes("Kari Nordmann") && mail.htmlContent.includes("Ring på døra"),
+        "email-v2-05: HTML content also includes the buyer block");
+      assertEq(mail.replyTo, "kari@example.com", "email-v2-06: Reply-To is the buyer's email when given");
+
+      const dbTok = (testDb.prepare("SELECT confirm_token FROM orders WHERE id = ?").get(orderId) as any)?.confirm_token;
+      verifiedNoOptToken = dbTok;
+
+      // ── PRG page displays the buyer's contact fields (read-only) ──────────
+      const page = await req("GET", `/produsent/ordre/${verifiedNoOptToken}`);
+      assertEq(page.status, 200, "prg-buyer-01: page loads");
+      assertTrue(page.text.includes("Kari Nordmann"), "prg-buyer-02: page shows buyer_name");
+      assertTrue(page.text.includes("+47 91234567"), "prg-buyer-03: page shows buyer_phone");
+      assertTrue(page.text.includes("kari@example.com"), "prg-buyer-04: page shows buyer_email");
+      assertTrue(page.text.includes("Ring på døra"), "prg-buyer-05: page shows delivery_note");
+
+      // ── PRG page shows NOTHING when the order has no buyer fields (the
+      // earlier ag-optin order from block (b), submitted with no contact) ──
+      const pageNoContact = await req("GET", `/produsent/ordre/${optinToken}`);
+      assertTrue(!pageNoContact.text.includes("Leveringsønske:"),
+        "prg-buyer-06: no buyer block rendered at all when the order carries no contact fields");
+
+      // ── v1 rollback flag: byte-identical to the pre-Slice-2 template, no
+      // buyer fields, default Reply-To — even though the ORDER still carries
+      // the buyer fields (the flag governs rendering, not data retention) ──
+      const prevVersionFlag = process.env.ORDER_NOTIFY_EMAIL_VERSION;
+      process.env.ORDER_NOTIFY_EMAIL_VERSION = "v1";
+      try {
+        sent.length = 0;
+        const c2 = await req("POST", "/api/marketplace/cart");
+        const cartId2 = c2.body.cart_id as string;
+        const buyerRef2 = c2.body.buyer_ref as string;
+        await req("POST", `/api/marketplace/cart/${cartId2}/items`, {
+          body: { product_id: "prod-verified-optin", qty: 1, buyer_ref: buyerRef2 },
+        });
+        await req("POST", `/api/marketplace/cart/${cartId2}/submit`, {
+          body: {
+            buyer_ref: buyerRef2,
+            buyer_name: "Ola Buyer",
+            buyer_email: "ola@example.com",
+            contact_consent: true,
+          },
+        });
+        await waitFor(() => sent.length >= 1);
+        const v1Mail = sent[0]!;
+        assertTrue(!v1Mail.textContent.includes("Ola Buyer") && !v1Mail.htmlContent.includes("Ola Buyer"),
+          "email-v1-01: ORDER_NOTIFY_EMAIL_VERSION=v1 suppresses the buyer block entirely, even though the order has the data");
+        assertEq(v1Mail.replyTo, "kontakt@rettfrabonden.com",
+          "email-v1-02: v1 keeps the fixed platform Reply-To, never the buyer's email");
+      } finally {
+        if (prevVersionFlag === undefined) delete process.env.ORDER_NOTIFY_EMAIL_VERSION;
+        else process.env.ORDER_NOTIFY_EMAIL_VERSION = prevVersionFlag;
+      }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (b3) orch-pr-20260919-handleliste-slice2 fix-up (independent code-
+    // reviewer, CHANGES-REQUESTED): isEligibleForRealOrder() used to
+    // delegate its cross-check condition to isProducerEligible(), which
+    // hard-requires agent_knowledge.verification_status = 'verified' with NO
+    // is_verified alternative — making the Slice 2 Gate-3 widening dead code
+    // in production, since submitCart() never even created a real order row
+    // for an owner-verified-but-not-internally-cross-checked producer for
+    // order-notify-service.ts's correctly-widened gate to run against.
+    //
+    // This is the full END-TO-END proof of the fix, through submitCart()
+    // itself (not just a standalone isEligibleForRealOrder() call):
+    // ag-owner-verified-only (is_verified=1, opt_in=1) is admitted to the
+    // cart while verification_status='verified' (addCartItem()'s UNCHANGED
+    // admission gate requires this), then verification_status flips AWAY
+    // from 'verified' before submit — reproducing "owner-verified but not
+    // internally cross-checked" at the exact moment submitCart() re-checks
+    // eligibility (defense-in-depth re-check, same pattern as the
+    // availability re-check — see submitCart()'s own doc comment). Scenario:
+    // is_verified=1, verification_status≠'verified', opt_in=1, not blocked
+    // → REAL ORDER created, email sent.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = 'ag-owner-verified-only'").run();
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      const addRes = await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-owner-verified-only", qty: 1, buyer_ref: buyerRef },
+      });
+      assertEq(addRes.status, 200, "owner-verified-e2e-00: add-to-cart succeeds while verification_status='verified' (addCartItem()'s unchanged admission gate)");
+
+      // Flip AWAY from 'verified' before submit — reproduces "is_verified=1,
+      // verification_status≠'verified'" at submit time, and restores the
+      // fixture's declared seed state (also what the (c) gate matrix below
+      // expects for this agent).
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'unverified' WHERE agent_id = 'ag-owner-verified-only'").run();
+
+      sent.length = 0;
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, { body: { buyer_ref: buyerRef } });
+      assertEq(s.status, 201, "owner-verified-e2e-01: submit succeeds");
+      assertEq(s.body?.orders?.length, 1,
+        "owner-verified-e2e-02: is_verified=1 + opt_in=1, verification_status NOT 'verified' at submit-time → REAL order created end-to-end (previously unreachable)");
+      assertEq(s.body?.contact_handoffs?.length, 0, "owner-verified-e2e-03: no contact_handoffs — this went through as a real order");
+      const orderId = s.body.orders?.[0]?.order_id as string;
+
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "owner-verified-e2e-04: exactly one email sent, via the is_verified path, from a real submitCart() run");
+      assertEq(sent[0]?.to, "eierverifisertkun@example.no", "owner-verified-e2e-05: recipient is the producer's contact_email");
+
+      const dbOrder = testDb.prepare("SELECT status, confirm_token FROM orders WHERE id = ?").get(orderId) as
+        | { status: string; confirm_token: string }
+        | undefined;
+      assertEq(dbOrder?.status, "pending", "owner-verified-e2e-06: a real order row exists with status='pending'");
+      assertTrue(!!dbOrder?.confirm_token, "owner-verified-e2e-07: order carries a confirm_token (producer PRG capability)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (b4) Same producer as (b3), opt-in-regression pairing (mirrors (a2)):
+    // opt-in must STILL be mandatory end-to-end even when is_verified=1 AND
+    // verification_status≠'verified' — neither alternative on gate 3 ever
+    // makes gate 1 (opt-in) optional. Scenario: is_verified=1,
+    // verification_status≠'verified', opt_in=0 → still NO real order,
+    // contact-handoff only.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-owner-verified-only'").run();
+
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = 'ag-owner-verified-only'").run();
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      const addRes = await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-owner-verified-only", qty: 1, buyer_ref: buyerRef },
+      });
+      assertEq(addRes.status, 200, "owner-verified-optout-e2e-00: add-to-cart still succeeds while verification_status='verified'");
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'unverified' WHERE agent_id = 'ag-owner-verified-only'").run();
+
+      sent.length = 0;
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, { body: { buyer_ref: buyerRef } });
+      assertEq(s.status, 201, "owner-verified-optout-e2e-01: submit itself still succeeds");
+      assertEq(s.body?.orders?.length, 0,
+        "owner-verified-optout-e2e-02: is_verified=1 WITHOUT opt_in=1 (verification_status≠'verified') → still NO real order end-to-end — opt-in stays mandatory");
+      assertEq(s.body?.contact_handoffs?.length, 1, "owner-verified-optout-e2e-03: producer surfaces as a contact_handoff instead");
+      await new Promise((r) => setTimeout(r, 150));
+      assertEq(sent.length, 0, "owner-verified-optout-e2e-04: NO email sent");
+
+      // Restore this agent's declared seed state (opt_in=1) for the (c) gate
+      // matrix below.
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (c0) isEligibleForRealOrder() direct unit matrix — the four scenarios
+    // from the reviewer's CHANGES-REQUESTED verdict, checked directly against
+    // the fixed function (in addition to (b3)/(b4)'s full end-to-end proof
+    // above for the two is_verified=1 cases).
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      // 1) is_verified=1, verification_status≠'verified', opt_in=1, not
+      //    blocked → eligible (the fix: previously unreachable).
+      assertTrue(
+        cartSvc.isEligibleForRealOrder("ag-owner-verified-only"),
+        "real-order-01: is_verified=1 + opt_in=1, verification_status≠'verified' → eligible"
+      );
+
+      // 2) is_verified=1, verification_status≠'verified', opt_in=0 → NOT
+      //    eligible (opt-in stays mandatory, independent of is_verified).
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-owner-verified-only'").run();
+      assertTrue(
+        !cartSvc.isEligibleForRealOrder("ag-owner-verified-only"),
+        "real-order-02: is_verified=1, verification_status≠'verified', opt_in=0 → NOT eligible"
+      );
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+
+      // 3) verification_status='verified', is_verified=0, opt_in=1 →
+      //    eligible (pre-existing behavior, unaffected by the fix).
+      assertTrue(
+        cartSvc.isEligibleForRealOrder("ag-optin"),
+        "real-order-03: verification_status='verified', is_verified=0, opt_in=1 → eligible (pre-existing behavior unaffected)"
+      );
+
+      // 4) verification_status≠'verified', is_verified=0, opt_in=1 → NOT
+      //    eligible (neither condition of the OR is met).
+      assertTrue(
+        !cartSvc.isEligibleForRealOrder("ag-unverif"),
+        "real-order-04: verification_status≠'verified', is_verified=0, opt_in=1 → NOT eligible (neither OR condition met)"
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // (c) Recipient-gate unit matrix
     // ════════════════════════════════════════════════════════════════════════
     {
@@ -321,6 +643,43 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(r7.eligible && r7.email === DANIEL_EMAIL && r7.via === "admin_override",
         "gate-07: admin-set order_notification_email overrides the verified-contact requirement");
       testDb.prepare("UPDATE agents SET order_notification_email = NULL WHERE id = 'ag-unverif'").run();
+
+      // orch-pr-20260919-handleliste-slice2 (Gate expansion, CORRECTED):
+      // is_verified=1 extends ONLY gate 3 (verified-contact-or-admin-
+      // override), never gate 1 (opt-in) — dev-request line 160-161 + AC4.
+      // ag-verified-noopt has is_verified=1 but opt_in=0 (the agents-table
+      // default) → CORE REGRESSION check: must still be DENIED on gate 1,
+      // even though it has both is_verified=1 AND a verified contact.
+      const r8 = notifySvc.resolveOrderNotificationRecipient("ag-verified-noopt");
+      assertTrue(!r8.eligible && r8.reason === "not_opted_in",
+        "gate-08: is_verified=1 alone, WITHOUT opt_in=1, is still denied — opt-in remains mandatory (core regression fixed)");
+
+      // ag-verified-optin has BOTH is_verified=1 AND opt_in=1 AND a verified
+      // contact (AC4's exact positive case, realistic data) → admitted.
+      const r8b = notifySvc.resolveOrderNotificationRecipient("ag-verified-optin");
+      assertTrue(r8b.eligible && r8b.email === "verifisertoptin@example.no",
+        "gate-08b: is_verified=1 AND opt_in=1 together → admitted");
+
+      // ag-owner-verified-only isolates the actual OR-clause: is_verified=1
+      // AND opt_in=1, but verification_status='unverified' — admission can
+      // ONLY be coming from the is_verified alternative on gate 3, never the
+      // pre-existing verified_contact path. via='owner_verified' proves it.
+      const r8c = notifySvc.resolveOrderNotificationRecipient("ag-owner-verified-only");
+      assertTrue(r8c.eligible && r8c.email === "eierverifisertkun@example.no" && r8c.via === "owner_verified",
+        "gate-08c: is_verified=1 alone satisfies gate 3 (opt_in=1 still required) — admitted via the new OR-clause");
+
+      // Sanity: is_verified=0 AND opt_in=0 (ag-optout, seeded above) is still
+      // denied — the gate-3 OR-clause only ever widens gate 3, never gate 1.
+      const r9 = notifySvc.resolveOrderNotificationRecipient("ag-optout");
+      assertTrue(!r9.eligible && r9.reason === "not_opted_in",
+        "gate-09: neither opt_in nor is_verified set → still denied (gate-02's assertion still holds after the expansion)");
+
+      // opt_in=1 alone, with NEITHER a verified contact NOR is_verified NOR
+      // admin override, is still denied on gate 3 — the is_verified
+      // alternative does not widen gate 3 to "opt_in is enough by itself".
+      const r10 = notifySvc.resolveOrderNotificationRecipient("ag-unverif");
+      assertTrue(!r10.eligible && r10.reason === "unverified_contact",
+        "gate-10: opt_in=1, is_verified=0, no verified-contact/override → still denied (gate 3 fails, same as gate-03)");
     }
 
     // ════════════════════════════════════════════════════════════════════════
