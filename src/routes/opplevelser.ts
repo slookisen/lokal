@@ -26725,10 +26725,23 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       const pageText: string | null = evidenceOutcome.pageText;
 
       // Boilerplate-description check: SEPARATE from the judge verdict above,
-      // only meaningful when a real fetch actually happened (pageText !==
-      // null) — a fetch failure leaves nothing to compare the stored
+      // only meaningful when a real fetch actually happened (currentSummary
+      // !== null) — a fetch failure leaves nothing to compare the stored
       // description against, so it is never counted as boilerplate on doubt.
-      const isBoilerplate = pageText !== null && row.description !== null && row.description === pageText;
+      //
+      // Compares against `evidenceOutcome.currentSummary` — the SAME
+      // extractive summary (meta-description-first, capped ~300 chars) the
+      // content-refresh writer would produce for this page today — NOT
+      // `pageText` (the full, uncapped visible page body). `row.description`
+      // is always meta-derived-or-capped-paragraph, so it can never equal
+      // the full body text; comparing it against `pageText` made this check
+      // dead code (see dev-request diagnosis). `currentSummary` is the
+      // apples-to-apples comparison: "is the stored description still
+      // exactly what this page would currently produce?"
+      const isBoilerplate =
+        row.description !== null &&
+        evidenceOutcome.currentSummary !== null &&
+        row.description === evidenceOutcome.currentSummary;
       if (isBoilerplate) counts.description_nulled++;
 
       const verdictKey: "match" | "mismatch" | "unresolved" =
