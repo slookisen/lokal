@@ -158,10 +158,14 @@ export function runOpplevelserBookingSendGuardTests(
     const claimPath = require.resolve("../services/gardssalg-claim");
     const emailPath = require.resolve("../services/email-service");
     const sendGuardPath = require.resolve("../services/send-guard");
+    // 2026-09-17: the admin route now resolves provider_query through this
+    // service, which holds its own experience-store reference — it must be
+    // reloaded alongside the store or it would query a stale DB singleton.
+    const resolvePath = require.resolve("../services/gardssalg-booking-resolve");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [
       dbFactoryPath, experienceStorePath, bookingStorePath,
-      claimPath, emailPath, sendGuardPath, opplevelserPath,
+      claimPath, emailPath, sendGuardPath, resolvePath, opplevelserPath,
     ];
     for (const p of cachePaths) delete require.cache[p];
 
@@ -486,6 +490,72 @@ export function runOpplevelserBookingSendGuardTests(
       assertEq(happy.body.intended_recipients.producer, "ekte.produsent@gard.no", "o6: response names the real producer it did NOT contact");
       assertEq(sent.map((m) => m.to), [REDIRECT, REDIRECT], "o7: both emails went to the redirect address");
       assertEq(happy.body.sends.map((s: any) => s.ok), [true, true], "o8: both sends reported back to the operator");
+
+      // ── (o-q) provider_query + requested_weekday on the admin route ──────
+      // 2026-09-17 follow-up to dev-request 2026-09-16-opplevagent-en-setning-
+      // booking-via-ai: the operator's E2E can be driven by NAME like a real
+      // assistant would, and — admin-only — may name the HIDDEN test producer.
+      const insertNamed = expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, booking_live, catalog_hidden, slug,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @booking_live, @catalog_hidden, @slug,
+                 'bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`,
+      );
+      insertNamed.run({ id: "prov-hidden-live", navn: "Skjult Testgard E2E", epost: "skjult@gard.example.no", booking_live: 1, catalog_hidden: 1, slug: "skjult-testgard-e2e" });
+      insertNamed.run({ id: "prov-amb-1", navn: "Ambig Bryggeri Nord", epost: "nord@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-nord" });
+      insertNamed.run({ id: "prov-amb-2", navn: "Ambig Bryggeri Sør", epost: "sor@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-sor" });
+
+      // A slot ~20 days ahead at 11:00 Oslo, computed from now (never stale).
+      const osloParts = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+      const oget = (t: string): number => +(osloParts.find((x) => x.type === t)?.value ?? "0");
+      const aheadDate = new Date(Date.UTC(oget("year"), oget("month") - 1, oget("day") + 20));
+      const pad = (n: number): string => String(n).padStart(2, "0");
+      const aheadSlot = `${aheadDate.getUTCFullYear()}-${pad(aheadDate.getUTCMonth() + 1)}-${pad(aheadDate.getUTCDate())}T11:00`;
+      const weekdayNb = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"];
+      const aheadWeekday = weekdayNb[(aheadDate.getUTCDay() + 6) % 7]!;
+      const wrongWeekday = weekdayNb[((aheadDate.getUTCDay() + 6) % 7 + 1) % 7]!;
+      const guest = { party_size: 2, guest_name: "Kari Nordmann", guest_email: "kari@example.no" };
+      const rowsBefore = (expDb.prepare(`SELECT COUNT(*) n FROM gardssalg_bookings`).get() as any).n;
+
+      const qMissing = await callRoute(opplevelserRouter, { headers: auth, body: { slot_at: aheadSlot, ...guest } });
+      assertEq(qMissing.status, 400, "o9: neither provider_id nor provider_query -> 400");
+      assertEq(qMissing.body.error, "invalid_input", "o9b: …invalid_input");
+
+      const qNone = await callRoute(opplevelserRouter, { headers: auth, body: { provider_query: "Finnes Ikke Gård", slot_at: aheadSlot, ...guest } });
+      assertEq(qNone.status, 404, "o10: unknown name -> 404");
+      assertEq(qNone.body.reason, "provider_not_found", "o10b: …provider_not_found");
+
+      const qAmb = await callRoute(opplevelserRouter, { headers: auth, body: { provider_query: "Ambig Bryggeri", slot_at: aheadSlot, ...guest } });
+      assertEq(qAmb.status, 409, "o11: two matching producers -> 409");
+      assertEq(qAmb.body.reason, "provider_ambiguous", "o11b: …provider_ambiguous");
+      assertEq((qAmb.body.candidates as any[]).map((c) => c.provider_id).sort(), ["prov-amb-1", "prov-amb-2"], "o11c: candidates listed, none chosen");
+
+      const qWrongDay = await callRoute(opplevelserRouter, { headers: auth, body: { provider_query: "Skjult Testgard E2E", slot_at: aheadSlot, requested_weekday: wrongWeekday, ...guest } });
+      assertEq(qWrongDay.status, 409, "o12: stated weekday disagrees with the date -> 409");
+      assertEq(qWrongDay.body.reason, "weekday_mismatch", "o12b: …weekday_mismatch");
+      assertEq((qWrongDay.body.suggestions as any[]).length, 2, "o12c: two nearest matching dates suggested");
+
+      const qBadDay = await callRoute(opplevelserRouter, { headers: auth, body: { provider_query: "Skjult Testgard E2E", slot_at: aheadSlot, requested_weekday: "blursday", ...guest } });
+      assertEq(qBadDay.status, 400, "o13: unknown weekday word -> 400");
+
+      assertEq((expDb.prepare(`SELECT COUNT(*) n FROM gardssalg_bookings`).get() as any).n, rowsBefore, "o14: none of the above created a booking row");
+
+      sent = [];
+      const qHidden = await callRoute(opplevelserRouter, { headers: auth, body: { provider_query: "Skjult Testgard E2E", slot_at: aheadSlot, requested_weekday: aheadWeekday, source: "mcp", ...guest } });
+      assertEq(qHidden.status, 200, "o15: the HIDDEN live test producer resolves by name on the admin route -> 200");
+      assertEq(qHidden.body.provider?.id, "prov-hidden-live", "o15b: provider echoed with the resolved id");
+      assertEq(qHidden.body.provider?.resolved_from_query, "Skjult Testgard E2E", "o15c: …and the query it came from");
+      assertTrue(typeof qHidden.body.slot_at_local === "string" && qHidden.body.slot_at_local.startsWith(aheadWeekday), "o15d: slot_at_local rendered in Norwegian");
+      assertEq(qHidden.body.is_test, 1, "o15e: still a test-flagged booking");
+      assertEq(sent.map((m) => m.to), [REDIRECT, REDIRECT], "o15f: both emails still redirected");
+      const hiddenRow = expDb.prepare(`SELECT provider_id, is_test FROM gardssalg_bookings WHERE booking_ref = ?`).get(qHidden.body.booking_ref) as any;
+      assertEq(hiddenRow?.provider_id, "prov-hidden-live", "o15g: row targets the hidden test producer");
+
+      // The PUBLIC route must NOT gain that reach: the same name is unknown there.
+      const pubHidden = await callRoute(opplevelserRouter, { url: "/book", body: { provider_query: "Skjult Testgard E2E", slot_at: aheadSlot, ...guest } });
+      assertEq(pubHidden.status, 200, "o16: public POST /book with the hidden producer's name -> 200 honest non-success");
+      assertEq(pubHidden.body.reason, "provider_not_found", "o16b: …provider_not_found — hidden rows stay unreachable publicly");
 
       // ── (p) POST /admin/claim-test-send ──────────────────────────────────
       const claimUnauth = await callRoute(opplevelserRouter, { url: "/admin/claim-test-send", body: { provider_id: "prov-live" } });

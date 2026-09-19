@@ -9336,7 +9336,36 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
   const body = (req.body ?? {}) as Record<string, unknown>;
   const source = typeof body.source === "string" && body.source.trim() !== "" ? body.source.trim() : "mcp";
 
-  const parsed = BookingInputSchema.safeParse(body);
+  // ─── 2026-09-17 follow-up to dev-request 2026-09-16-opplevagent-en-setning-
+  // booking-via-ai (FUNN admin-booking-test-send-mangler-provider-query): the
+  // same one-sentence pre-checks the public entry points run — provider_query
+  // → provider_id, and the requested_weekday guard — so an operator's E2E can
+  // be driven by NAME exactly like a real assistant would. ONE deliberate
+  // difference: this admin-key-gated route resolves with includeHidden, so
+  // the hidden, email-pinned test producer (the only booking_live row while no
+  // real producer has activated booking) can be named. Public callers can
+  // never reach a hidden row this way (opplevelser-gardssalg-one-shot-
+  // booking.test.ts pins it). The dispatch gate below is unchanged.
+  const rawProviderId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  const rawProviderQuery = typeof body.provider_query === "string" ? body.provider_query.trim() : "";
+  let bodyForSchema: Record<string, unknown> = body;
+  let resolvedFromQuery: string | null = null;
+  if (!rawProviderId) {
+    if (!rawProviderQuery) {
+      return res.status(400).json(providerQueryMissingPayload());
+    }
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true });
+    if (resolution.kind === "none") {
+      return res.status(404).json(providerNotFoundPayload(rawProviderQuery));
+    }
+    if (resolution.kind === "ambiguous") {
+      return res.status(409).json(providerAmbiguousPayload(rawProviderQuery, resolution.candidates));
+    }
+    bodyForSchema = { ...body, provider_id: resolution.provider.id };
+    resolvedFromQuery = rawProviderQuery;
+  }
+
+  const parsed = BookingInputSchema.safeParse(bodyForSchema);
   if (!parsed.success) {
     return res.status(400).json({
       success: false,
@@ -9345,13 +9374,32 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     });
   }
 
+  const weekdayCheck = checkRequestedWeekday(
+    parsed.data.slot_at,
+    typeof body.requested_weekday === "string" ? body.requested_weekday : undefined,
+  );
+  if (!weekdayCheck.ok) {
+    if (weekdayCheck.reason === "unknown_weekday") {
+      return res.status(400).json(unknownWeekdayPayload(weekdayCheck.requested_weekday));
+    }
+    return res.status(409).json(weekdayMismatchPayload(weekdayCheck.mismatch));
+  }
+
   // Same gate as the public path — a test must not bypass booking_live /
   // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
   const provider = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
     | null;
+  const providerInfo = provider
+    ? {
+        id: parsed.data.provider_id,
+        navn: String(provider.navn ?? ""),
+        profile_url: gardssalgProfileUrl(provider.slug ?? null),
+        ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
+      }
+    : null;
   if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
-    return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id });
+    return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id, provider: providerInfo });
   }
 
   let booking;
@@ -9385,6 +9433,8 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     booking_id: booking.booking_id,
     source: booking.source,
     is_test: booking.is_test,
+    provider: providerInfo,
+    slot_at_local: formatSlotOslo(parsed.data.slot_at),
     intended_recipients: {
       guest: booking.guest_email,
       producer: provider?.epost ?? null,
