@@ -164,17 +164,30 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     testDb.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'ag-verified-optin'").run();
     insertProduct.run("prod-verified-optin", "ag-verified-optin", "Gulrøtter", "gulrøtter", 25, "kg");
 
-    // Unit-level-only twin (never added to a cart): is_verified=1 AND
-    // opt_in=1, but verification_status='unverified' — isolates the
-    // is_verified alternative on gate 3 in resolveOrderNotificationRecipient()
+    // is_verified=1 AND opt_in=1, but verification_status='unverified' —
+    // isolates the is_verified alternative on gate 3 in
+    // resolveOrderNotificationRecipient() AND on isEligibleForRealOrder()
     // precisely, since it cannot be admitted via the pre-existing
-    // verified_contact path. (Exercised directly in the gate matrix below,
-    // not through the cart — isProducerEligible()/addCartItem() would reject
-    // an unverified contact regardless of is_verified, which is correct and
-    // out of this slice's scope.)
+    // verified_contact path.
+    //
+    // orch-pr-20260919-handleliste-slice2 fix-up (independent code-reviewer,
+    // CHANGES-REQUESTED): this agent used to be "never added to a cart" here
+    // because isEligibleForRealOrder() delegated to isProducerEligible(),
+    // which hard-requires verification_status='verified' with no is_verified
+    // alternative — the exact bug this fix-up corrects. It IS now addable
+    // and end-to-end order-able — see block (b3)/(b4) below, which flip
+    // verification_status to 'verified' just long enough to pass
+    // addCartItem()'s UNCHANGED admission gate (mirrors a real add-time state
+    // preceding a later cross-check change), then back to 'unverified'
+    // before submit to reproduce "owner-verified but not internally
+    // cross-checked" at the moment submitCart() re-checks eligibility. Both
+    // blocks restore this agent to its declared seed state (verification_
+    // status='unverified', opt_in=1) afterward, which the (c) gate matrix
+    // below still relies on.
     insertAgent.run("ag-owner-verified-only", "Kun Eierverifisert Gård", "eierverifisertkun@example.no", "key-owner-verified-only");
     insertKnowledge.run("ag-owner-verified-only", "unverified");
     testDb.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+    insertProduct.run("prod-owner-verified-only", "ag-owner-verified-only", "Poteter", "poteter-eierverifisert", 30, "kg");
 
     // Gate-matrix-only agents (not orderable through the cart; exercised via
     // resolveOrderNotificationRecipient directly).
@@ -379,10 +392,11 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     // (b2) orch-pr-20260919-handleliste-slice2: gate expansion end-to-end
     // (opt_in=1 AND is_verified=1 together, on realistic verified-contact
     // data — AC4's exact positive case; the OR-clause on gate 3 is isolated
-    // separately at the unit level by gate-08c below, using
-    // ag-owner-verified-only, which is NOT addable to a cart) + email v2
-    // content (buyer fields + dynamic Reply-To) + v1 rollback flag + PRG
-    // page showing the buyer's contact fields.
+    // separately at the unit level by gate-08c below, and end-to-end through
+    // submitCart() itself by (b3)/(b4) further down, both using
+    // ag-owner-verified-only) + email v2 content (buyer fields + dynamic
+    // Reply-To) + v1 rollback flag + PRG page showing the buyer's contact
+    // fields.
     // ════════════════════════════════════════════════════════════════════════
     let verifiedNoOptToken = "";
     {
@@ -471,6 +485,136 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         if (prevVersionFlag === undefined) delete process.env.ORDER_NOTIFY_EMAIL_VERSION;
         else process.env.ORDER_NOTIFY_EMAIL_VERSION = prevVersionFlag;
       }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (b3) orch-pr-20260919-handleliste-slice2 fix-up (independent code-
+    // reviewer, CHANGES-REQUESTED): isEligibleForRealOrder() used to
+    // delegate its cross-check condition to isProducerEligible(), which
+    // hard-requires agent_knowledge.verification_status = 'verified' with NO
+    // is_verified alternative — making the Slice 2 Gate-3 widening dead code
+    // in production, since submitCart() never even created a real order row
+    // for an owner-verified-but-not-internally-cross-checked producer for
+    // order-notify-service.ts's correctly-widened gate to run against.
+    //
+    // This is the full END-TO-END proof of the fix, through submitCart()
+    // itself (not just a standalone isEligibleForRealOrder() call):
+    // ag-owner-verified-only (is_verified=1, opt_in=1) is admitted to the
+    // cart while verification_status='verified' (addCartItem()'s UNCHANGED
+    // admission gate requires this), then verification_status flips AWAY
+    // from 'verified' before submit — reproducing "owner-verified but not
+    // internally cross-checked" at the exact moment submitCart() re-checks
+    // eligibility (defense-in-depth re-check, same pattern as the
+    // availability re-check — see submitCart()'s own doc comment). Scenario:
+    // is_verified=1, verification_status≠'verified', opt_in=1, not blocked
+    // → REAL ORDER created, email sent.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = 'ag-owner-verified-only'").run();
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      const addRes = await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-owner-verified-only", qty: 1, buyer_ref: buyerRef },
+      });
+      assertEq(addRes.status, 200, "owner-verified-e2e-00: add-to-cart succeeds while verification_status='verified' (addCartItem()'s unchanged admission gate)");
+
+      // Flip AWAY from 'verified' before submit — reproduces "is_verified=1,
+      // verification_status≠'verified'" at submit time, and restores the
+      // fixture's declared seed state (also what the (c) gate matrix below
+      // expects for this agent).
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'unverified' WHERE agent_id = 'ag-owner-verified-only'").run();
+
+      sent.length = 0;
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, { body: { buyer_ref: buyerRef } });
+      assertEq(s.status, 201, "owner-verified-e2e-01: submit succeeds");
+      assertEq(s.body?.orders?.length, 1,
+        "owner-verified-e2e-02: is_verified=1 + opt_in=1, verification_status NOT 'verified' at submit-time → REAL order created end-to-end (previously unreachable)");
+      assertEq(s.body?.contact_handoffs?.length, 0, "owner-verified-e2e-03: no contact_handoffs — this went through as a real order");
+      const orderId = s.body.orders?.[0]?.order_id as string;
+
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "owner-verified-e2e-04: exactly one email sent, via the is_verified path, from a real submitCart() run");
+      assertEq(sent[0]?.to, "eierverifisertkun@example.no", "owner-verified-e2e-05: recipient is the producer's contact_email");
+
+      const dbOrder = testDb.prepare("SELECT status, confirm_token FROM orders WHERE id = ?").get(orderId) as
+        | { status: string; confirm_token: string }
+        | undefined;
+      assertEq(dbOrder?.status, "pending", "owner-verified-e2e-06: a real order row exists with status='pending'");
+      assertTrue(!!dbOrder?.confirm_token, "owner-verified-e2e-07: order carries a confirm_token (producer PRG capability)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (b4) Same producer as (b3), opt-in-regression pairing (mirrors (a2)):
+    // opt-in must STILL be mandatory end-to-end even when is_verified=1 AND
+    // verification_status≠'verified' — neither alternative on gate 3 ever
+    // makes gate 1 (opt-in) optional. Scenario: is_verified=1,
+    // verification_status≠'verified', opt_in=0 → still NO real order,
+    // contact-handoff only.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-owner-verified-only'").run();
+
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = 'ag-owner-verified-only'").run();
+      const c = await req("POST", "/api/marketplace/cart");
+      const cartId = c.body.cart_id as string;
+      const buyerRef = c.body.buyer_ref as string;
+      const addRes = await req("POST", `/api/marketplace/cart/${cartId}/items`, {
+        body: { product_id: "prod-owner-verified-only", qty: 1, buyer_ref: buyerRef },
+      });
+      assertEq(addRes.status, 200, "owner-verified-optout-e2e-00: add-to-cart still succeeds while verification_status='verified'");
+      testDb.prepare("UPDATE agent_knowledge SET verification_status = 'unverified' WHERE agent_id = 'ag-owner-verified-only'").run();
+
+      sent.length = 0;
+      const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, { body: { buyer_ref: buyerRef } });
+      assertEq(s.status, 201, "owner-verified-optout-e2e-01: submit itself still succeeds");
+      assertEq(s.body?.orders?.length, 0,
+        "owner-verified-optout-e2e-02: is_verified=1 WITHOUT opt_in=1 (verification_status≠'verified') → still NO real order end-to-end — opt-in stays mandatory");
+      assertEq(s.body?.contact_handoffs?.length, 1, "owner-verified-optout-e2e-03: producer surfaces as a contact_handoff instead");
+      await new Promise((r) => setTimeout(r, 150));
+      assertEq(sent.length, 0, "owner-verified-optout-e2e-04: NO email sent");
+
+      // Restore this agent's declared seed state (opt_in=1) for the (c) gate
+      // matrix below.
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (c0) isEligibleForRealOrder() direct unit matrix — the four scenarios
+    // from the reviewer's CHANGES-REQUESTED verdict, checked directly against
+    // the fixed function (in addition to (b3)/(b4)'s full end-to-end proof
+    // above for the two is_verified=1 cases).
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      // 1) is_verified=1, verification_status≠'verified', opt_in=1, not
+      //    blocked → eligible (the fix: previously unreachable).
+      assertTrue(
+        cartSvc.isEligibleForRealOrder("ag-owner-verified-only"),
+        "real-order-01: is_verified=1 + opt_in=1, verification_status≠'verified' → eligible"
+      );
+
+      // 2) is_verified=1, verification_status≠'verified', opt_in=0 → NOT
+      //    eligible (opt-in stays mandatory, independent of is_verified).
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-owner-verified-only'").run();
+      assertTrue(
+        !cartSvc.isEligibleForRealOrder("ag-owner-verified-only"),
+        "real-order-02: is_verified=1, verification_status≠'verified', opt_in=0 → NOT eligible"
+      );
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-owner-verified-only'").run();
+
+      // 3) verification_status='verified', is_verified=0, opt_in=1 →
+      //    eligible (pre-existing behavior, unaffected by the fix).
+      assertTrue(
+        cartSvc.isEligibleForRealOrder("ag-optin"),
+        "real-order-03: verification_status='verified', is_verified=0, opt_in=1 → eligible (pre-existing behavior unaffected)"
+      );
+
+      // 4) verification_status≠'verified', is_verified=0, opt_in=1 → NOT
+      //    eligible (neither condition of the OR is met).
+      assertTrue(
+        !cartSvc.isEligibleForRealOrder("ag-unverif"),
+        "real-order-04: verification_status≠'verified', is_verified=0, opt_in=1 → NOT eligible (neither OR condition met)"
+      );
     }
 
     // ════════════════════════════════════════════════════════════════════════

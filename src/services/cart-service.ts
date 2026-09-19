@@ -131,34 +131,52 @@ export function isProducerEligible(agentId: string): boolean {
 // buyer get a contact-handoff instead" — used ONLY in submitCart()'s
 // per-producer order/handoff split below.
 //
-// CORRECTED (fix-up on this branch): opt-in (order-notify-service.ts's Gate
-// 1, order_notifications_opt_in = 1) is MANDATORY and INDEPENDENT — it is
-// NEVER satisfied by is_verified alone. Only Gate 3 (verified contact OR
-// admin override) gets the Slice 2 `OR a.is_verified = 1` alternative (dev-
-// request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt line
-// 160-161: "Gate-klausul 3 ... utvides med `OR a.is_verified = 1`" — this
-// extends ONLY that one clause; AC4 requires `is_verified = 1 AND
-// order_notifications_opt_in = 1` together). An earlier pass on this branch
-// wrongly OR'd opt_in with is_verified across the WHOLE gate — corrected.
+// FIX-UP (independent code-reviewer, CHANGES-REQUESTED): the previous
+// version of this function delegated its cross-check condition to
+// `if (!isProducerEligible(agentId)) return false;` — but isProducerEligible()
+// hard-requires `agent_knowledge.verification_status = 'verified'` with NO
+// is_verified alternative. That made the Slice 2 widening dead code in
+// production: an owner-verified-but-not-internally-cross-checked producer
+// (agents.is_verified = 1, ~35 agents) was rejected right here, before
+// order-notify-service.ts's correctly-widened Gate 3 ever got a chance to
+// run — defeating the dev-request's own stated goal (line 160-163:
+// "isProducerEligible i cart-service.ts skal godta is_verified = 1 på samme
+// måte som gate 3"). isProducerEligible() itself, and addCartItem()'s
+// add-to-cart admission gate that calls it, are UNCHANGED — narrowing
+// admission for the ~1600+ producers who aren't verification_status=
+// 'verified' would be a large unrelated regression (confirmed out of scope
+// by the reviewer and an earlier pass on this branch).
 //
-// The Gate-3-equivalent check is deliberately NOT re-implemented here: this
-// function is layered on TOP of isProducerEligible() above, which already
-// requires `agent_knowledge.verification_status = 'verified'` for every
-// caller that reaches this point — i.e. the "verified contact" side of Gate
-// 3 already holds by construction before is_verified is even considered.
-// So the one ADDITIONAL condition this function needs is Gate 1 (opt-in),
-// mandatory, full stop. (Gate 2 — a recipient email exists — and Gate 4 —
-// not blocklisted — are deliberately NOT checked here either, same as
-// before this slice: they are order-notify-service.ts's job at actual SEND
-// time, decoupled from order-row creation, e.g. a "pending" order can still
-// exist with its confirm_token generated even when no notification goes
-// out — pre-existing behavior, unchanged.)
+// This function now runs its OWN query, reproducing isProducerEligible()'s
+// non-cross-check conditions directly (no umbrella account; not
+// second-line-only verification — LEFT JOIN so an agent with NO
+// agent_knowledge row at all, e.g. a purely owner-claimed profile that was
+// never through the internal cross-check pipeline, still evaluates instead
+// of being silently excluded by an INNER JOIN), while replacing the hard
+// `verification_status = 'verified'` requirement with
+// `(verification_status = 'verified' OR agents.is_verified = 1)` — mirroring
+// order-notify-service.ts's Gate 3 widening exactly.
+//
+// Gate 1 (opt-in, order_notifications_opt_in = 1) stays MANDATORY and
+// INDEPENDENT, ANDed on top — it is NEVER satisfied by is_verified alone
+// (dev-request AC4: "is_verified = 1 AND order_notifications_opt_in = 1"
+// together; an earlier pass on this branch wrongly OR'd opt_in with
+// is_verified across the WHOLE gate — corrected, see git history). Gate 2 —
+// a recipient email exists — and Gate 4 — not blocklisted — are deliberately
+// NOT checked here, same as before this fix-up: they are
+// order-notify-service.ts's job at actual SEND time, decoupled from
+// order-row creation (a "pending" order can still exist with its
+// confirm_token generated even when no notification goes out — pre-existing
+// behavior, unchanged).
 export function isEligibleForRealOrder(agentId: string): boolean {
-  if (!isProducerEligible(agentId)) return false;
   const db = _cartTestDb ?? getDb();
   const row = db.prepare(`
     SELECT 1 FROM agents a
+    LEFT JOIN agent_knowledge k ON k.agent_id = a.id
     WHERE a.id = ?
+      AND a.umbrella_type IS NULL
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND (k.verification_status = 'verified' OR a.is_verified = 1)
       AND a.order_notifications_opt_in = 1
   `).get(agentId);
   return !!row;
@@ -803,11 +821,17 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
   // Producers eligible for a real order RIGHT NOW — re-checked here at
   // submit (defense-in-depth; addCartItem() already required isProducerEligible()
   // at add time, so in the common case nothing changes — it only matters if
-  // eligibility changed between add and submit). Slice 2 (hybrid utsending):
-  // uses isEligibleForRealOrder(), which layers the opt-in/is_verified gate
-  // on top of isProducerEligible() — see that function's doc comment for why
-  // this is a SEPARATE function rather than a change to isProducerEligible()
-  // itself (addCartItem()'s admission gate is deliberately untouched).
+  // eligibility changed between add and submit — see isEligibleForRealOrder()'s
+  // own doc comment for why that IS exactly how an is_verified=1-but-not-
+  // internally-verified producer ever reaches a real order: verification_status
+  // can move to/from 'verified' between add-time and submit-time). Slice 2
+  // (hybrid utsending): uses isEligibleForRealOrder(), which reproduces
+  // isProducerEligible()'s non-cross-check conditions (no umbrella, not
+  // second-line-only) with its own `verification_status = 'verified' OR
+  // is_verified = 1` gate ANDed with the mandatory opt-in — see that
+  // function's doc comment for why this is a SEPARATE function/query rather
+  // than a change to isProducerEligible() itself (addCartItem()'s admission
+  // gate is deliberately untouched).
   const eligibleAgentIds = new Set<string>();
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
