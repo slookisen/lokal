@@ -42,8 +42,20 @@
 
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified } from "../database/init";
+import { isBlocked } from "../services/blocklist-service";
+import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors } from "../services/outreach-suppression-signals";
 
 const router = Router();
+
+// dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-gate-
+// felt: same default cooldown window GET /admin/outreach-candidates uses
+// when its own `?cooldown_days=` is left unset (see that route's own
+// default). The `gate` block below reuses the REAL gate's own suppression
+// helpers (isBlocked, getRecentlyEmailedAddresses, getCrossPlatformSuppressors)
+// so this diagnosis surface never drifts from what the real gate would do —
+// see this route's own header comment for why re-implementing gate logic
+// here is exactly the failure mode this route exists to prevent.
+const POOL_BLOCKER_EXPLAIN_DEFAULT_COOLDOWN_DAYS = 60;
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -294,6 +306,21 @@ router.get("/", (req: Request, res: Response) => {
   const nowMs = Date.now();
   const backoffDays = noYieldBackoffDays();
 
+  // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+  // gate-felt: same optional override the real gate exposes
+  // (?cooldown_days=), defaulting to the same 60 days, so a caller diagnosing
+  // a specific outreach-candidates call can match its cooldown window exactly.
+  const cooldownDaysRaw = parseInt(String(req.query.cooldown_days ?? ""), 10);
+  const cooldownDays = Number.isFinite(cooldownDaysRaw) && cooldownDaysRaw > 0
+    ? cooldownDaysRaw
+    : POOL_BLOCKER_EXPLAIN_DEFAULT_COOLDOWN_DAYS;
+
+  // Computed once (not per-agent) — same helpers the real gate
+  // (GET /admin/outreach-candidates?mode=first) uses, see
+  // outreach-suppression-signals.ts.
+  const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
+  const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays);
+
   const stmt = db.prepare(`
     SELECT a.id AS id, a.name AS name, a.umbrella_type AS umbrella_type,
            a.is_active AS is_active, a.url AS a_url, a.contact_email AS contact_email,
@@ -352,6 +379,26 @@ router.get("/", (req: Request, res: Response) => {
     const backoffActive = (noYield >= 3 || wrongEntity >= 3) && row.last_enrichment_attempt_at !== null && attemptRecent;
     const urlFresh = withinDays(row.url_last_probed, 30, nowMs);
     const urlHealthy = row.url_last_status !== null && row.url_last_status >= 200 && row.url_last_status < 400;
+
+    // ── `gate` — the SAME suppression checks the real gate
+    // (GET /admin/outreach-candidates?mode=first) applies, via the SAME
+    // helpers (isBlocked, getRecentlyEmailedAddresses,
+    // getCrossPlatformSuppressors) — never a parallel reimplementation. Only
+    // the 3 checks that are cheap/meaningful to re-derive per-agent outside
+    // that route's own candidate loop; the rest of that gate's suppression
+    // reasons (replied/opted-out/customer/hard-bounced/etc.) are already
+    // covered by this route's existing pool_blockers/signals above.
+    const emailLower = email.toLowerCase();
+    const gate = {
+      blocklisted: isBlocked({
+        agentId: row.id,
+        name: row.name ?? undefined,
+        email: email || undefined,
+        website: kWebsite || undefined,
+      }).blocked,
+      recent_crm_send_email_match: email.length > 0 && recentlyEmailedAddresses.has(emailLower),
+      cross_platform_cooldown: email.length > 0 && crossPlatformSuppressors.has(emailLower),
+    };
 
     // ── Funnel A: outreach-ready pool legs (admin-outreach-pool.ts order) ──
     const poolBlockers: string[] = [];
@@ -432,6 +479,10 @@ router.get("/", (req: Request, res: Response) => {
       found: true as const,
       name: row.name,
       in_pool: row.in_pool === 1,
+      // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+      // gate-felt: see the `gate` computation above — same helpers the real
+      // gate uses, never a parallel reimplementation.
+      gate,
       signals: {
         umbrella_type: row.umbrella_type,
         is_active: row.is_active === 1,
@@ -478,6 +529,11 @@ router.get("/", (req: Request, res: Response) => {
     success: true,
     count: agents.length,
     no_yield_backoff_days: backoffDays,
+    // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+    // gate-felt: the cooldown window `gate.recent_crm_send_email_match` /
+    // `gate.cross_platform_cooldown` were computed with, same pattern as
+    // `no_yield_backoff_days` above.
+    cooldown_days_used: cooldownDays,
     agents,
   });
 });

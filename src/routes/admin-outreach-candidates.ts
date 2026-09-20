@@ -40,6 +40,11 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import {
+  getRecentlyEmailedAddresses,
+  getCrossPlatformSuppressors,
+  outreachSentLogHasVerticalColumn,
+} from "../services/outreach-suppression-signals";
 import { dedupeByEmail } from "../services/marketing-dedupe";
 import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 import {
@@ -486,27 +491,13 @@ router.get("/", (req: Request, res: Response) => {
     // The degraded path reports `unavailable: true` instead of `count: 0`.
     // A confident zero on a database that cannot answer the question is the
     // same silence 4e exists to remove, one level up.
-    const crossPlatformSuppressors = new Map<string, { vertical: string; last_sent_at: string }>();
-    const oslHasVertical = (db.prepare("PRAGMA table_info(outreach_sent_log)").all() as Array<{ name: string }>)
-      .some((c) => c.name === "vertical_id");
-
-    if (oslHasVertical) {
-      for (const r of db
-        .prepare(
-          `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
-             FROM outreach_sent_log
-            WHERE recipient_email IS NOT NULL AND recipient_email != ''
-              AND sent_at >= ?
-              AND vertical_id IS NOT NULL AND vertical_id != 'rfb'
-            GROUP BY LOWER(recipient_email), vertical_id`,
-        )
-        .all(cutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
-        const prev = crossPlatformSuppressors.get(r.email);
-        if (!prev || r.last_sent_at > prev.last_sent_at) {
-          crossPlatformSuppressors.set(r.email, { vertical: r.vertical_id, last_sent_at: r.last_sent_at });
-        }
-      }
-    }
+    // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+    // gate-felt: extracted, unchanged, into outreach-suppression-signals.ts
+    // (getCrossPlatformSuppressors) so /admin/pool-blocker-explain can reuse
+    // the identical check instead of a parallel reimplementation. Pure
+    // extraction — same SQL, same cutoff, same shape.
+    const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays);
+    const oslHasVertical = outreachSentLogHasVerticalColumn(db);
     const crossPlatformSkipped: Array<{
       agent_id: string;
       email: string;
@@ -550,32 +541,13 @@ router.get("/", (req: Request, res: Response) => {
     // the v2 trigger uses — an out/sent message on a thread with NO inbound (a
     // cold outreach) — so this independent guard now catches compose- sends too.
     // (marketing-batch threads have no inbound, so #233's cases still match.)
-    const recentSendCutoff = cutoff;
-    const recentMarketingSends = db.prepare(`
-      SELECT m.to_emails FROM crm_messages m
-      WHERE m.direction = 'out'
-        AND m.delivery_status = 'sent'
-        AND m.sent_at IS NOT NULL
-        AND m.sent_at > ?
-        AND NOT EXISTS (
-          SELECT 1 FROM crm_messages m2
-          WHERE m2.thread_id = m.thread_id AND m2.direction = 'in'
-        )
-    `).all(recentSendCutoff) as Array<{ to_emails: string | null }>;
-
-    const recentlyEmailedAddresses = new Set<string>();
-    for (const msg of recentMarketingSends) {
-      let addrs: unknown;
-      try {
-        addrs = JSON.parse(msg.to_emails || "[]");
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(addrs)) continue;
-      for (const a of addrs) {
-        if (typeof a === "string" && a) recentlyEmailedAddresses.add(a.trim().toLowerCase());
-      }
-    }
+    //
+    // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+    // gate-felt: extracted, unchanged, into outreach-suppression-signals.ts
+    // (getRecentlyEmailedAddresses) so /admin/pool-blocker-explain can reuse
+    // the identical check instead of a parallel reimplementation. Pure
+    // extraction — same SQL, same cutoff, same shape.
+    const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
 
     // ── Step 3: separate candidates from suppressed ───────────────────────────
     // Internal working shape carries the dedupe tiebreak fields (views_count,

@@ -1259,6 +1259,24 @@ console.log("── admin-outreach-candidates (belt-and-suspenders CRM-send guar
   console.log(`  admin-outreach-candidates-crm-send-guard: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+// gate-felt, punkt 2: GET /admin/pool-blocker-explain's `gate` field reuses
+// the SAME suppression helpers the real gate (admin-outreach-candidates.ts
+// mode=first) uses — isBlocked() + the new outreach-suppression-signals.ts
+// helpers. Synchronous (both routes under test do no async I/O), same
+// convention as the crm-send-guard block just above.
+console.log("── admin-pool-blocker-explain (gate field: blocklisted / recent_crm_send_email_match / cross_platform_cooldown) ──");
+{
+  const { runAdminPoolBlockerExplainGateTests } =
+    require("../src/routes/admin-pool-blocker-explain-gate.test") as
+      typeof import("../src/routes/admin-pool-blocker-explain-gate.test");
+  const r = runAdminPoolBlockerExplainGateTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-pool-blocker-explain-gate: " + f);
+  console.log(`  admin-pool-blocker-explain-gate: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── mode=second "eldst-kontaktet-først" ordering (2026-07-12, Daniel) ──
 console.log("── admin-outreach-candidates (mode=second oldest-contacted-first ordering) ──");
 {
@@ -40548,6 +40566,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("verifier-drain-observability: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+// gate-felt, punkt 1: optional `agentIds` filter on POST /admin/run-verifier
+// and POST /admin/run-verifier/sweep. Own in-memory DB (swaps the shared
+// getDb() singleton) — runs via runSerial() same as the drain-observability
+// suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-run-verifier-agentids: explicit-id batch filter ──");
+  try {
+    const { runAdminRunVerifierAgentIdsTests } = require("../src/routes/admin-run-verifier-agentids.test") as
+      typeof import("../src/routes/admin-run-verifier-agentids.test");
+    const aid = await runAdminRunVerifierAgentIdsTests({ log: false });
+    passed += aid.passed;
+    failed += aid.failed;
+    for (const f of aid.failures) failures.push("run-verifier-agentids: " + f);
+    console.log(`  run-verifier-agentids: ${aid.passed} passed, ${aid.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("run-verifier-agentids: unexpected error: " + String(err?.stack || err?.message || err));
   }
 });
 

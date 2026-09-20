@@ -24,6 +24,25 @@ function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
 
+// parseAgentIds — dev-request 2026-09-16-run-verifier-agentids-og-pool-
+// blocker-explain-gate-felt: shared query/body parser for the optional
+// `agentIds` filter, used by both POST /admin/run-verifier and POST
+// /admin/run-verifier/sweep. Accepts a JSON body array (`{"agentIds":[...]}`)
+// or a comma-separated query string (`?agentIds=a,b,c`). Returns undefined
+// when absent/empty so callers can `?? ` it away with no behavior change.
+function parseAgentIds(req: Request): string[] | undefined {
+  const raw = (req.body && req.body.agentIds !== undefined ? req.body.agentIds : req.query.agentIds);
+  if (raw === undefined || raw === null) return undefined;
+  let ids: string[];
+  if (Array.isArray(raw)) {
+    ids = raw.map((v) => String(v).trim());
+  } else {
+    ids = String(raw).split(",").map((v) => v.trim());
+  }
+  ids = ids.filter((v) => v.length > 0);
+  return ids.length > 0 ? ids : undefined;
+}
+
 function requireAdmin(req: Request, res: Response): boolean {
   const expected = getAdminKey();
   if (!expected) {
@@ -124,6 +143,12 @@ export async function runVerifierTick(opts: {
   reprocessReviewQueue?: boolean;
   biasGrowth?: boolean;
   skipTickLock?: boolean;
+  // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+  // gate-felt: optional explicit id filter, threaded straight through to
+  // runVerifierBatch's own `agentIds` opt (see its doc comment there for
+  // full semantics). Default undefined — every existing caller (cron tick,
+  // 2B-PENDING, PR-97 drain) omits this and is byte-for-byte unchanged.
+  agentIds?: string[];
 } = {}): Promise<VerifierTickResult> {
   const tickStartedAt = new Date().toISOString();
   const tickRunId = `run-${tickStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-tick`;
@@ -175,10 +200,10 @@ export async function runVerifierTick(opts: {
   // never duplicated (runVerifierBatch dedupes by agent id).
   const batchResult = await runVerifierBatch(
     reprocessReviewQueue
-      ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup }
+      ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup, agentIds: opts.agentIds }
       : biasGrowth
-        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true }
-        : { batchSize, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true }
+        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds }
+        : { batchSize, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds }
   );
   const results = batchResult.results;
 
@@ -380,8 +405,14 @@ router.post("/", async (req: Request, res: Response) => {
     req.query.skip_tick_lock === "true" ||
     (req.body && (req.body.skip_tick_lock === true || req.body.skip_tick_lock === "1"));
 
+  // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+  // gate-felt: optional explicit id filter — see parseAgentIds/runVerifierTick/
+  // runVerifierBatch doc comments. Default undefined; every existing caller
+  // that doesn't pass this is byte-for-byte unaffected.
+  const agentIds = parseAgentIds(req);
+
   try {
-    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth, skipTickLock });
+    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth, skipTickLock, agentIds });
 
     if (tick.skipped) {
       // dev-request 2026-08-17-verifier-tick-lock: same response shape as
@@ -476,7 +507,13 @@ router.post("/sweep", async (req: Request, res: Response) => {
   const maxAgentsRaw = (req.body && req.body.maxAgents) || req.query.maxAgents;
   const maxAgents = maxAgentsRaw ? parseInt(String(maxAgentsRaw), 10) : undefined;
 
-  const result = startSweep({ chunkSize, maxAgents, db });
+  // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+  // gate-felt: optional explicit id filter — see parseAgentIds/startSweep's
+  // own `agentIds` doc comment. Default undefined; every existing caller
+  // that doesn't pass this is byte-for-byte unaffected.
+  const agentIds = parseAgentIds(req);
+
+  const result = startSweep({ chunkSize, maxAgents, db, agentIds });
 
   if (!result.started) {
     // A sweep is already in flight — surface current job for observability.
