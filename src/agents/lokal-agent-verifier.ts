@@ -428,6 +428,34 @@ export function pickBatch(db: any, limit = 30): any[] {
     .all(limit);
 }
 
+// ─── dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+//     gate-felt: explicit-id picker ─────────────────────────────────────────
+//
+// Given a caller-provided list of agent ids, select exactly those rows —
+// used when runVerifierBatch's `agentIds` opt is set, which REPLACES the
+// normal pickFn-driven batch-selection entirely (see runVerifierBatch's
+// `agentIds` doc comment below). Same column set as every other picker so
+// the downstream gate/loop logic works completely unchanged. Deliberately
+// no verification_status filter and no ordering by recency — the caller
+// named the exact set, so this just fetches those rows (that still have an
+// agent_knowledge row) in whatever order SQLite's IN(...) returns them.
+export function pickByIds(db: any, ids: string[]): any[] {
+  if (!ids || ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
+              k.email, k.phone, k.address,
+              k.website, k.about, k.products, k.field_provenance,
+              k.verification_status, k.enrichment_status,
+              k.last_verified_at, k.last_http_check_at, k.last_http_status
+         FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id IN (${placeholders})`
+    )
+    .all(...ids);
+}
+
 // PR-27: Re-process review_required + data_insufficient agents first.
 // After PR-25 backfill + PR-26 aggregateVerdict fix, many of these
 // now have proper provenance and can be moved to `verified`. Default
@@ -1679,6 +1707,17 @@ export async function runVerifierBatch(opts: {
   // gate, same guards, same applyVerifierOutcome persistence) as every
   // other candidate.
   includeStaleReviewRequired?: boolean;
+  // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+  // gate-felt: optional explicit id filter. When set (non-empty), REPLACES
+  // the normal batch-selection (`pickFn`, and the `includeStaleReviewRequired`
+  // merge) entirely with `pickByIds(db, agentIds)` — i.e. this run processes
+  // exactly the given agent ids and nothing else. Every other opt (`force`,
+  // `skipTickLock`, `reprocessReviewQueue`, `biasGrowth`, `batchSize`, etc. —
+  // all handled by callers, not read here) stays unchanged and composable:
+  // this only swaps which candidates enter the SAME loop/gate/persistence
+  // below. Default undefined/empty — every existing caller and test is
+  // byte-identical unless it explicitly passes this.
+  agentIds?: string[];
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -1701,13 +1740,17 @@ export async function runVerifierBatch(opts: {
   // IDENTICAL to pre-this-PR behaviour.
   const secondLineEnabled = process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED === "true";
 
+  const hasExplicitAgentIds = !!(opts.agentIds && opts.agentIds.length > 0);
   const pickFn = opts.pickFn ?? pickBatch;
-  const candidates = pickFn(db, limit);
+  const candidates = hasExplicitAgentIds ? pickByIds(db, opts.agentIds!) : pickFn(db, limit);
 
   // Additive stale-review_required merge (see includeStaleReviewRequired's
   // doc comment above) — dedup by id against whatever `pickFn` already
   // returned so no candidate is ever processed twice in the same run.
-  if (opts.includeStaleReviewRequired) {
+  // Skipped entirely when `agentIds` is set: an explicit id filter REPLACES
+  // selection, so this run must process exactly that set — see `agentIds`'s
+  // doc comment above.
+  if (opts.includeStaleReviewRequired && !hasExplicitAgentIds) {
     const haveIds = new Set(candidates.map((r: any) => r.id));
     const staleReviewRequired = pickStaleReviewRequiredBatch(db, 40).filter(
       (r: any) => !haveIds.has(r.id)

@@ -133,6 +133,7 @@ export interface StartSweepOpts {
     batchSize: number;
     pickFn: (db: any, limit?: number) => any[];
     db?: any;
+    agentIds?: string[];
   }) => Promise<{ run_id: string; started_at: string; finished_at: string; results: VerifierResult[] }>;
   /**
    * Injectable sleep — defaults to defaultSleep. Pass `() => Promise.resolve()`
@@ -141,6 +142,22 @@ export interface StartSweepOpts {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable DB — defaults to getDb(). */
   db?: any;
+  /**
+   * dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
+   * gate-felt: optional explicit id filter. When set (non-empty), REPLACES
+   * the default `pending_verify`-scoped `pickPendingVerifyBatch` selection
+   * with the given ids, consumed in `chunkSize`-sized slices (same gentle
+   * pacing/sleep-between-chunks as the default scope) until every id has
+   * been processed exactly once — then the sweep stops. This does NOT reuse
+   * the default loop's "stop when a chunk comes back empty" exhaustion
+   * signal: that signal only works because rows leave `pending_verify` as
+   * they're processed, and an explicit id filter has no such natural
+   * exhaustion (the same ids would just keep matching forever). Every other
+   * control (chunkSize, maxAgents, the safety cap, the consecutive-error
+   * breaker, sleepMs) is unchanged and composes normally. Default
+   * undefined — every existing caller/test is byte-for-byte unaffected.
+   */
+  agentIds?: string[];
 }
 
 export interface StartSweepResult {
@@ -169,6 +186,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
   const runBatchFn = opts.runBatch ?? runVerifierBatch;
   const sleepFn = opts.sleep ?? defaultSleep;
   const db = opts.db ?? getDb();
+  const agentIds = opts.agentIds && opts.agentIds.length > 0 ? [...opts.agentIds] : undefined;
 
   const jobId = makeJobId();
   const startedAt = new Date().toISOString();
@@ -202,6 +220,10 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     const HARD_SAFETY_CAP = 5000; // never process more than this in one sweep
     const MAX_CONSECUTIVE_ERRORS = 3;
     let consecutiveErrors = 0;
+    // Only used when `agentIds` is set — see its doc comment above for why
+    // the explicit-id path can't rely on the default loop's
+    // empty-chunk-from-DB exhaustion signal.
+    let idCursor = 0;
 
     try {
       while (true) {
@@ -214,14 +236,31 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
           console.log(`[verifier-sweep] ${jobId}: maxAgents (${maxAgents}) reached, stopping`);
           break;
         }
+        if (agentIds && idCursor >= agentIds.length) {
+          console.log(`[verifier-sweep] ${jobId}: explicit agentIds exhausted after ${_sweepJob.processed} agents`);
+          break;
+        }
+
+        const chunkAgentIds = agentIds ? agentIds.slice(idCursor, idCursor + chunkSize) : undefined;
 
         let chunkResult: Awaited<ReturnType<typeof runVerifierBatch>>;
         try {
-          chunkResult = await runBatchFn({
-            batchSize: chunkSize,
-            pickFn: pickPendingVerifyBatch,
-            db,
-          });
+          chunkResult = chunkAgentIds
+            ? await runBatchFn({
+                batchSize: chunkAgentIds.length,
+                pickFn: pickPendingVerifyBatch,
+                agentIds: chunkAgentIds,
+                db,
+              })
+            : await runBatchFn({
+                batchSize: chunkSize,
+                pickFn: pickPendingVerifyBatch,
+                db,
+              });
+          // Advance the cursor only after a successful chunk, so a failed
+          // chunk (caught below) is retried on the same slice of ids rather
+          // than being silently skipped.
+          if (chunkAgentIds) idCursor += chunkAgentIds.length;
         } catch (err: unknown) {
           consecutiveErrors++;
           _sweepJob.errors++;
@@ -245,8 +284,16 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
 
         const { results } = chunkResult;
 
-        // Empty chunk means no more pending_verify agents.
+        // Empty chunk: for the default pending_verify scope this means the
+        // backlog is exhausted, so stop. For the explicit-agentIds scope an
+        // empty chunk just means none of that particular id slice matched a
+        // row (e.g. already-deleted ids) — idCursor already advanced above,
+        // so loop again to try the next slice instead of stopping early.
         if (results.length === 0) {
+          if (chunkAgentIds) {
+            await sleepFn(sleepMs);
+            continue;
+          }
           console.log(`[verifier-sweep] ${jobId}: empty chunk — backlog exhausted after ${_sweepJob.processed} agents`);
           break;
         }
