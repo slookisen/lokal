@@ -531,3 +531,116 @@ export function runRetentionPass(opts: {
 
   return { rollup, runLedger, vacuum: vacuumResult, dryRun };
 }
+
+/**
+ * dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+ * Skive 4, Part C: the five permanent rollup tables Skive 1-3 write into
+ * (page_view_daily/sessions_daily/query_daily/query_text_daily/
+ * agent_view_daily — schemas in database/init.ts) plus their exact column
+ * lists, used both by GET /admin/analytics/export/:table's rollup branch
+ * (Part A) and by a future separate monthly-archive scheduled job (out of
+ * scope here — see the dev-request's Non-goals). Column order here IS the
+ * CSV header order.
+ *
+ * agent_view_daily deliberately has no vertical_id column (see its
+ * CREATE TABLE comment in database/init.ts) — the only one of the five where
+ * that's true — so callers that scope by vertical (isolation-locked
+ * secondary hosts) must skip that filter for this one table, same as every
+ * other reader of it in this codebase (e.g. analytics-rollup-reads.ts).
+ */
+export const ROLLUP_TABLE_NAMES = [
+  "page_view_daily",
+  "sessions_daily",
+  "query_daily",
+  "query_text_daily",
+  "agent_view_daily",
+] as const;
+export type RollupTableName = typeof ROLLUP_TABLE_NAMES[number];
+
+const ROLLUP_TABLE_COLUMNS: Record<RollupTableName, readonly string[]> = {
+  page_view_daily: ["day", "path", "source", "bot_type", "vertical_id", "view_count", "session_count"],
+  sessions_daily: ["day", "vertical_id", "bot_type", "session_count"],
+  query_daily: ["day", "protocol", "agent_id", "vertical_id", "city", "query_count", "result_count_sum", "response_time_ms_sum", "response_time_ms_n"],
+  query_text_daily: ["day", "query", "vertical_id", "query_count"],
+  agent_view_daily: ["day", "agent_id", "view_source", "city", "view_count"],
+};
+
+export function isRollupTableName(table: string): table is RollupTableName {
+  return (ROLLUP_TABLE_NAMES as readonly string[]).includes(table);
+}
+
+export function getRollupTableColumns(table: RollupTableName): readonly string[] {
+  return ROLLUP_TABLE_COLUMNS[table];
+}
+
+// RFC-4180-ish escaping: quote a field only when it contains a comma,
+// quote, or newline, doubling any embedded quotes. null/undefined -> "".
+function csvEscapeField(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const s = String(value);
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+export interface RollupCsvOptions {
+  /** Scope to one vertical (rfb|dental|experiences). No-op for agent_view_daily (no vertical_id column). */
+  vertical?: string;
+  /** Row cap — omitted means "all rows" (this is permanent, already-aggregated history, not the raw firehose the existing raw export caps by default). */
+  limit?: number;
+  offset?: number;
+  /** Test-only seam, mirrors getRollupBoundaryDate's own dbHandle param. */
+  dbHandle?: ReturnType<typeof getDb>;
+}
+
+/**
+ * One rollup table -> CSV text (header row + one row per record, "\n"
+ * line endings). Never throws on an empty table — returns just the header
+ * line followed by a trailing newline.
+ */
+export function rollupTableToCsv(table: RollupTableName, opts: RollupCsvOptions = {}): string {
+  const db = opts.dbHandle ?? getDb();
+  const columns = ROLLUP_TABLE_COLUMNS[table];
+  const hasVertical = (columns as readonly string[]).includes("vertical_id");
+
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (hasVertical && opts.vertical) {
+    where.push("vertical_id = ?");
+    params.push(opts.vertical);
+  }
+
+  let sql = `SELECT ${columns.join(", ")} FROM ${table}` +
+    (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+    ` ORDER BY day DESC`;
+  if (opts.limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(opts.limit);
+    if (opts.offset !== undefined) {
+      sql += " OFFSET ?";
+      params.push(opts.offset);
+    }
+  }
+
+  const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+
+  const lines: string[] = [columns.join(",")];
+  for (const row of rows) {
+    lines.push(columns.map((c) => csvEscapeField(row[c])).join(","));
+  }
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * All five rollup tables -> CSV text, keyed by table name. Convenience
+ * wrapper around rollupTableToCsv() for a caller that wants "all five" in
+ * one call (e.g. the future monthly-archive job).
+ */
+export function allRollupTablesToCsv(
+  opts: RollupCsvOptions = {},
+): Record<RollupTableName, string> {
+  const out = {} as Record<RollupTableName, string>;
+  for (const table of ROLLUP_TABLE_NAMES) {
+    out[table] = rollupTableToCsv(table, opts);
+  }
+  return out;
+}
