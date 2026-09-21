@@ -50,6 +50,7 @@ import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 
 import {
   discoverExperiencesRelaxed,
@@ -1237,9 +1238,10 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 async function getOrCreateExperiencesSession(
-  sessionId?: string,
+  sessionId: string | undefined,
+  isInitialize: boolean,
   req?: Request
-): Promise<{ id: string; session: ExperiencesMcpSession }> {
+): Promise<{ id: string; session: ExperiencesMcpSession } | { notFound: true }> {
   if (sessionId && experiencesSessions.has(sessionId)) {
     const session = experiencesSessions.get(sessionId)!;
     session.lastActivity = Date.now();
@@ -1252,7 +1254,19 @@ async function getOrCreateExperiencesSession(
     return { id: sessionId, session };
   }
 
-  const id = sessionId || randomUUID();
+  if (!isInitialize) {
+    // A session id was PROVIDED but is unknown/expired (in-memory Map wiped
+    // by a deploy/restart), or no session id was sent at all — per the MCP
+    // spec both are a 404, not a silently-created new session (mirrors
+    // getOrCreateSession() in mcp.ts / getOrCreateDentalSession() in
+    // dental-mcp.ts, PR #878). Nothing is inserted into `experiencesSessions`
+    // on this branch.
+    return { notFound: true };
+  }
+
+  // initialize ALWAYS mints the server's own id — a client-supplied id is
+  // never adopted, whether or not it happens to already be in the map.
+  const id = randomUUID();
   const clientIdentity = req ? detectExperiencesMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
@@ -1304,8 +1318,12 @@ async function getOrCreateExperiencesSession(
 router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const { session } = await getOrCreateExperiencesSession(sessionId, req);
-    await session.transport.handleRequest(req, res, req.body);
+    const result = await getOrCreateExperiencesSession(sessionId, isMcpInitializeRequestBody(req.body), req);
+    if ("notFound" in result) {
+      sendMcpSessionNotFound(res);
+      return;
+    }
+    await result.session.transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("[experiences-mcp] POST error:", err.message);
     if (!res.headersSent) {
@@ -1354,7 +1372,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 </body></html>`);
       return;
     }
-    res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
+    sendMcpSessionNotFound(res);
     return;
   }
   const session = experiencesSessions.get(sessionId)!;
