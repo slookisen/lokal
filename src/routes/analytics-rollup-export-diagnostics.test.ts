@@ -499,6 +499,76 @@ export async function runAnalyticsRollupExportDiagnosticsTests(
         "c13: allRollupTablesToCsv returns exactly the five rollup table keys",
       );
       assertTrue(all.sessions_daily.startsWith("day,vertical_id,bot_type,session_count\n"), "c14: allRollupTablesToCsv's sessions_daily entry has the right header");
+
+      // ── CSV/formula-injection mitigation (OWASP) — query_text_daily.query
+      //    is populated from raw, visitor-controlled search text, so a
+      //    leading =/+/-/@ must be neutralized with a leading single quote
+      //    before it reaches an admin's spreadsheet app ──────────────────────
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-01', '=1+1', 'rfb', 1)`,
+        )
+        .run();
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-02', '+cmd|'' /C calc''!A1', 'rfb', 1)`,
+        )
+        .run();
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-03', '@SUM(1,1)', 'rfb', 1)`,
+        )
+        .run();
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-04', '=1+1,2', 'rfb', 1)`,
+        )
+        .run();
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-05', 'poteter', 'rfb', 1)`,
+        )
+        .run();
+      csvDb
+        .prepare(
+          `INSERT INTO query_text_daily (day, query, vertical_id, query_count) VALUES ('2026-04-06', '-5 poser', 'rfb', 1)`,
+        )
+        .run();
+
+      const qtdInjectionCsv = rollupTableToCsv("query_text_daily", { dbHandle: csvDb as any, vertical: "rfb" });
+      const qtdInjectionLines = qtdInjectionCsv.split("\n").filter((l) => l.length > 0);
+      const qtdRowByDay = new Map(qtdInjectionLines.slice(1).map((l) => [l.split(",")[0], l]));
+
+      assertEq(
+        qtdRowByDay.get("2026-04-01"),
+        "2026-04-01,'=1+1,rfb,1",
+        "c15: leading '=' is neutralized with a leading single quote (no live formula)",
+      );
+      assertEq(
+        qtdRowByDay.get("2026-04-02"),
+        `2026-04-02,'+cmd|' /C calc'!A1,rfb,1`,
+        "c16: leading '+' is neutralized (DDE-style payload; no comma/double-quote here so no additional RFC-4180 quoting kicks in)",
+      );
+      assertEq(
+        qtdRowByDay.get("2026-04-03"),
+        `2026-04-03,"'@SUM(1,1)",rfb,1`,
+        "c17: leading '@' is neutralized AND the embedded comma in '(1,1)' correctly triggers RFC-4180 quoting",
+      );
+      assertEq(
+        qtdRowByDay.get("2026-04-04"),
+        `2026-04-04,"'=1+1,2",rfb,1`,
+        "c18: a leading '=' value that ALSO contains a comma is BOTH neutralized AND comma-quoted",
+      );
+      assertEq(
+        qtdRowByDay.get("2026-04-05"),
+        "2026-04-05,poteter,rfb,1",
+        "c19: an ordinary safe value is left completely unchanged (no spurious prefixing)",
+      );
+      assertEq(
+        qtdRowByDay.get("2026-04-06"),
+        "2026-04-06,'-5 poser,rfb,1",
+        "c20: leading '-' is neutralized too (OWASP treats '-' as a formula-trigger char same as =/+/@)",
+      );
     } finally {
       if (prevDb) __setDbForTesting(prevDb);
       csvDb.close();

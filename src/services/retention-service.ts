@@ -575,9 +575,14 @@ export function getRollupTableColumns(table: RollupTableName): readonly string[]
 
 // RFC-4180-ish escaping: quote a field only when it contains a comma,
 // quote, or newline, doubling any embedded quotes. null/undefined -> "".
+// CSV/formula-injection mitigation (OWASP): a value starting with =, +, -,
+// @, tab, or CR is prefixed with a leading single quote so spreadsheet apps
+// (Excel/Google Sheets) treat it as inert text instead of a live formula.
+// Applied before the comma/quote/newline quoting so the two compose
+// correctly (e.g. "=1+1,2" ends up both prefixed AND comma-quoted).
 function csvEscapeField(value: unknown): string {
   if (value === null || value === undefined) return "";
-  const s = String(value);
+  const s = String(value).replace(/^[=+\-@\t\r]/, "'$&");
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
