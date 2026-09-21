@@ -45045,3 +45045,28 @@ runSerial(async () => {
     failures.push("opplevelser-drink-coverage: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+// Skive 4: GET /admin/analytics/export/:table extended to the five permanent
+// rollup tables (JSON + CSV) + GET /admin/analytics/ops/diagnostics's
+// additive database.rollup.<table>.{rows,oldestDay} block + the shared
+// rollupTableToCsv()/allRollupTablesToCsv() helper in retention-service.ts
+// (src/routes/analytics.ts, src/services/retention-service.ts). Own
+// dedicated test file, in-memory DB singleton swap — runs via runSerial
+// after the barrier, so it's safe to swap getDb(). Tail position, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention, Skive 4: rollup export + diagnostics ──");
+  try {
+    const { runAnalyticsRollupExportDiagnosticsTests } = require("../src/routes/analytics-rollup-export-diagnostics.test") as
+      typeof import("../src/routes/analytics-rollup-export-diagnostics.test");
+    const red = await runAnalyticsRollupExportDiagnosticsTests({ log: false });
+    passed += red.passed;
+    failed += red.failed;
+    for (const f of red.failures) failures.push("analytics-rollup-export-diagnostics: " + f);
+    console.log(`  analytics-rollup-export-diagnostics: ${red.passed} passed, ${red.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-rollup-export-diagnostics: unexpected error: " + String(err?.message || err));
+  }
+});

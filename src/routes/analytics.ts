@@ -5,6 +5,12 @@ import { getDb } from "../database/init";
 import { analyticsService, VerticalId } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
+import {
+  isRollupTableName,
+  getRollupTableColumns,
+  rollupTableToCsv,
+  type RollupTableName,
+} from "../services/retention-service";
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
 // JS .toISOString() uses "T" separator which breaks SQLite string comparison.
@@ -418,31 +424,94 @@ router.get("/consumer-usage", (req: Request, res: Response) => {
 
 /**
  * GET /admin/analytics/export/:table
- * Export raw analytics data
+ * Export raw analytics data — OR, as of dev-request 2026-09-02-analytics-
+ * historikk-rollup-lesere-foer-retention Skive 4, one of the five permanent
+ * rollup tables (page_view_daily/sessions_daily/query_daily/
+ * query_text_daily/agent_view_daily — schemas in database/init.ts, written
+ * by retention-service.ts's rollupAndPrune* functions before raw rows are
+ * pruned).
  * Params:
  *   table = "page_views" | "queries" | "agent_views"
+ *         | "page_view_daily" | "sessions_daily" | "query_daily"
+ *         | "query_text_daily" | "agent_view_daily"
  * Query params:
- *   limit=1000 (default)
+ *   limit=1000 (default; rollup tables default 10000 — already-aggregated
+ *     permanent history, much smaller per row count than raw)
  *   offset=0 (default)
+ *   format=json (default) | csv — ROLLUP TABLES ONLY. The three original raw
+ *     tables above are unchanged: always JSON, `format` is ignored for them,
+ *     exactly as before this slice.
  */
 router.get("/export/:table", (req: Request, res: Response) => {
-  const table = req.params.table as "page_views" | "queries" | "agent_views";
+  const table = req.params.table as string;
+  const RAW_TABLES = ["page_views", "queries", "agent_views"] as const;
 
-  if (!["page_views", "queries", "agent_views"].includes(table)) {
-    res.status(400).json({ error: "Invalid table. Must be one of: page_views, queries, agent_views" });
+  // ── Original three raw tables: behaviour is 100% unchanged ───────────
+  if ((RAW_TABLES as readonly string[]).includes(table)) {
+    const limit = Math.min(10000, parseInt(req.query.limit as string) || 1000);
+    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+
+    // On an isolation-locked host, scope the raw export to that vertical too so
+    // a per-site dashboard can never dump another vertical's rows.
+    const result = analyticsService.exportData(
+      table as "page_views" | "queries" | "agent_views",
+      limit,
+      offset,
+      lockedVerticalForHost(req),
+    );
+    res.json({
+      table,
+      timestamp: new Date().toISOString(),
+      ...result,
+    });
     return;
   }
 
-  const limit = Math.min(10000, parseInt(req.query.limit as string) || 1000);
-  const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+  // ── Skive 4: the five permanent rollup tables, JSON or CSV ────────────
+  if (isRollupTableName(table)) {
+    const rollupTable = table as RollupTableName;
+    const limit = Math.min(100000, parseInt(req.query.limit as string) || 10000);
+    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+    const format = String(req.query.format || "json").toLowerCase();
+    // Same isolation-locked-host scoping as the raw path above (no free-form
+    // ?vertical= override, matching the raw export's own convention).
+    const vertical = lockedVerticalForHost(req);
 
-  // On an isolation-locked host, scope the raw export to that vertical too so
-  // a per-site dashboard can never dump another vertical's rows.
-  const result = analyticsService.exportData(table, limit, offset, lockedVerticalForHost(req));
-  res.json({
-    table,
-    timestamp: new Date().toISOString(),
-    ...result,
+    if (format === "csv") {
+      const csv = rollupTableToCsv(rollupTable, { vertical, limit, offset });
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${rollupTable}.csv"`);
+      res.send(csv);
+      return;
+    }
+
+    const db = getDb();
+    const columns = getRollupTableColumns(rollupTable);
+    const hasVertical = (columns as readonly string[]).includes("vertical_id");
+    const where = hasVertical && vertical ? "WHERE vertical_id = ?" : "";
+    const params: string[] = hasVertical && vertical ? [vertical] : [];
+
+    const countResult = db.prepare(`SELECT COUNT(*) as count FROM ${rollupTable} ${where}`).get(...params) as any;
+    const total = countResult.count;
+    const data = db
+      .prepare(`SELECT ${columns.join(", ")} FROM ${rollupTable} ${where} ORDER BY day DESC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as any[];
+
+    res.json({
+      table: rollupTable,
+      timestamp: new Date().toISOString(),
+      data,
+      total,
+      limit,
+      offset,
+    });
+    return;
+  }
+
+  res.status(400).json({
+    error:
+      "Invalid table. Must be one of: page_views, queries, agent_views, " +
+      "page_view_daily, sessions_daily, query_daily, query_text_daily, agent_view_daily",
   });
 });
 
@@ -1384,6 +1453,17 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
     const oldestPv = (db.prepare("SELECT MIN(created_at) as d FROM analytics_page_views").get() as any)?.d;
     const oldestQ = (db.prepare("SELECT MIN(created_at) as d FROM analytics_queries").get() as any)?.d;
 
+    // dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention,
+    // Skive 4 Part B: rows + oldest `day` for each of the five permanent
+    // rollup tables — additive only, nests under a new `rollup` key so every
+    // pre-existing field above stays byte-identical.
+    const rollup: Record<string, { rows: number; oldestDay: string | null }> = {};
+    for (const t of ["page_view_daily", "sessions_daily", "query_daily", "query_text_daily", "agent_view_daily"] as const) {
+      const rows = (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as any).c;
+      const oldestDay = (db.prepare(`SELECT MIN(day) as d FROM ${t}`).get() as any)?.d ?? null;
+      rollup[t] = { rows, oldestDay };
+    }
+
     // DB file size
     let dbSizeMb = 0;
     try { dbSizeMb = Math.round(fs.statSync(dbPath).size / 1024 / 1024 * 10) / 10; } catch {}
@@ -1433,6 +1513,7 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
           pageView: oldestPv,
           query: oldestQ,
         },
+        rollup,
       },
       lastHour: {
         totalViews: recentPv,
