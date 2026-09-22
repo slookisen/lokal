@@ -124,6 +124,22 @@ primary_region = 'arn'
   LANG_COOKIE_REDIRECT_ENABLED = 'true'
   OPPLEVAGENT_LANG_SWITCHER_ENABLED = 'false'
   SV_LOCALE_ENABLED = 'false'
+  # dev-request 2026-09-21-opplevagent-cooldown-40-doegn, Daniel-authorized
+  # live 2026-09-21 (A2A daniel-responses/2026-09-21-go-fiks-telefonuttrekk-
+  # foerst-og-cooldown-40.md): lowers the outreach cooldown from the 60-day
+  # default to 40 days, primarily to unblock the opplevagent (experiences)
+  # outreach pool, which had 0 candidates because all 196 ready producers
+  # were in cooldown (oldest contact was 43 days ago). The cooldown is
+  # deliberately CROSS-platform (same From-address as RFB — see crm.ts) —
+  # this also shortens RFB's own second-touch window from 60 to 40 days.
+  # Live-measured impact before this change: GET /admin/outreach-candidates
+  # ?mode=second&cooldown_days=60 -> 4 candidates; ...&cooldown_days=40 ->
+  # 14 candidates (delta +10, well under the dev-request's AC2
+  # stop-and-escalate threshold of 100). Read defensively (falls back to 60)
+  # in crm.ts and opplevelser.ts (referenced for context, but not read, in
+  # marketplace.ts). Rollback: set back to '60' or remove the line — no
+  # migration, no deploy-side state.
+  OUTREACH_COOLDOWN_DAYS = '40'
 
 [[mounts]]
   source = 'lokal_data'
