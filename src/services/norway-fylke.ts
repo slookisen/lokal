@@ -628,7 +628,13 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
 // Deliberately curated + narrow: every kommune name below is a display name
 // ALREADY present as a key of CITY_TO_FYLKE_RAW above (verified directly in
 // experiences-a2a.test.ts) — no invented/unverified kommune name is added
-// here. A tourist-region name NOT in this table intentionally still resolves
+// here — EXCEPT "Senja" itself (see that entry's own comment below): it is
+// the real DB kommune value post-2020-reform, not a CITY_TO_FYLKE_RAW-listed
+// stand-in town, so it's intentionally absent from CITY_TO_FYLKE_RAW/
+// KOMMUNE_NAMES (detectKommune() must not treat every region label as also a
+// standalone kommune) while still being correct as a REGION_TO_KOMMUNER
+// expansion target, which only feeds the `kommune IN (...)` SQL clause.
+// A tourist-region name NOT in this table intentionally still resolves
 // to count:0 (no fuzzy/fallback matching) — see the closed dev-request
 // 2026-09-06-opplevagent-discovery-nulltreff-standardliste, whose "no false
 // standard list" guarantee this preserves.
@@ -650,7 +656,16 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
 export const REGION_TO_KOMMUNER: Readonly<Record<string, readonly string[]>> = {
   "Lofoten": ["Svolvær", "Leknes", "Reine", "Henningsvær"],
   "Hardanger": ["Odda", "Ulvik", "Jondal", "Eidfjord", "Kvinnherad"],
-  "Senja": ["Finnsnes"],
+  // "Senja" is BOTH the curated tourist-region label AND, since the 2020
+  // municipal reform merged Lenvik/Berg/Torsken/Tranøy into one new kommune
+  // literally named "Senja", the real, current `experiences.kommune` value
+  // itself (verified live: 20 real rows tagged kommune:"Senja" directly) —
+  // unlike every other region here, whose district name isn't itself a DB
+  // kommune value. "Finnsnes" (the merged kommune's administrative center)
+  // is kept too since it's harmless as an IN(...) member, but it alone
+  // produced 0 live hits (2026-09-22 fix-up to PR #907, dev-request 2026-
+  // 09-21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke AC2).
+  "Senja": ["Senja", "Finnsnes"],
   "Sunnmøre": ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven"],
   "Nordmøre": ["Kristiansund", "Surnadal"],
   "Valdres": ["Fagernes", "Beitostølen"],

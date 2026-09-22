@@ -308,7 +308,11 @@ export function runExperiencesA2aGardssalgTests(opts: { log?: boolean } = {}): P
       const regionFixtures: Array<{ region: string; kommune: string; fylke: string; title: string }> = [
         { region: "Lofoten", kommune: "Svolvær", fylke: "Nordland", title: "Havørnsafari i Lofoten" },
         { region: "Hardanger", kommune: "Odda", fylke: "Vestland", title: "Fjordvandring i Hardanger" },
-        { region: "Senja", kommune: "Finnsnes", fylke: "Troms", title: "Fjelltur på Senja" },
+        // kommune "Senja" (not "Finnsnes") deliberately — the real,
+        // post-2020-reform DB kommune value (2026-09-22 fix-up to PR #907,
+        // dev-request 2026-09-21-...-fylke AC2: live probe found 20 real
+        // rows tagged kommune:"Senja" directly, 0 tagged "Finnsnes").
+        { region: "Senja", kommune: "Senja", fylke: "Troms", title: "Fjelltur på Senja" },
       ];
       for (const fx of regionFixtures) {
         const providerId = expStore.createProvider({
