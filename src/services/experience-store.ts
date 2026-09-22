@@ -254,6 +254,14 @@ export type Experience = z.infer<typeof ExperienceSchema>;
 const DiscoverFilterBaseSchema = z.object({
   fylke: z.string().optional(),
   kommune: z.string().optional(),
+  // Multi-kommune expansion of a curated tourist-region name (dev-request
+  // 2026-09-21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke) — set
+  // internally by experiences-a2a.ts's parseExperiencesIntent() when a query
+  // names a region like "Lofoten" instead of an exact kommune/fylke. Purely
+  // additive alongside `kommune` above (never replaces it): an ordinary
+  // single-kommune filter is entirely unaffected. See buildKommuneInClause()
+  // below for how this drives the SQL WHERE-builder.
+  kommuner: z.array(z.string()).optional(),
   category: z.string().optional(),
   indoor_outdoor: IndoorOutdoorSchema.optional(),
   weather: z.enum(["rain", "snow", "clear", "any"]).optional(),
@@ -1501,6 +1509,35 @@ export function buildFylkeInClause(
 }
 
 /**
+ * Builds a `<column> IN (...)` fragment + bound params for a kommune LIST
+ * filter — the multi-kommune counterpart to a plain `kommune = @kommune`
+ * equality, driven by DiscoverFilter.kommuner (dev-request 2026-09-21-
+ * opplevagent-discovery-regionnavn-utenfor-kommune-fylke: a curated tourist-
+ * region name, e.g. "Lofoten", is expanded to its constituent kommune
+ * display names in experiences-a2a.ts's parseExperiencesIntent() BEFORE
+ * reaching here — see REGION_TO_KOMMUNER in norway-fylke.ts). Unlike
+ * buildFylkeInClause() above, this takes the list AS GIVEN — no alias/
+ * equivalence expansion — because the values it receives are already a
+ * literal, curated set, not a free-form caller string needing
+ * normalisation. Values are always bound as params, never string-
+ * concatenated. Caller must ensure `kommuner` is non-empty (an empty list
+ * would build a syntactically invalid `IN ()`).
+ */
+export function buildKommuneInClause(
+  kommuner: readonly string[],
+  column = "kommune",
+  paramPrefix = "kommune"
+): { sql: string; params: Record<string, string> } {
+  const params: Record<string, string> = {};
+  const placeholders = kommuner.map((v, i) => {
+    const key = `${paramPrefix}${i}`;
+    params[key] = v;
+    return `@${key}`;
+  });
+  return { sql: `${column} IN (${placeholders.join(", ")})`, params };
+}
+
+/**
  * Builds the WHERE-clause fragments + bound params shared by
  * discoverExperiences() and countDiscoverExperiences() — factored out so the
  * two can NEVER drift apart (see countDiscoverExperiences()'s doc comment for
@@ -1561,6 +1598,11 @@ function buildDiscoverWhere(f: DiscoverFilter): {
     Object.assign(params, fylkeParams);
   }
   if (f.kommune) { where.push("e.kommune = @kommune"); params.kommune = f.kommune; }
+  if (f.kommuner && f.kommuner.length > 0) {
+    const { sql, params: kommunerParams } = buildKommuneInClause(f.kommuner, "e.kommune", "kommuner");
+    where.push(sql);
+    Object.assign(params, kommunerParams);
+  }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
   if (f.indoor_outdoor) { where.push("e.indoor_outdoor IN (@io, 'both')"); params.io = f.indoor_outdoor; }
   // Rain/snow → prefer indoor + weather-independent.
@@ -1716,12 +1758,14 @@ const RELAX_ORDER: Array<keyof DiscoverFilter> = [
   "indoor_outdoor",
   "category",
   "kommune",
+  "kommuner",
   "fylke",
 ];
 
 const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   fylke: "fylke",
   kommune: "kommune",
+  kommuner: "kommuner",
   category: "kategori",
   indoor_outdoor: "innendørs/utendørs",
   weather: "vær",

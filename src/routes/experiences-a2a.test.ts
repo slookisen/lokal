@@ -40,7 +40,18 @@
  *      the `npm test` summary (see opplevelser-discover-relax.test.ts /
  *      opplevelser-gardssalg-mcp-discoverability.test.ts for the precedent
  *      this follows).
+ *
+ * Section 3 (added by dev-request 2026-09-21-opplevagent-discovery-
+ * regionnavn-utenfor-kommune-fylke) covers the curated tourist-region ->
+ * kommune-list expansion in parseExperiencesIntent()/REGION_TO_KOMMUNER
+ * (norway-fylke.ts): every curated region resolves to its documented kommune
+ * list AND surfaces a real seeded hit end-to-end, the Tromsø/Finnmark
+ * kommune/fylke control-group queries are unaffected, an out-of-list region
+ * word still parses to an empty (no-geography) filter, and no curated region
+ * name substring-collides with an unrelated kommune/fylke name.
  */
+
+import { REGION_TO_KOMMUNER } from "../services/norway-fylke";
 
 export interface TestSummary {
   passed: number;
@@ -254,6 +265,89 @@ export function runExperiencesA2aGardssalgTests(opts: { log?: boolean } = {}): P
       assertEq(ord1.result?.metadata?.filter, ord2.result?.metadata?.filter, "2f-3: parsed filter is stable/identical across repeated calls for the same ordinary query");
       assertEq(ord1.result?.artifacts?.[0]?.parts, ord2.result?.artifacts?.[0]?.parts, "2f-4: summary artifact is byte-identical across repeated calls");
       assertEq(ord1.result?.artifacts?.[1]?.parts, ord2.result?.artifacts?.[1]?.parts, "2f-5: results artifact is byte-identical across repeated calls");
+
+      // ── 3. Curated tourist-region -> kommune-list expansion (dev-request
+      //     2026-09-21-opplevagent-discovery-regionnavn-utenfor-kommune-
+      //     fylke) ────────────────────────────────────────────────────────
+
+      // 3a. Every curated region resolves, via parseExperiencesIntent(), to
+      //     EXACTLY its documented REGION_TO_KOMMUNER kommune list — and to
+      //     that list only (no kommune/fylke also set alongside it).
+      for (const [region, kommuner] of Object.entries(REGION_TO_KOMMUNER)) {
+        const parsed = parseExperiencesIntent(`hvilke opplevelser finnes i ${region}?`);
+        assertEq(
+          parsed,
+          { kommuner: [...kommuner] },
+          `3a-${region}: parseExperiencesIntent("...i ${region}?") sets kommuner to exactly [${kommuner.join(", ")}] and nothing else`
+        );
+      }
+
+      // 3b. Substring-trap check: none of the curated region names
+      //     substring-collide (word-prefix, matchesAsWordPrefix's own
+      //     convention) with an unrelated real kommune or fylke name in
+      //     either direction — analogous to the existing kommune "Os"-
+      //     inside-"Oslo" guard this file's sibling detectKommune() carries.
+      //     A collision in either direction would mean a region query wrongly
+      //     resolves as a kommune/fylke query (or vice versa). Verified
+      //     directly here (not merely asserted in a comment) against the
+      //     real KOMMUNE_NAMES/FYLKER tables the parser itself uses.
+      for (const region of Object.keys(REGION_TO_KOMMUNER)) {
+        const parsed = parseExperiencesIntent(`opplevelser i ${region}`);
+        assertTrue(
+          parsed.kommune === undefined && parsed.fylke === undefined,
+          `3b-${region}: region name "${region}" does not also/instead trigger a kommune or fylke match (no substring collision)`
+        );
+      }
+
+      // 3c. End-to-end: seed one real published experience inside a real
+      //     kommune from EACH of the three regions the dev-request measured
+      //     live (Lofoten/Hardanger/Senja), then confirm the full A2A handler
+      //     surfaces a non-zero, real hit for a natural-language region
+      //     query for each — the actual acceptance criteria (AC1/AC2), not
+      //     just the parser's filter shape.
+      const regionFixtures: Array<{ region: string; kommune: string; fylke: string; title: string }> = [
+        { region: "Lofoten", kommune: "Svolvær", fylke: "Nordland", title: "Havørnsafari i Lofoten" },
+        { region: "Hardanger", kommune: "Odda", fylke: "Vestland", title: "Fjordvandring i Hardanger" },
+        { region: "Senja", kommune: "Finnsnes", fylke: "Troms", title: "Fjelltur på Senja" },
+      ];
+      for (const fx of regionFixtures) {
+        const providerId = expStore.createProvider({
+          navn: `${fx.title} AS`, fylke: fx.fylke, kommune: fx.kommune,
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expStore.createExperience({
+          title: fx.title, provider_id: providerId,
+          provider_match_status: "matched", kommune: fx.kommune, fylke: fx.fylke,
+          category: "natur", verification_status: "verified", confidence: "high",
+          price_from: 400, duration_min: 120, indoor_outdoor: "outdoor",
+        });
+        const r: any = handleExperiencesMessageSend({ message: `hva kan vi finne på i ${fx.region}?` }, `region-${fx.region}`);
+        const dataPart = r.result?.artifacts?.[1]?.parts?.[0]?.data;
+        assertTrue((dataPart?.count ?? 0) >= 1, `3c-${fx.region}-1: "${fx.region}" query yields >=1 hit (seeded via kommune "${fx.kommune}")`);
+        const titles = (dataPart?.experiences as any[] | undefined)?.map((e) => e.title) ?? [];
+        assertTrue(titles.includes(fx.title), `3c-${fx.region}-2: the seeded ${fx.region}-area experience is present in the results`);
+      }
+
+      // 3d. Control group — existing kommune/fylke queries are byte-
+      //     identical to before region detection existed. Tromsø (kommune)
+      //     is already covered end-to-end in 2f above; Finnmark (fylke) is
+      //     added here explicitly.
+      const tromsoParsed = parseExperiencesIntent("hva kan vi finne på i Tromsø om vinteren?");
+      assertEq(tromsoParsed, { kommune: "Tromsø", season: "winter" }, "3d-1: control — \"Tromsø\" still parses to kommune only (unaffected by region detection)");
+      const finnmarkParsed = parseExperiencesIntent("opplevelser i Finnmark");
+      assertEq(finnmarkParsed, { fylke: "Finnmark" }, "3d-2: control — \"Finnmark\" still parses to fylke only (unaffected by region detection)");
+
+      // 3e. AC4 — a region name OUTSIDE the curated list still yields an
+      //     empty (no-geography) filter, never a false broad kommuner list.
+      //     "Vesterålen" is a real, well-known Norwegian tourist region
+      //     (already flagged as a non-kommune label in norway-fylke.ts) that
+      //     is deliberately NOT in REGION_TO_KOMMUNER.
+      const outOfListParsed = parseExperiencesIntent("kajakkpadling i Vesterålen");
+      assertEq(outOfListParsed, {}, "3e-1: an out-of-curated-list region name (\"Vesterålen\") parses to an empty filter — no kommune, no kommuner, no fylke");
+      const outOfListResult: any = handleExperiencesMessageSend({ message: "kajakkpadling i Vesterålen" }, "region-out-of-list");
+      assertEq(outOfListResult.result?.metadata?.zero_hit_reason, "unrecognized_query", "3e-2: the full handler treats it as an unrecognized query, same as before region detection existed");
+      const outOfListData = outOfListResult.result?.artifacts?.[1]?.parts?.[0]?.data;
+      assertEq(outOfListData?.count, 0, "3e-3: count is 0 — never a false broad standard list");
     } catch (err: any) {
       failed++;
       failures.push("experiences-a2a (gardssalg): unexpected error: " + String(err?.stack || err?.message || err));
