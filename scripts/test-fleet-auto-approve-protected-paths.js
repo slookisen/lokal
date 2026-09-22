@@ -30,12 +30,29 @@
 
 'use strict';
 
+// /session/i (below) was deliberately widened in 2026-07-18 (dev-request
+// 2026-07-13-fleet-auto-approve-protected-path-regex-widen) to catch real
+// session/auth filenames /auth/i alone misses (owner-portal.ts). Since then
+// it has produced two confirmed false positives on the SAME compound-
+// technical-term shape (dev-request 2026-09-22-fleet-auto-approve-session-
+// substring-filnavn-falsk-positiv): lokal#899 and lokal#906, both a
+// filename like `mcp-session-404.test.ts` — the MCP protocol's own
+// "session ID" wire concept (an HTTP 404-vs-400 error-code test), never an
+// auth session. Narrowed below to exclude exactly that shape — "session"
+// immediately preceded by "mcp-", or immediately followed by "-id"/
+// "-<digits>" as a whole token — while every other "session" filename hit
+// (session.ts, session-service.ts, auth-session-manager.ts, anything under
+// a session/ directory, etc.) still matches exactly as before (see the
+// AC1/AC2 test cases below). Mirrored (duplicated intentionally — see file
+// header) in .github/workflows/fleet-auto-approve.yml — keep both in sync.
+// Every other entry in this array is untouched (out of scope for this fix;
+// no known false positives).
 const PROTECTED = [
   /(^|\/)\.github\/workflows\//i,
   /(^|\/)fly\.toml$/i,
   /(^|\/)dockerfile$/i,
   /auth/i,
-  /session/i,
+  /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i,
   /cookie/i,
   /admin-key/i,
   /owner-portal/i,
@@ -365,6 +382,50 @@ check('an unrelated service file', 'src/services/order-notify-service.ts', false
 check('an unrelated test file', 'tests/test.ts', false);
 check('an unrelated frontend file', 'src/public/selger.html', false);
 check('a database schema file (not itself an auth surface)', 'src/database/init.ts', false);
+
+// ── dev-request 2026-09-22-fleet-auto-approve-session-substring-filnavn-
+// falsk-positiv ───────────────────────────────────────────────────────────
+// AC1: the confirmed false-positive class (lokal#899, lokal#906) — a
+// filename where "session" is part of an unrelated compound technical term
+// (the MCP protocol's own session-ID wire concept, an HTTP-status-code
+// test-name suffix) must no longer match ANY PROTECTED entry.
+check(
+  'AC1: lokal#899/#906 false positive — mcp-session-404.test.ts (MCP protocol session-ID error-code test, not auth) is NOT caught',
+  'src/routes/mcp-session-404.test.ts',
+  false,
+);
+check(
+  'AC1 variant: "session-id" as a bare protocol field name (no "mcp-" prefix) is also NOT caught',
+  'src/routes/protocol-session-id-parser.ts',
+  false,
+);
+check(
+  'AC1 variant: mcp-session prefix without a trailing digit/id is still NOT caught (the mcp- prefix alone is the excluded shape)',
+  'src/routes/mcp-session-handshake.test.ts',
+  false,
+);
+
+// AC2 (regression guard, security-critical direction): genuine auth/session
+// filenames must ALL still match, byte-identical to before this change.
+check('AC2: session.ts (bare, literal) is still caught', 'src/session.ts', true);
+check('AC2: a file under a directory literally named session/ is still caught', 'src/session/manager.ts', true);
+check('AC2: auth-session-manager.ts is still caught', 'src/services/auth-session-manager.ts', true);
+check(
+  'AC2: a filename naming the sessionFromRequest identifier is still caught',
+  'src/routes/sessionFromRequest.ts',
+  true,
+);
+check(
+  'AC2: a filename naming the readSessionCookie identifier is still caught',
+  'src/utils/readSessionCookie.ts',
+  true,
+);
+check(
+  'AC2: session-idle-timeout.ts (a plausible real auth filename whose suffix merely STARTS WITH "id") is still caught — the -id exclusion requires "id" as a whole token, not a prefix',
+  'src/services/session-idle-timeout.ts',
+  true,
+);
+check('AC2: owner-portal.ts (unrelated pattern, untouched by this fix) is still caught', 'src/routes/owner-portal.ts', true);
 
 function checkContent(name, patch, expectMatch) {
   const hit = contentEditMatch(patch);

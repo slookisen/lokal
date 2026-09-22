@@ -204,12 +204,32 @@ jobs:
             //    owner-portal.ts (#206, and again #287) because "owner-portal" has
             //    no "auth" substring — each of the patterns below is independent,
             //    not a rename of /auth/i.
+            // /session/i (below) was deliberately widened in 2026-07-18
+            // (dev-request 2026-07-13-fleet-auto-approve-protected-path-
+            // regex-widen) to catch real session/auth filenames /auth/i
+            // alone misses (owner-portal.ts). Since then it has produced
+            // two confirmed false positives on the SAME compound-technical-
+            // term shape (dev-request 2026-09-22-fleet-auto-approve-
+            // session-substring-filnavn-falsk-positiv): lokal#899 and
+            // lokal#906, both a filename like `mcp-session-404.test.ts` —
+            // the MCP protocol's own "session ID" wire concept (an HTTP
+            // 404-vs-400 error-code test), never an auth session. Narrowed
+            // below to exclude exactly that shape — "session" immediately
+            // preceded by "mcp-", or immediately followed by "-id"/
+            // "-<digits>" as a whole token — while every other "session"
+            // filename hit (session.ts, session-service.ts,
+            // auth-session-manager.ts, anything under a session/
+            // directory, etc.) still matches exactly as before (regression
+            // guard: scripts/test-fleet-auto-approve-protected-paths.js).
+            // Mirrored there — keep both in sync (same-file comment above
+            // still applies). Every other entry in this array is untouched
+            // (out of scope for this fix; no known false positives).
             const PROTECTED = [
               /(^|\/)\.github\/workflows\//i,
               /(^|\/)fly\.toml$/i,
               /(^|\/)dockerfile$/i,
               /auth/i,
-              /session/i,
+              /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i,
               /cookie/i,
               /admin-key/i,
               /owner-portal/i,
