@@ -7,7 +7,11 @@
  * natural-language query had no real hits, instead of count:0. Nonsense text
  * ("zzzqqq ingen treff xyzzy", "kajakk Lofoten", "Ystebakken") all returned
  * byte-identical top-3 ids and count:20 — indistinguishable from a real
- * match to a calling agent.
+ * match to a calling agent. (Historical repro record only: as of dev-request
+ * 2026-09-21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke,
+ * "Lofoten" is a curated, recognised region name — see test 2 below, which
+ * now uses "Vesterålen" in its place to keep exercising a genuinely
+ * unrecognised place name.)
  *
  * Two root causes in the "Default: discover" branch of
  * handleExperiencesMessageSend (src/routes/experiences-a2a.ts):
@@ -128,12 +132,19 @@ export function runExperiencesA2aZeroHitTests(opts: { log?: boolean } = {}): Pro
       assertTrue(typeof summaryPart1 === "string" && summaryPart1.length > 0, "1e: summary text is present");
       assertTrue(summaryPart1.includes("ingen treff") || summaryPart1.toLowerCase().includes("no matches"), "1f: summary reads as a genuine no-match, not a result count");
 
-      // ── 2. "kajakk Lofoten" — real words, no recognised place/season/
-      //     weather/indoor-outdoor signal (Lofoten is excluded from
-      //     detectKommune via NON_KOMMUNE_REGION_LABELS, and is not a FYLKER
-      //     substring) -> same zero-hit result ─────────────────────────────
-      const r2: any = handleExperiencesMessageSend({ message: "kajakk Lofoten" }, "z2");
-      assertEq(r2.result?.metadata?.zero_hit_reason, "unrecognized_query", "2a: \"kajakk Lofoten\" is also an unrecognized query");
+      // ── 2. "kajakk Vesterålen" — real words, no recognised place/season/
+      //     weather/indoor-outdoor signal. "Vesterålen" is excluded from
+      //     detectKommune via NON_KOMMUNE_REGION_LABELS, is not a FYLKER
+      //     substring, and — unlike "Lofoten" as of dev-request 2026-09-21-
+      //     opplevagent-discovery-regionnavn-utenfor-kommune-fylke — is also
+      //     NOT in the curated REGION_TO_KOMMUNER list, so it still parses to
+      //     an empty filter -> same zero-hit result as before that dev-
+      //     request. (Region-list coverage itself — including that a
+      //     recognised-but-no-catalog-hit region collapses into
+      //     "relaxation_exhausted", not "unrecognized_query" — is covered in
+      //     experiences-a2a.test.ts's dedicated region section.) ───────────
+      const r2: any = handleExperiencesMessageSend({ message: "kajakk Vesterålen" }, "z2");
+      assertEq(r2.result?.metadata?.zero_hit_reason, "unrecognized_query", "2a: \"kajakk Vesterålen\" is also an unrecognized query");
       const dataPart2 = r2.result?.artifacts?.[1]?.parts?.[0]?.data;
       assertEq(dataPart2?.count, 0, "2b: count is 0");
 

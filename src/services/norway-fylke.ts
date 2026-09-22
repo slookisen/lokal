@@ -607,6 +607,55 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
   "Helgeland",    // Nordland — spans Mo i Rana/Mosjøen/Brønnøysund/Sandnessjøen etc.
 ]);
 
+// ─── curated tourist-region → kommune-list expansion ───────────
+// dev-request 2026-09-21-opplevagent-discovery-regionnavn-utenfor-kommune-
+// fylke: a natural-language query naming a well-known MULTI-kommune tourist
+// region ("Lofoten", "Hardanger", "Senja", ...) previously fell through to
+// count:0 even when the catalog has real hits in the region's constituent
+// kommuner — the region name matches neither KOMMUNE_NAMES (a region is not
+// itself a kommune; several of these are already excluded via
+// NON_KOMMUNE_REGION_LABELS above) nor FYLKER (a region name isn't a fylke
+// name either) in experiences-a2a.ts.
+//
+// This is a DIFFERENT mechanism from ALIAS_TO_CANONICAL / fylke-2024-
+// migration.ts's KOMMUNE_NAME_ALIASES: those are 1:1 name folding (one
+// alternate spelling -> one canonical name). A region is 1:MANY kommuner, so
+// it drives a SQL `kommune IN (...)` (DiscoverFilter.kommuner -> see
+// buildKommuneInClause() in experience-store.ts), never a single `kommune =
+// @kommune` swap, and it is intentionally NOT added as a fake 1:1 kommune
+// synonym.
+//
+// Deliberately curated + narrow: every kommune name below is a display name
+// ALREADY present as a key of CITY_TO_FYLKE_RAW above (verified directly in
+// experiences-a2a.test.ts) — no invented/unverified kommune name is added
+// here. A tourist-region name NOT in this table intentionally still resolves
+// to count:0 (no fuzzy/fallback matching) — see the closed dev-request
+// 2026-09-06-opplevagent-discovery-nulltreff-standardliste, whose "no false
+// standard list" guarantee this preserves.
+//
+// Where the district's OFFICIAL kommune name isn't itself a CITY_TO_FYLKE_RAW
+// entry (e.g. Lofoten's real kommuner are Vågan/Vestvågøy/Flakstad/Moskenes/
+// Røst/Værøy — see the Lofoten entry's own comment in
+// NON_KOMMUNE_REGION_LABELS above — and none of those six is in
+// CITY_TO_FYLKE_RAW), the district's well-known town name is used instead
+// (e.g. "Svolvær" standing in for Vågan) — consistent with this module's
+// existing city/kommune convention, where several CITY_TO_FYLKE_RAW entries
+// are already a town name doing duty as its kommune's catalog-matching value
+// rather than the town's strict official kommune name.
+//
+// The Geiranger bug (a bygd wrongly present in CITY_TO_FYLKE_RAW as if it
+// were its own kommune) is a SEPARATE, already-flagged issue and explicitly
+// out of scope here — "Geiranger" is deliberately never referenced below,
+// even though it sits inside the Sunnmøre district.
+export const REGION_TO_KOMMUNER: Readonly<Record<string, readonly string[]>> = {
+  "Lofoten": ["Svolvær", "Leknes", "Reine", "Henningsvær"],
+  "Hardanger": ["Odda", "Ulvik", "Jondal", "Eidfjord", "Kvinnherad"],
+  "Senja": ["Finnsnes"],
+  "Sunnmøre": ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven"],
+  "Nordmøre": ["Kristiansund", "Surnadal"],
+  "Valdres": ["Fagernes", "Beitostølen"],
+};
+
 // Exported for tests + admin-UI sanity checks.
 export const __FYLKE_INTERNAL = {
   CANONICAL_FYLKER,

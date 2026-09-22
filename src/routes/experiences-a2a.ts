@@ -47,7 +47,7 @@ import {
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS } from "../services/norway-fylke";
+import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from "../services/norway-fylke";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
@@ -211,22 +211,53 @@ function detectKommune(lower: string): string | null {
   return best;
 }
 
+// Curated tourist-region names (dev-request 2026-09-21-opplevagent-
+// discovery-regionnavn-utenfor-kommune-fylke) — see REGION_TO_KOMMUNER in
+// norway-fylke.ts for the region -> kommune-list mapping itself, and that
+// export's own doc comment for why this is a SEPARATE list from
+// KOMMUNE_NAMES rather than more fake 1:1 kommune synonyms. Checked with the
+// exact same word-boundary-aware technique as detectKommune() above (longest
+// match wins on the rare chance two region names both match).
+const REGION_NAMES: string[] = Object.keys(REGION_TO_KOMMUNER);
+
+function detectRegion(lower: string): string | null {
+  let best: string | null = null;
+  for (const display of REGION_NAMES) {
+    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
+      if (!best || display.length > best.length) best = display;
+    }
+  }
+  return best;
+}
+
 export function parseExperiencesIntent(text: string): DiscoverFilter {
   const lower = text.toLowerCase();
   const params: DiscoverFilter = {};
 
-  // Kommune detection takes priority over fylke (see detectKommune above).
-  // A caller who only cares about kommune shouldn't also get a redundant
-  // (and possibly stale-era) fylke constraint ANDed in by discoverExperiences.
+  // Kommune detection takes priority over fylke AND over a curated region
+  // match (see detectKommune above) — a caller who named an exact kommune
+  // shouldn't have it shadowed by a broader region/fylke constraint. Only
+  // when no kommune matched do we check for a curated multi-kommune region
+  // name (e.g. "Lofoten" -> its constituent kommuner, dev-request 2026-09-
+  // 21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke); only when
+  // NEITHER a kommune NOR a region matched do we fall back to fylke
+  // detection, exactly as before this region-detection feature existed —
+  // so an existing kommune/fylke-only query (e.g. "Tromsø", "Finnmark")
+  // produces a byte-identical filter to before.
   const kommune = detectKommune(lower);
   if (kommune) {
     params.kommune = kommune;
   } else {
-    // Fylke detection — only when no kommune matched.
-    for (const f of FYLKER) {
-      if (lower.includes(f)) {
-        params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
-        break;
+    const region = detectRegion(lower);
+    if (region) {
+      params.kommuner = [...REGION_TO_KOMMUNER[region]];
+    } else {
+      // Fylke detection — only when no kommune or curated region matched.
+      for (const f of FYLKER) {
+        if (lower.includes(f)) {
+          params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
+          break;
+        }
       }
     }
   }
