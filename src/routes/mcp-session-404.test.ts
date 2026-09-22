@@ -31,7 +31,7 @@
  *      mcp-browser-landing-page.test.ts for that surface.
  *
  * Covers, per vertical (rfb via src/routes/mcp.ts, dental via
- * src/routes/dental-mcp.ts):
+ * src/routes/dental-mcp.ts, opplevagent via src/routes/experiences-mcp.ts):
  *   (a) tools/list with an unknown/expired mcp-session-id -> 404, JSON-RPC
  *       `-32001` body, and the session map did NOT grow from that request —
  *       proven behaviorally (no direct access to the module-private Map):
@@ -91,6 +91,7 @@ interface VerticalCase {
 const VERTICALS: VerticalCase[] = [
   { label: "rfb", routerPath: "./mcp", toolListMin: 14, sampleToolName: "lokal_search" },
   { label: "dental", routerPath: "./dental-mcp", toolListMin: 5, sampleToolName: "tannlege_search" },
+  { label: "opplevagent", routerPath: "./experiences-mcp", toolListMin: 5, sampleToolName: "discover_experiences" },
 ];
 
 // Parses a JSON-RPC response body that may be a raw JSON object or an SSE
