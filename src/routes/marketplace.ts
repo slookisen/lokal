@@ -4558,6 +4558,11 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 // each written field against field_provenance's cited source_url/snippet.
 // This endpoint ONLY serves the sample — the spot-check logic itself
 // (fetch + compare + escalate/pause) lives in a separate SKILL, not here.
+// The per-field fetch+compare step that SKILL calls out to is
+// POST /admin/field-spot-check (admin-field-spot-check.ts, dev-request
+// 2026-09-22-telefon-css-js-identifikator-falske-positiver point 2 fix-up) —
+// a thin wrapper around computeFieldSpotCheck() (src/agents/lokal-agent-
+// verifier.ts).
 //
 // Query params:
 //   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
@@ -6127,11 +6132,26 @@ export function extractPhone(html: string): string | null {
     // Bug fix 2: reject a run that is really a substring of a longer digit
     // sequence (e.g. an org number) by checking the raw neighbours of the
     // matched digit group (m[1]) in the original text.
+    //
+    // Widened (dev-request 2026-09-22-telefon-css-js-identifikator-falske-
+    // positiver) from a digit-only neighbour check to a full alphanumeric
+    // one: a CSS class name / JS identifier welds digits directly onto
+    // LETTERS with no separator (e.g. Wix's `StylableButton2545352419`),
+    // which the digit-only check let through. Norwegian phone numbers are
+    // never glued directly to a surrounding letter or digit with zero
+    // separating punctuation/whitespace, however they're written (with or
+    // without +47, with or without internal separators) — so this is a safe
+    // widening, not a narrowing, of what still gets accepted. `before` stays
+    // anchored to the WHOLE match start (m.index), not the captured group's
+    // start, so a "+47"/"0047" prefix glued directly to the digits (no
+    // separator) is still judged by what precedes the prefix, not by the
+    // prefix's own last digit (see phone-06/07/08 in
+    // homepage-provenance-contact-extraction-fix.test.ts).
     const groupStart = m.index + (m[0].length - m[1].length);
     const groupEnd = groupStart + m[1].length;
     const before = m.index > 0 ? text[m.index - 1] : "";
     const after = groupEnd < text.length ? text[groupEnd] : "";
-    if (/\d/.test(before) || /\d/.test(after)) continue;
+    if (/[A-Za-z0-9]/.test(before) || /[A-Za-z0-9]/.test(after)) continue;
     // Bug fix 3 (W33 2026-08-10): reject 8-digit runs that violate the
     // Norwegian numbering plan's leading-digit rule (subscriber numbers
     // start 2-9, never 0/1 — e.g. the live-written "02812441"). Delegates

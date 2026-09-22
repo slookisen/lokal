@@ -115,6 +115,100 @@ export function runSearchEnrichExtractionGuardsTests(
     "phones-03: an unquoted 'telefon:<digits>' config key inside a <script> block is not returned in the phones array when no real phone exists on the page",
   );
 
+  // ── Bug (dev-request 2026-09-22-telefon-css-js-identifikator-falske-
+  //    positiver): extractPhones — an 8-digit run embedded in a longer
+  //    alphanumeric token (CSS class name / JS config blob), NOT wrapped in
+  //    <script>/<style> — must be rejected even though bugs 1/3 above
+  //    (script/style stripping) don't apply, because these two live
+  //    incidents reached agent_knowledge.phone via markup OUTSIDE any
+  //    <script>/<style> block. ────────────────────────────────────────────
+
+  // Live incident 1: Bjørke Gård (bjorkegard.no) — "35267336" was the tail
+  // of a Facebook SDK config JSON blob's `"facebookAppId":"314192535267336"`
+  // rendered directly into the page body (e.g. a no-JS/SSR fallback), not
+  // inside a <script> tag. Must return [], not ["35267336"].
+  const htmlFacebookAppIdBlob =
+    '<html><body><div id="fb-root"></div>' +
+    '<div class="fb-config-fallback">{"facebookAppId":"314192535267336","xfbml":true}</div>' +
+    "<p>Velkommen til Bjørke Gård! Vi selger egne produkter fra gården.</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhones(htmlFacebookAppIdBlob),
+    [],
+    "phones-04 (Bjørke Gård repro): an 8-digit slice of a longer facebookAppId digit run is not returned when no real phone exists anywhere on the page",
+  );
+
+  // Live incident 2: Drivhuset Bageri & Gårdsutsalg (drivhusetbageri.no) —
+  // "45352419" was the tail of a Wix-generated CSS class name
+  // `StylableButton2545352419`. Fixture places the class-name-shaped token
+  // as page TEXT CONTENT (not inside a `class="..."` attribute) — an
+  // attribute value is already stripped away wholesale by the generic
+  // tag-strip regardless of this fix (it's inside `<...>`), so a fixture
+  // that only put it in an attribute would pass BEFORE this fix too and
+  // wouldn't actually exercise the new guard. This mirrors how such an
+  // identifier can leak into rendered/visible markup (e.g. an SSR
+  // warmup-data fallback block), matching the real incident shape: an
+  // 8-digit run welded directly onto letters with no separator. Must
+  // return [], not ["45352419"].
+  const htmlWixClassName =
+    '<html><body><div class="wix-warmup-fallback">{"compId":"StylableButton2545352419","type":"Container"}</div>' +
+    "<p>Velkommen til Drivhuset Bageri &amp; Gårdsutsalg!</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhones(htmlWixClassName),
+    [],
+    "phones-05 (Drivhuset repro): an 8-digit slice of a longer Wix CSS class name digit run is not returned when no real phone exists anywhere on the page",
+  );
+
+  // Regression-safety (positive control): the SAME two junk shapes, but with
+  // a genuine phone number ALSO present in visible body text — the junk
+  // must not prevent the real number from being found and returned.
+  const htmlJunkPlusRealPhone =
+    '<html><body><div id="fb-root"></div>' +
+    '<div class="fb-config-fallback">{"facebookAppId":"314192535267336"}</div>' +
+    '<div class="wix-warmup-fallback">{"compId":"StylableButton2545352419"}</div>' +
+    "<p>Velkommen til gården! Ring oss på 91234567 for bestilling.</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhones(htmlJunkPlusRealPhone),
+    ["91234567"],
+    "phones-06: a genuine phone number in visible body text is still correctly extracted alongside both junk shapes (regression-safety)",
+  );
+
+  // Positive controls — real phone numbers must keep extracting exactly as
+  // before (visible text / tel: link visible text / near a JSON-LD block /
+  // near a <meta> contact block), none of them glued to a surrounding
+  // letter or digit with no separator.
+  const phonePositiveControls: Array<{ label: string; html: string; expected: string[] }> = [
+    {
+      label: "phones-07: plain visible-text phone number, no other markup",
+      html: "<html><body><p>Ring 91234567 for bestilling.</p></body></html>",
+      expected: ["91234567"],
+    },
+    {
+      label: "phones-08: a tel: link whose visible anchor text carries the same digits",
+      html: '<html><body><a href="tel:+4791234567">91234567</a></body></html>',
+      expected: ["91234567"],
+    },
+    {
+      label: "phones-09: a real phone number in visible text alongside a JSON-LD <script> block (JSON-LD content itself stays stripped, unaffected by the new guard — the VISIBLE number is what's found)",
+      html:
+        '<html><head><script type="application/ld+json">{"@type":"LocalBusiness","telephone":"+4791234567"}</script></head>' +
+        "<body><p>Kontakt: 91234567</p></body></html>",
+      expected: ["91234567"],
+    },
+    {
+      label: "phones-10: a real phone number in visible text next to a <meta> contact tag (the meta attribute itself stays stripped like any tag — the VISIBLE number is what's found)",
+      html:
+        '<html><head><meta name="contact:phone_number" content="+4791234567"></head>' +
+        "<body><p>Telefon: 91234567</p></body></html>",
+      expected: ["91234567"],
+    },
+  ];
+  for (const c of phonePositiveControls) {
+    assertEq(extractPhones(c.html), c.expected, c.label);
+  }
+
   // ── Bug 2: extractEmails — favicon filename false positive ──────────────
 
   // Same fixture shape as css-favicon-extraction-guards.test.ts's favicon-01:

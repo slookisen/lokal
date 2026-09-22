@@ -558,6 +558,46 @@ function normalisePhoneHtml(raw: string): string {
     .replace(/\D/g, "");
 }
 
+/**
+ * Context gate for an 8-digit phone candidate (dev-request 2026-09-22-telefon-
+ * css-js-identifikator-falske-positiver): REJECT a candidate whose only
+ * occurrence is embedded in a longer alphanumeric token — i.e. the digit
+ * run is NOT bounded by a non-alphanumeric character on both sides. This
+ * catches two live incident shapes that reached agent_knowledge.phone
+ * unrejected:
+ *   - Bjørke Gård (bjorkegard.no): "35267336" was actually the tail of a
+ *     Facebook SDK config blob's `"facebookAppId":"314192535267336"` — an
+ *     8-digit SLICE of a longer 15-digit run, so a digit sits immediately
+ *     before the captured group.
+ *   - Drivhuset Bageri & Gårdsutsalg (drivhusetbageri.no): "45352419" was
+ *     the tail of a Wix-generated CSS class name `StylableButton2545352419`
+ *     — again an 8-digit slice of a longer digit run welded directly onto
+ *     letters, no separator anywhere.
+ * A single "is either neighbour alphanumeric" check covers BOTH shapes (a
+ * longer-than-8 digit run and a run welded onto a CSS/JS identifier) without
+ * needing two separate rules — a genuine Norwegian phone number, however
+ * it's written (with/without +47, with/without internal separators), is
+ * never directly glued to a surrounding letter or digit with zero
+ * separating punctuation/whitespace.
+ *
+ * `matchStart` is the start of the WHOLE regex match (which may include an
+ * optional "+47"/"0047"/"47 " prefix) — not the start of the captured
+ * 8-digit group — so a legitimate "+4791234567" (prefix glued directly to
+ * the digits, no separator) is judged by what precedes the "+"/"0047"/"47",
+ * not by the prefix's own last digit. `groupEnd` IS the end of the captured
+ * digit group, since nothing legitimate ever follows it inside the match.
+ */
+function phoneCandidateHasAlnumNeighbour(
+  text: string,
+  matchStart: number,
+  groupEnd: number,
+): boolean {
+  const ALNUM = /[A-Za-z0-9]/;
+  const before = matchStart > 0 ? text[matchStart - 1] : "";
+  const after = groupEnd < text.length ? text[groupEnd] : "";
+  return ALNUM.test(before) || ALNUM.test(after);
+}
+
 /** Collect ALL candidate phone numbers from HTML (mirrors marketplace.extractPhone). */
 export function extractPhones(html: string): string[] {
   // Bug fix (2026-08-17, dev-request search-enrich-css-favicon-extraction-
@@ -579,10 +619,18 @@ export function extractPhones(html: string): string[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const digits = normalisePhoneHtml(m[0]);
-    if (digits.length === 8 && !/^(\d)\1{7}$/.test(digits) && !seen.has(digits)) {
-      seen.add(digits);
-      out.push(digits);
-    }
+    if (digits.length !== 8 || /^(\d)\1{7}$/.test(digits)) continue;
+    // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver:
+    // reject a candidate embedded in a longer alphanumeric token (a digit
+    // run > 8 digits, or a run welded onto CSS/JS identifier letters) — see
+    // phoneCandidateHasAlnumNeighbour() above for the two live incidents
+    // this closes.
+    const groupStart = m.index + (m[0].length - m[1].length);
+    const groupEnd = groupStart + m[1].length;
+    if (phoneCandidateHasAlnumNeighbour(text, m.index, groupEnd)) continue;
+    if (seen.has(digits)) continue;
+    seen.add(digits);
+    out.push(digits);
   }
   return out;
 }
