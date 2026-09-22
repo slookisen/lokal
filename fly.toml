@@ -136,8 +136,9 @@ primary_region = 'arn'
   # ?mode=second&cooldown_days=60 -> 4 candidates; ...&cooldown_days=40 ->
   # 14 candidates (delta +10, well under the dev-request's AC2
   # stop-and-escalate threshold of 100). Read defensively (falls back to 60)
-  # in crm.ts, opplevelser.ts and marketplace.ts. Rollback: set back to '60'
-  # or remove the line — no migration, no deploy-side state.
+  # in crm.ts and opplevelser.ts (referenced for context, but not read, in
+  # marketplace.ts). Rollback: set back to '60' or remove the line — no
+  # migration, no deploy-side state.
   OUTREACH_COOLDOWN_DAYS = '40'
 
 [[mounts]]
