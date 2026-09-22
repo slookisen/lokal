@@ -138,6 +138,47 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-04: with a 9-digit org number AND a real phone present, the real phone (not a slice of the org number) is returned",
   );
 
+  // ── Bug (dev-request 2026-09-22-telefon-css-js-identifikator-falske-
+  //    positiver): the neighbour check above only ever looked for a DIGIT
+  //    neighbour, not a LETTER one — so an 8-digit run welded directly onto
+  //    surrounding letters with no separator (a product/model code, a CSS
+  //    class name, a JS identifier) still passed once it had contact
+  //    context nearby. Widened to a full alphanumeric-neighbour check. ────
+
+  // "Modell92345678 (Tlf)" — a trailing "(Tlf)" label provides valid contact
+  // context (PHONE_CONTEXT_GENERIC_AFTER: "^\s*[(,]?\s*(?:tlf...)"), and the
+  // digits themselves are a plain, non-repeated, non-sequential, valid-
+  // leading-digit 8-digit run — every prior check (shape, date, digit-
+  // neighbour, national8, context) would have accepted this. But the digits
+  // are welded directly onto "Modell" with zero separating punctuation —
+  // note the OLD digit-only neighbour check could not catch this: 'l' is
+  // not `\d`. Must now be rejected as embedded in a longer alphanumeric
+  // token, not returned as "92345678". (A trailing-letters shape like
+  // "92345678support" is deliberately NOT used here — the regex's own
+  // trailing `\b` already fails to match at all when a word character
+  // immediately follows the digits, both before AND after this fix, so it
+  // would not actually exercise the new check; a LEADING letter is what
+  // isolates the fix, since `\b` is never asserted at the match's start.)
+  const htmlPhoneGluedToLeadingLetters =
+    "<html><body><p>Modell92345678 (Tlf)</p></body></html>";
+  assertEq(
+    extractPhone(htmlPhoneGluedToLeadingLetters),
+    null,
+    "phone-33: an 8-digit run welded directly onto LEADING letters (no separator) is rejected even with valid trailing contact-label context",
+  );
+
+  // Same shape, but with a genuine, properly-separated phone elsewhere on
+  // the page — the letter-glued junk must not prevent the real number from
+  // being found (regression-safety, mirrors the org-number positive control
+  // above).
+  const htmlPhoneGluedToLeadingLettersPlusRealPhone =
+    "<html><body><p>Modell92345678 (Tlf). Ring oss på 91234567 for bestilling.</p></body></html>";
+  assertEq(
+    extractPhone(htmlPhoneGluedToLeadingLettersPlusRealPhone),
+    "91234567",
+    "phone-34: with a letter-glued junk run AND a real, properly-separated phone present, the real phone is returned",
+  );
+
   // Positive control: an ordinary valid 8-digit Norwegian phone number in a
   // normal sentence, not adjacent to any other digits, must still work.
   const htmlOrdinaryPhone =

@@ -183,6 +183,50 @@ export function isContentQualified(row: {
   return products.length >= 3;
 }
 
+// Own-platform-domain exclusion for the `outreach_ready_pool` VIEW (dev-
+// request 2026-09-22-telefon-css-js-identifikator-falske-positiver, point 4)
+// — a permanent WHERE-clause condition, not a one-off cleanup: an agent
+// whose "homepage" is actually rettfrabonden.com itself (a data bug, never a
+// real producer's own site — see admin-agents-url-write.ts's
+// isPlatformOwnedHost / admin-domain-coherence.ts's OWN_PLATFORM_DOMAINS,
+// the two existing WRITE-time guards for the same class of bug) must never
+// be marketing-emailed as if it were a genuine third-party producer.
+//
+// `homepage_url` here is the SAME concept every other call site already
+// computes — COALESCE(NULLIF(TRIM(k.website),''), NULLIF(TRIM(a.url),'')),
+// e.g. admin-knowledge.ts / admin-homepage-provenance-cohort.ts /
+// admin-pool-blocker-explain.ts / marketplace.ts's own
+// `COALESCE(k.website, a.url) AS homepage_url` — `k`/`a` must alias
+// `agent_knowledge`/`agents` in the query that interpolates this, same
+// requirement as POOL_CONTENT_THRESHOLD_SQL above.
+//
+// A plain substring LIKE (not a hostname-boundary parse) is deliberate here:
+// SQLite has no built-in URL parser and this codebase registers no REGEXP
+// function (verified — no db.function() call anywhere in this file), so a
+// precise host-only match would need a JS-side re-check anyway. A producer
+// domain merely CONTAINING the literal string "rettfrabonden.com" (as
+// opposed to a real subdomain/path of it, which this also correctly
+// matches) is not a realistic false-positive this pool has ever seen, and
+// would itself be suspicious enough to warrant manual review rather than
+// automated outreach — so the small extra strictness this trades away is an
+// acceptable, documented judgment call, same spirit as the other simple
+// LIKE-based guards already in this file (e.g. the field_provenance
+// homepage-marker checks a few hundred lines below).
+export const POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL =
+  "LOWER(COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), ''), '')) NOT LIKE '%rettfrabonden.com%'";
+
+// Pure TS mirror of POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL above, for callers
+// that check an already-fetched row in-process. MUST stay logically
+// equivalent — do not hand-edit one without the other (same discipline as
+// isContentQualified/POOL_CONTENT_THRESHOLD_SQL above).
+export function isOwnPlatformHomepage(row: {
+  website?: string | null;
+  url?: string | null;
+}): boolean {
+  const homepageUrl = (row.website && row.website.trim()) || (row.url && row.url.trim()) || "";
+  return homepageUrl.toLowerCase().includes("rettfrabonden.com");
+}
+
 function initSchema(db: Database.Database): void {
   db.exec(`
     -- ════════════════════════════════════════════════════════════
@@ -2557,6 +2601,12 @@ function initSchema(db: Database.Database): void {
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}
+        /* dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+           point 4: an agent whose "homepage" is actually our OWN platform
+           domain (rettfrabonden.com) is a data bug, never a real producer's
+           site — never eligible for marketing outreach. See
+           POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
+        AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200

@@ -45070,3 +45070,71 @@ runSerial(async () => {
     failures.push("analytics-rollup-export-diagnostics: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 2: computeFieldSpotCheck()/fieldSpotCheckSubpageCandidates()
+// (src/agents/lokal-agent-verifier.ts) — the weekly field-verification
+// spot-check now follows up to 3 same-domain /om, /om-oss, /kontakt,
+// /about, /contact links discovered on the root page before concluding a
+// field "mismatch" (Vollan Gård repro: about text lives on /om-oss, not the
+// root). Pure fetchImpl injection, no shared DB/global-fetch touched — tail
+// position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver: field spot-check subpage follow ──");
+  try {
+    const { runLokalAgentVerifierFieldSpotCheckTests } = require("../src/agents/lokal-agent-verifier-field-spotcheck.test") as
+      typeof import("../src/agents/lokal-agent-verifier-field-spotcheck.test");
+    const fsc = await runLokalAgentVerifierFieldSpotCheckTests({ log: false });
+    passed += fsc.passed;
+    failed += fsc.failed;
+    for (const f of fsc.failures) failures.push("lokal-agent-verifier-field-spotcheck: " + f);
+    console.log(`  lokal-agent-verifier-field-spotcheck: ${fsc.passed} passed, ${fsc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-field-spotcheck: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 4: POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL / isOwnPlatformHomepage
+// (src/database/init.ts) — an agent whose homepage is our own platform
+// domain (rettfrabonden.com) must never appear in outreach_ready_pool. Own
+// in-memory DB (swaps the shared getDb() singleton) — tail position, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver: outreach_ready_pool own-domain exclusion ──");
+  try {
+    const { runInitOutreachPoolOwnDomainExclusionTests } = require("../src/database/init-outreach-pool-own-domain-exclusion.test") as
+      typeof import("../src/database/init-outreach-pool-own-domain-exclusion.test");
+    const pod = runInitOutreachPoolOwnDomainExclusionTests({ log: false });
+    passed += pod.passed;
+    failed += pod.failed;
+    for (const f of pod.failures) failures.push("init-outreach-pool-own-domain-exclusion: " + f);
+    console.log(`  init-outreach-pool-own-domain-exclusion: ${pod.passed} passed, ${pod.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("init-outreach-pool-own-domain-exclusion: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 2 fix-up (B3, adversarial-review CHANGES-REQUESTED finding): POST
+// /admin/field-spot-check — the thin HTTP wrapper around
+// computeFieldSpotCheck() that gives the weekly field-verification SKILL an
+// actual endpoint to call (Vollan Gård repro, end-to-end through the route).
+// Own in-memory DB + globalThis.fetch stub — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver: field spot-check admin route ──");
+  try {
+    const { runAdminFieldSpotCheckTests } = require("../src/routes/admin-field-spot-check.test") as
+      typeof import("../src/routes/admin-field-spot-check.test");
+    const fsc = await runAdminFieldSpotCheckTests({ log: false });
+    passed += fsc.passed;
+    failed += fsc.failed;
+    for (const f of fsc.failures) failures.push("admin-field-spot-check: " + f);
+    console.log(`  admin-field-spot-check: ${fsc.passed} passed, ${fsc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-field-spot-check: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -69,6 +69,7 @@ import { startProfileTranslationsWorker, startProfileTranslationsStaleSweep } fr
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
+import adminFieldSpotCheckRoutes from "./routes/admin-field-spot-check";
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
@@ -781,6 +782,14 @@ app.use("/admin/contact-write-guard-audit", adminLimiter, adminContactWriteGuard
 // path but only ever invoked by a human after reviewing a dry-run's numbers.
 // POST /admin/contact-write-guard-retro-sweep
 app.use("/admin/contact-write-guard-retro-sweep", adminLimiter, adminContactWriteGuardRetroSweepRoutes);
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 2 fix-up (B3): thin HTTP wrapper around computeFieldSpotCheck()
+// (src/agents/lokal-agent-verifier.ts) so the weekly field-verification
+// SKILL (GET /admin/agents/recently-enriched's own comment: "lives in a
+// separate SKILL, not here") has an actual endpoint to call — the function
+// existed but had no production caller until this route.
+// POST /admin/field-spot-check
+app.use("/admin/field-spot-check", adminLimiter, adminFieldSpotCheckRoutes);
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2: the
 // live-data-cleanup half of PR #405 (that PR's own commit message flagged
 // this as "a separate, non-code operational step, not part of this PR").

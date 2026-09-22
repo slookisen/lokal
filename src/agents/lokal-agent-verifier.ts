@@ -65,6 +65,18 @@ import {
   looksLikePersonalName,
 } from "../routes/admin-rfb-brreg-selfsufficiency";
 import { parseNameLocationSuffix } from "../services/location-suffix-parser";
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver
+// (point 2): computeFieldSpotCheck below re-fetches a field's source page(s)
+// and reuses fetchPage/visibleTextOf (the SAME classified fetcher every
+// other enrichment pipeline uses — see fetch-page.ts's own header for why a
+// fourth hand-rolled fetcher must never be added) and
+// checkAboutCandidateSubstantiatedBySource (the SAME substantiation judgment
+// already used at write-time — unchanged, reused, never re-implemented).
+import { fetchPage, visibleTextOf } from "../services/fetch-page";
+import {
+  checkAboutCandidateSubstantiatedBySource,
+  type AboutSubstantiationVerdict,
+} from "../services/about-source-substantiation";
 
 export interface VerifierResult {
   agent_id: string;
@@ -1671,6 +1683,179 @@ export async function resolveBrregLookup(
   } catch {
     return null;
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ─── Field-verification spot-check: subpage follow (dev-request
+//     2026-09-22-telefon-css-js-identifikator-falske-positiver, point 2) ──
+//
+// GET /admin/agents/recently-enriched (marketplace.ts) samples recently-
+// enriched agents for the platform-verifier's weekly field spot-check; the
+// spot-check itself only ever re-fetched field_provenance.source_url (the
+// ROOT page) and flagged a "mismatch" the moment a field's value wasn't
+// found there — even when the field's true content lives one level deep, on
+// a same-domain subpage. Live false-positive: Vollan Gård's `about` text is
+// verbatim present on vollangaard.no/om-oss but is never mentioned on the
+// root page, so the root-only check wrongly flagged it as a mismatch.
+//
+// computeFieldSpotCheck() fixes the FETCH/MEASUREMENT method only — it does
+// NOT touch how a field is JUDGED against page text (that's
+// checkAboutCandidateSubstantiatedBySource, reused as-is, unchanged; see its
+// own file for that contract). It fetches the root page first exactly as
+// before; only when the field isn't substantiated there does it follow up
+// to `maxSubpages` (default 3) same-domain links discovered on the root
+// page itself whose path matches /om, /om-oss, /kontakt, /about or
+// /contact — link-driven, not blind-guessed, same discipline
+// buildPageEvidence() already established elsewhere in this codebase (blind
+// fixed-path guessing measured a 100% miss rate on real producer sites; see
+// fetch-page.ts's discoverContentLinks header comment). The FIRST subpage
+// (in discovery order) the field is actually found on wins; provenance is
+// stamped to THAT page's URL, never the root, so a later re-check keeps
+// looking in the right place.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Same-domain link on the root page whose path matches one of the spot-
+ *  check's five accepted subpage shapes — om, om-oss, kontakt, about,
+ *  contact — as a whole path SEGMENT (never a substring, so "/om-garden" or
+ *  "/produkter" do not match). PURE, no network. Exported for tests. */
+export function fieldSpotCheckSubpageCandidates(
+  rootHtml: string,
+  rootUrl: string,
+  maxSubpages = 3,
+): string[] {
+  let base: URL;
+  try {
+    base = new URL(withDefaultScheme(rootUrl));
+  } catch {
+    return [];
+  }
+  const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[?#])/i;
+  const found: string[] = [];
+  const seen = new Set<string>();
+  for (const m of rootHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)) {
+    if (found.length >= maxSubpages) break;
+    const raw = m[1]!;
+    if (raw.startsWith("#")) continue; // pure in-page anchor, no new page
+    let abs: URL;
+    try {
+      abs = new URL(raw, base);
+    } catch {
+      continue;
+    }
+    if (abs.protocol !== "http:" && abs.protocol !== "https:") continue;
+    if (abs.host !== base.host) continue; // same-domain only
+    abs.hash = "";
+    if (abs.pathname === base.pathname && abs.search === base.search) continue; // same page as root
+    if (!SUBPAGE_SEGMENT_RE.test(abs.pathname)) continue;
+    const key = abs.toString();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(key);
+  }
+  return found;
+}
+
+export interface FieldSpotCheckResult {
+  /** "match": substantiated on the root or a followed subpage.
+   *  "mismatch": not substantiated anywhere fetched — the only outcome that
+   *  should ever be escalated/paused downstream.
+   *  "unverifiable": the root page itself could not be fetched at all, so no
+   *  confident judgment either way was possible — NEVER treated as a
+   *  mismatch (same fail-closed-toward-no-action posture as the rest of
+   *  this file's checks). */
+  status: "match" | "mismatch" | "unverifiable";
+  /** The URL the field was actually found on (status "match"), or the root
+   *  URL (status "mismatch"/"unverifiable") — this is what provenance
+   *  should be stamped to, NEVER unconditionally the original root_url. */
+  checked_url: string;
+  /** Every URL actually fetched, in order (root first) — for logging/audit. */
+  urls_tried: string[];
+  reason: string;
+}
+
+/**
+ * Re-verify one field's stored value against its live source page(s):
+ * fetch `root_url` first; if the field isn't substantiated there, follow up
+ * to `maxSubpages` same-domain /om, /om-oss, /kontakt, /about, /contact
+ * links discovered ON the root page and check each in turn, stopping at the
+ * first match. `substantiate` defaults to
+ * checkAboutCandidateSubstantiatedBySource (about-source-substantiation.ts)
+ * — reused UNCHANGED, per this fix's own scope: only WHICH pages get
+ * fetched changes, never how a field is judged against page text.
+ */
+export async function computeFieldSpotCheck(
+  input: {
+    field_value: string | null;
+    root_url: string;
+    maxSubpages?: number;
+  },
+  deps: {
+    fetchImpl?: typeof fetch;
+    substantiate?: (
+      candidate: string | null | undefined,
+      sourceText: string | null | undefined,
+    ) => AboutSubstantiationVerdict;
+  } = {},
+): Promise<FieldSpotCheckResult> {
+  const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
+  const maxSubpages = input.maxSubpages ?? 3;
+  const urlsTried: string[] = [];
+
+  const rootResult = await fetchPage(input.root_url, {
+    userAgent: "Lokal-FieldSpotCheck/1.0",
+    fetchImpl: deps.fetchImpl,
+  });
+  urlsTried.push(input.root_url);
+  if (!rootResult.ok) {
+    return {
+      status: "unverifiable",
+      checked_url: input.root_url,
+      urls_tried: urlsTried,
+      reason: `root page fetch failed (${rootResult.reason}) — cannot confidently judge, not treated as a mismatch`,
+    };
+  }
+
+  const rootSourceText = `${rootResult.html}\n${visibleTextOf(rootResult.html)}`;
+  const rootVerdict = substantiate(input.field_value, rootSourceText);
+  if (rootVerdict.substantiated) {
+    return {
+      status: "match",
+      checked_url: rootResult.finalUrl || input.root_url,
+      urls_tried: urlsTried,
+      reason: rootVerdict.reason,
+    };
+  }
+
+  const subpages = fieldSpotCheckSubpageCandidates(
+    rootResult.html,
+    rootResult.finalUrl || input.root_url,
+    maxSubpages,
+  );
+  for (const subpageUrl of subpages) {
+    const subResult = await fetchPage(subpageUrl, {
+      userAgent: "Lokal-FieldSpotCheck/1.0",
+      fetchImpl: deps.fetchImpl,
+    });
+    urlsTried.push(subpageUrl);
+    if (!subResult.ok) continue; // one dead subpage link never aborts the others
+    const subSourceText = `${subResult.html}\n${visibleTextOf(subResult.html)}`;
+    const subVerdict = substantiate(input.field_value, subSourceText);
+    if (subVerdict.substantiated) {
+      return {
+        status: "match",
+        checked_url: subResult.finalUrl || subpageUrl,
+        urls_tried: urlsTried,
+        reason: subVerdict.reason,
+      };
+    }
+  }
+
+  return {
+    status: "mismatch",
+    checked_url: rootResult.finalUrl || input.root_url,
+    urls_tried: urlsTried,
+    reason: `not substantiated on the root page or any of ${subpages.length} followed subpage(s)`,
+  };
 }
 
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
