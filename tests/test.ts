@@ -41954,6 +41954,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-19-rfb-verifiseringskoen-maalrettet-reverifisering-og-
+// parkerings-innsyn (item 2 only — item 1's run-verifier agentIds filter
+// shipped separately in lokal#904): pending_verify_parking rotation-
+// visibility fields on GET /admin/outreach-ready-pool/stats
+// (parked_age_buckets, next_release_at, oldest_parked_since — additive,
+// read-only, alongside the pre-existing parked_active/
+// parked_expired_ready_for_retry). Own in-memory prod-schema DB, same
+// convention as the blocker_breakdown suite just above. Runs via
+// runSerial() like the Fase 0/1/2/2c suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-verifiseringskoen-maalrettet-reverifisering-og-parkerings-innsyn (item 2): pending_verify_parking rotation-visibility on GET /admin/outreach-ready-pool/stats ──");
+  try {
+    const { runAdminOutreachPoolPendingVerifyParkingTests } = require("../src/routes/admin-outreach-pool-pending-verify-parking.test") as
+      typeof import("../src/routes/admin-outreach-pool-pending-verify-parking.test");
+    const pvp = await runAdminOutreachPoolPendingVerifyParkingTests({ log: false });
+    passed += pvp.passed;
+    failed += pvp.failed;
+    for (const f of pvp.failures) failures.push("outreach-pool-pending-verify-parking: " + f);
+    console.log(`  outreach-pool-pending-verify-parking: ${pvp.passed} passed, ${pvp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-pool-pending-verify-parking: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann (criterion 4):
 // GET /admin/agents/category-sanity-report (src/routes/admin-agents.ts) —
 // read-only, report-only detector for RFB producer rows whose `categories`

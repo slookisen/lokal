@@ -195,16 +195,74 @@ router.get("/stats", (req: Request, res: Response) => {
       )
       .get() as { parked_active: number | null; parked_expired: number | null };
 
+    // dev-request 2026-09-19-rfb-verifiseringskoen-maalrettet-reverifisering-
+    // og-parkerings-innsyn (item 2, "Innsyn: parkeringens rotasjon skal være
+    // lesbar"): three additive, read-only fields alongside the pre-existing
+    // parked_active/parked_expired split — no gate/threshold/cooldown logic
+    // touched, no new column, one extra SQL query (computed in SQLite, not
+    // pulled into app memory).
+    //
+    // Age buckets: age = now - pending_verify_parked_since, bucketed
+    // [0,7) / [7,14) / [14,30) / [30,inf) days — lower bound inclusive,
+    // upper bound exclusive — so every currently-parked row lands in
+    // exactly one bucket. The "30d+" bucket reuses the SAME
+    // "<= now-30days" condition as parked_expired above: it is that same
+    // population re-expressed as part of this 4-bucket breakdown, not a
+    // second, overlapping count.
+    //
+    // AC4 judgment call: the dev-request's own wording ("bøttene summerer
+    // til parked_active") is ambiguous, because the 30d+ bucket is by
+    // construction the parked_expired population, not a subset of
+    // parked_active. For the four buckets to be a genuine, non-overlapping
+    // partition of "every row currently parked" (which is what a rotation-
+    // visibility view needs), they must sum to
+    // parked_active + parked_expired_ready_for_retry, not to parked_active
+    // alone — implemented that way below (see the route-level test file for
+    // the reconciliation assertion).
     const pendingVerifyParking = db
       .prepare(
         `SELECT
            SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
                      AND pending_verify_parked_since > datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_active,
            SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
-                     AND pending_verify_parked_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_expired
+                     AND pending_verify_parked_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_expired,
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since > datetime('now', '-7 days') THEN 1 ELSE 0 END) AS bucket_0_7d,
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since <= datetime('now', '-7 days')
+                     AND pending_verify_parked_since > datetime('now', '-14 days') THEN 1 ELSE 0 END) AS bucket_7_14d,
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since <= datetime('now', '-14 days')
+                     AND pending_verify_parked_since > datetime('now', '-30 days') THEN 1 ELSE 0 END) AS bucket_14_30d,
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS bucket_30d_plus,
+           -- next_release_at: earliest active-parked row's parked_since + 30
+           -- days (i.e. when the next currently-backed-off row becomes
+           -- eligible for retry) — NULL when there is no active-parked row.
+           -- datetime(NULL, '+30 days') itself evaluates to NULL in SQLite,
+           -- so no separate NULL-guard is needed here.
+           datetime(
+             MIN(CASE WHEN pending_verify_parked_since IS NOT NULL
+                       AND pending_verify_parked_since > datetime('now', '-30 days')
+                       THEN pending_verify_parked_since END),
+             '+30 days'
+           ) AS next_release_at,
+           -- oldest_parked_since: earliest pending_verify_parked_since across
+           -- ALL currently-parked rows (active + expired); MIN() ignores
+           -- NULLs, so this is NULL only when nothing is parked at all.
+           MIN(pending_verify_parked_since) AS oldest_parked_since
          FROM agent_knowledge`
       )
-      .get() as { parked_active: number | null; parked_expired: number | null };
+      .get() as {
+        parked_active: number | null;
+        parked_expired: number | null;
+        bucket_0_7d: number | null;
+        bucket_7_14d: number | null;
+        bucket_14_30d: number | null;
+        bucket_30d_plus: number | null;
+        next_release_at: string | null;
+        oldest_parked_since: string | null;
+      };
 
     // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 1,
     // stats slice): progress gauge for the low_quality re-enrichment cohort
@@ -450,6 +508,18 @@ router.get("/stats", (req: Request, res: Response) => {
       pending_verify_parking: {
         parked_active: pendingVerifyParking?.parked_active ?? 0,
         parked_expired_ready_for_retry: pendingVerifyParking?.parked_expired ?? 0,
+        // dev-request 2026-09-19-rfb-verifiseringskoen-maalrettet-reverifisering-
+        // og-parkerings-innsyn (item 2): additive, read-only rotation-visibility
+        // fields — see the comment above the pendingVerifyParking query for the
+        // bucket-boundary and AC4-total judgment call.
+        parked_age_buckets: {
+          "0-7d": pendingVerifyParking?.bucket_0_7d ?? 0,
+          "7-14d": pendingVerifyParking?.bucket_7_14d ?? 0,
+          "14-30d": pendingVerifyParking?.bucket_14_30d ?? 0,
+          "30d+": pendingVerifyParking?.bucket_30d_plus ?? 0,
+        },
+        next_release_at: pendingVerifyParking?.next_release_at ?? null,
+        oldest_parked_since: pendingVerifyParking?.oldest_parked_since ?? null,
       },
       low_quality_cohort: {
         total: lowQualityRows.length,
