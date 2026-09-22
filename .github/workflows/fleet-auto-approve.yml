@@ -213,23 +213,47 @@ jobs:
             // session-substring-filnavn-falsk-positiv): lokal#899 and
             // lokal#906, both a filename like `mcp-session-404.test.ts` —
             // the MCP protocol's own "session ID" wire concept (an HTTP
-            // 404-vs-400 error-code test), never an auth session. Narrowed
-            // below to exclude exactly that shape — "session" immediately
-            // preceded by "mcp-", or immediately followed by "-id"/
-            // "-<digits>" as a whole token — while every other "session"
-            // filename hit (session.ts, session-service.ts,
-            // auth-session-manager.ts, anything under a session/
-            // directory, etc.) still matches exactly as before (regression
-            // guard: scripts/test-fleet-auto-approve-protected-paths.js).
-            // Mirrored there — keep both in sync (same-file comment above
-            // still applies). Every other entry in this array is untouched
-            // (out of scope for this fix; no known false positives).
+            // 404-vs-400 error-code test), never an auth session.
+            //
+            // Round 1 of this fix (commit 07b8fed) used
+            // /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i — a SINGLE match with two
+            // lookaround assertions at the same anchor. That is WRONG: a
+            // regex match requires ALL its assertions to hold, so the match
+            // (= protected) fails, and the file goes UNPROTECTED, if EITHER
+            // assertion independently fails — i.e. the mcp- prefix ALONE, or
+            // the -id/-digits suffix ALONE, was enough to exclude a file, when
+            // only BOTH together (the exact `mcp-session-<digits>` FP shape)
+            // should. Round-1 review confirmed this as a live security
+            // regression: it wrongly unprotected
+            // src/services/mcp-session-protocol.ts (an EXISTING production
+            // MCP session-id-validation file — mcp- prefix, no digit/id
+            // suffix) and any bare `session-id-*.ts`/`sessionId.ts`-shaped
+            // real auth filename (digit/id suffix, no mcp- prefix).
+            //
+            // Fixed below with an alternation of the two branches instead —
+            // /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i — which matches
+            // (protects) if EITHER branch matches on its own: "session" not
+            // preceded by "mcp-" (protects regardless of suffix), OR
+            // "session" not followed by the -id/-digits suffix (protects
+            // regardless of prefix). A file is excluded (unprotected) only
+            // when NEITHER branch matches, i.e. when it has BOTH the mcp-
+            // prefix immediately before "session" AND the -id/-digits suffix
+            // immediately after — exactly, and only, the confirmed FP shape.
+            // Every other "session" filename hit (session.ts,
+            // session-service.ts, auth-session-manager.ts, anything under a
+            // session/ directory, mcp-session-protocol.ts,
+            // session-id-generator.ts, etc.) still matches, as it did before
+            // round 1 ever ran (regression guard:
+            // scripts/test-fleet-auto-approve-protected-paths.js). Mirrored
+            // there — keep both in sync (same-file comment above still
+            // applies). Every other entry in this array is untouched (out of
+            // scope for this fix; no known false positives).
             const PROTECTED = [
               /(^|\/)\.github\/workflows\//i,
               /(^|\/)fly\.toml$/i,
               /(^|\/)dockerfile$/i,
               /auth/i,
-              /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i,
+              /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i,
               /cookie/i,
               /admin-key/i,
               /owner-portal/i,

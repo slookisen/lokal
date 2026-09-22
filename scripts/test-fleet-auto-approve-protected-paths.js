@@ -38,21 +38,43 @@
 // substring-filnavn-falsk-positiv): lokal#899 and lokal#906, both a
 // filename like `mcp-session-404.test.ts` — the MCP protocol's own
 // "session ID" wire concept (an HTTP 404-vs-400 error-code test), never an
-// auth session. Narrowed below to exclude exactly that shape — "session"
-// immediately preceded by "mcp-", or immediately followed by "-id"/
-// "-<digits>" as a whole token — while every other "session" filename hit
-// (session.ts, session-service.ts, auth-session-manager.ts, anything under
-// a session/ directory, etc.) still matches exactly as before (see the
-// AC1/AC2 test cases below). Mirrored (duplicated intentionally — see file
-// header) in .github/workflows/fleet-auto-approve.yml — keep both in sync.
-// Every other entry in this array is untouched (out of scope for this fix;
-// no known false positives).
+// auth session.
+//
+// Round 1 of this fix (commit 07b8fed) used
+// /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i — a SINGLE match with two lookaround
+// assertions at the same anchor. That is WRONG: a regex match requires ALL
+// its assertions to hold, so the match (= protected) fails, and the file
+// goes UNPROTECTED, if EITHER assertion independently fails — i.e. the mcp-
+// prefix ALONE, or the -id/-digits suffix ALONE, was enough to exclude a
+// file, when only BOTH together (the exact `mcp-session-<digits>` FP shape)
+// should be. Round-1 review confirmed this as a live security regression:
+// it wrongly unprotected src/services/mcp-session-protocol.ts (an EXISTING
+// production MCP session-id-validation file — mcp- prefix, no digit/id
+// suffix) and any bare `session-id-*.ts`/`sessionId.ts`-shaped real auth
+// filename (digit/id suffix, no mcp- prefix).
+//
+// Fixed below with an alternation of the two branches instead —
+// /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i — which matches
+// (protects) if EITHER branch matches on its own: "session" not preceded by
+// "mcp-" (protects regardless of suffix), OR "session" not followed by the
+// -id/-digits suffix (protects regardless of prefix). A file is excluded
+// (unprotected) only when NEITHER branch matches, i.e. when it has BOTH the
+// mcp- prefix immediately before "session" AND the -id/-digits suffix
+// immediately after — exactly, and only, the confirmed FP shape. Every
+// other "session" filename hit (session.ts, session-service.ts,
+// auth-session-manager.ts, anything under a session/ directory,
+// mcp-session-protocol.ts, session-id-generator.ts, etc.) still matches, as
+// it did before round 1 ever ran (see the AC1/AC2 test cases below).
+// Mirrored (duplicated intentionally — see file header) in
+// .github/workflows/fleet-auto-approve.yml — keep both in sync. Every other
+// entry in this array is untouched (out of scope for this fix; no known
+// false positives).
 const PROTECTED = [
   /(^|\/)\.github\/workflows\//i,
   /(^|\/)fly\.toml$/i,
   /(^|\/)dockerfile$/i,
   /auth/i,
-  /(?<!mcp-)session(?!-?(?:id|\d+)\b)/i,
+  /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i,
   /cookie/i,
   /admin-key/i,
   /owner-portal/i,
@@ -388,21 +410,38 @@ check('a database schema file (not itself an auth surface)', 'src/database/init.
 // AC1: the confirmed false-positive class (lokal#899, lokal#906) — a
 // filename where "session" is part of an unrelated compound technical term
 // (the MCP protocol's own session-ID wire concept, an HTTP-status-code
-// test-name suffix) must no longer match ANY PROTECTED entry.
+// test-name suffix) must no longer match ANY PROTECTED entry. This is the
+// ONLY case that should be excluded: it has BOTH the mcp- prefix AND the
+// -digits suffix, jointly, on the same "session" occurrence.
 check(
   'AC1: lokal#899/#906 false positive — mcp-session-404.test.ts (MCP protocol session-ID error-code test, not auth) is NOT caught',
   'src/routes/mcp-session-404.test.ts',
   false,
 );
+
+// Round-2 fix (this round): round 1's single-match, two-lookaround regex
+// wrongly excluded a file if EITHER the mcp- prefix OR the -id/-digits
+// suffix was present alone (assertions ANDed at one anchor point = both
+// must hold for the match, so either one failing dropped protection). The
+// corrected alternation only excludes when BOTH are present jointly. These
+// two cases were previously asserted `false` (not caught) under round 1's
+// regex; round-1 review proved that direction is a live regression — they
+// flip to `true` (caught) here, since neither has BOTH the mcp- prefix AND
+// the -id/-digits suffix on the same "session".
 check(
-  'AC1 variant: "session-id" as a bare protocol field name (no "mcp-" prefix) is also NOT caught',
+  'AC1 variant (flipped from round 1 — round-1-review regression): "session-id" as a bare protocol field name with NO "mcp-" prefix is CAUGHT (real auth-shaped filename, digit/id suffix alone is not enough to exclude)',
   'src/routes/protocol-session-id-parser.ts',
-  false,
+  true,
 );
 check(
-  'AC1 variant: mcp-session prefix without a trailing digit/id is still NOT caught (the mcp- prefix alone is the excluded shape)',
+  'AC1 variant (flipped from round 1 — round-1-review regression): mcp-session prefix WITHOUT a trailing digit/id is CAUGHT (mcp- prefix alone is not enough to exclude)',
   'src/routes/mcp-session-handshake.test.ts',
-  false,
+  true,
+);
+check(
+  'AC1 variant: "mcp-" present only via a longer "my-mcp-" substring, no digit/id suffix, is CAUGHT (mcp- prefix alone — even when it is itself a substring of a longer token — is not enough to exclude without the suffix too)',
+  'src/routes/my-mcp-session-handler.ts',
+  true,
 );
 
 // AC2 (regression guard, security-critical direction): genuine auth/session
@@ -426,6 +465,21 @@ check(
   true,
 );
 check('AC2: owner-portal.ts (unrelated pattern, untouched by this fix) is still caught', 'src/routes/owner-portal.ts', true);
+check(
+  'AC2 (round-1-review regression, THE flagged case): mcp-session-protocol.ts — an EXISTING production file (MCP session-id validation) — is still caught: mcp- prefix present, but NO digit/id suffix, so joint-AND exclusion does not apply',
+  'src/services/mcp-session-protocol.ts',
+  true,
+);
+check(
+  'AC2 (round-1-review regression): session-id-generator.ts — real auth code, digit/id suffix but no mcp- prefix — is still caught',
+  'src/services/session-id-generator.ts',
+  true,
+);
+check(
+  'AC2 (round-1-review regression): session-id-validator.ts — same shape as above — is still caught',
+  'src/services/session-id-validator.ts',
+  true,
+);
 
 function checkContent(name, patch, expectMatch) {
   const hit = contentEditMatch(patch);
