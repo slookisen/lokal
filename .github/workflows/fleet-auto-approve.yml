@@ -230,20 +230,51 @@ jobs:
             // suffix) and any bare `session-id-*.ts`/`sessionId.ts`-shaped
             // real auth filename (digit/id suffix, no mcp- prefix).
             //
-            // Fixed below with an alternation of the two branches instead —
-            // /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i — which matches
-            // (protects) if EITHER branch matches on its own: "session" not
-            // preceded by "mcp-" (protects regardless of suffix), OR
-            // "session" not followed by the -id/-digits suffix (protects
-            // regardless of prefix). A file is excluded (unprotected) only
-            // when NEITHER branch matches, i.e. when it has BOTH the mcp-
-            // prefix immediately before "session" AND the -id/-digits suffix
-            // immediately after — exactly, and only, the confirmed FP shape.
+            // Round 2 (commit 927d1f3) fixed the AND-vs-OR bug with an
+            // alternation of the two branches instead —
+            // /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i — matching
+            // (protecting) if EITHER branch matches on its own: "session" not
+            // preceded by "mcp-", OR "session" not followed by the -id/-digits
+            // suffix. That correctly requires BOTH the mcp- prefix AND the
+            // -id/-digits suffix jointly to exclude — verified via independent
+            // re-derivation and a 21/21 adversarial truth-table pass. BUT
+            // round-2 review found a second, narrower gap: that joint
+            // exclusion is a pure filename-SHAPE heuristic ("mcp-session-" +
+            // id/digit), not anchored to the one fact both confirmed real FPs
+            // (lokal#899, lokal#906 — the SAME file, `mcp-session-404.test.ts`,
+            // hit twice) actually share: they are TEST files
+            // (`.test.ts` — this repo's only test-file suffix convention;
+            // grepped 2026-09-22, 438 `*.test.ts` files, zero `*.spec.ts`).
+            // Round 2's regex would ALSO have unprotected 5 concrete
+            // PRODUCTION (non-test) files proven to exist in this functional
+            // area: mcp-session-id-validator.ts, mcp-session-id-manager.ts,
+            // mcp-session-2-handshake.ts, mcp-session-3-migration.ts,
+            // mcp-session-id-store.ts — every one has the mcp-+digit/id shape
+            // but is real production code, not a test artifact.
+            //
+            // Round 3 (this fix) adds a THIRD, evidence-anchored condition:
+            // the filename must also end in `.test.ts`. Exclusion now
+            // requires all three, jointly: (mcp- prefix immediately before
+            // "session") AND (-id/-digits suffix immediately after) AND
+            // (filename ends in `.test.ts`) — exactly, and only, the shape of
+            // the two confirmed FPs, generalized just enough to cover a
+            // future differently-numbered MCP test (e.g.
+            // `mcp-session-500-error.test.ts`), never a production file of
+            // the same shape. As in round 2, De Morgan's law turns
+            // NOT(A AND B AND C) into the provably-equivalent
+            // (NOT A) OR (NOT B) OR (NOT C) — three independent alternation
+            // branches, each protecting the file on its own if that one
+            // condition alone already rules out the FP shape:
+            // /((?<!mcp-)session|session(?!-?(?:id|\d+)\b)|session(?!.*\.test\.ts$))/i
+            // Branch 3 (NOT C) is what closes round 2's gap: a file with the
+            // mcp-+digit/id shape but NOT ending in `.test.ts` still matches
+            // branch 3 and stays protected, regardless of branches 1/2.
             // Every other "session" filename hit (session.ts,
             // session-service.ts, auth-session-manager.ts, anything under a
             // session/ directory, mcp-session-protocol.ts,
-            // session-id-generator.ts, etc.) still matches, as it did before
-            // round 1 ever ran (regression guard:
+            // session-id-generator.ts, the 5 round-2 production-file gap
+            // cases, etc.) still matches, as it did before round 1 ever ran
+            // (regression guard:
             // scripts/test-fleet-auto-approve-protected-paths.js). Mirrored
             // there — keep both in sync (same-file comment above still
             // applies). Every other entry in this array is untouched (out of
@@ -253,7 +284,7 @@ jobs:
               /(^|\/)fly\.toml$/i,
               /(^|\/)dockerfile$/i,
               /auth/i,
-              /((?<!mcp-)session|session(?!-?(?:id|\d+)\b))/i,
+              /((?<!mcp-)session|session(?!-?(?:id|\d+)\b)|session(?!.*\.test\.ts$))/i,
               /cookie/i,
               /admin-key/i,
               /owner-portal/i,
