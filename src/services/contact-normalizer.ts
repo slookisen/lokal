@@ -202,10 +202,11 @@ export interface PhoneWriteClassification {
  *      org-nr-shaped value is caught even before/independent of the shape
  *      check, AND the rule-1 `reduced` (national8) form, so a bare (no
  *      `+`/`00`) `47`-prefixed value that `normalizePhone` doesn't strip but
- *      `national8` still reduces to the org-nr's last 8 digits is also
+ *      `national8` still reduces to an 8-digit window of the org-nr is also
  *      caught. Fails if `normalizePhone(raw)` equals `normalizePhone(orgNr)`,
- *      OR equals the LAST 8 digits of `normalizePhone(orgNr)`, OR `reduced`
- *      equals that same last-8-digit form. Skipped (cannot fail) when
+ *      OR equals the LAST 8 digits of `normalizePhone(orgNr)`, OR equals the
+ *      FIRST 8 digits of `normalizePhone(orgNr)`, OR `reduced` equals either
+ *      of those two 8-digit window forms. Skipped (cannot fail) when
  *      `orgNr` is empty/null.
  *   3. `date_shape` — not a plausible calendar date: if the value reduces to
  *      exactly 8 digits, those 8 digits must NOT parse as a plausible
@@ -239,7 +240,14 @@ export function classifyPhoneForWrite(
     const orgDigits = normalizePhone(orgNr);
     if (orgDigits) {
       const orgLast8 = orgDigits.length >= 8 ? orgDigits.slice(-8) : orgDigits;
-      if (rawDigits === orgDigits || rawDigits === orgLast8 || reduced === orgLast8) {
+      const orgFirst8 = orgDigits.length >= 8 ? orgDigits.slice(0, 8) : orgDigits;
+      if (
+        rawDigits === orgDigits ||
+        rawDigits === orgLast8 ||
+        rawDigits === orgFirst8 ||
+        reduced === orgLast8 ||
+        reduced === orgFirst8
+      ) {
         failedRules.push("org_nr_collision");
       }
     }

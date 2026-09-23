@@ -251,6 +251,81 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
     );
   }
 
+  // ── Rule 2 extension: FIRST 8 digits of a 9-digit org-nr (dev-request
+  // 2026-09-23-orgnr-collision-first8) ─────────────────────────────────────
+  //
+  // verification-pilot/2026-09-23-telefon-retro-skann-uavhengig-maaling.md
+  // (slookisen/A2A) found 4 live production phone values that are literally
+  // the FIRST 8 digits of the producer's own 9-digit org-nr — a window the
+  // pre-fix rule 2 never checked (it only compared the full org-nr and the
+  // LAST 8 digits). Each fixture below is a real (raw, orgNr) pair from that
+  // measurement.
+  {
+    const firstEightFixtures: Array<[string, string]> = [
+      ["89804913", "898049132"],
+      ["99960777", "999607772"],
+      ["92504433", "925044334"],
+      ["98480949", "984809492"],
+    ];
+
+    for (const [raw, orgNr] of firstEightFixtures) {
+      assertEq(
+        validatePhoneForWrite(raw, orgNr),
+        null,
+        `validatePhoneForWrite: first-8-digit org-nr collision rejected (raw=${raw}, orgNr=${orgNr})`,
+      );
+      assertEq(
+        classifyPhoneForWrite(raw, orgNr).failedRules,
+        ["org_nr_collision"],
+        `classifyPhoneForWrite: first-8-digit org-nr collision fails EXACTLY 'org_nr_collision' (raw=${raw}, orgNr=${orgNr})`,
+      );
+
+      // Same fixture, normalized: "+47" prefix and spaces inserted into the
+      // raw value — proves normalizePhone() still runs before the first-8
+      // comparison, not just on bare digit strings.
+      const withPrefix = `+47 ${raw.slice(0, 3)} ${raw.slice(3, 5)} ${raw.slice(5)}`;
+      assertEq(
+        validatePhoneForWrite(withPrefix, orgNr),
+        null,
+        `validatePhoneForWrite: first-8-digit org-nr collision rejected with +47 prefix/spaces (raw="${withPrefix}", orgNr=${orgNr})`,
+      );
+      assertEq(
+        classifyPhoneForWrite(withPrefix, orgNr).failedRules,
+        ["org_nr_collision"],
+        `classifyPhoneForWrite: first-8-digit org-nr collision (+47 prefix/spaces) fails EXACTLY 'org_nr_collision' (raw="${withPrefix}", orgNr=${orgNr})`,
+      );
+    }
+
+    // Regression — full org-nr match is unchanged by the first-8 addition.
+    assertEq(
+      classifyPhoneForWrite("898049132", "898049132").failedRules.includes("org_nr_collision"),
+      true,
+      "classifyPhoneForWrite: full org-nr match still fails 'org_nr_collision' (first-8 addition is additive, not a replacement)",
+    );
+
+    // Regression — last-8 match is unchanged by the first-8 addition. Org-nr
+    // "898049132"'s last 8 digits are "98049132" — distinct from its first 8
+    // ("89804913") — so this exercises the ORIGINAL leg specifically.
+    assertEq(
+      classifyPhoneForWrite("98049132", "898049132").failedRules,
+      ["org_nr_collision"],
+      "classifyPhoneForWrite: last-8-digit org-nr match still fails EXACTLY 'org_nr_collision' (first-8 addition is additive, not a replacement)",
+    );
+
+    // Negative control — a real phone number that is not any window
+    // (full / first-8 / last-8) of the org-nr is still accepted.
+    assertEq(
+      validatePhoneForWrite("911 22 333", "898049132"),
+      "911 22 333",
+      "validatePhoneForWrite: genuinely valid phone unrelated to org-nr's first-8/last-8 windows is accepted",
+    );
+    assertEq(
+      classifyPhoneForWrite("911 22 333", "898049132").failedRules,
+      [],
+      "classifyPhoneForWrite: genuinely valid phone unrelated to org-nr's first-8/last-8 windows has an EMPTY failedRules list",
+    );
+  }
+
   // ── Negative control: a genuinely valid phone is NOT rejected ────────────
   {
     const result = validatePhoneForWrite("911 22 333", "927011840");
