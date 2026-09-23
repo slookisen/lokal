@@ -273,6 +273,57 @@ function classifyLoosePhoneOccurrences(text: string, digits: string): LooseTextV
   return sawWelded ? "welded" : "clean";
 }
 
+/** Percent-decode `text` (best-effort): replaces every `%XX` escape with the
+ *  corresponding character via `String.fromCharCode`. Deliberately NOT
+ *  `decodeURIComponent`, which THROWS on a malformed or partial multi-byte
+ *  UTF-8 escape sequence — routine in an arbitrary slice of a script/style
+ *  block that was never meant to be parsed as a URI component. This route
+ *  only needs ASCII punctuation/digits to survive intact for the loose-text
+ *  neighbour check below, so a mis-decoded multi-byte (e.g. Norwegian
+ *  letter) escape is harmless; never throws. */
+function percentDecodeForPhoneMatch(text: string): string {
+  return text.replace(/%[0-9A-Fa-f]{2}/g, (seq) => String.fromCharCode(parseInt(seq.slice(1), 16)));
+}
+
+/** Decode the HTML entities relevant to the loose-text neighbour check
+ *  (quotes/angle-brackets/ampersand, plus numeric decimal/hex entities) —
+ *  not a general-purpose HTML entity decoder. `&amp;` is decoded LAST so a
+ *  double-escaped entity (e.g. `&amp;quot;`) decodes to the literal text
+ *  `&quot;` rather than being incorrectly unescaped twice into `"`. */
+function htmlEntityDecodeForPhoneMatch(text: string): string {
+  return text
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#x([0-9A-Fa-f]+);/gi, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_m, dec: string) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&amp;/gi, "&");
+}
+
+/** Applies percent-decoding then HTML-entity-decoding (in that order) to
+ *  `text` — a page can legitimately contain a URL-encoded (or HTML-entity-
+ *  encoded) JSON blob inside a <script> block (e.g. `%22phone%22%3A%22%2B...`,
+ *  the URL-encoding of `"phone":"+...`) where the raw, undecoded digit run
+ *  is welded to an encoding artifact character (a literal "B" from "%2B")
+ *  even though the number is genuinely cleanly quoted once decoded. Never
+ *  throws (see percentDecodeForPhoneMatch). Callers decode the ALREADY-
+ *  EXTRACTED text (visiblePhoneText()/scriptStylePhoneText() output), never
+ *  the raw pre-extraction html, so a decode that happens to produce "<"/">"
+ *  can't corrupt tag-boundary detection. */
+function decodeForPhoneMatch(text: string): string {
+  return htmlEntityDecodeForPhoneMatch(percentDecodeForPhoneMatch(text));
+}
+
+/** Combine two loose-text verdicts — a raw-text scan and a decoded-text scan
+ *  of the SAME extracted text — into one: "clean" wins if either input is
+ *  "clean", else "welded" wins if either is "welded", else "absent". */
+function bestLooseVerdict(a: LooseTextVerdict, b: LooseTextVerdict): LooseTextVerdict {
+  if (a === "clean" || b === "clean") return "clean";
+  if (a === "welded" || b === "welded") return "welded";
+  return "absent";
+}
+
 /** True iff `digits` is reachable via a `tel:` link on the page (any
  *  formatting — normalizePhone() handles +47/0047/separators). */
 function phoneFoundViaTelLink(html: string, digits: string): boolean {
@@ -411,7 +462,11 @@ export function judgePhoneOnPage(html: string, digits: string): PagePhoneJudgeme
   if (phoneFoundViaTelLink(html, digits) || phoneFoundViaJsonLd(html, digits) || phoneFoundViaMeta(html, digits)) {
     return "clean";
   }
-  const bodyVerdict = classifyLoosePhoneOccurrences(visiblePhoneText(html), digits);
+  const bodyText = visiblePhoneText(html);
+  const bodyVerdict = bestLooseVerdict(
+    classifyLoosePhoneOccurrences(bodyText, digits),
+    classifyLoosePhoneOccurrences(decodeForPhoneMatch(bodyText), digits),
+  );
   if (bodyVerdict === "clean") return "clean";
 
   // Round-4 fix (Fix C, round-3 CHANGES-REQUESTED finding): a welded
@@ -428,7 +483,11 @@ export function judgePhoneOnPage(html: string, digits: string): PagePhoneJudgeme
   //   2. else, clean (non-welded) in script/style -> "ambiguous_script_style"
   //   3. else, if welded somewhere (body OR script/style) -> "reject_shape"
   //   4. else (no occurrence anywhere) -> "absent"
-  const scriptVerdict = classifyLoosePhoneOccurrences(scriptStylePhoneText(html), digits);
+  const scriptText = scriptStylePhoneText(html);
+  const scriptVerdict = bestLooseVerdict(
+    classifyLoosePhoneOccurrences(scriptText, digits),
+    classifyLoosePhoneOccurrences(decodeForPhoneMatch(scriptText), digits),
+  );
   if (scriptVerdict === "clean") return "ambiguous_script_style";
 
   if (bodyVerdict === "welded" || scriptVerdict === "welded") return "reject_shape";

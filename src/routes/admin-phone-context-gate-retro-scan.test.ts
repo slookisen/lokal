@@ -1236,6 +1236,82 @@ export async function runAdminPhoneContextGateRetroScanTests(
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Round-5 fix: judgePhoneOnPage must decode URL-encoding AND HTML
+  // entities before the loose-text neighbour check, not just scan the raw
+  // extracted text. Confirmed real-world false positive (Konditoriet i
+  // Sandnes, phone 51662385): its page embeds a URL-encoded JSON blob
+  // inside a <script> block containing the literal substring
+  // `%22phone%22%3A%22%2B4751662385%22` — the URL-encoding of
+  // `"phone":"+4751662385"`. Digits are NOT percent-escaped, so the raw
+  // digit run `4751662385` sits unescaped in the HTML, but the match
+  // (which greedily consumes the optional "47" country-code prefix) starts
+  // right after the literal characters "%2B" — i.e. its "before" character
+  // is the letter "B" (alphanumeric), misclassifying a cleanly-quoted JSON
+  // string value as welded. Only once "%2B" is decoded back to "+" does the
+  // character before THAT become the opening quote ("), correctly clean.
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    // fp-10: the Konditoriet regression fixture itself — raw percent-encoding.
+    // The clean match only exists inside a <script> block (never in visible
+    // text), so per judgePhoneOnPage's own documented precedence this must
+    // resolve to "ambiguous_script_style" (found, but not customer-facing-
+    // confirmable) — NOT "reject_shape" (which would flag Konditoriet's
+    // genuine, verified phone number for deletion).
+    const konditorietPercentEncodedHtml =
+      "<html><head><script>" +
+      'var initialState = decodeURIComponent("%7B%22phone%22%3A%22%2B4751662385%22%7D");' +
+      "</script></head><body><p>Konditoriet i Sandnes</p></body></html>";
+    assertEq(
+      judgePhoneOnPage(konditorietPercentEncodedHtml, "51662385"),
+      "ambiguous_script_style",
+      "fp-10 (Konditoriet repro, percent-encoded): %22phone%22%3A%22%2B4751662385%22 in a <script> block -> ambiguous_script_style, NOT reject_shape",
+    );
+
+    // fp-11: same shape, HTML-entity-encoded instead of percent-encoded
+    // (&quot; for the quotes, &#43; for the plus sign) — same assertion.
+    const konditorietEntityEncodedHtml =
+      "<html><head><script>" +
+      'var initialState = {&quot;phone&quot;:&quot;&#43;4751662385&quot;};' +
+      "</script></head><body><p>Konditoriet i Sandnes</p></body></html>";
+    assertEq(
+      judgePhoneOnPage(konditorietEntityEncodedHtml, "51662385"),
+      "ambiguous_script_style",
+      "fp-11 (Konditoriet repro, HTML-entity-encoded): &quot;phone&quot;:&quot;&#43;4751662385&quot; in a <script> block -> ambiguous_script_style, NOT reject_shape",
+    );
+
+    // fp-12 (regression guard, HTML-entity variant using hex numeric
+    // entity &#x2B; for the plus sign instead of the named &#43;): same
+    // assertion, confirming both numeric-entity forms decode correctly.
+    const konditorietHexEntityEncodedHtml =
+      "<html><head><script>" +
+      'var initialState = {&quot;phone&quot;:&quot;&#x2B;4751662385&quot;};' +
+      "</script></head><body><p>Konditoriet i Sandnes</p></body></html>";
+    assertEq(
+      judgePhoneOnPage(konditorietHexEntityEncodedHtml, "51662385"),
+      "ambiguous_script_style",
+      "fp-12 (Konditoriet repro, hex HTML-entity &#x2B;): same shape with &#x2B; instead of &#43; -> ambiguous_script_style, NOT reject_shape",
+    );
+
+    // fp-13 (regression guard): a welded, NOT URL/entity-encoded occurrence
+    // must still correctly reject — decoding text with no %XX/entity
+    // sequences at all must be a pure no-op that doesn't change the
+    // verdict. Reuses the Bjørke Gård facebookAppId JSON-blob-slice shape
+    // (same fixture shape as the scan-01 repro above).
+    const bjorkeGardHtml =
+      '<html><body><div class="fb-config-fallback">{"facebookAppId":"314192535267336"}</div>' +
+      "<p>Velkommen til Bjørke Gård!</p></body></html>";
+    assertEq(
+      judgePhoneOnPage(bjorkeGardHtml, "35267336"),
+      "reject_shape",
+      "fp-13 (regression guard, Bjørke Gård facebookAppId shape, unencoded): decoding a no-op input must not change reject_shape -> still reject_shape",
+    );
+
+    // (A clean, non-welded, non-encoded case — a tel: link — is already
+    // covered end-to-end by fp-01 above via scanOnePhoneRow; no new test
+    // needed to confirm no regression there.)
+  }
+
   return { passed, failed, failures };
 }
 
