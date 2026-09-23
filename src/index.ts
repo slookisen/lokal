@@ -69,6 +69,7 @@ import { startProfileTranslationsWorker, startProfileTranslationsStaleSweep } fr
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
+import adminPhoneContextGateRetroScanRoutes from "./routes/admin-phone-context-gate-retro-scan";
 import adminFieldSpotCheckRoutes from "./routes/admin-field-spot-check";
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
@@ -782,6 +783,17 @@ app.use("/admin/contact-write-guard-audit", adminLimiter, adminContactWriteGuard
 // path but only ever invoked by a human after reviewing a dry-run's numbers.
 // POST /admin/contact-write-guard-retro-sweep
 app.use("/admin/contact-write-guard-retro-sweep", adminLimiter, adminContactWriteGuardRetroSweepRoutes);
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 3: one-time retro-scan of existing agent_knowledge.phone values
+// against the FIXED extractPhones() context-gate rule (services/search-
+// enrich.ts) — re-fetches each row's homepage and re-extracts, flagging any
+// stored phone the fixed rule would no longer extract. Dry-run by default
+// (report + count, no writes, no DB mutation); dry_run:false actually blanks
+// the flagged phone AND resets verification_status to 'pending_verify' so
+// the verifier re-judges the row — never touching an owner-claimed agent
+// (claimed_at) or a curated_fields-locked phone field.
+// POST /admin/phone-context-gate-retro-scan
+app.use("/admin/phone-context-gate-retro-scan", adminLimiter, adminPhoneContextGateRetroScanRoutes);
 // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
 // point 2 fix-up (B3): thin HTTP wrapper around computeFieldSpotCheck()
 // (src/agents/lokal-agent-verifier.ts) so the weekly field-verification
