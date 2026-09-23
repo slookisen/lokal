@@ -3834,6 +3834,29 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_handoffs_agent_id ON cart_handoffs(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cart_handoffs_cart_id ON cart_handoffs(cart_id)`);
 
+  // ─── dev-request 2026-09-16-handleliste-med-produsentvalg-og- ───────────
+  // bestillingsflyt, Slice 2: hybrid utsending — buyer contact fields ─────
+  // COPIED from `carts` onto `orders` at submit time (cart-service.ts's
+  // submitCart()), so the producer email (order-notify-service.ts's v2
+  // template) and the tokenized /produsent/ordre/:token page can read them
+  // straight off the order — an order must stand on its own (it survives
+  // the cart's own 30-day contact-data sweep running on a different clock;
+  // see cart-contact-sweep.ts). Same 5 columns, same names, as carts' own
+  // Slice-1 columns above — purely additive, idempotent ALTER idiom.
+  // Nulled by cart-contact-sweep.ts's sweepExpiredCartContactData() 30 days
+  // after the order itself reaches a TERMINAL status (declined/completed/
+  // cancelled) — independent of the cart-level sweep, which waits for
+  // every order in the cart.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN buyer_name TEXT`,
+    `ALTER TABLE orders ADD COLUMN buyer_email TEXT`,
+    `ALTER TABLE orders ADD COLUMN buyer_phone TEXT`,
+    `ALTER TABLE orders ADD COLUMN delivery_note TEXT`,
+    `ALTER TABLE orders ADD COLUMN contact_consent_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   // ─── Slice 1 of dev-request 2026-06-30-brreg-verification-gate ─────────
   // Schema + lookup-function ONLY. This slice does NOT wire org-nr
   // verification into any registration/enrichment endpoint — that's

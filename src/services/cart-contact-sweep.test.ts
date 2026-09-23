@@ -92,9 +92,39 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     `).run(id, cartId, `bref_${cartId}`, status, `ctok_${id}`, updatedAt);
   }
 
+  // Slice 2: an order carrying its OWN copy of the 5 buyer-contact columns
+  // (mirrors what cart-service.ts's submitCart() writes at order-creation
+  // time). `noContact: true` inserts an order with all 5 columns NULL — the
+  // "already clean, nothing to sweep" case.
+  function insertOrderWithContact(
+    id: string,
+    cartId: string,
+    status: string,
+    updatedAt: string,
+    opts3: { noContact?: boolean } = {}
+  ) {
+    const c = opts3.noContact ? null : "Order Buyer";
+    db.prepare(`
+      INSERT INTO orders
+        (id, cart_id, agent_id, buyer_ref, status, fulfilment, total_nok, confirm_token, created_at, updated_at,
+         buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at)
+      VALUES (?, ?, 'agent-x', ?, ?, 'pickup', 30, ?, datetime('now'), ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, cartId, `bref_${cartId}`, status, `ctok_${id}`, updatedAt,
+      c, c ? "orderbuyer@example.com" : null, c ? "+47 90000099" : null,
+      c ? "Legg ved døra" : null, c ? sqlTs(now) : null
+    );
+  }
+
   function readCart(id: string): any {
     return db.prepare(
       "SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, updated_at FROM carts WHERE id = ?"
+    ).get(id);
+  }
+
+  function readOrder(id: string): any {
+    return db.prepare(
+      "SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, status FROM orders WHERE id = ?"
     ).get(id);
   }
 
@@ -145,6 +175,55 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     `).run(sqlTs(days(60)));
     insertOrder("order-8", "cart-already-clean", "completed", sqlTs(days(60)));
 
+    // ═══════════ Slice 2: order-level sweep (independent per-order clock) ═
+    // Every fixture cart below is inserted WITHOUT its own contact fields
+    // (same raw-insert idiom as cart-already-clean above) so these cases
+    // exercise ONLY the order-level rule, without perturbing the cart-level
+    // sweptCartIds/sweptCount assertion right below.
+
+    // ── order-level-old-terminal: completed 40d ago → SWEPT ────────────────
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES ('cart-order-level-old', 'bref_cart-order-level-old', 'platform_agent', 'submitted', 'NOK', datetime('now'), ?)
+    `).run(sqlTs(days(40)));
+    insertOrderWithContact("order-level-old-terminal", "cart-order-level-old", "completed", sqlTs(days(40)));
+
+    // ── order-level-recent-terminal: declined only 10d ago → NOT swept yet ─
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES ('cart-order-level-recent', 'bref_cart-order-level-recent', 'platform_agent', 'submitted', 'NOK', datetime('now'), ?)
+    `).run(sqlTs(days(10)));
+    insertOrderWithContact("order-level-recent-terminal", "cart-order-level-recent", "declined", sqlTs(days(10)));
+
+    // ── order-level-live-order: still 'pending', 90d old → NEVER swept while
+    // live, no matter how old (mirrors the cart-level rule's own such case).
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES ('cart-order-level-live', 'bref_cart-order-level-live', 'platform_agent', 'submitted', 'NOK', datetime('now'), ?)
+    `).run(sqlTs(days(90)));
+    insertOrderWithContact("order-level-live-order", "cart-order-level-live", "pending", sqlTs(days(90)));
+
+    // ── order-level-already-clean: terminal+old but already has NULL
+    // contact fields → never reselected (idempotency / nothing to null).
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES ('cart-order-level-clean', 'bref_cart-order-level-clean', 'platform_agent', 'submitted', 'NOK', datetime('now'), ?)
+    `).run(sqlTs(days(60)));
+    insertOrderWithContact("order-level-already-clean", "cart-order-level-clean", "completed", sqlTs(days(60)), { noContact: true });
+
+    // ── cart-order-level-mixed-status: TWO orders, one terminal+old, one
+    // still pending. The ORDER-level rule sweeps ONLY the terminal+old one,
+    // independent of its sibling's status — a materially different rule
+    // from the cart-level one (which requires ALL orders terminal before
+    // touching the CART's own fields — see cart-two-orders-mixed-age above,
+    // a same-shaped fixture that tests THAT rule instead).
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES ('cart-order-level-mixed-status', 'bref_cart-order-level-mixed-status', 'platform_agent', 'submitted', 'NOK', datetime('now'), ?)
+    `).run(sqlTs(days(1)));
+    insertOrderWithContact("order-level-mixed-terminal", "cart-order-level-mixed-status", "completed", sqlTs(days(45)));
+    insertOrderWithContact("order-level-mixed-pending", "cart-order-level-mixed-status", "pending", sqlTs(days(90)));
+
     const result = sweepMod.sweepExpiredCartContactData(30, now);
 
     assertEq(
@@ -176,14 +255,61 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
       assertTrue(c.buyer_name === "Test Buyer", `${id}: buyer_name left untouched (not eligible yet)`);
     }
 
-    // ── Order rows themselves are never touched by the sweep ──────────────
+    // ── An order's STATUS is never touched by the sweep — only its 5
+    // contact columns (order-1 here has none, so nothing changes at all).
     const order1 = db.prepare("SELECT status FROM orders WHERE id = 'order-1'").get() as any;
-    assertEq(order1.status, "completed", "sweep never touches order rows, only carts' contact columns");
+    assertEq(order1.status, "completed", "sweep never touches an order's status, only its contact columns");
+
+    // ── Slice 2: order-level sweep results ─────────────────────────────────
+    assertEq(
+      [...result.sweptOrderIds].sort(),
+      ["order-level-mixed-terminal", "order-level-old-terminal"].sort(),
+      "sweepExpiredCartContactData: sweeps exactly the two eligible orders (order-level clock)"
+    );
+    assertEq(result.sweptOrderCount, 2, "sweepExpiredCartContactData: sweptOrderCount matches sweptOrderIds.length");
+
+    for (const id of ["order-level-old-terminal", "order-level-mixed-terminal"]) {
+      const o = readOrder(id);
+      assertEq(o.buyer_name, null, `${id}: buyer_name nulled`);
+      assertEq(o.buyer_email, null, `${id}: buyer_email nulled`);
+      assertEq(o.buyer_phone, null, `${id}: buyer_phone nulled`);
+      assertEq(o.delivery_note, null, `${id}: delivery_note nulled`);
+      assertEq(o.contact_consent_at, null, `${id}: contact_consent_at nulled`);
+    }
+
+    for (const id of ["order-level-recent-terminal", "order-level-live-order", "order-level-mixed-pending"]) {
+      const o = readOrder(id);
+      assertEq(o.buyer_name, "Order Buyer", `${id}: buyer_name left untouched (not eligible yet)`);
+    }
+
+    // The sibling of order-level-mixed-terminal is untouched precisely
+    // BECAUSE it's still 'pending', even though the cart-level rule (which
+    // this order-level rule does NOT apply) would have blocked on it too —
+    // this proves the two rules are independent, not that this one somehow
+    // waited on the sibling.
+    assertTrue(
+      readOrder("order-level-mixed-terminal").buyer_name === null &&
+      readOrder("order-level-mixed-pending").buyer_name === "Order Buyer",
+      "order-level sweep ignores sibling-order status entirely — a materially different rule from the cart-level one"
+    );
+
+    // Cart-level fields are unaffected by the order-level rule: none of the
+    // order-level fixture carts were ever cart-level candidates (inserted
+    // with no contact fields of their own, same idiom as cart-already-clean
+    // above), and none of them appear in sweptCartIds (already asserted by
+    // the exact-match assertion above) — proving the order-level sweep only
+    // ever writes to `orders`, never to `carts`.
+    assertTrue(
+      readCart("cart-order-level-old").buyer_name == null,
+      "cart-order-level-old: cart-level buyer_name stays NULL — it never had one to begin with, and the order-level sweep never writes to carts"
+    );
 
     // ── Idempotency: a second run on the same fixture sweeps nothing new ──
     const secondRun = sweepMod.sweepExpiredCartContactData(30, now);
     assertEq(secondRun.sweptCartIds, [], "sweepExpiredCartContactData: re-running is a no-op — already-swept carts are never re-selected");
     assertEq(secondRun.sweptCount, 0, "sweepExpiredCartContactData: second run's sweptCount is 0");
+    assertEq(secondRun.sweptOrderIds, [], "sweepExpiredCartContactData: re-running is a no-op — already-swept orders are never re-selected");
+    assertEq(secondRun.sweptOrderCount, 0, "sweepExpiredCartContactData: second run's sweptOrderCount is 0");
   } finally {
     sweepMod.__setCartContactSweepTestDb(null);
     initMod.__setDbForTesting(prevDb as any);

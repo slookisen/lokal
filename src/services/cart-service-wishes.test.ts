@@ -116,6 +116,15 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
     insertKnowledge("agent-eligible");
     insertProduct("prod-potet", "agent-eligible", "Poteter");
     insertProduct("prod-egg", "agent-eligible", "Egg");
+    // orch-pr-20260919-handleliste-slice2: submitCart()'s order/handoff
+    // split now ALSO requires the full order-notify send-gate (opt_in=1 is
+    // mandatory; a verified-contact-or-is_verified profile satisfies the
+    // separate gate-3 clause — see isEligibleForRealOrder(), cart-service.ts)
+    // — set opt_in here so this file's pre-existing "eligible producer's
+    // chosen offer becomes a real order" scenarios keep testing the
+    // WISH-mirroring mechanics they were written for, unentangled from that
+    // separate, orthogonal gate.
+    db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'agent-eligible'").run();
 
     insertAgent("agent-contact-only", "Gard KontaktSelv");
     insertKnowledge("agent-contact-only", { verificationStatus: "verified", verifiedSecondLine: 1 }); // second-line only — never checkout-eligible

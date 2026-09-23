@@ -116,6 +116,72 @@ export function isProducerEligible(agentId: string): boolean {
   return !!row;
 }
 
+// ─── Real-order eligibility (Slice 2 of dev-request 2026-09-16- ───────────
+// handleliste-med-produsentvalg-og-bestillingsflyt: hybrid utsending) ──────
+// Deliberately a SEPARATE, STRICTER function from isProducerEligible() above,
+// not a change to it: isProducerEligible() is also the addCartItem() add-to-
+// cart admission gate (line ~227 below) — "is this a real, discoverable,
+// non-spam, checkout-grade producer at all", asked for ~1600+ producers on
+// every add. Tightening THAT gate to also require opt-in/owner-verification
+// would make the vast majority of today's producers un-addable to a cart at
+// all (only 35 agents.is_verified=1, ~0 known order_notifications_opt_in=1,
+// out of ~1646) — not what this slice is for.
+// isEligibleForRealOrder() answers a narrower, submit-time-only question:
+// "will this producer actually receive a real order + email, or does the
+// buyer get a contact-handoff instead" — used ONLY in submitCart()'s
+// per-producer order/handoff split below.
+//
+// FIX-UP (independent code-reviewer, CHANGES-REQUESTED): the previous
+// version of this function delegated its cross-check condition to
+// `if (!isProducerEligible(agentId)) return false;` — but isProducerEligible()
+// hard-requires `agent_knowledge.verification_status = 'verified'` with NO
+// is_verified alternative. That made the Slice 2 widening dead code in
+// production: an owner-verified-but-not-internally-cross-checked producer
+// (agents.is_verified = 1, ~35 agents) was rejected right here, before
+// order-notify-service.ts's correctly-widened Gate 3 ever got a chance to
+// run — defeating the dev-request's own stated goal (line 160-163:
+// "isProducerEligible i cart-service.ts skal godta is_verified = 1 på samme
+// måte som gate 3"). isProducerEligible() itself, and addCartItem()'s
+// add-to-cart admission gate that calls it, are UNCHANGED — narrowing
+// admission for the ~1600+ producers who aren't verification_status=
+// 'verified' would be a large unrelated regression (confirmed out of scope
+// by the reviewer and an earlier pass on this branch).
+//
+// This function now runs its OWN query, reproducing isProducerEligible()'s
+// non-cross-check conditions directly (no umbrella account; not
+// second-line-only verification — LEFT JOIN so an agent with NO
+// agent_knowledge row at all, e.g. a purely owner-claimed profile that was
+// never through the internal cross-check pipeline, still evaluates instead
+// of being silently excluded by an INNER JOIN), while replacing the hard
+// `verification_status = 'verified'` requirement with
+// `(verification_status = 'verified' OR agents.is_verified = 1)` — mirroring
+// order-notify-service.ts's Gate 3 widening exactly.
+//
+// Gate 1 (opt-in, order_notifications_opt_in = 1) stays MANDATORY and
+// INDEPENDENT, ANDed on top — it is NEVER satisfied by is_verified alone
+// (dev-request AC4: "is_verified = 1 AND order_notifications_opt_in = 1"
+// together; an earlier pass on this branch wrongly OR'd opt_in with
+// is_verified across the WHOLE gate — corrected, see git history). Gate 2 —
+// a recipient email exists — and Gate 4 — not blocklisted — are deliberately
+// NOT checked here, same as before this fix-up: they are
+// order-notify-service.ts's job at actual SEND time, decoupled from
+// order-row creation (a "pending" order can still exist with its
+// confirm_token generated even when no notification goes out — pre-existing
+// behavior, unchanged).
+export function isEligibleForRealOrder(agentId: string): boolean {
+  const db = _cartTestDb ?? getDb();
+  const row = db.prepare(`
+    SELECT 1 FROM agents a
+    LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE a.id = ?
+      AND a.umbrella_type IS NULL
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND (k.verification_status = 'verified' OR a.is_verified = 1)
+      AND a.order_notifications_opt_in = 1
+  `).get(agentId);
+  return !!row;
+}
+
 // ─── Create cart ─────────────────────────────────────────────────────────────
 
 export function createCart(): { cart_id: string; buyer_ref: string } {
@@ -753,15 +819,23 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
   }
 
   // Producers eligible for a real order RIGHT NOW — re-checked here at
-  // submit (defense-in-depth; addCartItem() already required this at add
-  // time, so in the common case nothing changes — it only matters if
-  // eligibility changed between add and submit). Reuses isProducerEligible()
-  // COMPLETELY UNCHANGED, per this slice's own scope: its gating logic is
-  // not touched here.
+  // submit (defense-in-depth; addCartItem() already required isProducerEligible()
+  // at add time, so in the common case nothing changes — it only matters if
+  // eligibility changed between add and submit — see isEligibleForRealOrder()'s
+  // own doc comment for why that IS exactly how an is_verified=1-but-not-
+  // internally-verified producer ever reaches a real order: verification_status
+  // can move to/from 'verified' between add-time and submit-time). Slice 2
+  // (hybrid utsending): uses isEligibleForRealOrder(), which reproduces
+  // isProducerEligible()'s non-cross-check conditions (no umbrella, not
+  // second-line-only) with its own `verification_status = 'verified' OR
+  // is_verified = 1` gate ANDed with the mandatory opt-in — see that
+  // function's doc comment for why this is a SEPARATE function/query rather
+  // than a change to isProducerEligible() itself (addCartItem()'s admission
+  // gate is deliberately untouched).
   const eligibleAgentIds = new Set<string>();
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
-    (isProducerEligible(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+    (isEligibleForRealOrder(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
   }
 
   // Everything that will NOT become a real order — mode='contact' wishes
@@ -842,13 +916,28 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
       }, 0);
       const producer_name = agentItems[0]!.producer_name;
 
+      // Slice 2 (hybrid utsending): the buyer contact fields are copied onto
+      // the order itself, same values/columns as the `carts` row just above
+      // — the order-notify-service.ts v2 email and the /produsent/ordre/
+      // :token page both read from the ORDER, not the cart (an order must
+      // stand on its own; the cart-level and order-level 30-day sweeps run
+      // independently, see cart-contact-sweep.ts).
       db.prepare(`
         INSERT INTO orders
           (id, cart_id, agent_id, buyer_ref, status, fulfilment, pickup_time,
-           total_nok, confirm_token, created_at, updated_at)
+           total_nok, confirm_token, created_at, updated_at,
+           buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at)
         VALUES
-          (?, ?, ?, ?, 'pending', 'pickup', NULL, ?, ?, datetime('now'), datetime('now'))
-      `).run(order_id, cartId, agent_id, buyer_ref, total_nok, confirm_token);
+          (?, ?, ?, ?, 'pending', 'pickup', NULL, ?, ?, datetime('now'), datetime('now'),
+           ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END)
+      `).run(
+        order_id, cartId, agent_id, buyer_ref, total_nok, confirm_token,
+        contact?.buyer_name ?? null,
+        contact?.buyer_email ?? null,
+        contact?.buyer_phone ?? null,
+        contact?.delivery_note ?? null,
+        consentNow ? 1 : 0
+      );
 
       for (const item of agentItems) {
         const line_total =
@@ -886,6 +975,13 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
         pickup_time: null,
         total_nok,
         items: agentItems.map((i) => ({ name: i.product_name, qty: i.qty, unit: i.unit })),
+        // Slice 2: forwarded straight from the submit call (not re-read from
+        // the DB — the transaction just wrote the same values to `orders`
+        // above), so the v2 email template can include them.
+        buyer_name: contact?.buyer_name ?? null,
+        buyer_email: contact?.buyer_email ?? null,
+        buyer_phone: contact?.buyer_phone ?? null,
+        delivery_note: contact?.delivery_note ?? null,
       });
     }
   });
@@ -1148,6 +1244,14 @@ export interface ProducerOrderView {
   total_nok: number | null;
   buyer_ref: string;
   created_at: string;
+  // Slice 2 (hybrid utsending): buyer contact fields, read-only display on
+  // the /produsent/ordre/:token page when present — null for orders created
+  // before this slice, for a no-consent submit, or after the 30-day sweep
+  // (cart-contact-sweep.ts) has nulled them.
+  buyer_name: string | null;
+  buyer_email: string | null;
+  buyer_phone: string | null;
+  delivery_note: string | null;
   items: Array<{
     name_snapshot: string | null;
     qty: number | null;
@@ -1163,7 +1267,8 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
 
   const order = db.prepare(`
     SELECT o.id, o.agent_id, o.status, o.cancel_reason, o.fulfilment, o.pickup_time,
-           o.total_nok, o.buyer_ref, o.created_at, a.name AS producer_name
+           o.total_nok, o.buyer_ref, o.created_at, a.name AS producer_name,
+           o.buyer_name, o.buyer_email, o.buyer_phone, o.delivery_note
     FROM orders o
     INNER JOIN agents a ON a.id = o.agent_id
     WHERE o.confirm_token = ?
@@ -1172,6 +1277,8 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
         id: string; agent_id: string; status: string; cancel_reason: string | null;
         fulfilment: string; pickup_time: string | null; total_nok: number | null;
         buyer_ref: string; created_at: string; producer_name: string;
+        buyer_name: string | null; buyer_email: string | null; buyer_phone: string | null;
+        delivery_note: string | null;
       }
     | undefined;
 
@@ -1193,6 +1300,10 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
     total_nok: order.total_nok,
     buyer_ref: order.buyer_ref,
     created_at: order.created_at,
+    buyer_name: order.buyer_name,
+    buyer_email: order.buyer_email,
+    buyer_phone: order.buyer_phone,
+    delivery_note: order.delivery_note,
     items,
     timeline: getOrderTimeline(order.id),
   };
