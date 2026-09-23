@@ -45163,3 +45163,26 @@ runSerial(async () => {
     failures.push("admin-field-spot-check: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
+// point 3 (PR #909, round 4 of review — the one authorized exception to the
+// 3-round cap, scoped to exactly round 3's 3 CHANGES-REQUESTED findings):
+// POST /admin/phone-context-gate-retro-scan — the one-time retro-scan of
+// existing agent_knowledge.phone values against the fixed extractPhones()
+// context-gate rule (Bjørke Gård / Drivhuset Bageri repro). Own in-memory DB
+// + globalThis.fetch stub — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver: phone context-gate retro-scan ──");
+  try {
+    const { runAdminPhoneContextGateRetroScanTests } = require("../src/routes/admin-phone-context-gate-retro-scan.test") as
+      typeof import("../src/routes/admin-phone-context-gate-retro-scan.test");
+    const pcg = await runAdminPhoneContextGateRetroScanTests({ log: false });
+    passed += pcg.passed;
+    failed += pcg.failed;
+    for (const f of pcg.failures) failures.push("admin-phone-context-gate-retro-scan: " + f);
+    console.log(`  admin-phone-context-gate-retro-scan: ${pcg.passed} passed, ${pcg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-phone-context-gate-retro-scan: unexpected error: " + String(err?.message || err));
+  }
+});
