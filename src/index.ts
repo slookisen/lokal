@@ -42,6 +42,7 @@ import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
+import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -1308,6 +1309,33 @@ app.listen(Number(PORT), HOST, async () => {
         }
       } catch (err) {
         console.error("[auto-prune] failed (non-fatal):", err);
+      }
+
+      // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+      // sweepExpiredCartContactData() (services/cart-contact-sweep.ts) was
+      // written+tested but never wired to run automatically — piggybacks on
+      // this SAME once-daily 03:00–03:59 UTC window rather than adding a
+      // second setInterval. Own try/catch so a sweep failure can never
+      // affect the analytics prune above (or vice versa).
+      //
+      // SAFETY: this is a REAL deletion job against production buyer
+      // contact data (name/email/phone/delivery note), so it defaults to
+      // dryRun=true (count-only, writes nothing) until CART_CONTACT_SWEEP_LIVE
+      // is explicitly set to "true" — mirrors the CATALOG_SYNC_SCHEDULER_ENABLED
+      // -style explicit-opt-in convention already used for other scheduler
+      // additions in this file. Flip it once a few days of dry-run log lines
+      // (below) look sane in production.
+      try {
+        const sweepLive = process.env.CART_CONTACT_SWEEP_LIVE === "true";
+        const sweepResult = sweepExpiredCartContactData(30, now, !sweepLive);
+        console.log(
+          `[cart-contact-sweep] dryRun=${sweepResult.dryRun} sweptCount=${sweepResult.sweptCount}` +
+          (sweepResult.dryRun
+            ? " (count-only, no rows modified — set CART_CONTACT_SWEEP_LIVE=true to enable real deletion)"
+            : "")
+        );
+      } catch (err) {
+        console.error("[cart-contact-sweep] failed (non-fatal):", err);
       }
     };
 

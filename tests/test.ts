@@ -45186,3 +45186,84 @@ runSerial(async () => {
     failures.push("admin-phone-context-gate-retro-scan: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C1:
+// RFB /mcp rate limiting (mcpIpEmergencyBrakeLimiter / mcpPrimaryLimiter /
+// mcpCartToolLimiter, src/middleware/mcp-rate-limit.ts). Own tiny real HTTP
+// servers on ephemeral ports (same technique as
+// consumer-identity-rate-limit.test.ts) — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C1: MCP /mcp rate limiting ──");
+  try {
+    const { runMcpRateLimitTests } = require("../src/middleware/mcp-rate-limit.test") as
+      typeof import("../src/middleware/mcp-rate-limit.test");
+    const mrl = await runMcpRateLimitTests({ log: false });
+    passed += mrl.passed;
+    failed += mrl.failed;
+    for (const f of mrl.failures) failures.push("mcp-rate-limit: " + f);
+    console.log(`  mcp-rate-limit: ${mrl.passed} passed, ${mrl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-rate-limit: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C2:
+// /personvern + /vilkar match what the code actually does; /privacy and
+// /privacy-policy (discovery.ts) now redirect to /personvern instead of
+// serving their own stale, diverging copy. Router.handle() directly on
+// seo.ts/discovery.ts, no DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C2: privacy/terms truth ──");
+  try {
+    const { runRfbPrivacyTermsTruthTests } = require("../src/routes/rfb-privacy-terms-truth.test") as
+      typeof import("../src/routes/rfb-privacy-terms-truth.test");
+    const ptt = await runRfbPrivacyTermsTruthTests({ log: false });
+    passed += ptt.passed;
+    failed += ptt.failed;
+    for (const f of ptt.failures) failures.push("rfb-privacy-terms-truth: " + f);
+    console.log(`  rfb-privacy-terms-truth: ${ptt.passed} passed, ${ptt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-privacy-terms-truth: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
+// checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
+// is now literally true). Own in-memory DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3: cart expiry enforcement ──");
+  try {
+    const { runCartServiceExpiryTests } = require("../src/services/cart-service-expiry.test") as
+      typeof import("../src/services/cart-service-expiry.test");
+    const cse = runCartServiceExpiryTests({ log: false });
+    passed += cse.passed;
+    failed += cse.failed;
+    for (const f of cse.failures) failures.push("cart-service-expiry: " + f);
+    console.log(`  cart-service-expiry: ${cse.passed} passed, ${cse.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-service-expiry: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
+// analytics_mcp_calls joins the daily retention pass (pruneAnalyticsMcpCalls,
+// services/retention-service.ts; wired into AnalyticsService.runAutoPrune()).
+// Own in-memory DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3: analytics_mcp_calls retention ──");
+  try {
+    const { runRetentionMcpCallsPruneTests } = require("../src/services/retention-mcp-calls-prune.test") as
+      typeof import("../src/services/retention-mcp-calls-prune.test");
+    const rmp = runRetentionMcpCallsPruneTests({ log: false });
+    passed += rmp.passed;
+    failed += rmp.failed;
+    for (const f of rmp.failures) failures.push("retention-mcp-calls-prune: " + f);
+    console.log(`  retention-mcp-calls-prune: ${rmp.passed} passed, ${rmp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("retention-mcp-calls-prune: unexpected error: " + String(err?.message || err));
+  }
+});

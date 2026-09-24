@@ -1175,7 +1175,7 @@ export class AnalyticsService {
     // page views.
     try {
       const r = this.runAutoPrune({ daysToKeep: olderThanDays });
-      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews;
+      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews + r.deleted.mcpCalls;
       console.log(
         `[analytics] Pruned ${total} old records (rollup-before-delete) ` +
         `skippedPendingRollup=${JSON.stringify(r.skippedPendingRollup)}`
@@ -1222,7 +1222,7 @@ export class AnalyticsService {
   runAutoPrune(opts: { daysToKeep: number }): {
     daysKept: number;
     cutoff: string;
-    deleted: { pageViews: number; queries: number; agentViews: number };
+    deleted: { pageViews: number; queries: number; agentViews: number; mcpCalls: number };
     skippedPendingRollup: string[];
     wouldDeleteIfPruned: { queries: number; agentViews: number };
   } {
@@ -1230,7 +1230,7 @@ export class AnalyticsService {
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
 
-    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews } =
+    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews, pruneAnalyticsMcpCalls } =
       require("./retention-service") as typeof import("./retention-service");
 
     // Sizing counts are read BEFORE the rollup+delete runs, so
@@ -1242,6 +1242,11 @@ export class AnalyticsService {
     const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
     const qResult = rollupAndPruneQueries(daysKept, 7, false);
     const avResult = rollupAndPruneAgentViews(daysKept, 7, false);
+    // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+    // analytics_mcp_calls joins the same daily retention pass, same window
+    // as page views — delete-only (no rollup table for this one, see
+    // pruneAnalyticsMcpCalls's own doc comment).
+    const mcpCallsResult = pruneAnalyticsMcpCalls(daysKept, false);
 
     // Rollup coverage per source table — computed, not hardcoded, so a future
     // analytics table without a rollup destination shows up here instead of
@@ -1263,6 +1268,7 @@ export class AnalyticsService {
         pageViews: pvResult.rowsDeleted || 0,
         queries: qResult.rowsDeleted || 0,
         agentViews: avResult.rowsDeleted || 0,
+        mcpCalls: mcpCallsResult.rowsDeleted || 0,
       },
       skippedPendingRollup,
       wouldDeleteIfPruned: {

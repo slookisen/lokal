@@ -551,8 +551,12 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       // Repeated calls once the source is exhausted must NEVER change a rollup table.
       const r2 = analyticsService.runAutoPrune({ daysToKeep: DAYS_TO_KEEP });
       const r3 = analyticsService.runAutoPrune({ daysToKeep: DAYS_TO_KEEP });
-      assertEq(r2.deleted, { pageViews: 0, queries: 0, agentViews: 0 }, "runAutoPrune: second call deletes nothing");
-      assertEq(r3.deleted, { pageViews: 0, queries: 0, agentViews: 0 }, "runAutoPrune: third call deletes nothing");
+      // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+      // runAutoPrune()'s `deleted` gained an additive `mcpCalls` field
+      // (analytics_mcp_calls now shares this same retention pass) — 0 here
+      // since this fixture never inserts any analytics_mcp_calls rows.
+      assertEq(r2.deleted, { pageViews: 0, queries: 0, agentViews: 0, mcpCalls: 0 }, "runAutoPrune: second call deletes nothing");
+      assertEq(r3.deleted, { pageViews: 0, queries: 0, agentViews: 0, mcpCalls: 0 }, "runAutoPrune: third call deletes nothing");
       assertEq(r3.skippedPendingRollup, [], "runAutoPrune: skippedPendingRollup stays [] across calls");
       assertEq(rollupSnapshot(), snap1,
         "runAutoPrune: all 5 rollup tables are byte-stable across repeated calls (nothing ever deletes FROM a rollup table)");
