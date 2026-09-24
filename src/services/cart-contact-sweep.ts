@@ -14,11 +14,14 @@
  * value — sweepExpiredCartContactData() returns only cart ids (not
  * personal data) and a count, for a caller to log/report on safely.
  *
- * NOT WIRED to a scheduled job in this slice (see this slice's build
- * report for why) — call sweepExpiredCartContactData() from whatever cron
- * registration a follow-up slice adds, mirroring the
- * CATALOG_SYNC_SCHEDULER_ENABLED-style flag + daily scheduler already in
- * src/index.ts for product-catalog-sync.ts.
+ * WIRED (dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3)
+ * into the existing once-daily auto-prune tick in src/index.ts, behind the
+ * CART_CONTACT_SWEEP_LIVE env flag (mirrors the CATALOG_SYNC_SCHEDULER_ENABLED
+ * -style explicit-opt-in convention already used there). Because this is a
+ * REAL deletion job against production buyer data, the scheduler defaults
+ * to calling it with `dryRun: true` (count-only, mutates nothing) until that
+ * flag is explicitly set to "true" — see the `dryRun` parameter below and
+ * src/index.ts's own comment at the call site for the rollout plan.
  */
 
 import { getDb } from "../database/init";
@@ -34,6 +37,8 @@ export function __setCartContactSweepTestDb(db: any): void {
 export interface CartContactSweepResult {
   sweptCartIds: string[];
   sweptCount: number;
+  /** True when this call only COUNTED eligible carts and modified nothing. */
+  dryRun: boolean;
 }
 
 // Mirrors cart-service.ts's VALID_TRANSITIONS: these three statuses have no
@@ -46,10 +51,17 @@ const TERMINAL_ORDER_STATUSES: ReadonlySet<string> = new Set(["declined", "compl
  * or never had contact fields — e.g. an MCP-only cart from before this
  * slice) is never selected, so re-running costs nothing. `now` is
  * injectable for tests; real callers should omit it.
+ *
+ * `dryRun` (default false): when true, candidates are found and returned
+ * exactly as normal (same sweptCartIds/sweptCount a real run would report)
+ * but NO row is written — a safe way to see what a real run WOULD delete
+ * before enabling it for real. See src/index.ts's scheduler wiring, which
+ * defaults to dryRun until CART_CONTACT_SWEEP_LIVE=true is set.
  */
 export function sweepExpiredCartContactData(
   cutoffDays: number = 30,
-  now: Date = new Date()
+  now: Date = new Date(),
+  dryRun: boolean = false
 ): CartContactSweepResult {
   const db = _sweepTestDb ?? getDb();
 
@@ -69,7 +81,7 @@ export function sweepExpiredCartContactData(
            OR delivery_note IS NOT NULL OR contact_consent_at IS NOT NULL)
   `).all() as Array<{ id: string; updated_at: string }>;
 
-  if (!candidates.length) return { sweptCartIds: [], sweptCount: 0 };
+  if (!candidates.length) return { sweptCartIds: [], sweptCount: 0, dryRun };
 
   const ordersStmt = db.prepare(`SELECT status, updated_at FROM orders WHERE cart_id = ?`);
   const nullOutStmt = db.prepare(`
@@ -81,7 +93,10 @@ export function sweepExpiredCartContactData(
 
   const sweptCartIds: string[] = [];
 
-  const tx = db.transaction(() => {
+  // Candidate detection is IDENTICAL whether or not this is a dry run — only
+  // whether nullOutStmt actually runs differs, so a dry-run's sweptCartIds
+  // reports exactly what a real run would sweep, before anything is written.
+  const applyToEligibleCarts = () => {
     for (const cart of candidates) {
       const orders = ordersStmt.all(cart.id) as Array<{ status: string; updated_at: string }>;
 
@@ -102,12 +117,21 @@ export function sweepExpiredCartContactData(
       }
 
       if (eligible) {
-        nullOutStmt.run(cart.id);
+        if (!dryRun) nullOutStmt.run(cart.id);
         sweptCartIds.push(cart.id);
       }
     }
-  });
-  tx();
+  };
 
-  return { sweptCartIds, sweptCount: sweptCartIds.length };
+  if (dryRun) {
+    // No mutation at all in a dry run — deliberately NOT wrapped in
+    // db.transaction() (that API implies a write scope) even though
+    // applyToEligibleCarts() itself never calls nullOutStmt.run() here.
+    applyToEligibleCarts();
+  } else {
+    const tx = db.transaction(applyToEligibleCarts);
+    tx();
+  }
+
+  return { sweptCartIds, sweptCount: sweptCartIds.length, dryRun };
 }

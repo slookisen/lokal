@@ -2807,10 +2807,11 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Which page you visit (URL path)</li>
       <li>Referrer URL (where you came from)</li>
-      <li>An anonymised hash of IP address and browser type (SHA-256, truncated \u2014 we do not store the full IP address or browser string)</li>
+      <li>An anonymised, salted hash of your IP address (SHA-256, truncated \u2014 we do not store your full IP address) and a separate hash of your browser type</li>
+      <li>For human visitors, a coarse device category (mobile / tablet / desktop) \u2014 never your full, raw browser string. Automated tools and crawlers (e.g. GPTBot, Googlebot) are instead identified by their own self-declared, non-personal client name, so we can see which bots and AI crawlers visit the site</li>
       <li>Timestamp of the visit</li>
     </ul>
-    <p>We use no cookies. We use no third-party analytics tools such as Google Analytics. All analysis happens in our own database.</p>
+    <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and one or two cookies that remember your language choice — a cookie set when you use the language switcher (expires after 1 year), and a session-only cookie the server may set when you follow a language-specific link (cleared when you close your browser). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
 
     <h3>Search and AI queries</h3>
     <p>When you search for producers \u2014 via the website, ChatGPT, Claude MCP or the API \u2014 we store:</p>
@@ -2822,6 +2823,11 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Anonymised IP hash (same method as for page visits)</li>
     </ul>
     <p>We store this to understand which searches give good results and to improve the service.</p>
+
+    <h3>MCP/A2A tool calls</h3>
+    <p>When an AI tool (e.g. ChatGPT or Claude) calls one of our MCP or A2A tools, we log — separately from the search log above, per call — which tool was used, which protocol (MCP/A2A), response time, and the caller's full browser/client string (User-Agent) — this is stored as-is, NOT hashed, unlike the page-visit hash above, so we can tell which AI clients actually use the service. We also store a salted IP hash (see “Security” below). This log is deleted automatically on the same schedule as our other analytics data (see “How long we keep data”).</p>
+    <p>When you use ${brand} via ChatGPT or Claude, your request passes through that provider's own infrastructure (run by OpenAI or Anthropic respectively) before it ever reaches our server — we have no control over or visibility into how they handle your data before the call reaches us.</p>
+    <p>The <code>lokal_geocode</code> tool (place name → coordinates) forwards your search text to the Norwegian Mapping Authority's public geocoding API (Kartverket, ws.geonorge.no) to look it up.</p>
 
     <h3>Sellers who register (claim)</h3>
     <p>When you register as a ${getConfig().domain_dictionary.entity} to manage your profile, we collect:</p>
@@ -2841,9 +2847,12 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Conversations between agents</h3>
     <p>${brand} supports the A2A protocol (agent-to-agent). When an AI agent contacts a producer agent, the conversation text, status and any transaction info are stored in the database.</p>
 
+    <h3>Shopping cart, orders and buyer token</h3>
+    <p>When you create a shopping cart (via the website or the MCP tools <code>lokal_cart_create</code> etc.) we store the cart's contents (chosen products and producers) and a capability token (buyer_ref) needed to manage it further — a cart is valid for 7 days. If you provide contact details when ordering (name, email, phone, delivery note), that is kept until the order is finally resolved (completed/declined/cancelled), then deleted automatically 30 days after that (or 30 days after submission if no real order was created). Orders carry no payment — we never charge a card — and are sent to the relevant producer; producers who opted in to order notifications get an email about the order.</p>
+
     <h2>What we do not collect</h2>
     <ul>
-      <li>We use no cookies</li>
+      <li>We use only essential cookies (seller sign-in session, language choice) — never advertising or tracking cookies</li>
       <li>We have no third-party tracking (no Google Analytics, Facebook Pixel, etc.)</li>
       <li>We do not store full IP addresses \u2014 only a truncated hash</li>
       <li>We do not store passwords (passwordless sign-in)</li>
@@ -2882,6 +2891,9 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
         <tr><td>Seller profile</td><td>For as long as you wish to remain registered.</td></tr>
         <tr><td>Uploaded images</td><td>Stored until manually deleted.</td></tr>
+        <tr><td>MCP/A2A tool-call log</td><td>Same automatic retention window as other analytics (60 days by default).</td></tr>
+        <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
+        <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
       </tbody>
     </table>
 
@@ -2903,14 +2915,14 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Admin access is protected by API keys in environment variables</li>
       <li>Content Security Policy (CSP) and other security headers are active</li>
       <li>All database queries are parameterised (protection against SQL injection)</li>
-      <li>IP addresses and browser info are stored only as hashes (irreversible anonymisation)</li>
-      <li>Rate limiting on sensitive endpoints</li>
+      <li>IP addresses for page visits and searches are stored only as a salted SHA-256 hash (pseudonymisation \u2014 not recoverable without our server-side secret salt, which we never publish). MCP/A2A tool-call logs additionally store the caller's full browser/client string (User-Agent) as-is, to show which AI clients use the service \u2014 see \u201cMCP/A2A tool calls\u201d above</li>
+      <li>Rate limiting on sensitive endpoints, including the MCP endpoint (per-session/API-key quota, plus a stricter quota on cart-related tools)</li>
     </ul>
 
     <h2>Changes to this policy</h2>
     <p>If we change how we handle data, we update this page. We have no newsletter or popup notifications \u2014 check this page if you're wondering.</p>
 
-    <p class="pv-updated">Last updated: 16 April 2026</p>
+    <p class="pv-updated">Last updated: 24 September 2026</p>
   </section>` : `
   <section class="pv-hero">
     <h1>Personvern</h1>
@@ -2929,10 +2941,11 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Hvilken side du besøker (URL-sti)</li>
       <li>Referanse-URL (hvor du kom fra)</li>
-      <li>En anonymisert hash av IP-adresse og nettleser-type (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse eller nettleser-streng)</li>
+      <li>En anonymisert, saltet hash av IP-adressen din (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse) og en separat hash av nettlesertypen din</li>
+      <li>For besøkende mennesker en grov enhetskategori (mobil / nettbrett / PC) \u2014 aldri din fullstendige, rå nettleser-streng. Automatiserte verktøy og roboter (f.eks. GPTBot, Googlebot) identifiseres i stedet med sitt eget selvangitte, ikke-personlige klientnavn, slik at vi kan se hvilke roboter og AI-crawlere som besøker siden</li>
       <li>Tidspunkt for besøket</li>
     </ul>
-    <p>Vi bruker ingen informasjonskapsler (cookies). Vi bruker ingen tredjepartsanalyseverktøy som Google Analytics. All analyse skjer i vår egen database.</p>
+    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
     <h3>Søk og AI-spørringer</h3>
     <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>
@@ -2944,6 +2957,11 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Anonymisert IP-hash (samme metode som for sidebesøk)</li>
     </ul>
     <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
+
+    <h3>MCP/A2A-verktøykall</h3>
+    <p>Når et AI-verktøy (f.eks. ChatGPT eller Claude) kaller et av våre MCP- eller A2A-verktøy, logger vi — separat fra søkeloggen over, per kall — hvilket verktøy som ble brukt, hvilken protokoll (MCP/A2A), responstid, samt den kallende klientens fulle nettleser-/klient-streng (User-Agent) — denne lagres i klartekst, IKKE som hash, i motsetning til sidebesøk-hashen over, slik at vi kan se hvilke AI-klienter som faktisk bruker tjenesten. Vi lagrer også en saltet IP-hash (se «Sikkerhet» under). Denne loggen slettes automatisk etter samme frist som annen analytikk (se «Hvor lenge vi lagrer data»).</p>
+    <p>Når du bruker ${brand} via ChatGPT eller Claude, går forespørselen din gjennom denne leverandørens egen infrastruktur (driftet av henholdsvis OpenAI eller Anthropic) før den i det hele tatt når vår server — vi har ingen kontroll over eller innsyn i hvordan de behandler dine data før kallet når oss.</p>
+    <p>Verktøyet <code>lokal_geocode</code> (stedsnavn → koordinater) sender søketeksten din videre til Kartverkets offentlige geokodings-API (ws.geonorge.no) for oppslag.</p>
 
     <h3>Selgere som registrerer seg (claim)</h3>
     <p>Når du som ${getConfig().domain_dictionary.entity} registrerer deg for å administrere din profil, samler vi inn:</p>
@@ -2963,13 +2981,12 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Samtaler mellom agenter</h3>
     <p>${brand} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
 
-    <h3>Hentebestillinger (handleliste)</h3>
-    <p>Du kan sette sammen en hentebestilling hos deltakende ${getConfig().domain_dictionary.entity_plural_long} \u2014 på nettsiden eller via en AI-assistent som ChatGPT eller Claude. Da lagrer vi hvilke varer og hvor mange du har valgt, eventuelle merknader til varene og et anonymt kjøper-token. Når du sender bestillingen, får hver produsent som har valgt å motta ordrevarsler en e-post om sin del av bestillingen. Vi tar ikke imot betaling \u2014 du betaler produsenten ved henting.</p>
-    <p>Via AI-assistenter samler vi ikke inn navn, e-post eller telefonnummer; bestillingen er bare knyttet til det anonyme tokenet. Oppgir du navn, e-post eller telefonnummer på nettsiden, lagres det sammen med bestillingen og slettes automatisk 30 dager etter at bestillingen er avsluttet.</p>
+    <h3>Handlekurv, bestilling og kjøpertoken</h3>
+    <p>Når du oppretter en handlekurv (via nettsiden eller MCP-verktøyene <code>lokal_cart_create</code> m.fl.) lagrer vi kurvens innhold (valgte produkter og produsenter) og et kapabilitetstoken (buyer_ref) som kreves for å styre kurven videre — en kurv er gyldig i 7 dager. Hvis du oppgir kontaktinfo ved bestilling (navn, e-post, telefon, leveringsmerknad), beholdes dette til bestillingen er endelig avgjort (levert/avvist/kansellert), og slettes deretter automatisk 30 dager senere (eller 30 dager etter innsending, hvis ingen faktisk bestilling ble opprettet). Bestillinger innebærer ingen betaling — vi belaster aldri kort — og sendes til den aktuelle produsenten; produsenter som har takket ja til ordrevarsling får e-post om bestillingen.</p>
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
-      <li>Vi bruker ingen informasjonskapsler (cookies)</li>
+      <li>Vi bruker kun essensielle informasjonskapsler (innlogging for selgere, språkvalg) — aldri annonse- eller sporingscookies</li>
       <li>Vi har ingen tredjepartssporing (ingen Google Analytics, Facebook Pixel, etc.)</li>
       <li>Vi lagrer ikke fullstendige IP-adresser \u2014 kun en forkortet hash</li>
       <li>Vi lagrer ikke passord (passwordless innlogging)</li>
@@ -3009,7 +3026,9 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
         <tr><td>Selgerprofil</td><td>Så lenge du ønsker å være registrert.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
-        <tr><td>Kontaktopplysninger i hentebestillinger</td><td>Slettes automatisk 30 dager etter at bestillingen er avsluttet.</td></tr>
+        <tr><td>MCP/A2A-verktøykall-logg</td><td>Samme automatiske retensjonsvindu som annen analytikk (60 dager som standard).</td></tr>
+        <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
+        <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
       </tbody>
     </table>
 
@@ -3031,8 +3050,8 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Admin-tilgang er beskyttet med API-nøkler i miljøvariabler</li>
       <li>Content Security Policy (CSP) og andre sikkerhetsheadere er aktive</li>
       <li>Alle databasespørringer er parameterisert (beskyttelse mot SQL-injeksjon)</li>
-      <li>IP-adresser og nettleserinfo lagres kun som hasher (ikke-reversibel anonymisering)</li>
-      <li>Rate limiting på sensitive endepunkter</li>
+      <li>IP-adresser for sidebesøk og søk lagres kun som en saltet SHA-256-hash (pseudonymisering — ikke gjenkjennelig til IP-adresse uten vår hemmelige salt-verdi, som kun finnes server-side og aldri publiseres). MCP/A2A-verktøykall lagrer i tillegg den kallende klientens fulle nettleser-/klient-streng (User-Agent) i klartekst, for å kunne vise hvilke AI-klienter som bruker tjenesten — se «MCP/A2A-verktøykall» over</li>
+      <li>Rate limiting på sensitive endepunkter, inkludert MCP-endepunktet (kvote per økt/API-nøkkel, pluss en strengere kvote for handlekurv-relaterte verktøy)</li>
     </ul>
 
     <h2>Endringer i denne policyen</h2>

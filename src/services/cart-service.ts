@@ -149,8 +149,8 @@ export function checkCartToken(
 
   const db = _cartTestDb ?? getDb();
   const cart = db.prepare(
-    "SELECT id, status, buyer_ref FROM carts WHERE id = ?"
-  ).get(cartId) as { id: string; status: string; buyer_ref: string } | undefined;
+    "SELECT id, status, buyer_ref, expires_at FROM carts WHERE id = ?"
+  ).get(cartId) as { id: string; status: string; buyer_ref: string; expires_at: string | null } | undefined;
 
   if (!cart) {
     return { ok: false, status: 404, error: "Cart not found" };
@@ -160,7 +160,25 @@ export function checkCartToken(
     return { ok: false, status: 403, error: "Invalid buyer token" };
   }
 
-  return { ok: true, cart };
+  // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+  // createCart() has always written expires_at (7 days out) but nothing
+  // ever READ it — the lokal_cart_create tool description promises "valid
+  // for 7 days" (src/routes/mcp.ts, out of scope for this PR to reword) with
+  // nothing actually enforcing that promise. Every cart mutation/read in
+  // both the REST router (marketplace-cart.ts) and the MCP tools (mcp.ts)
+  // calls checkCartToken() first, so enforcing it here makes the promise
+  // true everywhere in one place. Checked AFTER the token match above so a
+  // caller presenting the WRONG token still gets a plain "invalid token"
+  // (403), never an "expired" hint that would leak whether a given cart id
+  // exists/has expired to someone who can't prove they own it. A NULL
+  // expires_at (there are no such rows in production — createCart() always
+  // sets it — but the column is nullable and some pre-Slice-1 test fixtures
+  // omit it) is treated as "no expiry", not as already-expired.
+  if (cart.expires_at && new Date(cart.expires_at).getTime() < Date.now()) {
+    return { ok: false, status: 410, error: "Cart has expired" };
+  }
+
+  return { ok: true, cart: { id: cart.id, status: cart.status, buyer_ref: cart.buyer_ref } };
 }
 
 // ─── Add / upsert item ───────────────────────────────────────────────────────

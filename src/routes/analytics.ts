@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import path from "path";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { analyticsService, VerticalId } from "../services/analytics-service";
+import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
 import {
@@ -703,6 +703,36 @@ router.get("/pages", (req: Request, res: Response) => {
   }
 });
 
+// ─── Device classification for /devices (Enheter widget) ────────────────
+// session_id has TWO possible shapes here (2nd review round, C2 follow-up):
+//   - HUMAN traffic (current format, since the C2 privacy fix in this same
+//     branch): `${ipHash}:${bucket}:${hash}` where bucket is one of
+//     HUMAN_DEVICE_BUCKETS ('mobile'/'tablet'/'desktop') — no raw UA. The
+//     bucket is already known; it must be read literally, not re-derived.
+//   - Everything else (bots/dev-tools that keep their exact UA in
+//     session_id, PLUS any pre-migration legacy human rows still holding a
+//     raw UA): `${ipHash}:${rawUserAgentOrBotToken}` — same as before this
+//     fix, classified by substring match over that raw string.
+// Exported for direct unit coverage (more testable than driving the whole
+// route + DB for every case).
+export function deriveDeviceFromSessionId(sessionId: string): 'desktop' | 'mobile' | 'tablet' | 'unknown' {
+  const rest = sessionId.includes(':') ? sessionId.split(':').slice(1).join(':') : '';
+  const firstSegment = rest.includes(':') ? rest.slice(0, rest.indexOf(':')) : rest;
+  if ((HUMAN_DEVICE_BUCKETS as readonly string[]).includes(firstSegment)) {
+    return firstSegment as 'desktop' | 'mobile' | 'tablet';
+  }
+  const lower = rest.toLowerCase();
+  // Order matters — tablet check first because iPads include "Mobile" too.
+  if (lower.includes('ipad') || lower.includes('tablet')) {
+    return 'tablet';
+  } else if (lower.includes('mobile') || lower.includes('iphone') || lower.includes('android')) {
+    return 'mobile';
+  } else if (lower.includes('mozilla') || lower.includes('chrome') || lower.includes('safari') || lower.includes('firefox') || lower.includes('edg/')) {
+    return 'desktop';
+  }
+  return 'unknown';
+}
+
 /**
  * GET /admin/analytics/devices
  * Device type breakdown
@@ -714,10 +744,11 @@ router.get("/devices", (req: Request, res: Response) => {
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
-    // Proper device breakdown from the User-Agent embedded in session_id
-    // (format: "ipHash:userAgent"). Previously this endpoint grouped by the
-    // `source` column (direct/search/social/referral), which is *referrer*,
-    // not device — meaning Trafikkilder and Enheter showed identical data.
+    // Device breakdown derived from session_id — see deriveDeviceFromSessionId()
+    // above for the two formats it has to handle. Previously this endpoint
+    // grouped by the `source` column (direct/search/social/referral), which
+    // is *referrer*, not device — meaning Trafikkilder and Enheter showed
+    // identical data.
     //
     // Filter out bots/scanners so the Enheter widget reflects human visitors
     // only. Bot traffic has its own widget (Bot-fordeling).
@@ -746,19 +777,7 @@ router.get("/devices", (req: Request, res: Response) => {
     };
 
     for (const r of rows) {
-      const ua = r.session_id.includes(':') ? r.session_id.split(':').slice(1).join(':') : '';
-      const lower = ua.toLowerCase();
-      let device: 'desktop' | 'mobile' | 'tablet' | 'unknown';
-      // Order matters — tablet check first because iPads include "Mobile" too.
-      if (lower.includes('ipad') || lower.includes('tablet')) {
-        device = 'tablet';
-      } else if (lower.includes('mobile') || lower.includes('iphone') || lower.includes('android')) {
-        device = 'mobile';
-      } else if (lower.includes('mozilla') || lower.includes('chrome') || lower.includes('safari') || lower.includes('firefox') || lower.includes('edg/')) {
-        device = 'desktop';
-      } else {
-        device = 'unknown';
-      }
+      const device = deriveDeviceFromSessionId(r.session_id);
       buckets[device].count += r.count;
       buckets[device].visitors += 1;
     }

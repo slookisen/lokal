@@ -429,6 +429,41 @@ export function isAnalyticsRollupReadEnabled(): boolean {
 }
 
 /**
+ * dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+ * analytics_mcp_calls (MCP/A2A/agent-card usage logging — database/init.ts,
+ * filled by services/mcp-usage-logger.ts) had NO retention/pruning at all —
+ * the /personvern page now promises the same automatic retention window as
+ * analytics_page_views (see seo.ts's "MCP/A2A tool-call log" row), so this
+ * makes that literally true. Plain COUNT-then-DELETE, no rollup step —
+ * mirrors pruneRunLedger's own delete-only shape below rather than the
+ * rollup-then-delete shape rollupAndPrunePageViews/etc use above, since no
+ * rollup destination exists for this table (this ledger's own aggregate
+ * view, "which tools/who calls us", already lives separately in
+ * consumer_usage_ledger for keyed callers — unaffected by this prune).
+ */
+export function pruneAnalyticsMcpCalls(
+  daysToKeep: number = 60,
+  dryRun: boolean = false
+): { rowsDeleted: number } {
+  const db = getDb();
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - daysToKeep);
+  const cutoffStr = cutoff.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+
+  const toDelete = (db.prepare(
+    "SELECT COUNT(*) as c FROM analytics_mcp_calls WHERE created_at < ?"
+  ).get(cutoffStr) as { c: number }).c;
+
+  if (toDelete === 0) return { rowsDeleted: 0 };
+
+  if (!dryRun) {
+    db.prepare("DELETE FROM analytics_mcp_calls WHERE created_at < ?").run(cutoffStr);
+  }
+
+  return { rowsDeleted: dryRun ? 0 : toDelete };
+}
+
+/**
  * Summarize run-ledger rows older than keepDays into runs_daily_summary,
  * then DELETE the raw run rows.
  * SAFETY: summary INSERT runs BEFORE DELETE in a transaction.
