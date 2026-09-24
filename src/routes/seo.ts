@@ -5317,8 +5317,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // Clean price to numeric: "kr 275/kg" → "275", "kr 350" → "350"
         const numericPrice = (priceValue || "").replace(/[^0-9.,]/g, "").replace(",", ".").split("/")[0];
 
-        // Google REQUIRES price — skip products without one (they cause validation errors)
-        if (!numericPrice || isNaN(parseFloat(numericPrice))) return null;
+        // dev-request 2026-09-24-ai-sok-bli-svaret-rfb slice B1: a product
+        // without a parseable price still gets a makesOffer entry — `price`
+        // is only ever included when a real numeric price was found (never
+        // invented), so we track that separately instead of skipping.
+        const hasPrice = !!numericPrice && !isNaN(parseFloat(numericPrice));
 
         const product: any = {
           "@type": "Product",
@@ -5332,7 +5335,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           },
           "offers": {
             "@type": "Offer",
-            "price": parseFloat(numericPrice),
+            ...(hasPrice ? { "price": parseFloat(numericPrice) } : {}),
             "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
             "seller": { "@type": "LocalBusiness", "name": agent.name },
@@ -5384,7 +5387,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         return {
           "@type": "Offer",
           "itemOffered": product,
-          "price": parseFloat(numericPrice),
+          ...(hasPrice ? { "price": parseFloat(numericPrice) } : {}),
           "priceCurrency": "NOK",
           "availability": "https://schema.org/InStock",
         };

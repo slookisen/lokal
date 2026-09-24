@@ -45289,3 +45289,24 @@ runSerial(async () => {
     failures.push("retention-mcp-calls-prune: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B1: seo.ts's
+// jsonLd.makesOffer builder no longer drops products without a parseable
+// numeric price — every named product gets an Offer, `price` is included
+// only when a real numeric price was found. Own in-memory DB — tail
+// position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B1: makesOffer price optional ──");
+  try {
+    const { runMakesOfferPriceOptionalTests } = require("../src/routes/rfb-makesoffer-price-optional.test") as
+      typeof import("../src/routes/rfb-makesoffer-price-optional.test");
+    const mop = await runMakesOfferPriceOptionalTests({ log: false });
+    passed += mop.passed;
+    failed += mop.failed;
+    for (const f of mop.failures) failures.push("rfb-makesoffer-price-optional: " + f);
+    console.log(`  rfb-makesoffer-price-optional: ${mop.passed} passed, ${mop.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-makesoffer-price-optional: unexpected error: " + String(err?.message || err));
+  }
+});
