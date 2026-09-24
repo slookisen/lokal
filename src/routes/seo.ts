@@ -2811,7 +2811,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>For human visitors, a coarse device category (mobile / tablet / desktop) \u2014 never your full, raw browser string. Automated tools and crawlers (e.g. GPTBot, Googlebot) are instead identified by their own self-declared, non-personal client name, so we can see which bots and AI crawlers visit the site</li>
       <li>Timestamp of the visit</li>
     </ul>
-    <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and a cookie that remembers your chosen language when you switch it (expires after 1 year). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
+    <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and one or two cookies that remember your language choice — a cookie set when you use the language switcher (expires after 1 year), and a session-only cookie the server may set when you follow a language-specific link (cleared when you close your browser). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
 
     <h3>Search and AI queries</h3>
     <p>When you search for producers \u2014 via the website, ChatGPT, Claude MCP or the API \u2014 we store:</p>
@@ -2945,7 +2945,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>For besøkende mennesker en grov enhetskategori (mobil / nettbrett / PC) \u2014 aldri din fullstendige, rå nettleser-streng. Automatiserte verktøy og roboter (f.eks. GPTBot, Googlebot) identifiseres i stedet med sitt eget selvangitte, ikke-personlige klientnavn, slik at vi kan se hvilke roboter og AI-crawlere som besøker siden</li>
       <li>Tidspunkt for besøket</li>
     </ul>
-    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og en cookie som husker språkvalget ditt når du bytter (utløper etter 1 år). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
+    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
     <h3>Søk og AI-spørringer</h3>
     <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>

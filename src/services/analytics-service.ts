@@ -169,7 +169,16 @@ function hashUserAgent(ua: string): string {
 // browsers behind the same IP (e.g. two people on one Wi-Fi, or one
 // person's phone vs laptop) still get different session_ids even though
 // they share a coarse device bucket — while never storing either raw UA.
-function humanDeviceBucket(userAgent: string): string {
+//
+// Exported (2nd review round, C2 follow-up) so read-side consumers can
+// recognize the new bucketed format instead of re-deriving device type from
+// UA substring matching against session_id — which breaks for human traffic
+// now that session_id holds a bucket token, not a raw UA. Currently used by
+// routes/analytics.ts's GET /admin/analytics/devices.
+export const HUMAN_DEVICE_BUCKETS = ["mobile", "tablet", "desktop"] as const;
+export type HumanDeviceBucket = (typeof HUMAN_DEVICE_BUCKETS)[number];
+
+function humanDeviceBucket(userAgent: string): HumanDeviceBucket {
   const ua = userAgent || "";
   if (/Tablet|iPad/i.test(ua)) return "tablet";
   if (/Mobile|iPhone|Android/i.test(ua)) return "mobile";

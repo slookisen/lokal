@@ -41669,6 +41669,28 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // Runs in the runSerial() chain, right after analytics-adminkey.test.ts,
+  // i.e. post-barrier/sequential — same exemption reasoning as crm.test.ts
+  // and analytics-adminkey.test.ts above: it varies process.env.ADMIN_KEY
+  // itself (own restore-in-finally), which is only safe here because
+  // nothing else reads that env var concurrently at this point in the run.
+  console.log("\n── 2nd review round, C2 follow-up (dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet): GET /admin/analytics/devices device classification ──");
+  try {
+    const { runAnalyticsDevicesTests } = require("../src/routes/analytics-devices.test") as
+      typeof import("../src/routes/analytics-devices.test");
+    const adt = await runAnalyticsDevicesTests({ log: false });
+    passed += adt.passed;
+    failed += adt.failed;
+    for (const f of adt.failures) failures.push("analytics-devices: " + f);
+    console.log(`  analytics-devices: ${adt.passed} passed, ${adt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-devices: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ analytics-devices: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
   try {
     const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as
