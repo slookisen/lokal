@@ -32,6 +32,7 @@ import adminOrdersRoutes from "./routes/admin-orders";
 import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
+import { mcpIpEmergencyBrakeLimiter, mcpPrimaryLimiter, mcpCartToolLimiter } from "./middleware/mcp-rate-limit";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
@@ -499,7 +500,19 @@ app.use("/api/marketplace", cartRouter);
 app.use("/produsent/ordre", producerOrderRouter);
 app.use("/api/tannlege", dentalRoutes);
 app.use("/api/opplevelser", opplevelserRoutes);
-app.use("/mcp", mcpUsageLogger("mcp", "rfb"), mcpRoutes);
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C1: RFB's
+// /mcp had no limiter at all (unlike dentalLimiter/jsonRpcLimiter/
+// generalLimiter on its siblings) — see middleware/mcp-rate-limit.ts's file
+// header for the full three-limiter design (IP emergency brake, per-
+// session/key primary quota, stricter cart-tool quota).
+app.use(
+  "/mcp",
+  mcpIpEmergencyBrakeLimiter,
+  mcpPrimaryLimiter,
+  mcpCartToolLimiter,
+  mcpUsageLogger("mcp", "rfb"),
+  mcpRoutes
+);
 app.use("/a2a", mcpUsageLogger("a2a", "rfb"));
 app.use("/", a2aRoutes);
 
