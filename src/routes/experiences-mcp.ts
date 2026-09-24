@@ -131,6 +131,7 @@ import {
   weekdayMismatchPayload,
 } from "../services/gardssalg-booking-resolve";
 
+import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 
@@ -202,13 +203,16 @@ export const DiscoverExperiencesInputSchema = {
     "Norwegian municipality (kommune). Examples: 'Tromsø', 'Bergen', 'Stavanger'"
   ),
   category: z.string().optional().describe(
-    "Experience category slug. Examples: 'natur_friluft', 'dyreliv_safari', 'mat_drikke', 'vinter'"
+    "Experience category slug — one of: 'kultur_historie' (culture/history, museums), 'natur_friluft' (nature/outdoors), " +
+    "'adrenalin_action', 'sightseeing_transport' (sightseeing, cruises, cable cars), 'overnatting_opplevelse' (stays), " +
+    "'dyreliv_safari' (wildlife, whale/moose safaris, dog sledding), 'vinter_sno' (winter & snow), 'mat_drikke' (food & drink), " +
+    "'velvaere_spa' (wellness/spa). Call list_experience_categories for live counts."
   ),
   weather: z.enum(["rain", "snow", "clear", "any"]).optional().describe(
     "Weather suitability filter. 'rain'/'snow' prefers indoor + weather-independent experiences. Examples: 'rain', 'clear'"
   ),
   season: z.string().optional().describe(
-    "Season filter. Examples: 'summer', 'winter', 'spring', 'autumn'"
+    "Season filter: 'summer', 'winter', 'spring' or 'autumn' (the Norwegian words sommer/vinter/vår/høst work too). Year-round experiences are always included."
   ),
   indoor_outdoor: z.enum(["indoor", "outdoor", "both"]).optional().describe(
     "Indoor/outdoor preference. Examples: 'indoor', 'outdoor', 'both'"
@@ -244,6 +248,29 @@ export const DiscoverExperiencesInputSchema = {
     "Max results (default 20, max 50)"
   ),
 };
+
+// ChatGPT app review 2026-09-24: this tool's own description used to offer
+// 'vinter' as a category example — not a slug that exists (the real one is
+// 'vinter_sno'), so a model copying it got the category silently relaxed
+// away. The description now lists the real slugs; this maps the obvious
+// plain-word guesses (Norwegian or English) onto them. Real slugs and unknown
+// values pass through untouched.
+const CATEGORY_ALIASES: Record<string, string> = {
+  kultur: "kultur_historie", historie: "kultur_historie", culture: "kultur_historie", history: "kultur_historie", museum: "kultur_historie",
+  natur: "natur_friluft", friluft: "natur_friluft", nature: "natur_friluft", outdoors: "natur_friluft", outdoor: "natur_friluft",
+  adrenalin: "adrenalin_action", action: "adrenalin_action", adventure: "adrenalin_action",
+  sightseeing: "sightseeing_transport",
+  overnatting: "overnatting_opplevelse", accommodation: "overnatting_opplevelse", stay: "overnatting_opplevelse", stays: "overnatting_opplevelse",
+  dyreliv: "dyreliv_safari", safari: "dyreliv_safari", wildlife: "dyreliv_safari", animals: "dyreliv_safari",
+  vinter: "vinter_sno", winter: "vinter_sno", "snø": "vinter_sno", snow: "vinter_sno",
+  mat: "mat_drikke", drikke: "mat_drikke", food: "mat_drikke", "food_drink": "mat_drikke",
+  "velvære": "velvaere_spa", velvaere: "velvaere_spa", spa: "velvaere_spa", wellness: "velvaere_spa",
+};
+
+export function normalizeExperienceCategory(category: string): string {
+  const key = category.trim().toLowerCase();
+  return CATEGORY_ALIASES[key] ?? category.trim();
+}
 
 export const ListExperienceCategoriesInputSchema = {};
 
@@ -355,90 +382,6 @@ export const BookGardssalgInputSchema = {
   ),
 };
 
-// ─── OpenAI Apps SDK UI components (MCP resources) ──────────
-// These HTML resources are served via resources/list + resources/read so
-// ChatGPT can render inline cards when a tool result references the template.
-// Content is fully self-contained (no external CDN) per spec.
-
-const EXPERIENCES_LIST_HTML = `<!DOCTYPE html>
-<html lang="no">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Opplevagent — Opplevelser</title>
-<style>
-  body { font-family: system-ui, sans-serif; margin: 0; padding: 8px; background: #fff; }
-  .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
-  .card:hover { background: #f9fafb; }
-  .card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: #111; }
-  .card p { margin: 0; font-size: 12px; color: #6b7280; }
-  .badge { display: inline-block; background: #f3f4f6; border-radius: 4px; padding: 2px 6px; font-size: 11px; margin-right: 4px; }
-</style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-(async () => {
-  const data = await window.openai?.getToolOutput?.() || {};
-  const results = data.results || data.experiences || [];
-  const root = document.getElementById('root');
-  if (!results.length) { root.innerHTML = '<p>Ingen opplevelser funnet.</p>'; return; }
-  root.innerHTML = results.map(e => \`
-    <div class="card" onclick="window.openai?.sendMessage?.('Vis detaljer for \${e.title}')">
-      <h3>\${e.title}</h3>
-      <p>
-        <span class="badge">\${e.category || ''}</span>
-        <span class="badge">\${e.fylke || e.kommune || ''}</span>
-        \${e.price_from ? \`<span class="badge">fra \${e.price_from} kr</span>\` : ''}
-        \${e.duration_min ? \`<span class="badge">\${e.duration_min} min</span>\` : ''}
-      </p>
-      <p><a href="https://opplevagent.no/opplevelse/\${e.slug}" target="_blank" rel="noopener">Les mer ↗</a></p>
-    </div>
-  \`).join('');
-})();
-</script>
-</body>
-</html>`;
-
-const EXPERIENCE_DETAIL_HTML = `<!DOCTYPE html>
-<html lang="no">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Opplevagent — Detaljer</title>
-<style>
-  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; background: #fff; }
-  h2 { margin: 0 0 8px; font-size: 16px; color: #111; }
-  p { margin: 0 0 6px; font-size: 13px; color: #374151; }
-  .meta { font-size: 12px; color: #6b7280; margin-bottom: 8px; }
-  .badge { display: inline-block; background: #f3f4f6; border-radius: 4px; padding: 2px 6px; font-size: 11px; margin-right: 4px; }
-  a.cta { display: inline-block; margin-top: 8px; padding: 8px 16px; background: #059669; color: #fff; border-radius: 6px; text-decoration: none; font-size: 13px; }
-</style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-(async () => {
-  const e = await window.openai?.getToolOutput?.() || {};
-  const root = document.getElementById('root');
-  root.innerHTML = \`
-    <h2>\${e.title || 'Opplevelse'}</h2>
-    <div class="meta">
-      <span class="badge">\${e.category || ''}</span>
-      <span class="badge">\${e.fylke || ''}</span>
-      \${e.indoor_outdoor ? \`<span class="badge">\${e.indoor_outdoor}</span>\` : ''}
-      \${e.price_from ? \`<span class="badge">fra \${e.price_from} kr</span>\` : ''}
-      \${e.duration_min ? \`<span class="badge">\${e.duration_min} min</span>\` : ''}
-    </div>
-    <p>\${e.description || ''}</p>
-    \${e.booking_url ? \`<a class="cta" href="\${e.booking_url}" target="_blank" rel="noopener">Book nå ↗</a>\` : ''}
-    <br><a href="https://opplevagent.no/opplevelse/\${e.slug || ''}" target="_blank" rel="noopener" style="font-size:12px;color:#6b7280;">Se på opplevagent.no ↗</a>
-  \`;
-})();
-</script>
-</body>
-</html>`;
-
 // ─── Tool registrations ──────────────────────────────────────
 
 // Uniform JSON-in-text tool result for book_gardssalg's honest non-success
@@ -451,6 +394,48 @@ function jsonToolResult(payload: Record<string, unknown>, isError = false) {
     content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
     ...(isError ? { isError: true as const } : {}),
   };
+}
+
+// ChatGPT app review 2026-09-24. The widget resources follow the MCP Apps
+// standard ChatGPT implements: MIME type `text/html;profile=mcp-app`, tools
+// point at them with `_meta.ui.resourceUri` (plus the ChatGPT alias
+// `openai/outputTemplate`), and each resource declares its CSP and the
+// dedicated `ui.domain` a submission with UI must carry. The templates load
+// nothing from the network (inline CSS/JS), so both CSP allow-lists are
+// empty; opplevagent.no is listed as the one trusted openExternal target.
+export const WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
+export const WIDGET_DOMAIN = "https://opplevagent.no";
+
+function registerWidgetResource(
+  server: McpServer,
+  name: string,
+  uri: string,
+  html: string,
+  widgetDescription: string,
+): void {
+  const meta = {
+    ui: {
+      prefersBorder: true,
+      domain: WIDGET_DOMAIN,
+      csp: { connectDomains: [] as string[], resourceDomains: [] as string[] },
+    },
+    "openai/widgetDescription": widgetDescription,
+    "openai/widgetPrefersBorder": true,
+    "openai/widgetDomain": WIDGET_DOMAIN,
+    "openai/widgetCSP": {
+      connect_domains: [] as string[],
+      resource_domains: [] as string[],
+      redirect_domains: [WIDGET_DOMAIN],
+    },
+  };
+  server.registerResource(
+    name,
+    uri,
+    { title: "Opplevagent", description: widgetDescription, mimeType: WIDGET_MIME_TYPE, _meta: meta },
+    async () => ({
+      contents: [{ uri, mimeType: WIDGET_MIME_TYPE, text: html, _meta: meta }],
+    }),
+  );
 }
 
 function registerExperienceTools(
@@ -481,10 +466,18 @@ function registerExperienceTools(
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        // Closed world: reads only Opplevagent's own catalogue database and
+        // calls no outside service. Returning a provider's URL is not
+        // "interacting" with that provider. (ChatGPT app review 2026-09-24:
+        // this used to be true with a "results link out" justification — the
+        // same kind of read-only DB lookup as list_experience_categories.)
+        openWorldHint: false,
       },
       _meta: {
+        ui: { resourceUri: "ui://opplevagent/experiences-list" },
         "openai/outputTemplate": "ui://opplevagent/experiences-list",
+        "openai/toolInvocation/invoking": "Searching experiences…",
+        "openai/toolInvocation/invoked": "Found experiences",
       },
     },
     async ({ fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }) => {
@@ -492,7 +485,7 @@ function registerExperienceTools(
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
         if (kommune) filter.kommune = kommune;
-        if (category) filter.category = category;
+        if (category) filter.category = normalizeExperienceCategory(category);
         if (weather) filter.weather = weather;
         if (season) filter.season = season;
         if (indoor_outdoor) filter.indoor_outdoor = indoor_outdoor;
@@ -563,7 +556,11 @@ function registerExperienceTools(
           });
         } catch { /* fail-open: never affects the tool result */ }
 
+        // structuredContent is what the experiences-list widget reads
+        // (window.openai.toolOutput); the text block keeps the same JSON for
+        // MCP clients without widget support.
         return {
+          structuredContent: result,
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (err: any) {
@@ -645,41 +642,23 @@ function registerExperienceTools(
   // ─── OpenAI Apps SDK resources ──────────────────────────────
   // resources/list returns these two; resources/read returns the HTML content.
   // ChatGPT uses these as output templates referenced by tools via _meta.
-
-  server.resource(
+  // ChatGPT app review 2026-09-24: served as MCP Apps resources (see
+  // registerWidgetResource above) — plain `text/html` is not rendered as a
+  // component. The templates themselves live in opplevagent-widgets.ts; see
+  // its header for the toolOutput fix.
+  registerWidgetResource(
+    server,
     "experiences-list",
     "ui://opplevagent/experiences-list",
-    {
-      description: "ChatGPT inline card list for discover_experiences results — renders each experience as a clickable card with title, category, location, price, and duration.",
-      mimeType: "text/html",
-    },
-    async () => ({
-      contents: [
-        {
-          uri: "ui://opplevagent/experiences-list",
-          text: EXPERIENCES_LIST_HTML,
-          mimeType: "text/html",
-        },
-      ],
-    })
+    EXPERIENCES_LIST_HTML,
+    "Cards for the experiences the assistant just found, each with a Details button and a link to opplevagent.no. The assistant should summarise the results briefly rather than repeat every card.",
   );
-
-  server.resource(
+  registerWidgetResource(
+    server,
     "experience-detail",
     "ui://opplevagent/experience-detail",
-    {
-      description: "ChatGPT inline card for get_experience results — renders full details for a single experience with title, meta badges, description, and a booking CTA.",
-      mimeType: "text/html",
-    },
-    async () => ({
-      contents: [
-        {
-          uri: "ui://opplevagent/experience-detail",
-          text: EXPERIENCE_DETAIL_HTML,
-          mimeType: "text/html",
-        },
-      ],
-    })
+    EXPERIENCE_DETAIL_HTML,
+    "A detail card for one experience: category, place, price, duration, season, description and links to the provider and opplevagent.no.",
   );
 
   // Tool 3: get_experience
@@ -701,10 +680,18 @@ function registerExperienceTools(
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        // Closed world: reads only Opplevagent's own catalogue database and
+        // calls no outside service. Returning a provider's URL is not
+        // "interacting" with that provider. (ChatGPT app review 2026-09-24:
+        // this used to be true with a "results link out" justification — the
+        // same kind of read-only DB lookup as list_experience_categories.)
+        openWorldHint: false,
       },
       _meta: {
+        ui: { resourceUri: "ui://opplevagent/experience-detail" },
         "openai/outputTemplate": "ui://opplevagent/experience-detail",
+        "openai/toolInvocation/invoking": "Loading experience…",
+        "openai/toolInvocation/invoked": "Loaded experience",
       },
     },
     async ({ id }) => {
@@ -763,7 +750,9 @@ function registerExperienceTools(
           });
         } catch { /* fail-open: never affects the tool result */ }
 
+        // structuredContent feeds the experience-detail widget; see discover_experiences.
         return {
+          structuredContent: result,
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (err: any) {
@@ -811,7 +800,12 @@ function registerExperienceTools(
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        // Closed world: reads only Opplevagent's own catalogue database and
+        // calls no outside service. Returning a provider's URL is not
+        // "interacting" with that provider. (ChatGPT app review 2026-09-24:
+        // this used to be true with a "results link out" justification — the
+        // same kind of read-only DB lookup as list_experience_categories.)
+        openWorldHint: false,
       },
     },
     async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }) => {
@@ -955,7 +949,12 @@ function registerExperienceTools(
       annotations: {
         title: "Request a gårdssalg booking",
         readOnlyHint: false,
-        destructiveHint: false,
+        // Destructive: the request itself is only a pending row, but the call
+        // e-mails the producer and the guest, and a sent e-mail cannot be
+        // recalled — OpenAI's rule for "sending messages … you can't undo".
+        // Same rule as lokal_cart_submit. (ChatGPT app review 2026-09-24:
+        // false in v1.0.0.)
+        destructiveHint: true,
         idempotentHint: false,
         // openWorldHint is TRUE because submitting reaches third parties outside
         // this app: the producer is notified and the guest receives a

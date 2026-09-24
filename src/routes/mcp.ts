@@ -268,8 +268,13 @@ export function registerTools(
         title: "Search local food producers",
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: false,
+        idempotentHint: true,
+        // Open world: when the query names a place that is not in the built-in
+        // city list or our own producer table, geocodingService looks it up in
+        // Kartverket's public place-name API (ws.geonorge.no) — a read-only call
+        // to the public internet, which OpenAI's definition counts as open-world
+        // (ChatGPT app review 2026-09-24; it was declared false in v1.0.1).
+        openWorldHint: true,
       },
     },
     async ({ query, lat, lng, radius_km, limit }) => {
@@ -423,7 +428,10 @@ export function registerTools(
         title: "Discover producers by filter",
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: false,
+        // Read-only, so repeating a call changes nothing; closed world: it
+        // filters our own producer table by the given coordinates and never
+        // geocodes a place name.
+        idempotentHint: true,
         openWorldHint: false,
       },
     },
@@ -879,7 +887,11 @@ export function registerTools(
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false,
+        // Open world: names not in the built-in list or our producer table are
+        // resolved through Kartverket's public place-name API (see
+        // lokal_search above). Declared false in v1.0.1 while the description
+        // already said "via Kartverket Stedsnavn API fallback".
+        openWorldHint: true,
       },
     },
     async ({ place }) => {
@@ -926,8 +938,10 @@ export function registerTools(
         title: "Find offers for shopping-list items",
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: false,
+        idempotentHint: true,
+        // Open world: `near` is geocoded, which can reach Kartverket's public
+        // place-name API (see lokal_search above).
+        openWorldHint: true,
       },
     },
     async ({ items, near, lat, lng, radius_km }) => {
@@ -961,7 +975,8 @@ export function registerTools(
 
   // ─── Cart tools (Phase 1) ────────────────────────────────────
   // Tools 10-14: shopping cart ("handleliste") for local food pickup orders.
-  // No payment. No seller notification. Anonymous buyer (buyer_ref token).
+  // No payment. Anonymous buyer (buyer_ref token). Submitting e-mails the
+  // producers who opted in to order notifications (see lokal_cart_submit).
 
   // Tool 10: Create a cart
   server.registerTool(
@@ -1010,8 +1025,13 @@ export function registerTools(
       annotations: {
         title: "Add cart item",
         readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
+        // Destructive: re-adding a product already in the cart REPLACES that
+        // line's quantity and note (upsert, see cart-service.addCartItem) — it
+        // overwrites what the user set before. Idempotent for the same reason:
+        // the same call twice leaves the same cart. (ChatGPT app review
+        // 2026-09-24: both were false in v1.0.1.)
+        destructiveHint: true,
+        idempotentHint: true,
         openWorldHint: false,
       },
     },
@@ -1078,12 +1098,18 @@ export function registerTools(
       annotations: {
         title: "Submit cart",
         readOnlyHint: false,
-        destructiveHint: false,
+        // Destructive: submitting cannot be undone from the buyer's side — the
+        // cart is closed for editing and each opted-in producer is e-mailed
+        // about their order, and a sent e-mail cannot be recalled. OpenAI's
+        // rule: "sending messages or transactions you can't undo" → true.
+        // (ChatGPT app review 2026-09-24: false in v1.0.1.)
+        destructiveHint: true,
         idempotentHint: false,
         // openWorldHint is TRUE because submitting reaches a third party outside
         // this app: sellers who opted in to order notifications are emailed about
-        // their own order (order-notify-service). Every other tool stays false —
-        // they only read or write Rett fra Bonden's own records.
+        // their own order (order-notify-service). The only other open-world
+        // tools are the three that can query Kartverket's public place-name API
+        // (lokal_search, lokal_geocode, lokal_find_offers).
         openWorldHint: true,
       },
     },

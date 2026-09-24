@@ -15484,13 +15484,16 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
     "pr-76: lokal_geocode description mentions 'Norwegian place name'"
   );
 
-  // (4) HTTP-MCP server: tool annotations are read-only + idempotent + closed-world
+  // (4) HTTP-MCP server: tool annotations are read-only + idempotent + open-world.
+  // ChatGPT app review 2026-09-24: open-world, because names outside the
+  // built-in list are resolved through Kartverket's public API (the full
+  // annotation table is pinned in src/routes/rfb-chatgpt-annotations.test.ts).
   assertTrue(
     !!toolBlockMatch &&
       /readOnlyHint:\s*true/.test(toolBlockMatch[0]) &&
       /idempotentHint:\s*true/.test(toolBlockMatch[0]) &&
-      /openWorldHint:\s*false/.test(toolBlockMatch[0]),
-    "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:false"
+      /openWorldHint:\s*true/.test(toolBlockMatch[0]),
+    "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:true"
   );
 
   // (5) Stdio MCP server: lokal_geocode mirrored
@@ -45184,5 +45187,42 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-phone-context-gate-retro-scan: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ChatGPT app review 2026-09-24 (RFB v1.0.1 rejected on tool annotations,
+// Opplevagent v1.0.0 rejected on test cases). Pins both apps' full
+// annotation tables, the Opplevagent widget bridge + structuredContent, and
+// the season/category filter fixes. The Opplevagent suite owns its own
+// in-memory experiences DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── ChatGPT app review 2026-09-24: RFB tool annotation table ──");
+  try {
+    const { runRfbChatgptAnnotationsTests } = require("../src/routes/rfb-chatgpt-annotations.test") as
+      typeof import("../src/routes/rfb-chatgpt-annotations.test");
+    const rca = runRfbChatgptAnnotationsTests({ log: false });
+    passed += rca.passed;
+    failed += rca.failed;
+    for (const f of rca.failures) failures.push("rfb-chatgpt-annotations: " + f);
+    console.log(`  rfb-chatgpt-annotations: ${rca.passed} passed, ${rca.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-chatgpt-annotations: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── ChatGPT app review 2026-09-24: Opplevagent widgets, annotations, season filter ──");
+  try {
+    const { runOpplevagentChatgptReviewTests } = require("../src/routes/opplevagent-chatgpt-review.test") as
+      typeof import("../src/routes/opplevagent-chatgpt-review.test");
+    const ocr = await runOpplevagentChatgptReviewTests({ log: false });
+    passed += ocr.passed;
+    failed += ocr.failed;
+    for (const f of ocr.failures) failures.push("opplevagent-chatgpt-review: " + f);
+    console.log(`  opplevagent-chatgpt-review: ${ocr.passed} passed, ${ocr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevagent-chatgpt-review: unexpected error: " + String(err?.message || err));
   }
 });

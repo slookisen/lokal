@@ -1,39 +1,34 @@
 // Regenerates the MCP Apps catalog submission screenshots in this directory.
-// Extracts EXPERIENCES_LIST_HTML / EXPERIENCE_DETAIL_HTML directly from
-// src/routes/experiences-mcp.ts (source of truth) so the screenshots can never
-// drift from the live card markup — no copy of the template is committed here.
+// Loads EXPERIENCES_LIST_HTML / EXPERIENCE_DETAIL_HTML from
+// src/routes/opplevagent-widgets.ts (source of truth, via tsx) so the
+// screenshots can never drift from the live card markup — no copy of the
+// template is committed here.
+//
+// The mock host sets ONLY what ChatGPT really provides: window.openai.toolOutput
+// (the tool result's structuredContent) plus theme/locale. Until 2026-09-24 this
+// script mocked a `getToolOutput()` function that ChatGPT never had, which is
+// why the screenshots looked right while the real cards were empty
+// (ChatGPT app review 2026-09-24; see opplevagent-widgets.ts).
 //
 // Usage: NODE_PATH=<path to playwright's install> node generate-screenshots.js
 const { chromium } = require('playwright');
-const fs = require('fs');
+const { execFileSync } = require('child_process');
 const path = require('path');
 
 const DIR = __dirname;
-const SRC = path.join(DIR, '..', '..', 'src', 'routes', 'experiences-mcp.ts');
+const ROOT = path.join(DIR, '..', '..');
 
-function extractTemplate(constName) {
-  const src = fs.readFileSync(SRC, 'utf8');
-  const start = src.indexOf(`const ${constName} = \``);
-  if (start === -1) throw new Error(`${constName} not found in ${SRC}`);
-  const bodyStart = start + `const ${constName} = \``.length;
-  // Find the first UNESCAPED closing backtick — a naive indexOf("`;") stops
-  // early at the nested template literal's own escaped closing backtick.
-  let end = bodyStart;
-  for (;;) {
-    end = src.indexOf('`;', end);
-    if (end === -1) throw new Error(`unterminated template for ${constName}`);
-    if (src[end - 1] !== '\\') break;
-    end += 1;
-  }
-  const raw = src.slice(bodyStart, end);
-  // Nested template-literal syntax (\` and \$) is escaped in the source so it
-  // survives being embedded in the OUTER template literal; unescape it back
-  // to plain, directly-runnable browser HTML/JS.
-  return raw.replace(/\\`/g, '`').replace(/\\\$/g, '$');
+function loadTemplates() {
+  const out = execFileSync(
+    path.join(ROOT, 'node_modules', '.bin', 'tsx'),
+    ['-e', "const w = require('./src/routes/opplevagent-widgets'); process.stdout.write(JSON.stringify({ list: w.EXPERIENCES_LIST_HTML, detail: w.EXPERIENCE_DETAIL_HTML }));"],
+    { cwd: ROOT, encoding: 'utf8' },
+  );
+  return JSON.parse(out);
 }
 
 function mockPage(html, dataObj) {
-  const inject = `<script>window.openai = { getToolOutput: async () => (${JSON.stringify(dataObj)}), sendMessage: () => {} };</script>`;
+  const inject = `<script>window.openai = { toolOutput: ${JSON.stringify(dataObj)}, theme: "light", locale: "nb-NO", openExternal: () => {}, sendFollowUpMessage: () => {} };</script>`;
   return html.replace('<script>', inject + '\n<script>');
 }
 
@@ -69,7 +64,7 @@ async function shoot(browser, html, { name, data, width, scale, testWidths }) {
 // `.../opplevelse/undefined` on every real list card). This mock's `slug` fields
 // are honest again: they match the real, now-fixed response shape.
 const listDataTroms = {
-  results: [
+  experiences: [
     { title: "Arctic Explorer — Northern Lights Cruise from Tromsø", slug: "arctic-explorer-northern-lights-cruise-from-tromso--72cad3eb", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: 800, duration_min: 180 },
     { title: "Aurora Safari Camp — Fjord Tours Tromsø", slug: "aurora-safari-camp-fjord-tours-tromso--f09aea75", category: "natur_friluft", fylke: "Troms", kommune: "Tromsø", price_from: 1490, duration_min: null },
     { title: "Fjellheisen — Tromsø Cable Car & Arctic Panorama", slug: "fjellheisen-tromso-cable-car-arctic-panorama--3a5c1e02", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: null, duration_min: null },
@@ -80,22 +75,22 @@ const listDataTroms = {
 
 const detailDataArctic = {
   title: "Arctic Explorer — Northern Lights Cruise from Tromsø",
-  category: "sightseeing_transport", fylke: "Troms", indoor_outdoor: "outdoor",
-  price_from: 800, duration_min: 180, description: null,
+  category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+  season: ["autumn", "winter", "spring"], price_from: 800, duration_min: 180, description: null,
   booking_url: "https://arcticexplorer.no",
   slug: "arctic-explorer-northern-lights-cruise-from-tromso--72cad3eb",
 };
 
 const detailDataAurora = {
   title: "Aurora Safari Camp — Fjord Tours Tromsø",
-  category: "natur_friluft", fylke: "Troms", indoor_outdoor: "outdoor",
-  price_from: 1490, duration_min: null, description: null,
+  category: "natur_friluft", fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+  season: ["host", "vinter"], price_from: 1490, duration_min: null, description: null,
   booking_url: "https://www.visitnorway.com/listings/aurora-safari-camp-in-tromso/",
   slug: "aurora-safari-camp-fjord-tours-tromso--f09aea75",
 };
 
 const listDataMixed = {
-  results: [
+  experiences: [
     { title: "Alta Museum — UNESCO World Heritage Rock Art Centre", slug: "alta-museum-unesco-world-heritage-rock-art-centre--1b6e4d3a", category: "kultur_historie", fylke: "Finnmark", kommune: "Alta", price_from: null, duration_min: 90 },
     { title: "Aquarama Spa — Southern Norway's Largest Spa Centre in Kristiansand", slug: "aquarama-spa-southern-norways-largest-spa-centre-in-kristiansand--e7c2f905", category: "velvaere_spa", fylke: "Agder", kommune: "Kristiansand", price_from: null, duration_min: 120 },
     { title: "Alpine Skiing at Hafjell — Family Ski Paradise", slug: "alpine-skiing-at-hafjell-family-ski-paradise--5a09b1c4", category: "vinter_sno", fylke: "Innlandet", kommune: "Øyer", price_from: null, duration_min: null },
@@ -104,8 +99,7 @@ const listDataMixed = {
 };
 
 (async () => {
-  const listHtml = extractTemplate('EXPERIENCES_LIST_HTML');
-  const detailHtml = extractTemplate('EXPERIENCE_DETAIL_HTML');
+  const { list: listHtml, detail: detailHtml } = loadTemplates();
   const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined });
   await shoot(browser, listHtml, { name: '01-experiences-list-troms.png', data: listDataTroms, width: 420, scale: 3, testWidths: [320] });
   await shoot(browser, detailHtml, { name: '02-experience-detail-arctic-explorer.png', data: detailDataArctic, width: 420, scale: 3, testWidths: [320] });

@@ -2963,6 +2963,10 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Samtaler mellom agenter</h3>
     <p>${brand} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
 
+    <h3>Hentebestillinger (handleliste)</h3>
+    <p>Du kan sette sammen en hentebestilling hos deltakende ${getConfig().domain_dictionary.entity_plural_long} \u2014 på nettsiden eller via en AI-assistent som ChatGPT eller Claude. Da lagrer vi hvilke varer og hvor mange du har valgt, eventuelle merknader til varene og et anonymt kjøper-token. Når du sender bestillingen, får hver produsent som har valgt å motta ordrevarsler en e-post om sin del av bestillingen. Vi tar ikke imot betaling \u2014 du betaler produsenten ved henting.</p>
+    <p>Via AI-assistenter samler vi ikke inn navn, e-post eller telefonnummer; bestillingen er bare knyttet til det anonyme tokenet. Oppgir du navn, e-post eller telefonnummer på nettsiden, lagres det sammen med bestillingen og slettes automatisk 30 dager etter at bestillingen er avsluttet.</p>
+
     <h2>Hva vi ikke samler inn</h2>
     <ul>
       <li>Vi bruker ingen informasjonskapsler (cookies)</li>
@@ -2982,6 +2986,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Selgerregistrering</td><td>Samtykke</td><td>Du gir aktivt data når du registrerer deg. Du kan trekke tilbake samtykket.</td></tr>
         <tr><td>Selgerprofil (offentlig info)</td><td>Samtykke</td><td>Du velger selv hva du legger inn. Alt er synlig på din profilside.</td></tr>
         <tr><td>Bildeoppasting</td><td>Samtykke</td><td>Du laster selv opp bilder. Bildeskanning er valgfritt.</td></tr>
+        <tr><td>Hentebestillinger</td><td>Avtale</td><td>For å formidle bestillingen til produsenten du bestiller fra.</td></tr>
       </tbody>
     </table>
 
@@ -3004,6 +3009,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
         <tr><td>Selgerprofil</td><td>Så lenge du ønsker å være registrert.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
+        <tr><td>Kontaktopplysninger i hentebestillinger</td><td>Slettes automatisk 30 dager etter at bestillingen er avsluttet.</td></tr>
       </tbody>
     </table>
 
@@ -3032,7 +3038,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Endringer i denne policyen</h2>
     <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
 
-    <p class="pv-updated">Sist oppdatert: 16. april 2026</p>
+    <p class="pv-updated">Sist oppdatert: 24. september 2026</p>
   </section>`;
 
   res.send(shell(
