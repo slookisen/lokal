@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
-import crypto from "crypto";
 import { getDb } from "../database/init";
 import { EventEmitter } from "events";
+import { hashIP } from "./analytics-service";
 
 // ─── Interaction Logger ─────────────────────────────────────
 // Logs every agent touch-point. This is the data layer that
@@ -9,7 +9,16 @@ import { EventEmitter } from "events";
 // and eventually billing.
 //
 // Design decisions:
-//   - IP is hashed (SHA-256 truncated) for privacy
+//   - IP is hashed via the shared, salted hashIP() (analytics-service.ts).
+//     dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C2 review
+//     finding 2: this file used to carry its OWN inline, UNSALTED
+//     crypto.createHash("sha256").update(ip).digest("hex").slice(0,16) — a
+//     second, independently-drifting IP-hashing implementation, used for
+//     real search-interaction logging (interactionLogger.log("search", …)
+//     from routes/marketplace.ts and routes/a2a.ts). The privacy page
+//     claims page-visit AND search IP hashing is salted; that was only true
+//     for page views. There is now exactly ONE IP-hashing implementation in
+//     the codebase, consistently salted.
 //   - EventEmitter for SSE — no polling, instant updates
 //   - Non-blocking: log failures don't break the request
 
@@ -51,9 +60,7 @@ class InteractionLogger extends EventEmitter {
     const db = getDb();
     const id = uuid();
     const now = new Date().toISOString();
-    const ipHash = opts.ipAddress
-      ? crypto.createHash("sha256").update(opts.ipAddress).digest("hex").slice(0, 16)
-      : null;
+    const ipHash = opts.ipAddress ? hashIP(opts.ipAddress) : null;
 
     try {
       db.prepare(`

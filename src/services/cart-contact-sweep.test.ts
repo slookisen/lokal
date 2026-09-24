@@ -145,7 +145,28 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     `).run(sqlTs(days(60)));
     insertOrder("order-8", "cart-already-clean", "completed", sqlTs(days(60)));
 
+    // ── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+    // dryRun=true finds the SAME candidates a real run would, but writes
+    // nothing — proven here BEFORE the real run below actually mutates
+    // anything, on the exact same fixture. ─────────────────────────────────
+    const dryRunResult = sweepMod.sweepExpiredCartContactData(30, now, true);
+    assertEq(dryRunResult.dryRun, true, "dryRun=true: result.dryRun echoes true");
+    assertEq(
+      [...dryRunResult.sweptCartIds].sort(),
+      ["cart-contact-only-old", "cart-terminal-old"].sort(),
+      "dryRun=true: reports the exact same 2 eligible carts a real run would"
+    );
+    assertEq(dryRunResult.sweptCount, 2, "dryRun=true: sweptCount matches the real run's eventual count");
+    // Nothing was actually written — both eligible carts' contact fields
+    // are still present.
+    for (const id of ["cart-terminal-old", "cart-contact-only-old"]) {
+      const c = readCart(id);
+      assertTrue(c.buyer_name === "Test Buyer", `dryRun=true: ${id}'s buyer_name is NOT nulled (no mutation happened)`);
+      assertTrue(c.buyer_email === "buyer@example.com", `dryRun=true: ${id}'s buyer_email is NOT nulled (no mutation happened)`);
+    }
+
     const result = sweepMod.sweepExpiredCartContactData(30, now);
+    assertEq(result.dryRun, false, "real run (dryRun omitted/false): result.dryRun is false");
 
     assertEq(
       [...result.sweptCartIds].sort(),

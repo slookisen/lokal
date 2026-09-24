@@ -83,13 +83,115 @@ export function getVerticalFromHost(hostname: string | undefined | null): Vertic
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C2: this used
+// to be a bare, UNSALTED SHA-256 truncated to 64 bits (16 hex chars) — the
+// /personvern page claimed that was "irreversible anonymisation", which was
+// false in two ways. First, unsalted: anyone (an outsider with read access
+// to a leaked ip_hash, or an insider) can brute-force it straight back to
+// the source IP in well under a second by hashing the entire IPv4 space
+// (~4.3 billion values) and comparing, with zero extra work — no secret
+// needed at all. Second, even salted, IPv4's address space is still small
+// enough that someone who ALSO has the salt can brute-force it just as
+// fast — a salt does not make this "irreversible" in the strict sense.
+// What salting DOES buy: an attacker without server-side access to
+// IP_HASH_SALT (i.e. anyone outside this process) can no longer use a
+// precomputed rainbow table of plain SHA-256(ip) to reverse a leaked hash
+// offline — the hash is worthless without the salt. That is
+// "pseudonymisation" in GDPR's Art. 4(5) sense, not "anonymisation", and
+// the privacy page (seo.ts) now says exactly that instead of overclaiming.
+//
+// IP_HASH_SALT is read like every other secret in this codebase
+// (TRIGGER_HMAC_SECRET in services/trigger-store.ts, STRIPE_*_KEY in
+// routes/admin-billing.ts, …): a bare process.env lookup, no bundled
+// default in a way that would silently run production unsalted. The
+// non-empty dev fallback below exists ONLY so local dev / `npm test` (which
+// never set a real secret) hash consistently within a single process run —
+// it is not a real secret and must never be the value used in production;
+// set a real IP_HASH_SALT in Fly secrets before this ships.
+//
+// C2 review finding 4: unlike TURNSTILE_SECRET_KEY (routes/contact.ts) which
+// logs a console.error when missing on the request that needed it, a bare
+// `|| "fallback"` here failed silently — an ops engineer would never see in
+// the logs that production was hashing IPs with the public, checked-into-git
+// dev salt. Warn loudly, once, at startup, if this looks like production
+// (NODE_ENV === "production", the same check middleware/security.ts already
+// uses to distinguish prod from dev) and no real salt was configured.
+if (!process.env.IP_HASH_SALT && process.env.NODE_ENV === "production") {
+  console.error(
+    "[analytics] IP_HASH_SALT is not set in production — falling back to the " +
+    "public, checked-into-git dev salt. IP hashes are effectively UNSALTED " +
+    "(trivially reversible). Set IP_HASH_SALT in Fly secrets."
+  );
+}
+const IP_HASH_SALT = process.env.IP_HASH_SALT || "lokal-dev-ip-hash-salt-not-for-production";
+
 export function hashIP(ip: string): string {
-  return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
+  return crypto.createHash("sha256").update(IP_HASH_SALT).update(ip).digest("hex").slice(0, 16);
 }
 
 // ─── Helper: Privacy-safe User-Agent hashing ─────────────────
 function hashUserAgent(ua: string): string {
   return crypto.createHash("sha256").update(ua).digest("hex").slice(0, 16);
+}
+
+// ─── Helper: session_id construction ──────────────────────────
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C2 review
+// finding 3: this used to be the bare `${ipHash}:${userAgent}` combo
+// (SessionManager.getOrCreate below), so analytics_page_views.session_id
+// held the caller's FULL, unhashed User-Agent string for every human page
+// view — even though there's a separate, correctly-hashed user_agent_hash
+// column right next to it. The privacy page promises we do not store a
+// human visitor's raw browser string; that was false.
+//
+// Fix: a UA that classifyUA() calls "human" is replaced with a coarse,
+// non-identifying device bucket (mobile/tablet/desktop) before it goes into
+// session_id — no human browser fingerprint is stored anywhere, in this
+// column or any other.
+//
+// A UA that classifies as anything else (GPTBot, ChatGPT-User, Googlebot,
+// curl/, …, or empty) keeps the EXACT original `${ipHash}:${userAgent}`
+// format, unchanged. These are self-declared automation identifiers, not
+// personal data, and a long list of read-side dashboards —
+// owner-stats-service.ts, profile-activity-service.ts,
+// gardssalg-owner-stats-service.ts, agent-stats.ts, retention-service.ts,
+// routes/analytics.ts, traffic-stats.ts, and this file's own AI-traffic
+// breakdown (below) — substring/LIKE-match specific bot & dev-tool names
+// straight out of session_id. Redacting those too would silently break
+// every one of them; leaving them exactly as before means none of those
+// callers need to change.
+//
+// Uniqueness contract (unchanged from before, and required by the C2
+// review): the same (ipHash, userAgent) pair always yields the same
+// session_id; a different ipHash OR a different userAgent always yields a
+// different one. The non-human branch keeps this trivially (it's the
+// original format). The human branch appends a hash of the FULL
+// `ipHash:userAgent` pair as its final segment, so two different human
+// browsers behind the same IP (e.g. two people on one Wi-Fi, or one
+// person's phone vs laptop) still get different session_ids even though
+// they share a coarse device bucket — while never storing either raw UA.
+//
+// Exported (2nd review round, C2 follow-up) so read-side consumers can
+// recognize the new bucketed format instead of re-deriving device type from
+// UA substring matching against session_id — which breaks for human traffic
+// now that session_id holds a bucket token, not a raw UA. Currently used by
+// routes/analytics.ts's GET /admin/analytics/devices.
+export const HUMAN_DEVICE_BUCKETS = ["mobile", "tablet", "desktop"] as const;
+export type HumanDeviceBucket = (typeof HUMAN_DEVICE_BUCKETS)[number];
+
+function humanDeviceBucket(userAgent: string): HumanDeviceBucket {
+  const ua = userAgent || "";
+  if (/Tablet|iPad/i.test(ua)) return "tablet";
+  if (/Mobile|iPhone|Android/i.test(ua)) return "mobile";
+  return "desktop";
+}
+
+export function sessionIdFor(ipHash: string, userAgent: string): string {
+  const ua = userAgent || "";
+  if (classifyUA(ua) !== "human") {
+    return `${ipHash}:${ua}`;
+  }
+  const uniqueSuffix = crypto.createHash("sha256").update(`${ipHash}:${ua}`).digest("hex").slice(0, 16);
+  return `${ipHash}:${humanDeviceBucket(ua)}:${uniqueSuffix}`;
 }
 
 // ─── Helper: Parse User-Agent to detect AI agents ──────────────
@@ -350,6 +452,9 @@ class SessionManager {
   private sessionTTL = 30 * 60 * 1000; // 30 minutes
 
   getOrCreate(ipHash: string, userAgent: string): string {
+    // The in-memory cache key stays the full raw (ipHash, userAgent) pair —
+    // it never leaves this process or touches the database, so it carries
+    // none of the session_id privacy concern (see sessionIdFor() above).
     const key = `${ipHash}:${userAgent}`;
     let session = this.sessions.get(key);
 
@@ -358,7 +463,7 @@ class SessionManager {
       this.sessions.set(key, session);
     }
 
-    return key;
+    return sessionIdFor(ipHash, userAgent);
   }
 
   cleanup(): void {
@@ -1148,7 +1253,7 @@ export class AnalyticsService {
     // page views.
     try {
       const r = this.runAutoPrune({ daysToKeep: olderThanDays });
-      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews;
+      const total = r.deleted.pageViews + r.deleted.queries + r.deleted.agentViews + r.deleted.mcpCalls;
       console.log(
         `[analytics] Pruned ${total} old records (rollup-before-delete) ` +
         `skippedPendingRollup=${JSON.stringify(r.skippedPendingRollup)}`
@@ -1195,7 +1300,7 @@ export class AnalyticsService {
   runAutoPrune(opts: { daysToKeep: number }): {
     daysKept: number;
     cutoff: string;
-    deleted: { pageViews: number; queries: number; agentViews: number };
+    deleted: { pageViews: number; queries: number; agentViews: number; mcpCalls: number };
     skippedPendingRollup: string[];
     wouldDeleteIfPruned: { queries: number; agentViews: number };
   } {
@@ -1203,7 +1308,7 @@ export class AnalyticsService {
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
 
-    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews } =
+    const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews, pruneAnalyticsMcpCalls } =
       require("./retention-service") as typeof import("./retention-service");
 
     // Sizing counts are read BEFORE the rollup+delete runs, so
@@ -1215,6 +1320,11 @@ export class AnalyticsService {
     const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
     const qResult = rollupAndPruneQueries(daysKept, 7, false);
     const avResult = rollupAndPruneAgentViews(daysKept, 7, false);
+    // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+    // analytics_mcp_calls joins the same daily retention pass, same window
+    // as page views — delete-only (no rollup table for this one, see
+    // pruneAnalyticsMcpCalls's own doc comment).
+    const mcpCallsResult = pruneAnalyticsMcpCalls(daysKept, false);
 
     // Rollup coverage per source table — computed, not hardcoded, so a future
     // analytics table without a rollup destination shows up here instead of
@@ -1236,6 +1346,7 @@ export class AnalyticsService {
         pageViews: pvResult.rowsDeleted || 0,
         queries: qResult.rowsDeleted || 0,
         agentViews: avResult.rowsDeleted || 0,
+        mcpCalls: mcpCallsResult.rowsDeleted || 0,
       },
       skippedPendingRollup,
       wouldDeleteIfPruned: {
