@@ -83,8 +83,35 @@ export function getVerticalFromHost(hostname: string | undefined | null): Vertic
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
+// dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C2: this used
+// to be a bare, UNSALTED SHA-256 truncated to 64 bits (16 hex chars) — the
+// /personvern page claimed that was "irreversible anonymisation", which was
+// false in two ways. First, unsalted: anyone (an outsider with read access
+// to a leaked ip_hash, or an insider) can brute-force it straight back to
+// the source IP in well under a second by hashing the entire IPv4 space
+// (~4.3 billion values) and comparing, with zero extra work — no secret
+// needed at all. Second, even salted, IPv4's address space is still small
+// enough that someone who ALSO has the salt can brute-force it just as
+// fast — a salt does not make this "irreversible" in the strict sense.
+// What salting DOES buy: an attacker without server-side access to
+// IP_HASH_SALT (i.e. anyone outside this process) can no longer use a
+// precomputed rainbow table of plain SHA-256(ip) to reverse a leaked hash
+// offline — the hash is worthless without the salt. That is
+// "pseudonymisation" in GDPR's Art. 4(5) sense, not "anonymisation", and
+// the privacy page (seo.ts) now says exactly that instead of overclaiming.
+//
+// IP_HASH_SALT is read like every other secret in this codebase
+// (TRIGGER_HMAC_SECRET in services/trigger-store.ts, STRIPE_*_KEY in
+// routes/admin-billing.ts, …): a bare process.env lookup, no bundled
+// default in a way that would silently run production unsalted. The
+// non-empty dev fallback below exists ONLY so local dev / `npm test` (which
+// never set a real secret) hash consistently within a single process run —
+// it is not a real secret and must never be the value used in production;
+// set a real IP_HASH_SALT in Fly secrets before this ships.
+const IP_HASH_SALT = process.env.IP_HASH_SALT || "lokal-dev-ip-hash-salt-not-for-production";
+
 export function hashIP(ip: string): string {
-  return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
+  return crypto.createHash("sha256").update(IP_HASH_SALT).update(ip).digest("hex").slice(0, 16);
 }
 
 // ─── Helper: Privacy-safe User-Agent hashing ─────────────────
