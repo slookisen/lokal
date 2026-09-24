@@ -350,6 +350,20 @@ function upsertDentalWebsiteReviewQueue(
   });
 }
 
+// Diagnostic-only label for WHY tier 2 (the navnesøk/search fallback leg)
+// failed to find a queueable candidate, when it genuinely ran
+// (search_attempted:true) but did not queue anything. Purely observability —
+// derived from state the existing per-host loop in attemptDentalWdSearchLeg
+// already computes (or trivial counters added around it); it changes no
+// matching/queueing decision anywhere. See attemptDentalWdSearchLeg's own doc
+// comment for exactly which branch produces which value.
+export type DentalWdSearchSkipReason =
+  | "search_api_error"
+  | "no_search_results"
+  | "all_hosts_filtered"
+  | "all_fetches_failed"
+  | "no_evidence_match";
+
 interface DentalWdResultEntry {
   agent_id: string;
   agent_name: string;
@@ -373,6 +387,12 @@ interface DentalWdResultEntry {
   // when tier 2 never attempted, so a response with the search seam left
   // unwired stays byte-identical to before this leg existed.
   search_attempted?: true;
+  // Informational-only, same framing as search_attempted directly above:
+  // WHY tier 2 found nothing, filled in only alongside search_attempted:true
+  // (i.e. only when tier 2 ran AND did not itself queue a candidate — a
+  // queued outcome, from either tier, never carries this field). See
+  // DentalWdSearchSkipReason's own doc comment for what each value means.
+  search_skip_reason?: DentalWdSearchSkipReason;
 }
 
 // Pure per-row discovery outcome — the SAME shape DentalWdResultEntry uses
@@ -392,6 +412,9 @@ export interface DentalWdDiscoveryOutcome {
   confidence?: number;
   reason?: string;
   search_attempted?: true;
+  // See DentalWdResultEntry.search_skip_reason above — same field, same
+  // framing, mirrored onto this pure per-row outcome shape.
+  search_skip_reason?: DentalWdSearchSkipReason;
   queue_reason?: "brreg_field" | "navnesok_fallback";
 }
 
@@ -494,14 +517,32 @@ async function attemptDentalWdBrregLeg(t: DentalWdTargetRow): Promise<DentalWdDi
 // queue a candidate the Brreg leg itself would have rejected on weaker
 // grounds. No subpages, no embedded-layer second chance, no shared-host-in-
 // catalog guard (narrowest independently-shippable slice; see the dev-
-// request's own non-goals). Returns null when nothing verifies (including
-// when the search call itself throws) — the caller then falls back to the
-// Brreg leg's own original result, unchanged. Pure w.r.t. the database, same
-// as attemptDentalWdBrregLeg above.
+// request's own non-goals). Returns `{ outcome: null, skipReason }` when
+// nothing verifies (including when the search call itself throws) — the
+// caller then falls back to the Brreg leg's own original result, unchanged.
+// `skipReason` is pure observability (dev-request unnamed prod-diagnostics
+// follow-up, 2026-09-24: both legs were failing 25/25 with no per-row
+// visibility into WHY tier 2 found nothing) — it is derived from counters
+// over the SAME per-host loop below and never changes which candidate, if
+// any, gets queued:
+//   - search_api_error:    the searchImpl(query) call itself threw.
+//   - no_search_results:   gardssalgWebsiteSearchCandidateHosts returned zero
+//                          hosts for this query.
+//   - all_hosts_filtered:  every host was rejected by classifyHjemmeside
+//                          (isBad) before ever being fetched.
+//   - all_fetches_failed:  at least one host passed the classifier, but
+//                          EVERY non-filtered host's fetchPage call failed
+//                          (!ok).
+//   - no_evidence_match:   at least one host fetched successfully, but none
+//                          passed the org_nr_found || (name_found &&
+//                          place_found) gate. Also the defensive fallback if
+//                          the loop ends without hitting any of the above
+//                          (should not normally happen).
+// Pure w.r.t. the database, same as attemptDentalWdBrregLeg above.
 async function attemptDentalWdSearchLeg(
   t: DentalWdTargetRow,
   searchImpl: (query: string) => Promise<BraveResult[]>,
-): Promise<DentalWdDiscoveryOutcome | null> {
+): Promise<{ outcome: DentalWdDiscoveryOutcome | null; skipReason?: DentalWdSearchSkipReason }> {
   const query = gardssalgWebsiteSearchQuery({ navn: t.navn, poststed: t.poststed });
 
   let results: BraveResult[];
@@ -511,14 +552,26 @@ async function attemptDentalWdSearchLeg(
     // A search failure (network/HTTP error) must not abort the row — it
     // simply falls through to the Brreg leg's own original result, exactly
     // as if tier 2 had found nothing.
-    return null;
+    return { outcome: null, skipReason: "search_api_error" };
   }
 
   const hosts = gardssalgWebsiteSearchCandidateHosts(results, DENTAL_WD_SEARCH_MAX_CANDIDATES);
+  if (hosts.length === 0) {
+    return { outcome: null, skipReason: "no_search_results" };
+  }
+
+  // Counters derived around the existing loop, purely for the diagnostic
+  // skipReason below — never consulted by the matching/queueing logic
+  // itself, which is otherwise byte-identical to before this change.
+  let filteredCount = 0;
+  let fetchFailedCount = 0;
 
   for (const host of hosts) {
     const classification = classifyHjemmeside(host);
-    if (classification.isBad) continue;
+    if (classification.isBad) {
+      filteredCount++;
+      continue;
+    }
 
     const candidateUrl = `https://${host}`;
     const fetchResult = await fetchPage(candidateUrl, {
@@ -526,7 +579,10 @@ async function attemptDentalWdSearchLeg(
       timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
       fetchImpl: dentalWdFetchImpl,
     });
-    if (!fetchResult.ok) continue;
+    if (!fetchResult.ok) {
+      fetchFailedCount++;
+      continue;
+    }
 
     const pageText = gardssalgPageText(fetchResult.html);
     const evidence = gardssalgWebsiteEvidenceMatch(pageText, {
@@ -552,17 +608,28 @@ async function attemptDentalWdSearchLeg(
     }
 
     return {
-      status: "queued",
-      candidate_url: finalCandidateUrl,
-      final_url: fetchResult.finalUrl,
-      evidence,
-      confidence,
-      search_attempted: true,
-      queue_reason: "navnesok_fallback",
+      outcome: {
+        status: "queued",
+        candidate_url: finalCandidateUrl,
+        final_url: fetchResult.finalUrl,
+        evidence,
+        confidence,
+        search_attempted: true,
+        queue_reason: "navnesok_fallback",
+      },
     };
   }
 
-  return null;
+  if (filteredCount === hosts.length) {
+    return { outcome: null, skipReason: "all_hosts_filtered" };
+  }
+  if (fetchFailedCount === hosts.length - filteredCount) {
+    return { outcome: null, skipReason: "all_fetches_failed" };
+  }
+  // At least one non-filtered host fetched successfully but none passed the
+  // evidence gate — also the defensive fallback for any unaccounted-for
+  // loop-exit shape.
+  return { outcome: null, skipReason: "no_evidence_match" };
 }
 
 // ─── shared discovery step (dev-request 2026-09-02-dental-hjemmeside-
@@ -590,10 +657,10 @@ export async function discoverDentalClinicWebsite(
 
   if (!searchImpl) return brregOutcome;
 
-  const searchOutcome = await attemptDentalWdSearchLeg(t, searchImpl);
-  if (searchOutcome) return searchOutcome;
+  const searchResult = await attemptDentalWdSearchLeg(t, searchImpl);
+  if (searchResult.outcome) return searchResult.outcome;
 
-  return { ...brregOutcome, search_attempted: true };
+  return { ...brregOutcome, search_attempted: true, search_skip_reason: searchResult.skipReason };
 }
 
 // Processes ONE candidate clinic end-to-end for the EXISTING batch route:
