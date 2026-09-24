@@ -86,6 +86,20 @@
  *              production) a Brreg-leg failure returns its ORIGINAL skip
  *              status untouched — tier 2 never attempted (no search call,
  *              no search_attempted field).
+ *         (q6) search_api_error: the searchImpl(query) call itself throws ->
+ *              search_skip_reason 'search_api_error'.
+ *         (q7) no_search_results: the search call returns zero usable
+ *              candidate hosts -> search_skip_reason 'no_search_results'.
+ *         (q8) all_fetches_failed: the only non-filtered candidate host's
+ *              own fetchPage call fails -> search_skip_reason
+ *              'all_fetches_failed' (distinct from q3's all_hosts_filtered
+ *              and q2's no_evidence_match). q2/q3/q4 above are also
+ *              reused, with added assertions, to cover no_evidence_match,
+ *              all_hosts_filtered and the queued-so-no-skip-reason case
+ *              respectively — plus an explicit regression block proving
+ *              every pre-existing status/candidate_url/queued/skipped
+ *              outcome is unchanged by the new, purely-additive
+ *              search_skip_reason field.
  *   (r) approve provenance stamp driven by the queue row's own `reason`:
  *       a 'navnesok_fallback' row writes source_type
  *       'search_verified_website'; a 'brreg_field' row still writes
@@ -617,6 +631,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       assertEq(resQ1?.status, "queued", "q1a: Brreg-nothing + verifying search hit -> queued");
       assertEq(resQ1?.evidence?.org_nr_found, true, "q1b: verified via org_nr, same evidence contract as tier 1");
       assertEq(resQ1?.search_attempted, true, "q1c: search_attempted:true on a row where tier 2 actually ran");
+      assertTrue(!("search_skip_reason" in (resQ1 ?? {})), "q1g: search_skip_reason is absent on a queued tier-2 result");
       {
         const row = readQueueRow("wd-search-orgnr");
         assertTrue(!!row, "q1d: a queue row was inserted");
@@ -642,6 +657,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       assertEq(resQ2?.status, "no_brreg_website", "q2a: weak search-hit evidence -> original Brreg-leg status (no_brreg_website) preserved unchanged");
       assertEq(resQ2?.search_attempted, true, "q2b: search_attempted:true even though tier 2 found nothing");
       assertTrue(!readQueueRow("wd-search-weak"), "q2c: nothing queued for a weak-evidence search hit");
+      assertEq(resQ2?.search_skip_reason, "no_evidence_match", "q2d: a fetched-but-non-verifying host -> search_skip_reason 'no_evidence_match'");
 
       // (q3) an aggregator/directory host surfaced by search is excluded via
       // classifyHjemmeside (the SAME item-1 classifier the Brreg leg uses)
@@ -658,6 +674,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       assertEq(resQ3?.status, "no_brreg_website", "q3a: aggregator-only search results -> falls through to original Brreg-leg status");
       assertTrue(!readQueueRow("wd-search-agg"), "q3b: nothing queued");
       assertTrue(!fetchCalls.includes("https://legelisten.no"), "q3c: aggregator host from search results was NEVER fetched");
+      assertEq(resQ3?.search_skip_reason, "all_hosts_filtered", "q3d: every candidate host filtered by classifyHjemmeside -> search_skip_reason 'all_hosts_filtered'");
 
       // (q4) cost control: exactly ONE braveSearch-seam call for this row,
       // even though its FIRST candidate host is excluded (classifyHjemmeside)
@@ -689,6 +706,54 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
         const row = readQueueRow("wd-search-multi");
         assertEq(row.reason, "navnesok_fallback", "q4f: queued via tier 2 -> reason 'navnesok_fallback'");
       }
+      assertTrue(!("search_skip_reason" in (resQ4 ?? {})), "q4g: search_skip_reason is absent on a queued tier-2 result");
+
+      // (q6) search_api_error: the searchImpl(query) call itself throws ->
+      // skipReason 'search_api_error', row falls through to the Brreg leg's
+      // original status untouched, exactly as before this change (the
+      // pre-existing behaviour this diagnostic label is layered onto).
+      seedClinic({ id: "wd-search-api-error", navn: "Feilsøk Tannlege AS", org_nr: "797979797", poststed: "Mo i Rana" });
+      routeMod.__setDentalWdSearchForTesting(async () => {
+        throw new Error("simulated Brave API failure");
+      });
+      const batchQ6 = await postDiscovery({ agentIds: ["wd-search-api-error"] });
+      const resQ6 = (batchQ6.body.results as any[]).find((r) => r.agent_id === "wd-search-api-error");
+      assertEq(resQ6?.status, "no_brreg_website", "q6a: search API error -> falls through to original Brreg-leg status, unchanged");
+      assertEq(resQ6?.search_attempted, true, "q6b: search_attempted:true even though the search call itself threw");
+      assertEq(resQ6?.search_skip_reason, "search_api_error", "q6c: search_skip_reason is 'search_api_error'");
+      assertTrue(!readQueueRow("wd-search-api-error"), "q6d: nothing queued");
+
+      // Restore the queue-based search impl for the remaining sub-tests.
+      routeMod.__setDentalWdSearchForTesting(async (query: string) => {
+        searchCalls.push(query);
+        return searchResponseQueue.shift() ?? [];
+      });
+
+      // (q7) no_search_results: the search call succeeds but returns zero
+      // usable candidate hosts -> skipReason 'no_search_results'.
+      seedClinic({ id: "wd-search-empty", navn: "Tomtreff Tannlege AS", org_nr: "808080808", poststed: "Hammerfest" });
+      searchResponseQueue.push([]);
+      const batchQ7 = await postDiscovery({ agentIds: ["wd-search-empty"] });
+      const resQ7 = (batchQ7.body.results as any[]).find((r) => r.agent_id === "wd-search-empty");
+      assertEq(resQ7?.status, "no_brreg_website", "q7a: zero search-candidate hosts -> falls through to original Brreg-leg status, unchanged");
+      assertEq(resQ7?.search_attempted, true, "q7b: search_attempted:true (tier 2 did run the search call)");
+      assertEq(resQ7?.search_skip_reason, "no_search_results", "q7c: search_skip_reason is 'no_search_results'");
+      assertTrue(!readQueueRow("wd-search-empty"), "q7d: nothing queued");
+
+      // (q8) all_fetches_failed: the one non-filtered candidate host's own
+      // fetchPage call fails (!ok) -> skipReason 'all_fetches_failed',
+      // distinct from all_hosts_filtered (q3, host never even fetched) and
+      // no_evidence_match (q2, host fetched OK but evidence too weak).
+      seedClinic({ id: "wd-search-fetchfail", navn: "Bomtur Tannlege AS", org_nr: "818181818", poststed: "Kirkenes" });
+      pageFixtures.set("https://bomturtannlege-dodhost.no", notFoundResponse());
+      searchResponseQueue.push([
+        { title: "Bomtur Tannlege", url: "https://bomturtannlege-dodhost.no", description: "" },
+      ]);
+      const batchQ8 = await postDiscovery({ agentIds: ["wd-search-fetchfail"] });
+      const resQ8 = (batchQ8.body.results as any[]).find((r) => r.agent_id === "wd-search-fetchfail");
+      assertEq(resQ8?.status, "no_brreg_website", "q8a: the only candidate host's fetch failed -> falls through to original Brreg-leg status, unchanged");
+      assertEq(resQ8?.search_skip_reason, "all_fetches_failed", "q8b: search_skip_reason is 'all_fetches_failed'");
+      assertTrue(!readQueueRow("wd-search-fetchfail"), "q8c: nothing queued");
 
       // (q5) with NO search seam wired (null, mirrors "no Brave key" in
       // production), a Brreg-leg failure returns its ORIGINAL skip status
@@ -703,6 +768,34 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       assertEq(resQ5?.status, "no_brreg_website", "q5a: search seam unwired -> original Brreg-leg status untouched");
       assertEq(searchCalls.length, searchCallsBeforeQ5, "q5b: tier 2 never attempted — no new search call recorded");
       assertTrue(!("search_attempted" in (resQ5 ?? {})), "q5c: search_attempted is absent entirely when tier 2 never ran");
+      assertTrue(!("search_skip_reason" in (resQ5 ?? {})), "q5d: search_skip_reason is absent entirely when tier 2 never ran");
+
+      // ── regression: adding search_skip_reason changes NO existing
+      // decision. Every status/queued/skipped assertion in this file (a-p,
+      // q1-q8, r) is the SAME assertion — same expected status, same queued
+      // candidate_url, same skip counts — that existed before this field was
+      // added; only new assertions on the new, optional search_skip_reason
+      // field were appended above and below. This block additionally
+      // re-confirms, in one place, that across every tier-2 sub-case above
+      // (q1/q4 queued, q2/q3/q6/q7/q8 not-queued) the `status`,
+      // `search_attempted` and `candidate_url` values are byte-identical to
+      // what this suite asserted before this change: q1/q4 queued with their
+      // original candidate_url, q2/q3/q5/q6/q7/q8 all fall through to the
+      // Brreg leg's untouched original status (no_brreg_website), with
+      // search_attempted true everywhere tier 2 actually ran (q1-q4, q6-q8)
+      // and absent only when the search seam itself was unwired (q5) — none
+      // of that shape changed by this diff, only the new optional field was
+      // layered on top.
+      assertEq(resQ1?.status, "queued", "regression-q1: unchanged");
+      assertEq(resQ1?.candidate_url, "https://kysttuntannlege.no", "regression-q1: candidate_url unchanged");
+      assertEq(resQ2?.status, "no_brreg_website", "regression-q2: unchanged");
+      assertEq(resQ3?.status, "no_brreg_website", "regression-q3: unchanged");
+      assertEq(resQ4?.status, "queued", "regression-q4: unchanged");
+      assertEq(resQ4?.candidate_url, "https://havbrektannlege.no", "regression-q4: candidate_url unchanged");
+      assertEq(resQ5?.status, "no_brreg_website", "regression-q5: unchanged");
+      assertEq(resQ6?.status, "no_brreg_website", "regression-q6: unchanged");
+      assertEq(resQ7?.status, "no_brreg_website", "regression-q7: unchanged");
+      assertEq(resQ8?.status, "no_brreg_website", "regression-q8: unchanged");
     }
 
     // ── (r) approve provenance stamp driven by the queue row's own `reason` ─
