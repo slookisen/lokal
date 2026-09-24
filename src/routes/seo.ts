@@ -2807,10 +2807,11 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Which page you visit (URL path)</li>
       <li>Referrer URL (where you came from)</li>
-      <li>An anonymised hash of IP address and browser type (SHA-256, truncated \u2014 we do not store the full IP address or browser string)</li>
+      <li>An anonymised, salted hash of your IP address (SHA-256, truncated \u2014 we do not store your full IP address) and a separate hash of your browser type</li>
+      <li>For human visitors, a coarse device category (mobile / tablet / desktop) \u2014 never your full, raw browser string. Automated tools and crawlers (e.g. GPTBot, Googlebot) are instead identified by their own self-declared, non-personal client name, so we can see which bots and AI crawlers visit the site</li>
       <li>Timestamp of the visit</li>
     </ul>
-    <p>We use no cookies. We use no third-party analytics tools such as Google Analytics. All analysis happens in our own database.</p>
+    <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and a cookie that remembers your chosen language when you switch it (expires after 1 year). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
 
     <h3>Search and AI queries</h3>
     <p>When you search for producers \u2014 via the website, ChatGPT, Claude MCP or the API \u2014 we store:</p>
@@ -2851,7 +2852,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
     <h2>What we do not collect</h2>
     <ul>
-      <li>We use no cookies</li>
+      <li>We use only essential cookies (seller sign-in session, language choice) — never advertising or tracking cookies</li>
       <li>We have no third-party tracking (no Google Analytics, Facebook Pixel, etc.)</li>
       <li>We do not store full IP addresses \u2014 only a truncated hash</li>
       <li>We do not store passwords (passwordless sign-in)</li>
@@ -2940,10 +2941,11 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Hvilken side du besøker (URL-sti)</li>
       <li>Referanse-URL (hvor du kom fra)</li>
-      <li>En anonymisert hash av IP-adresse og nettleser-type (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse eller nettleser-streng)</li>
+      <li>En anonymisert, saltet hash av IP-adressen din (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse) og en separat hash av nettlesertypen din</li>
+      <li>For besøkende mennesker en grov enhetskategori (mobil / nettbrett / PC) \u2014 aldri din fullstendige, rå nettleser-streng. Automatiserte verktøy og roboter (f.eks. GPTBot, Googlebot) identifiseres i stedet med sitt eget selvangitte, ikke-personlige klientnavn, slik at vi kan se hvilke roboter og AI-crawlere som besøker siden</li>
       <li>Tidspunkt for besøket</li>
     </ul>
-    <p>Vi bruker ingen informasjonskapsler (cookies). Vi bruker ingen tredjepartsanalyseverktøy som Google Analytics. All analyse skjer i vår egen database.</p>
+    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og en cookie som husker språkvalget ditt når du bytter (utløper etter 1 år). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
     <h3>Søk og AI-spørringer</h3>
     <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>
@@ -2984,7 +2986,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
-      <li>Vi bruker ingen informasjonskapsler (cookies)</li>
+      <li>Vi bruker kun essensielle informasjonskapsler (innlogging for selgere, språkvalg) — aldri annonse- eller sporingscookies</li>
       <li>Vi har ingen tredjepartssporing (ingen Google Analytics, Facebook Pixel, etc.)</li>
       <li>Vi lagrer ikke fullstendige IP-adresser \u2014 kun en forkortet hash</li>
       <li>Vi lagrer ikke passord (passwordless innlogging)</li>
