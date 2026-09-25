@@ -3421,9 +3421,20 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
     </section>
     ${body}`;
 
+    // GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
+    // slice B3) — mirrors the visible .sk-crumbs nav above exactly: Forside/Home
+    // › Salgskanaler (index) › this category. Purely additive alongside the
+    // existing CollectionPage jsonLd (own <script> tag via shell()'s array
+    // rendering — see rfb-bm-event-jsonld.test.ts for that convention).
+    const breadcrumbJsonLd = buildBreadcrumbJsonLd([
+      { name: t(lang, "nav.home"), url: `${BASE_URL}${localizedPath("/", lang)}` },
+      { name: crumbLabel, url: BASE_URL + localizedPath("/kategori", lang) },
+      { name, url: BASE_URL + localizedPath("/kategori/" + slug, lang) },
+    ]);
+
     res.send(shell(title, metaDesc, content, {
       canonical: BASE_URL + localizedPath("/kategori/" + slug, lang),
-      jsonLd,
+      jsonLd: [jsonLd, breadcrumbJsonLd],
       extraCss: SALGSKANAL_CSS,
       lang,
       pathForAlternate: "/kategori/" + slug,
@@ -3656,6 +3667,16 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       verifiedCount,
     });
     if (cityFaqJsonLd) jsonLdItems.push(cityFaqJsonLd);
+
+    // GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
+    // slice B3) — mirrors the visible .bc nav rendered just below exactly:
+    // Forside/Home › this kommune. Purely additive alongside the existing
+    // LocalBusiness + FAQPage jsonLdItems entries (own <script> tag per array
+    // element — see shell()'s jsonLd array rendering).
+    jsonLdItems.push(buildBreadcrumbJsonLd([
+      { name: t(lang, "nav.home"), url: `${BASE_URL}${localizedPath("/", lang)}` },
+      { name: cityName, url: cityCanonicalUrl },
+    ]));
 
     const content = `
     <section class="city-hero">
@@ -4273,6 +4294,29 @@ export function buildCityFaqJsonLd(params: {
       "@type": "Question",
       "name": q,
       "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+// GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
+// slice B3). Pure and unit-testable in isolation, mirroring the
+// buildProducerFaqJsonLd/buildCityFaqJsonLd convention above: every item
+// passed in must already be real, on-page data (the visible `.bc` breadcrumb
+// nav, a canonical URL, a page name) — this function never invents a label,
+// it only shapes whatever the caller already renders elsewhere on the page
+// into schema.org's ListItem array. No quality gate (unlike the FAQ
+// builders) — a breadcrumb trail is always well-formed once the caller has
+// at least a "Forside"/home entry, so this always returns an object, never
+// null.
+export function buildBreadcrumbJsonLd(items: Array<{ name: string; url: string }>): any {
+  return {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": items.map((item, i) => ({
+      "@type": "ListItem",
+      "position": i + 1,
+      "name": item.name,
+      "item": item.url,
     })),
   };
 }
@@ -5484,6 +5528,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       address: k.address,
     });
 
+    // GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
+    // slice B3) — mirrors the visible .bc nav rendered further below exactly:
+    // Forside/Home › (kommune, if known) › this producer. Purely additive
+    // alongside the existing LocalBusiness + FAQPage jsonLd (own <script> tag
+    // per array element — see shell()'s jsonLd array rendering).
+    const breadcrumbItems: Array<{ name: string; url: string }> = [
+      { name: t(lang, "nav.home"), url: `${BASE_URL}${localizedPath("/", lang)}` },
+    ];
+    if (cityName) {
+      breadcrumbItems.push({ name: cityName, url: `${BASE_URL}${localizedPath("/" + slugify(cityName), lang)}` });
+    }
+    breadcrumbItems.push({ name: agent.name, url: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}` });
+    const breadcrumbJsonLd = buildBreadcrumbJsonLd(breadcrumbItems);
+
     // GEO: answer-first SSR opening — see buildProducerAnswerFirstOpening for
     // the quality gate. Reuses the exact same real catalog fields as the FAQ
     // builder above. null (insufficient real facts) is a normal, expected
@@ -5871,7 +5929,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       pageTitle,
       pageMetaDescription,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd] : jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);

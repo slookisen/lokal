@@ -45394,3 +45394,25 @@ runSerial(async () => {
     failures.push("rfb-bm-event-jsonld: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B3: seo.ts's producer,
+// /kategori/:slug and /:city (kommune) pages now also emit schema.org
+// BreadcrumbList JSON-LD (own <script> tag alongside the existing
+// LocalBusiness/CollectionPage/FAQPage entries), mirroring each page's
+// existing visible .bc/.sk-crumbs breadcrumb nav. Own in-memory DB — tail
+// position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B3: BreadcrumbList JSON-LD ──");
+  try {
+    const { runBreadcrumbListJsonLdTests } = require("../src/routes/rfb-breadcrumblist-jsonld.test") as
+      typeof import("../src/routes/rfb-breadcrumblist-jsonld.test");
+    const bcl = await runBreadcrumbListJsonLdTests({ log: false });
+    passed += bcl.passed;
+    failed += bcl.failed;
+    for (const f of bcl.failures) failures.push("rfb-breadcrumblist-jsonld: " + f);
+    console.log(`  rfb-breadcrumblist-jsonld: ${bcl.passed} passed, ${bcl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-breadcrumblist-jsonld: unexpected error: " + String(err?.message || err));
+  }
+});
