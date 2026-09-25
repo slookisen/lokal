@@ -16,9 +16,13 @@
 // WHAT THIS ADDS (observability only — no request is changed or refused)
 // ──────────────────────────────────────────────────────────────────────
 // 1. A heartbeat timer (every `heartbeatMs`). When it fires late by more than
-//    `stallMs`, the loop was blocked; we record the stall together with a
-//    snapshot of the requests in flight and the background jobs running at
-//    that moment — the blocker is almost always among them.
+//    `stallMs`, the loop was blocked; we record the stall together with (a)
+//    the requests/jobs still in flight and (b) the requests/jobs that FINISHED
+//    inside the late window. A handler or job that blocks synchronously and
+//    completes in the same tick is gone from (a) by the time the late
+//    heartbeat runs — it shows up in (b). The blocker is in (a) ∪ (b); so are
+//    its victims (everything that was waiting), so read durations/start times,
+//    not list position alone.
 // 2. `requestTrackerMiddleware` — keeps the in-flight request set and logs any
 //    request slower than `slowRequestMs`.
 // 3. `trackJob(name, fn)` — wraps scheduler callbacks so a stall can name the
@@ -62,9 +66,31 @@ export function defaultEventLoopMonitorConfig(): EventLoopMonitorConfig {
   };
 }
 
-/** Longest paths/lists kept per record — bounds memory and log-line length. */
+/** Longest paths/hosts/lists kept per record — bounds memory and log-line length. */
 const MAX_PATH_CHARS = 200;
+const MAX_HOST_CHARS = 100;
 const MAX_SNAPSHOT_ENTRIES = 20;
+
+/**
+ * Copy a (possibly sliced) string so a stored record never keeps the whole
+ * request URL alive in V8's heap via a sliced-string parent reference.
+ */
+function detach(s: string): string {
+  return Buffer.from(s, "utf8").toString("utf8");
+}
+
+/**
+ * Mask path segments that look like bearer tokens (≥ 20 chars of
+ * [A-Za-z0-9_-] mixing letters and digits) — e.g. /produsent/ordre/:token,
+ * /api/marketplace/auth/m/:token — so they never reach logs or the report.
+ * Diagnosis only needs the route shape.
+ */
+export function redactPath(path: string): string {
+  return path
+    .split("/")
+    .map((seg) => (/^[A-Za-z0-9_-]{20,}$/.test(seg) && /[0-9]/.test(seg) && /[A-Za-z]/.test(seg) ? ":tok" : seg))
+    .join("/");
+}
 
 interface InflightRequest {
   method: string;
@@ -91,6 +117,13 @@ export interface StallRecord {
   /** Total in flight at detection, including ones cut by the cap or that arrived after the block. */
   inflightTotal: number;
   activeJobs: Array<{ name: string; ageMs: number }>;
+  /**
+   * Requests/jobs at least `stallMs` long that finished after the heartbeat
+   * was due (i.e. inside the blocked window), longest first. A synchronous
+   * blocker lands HERE, not in `inflight`/`activeJobs`: it completes (and its
+   * response's 'finish' fires via nextTick) before the late heartbeat runs.
+   */
+  finishedDuringBlock: Array<{ kind: "request" | "job"; label: string; startedAt: string; durationMs: number }>;
 }
 
 export interface SlowRequestRecord {
@@ -164,9 +197,11 @@ function snapshotInflight(at: number): StallRecord["inflight"] {
 }
 
 /**
- * Stall snapshot: only requests that started before the block (age ≥ lag —
- * nothing can register while the loop is blocked, so younger entries arrived
- * after it), most recent first, so the likely blocker leads the list.
+ * Stall snapshot of requests STILL in flight: only those that started before
+ * the block (age ≥ lag — nothing can register while the loop is blocked, so
+ * younger entries arrived after it), most recent first, so long-lived streams
+ * (hour-old SSE) sort last instead of filling the cap. A request that blocked
+ * synchronously has usually finished already — see `finishedDuringBlock`.
  */
 function snapshotInflightForStall(at: number, lagMs: number): StallRecord["inflight"] {
   return [...inflight.values()]
@@ -183,10 +218,36 @@ function snapshotJobs(at: number): StallRecord["activeJobs"] {
     .slice(0, MAX_SNAPSHOT_ENTRIES);
 }
 
+/**
+ * Requests/jobs at least `stallMs` long, kept briefly so the NEXT heartbeat can
+ * attribute a stall to work that already completed. Bounded twice: by count
+ * (RECENT_FINISH_CAP) and by being pruned to the current window on every beat.
+ */
+interface RecentFinish {
+  kind: "request" | "job";
+  label: string;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+}
+const RECENT_FINISH_CAP = 100;
+const recentFinishes: RecentFinish[] = [];
+
+function noteFinish(f: RecentFinish): void {
+  if (f.durationMs < cfg.stallMs) return;
+  recentFinishes.push(f);
+  if (recentFinishes.length > RECENT_FINISH_CAP) recentFinishes.splice(0, recentFinishes.length - RECENT_FINISH_CAP);
+}
+
 function beat(): void {
   const at = deps.now();
-  const lagMs = at - lastBeatAt - cfg.heartbeatMs;
+  const dueAt = lastBeatAt + cfg.heartbeatMs;
+  const lagMs = at - dueAt;
   lastBeatAt = at;
+  // Anything that finished before this heartbeat was due can no longer
+  // explain a later stall — drop it (keeps the buffer tiny in steady state).
+  const inWindow = recentFinishes.filter((f) => f.finishedAt >= dueAt);
+  recentFinishes.length = 0;
   if (lagMs < cfg.stallMs) return;
 
   const record: StallRecord = {
@@ -195,11 +256,16 @@ function beat(): void {
     inflight: snapshotInflightForStall(at, lagMs),
     inflightTotal: inflight.size,
     activeJobs: snapshotJobs(at),
+    finishedDuringBlock: inWindow
+      .sort((a, b) => b.durationMs - a.durationMs)
+      .slice(0, MAX_SNAPSHOT_ENTRIES)
+      .map((f) => ({ kind: f.kind, label: f.label, startedAt: iso(f.startedAt), durationMs: f.durationMs })),
   };
   pushCapped(stalls, record);
   const reqs = record.inflight.map((r) => `${r.method} ${r.host}${r.path} (${r.ageMs}ms)`).join(", ") || "none";
   const jobs = record.activeJobs.map((j) => `${j.name} (${j.ageMs}ms)`).join(", ") || "none";
-  deps.log(`[event-loop-stall] lag=${lagMs}ms inflight=[${reqs}] jobs=[${jobs}]`);
+  const fin = record.finishedDuringBlock.map((f) => `${f.kind === "job" ? "job " : ""}${f.label} (${f.durationMs}ms)`).join(", ") || "none";
+  deps.log(`[event-loop-stall] lag=${lagMs}ms finished_during_block=[${fin}] inflight=[${reqs}] jobs=[${jobs}]`);
 }
 
 /**
@@ -240,9 +306,9 @@ export function requestTrackerMiddleware(req: any, res: any, next: () => void): 
   const id = ++seq;
   const rawUrl = String(req.originalUrl || req.url || "");
   const entry: InflightRequest = {
-    method: String(req.method || "?"),
-    host: String(req.hostname || (req.headers && req.headers.host) || ""),
-    path: rawUrl.split("?")[0].slice(0, MAX_PATH_CHARS),
+    method: detach(String(req.method || "?").slice(0, 16)),
+    host: detach(String(req.hostname || (req.headers && req.headers.host) || "").slice(0, MAX_HOST_CHARS)),
+    path: detach(redactPath(rawUrl.split("?")[0].slice(0, MAX_PATH_CHARS))),
     startedAt: deps.now(),
   };
   inflight.set(id, entry);
@@ -252,7 +318,9 @@ export function requestTrackerMiddleware(req: any, res: any, next: () => void): 
     if (done) return;
     done = true;
     inflight.delete(id);
-    const durationMs = deps.now() - entry.startedAt;
+    const finishedAt = deps.now();
+    const durationMs = finishedAt - entry.startedAt;
+    noteFinish({ kind: "request", label: `${entry.method} ${entry.host}${entry.path}`, startedAt: entry.startedAt, finishedAt, durationMs });
     if (durationMs < cfg.slowRequestMs) return;
     const status = Number(res.statusCode) || 0;
     pushCapped(slowRequests, {
@@ -274,8 +342,10 @@ export function requestTrackerMiddleware(req: any, res: any, next: () => void): 
 
 /**
  * Wrap a (sync or async) job so it is visible in stall snapshots while it
- * runs and recorded when it is slow. The wrapper returns exactly what `fn`
- * returns and rethrows exactly what it throws — behaviour is unchanged.
+ * runs and recorded when it is slow. Sync: returns what `fn` returns and
+ * rethrows what it throws. Async: returns a promise that resolves/rejects
+ * exactly like `fn`'s — a rejection nobody handles is still an unhandled
+ * rejection (the wrapper never marks it handled), so behaviour is unchanged.
  */
 export function trackJob<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...args: A) => R {
   return (...args: A): R => {
@@ -284,7 +354,9 @@ export function trackJob<A extends unknown[], R>(name: string, fn: (...args: A) 
     activeJobs.set(id, { name, startedAt });
     const settle = (ok: boolean) => {
       activeJobs.delete(id);
-      const durationMs = deps.now() - startedAt;
+      const finishedAt = deps.now();
+      const durationMs = finishedAt - startedAt;
+      noteFinish({ kind: "job", label: name, startedAt, finishedAt, durationMs });
       if (durationMs < cfg.slowJobMs) return;
       pushCapped(slowJobs, { at: iso(startedAt), name, durationMs, ok });
       deps.log(`[slow-job] ${name} ${durationMs}ms ok=${ok}`);
@@ -298,15 +370,21 @@ export function trackJob<A extends unknown[], R>(name: string, fn: (...args: A) 
       throw err;
     }
     if (result && typeof (result as any).then === "function") {
-      // Observe settlement on a side branch; the caller still gets (and must
-      // still handle) the original promise, so rejections are not swallowed.
-      (result as any).then(
-        () => settle(true),
-        () => settle(false)
-      );
-    } else {
-      settle(true);
+      // Return the DERIVED promise (not a side branch): it carries the same
+      // value/rejection, and a rejection the caller ignores stays unhandled,
+      // exactly as it would have been without the wrapper.
+      return (result as any).then(
+        (v: unknown) => {
+          settle(true);
+          return v;
+        },
+        (e: unknown) => {
+          settle(false);
+          throw e;
+        }
+      ) as R;
     }
+    settle(true);
     return result;
   };
 }
@@ -357,6 +435,7 @@ export function __resetEventLoopMonitorForTesting(): void {
   stalls.length = 0;
   slowRequests.length = 0;
   slowJobs.length = 0;
+  recentFinishes.length = 0;
   lastBeatAt = 0;
 }
 

@@ -6,7 +6,8 @@
 // better-sqlite3 is synchronous, so each probe blocked the one event loop
 // every host shares — measured live 2026-09-21/25 at 2.2–2.6 s time-to-first-
 // byte on a cold cache. /health is polled by fleet routines and external
-// monitors; a health check must never itself be a source of stalls.
+// monitors. With the cache the counts run at most once per TTL instead of on
+// every probe (the one refresh per minute still runs in the request path).
 //
 // Both numbers are informational (a pruning hint and a traffic gauge), so a
 // value up to HEALTH_COUNTS_TTL_MS old is fine. `cachedAgeMs` says how old.

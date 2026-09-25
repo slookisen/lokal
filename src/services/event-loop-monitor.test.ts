@@ -16,7 +16,10 @@
  *      query string stripped, slow requests recorded + logged.
  *   C. Stall detection with an injected clock: a late heartbeat records a
  *      stall with the in-flight requests and active jobs of that moment; an
- *      on-time heartbeat records nothing; the log line names both.
+ *      on-time heartbeat records nothing; the log line names both. C9–C11
+ *      (review round 1, finding 1): a request/job that blocks synchronously
+ *      and FINISHES before the late heartbeat is attributed via
+ *      finishedDuringBlock; work that finished before the window is not.
  *   D. Summary/report shape: public summary carries numbers only (no paths),
  *      report is newest-first, ring buffers are capped.
  *   E. Kill switch: EVENT_LOOP_MONITOR_DISABLED=1 starts nothing.
@@ -160,6 +163,21 @@ export async function runEventLoopMonitorTests(opts: { log?: boolean } = {}): Pr
       res.emit("finish");
       assertTrue(elm.getEventLoopReport().slowRequests.every((r) => r.host !== "elm-hostheader.example"), "B9: a fast request is not recorded as slow");
     }
+    {
+      assertTrue(elm.redactPath("/produsent/ordre/Ab3dEf6hIj9kLm2nOp5qRs") === "/produsent/ordre/:tok",
+        "B10: a token-like path segment (≥ 20 chars, letters + digits) is masked");
+      assertTrue(elm.redactPath("/api/marketplace/auth/m/x9_Y8-z7W6v5U4t3S2r1Q0") === "/api/marketplace/auth/m/:tok",
+        "B11: …including base64url tokens with - and _");
+      assertTrue(elm.redactPath("/produsent/ola-nordmann-gard-oslo") === "/produsent/ola-nordmann-gard-oslo" && elm.redactPath("/mcp") === "/mcp",
+        "B12: ordinary routes and digit-free slugs are left intact");
+      const req: any = { method: "GET", hostname: "h".repeat(300) + ".example", originalUrl: "/produsent/ordre/Ab3dEf6hIj9kLm2nOp5qRs?x=1", headers: {} };
+      const res = fakeRes();
+      elm.requestTrackerMiddleware(req, res, () => {});
+      const e = elm.getEventLoopReport().inflightNow.find((r) => r.host.startsWith("hhhh"));
+      assertTrue(!!e && e.host.length === 100 && e.path === "/produsent/ordre/:tok",
+        "B13: the host is capped at 100 chars and the tracked path is redacted (review round 1, findings 3–4)");
+      res.emit("finish");
+    }
 
     // ── C. Stall detection (injected clock) ─────────────────────────
     setup();
@@ -214,6 +232,51 @@ export async function runEventLoopMonitorTests(opts: { log?: boolean } = {}): Pr
       const st = elm.getEventLoopReport().stalls;
       assertTrue(st.length === 3, "D4: the stall ring buffer is capped at ringSize");
       assertTrue(st[0].lagMs === 2004 && st[2].lagMs === 2002, "D5: report lists stalls newest first and keeps the newest");
+    }
+
+    // ── C9–C11. Blockers that finished before the late heartbeat ──────
+    setup();
+    {
+      // A handler blocks synchronously for 5 s and responds in the same tick:
+      // its 'finish' fires (nextTick) BEFORE the late heartbeat runs.
+      const res = fakeRes();
+      elm.requestTrackerMiddleware({ method: "GET", hostname: "elm-syncblock.example", originalUrl: "/admin/heavy-sync", headers: {} }, res, () => {});
+      clock += 5_000;
+      res.emit("finish");
+      elm.__heartbeatForTesting();
+      const st = elm.getEventLoopReport().stalls[0];
+      assertTrue(!!st && !st.inflight.some((r) => r.host === "elm-syncblock.example"),
+        "C9a: a synchronous blocker is no longer in flight when the stall is detected");
+      assertTrue(!!st && st.finishedDuringBlock.some((f) => f.kind === "request" && f.label === "GET elm-syncblock.example/admin/heavy-sync" && f.durationMs === 5_000),
+        "C9b: …but it is named in finishedDuringBlock with its duration");
+      assertTrue(lines.some((l) => l.startsWith("[event-loop-stall]") && l.includes("finished_during_block=[GET elm-syncblock.example/admin/heavy-sync (5000ms)]")),
+        "C9c: …and in the stall log line");
+    }
+    setup();
+    {
+      // A synchronous scheduler job (e.g. auto-prune) blocks for 4 s.
+      elm.trackJob("elm-test-syncjob", () => { clock += 4_000; })();
+      elm.__heartbeatForTesting();
+      const st = elm.getEventLoopReport().stalls[0];
+      assertTrue(!!st && st.activeJobs.length === 0 && st.finishedDuringBlock.some((f) => f.kind === "job" && f.label === "elm-test-syncjob" && f.durationMs === 4_000),
+        "C10: a synchronous job that blocked is attributed via finishedDuringBlock (not activeJobs)");
+    }
+    setup();
+    {
+      // A long request that finished BEFORE the heartbeat was due must not be
+      // blamed for a later, unrelated stall.
+      const res = fakeRes();
+      elm.requestTrackerMiddleware({ method: "GET", hostname: "elm-earlier.example", originalUrl: "/slow-io", headers: {} }, res, () => {});
+      clock += 3_000;
+      res.emit("finish");
+      elm.__configureEventLoopMonitorForTesting(); // heartbeat on time right after it
+      clock += 500;
+      elm.__heartbeatForTesting(); // on time: no stall, prunes the buffer
+      clock += 500 + 6_000; // next heartbeat 6 s late, nothing finished in between
+      elm.__heartbeatForTesting();
+      const st = elm.getEventLoopReport().stalls[0];
+      assertTrue(!!st && st.lagMs === 6_000 && st.finishedDuringBlock.length === 0,
+        "C11: work that finished before the late window is not attributed to the stall");
     }
 
     // ── C (cont.). Stall snapshot ordering vs long-lived streams ──
