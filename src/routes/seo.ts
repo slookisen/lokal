@@ -4843,6 +4843,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // the daily scraper. Quietly omitted on empty/missing-table.
       let bmEventsHtml = "";
       let bmEventsCountHeader = "";
+      // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B2: parallel
+      // schema.org Event JSON-LD array, built alongside bmEventsHtml below
+      // from the same eventRows. Stays [] on any query failure (same
+      // silent-omit behavior as bmEventsHtml — shares this try/catch, no
+      // second one) and on the empty-events path, so a page/day with no
+      // upcoming events emits byte-identical jsonLd to before this change.
+      let bmEventsJsonLd: any[] = [];
       try {
         // Decide whether this umbrella participates in the BM tree.
         const isVenue = umbrellaRow.umbrella_type === "venue";
@@ -4850,12 +4857,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         const isNational = agent.name.toLowerCase() === "bondens marked norge";
 
         if (isVenue || isLokallag || isNational) {
-          let eventRows: Array<{ event_name: string; location_text: string; start_at: string; end_at: string | null; source_url: string; venue_name: string; venue_id: string }> = [];
+          let eventRows: Array<{ event_name: string; location_text: string; start_at: string; end_at: string | null; source_url: string; venue_name: string; venue_id: string; lat: number | null; lng: number | null; city: string | null }> = [];
           const nowIso = new Date().toISOString();
           if (isVenue) {
             eventRows = umbDb.prepare(`
               SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
-                     a.id AS venue_id, a.name AS venue_name
+                     a.id AS venue_id, a.name AS venue_name, a.lat AS lat, a.lng AS lng, a.city AS city
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE e.venue_agent_id = ? AND e.start_at >= ?
                 AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
@@ -4864,7 +4871,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           } else if (isLokallag) {
             eventRows = umbDb.prepare(`
               SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
-                     a.id AS venue_id, a.name AS venue_name
+                     a.id AS venue_id, a.name AS venue_name, a.lat AS lat, a.lng AS lng, a.city AS city
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE (a.parent_umbrella_id = ? OR e.venue_agent_id = ?) AND e.start_at >= ?
                 AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
@@ -4874,7 +4881,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             // National: top-5 + counts
             eventRows = umbDb.prepare(`
               SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
-                     a.id AS venue_id, a.name AS venue_name
+                     a.id AS venue_id, a.name AS venue_name, a.lat AS lat, a.lng AS lng, a.city AS city
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE e.start_at >= ?
                 AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
@@ -4907,6 +4914,34 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
               const loc = r.location_text ? ` (${escapeHtml(r.location_text)})` : "";
               return `<li><strong>${escapeHtml(date)}</strong>${timeStr} &mdash; ${escapeHtml(r.event_name)}${loc}${venueAnno}</li>`;
             }).join("");
+            // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B2:
+            // schema.org Event per row with a name + start date. Same
+            // "only assign if we have data" style as the producer page's
+            // own jsonLd.address/jsonLd.geo (~line 5195) — no undefined
+            // keys are ever assigned, so JSON.stringify emits nothing for
+            // a missing field rather than a literal "undefined".
+            bmEventsJsonLd = eventRows
+              .filter(r => r.event_name && r.start_at)
+              .map(r => {
+                const place: any = { "@type": "Place", "name": r.venue_name };
+                if (r.city) {
+                  place.address = { "@type": "PostalAddress", "addressLocality": r.city, "addressCountry": "NO" };
+                }
+                if (r.lat && r.lng) {
+                  place.geo = { "@type": "GeoCoordinates", "latitude": r.lat, "longitude": r.lng };
+                }
+                const ev: any = {
+                  "@context": "https://schema.org",
+                  "@type": "Event",
+                  "name": r.event_name,
+                  "startDate": r.start_at,
+                  "location": place,
+                  "organizer": { "@type": "Organization", "name": "Bondens marked Norge" },
+                };
+                if (r.end_at) ev.endDate = r.end_at;
+                if (r.source_url) ev.url = r.source_url;
+                return ev;
+              });
             bmEventsHtml = `
         <div class="card">
           <div class="card-head"><span>&#128197;</span><h3>Kommende markedsdager${eventRows.length ? ` (${eventRows.length})` : ""}</h3></div>
@@ -4991,7 +5026,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         {
           extraCss: PROFILE_CSS,
           lang,
-          jsonLd: umbJsonLd,
+          // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B2: only
+          // widen to an array when there's at least one upcoming BM event —
+          // zero events keeps emitting exactly today's single Organization
+          // object, zero behavior change on pages/days with no events.
+          jsonLd: bmEventsJsonLd.length ? [umbJsonLd, ...bmEventsJsonLd] : umbJsonLd,
           pathForAlternate: "/produsent/" + slug,
         }
       ));

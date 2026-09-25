@@ -45373,3 +45373,24 @@ runSerial(async () => {
     failures.push("rfb-makesoffer-price-optional: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B2: seo.ts's umbrella
+// /produsent/:slug branch now also emits a parallel schema.org Event
+// JSON-LD entry per upcoming Bondens marked row (alongside the existing
+// Organization jsonLd), widening jsonLd to an array only when at least one
+// upcoming event exists. Own in-memory DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B2: BM Event JSON-LD ──");
+  try {
+    const { runBmEventJsonLdTests } = require("../src/routes/rfb-bm-event-jsonld.test") as
+      typeof import("../src/routes/rfb-bm-event-jsonld.test");
+    const bej = await runBmEventJsonLdTests({ log: false });
+    passed += bej.passed;
+    failed += bej.failed;
+    for (const f of bej.failures) failures.push("rfb-bm-event-jsonld: " + f);
+    console.log(`  rfb-bm-event-jsonld: ${bej.passed} passed, ${bej.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-bm-event-jsonld: unexpected error: " + String(err?.message || err));
+  }
+});
