@@ -40,6 +40,7 @@
 // Timers are injected so tests drive the chain synchronously instead of waiting
 // on wall clock.
 
+import { trackJob } from "./event-loop-monitor";
 export type BackfillSchedulerDeps = {
   /** Log/metric prefix, e.g. "agents-geocode". */
   label: string;
@@ -96,7 +97,9 @@ export function startBackfillScheduler(deps: BackfillSchedulerDeps): BackfillSch
     if (stopped) return;
     let next = deps.idleDelayMs;
     try {
-      await deps.runTick();
+      // Named for the event-loop stall monitor (dev-request 2026-09-19-prod-
+      // event-loop-stall-mcp-unhealthy): a stall during a tick names this worker.
+      await trackJob(deps.label, deps.runTick)();
     } catch (err) {
       // A failed tick is a reason to slow down, never a reason to stop.
       console.error(`[${deps.label}] tick failed:`, err);

@@ -42,6 +42,8 @@ import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
+import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
+import { getPageViewHealthCounts } from "./services/health-counts";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
@@ -165,6 +167,16 @@ const PORT = process.env.PORT || 3000;
 //   3. Breaks req.protocol (always "http" instead of "https")
 // "true" = trust the first proxy hop, which is Fly's edge.
 app.set("trust proxy", true);
+
+// ─── Event-loop stall monitor (dev-request 2026-09-19-prod-event-loop-stall-
+// mcp-unhealthy) ────────────────────────────────────────────────
+// Observability only: records when the single event loop every host shares is
+// blocked, together with the requests in flight and the background jobs
+// running at that moment. Mounted FIRST so every request on every host is in
+// the in-flight set. Details: src/services/event-loop-monitor.ts.
+// Report: GET /admin/analytics/ops/event-loop. Kill switch: EVENT_LOOP_MONITOR_DISABLED=1.
+startEventLoopMonitor();
+app.use(requestTrackerMiddleware);
 
 // ─── www → apex redirect ────────────────────────────────────
 // Canonical domain is rettfrabonden.com (no www).
@@ -576,12 +588,14 @@ app.get("/health", (_req, res) => {
     // See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet for why this differs
     // from traffic.totalAgents (below) and from llms.txt's producer count.
     const agentCount = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get() as any).c;
-    const pvCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
     const queryCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
 
-    // Recent activity (last hour)
-    const oneHourAgo = new Date(Date.now() - 3600000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
-    const recentPv = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views WHERE created_at > ?").get(oneHourAgo) as any).c;
+    // analytics_page_views totals (~1.2 M rows): cached for 60 s so /health
+    // itself never blocks the shared event loop on a cold full count —
+    // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy.
+    const pvCounts = getPageViewHealthCounts(db);
+    const pvCount = pvCounts.pageViews;
+    const recentPv = pvCounts.lastHourPageViews;
 
     // Uptime
     const uptimeSec = Math.floor(process.uptime());
@@ -626,6 +640,7 @@ app.get("/health", (_req, res) => {
         agents: agentCount,
         pageViews: pvCount,
         queries: queryCount,
+        pageViewsCachedAgeMs: pvCounts.cachedAgeMs,
       },
       // traffic.totalAgents = marketplaceRegistry.getStats().totalAgents = COUNT(*) FROM agents
       // with NO filter at all (includes inactive + umbrella-tagged rows). This is the SAME
@@ -637,6 +652,9 @@ app.get("/health", (_req, res) => {
         totalAgents: stats.totalAgents,
         activeCities: stats.cities.length,
       },
+      // Numbers only here (public endpoint); per-stall request/job detail is
+      // admin-only at GET /admin/analytics/ops/event-loop.
+      eventLoop: getEventLoopSummary(),
       responseMs,
     });
   } catch (err) {
@@ -1240,7 +1258,7 @@ app.listen(Number(PORT), HOST, async () => {
 
   // Recalculate trust scores in background (non-blocking)
   // Uses setTimeout(0) so the event loop can handle incoming requests first.
-  setTimeout(() => {
+  setTimeout(trackJob("boot-trust-recalc", () => {
     try {
       console.log("📊 Recalculating trust scores (background)...");
       const trustResult = trustScoreService.recalculateAll();
@@ -1248,7 +1266,7 @@ app.listen(Number(PORT), HOST, async () => {
     } catch (err) {
       console.error("Trust recalc failed (non-fatal):", err);
     }
-  }, 2000); // 2 second delay — let health checks pass first
+  }), 2000); // 2 second delay — let health checks pass first
 
   // ─── PR-21 / WO-19 (2026-05-10): link-freshness backfill ────────────
   // On every boot, probe every agent currently in the outreach pool.
@@ -1264,7 +1282,7 @@ app.listen(Number(PORT), HOST, async () => {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { runUrlBackfill } = require("./agents/lokal-agent-verifier");
       Promise.resolve()
-        .then(() => runUrlBackfill())
+        .then(trackJob("url-backfill", () => runUrlBackfill()))
         .catch((err: unknown) => {
           console.error("[enrichment-backfill] failed (non-fatal):", err);
         });
@@ -1340,7 +1358,7 @@ app.listen(Number(PORT), HOST, async () => {
     };
 
     // Check every hour. The shouldRunAutoPrune guard handles the rest.
-    setInterval(autoPruneTick, 60 * 60_000);
+    setInterval(trackJob("auto-prune", autoPruneTick), 60 * 60_000);
   }
 });
 
@@ -1357,7 +1375,7 @@ app.listen(Number(PORT), HOST, async () => {
 // Disable by setting RFB_DISABLE_DEBIO_SYNC=1 (e.g. on local dev / CI).
 let lastDebioSyncAt: Date | null = null;
 if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
-  setInterval(async () => {
+  setInterval(trackJob("debio-sync", async () => {
     const now = new Date();
     if (now.getUTCHours() !== 4) return; // fire only during 04:00 UTC window
     if (lastDebioSyncAt && (now.getTime() - lastDebioSyncAt.getTime()) < 23 * 3600_000) return;
@@ -1375,7 +1393,7 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
     } catch (err) {
       console.error("[debio-sync] failed:", err);
     }
-  }, 60 * 60_000); // hourly check
+  }), 60 * 60_000); // hourly check
 }
 
 // ─── dev-request 2026-07-06-rfb-salgskanal-kategorier: daily salgskanal ──
@@ -1397,7 +1415,7 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
 // Disable by setting RFB_DISABLE_SALGSKANAL_SYNC=1 (e.g. on local dev / CI).
 let lastSalgskanalSyncAt: Date | null = null;
 if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
-  setInterval(() => {
+  setInterval(trackJob("salgskanal-sync", () => {
     const now = new Date();
     if (now.getUTCHours() !== 5) return; // fire only during 05:00 UTC window
     if (lastSalgskanalSyncAt && (now.getTime() - lastSalgskanalSyncAt.getTime()) < 23 * 3600_000) return;
@@ -1415,7 +1433,7 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
     } catch (err) {
       console.error("[salgskanal-sync] failed:", err);
     }
-  }, 60 * 60_000); // hourly check
+  }), 60 * 60_000); // hourly check
 }
 
 // ─── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
@@ -1439,7 +1457,7 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
 // CATALOG_SYNC_SCHEDULER_ENABLED=true in fly.toml.
 let lastCatalogSyncAt: Date | null = null;
 if (process.env.CATALOG_SYNC_SCHEDULER_ENABLED === "true") {
-  setInterval(() => {
+  setInterval(trackJob("catalog-sync", () => {
     const now = new Date();
     if (now.getUTCHours() !== 7) return; // fire only during 07:00 UTC window
     if (lastCatalogSyncAt && (now.getTime() - lastCatalogSyncAt.getTime()) < 23 * 3600_000) return;
@@ -1457,7 +1475,7 @@ if (process.env.CATALOG_SYNC_SCHEDULER_ENABLED === "true") {
     } catch (err) {
       console.error("[catalog-sync] failed:", err);
     }
-  }, 60 * 60_000); // hourly check
+  }), 60 * 60_000); // hourly check
 }
 
 // ─── dev-request 2026-08-13-verifier-rutine-stub-og-kadens: internal ─────
@@ -1476,7 +1494,7 @@ if (process.env.CATALOG_SYNC_SCHEDULER_ENABLED === "true") {
 // fly.toml). Any other value, or omitting the var, is a no-op.
 let verifierTickRunning = false;
 if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
-  setInterval(async () => {
+  setInterval(trackJob("verifier-scheduler", async () => {
     if (!isVerifierWindowHour(new Date().getUTCHours())) return;
     if (verifierTickRunning) {
       console.warn("[verifier-scheduler] tick skipped — a previous tick is still running");
@@ -1498,7 +1516,7 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
     } finally {
       verifierTickRunning = false;
     }
-  }, 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
+  }), 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
 }
 
 // ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel
@@ -1529,7 +1547,7 @@ if (
   process.env.ENABLE_DENTAL === "1"
 ) {
   // First tick at boot + 30s (lets the volume mount and db-factory init).
-  setTimeout(async () => {
+  setTimeout(trackJob("dental-geocode", async () => {
     try {
       const { geocodeTick } = await import("./services/dental-geocode-worker");
       const r = await geocodeTick(50);
@@ -1541,10 +1559,10 @@ if (
     } catch (err) {
       console.error("[dental-geocode] boot-tick failed:", err);
     }
-  }, 30_000);
+  }), 30_000);
 
   // Subsequent ticks hourly.
-  setInterval(async () => {
+  setInterval(trackJob("dental-geocode", async () => {
     try {
       const { geocodeTick } = await import("./services/dental-geocode-worker");
       const r = await geocodeTick(50);
@@ -1556,7 +1574,7 @@ if (
     } catch (err) {
       console.error("[dental-geocode] tick failed:", err);
     }
-  }, 60 * 60_000);
+  }), 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-04-opplevagent-naer-meg-geosok (item 1, 2026-07-10):
@@ -1579,7 +1597,7 @@ if (
   process.env.ENABLE_EXPERIENCES === "1"
 ) {
   // First tick at boot + 30s (lets the volume mount and db-factory init).
-  setTimeout(async () => {
+  setTimeout(trackJob("experiences-geocode", async () => {
     try {
       const { experiencesGeocodeTick } = await import("./services/experiences-geocode-worker");
       const r = await experiencesGeocodeTick(50);
@@ -1596,10 +1614,10 @@ if (
     } catch (err) {
       console.error("[experiences-geocode] boot-tick failed:", err);
     }
-  }, 30_000);
+  }), 30_000);
 
   // Subsequent ticks hourly.
-  setInterval(async () => {
+  setInterval(trackJob("experiences-geocode", async () => {
     try {
       const { experiencesGeocodeTick } = await import("./services/experiences-geocode-worker");
       const r = await experiencesGeocodeTick(50);
@@ -1616,7 +1634,7 @@ if (
     } catch (err) {
       console.error("[experiences-geocode] tick failed:", err);
     }
-  }, 60 * 60_000);
+  }), 60 * 60_000);
 }
 
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
@@ -1640,7 +1658,7 @@ if (
   process.env.GARDSSALG_OUTREACH_DAILY_DISABLED !== "1"
 ) {
   let lastGardssalgOutreachRunAt: Date | null = null;
-  const gardssalgOutreachDailyTick = async () => {
+  const gardssalgOutreachDailyTick = trackJob("gardssalg-outreach-daily", async () => {
     const now = new Date();
     try {
       const { shouldRunGardssalgOutreachDaily, runGardssalgOutreachDaily } = await import("./routes/opplevelser");
@@ -1655,7 +1673,7 @@ if (
     } catch (err) {
       console.error("[gardssalg-outreach-daily] tick failed (non-fatal, retried next tick):", err);
     }
-  };
+  });
   setTimeout(() => { void gardssalgOutreachDailyTick(); }, 90_000);
   setInterval(() => { void gardssalgOutreachDailyTick(); }, 10 * 60_000);
 }
@@ -1744,7 +1762,7 @@ if (
   process.env.RFB_DISABLE_BOOKING_FOLLOWUPS !== "1" &&
   process.env.ENABLE_EXPERIENCES === "1"
 ) {
-  setInterval(async () => {
+  setInterval(trackJob("booking-followups", async () => {
     try {
       const { processBookingFollowups } = await import("./services/booking-store");
       const r = await processBookingFollowups();
@@ -1761,7 +1779,7 @@ if (
     } catch (err) {
       console.error("[booking-followups] tick failed:", err);
     }
-  }, 60 * 60_000);
+  }), 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
@@ -1796,7 +1814,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
   const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);
   console.log(`[dispatch-tick] enabled — runDispatchTick("active") every ${tickIntervalMin} min`);
 
-  const dispatchTick = async (label: string) => {
+  const dispatchTick = trackJob("dispatch-tick", async (label: string) => {
     try {
       const r = await runDispatchTick("active");
       // Log only when the tick actually did something — a no-op tick every
@@ -1811,7 +1829,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
     } catch (err) {
       console.error(`[dispatch-tick] ${label} failed (non-fatal):`, err);
     }
-  };
+  });
 
   // dev-requests/2026-07-09-self-continue-cooldown-carveout.md: every deploy swaps
   // the Fly machine and resets the interval phase, so a next_suggested envelope
