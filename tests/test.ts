@@ -43240,6 +43240,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about (Del B):
+// a SECOND, separate fact-level substantiation check
+// (about-fact-substantiation.ts) used ONLY by the `about` field's read-only
+// weekly spot-check (admin-field-spot-check.ts's deps.substantiate override
+// for field_name === "about") — never the write-guard above, which stays
+// unchanged. Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about: about fact-level substantiation (Del B) ──");
+  try {
+    const { runAboutFactSubstantiationTests } = require("../src/services/about-fact-substantiation.test") as
+      typeof import("../src/services/about-fact-substantiation.test");
+    const afs = await runAboutFactSubstantiationTests({ log: false });
+    passed += afs.passed;
+    failed += afs.failed;
+    for (const f of afs.failures) failures.push("about-fact-substantiation: " + f);
+    console.log(`  about-fact-substantiation: ${afs.passed} passed, ${afs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("about-fact-substantiation: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: RFB's
 // second (lower-bar) verification line + the paraply(umbrella)-routing
 // guard, both gated behind RFB_SECOND_LINE_VERIFICATION_ENABLED (default

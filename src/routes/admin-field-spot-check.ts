@@ -39,6 +39,7 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { computeFieldSpotCheck } from "../agents/lokal-agent-verifier";
+import { checkAboutCandidateFactSubstantiated } from "../services/about-fact-substantiation";
 
 const router = Router();
 
@@ -139,7 +140,21 @@ router.post("/", async (req: Request, res: Response) => {
 
     const fieldValue = (knowledge as any)?.[column] ?? null;
 
-    const result = await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl });
+    // dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about
+    // (Del B): `about` alone gets the fact-level substantiation check
+    // (about-fact-substantiation.ts) — tolerant of dialectal/paraphrase
+    // rewording as long as the candidate's own distinct facts (place names,
+    // founder names, years) are genuinely, locally corroborated on the
+    // fetched page(s). `phone`/`address` are UNCHANGED: no deps override,
+    // same default (checkAboutCandidateSubstantiatedBySource) as before —
+    // this fix's own scope is `about` only, per the dev-request.
+    const result =
+      fieldName === "about"
+        ? await computeFieldSpotCheck(
+            { field_value: fieldValue, root_url: rootUrl },
+            { substantiate: checkAboutCandidateFactSubstantiated },
+          )
+        : await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl });
 
     res.json({
       success: true,
