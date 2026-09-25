@@ -1,5 +1,11 @@
 # Opplevagent — ChatGPT App submission checklist
 
+> **2026-09-24: v1.0.0 was rejected (test cases).** Root causes, fixes and the
+> resubmission steps are in [`CHATGPT-APP-RESUBMISSION-2026-09-24.md`](../../CHATGPT-APP-RESUBMISSION-2026-09-24.md).
+> The card templates now live in `src/routes/opplevagent-widgets.ts` and are
+> served as MCP Apps resources (`text/html;profile=mcp-app`); the notes below
+> predate that change.
+
 > **Re-verified 2026-08-24 against the live endpoint.** The remote server now exposes
 > **5 tools** (snake_case): `discover_experiences`, `list_experience_categories`,
 > `get_experience`, `discover_gardssalg`, `book_gardssalg`. All carry `title` +

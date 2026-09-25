@@ -1537,6 +1537,36 @@ export function buildKommuneInClause(
   return { sql: `${column} IN (${placeholders.join(", ")})`, params };
 }
 
+// ─── Season-filter vocabulary (ChatGPT app review 2026-09-24) ─────────────
+// `experiences.season` is a JSON array written by several enrichment paths
+// that never agreed on one spelling: the same row set carries "winter" AND
+// "vinter", "autumn" AND "host"/"høst", "spring" AND "vaar"/"vår", and
+// "year_round" AND "all_year". The filter used to LIKE-match only the
+// caller's literal string, so `season:"winter"` silently dropped every
+// "vinter" row (e.g. Aurora Safari Camp, Tromsø dog sledding) — the direct
+// cause of the failed «Hva kan vi finne på i Troms om vinteren?» review case.
+// A caller may also pass the Norwegian word itself («vinter»), so the
+// expansion runs from ANY known spelling to ALL spellings of that season.
+const SEASON_SPELLINGS: ReadonlyArray<readonly string[]> = [
+  ["winter", "vinter"],
+  ["summer", "sommer"],
+  ["spring", "vår", "vaar", "var"],
+  ["autumn", "fall", "høst", "host", "haust"],
+];
+const YEAR_ROUND_SPELLINGS: readonly string[] = ["year_round", "all_year", "helår", "hele_året"];
+
+/**
+ * Every stored spelling that means the same season as `season`
+ * (case-insensitive). Unknown values pass through unchanged, so a filter
+ * value this table does not know still matches exactly as it did before.
+ * Exported for testing.
+ */
+export function seasonFilterSpellings(season: string): string[] {
+  const s = season.trim().toLowerCase();
+  const group = SEASON_SPELLINGS.find((g) => g.includes(s));
+  return group ? [...group] : [s];
+}
+
 /**
  * Builds the WHERE-clause fragments + bound params shared by
  * discoverExperiences() and countDiscoverExperiences() — factored out so the
@@ -1609,7 +1639,16 @@ function buildDiscoverWhere(f: DiscoverFilter): {
   if (f.weather === "rain" || f.weather === "snow") {
     where.push("(e.indoor_outdoor IN ('indoor','both') OR e.weather_dependent = 0)");
   }
-  if (f.season) { where.push("(e.season IS NULL OR e.season LIKE @season OR e.season LIKE '%year_round%')"); params.season = `%"${f.season}"%`; }
+  if (f.season) {
+    // Any spelling of the requested season, or any year-round marker; a row
+    // with no season data stays included, as before. See seasonFilterSpellings().
+    const likes: string[] = ["e.season IS NULL"];
+    [...seasonFilterSpellings(f.season), ...YEAR_ROUND_SPELLINGS].forEach((spelling, i) => {
+      likes.push(`lower(e.season) LIKE @season${i}`);
+      params[`season${i}`] = `%"${spelling}"%`;
+    });
+    where.push(`(${likes.join(" OR ")})`);
+  }
   if (typeof f.group_size === "number") {
     where.push("(e.group_min IS NULL OR e.group_min <= @gs) AND (e.group_max IS NULL OR e.group_max >= @gs)");
     params.gs = f.group_size;

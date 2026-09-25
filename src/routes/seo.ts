@@ -3003,6 +3003,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Selgerregistrering</td><td>Samtykke</td><td>Du gir aktivt data når du registrerer deg. Du kan trekke tilbake samtykket.</td></tr>
         <tr><td>Selgerprofil (offentlig info)</td><td>Samtykke</td><td>Du velger selv hva du legger inn. Alt er synlig på din profilside.</td></tr>
         <tr><td>Bildeoppasting</td><td>Samtykke</td><td>Du laster selv opp bilder. Bildeskanning er valgfritt.</td></tr>
+        <tr><td>Hentebestillinger</td><td>Avtale</td><td>For å formidle bestillingen til produsenten du bestiller fra.</td></tr>
       </tbody>
     </table>
 

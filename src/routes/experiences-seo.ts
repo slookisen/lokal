@@ -8902,26 +8902,28 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 22. juni 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 24. september 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
 <li><strong>Agent-forespørsler:</strong> hvilke agenter (ChatGPT, Claude, Perplexity m.fl.) som søker, hvilke filtre/søkeord som brukes, og hvilke opplevelser som vises — i aggregert form, uten IP-adresser eller personlige identifikatorer.</li>
-<li><strong>Tilbyder-henvendelser:</strong> e-postadresse lagres så lenge det er nødvendig for å bekrefte eierskap ved overtakelse/korrigering av en oppføring.</li></ul>
+<li><strong>Tilbyder-henvendelser:</strong> e-postadresse lagres så lenge det er nødvendig for å bekrefte eierskap ved overtakelse/korrigering av en oppføring.</li>
+<li><strong>Besøksforespørsler til gårdssalg:</strong> når du ber om et besøk hos en gårdssalg-produsent — på nettsiden eller via en AI-assistent som ChatGPT eller Claude — lagrer vi navn, e-postadresse, eventuelt telefonnummer, ønsket dato/tid, antall personer og en eventuell kommentar. Opplysningene sendes på e-post til produsenten du ba om å besøke, slik at produsenten kan svare deg, og du får selv en kvittering med en statuslenke. Formålet er kun å formidle og følge opp forespørselen; opplysningene brukes ikke til markedsføring.</li></ul>
 <h2>Hva vi IKKE samler inn</h2><ul><li>Ingen sporingscookies.</li><li>Ingen tredjeparts analyseverktøy.</li><li>Ingen betalinger eller kortdata — booking skjer hos tilbyderen.</li><li>Vi selger ikke data til tredjepart.</li></ul>
-<h2>Lagringstid</h2><p>Aggregerte analytikkdata lagres i opptil 180 dager. Opplevelsesdata fra offentlige kilder lagres så lenge opplevelsen er aktiv.</p>
-<h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Lagringstid</h2><p>Aggregerte analytikkdata lagres i opptil 180 dager. Opplevelsesdata fra offentlige kilder lagres så lenge opplevelsen er aktiv. Besøksforespørsler lagres så lenge det trengs for å gjennomføre og følge opp besøket, og slettes når du ber om det.</p>
+<h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Har du sendt en besøksforespørsel, kan du på samme adresse be om innsyn i, retting av eller sletting av opplysningene dine.</p>
 <h2>Kontakt</h2><p>E-post: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operatør: Daniel Fredriksen, Norge.</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 22 June 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 24 September 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
 <li><strong>Agent requests:</strong> which agents search, which filters/terms are used, and which experiences are shown — aggregated, without IP addresses or personal identifiers.</li>
-<li><strong>Provider claims:</strong> email stored only as long as needed to confirm ownership.</li></ul>
+<li><strong>Provider claims:</strong> email stored only as long as needed to confirm ownership.</li>
+<li><strong>Farm-sale visit requests:</strong> when you request a visit to a farm-sale (gårdssalg) producer — on the website or through an AI assistant such as ChatGPT or Claude — we store your name, email address, optional phone number, requested date/time, party size and any note. These details are emailed to the producer you asked to visit so they can reply to you, and you receive a receipt with a status link. They are used only to pass on and follow up the request, never for marketing.</li></ul>
 <h2>What we do NOT collect</h2><ul><li>No tracking cookies.</li><li>No third-party analytics.</li><li>No payments or card data — booking happens on the provider's site.</li><li>We do not sell data to third parties.</li></ul>
-<h2>Retention</h2><p>Aggregated analytics for up to 180 days; experience data from public records while the experience is active.</p>
-<h2>Your rights</h2><p>Providers may request removal or correction at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Retention</h2><p>Aggregated analytics for up to 180 days; experience data from public records while the experience is active; visit requests for as long as needed to complete and follow up the visit, and deleted on request.</p>
+<h2>Your rights</h2><p>Providers may request removal or correction at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. If you sent a visit request, you can ask for access to, correction of or deletion of your details at the same address.</p>
 <h2>Contact</h2><p>Email: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operator: Daniel Fredriksen, Norway.</p>`));
 });
 
