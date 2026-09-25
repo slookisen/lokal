@@ -169,6 +169,20 @@ interface VerifierStoredVerdict {
   website_ownership_unverified?: boolean | null;
   corroborated_email_missing?: boolean | null;
   email_website_gate?: { corroborated_email?: boolean } | null;
+  // dev-request 2026-09-15-review-required-koen-promoteres-ikke-aarsak-
+  // usynlig, AC1: the verifier's per-field cross-source verdict for
+  // `address` (CrossSourceResult, cross-source-validator.ts), persisted
+  // verbatim onto the stored verdict under this key. See quarantineReasons()
+  // below for why only `address` — not `phone`/`business_status`, the other
+  // two fields cross-source-validator.ts computes this same shape for — gets
+  // a mapping here.
+  address?: {
+    agree?: boolean;
+    source_count?: number;
+    sources_used?: string[];
+    verdict?: "pool_eligible" | "review_required" | "data_insufficient";
+    conflict?: { values?: { source: string; value: string }[]; severity?: "minor" | "major" };
+  } | null;
   [key: string]: unknown;
 }
 
@@ -213,11 +227,71 @@ function withinDays(iso: string | null, days: number, nowMs: number): boolean {
 //   quarantine:website_ownership_unverified
 //   quarantine:domain_incoherent(<reason>)
 //   quarantine:corroborated_email_missing
+//   quarantine:address_conflict(<severity>)      — see below
+//   quarantine:address_uncorroborated            — see below
+//   quarantine:address_data_insufficient         — see below
 //   quarantine:reason_missing                   — explicit fallback when
 //                                                  none of the above match
 //
 // READ-ONLY: this only parses data already stored on the row
 // (verification_review_reason + field_provenance) — it writes nothing.
+//
+// ── address_conflict / address_uncorroborated / address_data_insufficient
+//    (dev-request 2026-09-15-review-required-koen-promoteres-ikke-aarsak-
+//    usynlig, AC1; address_uncorroborated added on re-review) ─────────────
+//
+// A live probe of all 67 review_required rows (2026-09-25) found 58 falling
+// to the generic quarantine:reason_missing fallback above — every one of
+// those 58 had a `review_reason.address` object (the verifier's stored
+// CrossSourceResult for the `address` field, cross-source-validator.ts)
+// whose `verdict` was NOT `pool_eligible`. Mapping this one field alone
+// closes the gap to 67/67. But `verdict: "review_required"` on its own is
+// NOT enough to say "conflict" — crossSourceAgreement() returns that same
+// verdict string for THREE different underlying shapes, and only one of
+// them is a genuine disagreement:
+//
+//   1. `conflict` sub-object PRESENT (severity "major"/"minor") — ≥2
+//      high-quality (or ≥2 total) sources were compared and their values
+//      actually disagree. This is a real conflict — keep
+//      quarantine:address_conflict(<severity>).
+//   2. `conflict` ABSENT, exactly one real (non-inference) source
+//      (cross-source-validator.ts's `highQuality.length < 2 && valid.length
+//      < 2` branch) — there is nothing to disagree WITH, just one
+//      unconfirmed value (e.g. only a homepage address, no Google-Places
+//      corroboration yet).
+//   3. `conflict` ABSENT, zero real sources — only inference-typed ones
+//      (category_inference, web_search, …; cross-source-validator.ts's
+//      `valid.length === 0` branch) — same "nothing to compare" situation,
+//      just with a guessed value instead of even one real one.
+//   Cases 2 and 3 are a corroboration-COUNT problem (0 or 1 real source),
+//   not a disagreement between sources, so labelling them
+//   quarantine:address_conflict(unknown) (the pre-fix behaviour) actively
+//   misreports the cause to whoever reads pool_blockers next — it implies
+//   sources contradict each other when in fact there is at most one to
+//   begin with. They get their own label, quarantine:address_uncorroborated,
+//   so this stays distinguishable from case 1 by string alone. Detect "is
+//   this case 1" by checking for the `conflict` key itself (not by
+//   source_count/sources_used, which cross-source-validator.ts populates
+//   for cases 2 and 3 too and are for observability only) — `data_insufficient`
+//   (0 sources total, including inference — the `allValid.length === 0`
+//   branch, a stage earlier than case 3 above) keeps its own separate label
+//   below since it is a distinct verdict string, not a review_required
+//   sub-case.
+//
+// Deliberately NOT mapped: `phone` and `business_status`, the other two
+// fields cross-source-validator.ts computes this same CrossSourceResult
+// shape for and stores alongside `address`. cross-source-validator.ts's own
+// `GATING_FIELDS` constant (PR-26, 2026-05-11 policy, reaffirmed by the
+// 2026-08-07 Steg-B change — see that file's comments around the constant)
+// is `["address"]` ONLY: `phone`/`business_status` conflicts are computed
+// and persisted for display/observability but never gate review_required.
+// A row can carry a `phone` or `business_status` conflict and still be
+// pool_eligible on `address` alone, so naming those as quarantine reasons
+// here would misreport the actual cause — exactly the "guess at the wrong
+// mapping" failure mode this route exists to avoid (see this function's own
+// header comment above). If cross-source-validator.ts's GATING_FIELDS ever
+// grows, this mapping needs to grow with it — check that constant first,
+// don't re-derive gating from field name alone.
 //
 // website_ownership_unverified is read from field_provenance DIRECTLY
 // (mirroring the exact check lokal-agent-verifier.ts's Guard #1 makes:
@@ -247,6 +321,19 @@ function quarantineReasons(
         reasons.push(`quarantine:inference_only_fields(${f})`);
       }
     }
+  }
+
+  const addressVerdict = storedVerdict?.address?.verdict;
+  if (addressVerdict === "review_required") {
+    if (storedVerdict?.address?.conflict) {
+      reasons.push(`quarantine:address_conflict(${storedVerdict.address.conflict.severity ?? "unknown"})`);
+    } else {
+      // No `conflict` sub-object: 0 or 1 real (non-inference) source, so
+      // there is nothing to disagree with — see the doc comment above.
+      reasons.push("quarantine:address_uncorroborated");
+    }
+  } else if (addressVerdict === "data_insufficient") {
+    reasons.push("quarantine:address_data_insufficient");
   }
 
   let websiteOwnershipUnverified = storedVerdict?.website_ownership_unverified === true;

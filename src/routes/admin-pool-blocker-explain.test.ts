@@ -591,6 +591,216 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
         !rNotReview.body.agents[0].pool_blockers.some((b: string) => b.startsWith("quarantine:")),
         "m8: quarantine:* blockers are scoped to review_required rows only",
       );
+
+      // m9: dev-request 2026-09-15-review-required-koen-promoteres-ikke-
+      // aarsak-usynlig, AC1: review_reason.address.verdict = "review_required"
+      // with a major conflict -> quarantine:address_conflict(major).
+      insertAgent({
+        id: "pbe-addr-major",
+        name: "Adressekonflikt Gard Major",
+        website: "https://adressekonfliktmajor.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adressekonfliktmajor.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-major'`,
+      ).run(JSON.stringify({
+        address: {
+          verdict: "review_required",
+          conflict: {
+            severity: "major",
+            values: [
+              { source: "homepage", value: "Testveien 1" },
+              { source: "google_places", value: "Andreveien 9" },
+            ],
+          },
+        },
+      }));
+      const rAddrMajor = await callExplain({ agentId: "pbe-addr-major" });
+      assertTrue(
+        rAddrMajor.body.agents[0].pool_blockers.includes("quarantine:address_conflict(major)"),
+        "m9: address review_required verdict with major conflict -> quarantine:address_conflict(major)",
+      );
+
+      // m10: same shape, severity: "minor" -> quarantine:address_conflict(minor).
+      insertAgent({
+        id: "pbe-addr-minor",
+        name: "Adressekonflikt Gard Minor",
+        website: "https://adressekonfliktminor.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adressekonfliktminor.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-minor'`,
+      ).run(JSON.stringify({
+        address: {
+          verdict: "review_required",
+          conflict: {
+            severity: "minor",
+            values: [
+              { source: "homepage", value: "Testveien 1" },
+              { source: "google_places", value: "Testveien 1, 1940 Bjørkelangen" },
+            ],
+          },
+        },
+      }));
+      const rAddrMinor = await callExplain({ agentId: "pbe-addr-minor" });
+      assertTrue(
+        rAddrMinor.body.agents[0].pool_blockers.includes("quarantine:address_conflict(minor)"),
+        "m10: address review_required verdict with minor conflict -> quarantine:address_conflict(minor)",
+      );
+
+      // m11: review_reason.address.verdict = "data_insufficient" (no
+      // conflict sub-object) -> quarantine:address_data_insufficient.
+      insertAgent({
+        id: "pbe-addr-insufficient",
+        name: "Adresse Utilstrekkelig Gard",
+        website: "https://adresseutilstrekkelig.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adresseutilstrekkelig.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-insufficient'`,
+      ).run(JSON.stringify({ address: { verdict: "data_insufficient" } }));
+      const rAddrInsufficient = await callExplain({ agentId: "pbe-addr-insufficient" });
+      assertTrue(
+        rAddrInsufficient.body.agents[0].pool_blockers.includes("quarantine:address_data_insufficient"),
+        "m11: address data_insufficient verdict -> quarantine:address_data_insufficient",
+      );
+
+      // m12: review_reason.address.verdict = "pool_eligible" and no other
+      // guard fields set -> no quarantine:address_* blocker, and (since
+      // nothing else matches either) falls back to quarantine:reason_missing
+      // — mirrors m7's assertion style.
+      insertAgent({
+        id: "pbe-addr-eligible",
+        name: "Adresse Godkjent Gard",
+        website: "https://adressegodkjent.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adressegodkjent.no",
+        fieldProvenance: "{}",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-eligible'`,
+      ).run(JSON.stringify({ address: { verdict: "pool_eligible", agree: true, source_count: 2 } }));
+      const rAddrEligible = await callExplain({ agentId: "pbe-addr-eligible" });
+      assertTrue(
+        !rAddrEligible.body.agents[0].pool_blockers.some((b: string) => b.startsWith("quarantine:address_")),
+        "m12a: address pool_eligible verdict never adds a quarantine:address_* blocker",
+      );
+      assertTrue(
+        rAddrEligible.body.agents[0].pool_blockers.includes("quarantine:reason_missing"),
+        "m12b: with no other guard matching, still falls back to quarantine:reason_missing",
+      );
+
+      // m13: regression guard — review_reason.phone (a NON-gating field per
+      // cross-source-validator.ts's GATING_FIELDS=["address"]) carries a
+      // major conflict alone, address absent -> must NOT produce ANY
+      // quarantine:phone_* or quarantine:address_* blocker. This is the
+      // exact "guess at the wrong mapping" mistake this dev-request's spec
+      // warns against.
+      insertAgent({
+        id: "pbe-phone-only",
+        name: "Kun Telefonkonflikt Gard",
+        website: "https://kuntelefonkonflikt.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@kuntelefonkonflikt.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-phone-only'`,
+      ).run(JSON.stringify({
+        phone: {
+          verdict: "review_required",
+          conflict: {
+            severity: "major",
+            values: [
+              { source: "homepage", value: "+47 911 22 333" },
+              { source: "google_places", value: "+47 999 88 777" },
+            ],
+          },
+        },
+      }));
+      const rPhoneOnly = await callExplain({ agentId: "pbe-phone-only" });
+      assertTrue(
+        !rPhoneOnly.body.agents[0].pool_blockers.some(
+          (b: string) => b.startsWith("quarantine:phone_") || b.startsWith("quarantine:address_"),
+        ),
+        "m13: a phone-only conflict (non-gating field) produces no quarantine:phone_*/quarantine:address_* blocker",
+      );
+
+      // m14: CHANGES-REQUESTED fix-up — review_reason.address.verdict =
+      // "review_required" but with NO `conflict` sub-object at all and
+      // exactly one real source (cross-source-validator.ts's
+      // `highQuality.length < 2 && valid.length < 2` branch: e.g. only a
+      // homepage address, no Google-Places/second source to corroborate or
+      // disagree with) -> quarantine:address_uncorroborated, NOT
+      // quarantine:address_conflict(...) of any kind (there is nothing to
+      // conflict with).
+      insertAgent({
+        id: "pbe-addr-uncorroborated-onesource",
+        name: "Adresse Ukorrobert Gard Enkeltkilde",
+        website: "https://adresseukorroborertenkelt.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adresseukorroborertenkelt.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-uncorroborated-onesource'`,
+      ).run(JSON.stringify({
+        address: {
+          verdict: "review_required",
+          agree: false,
+          source_count: 1,
+          sources_used: ["homepage"],
+        },
+      }));
+      const rAddrUncorroboratedOne = await callExplain({ agentId: "pbe-addr-uncorroborated-onesource" });
+      assertTrue(
+        rAddrUncorroboratedOne.body.agents[0].pool_blockers.includes("quarantine:address_uncorroborated"),
+        "m14a: address review_required with no conflict + 1 real source -> quarantine:address_uncorroborated",
+      );
+      assertTrue(
+        !rAddrUncorroboratedOne.body.agents[0].pool_blockers.some((b: string) => b.startsWith("quarantine:address_conflict(")),
+        "m14b: ...and never quarantine:address_conflict(...) — there's nothing to disagree with",
+      );
+
+      // m15: same fix-up, but the other no-`conflict` review_required shape
+      // — zero real (non-inference) sources, only an inference-typed guess
+      // (cross-source-validator.ts's `valid.length === 0` branch: e.g. only
+      // web_search) -> also quarantine:address_uncorroborated, not a
+      // conflict label.
+      insertAgent({
+        id: "pbe-addr-uncorroborated-inference",
+        name: "Adresse Ukorrobert Gard Inferens",
+        website: "https://adresseukorroborertinferens.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        email: "post@adresseukorroborertinferens.no",
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-addr-uncorroborated-inference'`,
+      ).run(JSON.stringify({
+        address: {
+          verdict: "review_required",
+          agree: false,
+          source_count: 0,
+          sources_used: ["web_search"],
+        },
+      }));
+      const rAddrUncorroboratedInference = await callExplain({ agentId: "pbe-addr-uncorroborated-inference" });
+      assertTrue(
+        rAddrUncorroboratedInference.body.agents[0].pool_blockers.includes("quarantine:address_uncorroborated"),
+        "m15a: address review_required with no conflict + 0 real sources (inference-only) -> quarantine:address_uncorroborated",
+      );
+      assertTrue(
+        !rAddrUncorroboratedInference.body.agents[0].pool_blockers.some((b: string) => b.startsWith("quarantine:address_conflict(")),
+        "m15b: ...and never quarantine:address_conflict(...) either",
+      );
     }
 
     // ── (h) read-only: no writes happen --
