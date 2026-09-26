@@ -54,10 +54,10 @@
  *   (a) 403 without X-Admin-Key, 403 with wrong X-Admin-Key
  *   (b) happy path — one fixture per readiness_tier (outreach_ready,
  *       needs_enrichment, no_website, unreachable, skjult, ikke_soekbar,
- *       nettsted_uverifisert, dublettkonflikt) — all present in the response
- *       (never silently dropped), correctly tiered, and correctly marked
- *       (visible/claim_status/booking_status/is_searchable/website_verified/
- *       has_duplicate_conflict)
+ *       nettsted_uverifisert, dublettkonflikt, navnekollisjon) — all present
+ *       in the response (never silently dropped), correctly tiered, and
+ *       correctly marked (visible/claim_status/booking_status/is_searchable/
+ *       website_verified/has_duplicate_conflict/name_collision)
  *   (c) summary counts match the per-row tiers exactly, total == row count
  *   (d) a non-gårdssalg provider (no producer_type, not rfb-seed) is
  *       excluded, same scoping as the sibling contact-coverage report
@@ -68,6 +68,14 @@
  * dedup-merge (merged_into set) is excluded from the readiness output
  * entirely, even when every other field would otherwise tier it
  * outreach_ready — see the prov-merged fixture and its "g1" assertion below.
+ *
+ * Extended for dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-
+ * og-bridge, AC3: a row stamped experience_providers.name_collision=1 (by
+ * the recheck-backfill sweep, Slice 1 of the same dev-request) is excluded
+ * from outreach_ready — a new "navnekollisjon" tier, checked LAST (lowest
+ * precedence) so every pre-existing tier's behavior stays unchanged — see
+ * the prov-navnekollisjon fixture, its "b"/"c5e" assertions, and the
+ * direct computeGardssalgReadinessTier unit-level coverage under "h" below.
  */
 
 export interface TestSummary {
@@ -370,6 +378,26 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         title: "Fjellbekken kajakktur med fjordsafari",
         booking_url: "https://kajakkeventyr.no/turer",
       });
+      // navnekollisjon (dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-
+      // harvest-og-bridge, AC3): a byte-for-byte outreach_ready-shaped
+      // fixture (same shape as prov-ready) whose ONLY difference is
+      // name_collision being stamped 1 -- set via a raw UPDATE below, same
+      // precedent as prov-merged's merged_into further down -- so
+      // insertProvider's own column list keeps mirroring every OTHER
+      // fixture's insert shape unchanged. Must tier navnekollisjon, not
+      // outreach_ready, despite being otherwise fully content-complete/
+      // searchable/verified/conflict-free.
+      insertProvider.run({
+        id: "prov-navnekollisjon", navn: "Navnekollisjon Gård AS", org_nr: "151515151", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@navnekollisjon.no", telefon: null, hjemmeside: "https://navnekollisjon.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider, cider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "navnekollisjon-gard-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, geocode_confidence: null,
+      });
+      expDb.prepare(`UPDATE experience_providers SET name_collision = 1 WHERE id = 'prov-navnekollisjon'`).run();
+
       // non-gårdssalg provider (no producer_type, not rfb-seed) -> excluded
       // entirely, same scoping as the sibling contact-coverage report.
       insertProvider.run({
@@ -403,7 +431,8 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       });
       expDb.prepare(`UPDATE experience_providers SET merged_into = 'prov-ready' WHERE id = 'prov-merged'`).run();
 
-      const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const opplevelserModule = require("./opplevelser") as typeof import("./opplevelser");
+      const opplevelserRouter = opplevelserModule.default as any;
 
       // ── (a) auth gate ────────────────────────────────────────────────────
       const noKey = await callRoute(opplevelserRouter, {});
@@ -432,11 +461,12 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         "prov-unverified": "Uverifisert Gård AS",
         "prov-conflict": "Konflikt Gård AS",
         "prov-nametoken": "Fjellbekken Håndbryggeri AS",
+        "prov-navnekollisjon": "Navnekollisjon Gård AS",
       };
       const byId = (id: string) =>
         (ok.body.providers as any[]).find((r) => r.name === NAME_BY_FIXTURE_ID[id]);
 
-      assertEq(ok.body.providers.length, 11, "d1: total providers is 11 (non-gårdssalg row excluded, and merged-away prov-merged is ALSO excluded despite otherwise qualifying outreach_ready)");
+      assertEq(ok.body.providers.length, 12, "d1: total providers is 12 (non-gårdssalg row excluded, and merged-away prov-merged is ALSO excluded despite otherwise qualifying outreach_ready)");
 
       const ready = byId("prov-ready");
       assertTrue(!!ready, "b3: outreach_ready fixture present");
@@ -457,6 +487,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(ready?.website_verified, true, "b16b: prov-ready website_verified true (verified field_provenance)");
       assertEq(ready?.has_duplicate_conflict, false, "b16c: prov-ready has_duplicate_conflict false (no matching experience)");
       assertEq(ready?.geocode_confidence, "high", "b16d: prov-ready geocode_confidence passthrough (dev-request 2026-09-09-opplevagent-stedsetikett..., Skive 3)");
+      assertEq(ready?.name_collision, false, "b16e: prov-ready name_collision false (never stamped) -- dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge, AC3");
 
       const enrich = byId("prov-enrich");
       assertEq(enrich?.readiness_tier, "needs_enrichment", "b17: prov-enrich tiered needs_enrichment");
@@ -533,6 +564,19 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(conflict?.name_token_conflict_candidate, false, "f5: prov-conflict (provider_link basis) does NOT carry the candidate flag — the two fields never bleed into each other");
       assertEq(ready?.name_token_conflict_candidate, false, "f6: prov-ready (no matching experience at all) carries no candidate flag");
 
+      // ── (b, navnekollisjon) dev-request 2026-09-09-navnekollisjon-feil-
+      // enhet-ved-harvest-og-bridge, AC3: an otherwise fully outreach-ready
+      // row (content-complete, searchable, website-verified, not hidden, no
+      // duplicate conflict) but stamped name_collision=1 must tier
+      // navnekollisjon, never outreach_ready, until a human clears the flag.
+      const navnekollisjon = byId("prov-navnekollisjon");
+      assertTrue(!!navnekollisjon, "b47: prov-navnekollisjon fixture is present");
+      assertEq(navnekollisjon?.readiness_tier, "navnekollisjon", "b48: prov-navnekollisjon tiered navnekollisjon despite being otherwise fully outreach-ready");
+      assertEq(navnekollisjon?.name_collision, true, "b49: prov-navnekollisjon name_collision true (surfaced on the row for operator visibility)");
+      assertEq(navnekollisjon?.is_searchable, true, "b50: prov-navnekollisjon is_searchable true (has a slug, not hidden -- collision is the ONLY thing blocking it)");
+      assertEq(navnekollisjon?.website_verified, true, "b51: prov-navnekollisjon website_verified true");
+      assertEq(navnekollisjon?.has_duplicate_conflict, false, "b52: prov-navnekollisjon has_duplicate_conflict false (collision and duplicate-conflict are independent signals)");
+
       // No non-gårdssalg row leaked in.
       assertTrue(
         !(ok.body.providers as any[]).some((r) => r.name === "Ikke Gårdssalg AS"),
@@ -550,13 +594,48 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         "g1: merged-away provider (merged_into set) is excluded from providers list despite otherwise qualifying outreach_ready",
       );
 
+      // ── (h) dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-
+      // og-bridge, AC3: computeGardssalgReadinessTier unit-level coverage —
+      // called DIRECTLY (no DB/route involved), same precedent as the rest
+      // of this suite exercising the function only via the route, but this
+      // one new input is simplest to prove in isolation. Baseline input is
+      // otherwise fully outreach-ready (every OTHER check clears).
+      const FULLY_READY_INPUT = {
+        has_website: true,
+        has_about_text: true,
+        has_products: true,
+        brreg_verified: true,
+        has_email: true,
+        has_phone: false,
+        catalog_hidden: false,
+        is_searchable: true,
+        website_verified: true,
+        has_duplicate_conflict: false,
+      };
+      assertEq(
+        opplevelserModule.computeGardssalgReadinessTier({ ...FULLY_READY_INPUT, name_collision: true }),
+        "navnekollisjon",
+        "h1: name_collision:true on an otherwise fully outreach-ready input tiers navnekollisjon, not outreach_ready",
+      );
+      assertEq(
+        opplevelserModule.computeGardssalgReadinessTier({ ...FULLY_READY_INPUT, name_collision: false }),
+        "outreach_ready",
+        "h2: name_collision:false (explicit) is unchanged -- still outreach_ready",
+      );
+      assertEq(
+        opplevelserModule.computeGardssalgReadinessTier(FULLY_READY_INPUT),
+        "outreach_ready",
+        "h3: name_collision omitted entirely (undefined, matching every pre-existing caller) defaults safely -- still outreach_ready, same optional-field precedent as verified_second_line",
+      );
+
       // ── (c) summary ──────────────────────────────────────────────────────
-      // 11 fixtures: prov-ready + prov-nametoken (outreach_ready, 2),
+      // 12 fixtures: prov-ready + prov-nametoken (outreach_ready, 2),
       // prov-enrich + prov-no-brreg + prov-no-products (needs_enrichment, 3),
       // prov-noweb (no_website), prov-unreach (unreachable), prov-hidden
       // (skjult), prov-claimed (ikke_soekbar), prov-unverified
-      // (nettsted_uverifisert), prov-conflict (dublettkonflikt).
-      assertEq(ok.body.summary.total, 11, "c1: summary.total is 11");
+      // (nettsted_uverifisert), prov-conflict (dublettkonflikt),
+      // prov-navnekollisjon (navnekollisjon).
+      assertEq(ok.body.summary.total, 12, "c1: summary.total is 12");
       assertEq(ok.body.summary.outreach_ready, 2, "c2: summary.outreach_ready counts prov-ready + prov-nametoken (slice 1: the candidate no longer blocks)");
       assertEq(ok.body.summary.needs_enrichment, 3, "c3: summary.needs_enrichment counts prov-enrich + prov-no-brreg + prov-no-products");
       assertEq(ok.body.summary.no_website, 1, "c4: summary.no_website counts prov-noweb");
@@ -565,28 +644,30 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(ok.body.summary.ikke_soekbar, 1, "c5b: summary.ikke_soekbar counts prov-claimed");
       assertEq(ok.body.summary.nettsted_uverifisert, 1, "c5c: summary.nettsted_uverifisert counts prov-unverified");
       assertEq(ok.body.summary.dublettkonflikt, 1, "c5d: summary.dublettkonflikt counts prov-conflict");
+      assertEq(ok.body.summary.navnekollisjon, 1, "c5e: summary.navnekollisjon counts prov-navnekollisjon (dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge, AC3)");
       const summarySum =
         ok.body.summary.outreach_ready + ok.body.summary.needs_enrichment +
         ok.body.summary.no_website + ok.body.summary.unreachable +
         ok.body.summary.skjult + ok.body.summary.ikke_soekbar +
-        ok.body.summary.nettsted_uverifisert + ok.body.summary.dublettkonflikt;
-      assertEq(summarySum, ok.body.summary.total, "c6: per-tier summary counts (all 8 tiers) sum to total (every row tiered exactly once)");
+        ok.body.summary.nettsted_uverifisert + ok.body.summary.dublettkonflikt +
+        ok.body.summary.navnekollisjon;
+      assertEq(summarySum, ok.body.summary.total, "c6: per-tier summary counts (all 9 tiers) sum to total (every row tiered exactly once)");
       assertEq(ok.body.summary.name_token_conflict_candidates, 1, "c7: summary.name_token_conflict_candidates counts prov-nametoken only (informational, NOT a tier — excluded from the c6 sum)");
 
       // ── (c8-c11) geo_precision summary (dev-request 2026-09-09-opplevagent-
       // stedsetikett-poststed-og-kommunesentroide-kart, Skive 3, AC4): a
-      // SECOND, independent bucketing over the same 11 rows — not a tier,
+      // SECOND, independent bucketing over the same 12 rows — not a tier,
       // orthogonal to readiness_tier (e.g. prov-ready is both outreach_ready
       // AND geo_precision.address). high/medium/low (prov-ready/prov-enrich/
       // prov-no-brreg) -> address; sted (prov-no-products) -> sted;
-      // approximate (prov-noweb) -> kommune; no_match/NULL (the remaining 6:
+      // approximate (prov-noweb) -> kommune; no_match/NULL (the remaining 7:
       // prov-unreach, prov-hidden, prov-claimed, prov-unverified,
-      // prov-conflict, prov-nametoken) -> ukjent.
+      // prov-conflict, prov-nametoken, prov-navnekollisjon) -> ukjent.
       assertTrue(!!ok.body.summary.geo_precision, "c8: summary.geo_precision is present");
       assertEq(ok.body.summary.geo_precision.address, 3, "c9: geo_precision.address counts prov-ready(high)+prov-enrich(medium)+prov-no-brreg(low)");
       assertEq(ok.body.summary.geo_precision.sted, 1, "c10: geo_precision.sted counts prov-no-products");
       assertEq(ok.body.summary.geo_precision.kommune, 1, "c11: geo_precision.kommune counts prov-noweb(approximate)");
-      assertEq(ok.body.summary.geo_precision.ukjent, 6, "c12: geo_precision.ukjent counts the 6 no_match/NULL rows");
+      assertEq(ok.body.summary.geo_precision.ukjent, 7, "c12: geo_precision.ukjent counts the 7 no_match/NULL rows");
       const geoPrecisionSum =
         ok.body.summary.geo_precision.address + ok.body.summary.geo_precision.sted +
         ok.body.summary.geo_precision.kommune + ok.body.summary.geo_precision.ukjent;
@@ -607,6 +688,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(empty.body.summary.ikke_soekbar, 0, "e9: summary.ikke_soekbar is 0");
       assertEq(empty.body.summary.nettsted_uverifisert, 0, "e10: summary.nettsted_uverifisert is 0");
       assertEq(empty.body.summary.dublettkonflikt, 0, "e11: summary.dublettkonflikt is 0");
+      assertEq(empty.body.summary.navnekollisjon, 0, "e11a: summary.navnekollisjon is 0");
       assertEq(empty.body.summary.name_token_conflict_candidates, 0, "e12: summary.name_token_conflict_candidates is 0");
       assertEq(empty.body.summary.geo_precision.address, 0, "e13: geo_precision.address is 0");
       assertEq(empty.body.summary.geo_precision.sted, 0, "e14: geo_precision.sted is 0");

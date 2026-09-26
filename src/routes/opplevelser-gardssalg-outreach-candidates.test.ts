@@ -38,6 +38,14 @@
  *       mode=first, dedupe_suppressed_count reflects it
  *   (k) limit clamping: limit=0 -> clamped to 1; limit=500 -> not capped
  *       below the natural (small) candidate count
+ *   (l) dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-
+ *       bridge, AC3: a name_collision=1 row (otherwise fully eligible, with
+ *       a 45-day-old prior send so it would otherwise qualify for BOTH
+ *       mode=first's never-contacted OR mode=second's second-touch window,
+ *       depending on which is exercised) is excluded from BOTH modes; the
+ *       SAME row with name_collision flipped back to 0 reappears in
+ *       mode=second — proves the exclusion is a live per-row read, not a
+ *       one-way/cached decision.
  *
  * Exported runOpplevelserGardssalgOutreachCandidatesTests({log}) ->
  * TestSummary; wired into tests/test.ts. Standalone:
@@ -430,6 +438,67 @@ export function runOpplevelserGardssalgOutreachCandidatesTests(
       const clampedLow = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "first", limit: "0" } });
       assertEq(clampedLow.body.count, 1, "k3: limit=0 clamps to 1");
       assertEq(clampedLow.body.candidates.length, 1, "k4: exactly one candidate returned with limit=0");
+
+      // ── (l) dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-
+      // og-bridge, AC3: a row stamped experience_providers.name_collision=1
+      // (by the recheck-backfill sweep, Slice 1 of the same dev-request)
+      // must never surface as a cold-outreach candidate, in EITHER mode,
+      // until a human clears the flag. mkOutreachReady()'s base shape is
+      // already "otherwise fully outreach-ready" (email, website, about_
+      // text, products, brreg_verified=1, catalog_hidden=0, slug set ->
+      // is_searchable=1, VERIFIED_STAMP field_provenance -> website_
+      // verified=1, no matching experience row -> no duplicate conflict) --
+      // name_collision, set via a raw UPDATE (name_collision is not part of
+      // insertGo's own column list, mirroring the merged_into precedent in
+      // the sibling readiness-report test), is the ONLY thing that must
+      // block it here.
+      //
+      // Never-contacted + name_collision=1 -> would otherwise appear under
+      // mode=first exactly like prov-never (test b above) -- must be absent.
+      mkOutreachReady({ id: "prov-collision-never", navn: "Kollisjon Aldri Kontaktet Gård", epost: "post@fixture-collision-never.no" });
+      expDb.prepare(`UPDATE experience_providers SET name_collision = 1 WHERE id = 'prov-collision-never'`).run();
+
+      const firstCollisionNever = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "first" } });
+      assertTrue(
+        !(firstCollisionNever.body.candidates as any[]).some((c) => c.provider_id === "prov-collision-never"),
+        "l1: never-contacted, name_collision=1 provider ABSENT from mode=first (would otherwise appear, exactly like prov-never)",
+      );
+      const secondCollisionNever = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "second" } });
+      assertTrue(
+        !(secondCollisionNever.body.candidates as any[]).some((c) => c.provider_id === "prov-collision-never"),
+        "l2: also absent from mode=second (never contacted, independently of the collision)",
+      );
+
+      // Contacted 45 days ago + name_collision=1 -> would otherwise appear
+      // under mode=second exactly like prov-45d (test d above) -- must be
+      // absent instead. This is the sharper of the two fixtures: without
+      // name_collision this row WOULD be a valid mode=second candidate, so
+      // its absence here is caused by the collision flag specifically, not
+      // by touch-cadence.
+      mkOutreachReady({ id: "prov-collision-45d", navn: "Kollisjon Femogfoerti Dager Gård", epost: "post@fixture-collision-45d.no" });
+      insertSentRow("prov-collision-45d", "post@fixture-collision-45d.no", 45);
+      expDb.prepare(`UPDATE experience_providers SET name_collision = 1 WHERE id = 'prov-collision-45d'`).run();
+
+      const secondCollision45d = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "second" } });
+      assertTrue(
+        !(secondCollision45d.body.candidates as any[]).some((c) => c.provider_id === "prov-collision-45d"),
+        "l3: contacted-45-days-ago, name_collision=1 provider ABSENT from mode=second (would otherwise qualify, exactly like prov-45d)",
+      );
+      const firstCollision45d = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "first" } });
+      assertTrue(
+        !(firstCollision45d.body.candidates as any[]).some((c) => c.provider_id === "prov-collision-45d"),
+        "l4: also absent from mode=first (already contacted, independently of the collision)",
+      );
+
+      // Round-trip: flip name_collision back to 0 for the SAME row -> it
+      // reappears under mode=second. Proves the exclusion is a live per-row
+      // read of the flag, not a one-way/cached decision.
+      expDb.prepare(`UPDATE experience_providers SET name_collision = 0 WHERE id = 'prov-collision-45d'`).run();
+      const secondCollisionCleared = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "second" } });
+      assertTrue(
+        (secondCollisionCleared.body.candidates as any[]).some((c) => c.provider_id === "prov-collision-45d"),
+        "l5: flipping name_collision back to 0 for the SAME row makes it reappear under mode=second (round-trip, not a one-way exclusion)",
+      );
     } catch (err: any) {
       failed++;
       failures.push(
