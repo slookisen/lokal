@@ -1312,6 +1312,50 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       assertEq(descOf(idClaim), null, "ed-r15c: a content_source='claim' row was never written to");
       assertEq(descOf(idMerged), null, "ed-r15d: a dedup-merged-away row was never written to");
 
+      // ── ed-r16: skipped_reasons.generation_fail_reasons — a single apply-
+      //    mode batch with TWO rows that fail generation for two DIFFERENT
+      //    reasons (one LLM-fetch network throw -> "network_error", one
+      //    LLM returning the escape sentinel -> "sentinel") gets a full,
+      //    per-reason breakdown alongside the existing coarse buckets, which
+      //    stay exactly as they were (both distinct reasons are still a
+      //    SUBSET of generation_failed, same as no_title_node/fetch_failed
+      //    above; nothing here changes what is or isn't written). ──────────
+      {
+        const idBreakNetwork = expStore.createExperience(richSeed({ title: "Nettverksfeil-tur" }) as any);
+        const idBreakSentinel = expStore.createExperience(richSeed({ title: "Sentinel-tur" }) as any);
+
+        setStub(((async (_url: any, init: any) => {
+          const prompt = String(JSON.parse(init.body).messages[0].content);
+          if (prompt.includes("Du er faktakontrollør")) {
+            counters.judge++;
+            return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "GODKJENN\nOK." }] }) };
+          }
+          counters.generate++;
+          if (prompt.includes("Tittel: Nettverksfeil-tur")) throw new Error("boom");
+          if (prompt.includes("Tittel: Sentinel-tur")) {
+            return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "UTILSTREKKELIG_GRUNNLAG" }] }) };
+          }
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FAKTALINJE_FIXTURE }] }) };
+        }) as unknown) as typeof fetch);
+
+        const before = dumpAll();
+        const r = await post({ dry_run: false, ids: [idBreakNetwork, idBreakSentinel] });
+        assertEq(r.status, 200, "ed-r16a: 200");
+        assertEq(r.body.written, 0, "ed-r16b: written: 0 — both rows fail generation");
+        assertEq(r.body.skipped_reasons.generation_failed, 2, "ed-r16c: existing coarse bucket still counts both");
+        assertEq(r.body.skipped_reasons.thin_data, 0, "ed-r16d: existing thin_data bucket unaffected");
+        assertEq(r.body.skipped_reasons.judge_rejected, 0, "ed-r16e: existing judge_rejected bucket unaffected");
+        assertEq(r.body.skipped_reasons.no_title_node, 0, "ed-r16f: existing no_title_node field unaffected");
+        assertEq(r.body.skipped_reasons.fetch_failed, 0, "ed-r16g: existing fetch_failed field unaffected");
+        assertEq(r.body.skipped_reasons.generation_fail_reasons.network_error, 1,
+          "ed-r16h: generation_fail_reasons.network_error counts the fetch-throw row");
+        assertEq(r.body.skipped_reasons.generation_fail_reasons.sentinel, 1,
+          "ed-r16i: generation_fail_reasons.sentinel counts the escape-sentinel row");
+        assertEq(Object.keys(r.body.skipped_reasons.generation_fail_reasons).sort(), ["network_error", "sentinel"],
+          "ed-r16j: only the two reasons that actually occurred are present — no zero-filled enum keys");
+        assertEq(dumpAll(), before, "ed-r16k: ZERO rows changed");
+      }
+
       // ═══════════════════════════════════════════════════════════════
       // ed-k* — kildetro end-to-end, blocked-homepage fallthrough,
       // auto-supersede, and the new no_title_node/fetch_failed buckets
