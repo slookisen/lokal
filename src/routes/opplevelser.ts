@@ -16500,6 +16500,7 @@ export type GardssalgReadinessTier =
   | "ikke_soekbar"
   | "nettsted_uverifisert"
   | "dublettkonflikt"
+  | "navnekollisjon"
   | "krever_eier"
   | "dod_kilde";
 
@@ -16528,6 +16529,16 @@ export function computeGardssalgReadinessTier(input: {
   // and additive — omitted (undefined) behaves exactly like `false`, so every
   // OTHER caller of this function keeps its current behavior unchanged.
   verified_second_line?: boolean;
+  // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+  // AC3: the experience_providers.name_collision stamp (flagNameCollision(),
+  // experience-store.ts) set by the recheck-backfill sweep
+  // (experience-brreg-recheck-backfill.ts) when Brreg matching found >=2
+  // candidates sharing the provider's name with no kommune disambiguation —
+  // a genuine risk of attaching the WRONG entity's contact data. Optional
+  // and additive — omitted (undefined) behaves exactly like `false`, so
+  // every OTHER caller of this function keeps its current behavior
+  // unchanged, same precedent as verified_second_line above.
+  name_collision?: boolean;
 }): GardssalgReadinessTier {
   if (input.terminal_status) return input.terminal_status;
   if (!input.has_email && !input.has_phone) return "unreachable";
@@ -16567,6 +16578,15 @@ export function computeGardssalgReadinessTier(input: {
   // "minimal diff" instruction.
   if (!input.website_verified && !input.verified_second_line) return "nettsted_uverifisert";
   if (input.has_duplicate_conflict) return "dublettkonflikt";
+  // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+  // AC3: LAST branch before outreach_ready, deliberately — every existing
+  // tier's precedence above stays byte-for-byte unchanged; a row already
+  // caught by an earlier, more specific tier is reported under THAT tier,
+  // not navnekollisjon. Only once a row has cleared every other check does
+  // an unresolved name-collision stamp stop it from falling through to
+  // outreach_ready — it must be human-cleared (a fresh Brreg recheck
+  // resolving the ambiguity) before it can ever reach cold outreach again.
+  if (input.name_collision) return "navnekollisjon";
   return "outreach_ready";
 }
 
@@ -16649,6 +16669,13 @@ function computeGardssalgReadinessRows(
   // WHY without a separate field_provenance lookup.
   verified_second_line: boolean;
   has_duplicate_conflict: boolean;
+  // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+  // AC3: surfaces the experience_providers.name_collision stamp (set by the
+  // recheck-backfill sweep — see computeGardssalgReadinessTier's own
+  // `name_collision` doc comment above) for the SAME reason website_verified
+  // is — an operator/reviewer looking at a row tiered navnekollisjon needs
+  // to see WHY without a separate lookup.
+  name_collision: boolean;
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
@@ -16706,6 +16733,7 @@ function computeGardssalgReadinessRows(
     antall_ansatte: number | null;
     terminal_status: string | null;
     geocode_confidence: string | null;
+    name_collision: number | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -16716,7 +16744,7 @@ function computeGardssalgReadinessRows(
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status,
-                geocode_confidence
+                geocode_confidence, name_collision
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
             AND ${GARDSSALG_NOT_MERGED_WHERE}`;
@@ -16833,6 +16861,10 @@ function computeGardssalgReadinessRows(
     const size_flag_reason: GardssalgSizeFlagReason = antallAnsatteBrregConsulted ? "no_registered_figure" : null;
     const terminal_status =
       p.terminal_status === "krever_eier" || p.terminal_status === "dod_kilde" ? p.terminal_status : null;
+    // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+    // AC3: see computeGardssalgReadinessTier's own `name_collision` doc
+    // comment for what this stamp means and why it excludes a row here.
+    const name_collision = !!p.name_collision;
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -16847,6 +16879,7 @@ function computeGardssalgReadinessRows(
       has_duplicate_conflict,
       terminal_status,
       verified_second_line,
+      name_collision,
     });
 
     return {
@@ -16867,6 +16900,7 @@ function computeGardssalgReadinessRows(
       website_verified,
       verified_second_line,
       has_duplicate_conflict,
+      name_collision,
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
@@ -16926,6 +16960,11 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     ikke_soekbar: 0,
     nettsted_uverifisert: 0,
     dublettkonflikt: 0,
+    // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+    // AC3: new tier, same pre-initialized-to-0 discipline as every other
+    // tier key above (summary[p.readiness_tier]++ below type-requires every
+    // tier key to exist).
+    navnekollisjon: 0,
     // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
     // 3a: explicit end-status buckets, reported as their OWN population per
     // the dev-request's "rapporteres som sin egen bestand" requirement — not
@@ -20002,6 +20041,9 @@ export function computeGardssalgVeienTilPoolMissing(
   if (readinessRow.readiness_tier === "skjult") missing.push("catalog_hidden");
   if (readinessRow.readiness_tier === "ikke_soekbar") missing.push("is_searchable");
   if (readinessRow.readiness_tier === "dublettkonflikt") missing.push("duplicate_conflict");
+  // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
+  // AC3: same one-more-line pattern as the three checks above it.
+  if (readinessRow.readiness_tier === "navnekollisjon") missing.push("name_collision");
   return missing;
 }
 
