@@ -19,6 +19,11 @@
 // production config never does.
 process.env.NODE_ENV = 'test';
 process.env.EMAIL_FORCE_DRY_RUN = 'true';
+// dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: keep the suite
+// hermetic — no block may spawn the off-thread stats worker against whatever
+// file DB getDb() happens to open. The worker path is tested directly (with
+// its own temp DB) in src/services/offthread-stats.test.ts.
+process.env.OFFTHREAD_STATS_DISABLED = '1';
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
@@ -32031,6 +32036,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += hc.failed;
     for (const f of hc.failures) failures.push("health-counts: " + f);
     console.log(`  health-counts: ${hc.passed} passed, ${hc.failed} failed`);
+
+    // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: the homepage
+    // traffic stats and /health counts run in an off-thread worker
+    // (src/services/offthread-stats.ts); W-tests start the real worker
+    // against their own temp DB.
+    console.log("\n── offthread-stats: worker-computed traffic stats + /health counts ──");
+    const { runOffThreadStatsTests } = require("../src/services/offthread-stats.test") as
+      typeof import("../src/services/offthread-stats.test");
+    const ots = await runOffThreadStatsTests({ log: false });
+    passed += ots.passed;
+    failed += ots.failed;
+    for (const f of ots.failures) failures.push("offthread-stats: " + f);
+    console.log(`  offthread-stats: ${ots.passed} passed, ${ots.failed} failed`);
 
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN

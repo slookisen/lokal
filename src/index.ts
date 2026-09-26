@@ -44,6 +44,7 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { getPageViewHealthCounts } from "./services/health-counts";
+import { prewarmTrafficStats } from "./services/traffic-stats";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
@@ -1267,6 +1268,12 @@ app.listen(Number(PORT), HOST, async () => {
       console.error("Trust recalc failed (non-fatal):", err);
     }
   }), 2000); // 2 second delay — let health checks pass first
+
+  // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: the homepage
+  // traffic strips are computed off the main thread (offthread-stats.ts).
+  // Start the first computation for all three hosts now so they show real
+  // numbers as early as possible; until it lands they render zeros.
+  prewarmTrafficStats(["rfb", "dental", "experiences"]);
 
   // ─── PR-21 / WO-19 (2026-05-10): link-freshness backfill ────────────
   // On every boot, probe every agent currently in the outreach pool.

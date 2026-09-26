@@ -44,7 +44,7 @@
  */
 
 import { getDb } from "../database/init";
-import { getTrafficStats } from "./traffic-stats";
+import { getTrafficStatsSnapshot } from "./traffic-stats";
 import {
   countPublishedExperiences,
   countPublishedProviders,
@@ -100,6 +100,8 @@ function getOaSinceDate(): string | null {
 }
 
 const OA_HOME_COUNTERS_TTL_MS = 10 * 60 * 1000; // 10 min — inside the 5-15 min window
+/** Cache life of a result built while the traffic stats were still warming up. */
+const OA_HOME_COUNTERS_WARMUP_TTL_MS = 15_000;
 
 let _cache: { data: OaHomeCounters; time: number } | null = null;
 
@@ -115,7 +117,7 @@ export function getOaHomeCounters(): OaHomeCounters {
 
   // Traffic side: already host-scoped (vertical_id='experiences') and
   // already excludes fleet/internal traffic (is_owner) — see file header.
-  const traffic = getTrafficStats("experiences");
+  const { stats: traffic, ready: trafficReady } = getTrafficStatsSnapshot("experiences");
 
   // Catalog side: read defensively, same "render with 0s, never throw"
   // discipline as the rest of experiences-seo.ts (e.g. safeCategories()) —
@@ -146,7 +148,12 @@ export function getOaHomeCounters(): OaHomeCounters {
     kommuner,
     sinceDate: getOaSinceDate(),
   };
-  _cache = { data, time: now };
+  // Right after boot the traffic stats are computed off-thread
+  // (traffic-stats.ts) and are placeholder zeros until the first refresh
+  // lands. Caching those for the full 10-minute TTL would pin zeros on the
+  // homepage, so a not-ready result is cached for OA_HOME_COUNTERS_WARMUP_TTL_MS
+  // only (dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy).
+  _cache = { data, time: trafficReady ? now : now - (OA_HOME_COUNTERS_TTL_MS - OA_HOME_COUNTERS_WARMUP_TTL_MS) };
   return data;
 }
 

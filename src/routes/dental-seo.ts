@@ -16,7 +16,7 @@ import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
-import { getTrafficStats } from "../services/traffic-stats";
+import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
@@ -993,8 +993,13 @@ const SPECIALTIES = [
 // ═══════════════════════════════════════════════════════════
 
 router.get("/api/traffic-stats", (_req: Request, res: Response) => {
-  const s = getTrafficStats("dental");
+  // ready=false: the numbers are placeholder zeros while the first off-thread
+  // computation after boot is still running (dev-request
+  // 2026-09-19-prod-event-loop-stall-mcp-unhealthy) — do not read them as a drop.
+  const { stats: s, ready } = getTrafficStatsSnapshot("dental");
+  if (!ready) res.set("Cache-Control", "no-store");
   res.json({
+    ready,
     pageViews: s.pageViews,
     uniqueVisitors: s.uniqueVisitors,
     // New three-bucket fields (dev-request 2026-07-21 slice A)
