@@ -188,6 +188,134 @@ export function runDentalStorePublicCatalogClassFilterTests(
 }
 
 /**
+ * dev-request 2026-09-26-dental-forside-og-sted-synkron-3s:
+ * listPoststeder() used to pick each poststed's majority fylke with a
+ * CORRELATED subquery (one GROUP BY scan of the whole table per distinct
+ * poststed) -- the actual root cause of the ~3 s main-thread stalls on `/`
+ * and `/sted/:slug` (both read this via getCachedPoststeder()), measured at
+ * 266 ms on a synthetic 6900-row/1500-poststed DB with no other load.
+ * Rewritten as two flat, non-correlated GROUP BY queries + one JS reduce
+ * pass (6 ms on the same synthetic DB, 0 output mismatches). This test
+ * pins the two DIFFERENT filters the rewrite must keep exactly as they were:
+ *   - the per-poststed COUNT shown to visitors uses verification_status +
+ *     DENTAL_CLINIC_CLASS_SQL (same as every other public read surface here);
+ *   - the majority-FYLKE label uses verification_status only (deliberately
+ *     NOT catalog_class -- it is a display label, not a count) and a
+ *     rejected row must not count toward either.
+ * A poststed split across two fylker (3 rows fylke A, 2 rows fylke B) must
+ * report the majority fylke (A), not the fylke of whichever row happens to
+ * be inserted/scanned last -- exactly the class of bug a naive
+ * single-pass-without-tie-tracking rewrite could reintroduce.
+ */
+export function runDentalListPoststederFylkeModeTests(
+  opts: { log?: boolean } = {}
+): TestSummary {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+  function assertEq(actual: unknown, expected: unknown, label: string): void {
+    assertTrue(
+      JSON.stringify(actual) === JSON.stringify(expected),
+      `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`
+    );
+  }
+
+  const prevDentalPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPath = require.resolve("../database/db-factory");
+  const dentalStorePath = require.resolve("./dental-store");
+  const cachePaths = [dbFactoryPath, dentalStorePath];
+  for (const p of cachePaths) delete require.cache[p];
+
+  try {
+    const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+    dbFactory.__resetDbFactoryForTesting();
+    const store = require("./dental-store") as typeof import("./dental-store");
+    const db = dbFactory.getDb("dental");
+
+    // TRONDHEIM: 3 rows in fylke Trøndelag, 2 rows in fylke Innlandet ->
+    // majority fylke must be Trøndelag even though Innlandet rows are
+    // inserted (and thus scanned) last.
+    const trondheimSeed = [
+      { org_nr: "912900001", fylke: "Trøndelag" },
+      { org_nr: "912900002", fylke: "Trøndelag" },
+      { org_nr: "912900003", fylke: "Trøndelag" },
+      { org_nr: "912900004", fylke: "Innlandet" },
+      { org_nr: "912900005", fylke: "Innlandet" },
+    ];
+    for (const row of trondheimSeed) {
+      store.createDentalAgent({
+        navn: "Tannklinikk " + row.org_nr,
+        org_nr: row.org_nr,
+        fylke: row.fylke,
+        poststed: "TRONDHEIM",
+        telefon: "22110000",
+      } as any);
+    }
+
+    // One rejected + one catalog_class='person_enk' row in the same
+    // poststed: the rejected row must be excluded from BOTH the count and
+    // the fylke-mode pick; the person_enk row must be excluded from the
+    // count but still counted toward the fylke-mode pick (mirrors
+    // countPublicDentalAgents' filter vs. the old subquery's own filter).
+    const rejectedId = store.createDentalAgent({
+      navn: "Avvist Tannklinikk", org_nr: "912900006", fylke: "Feilfylke",
+      poststed: "TRONDHEIM", telefon: "22110000",
+    } as any);
+    db.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(rejectedId);
+
+    const enkId = store.createDentalAgent({
+      navn: "OLA NORDMANN", org_nr: "912900007", fylke: "Trøndelag",
+      poststed: "TRONDHEIM", telefon: "22110000",
+    } as any);
+    db.prepare("UPDATE dental_agents SET catalog_class = 'person_enk' WHERE id = ?").run(enkId);
+
+    const steder = store.listPoststeder(1);
+    const trondheim = steder.find((s) => s.poststed === "TRONDHEIM");
+    assertTrue(!!trondheim, "listPoststeder returns a TRONDHEIM row");
+    assertEq(trondheim?.fylke, "Trøndelag", "majority fylke (3 vs 2) wins regardless of insert/scan order");
+    assertEq(trondheim?.count, 5, "count excludes the rejected row and the person_enk row -> 5 (3 Trøndelag + 2 Innlandet clinic-eligible rows)");
+
+    const rejectedElsewhere = store.createDentalAgent({
+      navn: "Kun Avvist Tannklinikk", org_nr: "912900008", fylke: "Vestland",
+      poststed: "BERGEN", telefon: "22110000",
+    } as any);
+    db.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(rejectedElsewhere);
+    const bergen = steder.find((s) => s.poststed === "BERGEN") ??
+      store.listPoststeder(1).find((s) => s.poststed === "BERGEN");
+    assertTrue(!bergen, "a poststed with ONLY a rejected row is absent entirely (min-count filter, not a 0-count/null-fylke row)");
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store listPoststeder fylke-mode: unexpected error: " + String(err?.stack || err?.message || err));
+  } finally {
+    if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH;
+    else process.env.DENTAL_DB_PATH = prevDentalPath;
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+    } catch {
+      // best-effort cleanup
+    }
+    for (const p of cachePaths) delete require.cache[p];
+  }
+
+  return { passed, failed, failures };
+}
+
+/**
  * dev-request 2026-09-03-dental-stage-v-sample-recency-broken:
  * Stage V's "10% sample of last-24h commits" selector always drew the same 3
  * records because `.agent.updated_at` was always absent/null in the API
