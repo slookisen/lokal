@@ -23,7 +23,6 @@
 import type Database from "better-sqlite3";
 import { computePageViewCounts, type PageViewCounts } from "./health-counts-compute";
 import { createSwrCache, offThreadStatsUsable, runStatsTaskOffThread } from "./offthread-stats";
-import { trackJob } from "./event-loop-monitor";
 
 export const HEALTH_COUNTS_TTL_MS = 60_000;
 const HEALTH_COUNTS_RETRY_MS = 60_000;
@@ -114,10 +113,10 @@ export function createPageViewHealthCounter(deps: PageViewHealthCounterDeps): Pa
 
 const defaultCounter = createPageViewHealthCounter({
   offThreadUsable: offThreadStatsUsable,
+  // Not wrapped in trackJob() for the same reason as traffic-stats.ts: it never
+  // blocks the loop and must not show up as a stall suspect.
   runOffThread: (dbPath, nowMs) =>
-    trackJob("offthread:health-counts", () =>
-      runStatsTaskOffThread<PageViewCounts>(dbPath, { kind: "pageViewCounts", nowMs })
-    )(),
+    runStatsTaskOffThread<PageViewCounts>(dbPath, { kind: "pageViewCounts", nowMs }),
   computeSync: computePageViewCounts,
   now: Date.now,
   offThreadTtlMs: HEALTH_COUNTS_TTL_MS,
@@ -125,6 +124,11 @@ const defaultCounter = createPageViewHealthCounter({
   log: (msg) => console.warn(msg),
 });
 
+/**
+ * `nowMs`/`ttlMs` drive the synchronous path (and the one first fill on the
+ * off-thread path). Once the off-thread path is serving, freshness follows
+ * HEALTH_COUNTS_TTL_MS and the wall clock; `cachedAgeMs` reports the real age.
+ */
 export function getPageViewHealthCounts(
   db: Database.Database,
   nowMs: number = Date.now(),

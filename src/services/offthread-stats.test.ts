@@ -3,14 +3,15 @@
  *
  * Covers the fix that moves the homepage traffic stats and the /health page-view
  * counts off the main event loop:
- *   S1–S9   createSwrCache: stale-while-revalidate, de-duplication, failure back-off
+ *   S1–S10  createSwrCache: stale-while-revalidate, de-duplication, failure back-off, clear()
  *   T1–T9   createTrafficStatsReader (injected deps, fake DB handles): the off-thread
  *           path never runs the synchronous computation; the fallback path does
  *   P1–P5   createPageViewHealthCounter: one synchronous fill, then background refreshes
- *   U1–U4   offThreadStatsUsable: in-memory DBs, the kill switch, file DBs
- *   W1–W7   the REAL worker (worker_threads + tsx) against a temp-file SQLite DB:
+ *   U1–U5   offThreadStatsUsable: in-memory DBs, the kill switch, file DBs, non-WAL DBs
+ *   W1–W10  the REAL worker (worker_threads + tsx) against a temp-file SQLite DB:
  *           identical results to the synchronous computation, task errors, timeout,
- *           and the fall-back-after-3-failures safety valve
+ *           the per-task fall-back-after-3-failures safety valve, worker replacement
+ *           on a DB-path change, and the per-task run report
  *
  * No global DB injection and no await while process.env is modified, so it is safe
  * next to the concurrently running blocks in tests/test.ts. Exported
@@ -57,8 +58,9 @@ function stats(pageViews: number): TrafficStats {
   return { ...emptyTrafficStats(60), pageViews, humanViews: pageViews, realHumans: pageViews };
 }
 
-const FILE_DB = { name: "/data/lokal.db", memory: false } as unknown as Database.Database;
-const OTHER_FILE_DB = { name: "/data/other.db", memory: false } as unknown as Database.Database;
+const walPragma = () => "wal";
+const FILE_DB = { name: "/data/lokal.db", memory: false, pragma: walPragma } as unknown as Database.Database;
+const OTHER_FILE_DB = { name: "/data/other.db", memory: false, pragma: walPragma } as unknown as Database.Database;
 
 export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -146,6 +148,25 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     ok(calls.length === 4, "S9: a clock that moved backwards counts as stale and refreshes", calls);
     d.resolve(9);
     await swr.settled("a");
+
+    // S10: a refresh that started before clear() must not land in the cleared
+    // cache, and must not break de-duplication of the refresh started after it.
+    const oldD = deferred<number>();
+    const newD = deferred<number>();
+    let n = 0;
+    const cl = createSwrCache<number>({ ttlMs: 100, now: () => t, refresh: () => (n++ === 0 ? oldD.promise : newD.promise) });
+    cl.get("k");
+    cl.clear();
+    cl.get("k");
+    oldD.resolve(111);
+    await flush();
+    cl.get("k");
+    const afterOld = cl.get("k");
+    newD.resolve(222);
+    await cl.settled("k");
+    const afterNew = cl.get("k");
+    ok(afterOld === undefined && n === 2 && !!afterNew && afterNew.value === 222,
+      "S10: after clear() the old in-flight refresh is ignored and the new one is not duplicated", { afterOld, n, afterNew });
   }
 
   // ── T: createTrafficStatsReader ───────────────────────────────────
@@ -289,6 +310,9 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
       ok(offThreadStatsUsable(FILE_DB) === false, "U3: OFFTHREAD_STATS_DISABLED=1 is a kill switch");
       process.env.OFFTHREAD_STATS_DISABLED = "0";
       ok(offThreadStatsUsable(FILE_DB) === true, "U4: any other value leaves the worker enabled");
+      const rollbackDb = { name: "/data/rollback.db", memory: false, pragma: () => "delete" } as unknown as Database.Database;
+      ok(offThreadStatsUsable(rollbackDb) === false,
+        "U5: a DB outside WAL mode never uses the worker (a long read would block the main thread's writes)");
     } finally {
       if (prev === undefined) delete process.env.OFFTHREAD_STATS_DISABLED;
       else process.env.OFFTHREAD_STATS_DISABLED = prev;
@@ -376,11 +400,52 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     const brokenState = getOffThreadStatsState();
     const prev = process.env.OFFTHREAD_STATS_DISABLED;
     delete process.env.OFFTHREAD_STATS_DISABLED;
-    const usableWhenBroken = offThreadStatsUsable({ name: dbPath, memory: false } as unknown as Database.Database);
+    const usableWhenBroken = offThreadStatsUsable({ name: dbPath, memory: false, pragma: walPragma } as unknown as Database.Database);
     if (prev === undefined) delete process.env.OFFTHREAD_STATS_DISABLED;
     else process.env.OFFTHREAD_STATS_DISABLED = prev;
     ok(errs.length === OFFTHREAD_MAX_CONSECUTIVE_FAILURES && brokenState.broken && usableWhenBroken === false,
       "W7: a worker that cannot start fails its tasks, and after 3 failures in a row callers fall back to the synchronous path", { errs, brokenState, usableWhenBroken });
+
+    // W8: failures are counted per task — another task's successes do not
+    // reset a task that keeps failing, so the safety valve still trips.
+    __resetOffThreadStatsForTesting();
+    for (let i = 0; i < OFFTHREAD_MAX_CONSECUTIVE_FAILURES; i++) {
+      try {
+        await runStatsTaskOffThread(dbPath, { kind: "nope" } as any);
+      } catch {
+        // expected
+      }
+      await runStatsTaskOffThread<PageViewCounts>(dbPath, { kind: "pageViewCounts", nowMs });
+    }
+    const perTask = getOffThreadStatsState();
+    ok(perTask.broken && perTask.failuresByTask["nope"] === OFFTHREAD_MAX_CONSECUTIVE_FAILURES && perTask.failuresByTask["pageViewCounts"] === 0,
+      "W8: a task failing 3 times in a row trips the fallback even while another task keeps succeeding", perTask);
+
+    // W9: switching DB file replaces the worker; tasks queued on the old one
+    // are rejected right away without being charged as failures.
+    __resetOffThreadStatsForTesting();
+    const otherPath = path.join(tmp, "other.db");
+    const other = new Database(otherPath);
+    other.pragma("journal_mode = WAL");
+    other.exec("CREATE TABLE analytics_page_views (id INTEGER PRIMARY KEY, path TEXT, created_at TEXT)");
+    other.close();
+    const onOld = runStatsTaskOffThread<PageViewCounts>(dbPath, { kind: "pageViewCounts", nowMs });
+    const onNew = runStatsTaskOffThread<PageViewCounts>(otherPath, { kind: "pageViewCounts", nowMs });
+    let oldErr = "";
+    try {
+      await onOld;
+    } catch (e) {
+      oldErr = (e as Error).message;
+    }
+    const newRes = await onNew;
+    const swapState = getOffThreadStatsState();
+    ok(/replaced/.test(oldErr) && newRes.pageViews === 0 && swapState.consecutiveFailures === 0 && swapState.pendingTasks === 0,
+      "W9: a DB-path change rejects the old worker's queued tasks at once, without blame", { oldErr, newRes, swapState });
+
+    // W10: the admin report records each task's last run.
+    const run = swapState.lastRuns["pageViewCounts"];
+    ok(!!run && run.ok === true && run.durationMs >= 0 && typeof run.at === "string",
+      "W10: the last run of each task (ok, duration, time) is reported", swapState.lastRuns);
   } catch (e) {
     ok(false, "W: worker tests threw", (e as Error).stack);
   } finally {

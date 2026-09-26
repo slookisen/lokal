@@ -27,7 +27,7 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
-import { getTrafficStats } from "../services/traffic-stats";
+import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
@@ -990,8 +990,13 @@ function formatConvTime(iso: string): string {
 // ═══════════════════════════════════════════════════════════════
 
 router.get("/api/traffic-stats", (_req: Request, res: Response) => {
-  const s = getTrafficStats("rfb");
+  // ready=false: the numbers are placeholder zeros while the first off-thread
+  // computation after boot is still running (dev-request
+  // 2026-09-19-prod-event-loop-stall-mcp-unhealthy) — do not read them as a drop.
+  const { stats: s, ready } = getTrafficStatsSnapshot("rfb");
+  if (!ready) res.set("Cache-Control", "no-store");
   res.json({
+    ready,
     pageViews: s.pageViews,
     uniqueVisitors: s.uniqueVisitors,
     // New three-bucket fields (dev-request 2026-07-21 slice A)

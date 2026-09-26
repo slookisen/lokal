@@ -7,9 +7,11 @@
 // mode, so these reads never block the main connection's writes, and the
 // main thread stays free to serve every host while they run.
 //
-// Started by offthread-stats.ts with workerData = { dbPath }. Under tsx the
-// worker inherits the parent's --import loader, so this .ts file loads as-is.
-// Keep the import graph pure: no database/init, nothing with side effects.
+// Started by offthread-stats.ts with workerData = { dbPath }. tsx's loader
+// hooks do not reach worker threads, so under tsx this .ts file is loaded by
+// a small CommonJS bootstrap that registers tsx/cjs first (see ensureWorker
+// in offthread-stats.ts). Keep the import graph pure: no database/init,
+// nothing with side effects.
 
 import { parentPort, workerData } from "worker_threads";
 import Database from "better-sqlite3";

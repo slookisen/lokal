@@ -37,7 +37,6 @@ import {
   type TrafficStats,
 } from "./traffic-stats-compute";
 import { createSwrCache, offThreadStatsUsable, runStatsTaskOffThread } from "./offthread-stats";
-import { trackJob } from "./event-loop-monitor";
 
 export type { TrafficStats } from "./traffic-stats-compute";
 export { getRetentionWindowDays } from "./traffic-stats-compute";
@@ -168,10 +167,12 @@ export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficS
 const defaultReader = createTrafficStatsReader({
   getDb,
   offThreadUsable: offThreadStatsUsable,
+  // Deliberately NOT wrapped in the event-loop monitor's trackJob(): this work
+  // never blocks the loop, and a tracked job finishing inside a stall window
+  // would be listed as a stall suspect. Durations/outcomes are in the
+  // offThreadStats section of GET /admin/analytics/ops/event-loop instead.
   runOffThread: (dbPath, vertical, windowDays) =>
-    trackJob(`offthread:traffic-stats:${keyOf(vertical)}`, () =>
-      runStatsTaskOffThread<TrafficStats>(dbPath, { kind: "trafficStats", vertical, windowDays })
-    )(),
+    runStatsTaskOffThread<TrafficStats>(dbPath, { kind: "trafficStats", vertical, windowDays }),
   computeSync: (db, vertical) => computeTrafficStats(db, vertical),
   now: Date.now,
   syncTtlMs: TRAFFIC_CACHE_TTL_MS,
