@@ -44,7 +44,7 @@
  */
 
 import { getDb } from "../database/init";
-import { getTrafficStats } from "./traffic-stats";
+import { getTrafficStatsSnapshot } from "./traffic-stats";
 import {
   countPublishedExperiences,
   countPublishedProviders,
@@ -115,7 +115,7 @@ export function getOaHomeCounters(): OaHomeCounters {
 
   // Traffic side: already host-scoped (vertical_id='experiences') and
   // already excludes fleet/internal traffic (is_owner) — see file header.
-  const traffic = getTrafficStats("experiences");
+  const { stats: traffic, ready: trafficReady } = getTrafficStatsSnapshot("experiences");
 
   // Catalog side: read defensively, same "render with 0s, never throw"
   // discipline as the rest of experiences-seo.ts (e.g. safeCategories()) —
@@ -146,7 +146,11 @@ export function getOaHomeCounters(): OaHomeCounters {
     kommuner,
     sinceDate: getOaSinceDate(),
   };
-  _cache = { data, time: now };
+  // Only cache real numbers. Right after boot the traffic stats are computed
+  // off-thread (traffic-stats.ts) and are placeholder zeros until the first
+  // refresh lands; caching those would pin zeros on the homepage for the
+  // whole 10-minute TTL (dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy).
+  if (trafficReady) _cache = { data, time: now };
   return data;
 }
 

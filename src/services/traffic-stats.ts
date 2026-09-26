@@ -14,152 +14,188 @@
  * window so the public strips can label their numbers truthfully. The old
  * field names (realHumans / botAndAi / aiQueries) are kept as aliases for the
  * public /api/traffic-stats consumers.
+ *
+ * dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy (A2A): the
+ * computation (now traffic-stats-compute.ts) takes 8–23 s in prod and used to
+ * run synchronously inside the homepage request whenever the 2-minute cache
+ * had expired, freezing all three hosts. With a file-backed DB it now runs in
+ * the off-thread stats worker (offthread-stats.ts) and the request path only
+ * reads the cache: stale values are served while a background refresh runs.
+ * Until the first refresh after boot completes, callers get zeros and
+ * `ready: false` from getTrafficStatsSnapshot(). In-memory DBs, the kill
+ * switch OFFTHREAD_STATS_DISABLED=1, and a worker that keeps failing all use
+ * the original synchronous path with its 2-minute cache.
  */
 
+import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import type { VerticalId } from "./analytics-service";
-import { classifySession, SCANNER_PATH_PATTERNS } from "./traffic-classifier";
+import {
+  computeTrafficStats,
+  emptyTrafficStats,
+  getRetentionWindowDays,
+  type TrafficStats,
+} from "./traffic-stats-compute";
+import { createSwrCache, offThreadStatsUsable, runStatsTaskOffThread } from "./offthread-stats";
+import { trackJob } from "./event-loop-monitor";
 
-export interface TrafficStats {
-  pageViews: number;
-  uniqueVisitors: number;
-  /** Unique HUMAN sessions (NOT views) — the honest "ekte besøkende". */
-  realVisitors: number;
-  /** Page views from human sessions. */
-  humanViews: number;
-  /** Page views from human-initiated AI retrieval (`*-User` agents). */
-  aiSearchViews: number;
-  /** Page views from autonomous AI crawlers (GPTBot, ClaudeBot, …). */
-  aiCrawlerViews: number;
-  /**
-   * Everything non-human and non-ai_search: ai_crawler + search_engine +
-   * seo_bot + social + dev + other_bot + scanner views.
-   * Invariant: humanViews + aiSearchViews + botViews === pageViews.
-   */
-  botViews: number;
-  /** Effective data window in days = the auto-prune retention (runtime value). */
-  windowDays: number;
-  // ── Back-compat aliases (public /api/traffic-stats consumers) ──
-  /** @deprecated alias of humanViews (old name, old semantics preserved). */
-  realHumans: number;
-  /** @deprecated old aggregate: aiSearchViews + botViews + aiQueries. */
-  botAndAi: number;
-  aiQueries: number;
-}
+export type { TrafficStats } from "./traffic-stats-compute";
+export { getRetentionWindowDays } from "./traffic-stats-compute";
 
+/** Cache TTL on the synchronous (fallback) path — unchanged from before. */
+export const TRAFFIC_CACHE_TTL_MS = 120_000;
 /**
- * The runtime retention window — the SAME value the daily auto-prune job uses
- * (src/index.ts: RFB_AUTO_PRUNE_DAYS env, default 60, and runAutoPrune's
- * Math.max(7, …) clamp). Read at call time, not module load, so it always
- * reflects the running configuration.
+ * Refresh interval on the off-thread path. The numbers are 60-day totals, so
+ * 10 minutes of staleness is invisible, and it keeps the worker's full scans
+ * to a few per hour instead of one per vertical every 2 minutes.
  */
-export function getRetentionWindowDays(): number {
-  return Math.max(7, parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10) || 60);
+export const TRAFFIC_OFFTHREAD_TTL_MS = 10 * 60_000;
+/** After a failed off-thread refresh, wait this long before retrying that key. */
+const TRAFFIC_OFFTHREAD_RETRY_MS = 60_000;
+
+export interface TrafficStatsSnapshot {
+  stats: TrafficStats;
+  /** False only while the first off-thread computation after boot is running. */
+  ready: boolean;
 }
 
-const TRAFFIC_CACHE_TTL = 120_000; // 2 minutes
+export interface TrafficStatsReaderDeps {
+  getDb: () => Database.Database;
+  offThreadUsable: (db: Database.Database) => boolean;
+  runOffThread: (dbPath: string, vertical: VerticalId | undefined, windowDays: number) => Promise<TrafficStats>;
+  computeSync: (db: Database.Database, vertical: VerticalId | undefined) => TrafficStats;
+  now: () => number;
+  syncTtlMs: number;
+  offThreadTtlMs: number;
+  retryAfterMs: number;
+  log: (msg: string) => void;
+}
 
-// Per-vertical cache: keyed by vertical ?? 'all'
-const _trafficCache = new Map<string, { data: TrafficStats; time: number }>();
+export interface TrafficStatsReader {
+  snapshot(vertical?: VerticalId): TrafficStatsSnapshot;
+  /** Schedules an off-thread refresh when the worker path is in use; never computes synchronously. */
+  prewarm(vertical?: VerticalId): void;
+  /** Test hook: resolves once the key's in-flight off-thread refresh settles. */
+  settled(vertical?: VerticalId): Promise<void>;
+  reset(): void;
+}
 
-function emptyStats(): TrafficStats {
+function keyOf(vertical?: VerticalId): string {
+  return vertical ?? "all";
+}
+
+function verticalOf(key: string): VerticalId | undefined {
+  return key === "all" ? undefined : (key as VerticalId);
+}
+
+export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficStatsReader {
+  const syncCache = new Map<string, { data: TrafficStats; time: number }>();
+  // Path of the DB the off-thread cache was filled from. If getDb() starts
+  // returning a different file, the cache belongs to the old one and is dropped.
+  let offThreadDbPath: string | null = null;
+  const offThread = createSwrCache<TrafficStats>({
+    ttlMs: deps.offThreadTtlMs,
+    retryAfterMs: deps.retryAfterMs,
+    now: deps.now,
+    refresh: (key) => {
+      const dbPath = offThreadDbPath;
+      if (!dbPath) return Promise.reject(new Error("no DB path for off-thread traffic stats"));
+      return deps.runOffThread(dbPath, verticalOf(key), getRetentionWindowDays());
+    },
+    onError: (key, err) =>
+      deps.log(`[traffic-stats] off-thread refresh failed for ${key}: ${err instanceof Error ? err.message : String(err)}`),
+  });
+
+  function bindOffThreadDb(db: Database.Database): void {
+    if (offThreadDbPath !== db.name) {
+      offThread.clear();
+      offThreadDbPath = db.name;
+    }
+  }
+
   return {
-    pageViews: 0,
-    uniqueVisitors: 0,
-    realVisitors: 0,
-    humanViews: 0,
-    aiSearchViews: 0,
-    aiCrawlerViews: 0,
-    botViews: 0,
-    windowDays: getRetentionWindowDays(),
-    realHumans: 0,
-    botAndAi: 0,
-    aiQueries: 0,
+    snapshot(vertical) {
+      const cacheKey = keyOf(vertical);
+      let db: Database.Database;
+      try {
+        db = deps.getDb();
+      } catch {
+        return { stats: emptyTrafficStats(), ready: false };
+      }
+
+      if (deps.offThreadUsable(db)) {
+        bindOffThreadDb(db);
+        const hit = offThread.get(cacheKey);
+        return hit ? { stats: hit.value, ready: true } : { stats: emptyTrafficStats(), ready: false };
+      }
+
+      // Synchronous path (in-memory DB, kill switch, or worker broken).
+      const now = deps.now();
+      const cached = syncCache.get(cacheKey);
+      if (cached && now >= cached.time && now - cached.time < deps.syncTtlMs) {
+        return { stats: cached.data, ready: true };
+      }
+      try {
+        const data = deps.computeSync(db, vertical);
+        syncCache.set(cacheKey, { data, time: deps.now() });
+        return { stats: data, ready: true };
+      } catch {
+        return { stats: emptyTrafficStats(), ready: false };
+      }
+    },
+    prewarm(vertical) {
+      let db: Database.Database;
+      try {
+        db = deps.getDb();
+      } catch {
+        return;
+      }
+      if (!deps.offThreadUsable(db)) return;
+      bindOffThreadDb(db);
+      offThread.get(keyOf(vertical));
+    },
+    settled(vertical) {
+      return offThread.settled(keyOf(vertical));
+    },
+    reset() {
+      syncCache.clear();
+      offThread.clear();
+      offThreadDbPath = null;
+    },
   };
 }
 
+const defaultReader = createTrafficStatsReader({
+  getDb,
+  offThreadUsable: offThreadStatsUsable,
+  runOffThread: (dbPath, vertical, windowDays) =>
+    trackJob(`offthread:traffic-stats:${keyOf(vertical)}`, () =>
+      runStatsTaskOffThread<TrafficStats>(dbPath, { kind: "trafficStats", vertical, windowDays })
+    )(),
+  computeSync: (db, vertical) => computeTrafficStats(db, vertical),
+  now: Date.now,
+  syncTtlMs: TRAFFIC_CACHE_TTL_MS,
+  offThreadTtlMs: TRAFFIC_OFFTHREAD_TTL_MS,
+  retryAfterMs: TRAFFIC_OFFTHREAD_RETRY_MS,
+  log: (msg) => console.warn(msg),
+});
+
+/** Stats plus whether they are real (false = placeholder zeros before the first refresh). */
+export function getTrafficStatsSnapshot(vertical?: VerticalId): TrafficStatsSnapshot {
+  return defaultReader.snapshot(vertical);
+}
+
 export function getTrafficStats(vertical?: VerticalId): TrafficStats {
-  const cacheKey = vertical ?? 'all';
-  const now = Date.now();
-  const cached = _trafficCache.get(cacheKey);
-  if (cached && (now - cached.time) < TRAFFIC_CACHE_TTL) {
-    return cached.data;
-  }
-  try {
-    const db = getDb();
-    const notOwner = "(is_owner IS NULL OR is_owner = 0)";
-    const vertSql = vertical ? " AND vertical_id = ?" : "";
-    const vertParams: string[] = vertical ? [vertical] : [];
+  return defaultReader.snapshot(vertical).stats;
+}
 
-    // Total page views (excluding owner)
-    const pageViews = (db.prepare(
-      `SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}${vertSql}`
-    ).get(...vertParams) as any)?.n ?? 0;
-
-    // Session-based classification via the shared classifier
-    const sessions = db.prepare(`
-      SELECT session_id, COUNT(*) as views
-      FROM analytics_page_views
-      WHERE ${notOwner}${vertSql}
-      GROUP BY session_id
-    `).all(...vertParams) as any[];
-
-    // Sessions that hit scanner probe paths (wp-admin/.env/…) — fold into
-    // 'scanner' even when the UA looks like a plausible browser. Same rule
-    // as /admin/analytics/traffic-classification.
-    const scannerHits = db.prepare(`
-      SELECT DISTINCT session_id FROM analytics_page_views
-      WHERE ${notOwner}${vertSql} AND (${SCANNER_PATH_PATTERNS.map(() => 'path LIKE ?').join(' OR ')})
-    `).all(...vertParams, ...SCANNER_PATH_PATTERNS.map(p => `%${p}%`)) as any[];
-    const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
-
-    let realVisitors = 0;
-    let humanViews = 0;
-    let aiSearchViews = 0;
-    let aiCrawlerViews = 0;
-    let botViews = 0;
-    for (const s of sessions) {
-      const category = classifySession(s.session_id, {
-        scannerPaths: scannerSessionIds.has(s.session_id),
-      });
-      if (category === 'human') {
-        realVisitors += 1;
-        humanViews += s.views;
-      } else if (category === 'ai_search') {
-        aiSearchViews += s.views;
-      } else {
-        // ai_crawler + search_engine + seo_bot + social + dev + other_bot + scanner
-        if (category === 'ai_crawler') aiCrawlerViews += s.views;
-        botViews += s.views;
-      }
-    }
-
-    // AI queries from analytics_queries
-    const aiQueries = (db.prepare(
-      `SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}${vertSql}`
-    ).get(...vertParams) as any)?.n ?? 0;
-
-    const data: TrafficStats = {
-      pageViews,
-      uniqueVisitors: sessions.length,
-      realVisitors,
-      humanViews,
-      aiSearchViews,
-      aiCrawlerViews,
-      botViews,
-      windowDays: getRetentionWindowDays(),
-      // Back-compat aliases: realHumans was "views from sessions we didn't
-      // flag as bot/dev"; humanViews is its honest successor. botAndAi was
-      // "all bot/dev views + AI queries" — preserve that aggregate meaning.
-      realHumans: humanViews,
-      botAndAi: aiSearchViews + botViews + aiQueries,
-      aiQueries,
-    };
-    _trafficCache.set(cacheKey, { data, time: Date.now() });
-    return data;
-  } catch {
-    return emptyStats();
-  }
+/**
+ * Starts the first off-thread refresh for each vertical right after boot, so
+ * the homepages have real numbers as early as possible. No-op on the
+ * synchronous path (it never runs the full scans on the main thread).
+ */
+export function prewarmTrafficStats(verticals: VerticalId[]): void {
+  for (const v of verticals) defaultReader.prewarm(v);
 }
 
 /**
@@ -168,5 +204,5 @@ export function getTrafficStats(vertical?: VerticalId): TrafficStats {
  * __reset…ForTesting convention used elsewhere in this repo.
  */
 export function __resetTrafficStatsCacheForTesting(): void {
-  _trafficCache.clear();
+  defaultReader.reset();
 }

@@ -6,6 +6,7 @@ import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
 import { getEventLoopReport } from "../services/event-loop-monitor";
+import { getOffThreadStatsState } from "../services/offthread-stats";
 import {
   isRollupTableName,
   getRollupTableColumns,
@@ -1461,7 +1462,13 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
  * In-memory only — resets on restart. Source: src/services/event-loop-monitor.ts.
  */
 router.get("/ops/event-loop", (_req: Request, res: Response) => {
-  res.json({ timestamp: new Date().toISOString(), ...getEventLoopReport() });
+  res.json({
+    timestamp: new Date().toISOString(),
+    ...getEventLoopReport(),
+    // Off-thread stats worker (traffic strips + /health counts): broken=true
+    // means it fell back to the synchronous path (src/services/offthread-stats.ts).
+    offThreadStats: getOffThreadStatsState(),
+  });
 });
 
 /**
