@@ -35342,6 +35342,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-store updated_at hydration: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-09-26-dental-forside-og-sted-synkron-3s:
+  //    listPoststeder() correlated-subquery -> flat GROUP BY x2 rewrite ──
+  console.log("\n── dev-request 2026-09-26-dental-forside-og-sted-synkron-3s: listPoststeder fylke-mode (dental-store) ──");
+  try {
+    const { runDentalListPoststederFylkeModeTests } = require("../src/services/dental-store.test") as
+      typeof import("../src/services/dental-store.test");
+    const dlpm = runDentalListPoststederFylkeModeTests({ log: false });
+    passed += dlpm.passed;
+    failed += dlpm.failed;
+    for (const f of dlpm.failures) failures.push("dental-store listPoststeder fylke-mode: " + f);
+    console.log(`  dental-store listPoststeder fylke-mode: ${dlpm.passed} passed, ${dlpm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-store listPoststeder fylke-mode: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege: 5b/5c/5d
   //    dental-store.ts coverage (thin-profile predicate + sitemap exclusion,
   //    chain-sync, specialty title matching, directory_url hydration) ──

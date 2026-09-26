@@ -334,6 +334,12 @@ export function initDentalSchema(db: Database.Database): void {
   const indexes = [
     "CREATE INDEX IF NOT EXISTS idx_dental_org_nr ON dental_agents(org_nr)",
     "CREATE INDEX IF NOT EXISTS idx_dental_fylke ON dental_agents(fylke)",
+    // dev-request 2026-09-26-dental-forside-og-sted-synkron-3s: supports the
+    // two GROUP BY poststed[, fylke] queries in listPoststeder() (homepage +
+    // /sted/:slug, via getCachedPoststeder()). No poststed index existed
+    // before this; the old correlated-subquery version of that function
+    // scanned the whole table once per distinct poststed regardless.
+    "CREATE INDEX IF NOT EXISTS idx_dental_poststed ON dental_agents(poststed)",
     "CREATE INDEX IF NOT EXISTS idx_dental_chain ON dental_agents(chain_brand)",
     "CREATE INDEX IF NOT EXISTS idx_dental_verification ON dental_agents(verification_status)",
     "CREATE INDEX IF NOT EXISTS idx_aff_person ON dental_clinic_affiliations(person_id)",
