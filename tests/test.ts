@@ -32010,6 +32010,28 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ms404.failures) failures.push("mcp-session-404: " + f);
     console.log(`  mcp-session-404: ${ms404.passed} passed, ${ms404.failed} failed`);
 
+    // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy (A2A): the
+    // event-loop stall monitor (src/services/event-loop-monitor.ts) and the
+    // 60 s cache that keeps GET /health from a full COUNT(*) on every probe
+    // (src/services/health-counts.ts).
+    console.log("\n── event-loop-monitor: stall detection, request/job tracking, admin report ──");
+    const { runEventLoopMonitorTests } = require("../src/services/event-loop-monitor.test") as
+      typeof import("../src/services/event-loop-monitor.test");
+    const elm = await runEventLoopMonitorTests({ log: false });
+    passed += elm.passed;
+    failed += elm.failed;
+    for (const f of elm.failures) failures.push("event-loop-monitor: " + f);
+    console.log(`  event-loop-monitor: ${elm.passed} passed, ${elm.failed} failed`);
+
+    console.log("\n── health-counts: cached analytics_page_views counts for /health ──");
+    const { runHealthCountsTests } = require("../src/services/health-counts.test") as
+      typeof import("../src/services/health-counts.test");
+    const hc = await runHealthCountsTests({ log: false });
+    passed += hc.passed;
+    failed += hc.failed;
+    for (const f of hc.failures) failures.push("health-counts: " + f);
+    console.log(`  health-counts: ${hc.passed} passed, ${hc.failed} failed`);
+
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
     // wrapper over the EXISTING booking chain (BookingInputSchema,

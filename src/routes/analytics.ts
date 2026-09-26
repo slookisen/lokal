@@ -5,6 +5,7 @@ import { getDb } from "../database/init";
 import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
+import { getEventLoopReport } from "../services/event-loop-monitor";
 import {
   isRollupTableName,
   getRollupTableColumns,
@@ -1447,6 +1448,20 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
     res.status(500).json({ success: false, error: String(err) });
     return;
   }
+});
+
+/**
+ * GET /admin/analytics/ops/event-loop
+ * Event-loop stall report — dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy.
+ * Process-wide (one Node process serves rfb, dental and experiences), so it is
+ * not host-locked like the analytics reads: a stall on one host blocks all.
+ * Returns the delay percentiles, the most recent stalls (newest first) each
+ * with the requests in flight + background jobs running when it happened,
+ * the slowest requests/jobs, and what is in flight right now.
+ * In-memory only — resets on restart. Source: src/services/event-loop-monitor.ts.
+ */
+router.get("/ops/event-loop", (_req: Request, res: Response) => {
+  res.json({ timestamp: new Date().toISOString(), ...getEventLoopReport() });
 });
 
 /**
