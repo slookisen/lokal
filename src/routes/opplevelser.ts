@@ -32561,6 +32561,21 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
       // counted against the totals).
       no_title_node: outcomes.filter((o) => o.generation_fail_reason === "no_title_node").length,
       fetch_failed: outcomes.filter((o) => o.generation_fail_reason === "fetch_failed").length,
+      // Full breakdown of every DISTINCT generation_fail_reason that actually
+      // occurred in this batch (dev-request-flagged operational gap: the
+      // three buckets above collapse everything non-thin/non-judge into the
+      // single opaque "generation_failed" counter, hiding e.g. "sentinel"
+      // (the LLM itself declining — legitimate) vs. "network_error"/
+      // "no_api_key"/"http_error" (infra) vs. "ungrounded_numbers"/
+      // "above_word_ceiling" (quality gate). Diagnostic-only: omits keys with
+      // zero occurrences, never pre-populates the full enum, and does not
+      // change what gets written.
+      generation_fail_reasons: outcomes.reduce<Record<string, number>>((acc, o) => {
+        if (o.generation_fail_reason != null) {
+          acc[o.generation_fail_reason] = (acc[o.generation_fail_reason] || 0) + 1;
+        }
+        return acc;
+      }, {}),
     },
   });
 });
