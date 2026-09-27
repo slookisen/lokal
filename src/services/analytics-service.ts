@@ -1357,8 +1357,25 @@ export class AnalyticsService {
   }
 
   /**
-   * PR-92: Run SQLite VACUUM to reclaim disk space. Locks the DB briefly,
-   * so the scheduled task only calls this once a week (Sundays at 03:00 UTC).
+   * PR-92: Run SQLite VACUUM to reclaim disk space.
+   *
+   * orch-pr-20260927-weekly-vacuum-stall: this is no longer called
+   * automatically by the daily auto-prune scheduler (src/index.ts's
+   * autoPruneTick) — a synchronous `db.exec("VACUUM")` against the ~819MB
+   * prod DB measured 145,806ms of main-thread block (2026-09-27T03:45:15Z),
+   * during which every HTTP host and the MCP endpoint were fully
+   * unresponsive. See the comment above autoPruneTick's weekly-VACUUM block
+   * (now removed) for the full rationale: VACUUM only shrinks the file, it
+   * does not affect whether the file grows unbounded (SQLite reuses freed
+   * pages from deleted rows for new inserts via its internal freelist
+   * regardless of VACUUM), so the daily prune's deletes are what keep the DB
+   * bounded, not this. Kept as a manual/one-off helper — e.g. for a future
+   * ops script, or for the existing chunked `POST /admin/analytics/ops/vacuum`
+   * endpoint (src/routes/analytics.ts) to eventually delegate to, though
+   * that route currently has its own inline VACUUM call — NOT wired into any
+   * automatic path. Still fundamentally blocking (see that route's own doc
+   * comment): whatever calls this must do so off the request-serving
+   * process's hot path, deliberately, by a human, off-peak.
    */
   vacuumDatabase(): { sizeBeforeMb: number; sizeAfterMb: number; freedMb: number } {
     const db = getDb();
@@ -1380,6 +1397,23 @@ export class AnalyticsService {
       sizeAfterMb: toMb(sizeAfter),
       freedMb: toMb(sizeBefore - sizeAfter),
     };
+  }
+
+  /**
+   * orch-pr-20260927-weekly-vacuum-stall: cheap on-disk file size (MB), no
+   * DB access — just fs.statSync. Used by the daily [auto-prune] log line
+   * (src/index.ts) so DB growth stays observable now that the automatic
+   * weekly VACUUM is gone: if this trend does NOT plateau (see that log
+   * line's own doc comment for why it should), that's the signal to
+   * manually run `POST /admin/analytics/ops/vacuum` (src/routes/analytics.ts)
+   * rather than re-adding an automatic VACUUM to this hot path.
+   */
+  getDbFileSizeMb(): number {
+    const fs = require("fs");
+    const dbPath = process.env.DB_PATH || "./data/lokal.db";
+    let bytes = 0;
+    try { bytes = fs.statSync(dbPath).size; } catch { /* ok */ }
+    return Math.round((bytes / 1024 / 1024) * 10) / 10;
   }
 
   /**

@@ -1299,8 +1299,13 @@ app.listen(Number(PORT), HOST, async () => {
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
   // ~7–8 MB/day). Fires once per day inside the 03:00–03:59 UTC window
-  // and skips if we already ran in the last 23h. Once a week (Sundays)
-  // it also runs VACUUM to reclaim space SQLite can't reuse on its own.
+  // and skips if we already ran in the last 23h.
+  //
+  // orch-pr-20260927-weekly-vacuum-stall: this used to ALSO run a
+  // synchronous VACUUM once a week (Sundays), which blocked the process for
+  // ~146s against the prod-sized DB (every host + the MCP endpoint down for
+  // that whole window) — removed; see the doc comment further down (right
+  // where that call used to be) for the full rationale and the fallback.
   //
   // Disable on dev / CI with RFB_DISABLE_AUTO_PRUNE=1.
   if (process.env.RFB_DISABLE_AUTO_PRUNE !== "1") {
@@ -1320,17 +1325,51 @@ app.listen(Number(PORT), HOST, async () => {
         );
         lastPruneAt = now;
 
-        // Weekly VACUUM — Sundays only. Briefly locks the DB.
-        if (now.getUTCDay() === 0) {
-          try {
-            const v = analyticsService.vacuumDatabase();
-            console.log(
-              `[auto-prune] weekly VACUUM: ${v.sizeBeforeMb}MB → ${v.sizeAfterMb}MB ` +
-              `(freed ${v.freedMb}MB)`
-            );
-          } catch (err) {
-            console.error("[auto-prune] VACUUM failed (non-fatal):", err);
-          }
+        // orch-pr-20260927-weekly-vacuum-stall: this used to also run a
+        // synchronous `VACUUM` on Sundays here. Measured in prod
+        // 2026-09-27T03:45:15Z: against the then-~819MB DB that blocked the
+        // ONE Node event loop for 145,806ms (~146s) straight — every HTTP
+        // host and the MCP endpoint (polled hourly by Glama) were fully
+        // unresponsive for the whole window. That VACUUM call is REMOVED,
+        // not chunked/moved off-thread:
+        //   - better-sqlite3 is synchronous and VACUUM is not chunkable the
+        //     way the DELETE-heavy prune above is (SQLite rewrites the
+        //     whole file in one pass — see runVacuumJob's doc comment in
+        //     src/routes/analytics.ts for why even the existing manual/job
+        //     wrapped endpoint still can't avoid blocking for VACUUM's own
+        //     duration).
+        //   - a worker thread can't safely run VACUUM against this DB
+        //     either: VACUUM needs to rewrite/replace the whole file, and
+        //     src/services/offthread-stats.ts's own doc comment already
+        //     rules this out for the SAME db handle (its worker pattern is
+        //     read-only, precisely because a second connection doing
+        //     writes/rewrites while the main connection holds the file open
+        //     is not safe here).
+        //   - it isn't actually needed for the daily prune's PURPOSE
+        //     (bounded DB growth): VACUUM only shrinks the file to reclaim
+        //     free pages — it does not affect whether the file grows
+        //     unbounded. SQLite reuses freed pages from deleted rows for new
+        //     inserts via its internal freelist regardless of VACUUM/
+        //     auto_vacuum, so as long as this daily prune keeps deleting
+        //     rows roughly as fast as new ones come in (which is what the
+        //     RFB_AUTO_PRUNE_DAYS retention window is for), the file size
+        //     should reach its own equilibrium without ever running VACUUM.
+        // Fallback / observability: the DB file size is logged on every
+        // [auto-prune] line below (a cheap fs.statSync, not a DB read) so
+        // this assumption is checked continuously against real data, not
+        // just once. If it does NOT plateau over time, the fix is to run
+        // `POST /admin/analytics/ops/vacuum` (src/routes/analytics.ts) by
+        // hand, off-peak — that endpoint already responds 202 + a pollable
+        // jobId instead of holding the request open, though the VACUUM call
+        // inside it still blocks the event loop for its own duration, same
+        // as this removed call did, which is exactly why it must stay a
+        // deliberate, human-triggered, off-peak action and not run on an
+        // unattended weekly timer in this process.
+        try {
+          const sizeMb = analyticsService.getDbFileSizeMb();
+          console.log(`[auto-prune] db file size: ${sizeMb}MB (weekly auto-VACUUM disabled, see comment above)`);
+        } catch (err) {
+          console.error("[auto-prune] db size check failed (non-fatal):", err);
         }
       } catch (err) {
         console.error("[auto-prune] failed (non-fatal):", err);
