@@ -16685,6 +16685,95 @@ console.log("── orch-pr-92: daily auto-prune scheduled task ──");
     "orch-pr-92: custom windowHourUtc respected",
   );
 }
+
+// ── orch-pr-20260927-weekly-vacuum-stall: weekly auto-VACUUM removed ──
+// The Sunday-only synchronous `analyticsService.vacuumDatabase()` call
+// inside src/index.ts's autoPruneTick blocked the main thread ~146s against
+// the prod-sized DB (2026-09-27T03:45:15Z). It is now REMOVED (not chunked
+// — VACUUM cannot be chunked/moved off-thread against the live DB, see the
+// doc comments in src/index.ts / src/services/analytics-service.ts /
+// src/services/offthread-stats.ts for why). Source-scan regression guard:
+// this can't be exercised by calling into src/index.ts directly (it's the
+// process entrypoint — it starts the HTTP server and the real
+// setInterval-driven scheduler at import time), so — matching this test
+// suite's existing convention for asserting code shape in src/index.ts
+// (e.g. the "wo6" email-bounces block above) — assert directly on the
+// source text instead.
+console.log("── orch-pr-20260927-weekly-vacuum-stall: weekly auto-VACUUM removed ──");
+{
+  const fs = require("fs");
+  const indexSrc: string = fs.readFileSync("src/index.ts", "utf8");
+
+  // The automatic call is gone...
+  assertTrue(
+    !indexSrc.includes("analyticsService.vacuumDatabase()"),
+    "orch-pr-vacuum: autoPruneTick no longer calls analyticsService.vacuumDatabase() automatically",
+  );
+  // ...specifically the Sunday-gated block that used to wrap it is gone too
+  // (guards against a rewrite that keeps the call but drops the UTC-day gate,
+  // which would make it fire on every daily tick instead of never).
+  assertTrue(
+    !indexSrc.includes("now.getUTCDay() === 0"),
+    "orch-pr-vacuum: the weekly (Sunday-only) VACUUM gate is gone, not just relocated",
+  );
+
+  // ...but the daily prune itself, its kill switch, and its greppable
+  // [auto-prune] log-line prefix (fly logs consumers depend on this) are
+  // all still intact.
+  assertTrue(
+    indexSrc.includes('analyticsService.runAutoPrune({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP })'),
+    "orch-pr-vacuum: daily runAutoPrune() call is untouched",
+  );
+  assertTrue(
+    indexSrc.includes('process.env.RFB_DISABLE_AUTO_PRUNE !== "1"'),
+    "orch-pr-vacuum: RFB_DISABLE_AUTO_PRUNE=1 kill switch is untouched",
+  );
+  assertTrue(
+    indexSrc.includes("[auto-prune]"),
+    "orch-pr-vacuum: [auto-prune] log-line prefix preserved for fly-logs greps",
+  );
+
+  // Replacement fallback/observability: DB size is still logged every tick
+  // (so unbounded growth — if the no-VACUUM assumption ever turns out wrong
+  // — stays visible) via the new cheap, DB-access-free helper.
+  assertTrue(
+    indexSrc.includes("analyticsService.getDbFileSizeMb()"),
+    "orch-pr-vacuum: db file size is still logged in the [auto-prune] line each tick",
+  );
+}
+
+// analyticsService.getDbFileSizeMb(): cheap on-disk size helper, no DB
+// access — a plain fs.statSync against DB_PATH, rounded to 1 decimal MB.
+{
+  const { analyticsService } = require("../src/services/analytics-service");
+  const os = require("os");
+  const path = require("path");
+  const fs = require("fs");
+
+  const tmpPath = path.join(os.tmpdir(), `orch-pr-vacuum-size-test-${Date.now()}.db`);
+  const prevDbPath = process.env.DB_PATH;
+  try {
+    // 2.5 MiB of known size, so the MB rounding is easy to assert on.
+    fs.writeFileSync(tmpPath, Buffer.alloc(2.5 * 1024 * 1024));
+    process.env.DB_PATH = tmpPath;
+    const sizeMb = analyticsService.getDbFileSizeMb();
+    assertEq(sizeMb, 2.5, "orch-pr-vacuum: getDbFileSizeMb() reports the on-disk file size in MB");
+
+    // Missing file → 0, never throws (mirrors vacuumDatabase()'s own
+    // statSync try/catch convention just above it).
+    fs.unlinkSync(tmpPath);
+    assertEq(
+      analyticsService.getDbFileSizeMb(),
+      0,
+      "orch-pr-vacuum: getDbFileSizeMb() returns 0 (not a throw) when the DB file is missing",
+    );
+  } finally {
+    if (prevDbPath === undefined) delete process.env.DB_PATH;
+    else process.env.DB_PATH = prevDbPath;
+    try { fs.unlinkSync(tmpPath); } catch { /* already removed above */ }
+  }
+}
+
 // ─── PR-95 (2026-06-01): Debio organic-cert verification ─────────────
 //
 // Daniel-directive: only show a "Debio" label when actually verified via
