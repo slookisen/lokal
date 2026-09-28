@@ -44,6 +44,7 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { getPageViewHealthCounts } from "./services/health-counts";
+import { getWritePathHealth } from "./services/health-write-probe";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
@@ -620,6 +621,11 @@ app.get("/health", (_req, res) => {
     if (disk && disk.used_pct >= 95) { status = "critical"; warnings.push(`Data volume ${disk.used_pct}% full — SQLite writes will fail when it fills`); }
     else if (disk && disk.used_pct >= 85) { if (status !== "critical") status = "warning"; warnings.push(`Data volume ${disk.used_pct}% full`); }
 
+    // Write-path probe (cached 30 s) — dev-request 2026-09-28-health-endepunkt-
+    // maaler-ikke-skrivesti: a failing write path must not read as a healthy day.
+    const writePath = getWritePathHealth(db);
+    if (!writePath.ok) { status = "critical"; warnings.push(`DB write path failing: ${writePath.error}`); }
+
     const responseMs = Date.now() - startMs;
 
     res.json({
@@ -647,6 +653,7 @@ app.get("/health", (_req, res) => {
         queries: queryCount,
         pageViewsCachedAgeMs: pvCounts.cachedAgeMs,
       },
+      writePath,
       disk: disk && {
         totalMb: Math.round(disk.total_bytes / 1048576),
         freeMb: Math.round(disk.free_bytes / 1048576),

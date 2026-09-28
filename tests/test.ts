@@ -32126,6 +32126,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of hc.failures) failures.push("health-counts: " + f);
     console.log(`  health-counts: ${hc.passed} passed, ${hc.failed} failed`);
 
+    console.log("\n── health-write-probe: cached write-path probe for /health ──");
+    const { runHealthWriteProbeTests } = require("../src/services/health-write-probe.test") as
+      typeof import("../src/services/health-write-probe.test");
+    const wp = runHealthWriteProbeTests({ log: false });
+    passed += wp.passed;
+    failed += wp.failed;
+    for (const f of wp.failures) failures.push("health-write-probe: " + f);
+    console.log(`  health-write-probe: ${wp.passed} passed, ${wp.failed} failed`);
+
     // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: the homepage
     // traffic stats and /health counts run in an off-thread worker
     // (src/services/offthread-stats.ts); W-tests start the real worker
