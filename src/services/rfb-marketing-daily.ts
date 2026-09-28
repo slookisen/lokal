@@ -8,14 +8,11 @@
 // Opplevagent lane has used since 2026-09-05 (runGardssalgOutreachDaily,
 // routes/opplevelser.ts). The routine becomes report-only.
 //
-// Nothing that DECIDES what goes out is new here:
+// What the job reuses unchanged:
 //   • WHO: computeOutreachCandidates() — the exact function behind
 //     GET /admin/outreach-candidates (routes/admin-outreach-candidates.ts),
 //     mode=first first, then mode=second to fill the remaining budget, as the
-//     SKILL's FILL-MODUS orders it. Plus the SKILL's own post-refresh
-//     content-quality backstop (meetsAboutQualityBar — the "durable server
-//     fix" the SKILL itself names) and its canonical-URL rule; both can only
-//     REMOVE a candidate, never add one.
+//     SKILL's FILL-MODUS orders it.
 //   • WHAT: renderRfbOutreachEmail() — the v2 template + 2026-09-08/09
 //     addenda, verbatim (services/rfb-outreach-template.ts).
 //   • HOW: executeCompose() — the exact body of POST /admin/crm/compose
@@ -23,36 +20,77 @@
 //     intent 'resend_send', createdBy 'claude', never force — so every
 //     existing guard and cap counts it exactly like a routine send.
 //
+// Where the job DIFFERS from the routine's per-candidate steps (deliberate;
+// each can only hold a candidate back, never add one):
+//   • The SKILL's post-refresh content-quality gate, which the routine
+//     applied by LLM judgment, is a deterministic check here
+//     (meetsAboutQualityBar — the "durable server fix" the SKILL itself
+//     names — on agents.description OR agent_knowledge.about).
+//   • The profile URL is derived the way the agent card derives canonicalUrl
+//     and checked with the SKILL's validate_profile_url.
+//   • NOT DONE: the SKILL's pre-batch homepage-content refresh (step 2,
+//     POST /admin/homepage-content-refresh on the batch's agentIds). It is a
+//     network crawl that rewrites agent_knowledge, embedded in its route
+//     handler; whether the send job should trigger it is an owner decision
+//     that is still pending. Until then a profile is mailed with the content
+//     it has (the daily lokal-agent-enrichment refresh still runs); the
+//     content check above holds back the thin/boilerplate ones.
+//
 // What IS new is the button being pressed by the server, once a day, behind
 // these guards, in this order:
-//   G1 RFB_MARKETING_PLATFORM_ENABLED === "1"  (default OFF) — otherwise an
-//      apply run is a no-op (no reads beyond the lane, no writes, no
-//      envelope). A dry run still computes the list, so Daniel can review it
-//      before flipping the switch.
-//   G2 lane paused (rfb_marketing_lane_state, GET/POST
-//      /admin/rfb-marketing-lane) → skip. DB-backed, not a file: lokal has no
-//      runtime access to the A2A repo (same migration the Opplevagent lane
-//      made 2026-09-05).
-//   G3 a hard bounce / spam complaint (email_bounces — the table the gate
-//      already reads) on an address RFB outreach mailed in the last 48h, not
-//      already acknowledged → AUTO-PAUSE (apply only) + skip; and an
-//      in-process /health-equivalent "critical" signal (memory, data volume)
-//      → skip without pausing. No HTTP call to ourselves.
-//   G4 budget = RFB_MARKETING_DAILY_CAP (default 10, clamped 1–30) minus RFB
-//      outreach already sent today, and never more than what is left of
-//      OUTREACH_MAX_PER_DAY today. Counted from the DATABASE (outreach_sent_log
-//      + this job's ledger), so a restart or a second tick can never exceed it.
+//   G1  RFB_MARKETING_PLATFORM_ENABLED === "1" (default OFF) — otherwise an
+//       apply run is a no-op (no writes, no envelope). A dry run still
+//       computes the list, so Daniel can review it before flipping the switch.
+//   G1b apply without an injected transport requires a LIVE one
+//       (emailService.isLiveTransport(): SMTP configured, not forced dry-run);
+//       otherwise skip with no writes. sendRaw's DRY_RUN answer is
+//       {success:true} — it must never be counted as a real send (it would
+//       put producers who never got mail into the 60-day cooldown). A
+//       DRY_RUN answer that still slips through stops the run and is not
+//       recorded as sent.
+//   G2  lane paused (rfb_marketing_lane_state, GET/POST
+//       /admin/rfb-marketing-lane) → skip. DB-backed, not a file: lokal has
+//       no runtime access to the A2A repo (same migration the Opplevagent
+//       lane made 2026-09-05).
+//   G3  a hard bounce / spam complaint (email_bounces — the table the gate
+//       already reads) on an address RFB outreach mailed in the last 48h, not
+//       already acknowledged → AUTO-PAUSE (apply only) + skip; and an
+//       in-process /health-equivalent "critical" signal (memory, data volume)
+//       → skip without pausing. No HTTP call to ourselves.
+//       ACTIVATION PREREQUISITE (documented, not built here): email_bounces
+//       is only as good as what feeds it — today that is POST
+//       /admin/email-bounces (manual/admin ingestion; no Resend webhook in
+//       this repo). If bounces/complaints are not being recorded, this guard
+//       cannot fire; make sure they are before relying on the auto-pause.
+//   G4  budget = RFB_MARKETING_DAILY_CAP (default 10, clamped 1–30) minus RFB
+//       outreach already sent today, and never more than what is left of
+//       OUTREACH_MAX_PER_DAY today. Counted from the DATABASE
+//       (outreach_sent_log + this job's ledger), so a restart or a second tick
+//       can never exceed it.
 //
-// Reserve before send, fail closed (the bug NOT copied from the gårdssalg
-// lane, whose sender writes its sent-log AFTER the email and re-mailed six
-// producers on 2026-09-28 after a disk-full write failure the day before):
-// every recipient gets a rfb_marketing_send_ledger row (status 'reserved')
-// BEFORE the email is handed to the transport, inside the same synchronous
-// transaction that re-checks today's cap. If that write fails nothing is
-// sent and the loop stops. A 'reserved' row whose outcome never gets
-// recorded (crash, a failed follow-up write) counts as SENT for the budget
-// and keeps that address out of every later run for the cooldown window.
-// UNIQUE(day, recipient_email) makes a same-day second attempt impossible.
+// AT MOST ONCE per address (the gårdssalg lane's send-then-log bug — which
+// re-mailed six producers on 2026-09-28 after a disk-full write failure the
+// day before — is NOT copied):
+//   • Every recipient gets a rfb_marketing_send_ledger row (status
+//     'reserved') BEFORE the e-mail is handed to the transport, inside the
+//     same synchronous transaction that re-checks today's cap. If that write
+//     fails nothing is sent and the loop stops.
+//   • Once the transport has been invoked, only a confirmed send is 'sent';
+//     a transport error is 'unknown' (the server may have accepted DATA
+//     before the connection dropped), and the run stops at the FIRST such
+//     failure — a broken transport is not handed the rest of the list (and
+//     the run does not sit through one SMTP timeout per candidate). Only a
+//     failure BEFORE the transport ('failed') is safe to retry.
+//   • 'reserved' (outcome never recorded), 'sent' and 'unknown' all count
+//     toward today's budget and block the address — and the agent — for the
+//     cooldown window. UNIQUE(day, recipient_email) forbids a same-day retry.
+//   • Compose attempts per run are capped at budget + a small margin, so a
+//     streak of pre-transport refusals cannot walk the whole list.
+//   • Not reconciled (documented, not built): when compose's post-send write
+//     fails, outreach_sent_log may miss a row the ledger knows is 'sent'. The
+//     ledger blocks this job from re-sending it; other senders (manual
+//     compose) only see outreach_sent_log. Backfilling outreach_sent_log from
+//     the ledger would close that — a possible follow-up.
 
 import path from "path";
 import { getDb } from "../database/init";
@@ -63,6 +101,7 @@ import {
 } from "../routes/admin-outreach-candidates";
 import { executeCompose, resolveDailyOutreachCap, type ComposeDeps, type ComposeOutcome } from "../routes/crm";
 import { diskUsage } from "../routes/admin-db-backup";
+import { emailService } from "./email-service";
 import { recordRun } from "./run-ledger";
 import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService } from "./knowledge-service";
@@ -74,6 +113,7 @@ import {
   renderRfbOutreachEmail,
   rfbOutreachSocialProofLine,
   roundProducerCountDown,
+  type RfbOutreachRendered,
   type RfbOutreachSubjectVariant,
 } from "./rfb-outreach-template";
 
@@ -93,6 +133,14 @@ export const RFB_MARKETING_BOUNCE_LOOKBACK_HOURS = 48;
 export const RFB_MARKETING_GATE_COOLDOWN_DAYS_DEFAULT = 60;
 /** Per-mode candidate fetch; far above any budget so held/refused rows backfill. */
 export const RFB_MARKETING_CANDIDATE_FETCH_LIMIT = 100;
+/**
+ * Compose attempts allowed per run beyond the budget, for pre-transport
+ * refusals (4xx) that do not consume the budget. A run makes at most
+ * budget + this many compose calls.
+ */
+export const RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS = 5;
+/** Ledger statuses that mean "this address may have received the e-mail". */
+const CONTACTED_LEDGER_STATUSES_SQL = "('reserved', 'sent', 'unknown')";
 /**
  * The /health "critical" thresholds (src/index.ts, GET /health: memUsedMb >
  * 420 → critical; disk.used_pct >= 95 → critical). Mirrored here because
@@ -140,6 +188,17 @@ export function shouldRunRfbMarketingDaily(opts: {
     if (opts.now.getTime() - opts.lastRunAt.getTime() < minHoursBetween * 3600_000) return false;
   }
   return true;
+}
+
+/**
+ * Whether a tick's run counts as "today's run" for the tick's lastRunAt stamp
+ * (src/index.ts). Two skips do not: run_in_progress (a manual run was still in
+ * flight — it is not today's cron run) and health_red (a transient memory/disk
+ * "critical" reading at 08:10 must not cost the whole day). Both are retried
+ * on the next 10-minute tick inside the window.
+ */
+export function rfbMarketingRunConsumesWindow(r: { skipped_reason: string | null }): boolean {
+  return r.skipped_reason !== "run_in_progress" && r.skipped_reason !== "health_red";
 }
 
 function utcDay(d: Date): string {
@@ -226,10 +285,10 @@ export interface RfbMarketingBounceHit {
  * Hard bounces / spam complaints (email_bounces, the same table the gate's
  * is_hard_bounced reads) on addresses RFB outreach mailed in the last 48h —
  * outreach_sent_log (vertical 'rfb', whoever sent it) plus this job's own
- * ledger (a 'reserved' row may have no sent-log row yet). The gate never
- * selects an already-bounced address, so a hit is a NEW bounce on a recent
- * send. Bounces with id <= ackMaxId already triggered an auto-pause that a
- * human then cleared; they are not fresh any more.
+ * ledger ('reserved'/'sent'/'unknown' rows may have no sent-log row). The
+ * gate never selects an already-bounced address, so a hit is a NEW bounce on
+ * a recent send. Bounces with id <= ackMaxId already triggered an auto-pause
+ * that a human then cleared; they are not fresh any more.
  */
 export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: number | null): RfbMarketingBounceHit[] {
   const since = new Date(now.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);
@@ -246,7 +305,7 @@ export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: numbe
   const ledgerRows = db
     .prepare(
       `SELECT DISTINCT recipient_email AS email FROM rfb_marketing_send_ledger
-        WHERE status IN ('reserved', 'sent') AND reserved_at >= ?`,
+        WHERE status IN ${CONTACTED_LEDGER_STATUSES_SQL} AND reserved_at >= ?`,
     )
     .all(since.toISOString()) as Array<{ email: string }>;
   for (const r of ledgerRows) recipients.add(r.email);
@@ -326,8 +385,9 @@ export function probeRfbMarketingHealth(): RfbMarketingHealthSignal {
 /**
  * RFB outreach already sent (or possibly sent) today, UTC: distinct
  * recipients in outreach_sent_log (vertical 'rfb', any sender — a manual send
- * earlier today shrinks the budget) ∪ this job's ledger rows that are 'sent'
- * or still 'reserved' (outcome unknown → counted as sent).
+ * earlier today shrinks the budget) ∪ this job's ledger rows that are 'sent',
+ * 'unknown' (transport invoked, not confirmed) or still 'reserved' (outcome
+ * never recorded) — all counted as sent.
  */
 export function countRfbMarketingSentToday(db: Db, now: Date): {
   total: number;
@@ -351,7 +411,7 @@ export function countRfbMarketingSentToday(db: Db, now: Date): {
   const ledgerRows = db
     .prepare(
       `SELECT recipient_email AS email FROM rfb_marketing_send_ledger
-        WHERE day = ? AND status IN ('reserved', 'sent')`,
+        WHERE day = ? AND status IN ${CONTACTED_LEDGER_STATUSES_SQL}`,
     )
     .all(day) as Array<{ email: string }>;
   let ledgerOnly = 0;
@@ -435,28 +495,35 @@ export function checkRfbProfileContent(
 }
 
 /**
- * This job's own memory of an address: an attempt today (any outcome — the
- * UNIQUE(day, recipient) key would refuse a second one anyway), or a send
- * that went out / may have gone out ('sent'/'reserved') inside the cooldown
- * window — which covers a send whose outreach_sent_log row was never written.
+ * This job's own memory of an address OR an agent: an attempt today (any
+ * outcome — the UNIQUE(day, recipient) key would refuse a second one anyway),
+ * or a send that went out / may have gone out ('sent'/'unknown'/'reserved')
+ * inside the cooldown window — which covers a send whose outreach_sent_log row
+ * was never written. Matching the agent too keeps a producer whose address
+ * changed from being mailed twice within the window.
  */
 function ledgerBlocksRecipient(
   db: Db,
   email: string,
+  agentId: string,
   now: Date,
   cooldownDays: number,
 ): "already_attempted_today" | "recently_contacted_by_platform_job" | null {
   const today = db
-    .prepare(`SELECT 1 AS hit FROM rfb_marketing_send_ledger WHERE day = ? AND recipient_email = ? LIMIT 1`)
-    .get(utcDay(now), email);
+    .prepare(
+      `SELECT 1 AS hit FROM rfb_marketing_send_ledger
+        WHERE day = ? AND (recipient_email = ? OR agent_id = ?) LIMIT 1`,
+    )
+    .get(utcDay(now), email, agentId);
   if (today) return "already_attempted_today";
   const cutoff = new Date(now.getTime() - cooldownDays * 86400_000).toISOString();
   const recent = db
     .prepare(
       `SELECT 1 AS hit FROM rfb_marketing_send_ledger
-        WHERE recipient_email = ? AND status IN ('reserved', 'sent') AND reserved_at >= ? LIMIT 1`,
+        WHERE (recipient_email = ? OR agent_id = ?)
+          AND status IN ${CONTACTED_LEDGER_STATUSES_SQL} AND reserved_at >= ? LIMIT 1`,
     )
-    .get(email, cutoff);
+    .get(email, agentId, cutoff);
   return recent ? "recently_contacted_by_platform_job" : null;
 }
 
@@ -491,8 +558,11 @@ function reserveLedgerSlot(
     const used = countRfbMarketingSentToday(db, p.now).total;
     if (used >= p.dailyCap) return { kind: "cap_reached", used };
     const existing = db
-      .prepare(`SELECT 1 AS hit FROM rfb_marketing_send_ledger WHERE day = ? AND recipient_email = ?`)
-      .get(utcDay(p.now), p.email);
+      .prepare(
+        `SELECT 1 AS hit FROM rfb_marketing_send_ledger
+          WHERE day = ? AND (recipient_email = ? OR agent_id = ?)`,
+      )
+      .get(utcDay(p.now), p.email, p.agentId);
     if (existing) return { kind: "already_attempted_today" };
     const info = db
       .prepare(
@@ -510,7 +580,7 @@ function finalizeLedgerRow(
   db: Db,
   ledgerId: number,
   p: {
-    status: "sent" | "refused" | "failed";
+    status: "sent" | "unknown" | "refused" | "failed";
     httpStatus: number;
     threadId: string | null;
     outboxId: string | null;
@@ -530,6 +600,7 @@ export interface RfbMarketingLedgerSummary {
   day: string;
   reserved: number;
   sent: number;
+  unknown: number;
   refused: number;
   failed: number;
 }
@@ -539,9 +610,15 @@ export function summarizeRfbMarketingLedgerDay(db: Db, now: Date): RfbMarketingL
   const rows = db
     .prepare(`SELECT status, COUNT(*) AS n FROM rfb_marketing_send_ledger WHERE day = ? GROUP BY status`)
     .all(day) as Array<{ status: string; n: number }>;
-  const out: RfbMarketingLedgerSummary = { day, reserved: 0, sent: 0, refused: 0, failed: 0 };
+  const out: RfbMarketingLedgerSummary = { day, reserved: 0, sent: 0, unknown: 0, refused: 0, failed: 0 };
   for (const r of rows) {
-    if (r.status === "reserved" || r.status === "sent" || r.status === "refused" || r.status === "failed") {
+    if (
+      r.status === "reserved" ||
+      r.status === "sent" ||
+      r.status === "unknown" ||
+      r.status === "refused" ||
+      r.status === "failed"
+    ) {
       out[r.status] = r.n;
     }
   }
@@ -550,8 +627,10 @@ export function summarizeRfbMarketingLedgerDay(db: Db, now: Date): RfbMarketingL
 
 // ─── The run ───────────────────────────────────────────────────────────────
 
+
 export type RfbMarketingDailyRunSkipReason =
   | "disabled_by_env"
+  | "transport_not_live"
   | "run_in_progress"
   | "paused"
   | "bounce_or_complaint_recent"
@@ -560,21 +639,35 @@ export type RfbMarketingDailyRunSkipReason =
   | "outreach_max_per_day_reached"
   | "social_proof_unavailable"
   | "outreach_paused"
-  | "no_candidates";
+  /** The gate returned no candidate at all. */
+  | "no_candidates"
+  /** The gate returned candidates, but every one was held back or blocked. */
+  | "no_sendable_candidates";
 
 /** Why the send loop stopped before the budget or the candidate list ran out. */
 export type RfbMarketingStopReason =
   | "reservation_failed"
   | "ledger_update_failed"
   | "post_send_record_failed"
+  | "transport_failed"
+  | "transport_not_live"
   | "compose_error"
   | "render_failed"
+  | "db_error"
+  | "attempt_cap_reached"
   | "paused_mid_run"
   | "daily_cap_reached"
   | "outreach_max_per_day_reached"
   | "outreach_paused";
 
-export type RfbMarketingResultStatus = "sent" | "would_send" | "skipped" | "refused" | "error";
+/**
+ * Per-candidate outcome. "unknown": handed to the transport, not confirmed —
+ * possibly delivered, so counted and blocked like a send, never retried, and
+ * never claimed as sent.
+ */
+export type RfbMarketingResultStatus = "sent" | "unknown" | "would_send" | "skipped" | "refused" | "error";
+
+export type RfbMarketingLedgerStatus = "reserved" | "sent" | "unknown" | "refused" | "failed";
 
 export interface RfbMarketingResultRow {
   agent_id: string;
@@ -590,7 +683,9 @@ export interface RfbMarketingResultRow {
   thread_id?: string;
   outbox_id?: string;
   message_id?: string;
-  /** Ledger state after this row; false = the post-outcome ledger write failed (row left 'reserved'). */
+  /** The ledger row's status after this candidate ('reserved' if the final write failed). */
+  ledger_status?: RfbMarketingLedgerStatus;
+  /** false = the post-outcome ledger write failed (row left 'reserved'). */
   ledger_recorded?: boolean;
   post_send_error?: string;
   description_length?: number;
@@ -602,9 +697,23 @@ export interface RfbMarketingGateSummary {
   count: number;
   paused: boolean;
   suppressed_counts: unknown;
-  cross_platform_cooldown: { count: unknown; by_vertical: unknown; unavailable: boolean };
+  cross_platform_cooldown: {
+    count: unknown;
+    by_vertical: unknown;
+    unavailable: boolean;
+    /** Up to 25 of the gate's named producers (the gate itself caps at 100). */
+    producers: unknown[];
+    truncated: boolean;
+  };
   dedupe_suppressed_count: unknown;
   gate_integrity_violations: unknown;
+}
+
+export interface RfbMarketingHeldEntry {
+  agent_id: string;
+  name: string;
+  reason: RfbHeldReason;
+  description_length: number;
 }
 
 export interface RfbMarketingDailyRunReport {
@@ -614,6 +723,8 @@ export interface RfbMarketingDailyRunReport {
   trigger: "cron" | "manual";
   apply: boolean;
   enabled_by_env: boolean;
+  /** emailService.isLiveTransport() — false means sendRaw would only answer DRY_RUN. */
+  transport_live: boolean;
   started_at: string;
   finished_at: string;
   skipped_reason: RfbMarketingDailyRunSkipReason | null;
@@ -623,6 +734,8 @@ export interface RfbMarketingDailyRunReport {
   outreach_reserved_today: number;
   sent_today_before: number;
   budget: number;
+  compose_attempts: number;
+  max_compose_attempts: number;
   lane: RfbMarketingLaneState | null;
   auto_paused: boolean;
   recent_bounces: RfbMarketingBounceHit[];
@@ -631,9 +744,10 @@ export interface RfbMarketingDailyRunReport {
   social_proof: { producer_count: number; producer_count_rounded: number; line: string | null } | null;
   gate: { cooldown_days: number; first: RfbMarketingGateSummary | null; second: RfbMarketingGateSummary | null } | null;
   results: RfbMarketingResultRow[];
-  held_for_reenrichment: Array<{ agent_id: string; name: string; reason: RfbHeldReason; description_length: number }>;
+  held_for_reenrichment: RfbMarketingHeldEntry[];
   summary: {
     sent: number;
+    unknown: number;
     would_send: number;
     skipped: number;
     refused: number;
@@ -654,8 +768,13 @@ export interface RfbMarketingDailyDeps {
   healthProbe?: () => RfbMarketingHealthSignal;
 }
 
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
   const xp = (r.cross_platform_cooldown ?? {}) as Record<string, unknown>;
+  const producers = Array.isArray(xp.producers) ? (xp.producers as unknown[]) : [];
   return {
     count: r.count,
     paused: r.paused === true,
@@ -664,6 +783,8 @@ function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
       count: xp.count ?? null,
       by_vertical: xp.by_vertical ?? null,
       unavailable: xp.unavailable === true,
+      producers: producers.slice(0, 25),
+      truncated: producers.length > 25 || xp.truncated === true,
     },
     dedupe_suppressed_count: r.dedupe_suppressed_count ?? null,
     gate_integrity_violations: r.gate_integrity_violations ?? null,
@@ -671,7 +792,18 @@ function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
 }
 
 function summarizeResults(results: RfbMarketingResultRow[]): RfbMarketingDailyRunReport["summary"] {
-  const s = { sent: 0, would_send: 0, skipped: 0, refused: 0, error: 0, total: results.length, first_touch_sent: 0, second_touch_sent: 0, held: 0 };
+  const s = {
+    sent: 0,
+    unknown: 0,
+    would_send: 0,
+    skipped: 0,
+    refused: 0,
+    error: 0,
+    total: results.length,
+    first_touch_sent: 0,
+    second_touch_sent: 0,
+    held: 0,
+  };
   for (const r of results) {
     s[r.status] += 1;
     if (r.status === "sent") {
@@ -690,9 +822,10 @@ let rfbMarketingRunInFlight = false;
  * the list (with the exact rendered text) computed, nothing written, no
  * e-mail, no envelope. `apply: true` sends up to today's budget and records a
  * run envelope (agent rfb-marketing-platform) whatever the outcome — except
- * when G1 turned the job off or another run is still in flight. Throws only
- * if a guard's own read or the selection fails; per-candidate failures are
- * result rows, not exceptions.
+ * when G1/G1b turned the job off or another run is still in flight. Throws
+ * only if a guard's own read fails (before anything is sent); once selection
+ * starts, failures are result rows / a stopped_reason and the envelope is
+ * still written.
  */
 export async function runRfbMarketingDaily(opts: {
   apply: boolean;
@@ -733,6 +866,7 @@ async function runRfbMarketingDailyGuarded(opts: {
   const db = getDb();
   const deps = opts.deps ?? {};
   const enabled = isRfbMarketingPlatformEnabled();
+  const transportLive = emailService.isLiveTransport();
   const dailyCap = resolveRfbMarketingDailyCap();
   const outreachMaxPerDay = resolveDailyOutreachCap();
   const errors: string[] = [];
@@ -743,20 +877,23 @@ async function runRfbMarketingDailyGuarded(opts: {
     sent_today_before?: number;
     outreach_reserved_today?: number;
     budget?: number;
+    compose_attempts?: number;
+    max_compose_attempts?: number;
     auto_paused?: boolean;
     recent_bounces?: RfbMarketingBounceHit[];
     health?: RfbMarketingHealthSignal | null;
     social_proof?: RfbMarketingDailyRunReport["social_proof"];
     gate?: RfbMarketingDailyRunReport["gate"];
     results?: RfbMarketingResultRow[];
-    held?: RfbMarketingDailyRunReport["held_for_reenrichment"];
+    held?: RfbMarketingHeldEntry[];
   }): RfbMarketingDailyRunReport => {
     const results = partial.results ?? [];
+    const held = partial.held ?? [];
     let lane: RfbMarketingLaneState | null = null;
     try {
       lane = getRfbMarketingLaneState(db);
     } catch (err) {
-      errors.push(`lane state unreadable: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(`lane state unreadable: ${errMessage(err)}`);
     }
     const report: RfbMarketingDailyRunReport = {
       run_id: runId,
@@ -765,6 +902,7 @@ async function runRfbMarketingDailyGuarded(opts: {
       trigger: opts.trigger,
       apply: opts.apply,
       enabled_by_env: enabled,
+      transport_live: transportLive,
       started_at: startedAt,
       finished_at: clock().toISOString(),
       skipped_reason: partial.skipped_reason,
@@ -774,6 +912,8 @@ async function runRfbMarketingDailyGuarded(opts: {
       outreach_reserved_today: partial.outreach_reserved_today ?? 0,
       sent_today_before: partial.sent_today_before ?? 0,
       budget: partial.budget ?? 0,
+      compose_attempts: partial.compose_attempts ?? 0,
+      max_compose_attempts: partial.max_compose_attempts ?? 0,
       lane,
       auto_paused: partial.auto_paused ?? false,
       recent_bounces: partial.recent_bounces ?? [],
@@ -782,15 +922,17 @@ async function runRfbMarketingDailyGuarded(opts: {
       social_proof: partial.social_proof ?? null,
       gate: partial.gate ?? null,
       results,
-      held_for_reenrichment: partial.held ?? [],
+      held_for_reenrichment: held,
       summary: summarizeResults(results),
       envelope_recorded: false,
       errors,
     };
 
-    // Envelope: real runs only (a dry run leaves no trace), never when the env
-    // switch turned the job off, never for a call that found a run in flight.
-    if (opts.apply && report.skipped_reason !== "disabled_by_env" && report.skipped_reason !== "run_in_progress") {
+    // Envelope: real runs only (a dry run leaves no trace), never when the
+    // env switch or a non-live transport turned the job off (no writes at
+    // all), never for a call that found a run in flight.
+    const noTrace: Array<RfbMarketingDailyRunSkipReason | null> = ["disabled_by_env", "transport_not_live", "run_in_progress"];
+    if (opts.apply && !noTrace.includes(report.skipped_reason)) {
       try {
         const isTaken = db.prepare(`SELECT 1 FROM runs WHERE run_id = ?`);
         const base = report.run_id;
@@ -804,15 +946,20 @@ async function runRfbMarketingDailyGuarded(opts: {
       }
       const sentRows = results.filter((r) => r.status === "sent");
       const sentIds = sentRows.map((r) => r.agent_id);
-      const status =
-        report.summary.error > 0 ? (report.summary.sent > 0 ? "partial" : "failed") : "completed";
+      const unknownRows = results.filter((r) => r.status === "unknown");
+      // A clean run is "completed". Anything that went wrong — an error or
+      // unknown-delivery row, a stopped loop, a recorded error — is "partial"
+      // when something was sent, else "failed".
+      const troubled =
+        report.summary.error > 0 || report.summary.unknown > 0 || report.stopped_reason !== null || errors.length > 0;
+      const status = troubled ? (report.summary.sent > 0 ? "partial" : "failed") : "completed";
       const notes = (
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         (report.stopped_reason ? `stopped: ${report.stopped_reason}. ` : "") +
         `sent=${report.summary.sent} (first=${report.summary.first_touch_sent} second=${report.summary.second_touch_sent}) ` +
-        `refused=${report.summary.refused} errors=${report.summary.error} held=${report.summary.held} ` +
-        `budget=${report.budget} daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} ` +
-        `template=${RFB_OUTREACH_TEMPLATE_ID}` +
+        `unknown=${report.summary.unknown} refused=${report.summary.refused} errors=${report.summary.error} ` +
+        `held=${report.summary.held} budget=${report.budget} daily_cap=${report.daily_cap} ` +
+        `sent_today_before=${report.sent_today_before} template=${RFB_OUTREACH_TEMPLATE_ID}` +
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
         (report.health?.red ? ` health: ${report.health.reasons.join("; ")}` : "")
       ).slice(0, 490);
@@ -839,6 +986,30 @@ async function runRfbMarketingDailyGuarded(opts: {
             },
             { type: "custom", value: report.summary.first_touch_sent, meta: { kind: "rfb_marketing_first_touch_sent" } },
             { type: "custom", value: report.summary.second_touch_sent, meta: { kind: "rfb_marketing_second_touch_sent" } },
+            {
+              type: "custom",
+              value: report.summary.unknown,
+              meta: { kind: "rfb_marketing_unknown_delivery", agent_ids: unknownRows.map((r) => r.agent_id) },
+            },
+            // What a report-only routine needs to write marketing-runs/<date>/
+            // held-for-reenrichment.json (same row shape as the SKILL's file).
+            {
+              type: "custom",
+              value: held.length,
+              meta: {
+                kind: "rfb_marketing_held_for_reenrichment",
+                vertical: "rfb",
+                held: held.slice(0, 100),
+                truncated: held.length > 100,
+              },
+            },
+            // The gate's own suppression reporting (cross_platform_cooldown,
+            // suppressed_counts …) that the SKILL requires in every run report.
+            {
+              type: "custom",
+              value: report.gate?.first?.count ?? 0,
+              meta: { kind: "rfb_marketing_gate_summary", gate: report.gate },
+            },
           ],
           evidence: [
             {
@@ -859,11 +1030,11 @@ async function runRfbMarketingDailyGuarded(opts: {
       }
     }
     console.log(
-      `[rfb-marketing-daily] run_id=${report.run_id} apply=${opts.apply} enabled=${enabled} ` +
+      `[rfb-marketing-daily] run_id=${report.run_id} apply=${opts.apply} enabled=${enabled} transport_live=${transportLive} ` +
         `skipped=${report.skipped_reason ?? "-"} stopped=${report.stopped_reason ?? "-"} ` +
-        `sent=${report.summary.sent} would_send=${report.summary.would_send} refused=${report.summary.refused} ` +
-        `errors=${report.summary.error} held=${report.summary.held} budget=${report.budget} cap=${dailyCap} ` +
-        `auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}`,
+        `sent=${report.summary.sent} unknown=${report.summary.unknown} would_send=${report.summary.would_send} ` +
+        `refused=${report.summary.refused} errors=${report.summary.error} held=${report.summary.held} ` +
+        `budget=${report.budget} cap=${dailyCap} auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}`,
     );
     return report;
   };
@@ -876,6 +1047,14 @@ async function runRfbMarketingDailyGuarded(opts: {
   // run carries on read-only so the list can be reviewed before the flip.
   if (!enabled && opts.apply) {
     return finish({ skipped_reason: "disabled_by_env" });
+  }
+
+  // G1b — a real run needs a real transport. sendRaw answers DRY_RUN with
+  // {success: true} when SMTP is not configured; recording that as a send
+  // would put producers who never got mail into the cooldown. (An injected
+  // transport — tests — is the caller's responsibility.)
+  if (opts.apply && !deps.sendRaw && !transportLive) {
+    return finish({ skipped_reason: "transport_not_live" });
   }
 
   // G2 — lane paused.
@@ -902,7 +1081,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         });
         autoPaused = true;
       } catch (err) {
-        errors.push(`auto-pause write failed: ${err instanceof Error ? err.message : String(err)}`);
+        errors.push(`auto-pause write failed: ${errMessage(err)}`);
       }
     }
     return finish({ skipped_reason: "bounce_or_complaint_recent", auto_paused: autoPaused, recent_bounces: recentBounces });
@@ -920,7 +1099,14 @@ async function runRfbMarketingDailyGuarded(opts: {
   const rfbRemaining = Math.max(0, dailyCap - sentToday.total);
   const outreachRemaining = Math.max(0, outreachMaxPerDay - outreachReservedToday);
   const budget = Math.min(rfbRemaining, outreachRemaining);
-  const budgetInfo = { sent_today_before: sentToday.total, outreach_reserved_today: outreachReservedToday, budget, health };
+  const maxComposeAttempts = budget + RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS;
+  const budgetInfo = {
+    sent_today_before: sentToday.total,
+    outreach_reserved_today: outreachReservedToday,
+    budget,
+    max_compose_attempts: maxComposeAttempts,
+    health,
+  };
   if (budget === 0) {
     return finish({
       ...budgetInfo,
@@ -940,74 +1126,133 @@ async function runRfbMarketingDailyGuarded(opts: {
     return finish({ ...budgetInfo, social_proof: socialProof, skipped_reason: "social_proof_unavailable" });
   }
 
+  // From here on nothing throws out of the run: a failure becomes a result
+  // row and/or a stopped_reason, and finish() still writes the envelope.
+  const results: RfbMarketingResultRow[] = [];
+  const held: RfbMarketingHeldEntry[] = [];
+  const seenEmails = new Set<string>();
+  let composeAttempts = 0;
+  let committed = 0; // would_send (dry) or sent (apply) this run
+  let stoppedReason: RfbMarketingStopReason | null = null;
+
   // Selection: the gate, unchanged. mode=first first; mode=second only for the
   // budget first-touch leaves unfilled (the SKILL's FILL-MODUS).
   const cooldownDays = resolveRfbMarketingGateCooldownDays();
   const gate: NonNullable<RfbMarketingDailyRunReport["gate"]> = { cooldown_days: cooldownDays, first: null, second: null };
-  const firstGate = computeOutreachCandidates(db, { mode: "first", cooldownDays, limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT });
+  const done = (skipped: RfbMarketingDailyRunSkipReason | null) =>
+    finish({
+      ...budgetInfo,
+      social_proof: socialProof,
+      gate,
+      results,
+      held,
+      compose_attempts: composeAttempts,
+      stopped_reason: stoppedReason,
+      skipped_reason: skipped,
+    });
+
+  let firstGate: OutreachCandidatesResult;
+  try {
+    firstGate = computeOutreachCandidates(db, { mode: "first", cooldownDays, limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT });
+  } catch (err) {
+    errors.push(`gate (mode=first) failed: ${errMessage(err)}`);
+    stoppedReason = "db_error";
+    return done(null);
+  }
   gate.first = summarizeGate(firstGate);
   if (firstGate.paused) {
-    return finish({ ...budgetInfo, social_proof: socialProof, gate, skipped_reason: "outreach_paused" });
+    return done("outreach_paused");
   }
 
-  const results: RfbMarketingResultRow[] = [];
-  const held: RfbMarketingDailyRunReport["held_for_reenrichment"] = [];
-  const seenEmails = new Set<string>();
-  let committed = 0; // would_send (dry) or sent (apply) this run
-  let stoppedReason: RfbMarketingStopReason | null = null;
+  type Examined =
+    | { kind: "skip"; row: RfbMarketingResultRow }
+    | { kind: "held"; row: RfbMarketingResultRow; entry: RfbMarketingHeldEntry }
+    | { kind: "render_failed"; row: RfbMarketingResultRow }
+    | { kind: "ready"; row: RfbMarketingResultRow; rendered: RfbOutreachRendered };
+
+  // Read-only checks for one candidate. A thrown error here is a database
+  // problem (handled by the caller); render failures come back as a value.
+  const examine = (cand: OutreachCandidate, touch: "first" | "second"): Examined => {
+    const email = String(cand.email ?? "").trim().toLowerCase();
+    const row: RfbMarketingResultRow = { agent_id: cand.agent_id, name: cand.name, recipient_email: email, touch, status: "skipped" };
+    if (!email || seenEmails.has(email)) return { kind: "skip", row: { ...row, reason: "duplicate_email_in_run" } };
+    seenEmails.add(email);
+    const ledgerBlock = ledgerBlocksRecipient(db, email, cand.agent_id, now, cooldownDays);
+    if (ledgerBlock) return { kind: "skip", row: { ...row, reason: ledgerBlock } };
+    const profile = resolveRfbCanonicalProfileUrl(cand.agent_id);
+    if (!profile.ok) {
+      return {
+        kind: "skip",
+        row: { ...row, reason: `profile_url_unavailable:${profile.reason}`, ...(profile.url ? { profile_url: profile.url } : {}) },
+      };
+    }
+    row.profile_url = profile.url;
+    const content = checkRfbProfileContent(db, cand.agent_id);
+    if (!content.ok) {
+      return {
+        kind: "held",
+        row: { ...row, reason: `held_for_reenrichment:${content.reason}`, description_length: content.description_length },
+        entry: { agent_id: cand.agent_id, name: cand.name, reason: content.reason, description_length: content.description_length },
+      };
+    }
+    let rendered: RfbOutreachRendered;
+    try {
+      rendered = renderRfbOutreachEmail({
+        agentId: cand.agent_id,
+        producerName: cand.name,
+        profileUrl: profile.url,
+        producerCountTotal: producerCount,
+      });
+    } catch (err) {
+      return { kind: "render_failed", row: { ...row, status: "error", reason: `render_failed: ${errMessage(err)}` } };
+    }
+    row.subject_variant = rendered.variant;
+    row.subject = rendered.subject;
+    return { kind: "ready", row, rendered };
+  };
+
+  const stopOnDbError = (cand: OutreachCandidate, touch: "first" | "second", err: unknown): void => {
+    const msg = errMessage(err);
+    results.push({
+      agent_id: cand.agent_id,
+      name: cand.name,
+      recipient_email: String(cand.email ?? "").trim().toLowerCase(),
+      touch,
+      status: "error",
+      reason: `db_error: ${msg}`,
+    });
+    errors.push(`database error at ${cand.agent_id}: ${msg} — loop stopped`);
+    stoppedReason = "db_error";
+  };
 
   const processList = async (list: OutreachCandidate[], touch: "first" | "second"): Promise<void> => {
     for (const cand of list) {
       if (committed >= budget || stoppedReason) return;
-      const email = String(cand.email ?? "").trim().toLowerCase();
-      const row: RfbMarketingResultRow = {
-        agent_id: cand.agent_id,
-        name: cand.name,
-        recipient_email: email,
-        touch,
-        status: "skipped",
-      };
-      if (!email || seenEmails.has(email)) {
-        results.push({ ...row, reason: "duplicate_email_in_run" });
-        continue;
-      }
-      seenEmails.add(email);
 
-      const ledgerBlock = ledgerBlocksRecipient(db, email, now, cooldownDays);
-      if (ledgerBlock) {
-        results.push({ ...row, reason: ledgerBlock });
-        continue;
-      }
-      const profile = resolveRfbCanonicalProfileUrl(cand.agent_id);
-      if (!profile.ok) {
-        results.push({ ...row, reason: `profile_url_unavailable:${profile.reason}`, ...(profile.url ? { profile_url: profile.url } : {}) });
-        continue;
-      }
-      row.profile_url = profile.url;
-      const content = checkRfbProfileContent(db, cand.agent_id);
-      if (!content.ok) {
-        results.push({ ...row, reason: `held_for_reenrichment:${content.reason}`, description_length: content.description_length });
-        held.push({ agent_id: cand.agent_id, name: cand.name, reason: content.reason, description_length: content.description_length });
-        continue;
-      }
-
-      let rendered;
+      let exam: Examined;
       try {
-        rendered = renderRfbOutreachEmail({
-          agentId: cand.agent_id,
-          producerName: cand.name,
-          profileUrl: profile.url,
-          producerCountTotal: producerCount,
-        });
+        exam = examine(cand, touch);
       } catch (err) {
-        // Nothing reserved, nothing sent — but a render failure means the
-        // inputs are not what the template describes; stop rather than guess.
-        results.push({ ...row, status: "error", reason: `render_failed: ${err instanceof Error ? err.message : String(err)}` });
+        stopOnDbError(cand, touch, err);
+        return;
+      }
+      if (exam.kind === "skip") {
+        results.push(exam.row);
+        continue;
+      }
+      if (exam.kind === "held") {
+        results.push(exam.row);
+        held.push(exam.entry);
+        continue;
+      }
+      if (exam.kind === "render_failed") {
+        // Nothing reserved, nothing sent — but the inputs are not what the
+        // template describes; stop rather than guess.
+        results.push(exam.row);
         stoppedReason = "render_failed";
         return;
       }
-      row.subject_variant = rendered.variant;
-      row.subject = rendered.subject;
+      const { row, rendered } = exam;
 
       if (!opts.apply) {
         results.push({ ...row, status: "would_send", preview_text: rendered.text });
@@ -1017,8 +1262,18 @@ async function runRfbMarketingDailyGuarded(opts: {
 
       // Apply path. A pause set while this run is in flight takes effect
       // before the next reservation, not tomorrow.
-      if (getRfbMarketingLaneState(db).paused) {
-        stoppedReason = "paused_mid_run";
+      try {
+        if (getRfbMarketingLaneState(db).paused) {
+          stoppedReason = "paused_mid_run";
+          return;
+        }
+      } catch (err) {
+        stopOnDbError(cand, touch, err);
+        return;
+      }
+      // Pre-transport refusals do not consume the budget; this bounds them.
+      if (composeAttempts >= maxComposeAttempts) {
+        stoppedReason = "attempt_cap_reached";
         return;
       }
 
@@ -1031,12 +1286,12 @@ async function runRfbMarketingDailyGuarded(opts: {
           dailyCap,
           runId,
           agentId: cand.agent_id,
-          email,
+          email: row.recipient_email,
           touch,
           variant: rendered.variant,
         });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errMessage(err);
         results.push({ ...row, status: "error", reason: `reservation_failed: ${msg}` });
         errors.push(`reservation write failed for ${cand.agent_id}: ${msg} — nothing sent, loop stopped`);
         stoppedReason = "reservation_failed";
@@ -1051,6 +1306,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         continue;
       }
 
+      composeAttempts += 1;
       let outcome: ComposeOutcome;
       try {
         outcome = await executeCompose(
@@ -1070,8 +1326,8 @@ async function runRfbMarketingDailyGuarded(opts: {
         // executeCompose catches everything itself, so this should be
         // unreachable. If it ever throws, whether the e-mail left is unknown:
         // leave the ledger row 'reserved' (counted + blocked) and stop.
-        const msg = err instanceof Error ? err.message : String(err);
-        results.push({ ...row, status: "error", reason: `compose_threw: ${msg}`, ledger_recorded: false });
+        const msg = errMessage(err);
+        results.push({ ...row, status: "error", reason: `compose_threw: ${msg}`, ledger_status: "reserved", ledger_recorded: false });
         errors.push(`compose threw for ${cand.agent_id} (outcome unknown, ledger row left 'reserved'): ${msg}`);
         stoppedReason = "compose_error";
         return;
@@ -1086,8 +1342,18 @@ async function runRfbMarketingDailyGuarded(opts: {
       if (outboxId) row.outbox_id = outboxId;
       if (messageId) row.message_id = messageId;
 
-      let ledgerStatus: "sent" | "refused" | "failed";
-      if (outcome.delivery === "sent") {
+      let ledgerStatus: "sent" | "unknown" | "refused" | "failed";
+      if (outcome.delivery === "sent" && messageId === "DRY_RUN") {
+        // Defense in depth behind G1b: the transport "sent" nothing. Not a send.
+        ledgerStatus = "failed";
+        row.status = "error";
+        row.reason = "transport_dry_run";
+        errors.push(
+          `transport answered DRY_RUN for ${cand.agent_id} — nothing was delivered; run stopped ` +
+            `(compose recorded it as sent, so its outreach_sent_log row holds this address in cooldown)`,
+        );
+        stoppedReason = "transport_not_live";
+      } else if (outcome.delivery === "sent") {
         ledgerStatus = "sent";
         row.status = "sent";
         committed += 1;
@@ -1096,6 +1362,19 @@ async function runRfbMarketingDailyGuarded(opts: {
           errors.push(`post-send bookkeeping failed for ${cand.agent_id} (e-mail WAS sent): ${outcome.postSendError}`);
           stoppedReason = "post_send_record_failed";
         }
+      } else if (outcome.transportAttempted) {
+        // Handed to the transport and not confirmed: the server may have
+        // accepted DATA before the connection dropped. AT MOST ONCE — count and
+        // block it like a send, never retry it, never claim it; and stop here
+        // instead of trying the next address on a transport that is failing.
+        ledgerStatus = "unknown";
+        row.status = "unknown";
+        row.reason = `transport_failed:${composeError ?? outcome.httpStatus}`;
+        errors.push(
+          `transport did not confirm the send to ${cand.agent_id} (${composeError ?? outcome.httpStatus}) — ` +
+            `possibly delivered: counted and blocked, never retried; loop stopped`,
+        );
+        stoppedReason = "transport_failed";
       } else if (outcome.httpStatus >= 400 && outcome.httpStatus < 500) {
         ledgerStatus = "refused";
         row.status = "refused";
@@ -1103,14 +1382,13 @@ async function runRfbMarketingDailyGuarded(opts: {
         if (outcome.httpStatus === 423) stoppedReason = "outreach_paused";
         else if (composeError === "daily_cap_reached") stoppedReason = "outreach_max_per_day_reached";
       } else {
+        // Failed BEFORE the transport (a write inside compose): nothing was
+        // sent, so a later day may retry it. The database is the likely cause.
         ledgerStatus = "failed";
         row.status = "error";
         row.reason = `compose_failed:${composeError ?? outcome.httpStatus}`;
-        if (!outcome.transportAttempted) {
-          // Failed before the transport — the database is the likely cause.
-          errors.push(`compose failed before the transport for ${cand.agent_id}: ${composeError ?? outcome.httpStatus}`);
-          stoppedReason = "compose_error";
-        }
+        errors.push(`compose failed before the transport for ${cand.agent_id}: ${composeError ?? outcome.httpStatus}`);
+        stoppedReason = "compose_error";
       }
 
       try {
@@ -1120,14 +1398,16 @@ async function runRfbMarketingDailyGuarded(opts: {
           threadId,
           outboxId,
           messageId,
-          error: outcome.postSendError ?? (ledgerStatus === "sent" ? null : composeError),
+          error: outcome.postSendError ?? (ledgerStatus === "sent" ? null : row.reason ?? composeError),
           updatedAt: clock().toISOString(),
         });
+        row.ledger_status = ledgerStatus;
         row.ledger_recorded = true;
       } catch (err) {
         // The row stays 'reserved': counted as sent, address blocked for the
         // cooldown window. Stop — the database is not accepting writes.
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errMessage(err);
+        row.ledger_status = "reserved";
         row.ledger_recorded = false;
         errors.push(`ledger update failed for ${cand.agent_id} (row left 'reserved'): ${msg}`);
         if (!stoppedReason) stoppedReason = "ledger_update_failed";
@@ -1138,23 +1418,24 @@ async function runRfbMarketingDailyGuarded(opts: {
 
   await processList(firstGate.candidates, "first");
   if (committed < budget && !stoppedReason) {
-    const secondGate = computeOutreachCandidates(db, {
-      mode: "second",
-      cooldownDays,
-      limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT,
-    });
-    gate.second = summarizeGate(secondGate);
-    if (!secondGate.paused) await processList(secondGate.candidates, "second");
+    let secondGate: OutreachCandidatesResult | null = null;
+    try {
+      secondGate = computeOutreachCandidates(db, {
+        mode: "second",
+        cooldownDays,
+        limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT,
+      });
+    } catch (err) {
+      errors.push(`gate (mode=second) failed: ${errMessage(err)}`);
+      stoppedReason = "db_error";
+    }
+    if (secondGate) {
+      gate.second = summarizeGate(secondGate);
+      if (!secondGate.paused) await processList(secondGate.candidates, "second");
+    }
   }
 
-  const anyActionable = results.some((r) => r.status !== "skipped");
-  return finish({
-    ...budgetInfo,
-    social_proof: socialProof,
-    gate,
-    results,
-    held,
-    stopped_reason: stoppedReason,
-    skipped_reason: !anyActionable && !stoppedReason ? "no_candidates" : null,
-  });
+  const actionable = results.some((r) => r.status !== "skipped");
+  const gateReturned = (gate.first?.count ?? 0) + (gate.second?.count ?? 0);
+  return done(actionable || stoppedReason ? null : gateReturned > 0 ? "no_sendable_candidates" : "no_candidates");
 }

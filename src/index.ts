@@ -57,7 +57,7 @@ import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
-import { shouldRunRfbMarketingDaily, runRfbMarketingDaily } from "./services/rfb-marketing-daily";
+import { shouldRunRfbMarketingDaily, runRfbMarketingDaily, rfbMarketingRunConsumesWindow } from "./services/rfb-marketing-daily";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
@@ -1756,7 +1756,8 @@ if (
 // restart or a second tick inside the window can never exceed the cap or
 // re-send an address (every recipient is reserved in rfb_marketing_send_ledger
 // before its e-mail leaves). `lastRunAt` is only stamped after a run that did
-// not throw, so a transient DB error at 08:10 is retried on the next tick.
+// not throw and was not skipped for run_in_progress/health_red, so a transient
+// DB error or health dip at 08:10 is retried on the next tick in the window.
 // Statically imported (not `await import(...)`): one module instance, one
 // database/init singleton. Manual/dry runs: POST /admin/rfb-marketing-daily-run.
 if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
@@ -1766,8 +1767,10 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
     try {
       if (!shouldRunRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })) return;
       const r = await runRfbMarketingDaily({ apply: true, trigger: "cron", now });
-      // A manual run that was still in flight is not today's run — retry next tick.
-      if (r.skipped_reason !== "run_in_progress") lastRfbMarketingRunAt = now;
+      // Not today's run — retry on the next tick inside the window: a manual
+      // run that was still in flight, or a transient health_red (memory/disk
+      // "critical" at 08:10 must not cost the whole day).
+      if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;
       console.log(
         `[rfb-marketing-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
           `stopped=${r.stopped_reason ?? "-"} sent=${r.summary.sent} errors=${r.summary.error} ` +

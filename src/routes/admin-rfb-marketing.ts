@@ -8,6 +8,7 @@
 // the other RFB outreach levers in src/index.ts:
 //
 //   GET  /admin/rfb-marketing-lane       — lane state + the knobs the job runs with
+//                                          (incl. transport_live — G1b)
 //   POST /admin/rfb-marketing-lane       — {paused: boolean, by?, reason?}
 //   POST /admin/rfb-marketing-daily-run  — {apply?: boolean}; absent/false = dry run
 //
@@ -18,6 +19,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getDb } from "../database/init";
 import { resolveDailyOutreachCap } from "./crm";
+import { emailService } from "../services/email-service";
 import {
   RFB_MARKETING_DAILY_AGENT,
   RFB_MARKETING_DAILY_WINDOW_HOUR_UTC,
@@ -55,6 +57,9 @@ rfbMarketingLaneRouter.get("/", requireAdmin, (_req: Request, res: Response) => 
     res.json({
       ...getRfbMarketingLaneState(db),
       enabled_by_env: isRfbMarketingPlatformEnabled(),
+      // false = SMTP not configured / forced dry-run: an apply run would skip
+      // with transport_not_live (G1b) instead of "sending" DRY_RUNs.
+      transport_live: emailService.isLiveTransport(),
       daily_cap: resolveRfbMarketingDailyCap(),
       outreach_max_per_day: resolveDailyOutreachCap(),
       window_hour_utc: RFB_MARKETING_DAILY_WINDOW_HOUR_UTC,

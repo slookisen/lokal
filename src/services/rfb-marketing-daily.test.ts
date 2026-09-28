@@ -27,7 +27,11 @@
  *       fails → reported, loop stops, and the address is NOT re-sent the next
  *       day even though the gate selects it again
  *   (i) ledger UPDATE fails after a send → row stays 'reserved', loop stops,
- *       counted + blocked on the next run
+ *       counted + blocked on the next run; a transport failure AFTER the
+ *       hand-off is an 'unknown' delivery — AT MOST ONCE: counted, blocked for
+ *       the cooldown, never retried, and the run stops at the first one (a
+ *       thrown/ambiguous failure on day 1 → no e-mail on day 2; a failing
+ *       transport with five candidates → exactly one attempt)
  *   (j) G3 bounce/complaint → auto-pause (apply only), ack survives unpause,
  *       a new bounce re-pauses; soft/old/other-vertical bounces ignored
  *   (k) G3 health red → skip without pausing; /health threshold drift guard
@@ -40,6 +44,19 @@
  *   (q) canonical profile URL = the agent card's canonicalUrl
  *   (r) ledger UNIQUE(day, recipient) at the database level
  *   (s) default transport wiring (emailService, From/Reply-To, html part)
+ *   (t) G1b: apply without a live transport → transport_not_live, no writes;
+ *       isLiveTransport() = the negation of sendRaw's DRY_RUN short-circuit;
+ *       transport_live in the dry-run report and the lane GET; a DRY_RUN
+ *       answer that slips through stops the run and is not counted as sent
+ *   (u) the compose-attempt cap bounds a streak of pre-transport refusals
+ *   (v) a database error mid-run (a read, the second gate) → db_error, the
+ *       envelope is still written
+ *   (w) a lane pause set mid-run stops before the next reservation; the cap
+ *       is re-checked inside the reservation transaction (concurrent send)
+ *   (x) no_sendable_candidates vs no_candidates; the ledger blocks by agent
+ *       too (changed address, same day)
+ *   (y) envelope status: partial/failed whenever the run stopped or erred;
+ *       the held list, the gate summary and unknown deliveries as claims
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-marketing-daily.test.ts
@@ -161,6 +178,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   const origTransporter = emailSvc.transporter;
 
   let db: any = null;
+  // outreach_eligible_at seconds for seeded producers: seed order == gate order.
+  let eligibleSeq = 0;
 
   function setEnv(values: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>): void {
     for (const k of ENV_KEYS) delete process.env[k];
@@ -168,6 +187,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   }
 
   function freshDb(): any {
+    eligibleSeq = 0;
     db = new Database(":memory:");
     db.pragma("journal_mode = DELETE");
     db.pragma("foreign_keys = OFF");
@@ -188,7 +208,6 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     return db;
   }
 
-  let eligibleSeq = 0;
   function seedProducer(
     id: string,
     name: string,
@@ -341,6 +360,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(dry.results.map((x) => x.status), ["would_send", "would_send"], "b7: dry run still lists the candidates");
       assertEq(t.calls.length, 0, "b8: dry run sends nothing");
       assertEq(counts(), before, "b9: dry run writes nothing");
+      assertEq([typeof dry.transport_live, dry.transport_live], ["boolean", emailMod.emailService.isLiveTransport()], "b10: the dry-run report carries transport_live");
     }
 
     // ── (c) dry run (enabled): budget respected, exact preview ─────────────
@@ -384,6 +404,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(g.body.daily_cap, 1, "d5: GET reports the daily cap");
       assertEq([g.body.window_hour_utc, g.body.window_start_minute_utc], [8, 10], "d6: GET reports the 08:10Z window");
       assertEq(g.body.agent, "rfb-marketing-platform", "d7: GET names the envelope agent");
+      assertEq([typeof g.body.transport_live, g.body.transport_live], ["boolean", emailMod.emailService.isLiveTransport()], "d7b: GET reports transport_live (G1b)");
       const bad = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: "yes" } });
       assertEq(bad.status, 400, "d8: POST with non-boolean paused → 400");
       const p = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: true, by: "daniel", reason: "ferie" } });
@@ -539,6 +560,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(r.stopped_reason, "post_send_record_failed", "h3: run stops on a failed post-send write");
       assertEq(ledger().map((l) => l.status), ["sent"], "h4: the job's own ledger knows it was sent");
       assertEq(oslFor("disk@gard-test.no"), 0, "h5: outreach_sent_log never got the row (the exact 2026-09-27 gap)");
+      assertEq(runsRows()[0]?.status, "partial", "h5b: envelope 'partial' — something was sent, then the run stopped");
       db.exec(`DROP TRIGGER t_sent_flip_fails`);
       const gateAgain = aoc.computeOutreachCandidates(db, { mode: "first", cooldownDays: 60, limit: 100 });
       assertTrue(gateAgain.candidates.some((c) => c.email === "disk@gard-test.no"), "h6: the gate alone WOULD select the address again");
@@ -566,6 +588,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.results[0].status, r.results[0].ledger_recorded], ["sent", false], "i2: sent, ledger update reported as failed");
       assertEq(r.stopped_reason, "ledger_update_failed", "i3: run stops when the ledger cannot be written");
       assertEq(ledger().map((l) => l.status), ["reserved"], "i4: the row stays 'reserved'");
+      assertEq(runsRows()[0]?.status, "partial", "i4b: envelope 'partial'");
       db.exec(`DROP TRIGGER t_ledger_update_fails`);
       const again = await run(true, { transport: t });
       assertEq(again.sent_today_before, 1, "i5: the reserved row counts as today's send (not double-counted with its sent-log row)");
@@ -577,8 +600,10 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(t.calls.map((c) => c.to), ["ledger@gard-test.no", "etter@gard-test.no"], "i7: only the other producer is sent on the retry");
     }
 
-    // A transport failure is a per-recipient error (loop continues), is never
-    // re-attempted the same day, and is retried on a later day.
+    // A transport failure AFTER the hand-off has an UNKNOWN outcome (the
+    // server may have accepted DATA before the error came back). AT MOST
+    // ONCE: the address counts as contacted — today's budget and the cooldown
+    // block — it is never retried, and the run stops at the first such failure.
     freshDb();
     seedProducer("i-3", "Feil Gård", "feil@gard-test.no");
     seedProducer("i-4", "Frisk Gård", "frisk@gard-test.no");
@@ -596,18 +621,89 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       };
       const r = await run(true, { transport: failing as any });
       assertEq(
-        r.results.map((x) => [x.agent_id, x.status, x.reason ?? null]),
-        [["i-3", "error", "compose_failed:smtp 451 try later"], ["i-4", "sent", null]],
-        "i8: a transport failure is an error row and the loop continues",
+        r.results.map((x) => [x.agent_id, x.status, x.reason ?? null, x.ledger_status ?? null]),
+        [["i-3", "unknown", "transport_failed:smtp 451 try later", "unknown"]],
+        "i8: a transport failure is an UNKNOWN delivery (never 'error'-and-retry, never 'sent')",
       );
-      assertEq([r.stopped_reason, ledger().map((l) => l.status)], [null, ["failed", "sent"]], "i9: ledger records the failed attempt");
+      assertEq([r.stopped_reason, failingCalls], ["transport_failed", ["feil@gard-test.no"]], "i9: the run stops at the first transport failure — the next address is not tried");
+      assertEq([ledger().map((l) => l.status), r.summary.unknown, r.summary.sent], [["unknown"], 1, 0], "i10: ledger 'unknown'; the summary counts it as unknown, not sent");
+      const env = runsRows()[0];
+      const unknownClaim = (JSON.parse(env.claims) as Array<any>).find((c) => c.meta?.kind === "rfb_marketing_unknown_delivery");
+      assertEq([env.status, unknownClaim?.value, unknownClaim?.meta?.agent_ids], ["failed", 1, ["i-3"]], "i11: envelope 'failed' (nothing confirmed), the unknown delivery is a claim");
       const t = makeTransport();
       const same = await run(true, { transport: t });
-      assertEq(same.results.find((x) => x.agent_id === "i-3")?.reason, "already_attempted_today", "i10: no second attempt at the same address the same day");
-      assertEq(t.calls.length, 0, "i11: nothing sent on the same-day rerun");
+      assertEq(same.sent_today_before, 1, "i12: the unknown delivery counts toward today's budget");
+      assertEq(same.results.find((x) => x.agent_id === "i-3")?.reason, "already_attempted_today", "i13: no second attempt at the same address the same day");
+      assertEq(t.calls.map((c) => c.to), ["frisk@gard-test.no"], "i14: the same-day rerun sends only the producer never tried");
       const nextDay = await run(true, { transport: t, now: tomorrow() });
-      assertEq(nextDay.results.find((x) => x.agent_id === "i-3")?.status, "sent", "i12: a failed send is retried on a later day");
-      assertEq(failingCalls.concat(t.calls.map((c) => c.to)), ["feil@gard-test.no", "frisk@gard-test.no", "feil@gard-test.no"], "i13: exactly one retry, nobody else re-mailed");
+      assertEq(
+        [nextDay.results.find((x) => x.agent_id === "i-3")?.reason, nextDay.skipped_reason],
+        ["recently_contacted_by_platform_job", "no_sendable_candidates"],
+        "i15: next day the unknown address is still blocked (cooldown) — not retried",
+      );
+      assertEq(failingCalls.concat(t.calls.map((c) => c.to)), ["feil@gard-test.no", "frisk@gard-test.no"], "i16: feil@ was handed to the transport exactly once, ever");
+    }
+
+    // B1 regression: an AMBIGUOUS failure — the connection drops after DATA,
+    // sendRaw throws — on day 1 → no e-mail to that address on day 2.
+    freshDb();
+    seedProducer("v-1", "Tvil Gård", "tvil@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const wire: string[] = [];
+      const dropping = {
+        calls: [] as Array<Record<string, any>>,
+        sendRaw: async (o: any): Promise<{ success: boolean; messageId?: string; error?: string }> => {
+          wire.push(o.to);
+          throw new Error("socket hang up after DATA");
+        },
+      };
+      const d1 = await run(true, { transport: dropping as any });
+      assertEq(
+        [d1.results[0]?.status, d1.results[0]?.reason, d1.stopped_reason],
+        ["unknown", "transport_failed:socket hang up after DATA", "transport_failed"],
+        "i17: day 1 — a thrown transport error is an unknown delivery",
+      );
+      const sameDay = await run(true, { transport: makeTransport() });
+      assertEq(sameDay.skipped_reason, "daily_cap_already_sent", "i18: it used today's budget (cap 1)");
+      const t2 = makeTransport();
+      const d2 = await run(true, { transport: t2, now: tomorrow() });
+      assertEq(
+        [t2.calls.length, d2.results.find((x) => x.agent_id === "v-1")?.reason],
+        [0, "recently_contacted_by_platform_job"],
+        "i19: day 2 — no e-mail to that address",
+      );
+      assertEq(wire, ["tvil@gard-test.no"], "i20: exactly one hand-off to the transport, ever");
+    }
+
+    // B2: a transport that keeps failing is tried ONCE per run — not once per
+    // candidate: no hammering, no CRM thread per address, and the one address
+    // it was handed stays blocked.
+    freshDb();
+    const b2Names = ["Aust", "Berg", "Dal", "Eng", "Fjell"];
+    b2Names.forEach((n, i) => seedProducer(`x-${i + 1}`, `${n} Gård`, `${n.toLowerCase()}@gard-test.no`));
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "10" });
+    {
+      const wire: string[] = [];
+      const broken = {
+        calls: [] as Array<Record<string, any>>,
+        sendRaw: async (o: any) => {
+          wire.push(o.to);
+          return { success: false, error: "smtp 421 service not available" };
+        },
+      };
+      const r = await run(true, { transport: broken as any });
+      assertEq([wire.length, r.compose_attempts, r.stopped_reason], [1, 1, "transport_failed"], "i21: five candidates, failing transport → exactly ONE attempt, then stop");
+      assertEq(counts().crm_threads, 1, "i22: exactly one CRM thread (not one per candidate)");
+      assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["aust@gard-test.no", "unknown"]], "i23: one ledger row, 'unknown'");
+      const t = makeTransport();
+      const next = await run(true, { transport: t, now: tomorrow() });
+      assertEq(next.results.find((x) => x.agent_id === "x-1")?.reason, "recently_contacted_by_platform_job", "i24: next day the address it was handed is blocked");
+      assertEq(
+        t.calls.map((c) => c.to),
+        ["berg@gard-test.no", "dal@gard-test.no", "eng@gard-test.no", "fjell@gard-test.no"],
+        "i25: …and only the four never-tried producers are e-mailed",
+      );
     }
 
     // ── (j) G3 — bounce / complaint → auto-pause ───────────────────────────
@@ -682,6 +778,13 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const indexSrc = fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8");
       assertTrue(indexSrc.includes(`memUsedMb > ${daily.HEALTH_CRITICAL_RSS_MB}) { status = "critical"`), "k6: drift guard — /health's memory-critical threshold equals the mirror");
       assertTrue(indexSrc.includes(`disk.used_pct >= ${daily.HEALTH_CRITICAL_DISK_USED_PCT}) { status = "critical"`), "k7: drift guard — /health's disk-critical threshold equals the mirror");
+      const consumes = daily.rfbMarketingRunConsumesWindow;
+      assertEq(
+        [consumes({ skipped_reason: "health_red" }), consumes({ skipped_reason: "run_in_progress" }), consumes({ skipped_reason: null }), consumes({ skipped_reason: "paused" })],
+        [false, false, true, true],
+        "k8: a health_red (or run_in_progress) skip does not use up the day's tick window",
+      );
+      assertTrue(indexSrc.includes("if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;"), "k9: the 08:10Z tick stamps lastRunAt only through that rule");
     }
 
     // ── (l) G4 — budget from the database ──────────────────────────────────
@@ -758,6 +861,156 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.summary.sent, r.summary.held, r.summary.refused, r.stopped_reason], [1, 2, 1, null], "n3: summary; a per-recipient refusal does not stop the loop");
       assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["maxtouch@gard-test.no", "refused"], ["god@gard-test.no", "sent"]], "n4: the refused attempt is in the ledger as refused (not counted, not blocking)");
       assertEq(t.calls.map((c) => c.to), ["god@gard-test.no"], "n5: only the good candidate was e-mailed");
+      const env = runsRows()[0];
+      const claims = JSON.parse(env.claims) as Array<any>;
+      const byKind = (k: string) => claims.find((c) => c.meta?.kind === k);
+      assertEq(
+        [byKind("rfb_marketing_held_for_reenrichment")?.value, byKind("rfb_marketing_held_for_reenrichment")?.meta?.held],
+        [2, r.held_for_reenrichment],
+        "n6: the envelope carries the held-for-reenrichment list (the routine's held-for-reenrichment.json)",
+      );
+      assertEq(byKind("rfb_marketing_gate_summary")?.meta?.gate, r.gate, "n7: the envelope carries the gate's suppression summary");
+      assertEq([r.gate?.cooldown_days, r.gate?.first?.count, byKind("rfb_marketing_unknown_delivery")?.value], [60, 4, 0], "n8: gate summary + an unknown-delivery claim (0)");
+      assertEq(env.status, "completed", "n9: refusals and held rows alone keep the envelope 'completed'");
+    }
+
+    // ── (u) the compose-attempt cap ────────────────────────────────────────
+    // Pre-transport refusals (4xx) do not use the budget, so a streak of them
+    // is bounded at budget + RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS compose calls.
+    freshDb();
+    {
+      const extra = daily.RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS;
+      const maxTouched = [
+        { daysAgo: 100, vertical: "experiences" },
+        { daysAgo: 130, vertical: "experiences" },
+        { daysAgo: 160, vertical: "experiences" },
+      ];
+      for (let i = 1; i <= extra + 2; i++) {
+        seedProducer(`y-${i}`, `Nekt Gård ${String.fromCharCode(64 + i)}`, `nekt${i}@gard-test.no`, { priorSends: maxTouched });
+      }
+      seedProducer("y-good", "Siste Gård", "siste@gard-test.no");
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq([r.budget, r.max_compose_attempts, r.compose_attempts], [1, 1 + extra, 1 + extra], "u1: at most budget + margin compose calls in one run");
+      assertEq([r.stopped_reason, r.summary.refused, t.calls.length], ["attempt_cap_reached", 1 + extra, 0], "u2: a streak of refusals stops at the cap; nothing sent");
+      assertEq(
+        [ledger().length, ledger().every((l) => l.status === "refused")],
+        [1 + extra, true],
+        "u3: every attempt is a 'refused' ledger row; no reservation is left dangling at the cap",
+      );
+    }
+
+    // ── (v) a database error mid-run → db_error, envelope still written ────
+    freshDb();
+    seedProducer("z-1", "Tabell Gård", "tabell@gard-test.no");
+    seedProducer("z-2", "Borte Gård", "borte@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    {
+      const t = makeTransport();
+      const dropping = {
+        calls: t.calls,
+        sendRaw: async (o: any) => {
+          if (t.calls.length === 0) db.exec(`DROP TABLE rfb_marketing_lane_state`);
+          return t.sendRaw(o);
+        },
+      };
+      const r = await run(true, { transport: dropping as any });
+      assertEq([r.summary.sent, r.stopped_reason, t.calls.length], [1, "db_error", 1], "v1: a read failing mid-run stops the loop as db_error (after the one send)");
+      const errRow = r.results.find((x) => x.agent_id === "z-2");
+      assertEq([errRow?.status, String(errRow?.reason ?? "").startsWith("db_error: ")], ["error", true], "v2: the candidate it stopped at is an error row");
+      assertEq([r.envelope_recorded, runsRows()[0]?.status], [true, "partial"], "v3: the envelope is still written — 'partial'");
+    }
+    freshDb();
+    seedProducer("z-3", "Andre Runde Gård", "runde@gard-test.no", { secondTouchDaysAgo: 90 });
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    db.exec(`DROP TABLE outreach_max_touch_vern_config`);
+    {
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq([r.gate?.first?.count, r.stopped_reason, t.calls.length], [0, "db_error", 0], "v4: the mode=second gate throwing is db_error; nothing sent");
+      assertTrue(r.errors.some((e) => e.startsWith("gate (mode=second) failed")), "v5: the error names the gate");
+      assertEq([r.envelope_recorded, runsRows()[0]?.status], [true, "failed"], "v6: the envelope is still written — 'failed'");
+    }
+
+    // ── (w) mid-run pause; the cap re-checked inside the reservation ───────
+    freshDb();
+    seedProducer("pm-1", "Pause En", "pm1@gard-test.no");
+    seedProducer("pm-2", "Pause To", "pm2@gard-test.no");
+    seedProducer("pm-3", "Pause Tre", "pm3@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    {
+      const t = makeTransport();
+      const pausing = {
+        calls: t.calls,
+        sendRaw: async (o: any) => {
+          if (t.calls.length === 0) daily.setRfbMarketingLanePaused(db, { paused: true, by: "daniel", reason: "stopp nå" });
+          return t.sendRaw(o);
+        },
+      };
+      const r = await run(true, { transport: pausing as any });
+      assertEq([t.calls.length, r.summary.sent, r.stopped_reason], [1, 1, "paused_mid_run"], "w1: a pause set mid-run → exactly one send, then paused_mid_run");
+      assertEq([ledger().length, runsRows()[0]?.status], [1, "partial"], "w2: no further reservation; envelope 'partial'");
+    }
+    freshDb();
+    seedProducer("cc-1", "Kappløp En", "cc1@gard-test.no");
+    seedProducer("cc-2", "Kappløp To", "cc2@gard-test.no");
+    seedProducer("cc-3", "Kappløp Tre", "cc3@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
+    {
+      const t = makeTransport();
+      const racing = {
+        calls: t.calls,
+        sendRaw: async (o: any) => {
+          if (t.calls.length === 0) {
+            // A manual RFB compose recorded while this run is in flight.
+            db.prepare(
+              `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+               VALUES ('manual', 'manuell@annen.no', datetime('now'), 'email', 'manual-race', 'auto:cold_outreach_confirm_v2', 'rfb')`,
+            ).run();
+          }
+          return t.sendRaw(o);
+        },
+      };
+      const r = await run(true, { transport: racing as any });
+      assertEq([r.budget, t.calls.length, r.stopped_reason], [2, 1, "daily_cap_reached"], "w3: budget 2 at the start, a concurrent send took the second slot → daily_cap_reached after one send");
+      assertEq(ledger().map((l) => l.status), ["sent"], "w4: the transaction refused the reservation past the cap");
+    }
+
+    // ── (x) no_sendable_candidates; the ledger blocks by agent too ─────────
+    freshDb();
+    seedProducer("nn-1", "Engelsk To", "eng2@gard-test.no", { about: ENGLISH_ABOUT });
+    seedProducer("nn-2", "Kort To", "kort2@gard-test.no", {
+      about: "Liten gård.",
+      products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Ull" }]),
+    });
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    {
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq([r.skipped_reason, r.summary.held, t.calls.length], ["no_sendable_candidates", 2, 0], "x1: candidates returned but all held → no_sendable_candidates (not no_candidates)");
+      assertEq(r.gate?.first?.count, 2, "x2: …the gate did return them");
+    }
+    freshDb();
+    seedProducer("ag-1", "Ny Adresse Gård", "ny@gard-test.no");
+    seedProducer("ag-2", "Samme Dag Gård", "samme-ny@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    {
+      const insLedger = db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
+         VALUES (?, 'run-old', ?, ?, 'first', 'A', ?, ?)`,
+      );
+      const tenDaysAgo = new Date(Date.now() - 10 * 86400_000);
+      insLedger.run(day(tenDaysAgo), "ag-1", "gammel@gard-test.no", "sent", tenDaysAgo.toISOString());
+      insLedger.run(day(new Date()), "ag-2", "samme-gammel@gard-test.no", "refused", new Date().toISOString());
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq(
+        r.results.map((x) => [x.agent_id, x.reason ?? null]),
+        [["ag-1", "recently_contacted_by_platform_job"], ["ag-2", "already_attempted_today"]],
+        "x3: blocked by agent_id — an address changed inside the cooldown, and a second address the same day",
+      );
+      assertEq(t.calls.length, 0, "x4: nothing sent");
     }
 
     // ── (o) in-process mutex ───────────────────────────────────────────────
@@ -868,6 +1121,82 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         assertTrue(String(mails[0].html).includes("Wire Gård") && String(mails[0].html).includes("<p>"), "s5: html part derived from it");
         assertEq(r.results[0].message_id, "stub-wire-1", "s6: transport message id recorded");
       } finally {
+        emailSvc.isConfigured = origConfigured;
+        emailSvc.transporter = origTransporter;
+      }
+    }
+
+    // ── (t) G1b — a real run needs a live transport ────────────────────────
+    freshDb();
+    seedProducer("t-1", "Levende Gård", "levende@gard-test.no");
+    seedProducer("t-2", "Neste Levende Gård", "levende2@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+    {
+      const prevForce = process.env.EMAIL_FORCE_DRY_RUN;
+      const prevNodeEnv = process.env.NODE_ENV;
+      const svc = emailMod.emailService;
+      const stubTransporter = { sendMail: async () => ({ messageId: "stub-live" }) };
+      try {
+        // isLiveTransport() is exactly the negation of sendRaw's DRY_RUN short-circuit.
+        process.env.NODE_ENV = "test";
+        process.env.EMAIL_FORCE_DRY_RUN = "true";
+        emailSvc.isConfigured = false;
+        emailSvc.transporter = emailSvc.envTransporter;
+        const dryAnswer = await svc.sendRaw({ to: "x@gard-test.no", subject: "s", textContent: "t" } as any);
+        assertEq([svc.isLiveTransport(), dryAnswer.messageId], [false, "DRY_RUN"], "t1: SMTP not configured → not live (sendRaw answers DRY_RUN)");
+        emailSvc.isConfigured = true;
+        const forcedAnswer = await svc.sendRaw({ to: "x@gard-test.no", subject: "s", textContent: "t" } as any);
+        assertEq([svc.isLiveTransport(), forcedAnswer.messageId], [false, "DRY_RUN"], "t2: configured but forced dry-run (test env) → not live (DRY_RUN)");
+        delete process.env.EMAIL_FORCE_DRY_RUN;
+        assertEq(svc.isLiveTransport(), true, "t3: configured, env transporter, not forced → live");
+        process.env.EMAIL_FORCE_DRY_RUN = "true";
+        emailSvc.transporter = stubTransporter;
+        assertEq(svc.isLiveTransport(), true, "t4: a swapped-in transporter is never forced dry-run → live");
+
+        // Apply, no seam, transport not live → skip with no writes at all.
+        emailSvc.isConfigured = false;
+        emailSvc.transporter = emailSvc.envTransporter;
+        const changes = () => (db.prepare(`SELECT total_changes() AS n`).get() as { n: number }).n;
+        const before = changes();
+        const r = await daily.runRfbMarketingDaily({ apply: true, trigger: "manual", deps: { healthProbe: healthy } });
+        assertEq([r.skipped_reason, r.transport_live, r.envelope_recorded], ["transport_not_live", false, false], "t5: apply without a live transport → transport_not_live, no envelope");
+        assertEq(changes(), before, "t6: …and not a single row changed (total_changes)");
+        const dry = await daily.runRfbMarketingDaily({ apply: false, trigger: "manual", deps: { healthProbe: healthy } });
+        assertEq([dry.transport_live, dry.skipped_reason, dry.summary.would_send, changes()], [false, null, 2, before], "t7: a dry run reports transport_live=false and still lists, read-only");
+        const laneRouter = adminRoutes.rfbMarketingLaneRouter as any;
+        assertEq((await callRoute(laneRouter, { method: "GET", headers: auth })).body.transport_live, false, "t8: GET /admin/rfb-marketing-lane → transport_live false");
+        daily.__setRfbMarketingHealthProbeForTesting(healthy);
+        const viaRoute = await callRoute(adminRoutes.rfbMarketingDailyRunRouter as any, { method: "POST", headers: auth, body: { apply: true } });
+        daily.__setRfbMarketingHealthProbeForTesting(null);
+        assertEq([viaRoute.body.skipped_reason, changes()], ["transport_not_live", before], "t9: POST /admin/rfb-marketing-daily-run {apply:true} → transport_not_live, nothing written");
+        emailSvc.isConfigured = true;
+        emailSvc.transporter = stubTransporter;
+        assertEq((await callRoute(laneRouter, { method: "GET", headers: auth })).body.transport_live, true, "t10: …true once a real transport is in place");
+
+        // Defense in depth: a transport that answers DRY_RUN anyway (through the
+        // seam, which bypasses G1b) — the run stops and nothing counts as sent.
+        const wire: string[] = [];
+        const dryWire = {
+          calls: [] as Array<Record<string, any>>,
+          sendRaw: async (o: any) => {
+            wire.push(o.to);
+            return { success: true, messageId: "DRY_RUN" };
+          },
+        };
+        const r2 = await run(true, { transport: dryWire as any });
+        assertEq(
+          [r2.results[0]?.status, r2.results[0]?.reason, r2.stopped_reason, r2.summary.sent, wire.length],
+          ["error", "transport_dry_run", "transport_not_live", 0, 1],
+          "t11: a DRY_RUN answer stops the run at once and is not a send",
+        );
+        const env = runsRows()[0];
+        assertEq([ledger().map((l) => l.status), env?.status, JSON.parse(env?.claims ?? "[]")[0]?.value], [["failed"], "failed", 0], "t12: ledger 'failed' (not sent), envelope 'failed', emails_sent 0");
+      } finally {
+        if (prevForce === undefined) delete process.env.EMAIL_FORCE_DRY_RUN;
+        else process.env.EMAIL_FORCE_DRY_RUN = prevForce;
+        if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = prevNodeEnv;
+        daily.__setRfbMarketingHealthProbeForTesting(null);
         emailSvc.isConfigured = origConfigured;
         emailSvc.transporter = origTransporter;
       }

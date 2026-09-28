@@ -4936,12 +4936,17 @@ function initSchema(db: Database.Database): void {
   //
   // rfb_marketing_send_ledger — one row per recipient the daily job has
   // attempted, written BEFORE the email is handed to the transport
-  // (status 'reserved') and flipped to sent/refused/failed afterwards. It is
-  // the job's own restart-safe memory: today's budget is counted from it (plus
-  // outreach_sent_log), a 'reserved' row whose outcome was never recorded
-  // counts as sent and blocks a re-send of that address, and
-  // UNIQUE(day, recipient_email) makes a second attempt at the same address
-  // on the same UTC day impossible at the database level.
+  // (status 'reserved') and resolved afterwards to:
+  //   sent     — the transport accepted it;
+  //   unknown  — the transport was invoked but did not confirm (e.g. the
+  //              connection dropped after DATA): possibly delivered;
+  //   refused  — a compose guard refused it before the transport;
+  //   failed   — it failed before the transport (safe to retry).
+  // It is the job's own restart-safe, AT-MOST-ONCE memory: 'reserved',
+  // 'sent' and 'unknown' all count toward today's budget and block the
+  // address (and the agent) for the cooldown window; UNIQUE(day,
+  // recipient_email) makes a second attempt at the same address on the same
+  // UTC day impossible at the database level.
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS rfb_marketing_lane_state (
@@ -4963,7 +4968,7 @@ function initSchema(db: Database.Database): void {
         touch TEXT NOT NULL,
         subject_variant TEXT,
         status TEXT NOT NULL DEFAULT 'reserved'
-          CHECK (status IN ('reserved', 'sent', 'refused', 'failed')),
+          CHECK (status IN ('reserved', 'sent', 'unknown', 'refused', 'failed')),
         reserved_at TEXT NOT NULL,
         updated_at TEXT,
         http_status INTEGER,
@@ -4975,6 +4980,7 @@ function initSchema(db: Database.Database): void {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_recipient ON rfb_marketing_send_ledger(recipient_email)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_agent ON rfb_marketing_send_ledger(agent_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_day_status ON rfb_marketing_send_ledger(day, status)`);
   } catch (err) {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
