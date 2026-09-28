@@ -239,8 +239,12 @@ const CANDIDATE_WHERE = `
 // actually fetched/verified — see experience-scope.ts's providerInScopeSql().
 // An out-of-scope provider is still COUNTED (skipped_out_of_scope on the
 // tick result / out_of_scope on the queue-status denominator) but never
-// selected, never fetched, never written.
-const CANDIDATE_IN_SCOPE_WHERE = providerInScopeSql("id");
+// selected, never fetched, never written. The outer id is TABLE-QUALIFIED
+// (every query below reads FROM experience_providers, unaliased): the bare
+// "id" this used to pass bound to the EXISTS subquery's own experiences.id,
+// so a provider in scope only via a mat_drikke experience was never
+// selected (2026-09-28 fleet audit) — see providerInScopeSql()'s own doc.
+const CANDIDATE_IN_SCOPE_WHERE = providerInScopeSql("experience_providers.id");
 
 /** Denominator for the admin endpoint — how many providers this batch could
  * still re-check (in scope), and how many otherwise-eligible providers are

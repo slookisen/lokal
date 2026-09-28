@@ -45022,6 +45022,30 @@ runSerial(async () => {
   }
 });
 
+// providerInScopeSql() (src/services/experience-scope.ts) — 2026-09-28 fleet-
+// audit regression: both org.nr enrichment services passed it a bare "id",
+// which SQLite bound to the EXISTS subquery's own experiences.id, so the
+// "provider has a mat_drikke experience" leg of the scope rule above was
+// always FALSE. Pure, network-free unit coverage against its own minimal
+// in-memory DB (no db-factory); the route-level half is section (r) of the
+// two experience-orgnr-from-* test files registered above. Tail position
+// (right after its nearest sibling) is the convention, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experience-scope: providerInScopeSql() outer-row correlation ──");
+  try {
+    const { runExperienceScopeTests } = require("../src/services/experience-scope.test") as
+      typeof import("../src/services/experience-scope.test");
+    const esc = await runExperienceScopeTests({ log: false });
+    passed += esc.passed;
+    failed += esc.failed;
+    for (const f of esc.failures) failures.push("experience-scope: " + f);
+    console.log(`  experience-scope: ${esc.passed} passed, ${esc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-scope: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-17-opplevagent-needs-review-terminal-triage: POST
 // /admin/experiences-needs-review-triage (rules a-d, owner-lock exemption,
 // dry-run/apply) + POST /admin/experiences-needs-review-triage-rollback
