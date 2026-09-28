@@ -55,10 +55,11 @@
  *       column + field_provenance + audit table are all untouched afterwards
  *       (the transaction rolled back — no phantom audit row for
  *       planGardssalgContentRollback to act on)
- *   (n) 2026-09-28 regression (7 Fjell Bryggeri): a visit_text ending in an
- *       e-mail address ("… book via booking@7fjell.com") -> 200 and written,
- *       where it used to be refused as truncated_mid_sentence; a genuinely
- *       cut value is still refused -> 400 truncated_mid_sentence, fail-closed
+ *   (n) 2026-09-28 regression (7 Fjell Bryggeri): a visit_text ending in the
+ *       producer's e-mail address (paraphrased fixture, e.g. «… book via
+ *       booking@7fjell.com») -> 200 and written, where it used to be refused
+ *       as truncated_mid_sentence; a genuinely cut value is still refused ->
+ *       400 truncated_mid_sentence, fail-closed
  */
 
 export interface TestSummary {
@@ -625,9 +626,10 @@ export function runOpplevelserGardssalgSetContentFieldTests(
       assertEq(getAuditRows("scf-unmatched-field").length, 0, "m5: NO audit row — the transaction rolled back (no phantom row for rollback to act on)");
 
       // ── (n) 2026-09-28 regression (7 Fjell Bryggeri): trailing e-mail ─────
-      // The producer's requested visit_text ended in their booking address and
-      // was refused as truncated_mid_sentence only because its last character
-      // was "m". Text ending in an e-mail/URL is a finished sentence.
+      // The producer's requested visit_text ended in their e-mail address and
+      // was refused as truncated_mid_sentence only because an address does not
+      // end in punctuation. The value below paraphrases it (not the verbatim
+      // text). Text ending in an e-mail/URL is a finished sentence.
       mkProvider({ id: "scf-trailing-email", navn: "Trailing Email Gard", created_at: "2026-01-15 00:00:00" });
       const trailingEmailValue =
         "Vi tar imot grupper for omvisning og smaking i bryggeriet hele året. Book via booking@7fjell.com";

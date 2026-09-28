@@ -174,14 +174,14 @@ function looksLikeCssOrJsLeakage(trimmed: string): boolean {
 //
 // One exception (2026-09-28, 7 Fjell Bryggeri): text whose FINAL
 // whitespace-delimited token is an e-mail address or a URL is a finished
-// sentence, not a cut. The producer asked for a visit_text ending "… book
-// via booking@7fjell.com" and POST /admin/gardssalg-set-content-field
-// rejected it as truncated_mid_sentence purely because its last character
-// was "m" — yet ending on the booking address or the website is ordinary
-// producer copy, and (per applyGardssalgSetContentField's own doc comment)
-// a good value that trips this classifier is a classifier bug to fix, not a
-// value to force through. The token may carry the same closing characters
-// the punctuation check accepts ("booking@7fjell.com)"). Shapes that count:
+// sentence, not a cut. The producer asked for a visit text ending in their
+// e-mail address (paraphrased: «… book via booking@7fjell.com») and POST
+// /admin/gardssalg-set-content-field rejected it as truncated_mid_sentence
+// purely because an address does not end in punctuation — yet ending on
+// the booking address or the website is ordinary producer copy, and (per
+// applyGardssalgSetContentField's own doc comment) a good value that trips
+// this classifier is a classifier bug to fix, not a value to force through.
+// Shapes that count:
 //   - e-mail: local@domain.tld, any letter TLD (the "@" is the evidence);
 //   - URL with an explicit "http(s)://" or "www." prefix, any letter TLD;
 //   - BARE domain, optionally with a path ("7fjell.com", "gard.no/besok"),
@@ -198,12 +198,14 @@ function looksLikeCssOrJsLeakage(trimmed: string): boolean {
 // and a path must end on a letter, digit or "/" (so "gard.no/besok," — a
 // sentence that clearly went on — is still flagged). Known limitation: a
 // cut INSIDE a path, or one that still leaves a valid TLD
-// ("https://7fjell.com/boo", "https://7fjell.co"), is indistinguishable from
-// a real link and passes.
+// ("https://7fjell.com/boo", "https://7fjell.co", "booking@7fjell.co"), is
+// indistinguishable from a real link or address and passes. Deliberately
+// not recognised (still flagged, as before this exception): a "mailto:"
+// prefix, an upper-case scheme ("HTTPS://…") and a ":port".
 const GARDSSALG_TRUNCATION_MIN_LEN = 50;
-const GARDSSALG_TRAILING_EMAIL_RE = /^[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}[.!?…»"'”\)\]]*$/u;
+const GARDSSALG_TRAILING_EMAIL_RE = /^[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}$/u;
 const GARDSSALG_TRAILING_URL_RE =
-  /^(?:(?:https?:\/\/|www\.)(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}|(?:[\p{L}\p{N}-]+\.)+(?:no|com|net|org|eu|se|dk|info))(?:[\/?#](?:\S*[\p{L}\p{N}\/])?)?[.!?…»"'”\)\]]*$/u;
+  /^(?:(?:https?:\/\/|www\.)(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}|(?:[\p{L}\p{N}-]+\.)+(?:no|com|net|org|eu|se|dk|info))(?:[\/?#](?:\S*[\p{L}\p{N}\/])?)?$/u;
 function looksTruncatedMidSentence(trimmed: string): boolean {
   if (trimmed.length < GARDSSALG_TRUNCATION_MIN_LEN) return false;
   const lastToken = trimmed.split(/\s+/).pop() ?? "";

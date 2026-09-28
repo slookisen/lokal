@@ -309,11 +309,13 @@ export function runGardssalgQualityUpdateTests(opts: { log?: boolean } = {}): Te
     OK,
     "36 (2026-09-28, 7 Fjell Bryggeri-shaped): visit_text ending in a booking e-mail address is NOT truncated_mid_sentence"
   );
-  assertEq(
-    classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Book på forhånd (kontakt booking@7fjell.com)`),
-    OK,
-    "37: e-mail address followed by an accepted closing character ')' -> not truncated"
-  );
+  for (const address of ["post@bærgården.no", "BOOKING@7FJELL.NO"]) {
+    assertEq(
+      classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Send en e-post til ${address}`),
+      OK,
+      `37: an e-mail address with an æøå domain or in upper case ('${address}') -> not truncated`
+    );
+  }
   assertEq(
     classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Les mer på https://7fjell.com/besok`),
     OK,
@@ -373,6 +375,16 @@ export function runGardssalgQualityUpdateTests(opts: { log?: boolean } = {}): Te
     classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Spørsmål kan sendes til booking@7fjell.com,`),
     TRUNCATED,
     "47: an e-mail address followed by a comma (a sentence that went on) is STILL flagged — only the accepted closing characters may follow"
+  );
+  assertEq(
+    classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Les mer på gard.no/besok,`),
+    TRUNCATED,
+    "48: a URL path followed by a comma is STILL flagged — a path must end on a letter, digit or '/'"
+  );
+  assertEq(
+    classifyGardssalgFieldDefect("visit_text", `${VISIT_LEAD} Spørsmål kan sendes til booking@7fjell.c`),
+    TRUNCATED,
+    "49: an e-mail address cut inside its TLD ('booking@7fjell.c') is STILL flagged — the TLD needs >= 2 letters"
   );
 
   return { passed, failed, failures };
