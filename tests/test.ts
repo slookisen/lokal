@@ -45561,3 +45561,26 @@ runSerial(async () => {
     failures.push("rfb-breadcrumblist-jsonld: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Incident 2026-09-28: GET /admin/crm/sent-log filtered contact_email in
+// memory AFTER listSentMessages()'s platform-wide LIMIT (default 500), so
+// `?since_hours=all&contact_email=x` returned count 0 for producers whose
+// confirmations were older than the newest 500 outbound rows — five were
+// re-mailed a "we never confirmed" e-mail. The filter now runs in SQL before
+// the LIMIT. Pins its own in-memory DB via __pinInMemoryDbForTesting()
+// (restored in finally) — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── incident 2026-09-28: sent-log contact_email filtered in SQL before LIMIT ──");
+  try {
+    const { runCrmSentLogContactFilterTests } = require("../src/routes/crm-sent-log-contact-filter.test") as
+      typeof import("../src/routes/crm-sent-log-contact-filter.test");
+    const slc = await runCrmSentLogContactFilterTests({ log: false });
+    passed += slc.passed;
+    failed += slc.failed;
+    for (const f of slc.failures) failures.push("crm-sent-log-contact-filter: " + f);
+    console.log(`  crm-sent-log-contact-filter: ${slc.passed} passed, ${slc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-sent-log-contact-filter: unexpected error: " + String(err?.message || err));
+  }
+});
