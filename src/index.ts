@@ -56,6 +56,8 @@ import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
+import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
+import { shouldRunRfbMarketingDaily, runRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
@@ -773,6 +775,13 @@ app.use("/admin/outreach-sent-log", adminLimiter, adminOutreachCandidatesRoutes)
 // nesting under /admin/outreach-candidates: the knob is read by crm.ts too,
 // not scoped to the candidates gate alone.
 app.use("/admin/outreach-max-touch-vern", adminLimiter, adminOutreachMaxTouchVernRoutes);
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// platform-side daily RFB outreach send's two admin surfaces — the lane
+// switch (GET/POST /admin/rfb-marketing-lane) and the manual/dry run
+// (POST /admin/rfb-marketing-daily-run, dry run unless {apply: true}).
+// services/rfb-marketing-daily.ts; the 08:10Z tick is further down.
+app.use("/admin/rfb-marketing-lane", adminLimiter, rfbMarketingLaneRouter);
+app.use("/admin/rfb-marketing-daily-run", adminLimiter, rfbMarketingDailyRunRouter);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
@@ -1731,6 +1740,45 @@ if (
   });
   setTimeout(() => { void gardssalgOutreachDailyTick(); }, 90_000);
   setInterval(() => { void gardssalgOutreachDailyTick(); }, 10 * 60_000);
+}
+
+// ─── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben
+// (Daniel «GO A» 2026-09-19, reconfirmed 2026-09-22): RFB outreach is sent
+// by the platform itself once a day ────────────────────────────────────
+//
+// Same shape as the gårdssalg block just above, in its own 08:10–08:59 UTC
+// window (after gårdssalg's 08:00Z start) via shouldRunRfbMarketingDaily.
+// Registered ONLY when RFB_MARKETING_PLATFORM_ENABLED=1 (default OFF — no
+// tick exists at all otherwise), and the job re-checks that same switch as
+// its guard G1. Its other guards (lane pause, fresh bounce/complaint →
+// auto-pause, /health-equivalent red, today's budget) live in
+// runRfbMarketingDaily and read the DATABASE, not this process's memory: a
+// restart or a second tick inside the window can never exceed the cap or
+// re-send an address (every recipient is reserved in rfb_marketing_send_ledger
+// before its e-mail leaves). `lastRunAt` is only stamped after a run that did
+// not throw, so a transient DB error at 08:10 is retried on the next tick.
+// Statically imported (not `await import(...)`): one module instance, one
+// database/init singleton. Manual/dry runs: POST /admin/rfb-marketing-daily-run.
+if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
+  let lastRfbMarketingRunAt: Date | null = null;
+  const rfbMarketingDailyTick = trackJob("rfb-marketing-daily", async () => {
+    const now = new Date();
+    try {
+      if (!shouldRunRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })) return;
+      const r = await runRfbMarketingDaily({ apply: true, trigger: "cron", now });
+      // A manual run that was still in flight is not today's run — retry next tick.
+      if (r.skipped_reason !== "run_in_progress") lastRfbMarketingRunAt = now;
+      console.log(
+        `[rfb-marketing-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `stopped=${r.stopped_reason ?? "-"} sent=${r.summary.sent} errors=${r.summary.error} ` +
+          `budget=${r.budget} cap=${r.daily_cap} auto_paused=${r.auto_paused} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[rfb-marketing-daily] tick failed (non-fatal, retried next tick):", err);
+    }
+  });
+  setTimeout(() => { void rfbMarketingDailyTick(); }, 120_000);
+  setInterval(() => { void rfbMarketingDailyTick(); }, 10 * 60_000);
 }
 
 // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
