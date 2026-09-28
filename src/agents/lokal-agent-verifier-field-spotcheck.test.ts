@@ -27,6 +27,7 @@
 import {
   computeFieldSpotCheck,
   fieldSpotCheckSubpageCandidates,
+  FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS,
 } from "./lokal-agent-verifier";
 
 export interface TestSummary {
@@ -182,7 +183,7 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
       if (u === "https://feilgard.example/") {
         return htmlResponse(
           200,
-          '<html><body><p>Velkommen.</p><a href="/om-oss">Om oss</a><a href="/kontakt">Kontakt</a></body></html>',
+          `<html><body><p>Velkommen. ${"Vi selger egg og grønnsaker direkte fra gården. ".repeat(30)}</p><a href="/om-oss">Om oss</a><a href="/kontakt">Kontakt</a></body></html>`,
         );
       }
       if (u === "https://feilgard.example/om-oss") {
@@ -200,6 +201,26 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
     );
     assertEq(result.status, "mismatch", "e2e-03a: a value genuinely unsupported anywhere fetched -> mismatch");
     assertEq(result.urls_tried.length, 3, "e2e-03b: root + both discovered subpages were all tried before concluding mismatch");
+  }
+
+  // e2e-03c: near-empty static HTML (JS-rendered page) on every fetched page
+  // -> unverifiable, NOT mismatch (FUNN field-spot-check-statisk-html-uten-
+  // innhold-gir-mismatch). Same shape as e2e-03 but with no substantive text.
+  {
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u === "https://tomgard.example/") {
+        return htmlResponse(200, '<html><body><div id="app"></div><a href="/om-oss">Om oss</a></body></html>');
+      }
+      if (u === "https://tomgard.example/om-oss") return htmlResponse(200, "<html><body><div id=\"app\"></div></body></html>");
+      throw new Error(`e2e-03c: unexpected fetch to ${u}`);
+    }) as unknown as typeof fetch;
+    const result = await computeFieldSpotCheck(
+      { field_value: "Vi driver med alpakkaull og strikking i Numedal.", root_url: "https://tomgard.example/" },
+      { fetchImpl },
+    );
+    assertEq(result.status, "unverifiable", "e2e-03c: near-empty static HTML everywhere -> unverifiable, not mismatch");
+    assertEq(FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS, 1200, "e2e-03d: threshold constant is 1200");
   }
 
   // e2e-04: the root page cannot be fetched at all -> unverifiable, NEVER
