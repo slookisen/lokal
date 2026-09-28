@@ -1,0 +1,79 @@
+# Extend a Fly volume (grow only) and restart the machine it is attached to.
+#
+# Why this exists: local `flyctl` is blocked by Windows Application Control on
+# Daniel's machine (see fly-deploy.yml / fly-secrets.yml), and the Fly web
+# dashboard has no "extend" action for volumes. On 2026-09-27 the 3 GB
+# lokal_data volume filled up, every SQLite write failed with `disk I/O error`,
+# and the app could no longer boot. The runner already holds FLY_API_TOKEN.
+#
+# How to use: Actions tab -> "Fly Volume Extend" -> Run workflow.
+# Fly volumes can only grow; `size_gb` must be larger than the current size.
+
+name: Fly Volume Extend
+
+on:
+  workflow_dispatch:
+    inputs:
+      volume_id:
+        description: 'Volume id (fly.io -> lokal -> Volumes)'
+        required: true
+        default: 'vol_42lpjw038ge6971r'
+      size_gb:
+        description: 'New total size in GB (must be larger than the current size)'
+        required: true
+        default: '6'
+      app:
+        description: 'Fly app name'
+        required: true
+        default: 'lokal'
+      restart:
+        description: 'Restart the attached machine afterwards'
+        type: boolean
+        default: true
+
+jobs:
+  extend:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-volume-${{ inputs.app }}
+      cancel-in-progress: false
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: ${{ inputs.app }}
+      VOLUME_ID: ${{ inputs.volume_id }}
+      SIZE_GB: ${{ inputs.size_gb }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$SIZE_GB" =~ ^[0-9]+$ ]] || { echo "::error::size_gb must be a whole number"; exit 1; }
+          [[ "$VOLUME_ID" =~ ^vol_[a-z0-9]+$ ]] || { echo "::error::volume_id must look like vol_..."; exit 1; }
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Volume before
+        run: flyctl volumes show "$VOLUME_ID" -a "$FLY_APP"
+
+      - name: Extend volume
+        run: flyctl volumes extend "$VOLUME_ID" -a "$FLY_APP" --size "$SIZE_GB" --yes
+
+      - name: Restart attached machine
+        if: ${{ inputs.restart }}
+        # A deploy triggered by the same merge may hold the machine lease; the
+        # extend above is what matters, and that deploy restarts the machine too.
+        continue-on-error: true
+        run: |
+          MACHINE_ID=$(flyctl volumes show "$VOLUME_ID" -a "$FLY_APP" --json | jq -r '.attached_machine_id // .AttachedMachine // empty')
+          [ -n "$MACHINE_ID" ] || { echo "no attached machine found"; exit 0; }
+          flyctl machine restart "$MACHINE_ID" -a "$FLY_APP"
+
+      - name: Volume after + health
+        run: |
+          flyctl volumes show "$VOLUME_ID" -a "$FLY_APP"
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://rettfrabonden.com/health || true)
+            echo "health attempt $i: $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 15
+          done
+          echo "::warning::/health not 200 yet — check fly.io -> lokal -> Machines"
