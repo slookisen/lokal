@@ -587,8 +587,10 @@ const composeSchema = z.object({
 // OUTREACH_MAX_PER_DAY (default 50): max cold-outreach (resend_send,
 // createdBy='claude') sends per UTC calendar day. Shared by the reserve
 // guard in POST /compose and the read-back in GET /sent-log so both sides
-// parse the env var identically.
-function resolveDailyOutreachCap(): number {
+// parse the env var identically. Exported (dev-request 2026-09-19-rfb-
+// marketing-utsending-inn-i-plattformjobben) so the platform-side daily RFB
+// send reads the SAME cap when it sizes its own budget.
+export function resolveDailyOutreachCap(): number {
   return Math.max(1, parseInt(String(process.env.OUTREACH_MAX_PER_DAY ?? "50"), 10) || 50);
 }
 
@@ -596,9 +598,87 @@ function todayUTC(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-router.post("/compose", async (req, res) => {
-  const parsed = composeSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+// ─── executeCompose — the POST /compose guard chain + send, as a function ───
+//
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// body of POST /compose, extracted verbatim so the platform-side daily RFB
+// send (services/rfb-marketing-daily.ts) goes through the EXACT guard chain
+// the marketing routine's compose calls went through — max-touch-vern, the
+// OUTREACH_PAUSED kill-switch, the OUTREACH_MAX_PER_DAY reservation, the
+// inbound/untriaged exemption, the email-keyed cooldown, the 24h raw-send
+// guard, the queued crm_messages row written before the send, the outbox row,
+// the platform identity (From/Reply-To), and the queued→sent flip whose
+// trigger records outreach_sent_log. One implementation, not a copy.
+//
+// `rawBody` is validated by composeSchema exactly as the route did (a 400
+// outcome on failure). `httpStatus` + `body` are what the route answers with,
+// byte-identical to the pre-extraction handler. `delivery` /
+// `transportAttempted` / `postSendError` are NOT part of the HTTP response —
+// they tell a non-HTTP caller what actually happened on the wire, which the
+// status code alone cannot: a transport-accepted email whose post-send
+// bookkeeping write then threw still answers 500 here (unchanged route
+// behaviour), but it WAS sent, and a caller that must never re-send has to
+// know that.
+export type ComposeRequest = z.infer<typeof composeSchema>;
+
+export type ComposeSendRaw = (
+  options: Parameters<typeof emailService.sendRaw>[0],
+) => ReturnType<typeof emailService.sendRaw>;
+
+export interface ComposeDeps {
+  /** Transport seam — defaults to emailService.sendRaw (the route always uses the default). */
+  sendRaw?: ComposeSendRaw;
+}
+
+export interface ComposeOutcome {
+  /** HTTP status POST /admin/crm/compose answers with. */
+  httpStatus: number;
+  /** JSON body POST /admin/crm/compose answers with. */
+  body: Record<string, unknown>;
+  /**
+   * "sent": the transport accepted the email (even if a later bookkeeping
+   * write threw — see postSendError). "not_sent": refused by a guard, failed
+   * before the transport, or the transport reported failure.
+   * "draft_queued": gmail_draft intent — queued for the CS-agent, nothing sent.
+   */
+  delivery: "sent" | "not_sent" | "draft_queued";
+  /** True once the transport was actually invoked for this request. */
+  transportAttempted: boolean;
+  /** Set when the transport accepted the email and a write AFTER that threw. */
+  postSendError?: string;
+}
+
+//
+// Synchronous where the route was synchronous: everything up to the transport
+// call (validation, every guard, the queued message + outbox rows) runs in the
+// caller's tick, and every outcome decided there — 400, each refusal,
+// gmail_draft, a pre-send failure — is RETURNED synchronously, so the route
+// answers in the same tick exactly as the handler did before the extraction.
+// Only a resend_send returns a Promise (the await on the transport). Callers
+// that do not care simply `await` the result either way.
+export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): ComposeOutcome | Promise<ComposeOutcome> {
+  const sendRaw: ComposeSendRaw = deps.sendRaw ?? ((options) => emailService.sendRaw(options));
+  // Tracks what reached the wire, for ComposeOutcome.delivery — see above.
+  let transportAttempted = false;
+  let transportAccepted = false;
+  const notSent = (httpStatus: number, body: Record<string, unknown>): ComposeOutcome => ({
+    httpStatus,
+    body,
+    delivery: "not_sent",
+    transportAttempted,
+  });
+  // The handler's outer catch (500 "compose failed"), shared by the
+  // synchronous part and the send continuation below.
+  const outerFailure = (err: any): ComposeOutcome => {
+    const body = { success: false, error: err.message ?? "compose failed" };
+    if (transportAccepted) {
+      return { httpStatus: 500, body, delivery: "sent", transportAttempted, postSendError: String(err?.message ?? err) };
+    }
+    return notSent(500, body);
+  };
+
+  const parsed = composeSchema.safeParse(rawBody);
+  if (!parsed.success) return notSent(400, { error: "invalid body", details: parsed.error.issues });
   const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force, vertical } = parsed.data;
   // Steg C2: set true only when this request actually reserved a daily-cap
   // slot (i.e. the resend_send/claude/!force guard block below ran and its
@@ -617,7 +697,7 @@ router.post("/compose", async (req, res) => {
     // checkMaxTouchVern() above for the full rationale.
     const maxTouchRefusal = checkMaxTouchVern(getDb(), to);
     if (maxTouchRefusal) {
-      return res.status(429).json(maxTouchRefusal);
+      return notSent(429, maxTouchRefusal);
     }
 
     // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
@@ -626,7 +706,7 @@ router.post("/compose", async (req, res) => {
     // CS conversation replies are unaffected. Belt-and-suspenders with the gate,
     // which already returns 0 candidates when paused.
     if (isOutreachPaused() && intent === "resend_send" && createdBy === "claude") {
-      return res.status(423).json({
+      return notSent(423, {
         success: false,
         error: "outreach_paused",
         reason: "Cold outreach is paused (OUTREACH_PAUSED=true). Automated claude-actor sends are blocked until the flag is cleared.",
@@ -665,7 +745,7 @@ router.post("/compose", async (req, res) => {
       `).run(today, dailyCap);
 
       if (reservation.changes === 0) {
-        return res.status(429).json({
+        return notSent(429, {
           success: false,
           error: "daily_cap_reached",
           reason: `daily outreach cap reached: ${dailyCap} sent today (OUTREACH_MAX_PER_DAY=${dailyCap}) — try again after UTC midnight`,
@@ -790,7 +870,7 @@ router.post("/compose", async (req, res) => {
         if (priorOutreach) {
           const byVertical = priorOutreach.vertical_id;
           const crossPlatform = isCrmVertical(byVertical) && byVertical !== vertical;
-          return res.status(429).json({
+          return notSent(429, {
             success: false,
             error: "cooldown_suppressed",
             reason:
@@ -831,7 +911,7 @@ router.post("/compose", async (req, res) => {
         `).all(to, lookback24h) as Array<{ id: string; thread_id: string; subject: string; sent_at: string }>;
 
         if (recent.length > 0) {
-          return res.status(429).json({
+          return notSent(429, {
             success: false,
             error: "rate_limited",
             reason: `claude-actor already sent ${recent.length} cold-outreach email(s) to ${to} in the last 24h, and contact has no inbound in last 7 days`,
@@ -885,70 +965,108 @@ router.post("/compose", async (req, res) => {
     });
 
     if (intent === "resend_send") {
-      try {
-        const composeIdentity = resolveCrmIdentity(vertical);
-        const result = await emailService.sendRaw({
-          to,
-          subject,
-          textContent: bodyText,
-          htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
-          from: crmFromHeader(vertical),
-          replyTo: composeIdentity.replyTo,
-        });
-        if (result.success) {
-          crmService.markOutboxResult(queued.id, "completed", result.messageId);
-          crmService.updateMessageDeliveryStatus(messageId, "sent");
-          crmService.logAction({
-            threadId,
-            contactId,
-            type: "sent",
-            actor: createdBy,
-            payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", composedNew: true, internalMessageId: messageId },
-          });
-          return res.json({
-            success: true,
-            threadId,
-            contactId,
-            outboxId: queued.id,
-            messageId: result.messageId,
-            channel: "resend_smtp",
-          });
+      // The one await in the whole chain. Everything above ran synchronously in
+      // the caller's tick, exactly as it did inside the route handler; this
+      // continuation keeps the handler's inner try/catch AND its outer catch.
+      return (async (): Promise<ComposeOutcome> => {
+        try {
+          try {
+            const composeIdentity = resolveCrmIdentity(vertical);
+            const sendOptions = {
+              to,
+              subject,
+              textContent: bodyText,
+              htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
+              from: crmFromHeader(vertical),
+              replyTo: composeIdentity.replyTo,
+            };
+            transportAttempted = true;
+            const result = await sendRaw(sendOptions);
+            if (result.success) {
+              transportAccepted = true;
+              crmService.markOutboxResult(queued.id, "completed", result.messageId);
+              crmService.updateMessageDeliveryStatus(messageId, "sent");
+              crmService.logAction({
+                threadId,
+                contactId,
+                type: "sent",
+                actor: createdBy,
+                payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", composedNew: true, internalMessageId: messageId },
+              });
+              return {
+                httpStatus: 200,
+                body: {
+                  success: true,
+                  threadId,
+                  contactId,
+                  outboxId: queued.id,
+                  messageId: result.messageId,
+                  channel: "resend_smtp",
+                },
+                delivery: "sent",
+                transportAttempted,
+              };
+            }
+            crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
+            crmService.updateMessageDeliveryStatus(messageId, "failed");
+            if (capReservedToday) {
+              getDb().prepare(
+                `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
+              ).run(capReservedToday);
+            }
+            return notSent(500, { success: false, error: result.error || "send failed", outboxId: queued.id, threadId });
+          } catch (err: any) {
+            // Unchanged route behaviour below, including when the transport had
+            // already accepted the email and a post-send write threw — the
+            // outcome's `delivery`/`postSendError` carry that fact to non-HTTP
+            // callers (see the ComposeOutcome doc comment above).
+            const sentThenFailed = transportAccepted;
+            crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
+            crmService.updateMessageDeliveryStatus(messageId, "failed");
+            if (capReservedToday) {
+              getDb().prepare(
+                `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
+              ).run(capReservedToday);
+            }
+            const body = { success: false, error: err.message ?? "exception", threadId };
+            if (sentThenFailed) {
+              return { httpStatus: 500, body, delivery: "sent", transportAttempted, postSendError: String(err?.message ?? err) };
+            }
+            return notSent(500, body);
+          }
+        } catch (err: any) {
+          return outerFailure(err);
         }
-        crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
-        crmService.updateMessageDeliveryStatus(messageId, "failed");
-        if (capReservedToday) {
-          getDb().prepare(
-            `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
-          ).run(capReservedToday);
-        }
-        return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id, threadId });
-      } catch (err: any) {
-        crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
-        crmService.updateMessageDeliveryStatus(messageId, "failed");
-        if (capReservedToday) {
-          getDb().prepare(
-            `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
-          ).run(capReservedToday);
-        }
-        return res.status(500).json({ success: false, error: err.message ?? "exception", threadId });
-      }
+      })();
     }
 
     // gmail_draft path: leave delivery_status as 'queued' here.
     // It transitions to 'draft_in_gmail' once the CS-agent picks up the
     // outbox item and reports back via /outbox/:id/result.
 
-    res.json({
-      success: true,
-      threadId,
-      contactId,
-      outboxId: queued.id,
-      intent: "gmail_draft",
-      note: "Queued — will appear in your Gmail Drafts after next CS-agent run.",
-    });
+    return {
+      httpStatus: 200,
+      body: {
+        success: true,
+        threadId,
+        contactId,
+        outboxId: queued.id,
+        intent: "gmail_draft",
+        note: "Queued — will appear in your Gmail Drafts after next CS-agent run.",
+      },
+      delivery: "draft_queued",
+      transportAttempted,
+    };
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message ?? "compose failed" });
+    return outerFailure(err);
   }
+}
+
+router.post("/compose", async (req, res) => {
+  const result = executeCompose(req.body);
+  // Answered in the same tick when no send is involved (see executeCompose).
+  const outcome = result instanceof Promise ? await result : result;
+  return res.status(outcome.httpStatus).json(outcome.body);
 });
 
 /**

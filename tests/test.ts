@@ -45561,3 +45561,45 @@ runSerial(async () => {
     failures.push("rfb-breadcrumblist-jsonld: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// GET /admin/outreach-candidates selection and the POST /admin/crm/compose
+// guard chain are extracted into computeOutreachCandidates() / executeCompose()
+// so the platform-side daily RFB send runs the SAME gate and send path. These
+// two suites pin that both routes answer exactly as before (body, status, DB
+// side effects, same-tick dispatch) and that each equals its function. Both
+// pin the DB singleton on their own in-memory DB (restored in finally) —
+// runSerial, tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: outreach-candidates extraction parity ──");
+  try {
+    const { runAdminOutreachCandidatesExtractionParityTests } =
+      require("../src/routes/admin-outreach-candidates-extraction-parity.test") as
+        typeof import("../src/routes/admin-outreach-candidates-extraction-parity.test");
+    const aep = runAdminOutreachCandidatesExtractionParityTests({ log: false });
+    passed += aep.passed;
+    failed += aep.failed;
+    for (const f of aep.failures) failures.push("admin-outreach-candidates-extraction-parity: " + f);
+    console.log(`  admin-outreach-candidates-extraction-parity: ${aep.passed} passed, ${aep.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-outreach-candidates-extraction-parity: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: crm compose extraction parity ──");
+  try {
+    const { runCrmComposeExtractionParityTests } =
+      require("../src/routes/crm-compose-extraction-parity.test") as
+        typeof import("../src/routes/crm-compose-extraction-parity.test");
+    const cep = await runCrmComposeExtractionParityTests({ log: false });
+    passed += cep.passed;
+    failed += cep.failed;
+    for (const f of cep.failures) failures.push("crm-compose-extraction-parity: " + f);
+    console.log(`  crm-compose-extraction-parity: ${cep.passed} passed, ${cep.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-compose-extraction-parity: unexpected error: " + String(err?.message || err));
+  }
+});
