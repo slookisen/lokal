@@ -171,9 +171,43 @@ function looksLikeCssOrJsLeakage(trimmed: string): boolean {
 // punctuation) but will not catch every truncation (a cut that happens to
 // land on a word ending in a real Norwegian word is indistinguishable from
 // an intentional sentence fragment by this check alone).
+//
+// One exception (2026-09-28, 7 Fjell Bryggeri): text whose FINAL
+// whitespace-delimited token is an e-mail address or a URL is a finished
+// sentence, not a cut. The producer asked for a visit_text ending "… book
+// via booking@7fjell.com" and POST /admin/gardssalg-set-content-field
+// rejected it as truncated_mid_sentence purely because its last character
+// was "m" — yet ending on the booking address or the website is ordinary
+// producer copy, and (per applyGardssalgSetContentField's own doc comment)
+// a good value that trips this classifier is a classifier bug to fix, not a
+// value to force through. The token may carry the same closing characters
+// the punctuation check accepts ("booking@7fjell.com)"). Shapes that count:
+//   - e-mail: local@domain.tld, any letter TLD (the "@" is the evidence);
+//   - URL with an explicit "http(s)://" or "www." prefix, any letter TLD;
+//   - BARE domain, optionally with a path ("7fjell.com", "gard.no/besok"),
+//     but only with a lowercase TLD from the short list in the regex below
+//     (.no, the common generics, .eu, .se/.dk — any other TLD still passes
+//     when written with "http(s)://" or "www.") — a bare "word.word" is
+//     otherwise exactly what an abbreviation ("f.eks") or a scraped,
+//     space-less sentence boundary ("i sommer.Velkommen", or one cut to
+//     "i sommer.Se") looks like, and neither may pass for a domain.
+// Kept tight on purpose: only the LAST token is inspected (an "@" or a
+// domain earlier in the text never excuses a cut ending — "… Seks kilome",
+// "… åpent hver lør" are still flagged), the address must be complete up to
+// its TLD ("booking@7fjell", "www.7fjell", "7fjell.c" still count as cut),
+// and a path must end on a letter, digit or "/" (so "gard.no/besok," — a
+// sentence that clearly went on — is still flagged). Known limitation: a
+// cut INSIDE a path, or one that still leaves a valid TLD
+// ("https://7fjell.com/boo", "https://7fjell.co"), is indistinguishable from
+// a real link and passes.
 const GARDSSALG_TRUNCATION_MIN_LEN = 50;
+const GARDSSALG_TRAILING_EMAIL_RE = /^[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}[.!?…»"'”\)\]]*$/u;
+const GARDSSALG_TRAILING_URL_RE =
+  /^(?:(?:https?:\/\/|www\.)(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}|(?:[\p{L}\p{N}-]+\.)+(?:no|com|net|org|eu|se|dk|info))(?:[\/?#](?:\S*[\p{L}\p{N}\/])?)?[.!?…»"'”\)\]]*$/u;
 function looksTruncatedMidSentence(trimmed: string): boolean {
   if (trimmed.length < GARDSSALG_TRUNCATION_MIN_LEN) return false;
+  const lastToken = trimmed.split(/\s+/).pop() ?? "";
+  if (GARDSSALG_TRAILING_EMAIL_RE.test(lastToken) || GARDSSALG_TRAILING_URL_RE.test(lastToken)) return false;
   return !/[.!?…»"'”\)\]]$/.test(trimmed);
 }
 
