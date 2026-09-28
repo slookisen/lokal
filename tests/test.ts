@@ -45603,3 +45603,22 @@ runSerial(async () => {
     failures.push("crm-compose-extraction-parity: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// RFB outreach e-mail as code (services/rfb-outreach-template.ts) — pure, no
+// DB; pinned byte-for-byte against the effective A2A template.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: RFB outreach template ──");
+  try {
+    const { runRfbOutreachTemplateTests } = require("../src/services/rfb-outreach-template.test") as
+      typeof import("../src/services/rfb-outreach-template.test");
+    const rot = runRfbOutreachTemplateTests({ log: false });
+    passed += rot.passed;
+    failed += rot.failed;
+    for (const f of rot.failures) failures.push("rfb-outreach-template: " + f);
+    console.log(`  rfb-outreach-template: ${rot.passed} passed, ${rot.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-outreach-template: unexpected error: " + String(err?.message || err));
+  }
+});
