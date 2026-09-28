@@ -31263,9 +31263,11 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     // Incident 2026-09-27/28 (full prod volume -> the post-send sent_log
     // INSERT threw -> no cooldown/budget row -> the same six producers were
     // mailed again the next day): the send path now reserves its
-    // experience_outreach_sent_log row BEFORE sending and both send loops stop
-    // on a DB write failure. Same in-memory-DB + fake-transporter pattern,
-    // runs sequentially inside this same gated block.
+    // experience_outreach_sent_log row BEFORE sending — atomically with the
+    // cooldown check for real sends, so overlapping runs and duplicate ids
+    // cannot double-send either — and both send loops stop on a DB write
+    // failure or an unknown send outcome. Same in-memory-DB + fake-transporter
+    // pattern, runs sequentially inside this same gated block.
     console.log("\n── opplevelser-gardssalg-outreach-reserve-before-send: sent_log reserved before the send ──");
     const { runOpplevelserGardssalgOutreachReserveBeforeSendTests } = require("../src/routes/opplevelser-gardssalg-outreach-reserve-before-send.test") as
       typeof import("../src/routes/opplevelser-gardssalg-outreach-reserve-before-send.test");

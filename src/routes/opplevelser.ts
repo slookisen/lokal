@@ -17791,6 +17791,16 @@ export type GardssalgOutreachEligibility =
       cross_platform_by?: string;
     };
 
+// Same cooldown-window derivation as routes/crm.ts ~L441 and the (former)
+// inline copy in POST /admin/gardssalg-outreach-pilot-send. One helper since
+// the reserve-before-send follow-up (incident 2026-09-27/28): the eligibility
+// check below and sendGardssalgOutreachToEligibleProvider's atomic reservation
+// (the same check, re-run at write time) must never disagree on the window.
+function gardssalgOutreachCooldownCutoffIso(): string {
+  const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+  return new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+}
+
 export function computeGardssalgOutreachSendEligibility(
   expDb: Database.Database,
   providerIds: string[],
@@ -17807,10 +17817,7 @@ export function computeGardssalgOutreachSendEligibility(
   const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, providerIds, opts);
   const preflightById = new Map(preflightResults.map((r) => [r.provider_id, r]));
 
-  // Same cooldown-window derivation as routes/crm.ts ~L441 and the (former)
-  // inline copy in POST /admin/gardssalg-outreach-pilot-send.
-  const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
-  const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+  const cooldownCutoff = gardssalgOutreachCooldownCutoffIso();
 
   const out: GardssalgOutreachEligibility[] = [];
 
@@ -18446,7 +18453,10 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
 
   const isTest = body.is_test === true;
   const apply = body.apply === true;
-  const providerIds = rawIds as string[];
+  // Deduped, first-occurrence order (reserve-before-send follow-up, incident
+  // 2026-09-27/28): `provider_ids: [X, X], apply: true` used to mail X twice.
+  // One result row per UNIQUE id.
+  const providerIds = [...new Set(rawIds as string[])];
 
   // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: which
   // rendered draft this batch uses. Absent = "standard" (the pre-existing
@@ -18470,12 +18480,12 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     // cooldown are enforced on the actual send path, never a forked copy.
     const eligibility = computeGardssalgOutreachSendEligibility(expDb, providerIds);
 
-    // Incident 2026-09-27/28: once a send row comes back db_write_failed the
-    // experiences DB is not taking sent_log writes — no further send is
-    // attempted in this batch. The remaining ELIGIBLE ids are reported as
-    // skipped/GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON (still one row per
-    // requested id); ineligible ids keep their own skip reason.
-    let stoppedOnDbWriteFailure = false;
+    // Incident 2026-09-27/28: once a send row stops the batch (see
+    // gardssalgOutreachBatchStopReason — a sent_log write failed, or a send
+    // threw with its reservation kept) no further send is attempted. The
+    // remaining ELIGIBLE ids are reported as skipped with that reason (still
+    // one row per unique id); ineligible ids keep their own skip reason.
+    let notAttemptedReason: string | null = null;
     for (const elig of eligibility) {
       if (!elig.eligible) {
         // NO-GO / skipped: no send attempt. `reason`/`preflight_reason`/
@@ -18506,8 +18516,8 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         continue;
       }
 
-      if (stoppedOnDbWriteFailure) {
-        results.push({ provider_id: elig.provider_id, status: "skipped", reason: GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON });
+      if (notAttemptedReason) {
+        results.push({ provider_id: elig.provider_id, status: "skipped", reason: notAttemptedReason });
         continue;
       }
       const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
@@ -18516,7 +18526,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         source: "gardssalg-outreach-pilot-send",
       });
       results.push(row);
-      if (row.db_write_failed) stoppedOnDbWriteFailure = true;
+      notAttemptedReason = gardssalgOutreachBatchStopReason(row);
     }
 
     const summary = summariseGardssalgOutreachSendResults(results);
@@ -18577,6 +18587,8 @@ export type GardssalgOutreachSendResultRow = {
   // in place (the send threw, outcome unknown; or releasing it failed), so
   // this provider now sits in cooldown even though the mail may never have
   // gone out. Fail-closed: a possibly missed mail beats a possible second one.
+  // Both looping callers stop on it too, so a deterministic exception costs
+  // one producer a false cooldown, never a whole batch.
   reservation_kept?: true;
 };
 
@@ -18588,8 +18600,25 @@ export type GardssalgOutreachSendResultRow = {
 // it exactly like a confirmed send (cooldown, daily budget, touch history).
 export const GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE = "reserved";
 // `reason` on the eligible rows a looping caller never attempted because an
-// earlier row came back db_write_failed (reported as status "skipped").
+// earlier row stopped the batch (reported as status "skipped"): after a
+// db_write_failed row, and after a send that threw (reservation_kept).
 export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON = "not_attempted_after_db_write_failure";
+export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON = "not_attempted_after_send_outcome_unknown";
+
+/**
+ * The one stop rule both looping callers (POST /admin/gardssalg-outreach-
+ * pilot-send, runGardssalgOutreachDaily) apply after each send row: null =
+ * carry on; otherwise no further send is attempted and every remaining
+ * eligible candidate is reported as skipped with the returned reason. A
+ * db_write_failed row means the DB is not taking sent_log writes; a
+ * reservation_kept row means a send threw — often deterministically, so the
+ * next candidate would only burn another producer into a false cooldown.
+ */
+export function gardssalgOutreachBatchStopReason(row: GardssalgOutreachSendResultRow): string | null {
+  if (row.db_write_failed) return GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON;
+  if (row.reservation_kept) return GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON;
+  return null;
+}
 
 export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility, { eligible: true }>;
 
@@ -18611,6 +18640,9 @@ export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility,
  * the next day's run mailed the same six producers again. Fail-closed now —
  * a DB that is not taking writes can cost a send, never duplicate one:
  *   - reservation INSERT throws  -> nothing is sent: error + db_write_failed
+ *   - reservation refused (real send; the recipient entered cooldown after
+ *     the caller's eligibility check — an overlapping run, a duplicate id)
+ *                                -> nothing is sent: skipped/cooldown_suppressed
  *   - send returns success:false -> nothing left the building: reservation
  *     released (DELETE) so the provider stays eligible, as before. If that
  *     DELETE throws the row stays (the provider just sits in cooldown):
@@ -18620,6 +18652,8 @@ export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility,
  *   - confirm UPDATE throws      -> the mail DID go out: sent +
  *     log_recorded:false + db_write_failed; the reservation row still holds
  *     cooldown and budget
+ * Looping callers stop on db_write_failed / reservation_kept — see
+ * gardssalgOutreachBatchStopReason.
  */
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
@@ -18638,14 +18672,35 @@ export async function sendGardssalgOutreachToEligibleProvider(
 
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
   // old post-send INSERT did, so every reader's timestamp handling is unchanged.
-  let reservationId: number | bigint;
+  //
+  // For a real send the reservation IS the own-table cooldown check, done
+  // atomically: the row only lands when no real row for this recipient exists
+  // inside the cooldown window — same predicate and cutoff as
+  // computeGardssalgOutreachSendEligibility. Callers check eligibility for a
+  // whole batch up front, so an overlapping run (a cron re-tick while a run is
+  // still sending, a manual daily-run/pilot-send in the same window) or
+  // `provider_ids: [X, X]` used to mail the same producer twice. One
+  // synchronous INSERT…SELECT: nothing can interleave between the check and
+  // the write. Test sends (is_test=1) keep the plain INSERT — they never count
+  // toward the cooldown in the first place.
+  let reservation: { changes: number; lastInsertRowid: number | bigint };
   try {
-    reservationId = expDb
-      .prepare(
-        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
-         VALUES (?, ?, 'email', NULL, ?, ?)`,
-      )
-      .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, isTest ? 1 : 0).lastInsertRowid;
+    reservation = isTest
+      ? expDb
+          .prepare(
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
+             VALUES (?, ?, 'email', NULL, ?, 1)`,
+          )
+          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE)
+      : expDb
+          .prepare(
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
+             SELECT ?, ?, 'email', NULL, ?, 0
+              WHERE NOT EXISTS (
+                SELECT 1 FROM experience_outreach_sent_log
+                 WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ? AND is_test = 0)`,
+          )
+          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, email, gardssalgOutreachCooldownCutoffIso());
   } catch (dbErr) {
     console.error(`[${opts.source}] sent_log reservation failed — NOT sending`, { providerId, email, error: errMsg(dbErr) });
     return {
@@ -18655,6 +18710,14 @@ export async function sendGardssalgOutreachToEligibleProvider(
       db_write_failed: true,
     };
   }
+  if (reservation.changes === 0) {
+    // Another send to this recipient landed after the caller's eligibility
+    // check: the same skip the eligibility check itself reports — not an
+    // error, and not a reason to stop the loop.
+    console.warn(`[${opts.source}] reservation refused — recipient already in cooldown, NOT sending`, { providerId, email });
+    return { provider_id: providerId, status: "skipped", reason: "cooldown_suppressed", suppressed_by: "experiences" };
+  }
+  const reservationId = reservation.lastInsertRowid;
 
   try {
     const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
@@ -19552,6 +19615,8 @@ router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, 
 // checked in code before the first email:
 //
 //   1. GARDSSALG_OUTREACH_DAILY_DISABLED=1 (env)          → nothing runs at all
+//   1b. another apply run still in flight (this process) → skip, no envelope
+//      (reserve-before-send follow-up, incident 2026-09-27/28)
 //   2. lane paused (experience_outreach_lane_state)      → skip
 //      Anyone with the admin key may set paused:true (routines included, e.g.
 //      on a bounce); clearing it is Daniel's call — same rule as the old
@@ -19693,6 +19758,9 @@ export function findGardssalgOutreachRecentBounces(
 
 export type GardssalgOutreachDailyRunSkipReason =
   | "disabled_by_env"
+  // Another apply run is still in flight in this process (reserve-before-send
+  // follow-up, incident 2026-09-27/28) — see runGardssalgOutreachDaily.
+  | "run_in_progress"
   | "paused"
   | "bounce_or_complaint_recent"
   | "daily_cap_already_sent"
@@ -19725,9 +19793,14 @@ export interface GardssalgOutreachDailyRunReport {
   //   stopped_on_db_write_failure — the loop stopped at a db_write_failed
   //     row; the candidates after it are `skipped` rows with reason
   //     GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON (still eligible next run).
+  //   stopped_on_send_outcome_unknown — the loop stopped at a send that threw
+  //     (reservation_kept); the rest are skipped with reason
+  //     GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON.
+  //   Either stop keeps the envelope status off `completed`.
   errors: Array<{ provider_id: string; status: GardssalgOutreachSendResultRow["status"]; reason: string }>;
   log_not_recorded: number;
   stopped_on_db_write_failure: boolean;
+  stopped_on_send_outcome_unknown: boolean;
   envelope_recorded: boolean;
   // dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
   // the outcome of the autosvar-apply pass this same run made BEFORE
@@ -19736,6 +19809,8 @@ export interface GardssalgOutreachDailyRunReport {
   autosvar_apply: GardssalgAutosvarApplyResult | null;
 }
 
+let gardssalgOutreachDailyApplyInFlight = false;
+
 /**
  * The daily send. `apply: false` is a full dry run (guards evaluated, list
  * computed, nothing written, no envelope). `apply: true` sends up to
@@ -19743,12 +19818,35 @@ export interface GardssalgOutreachDailyRunReport {
  * records a run envelope whatever the outcome. Throws only if the selection
  * itself fails (a DB error) — per-provider send failures are rows, not
  * exceptions, so an error on provider 3 never loses providers 1–2.
+ *
+ * One apply run at a time per process (reserve-before-send follow-up,
+ * incident 2026-09-27/28): the cron tick (index.ts, every 10 min) stamps
+ * lastRunAt only after a run finishes, so a slow run could be re-ticked, and
+ * a manual POST /admin/gardssalg-outreach-daily-run can land in the same
+ * window. The atomic reservation in sendGardssalgOutreachToEligibleProvider
+ * already stops a second mail to the same producer; this keeps a concurrent
+ * run from also spending the day's budget a second time. The flag is set
+ * synchronously (before the first await) and cleared in `finally`.
  */
 export async function runGardssalgOutreachDaily(opts: {
   apply: boolean;
   trigger: "cron" | "manual";
   now?: Date;
 }): Promise<GardssalgOutreachDailyRunReport> {
+  if (!opts.apply) return runGardssalgOutreachDailyOnce(opts, false);
+  if (gardssalgOutreachDailyApplyInFlight) return runGardssalgOutreachDailyOnce(opts, true);
+  gardssalgOutreachDailyApplyInFlight = true;
+  try {
+    return await runGardssalgOutreachDailyOnce(opts, false);
+  } finally {
+    gardssalgOutreachDailyApplyInFlight = false;
+  }
+}
+
+async function runGardssalgOutreachDailyOnce(
+  opts: { apply: boolean; trigger: "cron" | "manual"; now?: Date },
+  runInProgress: boolean,
+): Promise<GardssalgOutreachDailyRunReport> {
   const now = opts.now ?? new Date();
   const startedAt = now.toISOString();
   const day = startedAt.slice(0, 10);
@@ -19797,15 +19895,29 @@ export async function runGardssalgOutreachDaily(opts: {
         .map((r) => ({ provider_id: r.provider_id, status: r.status, reason: r.reason ?? "unknown" })),
       log_not_recorded: results.filter((r) => r.log_recorded === false).length,
       stopped_on_db_write_failure: results.some((r) => r.db_write_failed === true),
+      stopped_on_send_outcome_unknown: results.some((r) => r.reservation_kept === true && r.db_write_failed !== true),
       envelope_recorded: false,
       autosvar_apply: partial.autosvar_apply ?? null,
     };
+    // Why the loop stopped early (at most one cause — it stops at the first
+    // stopping row) and whom it therefore never tried.
+    const stopCause = report.stopped_on_db_write_failure
+      ? "sent_log write failed"
+      : report.stopped_on_send_outcome_unknown
+        ? "send outcome unknown"
+        : null;
     const notAttempted = results
-      .filter((r) => r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON)
+      .filter(
+        (r) =>
+          r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON ||
+          r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON,
+      )
       .map((r) => r.provider_id);
     // Envelope: real runs only (a dry run leaves no trace anywhere), and never
-    // when the env switch turned the job off entirely.
-    if (opts.apply && report.skipped_reason !== "disabled_by_env") {
+    // when the env switch turned the job off entirely — nor for a
+    // run_in_progress collision: the run in flight records the day's
+    // envelope, and a second one would only take its run_id.
+    if (opts.apply && report.skipped_reason !== "disabled_by_env" && report.skipped_reason !== "run_in_progress") {
       // The day's cron id is reused only while it is free; a later real run the
       // same day (a retry after a recorded skip) gets a time suffix instead of
       // silently colliding with recordRun's ON CONFLICT DO NOTHING.
@@ -19825,15 +19937,19 @@ export async function runGardssalgOutreachDaily(opts: {
         (c) => c.touch === "second" && sentIds.includes(c.provider_id),
       ).length;
       const firstTouchSent = sentIds.length - secondTouchSent;
-      const status = report.summary.error > 0 ? (report.summary.sent > 0 ? "partial" : "failed") : "completed";
+      // Incident 2026-09-27/28: a stopped run is never `completed`, even with
+      // no error row (a delivered send whose sent_log confirm failed) — a
+      // routine that reads only the status must notice. Clean runs: unchanged.
+      const status =
+        report.summary.error > 0 || stopCause !== null ? (report.summary.sent > 0 ? "partial" : "failed") : "completed";
       const notes =
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
         `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
         // Incident 2026-09-27/28 — only on a run that hit a sent_log write
-        // failure, so a clean run's notes are byte-identical to before.
+        // failure or a stop, so a clean run's notes are byte-identical to before.
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
-        (report.stopped_on_db_write_failure ? ` STOPPED (sent_log write failed): not_attempted=${notAttempted.length}` : "") +
+        (stopCause ? ` STOPPED (${stopCause}): not_attempted=${notAttempted.length}` : "") +
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
         (report.autosvar_apply
           ? ` autosvar: applied=${report.autosvar_apply.counts.applied} queued=${report.autosvar_apply.counts.queued} ` +
@@ -19861,19 +19977,19 @@ export async function runGardssalgOutreachDaily(opts: {
           notes,
           // Incident 2026-09-27/28: the per-candidate failures ride in the
           // envelope's own `errors` field, plus one entry naming the
-          // candidates a db_write_failed stop left untried. Omitted (NULL in
-          // the ledger) on a clean run, so a normal envelope is unchanged.
-          ...(report.errors.length > 0 || report.stopped_on_db_write_failure
+          // candidates a stop left untried. Omitted (NULL in the ledger) on
+          // a clean run, so a normal envelope is unchanged.
+          ...(report.errors.length > 0 || stopCause !== null
             ? {
                 errors: [
                   ...report.errors.map((e) => ({
                     message: e.reason,
                     meta: { provider_id: e.provider_id, status: e.status },
                   })),
-                  ...(report.stopped_on_db_write_failure
+                  ...(stopCause
                     ? [
                         {
-                          message: `stopped: sent_log write failed — ${notAttempted.length} candidate(s) not attempted`,
+                          message: `stopped: ${stopCause} — ${notAttempted.length} candidate(s) not attempted`,
                           meta: { not_attempted: notAttempted },
                         },
                       ]
@@ -19892,7 +20008,7 @@ export async function runGardssalgOutreachDaily(opts: {
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} cap=${dailyCap} ` +
         `auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}` +
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
-        (report.stopped_on_db_write_failure ? ` STOPPED (sent_log write failed): not_attempted=${notAttempted.length}` : ""),
+        (stopCause ? ` STOPPED (${stopCause}): not_attempted=${notAttempted.length}` : ""),
     );
     return report;
   };
@@ -19900,6 +20016,11 @@ export async function runGardssalgOutreachDaily(opts: {
   // Guard 1 — env switch.
   if (process.env.GARDSSALG_OUTREACH_DAILY_DISABLED === "1") {
     return finish({ skipped_reason: "disabled_by_env", sent_today_before: 0, budget: 0 });
+  }
+  // Guard 1b — another apply run is still in flight in this process (see
+  // runGardssalgOutreachDaily); it records the day's envelope, this one none.
+  if (runInProgress) {
+    return finish({ skipped_reason: "run_in_progress", sent_today_before: 0, budget: 0 });
   }
   // Guard 2 — lane paused.
   if (getGardssalgOutreachLaneState(expDb).paused) {
@@ -19967,18 +20088,18 @@ export async function runGardssalgOutreachDaily(opts: {
   }));
 
   const results: GardssalgOutreachSendResultRow[] = [];
-  // Incident 2026-09-27/28: stop at the first db_write_failed row, same guard
-  // as POST /admin/gardssalg-outreach-pilot-send — the DB is not taking
-  // sent_log writes, so no further candidate is tried; each one left is a
-  // skipped/GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON row (see finish()).
-  let stoppedOnDbWriteFailure = false;
+  // Incident 2026-09-27/28: stop at the first row that stops the batch, same
+  // rule as POST /admin/gardssalg-outreach-pilot-send (see
+  // gardssalgOutreachBatchStopReason) — no further candidate is tried; each
+  // one left is a skipped row carrying that reason (see finish()).
+  let notAttemptedReason: string | null = null;
   for (const elig of selected) {
     if (!opts.apply) {
       results.push({ provider_id: elig.provider_id, status: "would_send" });
       continue;
     }
-    if (stoppedOnDbWriteFailure) {
-      results.push({ provider_id: elig.provider_id, status: "skipped", reason: GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON });
+    if (notAttemptedReason) {
+      results.push({ provider_id: elig.provider_id, status: "skipped", reason: notAttemptedReason });
       continue;
     }
     const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
@@ -19987,7 +20108,7 @@ export async function runGardssalgOutreachDaily(opts: {
       source: "gardssalg-outreach-daily-run",
     });
     results.push(row);
-    if (row.db_write_failed) stoppedOnDbWriteFailure = true;
+    notAttemptedReason = gardssalgOutreachBatchStopReason(row);
   }
   return finish({
     skipped_reason: null,

@@ -180,10 +180,14 @@ kontakt@opplevagent.no
   // instead of the former fixed 12000-char window, which the reserve-before-
   // send fix (incident 2026-09-27/28) outgrew with its own comments.
   const pilotStart = routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"');
-  const pilotBlock = routeSrc.slice(
-    pilotStart,
-    routeSrc.indexOf("export function summariseGardssalgOutreachSendResults", pilotStart),
+  const pilotEnd = routeSrc.indexOf("export function summariseGardssalgOutreachSendResults(", pilotStart);
+  // Both markers must exist, end after start: renaming either one fails here
+  // loudly instead of silently widening (end -1) or emptying the window.
+  check(
+    "r0: the pilot-send block's start and end markers both exist, end after start",
+    pilotStart >= 0 && pilotEnd > pilotStart,
   );
+  const pilotBlock = pilotStart >= 0 && pilotEnd > pilotStart ? routeSrc.slice(pilotStart, pilotEnd) : "";
 
   check(
     "r1: route rejects unknown template values with a 400 (fail-closed enum)",
