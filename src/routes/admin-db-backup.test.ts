@@ -487,6 +487,43 @@ export function runAdminDbBackupTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq(lokalDeletedFromCombined.length, 0, "per-db retention: pruneBackups deletes NOTHING from the lokal-db dir (3 < 10)");
 
       fs.rmSync(combinedRetentionRoot, { recursive: true, force: true });
+
+      // ── (m) POST /backup/prune + GET /disk + free-space guard ─────
+      const listLokal = () => fs.readdirSync(backupsDir).filter((f) => BACKUP_FILENAME_RE.test(f)).sort();
+      const beforePrune = listLokal();
+      assertTrue(beforePrune.length >= 2, "prune: at least 2 lokal backups exist before pruning");
+
+      const pruneNoKey = await callRoute(router, { method: "POST", url: "/backup/prune?keep=1" });
+      assertEq(pruneNoKey.status, 403, "prune: no X-Admin-Key -> 403");
+      for (const bad of ["", "?keep=", "?keep=abc", "?keep=11", "?keep=-1"]) {
+        const r = await callRoute(router, { method: "POST", url: "/backup/prune" + bad, headers: { "x-admin-key": testKey } });
+        assertEq(r.status, 400, `prune: invalid keep '${bad}' -> 400`);
+      }
+      assertEq(listLokal(), beforePrune, "prune: rejected calls deleted nothing");
+
+      const pruned = await callRoute(router, { method: "POST", url: "/backup/prune?db=lokal&keep=1", headers: { "x-admin-key": testKey } });
+      assertEq(pruned.status, 200, "prune: keep=1 -> 200");
+      assertEq(pruned.body?.deleted, beforePrune.slice(0, beforePrune.length - 1), "prune: deletes all but the newest, oldest first");
+      assertEq(listLokal(), [beforePrune[beforePrune.length - 1]], "prune: only the newest lokal backup remains");
+      assertTrue(typeof pruned.body?.disk_after?.free_bytes === "number", "prune: response reports disk_after");
+
+      const diskNoKey = await callRoute(router, { method: "GET", url: "/disk" });
+      assertEq(diskNoKey.status, 403, "disk: no X-Admin-Key -> 403");
+      const disk = await callRoute(router, { method: "GET", url: "/disk", headers: { "x-admin-key": testKey } });
+      assertEq(disk.status, 200, "disk: with key -> 200");
+      assertTrue(disk.body?.disk?.total_bytes > 0, "disk: reports volume total_bytes");
+      assertEq(disk.body?.backups?.lokal?.count, 1, "disk: counts the remaining lokal backup");
+      assertTrue(Array.isArray(disk.body?.files), "disk: lists data-dir files");
+
+      const realStatfs = fs.statfsSync;
+      (fs as any).statfsSync = (p: any) => ({ ...realStatfs(p), bavail: 0 });
+      try {
+        const full = await callRoute(router, { method: "POST", url: "/backup", headers: { "x-admin-key": testKey } });
+        assertEq(full.status, 507, "free-space guard: POST /backup on a full volume -> 507");
+        assertEq(listLokal().length, 1, "free-space guard: no backup file written");
+      } finally {
+        (fs as any).statfsSync = realStatfs;
+      }
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

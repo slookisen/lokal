@@ -280,6 +280,73 @@ function parseDbKey(raw: unknown, res: Response): DbKey | null {
   return null;
 }
 
+// Backups live on the same Fly volume as the live DBs. Two full lokal.db
+// copies (1.35 GB) filled it on 2026-09-27 and every SQLite write then
+// failed with SQLITE_IOERR ("disk I/O error") for ~19 h.
+export function diskUsage(dir: string): { total_bytes: number; free_bytes: number; used_pct: number } | null {
+  try {
+    const s = fs.statfsSync(dir);
+    const total = s.blocks * s.bsize;
+    const free = s.bavail * s.bsize;
+    return { total_bytes: total, free_bytes: free, used_pct: total > 0 ? Math.round(((total - free) / total) * 1000) / 10 : 0 };
+  } catch {
+    return null;
+  }
+}
+
+function fileSize(p: string): number {
+  try { return fs.statSync(p).size; } catch { return 0; }
+}
+
+// A backup copies the whole DB; refuse unless it fits with this much slack left over.
+export const BACKUP_FREE_SPACE_MARGIN_BYTES = 256 * 1024 * 1024;
+
+// ─── GET /disk ────────────────────────────────────────────────
+router.get("/disk", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const dataDir = path.dirname(DB_PATH);
+  const files: { name: string; size_bytes: number }[] = [];
+  try {
+    for (const name of fs.readdirSync(dataDir)) {
+      const st = fs.statSync(path.join(dataDir, name));
+      if (st.isFile()) files.push({ name, size_bytes: st.size });
+    }
+  } catch { /* data dir missing -> empty list */ }
+  files.sort((a, b) => b.size_bytes - a.size_bytes);
+  const backups: Record<string, { count: number; total_bytes: number }> = {};
+  for (const key of Object.keys(DB_CONFIGS) as DbKey[]) {
+    const cfg = DB_CONFIGS[key];
+    let count = 0;
+    let total = 0;
+    try {
+      for (const f of fs.readdirSync(cfg.backupDir()).filter((n) => cfg.filenameRe.test(n))) {
+        count++;
+        total += fileSize(path.join(cfg.backupDir(), f));
+      }
+    } catch { /* no backups dir */ }
+    backups[key] = { count, total_bytes: total };
+  }
+  res.json({ success: true, data_dir: dataDir, disk: diskUsage(dataDir), files, backups });
+});
+
+// ─── POST /backup/prune ───────────────────────────────────────
+// Manual retention: keep only the `keep` newest backups for one db.
+router.post("/backup/prune", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const dbKey = parseDbKey(req.query.db, res);
+  if (dbKey === null) return;
+  const rawKeep = req.query.keep;
+  if (typeof rawKeep !== "string" || !/^\d+$/.test(rawKeep) || Number(rawKeep) > 10) {
+    res.status(400).json({ error: "keep query param is required: an integer 0-10" });
+    return;
+  }
+  const config = DB_CONFIGS[dbKey];
+  const dir = config.backupDir();
+  const diskBefore = diskUsage(dir);
+  const deleted = pruneBackups(dir, Number(rawKeep), config.filenameRe);
+  res.json({ success: true, db: dbKey, keep: Number(rawKeep), deleted, disk_before: diskBefore, disk_after: diskUsage(dir) });
+});
+
 // ─── POST /backup ─────────────────────────────────────────────
 router.post("/backup", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
@@ -293,6 +360,19 @@ router.post("/backup", (req: Request, res: Response) => {
     const db = config.getDb();
     const dir = config.backupDir();
     fs.mkdirSync(dir, { recursive: true });
+
+    const dbFile = db.name;
+    const needed = fileSize(dbFile) + fileSize(dbFile + "-wal") + BACKUP_FREE_SPACE_MARGIN_BYTES;
+    const disk = diskUsage(dir);
+    if (disk && disk.free_bytes < needed) {
+      res.status(507).json({
+        error: "Not enough free disk space for a backup on the shared data volume",
+        free_bytes: disk.free_bytes,
+        needed_bytes: needed,
+        hint: "POST /admin/db/backup/prune?db=<db>&keep=<n> to remove older backups first",
+      });
+      return;
+    }
 
     const destPath = buildDestPath(dir, config.filePrefix);
 

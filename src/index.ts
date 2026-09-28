@@ -50,7 +50,7 @@ import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
-import adminDbBackupRoutes from "./routes/admin-db-backup";
+import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
@@ -616,6 +616,10 @@ app.get("/health", (_req, res) => {
 
     if (pvCount > 500000) { warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`); }
 
+    const disk = diskUsage(path.dirname(dbPath));
+    if (disk && disk.used_pct >= 95) { status = "critical"; warnings.push(`Data volume ${disk.used_pct}% full — SQLite writes will fail when it fills`); }
+    else if (disk && disk.used_pct >= 85) { if (status !== "critical") status = "warning"; warnings.push(`Data volume ${disk.used_pct}% full`); }
+
     const responseMs = Date.now() - startMs;
 
     res.json({
@@ -642,6 +646,11 @@ app.get("/health", (_req, res) => {
         pageViews: pvCount,
         queries: queryCount,
         pageViewsCachedAgeMs: pvCounts.cachedAgeMs,
+      },
+      disk: disk && {
+        totalMb: Math.round(disk.total_bytes / 1048576),
+        freeMb: Math.round(disk.free_bytes / 1048576),
+        usedPct: disk.used_pct,
       },
       // traffic.totalAgents = marketplaceRegistry.getStats().totalAgents = COUNT(*) FROM agents
       // with NO filter at all (includes inactive + umbrella-tagged rows). This is the SAME
