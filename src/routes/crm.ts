@@ -638,7 +638,10 @@ export interface ComposeOutcome {
   /**
    * "sent": the transport accepted the email (even if a later bookkeeping
    * write threw — see postSendError). "not_sent": refused by a guard, failed
-   * before the transport, or the transport reported failure.
+   * before the transport, or the transport reported failure — and in that
+   * last case (`transportAttempted: true`) delivery is NOT known to have
+   * failed: the server may have accepted the message before the connection
+   * dropped, so an at-most-once caller must treat it as possibly delivered.
    * "draft_queued": gmail_draft intent — queued for the CS-agent, nothing sent.
    */
   delivery: "sent" | "not_sent" | "draft_queued";
@@ -649,13 +652,13 @@ export interface ComposeOutcome {
 }
 
 //
-// Synchronous where the route was synchronous: everything up to the transport
-// call (validation, every guard, the queued message + outbox rows) runs in the
-// caller's tick, and every outcome decided there — 400, each refusal,
-// gmail_draft, a pre-send failure — is RETURNED synchronously, so the route
-// answers in the same tick exactly as the handler did before the extraction.
-// Only a resend_send returns a Promise (the await on the transport). Callers
-// that do not care simply `await` the result either way.
+// Synchronous where the route was synchronous: every outcome decided before
+// the resend_send branch — the 400, each guard refusal, a failed write of the
+// queued message/outbox rows, and the whole gmail_draft path — is RETURNED
+// synchronously (a plain ComposeOutcome, not a Promise), so the route answers
+// those in the same tick exactly as the handler did before the extraction.
+// Only the resend_send branch returns a Promise (the await on the transport).
+// Callers that do not care simply `await` the result either way.
 export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): ComposeOutcome | Promise<ComposeOutcome> {
   const sendRaw: ComposeSendRaw = deps.sendRaw ?? ((options) => emailService.sendRaw(options));
   // Tracks what reached the wire, for ComposeOutcome.delivery — see above.

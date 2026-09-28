@@ -16,6 +16,13 @@
  *       about the wire: in particular a transport-ACCEPTED e-mail whose
  *       post-send bookkeeping write fails is still a 500 (unchanged route
  *       behaviour) but reports delivery "sent";
+ *   (1b) the refusal bodies a caller branches on — 423 outreach_paused and
+ *       the 429s (max_touch_suppressed, daily_cap_reached, cooldown_suppressed,
+ *       rate_limited) — are pinned LITERALLY, byte for byte as the pre-
+ *       extraction handler wrote them (key order included; only the
+ *       fixture-dependent timestamps normalized), so a drift in executeCompose
+ *       cannot hide behind (1)'s route-vs-direct comparison, which would drift
+ *       on both sides at once;
  *   (3) the `sendRaw` seam replaces the transport completely and receives the
  *       platform identity (From / Reply-To) the route would put on the wire.
  *
@@ -226,12 +233,14 @@ export async function runCrmComposeExtractionParityTests(opts: { log?: boolean }
   try {
     // ── (1) + (2) ──────────────────────────────────────────────────────────
     const router = crm.default as any;
+    const routeBodies: Record<string, any> = {};
     for (const sc of scenarios) {
       setEnv(sc.env);
       setTransport(sc.transport);
       const dbRoute = freshDb();
       sc.setup?.(dbRoute);
       const viaRoute = await callRoute(router, sc.body, { "x-admin-key": testKey });
+      routeBodies[sc.name] = { status: viaRoute.status, body: viaRoute.body };
       const routeDump = dump(dbRoute);
 
       setTransport(sc.transport);
@@ -251,6 +260,91 @@ export async function runCrmComposeExtractionParityTests(opts: { log?: boolean }
     }
     setEnv({});
     setTransport(undefined);
+
+    // ── (1b) the refusal bodies, literally ─────────────────────────────────
+    // Written out from the pre-extraction handler (origin/main 7068186a,
+    // routes/crm.ts checkMaxTouchVern() and the POST /compose guard chain).
+    // Only the fixture's own timestamps are normalized (norm → "<ts>"), so the
+    // placeholder date below stands for them.
+    {
+      const TS = "2000-01-01 00:00:00";
+      const OVERRIDE_BYPASS = "Pass createdBy=daniel and force=true to bypass (manual override)";
+      const pinned: Array<[string, number, Record<string, unknown>]> = [
+        [
+          "423 OUTREACH_PAUSED",
+          423,
+          {
+            success: false,
+            error: "outreach_paused",
+            reason: "Cold outreach is paused (OUTREACH_PAUSED=true). Automated claude-actor sends are blocked until the flag is cleared.",
+            override: "Pass createdBy=daniel and force=true for a manual override.",
+          },
+        ],
+        [
+          "429 max-touch-vern",
+          429,
+          {
+            success: false,
+            error: "max_touch_suppressed",
+            reason:
+              `refusing to send to ${TO}: 3 prior outreach_sent_log send(s) ` +
+              `(any vertical) with ZERO inbound reply ever, meeting or exceeding the max-touch-vern ` +
+              `threshold (3). This is a hard invariant, not a bypassable cooldown — ` +
+              `force/createdBy do not override it. An inbound reply from this address lifts the ` +
+              `suppression (the send-count log itself is never reset).`,
+            to: TO,
+            send_count: 3,
+            threshold: 3,
+            last_sent_at: TS,
+          },
+        ],
+        [
+          "429 OUTREACH_MAX_PER_DAY",
+          429,
+          {
+            success: false,
+            error: "daily_cap_reached",
+            reason: "daily outreach cap reached: 1 sent today (OUTREACH_MAX_PER_DAY=1) — try again after UTC midnight",
+            cap: 1,
+            override: OVERRIDE_BYPASS,
+          },
+        ],
+        [
+          "429 cooldown (cross-platform)",
+          429,
+          {
+            success: false,
+            error: "cooldown_suppressed",
+            reason:
+              `already sent cold outreach to ${TO} on ${TS} — within the 60-day ` +
+              `cooldown (outreach_sent_log, email-keyed)` +
+              `. The suppressing send was on the experiences platform, not rfb — this is the ` +
+              `cross-platform cooldown, which is intentional: both platforms send from the same address.`,
+            last_sent_at: TS,
+            suppressed_by_vertical: "experiences",
+            cross_platform: true,
+            cooldown_days: 60,
+            override: OVERRIDE_BYPASS,
+          },
+        ],
+        [
+          "429 24h rate-limit",
+          429,
+          {
+            success: false,
+            error: "rate_limited",
+            reason: `claude-actor already sent 1 cold-outreach email(s) to ${TO} in the last 24h, and contact has no inbound in last 7 days`,
+            last_sent_at: TS,
+            prior_thread_id: "t-p",
+            prior_subjects: ["s"],
+            override: OVERRIDE_BYPASS,
+          },
+        ],
+      ];
+      for (const [name, status, body] of pinned) {
+        assertEq(norm(routeBodies[name]), norm({ status, body }), `c16 ${name}: route status + body are the pinned literal`);
+      }
+    }
 
     // Specific facts the table above relies on.
     {

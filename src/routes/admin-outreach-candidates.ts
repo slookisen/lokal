@@ -305,15 +305,23 @@ export function parseOutreachCandidatesLimit(raw: unknown): number {
 }
 
 /**
- * The outreach suppression gate. Pure selection + read-only SQL against `db`
- * (no writes). Returns the exact body the route responds with, including the
+ * The outreach suppression gate. Pure selection + read-only SQL (no writes).
+ * Returns the exact body the route responds with, including the
  * OUTREACH_PAUSED short-circuit (zero candidates) — so every caller of the
  * gate honours the kill-switch the same way.
+ *
+ * `db` MUST be the getDb() singleton: every query here runs on `db`, but the
+ * blocklist check (isBlocked(), services/blocklist-service.ts) reads getDb()
+ * itself. A different handle would make the blocklist silently consult
+ * another database than every other suppression — so that is refused.
  */
 export function computeOutreachCandidates(
   db: ReturnType<typeof getDb>,
   params: OutreachCandidatesParams,
 ): OutreachCandidatesResult {
+  if (db !== getDb()) {
+    throw new Error("computeOutreachCandidates: db must be the getDb() singleton (isBlocked() reads getDb())");
+  }
   const { mode, cooldownDays, limit } = params;
 
     // ── Global kill-switch (P0-2026-07-11) ──────────────────────────────────

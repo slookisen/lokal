@@ -16,7 +16,10 @@
  *       literally;
  *   (3) the parse helpers reproduce the route's historical ?cooldown_days /
  *       ?limit parsing;
- *   (4) computeOutreachCandidates() writes nothing (total_changes() unchanged).
+ *   (4) computeOutreachCandidates() writes nothing (total_changes() unchanged);
+ *   (5) it refuses any handle but the getDb() singleton — the blocklist check
+ *       (isBlocked()) reads getDb() itself, so another handle would split the
+ *       gate across two databases.
  *
  * (A one-off differential run against the untouched origin/main handler —
  * same fixtures, 11 query shapes — showed zero differences; this file keeps the
@@ -220,6 +223,22 @@ export function runAdminOutreachCandidatesExtractionParityTests(opts: { log?: bo
     aoc.computeOutreachCandidates(db as any, { mode: "first", cooldownDays: 60, limit: 100 });
     aoc.computeOutreachCandidates(db as any, { mode: "second", cooldownDays: 60, limit: 100 });
     assertEq(changes(), before, "p4: computeOutreachCandidates writes nothing");
+
+    // ── (5) the singleton requirement ──────────────────────────────────────
+    const other = new Database(":memory:");
+    let refused = "";
+    try {
+      aoc.computeOutreachCandidates(other as any, { mode: "first", cooldownDays: 60, limit: 100 });
+    } catch (err) {
+      refused = err instanceof Error ? err.message : String(err);
+    } finally {
+      other.close();
+    }
+    assertEq(
+      refused,
+      "computeOutreachCandidates: db must be the getDb() singleton (isBlocked() reads getDb())",
+      "p5: a handle other than the getDb() singleton is refused",
+    );
   } catch (err) {
     failed++;
     failures.push(`aoc-extraction-parity: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
