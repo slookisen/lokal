@@ -165,6 +165,29 @@ export async function runAdminFieldSpotCheckTests(
     const routeMod = require("./admin-field-spot-check");
     const router = routeMod.default;
 
+    // ── Phone normalization (pure) ────────────────────────────────────
+    const phoneOk = (stored: string, page: string) =>
+      routeMod.checkPhoneSubstantiatedBySource(stored, page).substantiated;
+    assertEq(phoneOk("+47 41 63 44 22", "<p>Ring: 41634422</p>"), true, "phone-01: +47 41 63 44 22 vs 41634422 -> match");
+    assertEq(phoneOk("+47 482 60 494", "Tlf 48260494"), true, "phone-02: +47 482 60 494 vs 48260494 -> match");
+    assertEq(phoneOk("+47 90583186", "Telefon: 905 83 186"), true, "phone-03: +47 90583186 vs 905 83 186 -> match");
+    assertEq(phoneOk("+47 97 18 45 15", "Mobil 97 18 45 15 "), true, "phone-04: +47 97 18 45 15 vs 97 18 45 15 -> match");
+    assertEq(phoneOk("41634422", "tel:+4741634422"), true, "phone-05: country-code prefixed run on page -> match");
+    assertEq(phoneOk("+47 41 63 44 22", "Ring 41 63 44 23"), false, "phone-06: different number -> mismatch");
+    assertEq(phoneOk("+47 41 63 44 22", "id 9941634422 og 416344221"), false, "phone-07: embedded in longer digit run -> mismatch");
+    assertEq(routeMod.normalizePhoneToNationalDigits("0047 41 63 44 22"), "41634422", "phone-08: 0047 prefix stripped");
+    assertEq(routeMod.normalizePhoneToNationalDigits("12345"), null, "phone-09: non-8-digit -> null");
+    assertEq(
+      routeMod.checkPhoneSubstantiatedBySource("12345", "ring 12345 nå").substantiated,
+      routeMod.checkPhoneSubstantiatedBySource("12345", "ring 12345 nå").substantiated,
+      "phone-10: non-8-digit falls back to text check (no throw)",
+    );
+    assertEq(
+      routeMod.checkPhoneSubstantiatedBySource("12345", "ring 12345 nå").reason,
+      require("../services/about-source-substantiation").checkAboutCandidateSubstantiatedBySource("12345", "ring 12345 nå").reason,
+      "phone-11: non-8-digit fallback equals standard text check verdict",
+    );
+
     // ── Auth: admin not configured (no ADMIN_KEY/ANALYTICS_ADMIN_KEY at
     //    all) -> 503, checked BEFORE the X-Admin-Key comparison. ──────
     const savedAdminKey = process.env.ADMIN_KEY;

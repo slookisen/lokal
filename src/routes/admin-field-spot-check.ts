@@ -40,6 +40,10 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { computeFieldSpotCheck } from "../agents/lokal-agent-verifier";
 import { checkAboutCandidateFactSubstantiated } from "../services/about-fact-substantiation";
+import {
+  checkAboutCandidateSubstantiatedBySource,
+  type AboutSubstantiationVerdict,
+} from "../services/about-source-substantiation";
 
 const router = Router();
 
@@ -59,6 +63,41 @@ function requireAdmin(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+
+/** Normalize a stored phone number to 8 national digits: strip every
+ *  non-digit, then strip a leading 0047/47 country code when exactly 8
+ *  digits remain. Returns null when the value doesn't normalize to 8 digits
+ *  (caller then falls back to the text check). PURE. Exported for tests. */
+export function normalizePhoneToNationalDigits(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const digits = value.replace(/\D/g, "");
+  if (/^\d{8}$/.test(digits)) return digits;
+  const m = /^(?:0047|47)(\d{8})$/.exec(digits);
+  return m ? m[1]! : null;
+}
+
+/** Phone-specific substantiation: the text-based default false-mismatches
+ *  on formatting differences ("+47 41 63 44 22" vs "41634422"). Collapses
+ *  separators (space/nbsp/dot/dash/parentheses/+) between digits on the page
+ *  text, then requires the 8 national digits to be a WHOLE digit run —
+ *  optionally prefixed by a 47/0047 country code — so a number embedded in
+ *  a longer digit run (ids, other numbers) never matches. Falls back to the
+ *  standard text check when the stored value isn't an 8-digit number. PURE.
+ *  Exported for tests. */
+export function checkPhoneSubstantiatedBySource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): AboutSubstantiationVerdict {
+  const national = normalizePhoneToNationalDigits(candidate);
+  if (!national) return checkAboutCandidateSubstantiatedBySource(candidate, sourceText);
+  const collapsed = (sourceText || "").replace(/(\d)[ \t\u00a0.\-()+]+(?=\d)/g, "$1");
+  for (const run of collapsed.match(/\d+/g) || []) {
+    if (run === national || run === "47" + national || run === "0047" + national) {
+      return { substantiated: true, reason: `phone ${national} found on page (digits normalized)` };
+    }
+  }
+  return { substantiated: false, reason: `phone ${national} not found on page as a whole 8-digit number` };
 }
 
 /** Whitelisted spot-checkable fields -> their agent_knowledge column. Only
@@ -154,7 +193,12 @@ router.post("/", async (req: Request, res: Response) => {
             { field_value: fieldValue, root_url: rootUrl },
             { substantiate: checkAboutCandidateFactSubstantiated },
           )
-        : await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl });
+        : fieldName === "phone"
+          ? await computeFieldSpotCheck(
+              { field_value: fieldValue, root_url: rootUrl },
+              { substantiate: checkPhoneSubstantiatedBySource },
+            )
+          : await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl });
 
     res.json({
       success: true,
