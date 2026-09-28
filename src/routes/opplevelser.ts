@@ -18470,6 +18470,12 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     // cooldown are enforced on the actual send path, never a forked copy.
     const eligibility = computeGardssalgOutreachSendEligibility(expDb, providerIds);
 
+    // Incident 2026-09-27/28: once a send row comes back db_write_failed the
+    // experiences DB is not taking sent_log writes — no further send is
+    // attempted in this batch. The remaining ELIGIBLE ids are reported as
+    // skipped/GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON (still one row per
+    // requested id); ineligible ids keep their own skip reason.
+    let stoppedOnDbWriteFailure = false;
     for (const elig of eligibility) {
       if (!elig.eligible) {
         // NO-GO / skipped: no send attempt. `reason`/`preflight_reason`/
@@ -18500,13 +18506,17 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         continue;
       }
 
-      results.push(
-        await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-          template,
-          isTest,
-          source: "gardssalg-outreach-pilot-send",
-        }),
-      );
+      if (stoppedOnDbWriteFailure) {
+        results.push({ provider_id: elig.provider_id, status: "skipped", reason: GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON });
+        continue;
+      }
+      const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
+        template,
+        isTest,
+        source: "gardssalg-outreach-pilot-send",
+      });
+      results.push(row);
+      if (row.db_write_failed) stoppedOnDbWriteFailure = true;
     }
 
     const summary = summariseGardssalgOutreachSendResults(results);
@@ -18543,18 +18553,73 @@ export type GardssalgOutreachSendResultRow = {
   // false when the mail went out but the CRM write failed. Absent on test
   // sends, which are deliberately not filed.
   crm_recorded?: boolean;
+  // Incident 2026-09-27/28 (prod volume full: every sent_log INSERT threw
+  // AFTER the mail had already gone out, so no cooldown/budget row existed
+  // and the next day's run mailed the same six producers again). The send
+  // path now RESERVES its experience_outreach_sent_log row before sending —
+  // see sendGardssalgOutreachToEligibleProvider's doc comment. The three
+  // fields below report how that went; all absent on would_send/skipped rows.
+  //
+  // log_recorded: present on EVERY `sent` row (test sends too — they are
+  // logged, is_test=1). true = the reservation was confirmed with the
+  // Resend message_id; false = the mail went out but the confirm UPDATE
+  // failed. false is NOT a cooldown gap: the reservation row still exists,
+  // so cooldown and daily budget hold — only message_id is missing.
+  log_recorded?: boolean;
+  // db_write_failed: an experience_outreach_sent_log write on this row's
+  // path threw (reservation INSERT, release DELETE or confirm UPDATE) — the
+  // DB is not taking writes, so both looping callers (POST /admin/gardssalg-
+  // outreach-pilot-send, runGardssalgOutreachDaily) stop attempting further
+  // candidates. Says nothing about whether mail left; `status` does ("sent"
+  // = it did; "error" = it did not, or — with reservation_kept — unknown).
+  db_write_failed?: true;
+  // reservation_kept: an `error` row whose reservation was deliberately left
+  // in place (the send threw, outcome unknown; or releasing it failed), so
+  // this provider now sits in cooldown even though the mail may never have
+  // gone out. Fail-closed: a possibly missed mail beats a possible second one.
+  reservation_kept?: true;
 };
+
+// Incident 2026-09-27/28: `notes` value a reservation row carries between the
+// pre-send INSERT and the post-send confirm UPDATE (which sets message_id and
+// clears it back to NULL, so a confirmed row is identical to a pre-fix one).
+// A row still carrying it after the call is a send whose confirm never landed
+// (outcome unknown, or the UPDATE failed) — every reader of the table counts
+// it exactly like a confirmed send (cooldown, daily budget, touch history).
+export const GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE = "reserved";
+// `reason` on the eligible rows a looping caller never attempted because an
+// earlier row came back db_write_failed (reported as status "skipped").
+export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON = "not_attempted_after_db_write_failure";
 
 export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility, { eligible: true }>;
 
 /**
  * Send ONE outreach email to an already-eligible provider and record it:
- * (1) emailService.sendGardssalgOutreach (the send guard / test redirect
- * lives inside it, unchanged), (2) one experience_outreach_sent_log row (the
- * lane's own cooldown source), (3) the CRM outbound thread (real sends only —
- * dev-request 2026-08-09-outreach-send-uten-crm-spor). Never throws for a
- * per-provider failure: the row's `status` carries the outcome, so a caller
- * looping over several providers cannot lose the rows already sent.
+ * (1) RESERVE one experience_outreach_sent_log row (the lane's cooldown AND
+ * daily-budget source) BEFORE sending, (2) emailService.sendGardssalgOutreach
+ * (the send guard / test redirect lives inside it, unchanged), (3) confirm
+ * the reservation with the Resend message_id, (4) the CRM outbound thread
+ * (real sends only — dev-request 2026-08-09-outreach-send-uten-crm-spor).
+ * Never throws for a per-provider failure: the row's `status` carries the
+ * outcome, so a caller looping over several providers cannot lose the rows
+ * already sent.
+ *
+ * Reserve-before-send, incident 2026-09-27/28: the row used to be INSERTed
+ * only AFTER the send. With the prod volume full every INSERT threw ("disk
+ * I/O error"), the six already-delivered mails were reported as `error`, no
+ * row set a cooldown or counted toward countGardssalgOutreachSentToday, and
+ * the next day's run mailed the same six producers again. Fail-closed now —
+ * a DB that is not taking writes can cost a send, never duplicate one:
+ *   - reservation INSERT throws  -> nothing is sent: error + db_write_failed
+ *   - send returns success:false -> nothing left the building: reservation
+ *     released (DELETE) so the provider stays eligible, as before. If that
+ *     DELETE throws the row stays (the provider just sits in cooldown):
+ *     error + db_write_failed + reservation_kept
+ *   - send throws                -> outcome unknown (the mail may have
+ *     left): reservation KEPT: error + reservation_kept
+ *   - confirm UPDATE throws      -> the mail DID go out: sent +
+ *     log_recorded:false + db_write_failed; the reservation row still holds
+ *     cooldown and budget
  */
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
@@ -18569,6 +18634,27 @@ export async function sendGardssalgOutreachToEligibleProvider(
   // One timestamp per provider, captured BEFORE the send so the CRM row's
   // sentAt and its fallback messageId are derived from the same instant.
   const sentAtIso = new Date().toISOString();
+  const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
+  // old post-send INSERT did, so every reader's timestamp handling is unchanged.
+  let reservationId: number | bigint;
+  try {
+    reservationId = expDb
+      .prepare(
+        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
+         VALUES (?, ?, 'email', NULL, ?, ?)`,
+      )
+      .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, isTest ? 1 : 0).lastInsertRowid;
+  } catch (dbErr) {
+    console.error(`[${opts.source}] sent_log reservation failed — NOT sending`, { providerId, email, error: errMsg(dbErr) });
+    return {
+      provider_id: providerId,
+      status: "error",
+      reason: `sent_log_reservation_failed: ${errMsg(dbErr)}`,
+      db_write_failed: true,
+    };
+  }
 
   try {
     const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
@@ -18576,14 +18662,40 @@ export async function sendGardssalgOutreachToEligibleProvider(
       template,
     });
     if (!sendResult.success) {
-      return { provider_id: providerId, status: "error", reason: sendResult.error || "send_failed" };
+      // Rejected — nothing left the building. Release the reservation so the
+      // provider stays eligible, exactly as before this fix (no row on failure).
+      const reason = sendResult.error || "send_failed";
+      try {
+        expDb.prepare(`DELETE FROM experience_outreach_sent_log WHERE id = ?`).run(reservationId);
+      } catch (dbErr) {
+        console.error(`[${opts.source}] sent_log reservation release failed — row left (provider stays in cooldown)`, {
+          providerId,
+          email,
+          error: errMsg(dbErr),
+        });
+        return {
+          provider_id: providerId,
+          status: "error",
+          reason: `${reason}; sent_log_release_failed: ${errMsg(dbErr)}`,
+          db_write_failed: true,
+          reservation_kept: true,
+        };
+      }
+      return { provider_id: providerId, status: "error", reason };
     }
-    expDb
-      .prepare(
-        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, is_test)
-         VALUES (?, ?, 'email', ?, ?)`,
-      )
-      .run(providerId, email, sendResult.messageId ?? null, isTest ? 1 : 0);
+    // Confirm the reservation. A failure here must NOT turn a delivered send
+    // into an error (the caller would retry and mail the producer twice):
+    // log_recorded:false instead — the reservation row keeps cooldown/budget.
+    let logFailure: string | undefined;
+    try {
+      const confirmed = expDb
+        .prepare(`UPDATE experience_outreach_sent_log SET message_id = ?, notes = NULL WHERE id = ?`)
+        .run(sendResult.messageId ?? null, reservationId);
+      if (confirmed.changes !== 1) throw new Error("reservation row not found");
+    } catch (dbErr) {
+      logFailure = `sent_log_update_failed: ${errMsg(dbErr)}`;
+      console.error(`[${opts.source}] sent_log confirm failed after a SUCCESSFUL send`, { providerId, email, error: errMsg(dbErr) });
+    }
 
     // File the send in the CRM. Deliberately NOT fatal: the email has already
     // left the building — a CRM hiccup must never turn a delivered send into a
@@ -18634,12 +18746,28 @@ export async function sendGardssalgOutreachToEligibleProvider(
         });
       }
     }
-    return { provider_id: providerId, status: "sent", ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }) };
+    return {
+      provider_id: providerId,
+      status: "sent",
+      ...(logFailure === undefined ? {} : { reason: logFailure, db_write_failed: true as const }),
+      log_recorded: logFailure === undefined,
+      ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }),
+    };
   } catch (err) {
+    // Every write above has its own catch, so only the send itself lands
+    // here — and sendEmail already turns transport errors into success:false,
+    // so this throw escaped from somewhere we cannot see past: the mail may
+    // have left. KEEP the reservation — never risk mailing this producer twice.
+    console.error(`[${opts.source}] send threw (outcome unknown) — sent_log reservation KEPT`, {
+      providerId,
+      email,
+      error: errMsg(err),
+    });
     return {
       provider_id: providerId,
       status: "error",
-      reason: err instanceof Error ? err.message : String(err),
+      reason: `send_outcome_unknown: ${errMsg(err)}`,
+      reservation_kept: true,
     };
   }
 }
@@ -19510,7 +19638,12 @@ export function shouldRunGardssalgOutreachDaily(opts: {
   return true;
 }
 
-/** Real (non-test) sends logged today (UTC) on this lane, whoever sent them. */
+/**
+ * Real (non-test) sends logged today (UTC) on this lane, whoever sent them.
+ * Includes reservation rows whose confirm never landed (notes =
+ * GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE — incident 2026-09-27/28): a send
+ * with an unknown outcome spends budget, fail-closed.
+ */
 export function countGardssalgOutreachSentToday(expDb: ReturnType<typeof getExpDb>, now: Date): number {
   const day = now.toISOString().slice(0, 10);
   const row = expDb
@@ -19582,6 +19715,19 @@ export interface GardssalgOutreachDailyRunReport {
   candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second" }>;
   results: GardssalgOutreachSendResultRow[];
   summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
+  // Incident 2026-09-27/28 (sent_log reserve-before-send), derived from
+  // `results` so every return path carries them (empty/0/false on a skip):
+  //   errors — one compact entry per `error` row AND per `sent` row whose
+  //     sent_log confirm failed (log_recorded:false; `status` tells the two
+  //     apart), so the morning report sees exactly what happened.
+  //   log_not_recorded — count of `sent` rows with log_recorded:false (the
+  //     mail went out; cooldown/budget hold via the reservation row).
+  //   stopped_on_db_write_failure — the loop stopped at a db_write_failed
+  //     row; the candidates after it are `skipped` rows with reason
+  //     GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON (still eligible next run).
+  errors: Array<{ provider_id: string; status: GardssalgOutreachSendResultRow["status"]; reason: string }>;
+  log_not_recorded: number;
+  stopped_on_db_write_failure: boolean;
   envelope_recorded: boolean;
   // dev-request 2026-09-05-opplevagent-autosvar-apply-inn-i-plattformjobben:
   // the outcome of the autosvar-apply pass this same run made BEFORE
@@ -19646,9 +19792,17 @@ export async function runGardssalgOutreachDaily(opts: {
       candidates: partial.candidates ?? [],
       results,
       summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
+      errors: results
+        .filter((r) => r.status === "error" || r.log_recorded === false)
+        .map((r) => ({ provider_id: r.provider_id, status: r.status, reason: r.reason ?? "unknown" })),
+      log_not_recorded: results.filter((r) => r.log_recorded === false).length,
+      stopped_on_db_write_failure: results.some((r) => r.db_write_failed === true),
       envelope_recorded: false,
       autosvar_apply: partial.autosvar_apply ?? null,
     };
+    const notAttempted = results
+      .filter((r) => r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON)
+      .map((r) => r.provider_id);
     // Envelope: real runs only (a dry run leaves no trace anywhere), and never
     // when the env switch turned the job off entirely.
     if (opts.apply && report.skipped_reason !== "disabled_by_env") {
@@ -19676,6 +19830,10 @@ export async function runGardssalgOutreachDaily(opts: {
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
         `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
+        // Incident 2026-09-27/28 — only on a run that hit a sent_log write
+        // failure, so a clean run's notes are byte-identical to before.
+        (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
+        (report.stopped_on_db_write_failure ? ` STOPPED (sent_log write failed): not_attempted=${notAttempted.length}` : "") +
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
         (report.autosvar_apply
           ? ` autosvar: applied=${report.autosvar_apply.counts.applied} queued=${report.autosvar_apply.counts.queued} ` +
@@ -19701,6 +19859,28 @@ export async function runGardssalgOutreachDaily(opts: {
           ],
           evidence: [{ claim_idx: 0, ids: sentIds }],
           notes,
+          // Incident 2026-09-27/28: the per-candidate failures ride in the
+          // envelope's own `errors` field, plus one entry naming the
+          // candidates a db_write_failed stop left untried. Omitted (NULL in
+          // the ledger) on a clean run, so a normal envelope is unchanged.
+          ...(report.errors.length > 0 || report.stopped_on_db_write_failure
+            ? {
+                errors: [
+                  ...report.errors.map((e) => ({
+                    message: e.reason,
+                    meta: { provider_id: e.provider_id, status: e.status },
+                  })),
+                  ...(report.stopped_on_db_write_failure
+                    ? [
+                        {
+                          message: `stopped: sent_log write failed — ${notAttempted.length} candidate(s) not attempted`,
+                          meta: { not_attempted: notAttempted },
+                        },
+                      ]
+                    : []),
+                ],
+              }
+            : {}),
         });
         report.envelope_recorded = true;
       } catch (err) {
@@ -19710,7 +19890,9 @@ export async function runGardssalgOutreachDaily(opts: {
     console.log(
       `[gardssalg-outreach-daily] run_id=${report.run_id} apply=${opts.apply} skipped=${report.skipped_reason ?? "-"} ` +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} cap=${dailyCap} ` +
-        `auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}`,
+        `auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}` +
+        (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
+        (report.stopped_on_db_write_failure ? ` STOPPED (sent_log write failed): not_attempted=${notAttempted.length}` : ""),
     );
     return report;
   };
@@ -19785,18 +19967,27 @@ export async function runGardssalgOutreachDaily(opts: {
   }));
 
   const results: GardssalgOutreachSendResultRow[] = [];
+  // Incident 2026-09-27/28: stop at the first db_write_failed row, same guard
+  // as POST /admin/gardssalg-outreach-pilot-send — the DB is not taking
+  // sent_log writes, so no further candidate is tried; each one left is a
+  // skipped/GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON row (see finish()).
+  let stoppedOnDbWriteFailure = false;
   for (const elig of selected) {
     if (!opts.apply) {
       results.push({ provider_id: elig.provider_id, status: "would_send" });
       continue;
     }
-    results.push(
-      await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-        template: "personal",
-        isTest: false,
-        source: "gardssalg-outreach-daily-run",
-      }),
-    );
+    if (stoppedOnDbWriteFailure) {
+      results.push({ provider_id: elig.provider_id, status: "skipped", reason: GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON });
+      continue;
+    }
+    const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
+      template: "personal",
+      isTest: false,
+      source: "gardssalg-outreach-daily-run",
+    });
+    results.push(row);
+    if (row.db_write_failed) stoppedOnDbWriteFailure = true;
   }
   return finish({
     skipped_reason: null,

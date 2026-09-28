@@ -174,9 +174,15 @@ kontakt@opplevagent.no
 
   // ── 2. Source guards on the route ──────────────────────────────────
   const routeSrc = fs.readFileSync(path.join(__dirname, "opplevelser.ts"), "utf8");
+  // The block runs from the route through its extracted per-provider send
+  // (sendGardssalgOutreachToEligibleProvider), which ends where
+  // summariseGardssalgOutreachSendResults begins — a semantic end marker
+  // instead of the former fixed 12000-char window, which the reserve-before-
+  // send fix (incident 2026-09-27/28) outgrew with its own comments.
+  const pilotStart = routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"');
   const pilotBlock = routeSrc.slice(
-    routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"'),
-    routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"') + 12000,
+    pilotStart,
+    routeSrc.indexOf("export function summariseGardssalgOutreachSendResults", pilotStart),
   );
 
   check(
