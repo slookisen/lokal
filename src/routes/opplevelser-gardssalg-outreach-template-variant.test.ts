@@ -174,10 +174,20 @@ kontakt@opplevagent.no
 
   // ── 2. Source guards on the route ──────────────────────────────────
   const routeSrc = fs.readFileSync(path.join(__dirname, "opplevelser.ts"), "utf8");
-  const pilotBlock = routeSrc.slice(
-    routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"'),
-    routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"') + 12000,
+  // The block runs from the route through its extracted per-provider send
+  // (sendGardssalgOutreachToEligibleProvider), which ends where
+  // summariseGardssalgOutreachSendResults begins — a semantic end marker
+  // instead of the former fixed 12000-char window, which the reserve-before-
+  // send fix (incident 2026-09-27/28) outgrew with its own comments.
+  const pilotStart = routeSrc.indexOf('router.post("/admin/gardssalg-outreach-pilot-send"');
+  const pilotEnd = routeSrc.indexOf("export function summariseGardssalgOutreachSendResults(", pilotStart);
+  // Both markers must exist, end after start: renaming either one fails here
+  // loudly instead of silently widening (end -1) or emptying the window.
+  check(
+    "r0: the pilot-send block's start and end markers both exist, end after start",
+    pilotStart >= 0 && pilotEnd > pilotStart,
   );
+  const pilotBlock = pilotStart >= 0 && pilotEnd > pilotStart ? routeSrc.slice(pilotStart, pilotEnd) : "";
 
   check(
     "r1: route rejects unknown template values with a 400 (fail-closed enum)",

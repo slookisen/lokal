@@ -31260,6 +31260,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of godr.failures) failures.push("opplevelser-gardssalg-outreach-daily-run: " + f);
     console.log(`  opplevelser-gardssalg-outreach-daily-run: ${godr.passed} passed, ${godr.failed} failed`);
 
+    // Incident 2026-09-27/28 (full prod volume -> the post-send sent_log
+    // INSERT threw -> no cooldown/budget row -> the same six producers were
+    // mailed again the next day): the send path now reserves its
+    // experience_outreach_sent_log row BEFORE sending — atomically with the
+    // cooldown check for real sends, so overlapping runs and duplicate ids
+    // cannot double-send either — and both send loops stop on a DB write
+    // failure or an unknown send outcome. Same in-memory-DB + fake-transporter
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-reserve-before-send: sent_log reserved before the send ──");
+    const { runOpplevelserGardssalgOutreachReserveBeforeSendTests } = require("../src/routes/opplevelser-gardssalg-outreach-reserve-before-send.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-reserve-before-send.test");
+    const gorb = await runOpplevelserGardssalgOutreachReserveBeforeSendTests({ log: false });
+    passed += gorb.passed;
+    failed += gorb.failed;
+    for (const f of gorb.failures) failures.push("opplevelser-gardssalg-outreach-reserve-before-send: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-reserve-before-send: ${gorb.passed} passed, ${gorb.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed
