@@ -209,7 +209,7 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
     // (b) Unpriced only -> no makesOffer at all (never []), name-only OfferCatalog, no Offer.
     {
       seedAgent({ id: "unpriced-gard", name: "Uprist Gaard", city: "Bergen", lat: 60.39, lng: 5.32 });
-      seedProducts("unpriced-gard", [{ name: "Ost" }, { name: "Egg", price: "på forespørsel" }, { name: "Honning", price: "0" }]);
+      seedProducts("unpriced-gard", [{ name: "Ost <b>" }, { name: "Egg", price: "på forespørsel" }, { name: "Honning", price: "0" }]);
       resetRegistryCache();
 
       const r = invoke("/produsent/:slug", { params: { slug: "uprist-gaard" }, lang: "no", ip: "127.0.0.1" });
@@ -221,8 +221,9 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       const items = ld.hasOfferCatalog.itemListElement;
       assertTrue(items.length === 3 && items.every((i: any) => i["@type"] === "Thing" && i.name && !("price" in i) && !("offers" in i)),
         "unpriced: catalog holds name-only Things");
-      assertTrue(!/"@type":"(Offer|Product)"/.test(r.body.replace(/\s/g, "")) || offersWithoutPrice(allJsonLd(r.body)) === 0,
-        "unpriced: no priceless Offer");
+      assertTrue(!/"@type":"(Offer|Product)"/.test(r.body.replace(/\s/g, "")), "unpriced: no Offer/Product at all in page JSON-LD");
+      assertTrue([...r.body.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].every(b => !b[1].includes("<")),
+        "unpriced: JSON-LD payload contains no raw '<' (escaped as \\u003c)");
       assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: unpriced page has no Offer without price");
     }
 
@@ -262,6 +263,10 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       eq("275/500g", null); eq("500g", null);
       eq("1.200", null); eq("1,500", null);
       eq("0", null); eq("kr 0", null); eq("0,00", null); eq(0, null); eq(-5, null);
+      eq("1 200,-", 1200); eq("kr 1 200,-", 1200); eq("1 200 kr", 1200); eq("275,-", 275); eq("fra 99", 99);
+      eq("2 for 100", null); eq("2 x 50", null); eq("100 kr for 2", null); eq("99 kr per 100g", null);
+      eq("1 2000", null);
+      for (const d of ["\u2212", "\u2012", "\u2010", "\u2011", "\u2015"]) eq(`150${d}200`, null);
       eq("", null); eq("   ", null); eq(undefined, null); eq(null, null); eq("på forespørsel", null);
 
       // Event fields

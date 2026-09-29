@@ -410,12 +410,14 @@ export function parseNokPrice(raw: unknown): number | null {
   const s = raw.trim();
   if (!s) return null;
   // Ranges: "150–200", "kr 150 - kr 200", "150 til 200"
-  if (/\d\s*(?:[–—-]|til|to)\s*(?:kr\.?\s*)?\d/i.test(s)) return null;
-  const m = s.match(/\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?(?![\d.,])|\d[\d.,]*/);
+  if (/\d\s*(?:[–—\u2212\u2012\u2010\u2011\u2015-]|til|to)\s*(?:kr\.?\s*)?\d/i.test(s)) return null;
+  // Multi-buy / quantity text: "2 for 100", "100 kr for 2", "2 x 50", "99 kr per 100g"
+  if (/\bfor\s*\d/i.test(s) || /\d\s*[x×]\s*\d/i.test(s) || /\b(?:per|pr)\.?\s*\d/i.test(s)) return null;
+  const m = s.match(/\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?(?!\d|[.,]\d)|\d[\d.,]*/);
   if (!m) return null;
   const after = s.slice((m.index || 0) + m[0].length);
   // Per-unit quantity ("275/500g") and bare weights/volumes ("500g") are not prices.
-  if (/^\s*\/\s*\d/.test(after)) return null;
+  if (/^\s*\/\s*\d/.test(after) || /^[ \u00a0]+\d/.test(after)) return null;
   if (/^\s*(?:g|kg|l|dl|cl|ml|stk)\b/i.test(after) && !/^\s*kr/i.test(after)) return null;
   let tok = m[0].replace(/[ \u00a0]/g, "").replace(/[.,]+$/, "");
   let num: number;
@@ -635,8 +637,8 @@ function shell(
 
   const jsonLdScript = extra?.jsonLd
     ? (Array.isArray(extra.jsonLd)
-        ? extra.jsonLd.map(j => `<script type="application/ld+json">${JSON.stringify(j)}</script>`).join("\n")
-        : `<script type="application/ld+json">${JSON.stringify(extra.jsonLd)}</script>`)
+        ? extra.jsonLd.map(j => `<script type="application/ld+json">${JSON.stringify(j).replace(/</g, "\\u003c")}</script>`).join("\n")
+        : `<script type="application/ld+json">${JSON.stringify(extra.jsonLd).replace(/</g, "\\u003c")}</script>`)
     : "";
 
   const langSwitcherCss = `
