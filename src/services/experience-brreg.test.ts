@@ -171,6 +171,72 @@ export function runExperienceBrregTests(opts: { log?: boolean } = {}): Promise<T
         assertEq(v.matched_navn, "SAMEIET FJELL AS", "c4: matched_navn is the kommune-matching candidate");
         assertEq(v.match_confidence, "high", "c5: kommune match -> high confidence");
       }
+
+      // ── (d) NACE_ALLOW farm/food/drink families (B19, 2026-09-29 — see
+      // the NACE_ALLOW block comment in experience-brreg.ts). Each case is a
+      // SINGLE active candidate with an exact name + kommune match, so the
+      // ONLY thing deciding verified_active vs unverified is naceOk(): every
+      // d-case below returned `unverified` / no_confident_brreg_match on the
+      // pre-B19 tourism-only list, and the retail case must STILL do so. ──
+      const naceCase = async (kode: string, navn: string, orgnr: string) => {
+        __setBrregFetchForTesting(
+          stubWith([
+            {
+              organisasjonsnummer: orgnr,
+              navn: navn.toUpperCase(),
+              naeringskode1: { kode },
+              forretningsadresse: { kommune: "Voss" },
+              konkurs: false, underAvvikling: false, underTvangsavviklingEllerTvangsopplosning: false, slettedato: null,
+            },
+          ]),
+        );
+        return classifyProvider({ name: navn, kommune: "Voss" });
+      };
+      {
+        const v = await naceCase("01.410", "Nordbø Gard AS", "970000001");
+        assertEq(v.classification, "verified_active", "d1: farm 01.410 (melkeproduksjon) + exact name -> verified_active");
+        assertEq(v.brreg_active, 1, "d1b: farm -> brreg_active 1");
+        assertEq(v.naeringskode, "01.410", "d1c: farm -> naeringskode carried through");
+      }
+      {
+        const v = await naceCase("10.510", "Vossa Ysteri AS", "970000002");
+        assertEq(v.classification, "verified_active", "d2: dairy/food 10.510 (ysteri) + exact name -> verified_active");
+        assertEq(v.org_nr, "970000002", "d2b: dairy -> org_nr attached");
+      }
+      {
+        const v = await naceCase("11.050", "Voss Bryggeri AS", "970000003");
+        assertEq(v.classification, "verified_active", "d3: beverage 11.050 (bryggeri) + exact name -> verified_active");
+        assertEq(v.brreg_verified, 1, "d3b: beverage -> brreg_verified 1");
+      }
+      {
+        const v = await naceCase("01.210", "Hebnes Vingård", "970000004");
+        assertEq(v.classification, "verified_active", "d4: perennial 01.210 (druer/vingård) + exact name -> verified_active");
+      }
+      {
+        // Retail stays OUT: a shop sharing a farm's name is the wrong-entity
+        // match the NACE gate exists to refuse (score ×0.2 and accept
+        // requires naceOk) — unchanged by B19.
+        const v = await naceCase("47.210", "Voss Gardsbutikk AS", "970000005");
+        assertEq(v.classification, "unverified", "d5: retail 47.210 + exact name -> STILL unverified (47.x not allowed)");
+        assertEq(v.org_nr, null, "d5b: retail -> no org_nr attached");
+        assertEq(v.reason, "no_confident_brreg_match", "d5c: retail -> no_confident_brreg_match");
+      }
+      {
+        // Wholesale likewise stays out.
+        const v = await naceCase("46.310", "Voss Frukt Engros AS", "970000006");
+        assertEq(v.classification, "unverified", "d6: wholesale 46.310 + exact name -> STILL unverified (46.x not allowed)");
+      }
+      {
+        // 01.6 (agricultural support/contract services) is deliberately NOT
+        // covered — only groups 01.1–01.5 were added, never a bare "01.".
+        const v = await naceCase("01.610", "Voss Landbrukstjenester AS", "970000007");
+        assertEq(v.classification, "unverified", "d7: 01.610 support services -> unverified (only 01.1–01.5 allowed)");
+      }
+      {
+        // Regression: an existing tourism code is still accepted.
+        const v = await naceCase("93.291", "Voss Aktiv AS", "970000008");
+        assertEq(v.classification, "verified_active", "d8: tourism 93.291 still -> verified_active (unchanged)");
+      }
     } catch (err: any) {
       failed++;
       failures.push("experience-brreg: unexpected error: " + String(err?.stack || err));
