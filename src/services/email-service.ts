@@ -492,6 +492,20 @@ export class EmailService {
     });
   }
 
+  /**
+   * True when sendEmail()/sendRaw() would hand a message to a real transport
+   * right now; false when they would take the DRY_RUN short-circuit (SMTP_*
+   * not configured, or forced dry-run under test) and answer
+   * `{success: true, messageId: 'DRY_RUN'}` without delivering anything.
+   * Exactly the negation of that short-circuit's condition, evaluated at call
+   * time like the short-circuit itself. dev-request 2026-09-19-rfb-marketing-
+   * utsending-inn-i-plattformjobben: the platform-side daily send refuses to
+   * run when this is false, so a DRY_RUN is never recorded as a real send.
+   */
+  isLiveTransport(): boolean {
+    return !(!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun()));
+  }
+
   async sendRaw(options: {
     to: string;
     cc?: string;

@@ -45612,6 +45612,89 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// GET /admin/outreach-candidates selection and the POST /admin/crm/compose
+// guard chain are extracted into computeOutreachCandidates() / executeCompose()
+// so the platform-side daily RFB send runs the SAME gate and send path. These
+// two suites pin that both routes answer exactly as before (body, status, DB
+// side effects, same-tick dispatch) and that each equals its function. Both
+// pin the DB singleton on their own in-memory DB (restored in finally) —
+// runSerial, tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: outreach-candidates extraction parity ──");
+  try {
+    const { runAdminOutreachCandidatesExtractionParityTests } =
+      require("../src/routes/admin-outreach-candidates-extraction-parity.test") as
+        typeof import("../src/routes/admin-outreach-candidates-extraction-parity.test");
+    const aep = runAdminOutreachCandidatesExtractionParityTests({ log: false });
+    passed += aep.passed;
+    failed += aep.failed;
+    for (const f of aep.failures) failures.push("admin-outreach-candidates-extraction-parity: " + f);
+    console.log(`  admin-outreach-candidates-extraction-parity: ${aep.passed} passed, ${aep.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-outreach-candidates-extraction-parity: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: crm compose extraction parity ──");
+  try {
+    const { runCrmComposeExtractionParityTests } =
+      require("../src/routes/crm-compose-extraction-parity.test") as
+        typeof import("../src/routes/crm-compose-extraction-parity.test");
+    const cep = await runCrmComposeExtractionParityTests({ log: false });
+    passed += cep.passed;
+    failed += cep.failed;
+    for (const f of cep.failures) failures.push("crm-compose-extraction-parity: " + f);
+    console.log(`  crm-compose-extraction-parity: ${cep.passed} passed, ${cep.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-compose-extraction-parity: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// RFB outreach e-mail as code (services/rfb-outreach-template.ts) — pure, no
+// DB; pinned byte-for-byte against the effective A2A template.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: RFB outreach template ──");
+  try {
+    const { runRfbOutreachTemplateTests } = require("../src/services/rfb-outreach-template.test") as
+      typeof import("../src/services/rfb-outreach-template.test");
+    const rot = runRfbOutreachTemplateTests({ log: false });
+    passed += rot.passed;
+    failed += rot.failed;
+    for (const f of rot.failures) failures.push("rfb-outreach-template: " + f);
+    console.log(`  rfb-outreach-template: ${rot.passed} passed, ${rot.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-outreach-template: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// platform-side daily RFB outreach send (services/rfb-marketing-daily.ts) —
+// guards G1–G4, dry run, reserve-before-send fail-closed, restart/second-tick
+// idempotency, lane + daily-run routes. Pins the DB singleton on fresh
+// in-memory DBs (restored in finally) — runSerial, tail position, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: runRfbMarketingDaily ──");
+  try {
+    const { runRfbMarketingDailyTests } = require("../src/services/rfb-marketing-daily.test") as
+      typeof import("../src/services/rfb-marketing-daily.test");
+    const rmd = await runRfbMarketingDailyTests({ log: false });
+    passed += rmd.passed;
+    failed += rmd.failed;
+    for (const f of rmd.failures) failures.push("rfb-marketing-daily: " + f);
+    console.log(`  rfb-marketing-daily: ${rmd.passed} passed, ${rmd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-marketing-daily: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Incident 2026-09-28: GET /admin/crm/sent-log filtered contact_email in
 // memory AFTER listSentMessages()'s platform-wide LIMIT (default 500), so
 // `?since_hours=all&contact_email=x` returned count 0 for producers whose

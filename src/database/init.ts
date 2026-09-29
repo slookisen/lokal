@@ -4920,6 +4920,71 @@ function initSchema(db: Database.Database): void {
          ON agent_knowledge(city_backfill_attempted_at)`
     );
   } catch { /* index already created */ }
+
+  // ─── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben ──
+  // Two tables for the platform-side daily RFB outreach send
+  // (services/rfb-marketing-daily.ts). Purely additive; plain CREATE TABLE IF
+  // NOT EXISTS is itself the safe migration (same idiom as
+  // outreach_daily_send_cap above).
+  //
+  // rfb_marketing_lane_state — the lane's DB-backed pause switch (singleton
+  // row id=1), same shape as experience_outreach_lane_state (the gårdssalg
+  // lane's switch, database/init-experiences.ts) plus bounce_ack_max_id: the
+  // highest email_bounces.id that has already triggered an auto-pause, so a
+  // bounce Daniel has seen and cleared the pause for does not re-pause the
+  // lane on the next tick. No row = unpaused (same default as gårdssalg).
+  //
+  // rfb_marketing_send_ledger — one row per recipient the daily job has
+  // attempted, written BEFORE the email is handed to the transport
+  // (status 'reserved') and resolved afterwards to:
+  //   sent     — the transport accepted it;
+  //   unknown  — the transport was invoked but did not confirm (e.g. the
+  //              connection dropped after DATA): possibly delivered;
+  //   refused  — a compose guard refused it before the transport;
+  //   failed   — it failed before the transport (safe to retry).
+  // It is the job's own restart-safe, AT-MOST-ONCE memory: 'reserved',
+  // 'sent' and 'unknown' all count toward today's budget and block the
+  // address (and the agent) for the cooldown window; UNIQUE(day,
+  // recipient_email) makes a second attempt at the same address on the same
+  // UTC day impossible at the database level.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS rfb_marketing_lane_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        paused INTEGER NOT NULL DEFAULT 0,
+        changed_at TEXT,
+        changed_by TEXT,
+        reason TEXT,
+        bounce_ack_max_id INTEGER
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS rfb_marketing_send_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        day TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        recipient_email TEXT NOT NULL,
+        touch TEXT NOT NULL,
+        subject_variant TEXT,
+        status TEXT NOT NULL DEFAULT 'reserved'
+          CHECK (status IN ('reserved', 'sent', 'unknown', 'refused', 'failed')),
+        reserved_at TEXT NOT NULL,
+        updated_at TEXT,
+        http_status INTEGER,
+        thread_id TEXT,
+        outbox_id TEXT,
+        message_id TEXT,
+        error TEXT,
+        UNIQUE (day, recipient_email)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_recipient ON rfb_marketing_send_ledger(recipient_email)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_agent ON rfb_marketing_send_ledger(agent_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_day_status ON rfb_marketing_send_ledger(day, status)`);
+  } catch (err) {
+    console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
+  }
 }
 
 export function closeDb(): void {

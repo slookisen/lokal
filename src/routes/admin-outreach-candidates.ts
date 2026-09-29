@@ -252,16 +252,77 @@ export function coreEligibilityCheck(
 //              (uses outreach_ready_pool VIEW directly — VIEW enforces this)
 // mode=second → agent HAS a row whose EARLIEST sent_at is older than cooldown_days
 //              (uses the pool base conditions WITHOUT the VIEW's sent_log exclusion)
-router.get("/", (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
-  try {
-    const db = getDb();
+//
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
+// selection itself lives in computeOutreachCandidates() below, extracted
+// verbatim out of this route's handler, so the platform-side daily RFB send
+// (services/rfb-marketing-daily.ts) runs the SAME gate this route serves —
+// one implementation, not a parallel copy that could drift. The route keeps
+// its auth, its mode validation (400) and its try/catch (500); the returned
+// object is exactly the JSON body the route has always answered with.
 
-    const mode = String(req.query.mode ?? "").toLowerCase();
-    if (mode !== "first" && mode !== "second") {
-      res.status(400).json({ success: false, error: "mode must be 'first' or 'second'" });
-      return;
-    }
+export type OutreachCandidatesMode = "first" | "second";
+
+export interface OutreachCandidatesParams {
+  mode: OutreachCandidatesMode;
+  /** Parsed exactly as the route parses ?cooldown_days — see parseOutreachCandidatesCooldownDays. */
+  cooldownDays: number;
+  /** Parsed exactly as the route parses ?limit — see parseOutreachCandidatesLimit. */
+  limit: number;
+}
+
+export interface OutreachCandidate {
+  agent_id: string;
+  name: string;
+  email: string;
+}
+
+/**
+ * The JSON body GET /admin/outreach-candidates answers with (200). Typed
+ * loosely beyond the fields a caller branches on — the rest of the body
+ * (suppressed_counts, cross_platform_cooldown, max_touch_suppressed, …) is
+ * reporting, returned as-is.
+ */
+export interface OutreachCandidatesResult {
+  success: true;
+  mode: OutreachCandidatesMode;
+  paused?: true;
+  cooldown_days: number;
+  count: number;
+  candidates: OutreachCandidate[];
+  [key: string]: unknown;
+}
+
+/** ?cooldown_days → integer ≥ 1, default 60 (unchanged route semantics). */
+export function parseOutreachCandidatesCooldownDays(raw: unknown): number {
+  return Math.max(1, parseInt(String(raw ?? "60"), 10) || 60);
+}
+
+/** ?limit → integer clamped to 1–500, default 100 (unchanged route semantics). */
+export function parseOutreachCandidatesLimit(raw: unknown): number {
+  const limitRaw = parseInt(String(raw ?? "100"), 10);
+  return Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 100, 1), 500);
+}
+
+/**
+ * The outreach suppression gate. Pure selection + read-only SQL (no writes).
+ * Returns the exact body the route responds with, including the
+ * OUTREACH_PAUSED short-circuit (zero candidates) — so every caller of the
+ * gate honours the kill-switch the same way.
+ *
+ * `db` MUST be the getDb() singleton: every query here runs on `db`, but the
+ * blocklist check (isBlocked(), services/blocklist-service.ts) reads getDb()
+ * itself. A different handle would make the blocklist silently consult
+ * another database than every other suppression — so that is refused.
+ */
+export function computeOutreachCandidates(
+  db: ReturnType<typeof getDb>,
+  params: OutreachCandidatesParams,
+): OutreachCandidatesResult {
+  if (db !== getDb()) {
+    throw new Error("computeOutreachCandidates: db must be the getDb() singleton (isBlocked() reads getDb())");
+  }
+  const { mode, cooldownDays, limit } = params;
 
     // ── Global kill-switch (P0-2026-07-11) ──────────────────────────────────
     // OUTREACH_PAUSED=true makes the gate return zero candidates so no batch can
@@ -269,21 +330,16 @@ router.get("/", (req: Request, res: Response) => {
     // paused marketing Cloud Routine: a re-enabled/forgotten routine still gets
     // nothing to send. Reversible via secret (unset / set to anything but true).
     if (isOutreachPaused()) {
-      res.json({
+      return {
         success: true,
         mode,
         paused: true,
-        cooldown_days: Math.max(1, parseInt(String(req.query.cooldown_days ?? "60"), 10) || 60),
+        cooldown_days: cooldownDays,
         count: 0,
         candidates: [],
         note: "outreach is paused (OUTREACH_PAUSED=true)",
-      });
-      return;
+      };
     }
-
-    const cooldownDays = Math.max(1, parseInt(String(req.query.cooldown_days ?? "60"), 10) || 60);
-    const limitRaw = parseInt(String(req.query.limit ?? "100"), 10);
-    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 100, 1), 500);
 
     // ── Step 1: pull base pool rows ────────────────────────────────────────────
     //
@@ -832,7 +888,7 @@ router.get("/", (req: Request, res: Response) => {
     // Cap by limit AFTER suppression + dedupe + ordering + gate-integrity re-check.
     const finalCandidates = eligibleOrdered.slice(0, limit);
 
-    res.json({
+    return {
       success: true,
       mode,
       cooldown_days: cooldownDays,
@@ -917,7 +973,27 @@ router.get("/", (req: Request, res: Response) => {
           "without resetting the send-count history. Threshold/on-off are admin-configurable, no " +
           "deploy needed — GET/POST /admin/outreach-max-touch-vern.",
       },
-    });
+    };
+}
+
+router.get("/", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const db = getDb();
+
+    const mode = String(req.query.mode ?? "").toLowerCase();
+    if (mode !== "first" && mode !== "second") {
+      res.status(400).json({ success: false, error: "mode must be 'first' or 'second'" });
+      return;
+    }
+
+    res.json(
+      computeOutreachCandidates(db, {
+        mode,
+        cooldownDays: parseOutreachCandidatesCooldownDays(req.query.cooldown_days),
+        limit: parseOutreachCandidatesLimit(req.query.limit),
+      }),
+    );
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
   }
