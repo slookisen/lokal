@@ -4,11 +4,12 @@
  * daniel-responses/2026-09-24-go-chatgpt-claude-spor-a-b-c.md in the A2A repo).
  *
  * Covers `src/routes/seo.ts`'s `GET /produsent/:slug` JSON-LD builder for
- * `jsonLd.makesOffer`: a product with no parseable numeric price used to be
- * dropped entirely (`if (!numericPrice || isNaN(parseFloat(numericPrice)))
- * return null;`). That gate is gone — every product with a name now gets an
- * Offer entry, and `price` is included ONLY when a real numeric price was
- * actually found in the source data (never fabricated as 0/null/"").
+ * `jsonLd.makesOffer`. Contract as of dev-request
+ * 2026-09-29-gsc-strukturerte-data-og-5xx (supersedes B1: Google rejects
+ * Offers without price): only products with a valid numeric price > 0 become
+ * Offer/Product; unpriced ones go to a name-only hasOfferCatalog; makesOffer
+ * is omitted (never []) when nothing is priced. Also unit-tests parseNokPrice,
+ * buildBmEventJsonLd and the permanent "no Offer without price" invariant.
  *
  * Same synthetic router.handle()-less harness as
  * rfb-trust-score-public-display-removed.test.ts (own `Database(":memory:")`,
@@ -180,60 +181,110 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       assertTrue(inner.shippingDetails["@type"] === "OfferShippingDetails", "priced: shippingDetails @type is unchanged");
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // (b) No price anywhere (name only, no parseable price in the name
-    // string either) -> product still appears, price key truly absent.
-    // ══════════════════════════════════════════════════════════════
+    /** Permanent invariant (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx): no Offer without numeric price > 0, anywhere in the JSON-LD. */
+    function offersWithoutPrice(node: any): number {
+      let bad = 0;
+      if (Array.isArray(node)) { for (const n of node) bad += offersWithoutPrice(n); return bad; }
+      if (node && typeof node === "object") {
+        if (node["@type"] === "Offer" && !(typeof node.price === "number" && node.price > 0)) bad++;
+        for (const k of Object.keys(node)) bad += offersWithoutPrice(node[k]);
+      }
+      return bad;
+    }
+    function allJsonLd(body: string): any[] {
+      return [...body.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
+        .map(b => { try { return JSON.parse(b[1]); } catch { return null; } }).filter(Boolean);
+    }
+    function mainLd(body: string): any {
+      for (const p of allJsonLd(body)) for (const c of (Array.isArray(p) ? p : [p])) if (c && c["@type"] && c.name) return c;
+      return null;
+    }
+
+    // (a2) invariant on the priced page
+    {
+      const r = invoke("/produsent/:slug", { params: { slug: "priset-gaard" }, lang: "no", ip: "127.0.0.1" });
+      assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: priced page has no Offer without price > 0");
+    }
+
+    // (b) Unpriced only -> no makesOffer at all (never []), name-only OfferCatalog, no Offer.
     {
       seedAgent({ id: "unpriced-gard", name: "Uprist Gaard", city: "Bergen", lat: 60.39, lng: 5.32 });
-      seedProducts("unpriced-gard", [{ name: "Ost" }]);
+      seedProducts("unpriced-gard", [{ name: "Ost <b>" }, { name: "Egg", price: "på forespørsel" }, { name: "Honning", price: "0" }]);
       resetRegistryCache();
 
       const r = invoke("/produsent/:slug", { params: { slug: "uprist-gaard" }, lang: "no", ip: "127.0.0.1" });
       assertTrue(r.status === 200, "unpriced: renders 200");
-      const ld = extractMakesOfferJsonLd(r.body);
-      assertTrue(!!ld, "unpriced: a JSON-LD block with makesOffer is present");
-      assertTrue(ld.makesOffer.length === 1, "unpriced: makesOffer still contains the priceless product (not silently dropped)");
-      const offer = ld.makesOffer[0];
-      const inner = offer.itemOffered.offers;
-
-      assertTrue(offer.itemOffered.name === "Ost", "unpriced: itemOffered.name is the seeded product name");
-      assertTrue(offer.priceCurrency === "NOK", "unpriced: outer priceCurrency is still set");
-      assertTrue(offer.availability === "https://schema.org/InStock", "unpriced: outer availability is still set");
-      assertTrue(!("price" in offer), "unpriced: outer offer has NO price key at all (not 0/null/empty)");
-      assertTrue(inner.priceCurrency === "NOK", "unpriced: inner offers.priceCurrency is still set");
-      assertTrue(inner.availability === "https://schema.org/InStock", "unpriced: inner offers.availability is still set");
-      assertTrue(!("price" in inner), "unpriced: inner offers has NO price key at all (not 0/null/empty)");
+      const ld = mainLd(r.body);
+      assertTrue(!!ld, "unpriced: main JSON-LD present");
+      assertTrue(!("makesOffer" in ld), "unpriced: makesOffer omitted entirely (no [])");
+      assertTrue(ld.hasOfferCatalog && ld.hasOfferCatalog["@type"] === "OfferCatalog", "unpriced: OfferCatalog present");
+      const items = ld.hasOfferCatalog.itemListElement;
+      assertTrue(items.length === 3 && items.every((i: any) => i["@type"] === "Thing" && i.name && !("price" in i) && !("offers" in i)),
+        "unpriced: catalog holds name-only Things");
+      assertTrue(!/"@type":"(Offer|Product)"/.test(r.body.replace(/\s/g, "")), "unpriced: no Offer/Product at all in page JSON-LD");
+      assertTrue([...r.body.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].every(b => !b[1].includes("<")),
+        "unpriced: JSON-LD payload contains no raw '<' (escaped as \\u003c)");
+      assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: unpriced page has no Offer without price");
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // (c) Mixed priced + unpriced products in the same list -> both
-    // survive into makesOffer (today's code would silently drop the
-    // unpriced one).
-    // ══════════════════════════════════════════════════════════════
+    // (c) Mixed -> only priced in makesOffer; unpriced in catalog.
     {
       seedAgent({ id: "mixed-gard", name: "Blandet Gaard", city: "Trondheim", lat: 63.43, lng: 10.39 });
       seedProducts("mixed-gard", [
         { name: "Lammelår", price: "275" },
         { name: "Ost" },
+        { name: "Skinke", price: "kr 150–200/kg" },
+        { name: "Pølse – kr 1.200,50" },
       ]);
       resetRegistryCache();
 
       const r = invoke("/produsent/:slug", { params: { slug: "blandet-gaard" }, lang: "no", ip: "127.0.0.1" });
-      assertTrue(r.status === 200, "mixed: renders 200");
-      const ld = extractMakesOfferJsonLd(r.body);
-      assertTrue(!!ld, "mixed: a JSON-LD block with makesOffer is present");
-      assertTrue(ld.makesOffer.length === 2, "mixed: both the priced and unpriced product survive into makesOffer");
-
+      const ld = mainLd(r.body);
+      assertTrue(Array.isArray(ld.makesOffer) && ld.makesOffer.length === 2, "mixed: only the two validly priced products in makesOffer");
       const names = ld.makesOffer.map((o: any) => o.itemOffered.name);
-      assertTrue(names.includes("Lammelår") && names.includes("Ost"), "mixed: both product names are present");
+      assertTrue(names.includes("Lammelår") && names.includes("Pølse"), "mixed: priced names present");
+      const pol = ld.makesOffer.find((o: any) => o.itemOffered.name === "Pølse");
+      assertTrue(pol.price === 1200.5 && pol.itemOffered.offers.price === 1200.5, "mixed: Norwegian 1.200,50 parsed as 1200.5");
+      const cat = ld.hasOfferCatalog.itemListElement.map((i: any) => i.name);
+      assertTrue(cat.length === 2 && cat.includes("Ost") && cat.includes("Skinke"), "mixed: Ost + range-priced Skinke go to the catalog");
+      assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: mixed page has no Offer without price");
+    }
 
-      const pricedOffer = ld.makesOffer.find((o: any) => o.itemOffered.name === "Lammelår");
-      const unpricedOffer = ld.makesOffer.find((o: any) => o.itemOffered.name === "Ost");
-      assertTrue(pricedOffer.price === 275, "mixed: priced entry keeps its price");
-      assertTrue(!("price" in unpricedOffer), "mixed: unpriced entry has no price key");
-      assertTrue(unpricedOffer.priceCurrency === "NOK" && unpricedOffer.availability === "https://schema.org/InStock",
-        "mixed: unpriced entry still has priceCurrency/availability");
+    // ══════════════════════════════════════════════════════════════
+    // parseNokPrice unit tests
+    // ══════════════════════════════════════════════════════════════
+    {
+      const { parseNokPrice, buildBmEventJsonLd } = require("./seo") as typeof import("./seo");
+      const eq = (input: unknown, want: number | null) =>
+        assertTrue(parseNokPrice(input) === want, `parseNokPrice(${JSON.stringify(input)}) === ${want}`);
+      eq("275", 275); eq("kr 350", 350); eq("kr 275/kg", 275); eq("275,50", 275.5); eq("99.90", 99.9);
+      eq("1.200,50", 1200.5); eq("1 200", 1200); eq("1.200.000", 1200000); eq(275, 275);
+      eq("kr 150–200/kg", null); eq("150-200", null); eq("150 til 200", null);
+      eq("275/500g", null); eq("500g", null);
+      eq("1.200", null); eq("1,500", null);
+      eq("0", null); eq("kr 0", null); eq("0,00", null); eq(0, null); eq(-5, null);
+      eq("1 200,-", 1200); eq("kr 1 200,-", 1200); eq("1 200 kr", 1200); eq("275,-", 275); eq("fra 99", 99);
+      eq("2 for 100", null); eq("2 x 50", null); eq("100 kr for 2", null); eq("99 kr per 100g", null);
+      eq("1 2000", null);
+      for (const d of ["\u2212", "\u2012", "\u2010", "\u2011", "\u2015"]) eq(`150${d}200`, null);
+      eq("", null); eq("   ", null); eq(undefined, null); eq(null, null); eq("på forespørsel", null);
+
+      // Event fields
+      const base = { event_name: "Bondens marked Oslo", location_text: "Youngstorget", start_at: "2026-10-10T10:00:00+02:00",
+        end_at: "2026-10-10T15:00:00+02:00", source_url: "https://bondensmarked.no/oslo", venue_name: "Youngstorget", city: "Oslo", lat: 59.9, lng: 10.7 };
+      const ev = buildBmEventJsonLd(base, "https://cdn.example.no/x.jpg", "https://rettfrabonden.com");
+      assertTrue(ev.eventStatus === "https://schema.org/EventScheduled", "event: eventStatus");
+      assertTrue(ev.eventAttendanceMode === "https://schema.org/OfflineEventAttendanceMode", "event: attendance mode");
+      assertTrue(ev.organizer.url === "https://bondensmarked.no", "event: organizer.url");
+      assertTrue(ev.image === "https://cdn.example.no/x.jpg", "event: venue image used");
+      assertTrue(typeof ev.description === "string" && ev.description.includes("Youngstorget") && ev.description.includes("10:00"), "event: description from known fields");
+      assertTrue(ev.startDate === "2026-10-10T10:00:00+02:00" && ev.endDate === "2026-10-10T15:00:00+02:00", "event: ISO offsets preserved");
+      assertTrue(!("offers" in ev), "event: no offers");
+      const ev2 = buildBmEventJsonLd({ ...base, end_at: null, source_url: null, city: null, lat: null, lng: null }, null, "https://rettfrabonden.com");
+      assertTrue(ev2.image === "https://rettfrabonden.com/logo-512.png", "event: logo fallback is absolute https");
+      assertTrue(!("endDate" in ev2) && !("url" in ev2), "event: no empty optional keys");
+      assertTrue(!JSON.stringify(ev2).includes("undefined") && !JSON.stringify(ev2).includes('""'), "event: no undefined/empty values");
+      assertTrue(buildBmEventJsonLd(base, "/relative.jpg", "https://rettfrabonden.com").image === "https://rettfrabonden.com/logo-512.png", "event: non-http image rejected");
     }
   } catch (err) {
     failed++;
