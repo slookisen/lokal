@@ -17751,8 +17751,9 @@ router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, 
 // stoerrelsesgate, Skive 2 (daily prep): the per-id ELIGIBILITY determination
 // that used to live only inline in POST /admin/gardssalg-outreach-pilot-send's
 // loop — preflight GO/NO-GO (which itself already folds in Skive 1's size
-// gate), no_email, blocklist, own-table cooldown, cross-platform cooldown —
-// is now a standalone, side-effect-free (no email sent, no row written)
+// gate), no_email, blocklist, own-table cooldown, cross-platform cooldown
+// (and, since owner decision 2026-09-29 «1B», hard bounce/complaint from
+// email_bounces) — is now a standalone, side-effect-free (no email sent, no row written)
 // function, so the new GET /admin/gardssalg-outreach-daily-prep route further
 // below can run the EXACT SAME dry-run eligibility check pilot-send's own
 // dry-run (`apply` absent) path runs, never a second/forked copy. Behavior-
@@ -17773,6 +17774,9 @@ export type GardssalgOutreachEligibility =
       last_sent_at?: string;
       suppressed_by?: string;
       cross_platform?: boolean;
+      // reason "hard_bounced" only: the email_bounces row that suppressed it.
+      bounce_type?: string;
+      bounced_at?: string;
     }
   | {
       provider_id: string;
@@ -17799,6 +17803,26 @@ export type GardssalgOutreachEligibility =
 function gardssalgOutreachCooldownCutoffIso(): string {
   const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
   return new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+}
+
+/**
+ * Latest hard bounce / spam complaint on this address in email_bounces (RFB
+ * db — the table POST /webhooks/resend feeds), or null. Case- and
+ * whitespace-insensitive, same predicate as compose's recipient_bounced
+ * guard (routes/crm.ts). Outreach-only suppression (owner decision
+ * 2026-09-29 «1B») — ordering/registration never read this.
+ */
+export function findGardssalgOutreachHardBounce(
+  email: string,
+): { bounce_type: string; bounced_at: string } | null {
+  const row = getRfbDb()
+    .prepare(
+      `SELECT bounce_type, bounced_at FROM email_bounces
+        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint')
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get(email) as { bounce_type: string; bounced_at: string } | undefined;
+  return row ?? null;
 }
 
 export function computeGardssalgOutreachSendEligibility(
@@ -17854,6 +17878,28 @@ export function computeGardssalgOutreachSendEligibility(
     const blockCheck = isBlocked({ email });
     if (blockCheck.blocked) {
       out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "blocklisted" });
+      continue;
+    }
+
+    // ── Hard bounce / spam complaint (owner decision 2026-09-29 «1B») ────
+    // POST /webhooks/resend records these in email_bounces (RFB db,
+    // vertical-agnostic, keyed on the address) and deliberately NOT in
+    // agent_blocklist — the general blocklist also gates ordering and
+    // registration, a bounce must only stop OUTREACH. So this lane reads
+    // email_bounces itself: same predicate as the RFB gate's is_hard_bounced
+    // and compose's recipient_bounced guard. Covers every caller of this
+    // function (pilot-send, daily-prep → daily-run, candidates mode=first);
+    // sendGardssalgOutreachToEligibleProvider re-checks at send time.
+    const bounced = findGardssalgOutreachHardBounce(email);
+    if (bounced) {
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "hard_bounced",
+        bounce_type: bounced.bounce_type,
+        bounced_at: bounced.bounced_at,
+      });
       continue;
     }
 
@@ -18261,6 +18307,8 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         // eligible:false — bucket its reason into this response's contract.
         if (e.reason === "blocklisted") {
           blocklistedCount++;
+        } else if (e.reason === "hard_bounced") {
+          hardBouncedCount++;
         } else if (e.reason === "cooldown_suppressed") {
           if (e.cross_platform) crossPlatformCooldownCount++;
           else contactedOrCooldownCount++;
@@ -18476,7 +18524,8 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
   try {
     // Single eligibility pass — the same computeGardssalgOutreachSendEligibility
     // GET /admin/gardssalg-outreach-daily-prep runs, so preflight (incl. the
-    // size gate), no_email, blocklist, own-table cooldown and cross-platform
+    // size gate), no_email, blocklist, hard bounce/complaint (email_bounces,
+    // owner decision 2026-09-29 «1B»), own-table cooldown and cross-platform
     // cooldown are enforced on the actual send path, never a forked copy.
     const eligibility = computeGardssalgOutreachSendEligibility(expDb, providerIds);
 
@@ -18669,6 +18718,23 @@ export async function sendGardssalgOutreachToEligibleProvider(
   // sentAt and its fallback messageId are derived from the same instant.
   const sentAtIso = new Date().toISOString();
   const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  // Send-time bounce re-check (owner decision 2026-09-29 «1B»): the caller's
+  // eligibility pass already dropped hard-bounced/complained addresses, but a
+  // Resend webhook can land between that batch-wide check and this send.
+  // Mirrors compose's recipient_bounced guard. Fail closed: if the lookup
+  // itself fails, do not send (a skip, not a batch stop — nothing written).
+  let sendTimeBounce: { bounce_type: string; bounced_at: string } | null;
+  try {
+    sendTimeBounce = findGardssalgOutreachHardBounce(email);
+  } catch (lookupErr) {
+    console.error(`[${opts.source}] email_bounces lookup failed — NOT sending`, { providerId, email, error: errMsg(lookupErr) });
+    return { provider_id: providerId, status: "skipped", reason: `bounce_check_failed: ${errMsg(lookupErr)}` };
+  }
+  if (sendTimeBounce) {
+    console.warn(`[${opts.source}] recipient hard-bounced/complained since eligibility — NOT sending`, { providerId, email });
+    return { provider_id: providerId, status: "skipped", reason: "hard_bounced" };
+  }
 
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
   // old post-send INSERT did, so every reader's timestamp handling is unchanged.

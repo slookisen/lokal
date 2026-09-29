@@ -1,4 +1,4 @@
-// ─── resend-webhook.ts (owner decision 2026-09-29 «Blacklist bounces») ────
+// ─── resend-webhook.ts (owner decision 2026-09-29 «Blacklist bounces», narrowed by «1B») ─
 // Automatic bounce/complaint intake. Before this, email_bounces was filled
 // ONLY by a manual POST /admin/email-bounces, so the two platform jobs whose
 // auto-pause reads it — the RFB daily send (rfb-marketing-daily.ts G3) and
@@ -17,14 +17,25 @@
 //      transaction keyed on svix-id (resend_webhook_events PRIMARY KEY):
 //        • email.bounced with bounce.type "Permanent" (hard) and
 //          email.complained (spam complaint) → bounceService.record() into
-//          email_bounces (bounce_type 'hard' / 'complaint' — exactly the two
-//          values both auto-pauses, the outreach gate's is_hard_bounced and
-//          compose's bounce guard read) AND blocklist add({ email }) — the
-//          literal-address agent_blocklist row every email-keyed isBlocked()
-//          gate already honours (outreach candidates, gårdssalg/opplevagent
-//          outreach, order notifications). Never touches agents/profiles.
+//          email_bounces (bounce_type 'hard' / 'complaint'). That row is the
+//          ONLY thing written. It suppresses OUTREACH, and only outreach:
+//          every automated outreach sender reads it — the RFB outreach gate
+//          (computeOutreachCandidates' is_hard_bounced), compose's
+//          recipient_bounced guard (executeCompose, the RFB daily job's send
+//          path), the Opplevagent gårdssalg eligibility
+//          (computeGardssalgOutreachSendEligibility → pilot-send, daily-prep,
+//          daily-run, candidates) and its send-time re-check
+//          (sendGardssalgOutreachToEligibleProvider) — plus both auto-pauses.
+//        • NO agent_blocklist row (owner decision «1B», 2026-09-29). The
+//          general blocklist's email-keyed isBlocked() is ALSO read by
+//          ordering (catalog-offers canOrder), order notifications
+//          (order-notify-service) and registration (marketplace register /
+//          claim). A hard bounce or a spam complaint about a cold email is not
+//          a reason to stop a producer from being ordered from, being told
+//          about an order, or registering — so it must not reach that table.
+//          Never touches agents/profiles either.
 //        • email.bounced with any other bounce.type (Transient/Undetermined/
-//          missing) → soft: ledger row + console line, NOT blacklisted.
+//          missing) → soft: ledger row + console line, nothing recorded.
 //          Mailbox-full / greylisting is not a dead address.
 //        • any other event type → 200, nothing written (so subscribing to
 //          more events in the Resend dashboard is harmless).
@@ -45,7 +56,7 @@
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { bounceService } from "./bounce-service";
-import { add as blocklistAdd, normalizeEmail } from "./blocklist-service";
+import { normalizeEmail } from "./blocklist-service";
 
 export const SVIX_TIMESTAMP_TOLERANCE_SECONDS = 5 * 60;
 export const RESEND_WEBHOOK_SOURCE = "resend-webhook";
@@ -107,8 +118,8 @@ export function verifySvixSignature(input: {
 
 // ─── 2. Event processing ────────────────────────────────────────────────
 export type ResendWebhookOutcome =
-  | "hard_bounce_blocklisted"
-  | "complaint_blocklisted"
+  | "hard_bounce_recorded"
+  | "complaint_recorded"
   | "soft_bounce_logged"
   | "ambiguous_recipient"
   | "ignored_event_type"
@@ -122,7 +133,7 @@ export interface ResendWebhookResult {
 const ACTED_EVENT_TYPES = new Set(["email.bounced", "email.complained"]);
 // Mirrors the upper bound of a valid address (RFC 5321 path limit) plus a
 // minimal local@domain shape. Not a validator — just "is this plausibly the
-// one recipient address, and not junk we'd write into two tables".
+// one recipient address, and not junk we'd write into email_bounces".
 const PLAUSIBLE_EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}$/;
 
 /** Exactly one plausible recipient, normalized; null otherwise. */
@@ -130,7 +141,7 @@ function singleRecipient(data: any): string | null {
   const raw = data?.to;
   const list: unknown[] = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
   // Multi-recipient event: Resend does not say WHICH address bounced, and
-  // blacklisting a co-recipient that didn't bounce would be wrong. Every send
+  // suppressing a co-recipient that didn't bounce would be wrong. Every send
   // path in this repo mails exactly one `to`, so this never happens for our
   // own outreach — it's logged, not acted on.
   if (list.length !== 1 || typeof list[0] !== "string") return null;
@@ -164,8 +175,8 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
 
   let outcome: ResendWebhookOutcome;
   if (!email) outcome = "ambiguous_recipient";
-  else if (isComplaint) outcome = "complaint_blocklisted";
-  else if (isHard) outcome = "hard_bounce_blocklisted";
+  else if (isComplaint) outcome = "complaint_recorded";
+  else if (isHard) outcome = "hard_bounce_recorded";
   else outcome = "soft_bounce_logged";
 
   const db = getDb();
@@ -178,7 +189,7 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       duplicate = true;
       return;
     }
-    if (outcome !== "hard_bounce_blocklisted" && outcome !== "complaint_blocklisted") return;
+    if (outcome !== "hard_bounce_recorded" && outcome !== "complaint_recorded") return;
     const resendEmailId = typeof data?.email_id === "string" ? data.email_id.slice(0, 128) : undefined;
     const diag = typeof data?.bounce?.message === "string" ? data.bounce.message : "";
     const reason = isComplaint
@@ -191,15 +202,12 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       bounceType: isComplaint ? "complaint" : "hard",
       reason: reason.slice(0, REASON_MAX_CHARS),
     });
-    // Literal address only (PR-14 policy) — never the domain, never the
-    // agent/name/website: the producer's profile stays exactly as it is, we
-    // just stop mailing this one address. Undo: DELETE /api/marketplace/
-    // admin/blocklist/:id for the 'email' row (the email_bounces row stays —
-    // it is the historical fact the auto-pauses key on).
-    blocklistAdd({
-      email: email!,
-      reason: `${isComplaint ? "spam_complaint" : "hard_bounce"} (source=${RESEND_WEBHOOK_SOURCE})`,
-    });
+    // Deliberately NO blocklist add() here (owner decision «1B»): the
+    // email_bounces row above is what the outreach senders read; the general
+    // agent_blocklist also gates ordering / order notifications /
+    // registration, which a bounce must not touch. Undo a misclassified
+    // bounce by removing its email_bounces row (or the manual
+    // createdBy=daniel + force=true override on compose).
   })();
 
   if (duplicate) {

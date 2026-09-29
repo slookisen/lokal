@@ -254,8 +254,9 @@ app.use(markdownNegotiation);
 app.use(langMiddleware);
 
 // ─── POST /webhooks/resend (owner decision 2026-09-29 «Blacklist bounces») ──
-// Svix-signed Resend events → email_bounces + agent_blocklist (hard bounce /
-// spam complaint). Mounted HERE — after express.json (needs req.rawBody) but
+// Svix-signed Resend events → email_bounces only (hard bounce / spam
+// complaint; suppresses outreach, never ordering/registration — owner
+// decision «1B», no agent_blocklist row). Mounted HERE — after express.json (needs req.rawBody) but
 // BEFORE the dental/opplevagent host gates and every admin/auth router, so
 // nothing can 404/403 it first. Path is unique; every other request falls
 // straight through. Auth = Svix signature (RESEND_WEBHOOK_SECRET; unset → 503).

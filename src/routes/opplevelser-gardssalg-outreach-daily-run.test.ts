@@ -423,17 +423,27 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       );
       assertEq(prep.body.pool.daily_cap, 4, "h7: daily-prep still reports the cap");
       assertEq(prep.body.candidates.length, 0, "h8: both providers now in cooldown -> no candidates");
+      // Owner decision 2026-09-29 «1B»: prov-alpha's address was hard-bounced
+      // in (g); eligibility checks email_bounces before the cooldown, so it
+      // is now excluded as hard_bounced, prov-beta still as cooldown.
       assertEq(
-        prep.body.excluded.filter((e: any) => e.reason === "cooldown_suppressed").length,
-        2,
-        "h9: both excluded as cooldown_suppressed",
+        prep.body.excluded
+          .filter((e: any) => e.provider_id === "prov-alpha" || e.provider_id === "prov-beta")
+          .map((e: any) => [e.provider_id, e.reason])
+          .sort(),
+        [["prov-alpha", "hard_bounced"], ["prov-beta", "cooldown_suppressed"]],
+        "h9: alpha excluded as hard_bounced (bounced in g), beta as cooldown_suppressed",
       );
       const pilotDry = await callRoute(opplevelserRouter, {
-        method: "POST", url: "/admin/gardssalg-outreach-pilot-send", headers: auth, body: { provider_ids: ["prov-alpha"] },
+        method: "POST", url: "/admin/gardssalg-outreach-pilot-send", headers: auth, body: { provider_ids: ["prov-alpha", "prov-beta"] },
       });
       assertEq(pilotDry.status, 200, "h10: pilot-send route still answers after extraction");
-      assertEq(pilotDry.body.results[0].status, "skipped", "h11: pilot-send dry run reports the cooldown skip");
-      assertEq(pilotDry.body.results[0].reason, "cooldown_suppressed", "h12: ...with the same reason as before");
+      assertEq(
+        (pilotDry.body.results as any[]).map((r) => [r.provider_id, r.status, r.reason]),
+        [["prov-alpha", "skipped", "hard_bounced"], ["prov-beta", "skipped", "cooldown_suppressed"]],
+        "h11: pilot-send dry run skips the bounced address as hard_bounced",
+      );
+      assertEq(pilotDry.body.results[1].suppressed_by, "experiences", "h12: ...and the cooldown skip keeps its reason/suppressed_by");
 
       // ── (i) AC1: a domain_match autosvar candidate is reflected in the
       // SAME daily run's outcome counts (dry run: would_apply > 0) ───────

@@ -42347,11 +42347,13 @@ runSerial(async () => {
 });
 
 // owner decision 2026-09-29 «Blacklist bounces»: POST /webhooks/resend —
-// Svix-verified Resend hard bounces / complaints → email_bounces +
-// agent_blocklist, and the outreach gate + compose bounce guard suppressing
-// the address afterwards (src/routes/resend-webhook.test.ts; loopback only).
+// Svix-verified Resend hard bounces / complaints → email_bounces only (no
+// agent_blocklist row, owner decision «1B»), the outreach gate + compose
+// bounce guard suppressing the address afterwards, and ordering / order
+// notifications / registration left untouched
+// (src/routes/resend-webhook.test.ts; loopback only).
 runSerial(async () => {
-  console.log("\n── owner 2026-09-29: resend-webhook (Svix signature, hard bounce/complaint → email_bounces + blocklist, gate + compose suppress) ──");
+  console.log("\n── owner 2026-09-29: resend-webhook (Svix signature, hard bounce/complaint → email_bounces only, gate + compose suppress, ordering/register untouched) ──");
   try {
     const { runResendWebhookTests } = require("../src/routes/resend-webhook.test") as
       typeof import("../src/routes/resend-webhook.test");

@@ -1,8 +1,10 @@
 /**
  * resend-webhook.test.ts — POST /webhooks/resend (owner decision 2026-09-29
- * «Blacklist bounces»): Svix-signed Resend events → email_bounces +
- * agent_blocklist, and the two send-side consumers that must then suppress
- * the address (computeOutreachCandidates + executeCompose's bounce guard).
+ * «Blacklist bounces», narrowed by «1B»): Svix-signed Resend events →
+ * email_bounces ONLY (no agent_blocklist row), the two RFB send-side
+ * consumers that must then suppress the address (computeOutreachCandidates +
+ * executeCompose's bounce guard), and the non-outreach paths that must NOT
+ * (ordering / canOrder, order notifications, registration).
  *
  * Runs the REAL route over loopback HTTP behind the same express.json({verify})
  * raw-body capture index.ts installs, so the signature is checked over the
@@ -10,18 +12,21 @@
  * locally per run; nothing leaves 127.0.0.1.
  *
  *   w1  secret unset → 503, nothing written
- *   w2  valid hard bounce → email_bounces 'hard' + blocklist 'email' row;
+ *   w2  valid hard bounce → email_bounces 'hard', NO blocklist row;
  *       gate drops the agent it previously returned; compose (claude
  *       resend_send) refuses 409 recipient_bounced with no transport call;
- *       daniel+force overrides; an unrelated address still sends
- *   w3  complaint → same with bounce_type 'complaint' / spam_complaint
+ *       daniel+force overrides; an unrelated address still sends;
+ *       «1B»: isBlocked({email}) stays false, findOffers can_order stays
+ *       true, the order-notification recipient stays eligible, and both
+ *       register blocklist shapes (/register, /admin/register) pass
+ *   w3  complaint → same with bounce_type 'complaint', NO blocklist row
  *   w4  soft (Transient / missing type) → ledger only, no bounce, no blocklist
  *   w5  bad / missing / wrong-secret / tampered signature → 401, nothing written
  *   w6  stale and far-future timestamps → 401
  *   w7  replayed svix-id → 200 duplicate, no new rows; a second svix-id for
  *       the same email_id → no duplicate bounce/blocklist rows
  *   w8  unrelated event type → 200 no-op (nothing written)
- *   w9  multi-recipient → ambiguous, nothing blacklisted; display-name +
+ *   w9  multi-recipient → ambiguous, nothing recorded; display-name +
  *       upper-case recipient normalized
  *   w10 secret rotation (several v1 sigs, one valid) → accepted
  *   w11 non-JSON Content-Type → 400; oversize body → 413; both write nothing
@@ -73,6 +78,8 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
   const aoc = require("./admin-outreach-candidates") as typeof import("./admin-outreach-candidates");
   const crm = require("./crm") as typeof import("./crm");
   const { isBlocked } = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+  const { findOffers } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+  const { resolveOrderNotificationRecipient } = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
 
   const restoreDb = initMod.__pinInMemoryDbForTesting();
   const prevPaused = process.env.OUTREACH_PAUSED;
@@ -181,17 +188,48 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
     {
       const body = bounced(["hard@rw-farm.no"], { type: "Permanent", subType: "General", message: "550 5.1.1 user unknown" }, "em_hard1");
       const r = await post(body, signed(body, "msg_w2"));
-      assertEq([r.status, r.body.outcome], [200, "hard_bounce_blocklisted"], "w2: 200 hard_bounce_blocklisted");
+      assertEq([r.status, r.body.outcome], [200, "hard_bounce_recorded"], "w2: 200 hard_bounce_recorded");
       const b = db().prepare("SELECT email, bounce_type, resend_email_id, bounced_at, reason FROM email_bounces WHERE email = 'hard@rw-farm.no'").all() as any[];
       assertEq(b.map((x) => [x.email, x.bounce_type, x.resend_email_id, x.bounced_at]), [["hard@rw-farm.no", "hard", "em_hard1", "2026-09-29T10:00:00.000Z"]], "w2: email_bounces row (hard)");
       assertEq(String(b[0]?.reason).startsWith("resend-webhook: Permanent/General — 550 5.1.1"), true, "w2: reason carries source + diagnostic");
-      const bl = db().prepare("SELECT identifier_type, identifier_value, reason FROM agent_blocklist").all();
-      assertEq(bl, [{ identifier_type: "email", identifier_value: "hard@rw-farm.no", reason: "hard_bounce (source=resend-webhook)" }], "w2: exactly one literal-email blocklist row");
-      assertEq(isBlocked({ email: "HARD@rw-farm.no" }).blocked, true, "w2: isBlocked sees it");
+      assertEq(db().prepare("SELECT * FROM agent_blocklist").all(), [], "w2: «1B» NO agent_blocklist row written");
+      assertEq(isBlocked({ email: "HARD@rw-farm.no" }).blocked, false, "w2: «1B» isBlocked({email}) stays false");
       assertEq((db().prepare("SELECT COUNT(*) c FROM agents WHERE id = 'rw-hard'").get() as any).c, 1, "w2: profile NOT deleted");
       assertEq(gateIds(), ["rw-comp", "rw-ok", "rw-soft"], "w2: outreach gate drops the bounced agent");
       const s = aoc.computeOutreachCandidates(db(), { mode: "first", cooldownDays: 60, limit: 500 }).suppressed_counts as any;
-      assertEq([s.hard_bounced, s.blocklisted], [1, 1], "w2: gate counts it as hard_bounced + blocklisted");
+      assertEq([s.hard_bounced, s.blocklisted], [1, 0], "w2: gate counts it as hard_bounced (via email_bounces), not blocklisted");
+
+      // «1B»: ordering, order notifications and registration are untouched
+      // for the bounced address.
+      db().prepare(
+        `UPDATE agents SET is_verified = 1, is_active = 1, order_notifications_opt_in = 1, lat = 59.91, lng = 10.75, city = 'Oslo'
+          WHERE id = 'rw-hard'`,
+      ).run();
+      db().prepare(
+        `INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
+         VALUES ('rw-p1', 'rw-hard', 'Honning', 'honning', 150, 'glass', 'in_stock')`,
+      ).run();
+      const offers = await findOffers({ q: "honning", lat: 59.91, lng: 10.75 }, { geocode: async () => null });
+      assertEq(
+        offers.offers.filter((o) => o.producer.agent_id === "rw-hard").map((o) => o.producer.can_order),
+        [true],
+        "w2: «1B» findOffers can_order stays true for the bounced producer",
+      );
+      assertEq(
+        resolveOrderNotificationRecipient("rw-hard"),
+        { eligible: true, email: "hard@rw-farm.no", via: "verified_contact" },
+        "w2: «1B» order-notification recipient stays eligible",
+      );
+      assertEq(
+        isBlocked({ name: "Hard Gård", website: "https://rw-farm.no", email: "hard@rw-farm.no" }).blocked,
+        false,
+        "w2: «1B» /register blocklist gate passes the bounced address",
+      );
+      assertEq(
+        isBlocked({ name: "Hard Gård", website: "https://rw-farm.no", email: "hard@rw-farm.no", orgNr: "999999999" }).blocked,
+        false,
+        "w2: «1B» /admin/register blocklist gate passes the bounced address",
+      );
       transportCalls = [];
       const c = await compose("hard@rw-farm.no");
       assertEq([c.httpStatus, (c.body as any).error, c.transportAttempted, transportCalls.length], [409, "recipient_bounced", false, 0], "w2: compose refuses 409 recipient_bounced, no transport");
@@ -208,9 +246,10 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
     {
       const body = complained(["complain@rw-farm.no"], "em_c1");
       const r = await post(body, signed(body, "msg_w3"));
-      assertEq([r.status, r.body.outcome], [200, "complaint_blocklisted"], "w3: 200 complaint_blocklisted");
+      assertEq([r.status, r.body.outcome], [200, "complaint_recorded"], "w3: 200 complaint_recorded");
       assertEq(db().prepare("SELECT bounce_type FROM email_bounces WHERE email = 'complain@rw-farm.no'").all(), [{ bounce_type: "complaint" }], "w3: email_bounces row (complaint)");
-      assertEq(db().prepare("SELECT reason FROM agent_blocklist WHERE identifier_value = 'complain@rw-farm.no'").all(), [{ reason: "spam_complaint (source=resend-webhook)" }], "w3: blocklist row spam_complaint");
+      assertEq(db().prepare("SELECT COUNT(*) c FROM agent_blocklist").get(), { c: 0 }, "w3: «1B» still no blocklist row");
+      assertEq(isBlocked({ email: "complain@rw-farm.no" }).blocked, false, "w3: «1B» isBlocked({email}) stays false");
       assertEq(gateIds(), ["rw-ok", "rw-soft"], "w3: gate drops the complainer");
       const c = await compose("complain@rw-farm.no");
       assertEq([c.httpStatus, (c.body as any).bounce_type], [409, "complaint"], "w3: compose refuses");
@@ -224,7 +263,7 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
       assertEq([r.status, r.body.outcome], [200, "soft_bounce_logged"], "w4: Transient → soft_bounce_logged");
       const body2 = bounced(["soft@rw-farm.no"], undefined);
       const r2 = await post(body2, signed(body2, "msg_w4b"));
-      assertEq(r2.body.outcome, "soft_bounce_logged", "w4: missing bounce.type → soft (not blacklisted)");
+      assertEq(r2.body.outcome, "soft_bounce_logged", "w4: missing bounce.type → soft (nothing recorded)");
       const after = counts();
       assertEq([after.bounces - before.bounces, after.blocklist - before.blocklist, after.ledger - before.ledger], [0, 0, 2], "w4: ledger only — no bounce, no blocklist");
       assertEq(gateIds(), ["rw-ok", "rw-soft"], "w4: soft-bounced agent stays a candidate");
@@ -281,9 +320,9 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
       assertEq([r.status, r.body.outcome, r.body.duplicate], [200, "duplicate", true], "w7: replayed svix-id → 200 duplicate");
       assertEq(counts(), before, "w7: replay wrote nothing");
       const r2 = await post(body, signed(body, "msg_w7_new")); // Resend re-sent same email_id under a new svix-id
-      assertEq(r2.body.outcome, "hard_bounce_blocklisted", "w7: new svix-id, same email_id → processed");
+      assertEq(r2.body.outcome, "hard_bounce_recorded", "w7: new svix-id, same email_id → processed");
       const after = counts();
-      assertEq([after.bounces - before.bounces, after.blocklist - before.blocklist, after.ledger - before.ledger], [0, 0, 1], "w7: no duplicate bounce/blocklist rows (only the ledger grows)");
+      assertEq([after.bounces - before.bounces, after.blocklist - before.blocklist, after.ledger - before.ledger], [0, 0, 1], "w7: no duplicate bounce rows, no blocklist rows (only the ledger grows)");
     }
 
     // ── w8 unrelated event ─────────────────────────────────────────────
@@ -307,11 +346,11 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
       const rj = await post(junk, signed(junk, "msg_w9j"));
       assertEq(rj.body.outcome, "ambiguous_recipient", "w9: implausible address → ambiguous_recipient");
       const after = counts();
-      assertEq([after.bounces - before.bounces, after.blocklist - before.blocklist], [0, 0], "w9: nothing blacklisted");
+      assertEq([after.bounces - before.bounces, after.blocklist - before.blocklist], [0, 0], "w9: nothing recorded");
       const named = bounced(["Grei Gård <OK@RW-Farm.no>"], { type: "permanent" });
       const rn = await post(named, signed(named, "msg_w9n"));
-      assertEq(rn.body.outcome, "hard_bounce_blocklisted", "w9: display-name form + lower-case 'permanent' accepted");
-      assertEq((db().prepare("SELECT COUNT(*) c FROM agent_blocklist WHERE identifier_type='email' AND identifier_value='ok@rw-farm.no'").get() as any).c, 1, "w9: stored normalized (lower-case bare address)");
+      assertEq(rn.body.outcome, "hard_bounce_recorded", "w9: display-name form + lower-case 'permanent' accepted");
+      assertEq(db().prepare("SELECT email FROM email_bounces WHERE resend_email_id IS NOT NULL AND email LIKE 'ok@%'").all(), [{ email: "ok@rw-farm.no" }], "w9: stored normalized (lower-case bare address)");
       assertEq(gateIds(), ["rw-soft"], "w9: gate now drops it too");
     }
 
