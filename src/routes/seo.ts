@@ -397,6 +397,91 @@ const CATEGORY_NAME_TO_KEY: Record<string, string> = Object.fromEntries([
 ]);
 
 /**
+ * dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): strict NOK price parser.
+ * Returns a finite number > 0, or null ("unpriced") when the text is empty,
+ * zero/negative, a range ("150-200"), a per-unit-quantity price ("275/500g"),
+ * has ambiguous thousand/decimal separators ("1.200", "1,500") or is prose
+ * ("på forespørsel"). Never guesses: a wrong price is worse than none
+ * (Google requires the price to match the visible page).
+ */
+export function parseNokPrice(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  // Ranges: "150–200", "kr 150 - kr 200", "150 til 200"
+  if (/\d\s*(?:[–—-]|til|to)\s*(?:kr\.?\s*)?\d/i.test(s)) return null;
+  const m = s.match(/\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?(?![\d.,])|\d[\d.,]*/);
+  if (!m) return null;
+  const after = s.slice((m.index || 0) + m[0].length);
+  // Per-unit quantity ("275/500g") and bare weights/volumes ("500g") are not prices.
+  if (/^\s*\/\s*\d/.test(after)) return null;
+  if (/^\s*(?:g|kg|l|dl|cl|ml|stk)\b/i.test(after) && !/^\s*kr/i.test(after)) return null;
+  let tok = m[0].replace(/[ \u00a0]/g, "").replace(/[.,]+$/, "");
+  let num: number;
+  const dots = (tok.match(/\./g) || []).length;
+  const commas = (tok.match(/,/g) || []).length;
+  if (!dots && !commas) {
+    num = Number(tok);
+  } else if (dots && commas) {
+    if (/^\d{1,3}(?:\.\d{3})+,\d{1,2}$/.test(tok)) num = Number(tok.replace(/\./g, "").replace(",", "."));
+    else if (/^\d{1,3}(?:,\d{3})+\.\d{1,2}$/.test(tok)) num = Number(tok.replace(/,/g, ""));
+    else return null;
+  } else {
+    const sep = dots ? "." : ",";
+    const parts = tok.split(sep);
+    if (parts.length === 2 && /^\d{1,2}$/.test(parts[1])) {
+      num = Number(parts[0] + "." + parts[1]);
+    } else if (parts.length > 2 && parts.slice(1).every(g => /^\d{3}$/.test(g)) && /^\d{1,3}$/.test(parts[0])) {
+      num = Number(parts.join(""));
+    } else {
+      return null; // "1.200" / "1,500" are ambiguous
+    }
+  }
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+/**
+ * dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (B): schema.org Event for a
+ * Bondens marked market day. Only known fields; no offers; no undefined keys.
+ * start/end are passed through verbatim (ISO offset preserved, no UTC conversion).
+ */
+export function buildBmEventJsonLd(
+  r: { event_name: string; location_text?: string | null; start_at: string; end_at?: string | null; source_url?: string | null; venue_name: string; lat?: number | null; lng?: number | null; city?: string | null },
+  imageUrl: string | null,
+  baseUrl: string,
+): Record<string, any> {
+  const place: any = { "@type": "Place", "name": r.venue_name };
+  if (r.city) {
+    place.address = { "@type": "PostalAddress", "addressLocality": r.city, "addressCountry": "NO" };
+  }
+  if (r.lat && r.lng) {
+    place.geo = { "@type": "GeoCoordinates", "latitude": r.lat, "longitude": r.lng };
+  }
+  const date = r.start_at.slice(0, 10);
+  const time = r.start_at.slice(11, 16);
+  const endTime = r.end_at ? r.end_at.slice(11, 16) : "";
+  const when = time ? `${date} kl. ${time}${endTime ? "–" + endTime : ""}` : date;
+  const description = `${r.event_name} hos ${r.venue_name}${r.city ? " i " + r.city : ""}, ${when}.`;
+  const image = imageUrl && /^https?:\/\//i.test(imageUrl) ? imageUrl : `${baseUrl}/logo-512.png`;
+  const ev: any = {
+    "@context": "https://schema.org",
+    "@type": "Event",
+    "name": r.event_name,
+    "description": description,
+    "startDate": r.start_at,
+    "eventStatus": "https://schema.org/EventScheduled",
+    "eventAttendanceMode": "https://schema.org/OfflineEventAttendanceMode",
+    "location": place,
+    "image": image,
+    "organizer": { "@type": "Organization", "name": "Bondens marked Norge", "url": "https://bondensmarked.no" },
+  };
+  if (r.end_at) ev.endDate = r.end_at;
+  if (r.source_url) ev.url = r.source_url;
+  return ev;
+}
+
+/**
  * Display label for a PRODUCT name in the page language. Live 2026-09-03:
  * many producers list their products as bare category words ("Kjøtt",
  * "Grønnsaker", "Frukt"), so the English opening line read "sells Kjøtt,
@@ -4972,24 +5057,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             bmEventsJsonLd = eventRows
               .filter(r => r.event_name && r.start_at)
               .map(r => {
-                const place: any = { "@type": "Place", "name": r.venue_name };
-                if (r.city) {
-                  place.address = { "@type": "PostalAddress", "addressLocality": r.city, "addressCountry": "NO" };
-                }
-                if (r.lat && r.lng) {
-                  place.geo = { "@type": "GeoCoordinates", "latitude": r.lat, "longitude": r.lng };
-                }
-                const ev: any = {
-                  "@context": "https://schema.org",
-                  "@type": "Event",
-                  "name": r.event_name,
-                  "startDate": r.start_at,
-                  "location": place,
-                  "organizer": { "@type": "Organization", "name": "Bondens marked Norge" },
-                };
-                if (r.end_at) ev.endDate = r.end_at;
-                if (r.source_url) ev.url = r.source_url;
-                return ev;
+                let venueImg: string | null = null;
+                try {
+                  const kr = umbDb.prepare("SELECT images FROM agent_knowledge WHERE agent_id = ?").get(r.venue_id) as { images?: string } | undefined;
+                  const imgs = kr?.images ? JSON.parse(kr.images) : [];
+                  if (Array.isArray(imgs)) venueImg = imgs.find((u: any) => typeof u === "string" && /^https?:\/\//i.test(u)) || null;
+                } catch { /* fall back to site logo */ }
+                return buildBmEventJsonLd(r, venueImg, BASE_URL);
               });
             bmEventsHtml = `
         <div class="card">
@@ -5386,7 +5460,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Products as makesOffer — Google requires price + priceCurrency in every Offer
     if (productsList.length) {
-      jsonLd.makesOffer = productsList.slice(0, 20).map((p: any) => {
+      const unpricedItems: any[] = [];
+      const pricedOffers = productsList.slice(0, 20).map((p: any) => {
         const rawName = typeof p === "string" ? p : (p.name || "");
         if (!rawName) return null;
 
@@ -5394,23 +5469,25 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         let productName = productLabel(rawName, lang);
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
-        // Extract numeric price from various formats
-        if (!priceValue || !/\d/.test(priceValue)) {
-          const m = rawName.match(/^(.+?)\s*[–\-—]\s*(?:kr\.?\s*)?([\d.,]+)/i)
-            || rawName.match(/^(.+?)\s+kr\.?\s*([\d.,]+)/i);
+        // Extract numeric price from various formats (strict parser, see parseNokPrice)
+        let priceNum = parseNokPrice(priceValue);
+        if (priceNum === null) {
+          const m = rawName.match(/^(.+?)\s*[–\-—]\s*((?:kr\.?\s*)?\d.*)$/i)
+            || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
           if (m) {
             productName = m[1].trim();
-            priceValue = m[2].replace(",", ".").trim();
+            priceNum = parseNokPrice(m[2]);
           }
         }
-        // Clean price to numeric: "kr 275/kg" → "275", "kr 350" → "350"
-        const numericPrice = (priceValue || "").replace(/[^0-9.,]/g, "").replace(",", ".").split("/")[0];
 
-        // dev-request 2026-09-24-ai-sok-bli-svaret-rfb slice B1: a product
-        // without a parseable price still gets a makesOffer entry — `price`
-        // is only ever included when a real numeric price was found (never
-        // invented), so we track that separately instead of skipping.
-        const hasPrice = !!numericPrice && !isNaN(parseFloat(numericPrice));
+        // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
+        // rejects Offer without price, so unpriced products are NOT emitted
+        // as Offer/Product; they go to a non-validating OfferCatalog of
+        // name-only Things (keeps AI visibility from 2026-09-24 B1, no fake price).
+        if (priceNum === null) {
+          unpricedItems.push({ "@type": "Thing", "name": productName });
+          return null;
+        }
 
         const product: any = {
           "@type": "Product",
@@ -5424,7 +5501,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           },
           "offers": {
             "@type": "Offer",
-            ...(hasPrice ? { "price": parseFloat(numericPrice) } : {}),
+            "price": priceNum,
             "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
             "seller": { "@type": "LocalBusiness", "name": agent.name },
@@ -5476,11 +5553,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         return {
           "@type": "Offer",
           "itemOffered": product,
-          ...(hasPrice ? { "price": parseFloat(numericPrice) } : {}),
+          "price": priceNum,
           "priceCurrency": "NOK",
           "availability": "https://schema.org/InStock",
         };
       }).filter(Boolean);
+      if (pricedOffers.length) jsonLd.makesOffer = pricedOffers;
+      if (unpricedItems.length) {
+        jsonLd.hasOfferCatalog = { "@type": "OfferCatalog", "name": "Produkter", "itemListElement": unpricedItems };
+      }
     }
 
     // Certifications as hasCredential / keywords
