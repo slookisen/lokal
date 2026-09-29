@@ -159,13 +159,34 @@ export function experienceInScopeSql(categoryCol: string, providerIdCol: string)
 }
 
 /** SQL fragment: true when the PROVIDER itself (row from
- * experience_providers, `idCol` its own primary key expression — "id" when
- * unaliased) is in scope — either the provider is in the gårdssalg cohort
+ * experience_providers, `idCol` the OUTER query's own primary-key column,
+ * TABLE-QUALIFIED — "experience_providers.id" when unaliased, "<alias>.id"
+ * when aliased) is in scope — either the provider is in the gårdssalg cohort
  * itself, OR it has at least one associated `experiences` row whose category
  * includes mat_drikke. For call sites that SELECT experience_providers rows
  * directly with no specific experience row in hand (the two org.nr
- * enrichment services below). */
-export function providerInScopeSql(idCol = "id"): string {
+ * enrichment services, experience-orgnr-from-website.ts /
+ * experience-orgnr-from-name-kommune.ts).
+ *
+ * Never pass a bare "id". `idCol` is interpolated INSIDE the correlated
+ * EXISTS subquery over `experiences e_scope`, and SQLite resolves an
+ * unqualified column against the INNERMOST scope first — `experiences` has
+ * its own `id` column, so a bare "id" silently binds to e_scope.id and the
+ * correlation degenerates to `e_scope.provider_id = e_scope.id` (never true
+ * in practice) instead of pointing at the outer provider row. No error, no
+ * warning: from lokal PR #880 (dev-request 2026-09-18-opplevagent-skop-
+ * katalogen-til-gardssalg-og-drikke) until the 2026-09-28 fleet audit, both
+ * org.nr services passed "id" (this function's own old default), so the
+ * mat_drikke leg was always FALSE and a provider in scope ONLY via a
+ * mat_drikke experience was never selected — one cause of that audit's 863
+ * of 902 mat_drikke experience rows stuck in needs_review. Hence the
+ * qualified default: a caller that aliases experience_providers and forgets
+ * to pass "<alias>.id" now fails LOUDLY ("no such column:
+ * experience_providers.id") rather than silently dropping the mat_drikke
+ * leg. The cohort half (GARDSSALG_COHORT_PREDICATE_SQL) sits OUTSIDE the
+ * subquery, already resolving against the outer row, so it never had this
+ * trap. */
+export function providerInScopeSql(idCol = "experience_providers.id"): string {
   return (
     `(${GARDSSALG_COHORT_PREDICATE_SQL} OR EXISTS (` +
     `SELECT 1 FROM experiences e_scope WHERE e_scope.provider_id = ${idCol} ` +

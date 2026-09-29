@@ -1676,6 +1676,14 @@ router.get("/sent-log", (req, res) => {
     const sinceHours = sinceHoursRaw === "all" ? undefined : Math.max(1, parseInt(sinceHoursRaw, 10) || 168);
     const limit = Math.min(parseInt((req.query.limit as string) || "500", 10) || 500, 2000);
     const statusFilter = req.query.status as string | undefined;
+    // Phase 4.10c-2 Steg 2 — contact_email filter for the CS-agent dual-source guard.
+    // Used by the agent to check "has this recipient gotten ANY outbound from us
+    // in the lookback window?" before deciding to send a confirmation.
+    // Applied in SQL by listSentMessages(), BEFORE its LIMIT. It used to filter
+    // in memory AFTER it — i.e. only the newest `limit` outbound rows
+    // platform-wide — and returned count 0 for older confirmations (incident
+    // 2026-09-28, five producers re-mailed; see crm-service.ts).
+    const contactEmail = (req.query.contact_email as string | undefined)?.trim().toLowerCase();
 
     let messages = crmService.listSentMessages({
       sinceHours,
@@ -1683,9 +1691,11 @@ router.get("/sent-log", (req, res) => {
       deliveryStatus: (statusFilter && statusFilter !== "all"
         ? (statusFilter as "sent" | "queued" | "draft_in_gmail" | "failed")
         : undefined),
+      contactEmail,
     });
 
     // Optional in-memory filters
+    // NB: channel/actor are computed (COALESCE subqueries + JS fallback), so they still filter AFTER the SQL LIMIT.
     const channel = req.query.channel as string | undefined;
     if (channel && channel !== "all") {
       messages = messages.filter((m) => m.channel === channel || (channel === "resend_smtp" && m.channel?.includes("resend")));
@@ -1693,13 +1703,6 @@ router.get("/sent-log", (req, res) => {
     const actor = req.query.actor as string | undefined;
     if (actor && actor !== "all") {
       messages = messages.filter((m) => m.actor === actor);
-    }
-    // Phase 4.10c-2 Steg 2 — contact_email filter for the CS-agent dual-source guard.
-    // Used by the agent to check "has this recipient gotten ANY outbound from us
-    // in the lookback window?" before deciding to send a confirmation.
-    const contactEmail = (req.query.contact_email as string | undefined)?.trim().toLowerCase();
-    if (contactEmail) {
-      messages = messages.filter((m) => (m.contact_email || "").toLowerCase() === contactEmail);
     }
 
     // Quick aggregates so the dashboard can show counters at the top

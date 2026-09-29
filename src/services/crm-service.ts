@@ -1293,11 +1293,13 @@ class CrmService {
    *
    * NB: only returns messages with direction='out'. Filters by sent_at when
    * `since_hours` is given; otherwise all-time. Always orders newest first.
+   * `contactEmail` is filtered in SQL, i.e. BEFORE `limit` (see below).
    */
   listSentMessages(opts: {
     sinceHours?: number;
     limit?: number;
     deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
+    contactEmail?: string;
   } = {}): Array<{
     message_id: string;
     thread_id: string;
@@ -1337,6 +1339,26 @@ class CrmService {
     if (opts.deliveryStatus) {
       where.push("m.delivery_status = ?");
       params.push(opts.deliveryStatus);
+    }
+    // contact_email must narrow the rows BEFORE the LIMIT below, not after it.
+    // Incident 2026-09-28: GET /admin/crm/sent-log applied it in memory to this
+    // method's output — the newest `limit` (default 500) outbound rows
+    // PLATFORM-WIDE — so `?since_hours=all&contact_email=x` silently returned
+    // count 0 for anyone whose mail was older than that window. An operator
+    // read five such zeros as "never confirmed" and sent five producers a
+    // "sorry we never confirmed" e-mail, although all five had been confirmed
+    // in July/August (on compose-* threads). The CS routine's dual-source
+    // guard asks the same endpoint "has this recipient gotten ANY outbound
+    // from us?", so the truncation could also wave a duplicate through.
+    // Same match as the old in-memory filter: trimmed, case-insensitive, on
+    // the joined contact's email. Both crm_contacts writers (resolveContact(),
+    // routes/contact.ts) store trim().toLowerCase(), so SQLite's ASCII-only
+    // LOWER() loses nothing vs. JS toLowerCase(). `c` is an inner JOIN, so
+    // contact-less rows are excluded with or without this filter (unchanged).
+    const contactEmail = opts.contactEmail?.trim().toLowerCase();
+    if (contactEmail) {
+      where.push("LOWER(c.email) = ?");
+      params.push(contactEmail);
     }
 
     const sql = `
