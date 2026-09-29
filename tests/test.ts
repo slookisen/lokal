@@ -42346,6 +42346,26 @@ runSerial(async () => {
   }
 });
 
+// owner decision 2026-09-29 «Blacklist bounces»: POST /webhooks/resend —
+// Svix-verified Resend hard bounces / complaints → email_bounces +
+// agent_blocklist, and the outreach gate + compose bounce guard suppressing
+// the address afterwards (src/routes/resend-webhook.test.ts; loopback only).
+runSerial(async () => {
+  console.log("\n── owner 2026-09-29: resend-webhook (Svix signature, hard bounce/complaint → email_bounces + blocklist, gate + compose suppress) ──");
+  try {
+    const { runResendWebhookTests } = require("../src/routes/resend-webhook.test") as
+      typeof import("../src/routes/resend-webhook.test");
+    const rw = await runResendWebhookTests({ log: false });
+    passed += rw.passed;
+    failed += rw.failed;
+    for (const f of rw.failures) failures.push("resend-webhook: " + f);
+    console.log(`  resend-webhook: ${rw.passed} passed, ${rw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("resend-webhook: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2:
 // POST /admin/agents/org-nr-backfill + GET /admin/agents/org-nr-review-queue
 // + POST /admin/agents/org-nr-review-approve (src/routes/admin-agents.ts) —

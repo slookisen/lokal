@@ -703,6 +703,39 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
       return notSent(429, maxTouchRefusal);
     }
 
+    // ─── Bounce/complaint suppression (owner decision 2026-09-29 «Blacklist
+    // bounces») ─────────────────────────────────────────────────────────
+    // Send-path twin of the outreach gate's is_hard_bounced: an address with a
+    // hard bounce or spam complaint in email_bounces (fed automatically by
+    // POST /webhooks/resend since this change) is never handed to Resend
+    // again. Scoped to resend_send — the only intent that reaches the wire
+    // from here (gmail_draft is a human-reviewed draft). Not scoped to claude:
+    // a hard bounce is a fact about the address, like max-touch-vern above.
+    // The one override is the explicit manual one (createdBy=daniel +
+    // force=true) — kept because a misclassified bounce otherwise has no
+    // escape hatch short of editing the table; Resend's own suppression list
+    // may still drop it.
+    if (intent === "resend_send" && !(createdBy === "daniel" && force)) {
+      const bounced = getDb().prepare(`
+        SELECT bounce_type, bounced_at FROM email_bounces
+        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint')
+        ORDER BY id DESC LIMIT 1
+      `).get(to) as { bounce_type: string; bounced_at: string } | undefined;
+      if (bounced) {
+        return notSent(409, {
+          success: false,
+          error: "recipient_bounced",
+          reason:
+            `refusing to send to ${to}: email_bounces has a ${bounced.bounce_type === "complaint" ? "spam complaint" : "hard bounce"} ` +
+            `for this address (${bounced.bounced_at}). Mailing it again hurts sender reputation for every platform.`,
+          to,
+          bounce_type: bounced.bounce_type,
+          bounced_at: bounced.bounced_at,
+          override: "Pass createdBy=daniel and force=true for a manual override.",
+        });
+      }
+    }
+
     // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
     // When OUTREACH_PAUSED=true, block the automated cold-outreach channel
     // (claude-actor resend_send). Daniel's manual sends (createdBy='daniel') and

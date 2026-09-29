@@ -820,6 +820,22 @@ function initSchema(db: Database.Database): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_email_bounces_dedup
       ON email_bounces(email, COALESCE(resend_email_id, ''));
 
+    -- ─── resend_webhook_events (owner decision 2026-09-29 «Blacklist
+    -- bounces») ───────────────────────────────────────────────────
+    -- Idempotency ledger for POST /webhooks/resend (routes/resend-webhook.ts).
+    -- One row per svix-id Resend delivered for an event we ACT on
+    -- (email.bounced / email.complained); unrelated event types write nothing.
+    -- Svix retries the same svix-id until it gets a 2xx, so a PRIMARY KEY on
+    -- it turns a replay into a no-op. Holds the recipient address and the
+    -- outcome only — never the payload (subject/body/from are not stored).
+    CREATE TABLE IF NOT EXISTS resend_webhook_events (
+      svix_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      email TEXT,
+      outcome TEXT NOT NULL,
+      received_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
 
     -- Analytics indexes (for fast aggregation)
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_created ON analytics_page_views(created_at);

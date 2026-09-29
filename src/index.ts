@@ -68,6 +68,7 @@ import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
 import gardssalgClaimRoutes from "./routes/gardssalg-claim";
+import resendWebhookRoutes from "./routes/resend-webhook";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
@@ -251,6 +252,15 @@ app.use(markdownNegotiation);
 
 // Detect /en prefix → req.lang. Must run before any HTML route.
 app.use(langMiddleware);
+
+// ─── POST /webhooks/resend (owner decision 2026-09-29 «Blacklist bounces») ──
+// Svix-signed Resend events → email_bounces + agent_blocklist (hard bounce /
+// spam complaint). Mounted HERE — after express.json (needs req.rawBody) but
+// BEFORE the dental/opplevagent host gates and every admin/auth router, so
+// nothing can 404/403 it first. Path is unique; every other request falls
+// straight through. Auth = Svix signature (RESEND_WEBHOOK_SECRET; unset → 503).
+// See routes/resend-webhook.ts + services/resend-webhook.ts.
+app.use("/", resendWebhookRoutes);
 
 // ─── PR-109: finn-tannlege.com host routing ───────────────────────────
 // Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
@@ -1095,6 +1105,8 @@ app.get("/admin/blocklist", adminLimiter, (req, res) => {
 // commit — backfill from Resend lives in a follow-up WO so the schema +
 // query surface land first and marketing-comms can already exclude
 // hard-bounces from candidate-pools as soon as data exists.
+// Since 2026-09-29 the live feed is POST /webhooks/resend (mounted near the
+// top of this file); these routes stay the manual/backfill path.
 function requireAdmin(req: any, res: any): boolean {
   const adminKey = req.headers["x-admin-key"] as string;
   const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
