@@ -27,6 +27,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import * as dbFactory from "../database/db-factory";
 
 export interface TestSummary {
   passed: number;
@@ -117,6 +118,7 @@ export async function runAdminFieldSpotCheckTests(
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
   const prevFetch = (globalThis as any).fetch;
+  const prevDentalDbPath = process.env.DENTAL_DB_PATH;
 
   const db = new Database(":memory:");
   try {
@@ -146,8 +148,23 @@ export async function runAdminFieldSpotCheckTests(
     insertAgent.run("fsc-no-homepage", "Ingen Nettside Gård", "", "key-fsc-no-homepage");
     insertKnowledge.run("fsc-no-homepage", null, "Noe tekst", null);
 
+    // Dental fallback fixtures: fresh in-memory dental DB (real production
+    // dental schema via db-factory), separate from the RFB db above.
+    process.env.DENTAL_DB_PATH = ":memory:";
+    dbFactory.__resetDbFactoryForTesting();
+    const dentalDb = dbFactory.getDb("dental");
+    const insertDental = dentalDb.prepare(
+      `INSERT INTO dental_agents (id, navn, hjemmeside, telefon, adresse, om_oss) VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    insertDental.run("dental-ok", "Tannlege Test", "https://tannlege-test.no/", "+47 41 63 44 22", "Storgata 1", null);
+    insertDental.run("dental-about", "Tannlege Om Oss", "https://tannlege-test.no/", null, null, "Klinikk i Oslo sentrum");
+    insertDental.run("dental-nohp", "Tannlege Uten Nett", null, "22334455", null, null);
+
     (globalThis as any).fetch = (async (url: string | URL | Request) => {
       const u = String(url);
+      if (u === "https://tannlege-test.no/") {
+        return htmlResponse(200, "<html><body><p>Ring oss: 41 63 44 22</p></body></html>");
+      }
       if (u === "https://vollangaard.no/") {
         return htmlResponse(
           200,
@@ -271,11 +288,64 @@ export async function runAdminFieldSpotCheckTests(
       ["https://vollangaard.no/", "https://vollangaard.no/om-oss"],
       "e2e-07: urls_tried reports root fetched first, then the one subpage that actually matched",
     );
+
+    // ── Dental fallback (dev-request 2026-09-28-dental-field-spot-check-404) ──
+    const dentalOk = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "dental-ok", field_name: "phone" },
+    });
+    assertEq(dentalOk.status, 200, "dental-01: dental id resolves via dental_agents -> 200, not 404");
+    assertEq(dentalOk.body?.status, "match", "dental-02: telefon compared against hjemmeside page -> match");
+    assertEq(dentalOk.body?.root_url, "https://tannlege-test.no/", "dental-03: root_url from dental_agents.hjemmeside");
+    assertEq(dentalOk.body?.field_value, "+47 41 63 44 22", "dental-04: field_value from dental_agents.telefon");
+
+    const dentalMismatch = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "dental-ok", field_name: "address" },
+    });
+    assertEq(dentalMismatch.status, 200, "dental-05: address field on dental id -> 200");
+    assertEq(dentalMismatch.body?.status, "unverifiable", "dental-06: adresse not on (thin) page -> unverifiable, existing comparison logic verdict");
+
+    const dentalAbout = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "dental-about", field_name: "about" },
+    });
+    assertEq(dentalAbout.status, 200, "dental-12: about field on dental id -> 200");
+    assertEq(dentalAbout.body?.field_value, "Klinikk i Oslo sentrum", "dental-13: about field_value from dental_agents.om_oss (not navn)");
+
+    const dentalNoHp = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "dental-nohp", field_name: "phone" },
+    });
+    assertEq(dentalNoHp.status, 400, "dental-07: dental with no hjemmeside -> existing 'no homepage_url' 400 path");
+    assertEq(/no homepage_url on file/.test(String(dentalNoHp.body?.error)), true, "dental-08: error text names no homepage_url");
+
+    const neitherTable = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "in-neither-table", field_name: "phone" },
+    });
+    assertEq(neitherTable.status, 404, "dental-09: id in neither agents nor dental_agents -> 404");
+
+    const rfbStill = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "fsc-vollan", field_name: "about" },
+    });
+    assertEq(rfbStill.body?.status, "match", "dental-10: RFB id unaffected by dental fallback");
+    assertEq(rfbStill.body?.root_url, "https://vollangaard.no/", "dental-11: RFB root_url still from agent_knowledge");
   } catch (err: any) {
     failed++;
     failures.push("admin-field-spot-check: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     (globalThis as any).fetch = prevFetch;
+    if (prevDentalDbPath === undefined) delete process.env.DENTAL_DB_PATH;
+    else process.env.DENTAL_DB_PATH = prevDentalDbPath;
+    dbFactory.__resetDbFactoryForTesting();
     initMod.__setDbForTesting(prevDb as any);
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
