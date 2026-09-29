@@ -1568,6 +1568,8 @@ const HCR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about", "/produkter"]
  * is the exact pre-extraction call.
  */
 type HcrFetchIo = { deadlineAt?: number; fetchImpl?: typeof fetch };
+/** Tolerance between the caller's deadline and the fetch timers (see hcrFetchPage). */
+const HCR_DEADLINE_SLACK_MS = 25;
 
 async function hcrFetchPage(url: string, io?: HcrFetchIo): Promise<FetchPageResult> {
   if (!io) return fetchPage(url, { userAgent: HCR_UA, timeoutMs: HCR_FETCH_TIMEOUT_MS });
@@ -1592,7 +1594,13 @@ async function hcrFetchPage(url: string, io?: HcrFetchIo): Promise<FetchPageResu
     deadline.aborted
       ? Promise.reject(deadline.reason)
       : base(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline })) as typeof fetch;
-  return fetchPage(url, { userAgent: HCR_UA, timeoutMs: Math.min(HCR_FETCH_TIMEOUT_MS, remaining), fetchImpl: bounded });
+  // fetchPage's own per-attempt timer is given HCR_DEADLINE_SLACK_MS of head
+  // room so the shared deadline signal is the one that fires first: when both
+  // were set to `remaining`, fetchPage's timer could win by a millisecond and
+  // the post-fetch deadline check (Date.now() >= deadlineAt) then saw a
+  // not-yet-reached deadline and reported a plain `timeout` instead of
+  // refresh_deadline_exceeded (CI determinism gate, lokal#945).
+  return fetchPage(url, { userAgent: HCR_UA, timeoutMs: Math.min(HCR_FETCH_TIMEOUT_MS, remaining + HCR_DEADLINE_SLACK_MS), fetchImpl: bounded });
 }
 
 async function hcrFetchHtml(url: string, io?: HcrFetchIo): Promise<string | null> {
@@ -1849,7 +1857,10 @@ export async function refreshHomepageContent(
     // parking bookkeeping. Everything below this line up to the write
     // transaction is synchronous, so a caller that stopped waiting at the
     // deadline can never see a write land after it moved on.
-    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+    // Same slack as hcrFetchPage: timers may land a hair before the nominal
+    // deadline, and a fetch cut off by the deadline must never be reported as
+    // an ordinary timeout.
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS) {
       errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url}` });
       return;
     }
