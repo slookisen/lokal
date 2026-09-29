@@ -649,6 +649,14 @@ export async function runAdminEnrichmentWritePauseTests(
         // same convention as Trinn A immediately above. Both trinn landed
         // independently; the merge keeps both entries.
         "routes/opplevelser-experience-orgnr-from-name-kommune.test.ts",
+        // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben
+        // (owner decision 2026-09-29, pre-send homepage refresh): the daily
+        // RFB send calls admin-knowledge.ts's extracted refreshHomepageContent()
+        // and checks the SAME gate first, exactly as the route does — plus the
+        // two test files that set pause state via the service to prove it.
+        "routes/homepage-content-refresh-extraction-parity.test.ts",
+        "services/rfb-marketing-daily.test.ts",
+        "services/rfb-marketing-daily.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );
