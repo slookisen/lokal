@@ -41,6 +41,48 @@ const BRREG = "https://data.brreg.no/enhetsregisteret/api/enheter";
 const UA = "SkjerBot/0.1 (+https://skjer.org/bot; Brreg-verifier)";
 
 // Experience-plausible NACE prefixes (SN2025) — ported from brreg-verify.mjs.
+//
+// Farm / food / drink families added 2026-09-29 (owner decision: A2A
+// daniel-responses/2026-09-29-live-svar-backup-b9-cs-laas.md, B19 — «Ja du
+// kan gjøre det … overlapp med rfb profiler … det gjør ingenting»). WHY:
+// since the catalog was scoped to gårdssalg + mat/drikke (A2A dev-request
+// 2026-09-18-opplevagent-skop-katalogen-til-gardssalg-og-drikke, lokal
+// #880/#934), the providers the catalog actually wants are farms, dairies,
+// bakeries, breweries, cideries, distilleries — and NONE of their NACE codes
+// were on this tourism-only list, so the accept gate in classifyProvider()
+// (`best.sim >= 0.6 && naceOk(best.nace)`) could never return
+// verified_active for them, however exact the name match. The 2026-09-28
+// fleet audit (A2A audit-reports/2026-09-28-flaategjennomgang.md, N3) found
+// 863/902 mat_drikke experience rows stuck in needs_review, with this list
+// one of the two named causes (the other was the #934 scope-SQL bug).
+//
+// PREFIX SEMANTICS. naceOk() is `kode.startsWith(p)` against Brreg's
+// `naeringskode1.kode`, which is the 5-digit Norwegian subclass "NN.NNN"
+// (e.g. "01.410", "10.510", "11.050" — the SAME format
+// GARDSSALG_NACE_PRODUCER_TYPE in routes/opplevelser.ts and the rfb
+// BRREG_NACE_ALLOWLIST in routes/admin-agents.ts key on). So "01.4" matches
+// exactly SN group 01.4 (subclasses 01.41x–01.49x) and nothing else — a
+// "NN.N" prefix can never bleed into a sibling group because the first digit
+// after the dot IS the group digit. Deliberately NOT a bare "01." (would
+// admit 01.6 agricultural contract/support services and 01.7 hunting) and
+// NOT 46.x/47.x (wholesale/retail: a shop sharing a farm's name is exactly
+// the wrong-entity match this gate exists to refuse). Group contents below
+// are NACE Rev. 2.1 / SN2025 as best verifiable offline (the repo holds no
+// SN2025 code table); division 01/10/11 group boundaries are unchanged from
+// SN2007, which is what the prefix choice actually depends on:
+//   - "01.1" non-perennial crops (vegetables, potatoes, cereals) — gårdsbruk
+//   - "01.2" perennial crops, incl. 01.210 grapes (Hebnes Vingård's own code,
+//             see GARDSSALG_NACE_PRODUCER_TYPE) and fruit/berries
+//   - "01.3" plant propagation (planteskoler — a real gårdssalg type)
+//   - "01.4" animal husbandry (melk/storfe/sau/gris/fjørfe, 01.41x–01.49x)
+//   - "01.5" mixed farming (01.500)
+//   - "10."  the WHOLE food-manufacturing division (slakteri 10.1, fisk 10.2,
+//             frukt/saft 10.3, meieri/ysteri 10.5, mølle 10.6, bakeri 10.7,
+//             øvrig 10.8). Known over-reach: 10.9 animal feed — tolerated,
+//             the ≥0.6 name gate still has to pass first.
+//   - "11.0" the whole beverages group (11.010 destilleri … 11.050 bryggeri —
+//             the GARDSSALG_NACE_PRODUCER_TYPE set — plus malt and mineralvann/
+//             brus; division 11 has no group other than 11.0).
 const NACE_ALLOW = [
   "50.10",
   "55.20", "55.30",
@@ -52,6 +94,10 @@ const NACE_ALLOW = [
   "93.29",
   "49.34",
   "49.39",
+  // Farm / food / drink — B19 2026-09-29, see block comment above.
+  "01.1", "01.2", "01.3", "01.4", "01.5",
+  "10.",
+  "11.0",
 ];
 
 export const sleep = (ms: number): Promise<void> =>
