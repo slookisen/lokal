@@ -601,7 +601,10 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
       //      provider (producer_type:null, no mat_drikke experience) is
       //      NEVER selected/fetched — proven on the fetchCalls log, not just
       //      a response counter. A provider IN the gårdssalg cohort is still
-      //      resolved even with zero mat_drikke experiences (the OR rule). ══
+      //      resolved even with zero mat_drikke experiences (the OR rule) —
+      //      and so is a provider OUTSIDE the cohort whose only claim to
+      //      scope is a mat_drikke experience (the rule's other leg;
+      //      2026-09-28 regression, owf-r6/r7). ══════════════════════════
       {
         const fetchCallsBefore = fetchCalls.length;
 
@@ -626,9 +629,28 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
         );
         brregFixtures.set(orgNrCohort, brregEnhetResponse({ orgNr: orgNrCohort, navn: "GAARDSDRIKKE COHORT AS" }));
 
+        // 2026-09-28 fleet-audit regression: NO cohort fields, in scope ONLY
+        // via one mat_drikke experience (composite category form). While
+        // this service passed providerInScopeSql() a bare "id", SQLite bound
+        // it to the EXISTS subquery's own experiences.id, so this provider
+        // was never selected — never fetched, brreg_active stuck at NULL.
+        seedProvider({
+          id: "prov-scope-viamatdrikke", navn: "Sideri Matdrikke AS",
+          hjemmeside: "https://scope-viamatdrikke.test", producer_type: null,
+        });
+        expDb
+          .prepare(`INSERT INTO experiences (id, provider_id, title, category) VALUES (?, ?, ?, ?)`)
+          .run("exp-scope-viamatdrikke", "prov-scope-viamatdrikke", "Sidersmaking på gården", "kultur_historie, mat_drikke");
+        const orgNrMatDrikke = orgNrFor("scopematdrikke1");
+        pageFixtures.set(
+          "https://scope-viamatdrikke.test",
+          htmlResponse(`<html><body>Org.nr: ${orgNrMatDrikke}</body></html>`, "https://scope-viamatdrikke.test"),
+        );
+        brregFixtures.set(orgNrMatDrikke, brregEnhetResponse({ orgNr: orgNrMatDrikke, navn: "SIDERI MATDRIKKE AS" }));
+
         // `after` scoped past every earlier fixture id in this file (all
         // "prov-…" < "prov-scope-000" alphabetically) so this call's
-        // candidate set is exactly these 2 new rows (+ the harmless already-
+        // candidate set is exactly these 3 new rows (+ the harmless already-
         // exercised zz*-prefixed pagination/time-budget fixtures, which sort
         // after "prov-scope-…" and are idempotent either way).
         const r = await callRoute(opplevelserRouter, {
@@ -642,6 +664,11 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
         assertEq(providerRow("prov-scope-outofscope").brreg_active, null, "owf-r3: out-of-scope provider's brreg_active left untouched (still NULL)");
         assertEq(providerRow("prov-scope-viacohort").brreg_active, 1, "owf-r4: the gårdssalg-cohort provider (zero mat_drikke experiences) WAS resolved and written");
         assertTrue((r.body.skipped_out_of_scope as number) >= 1, "owf-r5: response reports skipped_out_of_scope >= 1 (additive field, on top of every pre-existing field)");
+        assertTrue(
+          fetchCalls.slice(fetchCallsBefore).includes("https://scope-viamatdrikke.test"),
+          "owf-r6: a provider in scope ONLY via a mat_drikke experience (no cohort fields) IS selected and its website fetched — the bare-\"id\" correlation never selected it",
+        );
+        assertEq(providerRow("prov-scope-viamatdrikke").brreg_active, 1, "owf-r7: …and it WAS resolved and written (brreg_active NULL -> 1)");
       }
 
       // ═══ (s) persisted after-cursor (dev-request 2026-09-14-opplevagent-
