@@ -1755,6 +1755,13 @@ export function fieldSpotCheckSubpageCandidates(
   return found;
 }
 
+/** dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about (FUNN
+ *  field-spot-check-statisk-html-uten-innhold-gir-mismatch): when the static
+ *  HTML of every fetched page carries less visible text than this in total
+ *  (JS-rendered / near-empty pages), the spot-check cannot judge the field
+ *  either way and returns "unverifiable" instead of "mismatch". */
+export const FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS = 1200;
+
 export interface FieldSpotCheckResult {
   /** "match": substantiated on the root or a followed subpage.
    *  "mismatch": not substantiated anywhere fetched — the only outcome that
@@ -1800,6 +1807,7 @@ export async function computeFieldSpotCheck(
   const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
   const maxSubpages = input.maxSubpages ?? 3;
   const urlsTried: string[] = [];
+  let visibleChars = 0;
 
   const rootResult = await fetchPage(input.root_url, {
     userAgent: "Lokal-FieldSpotCheck/1.0",
@@ -1815,6 +1823,7 @@ export async function computeFieldSpotCheck(
     };
   }
 
+  visibleChars += visibleTextOf(rootResult.html).length;
   const rootSourceText = `${rootResult.html}\n${visibleTextOf(rootResult.html)}`;
   const rootVerdict = substantiate(input.field_value, rootSourceText);
   if (rootVerdict.substantiated) {
@@ -1838,6 +1847,7 @@ export async function computeFieldSpotCheck(
     });
     urlsTried.push(subpageUrl);
     if (!subResult.ok) continue; // one dead subpage link never aborts the others
+    visibleChars += visibleTextOf(subResult.html).length;
     const subSourceText = `${subResult.html}\n${visibleTextOf(subResult.html)}`;
     const subVerdict = substantiate(input.field_value, subSourceText);
     if (subVerdict.substantiated) {
@@ -1848,6 +1858,15 @@ export async function computeFieldSpotCheck(
         reason: subVerdict.reason,
       };
     }
+  }
+
+  if (visibleChars < FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS) {
+    return {
+      status: "unverifiable",
+      checked_url: rootResult.finalUrl || input.root_url,
+      urls_tried: urlsTried,
+      reason: `fetched page(s) carry only ${visibleChars} visible chars of static text (< ${FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS}) — too little content to judge, not treated as a mismatch`,
+    };
   }
 
   return {

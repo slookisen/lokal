@@ -144,6 +144,12 @@ primary_region = 'arn'
 [[mounts]]
   source = 'lokal_data'
   destination = '/app/data'
+  # A full volume took down every SQLite write path on 2026-09-27/28 (and then
+  # the app itself, which cannot boot without writing). Let Fly grow the volume
+  # before it fills instead of relying on backup retention alone.
+  auto_extend_size_threshold = 80
+  auto_extend_size_increment = '1GB'
+  auto_extend_size_limit = '10GB'
 
 [http_service]
   internal_port = 3000
