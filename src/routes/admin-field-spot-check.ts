@@ -38,6 +38,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { getDb as getVerticalDb } from "../database/db-factory";
 import { computeFieldSpotCheck } from "../agents/lokal-agent-verifier";
 import { checkAboutCandidateFactSubstantiated } from "../services/about-fact-substantiation";
 import {
@@ -156,23 +157,47 @@ router.post("/", async (req: Request, res: Response) => {
   try {
     const db = getDb();
 
-    const agent = db.prepare(`SELECT url AS url, name AS name FROM agents WHERE id = ?`).get(agentId) as
+    let agent = db.prepare(`SELECT url AS url, name AS name FROM agents WHERE id = ?`).get(agentId) as
       | AgentRow
       | undefined;
+    let knowledge: KnowledgeRow | undefined;
+    let homepageSource = "agent_knowledge.website and agents.url both blank";
+
+    if (agent) {
+      knowledge = db
+        .prepare(`SELECT website AS website, phone AS phone, address AS address, about AS about FROM agent_knowledge WHERE agent_id = ?`)
+        .get(agentId) as KnowledgeRow | undefined;
+    } else {
+      // dev-request 2026-09-28-dental-field-spot-check-404-endepunkt-mangler:
+      // dental clinics live in dental_agents (separate dental DB), not
+      // agents. Only reached when the RFB lookup found nothing, so RFB
+      // behaviour is unchanged. Column mapping: hjemmeside -> website,
+      // telefon -> phone, adresse -> address, om_oss -> about. Read-only.
+      let dental: { navn: string; hjemmeside: string | null; telefon: string | null; adresse: string | null; om_oss: string | null } | undefined;
+      try {
+        dental = getVerticalDb("dental")
+          .prepare(`SELECT navn AS navn, hjemmeside AS hjemmeside, telefon AS telefon, adresse AS adresse, om_oss AS om_oss FROM dental_agents WHERE id = ?`)
+          .get(agentId) as typeof dental;
+      } catch (err) {
+        console.warn(`[field-spot-check] dental lookup failed for ${agentId}:`, (err as Error)?.message);
+        dental = undefined; // dental DB unavailable -> treat as not found
+      }
+      if (dental) {
+        agent = { url: null, name: dental.navn };
+        knowledge = { website: dental.hjemmeside, phone: dental.telefon, address: dental.adresse, about: dental.om_oss };
+        homepageSource = "dental_agents.hjemmeside blank";
+      }
+    }
     if (!agent) {
       res.status(404).json({ success: false, error: `agent not found: ${agentId}` });
       return;
     }
 
-    const knowledge = db
-      .prepare(`SELECT website AS website, phone AS phone, address AS address, about AS about FROM agent_knowledge WHERE agent_id = ?`)
-      .get(agentId) as KnowledgeRow | undefined;
-
     const rootUrl = (knowledge?.website && knowledge.website.trim()) || (agent.url && agent.url.trim()) || null;
     if (!rootUrl) {
       res.status(400).json({
         success: false,
-        error: "no homepage_url on file for this agent (agent_knowledge.website and agents.url both blank) — cannot spot-check",
+        error: `no homepage_url on file for this agent (${homepageSource}) — cannot spot-check`,
       });
       return;
     }
