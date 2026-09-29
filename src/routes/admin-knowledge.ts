@@ -1730,6 +1730,15 @@ export interface HomepageContentRefreshOptions {
 
 /** Error text for an agent whose fetch outlived HomepageContentRefreshOptions.deadlineAt. */
 export const HCR_DEADLINE_EXCEEDED = "refresh_deadline_exceeded";
+/**
+ * Error-text prefix for an agent whose homepage itself reads as gambling/theme
+ * spam (a hijacked or lapsed producer domain): nothing is written. The
+ * platform-side RFB send holds such a candidate instead of e-mailing it.
+ */
+export const HCR_THEME_SPAM_PAGE_ERROR = "theme_spam_page";
+/** skipped_unsubstantiated reason for an about/description candidate that reads as gambling/theme spam. */
+export const HCR_THEME_SPAM_CANDIDATE_REASON =
+  "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)";
 
 /**
  * The per-agent body of POST /admin/homepage-content-refresh, extracted
@@ -1891,7 +1900,7 @@ export async function refreshHomepageContent(
       console.log(
         `[homepage-content-refresh] ${agentId} SKIPPED — ${fetchUrl} looks like gambling/theme spam (hijacked or lapsed domain); nothing written`,
       );
-      errors.push({ agent_id: agentId, error: `theme_spam_page for ${fetchUrl}` });
+      errors.push({ agent_id: agentId, error: `${HCR_THEME_SPAM_PAGE_ERROR} for ${fetchUrl}` });
       return;
     }
 
@@ -1952,7 +1961,7 @@ export async function refreshHomepageContent(
           // candidate, whatever the page looked like as a whole.
           skippedUnsubstantiated.push({
             agent_id: agentId,
-            reason: "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)",
+            reason: HCR_THEME_SPAM_CANDIDATE_REASON,
           });
           console.log(
             `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,

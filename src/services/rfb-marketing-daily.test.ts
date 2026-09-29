@@ -62,7 +62,10 @@
  *       decides held/sent), never on a dry run, never blocking (failed /
  *       thrown / timeout / write-paused), bounded (count + per-candidate +
  *       total time), the real refreshHomepageContent path with curated locks
- *       and the enrichment write-pause, outcomes in report + envelope
+ *       and the enrichment write-pause, outcomes in report + envelope; a
+ *       hijacked (theme-spam) homepage HOLDS the candidate (hijacked_homepage:
+ *       no reservation, no compose, counted separately) while a transient
+ *       refresh failure still sends
  *   (N) N-A: unknown / post-send-failed / crash-left 'reserved' ledger rows
  *       reconciled into outreach_sent_log — an unknown delivery on day 0 is
  *       NOT offered as a first touch on day 61; idempotent across runs;
@@ -1283,6 +1286,92 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zh-1'`).get(),
         before,
         "z25: …with nothing written (no content, no parking strike)",
+      );
+    }
+
+    // Hijacked homepage (owner decision 2026-09-29 «2 Ja»): a theme-spam
+    // refresh HOLDS the candidate — no reservation, no compose, held with
+    // reason hijacked_homepage, counted separately — and the next candidate
+    // is still sent. A transient refresh failure still sends.
+    freshDb();
+    seedProducer("zs-1", "Kapret Gård", "kapret@gard-test.no");
+    seedProducer("zs-2", "Ekte Gård", "ekte@gard-test.no");
+    seedProducer("zs-3", "Treg Gård", "treg@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
+    {
+      const rec = recorder((_d, agentId) => {
+        if (agentId === "zs-1") return { outcome: "hijacked", error: "theme_spam_page for https://gard-test.no", ms: 2 };
+        if (agentId === "zs-2") return { outcome: "timeout", error: "fetch_failed:timeout (transient) for https://gard-test.no", ms: 2 };
+        return { outcome: "failed", error: "fetch_failed:conn_reset (transient) for https://gard-test.no", ms: 2 };
+      });
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      assertEq(
+        r.results.map((x) => [x.agent_id, x.status, x.reason ?? null, x.homepage_refresh?.outcome]),
+        [
+          ["zs-1", "skipped", "held_for_reenrichment:hijacked_homepage", "hijacked"],
+          ["zs-2", "sent", null, "timeout"],
+          ["zs-3", "sent", null, "failed"],
+        ],
+        "zs1: a hijacked homepage is held; the next candidates (transient timeout / failure) are still sent",
+      );
+      assertEq(t.calls.map((c) => c.to), ["ekte@gard-test.no", "treg@gard-test.no"], "zs2: the hijacked candidate is never handed to the transport");
+      assertEq(ledger().map((l) => l.recipient_email).includes("kapret@gard-test.no"), false, "zs3: no reservation for the hijacked candidate");
+      assertEq(
+        db.prepare(`SELECT COUNT(*) AS n FROM outreach_sent_log WHERE LOWER(recipient_email) = 'kapret@gard-test.no' OR agent_id = 'zs-1'`).get(),
+        { n: 0 },
+        "zs4: nothing recorded as sent for it",
+      );
+      assertEq(r.compose_attempts, 2, "zs5: the hold spends no compose attempt (and no send budget: cap 2 still sent two)");
+      assertEq(
+        r.held_for_reenrichment,
+        [{ agent_id: "zs-1", name: "Kapret Gård", reason: "hijacked_homepage", description_length: GOOD_ABOUT.trim().length, detail: "theme_spam_page for https://gard-test.no" }],
+        "zs6: held for re-enrichment with the reason and the refresh's finding — even though the e-mail domain equals the website domain",
+      );
+      assertEq(
+        [r.summary.held, r.summary.held_hijacked, r.homepage_refresh?.hijacked, r.homepage_refresh?.timeout, r.homepage_refresh?.failed],
+        [1, 1, 1, 1, 1],
+        "zs7: counted separately in the summary and the refresh summary",
+      );
+      const claims = JSON.parse(runsRows()[0].claims) as Array<any>;
+      const hij = claims.find((c) => c.meta?.kind === "rfb_marketing_held_hijacked_homepage");
+      assertEq([hij?.value, hij?.meta?.held?.map((h: any) => h.agent_id)], [1, ["zs-1"]], "zs8: its own envelope claim");
+      const heldClaim = claims.find((c) => c.meta?.kind === "rfb_marketing_held_for_reenrichment");
+      assertEq(heldClaim?.meta?.held?.map((h: any) => h.reason), ["hijacked_homepage"], "zs9: …and in the held-for-reenrichment claim");
+      assertTrue(runsRows()[0].notes.includes("held=1 (hijacked=1)"), "zs10: the envelope notes say so");
+      assertEq(runsRows()[0].status, "completed", "zs11: a hold does not make the run partial/failed");
+    }
+    // The REAL refresh path: the route's own theme-spam page detection → held.
+    freshDb();
+    seedProducer("zsr-1", "Kasino Gård", "post@kasino-gard.no");
+    seedProducer("zsr-2", "Ærlig Gård", "post@aerlig-gard.no");
+    db.prepare(`UPDATE agents SET url = 'https://kasino-gard.no' WHERE id = 'zsr-1'`).run();
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const spamPage = () =>
+        new Response(
+          `<html><head><title>Beste norske casino 2026</title><meta name="description" content="Casino bonus og free spins"></head><body><p>Spill casino med velkomstbonus.</p></body></html>`,
+          { status: 200, headers: { "content-type": "text/html; charset=utf-8" } },
+        );
+      const siteFetch = (async (url: string) => {
+        const u = new URL(url);
+        if (u.hostname === "kasino-gard.no") return spamPage();
+        return u.pathname === "/" || u.pathname === "" ? htmlPage(GOOD_ABOUT) : new Response("", { status: 404 });
+      }) as unknown as typeof fetch;
+      const before = db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zsr-1'`).get();
+      const t = makeTransport();
+      const r = await runZ(true, { refreshFetchImpl: siteFetch }, t);
+      const r1 = r.results.find((x) => x.agent_id === "zsr-1");
+      assertEq(
+        [r1?.homepage_refresh?.outcome, r1?.homepage_refresh?.error, r1?.status, r1?.reason],
+        ["hijacked", "theme_spam_page for https://kasino-gard.no", "skipped", "held_for_reenrichment:hijacked_homepage"],
+        "zs12: real path — the route's theme_spam_page skip holds the candidate",
+      );
+      assertEq(t.calls.map((c) => c.to), ["post@aerlig-gard.no"], "zs13: …and the next candidate takes the one budget slot");
+      assertEq(
+        db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zsr-1'`).get(),
+        before,
+        "zs14: nothing written from the spam page",
       );
     }
 

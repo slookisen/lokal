@@ -48,6 +48,26 @@
 //     never blocks the send: the candidate goes out with the content it has
 //     (still subject to the content check). Dry runs do not refresh (a
 //     refresh writes). Every outcome is in the report and the envelope.
+//   • EXCEPT a hijacked homepage (owner decision 2026-09-29, «2 Ja»): when
+//     the refresh finds that the producer's website now reads as gambling/
+//     theme spam — the route's own page-level `theme_spam_page` skip, or its
+//     about/description candidate rejected as gambling/theme spam — the site
+//     is no longer the producer's, and the profile we would link to may carry
+//     its copy. The candidate is NOT e-mailed: outcome `hijacked`, no
+//     reservation, no compose, added to held_for_reenrichment with reason
+//     `hijacked_homepage` (and the refresh error as `detail`) so the
+//     enrichment routine repairs the profile. Held whether or not the e-mail
+//     domain equals the website domain (no domain comparison is made). Same
+//     budget semantics as a content-quality hold: it spends a refresh, but
+//     neither send budget nor a compose attempt. Counted separately
+//     (summary.held_hijacked, refresh summary `hijacked`, envelope claim
+//     rfb_marketing_held_hijacked_homepage). Only the refresh can detect it,
+//     so a dry run (no refresh) or a refresh that did not fetch (write-
+//     paused, out of budget, failed, timed out) does not hold. A scraped
+//     code/script artifact is NOT a hijack (the site is still the
+//     producer's) and does not hold; the route has no parked-domain page
+//     classification (its `parked_now` is fetch-failure parking — a dead
+//     domain, not someone else's site) and a failed fetch still sends.
 //
 // What IS new is the button being pressed by the server, once a day, behind
 // these guards, in this order:
@@ -133,6 +153,8 @@ import { classifyAboutCheapBar, meetsAboutQualityBar } from "./search-enrich";
 import { enrichmentWritePauseBlockForAgents } from "./enrichment-write-pause";
 import {
   HCR_DEADLINE_EXCEEDED,
+  HCR_THEME_SPAM_CANDIDATE_REASON,
+  HCR_THEME_SPAM_PAGE_ERROR,
   refreshHomepageContent,
   selectHomepageContentRefreshTargetsByIds,
 } from "../routes/admin-knowledge";
@@ -509,7 +531,12 @@ export function resolveRfbCanonicalProfileUrl(
   return { ok: true, url };
 }
 
-export type RfbHeldReason = "for_kort" | "boilerplate" | "not_norwegian";
+/**
+ * for_kort / boilerplate / not_norwegian: the content check (SKILL vocabulary).
+ * hijacked_homepage: the pre-send refresh found the website taken over by
+ * gambling/theme spam (owner decision 2026-09-29, «2 Ja»).
+ */
+export type RfbHeldReason = "for_kort" | "boilerplate" | "not_norwegian" | "hijacked_homepage";
 
 /**
  * The SKILL's post-refresh content-quality gate, deterministically: the
@@ -540,6 +567,18 @@ export function checkRfbProfileContent(
   return { ok: false, reason, description_length: longer.trim().length };
 }
 
+/** Length of the longer prose block (agents.description / agent_knowledge.about), trimmed. */
+function rfbProfileProseLength(db: Db, agentId: string): number {
+  const row = db
+    .prepare(
+      `SELECT a.description AS description, k.about AS about
+         FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id = ?`,
+    )
+    .get(agentId) as { description: string | null; about: string | null } | undefined;
+  return Math.max((row?.description ?? "").trim().length, (row?.about ?? "").trim().length);
+}
+
 // ─── Pre-send homepage refresh (owner decision 2026-09-29) ─────────────────
 
 /**
@@ -550,7 +589,11 @@ export function checkRfbProfileContent(
  *   refreshed      at least one content field written from the homepage
  *   unchanged      fetched, nothing to write (already homepage-sourced,
  *                  curated/owner-locked, nothing extractable, rejected text)
- *   failed         fetch failed / theme-spam page / write failed / threw
+ *   hijacked       the homepage reads as gambling/theme spam (the route's
+ *                  `theme_spam_page` skip, or its about/description candidate
+ *                  rejected as theme spam) — the ONE outcome that stops the
+ *                  send: the candidate is held as `hijacked_homepage`
+ *   failed         fetch failed / write failed / threw
  *   timeout        cut off at the per-candidate or run deadline (no write)
  *   write_paused   enrichment write-pause on (or unreadable → fail-closed):
  *                  no crawl, no write — exactly the route's 423
@@ -561,6 +604,7 @@ export function checkRfbProfileContent(
 export type RfbHomepageRefreshOutcome =
   | "refreshed"
   | "unchanged"
+  | "hijacked"
   | "failed"
   | "timeout"
   | "write_paused"
@@ -618,8 +662,18 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
     const rejected = raced.skipped_unsubstantiated.find((c) => c.agent_id === agentId)?.reason;
     const extra = { ...(curated ? { curated_locked: curated } : {}), ...(rejected ? { rejected } : {}) };
     const err = raced.errors.find((e) => e.agent_id === agentId)?.error;
-    if (err) return done({ outcome: err.startsWith(HCR_DEADLINE_EXCEEDED) ? "timeout" : "failed", error: err, ...extra });
     const changed = raced.changed.find((c) => c.agent_id === agentId);
+    // Hijacked domain: the page-level skip (nothing written) or the
+    // candidate-level rejection (other fields may still have been written).
+    if (err?.startsWith(HCR_THEME_SPAM_PAGE_ERROR) || rejected === HCR_THEME_SPAM_CANDIDATE_REASON) {
+      return done({
+        outcome: "hijacked",
+        error: err ?? rejected,
+        ...(changed ? { fields: changed.fields } : {}),
+        ...extra,
+      });
+    }
+    if (err) return done({ outcome: err.startsWith(HCR_DEADLINE_EXCEEDED) ? "timeout" : "failed", error: err, ...extra });
     if (changed) return done({ outcome: "refreshed", fields: changed.fields, ...extra });
     return done({ outcome: "unchanged", ...extra });
   } catch (err) {
@@ -636,6 +690,7 @@ export interface RfbMarketingRefreshSummary {
   attempted: number;
   refreshed: number;
   unchanged: number;
+  hijacked: number;
   failed: number;
   timeout: number;
   write_paused: number;
@@ -1047,6 +1102,8 @@ export interface RfbMarketingHeldEntry {
   name: string;
   reason: RfbHeldReason;
   description_length: number;
+  /** hijacked_homepage only: the refresh's own finding (e.g. "theme_spam_page for https://…"). */
+  detail?: string;
 }
 
 export interface RfbMarketingDailyRunReport {
@@ -1097,6 +1154,8 @@ export interface RfbMarketingDailyRunReport {
     first_touch_sent: number;
     second_touch_sent: number;
     held: number;
+    /** Of `held`: candidates held because the homepage was hijacked (hijacked_homepage). */
+    held_hijacked: number;
   };
   envelope_recorded: boolean;
   errors: string[];
@@ -1150,6 +1209,7 @@ function summarizeResults(results: RfbMarketingResultRow[]): RfbMarketingDailyRu
     first_touch_sent: 0,
     second_touch_sent: 0,
     held: 0,
+    held_hijacked: 0,
   };
   for (const r of results) {
     s[r.status] += 1;
@@ -1158,6 +1218,7 @@ function summarizeResults(results: RfbMarketingResultRow[]): RfbMarketingDailyRu
       else s.first_touch_sent += 1;
     }
     if (r.status === "skipped" && r.reason?.startsWith("held_for_reenrichment:")) s.held += 1;
+    if (r.status === "skipped" && r.reason === "held_for_reenrichment:hijacked_homepage") s.held_hijacked += 1;
   }
   return s;
 }
@@ -1311,7 +1372,9 @@ async function runRfbMarketingDailyGuarded(opts: {
         (report.stopped_reason ? `stopped: ${report.stopped_reason}. ` : "") +
         `sent=${report.summary.sent} (first=${report.summary.first_touch_sent} second=${report.summary.second_touch_sent}) ` +
         `unknown=${report.summary.unknown} refused=${report.summary.refused} errors=${report.summary.error} ` +
-        `held=${report.summary.held} budget=${report.budget} daily_cap=${report.daily_cap} ` +
+        `held=${report.summary.held}` +
+        (report.summary.held_hijacked > 0 ? ` (hijacked=${report.summary.held_hijacked})` : "") +
+        ` budget=${report.budget} daily_cap=${report.daily_cap} ` +
         `sent_today_before=${report.sent_today_before} template=${RFB_OUTREACH_TEMPLATE_ID}` +
         (report.homepage_refresh?.mode === "applied"
           ? ` refresh=${report.homepage_refresh.refreshed}/${report.homepage_refresh.attempted}` +
@@ -1361,6 +1424,16 @@ async function runRfbMarketingDailyGuarded(opts: {
                 vertical: "rfb",
                 held: held.slice(0, 100),
                 truncated: held.length > 100,
+              },
+            },
+            // Of those: held because the homepage was hijacked (owner
+            // decision 2026-09-29 «2 Ja») — counted on their own.
+            {
+              type: "custom",
+              value: report.summary.held_hijacked,
+              meta: {
+                kind: "rfb_marketing_held_hijacked_homepage",
+                held: held.filter((h) => h.reason === "hijacked_homepage").slice(0, 100),
               },
             },
             // The pre-send homepage refresh (the routine logged `by_field` +
@@ -1418,6 +1491,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         `skipped=${report.skipped_reason ?? "-"} stopped=${report.stopped_reason ?? "-"} ` +
         `sent=${report.summary.sent} unknown=${report.summary.unknown} would_send=${report.summary.would_send} ` +
         `refused=${report.summary.refused} errors=${report.summary.error} held=${report.summary.held} ` +
+        `held_hijacked=${report.summary.held_hijacked} ` +
         `budget=${report.budget} cap=${dailyCap} auto_paused=${report.auto_paused} envelope=${report.envelope_recorded}`,
     );
     return report;
@@ -1556,6 +1630,7 @@ async function runRfbMarketingDailyGuarded(opts: {
     attempted: 0,
     refreshed: 0,
     unchanged: 0,
+    hijacked: 0,
     failed: 0,
     timeout: 0,
     write_paused: 0,
@@ -1729,9 +1804,25 @@ async function runRfbMarketingDailyGuarded(opts: {
           stoppedReason = "attempt_cap_reached";
           return;
         }
-        // Never blocks: whatever the outcome, the candidate continues to the
-        // content check with whatever content the profile now has.
-        pre.row.homepage_refresh = await refreshCandidate(cand.agent_id);
+        // Blocks only a hijacked homepage (owner decision 2026-09-29 «2 Ja»):
+        // held like a content-quality hold — no reservation, no compose, no
+        // send budget, no compose attempt. Every other outcome continues to
+        // the content check with whatever content the profile now has.
+        const refreshRow = await refreshCandidate(cand.agent_id);
+        pre.row.homepage_refresh = refreshRow;
+        if (refreshRow.outcome === "hijacked") {
+          let length: number;
+          try {
+            length = rfbProfileProseLength(db, cand.agent_id);
+          } catch (err) {
+            stopOnDbError(cand, touch, err);
+            return;
+          }
+          const detail = refreshRow.error ?? "theme_spam";
+          results.push({ ...pre.row, reason: "held_for_reenrichment:hijacked_homepage", description_length: length });
+          held.push({ agent_id: cand.agent_id, name: cand.name, reason: "hijacked_homepage", description_length: length, detail });
+          continue;
+        }
       }
 
       let exam: Examined;
