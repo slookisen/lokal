@@ -378,7 +378,7 @@ export function computeOutreachCandidates(
       -- TODO bounce-suppression: also cross-check by agent_id for non-direct-match bounces
       CASE WHEN EXISTS (
         SELECT 1 FROM email_bounces eb
-        WHERE LOWER(eb.email) = LOWER(k.email)
+        WHERE LOWER(TRIM(eb.email)) = LOWER(TRIM(k.email))
           AND eb.bounce_type IN ('hard', 'complaint')
       ) THEN 1 ELSE 0 END AS is_hard_bounced,
       -- orch-pr-17: raw data-quality columns read by the JS post-filter below.

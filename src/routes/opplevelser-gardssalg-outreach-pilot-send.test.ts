@@ -25,6 +25,13 @@
  *   (d) blocklist skip -> skipped/blocklisted (real agent_blocklist row via
  *       blocklist-service.addManualEntry, not a stub — isBlocked() reads
  *       the same RFB db this suite already controls)
+ *   (d-bounce) owner decision 2026-09-29 «1B»: a hard bounce / spam
+ *       complaint in email_bounces (no agent_blocklist row) -> eligibility
+ *       ineligible with reason hard_bounced (soft bounce + unaffected
+ *       address stay eligible); pilot-send apply sends nothing and reserves
+ *       nothing; the send-time re-check in
+ *       sendGardssalgOutreachToEligibleProvider catches a bounce that lands
+ *       after the eligibility pass (skip, not a batch stop)
  *   (e) own-table cooldown skip -> skipped/cooldown_suppressed,
  *       suppressed_by:"experiences", no cross_platform flag
  *   (f) cross-platform history is INFORMATIONAL, not blocking (Grep 7,
@@ -361,6 +368,91 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       assertEq(blocked.body.results[0].status, "skipped", "d2: blocklisted row status is skipped");
       assertEq(blocked.body.results[0].reason, "blocklisted", "d3: reason is blocklisted");
       assertEq(sent.length, sentBeforeNoGo, "d4: blocklisted row triggers zero send attempts");
+
+      // ── (d-bounce) hard bounce / spam complaint (owner decision
+      // 2026-09-29 «1B»): POST /webhooks/resend writes email_bounces only —
+      // no agent_blocklist row — so this lane must read email_bounces itself.
+      for (const [id, navn, epost, slug] of [
+        ["prov-oscar", "Oscar Gård", "post@fixture-oscar.no", "oscar-gard"],
+        ["prov-papa", "Papa Gård", "post@fixture-papa.no", "papa-gard"],
+        ["prov-quebec", "Quebec Gård", "post@fixture-quebec.no", "quebec-gard"],
+        ["prov-romeo", "Romeo Gård", "post@fixture-romeo.no", "romeo-gard"],
+      ]) {
+        insertGo.run({ id, navn, hjemmeside: `https://${slug}.example.no`, epost, slug, field_provenance: VERIFIED_STAMP });
+      }
+      const insertBounce = rfbDb.prepare(
+        `INSERT INTO email_bounces (email, bounced_at, resend_email_id, bounce_type, reason) VALUES (?, ?, ?, ?, 'resend-webhook: test')`,
+      );
+      // Stored exactly as the webhook stores it (normalized); the provider
+      // row's epost differs only in case — must still match.
+      insertBounce.run("post@fixture-oscar.no", "2026-09-29T10:00:00.000Z", "em_oscar", "hard");
+      insertBounce.run("post@fixture-papa.no", "2026-09-29T11:00:00.000Z", "em_papa", "complaint");
+      // A soft bounce is not a dead address — must NOT suppress.
+      insertBounce.run("post@fixture-quebec.no", "2026-09-29T12:00:00.000Z", "em_quebec", "soft");
+      expDb.prepare(`UPDATE experience_providers SET epost = 'Post@Fixture-Oscar.no' WHERE id = 'prov-oscar'`).run();
+      const blocklistBefore = (rfbDb.prepare(`SELECT COUNT(*) n FROM agent_blocklist`).get() as any).n;
+
+      const oppMod = require("./opplevelser") as typeof import("./opplevelser");
+      const elig = oppMod.computeGardssalgOutreachSendEligibility(expDb as any, ["prov-oscar", "prov-papa", "prov-quebec", "prov-romeo"]);
+      const byId = new Map(elig.map((e) => [e.provider_id, e as any]));
+      assertEq(
+        [byId.get("prov-oscar")?.eligible, byId.get("prov-oscar")?.reason, byId.get("prov-oscar")?.bounce_type, byId.get("prov-oscar")?.bounced_at],
+        [false, "hard_bounced", "hard", "2026-09-29T10:00:00.000Z"],
+        "db1: hard-bounced address -> ineligible, reason hard_bounced (case-insensitive match)",
+      );
+      assertEq(
+        [byId.get("prov-papa")?.eligible, byId.get("prov-papa")?.reason, byId.get("prov-papa")?.bounce_type],
+        [false, "hard_bounced", "complaint"],
+        "db2: spam-complained address -> ineligible, reason hard_bounced, bounce_type complaint",
+      );
+      assertEq(byId.get("prov-quebec")?.eligible, true, "db3: soft-bounced address stays eligible");
+      assertEq(byId.get("prov-romeo")?.eligible, true, "db4: unaffected address stays eligible");
+
+      const sentBeforeBounce = sent.length;
+      const logBeforeBounce = (expDb.prepare(`SELECT COUNT(*) n FROM experience_outreach_sent_log`).get() as any).n;
+      const bouncedApply = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_ids: ["prov-oscar", "prov-papa"], apply: true },
+      });
+      assertEq(bouncedApply.status, 200, "db5: apply on bounced rows -> 200");
+      assertEq(
+        (bouncedApply.body.results as any[]).map((r) => [r.provider_id, r.status, r.reason]),
+        [["prov-oscar", "skipped", "hard_bounced"], ["prov-papa", "skipped", "hard_bounced"]],
+        "db6: pilot-send apply skips both with reason hard_bounced",
+      );
+      assertEq(sent.length, sentBeforeBounce, "db7: zero send attempts for bounced rows");
+      assertEq(
+        (expDb.prepare(`SELECT COUNT(*) n FROM experience_outreach_sent_log`).get() as any).n,
+        logBeforeBounce,
+        "db8: no sent_log reservation for bounced rows",
+      );
+      const romeoDry = await callRoute(opplevelserRouter, { headers: auth, body: { provider_ids: ["prov-romeo"] } });
+      assertEq(romeoDry.body.results[0].status, "would_send", "db9: unaffected address still would_send via the route");
+
+      // Send-time re-check: a bounce landing AFTER the eligibility pass.
+      const romeoElig = oppMod
+        .computeGardssalgOutreachSendEligibility(expDb as any, ["prov-romeo"])
+        .find((e) => e.eligible) as any;
+      assertTrue(!!romeoElig, "db10: prov-romeo eligible before the late bounce");
+      insertBounce.run("post@fixture-romeo.no", "2026-09-29T13:00:00.000Z", "em_romeo", "hard");
+      const late = await oppMod.sendGardssalgOutreachToEligibleProvider(expDb as any, romeoElig, {
+        template: "standard",
+        isTest: false,
+        source: "pilot-send-test",
+      });
+      assertEq([late.status, late.reason], ["skipped", "hard_bounced"], "db11: send-time re-check skips a bounce that landed after eligibility");
+      assertEq(oppMod.gardssalgOutreachBatchStopReason(late), null, "db12: a send-time bounce skip does not stop the batch");
+      assertEq(sent.length, sentBeforeBounce, "db13: zero send attempts after the late bounce");
+      assertEq(
+        (expDb.prepare(`SELECT COUNT(*) n FROM experience_outreach_sent_log`).get() as any).n,
+        logBeforeBounce,
+        "db14: no sent_log reservation after the late bounce",
+      );
+      assertEq(
+        (rfbDb.prepare(`SELECT COUNT(*) n FROM agent_blocklist`).get() as any).n,
+        blocklistBefore,
+        "db15: bounce suppression wrote nothing to agent_blocklist",
+      );
 
       // ── (e) own-table cooldown skip ──────────────────────────────────
       expDb

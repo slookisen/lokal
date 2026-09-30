@@ -90,11 +90,12 @@
 //       already acknowledged → AUTO-PAUSE (apply only) + skip; and an
 //       in-process /health-equivalent "critical" signal (memory, data volume)
 //       → skip without pausing. No HTTP call to ourselves.
-//       ACTIVATION PREREQUISITE (documented, not built here): email_bounces
-//       is only as good as what feeds it — today that is POST
-//       /admin/email-bounces (manual/admin ingestion; no Resend webhook in
-//       this repo). If bounces/complaints are not being recorded, this guard
-//       cannot fire; make sure they are before relying on the auto-pause.
+//       Feed: POST /webhooks/resend (routes/resend-webhook.ts, owner
+//       decision 2026-09-29) records Resend hard bounces + complaints here
+//       automatically once RESEND_WEBHOOK_SECRET is set and the webhook is
+//       registered in the Resend dashboard; POST /admin/email-bounces
+//       remains the manual path. Without that configuration this guard
+//       still cannot fire.
 //   G4  budget = RFB_MARKETING_DAILY_CAP (default 10, clamped 1–30; fly.toml
 //       sets 20 — owner decision 2026-09-29 «dagskvote på 20stk») minus RFB
 //       outreach already sent today, and never more than what is left of
