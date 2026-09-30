@@ -400,7 +400,7 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     const brokenState = getOffThreadStatsState();
     const prev = process.env.OFFTHREAD_STATS_DISABLED;
     delete process.env.OFFTHREAD_STATS_DISABLED;
-    const usableWhenBroken = offThreadStatsUsable({ name: dbPath, memory: false, pragma: walPragma } as unknown as Database.Database);
+    const usableWhenBroken = offThreadStatsUsable({ name: dbPath, memory: false, pragma: walPragma } as unknown as Database.Database, "pageViewCounts");
     if (prev === undefined) delete process.env.OFFTHREAD_STATS_DISABLED;
     else process.env.OFFTHREAD_STATS_DISABLED = prev;
     ok(errs.length === OFFTHREAD_MAX_CONSECUTIVE_FAILURES && brokenState.broken && usableWhenBroken === false,
@@ -446,6 +446,64 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     const run = swapState.lastRuns["pageViewCounts"];
     ok(!!run && run.ok === true && run.durationMs >= 0 && typeof run.at === "string",
       "W10: the last run of each task (ok, duration, time) is reported", swapState.lastRuns);
+
+    // W11 (AC1): only the failing task falls back; other keys keep the worker.
+    __resetOffThreadStatsForTesting();
+    for (let i = 0; i < OFFTHREAD_MAX_CONSECUTIVE_FAILURES; i++) {
+      try {
+        await runStatsTaskOffThread(dbPath, { kind: "trafficStats", vertical: "experiences", windowDays: 60 } as any, 1);
+      } catch {
+        // expected (1 ms timeout) - charged to this key
+      }
+    }
+    const savedEnv = process.env.OFFTHREAD_STATS_DISABLED;
+    delete process.env.OFFTHREAD_STATS_DISABLED;
+    const walDb = { name: dbPath, memory: false, pragma: walPragma } as unknown as Database.Database;
+    const u = {
+      exp: offThreadStatsUsable(walDb, "trafficStats:experiences"),
+      rfb: offThreadStatsUsable(walDb, "trafficStats:rfb"),
+      pv: offThreadStatsUsable(walDb, "pageViewCounts"),
+    };
+    if (savedEnv === undefined) delete process.env.OFFTHREAD_STATS_DISABLED;
+    else process.env.OFFTHREAD_STATS_DISABLED = savedEnv;
+    const s11 = getOffThreadStatsState();
+    ok(!u.exp && u.rfb && u.pv && s11.brokenKeys.length === 1 && s11.brokenKeys[0] === "trafficStats:experiences",
+      "W11: one task failing 3x only breaks its own key; other keys keep using the worker", { u, s11 });
+
+    // W12 (AC2): a throwing journal_mode pragma is not cached.
+    __resetOffThreadStatsForTesting();
+    let throwing = true;
+    const flaky = {
+      name: dbPath, memory: false,
+      pragma: () => { if (throwing) throw new Error("boom"); return "wal"; },
+    } as unknown as Database.Database;
+    const origErr = console.error;
+    console.error = () => {};
+    const savedEnv2 = process.env.OFFTHREAD_STATS_DISABLED;
+    delete process.env.OFFTHREAD_STATS_DISABLED;
+    let first: boolean, second: boolean;
+    try {
+      first = offThreadStatsUsable(flaky);
+      throwing = false;
+      second = offThreadStatsUsable(flaky);
+    } finally {
+      console.error = origErr;
+      if (savedEnv2 === undefined) delete process.env.OFFTHREAD_STATS_DISABLED;
+      else process.env.OFFTHREAD_STATS_DISABLED = savedEnv2;
+    }
+    ok(first === false && second === true && getOffThreadStatsState().walMode === true,
+      "W12: a failed WAL probe returns false uncached; a later success gives true and is exposed as walMode", { first, second });
+
+    // W13 (AC3): a standalone process awaiting one off-thread task gets the answer before exit.
+    const script = path.join(tmp, "probe.ts");
+    fs.writeFileSync(script, `
+      import { runStatsTaskOffThread } from ${JSON.stringify(path.resolve(__dirname, "offthread-stats"))};
+      runStatsTaskOffThread(${JSON.stringify(dbPath)}, { kind: "pageViewCounts", nowMs: ${nowMs} })
+        .then((r: any) => console.log("RESULT:" + r.pageViews));
+    `);
+    const { spawnSync } = await import("child_process");
+    const probe = spawnSync(process.execPath, [require.resolve("tsx/cli"), script], { encoding: "utf8", timeout: 60_000 });
+    ok(probe.status === 0 && /RESULT:\d+/.test(probe.stdout), "W13: a short-lived process awaiting an off-thread task receives its result before exit", { status: probe.status, out: probe.stdout, err: probe.stderr });
   } catch (e) {
     ok(false, "W: worker tests threw", (e as Error).stack);
   } finally {

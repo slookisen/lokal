@@ -18,7 +18,7 @@
 // task error, a timeout, or a worker crash/start failure while the task was
 // queued. When any one task fails OFFTHREAD_MAX_CONSECUTIVE_FAILURES times in
 // a row (its own successes reset it; other tasks' successes do not), the
-// manager marks itself broken and callers fall back to the old synchronous
+// manager marks that task key broken and its callers (only) fall back to the old synchronous
 // code path, so the worst case is exactly the pre-fix behaviour.
 // Kill switch: OFFTHREAD_STATS_DISABLED=1 (the test suite sets it). In-memory
 // DBs never use the worker (a worker cannot open another thread's :memory:
@@ -57,10 +57,11 @@ let nextId = 1;
 const pending = new Map<number, Pending>();
 const failuresByTask = new Map<string, number>();
 const lastRuns = new Map<string, { at: string; durationMs: number; ok: boolean; error?: string }>();
-let broken = false;
-let brokenReason: string | null = null;
+const brokenKeys = new Map<string, string>(); // task key -> reason
 let workerScriptOverride: string | null = null;
 const walModeByDb = new WeakMap<object, boolean>();
+let lastWalMode: boolean | null = null;
+let walErrorLogged = false;
 
 /** Stable per-task key used for failure accounting and the admin report. */
 export function statsTaskKey(task: StatsTask): string {
@@ -77,19 +78,29 @@ function workerScriptPath(): string {
 function isWalMode(db: Database.Database): boolean {
   const cached = walModeByDb.get(db);
   if (cached !== undefined) return cached;
-  let wal = false;
   try {
-    wal = String(db.pragma("journal_mode", { simple: true })).toLowerCase() === "wal";
-  } catch {
-    wal = false;
+    const wal = String(db.pragma("journal_mode", { simple: true })).toLowerCase() === "wal";
+    walModeByDb.set(db, wal);
+    lastWalMode = wal;
+    return wal;
+  } catch (e) {
+    // Do not cache a failed probe: a transient error must not pin this DB to
+    // the synchronous path for the rest of the process.
+    if (!walErrorLogged) {
+      walErrorLogged = true;
+      console.error(`[offthread-stats] journal_mode probe failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return false;
   }
-  walModeByDb.set(db, wal);
-  return wal;
 }
 
-/** True when the aggregations for this DB handle should run in the worker. */
-export function offThreadStatsUsable(db: Database.Database): boolean {
-  if (broken) return false;
+/**
+ * True when the aggregations for this DB handle should run in the worker.
+ * With a task `key` only that task's broken state matters; without one, any
+ * broken task makes it false.
+ */
+export function offThreadStatsUsable(db: Database.Database, key?: string): boolean {
+  if (key === undefined ? brokenKeys.size > 0 : brokenKeys.has(key)) return false;
   if (process.env.OFFTHREAD_STATS_DISABLED === "1") return false;
   if (db.memory) return false;
   const name = db.name;
@@ -101,12 +112,11 @@ function recordFailure(key: string, err: Error, durationMs: number): void {
   const n = (failuresByTask.get(key) ?? 0) + 1;
   failuresByTask.set(key, n);
   lastRuns.set(key, { at: new Date().toISOString(), durationMs, ok: false, error: err.message });
-  if (!broken && n >= OFFTHREAD_MAX_CONSECUTIVE_FAILURES) {
-    broken = true;
-    brokenReason = `${key}: ${err.message}`;
+  if (!brokenKeys.has(key) && n >= OFFTHREAD_MAX_CONSECUTIVE_FAILURES) {
+    brokenKeys.set(key, err.message);
     console.error(
       `[offthread-stats] ${key} failed ${n} times in a row (last: ${err.message}); ` +
-        `falling back to synchronous stats on the main thread`
+        `falling back to synchronous stats on the main thread for this task`
     );
   }
 }
@@ -129,6 +139,13 @@ function failAllPending(err: Error, countAsFailure: boolean): void {
     if (countAsFailure) recordFailure(p.key, err, now - p.postedAt);
     p.reject(err);
   }
+}
+
+/** Keeps the process alive exactly while a task is pending (0->1 ref, back to 0 unref). */
+function syncRef(): void {
+  if (!worker) return;
+  if (pending.size > 0) worker.ref();
+  else worker.unref();
 }
 
 function dropWorker(): void {
@@ -167,11 +184,12 @@ function ensureWorker(dbPath: string): Worker {
         eval: true,
       })
     : new Worker(script, options);
-  w.unref();
+  w.unref(); // ref()ed only while tasks are pending (see syncRef)
   w.on("message", (res: StatsWorkerResponse) => {
     const p = pending.get(res.id);
     if (!p) return;
     pending.delete(res.id);
+    syncRef();
     clearTimeout(p.timer);
     const durationMs = Date.now() - p.postedAt;
     if (res.ok) {
@@ -224,6 +242,7 @@ export function runStatsTaskOffThread<T>(
     const timer = setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
+      syncRef();
       const err = new Error(`stats task ${key} timed out after ${timeoutMs} ms`);
       recordFailure(key, err, Date.now() - postedAt);
       // A task that overruns this long is stuck; replace the worker. Tasks
@@ -235,6 +254,7 @@ export function runStatsTaskOffThread<T>(
     }, timeoutMs);
     timer.unref();
     pending.set(id, { key, postedAt, resolve: resolve as (v: unknown) => void, reject, timer });
+    if (pending.size === 1) w.ref();
     const req: StatsWorkerRequest = { id, task };
     w.postMessage(req);
   });
@@ -248,8 +268,15 @@ export interface OffThreadStatsState {
   failuresByTask: Record<string, number>;
   /** Last completion per task (duration includes queueing in the worker). */
   lastRuns: Record<string, { at: string; durationMs: number; ok: boolean; error?: string }>;
+  /** True when at least one task is broken. */
   broken: boolean;
+  /** First broken task's reason (kept for compatibility). */
   brokenReason: string | null;
+  /** Task keys currently on the synchronous fallback, with reasons. */
+  brokenKeys: string[];
+  brokenReasons: Record<string, string>;
+  /** Last successfully probed WAL state; null when never probed successfully. */
+  walMode: boolean | null;
 }
 
 export function getOffThreadStatsState(): OffThreadStatsState {
@@ -261,8 +288,11 @@ export function getOffThreadStatsState(): OffThreadStatsState {
     consecutiveFailures: max,
     failuresByTask: Object.fromEntries(failuresByTask),
     lastRuns: Object.fromEntries(lastRuns),
-    broken,
-    brokenReason,
+    broken: brokenKeys.size > 0,
+    brokenReason: brokenKeys.size > 0 ? `${[...brokenKeys][0][0]}: ${[...brokenKeys][0][1]}` : null,
+    brokenKeys: [...brokenKeys.keys()],
+    brokenReasons: Object.fromEntries(brokenKeys),
+    walMode: lastWalMode,
   };
 }
 
@@ -376,8 +406,9 @@ export function __resetOffThreadStatsForTesting(): void {
   dropWorker();
   failuresByTask.clear();
   lastRuns.clear();
-  broken = false;
-  brokenReason = null;
+  brokenKeys.clear();
+  lastWalMode = null;
+  walErrorLogged = false;
   workerScriptOverride = null;
 }
 
