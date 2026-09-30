@@ -45676,6 +45676,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben (owner
+// decision 2026-09-29, «Oppfriskning av hjemmeside før utsending»): POST
+// /admin/homepage-content-refresh's per-agent body extracted into
+// refreshHomepageContent() for the daily RFB send — the route pinned against
+// goldens captured before the extraction, the function against the route, and
+// the caller-only deadline/fetch seams. Pins its own in-memory DB + global
+// fetch stub (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: homepage-content-refresh extraction parity ──");
+  try {
+    const { runHomepageContentRefreshExtractionParityTests } =
+      require("../src/routes/homepage-content-refresh-extraction-parity.test") as
+        typeof import("../src/routes/homepage-content-refresh-extraction-parity.test");
+    const hcx = await runHomepageContentRefreshExtractionParityTests({ log: false });
+    passed += hcx.passed;
+    failed += hcx.failed;
+    for (const f of hcx.failures) failures.push("homepage-content-refresh-extraction-parity: " + f);
+    console.log(`  homepage-content-refresh-extraction-parity: ${hcx.passed} passed, ${hcx.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-content-refresh-extraction-parity: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
 // RFB outreach e-mail as code (services/rfb-outreach-template.ts) — pure, no
 // DB; pinned byte-for-byte against the effective A2A template.
