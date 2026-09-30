@@ -140,6 +140,15 @@ primary_region = 'arn'
   # marketplace.ts). Rollback: set back to '60' or remove the line — no
   # migration, no deploy-side state.
   OUTREACH_COOLDOWN_DAYS = '40'
+  # Owner decision 2026-09-29 (A2A daniel-responses/2026-09-29-live-rfb-
+  # marketing-aktiveringsvalg.md, «dagskvote på 20stk»): the platform-side RFB
+  # outreach job (src/services/rfb-marketing-daily.ts) sends at most 20 per UTC
+  # day (code default 10, clamped 1–30). Its budget is also never more than
+  # what is left of the global OUTREACH_MAX_PER_DAY (code default 50, not set
+  # here; shared with every other createdBy=claude resend_send compose call).
+  # Inert until RFB_MARKETING_PLATFORM_ENABLED='1' — this line does not turn
+  # the job on. Rollback: remove the line (→ 10) or set a lower value.
+  RFB_MARKETING_DAILY_CAP = '20'
 
 [[mounts]]
   source = 'lokal_data'

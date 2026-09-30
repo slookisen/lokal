@@ -1562,12 +1562,49 @@ const HCR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about", "/produkter"]
  *  2. Every failure collapsed to `null`, which is why Phase 4c's run reports
  *     could only ever say "fetch_failed" without a cause.
  */
-async function hcrFetchPage(url: string): Promise<FetchPageResult> {
-  return fetchPage(url, { userAgent: HCR_UA, timeoutMs: HCR_FETCH_TIMEOUT_MS });
+/**
+ * Optional caller bounds for one refresh (refreshHomepageContent's
+ * deadlineAt/fetchImpl). Absent — always, for the route — every fetch below
+ * is the exact pre-extraction call.
+ */
+type HcrFetchIo = { deadlineAt?: number; fetchImpl?: typeof fetch };
+/** Tolerance between the caller's deadline and the fetch timers (see hcrFetchPage). */
+const HCR_DEADLINE_SLACK_MS = 25;
+
+async function hcrFetchPage(url: string, io?: HcrFetchIo): Promise<FetchPageResult> {
+  if (!io) return fetchPage(url, { userAgent: HCR_UA, timeoutMs: HCR_FETCH_TIMEOUT_MS });
+  const base: typeof fetch = io.fetchImpl ?? ((...a: Parameters<typeof fetch>) => globalThis.fetch(...a));
+  if (io.deadlineAt === undefined) {
+    return fetchPage(url, { userAgent: HCR_UA, timeoutMs: HCR_FETCH_TIMEOUT_MS, fetchImpl: base });
+  }
+  const remaining = io.deadlineAt - Date.now();
+  if (remaining <= 0) {
+    // Out of time before the request was even made: a transient `timeout`,
+    // never a parking strike (see fetch-page.ts persistenceOf).
+    return { ok: false, reason: "timeout", persistence: "transient", status: null, detail: "refresh deadline reached", attempts: 0 };
+  }
+  // One deadline signal shared by fetchPage's (at most two) attempts, so its
+  // retry cannot run past the deadline either; each attempt's own timeout
+  // still applies below it. The SSRF guard runs inside fetchPage before any
+  // of this is called.
+  const deadline = AbortSignal.timeout(remaining);
+  // A retry started after the deadline is refused here rather than handed an
+  // already-aborted signal (whose abort event never fires again).
+  const bounded = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+    deadline.aborted
+      ? Promise.reject(deadline.reason)
+      : base(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline })) as typeof fetch;
+  // fetchPage's own per-attempt timer is given HCR_DEADLINE_SLACK_MS of head
+  // room so the shared deadline signal is the one that fires first: when both
+  // were set to `remaining`, fetchPage's timer could win by a millisecond and
+  // the post-fetch deadline check (Date.now() >= deadlineAt) then saw a
+  // not-yet-reached deadline and reported a plain `timeout` instead of
+  // refresh_deadline_exceeded (CI determinism gate, lokal#945).
+  return fetchPage(url, { userAgent: HCR_UA, timeoutMs: Math.min(HCR_FETCH_TIMEOUT_MS, remaining + HCR_DEADLINE_SLACK_MS), fetchImpl: bounded });
 }
 
-async function hcrFetchHtml(url: string): Promise<string | null> {
-  const r = await hcrFetchPage(url);
+async function hcrFetchHtml(url: string, io?: HcrFetchIo): Promise<string | null> {
+  const r = await hcrFetchPage(url, io);
   return r.ok ? r.html : null;
 }
 
@@ -1581,9 +1618,9 @@ type HcrFetchOutcome =
   | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
-async function hcrFetchHomepageContent(homepageUrl: string): Promise<HcrFetchOutcome> {
+async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Promise<HcrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primary = await hcrFetchPage(fetchUrl);
+  const primary = await hcrFetchPage(fetchUrl, io);
   if (!primary.ok) {
     return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
   }
@@ -1599,7 +1636,9 @@ async function hcrFetchHomepageContent(homepageUrl: string): Promise<HcrFetchOut
     const discovered = discoverContentLinks(primaryHtml, u.toString(), HCR_CONTENT_PATHS.length);
     const targets = discovered.length > 0 ? discovered : HCR_CONTENT_PATHS.map((p) => `${base}${p}`);
     for (const target of targets) {
-      const sub = await hcrFetchHtml(target);
+      // No sub-page is started after a caller's deadline (never set by the route).
+      if (io?.deadlineAt !== undefined && Date.now() >= io.deadlineAt) break;
+      const sub = await hcrFetchHtml(target, io);
       if (sub) combinedHtml += "\n" + sub;
     }
   } catch {
@@ -1615,6 +1654,523 @@ type HcrTargetRow = {
 };
 
 type HcrFieldWrite = { field: string; value: string; columnVal: unknown; onAgents: boolean };
+
+/**
+ * The route's explicit-`agentIds` target selection, extracted unchanged
+ * (dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben,
+ * owner decision 2026-09-29 «Oppfriskning av hjemmeside før utsending»):
+ * string ids only, trimmed, capped at `limit` BEFORE filtering, then umbrella
+ * agents and agents without a usable homepage (agent_knowledge.website ||
+ * agents.url) dropped. Pure SELECT.
+ */
+export function selectHomepageContentRefreshTargetsByIds(
+  db: ReturnType<typeof getDb>,
+  agentIds: readonly unknown[],
+  limit: number,
+): HcrTargetRow[] {
+  // Explicit list — trust the caller, cap by limit, still exclude umbrellas
+  // and require a usable homepage (website || agents.url).
+  const ids = agentIds
+    .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+    .map((id) => id.trim())
+    .slice(0, limit);
+  return ids
+    .map((id) => {
+      const row = db
+        .prepare(
+          `SELECT a.id AS agent_id, a.name AS name, a.umbrella_type AS umbrella_type,
+                  COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url
+             FROM agents a
+             LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id = ?`,
+        )
+        .get(id) as
+        | { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null }
+        | undefined;
+      return row;
+    })
+    .filter(
+      (r): r is { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null } =>
+        !!r && r.umbrella_type == null && !!r.homepage_url && r.homepage_url.trim().length > 0,
+    )
+    .map((r) => ({ agent_id: r.agent_id, name: r.name, homepage_url: r.homepage_url }));
+}
+
+export type HomepageContentRefreshTarget = HcrTargetRow;
+
+export interface HomepageContentRefreshResult {
+  scanned: number;
+  by_field: Record<string, number>;
+  changed: Array<{ agent_id: string; fields: string[] }>;
+  skipped_curated: Array<{ agent_id: string; fields: string[] }>;
+  skipped_unsubstantiated: Array<{ agent_id: string; reason: string }>;
+  errors: Array<{ agent_id: string; error: string }>;
+  parked_now: string[];
+}
+
+export interface HomepageContentRefreshOptions {
+  /** true = the route's dry run: every candidate computed and reported, nothing written. */
+  dryRun: boolean;
+  /**
+   * Absolute Date.now() deadline in ms. NEVER set by the route (unset = no
+   * deadline, byte-identical behaviour). Set by the platform-side RFB send so
+   * a slow producer site cannot hold the morning run: every fetch is aborted
+   * at the deadline (its own 10s timeout still applies below it), no sub-page
+   * is started after it, and an agent whose fetch returns after it writes
+   * nothing (error `refresh_deadline_exceeded`). A deadline abort classifies
+   * as `timeout` (transient) — never a parking strike.
+   */
+  deadlineAt?: number;
+  /**
+   * fetch seam handed to fetchPage (the SSRF guard in fetchPage runs before
+   * it, unchanged). Unset = the global fetch, as the route always used.
+   */
+  fetchImpl?: typeof fetch;
+}
+
+/** Error text for an agent whose fetch outlived HomepageContentRefreshOptions.deadlineAt. */
+export const HCR_DEADLINE_EXCEEDED = "refresh_deadline_exceeded";
+/**
+ * Error-text prefix for an agent whose homepage itself reads as gambling/theme
+ * spam (a hijacked or lapsed producer domain): nothing is written. The
+ * platform-side RFB send holds such a candidate instead of e-mailing it.
+ */
+export const HCR_THEME_SPAM_PAGE_ERROR = "theme_spam_page";
+/** skipped_unsubstantiated reason for an about/description candidate that reads as gambling/theme spam. */
+export const HCR_THEME_SPAM_CANDIDATE_REASON =
+  "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)";
+
+/**
+ * The per-agent body of POST /admin/homepage-content-refresh, extracted
+ * verbatim (same dev-request/owner decision as
+ * selectHomepageContentRefreshTargetsByIds above) so the platform-side daily
+ * RFB send refreshes the producers it is about to e-mail through the SAME
+ * code the routine's step 2 called over HTTP — same SSRF-guarded fetchPage,
+ * same extractors, same canCorrectFactualField gate (curated/owner locks),
+ * same theme-spam/code-artifact/substantiation rejections, same parking
+ * bookkeeping, same contact-field exclusion. The route answers
+ * `{ dry_run, ...result }` with it, unchanged (pinned by
+ * homepage-content-refresh-extraction-parity.test.ts).
+ *
+ * NOT in here, on purpose: the enrichment write-pause gate. The route keeps
+ * it (a paused apply call is a 423 before any fetch), and a non-route caller
+ * must check enrichmentWritePauseBlockForAgents() itself before calling this
+ * with dryRun false — exactly as the route does.
+ */
+export async function refreshHomepageContent(
+  db: ReturnType<typeof getDb>,
+  targets: readonly HcrTargetRow[],
+  opts: HomepageContentRefreshOptions,
+): Promise<HomepageContentRefreshResult> {
+  const dryRun = opts.dryRun;
+  const fetchIo: HcrFetchIo | undefined =
+    opts.deadlineAt !== undefined || opts.fetchImpl ? { deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl } : undefined;
+  // ── Per-agent processing (moved verbatim from the route handler) ────────
+  const nowIso = new Date().toISOString();
+  let scanned = 0;
+  const byField: Record<string, number> = { about: 0, products: 0, categories: 0, description: 0 };
+  const changed: Array<{ agent_id: string; fields: string[] }> = [];
+  const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
+  const errors: Array<{ agent_id: string; error: string }> = [];
+  // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
+  // dropped because summarizeAbout()'s output could not be substantiated
+  // against the fetched page's own text — see the write-set loop below.
+  const skippedUnsubstantiated: Array<{ agent_id: string; reason: string }> = [];
+
+  // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
+  const HCR_CONCURRENCY = 3;
+
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3:
+  // this route previously never touched homepage_fetch_attempts /
+  // homepage_unreachable_since at all — a fetch failure here left no trace,
+  // so the SAME dead domain kept being re-selected forever (see the
+  // auto-select comment above for the measured evidence). Strike/park logic
+  // mirrors marketplace.ts's recordHomepageFetchFailure (3-strikes/30-day,
+  // re-stamped on an expired-then-failed-again retry), EXCEPT this route
+  // uses the already-classified `persistence` from services/fetch-page.ts
+  // (which marketplace.ts's own pre-fetchPage-era code does not) to decide
+  // whether a failure should strike at all: per fetch-page.ts's own
+  // documented contract, `transient` failures (timeout/5xx/429/conn_reset/
+  // conn_refused/tls_error — a cert or port blip routinely self-heals)
+  // MUST NOT count a strike, only `permanent` (dns_not_found/404/410) and
+  // `blocked` (401/403/empty_body — retrying is pointless, same answer
+  // every time) do. This is a deliberate, already-established platform
+  // decision (not invented here): "mis-parking a real producer for 30 days
+  // costs us far more than one wasted re-fetch." Concretely, of the six
+  // recurring dead domains in the measured reports, only hjortehagen.no
+  // (http_401 -> blocked) and sorligard.no (dns_not_found -> permanent)
+  // will actually park under this rule; rekoringen.no/trondheimkooperativ.no/
+  // sikje.no/fiskesalg.no are all `transient`-classified and will keep being
+  // retried indefinitely BY DESIGN. Bookkeeping itself is gated on !dryRun,
+  // same as every other write in this route — a preview call must never
+  // mutate state, which keeps behavior unchanged for the write-paused rfb
+  // read-only-mode runs (they only ever call this route without apply=1).
+  const HCR_PARK_AFTER_ATTEMPTS = 3;
+  const HCR_PARK_BACKOFF_MS = 30 * 86_400_000;
+  const parkedNow: string[] = [];
+
+  function recordHcrFetchFailure(agentId: string, persistence: FetchPersistence): void {
+    if (persistence === "transient") return; // never strike on a momentary blip
+    db.prepare(
+      "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE agent_id = ?",
+    ).run(agentId);
+    const row = db
+      .prepare(
+        "SELECT homepage_fetch_attempts, homepage_unreachable_since FROM agent_knowledge WHERE agent_id = ?",
+      )
+      .get(agentId) as
+      | { homepage_fetch_attempts: number; homepage_unreachable_since: string | null }
+      | undefined;
+    if (row && row.homepage_fetch_attempts >= HCR_PARK_AFTER_ATTEMPTS) {
+      const since = row.homepage_unreachable_since;
+      const expired = since !== null && Date.parse(since) <= Date.now() - HCR_PARK_BACKOFF_MS;
+      if (!since || expired) {
+        db.prepare(
+          "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?",
+        ).run(new Date().toISOString(), agentId);
+        parkedNow.push(agentId);
+      }
+    }
+  }
+
+  function recordHcrFetchSuccess(agentId: string): void {
+    db.prepare(
+      "UPDATE agent_knowledge SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE agent_id = ?",
+    ).run(agentId);
+  }
+
+  async function processOne(t: HcrTargetRow): Promise<void> {
+    const agentId = t.agent_id;
+    if (!t.homepage_url) {
+      errors.push({ agent_id: agentId, error: "no_homepage_url" });
+      return;
+    }
+
+    // Fetch homepage content server-side.
+    let fetched: HcrFetchOutcome;
+    try {
+      fetched = await hcrFetchHomepageContent(t.homepage_url, fetchIo);
+    } catch (e: any) {
+      // Genuinely unexpected exception (not a classified fetch failure —
+      // hcrFetchHomepageContent already catches its own network/parse
+      // errors and returns them as `{ok:false, reason, persistence}`
+      // instead of throwing). No persistence classification is available
+      // here, so this does NOT touch the parking counters — an unexpected
+      // code fault says nothing about whether the homepage itself is
+      // reachable, and striking on it could wrongly park a live site.
+      errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
+      return;
+    }
+    // Caller-set deadline (never set by the route): a fetch that came back
+    // after it — or was cut short by it — writes NOTHING, not even the
+    // parking bookkeeping. Everything below this line up to the write
+    // transaction is synchronous, so a caller that stopped waiting at the
+    // deadline can never see a write land after it moved on.
+    // Same slack as hcrFetchPage: timers may land a hair before the nominal
+    // deadline, and a fetch cut off by the deadline must never be reported as
+    // an ordinary timeout.
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS) {
+      errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url}` });
+      return;
+    }
+    if (!fetched.ok) {
+      // Report the CLASSIFIED reason, not a bare "fetch_failed" (dev-request
+      // 2026-07-27-fetch-infrastruktur-diagnose, P0-1). `persistence` tells a
+      // reader whether this URL is genuinely dead ("permanent") or merely
+      // uncooperative right now ("transient") — the distinction that decides
+      // whether parking the producer would be correct or would strand a live
+      // one for 30 days.
+      if (!dryRun) recordHcrFetchFailure(agentId, fetched.persistence);
+      errors.push({
+        agent_id: agentId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.homepage_url}`,
+      });
+      return;
+    }
+    if (!dryRun) recordHcrFetchSuccess(agentId);
+    const { primaryHtml, combinedHtml, fetchUrl } = fetched;
+    // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+    // beskrivelser: THIS loop is the path that wrote the live casino copy
+    // (provenance last_verified 2026-09-11..16 on all four hijacked
+    // profiles) — the stored website still answers 200, so the fetch
+    // "succeeds", and summarizeAbout() dutifully extracts the casino site's
+    // meta description. A hijacked/lapsed domain is not a source: skip the
+    // agent entirely, write nothing, and say so in the run output.
+    if (pageLooksLikeThemeSpam(primaryHtml)) {
+      console.log(
+        `[homepage-content-refresh] ${agentId} SKIPPED — ${fetchUrl} looks like gambling/theme spam (hijacked or lapsed domain); nothing written`,
+      );
+      errors.push({ agent_id: agentId, error: `${HCR_THEME_SPAM_PAGE_ERROR} for ${fetchUrl}` });
+      return;
+    }
+
+    // Run the PR-22 extractors on the fetched HTML.
+    const contentText = extractVisibleText(combinedHtml);
+    const businessTokens = extractBusinessTypeTokens(contentText);
+    const productCats = extractProductMentions(contentText);
+    const platformCategories = mapToPlatformCategories(productCats, businessTokens);
+    const aboutSummary = summarizeAbout(primaryHtml);
+
+    // Build candidate content fields.
+    const candidates: HcrFieldWrite[] = [];
+
+    // about / description from summarizeAbout — only if it clears the quality
+    // bar AND is actually substantiated by the page we just fetched.
+    //
+    // dev-request 2026-08-22-rfbweb-about-guard (reference incident: the
+    // "Li Lynghonning" agent showed a stale/mismatched about-text that did
+    // not match its actual source page): meetsAboutQualityBar only judges
+    // WHETHER aboutSummary reads as real, substantive prose (long enough,
+    // not nav/boilerplate-shaped) — it has never checked that the text is
+    // actually FROM this page. checkAboutCandidateSubstantiatedBySource is
+    // that check: a deterministic (no LLM) verbatim-or-close-paraphrase
+    // match against `primaryHtml` (raw, so `<meta ...content="...">`
+    // og:description/meta-description candidates — two of summarizeAbout's
+    // three extraction modes — still match even though their text never
+    // appears in tag-stripped visible text) concatenated with `contentText`
+    // (tag-stripped, so a prose candidate broken across inline tags still
+    // reads as contiguous text). Fail-closed: any candidate this cannot
+    // verify is dropped, exactly like summarizeAbout had returned nothing —
+    // never written, never silently trusted.
+    if (meetsAboutQualityBar(aboutSummary)) {
+      const substantiation = checkAboutCandidateSubstantiatedBySource(
+        aboutSummary,
+        `${primaryHtml}\n${contentText}`,
+      );
+      if (substantiation.substantiated) {
+        // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap
+        // (round-3 finding from #706 that was identified but never actually
+        // fixed before that PR merged): both candidates below derive from
+        // the SAME `aboutSummary` value, so one check gates both — a
+        // code-artifact `aboutSummary` (e.g. scraped Squarespace bootstrap
+        // JS, the real live Helios Trondheim defect) must produce NEITHER
+        // the `about` nor the `description` candidate, same as if
+        // summarizeAbout had returned nothing at all.
+        if (looksLikeCodeArtifact(aboutSummary)) {
+          skippedUnsubstantiated.push({
+            agent_id: agentId,
+            reason: "about/description candidate looks like a scraped code/script artifact",
+          });
+          console.log(
+            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
+          );
+        } else if (looksLikeThemeSpam(aboutSummary)) {
+          // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
+          // beskrivelser: belt-and-braces behind the page-level skip above —
+          // a summary that reads like gambling copy never becomes a
+          // candidate, whatever the page looked like as a whole.
+          skippedUnsubstantiated.push({
+            agent_id: agentId,
+            reason: HCR_THEME_SPAM_CANDIDATE_REASON,
+          });
+          console.log(
+            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
+          );
+        } else {
+          candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
+          candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+        }
+      } else {
+        skippedUnsubstantiated.push({ agent_id: agentId, reason: substantiation.reason });
+        console.log(
+          `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — not substantiated by fetched page (${fetchUrl}): ${substantiation.reason}`,
+        );
+      }
+    }
+
+    // products from the detected platform categories → ProductInfo[] shape.
+    if (platformCategories.length > 0) {
+      const productObjs = platformCategories.map((cat) => ({
+        name: CATEGORY_LABEL_NO[cat] ?? cat,
+        category: cat,
+        seasonal: false,
+      }));
+      candidates.push({
+        field: "products",
+        // Stable provenance value: canonical category list (order-independent).
+        value: platformCategories.join(","),
+        columnVal: JSON.stringify(productObjs),
+        onAgents: false,
+      });
+      // categories (agents table) — JSON array of platform category keys.
+      candidates.push({
+        field: "categories",
+        value: platformCategories.join(","),
+        columnVal: JSON.stringify(platformCategories),
+        onAgents: true,
+      });
+    }
+
+    scanned++;
+    if (candidates.length === 0) return; // nothing extractable — leave as-is.
+
+    // Load existing provenance + curated locks + current column values.
+    const kRow = db
+      .prepare(
+        "SELECT about, products, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?",
+      )
+      .get(agentId) as
+      | {
+          about?: string | null;
+          products?: string | null;
+          field_provenance?: string | null;
+          curated_fields?: string | null;
+        }
+      | undefined;
+    let existingProv: Record<string, unknown> = {};
+    if (kRow?.field_provenance) {
+      try {
+        const parsed = JSON.parse(kRow.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        /* tolerate junk */
+      }
+    }
+    const woUnverified =
+      !!existingProv.website_ownership &&
+      typeof existingProv.website_ownership === "object" &&
+      (existingProv.website_ownership as Record<string, unknown>).status === "unverified";
+
+    let curated: Record<string, unknown> = {};
+    if (kRow?.curated_fields) {
+      try {
+        const parsed = JSON.parse(kRow.curated_fields);
+        if (parsed && typeof parsed === "object") curated = parsed as Record<string, unknown>;
+      } catch {
+        /* tolerate junk */
+      }
+    }
+
+    // Decide each field through the gate. Build the write set + provenance.
+    const fieldsToWrite: HcrFieldWrite[] = [];
+    const incomingProvForMerge: Record<
+      string,
+      { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }
+    > = {};
+    const curatedSkipped: string[] = [];
+
+    for (const cand of candidates) {
+      // Incoming provenance for THIS field carries a single website_homepage
+      // source — that is what makes canCorrectFactualField allow overwriting a
+      // google_places value (and a pure-add when the field is empty).
+      const incomingFieldProv = [
+        { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: fetchUrl },
+      ];
+      const decision = canCorrectFactualField({
+        field: cand.field,
+        existingFieldProvenance: existingProv[cand.field],
+        websiteOwnershipUnverified: woUnverified,
+        incomingFieldProvenance: incomingFieldProv,
+        isCurated: !!curated[cand.field],
+      });
+      if (decision.allowed) {
+        fieldsToWrite.push(cand);
+        incomingProvForMerge[cand.field] = { sources: incomingFieldProv };
+      } else if (decision.reason === "curated_locked") {
+        curatedSkipped.push(cand.field);
+      }
+      // Other refusals (e.g. existing already homepage-sourced) are silently
+      // skipped — we never overwrite a non-google_places content value.
+    }
+
+    if (curatedSkipped.length > 0) {
+      skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
+    }
+    if (fieldsToWrite.length === 0) return;
+
+    const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
+    for (const f of writtenFields) {
+      if (f in byField) byField[f] = (byField[f] ?? 0) + 1;
+    }
+    changed.push({ agent_id: agentId, fields: writtenFields });
+
+    if (dryRun) return; // dry-run: report only, write nothing.
+
+    // ── Apply: column writes + provenance merge in one transaction ───────────
+    let mergedProv: Record<string, unknown>;
+    try {
+      mergedProv = mergeFieldProvenance(existingProv, incomingProvForMerge);
+    } catch (mergeErr: any) {
+      errors.push({ agent_id: agentId, error: `provenance_merge_failed: ${mergeErr?.message ?? String(mergeErr)}` });
+      return;
+    }
+    const provJson = JSON.stringify(mergedProv);
+
+    const akUpdates = fieldsToWrite.filter((f) => !f.onAgents); // about / products
+    const agentUpdates = fieldsToWrite.filter((f) => f.onAgents); // description / categories
+
+    try {
+      const tx = db.transaction(() => {
+        // Ensure an agent_knowledge row exists (auto-created agents may lack one).
+        const exists = db
+          .prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?")
+          .get(agentId) as { one: number } | undefined;
+        if (!exists) {
+          db.prepare(
+            "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)",
+          ).run(agentId, nowIso);
+        }
+
+        // agent_knowledge content columns (about/products) — never contact fields.
+        if (akUpdates.length > 0) {
+          const setClause = akUpdates.map((u) => `${u.field} = ?`).join(", ");
+          const params: unknown[] = akUpdates.map((u) => u.columnVal);
+          params.push(provJson, nowIso, agentId);
+          db.prepare(
+            `UPDATE agent_knowledge SET ${setClause}, field_provenance = ?, updated_at = ? WHERE agent_id = ?`,
+          ).run(...params);
+        } else {
+          // Only agents-table fields changed — still persist provenance.
+          db.prepare(
+            "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?",
+          ).run(provJson, nowIso, agentId);
+        }
+
+        // agents-table content columns (description/categories). Column names
+        // come from a fixed allow-list (description/categories), never user
+        // input, so the dynamic SET is injection-safe. No updated_at on agents.
+        if (agentUpdates.length > 0) {
+          const aSet = agentUpdates.map((u) => `${u.field} = ?`).join(", ");
+          const aParams: unknown[] = agentUpdates.map((u) => u.columnVal);
+          aParams.push(agentId);
+          db.prepare(`UPDATE agents SET ${aSet} WHERE id = ?`).run(...aParams);
+        }
+      });
+      tx();
+    } catch (writeErr: any) {
+      errors.push({ agent_id: agentId, error: `write_failed: ${writeErr?.message ?? String(writeErr)}` });
+      // Roll the reporting back for this agent — the tx aborted atomically.
+      const idx = changed.findIndex((c) => c.agent_id === agentId);
+      if (idx >= 0) {
+        for (const f of changed[idx].fields) {
+          if (f in byField && byField[f] > 0) byField[f] -= 1;
+        }
+        changed.splice(idx, 1);
+      }
+    }
+  }
+
+  for (let i = 0; i < targets.length; i += HCR_CONCURRENCY) {
+    const slice = targets.slice(i, i + HCR_CONCURRENCY);
+    await Promise.all(slice.map((t) => processOne(t)));
+  }
+
+
+  return {
+    scanned,
+    by_field: byField,
+    changed,
+    skipped_curated: skippedCurated,
+    // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
+    // dropped for failing the source-substantiation check — additive, absent
+    // key would be equally valid here, but an always-present (possibly
+    // empty) array matches this endpoint's existing `errors`/`changed`
+    // shape better than an optional field would.
+    skipped_unsubstantiated: skippedUnsubstantiated,
+    errors,
+    parked_now: parkedNow,
+  };
+}
 
 homepageContentRefreshRouter.post(
   "/homepage-content-refresh",
@@ -1648,32 +2204,7 @@ homepageContentRefreshRouter.post(
     // ── Target selection ─────────────────────────────────────────────────────
     let targets: HcrTargetRow[];
     if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
-      // Explicit list — trust the caller, cap by limit, still exclude umbrellas
-      // and require a usable homepage (website || agents.url).
-      const ids = (body.agentIds as unknown[])
-        .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-        .map((id) => id.trim())
-        .slice(0, limit);
-      targets = ids
-        .map((id) => {
-          const row = db
-            .prepare(
-              `SELECT a.id AS agent_id, a.name AS name, a.umbrella_type AS umbrella_type,
-                      COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url
-                 FROM agents a
-                 LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-                WHERE a.id = ?`,
-            )
-            .get(id) as
-            | { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null }
-            | undefined;
-          return row;
-        })
-        .filter(
-          (r): r is { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null } =>
-            !!r && r.umbrella_type == null && !!r.homepage_url && r.homepage_url.trim().length > 0,
-        )
-        .map((r) => ({ agent_id: r.agent_id, name: r.name, homepage_url: r.homepage_url }));
+      targets = selectHomepageContentRefreshTargetsByIds(db, body.agentIds as unknown[], limit);
     } else {
       // Auto-select: producers (non-umbrella) WITH a website AND existing
       // about/products, whose CONTENT provenance does NOT yet carry a
@@ -1754,399 +2285,11 @@ homepageContentRefreshRouter.post(
       }
     }
 
-    // ── Per-agent processing ──────────────────────────────────────────────────
-    const nowIso = new Date().toISOString();
-    let scanned = 0;
-    const byField: Record<string, number> = { about: 0, products: 0, categories: 0, description: 0 };
-    const changed: Array<{ agent_id: string; fields: string[] }> = [];
-    const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
-    const errors: Array<{ agent_id: string; error: string }> = [];
-    // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
-    // dropped because summarizeAbout()'s output could not be substantiated
-    // against the fetched page's own text — see the write-set loop below.
-    const skippedUnsubstantiated: Array<{ agent_id: string; reason: string }> = [];
-
-    // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
-    const HCR_CONCURRENCY = 3;
-
-    // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3:
-    // this route previously never touched homepage_fetch_attempts /
-    // homepage_unreachable_since at all — a fetch failure here left no trace,
-    // so the SAME dead domain kept being re-selected forever (see the
-    // auto-select comment above for the measured evidence). Strike/park logic
-    // mirrors marketplace.ts's recordHomepageFetchFailure (3-strikes/30-day,
-    // re-stamped on an expired-then-failed-again retry), EXCEPT this route
-    // uses the already-classified `persistence` from services/fetch-page.ts
-    // (which marketplace.ts's own pre-fetchPage-era code does not) to decide
-    // whether a failure should strike at all: per fetch-page.ts's own
-    // documented contract, `transient` failures (timeout/5xx/429/conn_reset/
-    // conn_refused/tls_error — a cert or port blip routinely self-heals)
-    // MUST NOT count a strike, only `permanent` (dns_not_found/404/410) and
-    // `blocked` (401/403/empty_body — retrying is pointless, same answer
-    // every time) do. This is a deliberate, already-established platform
-    // decision (not invented here): "mis-parking a real producer for 30 days
-    // costs us far more than one wasted re-fetch." Concretely, of the six
-    // recurring dead domains in the measured reports, only hjortehagen.no
-    // (http_401 -> blocked) and sorligard.no (dns_not_found -> permanent)
-    // will actually park under this rule; rekoringen.no/trondheimkooperativ.no/
-    // sikje.no/fiskesalg.no are all `transient`-classified and will keep being
-    // retried indefinitely BY DESIGN. Bookkeeping itself is gated on !dryRun,
-    // same as every other write in this route — a preview call must never
-    // mutate state, which keeps behavior unchanged for the write-paused rfb
-    // read-only-mode runs (they only ever call this route without apply=1).
-    const HCR_PARK_AFTER_ATTEMPTS = 3;
-    const HCR_PARK_BACKOFF_MS = 30 * 86_400_000;
-    const parkedNow: string[] = [];
-
-    function recordHcrFetchFailure(agentId: string, persistence: FetchPersistence): void {
-      if (persistence === "transient") return; // never strike on a momentary blip
-      db.prepare(
-        "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE agent_id = ?",
-      ).run(agentId);
-      const row = db
-        .prepare(
-          "SELECT homepage_fetch_attempts, homepage_unreachable_since FROM agent_knowledge WHERE agent_id = ?",
-        )
-        .get(agentId) as
-        | { homepage_fetch_attempts: number; homepage_unreachable_since: string | null }
-        | undefined;
-      if (row && row.homepage_fetch_attempts >= HCR_PARK_AFTER_ATTEMPTS) {
-        const since = row.homepage_unreachable_since;
-        const expired = since !== null && Date.parse(since) <= Date.now() - HCR_PARK_BACKOFF_MS;
-        if (!since || expired) {
-          db.prepare(
-            "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?",
-          ).run(new Date().toISOString(), agentId);
-          parkedNow.push(agentId);
-        }
-      }
-    }
-
-    function recordHcrFetchSuccess(agentId: string): void {
-      db.prepare(
-        "UPDATE agent_knowledge SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE agent_id = ?",
-      ).run(agentId);
-    }
-
-    async function processOne(t: HcrTargetRow): Promise<void> {
-      const agentId = t.agent_id;
-      if (!t.homepage_url) {
-        errors.push({ agent_id: agentId, error: "no_homepage_url" });
-        return;
-      }
-
-      // Fetch homepage content server-side.
-      let fetched: HcrFetchOutcome;
-      try {
-        fetched = await hcrFetchHomepageContent(t.homepage_url);
-      } catch (e: any) {
-        // Genuinely unexpected exception (not a classified fetch failure —
-        // hcrFetchHomepageContent already catches its own network/parse
-        // errors and returns them as `{ok:false, reason, persistence}`
-        // instead of throwing). No persistence classification is available
-        // here, so this does NOT touch the parking counters — an unexpected
-        // code fault says nothing about whether the homepage itself is
-        // reachable, and striking on it could wrongly park a live site.
-        errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
-        return;
-      }
-      if (!fetched.ok) {
-        // Report the CLASSIFIED reason, not a bare "fetch_failed" (dev-request
-        // 2026-07-27-fetch-infrastruktur-diagnose, P0-1). `persistence` tells a
-        // reader whether this URL is genuinely dead ("permanent") or merely
-        // uncooperative right now ("transient") — the distinction that decides
-        // whether parking the producer would be correct or would strand a live
-        // one for 30 days.
-        if (!dryRun) recordHcrFetchFailure(agentId, fetched.persistence);
-        errors.push({
-          agent_id: agentId,
-          error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.homepage_url}`,
-        });
-        return;
-      }
-      if (!dryRun) recordHcrFetchSuccess(agentId);
-      const { primaryHtml, combinedHtml, fetchUrl } = fetched;
-      // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
-      // beskrivelser: THIS loop is the path that wrote the live casino copy
-      // (provenance last_verified 2026-09-11..16 on all four hijacked
-      // profiles) — the stored website still answers 200, so the fetch
-      // "succeeds", and summarizeAbout() dutifully extracts the casino site's
-      // meta description. A hijacked/lapsed domain is not a source: skip the
-      // agent entirely, write nothing, and say so in the run output.
-      if (pageLooksLikeThemeSpam(primaryHtml)) {
-        console.log(
-          `[homepage-content-refresh] ${agentId} SKIPPED — ${fetchUrl} looks like gambling/theme spam (hijacked or lapsed domain); nothing written`,
-        );
-        errors.push({ agent_id: agentId, error: `theme_spam_page for ${fetchUrl}` });
-        return;
-      }
-
-      // Run the PR-22 extractors on the fetched HTML.
-      const contentText = extractVisibleText(combinedHtml);
-      const businessTokens = extractBusinessTypeTokens(contentText);
-      const productCats = extractProductMentions(contentText);
-      const platformCategories = mapToPlatformCategories(productCats, businessTokens);
-      const aboutSummary = summarizeAbout(primaryHtml);
-
-      // Build candidate content fields.
-      const candidates: HcrFieldWrite[] = [];
-
-      // about / description from summarizeAbout — only if it clears the quality
-      // bar AND is actually substantiated by the page we just fetched.
-      //
-      // dev-request 2026-08-22-rfbweb-about-guard (reference incident: the
-      // "Li Lynghonning" agent showed a stale/mismatched about-text that did
-      // not match its actual source page): meetsAboutQualityBar only judges
-      // WHETHER aboutSummary reads as real, substantive prose (long enough,
-      // not nav/boilerplate-shaped) — it has never checked that the text is
-      // actually FROM this page. checkAboutCandidateSubstantiatedBySource is
-      // that check: a deterministic (no LLM) verbatim-or-close-paraphrase
-      // match against `primaryHtml` (raw, so `<meta ...content="...">`
-      // og:description/meta-description candidates — two of summarizeAbout's
-      // three extraction modes — still match even though their text never
-      // appears in tag-stripped visible text) concatenated with `contentText`
-      // (tag-stripped, so a prose candidate broken across inline tags still
-      // reads as contiguous text). Fail-closed: any candidate this cannot
-      // verify is dropped, exactly like summarizeAbout had returned nothing —
-      // never written, never silently trusted.
-      if (meetsAboutQualityBar(aboutSummary)) {
-        const substantiation = checkAboutCandidateSubstantiatedBySource(
-          aboutSummary,
-          `${primaryHtml}\n${contentText}`,
-        );
-        if (substantiation.substantiated) {
-          // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap
-          // (round-3 finding from #706 that was identified but never actually
-          // fixed before that PR merged): both candidates below derive from
-          // the SAME `aboutSummary` value, so one check gates both — a
-          // code-artifact `aboutSummary` (e.g. scraped Squarespace bootstrap
-          // JS, the real live Helios Trondheim defect) must produce NEITHER
-          // the `about` nor the `description` candidate, same as if
-          // summarizeAbout had returned nothing at all.
-          if (looksLikeCodeArtifact(aboutSummary)) {
-            skippedUnsubstantiated.push({
-              agent_id: agentId,
-              reason: "about/description candidate looks like a scraped code/script artifact",
-            });
-            console.log(
-              `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
-            );
-          } else if (looksLikeThemeSpam(aboutSummary)) {
-            // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
-            // beskrivelser: belt-and-braces behind the page-level skip above —
-            // a summary that reads like gambling copy never becomes a
-            // candidate, whatever the page looked like as a whole.
-            skippedUnsubstantiated.push({
-              agent_id: agentId,
-              reason: "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)",
-            });
-            console.log(
-              `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
-            );
-          } else {
-            candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
-            candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
-          }
-        } else {
-          skippedUnsubstantiated.push({ agent_id: agentId, reason: substantiation.reason });
-          console.log(
-            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — not substantiated by fetched page (${fetchUrl}): ${substantiation.reason}`,
-          );
-        }
-      }
-
-      // products from the detected platform categories → ProductInfo[] shape.
-      if (platformCategories.length > 0) {
-        const productObjs = platformCategories.map((cat) => ({
-          name: CATEGORY_LABEL_NO[cat] ?? cat,
-          category: cat,
-          seasonal: false,
-        }));
-        candidates.push({
-          field: "products",
-          // Stable provenance value: canonical category list (order-independent).
-          value: platformCategories.join(","),
-          columnVal: JSON.stringify(productObjs),
-          onAgents: false,
-        });
-        // categories (agents table) — JSON array of platform category keys.
-        candidates.push({
-          field: "categories",
-          value: platformCategories.join(","),
-          columnVal: JSON.stringify(platformCategories),
-          onAgents: true,
-        });
-      }
-
-      scanned++;
-      if (candidates.length === 0) return; // nothing extractable — leave as-is.
-
-      // Load existing provenance + curated locks + current column values.
-      const kRow = db
-        .prepare(
-          "SELECT about, products, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?",
-        )
-        .get(agentId) as
-        | {
-            about?: string | null;
-            products?: string | null;
-            field_provenance?: string | null;
-            curated_fields?: string | null;
-          }
-        | undefined;
-      let existingProv: Record<string, unknown> = {};
-      if (kRow?.field_provenance) {
-        try {
-          const parsed = JSON.parse(kRow.field_provenance);
-          if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
-        } catch {
-          /* tolerate junk */
-        }
-      }
-      const woUnverified =
-        !!existingProv.website_ownership &&
-        typeof existingProv.website_ownership === "object" &&
-        (existingProv.website_ownership as Record<string, unknown>).status === "unverified";
-
-      let curated: Record<string, unknown> = {};
-      if (kRow?.curated_fields) {
-        try {
-          const parsed = JSON.parse(kRow.curated_fields);
-          if (parsed && typeof parsed === "object") curated = parsed as Record<string, unknown>;
-        } catch {
-          /* tolerate junk */
-        }
-      }
-
-      // Decide each field through the gate. Build the write set + provenance.
-      const fieldsToWrite: HcrFieldWrite[] = [];
-      const incomingProvForMerge: Record<
-        string,
-        { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }
-      > = {};
-      const curatedSkipped: string[] = [];
-
-      for (const cand of candidates) {
-        // Incoming provenance for THIS field carries a single website_homepage
-        // source — that is what makes canCorrectFactualField allow overwriting a
-        // google_places value (and a pure-add when the field is empty).
-        const incomingFieldProv = [
-          { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: fetchUrl },
-        ];
-        const decision = canCorrectFactualField({
-          field: cand.field,
-          existingFieldProvenance: existingProv[cand.field],
-          websiteOwnershipUnverified: woUnverified,
-          incomingFieldProvenance: incomingFieldProv,
-          isCurated: !!curated[cand.field],
-        });
-        if (decision.allowed) {
-          fieldsToWrite.push(cand);
-          incomingProvForMerge[cand.field] = { sources: incomingFieldProv };
-        } else if (decision.reason === "curated_locked") {
-          curatedSkipped.push(cand.field);
-        }
-        // Other refusals (e.g. existing already homepage-sourced) are silently
-        // skipped — we never overwrite a non-google_places content value.
-      }
-
-      if (curatedSkipped.length > 0) {
-        skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
-      }
-      if (fieldsToWrite.length === 0) return;
-
-      const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
-      for (const f of writtenFields) {
-        if (f in byField) byField[f] = (byField[f] ?? 0) + 1;
-      }
-      changed.push({ agent_id: agentId, fields: writtenFields });
-
-      if (dryRun) return; // dry-run: report only, write nothing.
-
-      // ── Apply: column writes + provenance merge in one transaction ───────────
-      let mergedProv: Record<string, unknown>;
-      try {
-        mergedProv = mergeFieldProvenance(existingProv, incomingProvForMerge);
-      } catch (mergeErr: any) {
-        errors.push({ agent_id: agentId, error: `provenance_merge_failed: ${mergeErr?.message ?? String(mergeErr)}` });
-        return;
-      }
-      const provJson = JSON.stringify(mergedProv);
-
-      const akUpdates = fieldsToWrite.filter((f) => !f.onAgents); // about / products
-      const agentUpdates = fieldsToWrite.filter((f) => f.onAgents); // description / categories
-
-      try {
-        const tx = db.transaction(() => {
-          // Ensure an agent_knowledge row exists (auto-created agents may lack one).
-          const exists = db
-            .prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?")
-            .get(agentId) as { one: number } | undefined;
-          if (!exists) {
-            db.prepare(
-              "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)",
-            ).run(agentId, nowIso);
-          }
-
-          // agent_knowledge content columns (about/products) — never contact fields.
-          if (akUpdates.length > 0) {
-            const setClause = akUpdates.map((u) => `${u.field} = ?`).join(", ");
-            const params: unknown[] = akUpdates.map((u) => u.columnVal);
-            params.push(provJson, nowIso, agentId);
-            db.prepare(
-              `UPDATE agent_knowledge SET ${setClause}, field_provenance = ?, updated_at = ? WHERE agent_id = ?`,
-            ).run(...params);
-          } else {
-            // Only agents-table fields changed — still persist provenance.
-            db.prepare(
-              "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?",
-            ).run(provJson, nowIso, agentId);
-          }
-
-          // agents-table content columns (description/categories). Column names
-          // come from a fixed allow-list (description/categories), never user
-          // input, so the dynamic SET is injection-safe. No updated_at on agents.
-          if (agentUpdates.length > 0) {
-            const aSet = agentUpdates.map((u) => `${u.field} = ?`).join(", ");
-            const aParams: unknown[] = agentUpdates.map((u) => u.columnVal);
-            aParams.push(agentId);
-            db.prepare(`UPDATE agents SET ${aSet} WHERE id = ?`).run(...aParams);
-          }
-        });
-        tx();
-      } catch (writeErr: any) {
-        errors.push({ agent_id: agentId, error: `write_failed: ${writeErr?.message ?? String(writeErr)}` });
-        // Roll the reporting back for this agent — the tx aborted atomically.
-        const idx = changed.findIndex((c) => c.agent_id === agentId);
-        if (idx >= 0) {
-          for (const f of changed[idx].fields) {
-            if (f in byField && byField[f] > 0) byField[f] -= 1;
-          }
-          changed.splice(idx, 1);
-        }
-      }
-    }
-
-    for (let i = 0; i < targets.length; i += HCR_CONCURRENCY) {
-      const slice = targets.slice(i, i + HCR_CONCURRENCY);
-      await Promise.all(slice.map((t) => processOne(t)));
-    }
-
-    res.json({
-      dry_run: dryRun,
-      scanned,
-      by_field: byField,
-      changed,
-      skipped_curated: skippedCurated,
-      // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
-      // dropped for failing the source-substantiation check — additive, absent
-      // key would be equally valid here, but an always-present (possibly
-      // empty) array matches this endpoint's existing `errors`/`changed`
-      // shape better than an optional field would.
-      skipped_unsubstantiated: skippedUnsubstantiated,
-      errors,
-      parked_now: parkedNow,
-    });
+    // ── Per-agent processing: refreshHomepageContent() above (extracted
+    // verbatim, dev-request 2026-09-19-rfb-marketing-utsending-inn-i-
+    // plattformjobben) — same response shape, same key order. ──────────────
+    const result = await refreshHomepageContent(db, targets, { dryRun });
+    res.json({ dry_run: dryRun, ...result });
   },
 );
 

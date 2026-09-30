@@ -57,6 +57,22 @@
  *       too (changed address, same day)
  *   (y) envelope status: partial/failed whenever the run stopped or erred;
  *       the held list, the gate summary and unknown deliveries as claims
+ *   (z) pre-send homepage refresh (owner decision 2026-09-29): only for the
+ *       candidates about to be sent, before the content check (fresh content
+ *       decides held/sent), never on a dry run, never blocking (failed /
+ *       thrown / timeout / write-paused), bounded (count + per-candidate +
+ *       total time), the real refreshHomepageContent path with curated locks
+ *       and the enrichment write-pause, outcomes in report + envelope; a
+ *       hijacked (theme-spam) homepage HOLDS the candidate (hijacked_homepage:
+ *       no reservation, no compose, counted separately) while a transient
+ *       refresh failure still sends
+ *   (N) N-A: unknown / post-send-failed / crash-left 'reserved' ledger rows
+ *       reconciled into outreach_sent_log — an unknown delivery on day 0 is
+ *       NOT offered as a first touch on day 61; idempotent across runs;
+ *       compose's email-keyed cooldown counts the reconciled row
+ *
+ * The pre-send refresh never touches the network in this file: every run
+ * gets a stub fetch (module-level default + per-run seams).
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-marketing-daily.test.ts
@@ -292,6 +308,15 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   function oslFor(email: string): number {
     return (db.prepare(`SELECT COUNT(*) AS c FROM outreach_sent_log WHERE recipient_email = ? AND notes LIKE 'auto:%'`).get(email) as { c: number }).c;
   }
+  /** outreach_sent_log rows the job reconciled from its ledger (N-A). */
+  function reconciledFor(email: string): Array<{ agent_id: string; message_id: string; notes: string; vertical_id: string; channel: string; sent_at: string }> {
+    return db
+      .prepare(
+        `SELECT agent_id, message_id, notes, vertical_id, channel, sent_at FROM outreach_sent_log
+          WHERE recipient_email = ? AND notes LIKE 'rfb-marketing-platform:%' ORDER BY id`,
+      )
+      .all(email);
+  }
   function runsRows(): Array<{ run_id: string; status: string; claims: string; notes: string; errors: string | null }> {
     return db
       .prepare(`SELECT run_id, status, claims, notes, errors FROM runs WHERE agent = ? ORDER BY rowid`)
@@ -299,6 +324,19 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   }
   const day = (d: Date) => d.toISOString().slice(0, 10);
   const tomorrow = () => new Date(Date.now() + 86400_000);
+
+  // No test in this file may reach a real homepage: unless a block injects its
+  // own, every pre-send refresh fetch "times out" (transient → no parking
+  // strike, no write — the candidate goes out with the content it has).
+  const noNetworkFetch = (async () => {
+    throw Object.assign(new Error("network disabled in rfb-marketing-daily tests"), { name: "TimeoutError" });
+  }) as unknown as typeof fetch;
+  daily.__setRfbMarketingRefreshFetchForTesting(noNetworkFetch);
+  const htmlPage = (og: string) =>
+    new Response(`<html><head><title>Gård</title><meta property="og:description" content="${og}"></head><body><p>Velkommen.</p></body></html>`, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
 
   try {
     // ── (a) scheduling + knobs ─────────────────────────────────────────────
@@ -517,9 +555,20 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       ).run(day(new Date()), new Date().toISOString());
       const r5 = await run(true, { transport: eTransport });
       assertEq([r5.skipped_reason, r5.sent_today_before], ["daily_cap_already_sent", 5], "f8: a crash-left 'reserved' row counts toward today's cap");
+      // N-A: r5's start-of-run sweep already wrote the crash-left row into
+      // outreach_sent_log, so from here on every reader counts it as a contact.
+      assertEq(
+        [r5.sent_log_reconciliation?.inserted, reconciledFor("krasj@gard-test.no").map((x) => [x.notes, x.vertical_id])],
+        [1, [["rfb-marketing-platform:reserved_outcome_unknown", "rfb"]]],
+        "f8b: the crash-left 'reserved' row is reconciled into outreach_sent_log at the start of the next run",
+      );
       const r6 = await run(true, { transport: eTransport, now: tomorrow() });
       const krasj = r6.results.find((x) => x.agent_id === "n-0000-0001");
-      assertEq(krasj?.reason, "recently_contacted_by_platform_job", "f9: next day, the reserved address is still blocked (outcome unknown → treated as sent)");
+      assertEq(
+        [krasj, r6.sent_log_reconciliation?.inserted, reconciledFor("krasj@gard-test.no").length],
+        [undefined, 0, 1],
+        "f9: next day the reserved address is no longer even a candidate (gate sees the reconciled row); the sweep is idempotent",
+      );
       assertEq(eTransport.calls.some((c) => c.to === "krasj@gard-test.no"), false, "f10: never e-mailed");
     }
 
@@ -559,16 +608,25 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.results[0].status, typeof r.results[0].post_send_error], ["sent", "string"], "h2: reported as SENT with the post-send error");
       assertEq(r.stopped_reason, "post_send_record_failed", "h3: run stops on a failed post-send write");
       assertEq(ledger().map((l) => l.status), ["sent"], "h4: the job's own ledger knows it was sent");
-      assertEq(oslFor("disk@gard-test.no"), 0, "h5: outreach_sent_log never got the row (the exact 2026-09-27 gap)");
+      assertEq(oslFor("disk@gard-test.no"), 0, "h5: compose's trigger never wrote its row (the exact 2026-09-27 gap)…");
+      assertEq(
+        [r.results[0].sent_log_reconciled, reconciledFor("disk@gard-test.no").map((x) => [x.agent_id, x.notes, x.vertical_id, x.channel])],
+        ["inserted", [["h-1", "rfb-marketing-platform:post_send_reconciled", "rfb", "email"]]],
+        "h5c: …so the job reconciled it into outreach_sent_log at finalize time (N-A)",
+      );
       assertEq(runsRows()[0]?.status, "partial", "h5b: envelope 'partial' — something was sent, then the run stopped");
       db.exec(`DROP TRIGGER t_sent_flip_fails`);
       const gateAgain = aoc.computeOutreachCandidates(db, { mode: "first", cooldownDays: 60, limit: 100 });
-      assertTrue(gateAgain.candidates.some((c) => c.email === "disk@gard-test.no"), "h6: the gate alone WOULD select the address again");
+      assertEq(
+        gateAgain.candidates.some((c) => c.email === "disk@gard-test.no"),
+        false,
+        "h6: the gate alone no longer selects the address (before N-A it did — only the ledger kept it out)",
+      );
       const next = await run(true, { transport: t, now: tomorrow() });
       assertEq(
-        next.results.find((x) => x.agent_id === "h-1")?.reason,
-        "recently_contacted_by_platform_job",
-        "h7: next day the ledger keeps it out",
+        [next.results.find((x) => x.agent_id === "h-1"), next.sent_log_reconciliation?.inserted],
+        [undefined, 0],
+        "h7: next day it is not a candidate at all; nothing left to reconcile",
       );
       assertEq(t.calls.filter((c) => c.to === "disk@gard-test.no").length, 1, "h8: the producer got exactly ONE e-mail");
       assertEq(t.calls.filter((c) => c.to === "neste@gard-test.no").length, 1, "h9: the rest of the list still goes out");
@@ -633,13 +691,18 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const t = makeTransport();
       const same = await run(true, { transport: t });
       assertEq(same.sent_today_before, 1, "i12: the unknown delivery counts toward today's budget");
-      assertEq(same.results.find((x) => x.agent_id === "i-3")?.reason, "already_attempted_today", "i13: no second attempt at the same address the same day");
+      assertEq(
+        [r.results[0].sent_log_reconciled, reconciledFor("feil@gard-test.no").map((x) => [x.agent_id, x.message_id.startsWith("rfb-ledger-"), x.notes])],
+        ["inserted", [["i-3", true, "rfb-marketing-platform:unknown_delivery"]]],
+        "i12b: the unknown delivery is written into outreach_sent_log at finalize time (N-A)",
+      );
+      assertEq(same.results.find((x) => x.agent_id === "i-3"), undefined, "i13: no second attempt at the same address the same day (the gate no longer offers it)");
       assertEq(t.calls.map((c) => c.to), ["frisk@gard-test.no"], "i14: the same-day rerun sends only the producer never tried");
       const nextDay = await run(true, { transport: t, now: tomorrow() });
       assertEq(
-        [nextDay.results.find((x) => x.agent_id === "i-3")?.reason, nextDay.skipped_reason],
-        ["recently_contacted_by_platform_job", "no_sendable_candidates"],
-        "i15: next day the unknown address is still blocked (cooldown) — not retried",
+        [nextDay.results.find((x) => x.agent_id === "i-3"), nextDay.skipped_reason],
+        [undefined, "no_candidates"],
+        "i15: next day the unknown address is not offered at all (outreach_sent_log) — not retried",
       );
       assertEq(failingCalls.concat(t.calls.map((c) => c.to)), ["feil@gard-test.no", "frisk@gard-test.no"], "i16: feil@ was handed to the transport exactly once, ever");
     }
@@ -669,9 +732,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const t2 = makeTransport();
       const d2 = await run(true, { transport: t2, now: tomorrow() });
       assertEq(
-        [t2.calls.length, d2.results.find((x) => x.agent_id === "v-1")?.reason],
-        [0, "recently_contacted_by_platform_job"],
-        "i19: day 2 — no e-mail to that address",
+        [t2.calls.length, d2.results.find((x) => x.agent_id === "v-1"), reconciledFor("tvil@gard-test.no").length],
+        [0, undefined, 1],
+        "i19: day 2 — no e-mail to that address (reconciled into outreach_sent_log on day 1)",
       );
       assertEq(wire, ["tvil@gard-test.no"], "i20: exactly one hand-off to the transport, ever");
     }
@@ -698,7 +761,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["aust@gard-test.no", "unknown"]], "i23: one ledger row, 'unknown'");
       const t = makeTransport();
       const next = await run(true, { transport: t, now: tomorrow() });
-      assertEq(next.results.find((x) => x.agent_id === "x-1")?.reason, "recently_contacted_by_platform_job", "i24: next day the address it was handed is blocked");
+      assertEq(
+        [next.results.find((x) => x.agent_id === "x-1"), reconciledFor("aust@gard-test.no").length],
+        [undefined, 1],
+        "i24: next day the address it was handed is not offered again (reconciled)",
+      );
       assertEq(
         t.calls.map((c) => c.to),
         ["berg@gard-test.no", "dal@gard-test.no", "eng@gard-test.no", "fjell@gard-test.no"],
@@ -1013,6 +1080,406 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(t.calls.length, 0, "x4: nothing sent");
     }
 
+    // ── (z) pre-send homepage refresh ──────────────────────────────────────
+    const THIN = "Gård.";
+    // Products keep a thin profile inside the gate's content threshold, so it
+    // reaches the job's own content check (same as block (n)).
+    const PRODUCTS3 = JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Ull" }]);
+    const recorder = (impl?: (db: any, agentId: string) => Promise<any> | any) => {
+      const calls: Array<{ agentId: string; deadlineAt: number; at: number }> = [];
+      const fn = async (d: any, agentId: string, o: { deadlineAt: number }) => {
+        calls.push({ agentId, deadlineAt: o.deadlineAt, at: Date.now() });
+        if (impl) return impl(d, agentId);
+        return { outcome: "unchanged", ms: 0 };
+      };
+      return { calls, fn };
+    };
+    const runZ = (apply: boolean, deps: Record<string, any>, t = makeTransport()) =>
+      daily.runRfbMarketingDaily({ apply, trigger: "manual", now: new Date(), deps: { sendRaw: t.sendRaw, healthProbe: healthy, ...deps } });
+
+    freshDb();
+    seedProducer("z-1", "En Gård", "en@gard-test.no");
+    seedProducer("z-2", "To Gård", "to@gard-test.no");
+    seedProducer("z-3", "Tre Gård", "tre@gard-test.no");
+    seedProducer("z-4", "Fire Gård", "fire@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
+    {
+      // z-1 already mailed by this job today (ledger) → skipped before any crawl.
+      db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
+         VALUES (?, 'run-earlier', 'z-1', 'en@gard-test.no', 'first', 'A', 'refused', ?)`,
+      ).run(day(new Date()), new Date().toISOString());
+      const dryRec = recorder();
+      const dry = await runZ(false, { homepageRefresh: dryRec.fn });
+      assertEq([dryRec.calls.length, dry.homepage_refresh?.mode, dry.homepage_refresh?.attempted], [0, "skipped_dry_run", 0], "z1: a dry run never refreshes (a refresh writes)");
+      const rec = recorder();
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      assertEq(rec.calls.map((c) => c.agentId), ["z-2", "z-3"], "z2: refreshed exactly the candidates that were then sent — not the ledger-blocked one, not the rest of the list");
+      assertEq(t.calls.map((c) => c.to), ["to@gard-test.no", "tre@gard-test.no"], "z3: …and those two were sent (cap 2)");
+      assertEq(
+        [r.homepage_refresh?.mode, r.homepage_refresh?.attempted, r.homepage_refresh?.unchanged, r.homepage_refresh?.max_refreshes],
+        ["applied", 2, 2, 2 + daily.RFB_MARKETING_EXTRA_REFRESHES],
+        "z4: refresh summary in the report (max = budget + extra)",
+      );
+      assertTrue(
+        rec.calls.every((c) => c.deadlineAt > c.at && c.deadlineAt - c.at <= daily.RFB_MARKETING_REFRESH_PER_CANDIDATE_MS),
+        "z5: each refresh gets a per-candidate deadline ≤ RFB_MARKETING_REFRESH_PER_CANDIDATE_MS",
+      );
+      assertEq(r.results.find((x) => x.agent_id === "z-2")?.homepage_refresh?.outcome, "unchanged", "z6: the outcome is on the result row");
+      const claim = (JSON.parse(runsRows()[0].claims) as Array<any>).find((c) => c.meta?.kind === "rfb_marketing_homepage_refresh");
+      assertEq([claim?.meta?.summary?.attempted, claim?.meta?.rows?.map((x: any) => x.agent_id)], [2, ["z-2", "z-3"]], "z7: the envelope carries the refresh outcomes");
+    }
+
+    // Fresh content decides held vs sent: the refresh runs BEFORE the content check.
+    freshDb();
+    seedProducer("z-5", "Tynn Gård", "tynn@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("z-6", "Tynn Igjen", "tynnigjen@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const rec = recorder((d, agentId) => {
+        if (agentId === "z-5") {
+          d.prepare(`UPDATE agent_knowledge SET about = ? WHERE agent_id = ?`).run(GOOD_ABOUT, agentId);
+          return { outcome: "refreshed", fields: ["about"], ms: 1 };
+        }
+        return { outcome: "unchanged", ms: 1 };
+      });
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      assertEq(
+        r.results.map((x) => [x.agent_id, x.status, x.reason ?? null]),
+        [["z-5", "sent", null], ["z-6", "skipped", "held_for_reenrichment:for_kort"]],
+        "z8: the refreshed profile passes the content check and is sent; the unrefreshed thin one is held",
+      );
+      assertEq([r.homepage_refresh?.refreshed, r.homepage_refresh?.by_field], [1, { about: 1 }], "z9: refreshed count + by_field");
+      assertEq(r.held_for_reenrichment.map((h) => h.agent_id), ["z-6"], "z10: held list after refresh");
+    }
+
+    // A failed / throwing refresh never blocks the send and never marks the run troubled.
+    freshDb();
+    seedProducer("z-7", "Feil Refresh", "feilrefresh@gard-test.no");
+    seedProducer("z-8", "Kast Refresh", "kastrefresh@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const rec = recorder((_d, agentId) => {
+        if (agentId === "z-8") throw new Error("boom");
+        return { outcome: "failed", error: "fetch_failed:http_404 (permanent) for https://gard-test.no", ms: 3 };
+      });
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      assertEq(t.calls.map((c) => c.to), ["feilrefresh@gard-test.no", "kastrefresh@gard-test.no"], "z11: both sent despite a failed and a throwing refresh");
+      assertEq(
+        [r.results[1].homepage_refresh?.outcome, (r.results[1].homepage_refresh?.error ?? "").startsWith("refresh_threw"), r.homepage_refresh?.failed],
+        ["failed", true, 2],
+        "z12: a thrown refresh is reported as failed",
+      );
+      assertEq([runsRows()[0].status, r.errors], ["completed", []], "z13: refresh failures do not make the run partial/failed");
+    }
+
+    // Bounded: the refresh COUNT (held candidates spend refreshes) and the TOTAL time budget.
+    freshDb();
+    for (let i = 1; i <= 12; i++) seedProducer(`zb-${String(i).padStart(2, "0")}`, `Tynn ${i}`, `tynn${i}@gard-test.no`, { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("zb-13", "God Gård", "god@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const rec = recorder();
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      const max = 1 + daily.RFB_MARKETING_EXTRA_REFRESHES;
+      assertEq(
+        [rec.calls.length, r.homepage_refresh?.attempted, r.homepage_refresh?.skipped_refresh_budget, t.calls.map((c) => c.to)],
+        [max, max, 13 - max, ["god@gard-test.no"]],
+        "z14: at most budget + RFB_MARKETING_EXTRA_REFRESHES refreshes; the rest go on with the content they have (the good one is still sent)",
+      );
+    }
+    freshDb();
+    for (let i = 1; i <= 4; i++) seedProducer(`zt-${i}`, `Tid ${i}`, `tid${i}@gard-test.no`);
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "4" });
+    {
+      const rec = recorder(async () => {
+        await new Promise((res) => setTimeout(res, 70));
+        return { outcome: "unchanged", ms: 70 };
+      });
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn, refreshLimits: { perCandidateMs: 1000, totalBudgetMs: 100 } }, t);
+      assertEq(
+        [rec.calls.length, r.homepage_refresh?.skipped_refresh_budget, t.calls.length],
+        [2, 2, 4],
+        "z15: the total time budget stops refreshing (not sending) once spent",
+      );
+      const first = rec.calls[0];
+      assertTrue(rec.calls[1].deadlineAt <= first.at + 100 + 5, "z16: a refresh started late in the budget gets a deadline clamped to the run's budget");
+    }
+
+    // The REAL refresh path (refreshHomepageContent) with a stub fetch:
+    // content written from the homepage, curated locks kept, write-pause honoured, timeout.
+    freshDb();
+    seedProducer("zr-1", "Hjemmeside Gård", "hjemme@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("zr-2", "Låst Gård", "laast@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    db.prepare(`UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = 'zr-2'`).run(JSON.stringify({ about: true, description: true }));
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const fetched: string[] = [];
+      const siteFetch = (async (url: string) => {
+        const u = new URL(url);
+        fetched.push(u.pathname);
+        return u.pathname === "/" || u.pathname === "" ? htmlPage(GOOD_ABOUT) : new Response("", { status: 404 });
+      }) as unknown as typeof fetch;
+      const t = makeTransport();
+      const r = await runZ(true, { refreshFetchImpl: siteFetch }, t);
+      const r1 = r.results.find((x) => x.agent_id === "zr-1");
+      const r2 = r.results.find((x) => x.agent_id === "zr-2");
+      assertEq([r1?.homepage_refresh?.outcome, r1?.status], ["refreshed", "sent"], "z17: real path — the homepage's own text is written, so the thin profile is now sent");
+      const k1 = db.prepare(`SELECT about, field_provenance FROM agent_knowledge WHERE agent_id = 'zr-1'`).get() as any;
+      assertEq([k1.about, JSON.parse(k1.field_provenance).about?.[0]?.source_type], [GOOD_ABOUT, "website_homepage"], "z18: written with website_homepage provenance (the route's writer)");
+      assertEq(
+        [r2?.homepage_refresh?.outcome, r2?.homepage_refresh?.curated_locked, r2?.status, r2?.reason],
+        ["unchanged", ["about", "description"], "skipped", "held_for_reenrichment:for_kort"],
+        "z19: curated/owner-locked about+description are never overwritten — still thin, so held",
+      );
+      const k2 = db.prepare(`SELECT a.description AS d, k.about AS a FROM agents a JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = 'zr-2'`).get() as any;
+      assertEq([k2.a, k2.d], [THIN, THIN], "z20: the locked columns are untouched in the database");
+      assertTrue(fetched.length > 0, "z21: the injected fetch (not the network) served the crawl");
+      const k1c = db.prepare(`SELECT email FROM agent_knowledge WHERE agent_id = 'zr-1'`).get() as any;
+      assertEq(k1c.email, "hjemme@gard-test.no", "z22: contact fields untouched");
+    }
+    freshDb();
+    seedProducer("zp-1", "Pause Gård", "pause@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const ewp = require("./enrichment-write-pause") as typeof import("./enrichment-write-pause");
+      ewp.setEnrichmentWritePause(db, { vertical: "rfb", enabled: true, reason: "test pause" }, "test");
+      let fetchCalls = 0;
+      const countingFetch = (async () => {
+        fetchCalls += 1;
+        return htmlPage(GOOD_ABOUT);
+      }) as unknown as typeof fetch;
+      const t = makeTransport();
+      const r = await runZ(true, { refreshFetchImpl: countingFetch }, t);
+      assertEq(
+        [r.results[0].homepage_refresh?.outcome, r.results[0].homepage_refresh?.error, fetchCalls, r.results[0].status],
+        ["write_paused", "test pause", 0, "sent"],
+        "z23: enrichment write-pause → no crawl, no write (the route's 423), the send still goes out",
+      );
+    }
+    freshDb();
+    seedProducer("zh-1", "Heng Gård", "heng@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const hanging = ((_u: string, init?: { signal?: AbortSignal }) =>
+        new Promise((_res, rej) => {
+          if (init?.signal?.aborted) return rej(init.signal.reason);
+          init?.signal?.addEventListener("abort", () => rej(init.signal!.reason));
+        })) as unknown as typeof fetch;
+      const before = db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zh-1'`).get();
+      const keepAlive = setTimeout(() => undefined, 5000);
+      const t0 = Date.now();
+      const t = makeTransport();
+      const r = await runZ(true, { refreshFetchImpl: hanging, refreshLimits: { perCandidateMs: 150 } }, t);
+      clearTimeout(keepAlive);
+      assertEq(
+        [r.results[0].homepage_refresh?.outcome, r.results[0].status, Date.now() - t0 < 3000],
+        ["timeout", "sent", true],
+        "z24: a hanging homepage is cut off at the per-candidate deadline and the send goes on",
+      );
+      assertEq(
+        db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zh-1'`).get(),
+        before,
+        "z25: …with nothing written (no content, no parking strike)",
+      );
+    }
+
+    // Hijacked homepage (owner decision 2026-09-29 «2 Ja»): a theme-spam
+    // refresh HOLDS the candidate — no reservation, no compose, held with
+    // reason hijacked_homepage, counted separately — and the next candidate
+    // is still sent. A transient refresh failure still sends.
+    freshDb();
+    seedProducer("zs-1", "Kapret Gård", "kapret@gard-test.no");
+    seedProducer("zs-2", "Ekte Gård", "ekte@gard-test.no");
+    seedProducer("zs-3", "Treg Gård", "treg@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
+    {
+      const rec = recorder((_d, agentId) => {
+        if (agentId === "zs-1") return { outcome: "hijacked", error: "theme_spam_page for https://gard-test.no", ms: 2 };
+        if (agentId === "zs-2") return { outcome: "timeout", error: "fetch_failed:timeout (transient) for https://gard-test.no", ms: 2 };
+        return { outcome: "failed", error: "fetch_failed:conn_reset (transient) for https://gard-test.no", ms: 2 };
+      });
+      const t = makeTransport();
+      const r = await runZ(true, { homepageRefresh: rec.fn }, t);
+      assertEq(
+        r.results.map((x) => [x.agent_id, x.status, x.reason ?? null, x.homepage_refresh?.outcome]),
+        [
+          ["zs-1", "skipped", "held_for_reenrichment:hijacked_homepage", "hijacked"],
+          ["zs-2", "sent", null, "timeout"],
+          ["zs-3", "sent", null, "failed"],
+        ],
+        "zs1: a hijacked homepage is held; the next candidates (transient timeout / failure) are still sent",
+      );
+      assertEq(t.calls.map((c) => c.to), ["ekte@gard-test.no", "treg@gard-test.no"], "zs2: the hijacked candidate is never handed to the transport");
+      assertEq(ledger().map((l) => l.recipient_email).includes("kapret@gard-test.no"), false, "zs3: no reservation for the hijacked candidate");
+      assertEq(
+        db.prepare(`SELECT COUNT(*) AS n FROM outreach_sent_log WHERE LOWER(recipient_email) = 'kapret@gard-test.no' OR agent_id = 'zs-1'`).get(),
+        { n: 0 },
+        "zs4: nothing recorded as sent for it",
+      );
+      assertEq(r.compose_attempts, 2, "zs5: the hold spends no compose attempt (and no send budget: cap 2 still sent two)");
+      assertEq(
+        r.held_for_reenrichment,
+        [{ agent_id: "zs-1", name: "Kapret Gård", reason: "hijacked_homepage", description_length: GOOD_ABOUT.trim().length, detail: "theme_spam_page for https://gard-test.no" }],
+        "zs6: held for re-enrichment with the reason and the refresh's finding — even though the e-mail domain equals the website domain",
+      );
+      assertEq(
+        [r.summary.held, r.summary.held_hijacked, r.homepage_refresh?.hijacked, r.homepage_refresh?.timeout, r.homepage_refresh?.failed],
+        [1, 1, 1, 1, 1],
+        "zs7: counted separately in the summary and the refresh summary",
+      );
+      const claims = JSON.parse(runsRows()[0].claims) as Array<any>;
+      const hij = claims.find((c) => c.meta?.kind === "rfb_marketing_held_hijacked_homepage");
+      assertEq([hij?.value, hij?.meta?.held?.map((h: any) => h.agent_id)], [1, ["zs-1"]], "zs8: its own envelope claim");
+      const heldClaim = claims.find((c) => c.meta?.kind === "rfb_marketing_held_for_reenrichment");
+      assertEq(heldClaim?.meta?.held?.map((h: any) => h.reason), ["hijacked_homepage"], "zs9: …and in the held-for-reenrichment claim");
+      assertTrue(runsRows()[0].notes.includes("held=1 (hijacked=1)"), "zs10: the envelope notes say so");
+      assertEq(runsRows()[0].status, "completed", "zs11: a hold does not make the run partial/failed");
+    }
+    // The REAL refresh path: the route's own theme-spam page detection → held.
+    freshDb();
+    seedProducer("zsr-1", "Kasino Gård", "post@kasino-gard.no");
+    seedProducer("zsr-2", "Ærlig Gård", "post@aerlig-gard.no");
+    db.prepare(`UPDATE agents SET url = 'https://kasino-gard.no' WHERE id = 'zsr-1'`).run();
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const spamPage = () =>
+        new Response(
+          `<html><head><title>Beste norske casino 2026</title><meta name="description" content="Casino bonus og free spins"></head><body><p>Spill casino med velkomstbonus.</p></body></html>`,
+          { status: 200, headers: { "content-type": "text/html; charset=utf-8" } },
+        );
+      const siteFetch = (async (url: string) => {
+        const u = new URL(url);
+        if (u.hostname === "kasino-gard.no") return spamPage();
+        return u.pathname === "/" || u.pathname === "" ? htmlPage(GOOD_ABOUT) : new Response("", { status: 404 });
+      }) as unknown as typeof fetch;
+      const before = db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zsr-1'`).get();
+      const t = makeTransport();
+      const r = await runZ(true, { refreshFetchImpl: siteFetch }, t);
+      const r1 = r.results.find((x) => x.agent_id === "zsr-1");
+      assertEq(
+        [r1?.homepage_refresh?.outcome, r1?.homepage_refresh?.error, r1?.status, r1?.reason],
+        ["hijacked", "theme_spam_page for https://kasino-gard.no", "skipped", "held_for_reenrichment:hijacked_homepage"],
+        "zs12: real path — the route's theme_spam_page skip holds the candidate",
+      );
+      assertEq(t.calls.map((c) => c.to), ["post@aerlig-gard.no"], "zs13: …and the next candidate takes the one budget slot");
+      assertEq(
+        db.prepare(`SELECT about, field_provenance, homepage_fetch_attempts FROM agent_knowledge WHERE agent_id = 'zsr-1'`).get(),
+        before,
+        "zs14: nothing written from the spam page",
+      );
+    }
+
+    // ── (N) N-A: possible contacts reconciled into outreach_sent_log ───────
+    freshDb();
+    seedProducer("na-1", "Ukjent Gård", "ukjent@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      // Day 0 = 61 days ago: the transport fails after the hand-off → 'unknown'.
+      const day0 = new Date(Date.now() - 61 * 86400_000);
+      const failing = { calls: [] as any[], sendRaw: async () => ({ success: false, error: "smtp 451" }) };
+      const r0 = await daily.runRfbMarketingDaily({ apply: true, trigger: "manual", now: day0, deps: { sendRaw: failing.sendRaw as any, healthProbe: healthy } });
+      assertEq([r0.results[0]?.status, r0.results[0]?.sent_log_reconciled], ["unknown", "inserted"], "N1: day 0 — unknown delivery, reconciled at finalize time");
+      const rec = reconciledFor("ukjent@gard-test.no");
+      assertEq(
+        [rec.length, rec[0]?.sent_at.slice(0, 10), rec[0]?.sent_at.includes("T")],
+        [1, day(day0), false],
+        "N2: the reconciled row is dated day 0 in the trigger's SQLite format",
+      );
+      // Control first: without the reconciled row, the gate WOULD offer the
+      // producer as a FIRST touch again once the ledger window is over (the
+      // N-A bug). Then the sweep puts the row back (idempotent re-insert).
+      db.prepare(`DELETE FROM outreach_sent_log WHERE notes LIKE 'rfb-marketing-platform:%'`).run();
+      const bare = aoc.computeOutreachCandidates(db, { mode: "first", cooldownDays: 60, limit: 100 });
+      assertEq(bare.candidates.some((c) => c.agent_id === "na-1"), true, "N3: control — without the reconciled row the gate re-selects it as a first touch");
+      assertEq(daily.reconcileRfbMarketingSentLog(db).inserted, 1, "N4: the start-of-run sweep restores it");
+      // Day 61: the ledger's 60-day window has passed — only outreach_sent_log remembers.
+      const firstGate = aoc.computeOutreachCandidates(db, { mode: "first", cooldownDays: 60, limit: 100 });
+      assertEq(firstGate.candidates.some((c) => c.agent_id === "na-1"), false, "N5: day 61 — the gate's mode=first excludes it");
+      const t = makeTransport();
+      const r61 = await run(true, { transport: t });
+      const again = r61.results.find((x) => x.agent_id === "na-1");
+      assertEq(
+        [again?.touch, again?.status],
+        ["second", "sent"],
+        "N5b: day 61 — it comes back only as a legitimate SECOND touch (day 0 counted as the first contact)",
+      );
+    }
+    freshDb();
+    seedProducer("na-2", "Idem Gård", "idem@gard-test.no");
+    seedProducer("na-3", "Normal Gård", "normal@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const nowIso = new Date().toISOString();
+      const ins = db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at, updated_at, error)
+         VALUES (?, 'run-x', ?, ?, 'first', 'A', ?, ?, ?, ?)`,
+      );
+      ins.run(day(new Date()), "na-2", "idem@gard-test.no", "unknown", nowIso, nowIso, "transport_failed:x");
+      ins.run(day(new Date(Date.now() - 86400_000)), "ghost-agent", "ghost@nowhere.test", "reserved", nowIso, null, null);
+      const s1 = daily.reconcileRfbMarketingSentLog(db);
+      const s2 = daily.reconcileRfbMarketingSentLog(db);
+      const s3 = daily.reconcileRfbMarketingSentLog(db);
+      assertEq(
+        [s1.inserted, s1.no_agent, s2.inserted, s2.already_present, s3.inserted, reconciledFor("idem@gard-test.no").length],
+        [1, 1, 0, 1, 0, 1],
+        "N6: idempotent — three sweeps, one row; an address with no agent on file writes nothing",
+      );
+      assertEq(
+        (db.prepare(`SELECT COUNT(*) AS c FROM outreach_sent_log WHERE recipient_email = 'ghost@nowhere.test'`).get() as any).c,
+        0,
+        "N7: no_agent → nothing inserted (outreach_sent_log.agent_id is NOT NULL, as for the trigger)",
+      );
+      // A normal send (compose's trigger row exists) forced into the sweep → already_present, no duplicate.
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq(t.calls.map((c) => c.to), ["normal@gard-test.no"], "N8: the reconciled address is not mailed; the other one is");
+      db.prepare(`UPDATE rfb_marketing_send_ledger SET error = 'forced' WHERE recipient_email = 'normal@gard-test.no'`).run();
+      const s4 = daily.reconcileRfbMarketingSentLog(db);
+      assertEq(
+        [s4.inserted, oslFor("normal@gard-test.no"), reconciledFor("normal@gard-test.no").length],
+        [0, 1, 0],
+        "N9: a send compose's trigger already recorded is never duplicated",
+      );
+      assertEq(r.sent_log_reconciliation?.inserted, 0, "N10: the run's own start sweep found nothing new");
+      // Compose's email-keyed (cross-platform) cooldown counts the reconciled row.
+      const crm = require("../routes/crm") as typeof import("../routes/crm");
+      const c = await crm.executeCompose(
+        { to: "idem@gard-test.no", subject: "s", bodyText: "b", intent: "resend_send", category: "marketing", createdBy: "claude", vertical: "rfb" },
+        { sendRaw: makeTransport().sendRaw },
+      );
+      assertEq([c.httpStatus, (c.body as any).error], [429, "cooldown_suppressed"], "N11: compose's cooldown refuses the reconciled address");
+    }
+    // A sweep that cannot write is reported, never fatal, and retried next run.
+    freshDb();
+    seedProducer("na-4", "Senere Gård", "senere@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const nowIso = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
+         VALUES (?, 'run-y', 'na-4', 'senere@gard-test.no', 'first', 'A', 'reserved', ?)`,
+      ).run(day(new Date(Date.now() - 86400_000)), nowIso);
+      db.exec(`CREATE TRIGGER t_osl_insert_fails BEFORE INSERT ON outreach_sent_log
+               WHEN NEW.notes LIKE 'rfb-marketing-platform:%'
+               BEGIN SELECT RAISE(ABORT, 'simulated disk full'); END;`);
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq(
+        [r.sent_log_reconciliation?.failed, r.errors.some((e) => e.includes("reconciliation failed")), r.skipped_reason],
+        [1, true, "no_sendable_candidates"],
+        "N12: a failed sweep is reported and the run carries on (the ledger still blocks the address)",
+      );
+      db.exec(`DROP TRIGGER t_osl_insert_fails`);
+      const r2 = await run(true, { transport: t });
+      assertEq([r2.sent_log_reconciliation?.inserted, reconciledFor("senere@gard-test.no").length, t.calls.length], [1, 1, 0], "N13: the next run's sweep writes it");
+    }
+
     // ── (o) in-process mutex ───────────────────────────────────────────────
     freshDb();
     seedProducer("o-1", "Samtidig En", "o1@gard-test.no");
@@ -1206,6 +1673,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     failures.push(`rfb-marketing-daily: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
     daily.__setRfbMarketingHealthProbeForTesting(null);
+    daily.__setRfbMarketingRefreshFetchForTesting(null);
     emailSvc.isConfigured = origConfigured;
     emailSvc.transporter = origTransporter;
     for (const k of ENV_KEYS) {
