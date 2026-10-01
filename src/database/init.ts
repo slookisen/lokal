@@ -2710,6 +2710,20 @@ function initSchema(db: Database.Database): void {
     console.error("Migration phase51_backfill_provenance_v1 failed:", err);
   }
 
+  // ─── inbound_email_seen: Resend email_id dedupe for POST /webhooks/inbound-email
+  // (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). PRIMARY KEY =
+  // one forward per email_id.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbound_email_seen (
+        email_id TEXT PRIMARY KEY,
+        received_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+  } catch (err) {
+    console.error("Migration inbound_email_seen failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.

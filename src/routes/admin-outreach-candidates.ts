@@ -11,7 +11,7 @@
 //        3. not replied (crm_contacts → crm_threads → crm_messages direction='in')
 //        4. not opted-out (crm_contacts.status != 'active' OR
 //                          agent_knowledge.verification_status = 'opt_out')
-//        5. not a customer (agents.claimed_at IS NOT NULL)
+//        5. not a customer (customerRuleSql: claimed_at OR a verified agent_claims row)
 //        6. hard-bounced (email_bounces table, Phase 4.14 / WO #6)
 //        7. not on agent_blocklist (orch-pr-20260614-8) — JS post-filter via
 //           isBlocked() to guarantee identical normalization to the write path
@@ -40,6 +40,7 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { customerRuleSql } from "../services/customer-rule";
 import {
   getRecentlyEmailedAddresses,
   getCrossPlatformSuppressors,
@@ -350,7 +351,7 @@ export function computeOutreachCandidates(
     // Both queries collect suppression metadata via CASE expressions:
     //   - has_replied: inbound crm_message linked via contact → thread → message
     //   - is_opted_out: crm blocked/archived OR verification_status=opt_out
-    //   - is_customer: agents.claimed_at IS NOT NULL
+    //   - is_customer: customerRuleSql() — claimed_at OR a verified agent_claims row
     //   - is_hard_bounced: email_bounces.bounce_type IN ('hard','complaint')
 
     const suppressionCols = `
@@ -374,7 +375,7 @@ export function computeOutreachCandidates(
             AND ak2.verification_status = 'opt_out'
         )
       ) THEN 1 ELSE 0 END AS is_opted_out,
-      CASE WHEN a.claimed_at IS NOT NULL THEN 1 ELSE 0 END AS is_customer,
+      CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS is_customer,
       -- TODO bounce-suppression: also cross-check by agent_id for non-direct-match bounces
       CASE WHEN EXISTS (
         SELECT 1 FROM email_bounces eb
