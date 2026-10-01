@@ -932,6 +932,13 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       .prepare("SELECT id, name FROM agents WHERE id = ?")
       .get(agentId) as any;
     if (agent) (agent as any).slug = slugify(String(agent.name || ""));
+    if (agent) {
+      // Tolerant read: a DB without the column renders as "off".
+      try {
+        const o = db.prepare("SELECT order_notifications_opt_in AS v FROM agents WHERE id = ?").get(agentId) as any;
+        agent.order_notifications_opt_in = o && o.v === 1 ? 1 : 0;
+      } catch { agent.order_notifications_opt_in = 0; }
+    }
     if (!agent) {
       return res.status(404).send(portalShell(
         "Fant ikke produsent",
@@ -958,6 +965,10 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Endringene er lagret.</div>`;
     } else if (status === "error") {
       alert = `<div class="ep-alert ep-alert-error" role="alert">Klarte ikke å lagre. Prøv igjen.</div>`;
+    } else if (status === "orders_on") {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar nå bestillinger på e-post.</div>`;
+    } else if (status === "orders_off") {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar ikke lenger bestillinger på e-post.</div>`;
     }
 
     // Editable fields with display labels (Norwegian Bokmål)
@@ -1029,6 +1040,16 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
             <button type="submit" class="ep-btn ep-btn-primary">Lagre alle endringer</button>
             <a href="${escapeHtml(backUrl)}" class="ep-btn ep-btn-secondary">Avbryt</a>
           </div>
+        </form>
+      </div>
+
+      <div class="ep-card" id="bestillinger">
+        <h2>Bestillinger</h2>
+        <p>Motta bestillinger på e-post: <strong>${agent.order_notifications_opt_in ? "På" : "Av"}</strong></p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Når den er på, sender vi bestillinger fra kunder til e-postadressen din. Du kan slå den av igjen når som helst.</p>
+        <form method="post" action="/eier/${encodeURIComponent(agent.id)}/order-notifications" style="margin:0;">
+          <input type="hidden" name="opt_in" value="${agent.order_notifications_opt_in ? "0" : "1"}">
+          <button type="submit" class="ep-btn ep-btn-primary">${agent.order_notifications_opt_in ? "Slå av bestillinger på e-post" : "Slå på bestillinger på e-post"}</button>
         </form>
       </div>
 
@@ -1114,6 +1135,64 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       "Feil",
       `<div class="ep-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`
     ));
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/agents/:id/order-notifications  { opt_in: boolean }
+// POST /eier/:agentId/order-notifications   (form, no-JS fallback)
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-09-16-handleliste slice 4: self-service toggle for
+// «Motta bestillinger på e-post». Owner session ONLY (verifyOwnerSession,
+// same as the other owner write routes): 401 without session, 403 when the
+// session belongs to another agent. Writes agents.order_notifications_opt_in
+// (default stays 0 — only an explicit owner action turns it on).
+function applyOwnerOrderOptIn(
+  req: Request,
+  agentId: string,
+  rawOptIn: unknown,
+): { status: number; body: any } {
+  const session = verifyOwnerSession(req);
+  if (!session.valid) {
+    return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
+  }
+  if (session.agentId !== agentId) {
+    return { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  }
+  let optIn: 0 | 1;
+  if (rawOptIn === true || rawOptIn === 1 || rawOptIn === "1" || rawOptIn === "true") optIn = 1;
+  else if (rawOptIn === false || rawOptIn === 0 || rawOptIn === "0" || rawOptIn === "false") optIn = 0;
+  else return { status: 400, body: { success: false, error: "bad_opt_in", message: "opt_in må være true eller false." } };
+  const info = getDb()
+    .prepare("UPDATE agents SET order_notifications_opt_in = ? WHERE id = ?")
+    .run(optIn, agentId);
+  if (!info.changes) {
+    return { status: 404, body: { success: false, error: "agent_not_found" } };
+  }
+  console.log(`[owner-portal] owner set order_notifications_opt_in=${optIn} for agent ${agentId}`);
+  return { status: 200, body: { success: true, agent_id: agentId, order_notifications_opt_in: optIn === 1 } };
+}
+
+router.post("/api/agents/:id/order-notifications", (req: Request, res: Response) => {
+  try {
+    const out = applyOwnerOrderOptIn(req, String(req.params.id || ""), req.body?.opt_in);
+    return res.status(out.status).json(out.body);
+  } catch (e: any) {
+    console.error("[owner-portal] POST order-notifications failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+router.post("/eier/:agentId/order-notifications", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  try {
+    const out = applyOwnerOrderOptIn(req, agentId, req.body?.opt_in);
+    if (out.status === 401) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    if (out.status !== 200) return res.status(out.status).json(out.body);
+    return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=orders_${out.body.order_notifications_opt_in ? "on" : "off"}#bestillinger`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier order-notifications failed:", e);
+    return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=error`);
   }
 });
 

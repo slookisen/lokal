@@ -143,4 +143,47 @@ router.get("/inbox", (req: Request, res: Response) => {
   }
 });
 
+// ─── GET /handoff-stats ─────────────────────────────────────────────────────
+// dev-request 2026-09-16-handleliste slice 4: contact-producer handoffs per
+// producer for the last 30 days (outreach signal: who do buyers want to
+// order from but cannot yet?). Reads cart_handoffs only — that table holds
+// agent_id + cart_id + item_count + created_at and NO buyer contact data;
+// cart_id is deliberately not returned either. Aggregates + producer name only.
+router.get("/handoff-stats", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const db = _adminOrdersTestDb ?? getDb();
+    const rows = db.prepare(
+      `SELECT h.agent_id AS agent_id,
+              a.name AS name,
+              COALESCE(a.order_notifications_opt_in, 0) AS opt_in,
+              COUNT(*) AS handoffs,
+              COALESCE(SUM(h.item_count), 0) AS items,
+              MAX(h.created_at) AS last_handoff_at
+         FROM cart_handoffs h
+         LEFT JOIN agents a ON a.id = h.agent_id
+        WHERE h.created_at >= datetime('now', ?)
+        GROUP BY h.agent_id
+        ORDER BY handoffs DESC, h.agent_id ASC`
+    ).all("-30 days") as any[];
+    const producers = rows.map((r) => ({
+      agent_id: r.agent_id,
+      name: r.name ?? null,
+      order_notifications_opt_in: r.opt_in === 1,
+      handoffs: r.handoffs,
+      items: r.items,
+      last_handoff_at: r.last_handoff_at,
+    }));
+    res.json({
+      success: true,
+      window_days: 30,
+      total_handoffs: producers.reduce((n, p) => n + p.handoffs, 0),
+      producers,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
 export default router;

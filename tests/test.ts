@@ -43736,6 +43736,23 @@ runSerial(async () => {
   }
 });
 
+// Same dev-request, Slice 4: owner opt-in toggle, claim-mail sentence, handoff-stats.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 4): owner opt-in toggle + handoff-stats ──");
+  try {
+    const { runOwnerOrderOptinHandoffStatsTests } = require("../src/routes/owner-order-optin-handoff-stats.test") as
+      typeof import("../src/routes/owner-order-optin-handoff-stats.test");
+    const s4 = await runOwnerOrderOptinHandoffStatsTests({ log: false });
+    passed += s4.passed;
+    failed += s4.failed;
+    for (const f of s4.failures) failures.push("owner-order-optin-handoff-stats: " + f);
+    console.log(`  owner-order-optin-handoff-stats: ${s4.passed} passed, ${s4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-order-optin-handoff-stats: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Same dev-request, Slice 1: the 30-day buyer-contact-data sweep
 // (sweepExpiredCartContactData) on a fixture DB.
 runSerial(async () => {
