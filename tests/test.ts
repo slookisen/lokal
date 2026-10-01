@@ -43718,6 +43718,24 @@ runSerial(async () => {
   }
 });
 
+// Same dev-request, Slice 3: web page /handleliste + /en/shopping-list behind
+// HANDLELISTE_ENABLED (flag off -> 404, noindex, escaping, e2e-ish flow).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 3): /handleliste page ──");
+  try {
+    const { runHandelistePageTests } = require("../src/routes/handleliste-page.test") as
+      typeof import("../src/routes/handleliste-page.test");
+    const hp = await runHandelistePageTests({ log: false });
+    passed += hp.passed;
+    failed += hp.failed;
+    for (const f of hp.failures) failures.push("handleliste-page: " + f);
+    console.log(`  handleliste-page: ${hp.passed} passed, ${hp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("handleliste-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Same dev-request, Slice 1: the 30-day buyer-contact-data sweep
 // (sweepExpiredCartContactData) on a fixture DB.
 runSerial(async () => {
