@@ -84,6 +84,7 @@ class MarketplaceRegistry {
   private invalidateCache() {
     this._agentsCache = null;
     this._statsCache = null;
+    this._slugIdMap = null;
   }
 
   // ─── Registration ─────────────────────────────────────────
@@ -1535,15 +1536,74 @@ class MarketplaceRegistry {
   // producers, and discovery surfaces continue to use getActiveAgents()
   // (producer-only) — only the direct main-agent lookup widens.
   //
-  // Not cached: this is called once per /produsent/:slug request and the
-  // working set is small (a few thousand rows max). Caching would invite
-  // staleness for newly-tagged umbrellas without measurable upside.
+  // Perf (dev-request 2026-09-26-rfb-produsentside-synkron-slug-skann): this used
+  // to run `SELECT * FROM agents WHERE is_active = 1` + slugify() on every row for
+  // EVERY /produsent/:slug request — O(all agents) of synchronous work incl. the
+  // large text/JSON columns, 5–25 s event-loop stalls under crawling. Now: a
+  // slug→id map built from `id, name` only (first scan-order match wins, exactly
+  // like the old Array.find), then ONE `WHERE id = ?` row read. Direct-SQL writers
+  // (deactivate, merge, bulk inserts) don't all go through invalidateCache(), so
+  // the map is guarded three ways: a (count, max rowid) fingerprint per lookup,
+  // re-verification of the hit row (still active AND slug still matches), and a
+  // throttled rebuild on a miss (renames via direct SQL).
+  private _slugIdMap: Map<string, string> | null = null;
+  private _slugIdMapDb: unknown = null;
+  private _slugIdMapFp = "";
+  private _slugIdMapBuiltAt = 0;
+  private static SLUG_MAP_MISS_REBUILD_MS = 2_000;
+  private static SLUG_MAP_MAX_AGE_MS = 30_000;
+
+  private slugFingerprint(db: ReturnType<typeof getDb>): string {
+    const r = db.prepare("SELECT COUNT(*) AS c, MAX(rowid) AS m FROM agents WHERE is_active = 1").get() as any;
+    return `${r.c}:${r.m}`;
+  }
+
+  private rebuildSlugMap(db: ReturnType<typeof getDb>, fp: string): Map<string, string> {
+    const rows = db.prepare("SELECT id, name FROM agents WHERE is_active = 1 ORDER BY rowid").all() as Array<{ id: string; name: string }>;
+    const map = new Map<string, string>();
+    for (const r of rows) {
+      const key = slugify(r.name).toLowerCase();
+      if (!map.has(key)) map.set(key, r.id);
+    }
+    this._slugIdMap = map;
+    this._slugIdMapDb = db;
+    this._slugIdMapFp = fp;
+    this._slugIdMapBuiltAt = Date.now();
+    return map;
+  }
+
   getAgentBySlugIncludingUmbrellas(slug: string): RegisteredAgent | undefined {
     const target = slug.toLowerCase();
     const db = getDb();
-    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
-    const row = rows.find(r => slugify(r.name).toLowerCase() === target);
-    return row ? this.rowToAgent(row) : undefined;
+    const now = Date.now();
+    const fp = this.slugFingerprint(db);
+    let map = this._slugIdMap;
+    let fresh = false;
+    if (!map || this._slugIdMapDb !== db || this._slugIdMapFp !== fp
+        || now - this._slugIdMapBuiltAt > MarketplaceRegistry.SLUG_MAP_MAX_AGE_MS) {
+      map = this.rebuildSlugMap(db, fp);
+      fresh = true;
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const id = map.get(target);
+      if (id === undefined) {
+        // Miss: a direct-SQL rename may not be in the map yet. Rebuild at most
+        // once per throttle window so a crawler of unknown slugs stays cheap.
+        if (!fresh && now - this._slugIdMapBuiltAt >= MarketplaceRegistry.SLUG_MAP_MISS_REBUILD_MS) {
+          map = this.rebuildSlugMap(db, fp);
+          fresh = true;
+          continue;
+        }
+        return undefined;
+      }
+      const row = db.prepare("SELECT * FROM agents WHERE id = ? AND is_active = 1").get(id) as any;
+      if (row && slugify(row.name).toLowerCase() === target) return this.rowToAgent(row);
+      // Stale entry (direct-SQL deactivate/rename): rebuild once and retry.
+      if (fresh) return undefined;
+      map = this.rebuildSlugMap(db, fp);
+      fresh = true;
+    }
+    return undefined;
   }
 
   // ─── Slug-alias resolution (dev-request 2026-09-03-rfb-korrigering-navn-

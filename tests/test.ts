@@ -10521,7 +10521,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a4.4: marketplace-registry.ts exports getAgentBySlugIncludingUmbrellas(slug)"
   );
   assertTrue(
-    /SELECT \* FROM agents WHERE is_active = 1["\`]\)/.test(regSrc),
+    /SELECT id, name FROM agents WHERE is_active = 1 ORDER BY rowid["\`]\)/.test(regSrc)
+      && /SELECT \* FROM agents WHERE id = \? AND is_active = 1["\`]\)/.test(regSrc),
     "phase5.11-a4.4: new method queries WHERE is_active = 1 (no umbrella_type filter)"
   );
 
@@ -42464,6 +42465,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("produsent-role-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-26-rfb-produsentside-synkron-slug-skann: slug→id map for
+// getAgentBySlugIncludingUmbrellas (parity vs. the old full-scan, direct-SQL
+// staleness, per-lookup cost). Own in-memory DB; runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-26-rfb-produsentside-synkron-slug-skann: slug lookup ──");
+  try {
+    const { runMarketplaceRegistrySlugLookupTests } = require("../src/services/marketplace-registry-slug-lookup.test") as
+      typeof import("../src/services/marketplace-registry-slug-lookup.test");
+    const sl = await runMarketplaceRegistrySlugLookupTests({ log: false });
+    passed += sl.passed;
+    failed += sl.failed;
+    for (const f of sl.failures) failures.push("slug-lookup: " + f);
+    console.log(`  slug-lookup: ${sl.passed} passed, ${sl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("slug-lookup: unexpected error: " + String(err?.message || err));
   }
 });
 
