@@ -14,8 +14,19 @@
  *   - a cart with nothing to null (already swept, or an open/never-
  *     submitted cart) is never selected — re-running is a no-op (proves
  *     idempotency on a fixture: two runs back to back sweep 0 the 2nd time).
- *   - never touches any column other than the 5 contact fields (order rows,
- *     other cart columns untouched).
+ *   - never touches any column other than the 5 contact fields (order
+ *     status, other cart/order columns untouched).
+ *
+ *   skive 2 (orders carry their own consent-gated copy of the 5 columns):
+ *   - each ORDER is swept independently 30+ days after ITS OWN terminal
+ *     status — regardless of sibling orders in the same cart (a cart with a
+ *     live sibling keeps its cart-level fields while the finished order's
+ *     copy is nulled).
+ *   - a live (pending/confirmed/ready) order is never swept, however old;
+ *     a recent terminal one not yet; an order with nothing to null never
+ *     appears in sweptOrderIds.
+ *   - dryRun reports the same order ids without writing; re-running is a
+ *     no-op.
  *
  * Standalone: npx tsx src/services/cart-contact-sweep.test.ts
  */
@@ -98,6 +109,29 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     ).get(id);
   }
 
+  // skive 2: order-level fixtures. The cart is deliberately CLEAN (no
+  // contact fields) unless stated, so the cart-level expectations stay
+  // exactly as they are and the order-level pass is proven on its own.
+  function insertCleanCart(id: string, status = "submitted") {
+    db.prepare(`
+      INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at)
+      VALUES (?, ?, 'platform_agent', ?, 'NOK', datetime('now'), datetime('now'))
+    `).run(id, `bref_${id}`, status);
+  }
+  function insertOrderWithContact(id: string, cartId: string, status: string, updatedAt: string) {
+    db.prepare(`
+      INSERT INTO orders (id, cart_id, agent_id, buyer_ref, status, fulfilment, total_nok, confirm_token, created_at, updated_at,
+                          buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at)
+      VALUES (?, ?, 'agent-x', ?, ?, 'pickup', 30, ?, datetime('now'), ?,
+              'Order Buyer', 'order-buyer@example.com', '+47 91111111', 'Henter etter 16', datetime('now'))
+    `).run(id, cartId, `bref_${cartId}`, status, `ctok_${id}`, updatedAt);
+  }
+  function readOrder(id: string): any {
+    return db.prepare(
+      "SELECT status, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, updated_at FROM orders WHERE id = ?"
+    ).get(id);
+  }
+
   try {
     initMod.__setDbForTesting(db as any);
     initMod.__initSchemaForTesting(db as any);
@@ -145,6 +179,29 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     `).run(sqlTs(days(60)));
     insertOrder("order-8", "cart-already-clean", "completed", sqlTs(days(60)));
 
+    // ── skive 2: ORDER-level fixtures (each order on its own clock) ────────
+    // o1: terminal (completed) 40 days ago, carries contact → SWEPT.
+    insertCleanCart("cart-o1");
+    insertOrderWithContact("ord-old-terminal", "cart-o1", "completed", sqlTs(days(40)));
+    // o2: terminal (declined) only 10 days ago → NOT yet.
+    insertCleanCart("cart-o2");
+    insertOrderWithContact("ord-recent-terminal", "cart-o2", "declined", sqlTs(days(10)));
+    // o3: still 'pending', 90 days old → NEVER while live.
+    insertCleanCart("cart-o3");
+    insertOrderWithContact("ord-live-old", "cart-o3", "pending", sqlTs(days(90)));
+    // o4: terminal + old but NO contact fields (pre-skive-2 / no-consent
+    // order) → nothing to null, never listed.
+    insertCleanCart("cart-o4");
+    insertOrder("ord-clean-old", "cart-o4", "completed", sqlTs(days(60)));
+    // o5: the independence case — a cart WITH contact fields holding one
+    // completed order (40 days) and one still-pending sibling (40 days):
+    // the cart-level fields must NOT clear (live sibling), but the finished
+    // order's own copy MUST (its own clock), and the pending sibling's not.
+    insertCart("cart-o5-mixed");
+    insertOrderWithContact("ord-o5-done", "cart-o5-mixed", "completed", sqlTs(days(40)));
+    insertOrderWithContact("ord-o5-pending", "cart-o5-mixed", "pending", sqlTs(days(40)));
+    const expectedSweptOrders = ["ord-o5-done", "ord-old-terminal"].sort();
+
     // ── dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
     // dryRun=true finds the SAME candidates a real run would, but writes
     // nothing — proven here BEFORE the real run below actually mutates
@@ -157,6 +214,11 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
       "dryRun=true: reports the exact same 2 eligible carts a real run would"
     );
     assertEq(dryRunResult.sweptCount, 2, "dryRun=true: sweptCount matches the real run's eventual count");
+    assertEq([...dryRunResult.sweptOrderIds].sort(), expectedSweptOrders, "dryRun=true (skive 2): reports exactly the 2 order rows a real run would sweep");
+    assertEq(dryRunResult.sweptOrderCount, 2, "dryRun=true (skive 2): sweptOrderCount matches");
+    for (const id of expectedSweptOrders) {
+      assertTrue(readOrder(id).buyer_name === "Order Buyer", `dryRun=true (skive 2): ${id}'s buyer_name is NOT nulled (no mutation happened)`);
+    }
     // Nothing was actually written — both eligible carts' contact fields
     // are still present.
     for (const id of ["cart-terminal-old", "cart-contact-only-old"]) {
@@ -174,6 +236,19 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
       "sweepExpiredCartContactData: sweeps exactly the two eligible carts"
     );
     assertEq(result.sweptCount, 2, "sweepExpiredCartContactData: sweptCount matches sweptCartIds.length");
+    assertEq([...result.sweptOrderIds].sort(), expectedSweptOrders, "skive 2: sweeps exactly the two eligible ORDER rows (own terminal+30d clock)");
+    assertEq(result.sweptOrderCount, 2, "skive 2: sweptOrderCount matches sweptOrderIds.length");
+    for (const id of expectedSweptOrders) {
+      const o = readOrder(id);
+      assertEq([o.buyer_name, o.buyer_email, o.buyer_phone, o.delivery_note, o.contact_consent_at], [null, null, null, null, null], `skive 2: ${id}: all five order contact columns nulled`);
+      assertEq(o.status, "completed", `skive 2: ${id}: status untouched by the sweep`);
+    }
+    for (const id of ["ord-recent-terminal", "ord-live-old", "ord-o5-pending"]) {
+      assertTrue(readOrder(id).buyer_name === "Order Buyer", `skive 2: ${id}: order contact left untouched (not eligible yet / live)`);
+    }
+    assertEq(readOrder("ord-clean-old").buyer_name, null, "skive 2: ord-clean-old had nothing to null");
+    assertTrue(!result.sweptOrderIds.includes("ord-clean-old"), "skive 2: an order with nothing to null never appears in sweptOrderIds");
+    assertTrue(readCart("cart-o5-mixed").buyer_name === "Test Buyer", "skive 2 independence: the mixed cart's OWN contact fields stay (live sibling) while its finished order's copy was nulled");
 
     // ── Swept carts: all 5 fields nulled ──────────────────────────────────
     for (const id of ["cart-terminal-old", "cart-contact-only-old"]) {
@@ -192,6 +267,7 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
       "cart-two-orders-mixed-age",
       "cart-contact-only-recent",
       "cart-still-open",
+      "cart-o5-mixed",
     ]) {
       const c = readCart(id);
       assertTrue(c.buyer_name === "Test Buyer", `${id}: buyer_name left untouched (not eligible yet)`);
@@ -205,6 +281,8 @@ export function runCartContactSweepTests(opts: { log?: boolean } = {}): TestSumm
     const secondRun = sweepMod.sweepExpiredCartContactData(30, now);
     assertEq(secondRun.sweptCartIds, [], "sweepExpiredCartContactData: re-running is a no-op — already-swept carts are never re-selected");
     assertEq(secondRun.sweptCount, 0, "sweepExpiredCartContactData: second run's sweptCount is 0");
+    assertEq(secondRun.sweptOrderIds, [], "skive 2: re-running sweeps no order twice");
+    assertEq(secondRun.sweptOrderCount, 0, "skive 2: second run's sweptOrderCount is 0");
   } finally {
     sweepMod.__setCartContactSweepTestDb(null);
     initMod.__setDbForTesting(prevDb as any);

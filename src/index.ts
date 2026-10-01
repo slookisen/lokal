@@ -1435,7 +1435,7 @@ app.listen(Number(PORT), HOST, async () => {
         const sweepLive = process.env.CART_CONTACT_SWEEP_LIVE === "true";
         const sweepResult = sweepExpiredCartContactData(30, now, !sweepLive);
         console.log(
-          `[cart-contact-sweep] dryRun=${sweepResult.dryRun} sweptCount=${sweepResult.sweptCount}` +
+          `[cart-contact-sweep] dryRun=${sweepResult.dryRun} sweptCount=${sweepResult.sweptCount} sweptOrderCount=${sweepResult.sweptOrderCount}` +
           (sweepResult.dryRun
             ? " (count-only, no rows modified — set CART_CONTACT_SWEEP_LIVE=true to enable real deletion)"
             : "")

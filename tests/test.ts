@@ -25828,10 +25828,18 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       city TEXT,
       umbrella_type TEXT,
       -- pilot-ordre-loop: submitCart's fire-and-forget notification resolver
-      -- reads these; default opt_in=0 means the legacy cart tests exercise
-      -- the never-send default path.
+      -- reads these. Since skive 2 of dev-request 2026-09-16-handleliste-
+      -- med-produsentvalg-og-bestillingsflyt the two seeded fase-1 producers
+      -- opt IN (the strict real-order gate requires it) and the send is
+      -- stubbed — see the __setOrderNotifySendForTesting pin below.
       order_notifications_opt_in INTEGER NOT NULL DEFAULT 0,
-      order_notification_email TEXT
+      order_notification_email TEXT,
+      -- skive 2: submitCart() now creates a REAL order only for a producer
+      -- that passes cart-service.isEligibleForRealOrder(), which also reads
+      -- the owner-claim flag — the two seeded producers set it (plus opt-in
+      -- + a contact e-mail) so this fase-1 regression block keeps
+      -- exercising the order path.
+      is_verified INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -25906,7 +25914,15 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       confirm_token TEXT,
       cancel_reason TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- skive 2: submitCart() writes the consent-gated buyer contact copy
+      -- onto every order row unconditionally (NULL without consent), so the
+      -- legacy hand-rolled orders table needs the 5 columns too.
+      buyer_name TEXT,
+      buyer_email TEXT,
+      buyer_phone TEXT,
+      delivery_note TEXT,
+      contact_consent_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
     CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
@@ -25968,6 +25984,22 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
     );
     CREATE INDEX IF NOT EXISTS idx_cart_handoffs_agent_id ON cart_handoffs(agent_id);
     CREATE INDEX IF NOT EXISTS idx_cart_handoffs_cart_id ON cart_handoffs(cart_id);
+    -- skive 2: isEligibleForRealOrder() (the submit split) and the notify
+    -- gate's suppression clause both call blocklist-service.isBlocked(),
+    -- which reads agent_blocklist via getDb() — present here (empty) so the
+    -- lookup is a real "not blocked" instead of a caught-and-logged error.
+    CREATE TABLE agent_blocklist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      identifier_type TEXT NOT NULL,
+      identifier_value TEXT NOT NULL,
+      reason TEXT,
+      source_email TEXT,
+      original_agent_id TEXT,
+      original_agent_name TEXT,
+      linked_org_nr TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(identifier_type, identifier_value)
+    );
   `);
 
   // Set the shared DB singleton to our test DB
@@ -25984,17 +26016,25 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   // read the global singleton, which concurrent blocks re-pin).
   const { __setTrustEventTestDb } = require("../src/services/trust-event-service");
   __setTrustEventTestDb(cartDb as any);
-  const { __setOrderNotifyTestDb } = require("../src/services/order-notify-service");
+  const { __setOrderNotifyTestDb, __setOrderNotifySendForTesting } = require("../src/services/order-notify-service");
   __setOrderNotifyTestDb(cartDb as any);
+  // skive 2: ag-carrot/ag-honey are opted in below (the strict real-order
+  // gate requires it), so each submit now fires a seller notification —
+  // stub the transport (same seam pilot-ordre-loop.test.ts uses) so nothing
+  // leaves the process; reset together with the other pins at the end.
+  __setOrderNotifySendForTesting(async () => ({ success: true, messageId: "stub-legacy-cart-block" }));
 
   // ── Seed two verified producers with products ─────────────────────────────
-  cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-carrot", "Gangstad Gård", "Trondheim");
+  // skive 2: both fase-1 producers must now pass isEligibleForRealOrder()
+  // (cross-check verified + owner-claimed + opted in + reachable) for the
+  // submit below to still create their two orders.
+  cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-carrot", "Gangstad Gård", "Trondheim", "carrot@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
   cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
     "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
   );
 
-  cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-honey", "Biene Honning", "Bergen");
+  cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-honey", "Biene Honning", "Bergen", "honey@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
   cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
     "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
@@ -26217,6 +26257,12 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       assertEq(items1[0].name_snapshot, "Gulrøtter", `cart-40: name_snapshot captured (got ${items1[0].name_snapshot})`);
       assertEq(items1[0].line_total, 60, `cart-41: carrot line_total=60 (got ${items1[0].line_total})`);
     }
+
+    // skive 2: no contact fields were sent with this submit → the order's
+    // consent-gated contact copy stays NULL (and so does contact_consent_at).
+    const o1 = cartDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at FROM orders WHERE id = ?").get(order1Id) as any;
+    assertTrue(!!o1 && o1.buyer_name === null && o1.buyer_email === null && o1.buyer_phone === null && o1.delivery_note === null && o1.contact_consent_at === null,
+      "cart-41b: order carries no buyer contact copy when the submit had no consent (skive 2 invariant)");
   }
 
   // ── Test: re-check at submit — mark product OOS after add, then submit ────────
@@ -26351,6 +26397,7 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   __setCartTestDb(null);
   __setTrustEventTestDb(null);
   __setOrderNotifyTestDb(null);
+  __setOrderNotifySendForTesting(null);
 
   _orchPr20260614_6Resolve();
 })();
@@ -35770,13 +35817,21 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
 // — mirroring the blocks above, it must run strictly after every other
 // singleton-swapping block; _emailOwnershipProvenancePromise is the
 // current tail of that serial chain.
+// skive 2 (dev-request 2026-09-16-handleliste-med-produsentvalg-og-
+// bestillingsflyt): ALSO wait for the legacy fase-1 cart block
+// (_orchPr20260614_6Promise) — since skive 2 its two seeded producers are
+// opted in, so it installs its own __setOrderNotifySendForTesting stub and
+// nulls it when done. That reset is a module-global behaviour change (not
+// just DB routing); without this explicit ordering it could, in principle,
+// land while this suite is between installing ITS stub and awaiting
+// `sent`, and the v2/v1 e-mail assertions here would see nothing captured.
 let _pilotOrdreLoopResolve: () => void = () => {};
 const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
   _pilotOrdreLoopResolve = r;
 });
 
 (async () => {
-  await Promise.allSettled([_emailOwnershipProvenancePromise]);
+  await Promise.allSettled([_emailOwnershipProvenancePromise, _orchPr20260614_6Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-13: pilot-ordre-loop (selgervarsling + livssyklus + trust-ledger) ──");

@@ -33,6 +33,16 @@ primary_region = 'arn'
   # 'true') or removing the line entirely turns it back off, with no
   # redeploy-side-effects beyond that.
   VERIFIER_SCHEDULER_ENABLED = '1'
+  # dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
+  # skive 0 (lokal#887): turns on the daily product-catalog sync in
+  # src/index.ts (hourly wake-up, fires once inside the 07:00 UTC window,
+  # same upsert as POST /admin/products/backfill — never touches a product
+  # row's `availability`, see src/services/product-catalog-sync.ts). Shipped
+  # flag-OFF in #887; Daniel GO live 2026-10-01 («Sett synk-flagget», A2A
+  # daniel-responses/2026-10-01-live-go-synk-flagg-og-skive-2-uten-lempning.md).
+  # Gate is `=== "true"`; fail-safe: anything else = off. Rollback: set to
+  # 'false' or remove the line — no deploy-side state.
+  CATALOG_SYNC_SCHEDULER_ENABLED = 'true'
   # dev-request 2026-08-14-fetch-vegg-headless-fallback.md Slice 4: turns on
   # admin-rfb-website-discovery.ts's headless-render fallback for JS-built
   # producer sites. The route already exists and is already tested — it was

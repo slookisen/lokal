@@ -1090,10 +1090,15 @@ export function registerTools(
     "lokal_cart_submit",
     {
       title: "Submit cart and place pickup orders",
-      description: "Submit the cart to create pickup orders — one order per producer. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. Sellers who have opted in to order notifications are notified by email and can confirm/decline the order; other sellers are not contacted. Returns a list of order IDs per producer. Use lokal_order_status to check order status.",
+      description: "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers); they get the order by e-mail and can confirm/decline it. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] and contact_handoffs[]. Use lokal_order_status to check an order.",
       inputSchema: {
         cart_id:   z.string().describe("Cart ID to submit"),
         buyer_ref: z.string().describe("Buyer capability token"),
+        buyer_name:      z.string().max(120).optional().describe("Buyer's name — shared with ordering producers only when contact_consent=true"),
+        buyer_email:     z.string().max(254).optional().describe("Buyer's e-mail — becomes the order e-mail's Reply-To when contact_consent=true"),
+        buyer_phone:     z.string().max(40).optional().describe("Buyer's phone — shared only when contact_consent=true"),
+        delivery_note:   z.string().max(500).optional().describe("Free-text delivery/pickup wish for the producer (orders are pickup; this is informational)"),
+        contact_consent: z.boolean().optional().describe("true = the buyer agrees that the contact fields above are passed to the producers who receive a real order. Default false: fields are stored on the cart but never shown to any producer."),
       },
       annotations: {
         title: "Submit cart",
@@ -1113,12 +1118,20 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ cart_id, buyer_ref }) => {
+    async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent }) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
       }
-      const result = svcSubmitCart(cart_id);
+      // Same trim-or-null normalisation as the REST route (marketplace-cart.ts).
+      const t = (v: unknown) => (typeof v === "string" ? v.trim() || null : null);
+      const result = svcSubmitCart(cart_id, {
+        buyer_name: t(buyer_name),
+        buyer_email: t(buyer_email),
+        buyer_phone: t(buyer_phone),
+        delivery_note: t(delivery_note),
+        contact_consent: contact_consent === true,
+      });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     }
   );

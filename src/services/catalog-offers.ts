@@ -22,19 +22,19 @@
 // implementation in geo-distance.ts (the same helper lokal_search's
 // marketplace-registry.ts discover() uses) — no full-table scan.
 //
-// can_order gate: is_verified (owner-claim, NOT the internal
-// verification_status cross-check — see marketplace-catalog.ts's own note on
-// why `verifisert_av_eier` is is_verified-only) AND
-// order_notifications_opt_in AND not blocklisted. The "blocked" check is the
-// exact same isBlocked({email}) call order-notify-service.ts's
-// resolveOrderNotificationRecipient() gate 4 uses — this module only READS
-// agents.order_notifications_opt_in / order_notification_email /
-// contact_email; it never changes order-notify-service.ts's own send logic.
+// can_order gate (skive 2): the ONE shared cart-service.isEligibleForRealOrder()
+// — the exact function submitCart() uses to decide real order vs contact
+// handoff — evaluated per offer row against the same db connection. So what
+// this surface advertises as orderable is, by construction, what submit will
+// actually turn into an order: cross-check verified + non-umbrella + not
+// second-line + active + owner-claimed (is_verified) + opted in + a
+// non-blocklisted recipient e-mail. `verifisert_av_eier` stays is_verified-
+// only (see marketplace-catalog.ts's own note on why).
 
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
-import { isBlocked } from "./blocklist-service";
+import { isEligibleForRealOrder } from "./cart-service";
 import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
@@ -120,9 +120,6 @@ interface RawOfferRow {
   lat: number;
   lng: number;
   is_verified: number;
-  opt_in: number;
-  order_notification_email: string | null;
-  contact_email: string | null;
 }
 
 async function defaultGeocode(place: string): Promise<{ lat: number; lng: number } | null> {
@@ -187,10 +184,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       p.availability, p.availability_updated_at, p.availability_source,
       a.id AS agent_id, a.name AS agent_name, a.city AS city,
       a.lat AS lat, a.lng AS lng,
-      a.is_verified AS is_verified,
-      a.order_notifications_opt_in AS opt_in,
-      a.order_notification_email AS order_notification_email,
-      a.contact_email AS contact_email
+      a.is_verified AS is_verified
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
     INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -228,13 +222,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     const salgskanaler = (salgskanalStmt.all(r.agent_id) as Array<{ name: string }>).map((s) => s.name);
 
     const isVerified = r.is_verified === 1;
-    const optedIn = r.opt_in === 1;
-    // Gate 4's exact check from order-notify-service.ts's
-    // resolveOrderNotificationRecipient(): admin override email wins over
-    // contact_email, and isBlocked() runs against whichever is present.
-    const recipientEmail = ((r.order_notification_email || "").trim() || (r.contact_email || "").trim());
-    const blocked = recipientEmail ? isBlocked({ email: recipientEmail }).blocked : false;
-    const canOrder = isVerified && optedIn && !blocked;
+    // skive 2: one shared gate with submitCart() — see the module doc comment.
+    const canOrder = isEligibleForRealOrder(r.agent_id, db);
 
     return {
       product_id: r.product_id ?? null,

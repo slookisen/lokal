@@ -10,8 +10,11 @@
  *     is checked here even though neither of those two currently check it,
  *     a deliberately stricter bar, see catalog-offers.ts's own note).
  *   - sorted ascending by distance_km, capped at limit (default/max 5).
- *   - can_order = is_verified AND order_notifications_opt_in AND NOT
- *     blocklisted — each clause independently provable false.
+ *   - can_order = cart-service.isEligibleForRealOrder() (skive 2: the SAME
+ *     gate submitCart() uses to decide real order vs contact handoff) =
+ *     cross-check verified AND is_verified AND order_notifications_opt_in
+ *     AND a reachable, non-blocklisted recipient — each clause
+ *     independently provable false.
  *   - verifisert_av_eier reflects ONLY is_verified (owner-claim), never the
  *     internal verification_status cross-check.
  *   - salgskanaler[] / delivery_text / phone / email / profile_url /
@@ -220,6 +223,14 @@ export async function runMarketplaceCatalogOffersTests(opts: { log?: boolean } =
     insertProduct(db, { id: "prod-blocked", agentId: "off-blocked", name: "Poteter" });
     addToBlocklist({ email: "blocked@example.com", reason: "test" });
 
+    // ── Eligible + owner-verified + opted in, but NO recipient address at
+    // all (empty contact_email, no admin override) — can_order=false (skive
+    // 2 reachability clause). Distinct product name so it never competes
+    // for the limit=5 window the shared-term ("poteter") tests use.
+    insertAgent(db, { id: "off-noemail", name: "Uten E-post Gård", lat: OSLO_NEAR.lat, lng: OSLO_NEAR.lng, isVerified: 1, optIn: 1, contactEmail: "" });
+    insertKnowledge(db, "off-noemail", { verificationStatus: "verified" });
+    insertProduct(db, { id: "prod-noemail", agentId: "off-noemail", name: "Mailfri Gulrot" });
+
     // ── 6 eligible, close producers to prove the 5-cap + ascending sort ──
     for (let i = 0; i < 6; i++) {
       const id = `off-cap-${i}`;
@@ -314,6 +325,13 @@ export async function runMarketplaceCatalogOffersTests(opts: { log?: boolean } =
       const blocked = byId.get("off-blocked");
       assertTrue(!!blocked, "can_order: off-blocked present");
       if (blocked) assertEq(blocked.producer.can_order, false, "can_order: blocklisted email → false");
+
+      // skive 2: no recipient anywhere → false (isEligibleForRealOrder()'s
+      // reachability clause — the admin override would be the only way in).
+      const r2 = await callRoute(catalogRouter, { url: "/offers", query: { q: "mailfri", lat: String(OSLO_NEAR.lat), lng: String(OSLO_NEAR.lng), radius_km: "1", limit: "5" } });
+      const noEmail = ((r2.body.offers as any[]) || []).find((o) => o.producer.agent_id === "off-noemail");
+      assertTrue(!!noEmail, "can_order: off-noemail present (visible, not orderable)");
+      if (noEmail) assertEq(noEmail.producer.can_order, false, "can_order: no recipient e-mail anywhere → false (skive 2 reachability clause)");
     }
 
     // ════════════════════════════════════════════════════════════════════
