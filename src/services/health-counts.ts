@@ -35,7 +35,7 @@ export interface PageViewHealthCounts {
 }
 
 export interface PageViewHealthCounterDeps {
-  offThreadUsable: (db: Database.Database) => boolean;
+  offThreadUsable: (db: Database.Database, taskKey?: string) => boolean;
   runOffThread: (dbPath: string, nowMs: number) => Promise<PageViewCounts>;
   computeSync: (db: Database.Database, nowMs: number) => PageViewCounts;
   now: () => number;
@@ -70,7 +70,7 @@ export function createPageViewHealthCounter(deps: PageViewHealthCounterDeps): Pa
 
   return {
     get(db, nowMs, ttlMs) {
-      if (deps.offThreadUsable(db)) {
+      if (deps.offThreadUsable(db, "pageViewCounts")) {
         if (offThreadDbPath !== db.name) {
           offThread.clear();
           offThreadDbPath = db.name;

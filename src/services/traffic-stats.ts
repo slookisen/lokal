@@ -60,7 +60,7 @@ export interface TrafficStatsSnapshot {
 
 export interface TrafficStatsReaderDeps {
   getDb: () => Database.Database;
-  offThreadUsable: (db: Database.Database) => boolean;
+  offThreadUsable: (db: Database.Database, taskKey?: string) => boolean;
   runOffThread: (dbPath: string, vertical: VerticalId | undefined, windowDays: number) => Promise<TrafficStats>;
   computeSync: (db: Database.Database, vertical: VerticalId | undefined) => TrafficStats;
   now: () => number;
@@ -122,7 +122,7 @@ export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficS
         return { stats: emptyTrafficStats(), ready: false };
       }
 
-      if (deps.offThreadUsable(db)) {
+      if (deps.offThreadUsable(db, `trafficStats:${cacheKey}`)) {
         bindOffThreadDb(db);
         const hit = offThread.get(cacheKey);
         return hit ? { stats: hit.value, ready: true } : { stats: emptyTrafficStats(), ready: false };
@@ -149,7 +149,7 @@ export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficS
       } catch {
         return;
       }
-      if (!deps.offThreadUsable(db)) return;
+      if (!deps.offThreadUsable(db, `trafficStats:${keyOf(vertical)}`)) return;
       bindOffThreadDb(db);
       offThread.get(keyOf(vertical));
     },
