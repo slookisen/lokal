@@ -400,8 +400,20 @@ export function getRollupBoundaryDate(
   const db = dbHandle ?? getDb();
   // `table` is one of the three literal names above, never user input — same
   // interpolation-is-safe precedent as analytics-service.ts's exportData().
+  //
+  // substr(MIN(col)), NOT MIN(substr(col)) — dev-request 2026-09-26-rfb-
+  // produsentside-synkron-slug-skann. This runs on EVERY /produsent/:slug
+  // (NB/EN, GET and HEAD) and /api/agents/:id/stats request, via
+  // getPrunedChatgptClaudeCounts → resolvePrunedWindow. A bare MIN(created_at)
+  // is answered from the created_at index in O(log n) (SQLite's min/max
+  // optimisation); wrapping the column in substr() disables that and walks
+  // the whole index — ~1.29 M entries in prod, ~110-150 ms of synchronous
+  // main-thread time per call even on a fast unthrottled CPU (~90 % of a
+  // producer-page render). Same result: truncating to the first 10 characters
+  // is monotone under SQLite's BINARY text ordering, so the prefix of the
+  // minimum IS the minimum of the prefixes; MIN() skips NULLs in both forms.
   const row = db.prepare(
-    `SELECT MIN(substr(created_at, 1, 10)) as d FROM ${table}`
+    `SELECT substr(MIN(created_at), 1, 10) as d FROM ${table}`
   ).get() as { d: string | null } | undefined;
   if (row?.d) return row.d;
   const tomorrow = new Date();
