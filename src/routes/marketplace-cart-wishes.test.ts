@@ -7,7 +7,10 @@
  *   POST   /cart/:id/wishes
  *   PATCH  /cart/:id/wishes/:wid
  *   DELETE /cart/:id/wishes/:wid
- *   POST   /cart/:id/submit         (contact fields + honeypot + contact_handoffs)
+ *   POST   /cart/:id/submit         (contact fields + honeypot + contact_handoffs;
+ *                                    skive 2: a real order only for an owner-
+ *                                    claimed + opted-in producer, consented
+ *                                    contact copied onto the order)
  *
  * Also proves cartWishesLimiter (express-rate-limit) is actually wired on
  * all four routes AND that it actually trips (real request-driven 429, not
@@ -155,6 +158,7 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
   const initMod = require("../database/init") as typeof import("../database/init");
   const { cartRouter } = require("./marketplace-cart") as typeof import("./marketplace-cart");
   const { cartWishesLimiter } = require("../middleware/security") as typeof import("../middleware/security");
+  const notifySvc = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
 
   const prevDb = (() => {
     try { return initMod.getDb(); } catch { return undefined; }
@@ -167,6 +171,11 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
   try {
     initMod.__setDbForTesting(db as any);
     initMod.__initSchemaForTesting(db as any);
+    // skive 2: agent-a is opted in below, so its real order fires a seller
+    // notification — pin the resolver to this DB and stub the transport
+    // (pilot-ordre-loop.test.ts's seam); both reset in `finally`.
+    notifySvc.__setOrderNotifyTestDb(db as any);
+    notifySvc.__setOrderNotifySendForTesting(async () => ({ success: true, messageId: "stub-marketplace-cart-wishes" }));
 
     db.prepare(`
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
@@ -180,6 +189,10 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
       INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
       VALUES ('prod-a', 'agent-a', 'Poteter', 'poteter', 20, 'kg', 'in_stock', 'enrichment')
     `).run();
+    // skive 2: a REAL order additionally needs the owner claim + opt-in
+    // (cart-service.isEligibleForRealOrder); agent-b below stays a
+    // contact-only (second-line) producer and must come back as a handoff.
+    db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-a'").run();
 
     db.prepare(`
       INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
@@ -311,6 +324,14 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
       assertEq(r.body.orders?.length, 1, "POST /cart/:id/submit: one order (the eligible producer's chosen offer)");
       assertEq(r.body.contact_handoffs?.length, 1, "POST /cart/:id/submit: one contact_handoffs entry (the contact-mode wish)");
       assertEq(r.body.contact_handoffs?.[0]?.agent_id, "agent-b", "POST /cart/:id/submit: handoff for the correct producer");
+
+      // skive 2: with contact_consent=true the order carries the buyer's
+      // contact copy (what the producer e-mail + confirm page render).
+      const orderRow = db.prepare("SELECT buyer_name, buyer_email, buyer_phone, contact_consent_at FROM orders WHERE id = ?").get(r.body.orders?.[0]?.order_id) as any;
+      assertEq(orderRow?.buyer_name, "Kari Testperson", "POST /cart/:id/submit: consented buyer_name copied onto the order (skive 2)");
+      assertEq(orderRow?.buyer_email, "kari@example.com", "POST /cart/:id/submit: consented buyer_email copied onto the order (skive 2)");
+      assertEq(orderRow?.buyer_phone, null, "POST /cart/:id/submit: a field the buyer did not give stays NULL on the order");
+      assertTrue(!!orderRow?.contact_consent_at, "POST /cart/:id/submit: order contact_consent_at stamped (skive 2)");
     }
 
     // ═══════════ DELETE wishes/:wid on an already-submitted (non-open) ═════
@@ -388,6 +409,8 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
       assertEq(r.status, 201, "rate limit: a fresh buyer_ref (same IP) is NOT blocked by a different buyer_ref's exhausted bucket");
     }
   } finally {
+    notifySvc.__setOrderNotifySendForTesting(null);
+    notifySvc.__setOrderNotifyTestDb(null);
     initMod.__setDbForTesting(prevDb as any);
   }
 

@@ -20,6 +20,7 @@ import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-n
 import { computeEffectiveAvailability } from "./supply-graph";
 import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
+import { isBlocked } from "./blocklist-service";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -114,6 +115,59 @@ export function isProducerEligible(agentId: string): boolean {
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
   `).get(agentId);
   return !!row;
+}
+
+// ─── Real-order eligibility (skive 2 of dev-request 2026-09-16-handleliste- ─
+// med-produsentvalg-og-bestillingsflyt: hybrid utsending) ────────────────────
+// Daniel 2026-10-01: «bygg skive 2 uten lempningen» — this gate is STRICTER
+// than isProducerEligible() above, never looser. isProducerEligible() (the
+// add-to-cart admission gate, UNCHANGED) decides whether a product can be put
+// in a cart at all; this function decides, at submit time, whether a chosen
+// producer gets a REAL order row + the notification e-mail, or whether the
+// buyer gets a contact-handoff instead. It is ALSO what GET /api/marketplace/
+// catalog/offers and lokal_find_offers expose as `can_order` (catalog-
+// offers.ts calls it per offer row), so the two surfaces can never drift.
+//
+// ALL of the following must hold:
+//   - everything isProducerEligible() requires (not an umbrella account,
+//     internal cross-check verification_status = 'verified', NOT
+//     second-line-only verification) — the INNER JOIN is deliberate: an
+//     agent with no agent_knowledge row has no cross-check and is out;
+//   - agents.is_active = 1 (never route a real order to a deactivated row);
+//   - agents.is_verified = 1 — the owner has claimed the profile («Verifisert
+//     av eier»); Daniel's rule: real orders only go to producers who have
+//     confirmed their profile;
+//   - agents.order_notifications_opt_in = 1 — explicit, independent,
+//     mandatory (never satisfied by any other signal);
+//   - a recipient e-mail exists (admin-set order_notification_email wins,
+//     else contact_email — the same resolution order-notify-service.ts's
+//     gate 2 uses) and it is not blocklisted (its gate 4, same isBlocked()).
+// The admin override is only a DESTINATION for the mail (Daniel's test-inbox
+// pattern); it never substitutes for the cross-check or the owner claim.
+// Net effect: a producer that fails any clause gets a contact_handoffs entry
+// and no order row — the «dead pending order nobody sees» gap is closed.
+//
+// `dbOverride` lets catalog-offers.ts (which takes an injectable db for its
+// tests) evaluate against the same connection it queried offers from.
+export function isEligibleForRealOrder(agentId: string, dbOverride?: any): boolean {
+  const db = dbOverride ?? _cartTestDb ?? getDb();
+  const row = db.prepare(`
+    SELECT a.order_notification_email AS override_email,
+           a.contact_email            AS contact_email
+    FROM agents a
+    INNER JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE a.id = ?
+      AND a.umbrella_type IS NULL
+      AND a.is_active = 1
+      AND k.verification_status = 'verified'
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND a.is_verified = 1
+      AND a.order_notifications_opt_in = 1
+  `).get(agentId) as { override_email: string | null; contact_email: string | null } | undefined;
+  if (!row) return false;
+  const email = (row.override_email || "").trim() || (row.contact_email || "").trim();
+  if (!email) return false;
+  return !isBlocked({ email }).blocked;
 }
 
 // ─── Create cart ─────────────────────────────────────────────────────────────
@@ -770,16 +824,18 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
     byAgent.get(item.agent_id)!.push(item);
   }
 
-  // Producers eligible for a real order RIGHT NOW — re-checked here at
-  // submit (defense-in-depth; addCartItem() already required this at add
-  // time, so in the common case nothing changes — it only matters if
-  // eligibility changed between add and submit). Reuses isProducerEligible()
-  // COMPLETELY UNCHANGED, per this slice's own scope: its gating logic is
-  // not touched here.
+  // Producers that get a REAL order right now (skive 2, hybrid utsending):
+  // isEligibleForRealOrder() — a strictly TIGHTER bar than the add-to-cart
+  // gate addCartItem() applied (isProducerEligible(), unchanged): on top of
+  // the cross-check it requires an active, owner-claimed (is_verified=1)
+  // producer who opted in to orders and has a non-blocklisted recipient
+  // address. Everyone else in the cart becomes a contact-handoff below —
+  // no order row, no e-mail. Before skive 2 a non-opted-in producer got a
+  // "dead" pending order nobody was ever told about; that gap is closed.
   const eligibleAgentIds = new Set<string>();
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
-    (isProducerEligible(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+    (isEligibleForRealOrder(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
   }
 
   // Everything that will NOT become a real order — mode='contact' wishes
@@ -821,6 +877,20 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
   const pendingNotifications: OrderNotificationInput[] = [];
   const consentNow = contact?.contact_consent === true;
 
+  // skive 2: the buyer's contact fields reach a PRODUCER (order row, e-mail,
+  // /produsent/ordre/:token page) ONLY when the buyer explicitly consented.
+  // Without consent the cart still stores what was typed (Slice 1, unchanged)
+  // but every producer-facing copy stays NULL — the invariant the orders
+  // columns document: non-NULL there ⇒ consent was given.
+  const sharedContact = consentNow
+    ? {
+        buyer_name: contact?.buyer_name ?? null,
+        buyer_email: contact?.buyer_email ?? null,
+        buyer_phone: contact?.buyer_phone ?? null,
+        delivery_note: contact?.delivery_note ?? null,
+      }
+    : { buyer_name: null, buyer_email: null, buyer_phone: null, delivery_note: null };
+
   // Transaction: set cart submitted (+ contact fields) + create one order
   // per ELIGIBLE producer + one cart_handoffs analytics row per handoff
   // (agent_id/cart_id/item_count only — no buyer contact fields, ever).
@@ -860,13 +930,27 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
       }, 0);
       const producer_name = agentItems[0]!.producer_name;
 
+      // skive 2: the consented buyer contact fields are copied onto the
+      // order itself — the v2 e-mail and the /produsent/ordre/:token page
+      // read from the ORDER, not the cart (an order must stand on its own;
+      // the cart-level and order-level 30-day sweeps run independently,
+      // see cart-contact-sweep.ts). All NULL when the buyer did not consent.
       db.prepare(`
         INSERT INTO orders
           (id, cart_id, agent_id, buyer_ref, status, fulfilment, pickup_time,
-           total_nok, confirm_token, created_at, updated_at)
+           total_nok, confirm_token, created_at, updated_at,
+           buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at)
         VALUES
-          (?, ?, ?, ?, 'pending', 'pickup', NULL, ?, ?, datetime('now'), datetime('now'))
-      `).run(order_id, cartId, agent_id, buyer_ref, total_nok, confirm_token);
+          (?, ?, ?, ?, 'pending', 'pickup', NULL, ?, ?, datetime('now'), datetime('now'),
+           ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END)
+      `).run(
+        order_id, cartId, agent_id, buyer_ref, total_nok, confirm_token,
+        sharedContact.buyer_name,
+        sharedContact.buyer_email,
+        sharedContact.buyer_phone,
+        sharedContact.delivery_note,
+        consentNow ? 1 : 0
+      );
 
       for (const item of agentItems) {
         const line_total =
@@ -904,6 +988,9 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
         pickup_time: null,
         total_nok,
         items: agentItems.map((i) => ({ name: i.product_name, qty: i.qty, unit: i.unit })),
+        // skive 2: same consent-gated values the transaction just wrote to
+        // `orders` — the v2 template renders them (and sets Reply-To).
+        ...sharedContact,
       });
     }
   });
@@ -1166,6 +1253,13 @@ export interface ProducerOrderView {
   total_nok: number | null;
   buyer_ref: string;
   created_at: string;
+  // skive 2: the buyer's consented contact fields, read-only display on the
+  // /produsent/ordre/:token page — null for orders created before skive 2,
+  // for a no-consent submit, or after the 30-day sweep nulled them.
+  buyer_name: string | null;
+  buyer_email: string | null;
+  buyer_phone: string | null;
+  delivery_note: string | null;
   items: Array<{
     name_snapshot: string | null;
     qty: number | null;
@@ -1181,7 +1275,8 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
 
   const order = db.prepare(`
     SELECT o.id, o.agent_id, o.status, o.cancel_reason, o.fulfilment, o.pickup_time,
-           o.total_nok, o.buyer_ref, o.created_at, a.name AS producer_name
+           o.total_nok, o.buyer_ref, o.created_at, a.name AS producer_name,
+           o.buyer_name, o.buyer_email, o.buyer_phone, o.delivery_note
     FROM orders o
     INNER JOIN agents a ON a.id = o.agent_id
     WHERE o.confirm_token = ?
@@ -1190,6 +1285,8 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
         id: string; agent_id: string; status: string; cancel_reason: string | null;
         fulfilment: string; pickup_time: string | null; total_nok: number | null;
         buyer_ref: string; created_at: string; producer_name: string;
+        buyer_name: string | null; buyer_email: string | null; buyer_phone: string | null;
+        delivery_note: string | null;
       }
     | undefined;
 
@@ -1211,6 +1308,10 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
     total_nok: order.total_nok,
     buyer_ref: order.buyer_ref,
     created_at: order.created_at,
+    buyer_name: order.buyer_name ?? null,
+    buyer_email: order.buyer_email ?? null,
+    buyer_phone: order.buyer_phone ?? null,
+    delivery_note: order.delivery_note ?? null,
     items,
     timeline: getOrderTimeline(order.id),
   };

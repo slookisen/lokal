@@ -6,7 +6,10 @@
  *
  * Covers:
  *   (a) Opt-in gate NEGATIVE (integration): a default agent (opt_in=0)
- *       receives NO email on cart submit — the never-send default.
+ *       receives NO email on cart submit — the never-send default. Since
+ *       skive 2 of dev-request 2026-09-16-handleliste-med-produsentvalg-og-
+ *       bestillingsflyt it does not even get an ORDER: submit demotes it to
+ *       a contact handoff (cart-service.isEligibleForRealOrder()).
  *   (b) Opt-in gate positive: verified + opt-in producer gets exactly one
  *       email per order, with the tokenized /produsent/ordre/:token link,
  *       WITHOUT the buyer's full capability token, and the
@@ -27,6 +30,17 @@
  *   (h) trust_events written at terminal states; trust-score interaction
  *       signal: 0 events = unchanged value, completed lifts, no-shows lower.
  *   (i) GET /admin/orders/inbox: auth + open orders listing.
+ *   (j) skive 2 — isEligibleForRealOrder() strict matrix: cross-check AND
+ *       owner claim (is_verified) AND opt-in AND reachable, every clause
+ *       independently false; the admin override never substitutes.
+ *   (k) skive 2 — v2 e-mail: «Kunde» block + Reply-To = buyer e-mail when
+ *       the buyer consented; the producer PRG page shows the same block.
+ *   (l) skive 2 — no consent: no «Kunde» block, default Reply-To, NULL
+ *       contact columns on the order, nothing on the PRG page.
+ *   (m) skive 2 — ORDER_NOTIFY_EMAIL_VERSION=v1 pins the original template
+ *       (no «Kunde» block, default Reply-To) even with consent.
+ *   (n) skive 2 — resolveReplyTo() header-injection guard, partial fields,
+ *       render dispatcher (unit level).
  *
  * DB is a fresh in-memory SQLite with the real production schema
  * (__initSchemaForTesting). Cart/notify/trust module-local DB handles are
@@ -86,13 +100,14 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     try { return initMod.getDb(); } catch { return undefined; }
   })();
   const prevAdminKey = process.env.ADMIN_KEY;
+  const prevEmailVersion = process.env.ORDER_NOTIFY_EMAIL_VERSION;
 
   const testDb = new Database(":memory:");
   const ADMIN_KEY = process.env.ADMIN_KEY || "pilot-ordre-loop-test-key";
   const DANIEL_EMAIL = "da.fredriksen@gmail.com";
 
   // Captured notification sends (stubbed transport).
-  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
+  const sent: Array<{ to: string; subject: string; htmlContent: string; textContent: string; replyTo?: string }> = [];
 
   let server: http.Server | null = null;
 
@@ -105,7 +120,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     notifySvc.__setOrderNotifyTestDb(testDb as any);
     adminOrdersMod.__setAdminOrdersTestDb(testDb as any);
     notifySvc.__setOrderNotifySendForTesting(async (o) => {
-      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent });
+      sent.push({ to: o.to, subject: o.subject, htmlContent: o.htmlContent, textContent: o.textContent, replyTo: o.replyTo });
       return { success: true, messageId: "stub" };
     });
     process.env.ADMIN_KEY = ADMIN_KEY;
@@ -128,16 +143,20 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     insertKnowledge.run("ag-optout", "verified");
     insertProduct.run("prod-optout", "ag-optout", "Poteter", "poteter", 40, "kg");
 
-    // Verified producer WITH opt-in — the happy send path.
+    // Verified producer WITH opt-in — the happy send path. skive 2: a REAL
+    // order also needs the owner claim (is_verified=1).
     insertAgent.run("ag-optin", "Optin Gård", "optin@example.no", "key-optin");
     insertKnowledge.run("ag-optin", "verified");
-    testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-optin'").run();
+    testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1, is_verified = 1 WHERE id = 'ag-optin'").run();
     insertProduct.run("prod-optin", "ag-optin", "Egg", "egg", 60, "brett");
 
     // Daniel's test agent: verified (so it's orderable) — the admin endpoint
     // will point its notifications at Daniel's own inbox.
     insertAgent.run("ag-daniel", "Daniels Testgård", "gard@example.no", "key-daniel");
     insertKnowledge.run("ag-daniel", "verified");
+    // skive 2: owner-claimed too — the admin override only ROUTES the mail,
+    // it never substitutes for the cross-check or the claim.
+    testDb.prepare("UPDATE agents SET is_verified = 1 WHERE id = 'ag-daniel'").run();
     insertProduct.run("prod-daniel", "ag-daniel", "Honning", "honning", 120, "glass");
 
     // Gate-matrix-only agents (not orderable through the cart; exercised via
@@ -227,7 +246,10 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       return cond();
     }
 
-    async function submitCartFor(productId: string): Promise<{ orderId: string; buyerRef: string }> {
+    async function submitCartFor(
+      productId: string,
+      contact: Record<string, unknown> = {}
+    ): Promise<{ orderId: string; buyerRef: string; cartId: string; status: number; orders: any[]; contactHandoffs: any[] }> {
       const c = await req("POST", "/api/marketplace/cart");
       const cartId = c.body.cart_id as string;
       const buyerRef = c.body.buyer_ref as string;
@@ -235,25 +257,39 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         body: { product_id: productId, qty: 2, buyer_ref: buyerRef },
       });
       const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
-        body: { buyer_ref: buyerRef },
+        body: { buyer_ref: buyerRef, ...contact },
       });
       const orderId = s.body?.orders?.[0]?.order_id as string;
-      return { orderId, buyerRef };
+      return {
+        orderId, buyerRef, cartId, status: s.status,
+        orders: (s.body?.orders ?? []) as any[],
+        contactHandoffs: (s.body?.contact_handoffs ?? []) as any[],
+      };
     }
 
     // ════════════════════════════════════════════════════════════════════════
     // (a) Opt-in gate NEGATIVE: default agent gets NO notification. Ever.
+    //     skive 2: …and no ORDER either — a cross-check-verified producer
+    //     without owner claim + opt-in is demoted to a contact handoff at
+    //     submit (isEligibleForRealOrder), closing the "dead pending order
+    //     nobody is told about" gap. The add-to-cart gate is unchanged.
     // ════════════════════════════════════════════════════════════════════════
     {
       sent.length = 0;
-      const { orderId } = await submitCartFor("prod-optout");
-      assertTrue(!!orderId, "optin-neg-01: submit against non-opted-in producer still creates the order");
+      const r = await submitCartFor("prod-optout");
+      assertEq(r.status, 201, "optin-neg-01: submit against a non-opted-in producer still succeeds (201) — demoted, not rejected");
+      assertEq(r.orders.length, 0, "optin-neg-01b: NO order is created for a producer who has not opted in (skive 2 strict gate)");
+      assertEq(r.contactHandoffs.length, 1, "optin-neg-01c: the producer comes back as exactly one contact handoff instead");
+      assertEq(r.contactHandoffs[0]?.agent_id, "ag-optout", "optin-neg-01d: the handoff is for the non-opted-in producer");
       // Give the fire-and-forget path ample time to (wrongly) send.
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r2) => setTimeout(r2, 150));
       assertEq(sent.length, 0, "optin-neg-02: NO email sent to a producer with default opt_in=0 (the never-send default)");
-      const row = testDb.prepare("SELECT confirm_token FROM orders WHERE id = ?").get(orderId) as any;
-      assertTrue(typeof row?.confirm_token === "string" && row.confirm_token.startsWith("ctok_"),
-        "optin-neg-03: confirm_token is generated at order creation even when no notification goes out");
+      const orderRows = testDb.prepare("SELECT COUNT(*) AS c FROM orders WHERE cart_id = ?").get(r.cartId) as any;
+      assertEq(orderRows?.c, 0, "optin-neg-03: no orders row exists for that cart (no dead pending order)");
+      const handoffRows = testDb.prepare("SELECT COUNT(*) AS c FROM cart_handoffs WHERE cart_id = ? AND agent_id = 'ag-optout'").get(r.cartId) as any;
+      assertEq(handoffRows?.c, 1, "optin-neg-04: one cart_handoffs analytics row written for the demoted producer");
+      assertEq(cartSvc.isProducerEligible("ag-optout"), true, "optin-neg-05: the add-to-cart gate (isProducerEligible) is UNCHANGED — still true for the cross-check-verified producer");
+      assertEq(cartSvc.isEligibleForRealOrder("ag-optout"), false, "optin-neg-06: isEligibleForRealOrder() is false for it (no owner claim, no opt-in)");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -374,9 +410,11 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       });
       assertEq(off.status, 200, "optin-admin-11: opt-out returns 200");
       sent.length = 0;
-      await submitCartFor("prod-daniel");
+      const afterOptOut = await submitCartFor("prod-daniel");
       await new Promise((r) => setTimeout(r, 150));
       assertEq(sent.length, 0, "optin-admin-12: after opt-out no email is sent again");
+      assertEq(afterOptOut.orders.length, 0, "optin-admin-12b: skive 2 — after opt-out the producer gets no ORDER either (contact handoff instead)");
+      assertEq(afterOptOut.contactHandoffs.map((h) => h.agent_id).join(","), "ag-daniel", "optin-admin-12c: the opted-out producer is returned as a contact handoff");
       // Re-enable for later sections.
       await req("POST", "/admin/orders/notification-optin", {
         headers: { "x-admin-key": ADMIN_KEY },
@@ -660,6 +698,220 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(((all.body?.orders || []) as any[]).length >= orders.length,
         "inbox-09: unfiltered listing is a superset of the per-producer one");
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (j) skive 2 — isEligibleForRealOrder() strict matrix (no «lempning»):
+    //     cross-check AND owner claim AND opt-in AND reachable. Every clause
+    //     independently false; the admin override never substitutes for the
+    //     cross-check or the owner claim — it only routes the mail.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const gate = (id: string) => cartSvc.isEligibleForRealOrder(id);
+      assertEq(gate("ag-optin"), true, "strict-01: cross-check + owner claim + opt-in + verified contact → true");
+      assertEq(gate("ag-optout"), false, "strict-02: cross-check only (no claim, no opt-in) → false");
+
+      // ag-unverif: opt-in, owner claim added, cross-check 'unverified' →
+      // false, and an admin override e-mail does NOT rescue it.
+      testDb.prepare("UPDATE agents SET is_verified = 1 WHERE id = 'ag-unverif'").run();
+      assertEq(gate("ag-unverif"), false, "strict-03: owner claim + opt-in WITHOUT the cross-check → false (no «OR is_verified» path)");
+      testDb.prepare("UPDATE agents SET order_notification_email = ? WHERE id = 'ag-unverif'").run(DANIEL_EMAIL);
+      assertEq(gate("ag-unverif"), false, "strict-04: admin override e-mail never substitutes for the missing cross-check");
+      testDb.prepare("UPDATE agents SET order_notification_email = NULL, is_verified = 0 WHERE id = 'ag-unverif'").run();
+
+      // Cross-check + opt-in but NO owner claim → false, override or not.
+      testDb.prepare("UPDATE agents SET is_verified = 0 WHERE id = 'ag-optin'").run();
+      assertEq(gate("ag-optin"), false, "strict-05: cross-check + opt-in WITHOUT the owner claim → false");
+      testDb.prepare("UPDATE agents SET order_notification_email = ? WHERE id = 'ag-optin'").run(DANIEL_EMAIL);
+      assertEq(gate("ag-optin"), false, "strict-06: admin override e-mail never substitutes for the missing owner claim");
+      testDb.prepare("UPDATE agents SET order_notification_email = NULL, is_verified = 1 WHERE id = 'ag-optin'").run();
+
+      // Opt-in flipped off → false.
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-optin'").run();
+      assertEq(gate("ag-optin"), false, "strict-07: opt-in withdrawn → false (explicit, independent, mandatory)");
+      testDb.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-optin'").run();
+
+      // Second-line-only verification → false.
+      testDb.prepare("UPDATE agent_knowledge SET verified_second_line = 1 WHERE agent_id = 'ag-optin'").run();
+      assertEq(gate("ag-optin"), false, "strict-08: verified_second_line=1 (outreach-only bar) → false");
+      testDb.prepare("UPDATE agent_knowledge SET verified_second_line = 0 WHERE agent_id = 'ag-optin'").run();
+
+      // Deactivated row → false.
+      testDb.prepare("UPDATE agents SET is_active = 0 WHERE id = 'ag-optin'").run();
+      assertEq(gate("ag-optin"), false, "strict-09: is_active=0 → false");
+      testDb.prepare("UPDATE agents SET is_active = 1 WHERE id = 'ag-optin'").run();
+
+      // No recipient anywhere → false; blocklisted → false.
+      testDb.prepare("UPDATE agents SET is_verified = 1 WHERE id IN ('ag-noemail', 'ag-blocked')").run();
+      assertEq(gate("ag-noemail"), false, "strict-10: no contact_email and no override → false (nobody to notify)");
+      assertEq(gate("ag-blocked"), false, "strict-11: blocklisted recipient → false (same suppression as the notify gate)");
+      testDb.prepare("UPDATE agents SET is_verified = 0 WHERE id IN ('ag-noemail', 'ag-blocked')").run();
+
+      assertEq(gate("no-such-agent"), false, "strict-12: unknown agent → false");
+      assertEq(gate("ag-optin"), true, "strict-13: reference producer restored → true again");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (k) skive 2 — v2 e-mail (default): «Kunde» block + Reply-To = buyer's
+    //     e-mail when the buyer consented; the order carries the contact
+    //     copy; the producer PRG page shows the same block.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      sent.length = 0;
+      delete process.env.ORDER_NOTIFY_EMAIL_VERSION;
+      assertEq(notifySvc.resolveOrderNotifyEmailVersion(), "v2", "v2-00: default e-mail version is v2 (flag unset)");
+      const r = await submitCartFor("prod-optin", {
+        buyer_name: "Kari Testkjøper",
+        buyer_email: "kari@example.com",
+        buyer_phone: "+47 91234567",
+        delivery_note: "Henter etter kl 16 <torsdag>",
+        contact_consent: true,
+      });
+      assertEq(r.orders.length, 1, "v2-01: consented submit against the eligible producer creates one order");
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "v2-02: exactly one notification sent");
+      const mail = sent[0]!;
+      assertEq(mail.to, "optin@example.no", "v2-03: recipient is still the producer's verified contact_email");
+      assertEq(mail.replyTo, "kari@example.com", "v2-04: Reply-To is the buyer's e-mail (so the producer can answer directly)");
+      assertTrue(mail.textContent.includes("Kunde:"), "v2-05: text body has the «Kunde» block");
+      assertTrue(mail.textContent.includes("Navn: Kari Testkjøper"), "v2-06: text body lists the buyer's name");
+      assertTrue(mail.textContent.includes("Telefon: +47 91234567"), "v2-07: text body lists the buyer's phone");
+      assertTrue(mail.textContent.includes("E-post: kari@example.com"), "v2-08: text body lists the buyer's e-mail");
+      assertTrue(mail.textContent.includes("Leveringsønske: Henter etter kl 16 <torsdag>"), "v2-09: text body lists the delivery wish verbatim");
+      assertTrue(mail.htmlContent.includes("Kunde:") && mail.htmlContent.includes("Kari Testkjøper") && mail.htmlContent.includes("+47 91234567"),
+        "v2-10: HTML body has the «Kunde» block with name + phone");
+      assertTrue(mail.htmlContent.includes("Henter etter kl 16 &lt;torsdag&gt;") && !mail.htmlContent.includes("<torsdag>"),
+        "v2-11: HTML body escapes the buyer-supplied delivery wish (no raw tag injection)");
+      assertTrue(mail.textContent.includes("Egg") && mail.textContent.includes("2 brett"), "v2-12: v2 keeps everything v1 had (items)");
+      assertTrue(/\/produsent\/ordre\/ctok_[a-f0-9]+/.test(mail.textContent), "v2-13: v2 keeps the tokenized confirm link");
+      assertTrue(!mail.textContent.includes(r.buyerRef) && !mail.htmlContent.includes(r.buyerRef),
+        "v2-14: the buyer's full capability token still never appears in the producer e-mail");
+
+      const o = testDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(r.orderId) as any;
+      assertEq(o?.buyer_name, "Kari Testkjøper", "v2-15: order row carries buyer_name (consented)");
+      assertEq(o?.buyer_email, "kari@example.com", "v2-16: order row carries buyer_email (consented)");
+      assertEq(o?.buyer_phone, "+47 91234567", "v2-17: order row carries buyer_phone (consented)");
+      assertEq(o?.delivery_note, "Henter etter kl 16 <torsdag>", "v2-18: order row carries delivery_note (consented)");
+      assertTrue(typeof o?.contact_consent_at === "string" && o.contact_consent_at.length > 0, "v2-19: order row has contact_consent_at stamped");
+
+      const page = await req("GET", `/produsent/ordre/${o.confirm_token}`);
+      assertEq(page.status, 200, "v2-20: producer PRG page renders");
+      assertTrue(page.text.includes("Kunde:"), "v2-21: PRG page shows the «Kunde» block");
+      assertTrue(page.text.includes("Kari Testkjøper") && page.text.includes("+47 91234567") && page.text.includes("kari@example.com"),
+        "v2-22: PRG page shows name, phone and e-mail");
+      assertTrue(page.text.includes("Henter etter kl 16 &lt;torsdag&gt;") && !page.text.includes("<torsdag>"),
+        "v2-23: PRG page escapes the delivery wish (no raw tag injection)");
+      assertTrue(!page.text.includes(r.buyerRef), "v2-24: PRG page never shows the buyer's capability token");
+      const statusAfterGet = (testDb.prepare("SELECT status FROM orders WHERE id = ?").get(r.orderId) as any)?.status;
+      assertEq(statusAfterGet, "pending", "v2-25: rendering the buyer block mutates nothing (still pending)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (l) skive 2 — NO consent: nothing buyer-identifying reaches the producer
+    //     (no «Kunde» block, default Reply-To, NULL order columns, PRG page
+    //     without the block) even though the fields were typed.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      sent.length = 0;
+      const r = await submitCartFor("prod-optin", {
+        buyer_name: "Ola Uten Samtykke",
+        buyer_email: "ola@example.com",
+        buyer_phone: "+47 99887766",
+        delivery_note: "Ring først",
+        contact_consent: false,
+      });
+      assertEq(r.orders.length, 1, "noconsent-01: the real order is still created");
+      await waitFor(() => sent.length >= 1);
+      assertEq(sent.length, 1, "noconsent-02: exactly one notification sent");
+      const mail = sent[0]!;
+      assertEq(mail.replyTo, notifySvc.DEFAULT_ORDER_NOTIFY_REPLY_TO, "noconsent-03: Reply-To is the platform default, not the buyer");
+      assertTrue(!mail.textContent.includes("Kunde:") && !mail.htmlContent.includes("Kunde:"), "noconsent-04: no «Kunde» block at all (not even empty rows)");
+      assertTrue(!mail.textContent.includes("Ola Uten Samtykke") && !mail.textContent.includes("ola@example.com") && !mail.textContent.includes("99887766") && !mail.textContent.includes("Ring først"),
+        "noconsent-05: none of the typed contact fields appear in the text body");
+      assertTrue(!mail.htmlContent.includes("Ola Uten Samtykke") && !mail.htmlContent.includes("ola@example.com") && !mail.htmlContent.includes("99887766"),
+        "noconsent-06: none of the typed contact fields appear in the HTML body");
+      const o = testDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(r.orderId) as any;
+      assertTrue(!!o && o.buyer_name === null && o.buyer_email === null && o.buyer_phone === null && o.delivery_note === null && o.contact_consent_at === null,
+        "noconsent-07: all five contact columns on the order are NULL (non-NULL ⇒ consent invariant)");
+      const c = testDb.prepare("SELECT buyer_name, contact_consent_at FROM carts WHERE id = ?").get(r.cartId) as any;
+      assertEq(c?.buyer_name, "Ola Uten Samtykke", "noconsent-08: the cart still stores the typed name (Slice 1 behaviour unchanged)");
+      assertEq(c?.contact_consent_at, null, "noconsent-09: cart contact_consent_at stays NULL");
+      const page = await req("GET", `/produsent/ordre/${o.confirm_token}`);
+      assertEq(page.status, 200, "noconsent-10: producer PRG page renders");
+      assertTrue(!page.text.includes("Kunde:") && !page.text.includes("Ola Uten Samtykke") && !page.text.includes("ola@example.com"),
+        "noconsent-11: PRG page shows no buyer block and no contact fields");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (m) skive 2 — ORDER_NOTIFY_EMAIL_VERSION=v1 pins the ORIGINAL template:
+    //     no «Kunde» block and the default Reply-To even WITH consent (the
+    //     order row still carries the consented copy — only the mail differs).
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      try {
+        process.env.ORDER_NOTIFY_EMAIL_VERSION = "v1";
+        assertEq(notifySvc.resolveOrderNotifyEmailVersion(), "v1", "v1-00: flag 'v1' selects v1 (read fresh per call, no restart)");
+        sent.length = 0;
+        const r = await submitCartFor("prod-optin", {
+          buyer_name: "Kari Testkjøper",
+          buyer_email: "kari@example.com",
+          buyer_phone: "+47 91234567",
+          contact_consent: true,
+        });
+        assertEq(r.orders.length, 1, "v1-01: order created under the v1 flag");
+        await waitFor(() => sent.length >= 1);
+        assertEq(sent.length, 1, "v1-02: exactly one notification sent");
+        const mail = sent[0]!;
+        assertEq(mail.replyTo, notifySvc.DEFAULT_ORDER_NOTIFY_REPLY_TO, "v1-03: v1 keeps the platform default Reply-To");
+        assertTrue(!mail.textContent.includes("Kunde:") && !mail.htmlContent.includes("Kunde:"), "v1-04: v1 has no «Kunde» block");
+        assertTrue(!mail.textContent.includes("Kari Testkjøper") && !mail.htmlContent.includes("kari@example.com"), "v1-05: v1 never includes buyer contact fields, consent or not");
+        assertTrue(mail.textContent.includes("Egg") && /\/produsent\/ordre\/ctok_[a-f0-9]+/.test(mail.textContent), "v1-06: v1 is the original mail (items + confirm link)");
+        const o = testDb.prepare("SELECT buyer_name FROM orders WHERE id = ?").get(r.orderId) as any;
+        assertEq(o?.buyer_name, "Kari Testkjøper", "v1-07: the ORDER still carries the consented copy — only the template differs");
+        process.env.ORDER_NOTIFY_EMAIL_VERSION = "v3";
+        assertEq(notifySvc.resolveOrderNotifyEmailVersion(), "v2", "v1-08: any value other than 'v1' means v2 (fail-safe default)");
+      } finally {
+        delete process.env.ORDER_NOTIFY_EMAIL_VERSION;
+      }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // (n) skive 2 — resolveReplyTo() header-injection guard, partial fields,
+    //     and the render dispatcher (unit level, no DB).
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const D = notifySvc.DEFAULT_ORDER_NOTIFY_REPLY_TO;
+      assertEq(D, "kontakt@rettfrabonden.com", "replyto-00: the named default is the pre-skive-2 platform Reply-To");
+      assertEq(notifySvc.resolveReplyTo("kari@example.com"), "kari@example.com", "replyto-01: plain address → used");
+      assertEq(notifySvc.resolveReplyTo("  Kari.N@Example.com "), "Kari.N@Example.com", "replyto-02: trimmed, case preserved");
+      assertEq(notifySvc.resolveReplyTo(null), D, "replyto-03: null → default");
+      assertEq(notifySvc.resolveReplyTo(""), D, "replyto-04: empty → default");
+      assertEq(notifySvc.resolveReplyTo("kari@example.com\r\nBcc: x@evil.example"), D, "replyto-05: CRLF header injection → default");
+      assertEq(notifySvc.resolveReplyTo("Kari <kari@example.com>"), D, "replyto-06: display-name/angle-bracket form → default");
+      assertEq(notifySvc.resolveReplyTo("kari@example.com, x@evil.example"), D, "replyto-07: multiple addresses → default");
+      assertEq(notifySvc.resolveReplyTo("not-an-email"), D, "replyto-08: no @/TLD → default");
+      assertEq(notifySvc.resolveReplyTo("a".repeat(250) + "@example.com"), D, "replyto-09: over 254 chars → default");
+
+      const base = {
+        order_id: "0123456789abcdef", agent_id: "ag-optin", producer_name: "Optin Gård",
+        buyer_ref: "bref_unit_0000000000", confirm_token: "ctok_unit", pickup_time: null, total_nok: 120,
+        items: [{ name: "Egg", qty: 2, unit: "brett" }],
+      };
+      const partial = notifySvc.renderOrderNotificationEmailV2({ ...base, buyer_phone: "+47 91234567" });
+      assertTrue(partial.textContent.includes("Kunde:") && partial.textContent.includes("Telefon: +47 91234567"), "render-01: v2 with only a phone renders the block with the phone row");
+      assertTrue(!partial.textContent.includes("Navn:") && !partial.textContent.includes("E-post:") && !partial.textContent.includes("Leveringsønske:"),
+        "render-02: absent fields are omitted, never rendered as blank rows");
+      assertEq(partial.replyTo, D, "render-03: no buyer e-mail → default Reply-To");
+      const none = notifySvc.renderOrderNotificationEmailV2(base);
+      const v1 = notifySvc.renderOrderNotificationEmailV1({ ...base, buyer_name: "Ignored", buyer_email: "ignored@example.com" });
+      assertTrue(!none.textContent.includes("Kunde:"), "render-04: v2 with no buyer fields has no «Kunde» block");
+      assertEq(none.textContent, v1.textContent, "render-05: v2 without buyer fields renders the identical text body to v1");
+      assertEq(none.htmlContent, v1.htmlContent, "render-06: v2 without buyer fields renders the identical HTML body to v1");
+      assertTrue(!v1.textContent.includes("Ignored") && !v1.htmlContent.includes("ignored@example.com"), "render-07: v1 ignores buyer fields entirely");
+      assertEq(notifySvc.renderOrderNotificationEmail("v1", { ...base, buyer_email: "kari@example.com" }).replyTo, D, "render-08: dispatcher 'v1' → v1 (default Reply-To)");
+      assertEq(notifySvc.renderOrderNotificationEmail("v2", { ...base, buyer_email: "kari@example.com" }).replyTo, "kari@example.com", "render-09: dispatcher 'v2' → v2 (buyer Reply-To)");
+      const blankish = notifySvc.renderOrderNotificationEmailV2({ ...base, buyer_name: "   ", buyer_email: "", buyer_phone: null, delivery_note: undefined });
+      assertTrue(!blankish.textContent.includes("Kunde:"), "render-10: whitespace-only/empty fields count as absent");
+    }
   } catch (err) {
     failed++;
     failures.push(`pilot-ordre-loop: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
@@ -673,6 +925,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     notifySvc.__setOrderNotifyTestDb(null);
     adminOrdersMod.__setAdminOrdersTestDb(null);
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
+    if (prevEmailVersion === undefined) delete process.env.ORDER_NOTIFY_EMAIL_VERSION; else process.env.ORDER_NOTIFY_EMAIL_VERSION = prevEmailVersion;
     if (prevDb) initMod.__setDbForTesting(prevDb);
     try { testDb.close(); } catch { /* best-effort */ }
   }

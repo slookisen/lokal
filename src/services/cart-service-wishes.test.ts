@@ -21,6 +21,13 @@
  *         contact_consent=true.
  *       * REGRESSION: a cart with no wishes at all (fase-1 flow) submits
  *         exactly as before — same orders, contact_handoffs: [].
+ *       * skive 2 (hybrid utsending, strict gate): a real order needs
+ *         isEligibleForRealOrder() — cross-check verified + owner-claimed
+ *         (is_verified=1) + order_notifications_opt_in=1 + a reachable,
+ *         non-blocklisted address; anything less → contact handoff, no
+ *         order row. The buyer's contact fields are copied onto the ORDER
+ *         only with contact_consent=true. Plus the isEligibleForRealOrder()
+ *         unit matrix (admin override never substitutes for a trust clause).
  *
  * Mirrors cart-service-second-line.test.ts's fixture idiom: fresh in-memory
  * better-sqlite3 DB via __initSchemaForTesting, module-local test-DB pin via
@@ -67,6 +74,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
 
   const initMod = require("../database/init") as typeof import("../database/init");
   const cartSvc = require("./cart-service") as typeof import("./cart-service");
+  const notifySvc = require("./order-notify-service") as typeof import("./order-notify-service");
 
   const prevDb = (() => {
     try { return initMod.getDb(); } catch { return undefined; }
@@ -110,12 +118,21 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
     initMod.__setDbForTesting(db as any);
     initMod.__initSchemaForTesting(db as any);
     cartSvc.__setCartTestDb(db as any);
+    // skive 2: agent-eligible is opted in below, so every real order fires a
+    // seller notification — pin the notify resolver to this DB and stub the
+    // transport (pilot-ordre-loop.test.ts's seam); both reset in `finally`.
+    notifySvc.__setOrderNotifyTestDb(db as any);
+    notifySvc.__setOrderNotifySendForTesting(async () => ({ success: true, messageId: "stub-cart-service-wishes" }));
 
     // ── Fixtures ──────────────────────────────────────────────────────────
     insertAgent("agent-eligible", "Gard Eligible");
     insertKnowledge("agent-eligible");
     insertProduct("prod-potet", "agent-eligible", "Poteter");
     insertProduct("prod-egg", "agent-eligible", "Egg");
+    // skive 2: the add-to-cart gate (isProducerEligible) is satisfied by the
+    // cross-check alone, but a REAL order now also needs the owner claim +
+    // opt-in (isEligibleForRealOrder).
+    db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-eligible'").run();
 
     insertAgent("agent-contact-only", "Gard KontaktSelv");
     insertKnowledge("agent-contact-only", { verificationStatus: "verified", verifiedSecondLine: 1 }); // second-line only — never checkout-eligible
@@ -123,6 +140,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
     insertAgent("agent-turns-ineligible", "Gard SnurIneligible");
     insertKnowledge("agent-turns-ineligible");
     insertProduct("prod-gulrot", "agent-turns-ineligible", "Gulrøtter");
+    db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-turns-ineligible'").run();
 
     // ═══════════ addCartWish ═══════════
 
@@ -461,6 +479,161 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       assertEq(wishCount, 0, "regression: no cart_wishes rows were created by the plain item-based flow");
     }
 
+    // ═══════════ skive 2: strict real-order gate at submit ════════════════
+    // ═══════════ (isEligibleForRealOrder) — opt-in missing → handoff ═════
+
+    {
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'agent-eligible'").run();
+      assertEq(cartSvc.isProducerEligible("agent-eligible"), true, "skive2 setup: add-to-cart gate (isProducerEligible) is UNCHANGED — still true without opt-in");
+      assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), false, "skive2: isEligibleForRealOrder() is false without order_notifications_opt_in");
+
+      const cart = cartSvc.createCart();
+      const add = cartSvc.addCartItem(cart.cart_id, "prod-potet", 2);
+      assertTrue(add.success === true, "skive2 setup: the product can still be put in a cart (add gate unchanged)");
+
+      const sub = cartSvc.submitCart(cart.cart_id);
+      assertTrue(sub.success === true, "skive2: submit still succeeds for a producer that fails the real-order gate (demoted, not rejected)");
+      if (sub.success) {
+        assertEq(sub.orders.length, 0, "skive2: NO order row for a cross-check-verified producer who has not opted in");
+        assertEq(sub.contact_handoffs.length, 1, "skive2: exactly one contact_handoffs entry instead");
+        assertEq(sub.contact_handoffs[0]?.agent_id, "agent-eligible", "skive2: the handoff is for that producer");
+      }
+      const orderRows = (db.prepare("SELECT COUNT(*) as c FROM orders WHERE cart_id = ?").get(cart.cart_id) as any).c;
+      assertEq(orderRows, 0, "skive2: no orders row written for the non-opted-in producer (no dead pending order)");
+      const handoffRows = (db.prepare("SELECT COUNT(*) as c FROM cart_handoffs WHERE cart_id = ? AND agent_id = 'agent-eligible'").get(cart.cart_id) as any).c;
+      assertEq(handoffRows, 1, "skive2: one cart_handoffs analytics row for the demoted producer");
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'agent-eligible'").run();
+    }
+
+    // ═══════════ skive 2: owner claim (is_verified) missing → handoff, ═══
+    // ═══════════ even with opt-in + cross-check ════════════════════════════
+
+    {
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = 'agent-eligible'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), false, "skive2: isEligibleForRealOrder() is false without the owner claim (is_verified=0), opt-in notwithstanding");
+
+      const cart = cartSvc.createCart();
+      cartSvc.addCartItem(cart.cart_id, "prod-potet", 1);
+      const sub = cartSvc.submitCart(cart.cart_id);
+      assertTrue(sub.success === true, "skive2: submit succeeds (handoff) for an unclaimed profile");
+      if (sub.success) {
+        assertEq(sub.orders.length, 0, "skive2: NO order for an opted-in but not owner-claimed producer");
+        assertEq(sub.contact_handoffs.map((h) => h.agent_id), ["agent-eligible"], "skive2: handoff for the unclaimed producer");
+      }
+      db.prepare("UPDATE agents SET is_verified = 1 WHERE id = 'agent-eligible'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), true, "skive2: all clauses satisfied again → isEligibleForRealOrder() true");
+    }
+
+    // ═══════════ skive 2: consent copies the buyer's contact onto the ORDER ═
+
+    {
+      const cart = cartSvc.createCart();
+      cartSvc.addCartItem(cart.cart_id, "prod-potet", 2);
+      const sub = cartSvc.submitCart(cart.cart_id, {
+        buyer_name: "Kari Nordmann",
+        buyer_email: "kari@example.com",
+        buyer_phone: "+47 91234567",
+        delivery_note: "Henter etter kl 16",
+        contact_consent: true,
+      });
+      assertTrue(sub.success === true && sub.orders.length === 1, "skive2 consent: one real order for the fully eligible producer");
+      const orderId = sub.success ? sub.orders[0]?.order_id : undefined;
+      const o = db.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(orderId) as any;
+      assertEq(o?.buyer_name, "Kari Nordmann", "skive2 consent: buyer_name copied onto the order");
+      assertEq(o?.buyer_email, "kari@example.com", "skive2 consent: buyer_email copied onto the order");
+      assertEq(o?.buyer_phone, "+47 91234567", "skive2 consent: buyer_phone copied onto the order");
+      assertEq(o?.delivery_note, "Henter etter kl 16", "skive2 consent: delivery_note copied onto the order");
+      assertTrue(typeof o?.contact_consent_at === "string" && o.contact_consent_at.length > 0, "skive2 consent: contact_consent_at stamped on the order");
+      // The order view the producer page reads exposes the same fields.
+      const view = cartSvc.getOrderByConfirmToken(o?.confirm_token);
+      assertEq(view?.buyer_name, "Kari Nordmann", "skive2 consent: getOrderByConfirmToken() surfaces buyer_name");
+      assertEq(view?.buyer_email, "kari@example.com", "skive2 consent: getOrderByConfirmToken() surfaces buyer_email");
+      assertEq(view?.buyer_phone, "+47 91234567", "skive2 consent: getOrderByConfirmToken() surfaces buyer_phone");
+      assertEq(view?.delivery_note, "Henter etter kl 16", "skive2 consent: getOrderByConfirmToken() surfaces delivery_note");
+    }
+
+    // ═══════════ skive 2: NO consent → the order's contact copy stays NULL ═
+    // ═══════════ (the cart still stores what was typed — Slice 1 unchanged) ═
+
+    {
+      const cart = cartSvc.createCart();
+      cartSvc.addCartItem(cart.cart_id, "prod-potet", 1);
+      const sub = cartSvc.submitCart(cart.cart_id, {
+        buyer_name: "Ola Nordmann",
+        buyer_email: "ola@example.com",
+        buyer_phone: "+47 99887766",
+        delivery_note: "Ring først",
+        contact_consent: false,
+      });
+      assertTrue(sub.success === true && sub.orders.length === 1, "skive2 no-consent: the real order is still created");
+      const orderId = sub.success ? sub.orders[0]?.order_id : undefined;
+      const o = db.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(orderId) as any;
+      assertEq([o?.buyer_name, o?.buyer_email, o?.buyer_phone, o?.delivery_note, o?.contact_consent_at], [null, null, null, null, null],
+        "skive2 no-consent: all five producer-facing contact columns on the order are NULL");
+      const c = db.prepare("SELECT buyer_name, buyer_email, contact_consent_at FROM carts WHERE id = ?").get(cart.cart_id) as any;
+      assertEq(c?.buyer_name, "Ola Nordmann", "skive2 no-consent: the cart row still stores the typed name (Slice 1 behaviour unchanged)");
+      assertEq(c?.contact_consent_at, null, "skive2 no-consent: cart contact_consent_at stays NULL");
+      const view = cartSvc.getOrderByConfirmToken(o?.confirm_token);
+      assertEq([view?.buyer_name, view?.buyer_email, view?.buyer_phone, view?.delivery_note], [null, null, null, null],
+        "skive2 no-consent: the producer order view exposes no contact fields");
+    }
+
+    // ═══════════ skive 2: isEligibleForRealOrder() unit matrix — every ═══
+    // ═══════════ clause independently provable false; the admin override ══
+    // ═══════════ never substitutes for the cross-check or the owner claim ══
+
+    {
+      // Second-line-only verification: never a real order, whatever else is set.
+      db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-contact-only'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-contact-only"), false, "gate-matrix: verified_second_line=1 → false even with owner claim + opt-in");
+      db.prepare("UPDATE agents SET is_verified = 0, order_notifications_opt_in = 0 WHERE id = 'agent-contact-only'").run();
+
+      // Cross-check missing (no agent_knowledge row at all): INNER JOIN → out.
+      insertAgent("agent-no-knowledge", "Gard UtenKryssjekk");
+      db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-no-knowledge'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-no-knowledge"), false, "gate-matrix: no agent_knowledge row (no cross-check) → false despite owner claim + opt-in");
+
+      // Cross-check pending + admin override e-mail: the override only routes
+      // the mail, it never satisfies the cross-check.
+      insertAgent("agent-pending-override", "Gard PendingOverride");
+      insertKnowledge("agent-pending-override", { verificationStatus: "pending" });
+      db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1, order_notification_email = 'daniel@example.com' WHERE id = 'agent-pending-override'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-pending-override"), false, "gate-matrix: verification_status='pending' → false even with owner claim + opt-in + admin override e-mail");
+
+      // Owner claim missing + admin override: still out.
+      insertAgent("agent-unclaimed-override", "Gard UnclaimedOverride");
+      insertKnowledge("agent-unclaimed-override");
+      db.prepare("UPDATE agents SET is_verified = 0, order_notifications_opt_in = 1, order_notification_email = 'daniel@example.com' WHERE id = 'agent-unclaimed-override'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-unclaimed-override"), false, "gate-matrix: is_verified=0 → false even with cross-check + opt-in + admin override e-mail");
+
+      // Inactive row: out.
+      db.prepare("UPDATE agents SET is_active = 0 WHERE id = 'agent-eligible'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), false, "gate-matrix: is_active=0 → false");
+      db.prepare("UPDATE agents SET is_active = 1 WHERE id = 'agent-eligible'").run();
+
+      // No recipient address anywhere: out…
+      insertAgent("agent-no-email", "Gard UtenEpost");
+      insertKnowledge("agent-no-email");
+      db.prepare("UPDATE agents SET contact_email = '', is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-no-email'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-no-email"), false, "gate-matrix: no contact_email and no override → false (nobody to notify)");
+      // …until the admin sets a destination (the override is a DESTINATION only).
+      db.prepare("UPDATE agents SET order_notification_email = 'daniel@example.com' WHERE id = 'agent-no-email'").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-no-email"), true, "gate-matrix: admin override supplies the missing destination when every trust clause already holds");
+
+      // Blocklisted address: out (same isBlocked() the notify gate uses).
+      insertAgent("agent-blocked", "Gard Blokkert");
+      insertKnowledge("agent-blocked");
+      db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = 'agent-blocked'").run();
+      db.prepare("INSERT INTO agent_blocklist (identifier_type, identifier_value, reason) VALUES ('email', 'agent-blocked@example.com', 'test')").run();
+      assertEq(cartSvc.isEligibleForRealOrder("agent-blocked"), false, "gate-matrix: blocklisted recipient → false");
+
+      // Unknown agent: out.
+      assertEq(cartSvc.isEligibleForRealOrder("does-not-exist"), false, "gate-matrix: unknown agent → false");
+
+      // The reference producer still passes.
+      assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), true, "gate-matrix: cross-check + owner claim + opt-in + reachable → true");
+    }
+
     // ═══════════ submitCart: empty cart (no items, no wishes) still 400 ═══
 
     {
@@ -470,6 +643,8 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       if (!sub.success) assertEq(sub.status, 400, "submitCart: empty-cart rejection is a 400");
     }
   } finally {
+    notifySvc.__setOrderNotifySendForTesting(null);
+    notifySvc.__setOrderNotifyTestDb(null);
     cartSvc.__setCartTestDb(null);
     initMod.__setDbForTesting(prevDb as any);
   }

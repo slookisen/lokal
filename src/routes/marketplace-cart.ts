@@ -323,9 +323,13 @@ cartRouter.get("/cart/:id", (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/marketplace/cart/:id/submit
 // Submit the cart. Re-checks availability of every item. Creates a real order
-// per producer eligible to receive one right now; every OTHER chosen producer
-// (contact-mode wishes, or one that turned out ineligible) comes back as a
-// contact_handoffs[] entry instead — no order row, no email.
+// per producer that passes cart-service.isEligibleForRealOrder() right now
+// (skive 2: cross-check verified + owner-claimed + opted in + reachable, not
+// blocklisted); every OTHER chosen producer (contact-mode wishes, or one that
+// fails that bar) comes back as a contact_handoffs[] entry instead — no
+// order row, no email. Contact fields reach a producer only with
+// contact_consent=true (copied onto the order, rendered in the e-mail and on
+// the producer's confirm page).
 // Token required. Body: { buyer_ref?: string, buyer_name?, buyer_email?,
 // buyer_phone?, delivery_note?, contact_consent?: boolean, website?: string }
 //
@@ -523,6 +527,23 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
     )
     .join("\n      ");
 
+  // skive 2 (hybrid utsending): the buyer's consented contact fields +
+  // delivery wish, when present on the order — read-only display, no new
+  // actions on this page. Omitted entirely (not shown as blank rows) when
+  // absent: pre-skive-2 orders, a no-consent submit, or after
+  // cart-contact-sweep.ts's 30-day sweep nulled them.
+  const buyerRowsHtml = [
+    order.buyer_name ? `<div><strong>Navn:</strong> ${escapePageHtml(order.buyer_name)}</div>` : "",
+    order.buyer_phone ? `<div><strong>Telefon:</strong> ${escapePageHtml(order.buyer_phone)}</div>` : "",
+    order.buyer_email ? `<div><strong>E-post:</strong> ${escapePageHtml(order.buyer_email)}</div>` : "",
+    order.delivery_note ? `<div><strong>Leveringsønske:</strong> ${escapePageHtml(order.delivery_note)}</div>` : "",
+  ]
+    .filter(Boolean)
+    .join("\n      ");
+  const buyerBlockHtml = buyerRowsHtml
+    ? `<div class="recap"><strong>Kunde:</strong>\n      ${buyerRowsHtml}\n    </div>`
+    : "";
+
   const timelineHtml = order.timeline.length
     ? `<div class="recap"><strong>Tidslinje:</strong>\n      ${order.timeline
         .map((e) => `<div>${escapePageHtml(e.created_at)}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
@@ -566,6 +587,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
       ${order.total_nok != null ? `<div><strong>Sum:</strong> ${order.total_nok} kr</div>` : ""}
       ${itemsHtml}
     </div>
+    ${buyerBlockHtml}
     ${timelineHtml}
     ${actionsHtml}
     <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. Ingen betaling skjer via plattformen.</p>
