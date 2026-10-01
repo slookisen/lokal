@@ -45783,3 +45783,27 @@ runSerial(async () => {
     failures.push("crm-sent-log-contact-filter: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-26-rfb-produsentside-synkron-slug-skann (P0), part 2
+// after #947: every /produsent/:slug, /en/produsent/:slug (GET and HEAD) and
+// /api/agents/:id/stats request walked the whole analytics_page_views
+// created_at index (getRollupBoundaryDate's MIN(substr(...))), and the
+// activity panel counted each path's rows in four passes. Both now return the
+// same results via an index min lookup and one SUM(CASE …) pass — proven here
+// against the old SQL as oracles. Swaps the getDb() singleton to its own
+// in-memory DB synchronously (restored in finally) — tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-26-rfb-produsentside-synkron-slug-skann: produsent hot path (rollup boundary + views30) ──");
+  try {
+    const { runProdusentHotPathTests } = require("../src/services/produsent-hot-path.test") as
+      typeof import("../src/services/produsent-hot-path.test");
+    const hp = runProdusentHotPathTests({ log: false });
+    passed += hp.passed;
+    failed += hp.failed;
+    for (const f of hp.failures) failures.push("produsent-hot-path: " + f);
+    console.log(`  produsent-hot-path: ${hp.passed} passed, ${hp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("produsent-hot-path: unexpected error: " + String(err?.message || err));
+  }
+});

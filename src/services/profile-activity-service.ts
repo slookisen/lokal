@@ -98,27 +98,31 @@ function likeClause(markers: string[]): { clause: string; params: string[] } {
 function getViews30(db: Database.Database, path: string): ProfileActivityViews {
   const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
   const aiNotParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
+  const gpt = likeClause(AI_MARKERS.chatgpt);
+  const cl = likeClause(AI_MARKERS.claude);
+  const oth = likeClause(AI_MARKERS.other);
 
-  const humanRow = db.prepare(`
-    SELECT COUNT(*) as c FROM analytics_page_views
+  // ONE pass over this path's rows instead of four (dev-request 2026-09-26-
+  // rfb-produsentside-synkron-slug-skann): this runs synchronously on every
+  // /produsent/:slug render, and each pass re-reads every 30-day row of the
+  // path — ~290 ms of the main thread for the most-viewed producer on a
+  // prod-scale DB, ~half of it after this change. Each SUM(CASE …) is exactly
+  // the predicate one of the former COUNT(*) queries had in its WHERE (a NULL
+  // session_id is "not true" in both forms, so it is counted in neither);
+  // COALESCE keeps COUNT(*)'s 0 for a path with no rows.
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(CASE WHEN ${aiNotClause} THEN 1 ELSE 0 END), 0) AS human,
+           COALESCE(SUM(CASE WHEN (${gpt.clause}) THEN 1 ELSE 0 END), 0) AS chatgpt,
+           COALESCE(SUM(CASE WHEN (${cl.clause}) THEN 1 ELSE 0 END), 0) AS claude,
+           COALESCE(SUM(CASE WHEN (${oth.clause}) THEN 1 ELSE 0 END), 0) AS other
+    FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
       AND created_at >= ${VIEWS_WINDOW_SQL}
-      AND ${aiNotClause}
-  `).get(path, ...aiNotParams) as { c: number } | undefined;
-  const human = humanRow?.c ?? 0;
-
-  function bucket(markers: string[]): number {
-    const { clause, params } = likeClause(markers);
-    const row = db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_page_views
-      WHERE path = ?
-        AND (is_owner IS NULL OR is_owner = 0)
-        AND created_at >= ${VIEWS_WINDOW_SQL}
-        AND (${clause})
-    `).get(path, ...params) as { c: number } | undefined;
-    return row?.c ?? 0;
-  }
+  `).get(...aiNotParams, ...gpt.params, ...cl.params, ...oth.params, path) as
+    { human: number; chatgpt: number; claude: number; other: number } | undefined;
+  const human = row?.human ?? 0;
+  const raw = { chatgpt: row?.chatgpt ?? 0, claude: row?.claude ?? 0, other: row?.other ?? 0 };
 
   // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
   // retention): 30-day window — safely inside the DEFAULT 60-day retention,
@@ -130,9 +134,9 @@ function getViews30(db: Database.Database, path: string): ProfileActivityViews {
   const cutoffIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
     .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
   const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
-  const chatgpt = bucket(AI_MARKERS.chatgpt) + prunedAi.chatgpt;
-  const claude = bucket(AI_MARKERS.claude) + prunedAi.claude;
-  const other = bucket(AI_MARKERS.other);
+  const chatgpt = raw.chatgpt + prunedAi.chatgpt;
+  const claude = raw.claude + prunedAi.claude;
+  const other = raw.other;
 
   return { human, ai: chatgpt + claude + other, aiBreakdown: { chatgpt, claude, other } };
 }
