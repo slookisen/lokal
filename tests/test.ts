@@ -42593,6 +42593,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-01-prod-sitemap-cache: GET /sitemap.xml in-memory TTL cache
+// (src/routes/seo.ts getSitemapXml / buildSitemapXml). Own :memory: DB fixture,
+// byte-equal golden (tests/fixtures/sitemap-golden.xml). Runs via runSerial()
+// like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-prod-sitemap-cache: sitemap.xml cache ──");
+  try {
+    const { runSeoSitemapCacheTests } = require("../src/routes/seo-sitemap-cache.test") as
+      typeof import("../src/routes/seo-sitemap-cache.test");
+    const sc = await runSeoSitemapCacheTests({ log: false });
+    passed += sc.passed;
+    failed += sc.failed;
+    for (const f of sc.failures) failures.push("sitemap-cache: " + f);
+    console.log(`  sitemap-cache: ${sc.passed} passed, ${sc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("sitemap-cache: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 1
 // (slug-alias/301 ved navnebytte): ensureAgentSlugAliasesTable /
 // insertAgentSlugAlias / resolveAgentSlugAlias (src/services/marketplace-

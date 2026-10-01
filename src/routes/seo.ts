@@ -6069,8 +6069,47 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 // GET /sitemap.xml
 // ═══════════════════════════════════════════════════════════════
 
-router.get("/sitemap.xml", (_req: Request, res: Response) => {
+// dev-request 2026-10-01-prod-sitemap-cache: the ~2.4 MB sitemap used to be
+// rebuilt synchronously on every request (blocking the event loop for every
+// crawler hit). Now built once per TTL and served from memory. TTL is
+// SITEMAP_CACHE_TTL_MS, default 30 min, clamped to 10–60 min. The agent list is
+// itself cached ~60 s and has no public invalidation hook, so TTL alone bounds
+// staleness (sitemap freshness is not time-critical).
+const SITEMAP_TTL_MIN_MS = 10 * 60_000;
+const SITEMAP_TTL_DEFAULT_MS = 30 * 60_000;
+const SITEMAP_TTL_MAX_MS = 60 * 60_000;
+
+export function resolveSitemapCacheTtlMs(raw: string | undefined = process.env.SITEMAP_CACHE_TTL_MS): number {
+  const n = Number(raw);
+  if (raw === undefined || raw.trim() === "" || !Number.isFinite(n)) return SITEMAP_TTL_DEFAULT_MS;
+  return Math.min(SITEMAP_TTL_MAX_MS, Math.max(SITEMAP_TTL_MIN_MS, Math.floor(n)));
+}
+
+let sitemapCache: { xml: string; builtAt: number } | null = null;
+
+/** Test hook: drop the cached sitemap. */
+export function __resetSitemapCacheForTesting(): void {
+  sitemapCache = null;
+}
+
+/**
+ * Cached sitemap XML. `now`/`build` are injectable for tests. A failing rebuild
+ * serves the previous valid version (and logs); with none, the error propagates
+ * so the handler answers 500 exactly as before.
+ */
+export function getSitemapXml(now: number = Date.now(), build: () => string = buildSitemapXml): string {
+  if (sitemapCache && now - sitemapCache.builtAt < resolveSitemapCacheTtlMs()) return sitemapCache.xml;
   try {
+    sitemapCache = { xml: build(), builtAt: now };
+  } catch (err) {
+    if (!sitemapCache) throw err;
+    console.error("Sitemap rebuild failed, serving previous version:", err);
+  }
+  return sitemapCache.xml;
+}
+
+export function buildSitemapXml(): string {
+  {
     const agents = marketplaceRegistry.getActiveAgents();
     const today = new Date().toISOString().split("T")[0];
     const cities = new Set<string>();
@@ -6169,7 +6208,15 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     console.log(`[sitemap] producer-entry filtering: ${skippedCount}/${agents.length} excluded by WO-17 gate`);
 
     xml += "\n</urlset>";
+    return xml;
+  }
+}
+
+router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  try {
+    const xml = getSitemapXml();
     res.header("Content-Type", "application/xml");
+    res.header("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
   } catch (err) {
     console.error("Sitemap error:", err);
