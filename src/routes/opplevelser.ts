@@ -832,7 +832,7 @@ import { isMatchableDomain } from "../services/gardssalg-rfb-enrich";
 // (same normalization scoreNameMatch itself uses internally for its
 // first-token tier, re-exposed here so the audit route can pre-bucket rows
 // instead of comparing every row against every other row).
-import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName, type BrregHit } from "../services/brreg-client";
+import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName, normaliseNamePruned, type BrregHit } from "../services/brreg-client";
 // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2 —
 // two already-reviewed org-nr candidate-generation heuristics (PR #679,
 // admin-rfb-brreg-selfsufficiency.ts) reused verbatim by the gårdssalg
@@ -23136,6 +23136,275 @@ const GARDSSALG_DEDUP_CATALOG_WHERE =
 const GARDSSALG_DEDUP_NOT_TEST_ROW_WHERE = "(producer_type IS NULL OR producer_type != 'test-gardssalg')";
 const GARDSSALG_DEDUP_IN_SCOPE_WHERE = `${GARDSSALG_DEDUP_CATALOG_WHERE} AND ${GARDSSALG_DEDUP_NOT_TEST_ROW_WHERE}`;
 
+export function gsDedupToRowOut(r: GsDedupRow) {
+  return {
+      id: r.id,
+      navn: r.navn,
+      org_nr: r.org_nr,
+      rfb_seed_source: r.rfb_seed_source,
+      producer_type: r.producer_type,
+      content_source: r.content_source,
+      has_email: gsDedupPresent(r.epost),
+      has_phone: gsDedupPresent(r.telefon),
+      unreachable: r.homepage_unreachable_since !== null,
+      homepage_unreachable_since: r.homepage_unreachable_since,
+  };
+}
+
+export type GsDedupGroup = {
+  signals: string[];
+  confidence: "high" | "low";
+  confidence_signals: string[];
+  corporate_group: boolean;
+  org_nr_conflict: boolean;
+  rows: ReturnType<typeof gsDedupToRowOut>[];
+};
+
+/** Connected-component grouping of the in-scope rows (unchanged logic, extracted from the route so tests can call it). Pure, exported. */
+export function gsDedupComputeGroups(rows: GsDedupRow[]): GsDedupGroup[] {
+  const uf = new GsDedupUnionFind(rows.length);
+
+  // ── Signal 1: org_nr (both sides set, equal) ────────────────────────────
+  const orgNrBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const v = r.org_nr && r.org_nr.trim();
+    if (!v) return;
+    const list = orgNrBuckets.get(v) ?? [];
+    list.push(i);
+    orgNrBuckets.set(v, list);
+  });
+  for (const idxs of orgNrBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 2: registrable website domain (both sides set, equal) ───────
+  const domainBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const d = homepageRegistrableDomain(r.hjemmeside);
+    if (!d) return;
+    const list = domainBuckets.get(d) ?? [];
+    list.push(i);
+    domainBuckets.set(d, list);
+  });
+  for (const idxs of domainBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 3: name (bucketed by first-token, then scored pairwise) ─────
+  const nameBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const key = normaliseName(gardssalgSearchName(r.navn)).split(" ")[0] ?? "";
+    if (!key) return;
+    const list = nameBuckets.get(key) ?? [];
+    list.push(i);
+    nameBuckets.set(key, list);
+  });
+  for (const idxs of nameBuckets.values()) {
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        if (gsDedupBestNameTier(rows[idxs[x]], rows[idxs[y]])) uf.union(idxs[x], idxs[y]);
+      }
+    }
+  }
+
+  // ── Collect connected components ────────────────────────────────────────
+  const componentsByRoot = new Map<number, number[]>();
+  rows.forEach((_, i) => {
+    const root = uf.find(i);
+    const list = componentsByRoot.get(root) ?? [];
+    list.push(i);
+    componentsByRoot.set(root, list);
+  });
+
+  const toRowOut = gsDedupToRowOut;
+
+  const groups: GsDedupGroup[] = [];
+
+  for (const idxs of componentsByRoot.values()) {
+    if (idxs.length < 2) continue;
+    // Re-derive which signal(s) fired for AT LEAST one pair in this group —
+    // groups are small (a handful of rows at most), so re-checking every
+    // pair here (rather than threading evidence through the union-find
+    // above) is cheap and keeps the "why grouped" logic in one place.
+    const signals = new Set<string>();
+    const confidenceSignals = new Set<string>();
+    let highConfidence = false;
+    let corporateGroup = false;
+    let orgNrConflict = false;
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        const a = rows[idxs[x]];
+        const b = rows[idxs[y]];
+        const orgA = a.org_nr && a.org_nr.trim();
+        const orgB = b.org_nr && b.org_nr.trim();
+        const orgMatch = !!(orgA && orgB && orgA === orgB);
+        // Point 3: different, BOTH-populated org_nr is positive proof of two
+        // separate companies for THIS pair — overrides any other matching
+        // signal below for this pair, regardless of domain/name evidence.
+        const orgConflictThisPair = !!(orgA && orgB && orgA !== orgB);
+        if (orgConflictThisPair) orgNrConflict = true;
+
+        const domA = homepageRegistrableDomain(a.hjemmeside);
+        const domB = homepageRegistrableDomain(b.hjemmeside);
+        const domMatch = !!(domA && domB && domA === domB);
+        if (domMatch) signals.add("domain");
+
+        const tier = gsDedupBestNameTier(a, b);
+        if (tier) signals.add(tier);
+
+        if (gsDedupIsCorporateGroupPair(a, b)) corporateGroup = true;
+
+        if (orgConflictThisPair) continue; // never contributes to high for this pair
+
+        if (orgMatch) {
+          signals.add("org_nr");
+          highConfidence = true;
+          confidenceSignals.add("org_nr");
+        }
+        if (domMatch) {
+          highConfidence = true;
+          confidenceSignals.add("domain");
+        }
+        if (tier && GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) {
+          highConfidence = true;
+          confidenceSignals.add(tier);
+        }
+      }
+    }
+    groups.push({
+      signals: Array.from(signals),
+      confidence: highConfidence ? "high" : "low",
+      confidence_signals: Array.from(confidenceSignals),
+      corporate_group: corporateGroup,
+      org_nr_conflict: orgNrConflict,
+      rows: idxs.map((i) => toRowOut(rows[i])),
+    });
+  }
+  return groups;
+}
+
+export interface GsDedupTwin {
+  signals: string[];
+  in_scope: ReturnType<typeof gsDedupToRowOut>;
+  out_of_scope: ReturnType<typeof gsDedupToRowOut>;
+}
+
+/**
+ * REFERENCE (legacy) O(n*m) implementation of out_of_scope_twins — the exact
+ * pre-2026-10-01 route logic, kept verbatim so the golden test can prove
+ * gsDedupComputeOutOfScopeTwins below returns identical output. NOT used by
+ * the route. Pure, exported for tests only.
+ */
+export function gsDedupComputeOutOfScopeTwinsLegacy(rows: GsDedupRow[], outOfScopeRows: GsDedupRow[]): GsDedupTwin[] {
+  const outOfScopeTwins: GsDedupTwin[] = [];
+  for (const outRow of outOfScopeRows) {
+    for (const inRow of rows) {
+      const twinSignals: string[] = [];
+
+      const orgA = outRow.org_nr && outRow.org_nr.trim();
+      const orgB = inRow.org_nr && inRow.org_nr.trim();
+      if (orgA && orgB && orgA === orgB) twinSignals.push("org_nr");
+
+      const domA = homepageRegistrableDomain(outRow.hjemmeside);
+      const domB = homepageRegistrableDomain(inRow.hjemmeside);
+      if (domA && domB && domA === domB) twinSignals.push("domain");
+
+      if (gsDedupBestNameTier(outRow, inRow) === "name_exact") twinSignals.push("name_exact");
+
+      if (twinSignals.length > 0) {
+        outOfScopeTwins.push({
+          signals: twinSignals,
+          in_scope: gsDedupToRowOut(inRow),
+          out_of_scope: gsDedupToRowOut(outRow),
+        });
+      }
+    }
+  }
+  return outOfScopeTwins;
+}
+
+/**
+ * Name keys under which two rows can reach scoreNameMatch >= 1.0 (name_exact).
+ * scoreNameMatch returns 1.0 iff normaliseNamePruned(a) is non-empty and
+ * equals normaliseNamePruned(b); the postnummer arguments only select
+ * 0.95 vs 0.80 on the non-exact path and never influence the 1.0 branch.
+ * gsDedupBestNameTier takes max(raw, stripped) and the tier is name_exact iff
+ * that max >= 1.0, i.e. iff the pruned RAW names are equal OR the pruned
+ * gardssalgSearchName()-STRIPPED names are equal. So the set of keys
+ * {pruned(raw), pruned(stripped)} (non-empty ones) indexes the relation
+ * exactly: two rows are name_exact iff their key sets intersect. Pure.
+ */
+export function gsDedupNameExactKeys(navn: string): string[] {
+  const keys: string[] = [];
+  const raw = normaliseNamePruned(navn);
+  if (raw.length > 0) keys.push(raw);
+  const stripped = normaliseNamePruned(gardssalgSearchName(navn));
+  if (stripped.length > 0 && stripped !== raw) keys.push(stripped);
+  return keys;
+}
+
+/**
+ * Linear-time (hash-join) out_of_scope_twins. Output is identical to
+ * gsDedupComputeOutOfScopeTwinsLegacy: same signals, same order (per
+ * out-of-scope row in input order, then in-scope rows in input order;
+ * signals ordered org_nr, domain, name_exact). Per-row org_nr / registrable
+ * domain / name keys are computed once; candidates come from three hash
+ * indexes, and each name candidate is additionally confirmed with the
+ * original pairwise gsDedupBestNameTier test. Pure, exported.
+ */
+export function gsDedupComputeOutOfScopeTwins(rows: GsDedupRow[], outOfScopeRows: GsDedupRow[]): GsDedupTwin[] {
+  const push = (m: Map<string, number[]>, k: string, i: number) => {
+    const l = m.get(k);
+    if (l) l.push(i);
+    else m.set(k, [i]);
+  };
+  const orgIdx = new Map<string, number[]>();
+  const domIdx = new Map<string, number[]>();
+  const nameIdx = new Map<string, number[]>();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const org = r.org_nr && r.org_nr.trim();
+    if (org) push(orgIdx, org, i);
+    const dom = homepageRegistrableDomain(r.hjemmeside);
+    if (dom) push(domIdx, dom, i);
+    for (const k of gsDedupNameExactKeys(r.navn)) push(nameIdx, k, i);
+  }
+
+  const inRowOut: Array<ReturnType<typeof gsDedupToRowOut> | undefined> = new Array(rows.length);
+  const twins: GsDedupTwin[] = [];
+  for (const outRow of outOfScopeRows) {
+    // inIdx -> bitmask: 1 = org_nr, 2 = domain, 4 = name_exact
+    const cand = new Map<number, number>();
+    const mark = (list: number[] | undefined, bit: number) => {
+      if (!list) return;
+      for (const i of list) cand.set(i, (cand.get(i) ?? 0) | bit);
+    };
+    const org = outRow.org_nr && outRow.org_nr.trim();
+    if (org) mark(orgIdx.get(org), 1);
+    const dom = homepageRegistrableDomain(outRow.hjemmeside);
+    if (dom) mark(domIdx.get(dom), 2);
+    const nameCands = new Set<number>();
+    for (const k of gsDedupNameExactKeys(outRow.navn)) {
+      const l = nameIdx.get(k);
+      if (l) for (const i of l) nameCands.add(i);
+    }
+    for (const i of nameCands) {
+      if (gsDedupBestNameTier(outRow, rows[i]) === "name_exact") cand.set(i, (cand.get(i) ?? 0) | 4);
+    }
+    if (cand.size === 0) continue;
+    const outOut = gsDedupToRowOut(outRow);
+    for (const i of Array.from(cand.keys()).sort((x, y) => x - y)) {
+      const m = cand.get(i)!;
+      const signals: string[] = [];
+      if (m & 1) signals.push("org_nr");
+      if (m & 2) signals.push("domain");
+      if (m & 4) signals.push("name_exact");
+      twins.push({ signals, in_scope: (inRowOut[i] ??= gsDedupToRowOut(rows[i])), out_of_scope: outOut });
+    }
+  }
+  return twins;
+}
+
 router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
 
@@ -23216,188 +23485,8 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
     return;
   }
 
-  const uf = new GsDedupUnionFind(rows.length);
-
-  // ── Signal 1: org_nr (both sides set, equal) ────────────────────────────
-  const orgNrBuckets = new Map<string, number[]>();
-  rows.forEach((r, i) => {
-    const v = r.org_nr && r.org_nr.trim();
-    if (!v) return;
-    const list = orgNrBuckets.get(v) ?? [];
-    list.push(i);
-    orgNrBuckets.set(v, list);
-  });
-  for (const idxs of orgNrBuckets.values()) {
-    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
-  }
-
-  // ── Signal 2: registrable website domain (both sides set, equal) ───────
-  const domainBuckets = new Map<string, number[]>();
-  rows.forEach((r, i) => {
-    const d = homepageRegistrableDomain(r.hjemmeside);
-    if (!d) return;
-    const list = domainBuckets.get(d) ?? [];
-    list.push(i);
-    domainBuckets.set(d, list);
-  });
-  for (const idxs of domainBuckets.values()) {
-    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
-  }
-
-  // ── Signal 3: name (bucketed by first-token, then scored pairwise) ─────
-  const nameBuckets = new Map<string, number[]>();
-  rows.forEach((r, i) => {
-    const key = normaliseName(gardssalgSearchName(r.navn)).split(" ")[0] ?? "";
-    if (!key) return;
-    const list = nameBuckets.get(key) ?? [];
-    list.push(i);
-    nameBuckets.set(key, list);
-  });
-  for (const idxs of nameBuckets.values()) {
-    for (let x = 0; x < idxs.length; x++) {
-      for (let y = x + 1; y < idxs.length; y++) {
-        if (gsDedupBestNameTier(rows[idxs[x]], rows[idxs[y]])) uf.union(idxs[x], idxs[y]);
-      }
-    }
-  }
-
-  // ── Collect connected components ────────────────────────────────────────
-  const componentsByRoot = new Map<number, number[]>();
-  rows.forEach((_, i) => {
-    const root = uf.find(i);
-    const list = componentsByRoot.get(root) ?? [];
-    list.push(i);
-    componentsByRoot.set(root, list);
-  });
-
-  const toRowOut = (r: GsDedupRow) => ({
-    id: r.id,
-    navn: r.navn,
-    org_nr: r.org_nr,
-    rfb_seed_source: r.rfb_seed_source,
-    producer_type: r.producer_type,
-    content_source: r.content_source,
-    has_email: gsDedupPresent(r.epost),
-    has_phone: gsDedupPresent(r.telefon),
-    unreachable: r.homepage_unreachable_since !== null,
-    homepage_unreachable_since: r.homepage_unreachable_since,
-  });
-
-  const groups: Array<{
-    signals: string[];
-    confidence: "high" | "low";
-    // Point 6 (dev-request 2026-08-18-gardssalg-dedup-org-nr-override): WHICH
-    // signal(s) actually justified `confidence: "high"` — a subset of
-    // `signals` (which lists ALL matched evidence, including tiers/matches
-    // that were considered but did NOT justify "high", e.g. a
-    // name_first_token_postal match, or a domain match suppressed by an
-    // org_nr conflict on that same pair). Always [] when confidence is "low"
-    // — a human reader can see exactly why a group was/wasn't trusted
-    // without re-deriving the scoring rules themselves.
-    confidence_signals: string[];
-    // True when some pair in this group differs ONLY by a trailing
-    // corporate/legal-form word (holding/gruppen/norge/"supply company") —
-    // e.g. "Fjording" vs "Fjording Holding". A DIFFERENT, related legal
-    // entity, never a duplicate-confidence signal — see
-    // gsDedupIsCorporateGroupPair.
-    corporate_group: boolean;
-    // True when some pair in this group has DIFFERENT, BOTH-populated
-    // org_nr values — positive proof of two separate companies for that
-    // pair, which overrides any other matching signal for it (point 3).
-    org_nr_conflict: boolean;
-    rows: ReturnType<typeof toRowOut>[];
-  }> = [];
-
-  for (const idxs of componentsByRoot.values()) {
-    if (idxs.length < 2) continue;
-    // Re-derive which signal(s) fired for AT LEAST one pair in this group —
-    // groups are small (a handful of rows at most), so re-checking every
-    // pair here (rather than threading evidence through the union-find
-    // above) is cheap and keeps the "why grouped" logic in one place.
-    const signals = new Set<string>();
-    const confidenceSignals = new Set<string>();
-    let highConfidence = false;
-    let corporateGroup = false;
-    let orgNrConflict = false;
-    for (let x = 0; x < idxs.length; x++) {
-      for (let y = x + 1; y < idxs.length; y++) {
-        const a = rows[idxs[x]];
-        const b = rows[idxs[y]];
-        const orgA = a.org_nr && a.org_nr.trim();
-        const orgB = b.org_nr && b.org_nr.trim();
-        const orgMatch = !!(orgA && orgB && orgA === orgB);
-        // Point 3: different, BOTH-populated org_nr is positive proof of two
-        // separate companies for THIS pair — overrides any other matching
-        // signal below for this pair, regardless of domain/name evidence.
-        const orgConflictThisPair = !!(orgA && orgB && orgA !== orgB);
-        if (orgConflictThisPair) orgNrConflict = true;
-
-        const domA = homepageRegistrableDomain(a.hjemmeside);
-        const domB = homepageRegistrableDomain(b.hjemmeside);
-        const domMatch = !!(domA && domB && domA === domB);
-        if (domMatch) signals.add("domain");
-
-        const tier = gsDedupBestNameTier(a, b);
-        if (tier) signals.add(tier);
-
-        if (gsDedupIsCorporateGroupPair(a, b)) corporateGroup = true;
-
-        if (orgConflictThisPair) continue; // never contributes to high for this pair
-
-        if (orgMatch) {
-          signals.add("org_nr");
-          highConfidence = true;
-          confidenceSignals.add("org_nr");
-        }
-        if (domMatch) {
-          highConfidence = true;
-          confidenceSignals.add("domain");
-        }
-        if (tier && GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) {
-          highConfidence = true;
-          confidenceSignals.add(tier);
-        }
-      }
-    }
-    groups.push({
-      signals: Array.from(signals),
-      confidence: highConfidence ? "high" : "low",
-      confidence_signals: Array.from(confidenceSignals),
-      corporate_group: corporateGroup,
-      org_nr_conflict: orgNrConflict,
-      rows: idxs.map((i) => toRowOut(rows[i])),
-    });
-  }
-
-  // ── out_of_scope_twins pairing (see the query comment above) ───────────
-  const outOfScopeTwins: Array<{
-    signals: string[];
-    in_scope: ReturnType<typeof toRowOut>;
-    out_of_scope: ReturnType<typeof toRowOut>;
-  }> = [];
-  for (const outRow of outOfScopeRows) {
-    for (const inRow of rows) {
-      const twinSignals: string[] = [];
-
-      const orgA = outRow.org_nr && outRow.org_nr.trim();
-      const orgB = inRow.org_nr && inRow.org_nr.trim();
-      if (orgA && orgB && orgA === orgB) twinSignals.push("org_nr");
-
-      const domA = homepageRegistrableDomain(outRow.hjemmeside);
-      const domB = homepageRegistrableDomain(inRow.hjemmeside);
-      if (domA && domB && domA === domB) twinSignals.push("domain");
-
-      if (gsDedupBestNameTier(outRow, inRow) === "name_exact") twinSignals.push("name_exact");
-
-      if (twinSignals.length > 0) {
-        outOfScopeTwins.push({
-          signals: twinSignals,
-          in_scope: toRowOut(inRow),
-          out_of_scope: toRowOut(outRow),
-        });
-      }
-    }
-  }
+  const groups = gsDedupComputeGroups(rows);
+  const outOfScopeTwins = gsDedupComputeOutOfScopeTwins(rows, outOfScopeRows);
 
   res.json({
     total_providers_scanned: rows.length,

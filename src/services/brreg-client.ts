@@ -109,7 +109,7 @@ export function normaliseName(s: string): string {
     .trim();
 }
 
-function normaliseNamePruned(s: string): string {
+export function normaliseNamePruned(s: string): string {
   const tokens = normaliseName(s).split(/\s+/).filter(Boolean);
   while (tokens.length > 1 && ORG_SUFFIXES.has(tokens[tokens.length - 1])) tokens.pop();
   return tokens.join(" ");
