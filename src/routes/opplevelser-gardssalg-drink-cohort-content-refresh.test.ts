@@ -205,7 +205,8 @@ export function runOpplevelserGardssalgDrinkCohortContentRefreshTests(
         // Excluded: parked (dead homepage within the 30-day window).
         { id: "dk-parked", navn: "Parkert Mjøderi", hjemmeside: "https://dk-parked.example.no", content_source: null,
           producer_type: "mjøderi", verified: true, last_content_attempt_at: null,
-          homepage_unreachable_since: "2026-09-01 00:00:00", created_at: "2026-01-05 00:00:00" },
+          homepage_unreachable_since: new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 19).replace("T", " "),
+          created_at: "2026-01-05 00:00:00" },
         // Excluded: no website at all.
         { id: "dk-nosite", navn: "Uten Hjemmeside Cideri", hjemmeside: null, content_source: null,
           producer_type: "cideri", verified: true, last_content_attempt_at: null, created_at: "2026-01-06 00:00:00" },
