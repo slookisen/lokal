@@ -31347,6 +31347,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorb.failures) failures.push("opplevelser-gardssalg-outreach-reserve-before-send: " + f);
     console.log(`  opplevelser-gardssalg-outreach-reserve-before-send: ${gorb.passed} passed, ${gorb.failed} failed`);
 
+    // dev-request 2026-09-30-opplevagent-svarvakt-og-tak-2: reply guard
+    // ("replied") + max-2-touch cap ("max_touch_reached") in the send path
+    // and daily-prep.
+    console.log("\n── opplevelser-gardssalg-outreach-reply-guard-touch-cap: replied + max_touch_reached ──");
+    const { runOpplevelserGardssalgOutreachReplyGuardTouchCapTests } = require("../src/routes/opplevelser-gardssalg-outreach-reply-guard-touch-cap.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-reply-guard-touch-cap.test");
+    const gorg = await runOpplevelserGardssalgOutreachReplyGuardTouchCapTests({ log: false });
+    passed += gorg.passed;
+    failed += gorg.failed;
+    for (const f of gorg.failures) failures.push("opplevelser-gardssalg-outreach-reply-guard-touch-cap: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-reply-guard-touch-cap: ${gorg.passed} passed, ${gorg.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed
