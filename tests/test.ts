@@ -31577,6 +31577,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpdar.failures) failures.push("opplevelser-gardssalg-provider-dedup-audit: " + f);
     console.log(`  opplevelser-gardssalg-provider-dedup-audit: ${gpdar.passed} passed, ${gpdar.failed} failed`);
 
+    // dev-request 2026-10-01-opplevagent-dedup-audit-hash-join: golden (old vs
+    // hash-join out_of_scope_twins) + 5000x5000 perf test.
+    console.log("\n── opplevelser-gardssalg-dedup-audit-hashjoin: golden + perf ──");
+    const { runOpplevelserGardssalgDedupAuditHashJoinTests } = require("../src/routes/opplevelser-gardssalg-dedup-audit-hashjoin.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-dedup-audit-hashjoin.test");
+    const gpdhj = runOpplevelserGardssalgDedupAuditHashJoinTests({ log: false });
+    passed += gpdhj.passed;
+    failed += gpdhj.failed;
+    for (const f of gpdhj.failures) failures.push("opplevelser-gardssalg-dedup-audit-hashjoin: " + f);
+    console.log(`  opplevelser-gardssalg-dedup-audit-hashjoin: ${gpdhj.passed} passed, ${gpdhj.failed} failed`);
+
     // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
     // spec-punkt 2 (merge lever, 2026-08-15): POST /admin/gardssalg-provider-
     // dedup-merge — executes an explicit, already human-verified
