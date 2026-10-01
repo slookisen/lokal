@@ -17825,6 +17825,34 @@ export function findGardssalgOutreachHardBounce(
   return row ?? null;
 }
 
+/**
+ * has_replied: the producer has at least one inbound CRM message on a thread
+ * with its contact. Mirrors admin-outreach-candidates.ts's has_replied
+ * subquery (agent_id -> provider_id + vertical_id = 'experiences',
+ * crm-service.ts resolveContact()'s experiences-vertical scoping). Single
+ * source for GET /admin/gardssalg-outreach-candidates AND
+ * computeGardssalgOutreachSendEligibility (dev-request
+ * 2026-09-30-opplevagent-svarvakt-og-tak-2) — never a second variant.
+ */
+export function gardssalgProducerHasCrmReply(rfbDb: ReturnType<typeof getRfbDb>, providerId: string): boolean {
+  const row = rfbDb
+    .prepare(
+      `SELECT 1
+         FROM crm_contacts cc
+         JOIN crm_threads ct ON ct.contact_id = cc.id
+         JOIN crm_messages cm ON cm.thread_id = ct.id
+        WHERE cc.provider_id = ?
+          AND cc.vertical_id = 'experiences'
+          AND cm.direction = 'in'
+        LIMIT 1`,
+    )
+    .get(providerId);
+  return row !== undefined;
+}
+
+/** Max cold touches per producer in this lane: the first + one follow-up. */
+export const GARDSSALG_OUTREACH_MAX_TOUCHES = 2;
+
 export function computeGardssalgOutreachSendEligibility(
   expDb: Database.Database,
   providerIds: string[],
@@ -17900,6 +17928,26 @@ export function computeGardssalgOutreachSendEligibility(
         bounce_type: bounced.bounce_type,
         bounced_at: bounced.bounced_at,
       });
+      continue;
+    }
+
+    // ── Reply guard (dev-request 2026-09-30-opplevagent-svarvakt-og-tak-2):
+    // a producer that has answered us never gets another cold email.
+    if (gardssalgProducerHasCrmReply(getRfbDb(), providerId)) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "replied" });
+      continue;
+    }
+
+    // ── Max-2-touch cap: 'sent' AND 'reserved' rows both count (a reserved
+    // row is a send in flight / kept after an ambiguous failure); test sends
+    // (is_test = 1) never count, as in the cooldown check below.
+    const touchCount = (
+      expDb
+        .prepare(`SELECT COUNT(*) AS n FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0`)
+        .get(providerId) as { n: number }
+    ).n;
+    if (touchCount >= GARDSSALG_OUTREACH_MAX_TOUCHES) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "max_touch_reached" });
       continue;
     }
 
@@ -18235,21 +18283,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // ── replied: mirrors admin-outreach-candidates.ts's has_replied subquery
     // (~L242-250), agent_id -> provider_id + vertical_id = 'experiences'
     // (crm-service.ts resolveContact()'s experiences-vertical scoping).
-    const hasCrmReply = (providerId: string): boolean => {
-      const row = rfbDb
-        .prepare(
-          `SELECT 1
-             FROM crm_contacts cc
-             JOIN crm_threads ct ON ct.contact_id = cc.id
-             JOIN crm_messages cm ON cm.thread_id = ct.id
-            WHERE cc.provider_id = ?
-              AND cc.vertical_id = 'experiences'
-              AND cm.direction = 'in'
-            LIMIT 1`,
-        )
-        .get(providerId);
-      return row !== undefined;
-    };
+    const hasCrmReply = (providerId: string): boolean => gardssalgProducerHasCrmReply(rfbDb, providerId);
 
     // ── hard-bounced: email_bounces lives in the RFB db and is
     // vertical-agnostic (keyed on email only, no agent/provider FK) — reused
@@ -18309,6 +18343,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           blocklistedCount++;
         } else if (e.reason === "hard_bounced") {
           hardBouncedCount++;
+        } else if (e.reason === "replied") {
+          repliedCount++;
+        } else if (e.reason === "max_touch_reached") {
+          contactedOrCooldownCount++;
         } else if (e.reason === "cooldown_suppressed") {
           if (e.cross_platform) crossPlatformCooldownCount++;
           else contactedOrCooldownCount++;
