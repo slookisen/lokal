@@ -793,6 +793,10 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;
   }
 
+  private orderToggleUrl(dashboardUrl: string): string {
+    return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
+  }
+
   private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string): string {
     return `
 <!DOCTYPE html>
@@ -849,6 +853,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       <li>Følge med på interaksjoner og preferanser</li>
     </ul>
     <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
+    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl))}">dashboarden din</a>.</p>
     <p>Lykke til!</p>
   </div>
 </body>
@@ -869,6 +874,9 @@ Din agent er klar. Du kan nå:
 
 Gå til dashboarden din:
 ${dashboardUrl}
+
+Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
+${this.orderToggleUrl(dashboardUrl)}
 
 Lykke til!
     `;
