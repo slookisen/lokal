@@ -32,6 +32,17 @@ const BOT_TYPE_CASE = `
   END
 `;
 
+/** B4: true iff analytics_page_views has utm_source AND page_view_utm_daily exists. */
+function hasUtmRollupSchema(db: ReturnType<typeof getDb>): boolean {
+  try {
+    const cols = db.prepare("PRAGMA table_info(analytics_page_views)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "utm_source")) return false;
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='page_view_utm_daily'").get();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Roll up raw page_views older than windowDays into page_view_daily AND
  * sessions_daily, then DELETE the raw rows. Processes in weekly batches to
@@ -123,6 +134,35 @@ export function rollupAndPrunePageViews(
           ON CONFLICT(day, vertical_id, bot_type) DO UPDATE SET
             session_count = session_count + excluded.session_count
         `).run(batchStart, batchEnd);
+
+        // 1c. B4: UTM-preserving rollup (additive; page_view_daily above is
+        //     unchanged). Skipped when the raw table has no utm columns yet
+        //     (older/mirrored schemas). Same window, same is_owner exclusion,
+        //     same transaction, runs before the DELETE.
+        if (hasUtmRollupSchema(db)) {
+          db.prepare(`
+            INSERT INTO page_view_utm_daily
+              (day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id, view_count, session_count)
+            SELECT
+              substr(created_at, 1, 10) as day,
+              COALESCE(utm_source, '') as utm_source,
+              COALESCE(utm_medium, '') as utm_medium,
+              COALESCE(utm_campaign, '') as utm_campaign,
+              ${BOT_TYPE_CASE} as bot_type,
+              COALESCE(vertical_id, 'rfb') as vertical_id,
+              COUNT(*) as view_count,
+              COUNT(DISTINCT session_id) as session_count
+            FROM analytics_page_views
+            WHERE substr(created_at, 1, 10) >= ?
+              AND substr(created_at, 1, 10) < ?
+              AND (is_owner IS NULL OR is_owner = 0)
+              AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
+            GROUP BY day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id
+            ON CONFLICT(day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id) DO UPDATE SET
+              view_count = view_count + excluded.view_count,
+              session_count = session_count + excluded.session_count
+          `).run(batchStart, batchEnd);
+        }
 
         // 2. DELETE: remove ALL raw rows (including is_owner) for this batch
         const del = db.prepare(`

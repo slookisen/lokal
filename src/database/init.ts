@@ -1424,6 +1424,18 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── B4 (dev-request 2026-09-24-ai-sok-bli-svaret-rfb): inbound UTM ──
+  // Nullable, additive columns. Plain ALTER TABLE ADD COLUMN is a
+  // metadata-only change in SQLite (no table rewrite, safe on ~1.3M rows).
+  // Deliberately NO index and NO backfill (either would scan the table).
+  for (const col of ["utm_source", "utm_medium", "utm_campaign"]) {
+    try {
+      db.exec(`ALTER TABLE analytics_page_views ADD COLUMN ${col} TEXT`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   // ─── Add source column to conversations ──────────────────────
   // Tracks where a conversation originated: a2a, mcp, web, api
   try {
@@ -4040,6 +4052,34 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
+
+  // B4: where the visitor who clicked came from (utm_source on the landing
+  // URL / same-origin Referer). Nullable, additive; metadata-only ALTER.
+  try {
+    db.exec(`ALTER TABLE contact_clicks ADD COLUMN utm_source TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // B4: UTM-preserving rollup destination. page_view_daily's PRIMARY KEY is
+  // left untouched (changing it would alter existing aggregates' grain), so
+  // utm lives in its own small additive table, written by
+  // retention-service.ts in the same transaction as page_view_daily, before
+  // the raw rows are deleted. Only rows with at least one utm_* value are
+  // rolled up here; NULL parts are stored as '' so the PK dedupes them.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_view_utm_daily (
+      day          TEXT NOT NULL,
+      utm_source   TEXT NOT NULL DEFAULT '',
+      utm_medium   TEXT NOT NULL DEFAULT '',
+      utm_campaign TEXT NOT NULL DEFAULT '',
+      bot_type     TEXT NOT NULL DEFAULT 'human',
+      vertical_id  TEXT NOT NULL DEFAULT 'rfb',
+      view_count   INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id)
+    )
+  `);
 
   // ─── Measure 2 of dev-request 2026-07-03-places-api-cost-reduction ──────
   // (SKU field-splitting, RFB google-rating-batch): Places API (New) Text

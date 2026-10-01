@@ -34934,8 +34934,37 @@ const _rollupReadBlendPromise: Promise<void> = new Promise<void>(r => {
   _rollupReadBlendResolve = r;
 });
 
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B4: utm capture at
+// landing + utm-preserving rollup + contact_clicks.utm_source. Swaps the
+// shared getDb() singleton -> strictly after rollup-slice2.
+let _utmCaptureResolve: () => void = () => {};
+const _utmCapturePromise: Promise<void> = new Promise<void>(r => {
+  _utmCaptureResolve = r;
+});
+
 (async () => {
   await Promise.allSettled([_rollupSlice2Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── B4: utm capture at landing ──");
+  try {
+    const { runUtmCaptureTests } = require("../src/services/utm-capture.test") as
+      typeof import("../src/services/utm-capture.test");
+    const ut = await runUtmCaptureTests({ log: false });
+    passed += ut.passed;
+    failed += ut.failed;
+    for (const f of ut.failures) failures.push("utm-capture: " + f);
+    console.log(`  utm-capture: ${ut.passed} passed, ${ut.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("utm-capture: unexpected error: " + String(err?.message || err));
+  } finally {
+    _utmCaptureResolve();
+  }
+})();
+
+(async () => {
+  await Promise.allSettled([_utmCapturePromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention, Skive 3: rollup read blend ──");

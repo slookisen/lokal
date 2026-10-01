@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
+import { extractUtmFromQuery } from "../utils/utm-capture";
 import { classifyUA, uaFromSessionId } from "./traffic-classifier";
 import {
   getPrunedPageViewCount,
@@ -563,13 +564,66 @@ export class AnalyticsService {
       const userAgentHash = hashUserAgent(userAgent);
       const ipHash = hashIP(clientIp);
       const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
+      const utm = extractUtmFromQuery(req.query); // B4: inbound utm_* (sanitised, nullable)
 
       db.prepare(`
-        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code, vertical_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null, getVerticalFromHost(req.hostname));
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code, vertical_id, utm_source, utm_medium, utm_campaign)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null, getVerticalFromHost(req.hostname), utm.utm_source, utm.utm_medium, utm.utm_campaign);
     } catch (err) {
       console.error("[analytics] Failed to track page view:", err);
+    }
+  }
+
+  /**
+   * B4: inbound UTM breakdown (raw window + rolled-up days, additive).
+   * Raw side: rows with any utm_* in the window. Rollup side: page_view_utm_daily
+   * for whole days strictly before the raw table's oldest surviving day (days
+   * are never double-counted: rollup deletes raw rows in the same transaction).
+   * Never throws; returns [] on error. Bounded: GROUP BY over the time-indexed
+   * window only, LIMIT 200 groups.
+   */
+  getUtmBreakdown(hours: number = 24): Array<{
+    utm_source: string; utm_medium: string; utm_campaign: string; views: number; sessions: number;
+  }> {
+    try {
+      const db = getDb();
+      const cutoff = new Date(Date.now() - hours * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+      const merged = new Map<string, { utm_source: string; utm_medium: string; utm_campaign: string; views: number; sessions: number }>();
+      const add = (r: any) => {
+        const key = `${r.utm_source}\u0000${r.utm_medium}\u0000${r.utm_campaign}`;
+        const cur = merged.get(key) || { utm_source: r.utm_source, utm_medium: r.utm_medium, utm_campaign: r.utm_campaign, views: 0, sessions: 0 };
+        cur.views += r.views;
+        cur.sessions += r.sessions;
+        merged.set(key, cur);
+      };
+      const raw = db.prepare(`
+        SELECT COALESCE(utm_source, '') AS utm_source, COALESCE(utm_medium, '') AS utm_medium,
+               COALESCE(utm_campaign, '') AS utm_campaign,
+               COUNT(*) AS views, COUNT(DISTINCT session_id) AS sessions
+        FROM analytics_page_views
+        WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
+          AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
+        GROUP BY 1, 2, 3
+        ORDER BY views DESC LIMIT 200
+      `).all(cutoff) as any[];
+      raw.forEach(add);
+      // Rolled-up days: only days older than the oldest surviving raw day.
+      const oldestRaw = (db.prepare(
+        "SELECT MIN(substr(created_at, 1, 10)) AS d FROM analytics_page_views"
+      ).get() as { d: string | null } | undefined)?.d;
+      const rolled = db.prepare(`
+        SELECT utm_source, utm_medium, utm_campaign,
+               SUM(view_count) AS views, SUM(session_count) AS sessions
+        FROM page_view_utm_daily
+        WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""}
+        GROUP BY 1, 2, 3
+      `).all(...(oldestRaw ? [cutoff.slice(0, 10), oldestRaw] : [cutoff.slice(0, 10)])) as any[];
+      rolled.forEach(add);
+      return [...merged.values()].sort((a, b) => b.views - a.views).slice(0, 200);
+    } catch (err) {
+      console.error("[analytics] Failed to compute utm breakdown:", err);
+      return [];
     }
   }
 
