@@ -39,6 +39,7 @@ import { getDb } from "../database/init";
 import { knowledgeService } from "../services/knowledge-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { addUtmParams } from "../utils/url-utm";
+import { extractUtmFromQuery, extractUtmFromUrl } from "../utils/utm-capture";
 
 // ─── Shared validation ───────────────────────────────────────────
 // agentId is our own generated id (see routes/marketplace.ts registration) —
@@ -124,6 +125,16 @@ function resolveRedirectUrl(agentId: string, kind: string): string | null {
   return candidate;
 }
 
+/** True iff the Referer's host is this request's own host (same-origin beacon). */
+function isOwnReferer(referer: string | undefined, host: string | undefined): boolean {
+  if (!referer || !host) return false;
+  try {
+    return new URL(referer).hostname.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /** Record one contact_clicks row. Never throws — callers treat tracking as best-effort. */
 function recordClick(req: Request, res: Response, agentId: string, kind: string): void {
   try {
@@ -131,9 +142,15 @@ function recordClick(req: Request, res: Response, agentId: string, kind: string)
     const ua = analyticsService.getUserAgent(req);
     const sessionId = analyticsService.getOrCreateSessionId(req, res);
     const isBot = parseUserAgent(ua).isBot ? 1 : 0;
+    // B4: utm_source of the visit — own query string first (GET /ut/...),
+    // else the same-origin Referer (the profile page the beacon fired from).
+    const utmSource =
+      extractUtmFromQuery(req.query).utm_source ||
+      (isOwnReferer(req.get("referer"), req.hostname) ? extractUtmFromUrl(req.get("referer")).utm_source : null) ||
+      null;
     db.prepare(
-      `INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot) VALUES (?, ?, ?, ?)`,
-    ).run(agentId, kind, sessionId, isBot);
+      `INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot, utm_source) VALUES (?, ?, ?, ?, ?)`,
+    ).run(agentId, kind, sessionId, isBot, utmSource);
   } catch (err) {
     console.error("[contact-tracking] failed to record click:", err);
   }

@@ -209,6 +209,21 @@ router.get("/summary", (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     ...summary,
     monthly_visits: monthlyVisits,
+    // B4 (additive): inbound utm_* attribution for the same 24h window.
+    utm: analyticsService.getUtmBreakdown(24, vertical),
+  });
+});
+
+/**
+ * GET /admin/analytics/utm?hours=24
+ * B4: landings by utm_source/medium/campaign (raw + rolled-up days).
+ */
+router.get("/utm", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  res.json({
+    timeframe: `last ${hours} hours`,
+    timestamp: new Date().toISOString(),
+    utm: analyticsService.getUtmBreakdown(hours, parseVertical(req)),
   });
 });
 
