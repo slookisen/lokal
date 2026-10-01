@@ -77,11 +77,16 @@ export async function runMarketplaceRegistrySlugLookupTests(opts: { log?: boolea
     for (let i = 0; i < 3000; i++) seed(`bulk-${i}`, `Bulk Gård ${i}`, { desc: big });
     seed("a-1", "Åsgård Ysteri");
     seed("a-2", "Åsgård  Ysteri!"); // duplicate slug — first scan-order match must win
+    // Duplicate slug where rowid order and lat/lng (old scan) order DISAGREE:
+    // old query scans idx_agents_geo, so the lower-lat row wins, not the lower rowid.
+    seed("geo-1", "Geo Dublett"); seed("geo-2", "Geo Dublett");
+    testDb.prepare("UPDATE agents SET lat = 63.4, lng = 10.4 WHERE id = 'geo-1'").run();
+    testDb.prepare("UPDATE agents SET lat = 59.9, lng = 10.7 WHERE id = 'geo-2'").run();
     seed("umb-1", "Testlokallag", { umbrella: "lokallag" });
     seed("off-1", "Skjult Gård", { active: 0 });
 
     // ── parity vs. old algorithm ───────────────────────────────────────
-    for (const slug of ["asgard-ysteri", "ASGARD-YSTERI", "testlokallag", "skjult-gard", "bulk-gard-0", "bulk-gard-2999", "finnes-ikke"]) {
+    for (const slug of ["asgard-ysteri", "ASGARD-YSTERI", "testlokallag", "skjult-gard", "bulk-gard-0", "bulk-gard-2999", "finnes-ikke", "geo-dublett"]) {
       assertEq(lookup(slug), reference(slug), `parity: ${slug}`);
     }
     assertEq(lookup("asgard-ysteri"), "a-1", "duplicate slug: first scan-order match wins");

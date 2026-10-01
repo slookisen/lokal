@@ -10521,7 +10521,7 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a4.4: marketplace-registry.ts exports getAgentBySlugIncludingUmbrellas(slug)"
   );
   assertTrue(
-    /SELECT id, name FROM agents WHERE is_active = 1 ORDER BY rowid["\`]\)/.test(regSrc)
+    /SELECT id, name FROM agents WHERE is_active = 1["\`]\)/.test(regSrc)
       && /SELECT \* FROM agents WHERE id = \? AND is_active = 1["\`]\)/.test(regSrc),
     "phase5.11-a4.4: new method queries WHERE is_active = 1 (no umbrella_type filter)"
   );

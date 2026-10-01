@@ -1540,12 +1540,14 @@ class MarketplaceRegistry {
   // to run `SELECT * FROM agents WHERE is_active = 1` + slugify() on every row for
   // EVERY /produsent/:slug request — O(all agents) of synchronous work incl. the
   // large text/JSON columns, 5–25 s event-loop stalls under crawling. Now: a
-  // slug→id map built from `id, name` only (first scan-order match wins, exactly
-  // like the old Array.find), then ONE `WHERE id = ?` row read. Direct-SQL writers
+  // slug→id map built from `id, name` only (first match in the SAME scan order as
+  // the old query wins, exactly like the old Array.find), then ONE `WHERE id = ?` row read. Direct-SQL writers
   // (deactivate, merge, bulk inserts) don't all go through invalidateCache(), so
   // the map is guarded three ways: a (count, max rowid) fingerprint per lookup,
   // re-verification of the hit row (still active AND slug still matches), and a
-  // throttled rebuild on a miss (renames via direct SQL).
+  // throttled rebuild on a miss (renames via direct SQL). Residual, bounded
+  // staleness (≤30 s max age): a direct-SQL rename INTO an existing slug, or a
+  // reactivation offset by a deactivation, keeps the fingerprint unchanged.
   private _slugIdMap: Map<string, string> | null = null;
   private _slugIdMapDb: unknown = null;
   private _slugIdMapFp = "";
@@ -1559,7 +1561,11 @@ class MarketplaceRegistry {
   }
 
   private rebuildSlugMap(db: ReturnType<typeof getDb>, fp: string): Map<string, string> {
-    const rows = db.prepare("SELECT id, name FROM agents WHERE is_active = 1 ORDER BY rowid").all() as Array<{ id: string; name: string }>;
+    const rows = db.prepare("SELECT id, name FROM agents WHERE is_active = 1").all() as Array<{ id: string; name: string }>;
+    // Deliberately NO ORDER BY: this must visit rows in the same order the old
+    // `SELECT * … WHERE is_active = 1` did (SQLite scans idx_agents_geo, i.e. lat/lng
+    // order, not rowid), so the winner among duplicate slugs is unchanged and still
+    // matches admin-agents-duplicate-slugs.ts `currentlyServedId`.
     const map = new Map<string, string>();
     for (const r of rows) {
       const key = slugify(r.name).toLowerCase();
