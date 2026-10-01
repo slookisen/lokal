@@ -650,6 +650,19 @@ class KnowledgeService {
       console.log(`[claim-verify:quarantine-gate] withheld is_verified badge for self_registered agent ${claim.agent_id} (claim ${claimId} still succeeded)`);
     }
 
+    // ─── dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach ──────────
+    // Stamp agents.claimed_at/claimed_via so every reader of the owner lock
+    // (outreach customer gate, contact-write guards, sweeps) sees the owner.
+    // Fill-only: never overwrites an existing claimed_at/claimed_via (e.g. one
+    // set by an earlier claim). Applies to self_registered rows too — the
+    // ownership is real even though the public badge is withheld above.
+    // agent_claims carries no user id, so claimed_by_user_id is left alone.
+    db.prepare(`
+      UPDATE agents
+         SET claimed_at = ?, claimed_via = COALESCE(claimed_via, 'claim')
+       WHERE id = ? AND claimed_at IS NULL
+    `).run(now, claim.agent_id);
+
     // Update knowledge data_source
     const knowledge = this.getKnowledge(claim.agent_id);
     if (knowledge) {

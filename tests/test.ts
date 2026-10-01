@@ -24956,6 +24956,14 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach: the shared
+    -- customer rule (services/customer-rule.ts) reads verified agent_claims.
+    CREATE TABLE agent_claims (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      status TEXT DEFAULT 'pending'
+    );
+
     CREATE TABLE analytics_agent_views (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id TEXT,
@@ -45852,5 +45860,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("produsent-hot-path: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach (slice 1): a verified
+// owner claim counts as customer in the outreach gate (shared customerRuleSql),
+// verifyClaim stamps agents.claimed_at fill-only, POST /admin/agents/claim-backfill
+// (dry-run default, audit rows, idempotent), and the inbound-email webhook
+// dedupes on email_id + answers 200 early. Pins the getDb() singleton to its own
+// in-memory DB (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach: owner claim = customer, claim backfill, inbound-email dedupe ──");
+  try {
+    const { runRfbOwnerClaimCustomerTests } = require("../src/routes/rfb-owner-claim-customer.test") as
+      typeof import("../src/routes/rfb-owner-claim-customer.test");
+    const oc = await runRfbOwnerClaimCustomerTests({ log: false });
+    passed += oc.passed;
+    failed += oc.failed;
+    for (const f of oc.failures) failures.push("rfb-owner-claim-customer: " + f);
+    console.log(`  rfb-owner-claim-customer: ${oc.passed} passed, ${oc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-owner-claim-customer: unexpected error: " + String(err?.message || err));
   }
 });

@@ -32,6 +32,7 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import { isCustomerSnapshot } from "../services/customer-rule";
 import { hasInternalNote, stripInternalNotes } from "../services/description-quality";
 import {
   enrichmentWritePauseBlockForAgents,
@@ -128,7 +129,7 @@ const LOCK_SNAPSHOT_SQL = `
 
 /** Owner lock: claimed_at OR a verified agent_claims row (both sources). */
 function isOwnerLocked(s: { claimed_at: string | null; verified_claims: number }): boolean {
-  return !!s.claimed_at || (s.verified_claims ?? 0) > 0;
+  return isCustomerSnapshot(s);
 }
 
 function isFieldCurated(curatedFieldsJson: string | null | undefined, fieldName: "description" | "about"): boolean {

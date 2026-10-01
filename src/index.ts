@@ -92,6 +92,7 @@ import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
@@ -769,6 +770,9 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
+// claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
+app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
 // POST /admin/agents/terminal-repark — categorical correction lever that
 // flips wrongly terminal_unconfirmable rows (parked by the pre-#718
 // no-data-was-treated-as-dead bug) back to pending_verify, leaving
