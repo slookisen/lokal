@@ -38149,6 +38149,17 @@ function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
       "prov-rfb-card-02: /a2a card documentationUrl is unchanged (additive-only)");
     assertEq(a2aCardBodyProv.securitySchemes.apiKey.name, "X-API-Key",
       "prov-rfb-card-03: /a2a card securitySchemes.apiKey is unchanged (additive-only)");
+    // A2A skill honesty (dev-request 2026-09-16-handleliste slice 5): the cart skill must
+    // point at MCP, since message/send on /a2a does not implement cart intents.
+    const cartSkillA2a = (a2aCardBodyProv.skills || []).find((sk: any) => sk.id === "build-shopping-cart");
+    assertTrue(!!cartSkillA2a, "a2a-skill-honesty-01: build-shopping-cart skill still advertised");
+    assertTrue(/MCP/.test(cartSkillA2a.description) && /lokal_cart_submit/.test(cartSkillA2a.description),
+      "a2a-skill-honesty-02: cart skill description routes to the MCP tools");
+    assertTrue(/Not available through message\/send/.test(cartSkillA2a.description),
+      "a2a-skill-honesty-03: cart skill states message/send does not handle carts");
+    assertTrue((cartSkillA2a.examples || []).some((ex: string) => /lokal_find_offers \{items: \["potet"\]/.test(ex)) &&
+      !(cartSkillA2a.examples || []).some((ex: string) => /\{q:/.test(ex)),
+      "a2a-skill-honesty-04: find_offers example uses the real `items` argument, not `q`");
 
     // ── getRegistryCard() (.well-known/agent-card.json) ──
     const registryCardProv: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
