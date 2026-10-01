@@ -1996,7 +1996,7 @@ export async function runVerifierBatch(opts: {
     const crossSourceResults: Record<string, CrossSourceResult> = {};
 
     for (const field of csFields) {
-      crossSourceResults[field] = crossSourceAgreement(fieldProv, field);
+      crossSourceResults[field] = crossSourceAgreement(fieldProv, field, { ownName: agent.name });
     }
 
     // PR-19: aggregate the per-field verdicts into a single agent-level verdict.

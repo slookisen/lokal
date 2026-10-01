@@ -26,7 +26,8 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
-import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
+import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
+import { randomUUID } from "crypto";
 import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
@@ -4354,6 +4355,148 @@ router.post("/admin/knowledge/provenance/cleanup", (req: Request, res: Response)
   }
 });
 
+// ─── POST /admin/knowledge/provenance/address-sweep ──────────────────
+// dev-request 2026-10-01-rfb-adressenormalisering-c1 (AC3). Sweep over stored
+// field_provenance.address for RFB rows. The existing provenance/cleanup routes
+// match only on source_type + value_regex, have no per-value normalize step and
+// write no audit rows, so this is a separate route following the same pattern.
+//
+// Lists (a) values that are DATES read as an address (looksLikeDateText on the
+// pre-postcode text) and (b) values whose leading label / own-name / company-
+// form noise is stripped by the new comparison preprocessing (stripAddressLeadingNoise).
+// DRY RUN BY DEFAULT: nothing is written unless body.apply === true.
+// Apply removes (a), replaces (b) with the stripped value, and writes ONE
+// agent_knowledge_audit row per change holding the before-value (rollback).
+//
+// Body: { apply?: boolean, agentIds?: string[], source_type?: string }
+// Auth: X-Admin-Key. Returns 200 { success, dry_run, date_count, normalize_count, changes[] }.
+
+router.post("/admin/knowledge/provenance/address-sweep", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { apply?: unknown; agentIds?: unknown; source_type?: unknown };
+  const apply = body.apply === true;
+  const sourceType = typeof body.source_type === "string" ? body.source_type.trim() : "";
+  const agentIdFilter = Array.isArray(body.agentIds)
+    ? new Set((body.agentIds as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim()))
+    : null;
+
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT k.agent_id AS agent_id, a.name AS name, k.field_provenance AS field_provenance
+           FROM agent_knowledge k
+           JOIN agents a ON a.id = k.agent_id
+          WHERE k.field_provenance IS NOT NULL AND k.field_provenance != '' AND k.field_provenance != '{}'`
+      )
+      .all() as { agent_id: string; name: string | null; field_provenance: string | null }[];
+
+    type Change = {
+      agent_id: string;
+      name: string | null;
+      kind: "date" | "normalize";
+      source_type: string | null;
+      before: string;
+      after: string | null;
+    };
+    const changes: Change[] = [];
+    const pending: { agentId: string; json: string; changes: Change[] }[] = [];
+
+    for (const row of rows) {
+      if (agentIdFilter && !agentIdFilter.has(row.agent_id)) continue;
+      let provenance: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(row.field_provenance ?? "");
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+        provenance = parsed as Record<string, unknown>;
+      } catch { continue; }
+
+      const entry = provenance.address;
+      let records: any[] = [];
+      let wasWrapped = false;
+      if (Array.isArray(entry)) {
+        records = entry;
+      } else if (entry && typeof entry === "object") {
+        const e = entry as Record<string, unknown>;
+        if (Array.isArray(e.sources)) { records = e.sources as any[]; wasWrapped = true; }
+        else records = [e];
+      } else {
+        continue;
+      }
+
+      const kept: any[] = [];
+      const rowChanges: Change[] = [];
+      for (const r of records) {
+        if (!r || typeof r !== "object" || typeof r.value !== "string" || r.value.trim() === "") { kept.push(r); continue; }
+        if (sourceType && r.source_type !== sourceType) { kept.push(r); continue; }
+        const value: string = r.value;
+        const stype = typeof r.source_type === "string" ? r.source_type : null;
+        const firstSeg = value.split(",")[0] ?? value;
+        if (looksLikeDateText(firstSeg)) {
+          rowChanges.push({ agent_id: row.agent_id, name: row.name, kind: "date", source_type: stype, before: value, after: null });
+          continue; // removed
+        }
+        const stripped = stripAddressLeadingNoise(value, row.name);
+        if (stripped !== value.trim()) {
+          rowChanges.push({ agent_id: row.agent_id, name: row.name, kind: "normalize", source_type: stype, before: value, after: stripped });
+          kept.push({ ...r, value: stripped });
+          continue;
+        }
+        kept.push(r);
+      }
+
+      if (rowChanges.length > 0) {
+        changes.push(...rowChanges);
+        provenance.address = wasWrapped ? { ...((entry as object) ?? {}), sources: kept } : kept;
+        pending.push({ agentId: row.agent_id, json: JSON.stringify(provenance), changes: rowChanges });
+      }
+    }
+
+    if (apply && pending.length > 0) {
+      const nowIso = new Date().toISOString();
+      const updateStmt = db.prepare("UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?");
+      const auditStmt = db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, 'field_provenance.address', ?, ?, 'admin', NULL, datetime('now'), ?)`
+      );
+      const tx = db.transaction((batch: typeof pending) => {
+        for (const p of batch) {
+          updateStmt.run(p.json, nowIso, p.agentId);
+          for (const c of p.changes) {
+            auditStmt.run(
+              randomUUID(),
+              p.agentId,
+              c.before,
+              c.after,
+              `address-sweep (dev-request 2026-10-01-rfb-adressenormalisering-c1) kind=${c.kind} source_type=${c.source_type ?? "?"}`,
+            );
+          }
+        }
+      });
+      tx(pending);
+    }
+
+    res.json({
+      success: true,
+      dry_run: !apply,
+      agents_touched: pending.length,
+      date_count: changes.filter((c) => c.kind === "date").length,
+      normalize_count: changes.filter((c) => c.kind === "normalize").length,
+      changes,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "address sweep failed", detail: err?.message ?? String(err) });
+  }
+});
+
 // ─── GET /admin/knowledge/:agentId/field-provenance ──────────────────
 // Returns the parsed field_provenance JSON for an agent plus a
 // sources_summary slice that mirrors cross-source-validator's
@@ -6536,6 +6679,10 @@ export function extractAddress(html: string): string | null {
     }
     const poststed = words.join(" ");
     const rawStreet = m[1].trim();
+    // dev-request 2026-10-01-rfb-adressenormalisering-c1: a date such as
+    // "September 17, 2025 Sesongavslutning" fits the pattern (the year reads as a
+    // postcode) — reject when the pre-postcode text is a month+day date.
+    if (looksLikeDateText(rawStreet)) continue;
     const street = (stripLeadingContactLabel(rawStreet) ?? rawStreet).trim();
     const candidate = `${street}, ${m[2]} ${poststed}`;
     // Sanity: skip obviously bad matches (< 10 chars of street part).

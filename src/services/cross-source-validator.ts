@@ -16,6 +16,7 @@
 // and is not applied to the website / domain-coherence axis.
 import {
   addressesMatch as contactAddressesMatch,
+  prepareAddressForComparison,
   phonesMatch as contactPhonesMatch,
   canonicalizeAddressVariants,
 } from "./contact-normalizer";
@@ -158,8 +159,13 @@ function normalizeAddress(raw: string): string {
 // grouped and the agent stayed review_required despite 2 agreeing Tier-A sources.
 // core = the first comma-segment (street + house number), space/punct-normalized.
 // postcode = the first standalone 4-digit token anywhere (Norwegian postnummer).
-export function parseAddressCore(raw: string): { core: string; postcode: string | null } {
-  const lower = (raw || "").toLowerCase().trim();
+export function parseAddressCore(
+  raw: string,
+  ownName?: string | null,
+): { core: string; postcode: string | null } {
+  // dev-request 2026-10-01-rfb-adressenormalisering-c1: same preprocessing as
+  // contactAddressesMatch (label/own-name/company-form strip + accent fold).
+  const lower = prepareAddressForComparison(raw || "", ownName).toLowerCase().trim();
   const firstSeg = lower.split(",")[0] ?? lower;
   const core = canonicalizeAddressVariants(
     firstSeg
@@ -233,7 +239,11 @@ function normalizeValue(fieldName: FieldName, value: string): string {
  */
 export function crossSourceAgreement(
   fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
-  fieldName: FieldName
+  fieldName: FieldName,
+  // dev-request 2026-10-01-rfb-adressenormalisering-c1: the row's own name, so a
+  // leading own-name ("Solvang Gård Bergenvegen 18") can be ignored when
+  // comparing addresses. Optional — callers without it keep the company-form rule.
+  opts: { ownName?: string | null } = {}
 ): CrossSourceResult {
   const raw = fieldProvenance[fieldName];
 
@@ -342,7 +352,7 @@ export function crossSourceAgreement(
     // never matches "Storgata 10".
     const byCore = new Map<string, { sources: string[]; postcodes: Set<string>; norms: Set<string> }>();
     for (const n of normalized) {
-      const { core, postcode } = parseAddressCore(n.value);
+      const { core, postcode } = parseAddressCore(n.value, opts.ownName);
       if (!core) continue;
       const g = byCore.get(core) ?? { sources: [], postcodes: new Set<string>(), norms: new Set<string>() };
       g.sources.push(n.source);
@@ -397,7 +407,7 @@ export function crossSourceAgreement(
   if (fieldName === "address" || fieldName === "phone") {
     const match = (a: string, b: string): boolean =>
       fieldName === "address"
-        ? contactAddressesMatch(a, b)
+        ? contactAddressesMatch(a, b, { ownName: opts.ownName })
         : contactPhonesMatch(a, b);
     // A group AGREES when some anchor record is matched by ≥1 OTHER
     // high-quality record (≥2 sources total clustering on that anchor).

@@ -393,13 +393,20 @@ export function stripTrailingContactLabel(
 // Kept in sync with TRAILING_CONTACT_LABEL above and
 // PHONE_CONTEXT_KONTAKT_HEADING (routes/marketplace.ts) — same label
 // vocabulary, including the "Kontaktinformasjon" long form.
-const LEADING_LABEL_WORD = "(?:Telefon|Tlf\\.?|E-?post|Adresse|Kontakt(?:info(?:rmasjon)?)?)";
+// dev-request 2026-10-01-rfb-adressenormalisering-c1: "Facebook"/"Instagram"
+// (social-menu text flattened in front of the address, e.g. "Facebook Instagram
+// Breivevegen 38, ...") join the label vocabulary.
+const LEADING_LABEL_WORD = "(?:Telefon|Tlf\\.?|E-?post|Adresse|Facebook|Instagram|Kontakt(?:info(?:rmasjon)?)?)";
 const LEGAL_SUFFIX_WORD = "(?:AS|ASA|SA|DA|ANS|ENK|BA|NUF)";
 const LEADING_CONTACT_LABEL_WITH_ENTITY = new RegExp(
   `^${LEADING_LABEL_WORD}[:,]?[\\s,:]+(?:\\p{L}[\\p{L}'-]*[\\s,:]+){0,4}?${LEGAL_SUFFIX_WORD}[\\s,:]+`,
   "iu",
 );
-const LEADING_CONTACT_LABEL = new RegExp(`^${LEADING_LABEL_WORD}[:,]?[\\s,:]+`, "i");
+// One OR MORE stacked bare labels ("Facebook Instagram <street>").
+const LEADING_CONTACT_LABEL = new RegExp(`^(?:${LEADING_LABEL_WORD}[:,]?[\\s,:]+)+`, "i");
+// A domain / URL prefix followed by "-" or "|" ("www.aalan.no - Lauvdalen 186").
+const LEADING_URL_PREFIX =
+  /^(?:https?:\/\/)?(?:www\.)?[a-z0-9æøå-]+(?:\.[a-z0-9æøå-]+)*\.[a-z]{2,}(?:\/\S*)?\s*[-|]\s*/i;
 
 /**
  * Strip a leading standalone contact-field label ("Telefon", "Tlf", "Tlf.",
@@ -428,7 +435,8 @@ export function stripLeadingContactLabel(
   const trimmed = address.trim();
 
   const entityMatch = trimmed.match(LEADING_CONTACT_LABEL_WITH_ENTITY);
-  const match = entityMatch ?? trimmed.match(LEADING_CONTACT_LABEL);
+  const match =
+    entityMatch ?? trimmed.match(LEADING_CONTACT_LABEL) ?? trimmed.match(LEADING_URL_PREFIX);
   if (!match) return address;
 
   const stripped = trimmed.slice(match[0].length).trim();
@@ -541,7 +549,10 @@ export function canonicalizeAddressVariants(text: string): string {
 // " 1940 bjørkelangen". Matches a 4-digit postnummer optionally followed by a
 // city name, anchored to the END of the normalized string. Used to strip an
 // appended postal tail so a street-only value can be compared to a full one.
-const POSTAL_TAIL = /(?:,\s*)?\b\d{4}\b(?:\s+[\p{L}\s.-]+?)?$/u;
+// A bare trailing 4-digit run with neither a comma nor a town ("veien 1244") is a
+// 4-digit HOUSE NUMBER, not a postal tail, and is left in the street part; a
+// token glued to "/" (range "1242/1246") is never a postcode either.
+const POSTAL_TAIL = /(?:,\s*(?<!\/)\b\d{4}\b(?:\s+[\p{L}\s.-]+?)?|(?<!\/)\b\d{4}\b\s+[\p{L}\s.-]+?)$/u;
 
 /**
  * Split a normalized address into its street part (everything before an
@@ -551,7 +562,13 @@ const POSTAL_TAIL = /(?:,\s*)?\b\d{4}\b(?:\s+[\p{L}\s.-]+?)?$/u;
  *   "bjørkeveien 20b"                    → { street: "bjørkeveien 20b", postcode: null }
  */
 export function splitAddress(normalized: string): { street: string; postcode: string | null } {
-  const pcMatch = normalized.match(/(?<!\d)(\d{4})(?!\d)/);
+  // Prefer a 4-digit token AFTER the first comma (the postal tail), so a 4-digit
+  // house number in the street segment ("ullstindveien 1246, 9023 ...") is not
+  // mistaken for the postcode. Tokens glued to a "/" (house-number range
+  // "1242/1246") are never postcodes.
+  const commaIdx = normalized.indexOf(",");
+  const pcRe = /(?<![\d/])(\d{4})(?![\d/])/;
+  const pcMatch = (commaIdx >= 0 ? normalized.slice(commaIdx).match(pcRe) : null) ?? normalized.match(pcRe);
   const postcode = pcMatch ? pcMatch[1] : null;
   const street = normalized
     .replace(POSTAL_TAIL, "")
@@ -604,9 +621,13 @@ function isWholeTokenPrefix(short: string, long: string): boolean {
  * street parts are identical. This is the critical anti-duplicate-promotion
  * safeguard.
  */
-export function addressesMatch(a: string, b: string): boolean {
-  const na = normalizeAddress(a);
-  const nb = normalizeAddress(b);
+export function addressesMatch(
+  a: string,
+  b: string,
+  opts: { ownName?: string | null } = {},
+): boolean {
+  const na = normalizeAddress(prepareAddressForComparison(a, opts.ownName));
+  const nb = normalizeAddress(prepareAddressForComparison(b, opts.ownName));
   if (!na || !nb) return false;
 
   // Fast path: exact normalized equality.
@@ -619,10 +640,117 @@ export function addressesMatch(a: string, b: string): boolean {
   if (pa.postcode && pb.postcode && pa.postcode !== pb.postcode) return false;
 
   // Street parts must be equal, or one a whole-token prefix of the other.
-  const sameStreet =
-    pa.street === pb.street ||
-    isWholeTokenPrefix(pa.street, pb.street) ||
-    isWholeTokenPrefix(pb.street, pa.street);
+  // A house-number range ("1242/1246") is expanded to each of its numbers; two
+  // streets match when any expansion pair matches. Only the same-token "N/M"
+  // form is expanded, so "1242" vs "1246" still conflict.
+  for (const sa of expandHouseNumberRange(pa.street)) {
+    for (const sb of expandHouseNumberRange(pb.street)) {
+      if (sa === sb || isWholeTokenPrefix(sa, sb) || isWholeTokenPrefix(sb, sa)) return true;
+    }
+  }
+  return false;
+}
 
-  return sameStreet;
+// ─── Comparison-only preprocessing (dev-request 2026-10-01-rfb-adressenormalisering-c1) ───
+
+const COMPANY_FORM_WORD = "(?:AS|SA|DA|ANS|ENK|BA|NUF)";
+// Leading name run (1-5 words, letters only) ending in a company form, followed
+// by the rest of the address. Case-SENSITIVE on the form so a lower-case "as"
+// inside a street name is never taken for a company form.
+const LEADING_COMPANY_NAME = new RegExp(
+  `^(?:\\p{L}[\\p{L}'.&-]*\\s+){1,5}?${COMPANY_FORM_WORD}\\s+(?=\\p{L})`,
+  "u",
+);
+
+// Accent folding for COMPARISON only. Never æ, ø or å (distinct Norwegian letters).
+const ACCENT_FOLD: Record<string, string> = {
+  é: "e", è: "e", ê: "e", á: "a", à: "a", ü: "u", ö: "o", ä: "a",
+  É: "E", È: "E", Ê: "E", Á: "A", À: "A", Ü: "U", Ö: "O", Ä: "A",
+};
+
+/** Fold é è ê á à ü ö ä to their base letter (length-preserving). Comparison only. */
+export function foldAccentsForComparison(text: string): string {
+  return text.replace(/[éèêáàüöäÉÈÊÁÀÜÖÄ]/g, (c) => ACCENT_FOLD[c] ?? c);
+}
+
+/**
+ * Strip leading noise from an address WITHOUT touching accents: contact/menu
+ * labels (incl. "Facebook"/"Instagram" and a "www.domain.no -" prefix), then a
+ * leading name ONLY when it is (a) the row's own name (or the name without its
+ * " — <place>" suffix) or (b) a word sequence ending in a company form
+ * (AS, SA, DA, ANS, ENK, BA, NUF). Arbitrary lead words are never removed
+ * ("Nedre Storgata 5" stays distinct from "Storgata 5"). The remainder must
+ * still contain a digit (house number) or the original is kept.
+ */
+export function stripAddressLeadingNoise(raw: string, ownName?: string | null): string {
+  if (typeof raw !== "string") return "";
+  let s = ((stripLeadingContactLabel(raw) as string | null | undefined) ?? raw).trim();
+
+  const candidates: string[] = [];
+  if (typeof ownName === "string" && ownName.trim()) {
+    const full = ownName.trim();
+    candidates.push(full);
+    const short = full.split(/\s+[—–-]\s+/)[0]?.trim();
+    if (short && short !== full) candidates.push(short);
+    candidates.sort((x, y) => y.length - x.length);
+  }
+  const lowered = foldAccentsForComparison(s).toLowerCase();
+  for (const c of candidates) {
+    const cl = foldAccentsForComparison(c).toLowerCase();
+    if (lowered.startsWith(cl + " ")) {
+      const rest = s.slice(c.length).trim();
+      if (/\d/.test(rest) && /^\p{L}/u.test(rest)) {
+        s = rest;
+        break;
+      }
+    }
+  }
+
+  const company = s.match(LEADING_COMPANY_NAME);
+  if (company) {
+    const rest = s.slice(company[0].length).trim();
+    if (/\d/.test(rest)) s = rest;
+  }
+  // A label may sit between name and street, or remain after a name strip.
+  s = ((stripLeadingContactLabel(s) as string | null | undefined) ?? s).trim();
+  return s || raw;
+}
+
+/**
+ * Shared preprocessing for BOTH parseAddressCore (cross-source-validator) and
+ * addressesMatch: leading-noise strip + accent fold. Used only to build
+ * comparison keys — never written back to storage.
+ */
+export function prepareAddressForComparison(raw: string, ownName?: string | null): string {
+  return foldAccentsForComparison(stripAddressLeadingNoise(raw, ownName))
+    // A trailing country ("..., Norge" / "... Norway") is not part of the place.
+    .replace(/[\s,]+(?:norge|norway)\s*$/i, "");
+}
+
+/**
+ * Expand a house-number range written as ONE token "N/M" ("ullstindvegen
+ * 1242/1246") into [N-variant, M-variant]. Any other form is returned as-is.
+ */
+export function expandHouseNumberRange(street: string): string[] {
+  const m = street.match(/^(.*\s)(\d{1,4}[a-z]?)\/(\d{1,4}[a-z]?)$/);
+  if (!m) return [street];
+  return [`${m[1]}${m[2]}`, `${m[1]}${m[3]}`];
+}
+
+const DATE_MONTHS =
+  "januar|january|februar|february|mars|march|april|mai|may|juni|june|juli|july|august|september|oktober|october|november|desember|december";
+// "September 17" / "mai 3rd" (month then day) or "17. september" (day then month).
+const DATE_LIKE = new RegExp(
+  `(?:\\b(?:${DATE_MONTHS})\\b\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?!\\d)|\\b\\d{1,2}\\.\\s*(?:${DATE_MONTHS})\\b)`,
+  "iu",
+);
+
+/**
+ * True when the text before an (apparent) postcode is a calendar date — a
+ * Norwegian or English month name followed by a day ("September 17, 2025"
+ * would otherwise read the year as a postcode). Used by extractAddress and the
+ * stored-value sweep.
+ */
+export function looksLikeDateText(text: string): boolean {
+  return typeof text === "string" && DATE_LIKE.test(text);
 }
