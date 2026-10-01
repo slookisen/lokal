@@ -106,7 +106,7 @@
       "description": "The gårdssalg side of the catalogue: farm-sale drink producers, with their booking status shown honestly. Text answer, no card.",
       "user_prompt": "Finn gårdssalg og lokale drikkeprodusenter i Vestland",
       "tools_triggered": "discover_gardssalg",
-      "expected_output": "Farm-sale drink producers in Vestland, for example 7 Fjell Bryggeri (brewery, Bergen), Balder Brygg (brewery, Sogndal), Kaupanger Vingard (vineyard, Sogndal) and Draopar (cidery, Eidfjord), each with municipality, producer type and a link to its opplevagent.no profile. Producers not yet taking bookings are shown as such, with a note to get in touch through the profile page.",
+      "expected_output": "A list of farm-sale drink producers in Vestland (breweries, cideries, vineyards, distilleries), for example 7 Fjell Bryggeri (brewery, Bergen) or Balder Brygg (brewery, Sogndal), each with municipality, producer type and a link to its opplevagent.no profile. Every listed producer is in Vestland. Producers not yet taking bookings are shown as such, with a note to get in touch through the profile page; the exact set of producers changes as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     }
