@@ -148,7 +148,13 @@ export function isProducerEligible(agentId: string): boolean {
 // and no order row — the «dead pending order nobody sees» gap is closed.
 //
 // `dbOverride` lets catalog-offers.ts (which takes an injectable db for its
-// tests) evaluate against the same connection it queried offers from.
+// tests) evaluate the agents/agent_knowledge clauses against the same
+// connection it queried offers from. The final isBlocked() clause always
+// reads the global getDb() singleton (blocklist-service has no injectable
+// handle) — identical in production, and tests that pass an override pin
+// the singleton to the same DB. isBlocked() is fail-open on a DB error
+// (same posture as the notify gate's clause 4), so an unreadable blocklist
+// never turns a real order into a handoff.
 export function isEligibleForRealOrder(agentId: string, dbOverride?: any): boolean {
   const db = dbOverride ?? _cartTestDb ?? getDb();
   const row = db.prepare(`
@@ -689,6 +695,20 @@ export interface SubmitContactInput {
   contact_consent?: boolean;
 }
 
+// skive 2: hard length caps on the buyer contact fields, enforced centrally
+// in submitCart() so every caller (REST route, MCP lokal_cart_submit, any
+// future website form) is symmetric. Since skive 2 these values are copied
+// onto the order, rendered into the producer e-mail and shown on the
+// producer's confirm page — an oversized value must be rejected up front
+// (400, no side effects) rather than create an order whose notification
+// then fails. The MCP tool's zod schema uses the same numbers.
+export const SUBMIT_CONTACT_MAX_LEN = {
+  buyer_name: 120,
+  buyer_email: 254,
+  buyer_phone: 40,
+  delivery_note: 500,
+} as const;
+
 export interface ContactHandoff {
   agent_id: string;
   name: string;
@@ -739,6 +759,20 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
   if (!cart) return { success: false, status: 404, error: "Cart not found" };
   if (cart.status !== "open") {
     return { success: false, status: 409, error: `Cart is already ${cart.status}` };
+  }
+
+  // skive 2: reject oversized contact fields BEFORE any side effect (see
+  // SUBMIT_CONTACT_MAX_LEN). The error names the field and the cap only —
+  // never the value (personal data).
+  for (const field of Object.keys(SUBMIT_CONTACT_MAX_LEN) as Array<keyof typeof SUBMIT_CONTACT_MAX_LEN>) {
+    const value = contact?.[field];
+    if (typeof value === "string" && value.length > SUBMIT_CONTACT_MAX_LEN[field]) {
+      return {
+        success: false,
+        status: 400,
+        error: `${field} is too long (max ${SUBMIT_CONTACT_MAX_LEN[field]} characters)`,
+      };
+    }
   }
 
   // mode='contact' wishes — no cart_items row, never touched by the

@@ -634,6 +634,47 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       assertEq(cartSvc.isEligibleForRealOrder("agent-eligible"), true, "gate-matrix: cross-check + owner claim + opt-in + reachable → true");
     }
 
+    // ═══════════ skive 2: oversized contact fields are rejected up front ══
+    // ═══════════ (400, no side effects) — same caps as lokal_cart_submit ══
+
+    {
+      const cart = cartSvc.createCart();
+      cartSvc.addCartItem(cart.cart_id, "prod-potet", 1);
+      const tooLong = cartSvc.submitCart(cart.cart_id, {
+        delivery_note: "x".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.delivery_note + 1),
+        contact_consent: true,
+      });
+      assertTrue(tooLong.success === false, "caps: a delivery_note over the cap is rejected");
+      if (!tooLong.success) {
+        assertEq(tooLong.status, 400, "caps: rejection is a 400");
+        assertTrue(tooLong.error.includes("delivery_note") && tooLong.error.includes("500") && !tooLong.error.includes("xxxx"),
+          "caps: error names the field and the cap, never the value");
+      }
+      const cartRow = db.prepare("SELECT status FROM carts WHERE id = ?").get(cart.cart_id) as any;
+      assertEq(cartRow.status, "open", "caps: rejected submit leaves the cart open (no side effect)");
+      const orderCount = (db.prepare("SELECT COUNT(*) as c FROM orders WHERE cart_id = ?").get(cart.cart_id) as any).c;
+      assertEq(orderCount, 0, "caps: no order was created by the rejected submit");
+
+      const nameTooLong = cartSvc.submitCart(cart.cart_id, { buyer_name: "n".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_name + 1) });
+      assertTrue(nameTooLong.success === false && nameTooLong.status === 400, "caps: buyer_name over the cap → 400 (consent irrelevant)");
+      const phoneTooLong = cartSvc.submitCart(cart.cart_id, { buyer_phone: "1".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_phone + 1) });
+      assertTrue(phoneTooLong.success === false && phoneTooLong.status === 400, "caps: buyer_phone over the cap → 400");
+      const emailTooLong = cartSvc.submitCart(cart.cart_id, { buyer_email: "e".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_email + 1) });
+      assertTrue(emailTooLong.success === false && emailTooLong.status === 400, "caps: buyer_email over the cap → 400");
+
+      // Exactly at the cap is accepted and the submit goes through as normal.
+      const atCap = cartSvc.submitCart(cart.cart_id, {
+        delivery_note: "y".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.delivery_note),
+        contact_consent: true,
+      });
+      assertTrue(atCap.success === true && atCap.orders.length === 1, "caps: a value exactly at the cap is accepted (one real order)");
+      assertEq(
+        [cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_name, cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_email, cartSvc.SUBMIT_CONTACT_MAX_LEN.buyer_phone, cartSvc.SUBMIT_CONTACT_MAX_LEN.delivery_note],
+        [120, 254, 40, 500],
+        "caps: the central limits are the same numbers lokal_cart_submit's schema uses"
+      );
+    }
+
     // ═══════════ submitCart: empty cart (no items, no wishes) still 400 ═══
 
     {

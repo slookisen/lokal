@@ -309,6 +309,22 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
     }
 
     {
+      // skive 2: oversized contact field → 400 from the central cap in
+      // submitCart() (same limits as lokal_cart_submit), no state change.
+      const r = await callRoute(cartRouter, {
+        method: "POST",
+        url: `/cart/${cartId}/submit`,
+        headers: { "x-cart-token": buyerRef },
+        body: { buyer_ref: buyerRef, delivery_note: "z".repeat(501), contact_consent: true },
+      });
+      assertEq(r.status, 400, "POST /cart/:id/submit: delivery_note over 500 chars → 400 (central cap)");
+      assertTrue(r.body.success === false && typeof r.body.error === "string" && r.body.error.includes("delivery_note") && !r.body.error.includes("zzz"),
+        "POST /cart/:id/submit: cap error names the field, never echoes the value");
+      const stillOpen = db.prepare("SELECT status FROM carts WHERE id = ?").get(cartId) as any;
+      assertEq(stillOpen.status, "open", "POST /cart/:id/submit: cap rejection leaves the cart 'open'");
+    }
+
+    {
       const r = await callRoute(cartRouter, {
         method: "POST",
         url: `/cart/${cartId}/submit`,

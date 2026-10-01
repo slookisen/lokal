@@ -35817,13 +35817,21 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
 // — mirroring the blocks above, it must run strictly after every other
 // singleton-swapping block; _emailOwnershipProvenancePromise is the
 // current tail of that serial chain.
+// skive 2 (dev-request 2026-09-16-handleliste-med-produsentvalg-og-
+// bestillingsflyt): ALSO wait for the legacy fase-1 cart block
+// (_orchPr20260614_6Promise) — since skive 2 its two seeded producers are
+// opted in, so it installs its own __setOrderNotifySendForTesting stub and
+// nulls it when done. That reset is a module-global behaviour change (not
+// just DB routing); without this explicit ordering it could, in principle,
+// land while this suite is between installing ITS stub and awaiting
+// `sent`, and the v2/v1 e-mail assertions here would see nothing captured.
 let _pilotOrdreLoopResolve: () => void = () => {};
 const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
   _pilotOrdreLoopResolve = r;
 });
 
 (async () => {
-  await Promise.allSettled([_emailOwnershipProvenancePromise]);
+  await Promise.allSettled([_emailOwnershipProvenancePromise, _orchPr20260614_6Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-13: pilot-ordre-loop (selgervarsling + livssyklus + trust-ledger) ──");

@@ -139,7 +139,7 @@ export function resolveOrderNotifyEmailVersion(): OrderNotifyEmailVersion {
 // single, plausible address with no whitespace, angle brackets, quotes or
 // separators (header-injection / display-name-smuggling guard); anything
 // else — including an empty value — falls back to the platform default.
-const REPLY_TO_EMAIL_RE = /^[^\s@<>,;"'()\\]+@[^\s@<>,;"'()\\]+\.[A-Za-z0-9-]{2,}$/;
+const REPLY_TO_EMAIL_RE = /^[^\s@<>,;"'()\\\x00-\x1f\x7f]+@[^\s@<>,;"'()\\\x00-\x1f\x7f]+\.[A-Za-z0-9-]{2,}$/;
 
 export function resolveReplyTo(buyerEmail: string | null | undefined): string {
   const e = (buyerEmail || "").trim();
