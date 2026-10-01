@@ -32,6 +32,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
+import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -611,7 +612,7 @@ function shell(
   title: string,
   description: string,
   content: string,
-  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; robots?: string }
+  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; robots?: string; alternateUrls?: { no: string; en: string } }
 ): string {
   const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
@@ -626,12 +627,14 @@ function shell(
   // fall back to canonical; this still produces valid (if less precise) hreflang.
   const noPath = extra?.pathForAlternate || (canonicalUrl.startsWith(BASE_URL) ? canonicalUrl.slice(BASE_URL.length) || "/" : "/");
   const enPath = noPath === "/" ? "/en" : "/en" + noPath;
-  const noUrl = BASE_URL + (noPath === "/" ? "" : noPath);
-  const enUrl = BASE_URL + enPath;
+  // alternateUrls: pages whose EN path is not "/en" + NO path (handleliste ↔
+  // shopping-list) pass both URLs explicitly; no sv alternate is emitted then.
+  const noUrl = extra?.alternateUrls?.no || BASE_URL + (noPath === "/" ? "" : noPath);
+  const enUrl = extra?.alternateUrls?.en || BASE_URL + enPath;
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: Swedish
   // alternate + switcher entry, ONLY while SV_LOCALE_ENABLED === "true" (with
   // the flag off /sv/* is not even routed, so advertising it would be a lie).
-  const svEnabled = isSvLocaleEnabled();
+  const svEnabled = isSvLocaleEnabled() && !extra?.alternateUrls;
   const svPath = noPath === "/" ? "/sv" : "/sv" + noPath;
   const svUrl = BASE_URL + svPath;
 
@@ -3619,6 +3622,40 @@ router.get("/verifisert-av-eier", (req: Request, res: Response) => {
   }
 });
 
+// GET /handleliste (NO) + /en/shopping-list (EN) — dev-request
+// 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt, Slice 3.
+// Behind HANDLELISTE_ENABLED (default off => next(), i.e. the normal 404;
+// not linked, not in the sitemap). noindex: one URL hosts every cart/result
+// step. Registered above router.get("/:city") (see the reserved-slug entries
+// there). langMiddleware strips "/en", so the EN page arrives as
+// "/shopping-list" with req.lang === "en"; each path only answers in its own
+// language (NO path under /en and EN path without /en fall through to 404).
+router.get([HANDELISTE_PATH_NO, HANDELISTE_PATH_EN], (req: Request, res: Response, next: any) => {
+  if (!isHandelisteEnabled()) return next();
+  const lang = req.lang;
+  const isEnPath = req.path === HANDELISTE_PATH_EN;
+  if ((lang === "en") !== isEnPath) return next();
+
+  try {
+    const page = buildHandelistePage(lang);
+    const noPath = HANDELISTE_PATH_NO;
+    const localized = lang === "en" ? "/en" + HANDELISTE_PATH_EN : noPath;
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Robots-Tag", "noindex, follow");
+    res.send(shell(page.title, page.description, page.content, {
+      canonical: BASE_URL + localized,
+      extraCss: page.extraCss,
+      lang,
+      pathForAlternate: HANDELISTE_PATH_NO,
+      alternateUrls: { no: BASE_URL + HANDELISTE_PATH_NO, en: BASE_URL + "/en" + HANDELISTE_PATH_EN },
+      robots: "noindex, follow",
+    }));
+  } catch (err) {
+    console.error("SEO /handleliste error:", err);
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
 router.get("/:city", (req: Request, res: Response, next: any) => {
   const citySlug = (req.params.city as string).toLowerCase();
 
@@ -3644,6 +3681,9 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       // /verifisert-av-eier is registered above this catch-all too, but same
       // belt-and-braces convention as /kategori and /reise above.
       || citySlug === "verifisert-av-eier"
+      // Slice 3 (handleliste): registered above this catch-all behind
+      // HANDLELISTE_ENABLED; reserved so a city slug never shadows it.
+      || citySlug === "handleliste" || citySlug === "shopping-list"
       || citySlug.includes(".")) {
     return next();
   }
