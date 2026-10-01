@@ -38157,6 +38157,9 @@ function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
       "a2a-skill-honesty-02: cart skill description routes to the MCP tools");
     assertTrue(/Not available through message\/send/.test(cartSkillA2a.description),
       "a2a-skill-honesty-03: cart skill states message/send does not handle carts");
+    assertTrue((cartSkillA2a.examples || []).some((ex: string) => /lokal_find_offers \{items: \["potet"\]/.test(ex)) &&
+      !(cartSkillA2a.examples || []).some((ex: string) => /\{q:/.test(ex)),
+      "a2a-skill-honesty-04: find_offers example uses the real `items` argument, not `q`");
 
     // ── getRegistryCard() (.well-known/agent-card.json) ──
     const registryCardProv: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
