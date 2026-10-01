@@ -1090,6 +1090,20 @@ console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
   console.log(`  contact-normalizer: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-10-01-rfb-adressenormalisering-c1: ledetekst / eget navn /
+// husnummerintervall / aksent tolerance in the address gate + date rejection in
+// extractAddress. Negatives (postcode/house-number/street/lead-word) stay conflicts. ──
+console.log("\n── rfb-address-normalization-c1 ──");
+{
+  const { runRfbAddressNormalizationC1Tests } = require("../src/routes/rfb-address-normalization-c1.test") as
+    typeof import("../src/routes/rfb-address-normalization-c1.test");
+  const r = runRfbAddressNormalizationC1Tests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-address-normalization-c1: " + f);
+  console.log(`  rfb-address-normalization-c1: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon
 // (slice 1): write-time contact guard — validatePhoneForWrite /
 // stripTrailingContactLabel (contact-normalizer.ts), wired into
