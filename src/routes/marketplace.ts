@@ -7,6 +7,7 @@ import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } 
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
+import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
@@ -3923,83 +3924,8 @@ router.get("/admin/claim-funnel", (req: Request, res: Response) => {
 // We forward it to the admin's Gmail so nothing gets lost.
 // ═══════════════════════════════════════════════════════════════
 
-router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
-  try {
-    const payload = req.body;
-
-    // Log full payload to debug Resend's format
-    console.log(`[Inbound] Raw payload: ${JSON.stringify(payload).substring(0, 2000)}`);
-
-    // Resend wraps inbound data in { type, created_at, data: { ... } }
-    const data = payload.data || payload; // fallback for direct test calls
-    const from = data.from || payload.from || "unknown";
-    const to = data.to || payload.to || [];
-    const subject = data.subject || payload.subject || "(ingen emne)";
-    const emailId = data.email_id || payload.email_id;
-
-    console.log(`[Inbound] Event: ${payload.type || "unknown"}, email_id: ${emailId}, from: ${from}, subject: "${subject}"`);
-
-    // Resend inbound webhooks don't include body — fetch it via API
-    let html = "";
-    let text = "";
-    const resendKey = process.env.RESEND_API_KEY;
-
-    if (emailId && resendKey) {
-      try {
-        const emailRes = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
-          headers: { Authorization: `Bearer ${resendKey}` },
-        });
-        if (emailRes.ok) {
-          const emailData = await emailRes.json() as { html?: string; text?: string };
-          html = emailData.html || "";
-          text = emailData.text || "";
-          console.log(`[Inbound] Fetched body for ${emailId} (${html.length} chars HTML, ${text.length} chars text)`);
-        } else {
-          console.warn(`[Inbound] Could not fetch email body: ${emailRes.status} ${emailRes.statusText}`);
-        }
-      } catch (fetchErr) {
-        console.warn(`[Inbound] Error fetching email body:`, fetchErr);
-      }
-    } else if (!resendKey) {
-      console.warn(`[Inbound] RESEND_API_KEY not set — cannot fetch email body`);
-    }
-
-    // Extract sender email for reply-to (format: "Name <email@domain.com>")
-    const senderEmail = typeof from === "string"
-      ? (from.match(/<([^>]+)>/)?.[1] || from)
-      : undefined;
-
-    // Forward to admin Gmail
-    const forwardTo = process.env.ADMIN_EMAIL || "da.fredriksen@gmail.com";
-    const bodyHtml = html || (text ? `<pre>${text}</pre>` : `<p><em>Ingen innhold i eposten.</em></p>`);
-    const bodyText = text || "(ingen tekstinnhold)";
-
-    const forwarded = await emailService.sendEmail({
-      to: forwardTo,
-      subject: `[Innkommende] ${subject} (fra ${from})`,
-      htmlContent: `
-        <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
-          <strong>Fra:</strong> ${from}<br>
-          <strong>Til:</strong> ${Array.isArray(to) ? to.join(", ") : to}<br>
-          <strong>Emne:</strong> ${subject}
-        </div>
-        ${bodyHtml}
-      `,
-      textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}\n\n${bodyText}`,
-      replyTo: senderEmail,
-    });
-
-    if (forwarded) {
-      console.log(`[Inbound] Forwarded to ${forwardTo}`);
-    } else {
-      console.warn(`[Inbound] Forward failed — email service not configured or send failed`);
-    }
-
-    res.status(200).json({ received: true });
-  } catch (err) {
-    console.error("[Inbound] Webhook error:", err);
-    res.status(200).json({ received: true }); // Always 200 so Resend doesn't retry
-  }
+router.post("/webhooks/inbound-email", (req: Request, res: Response) => {
+  void handleInboundEmailWebhook(req, res);
 });
 
 function getBaseUrl(req: Request): string {
