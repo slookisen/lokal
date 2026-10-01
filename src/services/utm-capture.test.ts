@@ -114,6 +114,22 @@ export async function runUtmCaptureTests(opts: { log?: boolean } = {}): Promise<
     const chat = bd2.find((x) => x.utm_source === "chatgpt" && x.utm_medium === "mcp");
     assertEq(chat?.views, 4, "breakdown: rolled-up (3) + raw (1) blended");
 
+    // ── vertical isolation ──
+    testDb.exec("DELETE FROM analytics_page_views; DELETE FROM page_view_utm_daily;");
+    const insV = testDb.prepare(
+      `INSERT INTO analytics_page_views (path, source, session_id, created_at, utm_source, vertical_id)
+       VALUES ('/p', 'direct', ?, ?, ?, ?)`);
+    insV.run("v1:UA", old(1), "rfbsrc", "rfb");
+    insV.run("v2:UA", old(1), "dentalsrc", "dental");
+    const insR = testDb.prepare(
+      `INSERT INTO page_view_utm_daily (day, utm_source, vertical_id, view_count, session_count) VALUES (?, ?, ?, 2, 1)`);
+    insR.run(old(300).slice(0, 10), "rfbrolled", "rfb");
+    insR.run(old(300).slice(0, 10), "dentalrolled", "dental");
+    const names = (v?: string) => analyticsService.getUtmBreakdown(24 * 400, v).map((x) => x.utm_source).sort();
+    assertEq(names("rfb"), ["rfbrolled", "rfbsrc"], "vertical: rfb breakdown excludes dental raw+rolled");
+    assertEq(names("dental"), ["dentalrolled", "dentalsrc"], "vertical: dental breakdown excludes rfb raw+rolled");
+    assertEq(names().length, 4, "vertical: no filter -> all");
+
     // ── contact_clicks ──
     const { default: _unused } = { default: 0 }; void _unused;
     testDb.exec("INSERT INTO contact_clicks (agent_id, kind, utm_source) VALUES ('a1','email','chatgpt')");

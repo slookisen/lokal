@@ -210,7 +210,7 @@ router.get("/summary", (req: Request, res: Response) => {
     ...summary,
     monthly_visits: monthlyVisits,
     // B4 (additive): inbound utm_* attribution for the same 24h window.
-    utm: analyticsService.getUtmBreakdown(24),
+    utm: analyticsService.getUtmBreakdown(24, vertical),
   });
 });
 
@@ -223,7 +223,7 @@ router.get("/utm", (req: Request, res: Response) => {
   res.json({
     timeframe: `last ${hours} hours`,
     timestamp: new Date().toISOString(),
-    utm: analyticsService.getUtmBreakdown(hours),
+    utm: analyticsService.getUtmBreakdown(hours, parseVertical(req)),
   });
 });
 

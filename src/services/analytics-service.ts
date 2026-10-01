@@ -580,15 +580,19 @@ export class AnalyticsService {
    * Raw side: rows with any utm_* in the window. Rollup side: page_view_utm_daily
    * for whole days strictly before the raw table's oldest surviving day (days
    * are never double-counted: rollup deletes raw rows in the same transaction).
+   * Rolled `sessions` are a sum of per-day distinct sessions (a session active on
+   * several days counts once per day); raw `sessions` are distinct over the window.
    * Never throws; returns [] on error. Bounded: GROUP BY over the time-indexed
    * window only, LIMIT 200 groups.
    */
-  getUtmBreakdown(hours: number = 24): Array<{
+  getUtmBreakdown(hours: number = 24, vertical?: string): Array<{
     utm_source: string; utm_medium: string; utm_campaign: string; views: number; sessions: number;
   }> {
     try {
       const db = getDb();
       const cutoff = new Date(Date.now() - hours * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+      const V = vertical ? " AND vertical_id = ?" : "";
+      const vp: string[] = vertical ? [vertical] : [];
       const merged = new Map<string, { utm_source: string; utm_medium: string; utm_campaign: string; views: number; sessions: number }>();
       const add = (r: any) => {
         const key = `${r.utm_source}\u0000${r.utm_medium}\u0000${r.utm_campaign}`;
@@ -603,22 +607,23 @@ export class AnalyticsService {
                COUNT(*) AS views, COUNT(DISTINCT session_id) AS sessions
         FROM analytics_page_views
         WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
-          AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
+          AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)${V}
         GROUP BY 1, 2, 3
         ORDER BY views DESC LIMIT 200
-      `).all(cutoff) as any[];
+      `).all(cutoff, ...vp) as any[];
       raw.forEach(add);
       // Rolled-up days: only days older than the oldest surviving raw day.
-      const oldestRaw = (db.prepare(
-        "SELECT MIN(substr(created_at, 1, 10)) AS d FROM analytics_page_views"
-      ).get() as { d: string | null } | undefined)?.d;
+      // MIN(created_at) uses the created_at index (no per-row substr()).
+      const oldestRaw = ((db.prepare(
+        "SELECT MIN(created_at) AS d FROM analytics_page_views"
+      ).get() as { d: string | null } | undefined)?.d || "").slice(0, 10) || null;
       const rolled = db.prepare(`
         SELECT utm_source, utm_medium, utm_campaign,
                SUM(view_count) AS views, SUM(session_count) AS sessions
         FROM page_view_utm_daily
-        WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""}
+        WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""}${V}
         GROUP BY 1, 2, 3
-      `).all(...(oldestRaw ? [cutoff.slice(0, 10), oldestRaw] : [cutoff.slice(0, 10)])) as any[];
+      `).all(...(oldestRaw ? [cutoff.slice(0, 10), oldestRaw] : [cutoff.slice(0, 10)]), ...vp) as any[];
       rolled.forEach(add);
       return [...merged.values()].sort((a, b) => b.views - a.views).slice(0, 200);
     } catch (err) {
