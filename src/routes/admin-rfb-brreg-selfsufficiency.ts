@@ -88,6 +88,7 @@
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
+import { mergeFieldProvenance } from "./admin-knowledge";
 import { getDb } from "../database/init";
 import {
   findLocalOrgnrCandidate,
@@ -647,8 +648,22 @@ export type RfbBssEmailOutcome =
   | "email_skipped_curated"
   | "not_attempted";
 
+/**
+ * Per-row outcome of the fill-only agent_knowledge.email write that runs in
+ * the SAME transaction as a performed agents.contact_email write (dev-request
+ * 2026-10-01-rfb-brreg-selvforsyning-feil-kolonne-c3). Only present when
+ * the contact_email write was actually performed (email_written).
+ * "knowledge_email_no_row" = the agent has no agent_knowledge row at all, so
+ * there was nothing to fill (this route never creates one).
+ */
+export type RfbBssKnowledgeEmailOutcome =
+  | "knowledge_email_written"
+  | "knowledge_email_kept_existing"
+  | "knowledge_email_no_row";
+
 export interface RfbBssEmailResolution {
   outcome: RfbBssEmailOutcome;
+  knowledgeOutcome?: RfbBssKnowledgeEmailOutcome;
   detail?: string;
 }
 
@@ -666,15 +681,31 @@ function applyRfbBssEmailWrite(
   newEmail: string,
   orgNr: string,
   batchId: string,
-): { outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime"; oldValue?: string | null } {
-  const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime"; oldValue?: string | null } => {
+): {
+  outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime";
+  oldValue?: string | null;
+  knowledgeOutcome?: RfbBssKnowledgeEmailOutcome;
+} {
+  const tx = db.transaction((): {
+    outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime";
+    oldValue?: string | null;
+    knowledgeOutcome?: RfbBssKnowledgeEmailOutcome;
+  } => {
     const cur = db
       .prepare(
-        `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email, k.curated_fields AS curated_fields
+        `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email, k.curated_fields AS curated_fields,
+                k.agent_id AS knowledge_agent_id, k.email AS knowledge_email, k.field_provenance AS field_provenance
            FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.id = ?`,
       )
-      .get(agentId) as { claimed_at: string | null; contact_email: string | null; curated_fields: string | null } | undefined;
+      .get(agentId) as {
+        claimed_at: string | null;
+        contact_email: string | null;
+        curated_fields: string | null;
+        knowledge_agent_id: string | null;
+        knowledge_email: string | null;
+        field_provenance: string | null;
+      } | undefined;
 
     if (!cur) return { outcome: "skippedLocked" }; // vanished mid-batch — treat as untouchable, never write
     if (cur.claimed_at) return { outcome: "skippedLocked", oldValue: cur.contact_email };
@@ -705,7 +736,50 @@ function applyRfbBssEmailWrite(
        VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
     ).run(randomUUID(), agentId, cur.contact_email, newEmail, `rfb-brreg-selfsufficiency org_nr:${orgNr} batch:${batchId}`);
 
-    return { outcome: "written", oldValue: cur.contact_email };
+    // agent_knowledge.email — FILL-ONLY, same transaction, same fresh
+    // snapshot, mirrors applyRfbCxWrite (admin-rfb-contact-extraction.ts).
+    // This is the column the verifier (pickBatch k.email) and the outreach
+    // pool (k.email IS NOT NULL AND != '') actually read; before this fix a
+    // Brreg address never reached either gate. It runs ONLY here, i.e. only
+    // when the contact_email write above was performed: the claimed_at /
+    // curated_fields locks (isContactEmailCurated covers the email lock) and
+    // the contact_email conflict / already-set returns above all exit before
+    // this point, so nothing is ever written to agent_knowledge.email for a
+    // locked, curated or own-site-wins row. A non-empty value is never
+    // overwritten.
+    let knowledgeOutcome: RfbBssKnowledgeEmailOutcome;
+    if (!cur.knowledge_agent_id) {
+      knowledgeOutcome = "knowledge_email_no_row";
+    } else if (cur.knowledge_email && cur.knowledge_email.trim()) {
+      knowledgeOutcome = "knowledge_email_kept_existing";
+    } else {
+      const nowIso = new Date().toISOString();
+      let existingProv: Record<string, unknown> = {};
+      if (cur.field_provenance) {
+        try {
+          const parsed = JSON.parse(cur.field_provenance);
+          if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+        } catch {
+          /* tolerate junk, mirrors every other mergeFieldProvenance call site */
+        }
+      }
+      const mergedProv = mergeFieldProvenance(existingProv, {
+        email: [
+          {
+            value: newEmail,
+            source_type: "brreg",
+            source_url: `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`,
+            fetched_at: nowIso,
+          },
+        ],
+      });
+      db.prepare(
+        `UPDATE agent_knowledge SET email = ?, field_provenance = ?, updated_at = ?, data_enriched_at = ? WHERE agent_id = ?`,
+      ).run(newEmail, JSON.stringify(mergedProv), nowIso, nowIso, agentId);
+      knowledgeOutcome = "knowledge_email_written";
+    }
+
+    return { outcome: "written", oldValue: cur.contact_email, knowledgeOutcome };
   });
   return tx();
 }
@@ -767,7 +841,7 @@ export async function resolveEmailForTarget(
   }
 
   const written = applyRfbBssEmailWrite(db, target.id, gateApprovedEmail, orgNr, batchId);
-  if (written.outcome === "written") return { outcome: "email_written" };
+  if (written.outcome === "written") return { outcome: "email_written", knowledgeOutcome: written.knowledgeOutcome };
   if (written.outcome === "skippedLocked") return { outcome: "email_skipped_locked" };
   if (written.outcome === "conflictAtWriteTime") {
     return {
@@ -964,6 +1038,11 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       not_attempted: 0,
     };
     const emailRejectReasons: Record<string, number> = {};
+    const knowledgeEmailCounts: Record<RfbBssKnowledgeEmailOutcome, number> = {
+      knowledge_email_written: 0,
+      knowledge_email_kept_existing: 0,
+      knowledge_email_no_row: 0,
+    };
 
     const details: Array<{
       agent_id: string;
@@ -975,6 +1054,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       website_reject_reason?: string;
       email_outcome: RfbBssEmailOutcome;
       email_detail?: string;
+      knowledge_email_outcome?: RfbBssKnowledgeEmailOutcome;
     }> = [];
     const errors: Array<{ agent_id: string; stage: "org_nr" | "website"; error: string }> = [];
 
@@ -1030,6 +1110,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
         websiteRejectReasons[websiteResolution.detail] = (websiteRejectReasons[websiteResolution.detail] ?? 0) + 1;
       }
       emailCounts[emailResolution.outcome]++;
+      if (emailResolution.knowledgeOutcome) knowledgeEmailCounts[emailResolution.knowledgeOutcome]++;
       if (emailResolution.detail) {
         emailRejectReasons[emailResolution.detail] = (emailRejectReasons[emailResolution.detail] ?? 0) + 1;
       }
@@ -1044,6 +1125,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
         ...("detail" in websiteResolution && websiteResolution.detail ? { website_reject_reason: websiteResolution.detail } : {}),
         email_outcome: emailResolution.outcome,
         ...(emailResolution.detail ? { email_detail: emailResolution.detail } : {}),
+        ...(emailResolution.knowledgeOutcome ? { knowledge_email_outcome: emailResolution.knowledgeOutcome } : {}),
       });
     }
 
@@ -1059,7 +1141,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       skipped_locked: skippedLocked,
       org_nr: { ...orgNrCounts, by_source: orgNrBySource },
       website: { ...websiteCounts, reject_reasons: websiteRejectReasons },
-      email: { ...emailCounts, reject_reasons: emailRejectReasons },
+      email: { ...emailCounts, ...knowledgeEmailCounts, reject_reasons: emailRejectReasons },
       headless_fallback_attempted: fallbackCounters.attempted,
       headless_fallback_verified: fallbackCounters.verified,
       details,
