@@ -154,6 +154,19 @@ export function runTrafficStatsTests(opts: { log?: boolean } = {}): TestSummary 
     delete process.env.RFB_AUTO_PRUNE_DAYS;
     trafficStats.__resetTrafficStatsCacheForTesting();
 
+    // ── (g) Off-thread TTL: 60 min default, env override clamped to 10–120 min
+    const MIN = 60_000;
+    assertEq(trafficStats.TRAFFIC_OFFTHREAD_TTL_MS, 60 * MIN, "g1: default off-thread TTL is 60 min");
+    assertEq(trafficStats.resolveOffThreadTtlMs(undefined), 60 * MIN, "g2: unset -> default");
+    assertEq(trafficStats.resolveOffThreadTtlMs(String(10 * MIN)), 10 * MIN, "g3: lower bound accepted");
+    assertEq(trafficStats.resolveOffThreadTtlMs(String(120 * MIN)), 120 * MIN, "g4: upper bound accepted");
+    assertEq(trafficStats.resolveOffThreadTtlMs(String(30 * MIN)), 30 * MIN, "g5: in-range value used");
+    assertEq(trafficStats.resolveOffThreadTtlMs(String(10 * MIN - 1)), 60 * MIN, "g6: below range -> default");
+    assertEq(trafficStats.resolveOffThreadTtlMs(String(120 * MIN + 1)), 60 * MIN, "g7: above range -> default");
+    assertEq(trafficStats.resolveOffThreadTtlMs("abc"), 60 * MIN, "g8: non-numeric -> default");
+    assertEq(trafficStats.resolveOffThreadTtlMs(""), 60 * MIN, "g9: empty -> default");
+    assertEq(trafficStats.resolveOffThreadTtlMs("-600000"), 60 * MIN, "g10: negative -> default");
+
     // ── (f) Vertical scoping ────────────────────────────────────────────
     const oa = trafficStats.getTrafficStats("experiences");
     assertEq(oa.pageViews, 1, "f1: experiences vertical sees only its own 1 row");

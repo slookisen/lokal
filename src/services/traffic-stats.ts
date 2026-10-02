@@ -44,11 +44,27 @@ export { getRetentionWindowDays } from "./traffic-stats-compute";
 /** Cache TTL on the synchronous (fallback) path — unchanged from before. */
 export const TRAFFIC_CACHE_TTL_MS = 120_000;
 /**
- * Refresh interval on the off-thread path. The numbers are 60-day totals, so
- * 10 minutes of staleness is invisible, and it keeps the worker's full scans
- * to a few per hour instead of one per vertical every 2 minutes.
+ * Refresh interval on the off-thread path. The numbers are 60-day totals, so an
+ * hour of staleness is acceptable (Daniel 2026-10-01), and each refresh is a
+ * full scan of analytics_page_views (~1.3M rows) that competes with the main
+ * thread for disk/cache on a 1-vCPU machine. Override with env
+ * TRAFFIC_OFFTHREAD_TTL_MS (milliseconds, 10–120 min) for a rollback without a
+ * deploy; anything outside that range falls back to the default.
  */
-export const TRAFFIC_OFFTHREAD_TTL_MS = 10 * 60_000;
+const TRAFFIC_OFFTHREAD_TTL_DEFAULT_MS = 60 * 60_000;
+const TRAFFIC_OFFTHREAD_TTL_MIN_MS = 10 * 60_000;
+const TRAFFIC_OFFTHREAD_TTL_MAX_MS = 120 * 60_000;
+
+export function resolveOffThreadTtlMs(raw: string | undefined): number {
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return TRAFFIC_OFFTHREAD_TTL_DEFAULT_MS;
+  const n = Number(raw.trim());
+  if (n < TRAFFIC_OFFTHREAD_TTL_MIN_MS || n > TRAFFIC_OFFTHREAD_TTL_MAX_MS) {
+    return TRAFFIC_OFFTHREAD_TTL_DEFAULT_MS;
+  }
+  return n;
+}
+
+export const TRAFFIC_OFFTHREAD_TTL_MS = resolveOffThreadTtlMs(process.env.TRAFFIC_OFFTHREAD_TTL_MS);
 /** After a failed off-thread refresh, wait this long before retrying that key. */
 const TRAFFIC_OFFTHREAD_RETRY_MS = 60_000;
 
