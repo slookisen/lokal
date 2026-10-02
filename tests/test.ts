@@ -32227,6 +32227,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of elm.failures) failures.push("event-loop-monitor: " + f);
     console.log(`  event-loop-monitor: ${elm.passed} passed, ${elm.failed} failed`);
 
+    // dev-request 2026-10-02-boot-jobber-event-loop-stall-etter-deploy: boot jobs
+    // run in slices behind an exclusive gate; url-backfill skips a recent restart.
+    console.log("\n── boot-job-gate: chunked boot jobs, exclusive gate, url-backfill skip ──");
+    const { runBootJobGateTests } = require("../src/services/boot-job-gate.test") as
+      typeof import("../src/services/boot-job-gate.test");
+    const bjg = await runBootJobGateTests({ log: false });
+    passed += bjg.passed;
+    failed += bjg.failed;
+    for (const f of bjg.failures) failures.push("boot-job-gate: " + f);
+    console.log(`  boot-job-gate: ${bjg.passed} passed, ${bjg.failed} failed`);
+
     console.log("\n── health-counts: cached analytics_page_views counts for /health ──");
     const { runHealthCountsTests } = require("../src/services/health-counts.test") as
       typeof import("../src/services/health-counts.test");

@@ -141,6 +141,7 @@ import { getDb } from "../database/init";
 import { transliterate, stripHouseLetterSuffix, type GeocodeDeps } from "./dental-geocode-worker";
 import { normalizeCityLabel } from "./city-normalizer";
 import { takeKartverketBudget } from "./kartverket-budget";
+import { runExclusiveBootJob } from "./boot-job-gate";
 import {
   startBackfillScheduler,
   type BackfillSchedulerDeps,
@@ -1155,7 +1156,8 @@ export function startPostalBackfillWorker(
     idleDelayMs: POSTAL_BACKFILL_IDLE_INTERVAL_MS,
     bootDelayMs: POSTAL_BACKFILL_BOOT_DELAY_MS,
     hasBacklog: postalBackfillHasBacklog,
-    runTick: async () => {
+    // Shared boot-job gate: never overlaps boot-trust-recalc / url-backfill.
+    runTick: () => runExclusiveBootJob(async () => {
       const r = await postalBackfillTick(POSTAL_BACKFILL_LIMIT_DEFAULT);
       if (r.skipped_already_running) {
         console.log("[postal-backfill] tick skipped — the previous tick is still running");
@@ -1168,7 +1170,7 @@ export function startPostalBackfillWorker(
         `no_match=${r.no_match} unusable=${r.unusable} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
-    },
+    }),
     ...overrides,
   });
 }

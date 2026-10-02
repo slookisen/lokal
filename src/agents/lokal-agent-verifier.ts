@@ -2650,6 +2650,9 @@ export async function runUrlBackfill(opts?: {
   fetchImpl?: FetchLike;
   onProgress?: (done: number, total: number) => void;
   logEveryN?: number;
+  /** Probe this many agents, then pause `chunkPauseMs` (event-loop breathing room). Default: no pause. */
+  chunkSize?: number;
+  chunkPauseMs?: number;
 }): Promise<{ scanned: number; ok: number; broken: number; demoted: number; durationMs: number }> {
   const db = opts?.db ?? getDb();
   const start = Date.now();
@@ -2694,6 +2697,9 @@ export async function runUrlBackfill(opts?: {
       console.log(`[enrichment-backfill] progress ${i + 1}/${candidates.length} (ok=${okCount} broken=${brokenCount} demoted=${demoted})`);
     }
     if (opts?.onProgress) opts.onProgress(i + 1, candidates.length);
+    if (opts?.chunkPauseMs && opts.chunkSize && (i + 1) % opts.chunkSize === 0 && i + 1 < candidates.length) {
+      await new Promise((r) => setTimeout(r, opts.chunkPauseMs));
+    }
   }
 
   const durationMs = Date.now() - start;

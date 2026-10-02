@@ -4977,6 +4977,20 @@ function initSchema(db: Database.Database): void {
     console.error("Migration profile_translations failed:", err);
   }
 
+  // dev-request 2026-10-02-boot-jobber-event-loop-stall-etter-deploy: tiny
+  // job-state table (services/boot-job-gate.ts). Holds the last COMPLETED run
+  // of boot jobs so url-backfill can skip a restart soon after a finished run.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS boot_job_state (
+        job TEXT PRIMARY KEY,
+        last_completed_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration boot_job_state failed:", err);
+  }
+
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already
   // exists (base CREATE TABLE above) — these three columns are the SAME

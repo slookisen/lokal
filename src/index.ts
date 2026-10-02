@@ -134,6 +134,10 @@ import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
 import { trustScoreService } from "./services/trust-score-service";
+import {
+  runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, shouldSkipRecentRun,
+  resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
+} from "./services/boot-job-gate";
 import { syncDebioVerifications } from "./services/debio-verification-service";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
 
@@ -1301,15 +1305,20 @@ app.listen(Number(PORT), HOST, async () => {
 
   // Recalculate trust scores in background (non-blocking)
   // Uses setTimeout(0) so the event loop can handle incoming requests first.
-  setTimeout(trackJob("boot-trust-recalc", () => {
-    try {
-      console.log("📊 Recalculating trust scores (background)...");
-      const trustResult = trustScoreService.recalculateAll();
-      console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
-    } catch (err) {
-      console.error("Trust recalc failed (non-fatal):", err);
-    }
-  }), 2000); // 2 second delay — let health checks pass first
+  // dev-request 2026-10-02-boot-jobber-event-loop-stall-etter-deploy: runs in
+  // short slices (yielding to the event loop between them) behind the shared
+  // boot-job gate, so it never blocks >500 ms nor overlaps url-backfill.
+  setTimeout(() => {
+    void runExclusiveBootJob(trackJob("boot-trust-recalc", async () => {
+      try {
+        console.log("📊 Recalculating trust scores (background, chunked)...");
+        const trustResult = await trustScoreService.recalculateAllChunked({ chunkSize: 20, pauseMs: 5 });
+        console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+      } catch (err) {
+        console.error("Trust recalc failed (non-fatal):", err);
+      }
+    }));
+  }, 2000); // 2 second delay — let health checks pass first
 
   // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: the homepage
   // traffic strips are computed off the main thread (offthread-stats.ts).
@@ -1326,16 +1335,26 @@ app.listen(Number(PORT), HOST, async () => {
   // Disable by setting RFB_DISABLE_URL_BACKFILL=1 (e.g. on dev / CI).
   if (process.env.RFB_DISABLE_URL_BACKFILL !== "1") {
     setTimeout(() => {
-      console.log("[enrichment-backfill] starting URL freshness backfill (non-blocking)…");
       // Lazy-require so a syntax error in the verifier never blocks boot.
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { runUrlBackfill } = require("./agents/lokal-agent-verifier");
-      Promise.resolve()
-        .then(trackJob("url-backfill", () => runUrlBackfill()))
-        .catch((err: unknown) => {
-          console.error("[enrichment-backfill] failed (non-fatal):", err);
-        });
-    }, 5000); // 5s delay — let health checks + trust recalc settle first
+      const minHours = resolveMinIntervalHours(process.env.RFB_URL_BACKFILL_MIN_INTERVAL_HOURS);
+      void runExclusiveBootJob(async () => {
+        const last = getJobLastCompletedAt(getDb(), URL_BACKFILL_JOB);
+        if (shouldSkipRecentRun({ lastCompletedAt: last, now: new Date(), minIntervalHours: minHours })) {
+          console.log(
+            `[enrichment-backfill] skipped — last completed run ${last!.toISOString()} is < ${minHours}h old ` +
+            `(RFB_URL_BACKFILL_MIN_INTERVAL_HOURS)`
+          );
+          return;
+        }
+        console.log("[enrichment-backfill] starting URL freshness backfill (non-blocking, chunked)…");
+        await trackJob("url-backfill", () => runUrlBackfill({ chunkSize: 5, chunkPauseMs: 1000 }))();
+        markJobCompleted(getDb(), URL_BACKFILL_JOB);
+      }).catch((err: unknown) => {
+        console.error("[enrichment-backfill] failed (non-fatal):", err);
+      });
+    }, URL_BACKFILL_BOOT_DELAY_MS); // ≥5 min — well after boot-trust-recalc + health checks
   }
 
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────

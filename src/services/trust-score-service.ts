@@ -1,5 +1,6 @@
 import { getDb } from "../database/init";
 import { getTrustEventCounts } from "./trust-event-service";
+import { runChunked } from "./boot-job-gate";
 
 // ─── Trust Score Service ──────────────────────────────────────
 //
@@ -166,6 +167,49 @@ class TrustScoreService {
       updated: agents.length,
       avgScore: agents.length > 0 ? Math.round((totalScore / agents.length) * 1000) / 1000 : 0,
       distribution,
+    };
+  }
+
+  // ─── Recalculate ALL agents in event-loop-friendly slices ──
+  // Same per-agent computation and result shape as recalculateAll(), but the
+  // work is split into slices of `chunkSize` agents (each in its own short
+  // transaction) with a setImmediate yield between slices, so no single
+  // block holds the event loop for long (dev-request 2026-10-02-boot-jobber-
+  // event-loop-stall-etter-deploy: the one-shot version blocked ~4.8 s).
+  async recalculateAllChunked(opts: { chunkSize?: number; pauseMs?: number } = {}): Promise<{
+    updated: number; avgScore: number; distribution: Record<string, number>; chunks: number;
+  }> {
+    const db = getDb();
+    const agents = db.prepare("SELECT id FROM agents WHERE is_active = 1").all() as any[];
+    const updateStmt = db.prepare("UPDATE agents SET trust_score = ? WHERE id = ?");
+    let totalScore = 0;
+    const distribution = { "0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0 };
+
+    const { chunks } = await runChunked(
+      agents,
+      (slice) => {
+        db.transaction(() => {
+          for (const agent of slice) {
+            const score = this.calculate(agent.id);
+            updateStmt.run(score, agent.id);
+            totalScore += score;
+            const pct = Math.round(score * 100);
+            if (pct <= 20) distribution["0-20"]++;
+            else if (pct <= 40) distribution["21-40"]++;
+            else if (pct <= 60) distribution["41-60"]++;
+            else if (pct <= 80) distribution["61-80"]++;
+            else distribution["81-100"]++;
+          }
+        })();
+      },
+      { chunkSize: opts.chunkSize ?? 25, pauseMs: opts.pauseMs ?? 0 }
+    );
+
+    return {
+      updated: agents.length,
+      avgScore: agents.length > 0 ? Math.round((totalScore / agents.length) * 1000) / 1000 : 0,
+      distribution,
+      chunks,
     };
   }
 
