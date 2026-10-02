@@ -1363,28 +1363,76 @@ export class AnalyticsService {
     skippedPendingRollup: string[];
     wouldDeleteIfPruned: { queries: number; agentViews: number };
   } {
-    const daysKept = Math.max(7, opts.daysToKeep || 60);
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
-
+    const ctx = this.autoPruneBegin(opts);
     const { rollupAndPrunePageViews, rollupAndPruneQueries, rollupAndPruneAgentViews, pruneAnalyticsMcpCalls } =
       require("./retention-service") as typeof import("./retention-service");
 
+    const pvResult = rollupAndPrunePageViews(ctx.daysKept, 7, false);
+    const qResult = rollupAndPruneQueries(ctx.daysKept, 7, false);
+    const avResult = rollupAndPruneAgentViews(ctx.daysKept, 7, false);
+    // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
+    // analytics_mcp_calls joins the same daily retention pass, same window
+    // as page views — delete-only (no rollup table for this one, see
+    // pruneAnalyticsMcpCalls's own doc comment).
+    const mcpCallsResult = pruneAnalyticsMcpCalls(ctx.daysKept, false);
+
+    // Reclaim WAL space — mirrors the /ops/prune route.
+    try { getDb().pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
+
+    return this.autoPruneResult(ctx, pvResult, qResult, avResult, mcpCallsResult);
+  }
+
+  /**
+   * dev-request 2026-10-01-prod-auto-prune-skansom: the nightly job's variant of
+   * runAutoPrune(). Identical rollups and identical deleted rows, but the
+   * rollup+delete work runs in <=2000-row transactions with a setImmediate yield
+   * between them (retention-service.ts core), so the event loop is never held
+   * for a whole table pass (47 s in prod on 2026-10-01). The closing checkpoint
+   * is PASSIVE, not TRUNCATE: TRUNCATE waits (up to the busy timeout) for the
+   * traffic-stats worker's in-progress read (offthread-stats.ts), PASSIVE never
+   * blocks — the WAL is simply reset by a later checkpoint. The manual routes
+   * keep the synchronous runAutoPrune() above (explicit, TRUNCATE).
+   */
+  async runAutoPruneAsync(opts: { daysToKeep: number }): Promise<{
+    daysKept: number;
+    cutoff: string;
+    deleted: { pageViews: number; queries: number; agentViews: number; mcpCalls: number };
+    skippedPendingRollup: string[];
+    wouldDeleteIfPruned: { queries: number; agentViews: number };
+  }> {
+    const ctx = this.autoPruneBegin(opts);
+    const {
+      rollupAndPrunePageViewsAsync, rollupAndPruneQueriesAsync, rollupAndPruneAgentViewsAsync, pruneAnalyticsMcpCalls,
+    } = require("./retention-service") as typeof import("./retention-service");
+
+    const pvResult = await rollupAndPrunePageViewsAsync(ctx.daysKept, 7, false);
+    const qResult = await rollupAndPruneQueriesAsync(ctx.daysKept, 7, false);
+    const avResult = await rollupAndPruneAgentViewsAsync(ctx.daysKept, 7, false);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const mcpCallsResult = pruneAnalyticsMcpCalls(ctx.daysKept, false);
+
+    try { getDb().pragma("wal_checkpoint(PASSIVE)"); } catch { /* non-fatal */ }
+
+    return this.autoPruneResult(ctx, pvResult, qResult, avResult, mcpCallsResult);
+  }
+
+  private autoPruneBegin(opts: { daysToKeep: number }): { daysKept: number; cutoff: string; qCount: number; avCount: number } {
+    const daysKept = Math.max(7, opts.daysToKeep || 60);
+    const db = getDb();
+    const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
     // Sizing counts are read BEFORE the rollup+delete runs, so
     // wouldDeleteIfPruned keeps meaning exactly what it meant in slice 1:
     // "how many rows were older than the cutoff going into this pass".
     const qCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries WHERE created_at < ?").get(cutoff) as { c: number }).c;
     const avCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views WHERE created_at < ?").get(cutoff) as { c: number }).c;
+    return { daysKept, cutoff, qCount, avCount };
+  }
 
-    const pvResult = rollupAndPrunePageViews(daysKept, 7, false);
-    const qResult = rollupAndPruneQueries(daysKept, 7, false);
-    const avResult = rollupAndPruneAgentViews(daysKept, 7, false);
-    // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
-    // analytics_mcp_calls joins the same daily retention pass, same window
-    // as page views — delete-only (no rollup table for this one, see
-    // pruneAnalyticsMcpCalls's own doc comment).
-    const mcpCallsResult = pruneAnalyticsMcpCalls(daysKept, false);
-
+  private autoPruneResult(
+    ctx: { daysKept: number; cutoff: string; qCount: number; avCount: number },
+    pvResult: { rowsDeleted: number }, qResult: { rowsDeleted: number },
+    avResult: { rowsDeleted: number }, mcpCallsResult: { rowsDeleted: number },
+  ) {
     // Rollup coverage per source table — computed, not hardcoded, so a future
     // analytics table without a rollup destination shows up here instead of
     // being silently deleted. All three are covered as of slice 2, so
@@ -1394,13 +1442,9 @@ export class AnalyticsService {
       analytics_agent_views: true,
     };
     const skippedPendingRollup = Object.keys(rollupCoverage).filter((t) => !rollupCoverage[t]);
-
-    // Reclaim WAL space — mirrors the /ops/prune route.
-    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
-
     return {
-      daysKept,
-      cutoff,
+      daysKept: ctx.daysKept,
+      cutoff: ctx.cutoff,
       deleted: {
         pageViews: pvResult.rowsDeleted || 0,
         queries: qResult.rowsDeleted || 0,
@@ -1409,8 +1453,8 @@ export class AnalyticsService {
       },
       skippedPendingRollup,
       wouldDeleteIfPruned: {
-        queries: qCount || 0,
-        agentViews: avCount || 0,
+        queries: ctx.qCount || 0,
+        agentViews: ctx.avCount || 0,
       },
     };
   }
