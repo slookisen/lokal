@@ -162,10 +162,31 @@ export function __setRfbCxRowDelayForTesting(ms: number | null): void {
 }
 
 // Kjørelås: ett kall om gangen; nummer to får 409 umiddelbart (mirrors
-// gsCxRunning, opplevelser.ts — same herding rationale: an abandoned/timed-
+// gsCxLock, opplevelser.ts — same herding rationale: an abandoned/timed-
 // out apply call must never stack with a fresh one and saturate the event
 // loop).
-let rfbCxRunning = false;
+//
+// Låsen bærer metadata ({ startedAt, runId }) og har en øvre grense: et kall
+// som finner en lås eldre enn RFB_CX_LOCK_MAX_MS tar den over (en hengt await
+// kan ellers holde låsen til restart — dev-request 2026-10-01-rfb-contact-
+// extraction-laas-henger). finally slipper KUN hvis runId fortsatt er vår.
+const RFB_CX_LOCK_MAX_MS_DEFAULT = 15 * 60 * 1000;
+let rfbCxLockMaxMsOverride: number | null = null;
+function rfbCxLockMaxMs(): number {
+  if (rfbCxLockMaxMsOverride !== null) return rfbCxLockMaxMsOverride;
+  const env = Number(process.env.RFB_CX_LOCK_MAX_MS);
+  return Number.isFinite(env) && env > 0 ? env : RFB_CX_LOCK_MAX_MS_DEFAULT;
+}
+let rfbCxLock: { startedAt: number; runId: string } | null = null;
+export function __setRfbCxLockMaxMsForTesting(ms: number | null): void {
+  rfbCxLockMaxMsOverride = ms;
+}
+export function __setRfbCxLockForTesting(lock: { startedAt: number; runId: string } | null): void {
+  rfbCxLock = lock;
+}
+export function __getRfbCxLockForTesting(): { startedAt: number; runId: string } | null {
+  return rfbCxLock;
+}
 
 // Per-host cooldown on a 429 (mirrors GS_CX_COOLDOWN_MS): a rate-limited host
 // is parked for this long so neither the rest of THIS run nor a fresh run
@@ -494,11 +515,22 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
   // Kjørelås checked/set synchronously, before any await — a concurrent call
   // fired right after this one must see the lock. The `finally` below is the
   // only thing that releases it, so a thrown error never leaves it hanging.
-  if (rfbCxRunning) {
-    res.status(409).json({ error: "run_in_progress", detail: "en rfb-contact-extraction-kjøring pågår allerede — vent til den er ferdig" });
-    return;
+  if (rfbCxLock) {
+    const lockAgeMs = Date.now() - rfbCxLock.startedAt;
+    if (lockAgeMs < rfbCxLockMaxMs()) {
+      res.status(409).json({
+        error: "run_in_progress",
+        detail: "en rfb-contact-extraction-kjøring pågår allerede — vent til den er ferdig",
+        started_at: new Date(rfbCxLock.startedAt).toISOString(),
+        run_id: rfbCxLock.runId,
+        lock_age_ms: lockAgeMs,
+      });
+      return;
+    }
+    console.warn(`[rfb-contact-extraction] lock_stale_takeover old_run_id=${rfbCxLock.runId} age_ms=${lockAgeMs}`);
   }
-  rfbCxRunning = true;
+  const rfbCxRunId = randomUUID();
+  rfbCxLock = { startedAt: Date.now(), runId: rfbCxRunId };
 
   try {
     const body = (req.body ?? {}) as { limit?: unknown; agentIds?: unknown; apply?: unknown; mode?: unknown };
@@ -758,7 +790,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
       results,
     });
   } finally {
-    rfbCxRunning = false;
+    if (rfbCxLock?.runId === rfbCxRunId) rfbCxLock = null;
   }
 });
 
