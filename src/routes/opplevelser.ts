@@ -9903,7 +9903,26 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 //      stablet seg).
 const GS_CX_DEFAULT_LIMIT = 8;
 const GS_CX_ROW_DELAY_MS = 250;
-let gsCxRunning = false;
+// Låsen bærer { startedAt, runId } og har øvre grense GS_CX_LOCK_MAX_MS: et kall
+// som finner en eldre lås tar den over (hengt await kan ellers holde den til
+// restart — samme fix som rfbCxLock i admin-rfb-contact-extraction.ts).
+const GS_CX_LOCK_MAX_MS_DEFAULT = 15 * 60 * 1000;
+let gsCxLockMaxMsOverride: number | null = null;
+function gsCxLockMaxMs(): number {
+  if (gsCxLockMaxMsOverride !== null) return gsCxLockMaxMsOverride;
+  const env = Number(process.env.GS_CX_LOCK_MAX_MS);
+  return Number.isFinite(env) && env > 0 ? env : GS_CX_LOCK_MAX_MS_DEFAULT;
+}
+let gsCxLock: { startedAt: number; runId: string } | null = null;
+export function __setGsCxLockMaxMsForTesting(ms: number | null): void {
+  gsCxLockMaxMsOverride = ms;
+}
+export function __setGsCxLockForTesting(lock: { startedAt: number; runId: string } | null): void {
+  gsCxLock = lock;
+}
+export function __getGsCxLockForTesting(): { startedAt: number; runId: string } | null {
+  return gsCxLock;
+}
 // Testene setter radpausen til 0 (fortsatt en ekte setTimeout-yield, bare uten
 // ventetid) — test-harnesset er timing-sensitivt (se tests/test.ts-headeren om
 // runSerial-kjeden), så sekunder med kunstig pause i én suite forskyver
@@ -10075,11 +10094,22 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
 
   // Kjørelås — sjekket og satt FØR noe arbeid. finally-blokken under er eneste
   // som slipper den, så en kastet feil aldri etterlater låsen hengende.
-  if (gsCxRunning) {
-    res.status(409).json({ error: "run_in_progress", detail: "en contact-extraction-kjøring pågår allerede — vent til den er ferdig" });
-    return;
+  if (gsCxLock) {
+    const lockAgeMs = Date.now() - gsCxLock.startedAt;
+    if (lockAgeMs < gsCxLockMaxMs()) {
+      res.status(409).json({
+        error: "run_in_progress",
+        detail: "en contact-extraction-kjøring pågår allerede — vent til den er ferdig",
+        started_at: new Date(gsCxLock.startedAt).toISOString(),
+        run_id: gsCxLock.runId,
+        lock_age_ms: lockAgeMs,
+      });
+      return;
+    }
+    console.warn(`[gardssalg-contact-extraction] lock_stale_takeover old_run_id=${gsCxLock.runId} age_ms=${lockAgeMs}`);
   }
-  gsCxRunning = true;
+  const gsCxRunId = crypto.randomUUID();
+  gsCxLock = { startedAt: Date.now(), runId: gsCxRunId };
   try {
   const batchId = `contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
@@ -10400,7 +10430,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     errors,
   });
   } finally {
-    gsCxRunning = false;
+    if (gsCxLock?.runId === gsCxRunId) gsCxLock = null;
   }
 });
 

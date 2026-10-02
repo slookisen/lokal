@@ -289,6 +289,31 @@ function fieldLabelFor(fieldType: ContactFieldType): string {
   return "e-postadresse";
 }
 
+// Upper bound on the whole judge call (connect + headers + body read). A hung
+// api.anthropic.com socket would otherwise hold the caller's run-lock until a
+// restart (dev-request 2026-10-01-rfb-contact-extraction-laas-henger).
+export const CONTACT_JUDGE_TIMEOUT_MS = 30_000;
+let judgeTimeoutMs = CONTACT_JUDGE_TIMEOUT_MS;
+export function __setContactJudgeTimeoutMsForTesting(ms: number | null): void {
+  judgeTimeoutMs = ms ?? CONTACT_JUDGE_TIMEOUT_MS;
+}
+
+// Rejects as soon as `signal` aborts, even if the wrapped promise (a fetch
+// stub, or a body read that ignores the signal) never settles.
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(Object.assign(new Error("judge_timeout"), { name: "TimeoutError" }));
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+const JUDGE_TIMEOUT_VERDICT: ContactCandidateJudgeVerdict = {
+  approved: false,
+  reason: "judge_timeout — dommer-kall tidsavbrutt — avvist fail-closed",
+};
+
 /**
  * judgeContactCandidate — the shared LLM judge. Same fail-closed
  * fetch/parse contract as marketplace.ts's judgeRfbContactCandidate: direct
@@ -338,9 +363,11 @@ ${CONTACT_JUDGE_REJECT_TOKEN}
 
 Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
 
+  // One signal covers the fetch AND both body reads below.
+  const signal = AbortSignal.timeout(judgeTimeoutMs);
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
+    response = await raceAbort(fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -352,16 +379,19 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }],
       }),
-    });
-  } catch {
+      signal,
+    }), signal);
+  } catch (err: any) {
+    if (signal.aborted || err?.name === "TimeoutError") return JUDGE_TIMEOUT_VERDICT;
     return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed" }; // never fabricate
   }
 
   if (!response.ok) {
     let bodySnippet = "";
     try {
-      bodySnippet = (await response.text()).slice(0, 300);
+      bodySnippet = (await raceAbort(response.text(), signal)).slice(0, 300);
     } catch {
+      if (signal.aborted) return JUDGE_TIMEOUT_VERDICT;
       bodySnippet = "(kunne ikke lese respons-body)";
     }
     console.error(`[judgeContactCandidate] non-ok response: status=${response.status} body=${bodySnippet}`);
@@ -373,8 +403,9 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
 
   let result: any;
   try {
-    result = await response.json();
+    result = await raceAbort(response.json(), signal);
   } catch {
+    if (signal.aborted) return JUDGE_TIMEOUT_VERDICT;
     return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
   }
 

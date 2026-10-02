@@ -46024,3 +46024,25 @@ runSerial(async () => {
     failures.push("rfb-owner-claim-customer: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-01-rfb-contact-extraction-laas-henger: run-locks of
+// POST /admin/rfb-contact-extraction and /admin/gardssalg-contact-extraction
+// carry { startedAt, runId } with an upper bound (stale takeover, runId-guarded
+// release, 409 metadata), and the shared LLM judge times out fail-closed.
+// Stubs globalThis.fetch/console.warn, swaps the getDb() singleton and busts
+// require-cache entries (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-contact-extraction-laas-henger: cx run-lock staleness + judge timeout ──");
+  try {
+    const { runCxRunLockStalenessTests } = require("../src/routes/cx-run-lock-staleness.test") as
+      typeof import("../src/routes/cx-run-lock-staleness.test");
+    const cl = await runCxRunLockStalenessTests({ log: false });
+    passed += cl.passed;
+    failed += cl.failed;
+    for (const f of cl.failures) failures.push("cx-run-lock-staleness: " + f);
+    console.log(`  cx-run-lock-staleness: ${cl.passed} passed, ${cl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cx-run-lock-staleness: unexpected error: " + String(err?.message || err));
+  }
+});
