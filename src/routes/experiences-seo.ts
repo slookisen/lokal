@@ -5334,7 +5334,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     // page's own reserve-CTA (arbeidspunkt 5, PR #571's .reserve-cta-paused).
     // Distinct from the 2026-08-09 "positive markers only" decision above —
     // that was about the badge/marker row, not this button's own label.
-    const bookingPaused = isBookingPaused(p.booking_live, p.catalog_hidden);
+    const bookingPaused = isBookingPaused(p.booking_live, p.catalog_hidden, p.is_test_provider);
     // The paused CTA keeps its OUTLINE-vs-FILL distinction from the active
     // one (that is what stops it looking bookable while it isn't — see
     // .gs-card-cta-paused's own comment); punkt 4 only swaps its flat grey
@@ -5695,7 +5695,7 @@ router.get(
     // 2026-08-12 (arbeidspunkt 5): computed once, reused by both the
     // reserve-notice AND the reserve-CTA's class/label below so they can
     // never disagree about paused state.
-    const bookingPaused = isBookingPaused(provider.booking_live, provider.catalog_hidden);
+    const bookingPaused = isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider);
     const sted = drivingSted(provider);
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
@@ -6184,7 +6184,7 @@ router.get(
     // /api/opplevelser/book). Independent of ?error=paused (that's the
     // banner shown AFTER a blocked submit attempt); this one is unmissable
     // up front so nothing on the page implies booking works today.
-    const notLive = isBookingPaused(provider.booking_live, provider.catalog_hidden);
+    const notLive = isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider);
     // Same claim-CTA coupling as the profile page's reserve-notice: an
     // unclaimed provider's paused state doubles as the owner's on-ramp
     // ("take over the profile and switch booking on"); a claimed provider's
@@ -6354,7 +6354,7 @@ router.post(
     // exactly (see isBookingPaused() in services/booking-store.ts). Checked
     // before touching req.body at all: no reserved row, no guest email, no
     // producer notification when paused, full stop.
-    if (isBookingPaused(provider.booking_live, provider.catalog_hidden)) {
+    if (isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider)) {
       res.redirect(303, `${backTo}?error=paused`);
       return;
     }

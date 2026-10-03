@@ -9388,7 +9388,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
   // Same gate as the public path — a test must not bypass booking_live /
   // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
   const provider = getProviderById(parsed.data.provider_id) as
-    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
     | null;
   const providerInfo = provider
     ? {
@@ -9398,7 +9398,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
         ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
       }
     : null;
-  if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+  if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
     return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id, provider: providerInfo });
   }
 
@@ -15788,7 +15788,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
 
     // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
     // verification_status); the raw UPDATE below sets the columns the schema
-    // doesn't (producer_type/booking_live/catalog_hidden/rfb_seed_source) plus
+    // doesn't (producer_type/booking_live/catalog_hidden/is_test_provider/rfb_seed_source) plus
     // commission_rate — exactly the createProvider()+raw-UPDATE split the tests
     // use. On a repeat call we reuse the existing row's id instead.
     const providerId = existing
@@ -15805,7 +15805,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
         `UPDATE experience_providers
             SET navn = @navn, epost = @email, slug = @slug,
                 producer_type = 'test-gardssalg', rfb_seed_source = NULL,
-                catalog_hidden = 1, booking_live = 1, commission_rate = 0,
+                catalog_hidden = 1, is_test_provider = 1, booking_live = 1, commission_rate = 0,
                 verification_status = 'verified', updated_at = datetime('now')
           WHERE id = @id`
       )
@@ -15863,7 +15863,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
 
     console.log(
       `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
-        `(catalog_hidden=1, booking_live=1, claimable=${claimable}, claimableEditable=${claimableEditable})`
+        `(catalog_hidden=1, is_test_provider=1, booking_live=1, claimable=${claimable}, claimableEditable=${claimableEditable})`
     );
 
     res.json({
@@ -16494,9 +16494,10 @@ export async function computeGardssalgSecondLineVerification(input: {
 function computeBookingStatus(
   bookingLive: number | null,
   catalogHidden: number | null,
+  isTestProvider: number | null,
 ): OutreachBookingStatus {
   if (bookingLive !== 1) return "none";
-  return isBookingPaused(bookingLive, catalogHidden) ? "paused" : "live";
+  return isBookingPaused(bookingLive, catalogHidden, isTestProvider) ? "paused" : "live";
 }
 
 // Deterministic, exhaustive tier assignment — every row gets EXACTLY one tier.
@@ -16757,6 +16758,7 @@ function computeGardssalgReadinessRows(
     content_source: string | null;
     booking_live: number | null;
     catalog_hidden: number | null;
+    is_test_provider: number | null;
     slug: string | null;
     field_provenance: string | null;
     brreg_verified: number | null;
@@ -16772,7 +16774,7 @@ function computeGardssalgReadinessRows(
   // every row must appear exactly once here.
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
-                content_source, booking_live, catalog_hidden, slug,
+                content_source, booking_live, catalog_hidden, is_test_provider, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status,
                 geocode_confidence, name_collision
            FROM experience_providers
@@ -16932,7 +16934,7 @@ function computeGardssalgReadinessRows(
       has_duplicate_conflict,
       name_collision,
       name_token_conflict_candidate,
-      booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
+      booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden, p.is_test_provider),
       readiness_tier,
       terminal_status,
       // Daniel, live session 2026-08-13: the stored homepage, surfaced.
@@ -29864,7 +29866,7 @@ router.post("/book", async (req: Request, res: Response) => {
   // 'reserved' row, never send the guest confirmation, never notify a
   // producer. See isBookingPaused() in services/booking-store.ts.
   const providerBook = getProviderById(parsed.data.provider_id) as
-    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+    | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
     | null;
   // Echoed on the paused + success responses (2026-09-16) so a caller that
   // resolved by name can tell the guest WHICH producer it acted on. Never
@@ -29878,7 +29880,7 @@ router.post("/book", async (req: Request, res: Response) => {
       }
     : null;
   const slotLocal = formatSlotOslo(parsed.data.slot_at);
-  if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null)) {
+  if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null, providerBook?.is_test_provider ?? null)) {
     res.status(200).json({
       success: false,
       paused: true,

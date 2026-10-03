@@ -29796,6 +29796,8 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   assertEq(rawTestRowTP.booking_live, 1, "tp-03b: test provider row itself still has booking_live===1");
   assertEq(rawTestRowTP.catalog_hidden, 1, "tp-03c: test provider row itself still has catalog_hidden===1");
   assertEq(rawTestRowTP.epost, danielEmailTP, "tp-03d: test provider row itself still has epost === the routed email");
+  assertEq((dbTP.prepare("SELECT is_test_provider AS t FROM experience_providers WHERE id = ?").get(testIdTP) as { t: number | null }).t, 1,
+    "tp-03e: the admin test-provider endpoint sets is_test_provider=1 (the booking gate's test identity)");
 
   // ═══ (d) regression — the ordinary provider is entirely unaffected ═══
   assertTrue(listAfterTP.some((p: any) => p.id === normalIdTP),
@@ -29845,8 +29847,10 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   // the global flag is off. REAL providers must STILL be gated by it (asserted).
   delete process.env.BOOKING_DISPATCH_ENABLED; // master switch OFF
   assertEq(bookStTP.bookingDispatchEnabled(), false, "tp-08a: precondition — global dispatch is OFF");
-  assertEq(bookStTP.isBookingPaused(1, 1), false,
-    "tp-08b: isBookingPaused(booking_live=1, catalog_hidden=1) === false with flag OFF (the carve-out)");
+  assertEq(bookStTP.isBookingPaused(1, 1, 1), false,
+    "tp-08b: isBookingPaused(booking_live=1, catalog_hidden=1, is_test_provider=1) === false with flag OFF (the carve-out)");
+  assertEq(bookStTP.isBookingPaused(1, 1), true,
+    "tp-08b2: catalog_hidden=1 WITHOUT is_test_provider is paused with flag OFF (no bypass for delisted producers)");
   emailCallsTP = [];
   const beforeBookOffTP = countBookingsTP();
   const bookOffTP = invokeBookTP({
@@ -32291,6 +32295,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gmbk.failed;
     for (const f of gmbk.failures) failures.push("opplevelser-gardssalg-mcp-booking: " + f);
     console.log(`  opplevelser-gardssalg-mcp-booking: ${gmbk.passed} passed, ${gmbk.failed} failed`);
+
+    // dev-request 2026-10-03-booking-avlistet-produsent-bypass: a catalog_hidden=1
+    // (delisted) producer is never dispatched to; the test provider has its own
+    // is_test_provider identity. Unit matrix + POST /book + book_gardssalg + migration.
+    console.log("\n── opplevelser-booking-delisted-bypass: delisted producer never dispatched ──");
+    const { runOpplevelserBookingDelistedBypassTests } = require("../src/routes/opplevelser-booking-delisted-bypass.test") as
+      typeof import("../src/routes/opplevelser-booking-delisted-bypass.test");
+    const bdb = await runOpplevelserBookingDelistedBypassTests({ log: false });
+    passed += bdb.passed;
+    failed += bdb.failed;
+    for (const f of bdb.failures) failures.push("opplevelser-booking-delisted-bypass: " + f);
+    console.log(`  opplevelser-booking-delisted-bypass: ${bdb.passed} passed, ${bdb.failed} failed`);
 
     // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai («book et
     // møte hos X fredag den 20. okt klokken 10.00» → one call): provider
