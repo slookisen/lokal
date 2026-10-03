@@ -2920,7 +2920,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>We store this to understand which searches give good results and to improve the service.</p>
 
     <h3>MCP/A2A tool calls</h3>
-    <p>When an AI tool (e.g. ChatGPT or Claude) calls one of our MCP or A2A tools, we log — separately from the search log above, per call — which tool was used, which protocol (MCP/A2A), response time, and the caller's full browser/client string (User-Agent) — this is stored as-is, NOT hashed, unlike the page-visit hash above, so we can tell which AI clients actually use the service. We also store a salted IP hash (see “Security” below). This log is deleted automatically on the same schedule as our other analytics data (see “How long we keep data”).</p>
+    <p>When an AI tool (e.g. ChatGPT or Claude) calls one of our MCP or A2A tools, we log — separately from the search log above, per call — which tool was used, which protocol (MCP/A2A), response time, and the caller's full browser/client string (User-Agent) — this is stored as-is, NOT hashed, unlike the page-visit hash above, so we can tell which AI clients actually use the service. We also store a salted IP hash (see “Security” below). This log is deleted automatically after 60 days (see “How long we keep data”).</p>
     <p>When you use ${brand} via ChatGPT or Claude, your request passes through that provider's own infrastructure (run by OpenAI or Anthropic respectively) before it ever reaches our server — we have no control over or visibility into how they handle your data before the call reaches us.</p>
     <p>The <code>lokal_geocode</code> tool (place name → coordinates) forwards your search text to the Norwegian Mapping Authority's public geocoding API (Kartverket, ws.geonorge.no) to look it up.</p>
 
@@ -2979,14 +2979,14 @@ router.get("/personvern", (req: Request, res: Response) => {
     <table class="pv-table">
       <thead><tr><th>Data type</th><th>Retention</th></tr></thead>
       <tbody>
-        <tr><td>Page-visit analytics</td><td>Can be deleted via admin. No automatic expiry is set today.</td></tr>
-        <tr><td>Search logs</td><td>Same as analytics.</td></tr>
+        <tr><td>Page-visit analytics</td><td>Individual page visits (with the anonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per page, which contain no IP hash or other link to a visitor and are kept.</td></tr>
+        <tr><td>Search logs</td><td>Individual searches (with the anonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per search text, without any link to who searched, and those counts are kept.</td></tr>
         <tr><td>Verification codes</td><td>Unverified claims expire after 7 days.</td></tr>
         <tr><td>Magic links</td><td>Expire after 15 minutes. Used links older than 1 hour are auto-deleted.</td></tr>
         <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
         <tr><td>Seller profile</td><td>For as long as you wish to remain registered.</td></tr>
         <tr><td>Uploaded images</td><td>Stored until manually deleted.</td></tr>
-        <tr><td>MCP/A2A tool-call log</td><td>Same automatic retention window as other analytics (60 days by default).</td></tr>
+        <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
         <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
       </tbody>
@@ -3054,7 +3054,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
 
     <h3>MCP/A2A-verktøykall</h3>
-    <p>Når et AI-verktøy (f.eks. ChatGPT eller Claude) kaller et av våre MCP- eller A2A-verktøy, logger vi — separat fra søkeloggen over, per kall — hvilket verktøy som ble brukt, hvilken protokoll (MCP/A2A), responstid, samt den kallende klientens fulle nettleser-/klient-streng (User-Agent) — denne lagres i klartekst, IKKE som hash, i motsetning til sidebesøk-hashen over, slik at vi kan se hvilke AI-klienter som faktisk bruker tjenesten. Vi lagrer også en saltet IP-hash (se «Sikkerhet» under). Denne loggen slettes automatisk etter samme frist som annen analytikk (se «Hvor lenge vi lagrer data»).</p>
+    <p>Når et AI-verktøy (f.eks. ChatGPT eller Claude) kaller et av våre MCP- eller A2A-verktøy, logger vi — separat fra søkeloggen over, per kall — hvilket verktøy som ble brukt, hvilken protokoll (MCP/A2A), responstid, samt den kallende klientens fulle nettleser-/klient-streng (User-Agent) — denne lagres i klartekst, IKKE som hash, i motsetning til sidebesøk-hashen over, slik at vi kan se hvilke AI-klienter som faktisk bruker tjenesten. Vi lagrer også en saltet IP-hash (se «Sikkerhet» under). Denne loggen slettes automatisk etter 60 dager (se «Hvor lenge vi lagrer data»).</p>
     <p>Når du bruker ${brand} via ChatGPT eller Claude, går forespørselen din gjennom denne leverandørens egen infrastruktur (driftet av henholdsvis OpenAI eller Anthropic) før den i det hele tatt når vår server — vi har ingen kontroll over eller innsyn i hvordan de behandler dine data før kallet når oss.</p>
     <p>Verktøyet <code>lokal_geocode</code> (stedsnavn → koordinater) sender søketeksten din videre til Kartverkets offentlige geokodings-API (ws.geonorge.no) for oppslag.</p>
 
@@ -3114,14 +3114,14 @@ router.get("/personvern", (req: Request, res: Response) => {
     <table class="pv-table">
       <thead><tr><th>Datatype</th><th>Oppbevaring</th></tr></thead>
       <tbody>
-        <tr><td>Sidebesøk-analytikk</td><td>Kan slettes via admin. Ingen automatisk utløp er satt per i dag.</td></tr>
-        <tr><td>Søkelogger</td><td>Samme som analytikk.</td></tr>
+        <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med anonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per side, uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
+        <tr><td>Søkelogger</td><td>Enkeltsøk (med anonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per søketekst, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
         <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
         <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
         <tr><td>Selgerprofil</td><td>Så lenge du ønsker å være registrert.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
-        <tr><td>MCP/A2A-verktøykall-logg</td><td>Samme automatiske retensjonsvindu som annen analytikk (60 dager som standard).</td></tr>
+        <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Ingen daglige tall beholdes fra denne loggen.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
       </tbody>

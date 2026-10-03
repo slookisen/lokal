@@ -47,6 +47,7 @@ import {
 import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
+import { isPlausibleNorwayCoord } from "../services/geo-distance";
 
 const router = Router();
 
@@ -409,8 +410,15 @@ export function registerTools(
 
           return sections.join("\n");
         } else {
-          // Compact view for broader searches
-          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
+          // Compact view for broader searches. ChatGPT app re-review
+          // 2026-10-03: a producer kept only for its broad category (`meat`
+          // for "lamb") says so, instead of reading like a documented match.
+          const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
+          const documented = (r.matchReasons as string[] | undefined)?.some((m) => m.startsWith("Produkter:"));
+          const categoryOnlyNote = productTerms.length > 0 && !documented
+            ? `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${productTerms.join("/")}» — spør produsenten. / Category match only: the listed products don't mention «${productTerms.join("/")}»; ask the producer.`
+            : "";
+          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist + categoryOnlyNote;
         }
       });
 
@@ -440,9 +448,9 @@ export function registerTools(
           "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
           "Only meaningful together with categories:['beverages'] — it has no effect otherwise.",
         ),
-        lat: z.number().optional().describe("Latitude for distance filtering"),
-        lng: z.number().optional().describe("Longitude for distance filtering"),
-        maxDistanceKm: z.number().optional().describe("Max distance in km"),
+        lat: z.number().optional().describe("Latitude for distance filtering (WGS84). Must be given together with lng."),
+        lng: z.number().optional().describe("Longitude for distance filtering (WGS84). Must be given together with lat."),
+        maxDistanceKm: z.number().optional().describe("Max distance in km from lat/lng (1–500, default 30). Only applies when lat/lng are given."),
         limit: z.number().min(1).max(50).default(10).describe("Max results"),
       },
       annotations: {
@@ -457,7 +465,28 @@ export function registerTools(
       },
     },
     async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }) => {
-      const body: any = { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
+      // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
+      // passed top-level, but discover() reads `location: {lat, lng}` — so the
+      // distance filter never ran and every call returned a nationwide list
+      // (a 1 km radius around Oslo and a 30 km radius around Rome alike).
+      const hasLat = typeof lat === "number";
+      const hasLng = typeof lng === "number";
+      if (hasLat !== hasLng || (hasLat && !isValidLatLng(lat as number, lng as number))) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Oppgi både `lat` og `lng` som gyldige koordinater, eller ingen av dem. / Supply both `lat` and `lng` as valid coordinates, or neither.",
+          }],
+        };
+      }
+      if (hasLat && !isPlausibleNorwayCoord(lat as number, lng as number)) {
+        return outsideNorwayAnswer(`${lat}, ${lng}`);
+      }
+      const body: any = { categories, tags, drinkSubcategory, limit: limit || 10, role: "producer" };
+      if (hasLat) {
+        body.location = { lat, lng };
+        body.maxDistanceKm = resolveSearchRadiusKm(maxDistanceKm);
+      }
       // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter (round-2
       // independent review of PR #823): this tool accepts `tags` directly and
       // is exposed to the same live ChatGPT app as `lokal_search` — it needs

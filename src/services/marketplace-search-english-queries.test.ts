@@ -367,6 +367,47 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
       ok(ids.includes("te-beverages"), `te2: the beverages-tagged fixture producer IS returned for "te"`);
       ok(!ids.includes("te-fruit-eggs"),
         `te3: the fruit/eggs-only fixture producer (Homme Gård case) is NOT returned for "te"`);
+
+      // ── ChatGPT app re-review 2026-10-03: a producer named outright is
+      // found whatever the spelling or the words around it ("Ostegarden
+      // Bergen" and the whole submission question both missed). ──
+      seedAgent({ id: "nm-ostegarden", name: "Ostegården — Krokeide", categories: ["dairy"] });
+      seedAgent({ id: "nm-lokalhonning", name: "Lokal Honning", categories: ["honey"] });
+      seedAgent({ id: "nm-lofoten", name: "Lofoten Bakeri", categories: ["bread"] });
+      const firstFor = (q: string) => marketplaceRegistry.discover(
+        { ...marketplaceRegistry.parseNaturalQuery(q), limit: 5 } as any).map(r => r.agent.id);
+      for (const q of [
+        "Ostegarden Bergen",
+        "Ostegaarden",
+        "ostegården",
+        "Tell me about Ostegården in Bergen — what do they make and how can I contact them?",
+      ]) {
+        ok(firstFor(q)[0] === "nm-ostegarden", `nm1: "${q}" finds Ostegården — Krokeide first`);
+      }
+      ok(nameQuery("honning Bergen") === undefined,
+        `nm2: a name made only of generic words ("Lokal Honning") never captures "honning Bergen"`);
+      ok(nameQuery("Lofoten bakeri") !== "Lofoten Bakeri",
+        `nm3: "Lofoten bakeri" stays a region + kind search, not a lookup of one producer named that`);
+      ok(!cats("Tell me about Ostegården in Bergen — what do they make and how can I contact them?").includes("meat"),
+        `nm4: English "and" in a filler-only question is not read as Norwegian «and» (duck → meat)`);
+      ok(cats("and Rogaland").includes("meat"), `nm5: Norwegian «and» on its own still selects meat`);
+
+      // ── re-review 2026-10-03: a producer whose product list names the
+      // product ranks above one kept only for the broad category. ──
+      seedAgent({ id: "pm-category-only", name: "Kjøttbutikken Fixture", categories: ["meat"] });
+      seedAgent({ id: "pm-documented", name: "Sauegarden Fixture", categories: ["meat"] });
+      db.prepare("INSERT INTO agent_knowledge (agent_id, products) VALUES (?, ?)").run(
+        "pm-category-only", JSON.stringify([{ name: "Svinekoteletter" }]));
+      db.prepare("INSERT INTO agent_knowledge (agent_id, products) VALUES (?, ?)").run(
+        "pm-documented", JSON.stringify([{ name: "Lammekjøtt" }]));
+      const lamb = marketplaceRegistry.discover(
+        { ...marketplaceRegistry.parseNaturalQuery("lam"), limit: 10 } as any);
+      const lambIds = lamb.map(r => r.agent.id);
+      ok(lambIds.indexOf("pm-documented") >= 0 && lambIds.indexOf("pm-documented") < lambIds.indexOf("pm-category-only"),
+        `pm1: "lam" ranks the producer that lists Lammekjøtt above the meat-only one (got ${JSON.stringify(lambIds)})`);
+      ok(lamb.find(r => r.agent.id === "pm-documented")!.matchReasons.some(m => m.startsWith("Produkter:"))
+        && !lamb.find(r => r.agent.id === "pm-category-only")!.matchReasons.some(m => m.startsWith("Produkter:")),
+        "pm2: only the documented producer carries a «Produkter:» match reason (what lokal_search labels on)");
     }
 
   } finally {

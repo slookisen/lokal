@@ -209,6 +209,21 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
         : /passed to a producer only if you agree to share them/.test(body),
       `/personvern (${lang}): says buyer contact details reach a producer only with consent`
     );
+    // ChatGPT app re-review 2026-10-03: the page said page visits had "no
+    // automatic expiry" while the MCP log "followed the same 60-day window"
+    // as them — contradictory, and both wrong against index.ts's daily
+    // auto-prune (RFB_AUTO_PRUNE_DAYS, default 60), which rolls up and
+    // deletes raw page views, searches and MCP calls.
+    assertTrue(
+      !/Ingen automatisk utløp/.test(body) && !/No automatic expiry/.test(body),
+      `/personvern (${lang}): no longer claims page visits have no automatic expiry`
+    );
+    assertTrue(
+      lang === "no"
+        ? /Enkeltbesøk \(med anonymisert IP-hash\) slettes automatisk etter 60 dager/.test(body)
+        : /Individual page visits \(with the anonymised IP hash\) are deleted automatically after 60 days/.test(body),
+      `/personvern (${lang}): states the 60-day automatic deletion of raw page visits`
+    );
   }
 
   // ── 6. /vilkar: no more "does not process transactions" overclaim ──────

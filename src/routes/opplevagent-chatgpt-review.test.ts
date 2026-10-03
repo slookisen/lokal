@@ -316,6 +316,21 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       const tromso = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { lat: 69.65, lng: 18.95, radius_km: 50 } })).result?.content?.[0]?.text ?? "{}");
       assertTrue(!/only covers/.test(tromso.summary ?? ""), "h4: an origin in Norway (Tromsø) is searched normally");
 
+      // ── (i) re-review 2026-10-03: /personvern promised analytics "for up
+      // to 180 days" and visit requests "as long as needed" — neither is
+      // backed by any deletion job. /vilkar (22 June) still described a pure
+      // discovery layer with no visit requests. Source-level checks: the
+      // legal pages are static strings in experiences-seo.ts. ──
+      const legalSrc = require("fs").readFileSync(require.resolve("./experiences-seo"), "utf8") as string;
+      assertTrue(!/opptil 180 dager/.test(legalSrc) && !/up to 180 days/.test(legalSrc),
+        "i1: /personvern no longer promises a 180-day analytics window no job enforces");
+      assertTrue(/Besøksforespørsler<\/strong> \(navn, e-post, telefon, ønsket tid, antall personer og kommentar\) slettes ikke automatisk i dag/.test(legalSrc)
+        && /Visit requests<\/strong> \(name, email, phone, requested time, party size and note\) are not deleted automatically today/.test(legalSrc),
+        "i2: /personvern states plainly (NO + EN) that visit requests are not auto-deleted and how deletion works");
+      assertTrue(/1a\. Besøksforespørsler til gårdssalg/.test(legalSrc) && /1a\. Farm-sale visit requests/.test(legalSrc)
+        && /ikke<\/strong> en bekreftet booking/.test(legalSrc) && /not<\/strong> a confirmed booking/.test(legalSrc),
+        "i3: /vilkar describes visit requests (NO + EN): forwarded by email, never a confirmed booking");
+
       // ── (b) templates: MIME type, CSP, and the host API they use ──────
       for (const uri of ["ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
         const read = await rpc("resources/read", { uri });

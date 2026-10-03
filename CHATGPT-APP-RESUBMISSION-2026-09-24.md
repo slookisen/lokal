@@ -27,6 +27,32 @@ Det har ikke kommet noen ny avvisning siden 24.09, og ingen av appene er sendt i
 
 Alt er låst med tester: `opplevagent-chatgpt-review.test.ts`, `rfb-chatgpt-annotations.test.ts`, `marketplace-search-english-queries.test.ts` og `rfb-privacy-terms-truth.test.ts`.
 
+## 0b. Etter ChatGPTs uavhengige gjennomgang (03.10.2026, runde 2)
+
+ChatGPT gjennomgikk pakken og fant disse problemene. De er nå rettet i koden:
+
+- **`lokal_discover` ignorerte koordinatene.** En radius på 30 km rundt Roma og 1 km rundt Oslo ga samme landsdekkende liste. Nå brukes lat/lng og radius, halve eller ugyldige koordinater avvises, og koordinater utenfor Norge gir svaret «dekker bare Norge».
+- **Navnesøket feilet ofte.** «Ostegarden Bergen» og hele spørsmålet i testcase 4 fant ikke Ostegården. Nå finnes en produsent som nevnes ved navn, uansett omkringliggende ord og skrivemåte (å/a, ø/o, æ/ae). Engelsk «and» tolkes heller ikke lenger som fuglen «and» (kjøtt).
+- **Produsenter uten produktet rangerte for høyt.** Produsenter der produktlista nevner det som søkes på, kommer nå først. Produsenter som bare er med fordi de har riktig kategori, får merknaden «Kategoritreff: produktlista nevner ikke …».
+- **Personvern for Rett fra Bonden motsa seg selv.** Siden sa både «ingen automatisk utløp» og «60 dager». Nå står det det koden faktisk gjør: rå besøks-, søke- og MCP-logger slettes automatisk etter 60 dager, og bare daglige tall uten kobling til personer beholdes.
+- **Personvern og vilkår for Opplevagent var upresise.**
+  - Påstanden om «opptil 180 dager» hadde ingen dekning i koden og er fjernet.
+  - Siden sier nå rett ut at besøksforespørsler ikke slettes automatisk, og at de slettes innen 30 dager når noen ber om det.
+  - Vilkårene har fått et eget avsnitt om besøksforespørsler.
+- **Innsendingsfila for Rett fra Bonden:**
+  - Testcase 4 bruker bare `lokal_search`.
+  - Forventet resultat beskriver nå rangering og merking av kategoritreff, og påstår ikke at honningen er «rå».
+  - App-beskrivelsen er nedtonet til det som kan dokumenteres.
+
+**Dette må du avgjøre selv (ikke kode):**
+- **Utgiver.** Hvis appene skal sendes inn som agentplatform.no AS, må selskapet være registrert og verifisert hos OpenAI først. Navnet på personvern- og vilkårssidene («Operatør: Daniel Fredriksen») må da også endres. Inntil det er på plass, send inn som privatperson, slik som før. Last ikke opp stiftelsesdokumentet: det inneholder fødselsnummer.
+- **`CART_CONTACT_SWEEP_LIVE`.** Personvernsiden for Rett fra Bonden lover at kjøpers kontaktinfo slettes automatisk etter 30 dager. Sletteknappen står i prøvemodus til denne Fly-hemmeligheten er satt til `true`. Sjekk loggen `[cart-contact-sweep]` og slå den på.
+- **Datafeil i katalogen:**
+  - «Snill Bie — Bømlo» har adresse på Fåberg.
+  - «Myrvold Gård — Huglo» har adresse i Jordet.
+  - «Voll Gård — Stavanger» har Trondheim-adresse.
+  - Det Franske Bakeri, Søtt+Salt Bakeri og Tresselts Birøkt er feilmerket med meieri.
+
 ## 1. Hvorfor appene ble avvist
 
 ### Rett fra Bonden: annotasjonene stemte ikke med oppførselen

@@ -233,6 +233,27 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
       assertTrue(!/tag-filtrene|tag filters/i.test(txt),
         "lokal_discover(tags): no tags-dropped note when no tags were requested");
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // ChatGPT app re-review 2026-10-03: lokal_discover's lat/lng/maxDistanceKm
+    // were passed to discover() top-level, but discover() reads `location` —
+    // the distance filter never ran and every call was nationwide.
+    // ══════════════════════════════════════════════════════════════
+    {
+      const disc = tools.get("lokal_discover")!;
+      const near = textOf(await disc.handler({ ...LYNGDAL, maxDistanceKm: 5, limit: 10 }));
+      assertTrue(/Lyngdal Gårdsmat/.test(near) && !/Mandal Honning/.test(near) && !/Tromsø Sjømat/.test(near),
+        `lokal_discover(geo): a 5 km radius around Lyngdal returns only the Lyngdal producer (got ${near.slice(0, 200)})`);
+      const wider = textOf(await disc.handler({ ...LYNGDAL, maxDistanceKm: 50, limit: 10 }));
+      assertTrue(/Lyngdal Gårdsmat/.test(wider) && /Mandal Honning/.test(wider) && !/Tromsø Sjømat/.test(wider),
+        "lokal_discover(geo): widening the radius to 50 km adds Mandal (≈25 km) but never Tromsø");
+      assertTrue(/\(\d+\.\d km\)/.test(wider), "lokal_discover(geo): results carry a real distance");
+      const rome = textOf(await disc.handler({ lat: 41.9028, lng: 12.4964, maxDistanceKm: 30, limit: 10 }));
+      assertTrue(/only covers small-scale food producers in Norway/.test(rome) && !/Lyngdal|Mandal|Tromsø Sjømat/.test(rome),
+        "lokal_discover(geo): coordinates in Rome get 'only covers Norway', not a Norwegian list");
+      const half = textOf(await disc.handler({ lat: 58.1, limit: 10 }));
+      assertTrue(/both `lat` and `lng`/.test(half), "lokal_discover(geo): lat without lng is rejected with a clear message");
+    }
   } finally {
     console.log = prevLog;
     __setGeocodingFetchForTesting();

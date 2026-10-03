@@ -493,6 +493,16 @@ class MarketplaceRegistry {
     // Sort by relevance (NOT popularity, NOT ad spend)
     results.sort((a, b) => b.relevanceScore - a.relevanceScore);
 
+    // ChatGPT app re-review 2026-10-03: a product search ("lamb Innlandet")
+    // also keeps producers that only carry the broad category (`meat`) with
+    // nothing about lamb in their product list. Those are possible matches,
+    // not documented ones, so every producer whose product list does name
+    // the product now ranks above them; relevance still orders each group.
+    if (productTerms && productTerms.length > 0) {
+      const documented = (r: DiscoveryResult) => (productMatchMap.has(r.agent.id) ? 1 : 0);
+      results.sort((a, b) => documented(b) - documented(a));
+    }
+
     return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
   }
 
@@ -807,7 +817,12 @@ class MarketplaceRegistry {
     // it never fires this guard on itself, so no duck→and reverse mapping
     // is ever built. English "duck" queries not selecting `meat` remains a
     // known, separate gap this fix does not close.
-    const suppressEnglishConjunction = englishTerms.length > 0;
+    // ChatGPT app re-review 2026-10-03: a whole English question with no food
+    // word in it ("what do they make and how can I contact them?") still
+    // turned «and» into `meat`. Two or more English filler words now mark the
+    // query as English too.
+    const englishFillerCount = q.split(/[^a-zæøå]+/).filter((w) => w !== "and" && ENGLISH_SKIP_WORDS.includes(w)).length;
+    const suppressEnglishConjunction = englishTerms.length > 0 || englishFillerCount >= 2;
     for (const [category, keywords] of Object.entries(categoryMap)) {
       for (const kw of keywords) {
         if (kw === "and" && suppressEnglishConjunction) continue;
@@ -901,6 +916,23 @@ class MarketplaceRegistry {
     const nameIndicators = ["gård", "gard", "farm", "mat", "ysteri", "bakeri", "bryggeri",
       "marked", "butikk", "kooperativ", "meieri", "slakteri", "gardsmat", "gardsutsalg"];
     const queryWords = query.split(/\s+/);
+
+    // Pass 0 (ChatGPT app re-review 2026-10-03): the query names a producer
+    // outright. Pass 1/2 below work word by word, so a whole question ("Tell
+    // me about Ostegården in Bergen — what do they make and how can I contact
+    // them?") built a name query out of every filler word and missed, and an
+    // ASCII spelling ("Ostegarden") matched nothing at all. Here the folded
+    // query (å→a, ø→o, æ→ae, case and punctuation ignored) is searched for
+    // each producer's own name, as a whole-word sequence; a hit becomes the
+    // name query in the producer's real spelling.
+    const explicitNames = findExplicitProducerNames(query, (w) =>
+      skipWords.has(w) || KNOWN_PLACE_WORDS.has(w) || GENERIC_NAME_WORDS.has(w)
+      || isCategoryOrTagWord(w, categoryMap, tagMap) || isEnglishFoodWord(w));
+    if (explicitNames.length > 0) {
+      (parsed as any)._nameQuery = explicitNames[0];
+      parsed.role = "producer";
+      return parsed;
+    }
     const indicatorIndex = queryWords.findIndex(w =>
       nameIndicators.some(ind => w.toLowerCase().replace(/[.,!?]/g, "") === ind ||
         w.toLowerCase().replace(/[.,!?]/g, "").endsWith(ind))
@@ -2269,6 +2301,72 @@ const ENGLISH_SKIP_WORDS = [
   "producer", "producers", "farm", "farms", "farmer", "farmers", "shop",
   "shops", "store", "stores", "local", "raw", "fresh", "good", "best",
 ];
+
+/** Words that make up a producer name without identifying one ("Lokal Honning"). */
+const GENERIC_NAME_WORDS = new Set([
+  "mat", "sjømat", "kjøtt", "fisk", "bakeri", "bryggeri", "ysteri", "meieri", "marked",
+  "butikk", "gård", "gard", "gården", "farm", "kooperativ", "slakteri", "gardsmat",
+  "gardsutsalg", "gårdsutsalg", "gårdsbutikk", "frukt", "bær", "honning", "egg", "melk",
+  "ost", "brød", "korn", "grønt", "grønnsaker", "lokalmat", "lokal", "økologisk", "as", "sa",
+  "og", "the",
+  // definite forms and drink-venue kinds ("Gardsutsalget", "Hardanger Cideri")
+  "gardsutsalget", "gårdsutsalget", "gårdsbutikken", "gardsbutikken", "bakeriet", "bryggeriet",
+  "meieriet", "ysteriet", "slakteriet", "markedet", "cideri", "sideri", "brenneri",
+  "destilleri", "vingård", "vingard", "mjøderi", "brygg", "handbryggeri",
+  // regions that lead many producer names ("Lofoten Bakeri") — a query naming
+  // the region and the kind is a category search, not a lookup of that one name
+  "lofoten", "vesterålen", "hardanger", "valdres", "senja", "jæren", "toten", "setesdal",
+  "helgeland", "hadeland", "romerike", "voss", "røros", "sunnmøre", "nordmøre",
+  "gudbrandsdalen", "inderøy", "sogn",
+]);
+
+/**
+ * Fold a name or query for spelling-tolerant comparison: lower case,
+ * å/aa→a, ø→o, æ→ae, accents stripped, everything that is not a letter or
+ * digit collapsed to single spaces.
+ */
+export function foldProducerName(s: string): string {
+  return ` ${String(s ?? "")
+    .toLocaleLowerCase("nb-NO")
+    .replace(/å/g, "a").replace(/aa/g, "a").replace(/ø/g, "o").replace(/æ/g, "ae")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()} `;
+}
+
+/**
+ * Producer names (their own spelling, the part before " — ") that occur in
+ * `query` as a whole-word sequence after folding, longest first. A name made
+ * only of words `isGenericWord` accepts (categories, places, filler) is never
+ * matched, so "Lokal Honning" cannot capture the query "honning".
+ */
+export function findExplicitProducerNames(query: string, isGenericWord: (w: string) => boolean): string[] {
+  const foldedQuery = foldProducerName(query);
+  if (foldedQuery.trim().length < 4) return [];
+  // A matching name has at least one non-generic word, and that word is in
+  // the query — so a query of only generic words ("poteter Bodø") cannot
+  // name a producer and needs no DB read.
+  const queryWords = String(query).toLocaleLowerCase("nb-NO").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (queryWords.every((w) => isGenericWord(w))) return [];
+  let rows: Array<{ name: string | null }>;
+  try {
+    rows = getDb()
+      .prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1")
+      .all() as Array<{ name: string | null }>;
+  } catch {
+    return []; // the lookup is an optimisation; the word-by-word passes still run
+  }
+  const hits = new Map<string, number>();
+  for (const { name } of rows) {
+    const core = String(name ?? "").split(/\s+[—–-]\s+/)[0].trim();
+    const folded = foldProducerName(core);
+    if (folded.trim().length < 5) continue;
+    const words = core.toLocaleLowerCase("nb-NO").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    if (words.every((w) => isGenericWord(w))) continue;
+    if (foldedQuery.includes(folded)) hits.set(core, folded.length);
+  }
+  return [...hits.entries()].sort((a, b) => b[1] - a[1]).map(([core]) => core);
+}
 
 /** Is `w` one of the food-category / tag keywords the parser already matched? */
 function isCategoryOrTagWord(
