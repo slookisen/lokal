@@ -45769,7 +45769,7 @@ runSerial(async () => {
   try {
     const { runRfbChatgptAnnotationsTests } = require("../src/routes/rfb-chatgpt-annotations.test") as
       typeof import("../src/routes/rfb-chatgpt-annotations.test");
-    const rca = runRfbChatgptAnnotationsTests({ log: false });
+    const rca = await runRfbChatgptAnnotationsTests({ log: false });
     passed += rca.passed;
     failed += rca.failed;
     for (const f of rca.failures) failures.push("rfb-chatgpt-annotations: " + f);

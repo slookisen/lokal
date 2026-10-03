@@ -17,7 +17,8 @@
  *   - every hint must be an explicit boolean.
  *
  * Harness mirrors mcp-find-offers.test.ts: registerTools() exercised through
- * a duck-typed server — annotations only, no DB needed.
+ * a duck-typed server — annotations, plus the outside-Norway answer that
+ * returns before any DB lookup.
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/rfb-chatgpt-annotations.test.ts
@@ -54,7 +55,7 @@ export const RFB_EXPECTED_ANNOTATIONS: Record<string, Hints> = {
   lokal_order_status: READ_CLOSED,
 };
 
-export function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}): TestSummary {
+export async function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
   let failed = 0;
@@ -86,8 +87,9 @@ export function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}): Tes
   try {
     const { registerTools } = require("./mcp") as typeof import("./mcp");
     const tools = new Map<string, any>();
+    const handlers = new Map<string, (args: any) => Promise<any>>();
     const fakeServer: any = {
-      registerTool(name: string, config: any) { tools.set(name, config); },
+      registerTool(name: string, config: any, handler: any) { tools.set(name, config); handlers.set(name, handler); },
       resource() { /* no-op */ },
       prompt() { /* no-op */ },
       registerResource() { /* no-op */ },
@@ -129,6 +131,25 @@ export function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}): Tes
     // Kartverket; if that dependency ever goes, the hint should be revisited.
     const geo = require("fs").readFileSync(require.resolve("../services/geocoding-service"), "utf8") as string;
     assertTrue(/ws\.geonorge\.no\/stedsnavn/.test(geo), "a4: geocodingService still calls Kartverket's public API (the reason for openWorldHint:true)");
+
+    // ── Negative test case "pizza restaurant in Rome" (re-review
+    // 2026-10-03): a place outside Norway is answered as such before any
+    // DB lookup, so "Rome" can no longer substring-match Romeriksmat. ──
+    const { foreignPlaceIn } = require("../services/outside-norway") as typeof import("../services/outside-norway");
+    assertEq(foreignPlaceIn("Find me a good pizza restaurant in Rome"), "rome", "n1: 'Rome' is recognised as outside Norway");
+    assertEq(foreignPlaceIn("safari lodge in Kenya"), "kenya", "n2: 'Kenya' is recognised as outside Norway");
+    for (const q of ["ost Bergen", "Romerike", "Romsdal lam", "india pale ale", "brussels sprouts", "hamburger Oslo", "wienerbrød Trondheim", "roma tomatoes", "reindeer meat Finnmark"]) {
+      assertEq(foreignPlaceIn(q), null, `n3: '${q}' is not mistaken for a place outside Norway`);
+    }
+    {
+      const r = await handlers.get("lokal_search")!({ query: "pizza restaurant Rome", limit: 10 });
+      const text = r?.content?.[0]?.text ?? "";
+      assertTrue(/only covers small-scale food producers in Norway/.test(text) && !/Romeriksmat/.test(text),
+        "n4: lokal_search 'pizza restaurant Rome' says it only covers Norway and lists no producer");
+      const offers = await handlers.get("lokal_find_offers")!({ items: ["pizza"], near: "Rome" });
+      assertTrue(/only covers small-scale food producers in Norway/.test(offers?.content?.[0]?.text ?? ""),
+        "n5: lokal_find_offers near 'Rome' gets the same answer");
+    }
   } catch (err: any) {
     failed++;
     failures.push("rfb-chatgpt-annotations: unexpected error: " + String(err?.stack || err?.message || err));
@@ -139,8 +160,9 @@ export function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}): Tes
 
 // Standalone runner: `npx tsx src/routes/rfb-chatgpt-annotations.test.ts`
 if (require.main === module) {
-  const summary = runRfbChatgptAnnotationsTests({ log: true });
-  console.log(`\n${summary.passed} passed, ${summary.failed} failed`);
-  for (const f of summary.failures) console.log(f);
-  process.exit(summary.failed > 0 ? 1 : 0);
+  runRfbChatgptAnnotationsTests({ log: true }).then((summary) => {
+    console.log(`\n${summary.passed} passed, ${summary.failed} failed`);
+    for (const f of summary.failures) console.log(f);
+    process.exit(summary.failed > 0 ? 1 : 0);
+  });
 }

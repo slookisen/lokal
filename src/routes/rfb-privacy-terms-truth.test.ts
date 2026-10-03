@@ -198,8 +198,16 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
       `/personvern (${lang}): no longer shows the stale 16 April 2026 "last updated" date`
     );
     assertTrue(
-      lang === "no" ? /Sist oppdatert: 24\. september 2026/.test(body) : /Last updated: 24 September 2026/.test(body),
+      lang === "no" ? /Sist oppdatert: 3\. oktober 2026/.test(body) : /Last updated: 3 October 2026/.test(body),
       `/personvern (${lang}): "last updated" date reflects this change`
+    );
+    // ChatGPT app re-review 2026-10-03: lokal_cart_submit takes optional
+    // buyer contact fields that reach a producer only with contact_consent.
+    assertTrue(
+      lang === "no"
+        ? /sendes videre til en produsent bare hvis du samtykker/.test(body)
+        : /passed to a producer only if you agree to share them/.test(body),
+      `/personvern (${lang}): says buyer contact details reach a producer only with consent`
     );
   }
 

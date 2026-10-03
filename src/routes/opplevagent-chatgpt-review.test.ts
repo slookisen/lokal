@@ -172,6 +172,14 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       expStore.createExperience({ ...base, title: "Rorbu hele året", category: "overnatting_opplevelse", season: ["all_year"] });
       expStore.createExperience({ ...base, title: "Midnattssol-kajakk", category: "natur_friluft", season: ["summer"] });
 
+      const insertGardssalg = dbFactory.getDb("experiences").prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, fylke, kommune, poststed, producer_type, slug, enrichment_state, verification_status, source, confidence)
+         VALUES (@id, @navn, 'experiences', @fylke, @kommune, @poststed, @producer_type, @slug, 'raw', 'pending_verify', 'test-fixture', 'medium')`
+      );
+      insertGardssalg.run({ id: "gs-fjell", navn: "Fjellbryggeriet", fylke: "Vestland", kommune: "Bergen", poststed: "Bergen", producer_type: "bryggeri", slug: "fjellbryggeriet" });
+      insertGardssalg.run({ id: "gs-ostlandet", navn: "Østlandssideri", fylke: "Innlandet", kommune: "Ringsaker", poststed: "Brumunddal", producer_type: "cideri", slug: "ostlandssideri" });
+
       const titlesFor = (filter: Record<string, unknown>) =>
         expStore.discoverExperiences(filter as any, 50).map((e) => e.title).sort();
 
@@ -267,6 +275,46 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       assertEq((byAliasText.experiences ?? []).map((e: any) => e.title), ["Hundekjøring"], "d2: … and returns only the vinter_sno row, not a relaxed list");
       assertEq(mcpModule.normalizeExperienceCategory("dyreliv_safari"), "dyreliv_safari", "d3: a real slug passes through unchanged");
       assertEq(mcpModule.normalizeExperienceCategory("Wildlife"), "dyreliv_safari", "d4: an English plain word maps to its slug");
+
+      // ── (f) re-review 2026-10-03: the label a model shows the user, or an
+      // invented slug, maps to the real slug instead of being relaxed away.
+      assertEq(mcpModule.normalizeExperienceCategory("wildlife & safari"), "dyreliv_safari", "f1: the English label 'wildlife & safari' maps to dyreliv_safari");
+      assertEq(mcpModule.normalizeExperienceCategory("wildlife_safari"), "dyreliv_safari", "f2: an invented slug 'wildlife_safari' maps to dyreliv_safari");
+      assertEq(mcpModule.normalizeExperienceCategory("Food and drink"), "mat_drikke", "f3: 'Food and drink' maps to mat_drikke");
+      assertEq(mcpModule.normalizeExperienceCategory("Sightseeing & transport"), "sightseeing_transport", "f4: 'Sightseeing & transport' maps to sightseeing_transport");
+      const unknownCat = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { fylke: "Troms", category: "karaoke" } })).result?.content?.[0]?.text ?? "{}");
+      assertEq(unknownCat.count, 0, "f5: an unknown category returns no experiences instead of a relaxed all-category list");
+      assertTrue(/Unknown category "karaoke"/.test(unknownCat.summary ?? "") && (unknownCat.valid_categories ?? []).includes("vinter_sno"),
+        "f6: … and names the valid category slugs so the model can retry");
+      const gsCat = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { category: "gårdssalg" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(gsCat.count === 0 && /discover_gardssalg/.test(gsCat.summary ?? ""), "f7: the gårdssalg category points at discover_gardssalg");
+      const lowerKommune = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { kommune: "tromsø", season: "winter" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(lowerKommune.count === 3 && !lowerKommune.relaxed_filters, "f8: kommune 'tromsø' (lower case) matches 'Tromsø' without relaxing the filter");
+
+      // ── (g) discover_gardssalg: the caller's county spelling ─────────────
+      const gsNames = async (args: Record<string, unknown>) => {
+        const r = await rpc("tools/call", { name: "discover_gardssalg", arguments: args });
+        return (JSON.parse(r.result?.content?.[0]?.text ?? "{}").gardssalg_producers ?? []).map((p: any) => p.navn).sort();
+      };
+      assertEq(await gsNames({ fylke: "Vestland" }), ["Fjellbryggeriet"], "g1: fylke 'Vestland' returns the Vestland producer only");
+      assertEq(await gsNames({ fylke: "vestland" }), ["Fjellbryggeriet"], "g2: fylke 'vestland' (lower case) matches too");
+      assertEq(await gsNames({ fylke: "Hordaland" }), ["Fjellbryggeriet"], "g3: the pre-2020 county 'Hordaland' maps to Vestland");
+      assertEq(await gsNames({ kommune: "bergen" }), ["Fjellbryggeriet"], "g4: kommune 'bergen' (lower case) matches 'Bergen'");
+      assertEq(await gsNames({ query: "gårdssalg Vestland" }), ["Fjellbryggeriet"], "g5: query 'gårdssalg Vestland' becomes a Vestland county filter, not zero hits");
+      assertEq(await gsNames({ query: "Fjellbryggeriet" }), ["Fjellbryggeriet"], "g6: a producer-name query still works");
+      assertEq(mcpModule.splitGardssalgQuery("lokale drikkeprodusenter i Vestland"), { q: "", fylke: "Vestland" }, "g7: generic words are dropped and the county is lifted out");
+      assertEq(mcpModule.splitGardssalgQuery("bryggeri Bergen"), { q: "bryggeri Bergen" }, "g8: a kommune is not mistaken for a county");
+
+      // ── (h) negative test case "safari lodge in Kenya": a place outside
+      // Norway is answered as such, never relaxed into Norwegian results ──
+      const kenya = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { fylke: "Kenya", category: "safari" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(kenya.count === 0 && (kenya.experiences ?? []).length === 0 && /only covers experiences and farm-sale producers in Norway/.test(kenya.summary ?? ""),
+        "h1: fylke 'Kenya' returns no experiences and says Opplevagent only covers Norway");
+      const nairobi = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { lat: -1.29, lng: 36.82, radius_km: 100 } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(nairobi.count === 0 && !nairobi.relaxed_filters, "h2: an origin outside Norway (Nairobi) is not relaxed into a Norwegian list");
+      assertEq(await gsNames({ query: "Kenya" }), [], "h3: discover_gardssalg query 'Kenya' returns no producers");
+      const tromso = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { lat: 69.65, lng: 18.95, radius_km: 50 } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(!/only covers/.test(tromso.summary ?? ""), "h4: an origin in Norway (Tromsø) is searched normally");
 
       // ── (b) templates: MIME type, CSP, and the host API they use ──────
       for (const uri of ["ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {

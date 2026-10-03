@@ -741,6 +741,11 @@ class MarketplaceRegistry {
         "kjøtt", "meat", "lam", "lammekjøtt", "svin", "svinekjøtt", "storfe",
         "storfekjøtt", "kylling", "and", "vilt", "elg", "hjort", "rein",
         "reinsdyr", "pølser", "spekemat", "fenalår", "ribbe", "pinnekjøtt",
+        // ChatGPT app re-review 2026-10-03: compounds are matched as whole
+        // words, so «reinsdyrkjøtt Finnmark» found neither «rein» nor
+        // «kjøtt» and fell back to every producer in Finnmark (a brewery and
+        // a bakery first).
+        "reinsdyrkjøtt", "reinkjøtt", "elgkjøtt", "hjortekjøtt", "viltkjøtt",
       ],
       "fish": [
         "fisk", "fish", "sjømat", "laks", "torsk", "reker", "krabbe", "blåskjell",

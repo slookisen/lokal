@@ -2943,7 +2943,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>${brand} supports the A2A protocol (agent-to-agent). When an AI agent contacts a producer agent, the conversation text, status and any transaction info are stored in the database.</p>
 
     <h3>Shopping cart, orders and buyer token</h3>
-    <p>When you create a shopping cart (via the website or the MCP tools <code>lokal_cart_create</code> etc.) we store the cart's contents (chosen products and producers) and a capability token (buyer_ref) needed to manage it further — a cart is valid for 7 days. If you provide contact details when ordering (name, email, phone, delivery note), that is kept until the order is finally resolved (completed/declined/cancelled), then deleted automatically 30 days after that (or 30 days after submission if no real order was created). Orders carry no payment — we never charge a card — and are sent to the relevant producer; producers who opted in to order notifications get an email about the order.</p>
+    <p>When you create a shopping cart (via the website or the MCP tools <code>lokal_cart_create</code> etc.) we store the cart's contents (chosen products and producers) and a capability token (buyer_ref) needed to manage it further — a cart is valid for 7 days. If you provide contact details when ordering (name, email, phone, delivery note), that is kept until the order is finally resolved (completed/declined/cancelled), then deleted automatically 30 days after that (or 30 days after submission if no real order was created). Your contact details are passed to a producer only if you agree to share them when you submit the order; otherwise no producer sees them. Orders carry no payment — we never charge a card. An order is sent by email only to producers who have verified their listing and opted in to receiving orders through the platform; for any other producer in the cart you get their public contact details and get in touch yourself.</p>
 
     <h2>What we do not collect</h2>
     <ul>
@@ -3017,7 +3017,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Changes to this policy</h2>
     <p>If we change how we handle data, we update this page. We have no newsletter or popup notifications \u2014 check this page if you're wondering.</p>
 
-    <p class="pv-updated">Last updated: 24 September 2026</p>
+    <p class="pv-updated">Last updated: 3 October 2026</p>
   </section>` : `
   <section class="pv-hero">
     <h1>Personvern</h1>
@@ -3077,7 +3077,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>${brand} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
 
     <h3>Handlekurv, bestilling og kjøpertoken</h3>
-    <p>Når du oppretter en handlekurv (via nettsiden eller MCP-verktøyene <code>lokal_cart_create</code> m.fl.) lagrer vi kurvens innhold (valgte produkter og produsenter) og et kapabilitetstoken (buyer_ref) som kreves for å styre kurven videre — en kurv er gyldig i 7 dager. Hvis du oppgir kontaktinfo ved bestilling (navn, e-post, telefon, leveringsmerknad), beholdes dette til bestillingen er endelig avgjort (levert/avvist/kansellert), og slettes deretter automatisk 30 dager senere (eller 30 dager etter innsending, hvis ingen faktisk bestilling ble opprettet). Bestillinger innebærer ingen betaling — vi belaster aldri kort — og sendes til den aktuelle produsenten; produsenter som har takket ja til ordrevarsling får e-post om bestillingen.</p>
+    <p>Når du oppretter en handlekurv (via nettsiden eller MCP-verktøyene <code>lokal_cart_create</code> m.fl.) lagrer vi kurvens innhold (valgte produkter og produsenter) og et kapabilitetstoken (buyer_ref) som kreves for å styre kurven videre — en kurv er gyldig i 7 dager. Hvis du oppgir kontaktinfo ved bestilling (navn, e-post, telefon, leveringsmerknad), beholdes dette til bestillingen er endelig avgjort (levert/avvist/kansellert), og slettes deretter automatisk 30 dager senere (eller 30 dager etter innsending, hvis ingen faktisk bestilling ble opprettet). Kontaktinfoen din sendes videre til en produsent bare hvis du samtykker til det når du sender bestillingen; ellers ser ingen produsent den. Bestillinger innebærer ingen betaling — vi belaster aldri kort. En bestilling sendes på e-post bare til produsenter som har verifisert profilen sin og takket ja til å motta bestillinger via plattformen; for øvrige produsenter i kurven får du deres offentlige kontaktinfo og tar kontakt selv.</p>
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
@@ -3152,7 +3152,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Endringer i denne policyen</h2>
     <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
 
-    <p class="pv-updated">Sist oppdatert: 24. september 2026</p>
+    <p class="pv-updated">Sist oppdatert: 3. oktober 2026</p>
   </section>`;
 
   res.send(shell(

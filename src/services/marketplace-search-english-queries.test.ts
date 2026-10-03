@@ -125,6 +125,10 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
     parity("potatoes Bodø", "poteter Bodø", "vegetables");
     parity("goat cheese farm", "geitost gård", "dairy");
     parity("pork sausages", "svin Rogaland", "meat");
+    // ChatGPT app re-review 2026-10-03 (submission test case 1): the common
+    // game-meat compounds are keywords in their own right.
+    parity("reindeer meat Finnmark", "reinsdyrkjøtt Finnmark", "meat");
+    ok(cats("reinkjøtt Finnmark").includes("meat"), `NO "reinkjøtt Finnmark" → meat`);
     // NB: the Norwegian twin is «svin», not «svinepølser». Category keywords are
     // matched on a word boundary, so a Norwegian COMPOUND ("svinepølser",
     // "geitostkake") selects no category — a real, pre-existing bug of the same
