@@ -2343,9 +2343,19 @@ export function foldProducerName(s: string): string {
 export function findExplicitProducerNames(query: string, isGenericWord: (w: string) => boolean): string[] {
   const foldedQuery = foldProducerName(query);
   if (foldedQuery.trim().length < 4) return [];
-  const rows = getDb()
-    .prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1")
-    .all() as Array<{ name: string | null }>;
+  // A matching name has at least one non-generic word, and that word is in
+  // the query — so a query of only generic words ("poteter Bodø") cannot
+  // name a producer and needs no DB read.
+  const queryWords = String(query).toLocaleLowerCase("nb-NO").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (queryWords.every((w) => isGenericWord(w))) return [];
+  let rows: Array<{ name: string | null }>;
+  try {
+    rows = getDb()
+      .prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1")
+      .all() as Array<{ name: string | null }>;
+  } catch {
+    return []; // the lookup is an optimisation; the word-by-word passes still run
+  }
   const hits = new Map<string, number>();
   for (const { name } of rows) {
     const core = String(name ?? "").split(/\s+[—–-]\s+/)[0].trim();
