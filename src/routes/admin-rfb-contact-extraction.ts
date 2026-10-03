@@ -105,7 +105,7 @@ import {
 // reused here rather than reinvented.
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
-import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
+import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS, MAX_RETRY_AFTER_WAIT_MS } from "../services/fetch-page";
 import { hostFromUrlLike, FREE_MAIL_DOMAINS } from "../services/cross-source-validator";
 // dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email (mode
 // "backfill_from_contact_email", below): the domain-coherence rule to mirror
@@ -357,22 +357,55 @@ function backfillEmailOwnDomain(email: string, website: string): boolean {
 // lowering the bar.
 export const RFB_CX_BACKFILL_MAX_SUBPAGES = 3;
 
+// Per-call row cap for backfill mode, derived so the worst case stays under
+// the run-lock ceiling (RFB_CX_LOCK_MAX_MS_DEFAULT, 15 min) — otherwise a
+// slow run could outlive its lock and a second call could take it over
+// mid-run. Worst case per fetchPage call: 2 attempts x DEFAULT_FETCH_TIMEOUT_MS
+// (10 s) + one Retry-After wait (MAX_RETRY_AFTER_WAIT_MS, 5 s) = 25 s; per row
+// (1 front + RFB_CX_BACKFILL_MAX_SUBPAGES) fetches + the row delay ≈ 100 s;
+// floor(900 s / 100.25 s) = 8 rows. (If RFB_CX_LOCK_MAX_MS is set lower via
+// env, the cap is not recomputed — the default ceiling is the design point.)
+export const RFB_CX_BACKFILL_WORST_CASE_ROW_MS =
+  (1 + RFB_CX_BACKFILL_MAX_SUBPAGES) * (2 * DEFAULT_FETCH_TIMEOUT_MS + MAX_RETRY_AFTER_WAIT_MS) + RFB_CX_ROW_DELAY_MS;
+export const RFB_CX_BACKFILL_HARD_CAP = Math.max(
+  1,
+  Math.floor(RFB_CX_LOCK_MAX_MS_DEFAULT / RFB_CX_BACKFILL_WORST_CASE_ROW_MS),
+);
+
 const EMAIL_TOKEN_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+/**
+ * Strip everything a visitor never sees BEFORE looking for the address:
+ * HTML comments (an unterminated one runs to end of document), and the
+ * full contents of <script>, <style>, <template> and <noscript>. A
+ * commented-out old mailto, or one inside a JS string, is not proof.
+ * Pure — exported for tests.
+ */
+export function stripInvisibleHtml(html: string): string {
+  return (html || "")
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
+    .replace(/<(script|style|template|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, " ");
+}
 
 /**
  * Does `email` literally appear on this page — as a mailto: href or in the
  * visible text — case-insensitively? Whole-address token equality (an
  * address embedded in a longer one, e.g. "xpost@a.no" or "post@a.no.evil",
- * does NOT count). Script/style content is excluded (gardssalgPageText), so
- * only what the site actually shows a visitor counts as proof.
+ * does NOT count). Comments and script/style/template/noscript content are
+ * stripped first (stripInvisibleHtml), and the mailto scan only accepts a
+ * real `href` attribute (whitespace before it — so `data-href="mailto:…"`
+ * does not count). In the text path gardssalgPageText replaces every tag and
+ * entity with a space, which is outside the local-part character class, so
+ * tag removal can never glue two fragments into one address.
  * Pure — exported for tests.
  */
 export function emailSeenOnPage(html: string, email: string): "mailto" | "text" | null {
   const want = (email || "").trim().toLowerCase();
   if (!want || !html) return null;
-  const mailtoRe = /href\s*=\s*["']\s*mailto:([^"'?]+)/gi;
+  const visible = stripInvisibleHtml(html);
+  const mailtoRe = /\shref\s*=\s*["']\s*mailto:([^"'?]+)/gi;
   let m: RegExpExecArray | null;
-  while ((m = mailtoRe.exec(html)) !== null) {
+  while ((m = mailtoRe.exec(visible)) !== null) {
     let raw = m[1] || "";
     try {
       raw = decodeURIComponent(raw);
@@ -383,7 +416,7 @@ export function emailSeenOnPage(html: string, email: string): "mailto" | "text" 
       if (part.trim().toLowerCase() === want) return "mailto";
     }
   }
-  const text = gardssalgPageText(html);
+  const text = gardssalgPageText(visible);
   const tokens = text.match(EMAIL_TOKEN_RE) || [];
   for (const tok of tokens) {
     if (tok.toLowerCase() === want) return "text";
@@ -396,7 +429,7 @@ type BackfillSiteProof =
   | { kind: "not_found"; pagesChecked: string[] }
   | { kind: "host_excluded"; detail: string }
   | { kind: "cooldown_skipped"; host: string }
-  | { kind: "fetch_failed" };
+  | { kind: "fetch_failed"; detail?: string };
 
 /**
  * Fetches the producer's own front page (and, if needed, up to
@@ -418,7 +451,18 @@ async function findEmailOnOwnSite(website: string, email: string): Promise<Backf
   const frontVia = emailSeenOnPage(front.html, email);
   if (frontVia) return { kind: "found", url: front.finalUrl, via: frontVia, pagesChecked };
 
-  for (const sub of gardssalgContactPageLinks(front.html, finalHost, RFB_CX_BACKFILL_MAX_SUBPAGES)) {
+  // Resolve relative links against the REAL final hostname (www kept):
+  // hostFromUrlLike strips "www.", and gardssalgContactPageLinks builds
+  // absolute URLs as https://<baseHost>, so a www-only site would otherwise
+  // get its contact pages requested on the apex host.
+  let linkHost = finalHost;
+  try {
+    linkHost = new URL(front.finalUrl).hostname || finalHost;
+  } catch {
+    /* keep finalHost */
+  }
+  const subLinks = gardssalgContactPageLinks(front.html, linkHost, RFB_CX_BACKFILL_MAX_SUBPAGES);
+  for (const sub of subLinks) {
     const subOutcome = await rfbCxFetchPage(sub);
     if (subOutcome.kind !== "ok") continue;
     // A subpage that redirects off-host is not the producer's own page.
@@ -427,6 +471,13 @@ async function findEmailOnOwnSite(website: string, email: string): Promise<Backf
     pagesChecked.push(subOutcome.finalUrl);
     const via = emailSeenOnPage(subOutcome.html, email);
     if (via) return { kind: "found", url: subOutcome.finalUrl, via, pagesChecked };
+  }
+  // The site linked contact pages but NONE of them could be read (failed,
+  // cooled down, or redirected off-host): we never saw the pages where the
+  // address would most likely be, so this is "could not check", not "not on
+  // site". Nothing is written either way.
+  if (subLinks.length > 0 && pagesChecked.length === 1) {
+    return { kind: "fetch_failed", detail: "contact_subpages_unavailable" };
   }
   return { kind: "not_found", pagesChecked };
 }
@@ -661,8 +712,9 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
       const ids = (body.agentIds as unknown[])
         .filter((v): v is string => typeof v === "string" && v.trim() !== "")
         .map((v) => v.trim());
-      if (ids.length > RFB_CX_HARD_CAP) {
-        res.status(400).json({ error: `Too many agentIds (max ${RFB_CX_HARD_CAP} per call)` });
+      const idCap = isBackfillMode ? RFB_CX_BACKFILL_HARD_CAP : RFB_CX_HARD_CAP;
+      if (ids.length > idCap) {
+        res.status(400).json({ error: `Too many agentIds (max ${idCap} per call${isBackfillMode ? " in backfill_from_contact_email mode" : ""})` });
         return;
       }
       targets = isBackfillMode ? selectRfbCxBackfillTargetsByIds(db, ids) : selectRfbCxTargetsByIds(db, ids);
@@ -673,7 +725,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
     } else {
       const limit = Math.min(
         typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_CX_DEFAULT_LIMIT,
-        RFB_CX_HARD_CAP,
+        isBackfillMode ? RFB_CX_BACKFILL_HARD_CAP : RFB_CX_HARD_CAP,
       );
       targets = isBackfillMode ? selectRfbCxBackfillTargets(db, limit) : selectRfbCxTargets(db, limit);
     }
@@ -733,7 +785,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
           continue;
         }
         if (proof.kind === "fetch_failed") {
-          results.push({ agent_id: t.id, agent_name: t.name, outcome: "fetch_failed", email: contactEmail });
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "fetch_failed", email: contactEmail, ...(proof.detail ? { detail: proof.detail } : {}) });
           continue;
         }
         if (proof.kind === "host_excluded") {

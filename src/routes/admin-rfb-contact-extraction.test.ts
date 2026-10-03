@@ -74,6 +74,8 @@
  *   (bf8) AC1b: own-domain address not on site -> rejected_not_on_site.
  *   (bf9) AC1c: the five 2026-10-02 hard bounces -> all rejected.
  *   (bf10) substring/script-only/redirect-to-social are not proof.
+ *   (bf11) all linked contact pages unreadable -> fetch_failed.
+ *   (bf-cap) backfill row cap keeps worst case under the 15-min lock.
  *   (prov) AC1e: every field_provenance.email written by ANY path in this
  *          suite is actually on its source_url page.
  *   (seen) emailSeenOnPage unit cases.
@@ -836,6 +838,11 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
         assertEq(knowledgeEmailOf(b.id), null, `bf9-db (AC1c): ${b.email} NOT written`);
       }
       assertEq(bf9.body.counts?.written, undefined, "bf9-none: not a single bounce address was written");
+      assertEq(
+        bf9.body.results.find((x: any) => x.agent_id === "cx-bf-hanssensmat")?.pages_checked,
+        ["https://www.hanssensmat.no", "https://www.hanssensmat.no/kontakt-oss/"],
+        "bf9-www: on a www site the linked /kontakt-oss/ is fetched on the www host (and read — it shows post@hahanssen.no, not the bounced address)",
+      );
 
       // (bf10) — whole-token match only, script content does not count, and
       // a redirect off to a social host is not "own site".
@@ -866,6 +873,45 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       const bf10b = await callExtraction({ agentIds: ["cx-bf-redirect"], mode: "backfill_from_contact_email", apply: true });
       assertEq(bf10b.body.results.find((x: any) => x.agent_id === "cx-bf-redirect")?.outcome, "host_excluded", "bf10-3: a website that redirects to a social host is not the producer's own site");
       assertEq(knowledgeEmailOf("cx-bf-redirect"), null, "bf10-4: nothing written");
+
+      // (bf11) review round 1: the site links contact pages but none of them
+      // can be read, and the address is not on the front page -> "could not
+      // check" (fetch_failed), not rejected_not_on_site. Nothing written.
+      insertAgent({
+        id: "cx-bf-subfail", name: "Nedside Gard", website: "https://nedsidegard.no",
+        contactEmail: "post@nedsidegard.no", fieldProvenance: liveDnsProvenance("nedsidegard.no"),
+      });
+      fixtures.set(
+        "https://nedsidegard.no",
+        htmlResponse('<html><body>Velkommen. <a href="/kontakt">Kontakt</a> <a href="/om-oss">Om oss</a></body></html>', { finalUrl: "https://nedsidegard.no" }),
+      );
+      // /kontakt and /om-oss deliberately have no fixture -> 404.
+      const bf11 = await callExtraction({ agentIds: ["cx-bf-subfail"], mode: "backfill_from_contact_email", apply: true });
+      const bf11Item = bf11.body.results.find((x: any) => x.agent_id === "cx-bf-subfail");
+      assertEq(bf11Item?.outcome, "fetch_failed", "bf11-1: every linked contact page unreadable -> fetch_failed, not rejected_not_on_site");
+      assertEq(bf11Item?.detail, "contact_subpages_unavailable", "bf11-2: detail names why");
+      assertEq(knowledgeEmailOf("cx-bf-subfail"), null, "bf11-3: nothing written");
+
+      // (bf-cap) review round 1: per-call row cap keeps the worst case under
+      // the 15-min run-lock ceiling.
+      {
+        const { RFB_CX_BACKFILL_HARD_CAP, RFB_CX_BACKFILL_WORST_CASE_ROW_MS, RFB_CX_BACKFILL_MAX_SUBPAGES } = routeModule;
+        const LOCK_MAX_MS = 15 * 60 * 1000;
+        assertTrue(RFB_CX_BACKFILL_HARD_CAP >= 1, "bf-cap-1: cap is at least 1");
+        assertTrue(
+          RFB_CX_BACKFILL_HARD_CAP * RFB_CX_BACKFILL_WORST_CASE_ROW_MS < LOCK_MAX_MS,
+          `bf-cap-2: cap (${RFB_CX_BACKFILL_HARD_CAP}) x worst-case row (${RFB_CX_BACKFILL_WORST_CASE_ROW_MS} ms) stays under the 15-min lock ceiling`,
+        );
+        assertTrue(
+          RFB_CX_BACKFILL_WORST_CASE_ROW_MS >= (1 + RFB_CX_BACKFILL_MAX_SUBPAGES) * 25_000,
+          "bf-cap-3: worst-case row budget accounts for 2 x 10 s attempts + 5 s Retry-After per fetch",
+        );
+        const tooMany = Array.from({ length: RFB_CX_BACKFILL_HARD_CAP + 1 }, (_, i) => `bfcap-${i}`);
+        const capResp = await callExtraction({ agentIds: tooMany, mode: "backfill_from_contact_email" });
+        assertEq(capResp.status, 400, `bf-cap-4: more than ${RFB_CX_BACKFILL_HARD_CAP} agentIds in backfill mode -> 400`);
+        const normalResp = await callExtraction({ agentIds: tooMany });
+        assertEq(normalResp.status, 200, "bf-cap-5: normal scrape mode keeps its own (larger) cap");
+      }
 
       // (bf5)/(bf6): cohort exclusion, proven via AUTO-SELECT (no agentIds).
       insertAgent({
@@ -928,6 +974,16 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(emailSeenOnPage("<p>post@a.nord.no</p>", "post@a.no"), null, "seen-5: longer domain is not a match");
       assertEq(emailSeenOnPage('<script>"post@a.no"</script>', "post@a.no"), null, "seen-6: script-only occurrence is not proof");
       assertEq(emailSeenOnPage("", "post@a.no"), null, "seen-7: empty page");
+      // Review round 1: invisible markup is never proof.
+      assertEq(emailSeenOnPage('<!-- <a href="mailto:post@a.no">gammel</a> -->', "post@a.no"), null, "seen-8: commented-out mailto is not proof");
+      assertEq(emailSeenOnPage("<!-- <p>gammel: post@a.no</p> -->", "post@a.no"), null, "seen-9: commented-out text is not proof");
+      assertEq(emailSeenOnPage(`<script>x='<a href="mailto:post@a.no">'</script>`, "post@a.no"), null, "seen-10: mailto inside a script string is not proof");
+      assertEq(emailSeenOnPage('<a data-href="mailto:post@a.no">x</a>', "post@a.no"), null, "seen-11: data-href is not an href");
+      assertEq(emailSeenOnPage('<template><a href="mailto:post@a.no">x</a></template><noscript>post@a.no</noscript><style>/* post@a.no */</style>', "post@a.no"), null, "seen-12: template/noscript/style content is not proof");
+      assertEq(emailSeenOnPage("<p>Kontakt</p><!-- uavsluttet kommentar post@a.no", "post@a.no"), null, "seen-13: unterminated comment runs to end of document");
+      assertEq(emailSeenOnPage('<!-- gammel: old@a.no --><script>var a=1;</script><a class="k" href="mailto:post@a.no">Kontakt</a>', "post@a.no"), "mailto", "seen-14 (positive control): a real visible mailto next to a comment/script still matches");
+      assertEq(emailSeenOnPage("<!-- x --><p>Skriv til post@a.no</p><script>1</script>", "post@a.no"), "text", "seen-15 (positive control): real visible text next to a comment/script still matches");
+      assertEq(emailSeenOnPage("<p>post</p><b>@a.no</b>", "post@a.no"), null, "seen-16: tag removal never glues fragments into an address");
     }
   } catch (err: any) {
     failed++;
