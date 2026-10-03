@@ -1166,7 +1166,7 @@ function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; opening_hours_text?: string | null }
+          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
           | null;
         // Echoed on every outcome below so the assistant can name the producer
         // it acted on (and link the profile when booking is not activated).
@@ -1180,7 +1180,7 @@ function registerExperienceTools(
             }
           : null;
         const slotLocal = formatSlotOslo(parsed.data.slot_at);
-        if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+        if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
           return {
             content: [{
               type: "text" as const,

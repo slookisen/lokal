@@ -42,40 +42,40 @@ export function bookingDispatchEnabled(): boolean {
 // providerBookingLive is whatever experience_providers.booking_live holds
 // (0/1/NULL/undefined) — anything but the literal 1 counts as "not live".
 //
-// providerCatalogHidden (optional) is experience_providers.catalog_hidden.
-// Originally this flag was set ONLY by the admin-key-gated
-// POST /admin/gardssalg/test-provider (the controlled slice-0 TEST provider,
-// notification email pinned by the admin caller) — a catalog_hidden=1
-// provider dispatching even when the global master switch is off was the
-// intended test harness, blast radius bounded to that admin-specified
-// address. As of the 2026-08-17 P0 consent-bug fix, catalog_hidden=1 is ALSO
-// set by POST /admin/gardssalg-provider-visibility for REAL producers who
-// asked to be delisted (the CS "fjern oss" flow) — this function's own
-// bypass logic below was NOT changed as part of that fix (out of scope; see
-// getGardssalgProviderBySlug()'s doc comment in experience-store.ts for what
-// WAS changed: the public produsent-profil/booking-panel slug lookup now
-// 404s for any catalog_hidden=1 row, real or test). That means this
-// function's bypass no longer distinguishes "the test provider" from "a real
-// delisted producer whose booking_live happened to still be 1" — a caller
-// that already holds such a provider's raw provider_id (POST
-// /api/opplevelser/book, the book_gardssalg MCP tool — neither goes through
-// getGardssalgProviderBySlug()/slug at all) can still dispatch a booking and
-// notify them, bypassing the master switch, even while they're delisted.
-// Flagged, not fixed here — see this fix's PR/report for the explicit
-// call-out; a real fix needs either flipping booking_live off whenever
-// catalog_hidden is set, or giving the test provider its own identity
-// instead of overloading catalog_hidden for it. REAL providers
+// providerCatalogHidden (optional) is experience_providers.catalog_hidden and
+// providerIsTest (optional) is experience_providers.is_test_provider.
+// catalog_hidden=1 means "not in the public catalog" and is set both for real
+// producers who asked to be delisted (the CS "fjern oss" flow, POST
+// /admin/gardssalg-provider-visibility) and for the controlled TEST provider.
+// A catalog_hidden=1 row therefore ALWAYS pauses dispatch — regardless of
+// booking_live and of the global master switch — UNLESS it is explicitly
+// flagged is_test_provider=1. That flag is set ONLY by the admin-key-gated
+// POST /admin/gardssalg/test-provider (and by the migration for the one known
+// test row, see init-experiences.ts); the flagged test provider keeps
+// dispatching even when the global master switch is off (notification email
+// pinned by the admin caller, blast radius bounded to that address).
+// Fixes the 2026-10-03 consent gap where a caller holding a delisted
+// producer's raw provider_id (POST /api/opplevelser/book, the book_gardssalg
+// MCP tool — neither goes through the slug lookup that 404s hidden rows)
+// could dispatch a booking and notify them. Fail-closed: an omitted
+// providerIsTest counts as "not a test provider". REAL visible providers
 // (catalog_hidden 0/NULL) are unchanged: they still require BOTH the global
 // BOOKING_DISPATCH_ENABLED master switch AND their own booking_live=1.
 export function isBookingPaused(
   providerBookingLive: number | null | undefined,
   providerCatalogHidden?: number | null | undefined,
+  providerIsTest?: number | null | undefined,
 ): boolean {
   // Must be onboarded either way.
   if (providerBookingLive !== 1) return true;
-  // Hidden, admin-created, email-pinned test provider → dispatch even if the
-  // global master switch is off (real providers below still require it).
-  if (providerCatalogHidden === 1) return false;
+  if (providerCatalogHidden === 1) {
+    // Delisted real producer (hidden, not the flagged test provider) → never
+    // dispatch, whatever the master switch says.
+    if (providerIsTest !== 1) return true;
+    // Flagged, admin-created, email-pinned test provider → dispatch even if
+    // the global master switch is off (real providers below still require it).
+    return false;
+  }
   // Real providers: unchanged double gate — still need the global master switch.
   return !bookingDispatchEnabled();
 }
@@ -1149,14 +1149,15 @@ function getProviderDispatchRow(provider_id: string): {
   epost: string | null;
   booking_live: number | null;
   catalog_hidden: number | null;
+  is_test_provider: number | null;
 } | null {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      "SELECT navn, epost, booking_live, catalog_hidden FROM experience_providers WHERE id = ?",
+      "SELECT navn, epost, booking_live, catalog_hidden, is_test_provider FROM experience_providers WHERE id = ?",
     )
     .get(provider_id) as
-    | { navn: string | null; epost: string | null; booking_live: number | null; catalog_hidden: number | null }
+    | { navn: string | null; epost: string | null; booking_live: number | null; catalog_hidden: number | null; is_test_provider: number | null }
     | undefined;
   return row ?? null;
 }
@@ -1167,7 +1168,7 @@ async function sendGatedProducerEmail(
   build: (producerEmail: string) => { subject: string; htmlContent: string; textContent: string },
 ): Promise<boolean> {
   const provider = getProviderDispatchRow(booking.provider_id);
-  if (!provider || isBookingPaused(provider.booking_live, provider.catalog_hidden)) {
+  if (!provider || isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider)) {
     console.log(
       `[booking-previsit] producer ${kind} SUPPRESSED by dispatch gate — provider ${booking.provider_id}, booking ${booking.booking_ref}`,
     );

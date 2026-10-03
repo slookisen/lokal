@@ -21,6 +21,10 @@
 import Database from "better-sqlite3";
 import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 
+// The one known hidden booking TEST provider row on prod (see the
+// is_test_provider migration below). Exported for tests.
+export const KNOWN_TEST_PROVIDER_ID = "0d11485a-c774-4f75-8bca-fd6e6fe19f8c";
+
 export function initExperiencesSchema(db: Database.Database): void {
   // experience_providers — one row per provider (organisasjon), Brreg-verified
   try {
@@ -959,6 +963,21 @@ export function initExperiencesSchema(db: Database.Database): void {
   try {
     db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
   } catch { /* already present */ }
+
+  // ─── Test-provider identity (dev-request 2026-10-03-booking-avlistet-
+  // produsent-bypass) ───────────────────────────────────────────────────────
+  // catalog_hidden=1 also marks REAL producers who asked to be delisted, so it
+  // can no longer double as "this is the test provider" for the booking gate.
+  // is_test_provider=1 is that identity: set ONLY by POST
+  // /admin/gardssalg/test-provider and, below, for the one known test row id.
+  // isBookingPaused() (services/booking-store.ts) always pauses a
+  // catalog_hidden=1 row that is not flagged. Additive; NULL/0 = not a test
+  // provider, so every other row is unaffected.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN is_test_provider INTEGER");
+  } catch { /* already present */ }
+  db.prepare("UPDATE experience_providers SET is_test_provider = 1 WHERE id = ? AND (is_test_provider IS NULL OR is_test_provider != 1)")
+    .run(KNOWN_TEST_PROVIDER_ID);
 
   // ─── Navnekollisjon Brreg-gate (dev-request 2026-09-13-navnekollisjon-
   // brreg-gate) ────────────────────────────────────────────────────────────

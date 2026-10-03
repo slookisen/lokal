@@ -3527,6 +3527,9 @@ export type GardssalgProviderRow = {
   // "fjern oss" delist lever for real producers) — both flows share this one
   // column/semantics.
   catalog_hidden: number | null;
+  // Additive (2026-10-03): 1 only for the admin test provider; lets
+  // isBookingPaused() tell it apart from a delisted real producer.
+  is_test_provider?: number | null;
   // Additive (2026-07-25, GSC opplevagent indekseringsfiks, sitemap lastmod
   // honesty item): the provider row's own updated_at — a real per-row
   // freshness signal for the /kategori/gardssalg/produsent/<slug> sitemap
@@ -3557,7 +3560,7 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at, field_provenance";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, field_provenance";
 
 export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

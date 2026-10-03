@@ -74,8 +74,9 @@ export function toProviderCandidate(row: GardssalgProviderRow): ProviderCandidat
   // Public callers never see catalog_hidden=1 rows (searchGardssalgProviders'
   // default exclusion), so this is the plain gate — same as discover_gardssalg.
   // The admin test-send route CAN resolve a hidden row (includeHidden), and
-  // for that row the hidden carve-out in isBookingPaused() is what decides.
-  const live = !isBookingPaused(row.booking_live, row.catalog_hidden ?? null);
+  // for that row the is_test_provider carve-out in isBookingPaused() decides
+  // (a hidden row that is not the flagged test provider is always paused).
+  const live = !isBookingPaused(row.booking_live, row.catalog_hidden ?? null, row.is_test_provider ?? null);
   return {
     provider_id: row.id,
     navn: row.navn,

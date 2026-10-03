@@ -307,6 +307,8 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         booking_live: 1, catalog_hidden: 1, slug: "skjult-test-gard", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1, geocode_confidence: null,
       });
+      // the test provider's own identity flag (catalog_hidden alone is always paused)
+      expDb.prepare("UPDATE experience_providers SET is_test_provider = 1 WHERE id = ?").run("prov-hidden");
       // manually-claimed row -- must still appear, claim_status carries the
       // raw content_source value ('manual'), never excluded. No slug and no
       // field_provenance (a manually-claimed row that hasn't been through the

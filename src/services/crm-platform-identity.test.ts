@@ -374,10 +374,10 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             `pi16i-guard: EXPERIENCES_DB_PATH points inside the scratch dir (${process.env.EXPERIENCES_DB_PATH}) — without this the seeding below writes to the PRODUCTION experiences database and nothing complains`);
           const expDb = dbf.getDb("experiences");
           expDb.exec(`CREATE TABLE IF NOT EXISTS experience_providers (
-            id TEXT PRIMARY KEY, navn TEXT, epost TEXT, booking_live INTEGER, catalog_hidden INTEGER)`);
-          expDb.prepare(`INSERT OR REPLACE INTO experience_providers (id, navn, epost, booking_live, catalog_hidden)
-                         VALUES ('prov-1','Dobel Gård','produsent@example.no',1,1)`).run();
-          // catalog_hidden = 1 on purpose: that is booking-store's documented
+            id TEXT PRIMARY KEY, navn TEXT, epost TEXT, booking_live INTEGER, catalog_hidden INTEGER, is_test_provider INTEGER)`);
+          expDb.prepare(`INSERT OR REPLACE INTO experience_providers (id, navn, epost, booking_live, catalog_hidden, is_test_provider)
+                         VALUES ('prov-1','Dobel Gård','produsent@example.no',1,1,1)`).run();
+          // catalog_hidden = 1 + is_test_provider = 1 on purpose: that is booking-store's documented
           // "hidden, admin-created, email-pinned test provider" case, which
           // dispatches without the global master switch. A real provider
           // (catalog_hidden = 0) additionally needs bookingDispatchEnabled(),

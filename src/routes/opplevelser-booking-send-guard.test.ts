@@ -503,6 +503,9 @@ export function runOpplevelserBookingSendGuardTests(
                  'bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`,
       );
       insertNamed.run({ id: "prov-hidden-live", navn: "Skjult Testgard E2E", epost: "skjult@gard.example.no", booking_live: 1, catalog_hidden: 1, slug: "skjult-testgard-e2e" });
+      // The hidden TEST provider carries its own identity (is_test_provider) —
+      // catalog_hidden alone always pauses dispatch (2026-10-03 fix).
+      expDb.prepare("UPDATE experience_providers SET is_test_provider = 1 WHERE id = ?").run("prov-hidden-live");
       insertNamed.run({ id: "prov-amb-1", navn: "Ambig Bryggeri Nord", epost: "nord@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-nord" });
       insertNamed.run({ id: "prov-amb-2", navn: "Ambig Bryggeri Sør", epost: "sor@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-sor" });
 
