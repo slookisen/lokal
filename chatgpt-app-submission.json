@@ -4,7 +4,7 @@
   "app_info": {
     "display_name": "Rett fra Bonden",
     "subtitle": "Find Norwegian farm food",
-    "description": "Rett fra Bonden (\"Straight from the Farmer\") helps you discover and contact small-scale food producers across Norway. Search more than 1,600 producers by location, product type, or category — local cheese, meat, vegetables, honey, fish, baked goods, and farm-made specialties. Each listing includes direct contact details, opening hours, current product range, and certifications such as Debio-organic and Nyt Norge so you can verify quality and buy directly from the farm. You can also assemble a pickup order from participating producers — no payment happens in chat; you pay the producer directly at pickup. Useful when you are traveling in Norway and want fresh local food, planning a farm visit or gårdsbutikk stop, sourcing Norwegian ingredients for a restaurant, or supporting short-trip local food systems. The app pulls from a continuously verified database with cross-source data quality checks (Brreg, Google Places, Debio) so listings stay accurate.",
+    "description": "Rett fra Bonden (\"Straight from the Farmer\") helps you discover and contact small-scale food producers across Norway. Search the producer catalogue by place, product or category — cheese, meat, vegetables, honey, fish, baked goods and farm-made specialties. Each listing shows the contact details the producer has published and, where available, opening hours, the products the producer lists, and certifications such as Debio-organic. Product lists come from the producers' own pages and can be incomplete, so the app marks when a producer only matches a broad category and suggests checking with the producer. You can also assemble a pickup order from producers who take orders through the platform — no payment happens in chat; you pay the producer directly at pickup. Useful when you are traveling in Norway and want local food, planning a farm-shop stop, or sourcing Norwegian ingredients. Listings are checked against public sources such as the Brønnøysund Register Centre and Debio, and corrected when errors are found.",
     "category": "FOOD"
   },
   "tools": {
@@ -194,7 +194,7 @@
       "description": "Product + region search for a regional speciality: reindeer meat in Finnmark.",
       "user_prompt": "Where can I buy reindeer meat in Finnmark?",
       "tools_triggered": "lokal_search",
-      "expected_output": "Meat producers in Finnmark, many of them reindeer herders, each with place, phone or e-mail where known and distance — for example Finnmark Kjøtt AS (Hammerfest, sells reindeer meat) and Skodi Rein AS (Karasjok). Every listed producer is in Finnmark and lists meat among its products. The exact set and order can change as the catalogue is updated.",
+      "expected_output": "Producers in Finnmark for reindeer meat, each with place, phone or e-mail where known and distance — for example Finnmark Kjøtt AS (Hammerfest), whose product list names reindeer meat, and reindeer herders in Karasjok such as Skodi Rein AS. Producers whose product list names reindeer meat come first; a producer listed only under the broad meat category is marked as a category match, with a note to check with the producer. Every listed producer is in Finnmark. The exact set and order can change as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     },
@@ -202,7 +202,7 @@
       "description": "English search combining a region with a specific product; checks that the region is used as a location, not as a producer name.",
       "user_prompt": "Find a farm in Vestfold with raw honey",
       "tools_triggered": "lokal_search",
-      "expected_output": "Beekeepers in and around Vestfold with contact details and distance, for example TønsbergBier (Tønsberg) and Wenche og Arnes Bigård (Debio-certified, Tjøme). Every listed producer sells honey. The exact set and order can change as the catalogue is updated.",
+      "expected_output": "Beekeepers in and around Vestfold with contact details and distance, for example TønsbergBier (Tønsberg) and Wenche og Arnes Bigård (Debio-certified, Tjøme). Every listed producer sells honey. The catalogue does not record whether a producer's honey is raw, so the answer does not claim that; it suggests asking the producer. The exact set and order can change as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     },
@@ -210,14 +210,14 @@
       "description": "English search for a meat product in an inland county.",
       "user_prompt": "Which farms in Innlandet sell lamb?",
       "tools_triggered": "lokal_search",
-      "expected_output": "Meat producers in Innlandet with contact details, for example Stølsvidda (Valdres — stølslam) and Sygard Grytting (Sør-Fron — lam). Every listed producer lists meat among its products. The exact set and order can change as the catalogue is updated.",
+      "expected_output": "Producers in Innlandet for lamb, with contact details — for example Sygard Grytting (Sør-Fron) and Stenbergs Gårdsverden (Lena, Toten), whose product lists name lamb. Producers whose product list names lamb come first; a producer listed only under the broad meat category is marked as a category match, with a note to check with the producer. The exact set and order can change as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     },
     {
-      "description": "Lookup of one named producer; the name search returns that producer's full product list and contact details in one call (the model may follow up with lokal_info).",
+      "description": "Lookup of one named producer: the name search alone returns that producer's full product list and contact details in one call.",
       "user_prompt": "Tell me about Ostegården in Bergen — what do they make and how can I contact them?",
-      "tools_triggered": "lokal_search, lokal_info",
+      "tools_triggered": "lokal_search",
       "expected_output": "Ostegården — Krokeide, a farm dairy in Fana, Bergen: products including Lagret Fanaost, Jørns Brie, Jørns Camembert and yoghurt; phone, e-mail (magnus@ostegarden.no), website ostegarden.no, payment by cash or Vipps, farm pickup or shipping, and a link to its Rett fra Bonden profile.",
       "expected_output_url": null,
       "file_attachment_urls": null
@@ -226,7 +226,7 @@
       "description": "English search for a regional speciality; checks that the product word selects the fish category and the place word the location.",
       "user_prompt": "Where can I buy stockfish in Lofoten?",
       "tools_triggered": "lokal_search",
-      "expected_output": "Seafood producers in Lofoten with contact details and distance, including H. Sverdrup AS at Reine (stockfish is its main product — original and pounded fillets, Lofotskiver) and Lofotprodukt AS in Leknes. Every listed producer sells fish. The exact set and order can change as the catalogue is updated.",
+      "expected_output": "Seafood producers in Lofoten with contact details and distance. Producers whose product list names stockfish (tørrfisk) come first, for example H. Sverdrup AS at Reine (original and pounded stockfish fillets, Lofotskiver); other fish producers such as Lofotprodukt AS in Leknes follow and are marked as category matches. Every listed producer sells fish. The exact set and order can change as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     }
@@ -257,5 +257,5 @@
       "file_attachment_urls": null
     }
   ],
-  "release_notes": "Resubmission after the 2026-09-24 review (tool annotations did not match behaviour). Every tool was re-checked against OpenAI's published annotation definitions and the server now declares: (1) openWorldHint true for lokal_search, lokal_geocode and lokal_find_offers, because a place name can be looked up in Kartverket's public place-name API; (2) destructiveHint true for lokal_cart_submit, because it closes the cart and e-mails producers, which cannot be undone; (3) destructiveHint true and idempotentHint true for lokal_cart_add_item, because re-adding a product replaces that line's quantity. All read-only tools declare idempotentHint true. lokal_find_offers (read-only shopping-list lookup) is new since v1.0.1. The five test cases were re-run against production before this submission. Please avoid running lokal_cart_submit against a real producer: it e-mails that farm. Since that first draft: test case 1 is now reindeer meat in Finnmark (cheese near Bergen also surfaced bakeries and fish stalls tagged with dairy); Norwegian compound meat words such as reinsdyrkjøtt are recognised by search; lokal_cart_submit creates real orders only for owner-verified producers who opted in to platform orders and returns contact details for the rest, and its optional buyer contact fields are shared with a producer only when the buyer consents (disclosed in the privacy policy). A search naming a place outside Norway (e.g. 'pizza in Rome') is now answered with a note that Rett fra Bonden only covers Norway; it used to substring-match a Norwegian producer name."
+  "release_notes": "Resubmission after the 2026-09-24 review (tool annotations did not match behaviour). Every tool was re-checked against OpenAI's published annotation definitions and the server now declares: (1) openWorldHint true for lokal_search, lokal_geocode and lokal_find_offers, because a place name can be looked up in Kartverket's public place-name API; (2) destructiveHint true for lokal_cart_submit, because it closes the cart and e-mails producers, which cannot be undone; (3) destructiveHint true and idempotentHint true for lokal_cart_add_item, because re-adding a product replaces that line's quantity. All read-only tools declare idempotentHint true. lokal_find_offers (read-only shopping-list lookup) is new since v1.0.1. The five test cases were re-run against production before this submission. Please avoid running lokal_cart_submit against a real producer: it e-mails that farm. Since that first draft: test case 1 is now reindeer meat in Finnmark (cheese near Bergen also surfaced bakeries and fish stalls tagged with dairy); Norwegian compound meat words such as reinsdyrkjøtt are recognised by search; lokal_cart_submit creates real orders only for owner-verified producers who opted in to platform orders and returns contact details for the rest, and its optional buyer contact fields are shared with a producer only when the buyer consents (disclosed in the privacy policy). A search naming a place outside Norway (e.g. 'pizza in Rome') is now answered with a note that Rett fra Bonden only covers Norway; it used to substring-match a Norwegian producer name. Follow-up after an independent pre-submission review: lokal_discover now applies its lat/lng distance filter (it used to return a nationwide list) and answers coordinates outside Norway with a note; a producer named in the question is found regardless of the surrounding words or ASCII spelling (Ostegarden/Ostegården), and English \"and\" in a question is no longer read as the Norwegian word for duck; producers whose product list names the searched product rank first and category-only matches are labelled as such; the privacy page now states the actual 60-day automatic deletion of page-visit, search and tool-call logs."
 }
