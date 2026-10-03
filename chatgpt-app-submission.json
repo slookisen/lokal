@@ -226,7 +226,7 @@
       "description": "English search for a regional speciality; checks that the product word selects the fish category and the place word the location.",
       "user_prompt": "Where can I buy stockfish in Lofoten?",
       "tools_triggered": "lokal_search",
-      "expected_output": "Seafood producers in Lofoten with contact details and distance. Producers whose product list names stockfish (tørrfisk) come first, for example H. Sverdrup AS at Reine (original and pounded stockfish fillets, Lofotskiver); other fish producers such as Lofotprodukt AS in Leknes follow and are marked as category matches. Every listed producer sells fish. The exact set and order can change as the catalogue is updated.",
+      "expected_output": "Seafood producers in Lofoten with contact details and distance. Producers whose product list names stockfish (tørrfisk) come first — for example H. Sverdrup AS at Reine (original and pounded stockfish fillets, Lofotskiver) and Lofotprodukt AS in Leknes; fish producers whose product list does not mention stockfish follow and are marked as category matches, with a note to check with the producer. Every listed producer sells fish. The exact set and order can change as the catalogue is updated.",
       "expected_output_url": null,
       "file_attachment_urls": null
     }
