@@ -1008,6 +1008,105 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       assertTrue(Object.keys(res.body.email.reject_reasons).length >= 1, "z13: reject_reasons carries at least the conflict's detail string");
     }
 
+    // ═══ C3: Brreg email also fills agent_knowledge.email (fill-only) ═══
+    // dev-request 2026-10-01-rfb-brreg-selvforsyning-feil-kolonne-c3.
+    const readKnowledge = (id: string): any =>
+      testDb.prepare("SELECT email, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?").get(id);
+    const setKnowledge = (id: string, col: string, val: string | null): void => {
+      testDb.prepare(`UPDATE agent_knowledge SET ${col} = ? WHERE agent_id = ?`).run(val, id);
+    };
+
+    // (c3a) empty knowledge.email is filled, with a merged brreg provenance entry
+    insertAgent({ id: "c3-fill", name: "C3 Fill AS", orgNr: "913000001", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    {
+      const r = await resolveEmailForTarget(testDb as any, targetRow("c3-fill") as any, "913000001", "post@bondensgaard-c3a.no", "test-batch-c3a", true);
+      assertEq(r.outcome, "email_written", "c3a1: contact_email written");
+      assertEq(r.knowledgeOutcome, "knowledge_email_written", "c3a2: knowledge_email_written reported");
+      const k = readKnowledge("c3-fill");
+      assertEq(k.email, "post@bondensgaard-c3a.no", "c3a3: agent_knowledge.email filled");
+      const prov = JSON.parse(k.field_provenance);
+      assertEq(prov.email?.length, 1, "c3a4: one field_provenance.email entry");
+      assertEq(prov.email[0].source_type, "brreg", "c3a5: provenance source_type brreg");
+      assertTrue(String(prov.email[0].source_url).includes("913000001"), "c3a6: provenance source_url is the Brreg lookup URL");
+      assertTrue(!!prov.email[0].fetched_at, "c3a7: provenance fetched_at set");
+    }
+
+    // (c3b) non-empty knowledge.email is untouched (contact_email still written)
+    insertAgent({ id: "c3-keep", name: "C3 Keep AS", orgNr: "913000002", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    setKnowledge("c3-keep", "email", "eksisterende@kjent-c3b.no");
+    {
+      const r = await resolveEmailForTarget(testDb as any, targetRow("c3-keep") as any, "913000002", "post@bondensgaard-c3b.no", "test-batch-c3b", true);
+      assertEq(r.outcome, "email_written", "c3b1: contact_email written");
+      assertEq(r.knowledgeOutcome, "knowledge_email_kept_existing", "c3b2: knowledge_email_kept_existing reported");
+      const k = readKnowledge("c3-keep");
+      assertEq(k.email, "eksisterende@kjent-c3b.no", "c3b3: non-empty knowledge.email NOT overwritten");
+      assertEq(k.field_provenance == null || k.field_provenance === "" || !JSON.parse(k.field_provenance).email, true, "c3b4: no provenance entry added when nothing written");
+    }
+
+    // (c3c) claimed_at lock => nothing written anywhere
+    insertAgent({ id: "c3-claimed", name: "C3 Claimed AS", orgNr: "913000003", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    {
+      const stale = targetRow("c3-claimed");
+      testDb.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run("2026-02-02 00:00:00", "c3-claimed");
+      const r = await resolveEmailForTarget(testDb as any, stale as any, "913000003", "post@bondensgaard-c3c.no", "test-batch-c3c", true);
+      assertEq(r.outcome, "email_skipped_locked", "c3c1: claimed -> skipped_locked");
+      assertEq(r.knowledgeOutcome, undefined, "c3c2: no knowledge outcome");
+      assertEq(readKnowledge("c3-claimed").email, null, "c3c3: knowledge.email untouched");
+      assertEq(readAgent("c3-claimed").contact_email, "", "c3c4: contact_email untouched");
+    }
+
+    // (c3d) curated email lock => nothing written anywhere
+    insertAgent({ id: "c3-curated", name: "C3 Curated AS", orgNr: "913000004", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    {
+      const stale = targetRow("c3-curated");
+      setKnowledge("c3-curated", "curated_fields", JSON.stringify({ contact_email: true }));
+      const r = await resolveEmailForTarget(testDb as any, stale as any, "913000004", "post@bondensgaard-c3d.no", "test-batch-c3d", true);
+      assertEq(r.outcome, "email_skipped_curated", "c3d1: curated -> skipped_curated");
+      assertEq(readKnowledge("c3-curated").email, null, "c3d2: knowledge.email untouched");
+      assertEq(readAgent("c3-curated").contact_email, "", "c3d3: contact_email untouched");
+    }
+
+    // (c3e) existing provenance for other fields / email is merged, not overwritten
+    insertAgent({ id: "c3-prov", name: "C3 Prov AS", orgNr: "913000005", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    setKnowledge("c3-prov", "field_provenance", JSON.stringify({
+      website: [{ value: "https://x.no", source_type: "own_site", fetched_at: "2026-01-01T00:00:00.000Z" }],
+      email: [{ value: "gammel@c3e.no", source_type: "rfb_contact_extraction", source_url: "https://x.no/kontakt", fetched_at: "2026-01-01T00:00:00.000Z" }],
+    }));
+    {
+      const r = await resolveEmailForTarget(testDb as any, targetRow("c3-prov") as any, "913000005", "post@bondensgaard-c3e.no", "test-batch-c3e", true);
+      assertEq(r.knowledgeOutcome, "knowledge_email_written", "c3e1: filled (knowledge.email was empty)");
+      const prov = JSON.parse(readKnowledge("c3-prov").field_provenance);
+      assertEq(prov.website?.[0]?.source_type, "own_site", "c3e2: unrelated provenance field preserved");
+      assertTrue(Array.isArray(prov.email) && prov.email.length >= 2, "c3e3: email provenance appended, not overwritten");
+      assertTrue(prov.email.some((e: any) => e.value === "gammel@c3e.no"), "c3e4: older email provenance entry still present");
+      assertTrue(prov.email.some((e: any) => e.value === "post@bondensgaard-c3e.no" && e.source_type === "brreg"), "c3e5: new brreg entry present");
+    }
+
+    // (c3f) own-site-wins conflict => neither column written
+    insertAgent({ id: "c3-conflict", name: "C3 Conflict AS", orgNr: "913000006", contactEmail: "egen@side-c3f.no", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    {
+      const r = await resolveEmailForTarget(testDb as any, targetRow("c3-conflict") as any, "913000006", "annen@brreg-c3f.no", "test-batch-c3f", true);
+      assertEq(r.outcome, "email_conflict_kept_own", "c3f1: conflict kept own");
+      assertEq(readKnowledge("c3-conflict").email, null, "c3f2: knowledge.email not written on conflict");
+    }
+
+    // (c3g) route level: per-row outcome in details[] and counters in summary
+    insertAgent({ id: "c3-route-fill", name: "C3 Route Fill AS", orgNr: "913000011", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    insertAgent({ id: "c3-route-keep", name: "C3 Route Keep AS", orgNr: "913000012", contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00" });
+    setKnowledge("c3-route-keep", "email", "har@allerede-c3g.no");
+    detailFixtures.set("913000011", { status: 200, body: activeDetail("913000011", "C3 Route Fill AS", { hjemmeside: null, epostadresse: "kontakt@bondensgaard-c3g1.no" }) });
+    detailFixtures.set("913000012", { status: 200, body: activeDetail("913000012", "C3 Route Keep AS", { hjemmeside: null, epostadresse: "kontakt@bondensgaard-c3g2.no" }) });
+    {
+      const res = await callRoute({ agentIds: ["c3-route-fill", "c3-route-keep"], apply: true });
+      assertEq(res.body.email.knowledge_email_written, 1, "c3g1: summary counts knowledge_email_written");
+      assertEq(res.body.email.knowledge_email_kept_existing, 1, "c3g2: summary counts knowledge_email_kept_existing");
+      const d1 = res.body.details.find((d: any) => d.agent_id === "c3-route-fill");
+      const d2 = res.body.details.find((d: any) => d.agent_id === "c3-route-keep");
+      assertEq(d1?.knowledge_email_outcome, "knowledge_email_written", "c3g3: per-row written");
+      assertEq(d2?.knowledge_email_outcome, "knowledge_email_kept_existing", "c3g4: per-row kept_existing");
+      assertEq(readKnowledge("c3-route-fill").email, "kontakt@bondensgaard-c3g1.no", "c3g5: route filled knowledge.email");
+    }
+
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-brreg-selfsufficiency: unexpected error: " + String(err?.stack || err?.message || err));
