@@ -46073,3 +46073,22 @@ runSerial(async () => {
     failures.push("cx-run-lock-staleness: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-02-prod-event-loop-stall-profilering-b: GET
+// /admin/agents/dump contacted_at via one grouped map (parity vs old SQL).
+// Swaps the getDb() singleton (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-02-prod-event-loop-stall-profilering-b: agents dump contacted_at map ──");
+  try {
+    const { runAdminAgentsDumpContactedMapTests } = require("../src/routes/admin-agents-dump-contacted-map.test") as
+      typeof import("../src/routes/admin-agents-dump-contacted-map.test");
+    const dm = await runAdminAgentsDumpContactedMapTests({ log: false });
+    passed += dm.passed;
+    failed += dm.failed;
+    for (const f of dm.failures) failures.push("admin-agents-dump-contacted-map: " + f);
+    console.log(`  admin-agents-dump-contacted-map: ${dm.passed} passed, ${dm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-dump-contacted-map: unexpected error: " + String(err?.message || err));
+  }
+});

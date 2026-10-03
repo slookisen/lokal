@@ -4592,16 +4592,28 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     // sent to a crm_contact whose email matches a.contact_email.
     // crm_messages → crm_threads.contact_id → crm_contacts.id (no
     // contact_id on messages directly).  direction enum is 'in'/'out'.
+    //
+    // PERF (dev-request 2026-10-02-prod-event-loop-stall-profilering-b): this
+    // used to be a correlated subquery per agent row with LOWER() on both
+    // sides of the email join, which defeats every index and blocked the event
+    // loop for 5–8 s per call in prod (event-loop monitor, 2026-10-03). The
+    // outbound-sent map is now built in ONE grouped pass and joined in JS;
+    // result shape and values are unchanged.
+    const contactedByEmail = new Map<string, string>();
+    const sentRows = db.prepare(`
+      SELECT LOWER(c.email) AS email, MAX(m.sent_at) AS contacted_at
+      FROM crm_messages m
+      JOIN crm_threads t ON t.id = m.thread_id
+      JOIN crm_contacts c ON c.id = t.contact_id
+      WHERE m.direction = 'out' AND c.email IS NOT NULL
+      GROUP BY LOWER(c.email)
+    `).all() as Array<{ email: string; contacted_at: string | null }>;
+    for (const r of sentRows) {
+      if (r.contacted_at != null) contactedByEmail.set(r.email, r.contacted_at);
+    }
+
     let sql = `
       SELECT a.id, a.name, a.city, a.contact_email as email, a.url as website,
-             (
-               SELECT MAX(m.sent_at)
-               FROM crm_messages m
-               JOIN crm_threads t ON t.id = m.thread_id
-               JOIN crm_contacts c ON c.id = t.contact_id
-               WHERE m.direction = 'out'
-                 AND LOWER(c.email) = LOWER(a.contact_email)
-             ) as contacted_at,
              CASE WHEN ac.id IS NOT NULL THEN 1 ELSE 0 END as is_claimed
       FROM agents a
       LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
@@ -4610,7 +4622,15 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     if (hasEmail) sql += " AND a.contact_email IS NOT NULL AND a.contact_email != ''";
     sql += " ORDER BY a.city, a.name";
 
-    let rows = db.prepare(sql).all() as any[];
+    let rows = (db.prepare(sql).all() as any[]).map((r) => ({
+      id: r.id,
+      name: r.name,
+      city: r.city,
+      email: r.email,
+      website: r.website,
+      contacted_at: r.email ? (contactedByEmail.get(String(r.email).replace(/[A-Z]/g, (ch) => ch.toLowerCase())) /* ASCII-only, matches SQLite LOWER() */ ?? null) : null,
+      is_claimed: r.is_claimed,
+    }));
     if (uncontacted) {
       rows = rows.filter((r) => r.contacted_at == null);
     }
