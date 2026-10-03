@@ -60,25 +60,23 @@
  * agents.contact_email assertions.
  *
  * dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email (option
- * A): mode:"backfill_from_contact_email" — a pure DB re-classification/
- * backfill of an address ALREADY on file in agents.contact_email into
- * agent_knowledge.email (no page fetch, so no fixtures/stubFetch use for
- * this section at all). Section (bf) covers:
- *   (bf1) dry-run over the new cohort reports the copy, writes nothing.
- *   (bf2) apply writes agent_knowledge.email with
- *         source_type:"harvest_contact_email" and source_url = k.website.
- *   (bf3) a platform-owned contact_email is rejected
- *         ("rejected_platform_domain"), never written.
- *   (bf4) a domain-mismatched (non-free-mail) contact_email is rejected
- *         ("rejected_domain_mismatch"), never written.
- *   (bf5) a row with no contact_email_dns_check.live=1 (missing, or
- *         explicitly 0) is NOT in the cohort at all — not just skipped, not
- *         present in `results`.
- *   (bf6) a row whose agent_knowledge.email is already non-blank is
- *         untouched (fill-only) — also not in the cohort (blank-email is
- *         part of the cohort filter itself).
- *   (bf7) the free-mail exemption: a gmail.com contact_email on a company
- *         whose website is a different domain IS accepted and written.
+ * A): mode:"backfill_from_contact_email" — backfill of an address ALREADY on
+ * file in agents.contact_email into agent_knowledge.email. Since dev-request
+ * 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet the address must be SEEN
+ * on the producer's own site first (old bf1-6/bf2-8/bf7/bf-nofetch encoded
+ * the defect and were rewritten). Section (bf) covers:
+ *   (bf1/bf2) AC1a: mailto on /kontakt -> written, source_url = /kontakt.
+ *   (bf3/bf4) platform-owned / domain-mismatch -> rejected before any fetch.
+ *   (bf-locks) claimed / curated rows skipped, before any fetch.
+ *   (bf5/bf6) cohort exclusion (no dns live=1 / k.email already set).
+ *   (bf7) AC1d: gmail not on own site -> rejected_not_on_site (dry-run too).
+ *   (bf7b) gmail shown on own site -> written.
+ *   (bf8) AC1b: own-domain address not on site -> rejected_not_on_site.
+ *   (bf9) AC1c: the five 2026-10-02 hard bounces -> all rejected.
+ *   (bf10) substring/script-only/redirect-to-social are not proof.
+ *   (prov) AC1e: every field_provenance.email written by ANY path in this
+ *          suite is actually on its source_url page.
+ *   (seen) emailSeenOnPage unit cases.
  *
  * globalThis.fetch is mocked directly, keyed on exact URL (same convention
  * as admin-rfb-website-discovery.test.ts). This file is intentionally NOT
@@ -638,21 +636,31 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
     }
 
     // ── (bf) mode: "backfill_from_contact_email" (dev-request
-    // 2026-09-02-rfb-innhoestet-contact-email-uten-k-email, option A) — a
-    // pure DB re-classification/backfill of an address ALREADY on file in
-    // agents.contact_email into agent_knowledge.email. No page fetch: no
-    // fixtures.set(...) needed for any row in this section, and fetchCalls
-    // must never grow across it.
+    // 2026-09-02-rfb-innhoestet-contact-email-uten-k-email, option A) —
+    // backfill of an address ALREADY on file in agents.contact_email into
+    // agent_knowledge.email. Since dev-request
+    // 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet every row must PROVE
+    // the address is on the producer's own site (front page or a linked
+    // contact-ish page) before anything is written; source_url = the page
+    // where it was seen. The old bf1-6/bf2-8 (source_url = k.website) and
+    // bf7 (free-mail exempt from proof, written without any page) encoded the
+    // defect and were deliberately rewritten.
     {
-      const fetchesBeforeBf = fetchCalls.length;
-
-      // (bf1)/(bf2): dry-run reports the copy without writing; apply then
-      // actually writes agent_knowledge.email with
-      // source_type:"harvest_contact_email" and source_url = k.website.
+      // (bf1)/(bf2) — AC1a: address on /kontakt as mailto -> dry-run reports
+      // the would-write with source_url = /kontakt; apply writes it with the
+      // same source_url (NOT the front page, where it does not appear).
       insertAgent({
         id: "cx-bf-basic", name: "Nydal Gard", website: "https://nydalgard.no",
         contactEmail: "post@nydalgard.no", fieldProvenance: liveDnsProvenance("nydalgard.no"),
       });
+      fixtures.set(
+        "https://nydalgard.no",
+        htmlResponse('<html><body>Velkommen til Nydal Gard. <a href="/kontakt">Kontakt</a></body></html>', { finalUrl: "https://nydalgard.no" }),
+      );
+      fixtures.set(
+        "https://nydalgard.no/kontakt",
+        htmlResponse('<html><body>Skriv til <a href="mailto:Post@Nydalgard.no">oss</a></body></html>', { finalUrl: "https://nydalgard.no/kontakt" }),
+      );
 
       const dry = await callExtraction({ agentIds: ["cx-bf-basic"], mode: "backfill_from_contact_email" });
       assertEq(dry.status, 200, "bf1-1: 200");
@@ -661,7 +669,8 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertTrue(!!dryItem, "bf1-3: result present for cx-bf-basic");
       assertEq(dryItem.outcome, "written", "bf1-4: outcome is 'written' (would-write in dry-run)");
       assertEq(dryItem.email, "post@nydalgard.no", "bf1-5: reports the already-known contact_email");
-      assertEq(dryItem.source_url, "https://nydalgard.no", "bf1-6: source_url is k.website");
+      assertEq(dryItem.source_url, "https://nydalgard.no/kontakt", "bf1-6 (AC1a): source_url is the page where the address was SEEN, not k.website");
+      assertEq(dryItem.found_via, "mailto", "bf1-6b: found via mailto (case-insensitive match)");
       assertEq(knowledgeEmailOf("cx-bf-basic"), null, "bf1-7: dry-run wrote NOTHING to agent_knowledge.email");
 
       const applied = await callExtraction({ agentIds: ["cx-bf-basic"], mode: "backfill_from_contact_email", apply: true });
@@ -673,27 +682,19 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(contactEmailOf("cx-bf-basic"), "post@nydalgard.no", "bf2-5: agents.contact_email unchanged (same-value no-op)");
       const bfProv = fieldProvenanceOf("cx-bf-basic");
       assertTrue(Array.isArray(bfProv.email) && bfProv.email.length === 1, "bf2-6: field_provenance.email has exactly one entry");
-      assertEq(bfProv.email[0].source_type, "harvest_contact_email", "bf2-7 (AC1): source_type is 'harvest_contact_email', distinguishing this from a fresh scrape");
-      assertEq(bfProv.email[0].source_url, "https://nydalgard.no", "bf2-8: field_provenance.email[0].source_url is k.website");
-      assertEq(bfProv.email[0].value, "post@nydalgard.no", "bf2-9: field_provenance.email[0].value matches the written address");
+      assertEq(bfProv.email?.[0]?.source_type, "harvest_contact_email", "bf2-7 (AC1): source_type is 'harvest_contact_email', distinguishing this from a fresh scrape");
+      assertEq(bfProv.email?.[0]?.source_url, "https://nydalgard.no/kontakt", "bf2-8 (AC1a): field_provenance.email[0].source_url is the /kontakt page where the address was seen");
+      assertEq(bfProv.email?.[0]?.value, "post@nydalgard.no", "bf2-9: field_provenance.email[0].value matches the written address");
 
-      // (bf2-audit) regression guard (CHANGES-REQUESTED review finding):
-      // newEmail in backfill mode is BY CONSTRUCTION identical to the row's
-      // pre-existing agents.contact_email (that's the whole premise of this
-      // mode — copying an already-on-file address into agent_knowledge.email),
-      // so applyRfbCxWrite must skip both the agents.contact_email UPDATE and
-      // the agent_knowledge_audit INSERT for it — a fabricated "X changed to
-      // X" audit row would pollute admin-agent-audit.ts's Daniel-only audit
-      // trail and break the dev-request's rollback contract (resetting
-      // k.email for provenance:harvest_contact_email rows must be
-      // sufficient). Only the outcome stays "written" (asserted as bf2-3
-      // above) — no DB-level contact_email audit row should exist.
+      // (bf2-audit) regression guard: backfill newEmail === contact_email by
+      // construction, so no "X changed to X" audit row.
       const bf2AuditRows = testDb
         .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = 'contact_email'")
         .all("cx-bf-basic");
       assertEq(bf2AuditRows.length, 0, "bf2-audit: no agent_knowledge_audit row for contact_email — value was unchanged");
 
-      // (bf3): platform-owned domain -> rejected, never written.
+      // (bf3): platform-owned domain -> rejected before any fetch.
+      const fetchesBeforeBf3 = fetchCalls.length;
       insertAgent({
         id: "cx-bf-platform", name: "Feilkontakt Backfill Gard", website: "https://feilbf.no",
         contactEmail: "kontakt@rettfrabonden.com", fieldProvenance: liveDnsProvenance("rettfrabonden.com"),
@@ -703,8 +704,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(bf3Item.outcome, "rejected_platform_domain", "bf3-1: platform-owned domain rejected");
       assertEq(knowledgeEmailOf("cx-bf-platform"), null, "bf3-2: nothing written to agent_knowledge.email");
 
-      // (bf4): non-free-mail domain mismatch (contact_email's domain differs
-      // from k.website's host) -> rejected, never written.
+      // (bf4): non-free-mail domain mismatch -> rejected before any fetch.
       insertAgent({
         id: "cx-bf-mismatch", name: "Ukoblet Backfill Gard", website: "https://ukobletbf.no",
         contactEmail: "post@heltannenbedrift.no", fieldProvenance: liveDnsProvenance("heltannenbedrift.no"),
@@ -714,22 +714,160 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(bf4Item.outcome, "rejected_domain_mismatch", "bf4-1: domain mismatch rejected");
       assertEq(knowledgeEmailOf("cx-bf-mismatch"), null, "bf4-2: nothing written to agent_knowledge.email");
 
-      // (bf7): free-mail exemption — a gmail.com contact_email on a company
-      // whose website is a completely different domain IS accepted.
+      // (bf-locks): claimed / curated rows are skipped exactly as before —
+      // and before any fetch.
+      insertAgent({
+        id: "cx-bf-claimed", name: "Eid Backfill Gard", website: "https://eidbf.no", claimedAt: "2026-01-01T00:00:00.000Z",
+        contactEmail: "post@eidbf.no", fieldProvenance: liveDnsProvenance("eidbf.no"),
+      });
+      insertAgent({
+        id: "cx-bf-curated", name: "Kuratert Backfill Gard", website: "https://kuratertbf.no",
+        curatedFields: JSON.stringify({ email: { by: "owner" } }),
+        contactEmail: "post@kuratertbf.no", fieldProvenance: liveDnsProvenance("kuratertbf.no"),
+      });
+      const bfLocks = await callExtraction({ agentIds: ["cx-bf-claimed", "cx-bf-curated"], mode: "backfill_from_contact_email", apply: true });
+      assertEq(bfLocks.body.results.find((x: any) => x.agent_id === "cx-bf-claimed")?.outcome, "skippedLocked", "bf-locks-1: claimed row skippedLocked");
+      assertEq(bfLocks.body.results.find((x: any) => x.agent_id === "cx-bf-curated")?.outcome, "skippedCurated", "bf-locks-2: curated row skippedCurated");
+      assertEq(knowledgeEmailOf("cx-bf-claimed"), null, "bf-locks-3: claimed row untouched");
+      assertEq(knowledgeEmailOf("cx-bf-curated"), null, "bf-locks-4: curated row untouched");
+      assertEq(fetchCalls.length, fetchesBeforeBf3, "bf-nofetch: platform/mismatch/locked/curated rows are rejected BEFORE any page fetch");
+
+      // (bf7) — AC1d: a gmail.com contact_email that does NOT appear on the
+      // producer's own site is NOT written (free-mail has no exemption from
+      // the on-site proof; previously it was written with no page at all).
       insertAgent({
         id: "cx-bf-freemail", name: "Fjellro Backfill Gard", website: "https://fjellrobf.no",
         contactEmail: "fjellrogard@gmail.com", fieldProvenance: liveDnsProvenance("gmail.com"),
       });
+      fixtures.set(
+        "https://fjellrobf.no",
+        htmlResponse('<html><body>Fjellro gard. <a href="/kontakt">Kontakt</a></body></html>', { finalUrl: "https://fjellrobf.no" }),
+      );
+      fixtures.set(
+        "https://fjellrobf.no/kontakt",
+        htmlResponse("<html><body>Ring oss på 912 34 567</body></html>", { finalUrl: "https://fjellrobf.no/kontakt" }),
+      );
+      const bf7Dry = await callExtraction({ agentIds: ["cx-bf-freemail"], mode: "backfill_from_contact_email" });
+      assertEq(bf7Dry.body.results.find((x: any) => x.agent_id === "cx-bf-freemail")?.outcome, "rejected_not_on_site", "bf7-0 (AC1d): dry-run reports the same rejected_not_on_site outcome");
       const bf7 = await callExtraction({ agentIds: ["cx-bf-freemail"], mode: "backfill_from_contact_email", apply: true });
       const bf7Item = bf7.body.results.find((x: any) => x.agent_id === "cx-bf-freemail");
-      assertEq(bf7Item.outcome, "written", "bf7-1: free-mail exemption accepted");
-      assertEq(knowledgeEmailOf("cx-bf-freemail"), "fjellrogard@gmail.com", "bf7-2: gmail.com address written despite domain differing from website");
+      assertEq(bf7Item.outcome, "rejected_not_on_site", "bf7-1 (AC1d): gmail address not on own site -> rejected_not_on_site");
+      assertEq(bf7Item.pages_checked, ["https://fjellrobf.no", "https://fjellrobf.no/kontakt"], "bf7-1b: pages_checked lists every own-site page that was read");
+      assertEq(knowledgeEmailOf("cx-bf-freemail"), null, "bf7-2 (AC1d): gmail address NOT written");
+      assertTrue(!fieldProvenanceOf("cx-bf-freemail").email, "bf7-3: no field_provenance.email entry");
 
-      // (bf5)/(bf6): cohort exclusion, proven via AUTO-SELECT (no agentIds)
-      // so that "not in the cohort at all" is distinguishable from the
-      // agentIds path's own "not_found" (which reports an id that simply
-      // isn't a row at all — a different case). A row absent from `results`
-      // here means selectRfbCxBackfillTargets never selected it.
+      // (bf7b): the same kind of free-mail address IS written when it is
+      // actually shown on the producer's own site (visible text).
+      insertAgent({
+        id: "cx-bf-freemail-ok", name: "Bekkely Backfill Gard", website: "https://bekkelybf.no",
+        contactEmail: "bekkelygard@gmail.com", fieldProvenance: liveDnsProvenance("gmail.com"),
+      });
+      fixtures.set(
+        "https://bekkelybf.no",
+        htmlResponse("<html><body>Bestilling: BEKKELYGARD@GMAIL.COM, eller ring.</body></html>", { finalUrl: "https://bekkelybf.no" }),
+      );
+      const bf7b = await callExtraction({ agentIds: ["cx-bf-freemail-ok"], mode: "backfill_from_contact_email", apply: true });
+      const bf7bItem = bf7b.body.results.find((x: any) => x.agent_id === "cx-bf-freemail-ok");
+      assertEq(bf7bItem?.outcome, "written", "bf7b-1: free-mail address seen in visible text on the front page IS written");
+      assertEq(bf7bItem?.found_via, "text", "bf7b-2: found via visible text (case-insensitive)");
+      assertEq(fieldProvenanceOf("cx-bf-freemail-ok").email?.[0]?.source_url, "https://bekkelybf.no", "bf7b-3: source_url is the front page, where it was seen");
+
+      // (bf8) — AC1b: own-domain address that is not on the site -> not
+      // written, distinct outcome; another address on the page is irrelevant.
+      insertAgent({
+        id: "cx-bf-notonsite", name: "Ikkepaaside Gard", website: "https://ikkepaaside.no",
+        contactEmail: "post@ikkepaaside.no", fieldProvenance: liveDnsProvenance("ikkepaaside.no"),
+      });
+      fixtures.set(
+        "https://ikkepaaside.no",
+        htmlResponse('<html><body><a href="mailto:salg@ikkepaaside.no">Salg</a> <a href="/om-oss">Om oss</a></body></html>', { finalUrl: "https://ikkepaaside.no" }),
+      );
+      fixtures.set(
+        "https://ikkepaaside.no/om-oss",
+        htmlResponse("<html><body>Vi er en liten gard.</body></html>", { finalUrl: "https://ikkepaaside.no/om-oss" }),
+      );
+      const bf8 = await callExtraction({ agentIds: ["cx-bf-notonsite"], mode: "backfill_from_contact_email", apply: true });
+      const bf8Item = bf8.body.results.find((x: any) => x.agent_id === "cx-bf-notonsite");
+      assertEq(bf8Item?.outcome, "rejected_not_on_site", "bf8-1 (AC1b): address not on own site -> rejected_not_on_site");
+      assertEq(knowledgeEmailOf("cx-bf-notonsite"), null, "bf8-2 (AC1b): nothing written");
+      assertEq(bf8.body.counts?.rejected_not_on_site, 1, "bf8-3: counted under counts.rejected_not_on_site");
+
+      // (bf9) — AC1c: the five 2026-10-02 hard bounces, with own-site pages
+      // that do not contain them (hanssensmat.no shows post@hahanssen.no).
+      const bounces: Array<{ id: string; name: string; site: string; email: string; front: string; sub?: [string, string] }> = [
+        {
+          id: "cx-bf-bofisk", name: "Bø Fisk", site: "https://bofisk.no", email: "post@bofisk.no",
+          front: '<html><body>Fersk fisk fra Bø. <a href="/kontakt">Kontakt</a></body></html>',
+          sub: ["https://bofisk.no/kontakt", "<html><body>Ring oss: 76 13 00 00. Besøk oss på kaia.</body></html>"],
+        },
+        {
+          id: "cx-bf-lillavendel", name: "Lillavendel", site: "https://lillavendel.no", email: "kontakt@lillavendel.no",
+          front: '<html><body>Lavendel fra egen hage. <a href="/kontakt-oss">Kontakt oss</a></body></html>',
+          sub: ["https://lillavendel.no/kontakt-oss", '<html><body><form action="/send">Navn <input name="n"></form></body></html>'],
+        },
+        {
+          id: "cx-bf-hanssensmat", name: "H.A. Hanssen", site: "https://www.hanssensmat.no", email: "post@hanssensmat.no",
+          front: '<html><body>H.A. Hanssen — mat fra Lofoten. <a href="/kontakt-oss/">Kontakt oss</a></body></html>',
+          sub: ["https://www.hanssensmat.no/kontakt-oss/", '<html><body>E-post: <a href="mailto:post@hahanssen.no">post@hahanssen.no</a></body></html>'],
+        },
+        {
+          id: "cx-bf-druehagen", name: "Druehagen", site: "https://druehagen.no", email: "post@druehagen.no",
+          front: '<html><body>Druehagen — vingård. <a href="/om-oss">Om oss</a></body></html>',
+          sub: ["https://druehagen.no/om-oss", "<html><body>Vi dyrker druer på Østlandet.</body></html>"],
+        },
+        {
+          id: "cx-bf-stavern", name: "Stavern Skalldyr", site: "https://stavernskalldyr.no", email: "kontakt@stavernskalldyr.no",
+          front: "<html><body>Skalldyr fra Stavern. Følg oss på Facebook.</body></html>",
+        },
+      ];
+      for (const b of bounces) {
+        insertAgent({ id: b.id, name: b.name, website: b.site, contactEmail: b.email, fieldProvenance: liveDnsProvenance(b.email.split("@")[1]!) });
+        fixtures.set(b.site, htmlResponse(b.front, { finalUrl: b.site }));
+        if (b.sub) fixtures.set(b.sub[0], htmlResponse(b.sub[1], { finalUrl: b.sub[0] }));
+      }
+      const bounceIds = bounces.map((b) => b.id);
+      const bf9Dry = await callExtraction({ agentIds: bounceIds, mode: "backfill_from_contact_email" });
+      const bf9 = await callExtraction({ agentIds: bounceIds, mode: "backfill_from_contact_email", apply: true });
+      for (const b of bounces) {
+        const dryOut = bf9Dry.body.results.find((x: any) => x.agent_id === b.id)?.outcome;
+        const out = bf9.body.results.find((x: any) => x.agent_id === b.id)?.outcome;
+        assertEq(dryOut, "rejected_not_on_site", `bf9-dry (AC1c): ${b.email} -> dry-run rejected_not_on_site`);
+        assertEq(out, "rejected_not_on_site", `bf9-apply (AC1c): ${b.email} -> rejected_not_on_site`);
+        assertEq(knowledgeEmailOf(b.id), null, `bf9-db (AC1c): ${b.email} NOT written`);
+      }
+      assertEq(bf9.body.counts?.written, undefined, "bf9-none: not a single bounce address was written");
+
+      // (bf10) — whole-token match only, script content does not count, and
+      // a redirect off to a social host is not "own site".
+      insertAgent({
+        id: "cx-bf-trap", name: "Felle Gard", website: "https://fellegard.no",
+        contactEmail: "post@fellegard.no", fieldProvenance: liveDnsProvenance("fellegard.no"),
+      });
+      fixtures.set(
+        "https://fellegard.no",
+        htmlResponse(
+          '<html><body>xpost@fellegard.no og post@fellegard.no.example.com <a href="mailto:ola.post@fellegard.no">Ola</a>' +
+            '<script>var cfg={"mail":"post@fellegard.no"};</script></body></html>',
+          { finalUrl: "https://fellegard.no" },
+        ),
+      );
+      const bf10 = await callExtraction({ agentIds: ["cx-bf-trap"], mode: "backfill_from_contact_email", apply: true });
+      assertEq(bf10.body.results.find((x: any) => x.agent_id === "cx-bf-trap")?.outcome, "rejected_not_on_site", "bf10-1: substring / longer-address / script-only occurrences are not proof");
+      assertEq(knowledgeEmailOf("cx-bf-trap"), null, "bf10-2: nothing written");
+
+      insertAgent({
+        id: "cx-bf-redirect", name: "Omdirigert Gard", website: "https://omdirigertgard.no",
+        contactEmail: "post@omdirigertgard.no", fieldProvenance: liveDnsProvenance("omdirigertgard.no"),
+      });
+      fixtures.set(
+        "https://omdirigertgard.no",
+        htmlResponse('<a href="mailto:post@omdirigertgard.no">Kontakt</a>', { finalUrl: "https://www.facebook.com/omdirigertgard" }),
+      );
+      const bf10b = await callExtraction({ agentIds: ["cx-bf-redirect"], mode: "backfill_from_contact_email", apply: true });
+      assertEq(bf10b.body.results.find((x: any) => x.agent_id === "cx-bf-redirect")?.outcome, "host_excluded", "bf10-3: a website that redirects to a social host is not the producer's own site");
+      assertEq(knowledgeEmailOf("cx-bf-redirect"), null, "bf10-4: nothing written");
+
+      // (bf5)/(bf6): cohort exclusion, proven via AUTO-SELECT (no agentIds).
       insertAgent({
         id: "cx-bf-notchecked", name: "Usjekket Gard", website: "https://usjekketbf.no",
         contactEmail: "post@usjekketbf.no", // field_provenance defaults to "{}" -> no dns_check.live key at all
@@ -751,8 +889,45 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(knowledgeEmailOf("cx-bf-notchecked"), null, "bf5-3: untouched — still null");
       assertEq(knowledgeEmailOf("cx-bf-deadflag"), null, "bf5-4: untouched — still null");
       assertEq(knowledgeEmailOf("cx-bf-filled"), "original@fyltbf.no", "bf6-2: untouched — pre-existing value preserved exactly");
+    }
 
-      assertEq(fetchCalls.length, fetchesBeforeBf, "bf-nofetch: backfill_from_contact_email never makes a live page fetch");
+    // ── (prov) AC1e — honest provenance across EVERY write path in this
+    // route (normal scrape mode + backfill): for every field_provenance.email
+    // entry written during this whole suite, the fixture page at its
+    // source_url must actually contain that address (mailto or visible
+    // text). A write path that set source_url to a page where the address
+    // was not seen (the pre-2026-10-03 backfill defect) fails here. ────────
+    {
+      const { emailSeenOnPage } = routeModule;
+      const rows = testDb
+        .prepare("SELECT agent_id, field_provenance FROM agent_knowledge WHERE field_provenance LIKE '%\"email\"%'")
+        .all() as Array<{ agent_id: string; field_provenance: string }>;
+      let checked = 0;
+      for (const row of rows) {
+        const prov = JSON.parse(row.field_provenance || "{}");
+        for (const entry of Array.isArray(prov.email) ? prov.email : []) {
+          checked++;
+          const fx = fixtures.get(String(entry.source_url));
+          const html = fx ? new TextDecoder().decode(await (fx as any).arrayBuffer()) : "";
+          assertTrue(
+            !!fx && emailSeenOnPage(html, String(entry.value)) !== null,
+            `prov-1 (AC1e): ${row.agent_id} field_provenance.email "${entry.value}" is actually on its source_url ${entry.source_url}`,
+          );
+        }
+      }
+      assertTrue(checked >= 8, `prov-2: setup — at least 8 field_provenance.email entries were checked (got ${checked})`);
+    }
+
+    // ── (seen) emailSeenOnPage unit cases ─────────────────────────────────
+    {
+      const { emailSeenOnPage } = routeModule;
+      assertEq(emailSeenOnPage('<a href="mailto:Post@A.no?subject=hei">x</a>', "post@a.no"), "mailto", "seen-1: mailto with query + case-insensitive");
+      assertEq(emailSeenOnPage('<a href="mailto:post%40a.no">x</a>', "post@a.no"), "mailto", "seen-2: URL-encoded mailto");
+      assertEq(emailSeenOnPage("<p>Kontakt: post@a.no.</p>", "post@a.no"), "text", "seen-3: visible text with trailing period");
+      assertEq(emailSeenOnPage("<p>ola.post@a.no</p>", "post@a.no"), null, "seen-4: longer local-part is not a match");
+      assertEq(emailSeenOnPage("<p>post@a.nord.no</p>", "post@a.no"), null, "seen-5: longer domain is not a match");
+      assertEq(emailSeenOnPage('<script>"post@a.no"</script>', "post@a.no"), null, "seen-6: script-only occurrence is not proof");
+      assertEq(emailSeenOnPage("", "post@a.no"), null, "seen-7: empty page");
     }
   } catch (err: any) {
     failed++;

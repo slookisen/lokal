@@ -288,14 +288,16 @@ function selectRfbCxTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): R
 // column BOTH funnel gates actually read. These rows are invisible to
 // RFB_CX_ELIGIBLE_WHERE above (contact_email is already non-blank so the
 // first clause excludes them, and they were never DNS-checked as dead so the
-// second clause doesn't match either). This is a pure re-classification/
-// backfill of an address ALREADY on file — no page fetch, no new scrape.
+// second clause doesn't match either). This backfills an address ALREADY on
+// file — but (dev-request 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet)
+// only after proving, by fetching the producer's own site, that the address
+// actually appears there; see findEmailOnOwnSite.
 //
 // Cohort requires field_provenance.contact_email_dns_check.live = 1
 // (explicitly DNS-confirmed alive) rather than merely "not flagged dead" —
 // a never-DNS-checked row (json_extract returns NULL, not 0) must NOT be
-// eligible, since an explicit-1 check is the only way to guarantee AC3
-// (liveness actually verified) with no live network call in this route.
+// eligible. (DNS liveness is NOT proof the address belongs to the producer —
+// that is what the on-site check in the route handler is for.)
 const RFB_CX_BACKFILL_ELIGIBLE_WHERE = `
   AND TRIM(COALESCE(k.email,'')) = ''
   AND TRIM(COALESCE(a.contact_email,'')) != ''
@@ -321,7 +323,9 @@ function selectRfbCxBackfillTargetsByIds(db: ReturnType<typeof getDb>, ids: stri
 // source_type for backfill-mode writes specifically — distinct from
 // RFB_CX_PROVENANCE_SOURCE_TYPE (fresh scrape) so these writes are
 // distinguishable in field_provenance.email as "copied from an
-// already-harvested agents.contact_email", per the dev-request's AC1.
+// already-harvested agents.contact_email", per the dev-request's AC1. Kept
+// unchanged (rollback contract keys on it); since 2026-10-03 the source_url
+// of such an entry is always the own-site page where the address was seen.
 const RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE = "harvest_contact_email";
 
 // Domain-coherence check mirroring lokal-agent-verifier.ts's
@@ -341,6 +345,92 @@ function backfillEmailOwnDomain(email: string, website: string): boolean {
   return emailMatchesSite || isFreeMail;
 }
 
+// ─── "Seen on the producer's own site" proof (dev-request
+// 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet) ─────────────────────────
+//
+// Max number of linked contact-ish subpages (kontakt / om-oss / team, via the
+// SAME gardssalgContactPageLinks helper the normal scrape mode uses) checked
+// per row in backfill mode, on top of the front page. The normal scrape mode
+// fetches 1 because it only needs SOME address; here we must confirm one
+// SPECIFIC address, so checking a couple more of the site's own linked pages
+// (same host only, never guessed paths) lowers false rejections without
+// lowering the bar.
+export const RFB_CX_BACKFILL_MAX_SUBPAGES = 3;
+
+const EMAIL_TOKEN_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+/**
+ * Does `email` literally appear on this page — as a mailto: href or in the
+ * visible text — case-insensitively? Whole-address token equality (an
+ * address embedded in a longer one, e.g. "xpost@a.no" or "post@a.no.evil",
+ * does NOT count). Script/style content is excluded (gardssalgPageText), so
+ * only what the site actually shows a visitor counts as proof.
+ * Pure — exported for tests.
+ */
+export function emailSeenOnPage(html: string, email: string): "mailto" | "text" | null {
+  const want = (email || "").trim().toLowerCase();
+  if (!want || !html) return null;
+  const mailtoRe = /href\s*=\s*["']\s*mailto:([^"'?]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = mailtoRe.exec(html)) !== null) {
+    let raw = m[1] || "";
+    try {
+      raw = decodeURIComponent(raw);
+    } catch {
+      /* keep raw */
+    }
+    for (const part of raw.split(/[,;]/)) {
+      if (part.trim().toLowerCase() === want) return "mailto";
+    }
+  }
+  const text = gardssalgPageText(html);
+  const tokens = text.match(EMAIL_TOKEN_RE) || [];
+  for (const tok of tokens) {
+    if (tok.toLowerCase() === want) return "text";
+  }
+  return null;
+}
+
+type BackfillSiteProof =
+  | { kind: "found"; url: string; via: "mailto" | "text"; pagesChecked: string[] }
+  | { kind: "not_found"; pagesChecked: string[] }
+  | { kind: "host_excluded"; detail: string }
+  | { kind: "cooldown_skipped"; host: string }
+  | { kind: "fetch_failed" };
+
+/**
+ * Fetches the producer's own front page (and, if needed, up to
+ * RFB_CX_BACKFILL_MAX_SUBPAGES linked same-host contact-ish pages) through
+ * the SAME rfbCxFetchPage (fetchPage SSRF guard + per-host 429 cooldown) the
+ * normal scrape mode uses, and reports the first page where `email` is seen.
+ * A redirect that lands on an excluded host (social/directory/hijacked) is
+ * treated as host_excluded — that page is not the producer's own site.
+ */
+async function findEmailOnOwnSite(website: string, email: string): Promise<BackfillSiteProof> {
+  const front = await rfbCxFetchPage(website);
+  if (front.kind === "cooldown_skipped") return { kind: "cooldown_skipped", host: front.host };
+  if (front.kind === "failed") return { kind: "fetch_failed" };
+  const finalHost = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(website) || "";
+  const finalExclusion = finalHost ? rfbWebsiteHostExclusionReason(finalHost) : null;
+  if (finalExclusion) return { kind: "host_excluded", detail: `redirect_${finalExclusion}` };
+
+  const pagesChecked: string[] = [front.finalUrl];
+  const frontVia = emailSeenOnPage(front.html, email);
+  if (frontVia) return { kind: "found", url: front.finalUrl, via: frontVia, pagesChecked };
+
+  for (const sub of gardssalgContactPageLinks(front.html, finalHost, RFB_CX_BACKFILL_MAX_SUBPAGES)) {
+    const subOutcome = await rfbCxFetchPage(sub);
+    if (subOutcome.kind !== "ok") continue;
+    // A subpage that redirects off-host is not the producer's own page.
+    const subHost = (hostFromUrlLike(subOutcome.finalUrl) || "").replace(/^www\./, "");
+    if (subHost !== finalHost.replace(/^www\./, "")) continue;
+    pagesChecked.push(subOutcome.finalUrl);
+    const via = emailSeenOnPage(subOutcome.html, email);
+    if (via) return { kind: "found", url: subOutcome.finalUrl, via, pagesChecked };
+  }
+  return { kind: "not_found", pagesChecked };
+}
+
 type ItemOutcome =
   | "written"
   | "no_contact_found"
@@ -356,7 +446,13 @@ type ItemOutcome =
   // 2026-09-02-rfb-innhoestet-contact-email-uten-k-email): a.contact_email
   // fails the domain-coherence check email_own_domain mirrors — neither an
   // own-domain/subdomain match against k.website nor a FREE_MAIL_DOMAINS hit.
-  | "rejected_domain_mismatch";
+  | "rejected_domain_mismatch"
+  // backfill_from_contact_email mode only (dev-request
+  // 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet): the producer's own
+  // site (front page + linked contact/about/team pages) was read, but the
+  // harvested a.contact_email does not appear on any of those pages — no
+  // traceable source, so nothing is written.
+  | "rejected_not_on_site";
 
 interface ResultItem {
   agent_id: string;
@@ -380,6 +476,11 @@ interface ResultItem {
   source_url?: string;
   old_value?: string | null;
   detail?: string;
+  // backfill_from_contact_email only: HOW the harvested address was seen on
+  // source_url ("mailto" href or visible "text"), and every page that was
+  // checked (so a rejected_not_on_site row is auditable).
+  found_via?: "mailto" | "text";
+  pages_checked?: string[];
 }
 
 // source_type recorded on the agent_knowledge.email field_provenance entry
@@ -543,11 +644,11 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
       req.query?.apply === "true";
     const dryRun = !apply;
     // dev-request 2026-09-02-rfb-innhoestet-contact-email-uten-k-email
-    // (option A): mode:"backfill_from_contact_email" is a pure DB
-    // re-classification/backfill of an address ALREADY on file
-    // (agents.contact_email) — no page fetch, different cohort, different
-    // per-row checks (see the isBackfillMode branch below). Any other/absent
-    // mode value keeps today's normal scrape flow completely untouched.
+    // (option A): mode:"backfill_from_contact_email" backfills an address
+    // ALREADY on file (agents.contact_email) — different cohort, different
+    // per-row checks, and (since 2026-10-03) an own-site proof fetch per row
+    // (see the isBackfillMode branch below). Any other/absent mode value
+    // keeps today's normal scrape flow completely untouched.
     const isBackfillMode = body.mode === "backfill_from_contact_email";
 
     const batchId = `rfb-contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
@@ -578,11 +679,23 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
     }
 
     if (isBackfillMode) {
-      // No page fetch — the email is already known from a.contact_email, so
-      // no rfbCxRowDelayMs pacing and no client-disconnect check either (both
-      // exist solely to be polite to third-party hosts / bail out of a
-      // long-running live-fetch loop; neither applies to a pure DB pass).
+      // dev-request 2026-10-03-rfb-epostkilde-sporbar-aldri-gjettet: this
+      // mode used to be a pure DB copy (no fetch) that wrote
+      // field_provenance.email.source_url = k.website WITHOUT the address
+      // ever having been seen there — 5 of 10 RFB sends on 2026-10-02 hard-
+      // bounced on such copies. Now every row must PROVE the harvested
+      // address is on the producer's own site (findEmailOnOwnSite) before
+      // anything is written, dry-run included (a preview never promises a
+      // write the apply would refuse). source_url = the page where it was
+      // actually seen. Free-mail addresses get no exemption from this proof.
+      // Since rows now make live fetches, the normal mode's row pacing and
+      // client-disconnect check apply here too.
+      let bfClientDisconnected = false;
       for (const t of targets) {
+        if ((req as any).aborted === true || res.writableEnded || (res as any).destroyed === true) {
+          bfClientDisconnected = true;
+          break;
+        }
         if (t.claimed_at) {
           results.push({ agent_id: t.id, agent_name: t.name, outcome: "skippedLocked" });
           continue;
@@ -606,22 +719,49 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
           continue;
         }
 
-        if (dryRun) {
+        const host = hostFromUrlLike(t.website);
+        const exclusionReason = host ? rfbWebsiteHostExclusionReason(host) : "invalid_website_url";
+        if (exclusionReason) {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "host_excluded", email: contactEmail, detail: exclusionReason });
+          continue;
+        }
+
+        await new Promise((r) => setTimeout(r, rfbCxRowDelayMs));
+        const proof = await findEmailOnOwnSite(t.website, contactEmail);
+        if (proof.kind === "cooldown_skipped") {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "cooldown_skipped", email: contactEmail, detail: proof.host });
+          continue;
+        }
+        if (proof.kind === "fetch_failed") {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "fetch_failed", email: contactEmail });
+          continue;
+        }
+        if (proof.kind === "host_excluded") {
+          results.push({ agent_id: t.id, agent_name: t.name, outcome: "host_excluded", email: contactEmail, detail: proof.detail });
+          continue;
+        }
+        if (proof.kind === "not_found") {
           results.push({
-            agent_id: t.id, agent_name: t.name, outcome: "written",
-            email: contactEmail, source_url: t.website, old_value: t.contact_email,
+            agent_id: t.id, agent_name: t.name, outcome: "rejected_not_on_site",
+            email: contactEmail, pages_checked: proof.pagesChecked,
           });
           continue;
         }
 
-        // source_url = t.website (the producer's own site), per the
-        // dev-request's spec — NOT the (unrelated) location the address was
-        // originally scraped from.
-        const written = applyRfbCxWrite(db, t.id, contactEmail, t.website, batchId, RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE);
+        if (dryRun) {
+          results.push({
+            agent_id: t.id, agent_name: t.name, outcome: "written",
+            email: contactEmail, source_url: proof.url, found_via: proof.via, old_value: t.contact_email,
+          });
+          continue;
+        }
+
+        // source_url = the page where the address was actually seen.
+        const written = applyRfbCxWrite(db, t.id, contactEmail, proof.url, batchId, RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE);
         if (written.outcome === "written") {
           results.push({
             agent_id: t.id, agent_name: t.name, outcome: "written",
-            email: contactEmail, source_url: t.website, old_value: written.oldValue,
+            email: contactEmail, source_url: proof.url, found_via: proof.via, old_value: written.oldValue,
           });
         } else {
           results.push({ agent_id: t.id, agent_name: t.name, outcome: written.outcome, old_value: written.oldValue });
@@ -638,7 +778,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         dry_run: dryRun,
         batch_id: batchId,
         scanned: targets.length,
-        aborted_client_disconnect: false,
+        aborted_client_disconnect: bfClientDisconnected,
         counts: backfillCounts,
         results,
       });
