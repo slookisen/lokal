@@ -6,6 +6,27 @@ Importfilene til innsendingsskjemaet ligger ved siden av dette dokumentet:
 Begge validerer mot OpenAIs skjema
 `https://developers.openai.com/plugins/schemas/chatgpt-app-submission.v1.json`.
 
+## 0. Oppdatering 03.10.2026 (les dette først)
+
+Det har ikke kommet noen ny avvisning siden 24.09, og ingen av appene er sendt inn på nytt. Før innsending ble alt kjørt på nytt mot produksjon. Testcasene ble i tillegg kjørt med flere varianter av argumentene ChatGPT kan finne på å sende. Det avdekket disse svakhetene, som nå er rettet:
+
+**Opplevagent**
+- Kategorien ble ignorert hvis modellen skrev den slik den vises for brukeren («wildlife & safari») eller fant på en slug («wildlife_safari»). Da viste listen alle kategorier, og testcase 4 lover bare dyreliv. Nå mappes ordene til riktig slug. En ukjent kategori gir en melding med gyldige verdier i stedet for å forsvinne stille.
+- Kommune med liten forbokstav («tromsø») ble ignorert, og da kom treff fra hele landet. Nå spiller store og små bokstaver ingen rolle.
+- `discover_gardssalg` ga null treff for «vestland» (liten forbokstav), «Hordaland» og fritekst som «gårdssalg Vestland». Det gjelder testcase 5. Alle tre gir nå Vestland-produsentene.
+- Verktøybeskrivelsen sier nå uttrykkelig at «om vinteren» er `season`, ikke kategorien `vinter_sno`. Med kategori forsvant nordlyscruiset og Aurora Safari Camp fra testcase 1.
+
+**Rett fra Bonden**
+- Testcase 1 er byttet fra «ost nær Bergen» til «reinsdyrkjøtt i Finnmark». Ostelista fikk med bakerier, fisketorgboder og en birøkter som er merket med meieri i dataene. En vurderer kunne underkjenne det.
+- Søket kjente ikke igjen «reinsdyrkjøtt» og «reinkjøtt». Da kom alle produsenter i Finnmark, med et bryggeri og et bakeri først. Ordene er nå lagt til.
+- `lokal_cart_submit` har fått valgfrie felt for kjøperens kontaktinfo og sender bare ekte bestillinger til verifiserte produsenter som har takket ja til bestillinger via plattformen. Begrunnelsen i importfila og personvernsiden (rettfrabonden.com/personvern) er oppdatert. Kontaktinfo deles bare med samtykke.
+- Forventet resultat i casene sier nå også at utvalg og rekkefølge kan endre seg.
+
+**Begge appene: negative testcaser**
+- Hvis ChatGPT likevel kalte verktøyet ved «pizza i Roma» eller «safarilodge i Kenya», svarte appene med norske treff. «Rome» traff Romeriksmat på Jessheim, og «Kenya» ble løsnet bort til en landsdekkende liste. Forventet oppførsel i begge casene er at appen *ikke* gir norske treff. Nå svarer verktøyene at de bare dekker Norge når et kjent utenlandsk sted (land eller storby) eller koordinater utenfor Norge er med i søket.
+
+Alt er låst med tester: `opplevagent-chatgpt-review.test.ts`, `rfb-chatgpt-annotations.test.ts`, `marketplace-search-english-queries.test.ts` og `rfb-privacy-terms-truth.test.ts`.
+
 ## 1. Hvorfor appene ble avvist
 
 ### Rett fra Bonden: annotasjonene stemte ikke med oppførselen
@@ -116,7 +137,7 @@ Alle feilene under er reprodusert mot produksjon 24.09:
 Alle testcasene er skrevet som *form på resultatet + noen stabile eksempler*, ikke eksakte tall eller rekkefølge. Da tåler de at katalogen endrer seg mellom innsending og vurdering. RFB-casene er kjørt mot produksjon 24.09. Opplevagent-casene forutsetter at PR-en er deployet, siden sesongfiksen og kortene trengs.
 
 - **RFB:**
-  - ost nær Bergen
+  - reinsdyrkjøtt i Finnmark (byttet ut ost nær Bergen 03.10)
   - rå honning i Vestfold
   - lam i Innlandet
   - Ostegården (navnesøk)

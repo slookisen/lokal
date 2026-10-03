@@ -44,6 +44,8 @@
  */
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
+import { foreignPlaceIn } from "../services/outside-norway";
 import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -195,6 +197,9 @@ export function detectExperiencesMcpClient(req: Request): string | undefined {
 
 // ─── Zod input schemas (exported for testing) ─────────────────
 
+/** list_experience_categories' synthetic entry for the discover_gardssalg vertical. */
+const GARDSSALG_CATEGORY = "gardssalg_smaking";
+
 export const DiscoverExperiencesInputSchema = {
   fylke: z.string().optional().describe(
     "Norwegian county (fylke). Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
@@ -206,13 +211,16 @@ export const DiscoverExperiencesInputSchema = {
     "Experience category slug — one of: 'kultur_historie' (culture/history, museums), 'natur_friluft' (nature/outdoors), " +
     "'adrenalin_action', 'sightseeing_transport' (sightseeing, cruises, cable cars), 'overnatting_opplevelse' (stays), " +
     "'dyreliv_safari' (wildlife, whale/moose safaris, dog sledding), 'vinter_sno' (winter & snow), 'mat_drikke' (food & drink), " +
-    "'velvaere_spa' (wellness/spa). Call list_experience_categories for live counts."
+    "'velvaere_spa' (wellness/spa). Call list_experience_categories for live counts. " +
+    "Omit category for a general 'what can we do' question. 'In winter' / 'om vinteren' is a season, not a category: " +
+    "use season='winter' — 'vinter_sno' covers only snow activities and would hide e.g. northern-lights cruises."
   ),
   weather: z.enum(["rain", "snow", "clear", "any"]).optional().describe(
-    "Weather suitability filter. 'rain'/'snow' prefers indoor + weather-independent experiences. Examples: 'rain', 'clear'"
+    "Today's weather, not the season: 'rain'/'snow' prefers indoor + weather-independent experiences. Examples: 'rain', 'clear'. For 'in winter' use season instead."
   ),
   season: z.string().optional().describe(
-    "Season filter: 'summer', 'winter', 'spring' or 'autumn' (the Norwegian words sommer/vinter/vår/høst work too). Year-round experiences are always included."
+    "Season filter: 'summer', 'winter', 'spring' or 'autumn' (the Norwegian words sommer/vinter/vår/høst work too). Year-round experiences are always included. " +
+    "Use this (not category or weather) when the user asks what to do in a season, e.g. 'Troms om vinteren' → fylke='Troms', season='winter'."
   ),
   indoor_outdoor: z.enum(["indoor", "outdoor", "both"]).optional().describe(
     "Indoor/outdoor preference. Examples: 'indoor', 'outdoor', 'both'"
@@ -253,23 +261,112 @@ export const DiscoverExperiencesInputSchema = {
 // 'vinter' as a category example — not a slug that exists (the real one is
 // 'vinter_sno'), so a model copying it got the category silently relaxed
 // away. The description now lists the real slugs; this maps the obvious
-// plain-word guesses (Norwegian or English) onto them. Real slugs and unknown
-// values pass through untouched.
+// plain-word guesses (Norwegian or English) onto them.
+//
+// Re-review 2026-10-03: a model also passes the human label it showed the
+// user ("wildlife & safari", "Food and drink") or an invented slug
+// ("wildlife_safari"). Those missed the table above, the filter was relaxed
+// away and the list mixed every category — test case 4 promises wildlife
+// only. Multi-word values are now split into words and the first word with
+// an alias wins; anything still unrecognised is reported back by
+// discover_experiences instead of being silently dropped.
 const CATEGORY_ALIASES: Record<string, string> = {
-  kultur: "kultur_historie", historie: "kultur_historie", culture: "kultur_historie", history: "kultur_historie", museum: "kultur_historie",
-  natur: "natur_friluft", friluft: "natur_friluft", nature: "natur_friluft", outdoors: "natur_friluft", outdoor: "natur_friluft",
-  adrenalin: "adrenalin_action", action: "adrenalin_action", adventure: "adrenalin_action",
-  sightseeing: "sightseeing_transport",
+  kultur: "kultur_historie", historie: "kultur_historie", culture: "kultur_historie", cultural: "kultur_historie", history: "kultur_historie", museum: "kultur_historie", museums: "kultur_historie",
+  natur: "natur_friluft", friluft: "natur_friluft", friluftsliv: "natur_friluft", nature: "natur_friluft", outdoors: "natur_friluft", outdoor: "natur_friluft",
+  adrenalin: "adrenalin_action", adrenaline: "adrenalin_action", action: "adrenalin_action", adventure: "adrenalin_action",
+  sightseeing: "sightseeing_transport", transport: "sightseeing_transport",
   overnatting: "overnatting_opplevelse", accommodation: "overnatting_opplevelse", stay: "overnatting_opplevelse", stays: "overnatting_opplevelse",
-  dyreliv: "dyreliv_safari", safari: "dyreliv_safari", wildlife: "dyreliv_safari", animals: "dyreliv_safari",
-  vinter: "vinter_sno", winter: "vinter_sno", "snø": "vinter_sno", snow: "vinter_sno",
+  dyreliv: "dyreliv_safari", safari: "dyreliv_safari", safaris: "dyreliv_safari", wildlife: "dyreliv_safari", animals: "dyreliv_safari", animal: "dyreliv_safari", dyr: "dyreliv_safari",
+  vinter: "vinter_sno", winter: "vinter_sno", "snø": "vinter_sno", sno: "vinter_sno", snow: "vinter_sno",
   mat: "mat_drikke", drikke: "mat_drikke", food: "mat_drikke", "food_drink": "mat_drikke",
   "velvære": "velvaere_spa", velvaere: "velvaere_spa", spa: "velvaere_spa", wellness: "velvaere_spa",
+  // Not an experience category: list_experience_categories appends this
+  // synthetic entry for the separate discover_gardssalg tool.
+  gardssalg: GARDSSALG_CATEGORY, "gårdssalg": GARDSSALG_CATEGORY, "farm-sale": GARDSSALG_CATEGORY, "farm_sale": GARDSSALG_CATEGORY,
 };
 
 export function normalizeExperienceCategory(category: string): string {
   const key = category.trim().toLowerCase();
-  return CATEGORY_ALIASES[key] ?? category.trim();
+  if (CATEGORY_ALIASES[key]) return CATEGORY_ALIASES[key];
+  if (listCategorySlugs().includes(key)) return key;
+  for (const word of key.split(/[^a-z0-9æøå]+/)) {
+    if (CATEGORY_ALIASES[word]) return CATEGORY_ALIASES[word];
+  }
+  return category.trim();
+}
+
+/** The experience category slugs that currently have published listings. */
+function listCategorySlugs(): string[] {
+  try {
+    return listCategories().map((c) => c.category);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The place a discover call names outside Norway — a foreign county/kommune/
+ * query word, or an origin outside Norway's bounding box — or null. Without
+ * this check "Kenya" was relaxed away like an over-narrow filter and the
+ * caller got a nationwide Norwegian list, the opposite of the submission's
+ * negative test case (ChatGPT app re-review 2026-10-03).
+ */
+export function outsideNorwayPlace(args: {
+  fylke?: string; kommune?: string; query?: string; lat?: number; lng?: number;
+}): string | null {
+  const named = foreignPlaceIn(args.fylke) ?? foreignPlaceIn(args.kommune) ?? foreignPlaceIn(args.query);
+  if (named) return named;
+  if (typeof args.lat === "number" && typeof args.lng === "number" && !isPlausibleNorwayCoord(args.lat, args.lng)) {
+    return `${args.lat}, ${args.lng}`;
+  }
+  return null;
+}
+
+function outsideNorwayResult(place: string, listKey: "experiences" | "gardssalg_producers", filter: object) {
+  const result = {
+    summary:
+      `Opplevagent dekker bare opplevelser og gårdssalg i Norge, og «${place}» ligger utenfor. Ingen treff foreslås. / ` +
+      `Opplevagent only covers experiences and farm-sale producers in Norway; "${place}" is outside that, so nothing is suggested.`,
+    count: 0,
+    filter_applied: filter,
+    [listKey]: [],
+  };
+  return {
+    ...(listKey === "experiences" ? { structuredContent: result } : {}),
+    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+  };
+}
+
+// Words a model adds to a discover_gardssalg query that describe the whole
+// vertical rather than a producer ("gårdssalg Vestland", "local drink
+// producers in Vestland"). Every query word must match a producer's name or
+// place, so one of these used to turn the search into zero hits.
+const GARDSSALG_QUERY_NOISE = new Set([
+  "gårdssalg", "gardssalg", "gårdsalg", "farm", "farms", "sale", "sales", "farm-sale", "farmsale",
+  "lokal", "lokale", "local", "drikke", "drikkeprodusent", "drikkeprodusenter", "drink", "drinks",
+  "produsent", "produsenter", "producer", "producers", "og", "and", "i", "in", "near", "nær", "ved",
+]);
+
+/**
+ * Split a free-text discover_gardssalg query into the producer lookup and a
+ * county. A word that is a fylke name ("Vestland", "hordaland") becomes the
+ * fylke filter, because the name lookup does not search the county column;
+ * the vertical's own generic words are dropped. (ChatGPT app re-review
+ * 2026-10-03: query "gårdssalg Vestland" returned nothing.)
+ */
+export function splitGardssalgQuery(query: string): { q: string; fylke?: string } {
+  const kept: string[] = [];
+  let fylke: string | undefined;
+  for (const word of query.trim().split(/\s+/)) {
+    const lc = word.toLocaleLowerCase("nb-NO").replace(/[.,;:!?]+$/, "");
+    if (!lc || GARDSSALG_QUERY_NOISE.has(lc)) continue;
+    if (!fylke && normaliseFylke(lc) && fylkeEquivalents(lc).some((v) => v.toLocaleLowerCase("nb-NO") === lc)) {
+      fylke = word.replace(/[.,;:!?]+$/, "");
+      continue;
+    }
+    kept.push(word);
+  }
+  return { q: kept.join(" "), ...(fylke ? { fylke } : {}) };
 }
 
 export const ListExperienceCategoriesInputSchema = {};
@@ -300,7 +397,7 @@ export const DiscoverGardssalgInputSchema = {
   // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: look a
   // SPECIFIC producer up by name/place — the step «book et møte hos X» needs.
   query: z.string().max(200).optional().describe(
-    "Free-text lookup of a specific producer by name and/or place, e.g. 'Fjordgard Bryggeri', 'Egge gård', 'sideri Hardanger'. Every word must match the producer's name, URL slug, place (poststed) or municipality; exact name matches rank first. Use this to get the `id` (provider_id) for book_gardssalg when the guest names a producer."
+    "Free-text lookup of a specific producer by name and/or place, e.g. 'Fjordgard Bryggeri', 'Egge gård', 'sideri Hardanger'. Every word must match the producer's name, URL slug, place (poststed) or municipality; exact name matches rank first. Use this to get the `id` (provider_id) for book_gardssalg when the guest names a producer. A county name in the query (e.g. 'Vestland') is applied as the fylke filter; for a whole county, prefer fylke."
   ),
   booking_live: z.boolean().optional().describe(
     "When true, only return producers that currently accept direct bookings. Omit to include producers regardless of booking status."
@@ -458,7 +555,8 @@ function registerExperienceTools(
         "municipality centroid) and are sorted nearest-first. " +
         "Returns title, category, location (fylke/kommune), description, and booking URL if available. " +
         "Only verified experiences from active providers (Brreg-checked) are returned. " +
-        "Examples: 'hva kan vi finne på i Troms om vinteren?', 'outdoor activities in Oslo for 4 people', " +
+        "Examples: 'hva kan vi finne på i Troms om vinteren?' (fylke='Troms', season='winter'), " +
+        "'wildlife experiences' (category='dyreliv_safari'), 'outdoor activities in Oslo for 4 people', " +
         "'experiences within 50km of lat 69.65 / lng 18.95'.",
       inputSchema: DiscoverExperiencesInputSchema,
       annotations: {
@@ -499,6 +597,31 @@ function registerExperienceTools(
         if (typeof radius_km === "number") filter.radius_km = radius_km;
         if (sort) filter.sort = sort;
         const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+
+        const foreign = outsideNorwayPlace({ fylke, kommune, lat, lng });
+        if (foreign) return outsideNorwayResult(foreign, "experiences", filter);
+
+        // A category that is not a real slug even after normalisation used to
+        // be relaxed away like an over-narrow filter, so the caller silently
+        // got every category. Say so instead and name the valid slugs; the
+        // gårdssalg entry from list_experience_categories points at its own
+        // tool. (ChatGPT app re-review 2026-10-03.)
+        if (filter.category) {
+          const slugs = listCategorySlugs();
+          const pointer =
+            filter.category === GARDSSALG_CATEGORY
+              ? "Gårdssalg-produsenter søkes med verktøyet discover_gardssalg. / Farm-sale drink producers are searched with the discover_gardssalg tool."
+              : slugs.length > 0 && !slugs.includes(filter.category)
+                ? `Ukjent kategori «${filter.category}». Gyldige kategorier: ${slugs.join(", ")}. / Unknown category "${filter.category}". Valid categories: ${slugs.join(", ")}.`
+                : null;
+          if (pointer) {
+            const result = { summary: pointer, count: 0, filter_applied: filter, valid_categories: slugs, experiences: [] };
+            return {
+              structuredContent: result,
+              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+            };
+          }
+        }
 
         const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit ?? 20);
         const relaxationNote = buildRelaxationNote(relaxedKeys);
@@ -610,7 +733,7 @@ function registerExperienceTools(
         // .all() call each time, but never mutate a store function's return
         // value on principle.
         const categories = [...listCategories()];
-        categories.push({ category: "gardssalg_smaking", count: countGardssalgProviders() });
+        categories.push({ category: GARDSSALG_CATEGORY, count: countGardssalgProviders() });
         const result = {
           count: categories.length,
           categories,
@@ -810,6 +933,8 @@ function registerExperienceTools(
     },
     async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }) => {
       try {
+        const foreign = outsideNorwayPlace({ fylke, kommune, query, lat, lng });
+        if (foreign) return outsideNorwayResult(foreign, "gardssalg_producers", { fylke, kommune, query });
         const filter: GardssalgSearchFilter = {};
         if (fylke) filter.fylke = fylke;
         if (kommune) filter.kommune = kommune;
@@ -818,7 +943,11 @@ function registerExperienceTools(
         // "mjød") to every known DB spelling of that type; any other value
         // passes through unchanged. See that function's own doc comment.
         if (producer_type) filter.producer_type = resolveGardssalgProducerTypeFilter(producer_type);
-        if (typeof query === "string" && query.trim()) filter.q = query.trim();
+        if (typeof query === "string" && query.trim()) {
+          const { q, fylke: queryFylke } = splitGardssalgQuery(query);
+          if (q) filter.q = q;
+          if (queryFylke && !filter.fylke) filter.fylke = queryFylke;
+        }
         if (typeof booking_live === "boolean") filter.booking_live = booking_live;
         if (typeof lat === "number") filter.lat = lat;
         if (typeof lng === "number") filter.lng = lng;

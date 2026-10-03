@@ -1509,6 +1509,29 @@ export function buildFylkeInClause(
 }
 
 /**
+ * Case-insensitive `<column> = kommune` fragment. An AI caller writes
+ * "tromsø" or "TROMSØ" as often as "Tromsø"; an exact match missed those,
+ * the filter was relaxed away and the caller got a nationwide list (ChatGPT
+ * app re-review 2026-10-03). SQLite's lower() folds ASCII only, so the
+ * caller's value is also bound in the stored title-case form ("ålesund" →
+ * "Ålesund", "nord-fron" → "Nord-Fron").
+ */
+export function buildKommuneEqClause(
+  kommune: string,
+  column = "kommune",
+  paramPrefix = "kommune"
+): { sql: string; params: Record<string, string> } {
+  const raw = kommune.trim();
+  const titled = raw
+    .toLocaleLowerCase("nb-NO")
+    .replace(/(^|[\s-])(\p{L})/gu, (_m, sep: string, ch: string) => sep + ch.toLocaleUpperCase("nb-NO"));
+  return {
+    sql: `(${column} = @${paramPrefix} OR lower(${column}) = lower(@${paramPrefix}) OR ${column} = @${paramPrefix}Titled)`,
+    params: { [paramPrefix]: raw, [`${paramPrefix}Titled`]: titled },
+  };
+}
+
+/**
  * Builds a `<column> IN (...)` fragment + bound params for a kommune LIST
  * filter — the multi-kommune counterpart to a plain `kommune = @kommune`
  * equality, driven by DiscoverFilter.kommuner (dev-request 2026-09-21-
@@ -1627,7 +1650,11 @@ function buildDiscoverWhere(f: DiscoverFilter): {
     where.push(sql);
     Object.assign(params, fylkeParams);
   }
-  if (f.kommune) { where.push("e.kommune = @kommune"); params.kommune = f.kommune; }
+  if (f.kommune) {
+    const { sql, params: kommuneParams } = buildKommuneEqClause(f.kommune, "e.kommune");
+    where.push(sql);
+    Object.assign(params, kommuneParams);
+  }
   if (f.kommuner && f.kommuner.length > 0) {
     const { sql, params: kommunerParams } = buildKommuneInClause(f.kommuner, "e.kommune", "kommuner");
     where.push(sql);
@@ -3678,12 +3705,12 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
 // hidden booking-flyt-v1 test provider) must NEVER be returned here under
 // any filter combination, same as the public grid/count.
 //
-// fylke/kommune/producer_type are simple exact-match filters. Unlike
-// discoverExperiences()'s fylke handling, this deliberately does NOT bridge
-// fylke-reform-era spelling variants via fylkeEquivalents() (see that
-// function's doc comment in norway-fylke.ts) — gårdssalg providers were all
-// seeded/enriched post-reform, so this column has no pre-2020/pre-2024
-// spelling variance to bridge.
+// producer_type is an exact-match filter. fylke/kommune match the same way
+// discoverExperiences() does: fylke through fylkeEquivalents() (see that
+// function's doc comment in norway-fylke.ts) and kommune case-insensitively.
+// gårdssalg providers were all seeded/enriched post-reform, so the column has
+// no spelling variance; the bridge is for the caller's spelling ("vestland",
+// "Hordaland").
 //
 // near-me (lat/lng[+radius_km]) mirrors discoverExperiences()'s own pattern:
 // a coarse bounding-box pre-filter in SQL, then the exact haversine cut +
@@ -3789,8 +3816,21 @@ export function searchGardssalgProviders(
   }
   const params: Record<string, unknown> = {};
 
-  if (filter.fylke) { where.push("fylke = @fylke"); params.fylke = filter.fylke; }
-  if (filter.kommune) { where.push("kommune = @kommune"); params.kommune = filter.kommune; }
+  // Re-review 2026-10-03: fylke now goes through the same fylkeEquivalents()
+  // bridge as discoverExperiences() and kommune through the same
+  // case-insensitive match. The column itself has no spelling variance (see
+  // the note above), but callers do: "vestland", "Hordaland" and "tromsø"
+  // all matched zero rows with a plain equality.
+  if (filter.fylke) {
+    const { sql, params: fylkeParams } = buildFylkeInClause(filter.fylke, "fylke");
+    where.push(sql);
+    Object.assign(params, fylkeParams);
+  }
+  if (filter.kommune) {
+    const { sql, params: kommuneParams } = buildKommuneEqClause(filter.kommune, "kommune");
+    where.push(sql);
+    Object.assign(params, kommuneParams);
+  }
   if (filter.producer_type) {
     if (Array.isArray(filter.producer_type)) {
       if (filter.producer_type.length > 0) {

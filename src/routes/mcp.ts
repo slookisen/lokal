@@ -46,6 +46,7 @@ import {
 // conversation. buildRequestMeta stays for session/traffic classification.
 import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
+import { foreignPlaceIn } from "../services/outside-norway";
 
 const router = Router();
 
@@ -241,6 +242,24 @@ export async function enrichParsedWithGeo(
 // Exported for testing (dev-request 2026-07-25-reisesok Fase 0g): lets a test
 // capture every tool's inputSchema + handler through a duck-typed server,
 // without standing up a transport.
+/**
+ * Answer for a search that names a place outside Norway. Without it, "pizza
+ * Rome" substring-matched the producer Romeriksmat — the opposite of the
+ * submission's negative test case (ChatGPT app re-review 2026-10-03).
+ */
+function outsideNorwayAnswer(place: string) {
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Rett fra Bonden dekker bare småskala matprodusenter i Norge, og «${place}» ligger utenfor. ` +
+        "Ingen produsenter foreslås. / " +
+        `Rett fra Bonden only covers small-scale food producers in Norway; "${place}" is outside that, ` +
+        "so no producers are suggested.",
+    }],
+  };
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -279,6 +298,8 @@ export function registerTools(
     },
     async ({ query, lat, lng, radius_km, limit }) => {
       const q = query || "";
+      const foreign = foreignPlaceIn(q);
+      if (foreign) return outsideNorwayAnswer(foreign);
       const parsed = marketplaceRegistry.parseNaturalQuery(q);
 
       // fix 0g(i): explicit coordinates beat any place name in the text —
@@ -945,6 +966,8 @@ export function registerTools(
       },
     },
     async ({ items, near, lat, lng, radius_km }) => {
+      const foreign = foreignPlaceIn(near);
+      if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
       if (!hasCoords && !(near && near.trim())) {
         return {
