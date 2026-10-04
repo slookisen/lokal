@@ -16736,8 +16736,8 @@ console.log("── orch-pr-20260927-weekly-vacuum-stall: weekly auto-VACUUM rem
   // [auto-prune] log-line prefix (fly logs consumers depend on this) are
   // all still intact.
   assertTrue(
-    indexSrc.includes('analyticsService.runAutoPrune({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP })'),
-    "orch-pr-vacuum: daily runAutoPrune() call is untouched",
+    indexSrc.includes('analyticsService.runAutoPruneAsync({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP })'),
+    "orch-pr-vacuum: daily auto-prune call is present (now the chunked async variant, dev-request 2026-10-01-prod-auto-prune-skansom)",
   );
   assertTrue(
     indexSrc.includes('process.env.RFB_DISABLE_AUTO_PRUNE !== "1"'),
@@ -35036,6 +35036,23 @@ const _rollupSlice2Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("analytics-rollup-slice2: unexpected error: " + String(err?.message || err));
+  }
+
+  // dev-request 2026-10-01-prod-auto-prune-skansom: chunked/indexed prune vs
+  // the legacy substr() implementation. Swaps the getDb() singleton too, so it
+  // runs serially inside this block (right after slice2), not as a new chain tail.
+  console.log("\n── dev-request 2026-10-01-prod-auto-prune-skansom: chunked auto-prune ──");
+  try {
+    const { runRetentionChunkedPruneTests } = require("../src/services/retention-chunked-prune.test") as
+      typeof import("../src/services/retention-chunked-prune.test");
+    const cp = await runRetentionChunkedPruneTests({ log: false });
+    passed += cp.passed;
+    failed += cp.failed;
+    for (const f of cp.failures) failures.push("chunked-prune: " + f);
+    console.log(`  chunked-prune: ${cp.passed} passed, ${cp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("chunked-prune: unexpected error: " + String(err?.message || err));
   } finally {
     _rollupSlice2Resolve();
   }

@@ -43,12 +43,357 @@ function hasUtmRollupSchema(db: ReturnType<typeof getDb>): boolean {
   }
 }
 
+// ─── Chunked, index-friendly rollup+prune core ───────────────────────────
+// dev-request 2026-10-01-prod-auto-prune-skansom. The nightly auto-prune used
+// to filter with `substr(created_at,1,10) >= ? AND substr(created_at,1,10) < ?`
+// (the function wrapper defeats idx_analytics_*_created, so every statement
+// read the whole table) and deleted a whole 7-day batch in ONE synchronous
+// transaction — 47 s of frozen event loop in prod on 2026-10-01. Now:
+//
+//  1. Direct range filter `created_at >= ? AND created_at < ?`. This selects
+//     EXACTLY the rows the substr() filter selected, for every stored shape
+//     (full 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DDTHH:MM:SS', bare 'YYYY-MM-DD',
+//     '', non-dates): with p = substr(c,1,10) and a boundary B of <=10 chars,
+//     `p >= B` <=> `c >= B` (c extends p, so they first differ inside the
+//     shared prefix, or p == c when c is short) and, for a 10-char B,
+//     `p < B` <=> `c < B` (p == B means c starts with B and is >= B, so both
+//     sides are false). NULL fails both forms. Boundaries are the verbatim
+//     oldest-prefix (<=10 chars) and 'YYYY-MM-DD' strings (exactly 10 chars).
+//  2. Work is split per calendar day (`day` is part of every rollup GROUP BY,
+//     so per-day rollups are identical to the per-batch ones).
+//  3. A day with <= chunkSize rows is rolled up AND deleted in one transaction
+//     exactly as before. A bigger day is crash-safe like this: one transaction
+//     rolls the whole day up (indexed range) and records a "rolled up, delete
+//     pending" marker for that [lo,hi) range in boot_job_state; the rows are
+//     then deleted in chunkSize-row transactions (rowid IN (... LIMIT ?)),
+//     the last of which clears the marker. A crash/throw anywhere leaves the
+//     marker, and the next run (any caller) FIRST finishes deleting the
+//     marked range WITHOUT rolling it up again, so nothing is double-counted
+//     (rollup rows are additive: ON CONFLICT ... + excluded). Rollup cannot
+//     be chunked per row batch: session_count is COUNT(DISTINCT session_id)
+//     per group, which is not additive across chunks.
+//  4. The generator yields after every transaction; the async wrapper awaits
+//     setImmediate there so request handlers run between chunks. The sync
+//     wrappers just drain the generator (manual routes, tests: old behaviour).
+// Residual: a row inserted into an already-rolled-up, marked day (older than
+// the retention window, so effectively never) is deleted without rollup.
+const PRUNE_CHUNK_ROWS = 2000;
+
+export interface PruneChunkOpts {
+  /** Rows per delete transaction (default 2000). */
+  chunkSize?: number;
+  /** Called after each committed transaction; tests throw here to simulate a crash. */
+  afterChunk?: (info: { table: string; phase: "rollup" | "delete"; rows: number }) => void;
+}
+
+type PruneResult = { rowsRolledUp: number; rowsDeleted: number; daysProcessed: number };
+type PruneSteps = Generator<void, PruneResult, void>;
+type Db = ReturnType<typeof getDb>;
+
+interface PruneSpec {
+  table: "analytics_page_views" | "analytics_queries" | "analytics_agent_views";
+  /** Rollup INSERT..SELECT statements; each takes (lo, hi) as its two params. */
+  rollupSql: (db: Db) => string[];
+}
+
+const markerJob = (table: string) => `retention-rolled-delete-pending:${table}`;
+
+function ensureMarkerTable(db: Db): void {
+  // Same DDL as init.ts / services/boot-job-gate.ts.
+  db.exec("CREATE TABLE IF NOT EXISTS boot_job_state (job TEXT PRIMARY KEY, last_completed_at TEXT NOT NULL)");
+}
+
+function readMarker(db: Db, table: string): string | null {
+  try {
+    const row = db.prepare("SELECT last_completed_at as v FROM boot_job_state WHERE job = ?")
+      .get(markerJob(table)) as { v: string } | undefined;
+    return row?.v ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Delete [lo,hi) in chunkSize-row transactions; clears `marker` (if any) in the final one. */
+function* deleteRangeInChunks(
+  db: Db, table: string, lo: string, hi: string, chunk: number, marker: string | null, opts: PruneChunkOpts
+): Generator<void, number, void> {
+  const del = db.prepare(
+    `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE created_at >= ? AND created_at < ? LIMIT ?)`
+  );
+  const clear = marker
+    ? db.prepare("DELETE FROM boot_job_state WHERE job = ? AND last_completed_at = ?")
+    : null;
+  let total = 0;
+  for (;;) {
+    let n = 0;
+    db.transaction(() => {
+      n = del.run(lo, hi, chunk).changes;
+      if (n < chunk && clear) clear.run(markerJob(table), marker);
+    })();
+    total += n;
+    opts.afterChunk?.({ table, phase: "delete", rows: n });
+    if (n < chunk) return total;
+    yield;
+  }
+}
+
+function* pruneTableSteps(
+  spec: PruneSpec, windowDays: number, batchDays: number, dryRun: boolean, opts: PruneChunkOpts
+): PruneSteps {
+  const db = getDb();
+  const table = spec.table;
+  const chunk = Math.max(1, Math.floor(opts.chunkSize ?? PRUNE_CHUNK_ROWS));
+  let totalRolledUp = 0;
+  let totalDeleted = 0;
+  let daysProcessed = 0;
+
+  // Finish an interrupted earlier run first (rows already rolled up, delete pending).
+  if (!dryRun) {
+    ensureMarkerTable(db);
+    const pending = readMarker(db, table);
+    if (pending) {
+      const [lo, hi] = pending.split("|");
+      totalDeleted += yield* deleteRangeInChunks(db, table, lo, hi, chunk, pending, opts);
+      yield;
+    }
+  }
+
+  // substr(MIN(col)) not MIN(substr(col)): same value (substr is monotone,
+  // MIN skips NULLs) but answered from the index in O(log n) (as #950).
+  const oldest = (db.prepare(
+    `SELECT substr(MIN(created_at), 1, 10) as d FROM ${table}`
+  ).get() as { d: string | null })?.d;
+  if (!oldest) return { rowsRolledUp: 0, rowsDeleted: totalDeleted, daysProcessed: 0 };
+
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - windowDays);
+  const cutoffStr = cutoffDate.toISOString().slice(0, 10); // YYYY-MM-DD
+
+  if (oldest >= cutoffStr) {
+    // All rows are within the retention window — nothing to do
+    return { rowsRolledUp: 0, rowsDeleted: totalDeleted, daysProcessed: 0 };
+  }
+
+  const countRange = db.prepare(`SELECT COUNT(*) as c FROM ${table} WHERE created_at >= ? AND created_at < ?`);
+  const countCapped = db.prepare(
+    `SELECT COUNT(*) as c FROM (SELECT 1 FROM ${table} WHERE created_at >= ? AND created_at < ? LIMIT ?)`
+  );
+  const delRange = db.prepare(`DELETE FROM ${table} WHERE created_at >= ? AND created_at < ?`);
+  const setMarker = db.prepare(
+    `INSERT INTO boot_job_state (job, last_completed_at) VALUES (?, ?)
+     ON CONFLICT(job) DO UPDATE SET last_completed_at = excluded.last_completed_at`
+  );
+  const rollupStmts = dryRun ? [] : spec.rollupSql(db).map((s) => db.prepare(s));
+
+  // Process in batchDays-wide windows from oldest to cutoff
+  let batchStart = oldest;
+  while (batchStart < cutoffStr) {
+    const batchEndDate = new Date(batchStart);
+    batchEndDate.setDate(batchEndDate.getDate() + batchDays);
+    let batchEnd = batchEndDate.toISOString().slice(0, 10);
+    if (batchEnd > cutoffStr) batchEnd = cutoffStr;
+
+    if (!dryRun) {
+      // Per-day sub-ranges [bounds[i], bounds[i+1]) covering [batchStart, batchEnd).
+      const bounds = [batchStart];
+      for (let k = 1; k <= batchDays; k++) {
+        const d = new Date(batchStart);
+        d.setDate(d.getDate() + k);
+        const b = d.toISOString().slice(0, 10);
+        if (b >= batchEnd) break;
+        if (b > bounds[bounds.length - 1]) bounds.push(b);
+      }
+      bounds.push(batchEnd);
+
+      for (let i = 0; i + 1 < bounds.length; i++) {
+        const lo = bounds[i];
+        const hi = bounds[i + 1];
+        const rows = (countCapped.get(lo, hi, chunk + 1) as { c: number }).c;
+        if (rows <= chunk) {
+          // Small day: rollup + delete atomically (the pre-chunking invariant).
+          db.transaction(() => {
+            for (const st of rollupStmts) st.run(lo, hi);
+            totalDeleted += delRange.run(lo, hi).changes;
+          })();
+          opts.afterChunk?.({ table, phase: "delete", rows });
+        } else {
+          // Big day: rollup + durable "delete pending" marker atomically, then chunked delete.
+          const marker = `${lo}|${hi}`;
+          db.transaction(() => {
+            for (const st of rollupStmts) st.run(lo, hi);
+            setMarker.run(markerJob(table), marker);
+          })();
+          opts.afterChunk?.({ table, phase: "rollup", rows });
+          yield;
+          totalDeleted += yield* deleteRangeInChunks(db, table, lo, hi, chunk, marker, opts);
+        }
+        yield;
+      }
+    }
+
+    // Count rows in batch for reporting (whether dry run or not)
+    const counted = (countRange.get(batchStart, batchEnd) as { c: number }).c;
+    if (dryRun) totalDeleted += counted;
+    totalRolledUp += counted;
+    daysProcessed += batchDays;
+
+    // Advance to next batch
+    batchStart = batchEnd;
+  }
+
+  return { rowsRolledUp: totalRolledUp, rowsDeleted: totalDeleted, daysProcessed };
+}
+
+function runStepsSync(gen: PruneSteps): PruneResult {
+  let r = gen.next();
+  while (!r.done) r = gen.next();
+  return r.value;
+}
+
+async function runStepsAsync(gen: PruneSteps): Promise<PruneResult> {
+  let r = gen.next();
+  while (!r.done) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    r = gen.next();
+  }
+  return r.value;
+}
+
+const PAGE_VIEWS_SPEC: PruneSpec = {
+  table: "analytics_page_views",
+  rollupSql: (db) => {
+    const sql = [
+      // 1. Rollup: INSERT into page_view_daily (upsert to handle re-runs)
+      `INSERT INTO page_view_daily (day, path, source, bot_type, vertical_id, view_count, session_count)
+       SELECT
+         substr(created_at, 1, 10) as day,
+         path,
+         COALESCE(source, 'unknown') as source,
+         ${BOT_TYPE_CASE} as bot_type,
+         COALESCE(vertical_id, 'rfb') as vertical_id,
+         COUNT(*) as view_count,
+         COUNT(DISTINCT session_id) as session_count
+       FROM analytics_page_views
+       WHERE created_at >= ? AND created_at < ?
+         AND (is_owner IS NULL OR is_owner = 0)
+       GROUP BY day, path, source, bot_type, vertical_id
+       ON CONFLICT(day, path, source, bot_type, vertical_id) DO UPDATE SET
+         view_count = view_count + excluded.view_count,
+         session_count = session_count + excluded.session_count`,
+      // 1b. Rollup: sessions_daily — TRUE distinct sessions per day, across
+      //     ALL paths. Same source rows, same is_owner exclusion, same
+      //     transaction; must run before the DELETE.
+      `INSERT INTO sessions_daily (day, vertical_id, bot_type, session_count)
+       SELECT
+         substr(created_at, 1, 10) as day,
+         COALESCE(vertical_id, 'rfb') as vertical_id,
+         ${BOT_TYPE_CASE} as bot_type,
+         COUNT(DISTINCT session_id) as session_count
+       FROM analytics_page_views
+       WHERE created_at >= ? AND created_at < ?
+         AND (is_owner IS NULL OR is_owner = 0)
+       GROUP BY day, vertical_id, bot_type
+       ON CONFLICT(day, vertical_id, bot_type) DO UPDATE SET
+         session_count = session_count + excluded.session_count`,
+    ];
+    // 1c. B4: UTM-preserving rollup (additive; page_view_daily above is
+    //     unchanged). Skipped when the raw table has no utm columns yet
+    //     (older/mirrored schemas). Same window, same is_owner exclusion,
+    //     same transaction, runs before the DELETE.
+    if (hasUtmRollupSchema(db)) {
+      sql.push(`INSERT INTO page_view_utm_daily
+           (day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id, view_count, session_count)
+         SELECT
+           substr(created_at, 1, 10) as day,
+           COALESCE(utm_source, '') as utm_source,
+           COALESCE(utm_medium, '') as utm_medium,
+           COALESCE(utm_campaign, '') as utm_campaign,
+           ${BOT_TYPE_CASE} as bot_type,
+           COALESCE(vertical_id, 'rfb') as vertical_id,
+           COUNT(*) as view_count,
+           COUNT(DISTINCT session_id) as session_count
+         FROM analytics_page_views
+         WHERE created_at >= ? AND created_at < ?
+           AND (is_owner IS NULL OR is_owner = 0)
+           AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
+         GROUP BY day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id
+         ON CONFLICT(day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id) DO UPDATE SET
+           view_count = view_count + excluded.view_count,
+           session_count = session_count + excluded.session_count`);
+    }
+    return sql;
+  },
+};
+
+const QUERIES_SPEC: PruneSpec = {
+  table: "analytics_queries",
+  rollupSql: () => [
+    // 1a. Rollup: query_daily (protocol/agent/vertical/city dimensions)
+    `INSERT INTO query_daily (
+       day, protocol, agent_id, vertical_id, city,
+       query_count, result_count_sum, response_time_ms_sum, response_time_ms_n
+     )
+     SELECT
+       substr(created_at, 1, 10) as day,
+       COALESCE(protocol, 'unknown') as protocol,
+       COALESCE(agent_id, '') as agent_id,
+       COALESCE(vertical_id, 'rfb') as vertical_id,
+       COALESCE(city, '') as city,
+       COUNT(*) as query_count,
+       COALESCE(SUM(result_count), 0) as result_count_sum,
+       COALESCE(SUM(response_time_ms), 0) as response_time_ms_sum,
+       COUNT(response_time_ms) as response_time_ms_n
+     FROM analytics_queries
+     WHERE created_at >= ? AND created_at < ?
+       AND (is_owner IS NULL OR is_owner = 0)
+     GROUP BY day, protocol, agent_id, vertical_id, city
+     ON CONFLICT(day, protocol, agent_id, vertical_id, city) DO UPDATE SET
+       query_count = query_count + excluded.query_count,
+       result_count_sum = result_count_sum + excluded.result_count_sum,
+       response_time_ms_sum = response_time_ms_sum + excluded.response_time_ms_sum,
+       response_time_ms_n = response_time_ms_n + excluded.response_time_ms_n`,
+    // 1b. Rollup: query_text_daily ("what did they actually search for")
+    `INSERT INTO query_text_daily (day, query, vertical_id, query_count)
+     SELECT
+       substr(created_at, 1, 10) as day,
+       query,
+       COALESCE(vertical_id, 'rfb') as vertical_id,
+       COUNT(*) as query_count
+     FROM analytics_queries
+     WHERE created_at >= ? AND created_at < ?
+       AND (is_owner IS NULL OR is_owner = 0)
+     GROUP BY day, query, vertical_id
+     ON CONFLICT(day, query, vertical_id) DO UPDATE SET
+       query_count = query_count + excluded.query_count`,
+  ],
+};
+
+const AGENT_VIEWS_SPEC: PruneSpec = {
+  table: "analytics_agent_views",
+  rollupSql: () => [
+    // 1. Rollup: agent_view_daily (upsert to handle re-runs)
+    `INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count)
+     SELECT
+       substr(created_at, 1, 10) as day,
+       agent_id,
+       COALESCE(view_source, 'unknown') as view_source,
+       COALESCE(city, '') as city,
+       COUNT(*) as view_count
+     FROM analytics_agent_views
+     WHERE created_at >= ? AND created_at < ?
+       AND (is_owner IS NULL OR is_owner = 0)
+     GROUP BY day, agent_id, view_source, city
+     ON CONFLICT(day, agent_id, view_source, city) DO UPDATE SET
+       view_count = view_count + excluded.view_count`,
+  ],
+};
+
 /**
  * Roll up raw page_views older than windowDays into page_view_daily AND
  * sessions_daily, then DELETE the raw rows. Processes in weekly batches to
  * limit lock time.
  *
- * SAFETY: rollup INSERTs run BEFORE DELETE in the SAME transaction.
+ * SAFETY: rollup INSERTs run BEFORE DELETE; atomic per small day, marker-guarded for big days (see core above).
  *         ON CONFLICT increments so re-runs are idempotent.
  *
  * orch-pr-20260903-analytics-rollup-slice2: additionally writes sessions_daily
@@ -62,132 +407,20 @@ function hasUtmRollupSchema(db: ReturnType<typeof getDb>): boolean {
 export function rollupAndPrunePageViews(
   windowDays: number = 90,
   batchDays: number = 7,
-  dryRun: boolean = false
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
 ): { rowsRolledUp: number; rowsDeleted: number; daysProcessed: number } {
-  const db = getDb();
+  return runStepsSync(pruneTableSteps(PAGE_VIEWS_SPEC, windowDays, batchDays, dryRun, opts));
+}
 
-  // Find the oldest row date and cutoff date
-  const oldest = (db.prepare(
-    "SELECT MIN(substr(created_at, 1, 10)) as d FROM analytics_page_views"
-  ).get() as { d: string | null })?.d;
-  if (!oldest) return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - windowDays);
-  const cutoffStr = cutoffDate.toISOString().slice(0, 10); // YYYY-MM-DD
-
-  if (oldest >= cutoffStr) {
-    // All rows are within the retention window — nothing to do
-    return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-  }
-
-  let totalRolledUp = 0;
-  let totalDeleted = 0;
-  let daysProcessed = 0;
-
-  // Process in batchDays-wide windows from oldest to cutoff
-  let batchStart = oldest;
-  while (batchStart < cutoffStr) {
-    const batchEndDate = new Date(batchStart);
-    batchEndDate.setDate(batchEndDate.getDate() + batchDays);
-    let batchEnd = batchEndDate.toISOString().slice(0, 10);
-    if (batchEnd > cutoffStr) batchEnd = cutoffStr;
-
-    if (!dryRun) {
-      db.transaction(() => {
-        // 1. Rollup: INSERT into page_view_daily (upsert to handle re-runs)
-        db.prepare(`
-          INSERT INTO page_view_daily (day, path, source, bot_type, vertical_id, view_count, session_count)
-          SELECT
-            substr(created_at, 1, 10) as day,
-            path,
-            COALESCE(source, 'unknown') as source,
-            ${BOT_TYPE_CASE} as bot_type,
-            COALESCE(vertical_id, 'rfb') as vertical_id,
-            COUNT(*) as view_count,
-            COUNT(DISTINCT session_id) as session_count
-          FROM analytics_page_views
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-            AND (is_owner IS NULL OR is_owner = 0)
-          GROUP BY day, path, source, bot_type, vertical_id
-          ON CONFLICT(day, path, source, bot_type, vertical_id) DO UPDATE SET
-            view_count = view_count + excluded.view_count,
-            session_count = session_count + excluded.session_count
-        `).run(batchStart, batchEnd);
-
-        // 1b. Rollup: sessions_daily — TRUE distinct sessions per day, across
-        //     ALL paths. Same source rows, same is_owner exclusion, same
-        //     transaction; must run before the DELETE below.
-        db.prepare(`
-          INSERT INTO sessions_daily (day, vertical_id, bot_type, session_count)
-          SELECT
-            substr(created_at, 1, 10) as day,
-            COALESCE(vertical_id, 'rfb') as vertical_id,
-            ${BOT_TYPE_CASE} as bot_type,
-            COUNT(DISTINCT session_id) as session_count
-          FROM analytics_page_views
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-            AND (is_owner IS NULL OR is_owner = 0)
-          GROUP BY day, vertical_id, bot_type
-          ON CONFLICT(day, vertical_id, bot_type) DO UPDATE SET
-            session_count = session_count + excluded.session_count
-        `).run(batchStart, batchEnd);
-
-        // 1c. B4: UTM-preserving rollup (additive; page_view_daily above is
-        //     unchanged). Skipped when the raw table has no utm columns yet
-        //     (older/mirrored schemas). Same window, same is_owner exclusion,
-        //     same transaction, runs before the DELETE.
-        if (hasUtmRollupSchema(db)) {
-          db.prepare(`
-            INSERT INTO page_view_utm_daily
-              (day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id, view_count, session_count)
-            SELECT
-              substr(created_at, 1, 10) as day,
-              COALESCE(utm_source, '') as utm_source,
-              COALESCE(utm_medium, '') as utm_medium,
-              COALESCE(utm_campaign, '') as utm_campaign,
-              ${BOT_TYPE_CASE} as bot_type,
-              COALESCE(vertical_id, 'rfb') as vertical_id,
-              COUNT(*) as view_count,
-              COUNT(DISTINCT session_id) as session_count
-            FROM analytics_page_views
-            WHERE substr(created_at, 1, 10) >= ?
-              AND substr(created_at, 1, 10) < ?
-              AND (is_owner IS NULL OR is_owner = 0)
-              AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
-            GROUP BY day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id
-            ON CONFLICT(day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id) DO UPDATE SET
-              view_count = view_count + excluded.view_count,
-              session_count = session_count + excluded.session_count
-          `).run(batchStart, batchEnd);
-        }
-
-        // 2. DELETE: remove ALL raw rows (including is_owner) for this batch
-        const del = db.prepare(`
-          DELETE FROM analytics_page_views
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-        `).run(batchStart, batchEnd);
-        totalDeleted += del.changes;
-      })();
-    }
-
-    // Count rows in batch for reporting (whether dry run or not)
-    const counted = (db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_page_views
-      WHERE substr(created_at, 1, 10) >= ? AND substr(created_at, 1, 10) < ?
-    `).get(batchStart, batchEnd) as { c: number }).c;
-    if (dryRun) totalDeleted += counted;
-    totalRolledUp += counted;
-    daysProcessed += batchDays;
-
-    // Advance to next batch
-    batchStart = batchEnd;
-  }
-
-  return { rowsRolledUp: totalRolledUp, rowsDeleted: totalDeleted, daysProcessed };
+/** Same as rollupAndPrunePageViews, but yields to the event loop (setImmediate) between transactions. */
+export function rollupAndPrunePageViewsAsync(
+  windowDays: number = 90,
+  batchDays: number = 7,
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
+): Promise<{ rowsRolledUp: number; rowsDeleted: number; daysProcessed: number }> {
+  return runStepsAsync(pruneTableSteps(PAGE_VIEWS_SPEC, windowDays, batchDays, dryRun, opts));
 }
 
 /**
@@ -211,104 +444,20 @@ export function rollupAndPrunePageViews(
 export function rollupAndPruneQueries(
   windowDays: number = 90,
   batchDays: number = 7,
-  dryRun: boolean = false
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
 ): { rowsRolledUp: number; rowsDeleted: number; daysProcessed: number } {
-  const db = getDb();
+  return runStepsSync(pruneTableSteps(QUERIES_SPEC, windowDays, batchDays, dryRun, opts));
+}
 
-  const oldest = (db.prepare(
-    "SELECT MIN(substr(created_at, 1, 10)) as d FROM analytics_queries"
-  ).get() as { d: string | null })?.d;
-  if (!oldest) return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - windowDays);
-  const cutoffStr = cutoffDate.toISOString().slice(0, 10); // YYYY-MM-DD
-
-  if (oldest >= cutoffStr) {
-    // All rows are within the retention window — nothing to do
-    return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-  }
-
-  let totalRolledUp = 0;
-  let totalDeleted = 0;
-  let daysProcessed = 0;
-
-  let batchStart = oldest;
-  while (batchStart < cutoffStr) {
-    const batchEndDate = new Date(batchStart);
-    batchEndDate.setDate(batchEndDate.getDate() + batchDays);
-    let batchEnd = batchEndDate.toISOString().slice(0, 10);
-    if (batchEnd > cutoffStr) batchEnd = cutoffStr;
-
-    if (!dryRun) {
-      db.transaction(() => {
-        // 1a. Rollup: query_daily (protocol/agent/vertical/city dimensions)
-        db.prepare(`
-          INSERT INTO query_daily (
-            day, protocol, agent_id, vertical_id, city,
-            query_count, result_count_sum, response_time_ms_sum, response_time_ms_n
-          )
-          SELECT
-            substr(created_at, 1, 10) as day,
-            COALESCE(protocol, 'unknown') as protocol,
-            COALESCE(agent_id, '') as agent_id,
-            COALESCE(vertical_id, 'rfb') as vertical_id,
-            COALESCE(city, '') as city,
-            COUNT(*) as query_count,
-            COALESCE(SUM(result_count), 0) as result_count_sum,
-            COALESCE(SUM(response_time_ms), 0) as response_time_ms_sum,
-            COUNT(response_time_ms) as response_time_ms_n
-          FROM analytics_queries
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-            AND (is_owner IS NULL OR is_owner = 0)
-          GROUP BY day, protocol, agent_id, vertical_id, city
-          ON CONFLICT(day, protocol, agent_id, vertical_id, city) DO UPDATE SET
-            query_count = query_count + excluded.query_count,
-            result_count_sum = result_count_sum + excluded.result_count_sum,
-            response_time_ms_sum = response_time_ms_sum + excluded.response_time_ms_sum,
-            response_time_ms_n = response_time_ms_n + excluded.response_time_ms_n
-        `).run(batchStart, batchEnd);
-
-        // 1b. Rollup: query_text_daily ("what did they actually search for")
-        db.prepare(`
-          INSERT INTO query_text_daily (day, query, vertical_id, query_count)
-          SELECT
-            substr(created_at, 1, 10) as day,
-            query,
-            COALESCE(vertical_id, 'rfb') as vertical_id,
-            COUNT(*) as query_count
-          FROM analytics_queries
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-            AND (is_owner IS NULL OR is_owner = 0)
-          GROUP BY day, query, vertical_id
-          ON CONFLICT(day, query, vertical_id) DO UPDATE SET
-            query_count = query_count + excluded.query_count
-        `).run(batchStart, batchEnd);
-
-        // 2. DELETE: remove ALL raw rows (including is_owner) for this batch
-        const del = db.prepare(`
-          DELETE FROM analytics_queries
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-        `).run(batchStart, batchEnd);
-        totalDeleted += del.changes;
-      })();
-    }
-
-    const counted = (db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_queries
-      WHERE substr(created_at, 1, 10) >= ? AND substr(created_at, 1, 10) < ?
-    `).get(batchStart, batchEnd) as { c: number }).c;
-    if (dryRun) totalDeleted += counted;
-    totalRolledUp += counted;
-    daysProcessed += batchDays;
-
-    batchStart = batchEnd;
-  }
-
-  return { rowsRolledUp: totalRolledUp, rowsDeleted: totalDeleted, daysProcessed };
+/** Same as rollupAndPruneQueries, but yields to the event loop (setImmediate) between transactions. */
+export function rollupAndPruneQueriesAsync(
+  windowDays: number = 90,
+  batchDays: number = 7,
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
+): Promise<{ rowsRolledUp: number; rowsDeleted: number; daysProcessed: number }> {
+  return runStepsAsync(pruneTableSteps(QUERIES_SPEC, windowDays, batchDays, dryRun, opts));
 }
 
 /**
@@ -332,77 +481,20 @@ export function rollupAndPruneQueries(
 export function rollupAndPruneAgentViews(
   windowDays: number = 90,
   batchDays: number = 7,
-  dryRun: boolean = false
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
 ): { rowsRolledUp: number; rowsDeleted: number; daysProcessed: number } {
-  const db = getDb();
+  return runStepsSync(pruneTableSteps(AGENT_VIEWS_SPEC, windowDays, batchDays, dryRun, opts));
+}
 
-  const oldest = (db.prepare(
-    "SELECT MIN(substr(created_at, 1, 10)) as d FROM analytics_agent_views"
-  ).get() as { d: string | null })?.d;
-  if (!oldest) return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - windowDays);
-  const cutoffStr = cutoffDate.toISOString().slice(0, 10); // YYYY-MM-DD
-
-  if (oldest >= cutoffStr) {
-    // All rows are within the retention window — nothing to do
-    return { rowsRolledUp: 0, rowsDeleted: 0, daysProcessed: 0 };
-  }
-
-  let totalRolledUp = 0;
-  let totalDeleted = 0;
-  let daysProcessed = 0;
-
-  let batchStart = oldest;
-  while (batchStart < cutoffStr) {
-    const batchEndDate = new Date(batchStart);
-    batchEndDate.setDate(batchEndDate.getDate() + batchDays);
-    let batchEnd = batchEndDate.toISOString().slice(0, 10);
-    if (batchEnd > cutoffStr) batchEnd = cutoffStr;
-
-    if (!dryRun) {
-      db.transaction(() => {
-        // 1. Rollup: agent_view_daily (upsert to handle re-runs)
-        db.prepare(`
-          INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count)
-          SELECT
-            substr(created_at, 1, 10) as day,
-            agent_id,
-            COALESCE(view_source, 'unknown') as view_source,
-            COALESCE(city, '') as city,
-            COUNT(*) as view_count
-          FROM analytics_agent_views
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-            AND (is_owner IS NULL OR is_owner = 0)
-          GROUP BY day, agent_id, view_source, city
-          ON CONFLICT(day, agent_id, view_source, city) DO UPDATE SET
-            view_count = view_count + excluded.view_count
-        `).run(batchStart, batchEnd);
-
-        // 2. DELETE: remove ALL raw rows (including is_owner) for this batch
-        const del = db.prepare(`
-          DELETE FROM analytics_agent_views
-          WHERE substr(created_at, 1, 10) >= ?
-            AND substr(created_at, 1, 10) < ?
-        `).run(batchStart, batchEnd);
-        totalDeleted += del.changes;
-      })();
-    }
-
-    const counted = (db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_agent_views
-      WHERE substr(created_at, 1, 10) >= ? AND substr(created_at, 1, 10) < ?
-    `).get(batchStart, batchEnd) as { c: number }).c;
-    if (dryRun) totalDeleted += counted;
-    totalRolledUp += counted;
-    daysProcessed += batchDays;
-
-    batchStart = batchEnd;
-  }
-
-  return { rowsRolledUp: totalRolledUp, rowsDeleted: totalDeleted, daysProcessed };
+/** Same as rollupAndPruneAgentViews, but yields to the event loop (setImmediate) between transactions. */
+export function rollupAndPruneAgentViewsAsync(
+  windowDays: number = 90,
+  batchDays: number = 7,
+  dryRun: boolean = false,
+  opts: PruneChunkOpts = {}
+): Promise<{ rowsRolledUp: number; rowsDeleted: number; daysProcessed: number }> {
+  return runStepsAsync(pruneTableSteps(AGENT_VIEWS_SPEC, windowDays, batchDays, dryRun, opts));
 }
 
 /**

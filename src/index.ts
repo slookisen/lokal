@@ -1373,11 +1373,18 @@ app.listen(Number(PORT), HOST, async () => {
     let lastPruneAt: Date | null = null;
     const AUTO_PRUNE_DAYS_TO_KEEP = parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10);
 
-    const autoPruneTick = () => {
+    // dev-request 2026-10-01-prod-auto-prune-skansom: the prune is async now
+    // (<=2000-row transactions, setImmediate between them); this flag stops an
+    // hourly tick from starting a second pass while one is still yielding.
+    let autoPruneRunning = false;
+
+    const autoPruneTick = async () => {
       const now = new Date();
+      if (autoPruneRunning) return;
       if (!shouldRunAutoPrune({ now, lastRunAt: lastPruneAt })) return;
+      autoPruneRunning = true;
       try {
-        const result = analyticsService.runAutoPrune({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP });
+        const result = await analyticsService.runAutoPruneAsync({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP });
         console.log(
           `[auto-prune] daysToKeep=${result.daysKept} cutoff=${result.cutoff} ` +
           `deleted=${JSON.stringify(result.deleted)} ` +
@@ -1434,6 +1441,8 @@ app.listen(Number(PORT), HOST, async () => {
         }
       } catch (err) {
         console.error("[auto-prune] failed (non-fatal):", err);
+      } finally {
+        autoPruneRunning = false;
       }
 
       // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, C3:
