@@ -4885,6 +4885,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           FROM agents
           WHERE parent_umbrella_id = ?
             AND is_active = 1
+            AND ${publicListableSql()}
           ORDER BY name ASC
         `).all(agent.id) as any[];
         for (const r of rows) {
@@ -4910,6 +4911,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           WHERE aff.umbrella_id = ?
             AND aff.status = 'active'
             AND a.is_active = 1
+            AND ${publicListableSql("a")}
           ORDER BY a.trust_score DESC, a.name ASC
           LIMIT 100
         `).all(agent.id) as any[];
@@ -6103,6 +6105,15 @@ let sitemapCache: { xml: string; builtAt: number } | null = null;
 
 /** Test hook: drop the cached sitemap. */
 export function __resetSitemapCacheForTesting(): void {
+  sitemapCache = null;
+}
+
+/**
+ * Drop the cached sitemap so the next request rebuilds it — for an admin write
+ * that removes a producer from public listing (POST /admin/test-producer) and
+ * must not leave its /produsent/ URL in /sitemap.xml for up to one TTL.
+ */
+export function invalidateSitemapCache(): void {
   sitemapCache = null;
 }
 

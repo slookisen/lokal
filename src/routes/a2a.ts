@@ -553,6 +553,14 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 
 // GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
+  // Same public by-id gate as /api/marketplace/agents/:id/card (dev-request
+  // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id
+  // for the hidden test fixture, a non-RFB-vertical row, or an unvetted
+  // self-registered agent — see isQuarantinedFromPublicView.
+  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string)) {
+    res.status(404).json({ error: "Agent not found" });
+    return;
+  }
   const card = agentCardService.generateCard(req.params.id as string, BASE_URL);
   if (!card) {
     res.status(404).json({ error: "Agent not found" });

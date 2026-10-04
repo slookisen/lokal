@@ -1132,6 +1132,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
           WHERE aff.umbrella_id = ?
             AND aff.status = 'active'
             AND p.is_active = 1
+            AND ${publicListableSql("p")}
           ORDER BY p.trust_score DESC, p.name ASC
           LIMIT 200
         `).all(agentId) as any[];
@@ -4823,7 +4824,9 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
       return;
     }
 
-    const wheres: string[] = ["aff.umbrella_id = ?", "p.is_active = 1"];
+    // Shared public-listability predicate on the member side (dev-request
+    // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt).
+    const wheres: string[] = ["aff.umbrella_id = ?", "p.is_active = 1", publicListableSql("p")];
     const params: any[] = [umbrellaId];
     if (status !== "all") { wheres.push("aff.status = ?"); params.push(status); }
     params.push(limit);

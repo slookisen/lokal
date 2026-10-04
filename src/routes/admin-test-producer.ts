@@ -54,6 +54,7 @@ import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { isEligibleForRealOrder } from "../services/cart-service";
+import { invalidateSitemapCache } from "./seo";
 
 const router = Router();
 
@@ -400,6 +401,7 @@ router.post("/", (req: Request, res: Response) => {
   marketplaceRegistry._statsCache = null;
   marketplaceRegistry._agentsCacheTime = 0;
   marketplaceRegistry._statsCacheTime = 0;
+  invalidateSitemapCache();
 
   const after = readProduct(db, id);
   res.json({

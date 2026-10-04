@@ -679,7 +679,9 @@ app.get("/health", (_req, res) => {
         usedPct: disk.used_pct,
       },
       // traffic.totalAgents = marketplaceRegistry.getStats().totalAgents = COUNT(*) FROM agents
-      // with NO filter at all (includes inactive + umbrella-tagged rows). This is the SAME
+      // filtered ONLY by the shared public-listability predicate (agent-visibility.ts: no
+      // hidden test fixture, RFB vertical only) — still includes inactive + umbrella-tagged
+      // rows. This is the SAME
       // underlying value as GET /api/stats' registry.totalAgents (src/routes/a2a.ts, the
       // /api/stats handler) — both call the same cached getStats(). See dev-request
       // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.

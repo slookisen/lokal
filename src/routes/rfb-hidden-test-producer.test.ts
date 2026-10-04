@@ -13,12 +13,16 @@
  *       feed, acp-feed.csv, catalog offers, lokal_find_offers, llms-full.txt,
  *       sitemap, /produsent/:slug, homepage, /verifisert-av-eier, city page,
  *       find-match, outreach pool VIEW + computeOutreachCandidates, verifier
- *       batch pickers, /a2a card + agents.json counts,
+ *       batch pickers, /reise corridor RFB stops (loadRfbCandidates), the
+ *       cached /sitemap.xml, /a2a card + agents.json counts,
  *       /api/stats, top producers, public agent-stats and card/info/vcard/
  *       trust). First as a CONTROL with catalog_hidden=0 (present everywhere,
  *       so no assertion below is vacuous), then hidden via the real POST
  *       /admin/test-producer (adopting the legacy pilot row) → absent
  *       everywhere, while an identical normal row stays present.
+ *   Umbrella member lists — /umbrellas/:id/members, lokal_get_umbrella_members
+ *       and umbrella-page children (affiliations and parent_umbrella_id):
+ *       control with the fixture un-hidden, then hidden.
  *   Vertical filter — an identical row with vertical_id='dental' is absent
  *       from every RFB surface and from the RFB stats counts in BOTH phases
  *       (the verifier pickers are the documented exception: hidden-only).
@@ -285,6 +289,7 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
     const verifier = require("../agents/lokal-agent-verifier") as typeof import("../agents/lokal-agent-verifier");
     const { computeOutreachCandidates } = require("./admin-outreach-candidates") as typeof import("./admin-outreach-candidates");
     const { analyticsService } = require("../services/analytics-service") as typeof import("../services/analytics-service");
+    const corridor = require("../services/route-corridor-service") as typeof import("../services/route-corridor-service");
 
     const tools = new Map<string, (args: any) => Promise<any>>();
     const { registerTools } = require("./mcp") as typeof import("./mcp");
@@ -319,6 +324,7 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       a2a: findRouteHandler(a2aRouter, "/a2a", "get"),
       apiStats: findRouteHandler(a2aRouter, "/api/stats", "get"),
       agentStats: findRouteHandler(agentStatsRouter, "/api/agents/:id/stats", "get"),
+      umbMembers: findRouteHandler(marketplaceRouter, "/umbrellas/:id/members", "get"),
       testProducer: findRouteHandler(tpRouter, "/", "post"),
     };
     const postTp = (body: any, key: string | null = adminKey()) =>
@@ -372,6 +378,15 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       s.lokal_find_offers = (fo[0]?.offers ?? []).map((o: any) => o.producer.agent_id);
       s.llms_full_txt = idsInText((await invoke(H.llmsFull, makeReq({}))).body);
       s.sitemap = idsInSitemap(seoMod.buildSitemapXml());
+      // The CACHED sitemap /sitemap.xml serves: primed by the control phase,
+      // so the hidden phase only passes if POST /admin/test-producer's apply
+      // invalidated it (otherwise it would serve the fixture for one TTL).
+      s.sitemap_cached = idsInSitemap(seoMod.getSitemapXml());
+      // /reise trip planner (rettfrabonden /reise + opplevagent /reise): its RFB
+      // stops come from loadRfbCandidates() over the corridor bbox.
+      s.reise_corridor = corridor.loadRfbCandidates(
+        { minLat: OSLO.lat - 0.5, maxLat: OSLO.lat + 0.5, minLng: OSLO.lng - 0.5, maxLng: OSLO.lng + 0.5 }, db,
+      ).map((c) => c.id);
       s.produsent_page = [];
       for (const [id, name] of ID_BY_NAME) {
         if ((await invoke(H.produsent, makeReq({ params: { slug: slugify(name) } }))).status === 200) s.produsent_page.push(id);
@@ -505,6 +520,54 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       const page = await invoke(H.produsent, makeReq({ params: { slug: slugify(FIXTURE_NAME) } }));
       assertEq(page.status, 404, "ac3: /produsent/<fixture-slug> → 404");
       assertTrue(!String(page.body).includes(FIXTURE_NAME), "ac3: the 404 page never leaks the fixture's name");
+    }
+
+    // ══ Umbrella member lists (producer side of the joins) ════════════════
+    // /umbrellas/:id/members, lokal_get_umbrella_members and the umbrella
+    // /produsent/ page's children (via agent_affiliations AND via
+    // parent_umbrella_id). Control first with the fixture briefly un-hidden,
+    // then hidden again. (The /agents/:id/card umbrella-members skill got the
+    // same predicate but is not reachable here: that block reads
+    // info.agent.umbrella_type, which getAgentInfo() never sets.)
+    {
+      const UMB_AFF = { id: "lh-umb-aff", name: "Paraplynettverket Bondeby" };
+      const UMB_DIRECT = { id: "lh-umb-direct", name: "Lokallaget Bondeby" };
+      for (const u of [UMB_AFF, UMB_DIRECT]) {
+        db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, categories, tags, trust_score, is_active, umbrella_type)
+           VALUES (?, ?, 'Et nettverk av lokale gårder rundt Oslo.', 'test', ?, ?, 'producer', ?, 'Oslo', '[]', '[]', 0.8, 1, 'market_network')`,
+        ).run(u.id, u.name, `${u.id}@example.no`, `https://${u.id}.example.no`, `key-${u.id}`);
+      }
+      const insAff = db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, labels) VALUES (?, ?, 'active', 'admin', '[]')");
+      for (const id of ALL) insAff.run(id, UMB_AFF.id);
+      const setParent = db.prepare("UPDATE agents SET parent_umbrella_id = ? WHERE id = ?");
+      for (const id of ALL) setParent.run(UMB_DIRECT.id, id);
+      const umbrellaSurfaces = async (): Promise<Record<string, string[]>> => {
+        clearRegistryCaches();
+        const u: Record<string, string[]> = {};
+        u.umbrella_members_route = ((await invoke(H.umbMembers, makeReq({ params: { id: UMB_AFF.id } }))).body?.members ?? []).map((m: any) => m.id);
+        u.lokal_get_umbrella_members = idsInText(await toolText("lokal_get_umbrella_members", { umbrellaId: UMB_AFF.id, limit: 100 }));
+        u.umbrella_page_affiliations = idsInText((await invoke(H.produsent, makeReq({ params: { slug: slugify(UMB_AFF.name) } }))).body);
+        u.umbrella_page_direct_children = idsInText((await invoke(H.produsent, makeReq({ params: { slug: slugify(UMB_DIRECT.name) } }))).body);
+        return u;
+      };
+      db.prepare("UPDATE agents SET catalog_hidden = 0 WHERE id = ?").run(LEGACY_ID);
+      const ctl = await umbrellaSurfaces();
+      db.prepare("UPDATE agents SET catalog_hidden = 1 WHERE id = ?").run(LEGACY_ID);
+      const hid = await umbrellaSurfaces();
+      for (const [surface, ids] of Object.entries(ctl)) {
+        assertTrue(ids.includes(NORMAL_ID) && ids.includes(LEGACY_ID), `umbrella-control: normal + un-hidden fixture present on ${surface} (got ${JSON.stringify(ids)})`);
+        assertTrue(!ids.includes(DENTAL_ID), `vertical: dental row absent from ${surface} (got ${JSON.stringify(ids)})`);
+      }
+      for (const [surface, ids] of Object.entries(hid)) {
+        assertTrue(ids.includes(NORMAL_ID), `umbrella: normal row still present on ${surface} (got ${JSON.stringify(ids)})`);
+        assertTrue(!ids.includes(LEGACY_ID), `umbrella: hidden fixture ABSENT from ${surface} (got ${JSON.stringify(ids)})`);
+        assertTrue(!ids.includes(DENTAL_ID), `vertical: dental row still absent from ${surface}`);
+      }
+      db.prepare("DELETE FROM agent_affiliations WHERE umbrella_id = ?").run(UMB_AFF.id);
+      for (const id of ALL) setParent.run(null, id);
+      for (const u of [UMB_AFF, UMB_DIRECT]) db.prepare("DELETE FROM agents WHERE id = ?").run(u.id);
+      clearRegistryCaches();
     }
 
     // ══ AC2 — the direct-id order flow (MCP lokal_info + cart tools) ══════
