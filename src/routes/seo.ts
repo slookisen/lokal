@@ -3724,9 +3724,11 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
     const cityName = (cityAgents[0] as any).city || (cityAgents[0] as any).location?.city || citySlug;
 
-    // Track city page view for analytics dashboard (one entry per city visit)
-    // Use the first agent as representative — getCityStats groups by city
-    analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
+    // NO trackAgentView here (2026-10-04, view-stats honesty): this used to
+    // book every city-page visit as a PROFILE view of cityAgents[0] — the
+    // city's highest-trust producer — which put e.g. test/placeholder agents
+    // in the top-producer list. The city visit itself is already recorded as
+    // a page view by the analytics middleware.
 
     applyPublishedTranslations(cityAgents, lang);
     const producerCards = cityAgents.map((a: any) => producerCard(a, undefined, lang)).join("");
@@ -4721,9 +4723,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ));
     }
 
-    // Track producer page view for analytics dashboard
+    // Track producer page view for analytics dashboard (is_owner, traffic
+    // class and Referer-derived source are read off the request).
     const cityName = (agent as any).city || (agent as any).location?.city || "";
-    analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
+    analyticsService.trackAgentView(req, agent.id, agent.name, cityName);
 
     // ── PR-30: freshness signal ─────────────────────────────────────
     // agent_knowledge.updated_at (TEXT, ISO 8601) is bumped on every

@@ -306,10 +306,12 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       ).run();
 
       // agent-a: raw row on the boundary day (city Oslo) + rollup row on a
-      // pruned day (SAME city) — must sum to one merged entry.
+      // pruned day (SAME city) — must sum to one merged entry. The raw row is
+      // a classified human view (2026-10-04 view-stats honesty: readers count
+      // traffic_category='human' rows only).
       testDb.prepare(
-        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
-         VALUES ('agent-a', 'Gard A', 'Oslo', 'seo', 'rfb', ?)`,
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at, traffic_category)
+         VALUES ('agent-a', 'Gard A', 'Oslo', 'seo', 'rfb', ?, 'human')`,
       ).run(`${boundaryDay} 12:00:00`);
       testDb.prepare(
         `INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count) VALUES (?, 'agent-a', 'seo', 'Oslo', 6)`,
@@ -372,7 +374,8 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
 
       const agentStatsPath = require.resolve("../routes/agent-stats");
       delete require.cache[agentStatsPath];
-      const agentStatsRouter = (require("../routes/agent-stats") as any).default;
+      const agentStatsMod = require("../routes/agent-stats") as any;
+      const agentStatsRouter = agentStatsMod.default;
       const statsHandler = findRouteHandler(agentStatsRouter, "/api/agents/:id/stats", "get");
       assertTrue(typeof statsHandler === "function", "agent-stats: GET /api/agents/:id/stats handler resolved");
 
@@ -383,6 +386,9 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       const path = "/produsent/stats-target-gard";
 
       async function callStats(): Promise<any> {
+        // 2026-10-04: the route now caches its payload for 120 s per agent id;
+        // every call here must see the CURRENT flag + DB state, so clear it.
+        agentStatsMod.__resetAgentStatsCacheForTesting();
         const res = fakeRes();
         await statsHandler({ params: { id: "agent-stats-target" }, headers: {}, query: {} } as any, res as any);
         assertTrue(res.statusCode === 200, "agent-stats: 200 from GET /api/agents/:id/stats");

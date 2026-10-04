@@ -141,8 +141,10 @@ function seedProducer(
      VALUES (?, ?, 'Listepoteter', 'listepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg')`,
   ).run(`prod-${o.id}`, o.id);
   db.prepare(
-    `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, created_at)
-     VALUES (?, ?, 'Oslo', 'search', datetime('now'))`,
+    // is_owner/traffic_category: top producers count human, non-owner views
+    // only (2026-10-04 view-stats honesty), so the fixture view is a human one.
+    `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, created_at, is_owner, traffic_category)
+     VALUES (?, ?, 'Oslo', 'search', datetime('now'), 0, 'human')`,
   ).run(o.id, o.name);
 }
 

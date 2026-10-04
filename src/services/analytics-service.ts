@@ -1,10 +1,18 @@
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
-import { getDb } from "../database/init";
+import { getDb, humanAgentViewSql } from "../database/init";
 import { slugify } from "../utils/slug";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { extractUtmFromQuery } from "../utils/utm-capture";
-import { classifyUA, uaFromSessionId } from "./traffic-classifier";
+import {
+  classifyUA,
+  uaFromSessionId,
+  aiVendorBucket,
+  isScannerUA,
+  isVelocityScraper,
+  SessionCategory,
+  SessionVelocity,
+} from "./traffic-classifier";
 import {
   getPrunedPageViewCount,
   getPrunedPageViewsBySource,
@@ -483,6 +491,75 @@ const sessionManager = new SessionManager();
 // Cleanup sessions every 5 minutes
 setInterval(() => sessionManager.cleanup(), 5 * 60 * 1000);
 
+// ─── Producer-profile view helpers (2026-10-04, view-stats honesty) ───────
+
+/**
+ * view_source of a profile view, derived from the Referer. Reuses
+ * classifyReferralSource's domain tokens; own-domain navigation (a city page,
+ * /sok, the map) is 'discovery'. Replaces the hard-coded 'seo'.
+ */
+export type AgentViewSource = "direct" | "discovery" | "search" | "ai" | "social" | "referral";
+export function agentViewSourceFor(referrer: string | null | undefined): AgentViewSource {
+  switch (classifyReferralSource(referrer).key) {
+    case "direkte": return "direct";
+    case "intern": return "discovery";
+    case "google": case "bing": case "duckduckgo": return "search";
+    case "chatgpt": case "perplexity": case "gemini": case "copilot": return "ai";
+    case "sosial": return "social";
+    default: return "referral";
+  }
+}
+
+/**
+ * Velocity aggregates for ONE session out of analytics_page_views, for
+ * traffic-classifier's isVelocityScraper. A single created_at-index range
+ * read (at most one hour of rows) filtered by session_id — never a table
+ * scan, there is no session_id index to need.
+ *   "trailing": both windows END at anchorMs (write path: "this request").
+ *   "centered": both windows are centred on anchorMs (read path: "around a
+ *               stored view").
+ * Never throws; returns null (= no velocity evidence) on error.
+ */
+export function getSessionVelocity(
+  sessionId: string,
+  anchorMs: number,
+  mode: "trailing" | "centered"
+): SessionVelocity | null {
+  try {
+    const span = (ms: number): [string, string] => mode === "trailing"
+      ? [sqliteDatetime(new Date(anchorMs - ms)), sqliteDatetime(new Date(anchorMs))]
+      : [sqliteDatetime(new Date(anchorMs - ms / 2)), sqliteDatetime(new Date(anchorMs + ms / 2))];
+    const [from10, to10] = span(10 * 60 * 1000);
+    const [fromHour, toHour] = span(60 * 60 * 1000);
+    const row = getDb().prepare(`
+      SELECT
+        COUNT(DISTINCT CASE WHEN created_at >= ? AND created_at <= ? THEN path END) AS u10,
+        COUNT(DISTINCT CASE WHEN path LIKE '%/produsent/%' THEN path END) AS p60
+      FROM analytics_page_views
+      WHERE created_at >= ? AND created_at <= ? AND session_id = ?
+    `).get(from10, to10, fromHour, toHour, sessionId) as { u10: number; p60: number } | undefined;
+    return { uniquePagesIn10Min: row?.u10 ?? 0, produsentPagesInHour: row?.p60 ?? 0 };
+  } catch (err) {
+    console.error("[analytics] Failed to read session velocity:", err);
+    return null;
+  }
+}
+
+/**
+ * traffic_category for a profile view at write time: the shared classifyUA
+ * bucket, with browser-looking traffic further split into scanner (fake
+ * stale Chrome) and scraper (velocity over the session's page views so far —
+ * this request's own page view is only written on response finish). Named
+ * bots never pay for the velocity read.
+ */
+function agentViewTrafficCategory(userAgent: string, sessionId: string): SessionCategory {
+  const category = classifyUA(userAgent);
+  if (category !== "human") return category;
+  if (isScannerUA(userAgent)) return "scanner";
+  if (isVelocityScraper(getSessionVelocity(sessionId, Date.now(), "trailing"))) return "scraper";
+  return "human";
+}
+
 // ═════════════════════════════════════════════════════════════════
 // PUBLIC API
 // ═════════════════════════════════════════════════════════════════
@@ -692,16 +769,38 @@ export class AnalyticsService {
   }
 
   /**
-   * Track when a producer/agent profile is viewed
-   * Call from SEO routes when /produsent/:id is loaded
+   * Track a producer/agent PROFILE view. Call ONLY from the profile page
+   * itself (/produsent/:slug) — never from a page that merely lists agents
+   * (city pages, search, maps): that books a "view" on whichever agent
+   * happens to be listed first. Until 2026-10-04 every /<city> visit was
+   * booked on that city's highest-trust producer this way.
+   *
+   * Every row carries is_owner + traffic_category (agentViewTrafficCategory)
+   * so readers can count humans only (humanAgentViewSql in database/init.ts),
+   * and view_source is derived from the Referer (agentViewSourceFor) instead
+   * of a hard-coded 'seo' that was true of every row and so said nothing.
    */
-  trackAgentView(agentId: string, agentName: string, city: string | undefined, source: "search" | "direct" | "discovery" | "seo", vertical: VerticalId = "rfb"): void {
+  trackAgentView(req: Request, agentId: string, agentName: string, city: string | undefined, vertical: VerticalId = "rfb"): void {
     try {
       const db = getDb();
+      // Defensive header access: route-level test harnesses invoke the
+      // profile handler with a bare { params, ip } req.
+      const userAgent = String(req.headers?.["user-agent"] || "");
+      const referrer = req.headers?.referer;
+      const isOwner = req.headers ? isOwnerRequest(req) : false;
+      const sessionId = sessionIdFor(hashIP(req.ip || "unknown"), userAgent);
       db.prepare(`
-        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(agentId, agentName, city || null, source, vertical);
+        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, is_owner, traffic_category)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        agentId,
+        agentName,
+        city || null,
+        agentViewSourceFor(referrer),
+        vertical,
+        isOwner ? 1 : 0,
+        agentViewTrafficCategory(userAgent, sessionId),
+      );
     } catch (err) {
       console.error("[analytics] Failed to track agent view:", err);
     }
@@ -906,9 +1005,7 @@ export class AnalyticsService {
         const ua = uaFromSessionId(row.session_id);
         const category = classifyUA(ua);
         if (category !== "ai_search" && category !== "ai_crawler") continue;
-        if (/GPTBot|ChatGPT|OAI-SearchBot/i.test(ua)) agentTraffic.chatgpt += row.count;
-        else if (/Claude|anthropic/i.test(ua)) agentTraffic.claude += row.count;
-        else agentTraffic.other += row.count;
+        agentTraffic[aiVendorBucket(ua)] += row.count;
       }
       // Skive 3: blend in the pruned-day chatgpt/claude portion from
       // page_view_daily's bot_type dimension — the token sets are identical
@@ -1048,6 +1145,11 @@ export class AnalyticsService {
       // byte — no re-ranking risk on that (fast, common) path.
       const prunedRows = getPrunedAgentViewRows(cutoff, vertical).filter(p => !hiddenSet.has(p.agent_id));
 
+      // 2026-10-04 (view-stats honesty): human, non-owner views only
+      // (humanAgentViewSql — legacy unclassified rows are not counted), and
+      // top_source is the most common DERIVED view_source among those same
+      // rows in the same window (it used to be all-time over every row, i.e.
+      // always the hard-coded 'seo').
       const rawQuery = `
         SELECT
           agent_id,
@@ -1056,17 +1158,18 @@ export class AnalyticsService {
           COUNT(*) as view_count,
           (SELECT view_source FROM analytics_agent_views aav2
            WHERE aav2.agent_id = aav.agent_id
+             AND aav2.created_at > ? AND ${humanAgentViewSql("aav2")}
            GROUP BY view_source
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_source
         FROM analytics_agent_views aav
-        WHERE created_at > ?${V}${H}
+        WHERE created_at > ? AND ${humanAgentViewSql("aav")}${V}${H}
         GROUP BY agent_id, agent_name, city
         ORDER BY view_count DESC
       `;
 
       if (prunedRows.length === 0) {
-        const results = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...vp, ...hiddenIds, limit) as any[];
+        const results = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, cutoff, ...vp, ...hiddenIds, limit) as any[];
         return results.map(r => ({
           agentId: r.agent_id,
           agentName: r.agent_name,
@@ -1079,7 +1182,7 @@ export class AnalyticsService {
       // Blending path: a pruned-day contribution could promote an agent past
       // the raw-only top N, so fetch ALL raw groups (no LIMIT) and re-rank in
       // JS after merging.
-      const rawResults = db.prepare(rawQuery).all(cutoff, ...vp, ...hiddenIds) as any[];
+      const rawResults = db.prepare(rawQuery).all(cutoff, cutoff, ...vp, ...hiddenIds) as any[];
 
       interface Acc { agentId: string; agentName: string; city: string | null; viewCount: number; topSource: string; }
       const byKey = new Map<string, Acc>();
@@ -1192,7 +1295,10 @@ export class AnalyticsService {
   }
 
   /**
-   * Get city-level analytics
+   * Get city-level analytics. viewCount = HUMAN producer-profile views of
+   * producers in that city (humanAgentViewSql). Visits to the /<city> page
+   * itself are page views (analytics_page_views), no longer booked here as a
+   * fake profile view of the city's top producer (2026-10-04).
    */
   getCityStats(hoursBack: number = 24, vertical?: VerticalId): Array<{
     city: string;
@@ -1219,7 +1325,8 @@ export class AnalyticsService {
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_category
         FROM analytics_agent_views aav
-        WHERE aav.created_at > ? AND aav.city IS NOT NULL${V.replace(/vertical_id/g, "aav.vertical_id")}
+        WHERE aav.created_at > ? AND aav.city IS NOT NULL
+          AND ${humanAgentViewSql("aav")}${V.replace(/vertical_id/g, "aav.vertical_id")}
         GROUP BY aav.city
         ORDER BY view_count DESC
       `).all(cutoff, cutoff, cutoff) as any[];

@@ -113,11 +113,12 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
   }
 
   // Record N profile-view rows for an agent (analytics_agent_views is what
-  // admin-outreach-pool.ts's views_count subquery counts).
+  // admin-outreach-pool.ts's views_count subquery counts — human rows only
+  // since 2026-10-04 view-stats honesty, so these are stamped 'human').
   function insertViews(agentId: string, agentName: string, count: number): void {
     const stmt = db.prepare(`
-      INSERT INTO analytics_agent_views (agent_id, agent_name, view_source)
-      VALUES (?, ?, 'direct')
+      INSERT INTO analytics_agent_views (agent_id, agent_name, view_source, traffic_category)
+      VALUES (?, ?, 'direct', 'human')
     `);
     for (let i = 0; i < count; i++) stmt.run(agentId, agentName);
   }

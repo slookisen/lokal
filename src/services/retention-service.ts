@@ -1,4 +1,4 @@
-import { getDb } from "../database/init";
+import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import fs from "fs";
 
 export interface RetentionResult {
@@ -372,17 +372,28 @@ const AGENT_VIEWS_SPEC: PruneSpec = {
   table: "analytics_agent_views",
   rollupSql: () => [
     // 1. Rollup: agent_view_daily (upsert to handle re-runs)
+    // 2026-10-04 (view-stats honesty): only human rows enter permanent
+    // history; classified non-human rows (bots, scanners, scrapers) are
+    // deleted without rollup, like is_owner rows. Legacy rows written before
+    // traffic_category existed (NULL) are still rolled up — nothing unknown is
+    // silently dropped — but into the LEGACY_AGENT_VIEW_SOURCE bucket that
+    // every agent_view_daily reader excludes (see database/init.ts).
+    // GROUP BY is positional: the view_source result column is a CASE over
+    // two input columns, and a bare `view_source` in GROUP BY would bind to
+    // the INPUT column, merging legacy and human rows into one group.
     `INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count)
      SELECT
        substr(created_at, 1, 10) as day,
        agent_id,
-       COALESCE(view_source, 'unknown') as view_source,
+       CASE WHEN traffic_category IS NULL THEN '${LEGACY_AGENT_VIEW_SOURCE}'
+            ELSE COALESCE(view_source, 'unknown') END as view_source,
        COALESCE(city, '') as city,
        COUNT(*) as view_count
      FROM analytics_agent_views
      WHERE created_at >= ? AND created_at < ?
        AND (is_owner IS NULL OR is_owner = 0)
-     GROUP BY day, agent_id, view_source, city
+       AND (traffic_category IS NULL OR traffic_category = 'human')
+     GROUP BY 1, 2, 3, 4
      ON CONFLICT(day, agent_id, view_source, city) DO UPDATE SET
        view_count = view_count + excluded.view_count`,
   ],
@@ -467,16 +478,14 @@ export function rollupAndPruneQueriesAsync(
  * (day×agent×view_source×city), then DELETE the raw rows. Same structure and
  * safety invariants as rollupAndPrunePageViews / rollupAndPruneQueries above.
  *
- * is_owner note: analytics_agent_views HAS an is_owner column (added by the
- * blanket ALTER-TABLE loop in database/init.ts that covered all three analytics
- * tables), but nothing in this codebase ever WRITES it — both insert sites
- * (analyticsService.trackAgentView and .recordAgentView) omit the column, so
- * every row is the DEFAULT 0 — and no reader filters on it (owner-stats-service
- * documents this explicitly). The exclusion below is therefore a no-op on real
- * data today; it is kept for consistency with the other two rollups, so that if
- * is_owner ever does start being written, this rollup already behaves like its
- * siblings instead of silently baking owner traffic into permanent history.
- * Rows are still DELETED regardless of is_owner, matching that same precedent.
+ * is_owner / traffic_category note: until 2026-10-04 nothing wrote either
+ * column (is_owner was always the DEFAULT 0; traffic_category did not exist).
+ * Since then analyticsService.trackAgentView stamps both, and this rollup
+ * keeps only human, non-owner rows — plus legacy NULL-category rows, which go
+ * into the LEGACY_AGENT_VIEW_SOURCE bucket readers exclude (see AGENT_VIEWS_SPEC
+ * above). The unused .recordAgentView wrapper still writes neither, so its rows
+ * would land in that legacy bucket too. Rows are still DELETED regardless of
+ * is_owner / traffic_category, matching the precedent of the other rollups.
  */
 export function rollupAndPruneAgentViews(
   windowDays: number = 90,
