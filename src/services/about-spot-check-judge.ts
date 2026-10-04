@@ -39,7 +39,8 @@
  * and checks each against all page text. Facts from several places may be
  * combined only when the pages tie them to the same business, facility,
  * product, person or event. A fact the pages state only about something else
- * (another year or event, a partner, an animal, a menu) is unsupported, and so
+ * (another year or event, a partner, an animal, a bare tag/link list) is
+ * unsupported — the producer's own footer address/contact info does count — and so
  * is any concrete fact found on no page. The old closing rule "doubt =
  * unsupported" is gone. NOT_SUPPORTED must name at least one concrete fact;
  * parseAboutJudgeReply treats a NOT_SUPPORTED with no claims as no answer.
@@ -181,7 +182,7 @@ Fremgangsmåte: del den lagrede teksten opp i enkeltpåstander. En påstand sier
 Regler:
 - Omskriving, oppsummering, annen ordstilling og forskjell mellom nynorsk og bokmål er HELT i orden — det er innholdet som teller, ikke ordlyden.
 - Opplysninger fra ulike steder og ulike sider kan settes sammen i én setning, så lenge sidene knytter dem til det samme (samme virksomhet, anlegg, produkt, person eller hendelse). Eksempel: "eget EFTA-godkjent produksjonsanlegg" er støttet når én side sier "eget produksjonsanlegg" og en annen sier "anlegget er EFTA-godkjent".
-- Et faktum som bare står på sidene om noe annet (en annen hendelse eller et annet år, en samarbeidspartner eller forhandler, et dyr, en annen virksomhet, en meny/fotlinje/tagg-liste) støtter ikke påstanden. Eksempel: står 2019 bare som fødselsåret til ei ku, støtter det ikke "garden har drevet siden 2019".
+- Et faktum som bare står på sidene om noe annet (en annen hendelse eller et annet år, en samarbeidspartner eller forhandler, et dyr, en annen virksomhet, eller bare en stikkord-/lenkeliste (tagg-sky, partnerlogoer, menypunkter) uten noe utsagn om virksomheten) støtter ikke påstanden. Eksempel: står 2019 bare som fødselsåret til ei ku, støtter det ikke "garden har drevet siden 2019". Produsentens egen adresse og kontaktinfo i bunnteksten eller på kontaktsiden er gyldig støtte for hvor virksomheten holder til og hvordan den kan kontaktes.
 - En påstand er støttet hvis sidene sier det samme, eller det følger direkte av det sidene sier. Små forskjeller i ordvalg, bøyning, bindestrek eller store/små bokstaver, og vanlige synonymer for hverdagsord, gjør den IKKE ustøttet. Faguttrykk og vernede betegnelser er ikke synonymer for hverandre: "økologisk" er ikke det samme som "naturlig", og "slakteri" er ikke det samme som "nedskjæringsanlegg".
 - En påstand er IKKE støttet hvis den inneholder et konkret faktum som sidene ikke nevner i det hele tatt, som sidene motsier, eller som sidene knytter til noe annet enn teksten gjør — eller hvis teksten handler om en annen virksomhet. Konkrete fakta er f.eks. årstall, antall, steder, personer, sertifiseringer, priser og utmerkelser, produkter, salgskanaler, kunder, kronebeløp, og superlativer som "eldst", "størst", "først", "eneste" og "prisvinnende".
 - Generelle, ufarlige formuleringer uten faktainnhold ("gode råvarer", "med stolthet", "populær") trenger ikke egen støtte.
