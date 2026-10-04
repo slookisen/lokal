@@ -47,7 +47,10 @@
  *     the same finding profile-activity-service.ts already documented for
  *     slice 2). Used here for "matching search queries" and "conversations
  *     per channel"; both are known, unfiltered-by-bot/owner gaps, same as
- *     slice 2's topQueryTerms/platform badges.
+ *     slice 2's topQueryTerms/platform badges. Both DO apply the shared
+ *     COUNTABLE_CONV_SQL predicate (is_internal + traffic_class, a2a spam
+ *     guard 2026-10-04), so our own fleet and classified spam/probe rows
+ *     no longer reach the owner's numbers.
  *
  *   - contact_clicks: HAS is_bot (applied below: is_bot = 0) but NO
  *     is_owner column (verified in init.ts — slice 1 only ever added
@@ -61,11 +64,16 @@
  *   - agent_metrics.times_discovered: a PRE-EXISTING lifetime counter, not
  *     a new aggregate query written by this slice — incremented in
  *     marketplace-registry.ts with no bot/owner filter either. Reused
- *     as-is (unchanged) for the funnel's "discovered" stage.
+ *     as-is (unchanged) for the funnel's "discovered" stage. HISTORICALLY
+ *     INFLATED: until the a2a spam guard (2026-10-04) discover() counted
+ *     every candidate, not just the returned page, and spam a2a calls were
+ *     tracked too. Since then only returned, countable results count; the
+ *     history has no per-row source and is deliberately left as-is.
  */
 
 import type Database from "better-sqlite3";
 import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
+import { COUNTABLE_CONV_SQL } from "./a2a-traffic-classifier";
 
 // ─── AI bot UA markers ────────────────────────────────────────────────
 // Same technique + marker lists as agent-stats.ts / profile-activity-
@@ -242,6 +250,7 @@ function getMatchingSearchQueries(db: Database.Database, agentId: string, limit 
       `SELECT query_text as term, COUNT(*) as cnt
        FROM conversations
        WHERE seller_agent_id = ?
+         AND ${COUNTABLE_CONV_SQL}
          AND query_text IS NOT NULL
          AND LENGTH(TRIM(query_text)) >= 2
        GROUP BY query_text
@@ -265,7 +274,7 @@ function getConversationsByChannel(db: Database.Database, agentId: string): Owne
     .prepare(
       `SELECT COALESCE(source, 'api') as source, COUNT(*) as cnt
        FROM conversations
-       WHERE seller_agent_id = ?
+       WHERE seller_agent_id = ? AND ${COUNTABLE_CONV_SQL}
        GROUP BY COALESCE(source, 'api')
        ORDER BY cnt DESC`,
     )

@@ -5999,6 +5999,8 @@ const _m2Promise = (async function runOwnerPortalTests() {
         seller_agent_id TEXT,
         source TEXT,
         query_text TEXT,
+        is_internal INTEGER NOT NULL DEFAULT 0,
+        traffic_class TEXT NOT NULL DEFAULT 'external',
         created_at TEXT DEFAULT (datetime('now'))
       );
       CREATE TABLE contact_clicks (
@@ -44536,6 +44538,46 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("a2a-tags-relaxed: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// a2a spam guard (2026-10-04): POST /a2a turned ANY text into a discovery
+// query and auto-started three seller conversations, so external machine spam
+// (~7 900 conversations, ~66 % of a2a) inflated every public conversation
+// stat and republished attacker payloads. Three suites: the pure classifier
+// (real prod payloads vs ordinary Norwegian queries), the route-level guard
+// (POST /a2a + REST conversation endpoints + public stats) and the admin
+// traffic-class backfill (dry-run / apply / reset / idempotency). The two
+// route suites pin their own in-memory DB singleton — runSerial().
+runSerial(async () => {
+  console.log("\n── a2a spam guard: classifier + POST /a2a guard + traffic-class backfill ──");
+  try {
+    const { runA2aTrafficClassifierTests } = require("../src/services/a2a-traffic-classifier.test") as
+      typeof import("../src/services/a2a-traffic-classifier.test");
+    const atc = runA2aTrafficClassifierTests({ log: false });
+    passed += atc.passed;
+    failed += atc.failed;
+    for (const f of atc.failures) failures.push("a2a-traffic-classifier: " + f);
+    console.log(`  a2a-traffic-classifier: ${atc.passed} passed, ${atc.failed} failed`);
+
+    const { runA2aSpamGuardTests } = require("../src/routes/a2a-spam-guard.test") as
+      typeof import("../src/routes/a2a-spam-guard.test");
+    const asg = await runA2aSpamGuardTests({ log: false });
+    passed += asg.passed;
+    failed += asg.failed;
+    for (const f of asg.failures) failures.push("a2a-spam-guard: " + f);
+    console.log(`  a2a-spam-guard: ${asg.passed} passed, ${asg.failed} failed`);
+
+    const { runAdminConversationsTrafficClassTests } = require("../src/routes/admin-conversations-traffic-class.test") as
+      typeof import("../src/routes/admin-conversations-traffic-class.test");
+    const tcb = await runAdminConversationsTrafficClassTests({ log: false });
+    passed += tcb.passed;
+    failed += tcb.failed;
+    for (const f of tcb.failures) failures.push("traffic-class-backfill: " + f);
+    console.log(`  traffic-class-backfill: ${tcb.passed} passed, ${tcb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("a2a spam guard: unexpected error: " + String(err?.message || err));
   }
 });
 

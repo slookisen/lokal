@@ -815,11 +815,16 @@ router.get("/devices", (req: Request, res: Response) => {
  * GET /admin/analytics/conversations
  * Samtaler (business-level agent-to-agent conversations) totals and per-source.
  * Separate signal from HTTP page-views; see conversation-service.
+ * total/bySource are the PUBLIC (countable) numbers. byTrafficClass keeps
+ * the excluded rows visible to admins (internal / spam / probe), and
+ * a2aGuard counts the POST /a2a calls the spam guard turned away since boot
+ * (those no longer leave a conversation row at all).
  */
 router.get("/conversations", (_req: Request, res: Response) => {
   try {
     // Lazy import to avoid circular init at module load.
     const { conversationService } = require("../services/conversation-service");
+    const { getA2aGuardStats } = require("../services/a2a-traffic-classifier");
     const sourceStats = conversationService.getSourceStats() as Array<{ source: string; count: number; lastActivity: string }>;
     const total = sourceStats.reduce((s, r) => s + r.count, 0);
     const bySource: Record<string, number> = { mcp: 0, a2a: 0, web: 0, api: 0 };
@@ -831,6 +836,8 @@ router.get("/conversations", (_req: Request, res: Response) => {
       total,
       bySource,
       sourceStats,
+      byTrafficClass: conversationService.getTrafficClassBreakdown(),
+      a2aGuard: getA2aGuardStats(),
     });
   } catch (err) {
     console.error("[analytics] conversations error:", err);

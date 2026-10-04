@@ -70,6 +70,16 @@ export interface DiscoverMeta {
   tagsRelaxed?: boolean;
 }
 
+/**
+ * Input options for discover(). a2a spam guard (2026-10-04):
+ * `trackDiscovery:false` skips the discovery_count/times_discovered bump for
+ * calls whose results nobody is shown as a real buyer (spam/probe traffic,
+ * no-intent text, count-only queries). Default true.
+ */
+export interface DiscoverOptions {
+  trackDiscovery?: boolean;
+}
+
 class MarketplaceRegistry {
   // ─── In-memory cache ──────────────────────────────────────────
   // Avoids re-querying + JSON.parse() on 1100+ agents per request.
@@ -190,8 +200,9 @@ class MarketplaceRegistry {
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
-  discover(query: DiscoveryQuery, meta?: DiscoverMeta): DiscoveryResult[] {
+  discover(query: DiscoveryQuery, meta?: DiscoverMeta, opts: DiscoverOptions = {}): DiscoveryResult[] {
     const db = getDb();
+    const trackDiscovery = opts.trackDiscovery !== false;
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
     // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
@@ -228,7 +239,7 @@ class MarketplaceRegistry {
           const geoFiltered = this.filterNameCandidatesByGeo(nameCandidates, query, meta);
           return this.buildNameMatchResults(
             geoFiltered, query, 0.9, `Navnematch: "${nameQuery}"`,
-            undefined, !!meta?.geoRelaxed,
+            undefined, !!meta?.geoRelaxed, trackDiscovery,
           );
         }
       }
@@ -284,7 +295,7 @@ class MarketplaceRegistry {
           if (fuzzyCandidates.length > 0) {
             const results = this.buildNameMatchResults(
               fuzzyCandidates, query, 0.75, `Mulig navnematch: "${nameQuery}"`, 10,
-              !!meta?.geoRelaxed,
+              !!meta?.geoRelaxed, trackDiscovery,
             );
             console.log(`[name-search-fuzzy] matched=${results.length} → ${results.map(r => r.agent.name).join(", ")}`);
             if (results.length > 0) return results;
@@ -463,9 +474,6 @@ class MarketplaceRegistry {
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, productTerms, productMatchMap);
 
-      // Track discovery stats (async-safe â€" fire and forget)
-      this.incrementDiscovery(agent.id);
-
       return {
         agent: {
           id: agent.id,
@@ -503,7 +511,11 @@ class MarketplaceRegistry {
       results.sort((a, b) => documented(b) - documented(a));
     }
 
-    return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
+    const page = results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
+    // Count a discovery only for what is actually returned (a2a spam guard:
+    // this used to bump every CANDIDATE — ~5k row writes per unfiltered call).
+    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    return page;
   }
 
   // ─── Result location + the distance honesty rule ──────────
@@ -609,6 +621,7 @@ class MarketplaceRegistry {
     reason: string,
     maxResults?: number,
     geoRelaxed = false,
+    trackDiscovery = true,
   ): DiscoveryResult[] {
     const origin = query.location;
     const maxKm = query.maxDistanceKm;
@@ -638,7 +651,6 @@ class MarketplaceRegistry {
 
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
-      this.incrementDiscovery(agent.id);
       const distanceKm = distanceOf(agent);
       if (typeof distanceKm === "number") rankDistance.set(agent.id, distanceKm);
 
@@ -674,7 +686,9 @@ class MarketplaceRegistry {
       return da - db;
     });
 
-    return results.slice(0, Math.min(maxResults ?? Infinity, query.limit || 20));
+    const page = results.slice(0, Math.min(maxResults ?? Infinity, query.limit || 20));
+    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    return page;
   }
 
   // ─── Natural language query parsing ───────────────────────
@@ -1840,13 +1854,23 @@ class MarketplaceRegistry {
     return this.generateApiKey();
   }
 
-  private incrementDiscovery(agentId: string): void {
+  // Bumps discovery_count/times_discovered for the RETURNED results only, all
+  // in one transaction (one fsync instead of three statements per agent).
+  private incrementDiscovery(agentIds: string[]): void {
+    if (agentIds.length === 0) return;
     try {
       const db = getDb();
-      db.prepare("UPDATE agents SET discovery_count = discovery_count + 1 WHERE id = ?").run(agentId);
+      const bumpAgent = db.prepare("UPDATE agents SET discovery_count = discovery_count + 1 WHERE id = ?");
       // Also update agent_metrics for social proof
-      db.prepare("INSERT OR IGNORE INTO agent_metrics (agent_id) VALUES (?)").run(agentId);
-      db.prepare("UPDATE agent_metrics SET times_discovered = times_discovered + 1, updated_at = datetime('now') WHERE agent_id = ?").run(agentId);
+      const ensureMetrics = db.prepare("INSERT OR IGNORE INTO agent_metrics (agent_id) VALUES (?)");
+      const bumpMetrics = db.prepare("UPDATE agent_metrics SET times_discovered = times_discovered + 1, updated_at = datetime('now') WHERE agent_id = ?");
+      db.transaction((ids: string[]) => {
+        for (const id of ids) {
+          bumpAgent.run(id);
+          ensureMetrics.run(id);
+          bumpMetrics.run(id);
+        }
+      })(agentIds);
     } catch { /* non-critical */ }
   }
 
