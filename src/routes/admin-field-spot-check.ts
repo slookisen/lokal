@@ -40,7 +40,18 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
-import { computeFieldSpotCheck, type FieldSpotCheckVerdict } from "../agents/lokal-agent-verifier";
+import {
+  computeFieldSpotCheck,
+  type FieldSpotCheckPageKind,
+  type FieldSpotCheckResult,
+  type FieldSpotCheckVerdict,
+} from "../agents/lokal-agent-verifier";
+import {
+  judgeAboutAgainstPages,
+  judgePageTextFromHtml,
+  type AboutJudgeVerdict,
+} from "../services/about-spot-check-judge";
+import { visibleTextOf } from "../services/fetch-page";
 import {
   ABOUT_FACT_MIN_FACTS,
   checkAboutCandidateFactSubstantiated,
@@ -174,6 +185,138 @@ export function checkAboutSpotCheckSubstantiated(
   return {
     substantiated: false,
     reason: `${guardNote} | fact-level check: ${fact.reason}`,
+  };
+}
+
+// ── about: LLM judge after the deterministic checks ─────────────────────────
+
+/** One page computeFieldSpotCheck fetched (its `onPage` observer). */
+export interface SpotCheckFetchedPage {
+  url: string;
+  kind: FieldSpotCheckPageKind;
+  html: string;
+}
+
+/** Final about verdict + where it came from. `judge` is "llm" only when the
+ *  model actually rendered the verdict; a deterministic match, or a judge
+ *  that could not answer, is "deterministic". */
+export interface AboutSpotCheckOutcome extends FieldSpotCheckResult {
+  judge: "llm" | "deterministic";
+  /** The model's unsupported claims (judge "llm" + mismatch), else []. */
+  unsupported_claims: string[];
+}
+
+/** Was the deterministic about failure on PARAPHRASE grounds only? Precisely:
+ *  the stored text has at least ABOUT_FACT_MIN_FACTS (2) facts — the
+ *  fact-level module's own definition: numbers with >= 3 digits and proper
+ *  nouns — and EVERY one of them occurs somewhere on the fetched pages
+ *  (raw markup, visible text, or entity-decoded text incl. meta
+ *  description; findAboutCandidateFactsAbsentFromSource's lenient
+ *  "mentioned at all" test). The deterministic checks then failed only on
+ *  wording — word overlap / local corroboration — not on a fact the site
+ *  never mentions. A text with a fact missing from every page, or with too
+ *  few facts to anchor on, is NOT a paraphrase-only failure. PURE. */
+export function isAboutFailureParaphraseOnly(
+  about: string | null | undefined,
+  pages: readonly SpotCheckFetchedPage[],
+): { paraphraseOnly: boolean; facts: string[]; absent: string[] } {
+  const combined = pages
+    .map((p) => `${p.html}\n${visibleTextOf(p.html)}\n${judgePageTextFromHtml(p.html)}`)
+    .join("\n");
+  const { facts, absent } = findAboutCandidateFactsAbsentFromSource(about, combined);
+  return { paraphraseOnly: facts.length >= ABOUT_FACT_MIN_FACTS && absent.length === 0, facts, absent };
+}
+
+/**
+ * The about spot-check's second stage. Called with the deterministic result
+ * (checkAboutSpotCheckSubstantiated over root + subpages) and the pages that
+ * walk fetched.
+ *
+ *   - deterministic `match` or `unverifiable` -> returned as-is, the judge
+ *     is NOT called (cost control; "unverifiable" already never counts as a
+ *     mismatch, and means too little / no page text was available).
+ *   - deterministic `mismatch` -> the LLM judge (about-spot-check-judge.ts)
+ *     reads the stored text + the fetched pages' text:
+ *       supported      -> `match`, reason prefixed "llm_judge:", checked_url /
+ *                         matched_page_kind = the page the model named (else
+ *                         the root);
+ *       not supported  -> `mismatch`, the unsupported claims listed in the
+ *                         reason and in `unsupported_claims`;
+ *       judge failed   -> (no key / timeout / network / non-200 / unparseable
+ *                         or ambiguous reply) the deterministic verdict stands,
+ *                         EXCEPT that a paraphrase-only failure
+ *                         (isAboutFailureParaphraseOnly) becomes `unverifiable`
+ *                         — a likely-false mismatch the judge could not
+ *                         confirm is not allowed to count toward the weekly
+ *                         auto-pause rate. Any other failure stays `mismatch`.
+ *
+ * `deps.judge` is a test seam (defaults to judgeAboutAgainstPages). Read-only.
+ */
+export async function resolveAboutSpotCheck(
+  about: string | null | undefined,
+  deterministic: FieldSpotCheckResult,
+  pages: readonly SpotCheckFetchedPage[],
+  deps: { judge?: typeof judgeAboutAgainstPages } = {},
+): Promise<AboutSpotCheckOutcome> {
+  const base: AboutSpotCheckOutcome = { ...deterministic, judge: "deterministic", unsupported_claims: [] };
+  const text = (about ?? "").trim();
+  if (deterministic.status !== "mismatch" || !text || pages.length === 0) return base;
+
+  const judgePages = pages.map((p) => ({ url: p.url, text: judgePageTextFromHtml(p.html) }));
+  let verdict: AboutJudgeVerdict;
+  try {
+    verdict = await (deps.judge ?? judgeAboutAgainstPages)({ about: text, pages: judgePages });
+  } catch (err: any) {
+    verdict = { ok: false, failure: "error", reason: `judge threw: ${String(err?.message || err)}` };
+  }
+
+  const detNote = `deterministic: ${deterministic.reason}`;
+  if (verdict.ok) {
+    if (verdict.supported) {
+      const best = verdict.bestPage !== null ? pages[verdict.bestPage] : undefined;
+      const page = best ?? pages[0]!;
+      return {
+        ...base,
+        status: "match",
+        judge: "llm",
+        checked_url: page.url,
+        matched_page_kind: page.kind,
+        reason:
+          `llm_judge: every factual claim is supported by the fetched page text` +
+          `${verdict.reason ? ` — ${verdict.reason}` : ""}${verdict.cached ? " (cached verdict)" : ""} | ${detNote}`,
+      };
+    }
+    const claims = verdict.unsupportedClaims;
+    return {
+      ...base,
+      status: "mismatch",
+      judge: "llm",
+      unsupported_claims: claims,
+      reason:
+        `llm_judge: not supported by the fetched pages — ` +
+        (claims.length > 0 ? `unsupported claim(s): ${claims.map((c) => `"${c}"`).join("; ")}` : "no claim list given") +
+        `${verdict.reason ? ` — ${verdict.reason}` : ""} | ${detNote}`,
+    };
+  }
+
+  const p = isAboutFailureParaphraseOnly(text, pages);
+  if (p.paraphraseOnly) {
+    return {
+      ...base,
+      status: "unverifiable",
+      reason:
+        `LLM judge unavailable (${verdict.failure}: ${verdict.reason}); the deterministic failure is on paraphrase ` +
+        `grounds only — all ${p.facts.length} facts (${p.facts.join(", ")}) appear on the fetched pages — ` +
+        `so cannot confidently judge, not treated as a mismatch | ${detNote}`,
+    };
+  }
+  return {
+    ...base,
+    reason:
+      `${deterministic.reason} | LLM judge unavailable (${verdict.failure}: ${verdict.reason}); deterministic mismatch kept` +
+      (p.absent.length > 0
+        ? ` — fact(s) ${p.absent.join(", ")} appear on none of the fetched pages`
+        : ` — fewer than ${ABOUT_FACT_MIN_FACTS} facts to anchor a paraphrase judgment`),
   };
 }
 
@@ -684,7 +827,9 @@ router.post("/", async (req: Request, res: Response) => {
     //   about   — write-guard check first, fact-level check
     //             (about-fact-substantiation.ts, dev-request
     //             2026-09-24-stikkproeve-undersider-og-faktanivaa-about Del B)
-    //             as an extra chance (checkAboutSpotCheckSubstantiated).
+    //             as an extra chance (checkAboutSpotCheckSubstantiated);
+    //             a deterministic mismatch then goes to the LLM judge
+    //             (resolveAboutSpotCheck, about-spot-check-judge.ts).
     //   phone   — normalized 8-digit national number (#933).
     //   address — street name + house number + postal code
     //             (checkAddressSubstantiatedBySource), the producer's own
@@ -701,7 +846,17 @@ router.post("/", async (req: Request, res: Response) => {
             ? (candidate: string | null | undefined, sourceText: string | null | undefined) =>
                 checkAddressSubstantiatedBySource(candidate, sourceText, { ownName })
             : undefined; // unreachable today (FIELD_COLUMN_MAP whitelist) — computeFieldSpotCheck's default
-    const result = await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl }, { substantiate });
+    // about only: keep the pages the walk fetched, so the LLM judge
+    // (resolveAboutSpotCheck) reuses them instead of fetching again.
+    const fetchedPages: SpotCheckFetchedPage[] = [];
+    const deterministic = await computeFieldSpotCheck(
+      { field_value: fieldValue, root_url: rootUrl },
+      { substantiate, onPage: fieldName === "about" ? (p) => fetchedPages.push(p) : undefined },
+    );
+    const result: AboutSpotCheckOutcome =
+      fieldName === "about"
+        ? await resolveAboutSpotCheck(fieldValue, deterministic, fetchedPages)
+        : { ...deterministic, judge: "deterministic", unsupported_claims: [] };
 
     res.json({
       success: true,
@@ -716,6 +871,12 @@ router.post("/", async (req: Request, res: Response) => {
       // "root" | "about_contact" | "terms_privacy" on a match, else null —
       // lets the weekly report tell terms/privacy-page matches apart.
       matched_page_kind: result.matched_page_kind ?? null,
+      // "llm" when the about LLM judge rendered the verdict, else
+      // "deterministic" (every phone/address check; about matches and
+      // judge-unavailable fallbacks).
+      judge: result.judge,
+      // about + judge "llm" + mismatch: the claims the pages do not support.
+      unsupported_claims: result.unsupported_claims,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
