@@ -30,6 +30,11 @@
  *       upper-case recipient normalized
  *   w10 secret rotation (several v1 sigs, one valid) → accepted
  *   w11 non-JSON Content-Type → 400; oversize body → 413; both write nothing
+ *   w12 send attribution (2026-10-04): agent_id_at_send / batch_id /
+ *       lane_at_send from the RFB daily ledger (run id), the Opplevagent
+ *       sent log (+ covering daily-run id), or outreach_sent_log (compose);
+ *       the latest send at/before Resend's acceptance; NULLs outside the
+ *       lookback; a failing lookup still records the bounce
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/routes/resend-webhook.test.ts
@@ -81,9 +86,14 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
   const { findOffers } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
   const { resolveOrderNotificationRecipient } = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
 
+  const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+
   const restoreDb = initMod.__pinInMemoryDbForTesting();
   const prevPaused = process.env.OUTREACH_PAUSED;
   delete process.env.OUTREACH_PAUSED;
+  // w12 opens an in-memory experiences db for the Opplevagent attribution source.
+  const prevEnableExperiences = process.env.ENABLE_EXPERIENCES;
+  const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
   const origLog = console.log;
   const origWarn = console.warn;
 
@@ -374,6 +384,87 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
       assertEq(rb.status, 413, "w11: > 64 KiB → 413");
       assertEq(counts(), before, "w11: nothing written");
     }
+
+    // ── w12 send attribution (2026-10-04) ──────────────────────────────
+    {
+      process.env.ENABLE_EXPERIENCES = "1";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      dbFactory.__resetDbFactoryForTesting();
+      const expDb = dbFactory.getDb("experiences");
+      const bounceAt = (to: string, acceptedAt: string, emailId: string, type = "email.bounced") =>
+        JSON.stringify({
+          type,
+          created_at: "2026-09-29T12:00:00.000Z",
+          data: { email_id: emailId, to: [to], subject: "x", created_at: acceptedAt, bounce: { type: "Permanent", subType: "General" } },
+        });
+      const attributed = (email: string) =>
+        db().prepare("SELECT agent_id_at_send, batch_id, lane_at_send FROM email_bounces WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
+      const sentLog = (agentId: string, email: string, sentAt: string, vertical: string) =>
+        db().prepare(
+          `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+           VALUES (?, ?, ?, 'email', ?, 'test', ?)`,
+        ).run(agentId, email, sentAt, `m-${email}-${sentAt}`, vertical);
+      seedAgent("rw-led", "Ledger Gård", "led@rw-farm.no");
+      seedAgent("rw-opp", "Opplev Gård", "opp@rw-farm.no");
+      seedAgent("rw-cmp", "Compose Gård", "cmp@rw-farm.no");
+      seedAgent("rw-old", "Gammel Gård", "old@rw-farm.no");
+
+      // RFB daily job: ledger + the sent-log row compose's trigger writes for
+      // the same send → the ledger wins (it carries the run id).
+      db().prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
+         VALUES ('2026-09-29', 'run-2026-09-29-rfb-marketing-platform', 'rw-led', 'led@rw-farm.no', 'first', 'A', 'sent', '2026-09-29T08:12:00.000Z')`,
+      ).run();
+      sentLog("rw-led", "led@rw-farm.no", "2026-09-29 08:12:01", "rfb");
+      let body = bounceAt("led@rw-farm.no", "2026-09-29T08:12:02.000Z", "em_w12a");
+      let r = await post(body, signed(body, "msg_w12a"));
+      assertEq(r.body.outcome, "hard_bounce_recorded", "w12: RFB daily-job bounce recorded");
+      assertEq(attributed("led@rw-farm.no"), { agent_id_at_send: "rw-led", batch_id: "run-2026-09-29-rfb-marketing-platform", lane_at_send: "rfb" }, "w12a: RFB daily-job send → ledger agent + run id, lane rfb");
+
+      // Opplevagent: experience_outreach_sent_log + the daily-run envelope that
+      // covers it; the CRM-trigger sent-log row (vertical 'experiences', an RFB
+      // agent matched by e-mail) loses to the lane's own log.
+      expDb.prepare(
+        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, message_id, is_test)
+         VALUES ('prov-opp', 'Opp@rw-farm.no', '2026-09-29 08:00:50', '<x@rettfrabonden.com>', 0)`,
+      ).run();
+      db().prepare(
+        `INSERT INTO runs (run_id, vertical, agent, trigger_source, started_at, finished_at, status)
+         VALUES ('run-2026-09-29-opplevagent-outreach-platform', 'experiences', 'opplevagent-outreach-platform', 'cron',
+                 '2026-09-29T08:00:40.000Z', '2026-09-29T08:01:30.000Z', 'completed')`,
+      ).run();
+      sentLog("rw-opp", "opp@rw-farm.no", "2026-09-29T08:00:50.500Z", "experiences");
+      body = bounceAt("opp@rw-farm.no", "2026-09-29T08:00:51.000Z", "em_w12b");
+      r = await post(body, signed(body, "msg_w12b"));
+      assertEq(attributed("opp@rw-farm.no"), { agent_id_at_send: "prov-opp", batch_id: "run-2026-09-29-opplevagent-outreach-platform", lane_at_send: "opplevagent" }, "w12b: Opplevagent send → provider id + covering daily-run id, lane opplevagent");
+
+      // Compose-only RFB send (routine/manual): sent-log row only → its agent,
+      // no batch. A LATER send (after Resend accepted the bounced mail) and an
+      // older Opplevagent send are not it.
+      expDb.prepare(
+        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, is_test)
+         VALUES ('prov-cmp', 'cmp@rw-farm.no', '2026-09-10 08:00:00', 0)`,
+      ).run();
+      sentLog("rw-cmp", "cmp@rw-farm.no", "2026-09-28 14:00:00", "rfb");
+      sentLog("rw-cmp", "cmp@rw-farm.no", "2026-09-29 15:00:00", "rfb");
+      body = bounceAt("cmp@rw-farm.no", "2026-09-28T14:00:03.000Z", "em_w12c", "email.complained");
+      r = await post(body, signed(body, "msg_w12c"));
+      assertEq(r.body.outcome, "complaint_recorded", "w12: complaint recorded");
+      assertEq(attributed("cmp@rw-farm.no"), { agent_id_at_send: "rw-cmp", batch_id: null, lane_at_send: "rfb" }, "w12c: compose send → sent-log agent, no batch; the latest send at/before acceptance wins");
+
+      // Nothing within the lookback → recorded exactly as before (NULLs).
+      sentLog("rw-old", "old@rw-farm.no", "2026-08-01 08:00:00", "rfb");
+      body = bounceAt("old@rw-farm.no", "2026-09-29T08:00:00.000Z", "em_w12d");
+      r = await post(body, signed(body, "msg_w12d"));
+      assertEq([r.body.outcome, attributed("old@rw-farm.no")], ["hard_bounce_recorded", { agent_id_at_send: null, batch_id: null, lane_at_send: null }], "w12d: no send inside the lookback → NULL attribution");
+
+      // A failing lookup never fails the webhook: the bounce is still recorded.
+      expDb.exec(`DROP TABLE experience_outreach_sent_log`);
+      sentLog("rw-ok", "ok2@rw-farm.no", "2026-09-29 08:00:00", "rfb");
+      body = bounceAt("ok2@rw-farm.no", "2026-09-29T08:00:01.000Z", "em_w12e");
+      r = await post(body, signed(body, "msg_w12e"));
+      assertEq([r.status, r.body.outcome, attributed("ok2@rw-farm.no")], [200, "hard_bounce_recorded", { agent_id_at_send: null, batch_id: null, lane_at_send: null }], "w12e: attribution lookup error → 200, bounce recorded without attribution");
+    }
   } catch (err: any) {
     failed++;
     failures.push("resend-webhook: unexpected error: " + String(err?.stack || err));
@@ -384,6 +475,11 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
     restoreDb();
     if (prevPaused === undefined) delete process.env.OUTREACH_PAUSED;
     else process.env.OUTREACH_PAUSED = prevPaused;
+    if (prevEnableExperiences === undefined) delete process.env.ENABLE_EXPERIENCES;
+    else process.env.ENABLE_EXPERIENCES = prevEnableExperiences;
+    if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+    dbFactory.__resetDbFactoryForTesting();
   }
   return { passed, failed, failures };
 }

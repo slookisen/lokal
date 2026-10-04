@@ -72,6 +72,7 @@ import { geocodingService } from "./geocoding-service";
 import { formatRfbDistanceLabel } from "./geo-precision";
 import { formatDistanceLabel } from "./experience-store";
 import { slugify } from "../utils/slug";
+import { publicListableSql } from "./agent-visibility";
 import {
   prepareRoute,
   corridorBoundingBox,
@@ -652,6 +653,12 @@ const EXPERIENCES_BASE_URL = process.env.OPPLEVAGENT_BASE_URL || "https://opplev
  * `umbrella_type IS NULL` mirrors marketplace-registry.discover()'s
  * producer-surface rule (Phase 5.11 A4.1) — an umbrella organisation is not a
  * place you stop at.
+ *
+ * /reise is a public RFB list surface like /search: the not-yet-vetted rule
+ * (`is_vetted`, same as discover()) and the shared public-listability
+ * predicate (agent-visibility.ts — no hidden test fixture, no dental/
+ * experiences rows from `agents`) apply here too; every stop links to a
+ * /produsent/ page, which 404s for exactly those rows.
  */
 export function loadRfbCandidates(
   box: { minLat: number; maxLat: number; minLng: number; maxLng: number },
@@ -664,6 +671,8 @@ export function loadRfbCandidates(
         WHERE is_active = 1
           AND umbrella_type IS NULL
           AND role = 'producer'
+          AND (is_vetted IS NULL OR is_vetted = 1)
+          AND ${publicListableSql()}
           AND lat IS NOT NULL AND lng IS NOT NULL
           AND lat BETWEEN ? AND ?
           AND lng BETWEEN ? AND ?`,

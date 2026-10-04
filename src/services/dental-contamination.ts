@@ -30,8 +30,32 @@
 // worker's own schema probe writes it here on purpose, every cycle, to
 // exercise the write path) — a sweep/repair pass must exclude them, not
 // flag or "fix" a deliberately-fake row. Single source of truth: dental.ts's
-// PUT /agents/:id guard and the schema-probe-sweep route both import this.
+// PUT /agents/:id guard and the schema-probe-sweep route both import this,
+// and the read-side helpers right below are built from it.
 export const DENTAL_SYNTHETIC_PROBE_IDS = new Set(["persistence-probe-pr100b"]);
+
+// dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the probe
+// row is a real dental_agents row (poststed/fylke "TEST", org_nr 999999999),
+// so every public read surface showed it as a clinic -- profile page, sitemap,
+// /sted/test, search, front-page counts, MCP/A2A lookups, /api/stats -- and
+// it counted in the admin reports (parking-stats, verifier cohort). The row
+// itself must stay (the probe WRITE path, PUT /agents/:id, and its by-id
+// read-back GET /api/tannlege/agents/:id are unchanged); only the read
+// surfaces skip it. Both forms below derive from DENTAL_SYNTHETIC_PROBE_IDS,
+// so there is still exactly one list of probe ids:
+//   - DENTAL_NOT_SYNTHETIC_PROBE_SQL: WHERE fragment on dental_agents.id for
+//     SQL-side filtering (ids are constants above, never user input, so
+//     inlining them as quoted literals is safe).
+//   - isDentalSyntheticProbeId(): for call sites that already hold a hydrated
+//     row from a single-row lookup (getDentalAgentById/ByOrgnr).
+export const DENTAL_NOT_SYNTHETIC_PROBE_SQL =
+  "(id NOT IN (" +
+  [...DENTAL_SYNTHETIC_PROBE_IDS].map((id) => `'${id.replace(/'/g, "''")}'`).join(", ") +
+  "))";
+
+export function isDentalSyntheticProbeId(id: string | null | undefined): boolean {
+  return typeof id === "string" && DENTAL_SYNTHETIC_PROBE_IDS.has(id);
+}
 
 // Parses `value` if it's a string (the RAW DB TEXT-column shape); returns it
 // unchanged otherwise (the already-parsed PUT-body shape). A malformed JSON

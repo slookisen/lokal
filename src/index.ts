@@ -44,6 +44,8 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { getPageViewHealthCounts } from "./services/health-counts";
+import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
+import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
@@ -52,13 +54,14 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
-import { shouldRunRfbMarketingDaily, runRfbMarketingDaily, rfbMarketingRunConsumesWindow } from "./services/rfb-marketing-daily";
+import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
@@ -92,6 +95,7 @@ import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -630,10 +634,16 @@ app.get("/health", (_req, res) => {
     if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
     else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }
 
-    // PR-92 (2026-06-01): raised 200 → 400 MB. Daily auto-prune now keeps DB bounded.
-    if (dbSizeMb > 400) { if (status !== "critical") status = "warning"; warnings.push(`DB large: ${dbSizeMb}MB`); }
-
-    if (pvCount > 500000) { warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`); }
+    // 2026-10-04: the static "DB large >400MB" / "analytics_page_views >500k rows"
+    // warnings are gone — the normal 60-day-retention steady state tripped them
+    // permanently, so status read 'warning' every day (noise). dbSizeMb and the row
+    // counts are still reported below as plain fields; the actionable signal is the
+    // daily auto-prune falling behind (see computePageViewPruneLag).
+    const pruneLag = computePageViewPruneLag(db, Date.now(), getRetentionWindowDays());
+    if (pruneLag.lagging) {
+      if (status !== "critical") status = "warning";
+      warnings.push(`Analytics auto-prune lagging: oldest page view ${pruneLag.oldestPageViewAgeDays}d old > ${pruneLag.retentionDays}d retention + ${PRUNE_LAG_GRACE_DAYS}d`);
+    }
 
     const disk = diskUsage(path.dirname(dbPath));
     if (disk && disk.used_pct >= 95) { status = "critical"; warnings.push(`Data volume ${disk.used_pct}% full — SQLite writes will fail when it fills`); }
@@ -670,6 +680,9 @@ app.get("/health", (_req, res) => {
         pageViews: pvCount,
         queries: queryCount,
         pageViewsCachedAgeMs: pvCounts.cachedAgeMs,
+        oldestPageViewAt: pruneLag.oldestPageViewAt,
+        oldestPageViewAgeDays: pruneLag.oldestPageViewAgeDays,
+        retentionDays: pruneLag.retentionDays,
       },
       writePath,
       disk: disk && {
@@ -678,7 +691,9 @@ app.get("/health", (_req, res) => {
         usedPct: disk.used_pct,
       },
       // traffic.totalAgents = marketplaceRegistry.getStats().totalAgents = COUNT(*) FROM agents
-      // with NO filter at all (includes inactive + umbrella-tagged rows). This is the SAME
+      // filtered ONLY by the shared public-listability predicate (agent-visibility.ts: no
+      // hidden test fixture, RFB vertical only) — still includes inactive + umbrella-tagged
+      // rows. This is the SAME
       // underlying value as GET /api/stats' registry.totalAgents (src/routes/a2a.ts, the
       // /api/stats handler) — both call the same cached getStats(). See dev-request
       // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
@@ -705,6 +720,9 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+// a2a spam guard (2026-10-04): POST /admin/conversations/traffic-class-backfill
+// (dry-run by default; {apply:true} writes; {reset:true,apply:true} reverts).
+app.use("/admin/conversations", adminLimiter, adminConversationsTrafficClassRoutes);
 // 2026-07-03 P1 (dev-requests/2026-06-30-platform-housekeeping-audit.md step 1):
 // read-only DB table-size diagnostic — GET /admin/db/table-sizes
 app.use("/admin/db", adminLimiter, adminDbTableSizesRoutes);
@@ -774,6 +792,10 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// POST /admin/test-producer — the ONE hidden RFB test producer for real test
+// orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
+// dry-run default, arm/retire, refuses every non-fixture row.
+app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
@@ -1764,7 +1786,9 @@ if (
 // in runGardssalgOutreachDaily — the DB is the memory, so a restart or a
 // second tick inside the window cannot double-send. `lastRunAt` is only
 // stamped after a run that did not throw, so a transient DB error at 08:00
-// is retried on the next tick within the window.
+// is retried on the next tick within the window. The stamp is also persisted
+// (boot_job_state, via tickGardssalgOutreachDaily), so a deploy/restart later
+// inside the window does not run the job a second time that day.
 //
 // Disable on dev / CI (or as a deploy-level kill-switch) with
 // GARDSSALG_OUTREACH_DAILY_DISABLED=1. Manual/dry runs:
@@ -1777,10 +1801,11 @@ if (
   const gardssalgOutreachDailyTick = trackJob("gardssalg-outreach-daily", async () => {
     const now = new Date();
     try {
-      const { shouldRunGardssalgOutreachDaily, runGardssalgOutreachDaily } = await import("./routes/opplevelser");
-      if (!shouldRunGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })) return;
-      const r = await runGardssalgOutreachDaily({ apply: true, trigger: "cron", now });
-      lastGardssalgOutreachRunAt = now;
+      const { tickGardssalgOutreachDaily } = await import("./routes/opplevelser");
+      const t = await tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt });
+      lastGardssalgOutreachRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
       console.log(
         `[gardssalg-outreach-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
           `sent=${r.summary.sent} errors=${r.summary.error} budget=${r.budget} cap=${r.daily_cap} ` +
@@ -1810,6 +1835,8 @@ if (
 // before its e-mail leaves). `lastRunAt` is only stamped after a run that did
 // not throw and was not skipped for run_in_progress/health_red, so a transient
 // DB error or health dip at 08:10 is retried on the next tick in the window.
+// The stamp is also persisted (boot_job_state, via tickRfbMarketingDaily), so
+// a deploy/restart later inside the window does not run the job twice a day.
 // Statically imported (not `await import(...)`): one module instance, one
 // database/init singleton. Manual/dry runs: POST /admin/rfb-marketing-daily-run.
 if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
@@ -1817,12 +1844,14 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   const rfbMarketingDailyTick = trackJob("rfb-marketing-daily", async () => {
     const now = new Date();
     try {
-      if (!shouldRunRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })) return;
-      const r = await runRfbMarketingDaily({ apply: true, trigger: "cron", now });
-      // Not today's run — retry on the next tick inside the window: a manual
-      // run that was still in flight, or a transient health_red (memory/disk
-      // "critical" at 08:10 must not cost the whole day).
-      if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;
+      // Not today's run — tickRfbMarketingDaily leaves the stamp alone so the
+      // next tick inside the window retries: a manual run that was still in
+      // flight, or a transient health_red (memory/disk "critical" at 08:10
+      // must not cost the whole day) — rfbMarketingRunConsumesWindow.
+      const t = await tickRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt });
+      lastRfbMarketingRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
       console.log(
         `[rfb-marketing-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
           `stopped=${r.stopped_reason ?? "-"} sent=${r.summary.sent} errors=${r.summary.error} ` +

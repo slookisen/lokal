@@ -41,6 +41,8 @@ import { getDb } from "../database/init";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { slugify } from "../utils/slug";
 import { getPrunedChatgptClaudeCounts } from "../services/analytics-rollup-reads";
+import { redactPII } from "../utils/pii-redact";
+import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "../services/a2a-traffic-classifier";
 import { getSessionVelocity } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, aiVendorBucket } from "../services/traffic-classifier";
 
@@ -225,8 +227,10 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
     // ── Conversations: count + last 5 with first buyer message ───────
     // We rely on seller_agent_id only. buyer_agent_id stays in the DB
     // for our own analytics but is never returned to clients.
+    // Countable only (a2a spam guard): our own fleet traffic and classified
+    // spam/probe conversations are never public engagement.
     const convCountRow = db.prepare(`
-      SELECT COUNT(*) as count FROM conversations WHERE seller_agent_id = ?
+      SELECT COUNT(*) as count FROM conversations WHERE seller_agent_id = ? AND ${COUNTABLE_CONV_SQL}
     `).get(agentId) as { count: number } | undefined;
     const conversationCount = convCountRow?.count ?? 0;
 
@@ -243,6 +247,8 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
     // Fall back to the first inbound message body if query_text is empty,
     // which can happen for older conversations created before the
     // query_text column existed.
+    // A wider window than the 5 shown, so rows dropped by the public
+    // query allow-list below don't leave the card short.
     const lastConvs = db.prepare(`
       SELECT
         c.id,
@@ -253,23 +259,28 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
           WHERE m.conversation_id = c.id AND m.sender_role = 'buyer'
           ORDER BY m.created_at ASC LIMIT 1) as first_buyer_msg
       FROM conversations c
-      WHERE c.seller_agent_id = ?
+      WHERE c.seller_agent_id = ? AND ${countableConvSql("c")}
       ORDER BY c.created_at DESC
-      LIMIT 5
+      LIMIT 20
     `).all(agentId) as ConvRow[];
 
     const lastConversations = lastConvs.map(r => {
       const question = (r.query_text && r.query_text.trim()) || (r.first_buyer_msg && r.first_buyer_msg.trim()) || "";
+      // Public query allow-list (no URLs/JSON/wallet strings/CJK payloads),
+      // then redactPII — this card is unauthenticated.
+      if (!isPublicQueryTerm(question, { maxLen: 500, maxWords: 80, allowPii: true })) return null;
+      const safe = redactPII(question);
       // Truncate aggressively — these render in a profile card, not a chat
       // view. ~140 chars matches our typical query length and keeps the
       // tile compact on mobile.
-      const truncated = question.length > 140 ? question.slice(0, 137) + "..." : question;
+      const truncated = safe.length > 140 ? safe.slice(0, 137) + "..." : safe;
       return {
         source: r.source || "api",
         createdAt: r.created_at,
         question: truncated,
       };
-    }).filter(c => c.question.length > 0);  // Hide bare/empty rows
+    }).filter((c): c is { source: string; createdAt: string; question: string } => !!c && c.question.length > 0)  // Hide bare/empty/rejected rows
+      .slice(0, 5);
 
     // 5-min HTTP cache. All-time aggregates change slowly; this absorbs
     // most of the load from AI bot crawls (which hit /produsent/<slug>

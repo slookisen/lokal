@@ -14943,6 +14943,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
 import { recordRun } from "../services/run-ledger";
+import { markJobCompleted, resolveDailyJobLastRunAt } from "../services/boot-job-gate";
 import {
   indexRfbByDomain,
   indexRfbByName,
@@ -19759,7 +19760,7 @@ router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, 
 //      controller/opplevagent-outreach-pause.yaml, now one endpoint instead
 //      of a file.
 //   3. hard bounce / spam complaint on a recipient contacted in the last
-//      48h                                                → auto-pause + skip
+//      48h, not yet acknowledged (bounce_ack_max_id)      → auto-pause + skip
 //   4. today's real sends already reach daily_cap        → skip
 //      (the DB is the memory here, so a restart or a second tick inside the
 //      window can never double-send; a manual send earlier the same day
@@ -19777,35 +19778,61 @@ export interface GardssalgOutreachLaneState {
   changed_at: string | null;
   changed_by: string | null;
   reason: string | null;
+  /**
+   * Highest email_bounces.id already acted on — by an auto-pause (Guard 3)
+   * or by a human lifting a pause (POST .../gardssalg-outreach-lane
+   * {"paused": false}). Dev-request 2026-10-03-opplevagent-lane-bounce-
+   * kvittering; same mechanism as rfb_marketing_lane_state.
+   */
+  bounce_ack_max_id: number | null;
 }
 
 export function getGardssalgOutreachLaneState(expDb: ReturnType<typeof getExpDb>): GardssalgOutreachLaneState {
   const row = expDb
-    .prepare(`SELECT paused, changed_at, changed_by, reason FROM experience_outreach_lane_state WHERE id = 1`)
-    .get() as { paused: number; changed_at: string | null; changed_by: string | null; reason: string | null } | undefined;
-  if (!row) return { paused: false, changed_at: null, changed_by: null, reason: null };
-  return { paused: row.paused === 1, changed_at: row.changed_at, changed_by: row.changed_by, reason: row.reason };
+    .prepare(
+      `SELECT paused, changed_at, changed_by, reason, bounce_ack_max_id FROM experience_outreach_lane_state WHERE id = 1`,
+    )
+    .get() as
+    | { paused: number; changed_at: string | null; changed_by: string | null; reason: string | null; bounce_ack_max_id: number | null }
+    | undefined;
+  if (!row) return { paused: false, changed_at: null, changed_by: null, reason: null, bounce_ack_max_id: null };
+  return {
+    paused: row.paused === 1,
+    changed_at: row.changed_at,
+    changed_by: row.changed_by,
+    reason: row.reason,
+    bounce_ack_max_id: row.bounce_ack_max_id,
+  };
 }
 
+/**
+ * Flip the lane. `bounceAckMaxId` only ever moves UP (same rule as
+ * setRfbMarketingLanePaused); omitted/null, the stored value is kept.
+ */
 export function setGardssalgOutreachLanePaused(
   expDb: ReturnType<typeof getExpDb>,
-  opts: { paused: boolean; by: string; reason: string | null },
+  opts: { paused: boolean; by: string; reason: string | null; bounceAckMaxId?: number | null },
 ): GardssalgOutreachLaneState {
   expDb
     .prepare(
-      `INSERT INTO experience_outreach_lane_state (id, paused, changed_at, changed_by, reason)
-       VALUES (1, @paused, @changed_at, @changed_by, @reason)
+      `INSERT INTO experience_outreach_lane_state (id, paused, changed_at, changed_by, reason, bounce_ack_max_id)
+       VALUES (1, @paused, @changed_at, @changed_by, @reason, @bounce_ack_max_id)
        ON CONFLICT(id) DO UPDATE SET
          paused = excluded.paused,
          changed_at = excluded.changed_at,
          changed_by = excluded.changed_by,
-         reason = excluded.reason`,
+         reason = excluded.reason,
+         bounce_ack_max_id = CASE
+           WHEN excluded.bounce_ack_max_id IS NULL THEN experience_outreach_lane_state.bounce_ack_max_id
+           ELSE MAX(excluded.bounce_ack_max_id, COALESCE(experience_outreach_lane_state.bounce_ack_max_id, 0))
+         END`,
     )
     .run({
       paused: opts.paused ? 1 : 0,
       changed_at: new Date().toISOString(),
       changed_by: opts.by,
       reason: opts.reason,
+      bounce_ack_max_id: opts.bounceAckMaxId ?? null,
     });
   return getGardssalgOutreachLaneState(expDb);
 }
@@ -19861,13 +19888,16 @@ export function countGardssalgOutreachSentToday(expDb: ReturnType<typeof getExpD
  * gate already reads) on addresses this lane contacted in the last 48h. The
  * gate never selects an address that is already bounced, so any hit here is
  * a NEW bounce on a recent send — exactly the "stop and let a human look"
- * case the routine's self-pause rule was written for.
+ * case the routine's self-pause rule was written for. Bounces with
+ * id <= ackMaxId (the lane's bounce_ack_max_id) already paused the lane, or
+ * were known when a human lifted a pause; they are not fresh any more.
  */
 export function findGardssalgOutreachRecentBounces(
   expDb: ReturnType<typeof getExpDb>,
   rfbDb: ReturnType<typeof getRfbDb>,
   now: Date,
-): Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }> {
+  ackMaxId: number | null,
+): GardssalgOutreachBounceHit[] {
   const since = new Date(now.getTime() - GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS * 3600_000)
     .toISOString()
     .slice(0, 19)
@@ -19878,18 +19908,28 @@ export function findGardssalgOutreachRecentBounces(
         WHERE is_test = 0 AND replace(substr(sent_at, 1, 19), 'T', ' ') >= ?`,
     )
     .all(since) as Array<{ recipient_email: string }>;
-  const hits: Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }> = [];
+  const lookup = rfbDb.prepare(
+    `SELECT id, bounce_type, bounced_at FROM email_bounces
+      WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint') AND id > ?
+      ORDER BY id DESC LIMIT 1`,
+  );
+  const hits: GardssalgOutreachBounceHit[] = [];
   for (const r of recent) {
-    const b = rfbDb
-      .prepare(
-        `SELECT bounce_type, bounced_at FROM email_bounces
-          WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
-          ORDER BY bounced_at DESC LIMIT 1`,
-      )
-      .get(r.recipient_email) as { bounce_type: string | null; bounced_at: string } | undefined;
-    if (b) hits.push({ recipient_email: r.recipient_email, bounce_type: b.bounce_type, bounced_at: b.bounced_at });
+    const b = lookup.get(r.recipient_email, ackMaxId ?? 0) as
+      | { id: number; bounce_type: string | null; bounced_at: string }
+      | undefined;
+    if (b) {
+      hits.push({ bounce_id: b.id, recipient_email: r.recipient_email, bounce_type: b.bounce_type, bounced_at: b.bounced_at });
+    }
   }
   return hits;
+}
+
+export interface GardssalgOutreachBounceHit {
+  bounce_id: number;
+  recipient_email: string;
+  bounce_type: string | null;
+  bounced_at: string;
 }
 
 export type GardssalgOutreachDailyRunSkipReason =
@@ -19915,7 +19955,7 @@ export interface GardssalgOutreachDailyRunReport {
   budget: number;
   lane: GardssalgOutreachLaneState;
   auto_paused: boolean;
-  recent_bounces: Array<{ recipient_email: string; bounce_type: string | null; bounced_at: string }>;
+  recent_bounces: GardssalgOutreachBounceHit[];
   candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second" }>;
   results: GardssalgOutreachSendResultRow[];
   summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
@@ -19977,6 +20017,32 @@ export async function runGardssalgOutreachDaily(opts: {
   } finally {
     gardssalgOutreachDailyApplyInFlight = false;
   }
+}
+
+/** boot_job_state key (RFB db) holding the 08:00Z tick's durable "ran today" stamp. */
+export const GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY = "gardssalg-outreach-daily";
+
+/**
+ * One 10-minute cron tick (src/index.ts). `lastRunAt` is the process's own
+ * memory, which a deploy/restart wipes: a restart at 08:52Z after an 08:09Z
+ * run used to run the job a second time that day (first tick at boot+90s).
+ * The DB guards kept that from exceeding the cap, but the second run still
+ * spent whatever budget was left, re-ran the autosvar pass and wrote a
+ * second envelope. The stamp is therefore also persisted (boot_job_state)
+ * and read back here. It is written after every run that did not throw —
+ * exactly when the in-memory stamp always was; a throw is retried on the
+ * next tick. Returns the stamp to keep in memory and the report (null when
+ * the scheduling guard said "not now").
+ */
+export async function tickGardssalgOutreachDaily(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+}): Promise<{ lastRunAt: Date | null; report: GardssalgOutreachDailyRunReport | null }> {
+  const lastRunAt = resolveDailyJobLastRunAt(getRfbDb(), GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY, opts.lastRunAt, opts.now);
+  if (!shouldRunGardssalgOutreachDaily({ now: opts.now, lastRunAt })) return { lastRunAt, report: null };
+  const report = await runGardssalgOutreachDaily({ apply: true, trigger: "cron", now: opts.now });
+  markJobCompleted(getRfbDb(), GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY, opts.now);
+  return { lastRunAt: opts.now, report };
 }
 
 async function runGardssalgOutreachDailyOnce(
@@ -20159,11 +20225,12 @@ async function runGardssalgOutreachDailyOnce(
     return finish({ skipped_reason: "run_in_progress", sent_today_before: 0, budget: 0 });
   }
   // Guard 2 — lane paused.
-  if (getGardssalgOutreachLaneState(expDb).paused) {
+  const laneBefore = getGardssalgOutreachLaneState(expDb);
+  if (laneBefore.paused) {
     return finish({ skipped_reason: "paused", sent_today_before: 0, budget: 0 });
   }
-  // Guard 3 — fresh hard bounce / complaint → auto-pause.
-  const recentBounces = findGardssalgOutreachRecentBounces(expDb, getRfbDb(), now);
+  // Guard 3 — fresh (not yet acknowledged) hard bounce / complaint → auto-pause.
+  const recentBounces = findGardssalgOutreachRecentBounces(expDb, getRfbDb(), now, laneBefore.bounce_ack_max_id);
   if (recentBounces.length > 0) {
     if (opts.apply) {
       setGardssalgOutreachLanePaused(expDb, {
@@ -20173,6 +20240,7 @@ async function runGardssalgOutreachDailyOnce(
           `auto-pause: hard bounce/complaint on ${recentBounces.length} recipient(s) contacted in the last ` +
           `${GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS}h (${recentBounces.map((b) => b.recipient_email).join(", ")}). ` +
           `Clearing the pause is Daniel's call: POST /api/opplevelser/admin/gardssalg-outreach-lane {"paused": false}.`,
+        bounceAckMaxId: Math.max(...recentBounces.map((b) => b.bounce_id)),
       });
     }
     return finish({
@@ -20259,6 +20327,17 @@ async function runGardssalgOutreachDailyOnce(
 // ─── GET/POST /api/opplevelser/admin/gardssalg-outreach-lane (admin) ────────
 // The lane's single switch. GET reports state + the knobs the job runs with;
 // POST {paused: boolean, by?: string, reason?: string} flips it.
+//
+// Lifting a pause (paused:false while the lane IS paused) also acknowledges
+// every hard bounce / complaint Guard 3 would see right now: bounce_ack_max_id
+// moves up to the highest such email_bounces.id, so the next run does not
+// re-pause on a bounce the human has just looked at (dev-request
+// 2026-10-03-opplevagent-lane-bounce-kvittering — the 2026-10-03 pause was set
+// by the routine, not Guard 3, so an ack written only on auto-pause would not
+// have covered it). A bounce that lands after the lift has a higher id and
+// still pauses. A paused:false on a lane that is not paused acknowledges
+// nothing — otherwise any no-op call could silence a bounce Guard 3 has not
+// acted on yet. The acknowledged bounces are echoed in the response.
 router.get("/admin/gardssalg-outreach-lane", requireAdmin, (_req: Request, res: Response) => {
   try {
     res.json({
@@ -20283,9 +20362,24 @@ router.post("/admin/gardssalg-outreach-lane", requireAdmin, (req: Request, res: 
   const by = typeof body.by === "string" && body.by.trim() !== "" ? body.by.trim().slice(0, 120) : "admin-api";
   const reason = typeof body.reason === "string" && body.reason.trim() !== "" ? body.reason.trim().slice(0, 500) : null;
   try {
-    const state = setGardssalgOutreachLanePaused(getExpDb("experiences"), { paused: body.paused, by, reason });
-    console.log(`[gardssalg-outreach-lane] paused=${state.paused} by=${by}${reason ? ` reason=${reason}` : ""}`);
-    res.json(state);
+    const expDb = getExpDb("experiences");
+    let acknowledged: GardssalgOutreachBounceHit[] = [];
+    if (body.paused === false && getGardssalgOutreachLaneState(expDb).paused) {
+      acknowledged = findGardssalgOutreachRecentBounces(expDb, getRfbDb(), new Date(), null);
+    }
+    const state = setGardssalgOutreachLanePaused(expDb, {
+      paused: body.paused,
+      by,
+      reason,
+      bounceAckMaxId: acknowledged.length > 0 ? Math.max(...acknowledged.map((b) => b.bounce_id)) : null,
+    });
+    console.log(
+      `[gardssalg-outreach-lane] paused=${state.paused} by=${by}${reason ? ` reason=${reason}` : ""}` +
+        (acknowledged.length > 0
+          ? ` acknowledged_bounces=${acknowledged.map((b) => `${b.bounce_id}:${b.recipient_email}`).join(",")}`
+          : ""),
+    );
+    res.json(body.paused === false ? { ...state, acknowledged_bounces: acknowledged } : state);
   } catch (err) {
     console.error("[gardssalg-outreach-lane] POST failed:", err);
     res.status(500).json({ error: "Internal error" });

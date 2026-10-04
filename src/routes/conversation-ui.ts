@@ -765,7 +765,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
     const statsHtml = `<div class="stats-row">
       <div class="stat-card">
         <div class="stat-num">${totalAll}</div>
-        <div class="stat-label">Totalt samtaler${isAdminView ? " <span style=\"opacity:.7\">(inkl. intern trafikk)</span>" : ""}</div>
+        <div class="stat-label">Totalt samtaler${isAdminView ? " <span style=\"opacity:.7\">(inkl. intern trafikk og spam/prober)</span>" : ""}</div>
       </div>
       ${["mcp", "a2a", "web", "api"].map(src => {
         const s = statsMap.get(src);

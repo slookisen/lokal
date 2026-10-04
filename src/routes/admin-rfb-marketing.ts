@@ -15,6 +15,16 @@
 // Anyone with the admin key may pause (routines included, e.g. on a bounce);
 // clearing a pause is Daniel's call. Same X-Admin-Key check (403) as the
 // reference lane routes.
+//
+// Lifting a pause (paused:false while the lane IS paused) acknowledges every
+// hard bounce / complaint G3 would see right now (bounce_ack_max_id moves up
+// to the highest such email_bounces.id). Before, only G3's own auto-pause
+// wrote the ack, so a pause set by a routine or a human on a bounce — the
+// Opplevagent lane's 2026-10-03 case (dev-request 2026-10-03-opplevagent-
+// lane-bounce-kvittering) — was re-set by G3 on the same bounce at the next
+// run. A bounce that lands after the lift still pauses; a paused:false on a
+// lane that is not paused acknowledges nothing. Same rule as
+// POST /api/opplevelser/admin/gardssalg-outreach-lane.
 
 import { Router, Request, Response, NextFunction } from "express";
 import { getDb } from "../database/init";
@@ -25,12 +35,14 @@ import {
   RFB_MARKETING_DAILY_WINDOW_HOUR_UTC,
   RFB_MARKETING_DAILY_WINDOW_START_MINUTE_UTC,
   countRfbMarketingSentToday,
+  findRfbMarketingRecentBounces,
   getRfbMarketingLaneState,
   isRfbMarketingPlatformEnabled,
   resolveRfbMarketingDailyCap,
   runRfbMarketingDaily,
   setRfbMarketingLanePaused,
   summarizeRfbMarketingLedgerDay,
+  type RfbMarketingBounceHit,
 } from "../services/rfb-marketing-daily";
 
 function getAdminKey(): string {
@@ -83,9 +95,24 @@ rfbMarketingLaneRouter.post("/", requireAdmin, (req: Request, res: Response) => 
   const by = typeof body.by === "string" && body.by.trim() !== "" ? body.by.trim().slice(0, 120) : "admin-api";
   const reason = typeof body.reason === "string" && body.reason.trim() !== "" ? body.reason.trim().slice(0, 500) : null;
   try {
-    const state = setRfbMarketingLanePaused(getDb(), { paused: body.paused, by, reason });
-    console.log(`[rfb-marketing-lane] paused=${state.paused} by=${by}${reason ? ` reason=${reason}` : ""}`);
-    res.json(state);
+    const db = getDb();
+    let acknowledged: RfbMarketingBounceHit[] = [];
+    if (body.paused === false && getRfbMarketingLaneState(db).paused) {
+      acknowledged = findRfbMarketingRecentBounces(db, new Date(), null);
+    }
+    const state = setRfbMarketingLanePaused(db, {
+      paused: body.paused,
+      by,
+      reason,
+      bounceAckMaxId: acknowledged.length > 0 ? Math.max(...acknowledged.map((b) => b.bounce_id)) : null,
+    });
+    console.log(
+      `[rfb-marketing-lane] paused=${state.paused} by=${by}${reason ? ` reason=${reason}` : ""}` +
+        (acknowledged.length > 0
+          ? ` acknowledged_bounces=${acknowledged.map((b) => `${b.bounce_id}:${b.recipient_email}`).join(",")}`
+          : ""),
+    );
+    res.json(body.paused === false ? { ...state, acknowledged_bounces: acknowledged } : state);
   } catch (err) {
     console.error("[rfb-marketing-lane] POST failed:", err);
     res.status(500).json({ error: "Internal error" });

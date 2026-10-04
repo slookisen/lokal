@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { ensureProfileTranslationsSchema } from "../services/profile-translations";
+import { publicListableSql } from "../services/agent-visibility";
 
 // ─── Database Initialization ─────────────────────────────────
 // SQLite is the right call for phase 1-3:
@@ -893,6 +894,18 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_blocklist ADD COLUMN linked_org_nr TEXT`);
   } catch { /* already exists — expected */ }
 
+  // ─── email_bounces.lane_at_send (bounce attribution, 2026-10-04) ────────
+  // Which outreach lane sent the mail that bounced: 'rfb' (the RFB daily job's
+  // ledger or any RFB outreach_sent_log row) or 'opplevagent' (the gårdssalg
+  // lane's experience_outreach_sent_log), else the sending vertical's id.
+  // Filled by the Resend webhook (services/resend-webhook.ts,
+  // resolveBounceSendAttribution) together with agent_id_at_send/batch_id,
+  // which until now were always NULL there. NULL = no matching send found.
+  // Additive, idempotent ALTER.
+  try {
+    db.exec(`ALTER TABLE email_bounces ADD COLUMN lane_at_send TEXT`);
+  } catch { /* already exists — expected */ }
+
   // ════════════════════════════════════════════════════════════
   // CRM: contacts, threads, messages, actions, outbox
   // Inbox-CRM for customer-service workflow.
@@ -1501,6 +1514,30 @@ function initSchema(db: Database.Database): void {
     if (!String(e?.message || '').includes('duplicate column name')) throw e;
     // Column already exists — idempotent, safe to ignore
   }
+
+  // ─── Add traffic_class to conversations (a2a spam guard, 2026-10-04) ──
+  // 'external' | 'probe' | 'spam' — what services/a2a-traffic-classifier.ts
+  // decided about the traffic that created the row. Internal-ness keeps its
+  // ONE home in is_internal above. Public counters/lists read the shared
+  // COUNTABLE_CONV_SQL predicate (is_internal=0 AND traffic_class='external').
+  // Same safety idiom as is_internal: additive, NOT NULL DEFAULT 'external'
+  // (every existing row stays publicly counted until the explicit admin
+  // backfill POST /admin/conversations/traffic-class-backfill moves it),
+  // idempotent on "duplicate column name". traffic_class_backfilled_at marks
+  // the rows that backfill changed, so its {reset:true} reverts exactly those.
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN traffic_class TEXT NOT NULL DEFAULT 'external'`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN traffic_class_backfilled_at TEXT`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_conversations_seller_traffic ON conversations(seller_agent_id, traffic_class)`);
 
   // ─── M1 (Phase 5.4a): magic_links.used_at ───────────────────
   // Tracks WHEN a magic-link token was actually used (clicked & redeemed).
@@ -2662,6 +2699,13 @@ function initSchema(db: Database.Database): void {
         AND a.is_active = 1
         AND (a.role IS NULL OR a.role = 'producer')
         AND (a.is_vetted IS NULL OR a.is_vetted = 1)
+        /* dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the
+           shared public-listability predicate (services/agent-visibility.ts) —
+           the hidden test fixture is never an outreach target, and neither is
+           a dental/experiences row that sits in agents (this is the RFB
+           pool). catalog_hidden is added further down this function; SQLite
+           resolves VIEW columns at query time, so the order is harmless. */
+        AND ${publicListableSql("a")}
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}
@@ -4802,6 +4846,22 @@ function initSchema(db: Database.Database): void {
          ON agents(origin, is_vetted, created_at) WHERE origin = 'self_registered' AND is_vetted = 0`
     );
   } catch { /* partial index unsupported or already created */ }
+
+  // ─── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt (Design 1)
+  // catalog_hidden: 1 = never on any public RFB list/search surface (search,
+  // lokal_search, catalog feed/offers, llms-full.txt, sitemap, /produsent/:slug,
+  // city/browse pages, stats, outreach pool, verifier batch …), while every
+  // direct-id order-flow path (/catalog/agents/:id/products, cart add/submit,
+  // /produsent/ordre/:token, admin inbox) keeps working. Same idea as
+  // experience_providers.catalog_hidden. DEFAULT 0, so every existing row is a
+  // no-op. The ONE place that reads it is services/agent-visibility.ts. The
+  // only writer is POST /admin/test-producer (routes/admin-test-producer.ts),
+  // which only ever touches the single origin='test_fixture' row.
+  // Rollback: the column is additive and may stay; retire the fixture with the
+  // endpoint (or UPDATE agents SET is_active=0 WHERE origin='test_fixture').
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* already exists — expected */ }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─

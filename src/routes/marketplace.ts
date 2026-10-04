@@ -11,6 +11,7 @@ import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { publicListableSql } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -1131,6 +1132,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
           WHERE aff.umbrella_id = ?
             AND aff.status = 'active'
             AND p.is_active = 1
+            AND ${publicListableSql("p")}
           ORDER BY p.trust_score DESC, p.name ASC
           LIMIT 200
         `).all(agentId) as any[];
@@ -3639,6 +3641,7 @@ router.get("/find-match", (req: Request, res: Response) => {
     FROM agents a
     LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
     WHERE a.is_active = 1
+      AND ${publicListableSql("a")}  -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt
   `).all() as any[];
 
   const matches: any[] = [];
@@ -4821,7 +4824,9 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
       return;
     }
 
-    const wheres: string[] = ["aff.umbrella_id = ?", "p.is_active = 1"];
+    // Shared public-listability predicate on the member side (dev-request
+    // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt).
+    const wheres: string[] = ["aff.umbrella_id = ?", "p.is_active = 1", publicListableSql("p")];
     const params: any[] = [umbrellaId];
     if (status !== "all") { wheres.push("aff.status = ?"); params.push(status); }
     params.push(limit);

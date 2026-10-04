@@ -1,11 +1,12 @@
 /**
  * boot-job-gate.test.ts — dev-request 2026-10-02-boot-jobber-event-loop-stall-
  * etter-deploy. Skip-logic for url-backfill, chunked execution (incl. the
- * chunked trust recalculation), and the exclusive boot-job gate.
+ * chunked trust recalculation), and the exclusive boot-job gate. B5-B10: the
+ * daily outreach ticks' persisted "ran today" stamp (resolveDailyJobLastRunAt).
  */
 import Database from "better-sqlite3";
 import {
-  runChunked, runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted,
+  runChunked, runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, resolveDailyJobLastRunAt,
   shouldSkipRecentRun, resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
 } from "./boot-job-gate";
 import { runUrlBackfill } from "../agents/lokal-agent-verifier";
@@ -45,6 +46,23 @@ export async function runBootJobGateTests(opts: { log?: boolean } = {}): Promise
     t(getJobLastCompletedAt(db, URL_BACKFILL_JOB)?.getTime() === hoursAgo(1).getTime(), "B3: stamp is upserted");
     t(getJobLastCompletedAt({ prepare() { throw new Error("db down"); }, exec() { throw new Error("db down"); } }, "x") === null,
       "B4: DB error -> null (never blocks the job)");
+
+    // ── B'. daily-tick stamp: memory ∪ persisted (outreach ticks, 2026-10-04) ──
+    const dJob = "daily-tick-test";
+    const at0809 = new Date("2026-10-04T08:09:00Z");
+    const at0852 = new Date("2026-10-04T08:52:00Z");
+    t(resolveDailyJobLastRunAt(db, dJob, null, at0852) === null, "B5: nothing in memory, nothing persisted -> null (job runs)");
+    markJobCompleted(db, dJob, at0809);
+    t(resolveDailyJobLastRunAt(db, dJob, null, at0852)?.getTime() === at0809.getTime(),
+      "B6: after a restart (memory empty) the persisted 08:09Z stamp is used");
+    const yesterday = new Date("2026-10-03T08:05:00Z");
+    t(resolveDailyJobLastRunAt(db, dJob, yesterday, at0852)?.getTime() === at0809.getTime(), "B7: the later of memory and DB wins (DB newer)");
+    const later = new Date("2026-10-04T08:30:00Z");
+    t(resolveDailyJobLastRunAt(db, dJob, later, at0852)?.getTime() === later.getTime(), "B8: the later of memory and DB wins (memory newer)");
+    t(resolveDailyJobLastRunAt(db, dJob, null, new Date("2026-10-04T08:00:00Z")) === null,
+      "B9: a persisted stamp in the future (clock skew) is not trusted");
+    t(resolveDailyJobLastRunAt({ prepare() { throw new Error("db down"); }, exec() { throw new Error("db down"); } }, dJob, yesterday, at0852)?.getTime() === yesterday.getTime(),
+      "B10: DB error -> the in-memory stamp alone");
 
     // ── C. chunked execution ──
     const sizes: number[] = [];

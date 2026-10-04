@@ -29,7 +29,9 @@
  *     analytics_agent_views got the is_owner ALTER TABLE), so query-term
  *     aggregation and the conversation-based platform badges (web/a2a/mcp)
  *     cannot be bot/owner-filtered at the DB level. This is a known,
- *     documented gap — not a fabricated filter.
+ *     documented gap — not a fabricated filter. (Since then conversations
+ *     gained is_internal + traffic_class; both conversation reads below use
+ *     the shared COUNTABLE_CONV_SQL predicate — see a2a-traffic-classifier.)
  *   - conversations.source only ever takes "a2a" | "mcp" | "web" | "api"
  *     (see ConversationSource in conversation-service.ts). "api" is a
  *     generic legacy default used by callers that don't identify a
@@ -42,6 +44,7 @@
 
 import type Database from "better-sqlite3";
 import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
+import { COUNTABLE_CONV_SQL, isPublicQueryTerm } from "./a2a-traffic-classifier";
 
 // ─── AI bot UA markers ────────────────────────────────────────────────
 // Same technique + marker lists as src/routes/agent-stats.ts's per-agent
@@ -149,20 +152,30 @@ function getViews30(db: Database.Database, path: string): ProfileActivityViews {
  * producers with an empty (and therefore useless) block. Grouping is
  * case-sensitive on the raw text, mirroring analytics-service.ts's
  * existing topSearchTerms convention (GROUP BY query, no normalization).
+ *
+ * a2a spam guard (2026-10-04): countable conversations only (not internal,
+ * not classified spam/probe), and every term must pass the public query
+ * allow-list (≤40 chars, no URL / 0x address / JSON / CJK payload, a real
+ * word) — this panel republished attacker payloads verbatim. A wider SQL
+ * window than the 3 shown so rejected terms don't leave the panel short.
  */
 function getTopQueryTerms(db: Database.Database, agentId: string): ProfileActivityQueryTerm[] {
   const rows = db.prepare(`
     SELECT query_text as term, COUNT(*) as cnt
     FROM conversations
     WHERE seller_agent_id = ?
+      AND ${COUNTABLE_CONV_SQL}
       AND query_text IS NOT NULL
-      AND LENGTH(TRIM(query_text)) >= 2
+      AND LENGTH(TRIM(query_text)) BETWEEN 2 AND 40
     GROUP BY query_text
     ORDER BY cnt DESC, term ASC
-    LIMIT 3
+    LIMIT 30
   `).all(agentId) as Array<{ term: string; cnt: number }>;
 
-  return rows.map((r) => ({ term: r.term, count: r.cnt }));
+  return rows
+    .filter((r) => isPublicQueryTerm(r.term))
+    .slice(0, 3)
+    .map((r) => ({ term: r.term, count: r.cnt }));
 }
 
 /**
@@ -179,9 +192,10 @@ function getPlatformBadges(
   agentId: string,
   views30: ProfileActivityViews,
 ): ProfilePlatformBadge[] {
+  // Countable only — a spam a2a call must not earn a producer the A2A badge.
   const sourceRows = db.prepare(`
     SELECT DISTINCT source FROM conversations
-    WHERE seller_agent_id = ? AND source IS NOT NULL
+    WHERE seller_agent_id = ? AND source IS NOT NULL AND ${COUNTABLE_CONV_SQL}
   `).all(agentId) as Array<{ source: string }>;
   const sources = new Set(sourceRows.map((r) => r.source));
 

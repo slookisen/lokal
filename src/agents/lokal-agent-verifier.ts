@@ -18,6 +18,13 @@
 // Reference: PHASE5-ENRICHMENT-REORG.md §8 + WO #8.
 
 import { getDb } from "../database/init";
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the batch
+// pickers below never select the catalog_hidden test fixture — its cross-check
+// status is owned by POST /admin/test-producer, and a verifier pass would
+// re-derive (demote) it. Only the catalog_hidden half of the shared predicate:
+// the verifier's vertical behaviour is unchanged by that dev-request. With no
+// hidden row the clause is "" and every picker's SQL is byte-identical.
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 import {
   crossSourceAgreement,
   aggregateVerdict,
@@ -72,7 +79,7 @@ import { parseNameLocationSuffix } from "../services/location-suffix-parser";
 // fourth hand-rolled fetcher must never be added) and
 // checkAboutCandidateSubstantiatedBySource (the SAME substantiation judgment
 // already used at write-time — unchanged, reused, never re-implemented).
-import { fetchPage, visibleTextOf } from "../services/fetch-page";
+import { DEFAULT_FETCH_TIMEOUT_MS, fetchPage, visibleTextOf } from "../services/fetch-page";
 import {
   checkAboutCandidateSubstantiatedBySource,
   type AboutSubstantiationVerdict,
@@ -415,6 +422,7 @@ export function computeEnrichmentStatus(input: {
 // Pick the next batch of agents to verify. Oldest-verified first;
 // http-failures bumped to the front so we re-check broken sites.
 export function pickBatch(db: any, limit = 30): any[] {
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -424,7 +432,7 @@ export function pickBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')
+        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')${hidden}
      -- dev-request 2026-08-23-terminal-unconfirmable: demonstrably
      -- unconfirmable agents (Brreg-dead, or zero identity sources on the
      -- second line) are removed from the hourly sweep permanently, same as
@@ -454,6 +462,7 @@ export function pickBatch(db: any, limit = 30): any[] {
 export function pickByIds(db: any, ids: string[]): any[] {
   if (!ids || ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -463,7 +472,7 @@ export function pickByIds(db: any, ids: string[]): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE a.id IN (${placeholders})`
+        WHERE a.id IN (${placeholders})${hidden}`
     )
     .all(...ids);
 }
@@ -495,6 +504,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
          OR k.domain_reconciliation_checked_at <= datetime('now','-30 days')
          OR k.verification_review_reason != COALESCE(k.domain_reconciliation_reason_snapshot, '')
        )`;
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -504,7 +514,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status IN ('review_required', 'data_insufficient')
+        WHERE k.verification_status IN ('review_required', 'data_insufficient')${hidden}
           ${parkingExclusion}
      ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
@@ -549,6 +559,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
 // before comparing, regardless of which format the column's own value is
 // in.
 export function pickStaleReviewRequiredBatch(db: any, cap = 40): any[] {
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -558,7 +569,7 @@ export function pickStaleReviewRequiredBatch(db: any, cap = 40): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status = 'review_required'
+        WHERE k.verification_status = 'review_required'${hidden}
           AND (
             k.last_verified_at IS NULL
             OR datetime(k.last_verified_at) <= datetime('now', '-7 days')
@@ -596,6 +607,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
   const parkingExclusion = process.env.PENDING_VERIFY_PARKING_DISABLED === "true"
     ? ""
     : `AND (k.pending_verify_parked_since IS NULL OR k.pending_verify_parked_since <= datetime('now','-30 days'))`;
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -606,7 +618,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status = 'pending_verify'
-          AND k.verification_status NOT IN ('opt_out')
+          AND k.verification_status NOT IN ('opt_out')${hidden}
           ${parkingExclusion}
      ORDER BY COALESCE(k.sweep_processed_at, k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
@@ -689,7 +701,10 @@ export function pickBatchBiased(
               k.verification_status, k.enrichment_status,
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
-   INNER JOIN agent_knowledge k ON k.agent_id = a.id`;
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id${catalogHiddenIdExclusionSql(db, "a")}`;
+  // (The catalog_hidden exclusion — "" when there is no hidden row — sits in
+  // the INNER JOIN's ON clause: for an inner join that is the same as a WHERE
+  // term, and it reaches all five queries below through this shared prefix.)
 
   // ── Round-robin ordering (dev-request 2026-08-10-verifier-portkjede-og-
   // provenansrydding, skive F — Daniel: «Unngå å kjøre gjennom de samme
@@ -1703,37 +1718,152 @@ export async function resolveBrregLookup(
 // checkAboutCandidateSubstantiatedBySource, reused as-is, unchanged; see its
 // own file for that contract). It fetches the root page first exactly as
 // before; only when the field isn't substantiated there does it follow up
-// to `maxSubpages` (default 3) same-domain links discovered on the root
-// page itself whose path matches /om, /om-oss, /kontakt, /about or
-// /contact — link-driven, not blind-guessed, same discipline
+// to `maxSubpages` (default FIELD_SPOT_CHECK_MAX_SUBPAGES = 5; was 3 before
+// the W40 false-positive fix) same-domain links discovered on the root page
+// itself whose path looks like an about/contact page (/om, /om-oss,
+// /om-garden, /kontakt, /kontakt-oss-2, /about-1, /contact-1, …) or a
+// terms/privacy page (/salgsvilkar, /salsvilkar, /kjopsvilkar, /personvern…;
+// see fieldSpotCheckSubpageCandidates' `extended` mode) — link-driven, not
+// blind-guessed, same discipline
 // buildPageEvidence() already established elsewhere in this codebase (blind
 // fixed-path guessing measured a 100% miss rate on real producer sites; see
 // fetch-page.ts's discoverContentLinks header comment). The FIRST subpage
 // (in discovery order) the field is actually found on wins; provenance is
 // stamped to THAT page's URL, never the root, so a later re-check keeps
-// looking in the right place.
+// looking in the right place. Two refinements: a field check may report a
+// WEAK match (address street + number on a page with no postal code at all)
+// that does not end the walk and loses to a CONFLICT seen on any fetched
+// page, or to a page that gives only a different postal code
+// (FieldSpotCheckVerdict.postcodeContradiction); and the whole call has a wall-clock budget
+// (FIELD_SPOT_CHECK_BUDGET_MS) after which no further subpage is fetched.
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Same-domain link on the root page whose path matches one of the spot-
- *  check's five accepted subpage shapes — om, om-oss, kontakt, about,
- *  contact — as a whole path SEGMENT (never a substring, so "/om-garden" or
- *  "/produkter" do not match). PURE, no network. Exported for tests. */
+/** How many same-domain subpages the field spot-check follows after the
+ *  root page (W40 false-positive fix: raised from 3 — with the extended
+ *  matching below a site's about/contact pages AND its terms/privacy pages
+ *  can all be candidates, e.g. borgundchili.no: /om-oss, /personvern,
+ *  /salsvilkar, where only the last one carries the address). */
+export const FIELD_SPOT_CHECK_MAX_SUBPAGES = 5;
+
+// Legacy (default) shape: exactly om | om-oss | kontakt | about | contact
+// as a whole path SEGMENT (never a substring, so "/om-garden" or
+// "/produkter" do not match).
+const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[?#])/i;
+
+// Extended shapes (opts.extended — the read-only field spot-check only; see
+// fieldSpotCheckSubpageCandidates). Matched against ONE decoded path segment
+// at a time. Tier 1 = about/contact pages: "om" exactly or followed by a
+// separator ("om-oss", "om-garden", "om_oss", "om.html") or "omoss…" —
+// deliberately NOT a bare "om" prefix, which would also take "/omvisning",
+// "/omtale", "/omsetning"; "kontakt…", "contact…", "about…" as plain
+// prefixes ("kontakt-oss-2", "kontaktinfo", "contact-1", "about-1",
+// "aboutus"). Tier 2 = terms/privacy pages, which Norwegian web shops are
+// legally required to carry the seller's name, address, org.nr and phone on
+// (salgs-/sals-/kjøpsvilkår, personvern…).
+const EXTENDED_PRIMARY_SEGMENT_RE = /^(?:om(?:[-_.].*)?|omoss.*|kontakt.*|contact.*|about.*)$/i;
+const EXTENDED_LEGAL_SEGMENT_RE = /^(?:salgsvilk[aå]r|salsvilk[aå]r|kj[oø]psvilk[aå]r|personvern).*$/i;
+
+// Extended-mode noise filters (review fix: prefix matching on every path
+// segment also took links like /wp-content/uploads/contact.pdf and
+// /produkt/kontaktgrill, which used up the subpage budget):
+//  - a segment with a file extension is a page only for these extensions
+//    ("om.html", "kontakt.php"); "contact.pdf", "kontakt.jpg" are files;
+//  - nothing under a WordPress system directory is a page to check;
+//  - segments AFTER a product/category/blog listing segment name that
+//    listing's items (a product called "Kontaktgrill", a post called
+//    "Om sommaren …"), never the site's own about/contact/terms page.
+const PAGE_FILE_EXTENSION_RE = /\.(?:html?|php|aspx?|jsp)$/i;
+const ANY_FILE_EXTENSION_RE = /\.[a-z0-9]{1,5}$/i;
+const WORDPRESS_SYSTEM_SEGMENT_RE = /^wp-(?:content|includes|json|admin)$/i;
+const LISTING_PARENT_SEGMENT_RE =
+  /^(?:produkt|produkter|product|products|product-page|product-category|product-tag|produktkategori|kategori|category|collections|tag|blog|blogg|blogs|nyheter|news|post|artikler|artikkel|oppskrift|oppskrifter|(?:19|20)\d{2})$/i;
+
+/** Tier of an (already same-host) pathname under the extended matching:
+ *  1 = about/contact, 2 = terms/privacy, 0 = not a candidate. Segments are
+ *  tested left to right up to the first listing segment (see the filters
+ *  above); a file segment is skipped, a WordPress system path is never a
+ *  candidate. PURE. */
+function extendedSubpageTier(pathname: string): 0 | 1 | 2 {
+  let tier: 0 | 1 | 2 = 0;
+  for (const rawSegment of pathname.split("/")) {
+    if (!rawSegment) continue;
+    let segment = rawSegment;
+    try {
+      segment = decodeURIComponent(rawSegment); // "kj%C3%B8psvilk%C3%A5r" -> "kjøpsvilkår"
+    } catch {
+      // malformed escape: test the raw segment as-is
+    }
+    if (WORDPRESS_SYSTEM_SEGMENT_RE.test(segment)) return 0;
+    if (LISTING_PARENT_SEGMENT_RE.test(segment)) break;
+    if (ANY_FILE_EXTENSION_RE.test(segment) && !PAGE_FILE_EXTENSION_RE.test(segment)) continue;
+    if (EXTENDED_PRIMARY_SEGMENT_RE.test(segment)) return 1;
+    if (EXTENDED_LEGAL_SEGMENT_RE.test(segment)) tier = 2;
+  }
+  return tier;
+}
+
+/** Same-domain links on the root page that look like the page a field's
+ *  value is likely to live on, in the order they should be fetched. PURE, no
+ *  network. Exported for tests.
+ *
+ *  Default (legacy) matching: one of the five exact segments om, om-oss,
+ *  kontakt, about, contact — in document order. This default is what
+ *  admin-phone-context-gate-retro-scan.ts (a route with a write/apply mode)
+ *  relies on, and is deliberately left unchanged.
+ *
+ *  `opts.extended` (used by computeFieldSpotCheck, the READ-ONLY weekly
+ *  spot-check — W40 false-positive fix, where 3 of the false mismatches had
+ *  the value on /kontakt-oss-2/, /contact-1 and /salsvilkar): accepts the
+ *  prefixed about/contact shapes and the terms/privacy pages described at
+ *  EXTENDED_PRIMARY_SEGMENT_RE / EXTENDED_LEGAL_SEGMENT_RE. About/contact
+ *  links come first, terms/privacy links after them (document order within
+ *  each tier), so a footer full of legal links can never crowd the real
+ *  contact page out of the `maxSubpages` budget. Files (".pdf", ".jpg"),
+ *  WordPress system paths and items under a product/category/blog listing
+ *  segment are not candidates (extendedSubpageTier).
+ *
+ *  Both modes: same host as the root only (never another domain — the
+ *  SSRF/scope guard; fetchPage applies its own SSRF guard on top), http(s)
+ *  only, pure in-page anchors and links back to the root page itself are
+ *  skipped, duplicates collapsed. */
 export function fieldSpotCheckSubpageCandidates(
   rootHtml: string,
   rootUrl: string,
-  maxSubpages = 3,
+  maxSubpages = FIELD_SPOT_CHECK_MAX_SUBPAGES,
+  opts: { extended?: boolean } = {},
 ): string[] {
+  return fieldSpotCheckSubpageCandidatesWithTier(rootHtml, rootUrl, maxSubpages, opts).map((c) => c.url);
+}
+
+/** A subpage candidate plus its tier: 1 = about/contact page, 2 =
+ *  terms/privacy page (extended mode only; the legacy mode is all tier 1). */
+export interface FieldSpotCheckSubpageCandidate {
+  url: string;
+  tier: 1 | 2;
+}
+
+/** fieldSpotCheckSubpageCandidates with each URL's tier kept, so
+ *  computeFieldSpotCheck can say when a match came from a terms/privacy page
+ *  (such pages can also list third parties' contact details: Forbrukerrådet,
+ *  Datatilsynet, the shop platform or payment provider). Same discovery
+ *  rules, same order, same cap. PURE. Exported for tests. */
+export function fieldSpotCheckSubpageCandidatesWithTier(
+  rootHtml: string,
+  rootUrl: string,
+  maxSubpages = FIELD_SPOT_CHECK_MAX_SUBPAGES,
+  opts: { extended?: boolean } = {},
+): FieldSpotCheckSubpageCandidate[] {
   let base: URL;
   try {
     base = new URL(withDefaultScheme(rootUrl));
   } catch {
     return [];
   }
-  const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[?#])/i;
-  const found: string[] = [];
+  const primary: FieldSpotCheckSubpageCandidate[] = [];
+  const legal: FieldSpotCheckSubpageCandidate[] = [];
   const seen = new Set<string>();
   for (const m of rootHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)) {
-    if (found.length >= maxSubpages) break;
+    if (primary.length >= maxSubpages) break; // tier 1 alone already fills the budget
     const raw = m[1]!;
     if (raw.startsWith("#")) continue; // pure in-page anchor, no new page
     let abs: URL;
@@ -1746,13 +1876,15 @@ export function fieldSpotCheckSubpageCandidates(
     if (abs.host !== base.host) continue; // same-domain only
     abs.hash = "";
     if (abs.pathname === base.pathname && abs.search === base.search) continue; // same page as root
-    if (!SUBPAGE_SEGMENT_RE.test(abs.pathname)) continue;
+    const tier = opts.extended ? extendedSubpageTier(abs.pathname) : SUBPAGE_SEGMENT_RE.test(abs.pathname) ? 1 : 0;
+    if (tier === 0) continue;
     const key = abs.toString();
     if (seen.has(key)) continue;
     seen.add(key);
-    found.push(key);
+    if (tier === 1) primary.push({ url: key, tier: 1 });
+    else legal.push({ url: key, tier: 2 });
   }
-  return found;
+  return [...primary, ...legal].slice(0, maxSubpages);
 }
 
 /** dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about (FUNN
@@ -1762,14 +1894,58 @@ export function fieldSpotCheckSubpageCandidates(
  *  either way and returns "unverifiable" instead of "mismatch". */
 export const FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS = 1200;
 
+/** Overall wall-clock budget for ONE computeFieldSpotCheck call. With up to
+ *  FIELD_SPOT_CHECK_MAX_SUBPAGES subpages after the root, and each fetchPage
+ *  call allowed its own 10 s timeout plus one transient retry, a single slow
+ *  site could otherwise hold a spot-check request for well over a minute
+ *  (admin-phone-context-gate-retro-scan.ts's comments record proxy timeouts
+ *  and 0-byte responses from exactly that kind of unbounded sequential
+ *  fetching). No subpage fetch starts once the budget is spent, and each
+ *  subpage fetch's own timeout is capped to what is left of it. Running out
+ *  before a verdict gives "unverifiable", never "mismatch". */
+export const FIELD_SPOT_CHECK_BUDGET_MS = 30_000;
+
+/** What a per-field `substantiate` judgment says about ONE fetched page.
+ *  The two optional flags let a field check express evidence that only
+ *  makes sense across pages (used by the address check in
+ *  admin-field-spot-check.ts; the about/phone checks never set them). */
+export interface FieldSpotCheckVerdict extends AboutSubstantiationVerdict {
+  /** Substantiated, but on weaker evidence (address: street + house number
+   *  found on a page that gives no postal code at all). A weak match does
+   *  NOT end the walk: the remaining candidate pages are still checked, and
+   *  a `conflict` on any fetched page turns the result into a mismatch. */
+  weak?: boolean;
+  /** NOT substantiated, and the page positively contradicts the stored
+   *  value (address: the same street + house number with a different postal
+   *  code). Overrides a weak match from any other page. */
+  conflict?: boolean;
+  /** NOT substantiated (address: street + house number not on this page),
+   *  but the page gives postal code(s) — `postcodes` — and never the stored
+   *  one. Alone it decides nothing (a page without the street is a plain
+   *  "not found"); it only stops a WEAK match on another page from becoming
+   *  a match: from the root or an about/contact page it turns that weak
+   *  match into a mismatch, from a terms/privacy page only (such pages can
+   *  list third parties' addresses) into "unverifiable". A full match is
+   *  unaffected. */
+  postcodeContradiction?: boolean;
+  /** With `postcodeContradiction`: the postal codes the page gives. */
+  postcodes?: string[];
+}
+
+/** Kind of page a match came from: the root page, an about/contact subpage
+ *  (tier 1) or a terms/privacy subpage (tier 2). */
+export type FieldSpotCheckPageKind = "root" | "about_contact" | "terms_privacy";
+
 export interface FieldSpotCheckResult {
   /** "match": substantiated on the root or a followed subpage.
-   *  "mismatch": not substantiated anywhere fetched — the only outcome that
-   *  should ever be escalated/paused downstream.
-   *  "unverifiable": the root page itself could not be fetched at all, so no
-   *  confident judgment either way was possible — NEVER treated as a
-   *  mismatch (same fail-closed-toward-no-action posture as the rest of
-   *  this file's checks). */
+   *  "mismatch": not substantiated anywhere fetched, or positively
+   *  contradicted on a fetched page — the only outcome that should ever be
+   *  escalated/paused downstream.
+   *  "unverifiable": the root page itself could not be fetched at all, the
+   *  fetched pages carry too little static text, or the time budget ran out
+   *  before a verdict — no confident judgment either way was possible, so
+   *  NEVER treated as a mismatch (same fail-closed-toward-no-action posture
+   *  as the rest of this file's checks). */
   status: "match" | "mismatch" | "unverifiable";
   /** The URL the field was actually found on (status "match"), or the root
    *  URL (status "mismatch"/"unverifiable") — this is what provenance
@@ -1778,34 +1954,62 @@ export interface FieldSpotCheckResult {
   /** Every URL actually fetched, in order (root first) — for logging/audit. */
   urls_tried: string[];
   reason: string;
+  /** Status "match" only: which kind of page the match came from. A
+   *  "terms_privacy" match is also called out in `reason`, so the weekly
+   *  report can tell these matches apart (such pages can list third
+   *  parties' contact details too). */
+  matched_page_kind?: FieldSpotCheckPageKind;
 }
+
+const TERMS_PRIVACY_MATCH_NOTE =
+  "matched on a terms/privacy page — such pages can also list third parties' contact details " +
+  "(Forbrukerrådet, Datatilsynet, the shop platform or payment provider), so confirm it is the producer's own";
 
 /**
  * Re-verify one field's stored value against its live source page(s):
  * fetch `root_url` first; if the field isn't substantiated there, follow up
- * to `maxSubpages` same-domain /om, /om-oss, /kontakt, /about, /contact
- * links discovered ON the root page and check each in turn, stopping at the
- * first match. `substantiate` defaults to
+ * to `maxSubpages` (default 5) same-domain about/contact and terms/privacy
+ * links discovered ON the root page (fieldSpotCheckSubpageCandidates,
+ * `extended` mode) and check each in turn, stopping at the first match.
+ * `substantiate` defaults to
  * checkAboutCandidateSubstantiatedBySource (about-source-substantiation.ts)
  * — reused UNCHANGED, per this fix's own scope: only WHICH pages get
  * fetched changes, never how a field is judged against page text.
+ *
+ * Cross-page evidence (FieldSpotCheckVerdict): a `weak` match does not stop
+ * the walk, and a `conflict` on any fetched page outranks a weak match, so a
+ * page that shows the address with a different postal code is never hidden
+ * by another page that shows the street + number without one. A result that
+ * would rest only on a weak match also yields to a `postcodeContradiction`
+ * (a page WITHOUT the street + number that gives a postal code, never the
+ * stored one): mismatch when that page is the root or an about/contact page,
+ * "unverifiable" when it is only a terms/privacy page. A full (non-weak)
+ * match still ends the walk at once, as before.
+ *
+ * Time budget: `input.budgetMs` (default FIELD_SPOT_CHECK_BUDGET_MS); see
+ * that constant. `deps.now` is a test seam (defaults to Date.now).
  */
 export async function computeFieldSpotCheck(
   input: {
     field_value: string | null;
     root_url: string;
     maxSubpages?: number;
+    budgetMs?: number;
   },
   deps: {
     fetchImpl?: typeof fetch;
     substantiate?: (
       candidate: string | null | undefined,
       sourceText: string | null | undefined,
-    ) => AboutSubstantiationVerdict;
+    ) => FieldSpotCheckVerdict;
+    now?: () => number;
   } = {},
 ): Promise<FieldSpotCheckResult> {
   const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
-  const maxSubpages = input.maxSubpages ?? 3;
+  const maxSubpages = input.maxSubpages ?? FIELD_SPOT_CHECK_MAX_SUBPAGES;
+  const budgetMs = input.budgetMs ?? FIELD_SPOT_CHECK_BUDGET_MS;
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
   const urlsTried: string[] = [];
   let visibleChars = 0;
 
@@ -1822,48 +2026,138 @@ export async function computeFieldSpotCheck(
       reason: `root page fetch failed (${rootResult.reason}) — cannot confidently judge, not treated as a mismatch`,
     };
   }
+  const rootCheckedUrl = rootResult.finalUrl || input.root_url;
+
+  const matchResult = (url: string, kind: FieldSpotCheckPageKind, reason: string): FieldSpotCheckResult => ({
+    status: "match",
+    checked_url: url,
+    urls_tried: urlsTried,
+    reason: kind === "terms_privacy" ? `${TERMS_PRIVACY_MATCH_NOTE}: ${reason}` : reason,
+    matched_page_kind: kind,
+  });
 
   visibleChars += visibleTextOf(rootResult.html).length;
   const rootSourceText = `${rootResult.html}\n${visibleTextOf(rootResult.html)}`;
-  const rootVerdict = substantiate(input.field_value, rootSourceText);
-  if (rootVerdict.substantiated) {
-    return {
-      status: "match",
-      checked_url: rootResult.finalUrl || input.root_url,
-      urls_tried: urlsTried,
-      reason: rootVerdict.reason,
-    };
+  const rootVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, rootSourceText);
+  if (rootVerdict.substantiated && !rootVerdict.weak) {
+    return matchResult(rootCheckedUrl, "root", rootVerdict.reason);
   }
 
-  const subpages = fieldSpotCheckSubpageCandidates(
-    rootResult.html,
-    rootResult.finalUrl || input.root_url,
-    maxSubpages,
-  );
-  for (const subpageUrl of subpages) {
+  // The first weak match and the first conflict seen, in fetch order.
+  let weak: { url: string; kind: FieldSpotCheckPageKind; reason: string } | null = rootVerdict.substantiated
+    ? { url: rootCheckedUrl, kind: "root", reason: rootVerdict.reason }
+    : null;
+  let conflict: { url: string; reason: string } | null =
+    !rootVerdict.substantiated && rootVerdict.conflict ? { url: rootCheckedUrl, reason: rootVerdict.reason } : null;
+  // Pages that do not have the value but give a postal code that is never
+  // the stored one (FieldSpotCheckVerdict.postcodeContradiction), in fetch
+  // order. Only consulted when the result would otherwise rest on a weak match.
+  const postcodeContradictions: { url: string; kind: FieldSpotCheckPageKind; reason: string }[] = [];
+  if (!rootVerdict.substantiated && !rootVerdict.conflict && rootVerdict.postcodeContradiction) {
+    postcodeContradictions.push({ url: rootCheckedUrl, kind: "root", reason: rootVerdict.reason });
+  }
+
+  const subpages = fieldSpotCheckSubpageCandidatesWithTier(rootResult.html, rootCheckedUrl, maxSubpages, {
+    extended: true,
+  });
+  let notChecked = 0;
+  for (let i = 0; i < subpages.length; i++) {
+    const { url: subpageUrl, tier } = subpages[i]!;
+    const remainingMs = budgetMs - (now() - startedAt);
+    if (remainingMs <= 0) {
+      notChecked = subpages.length - i;
+      break;
+    }
     const subResult = await fetchPage(subpageUrl, {
       userAgent: "Lokal-FieldSpotCheck/1.0",
       fetchImpl: deps.fetchImpl,
+      timeoutMs: Math.min(DEFAULT_FETCH_TIMEOUT_MS, remainingMs),
     });
     urlsTried.push(subpageUrl);
     if (!subResult.ok) continue; // one dead subpage link never aborts the others
     visibleChars += visibleTextOf(subResult.html).length;
     const subSourceText = `${subResult.html}\n${visibleTextOf(subResult.html)}`;
-    const subVerdict = substantiate(input.field_value, subSourceText);
+    const subVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, subSourceText);
+    const pageUrl = subResult.finalUrl || subpageUrl;
+    const kind: FieldSpotCheckPageKind = tier === 2 ? "terms_privacy" : "about_contact";
+    if (subVerdict.substantiated && !subVerdict.weak) {
+      // The stored value itself is on this page. If another page contradicted
+      // it, the site disagrees with itself — still a match, but say so.
+      const note = conflict ? ` (note: ${conflict.url} contradicts it — ${conflict.reason})` : "";
+      return matchResult(pageUrl, kind, `${subVerdict.reason}${note}`);
+    }
     if (subVerdict.substantiated) {
+      weak ??= { url: pageUrl, kind, reason: subVerdict.reason };
+    } else if (subVerdict.conflict) {
+      conflict ??= { url: pageUrl, reason: subVerdict.reason };
+    } else if (subVerdict.postcodeContradiction) {
+      postcodeContradictions.push({ url: pageUrl, kind, reason: subVerdict.reason });
+    }
+  }
+  const budgetNote =
+    notChecked > 0
+      ? `time budget (${budgetMs} ms) spent after ${urlsTried.length} page(s); ${notChecked} subpage(s) not checked`
+      : "";
+
+  if (conflict) {
+    return {
+      status: "mismatch",
+      checked_url: rootCheckedUrl,
+      urls_tried: urlsTried,
+      reason:
+        `contradicted on ${conflict.url}: ${conflict.reason}` +
+        (weak ? ` — this outranks the weaker match on ${weak.url} (${weak.reason})` : ""),
+    };
+  }
+  if (weak) {
+    // The weak match rests on a page that gives no postal code at all. If
+    // another fetched page gives postal code(s) and never the stored one,
+    // the site does not substantiate the stored value: from the producer's
+    // own root/about/contact page that is a mismatch; from terms/privacy
+    // pages only (they can carry a third party's address — Forbrukerrådet,
+    // Datatilsynet, the shop platform) it is "unverifiable", never a match.
+    const ownContradiction = postcodeContradictions.find((c) => c.kind !== "terms_privacy");
+    if (ownContradiction) {
       return {
-        status: "match",
-        checked_url: subResult.finalUrl || subpageUrl,
+        status: "mismatch",
+        checked_url: rootCheckedUrl,
         urls_tried: urlsTried,
-        reason: subVerdict.reason,
+        reason:
+          `contradicted on ${ownContradiction.url}: ${ownContradiction.reason} — this outranks ` +
+          `the weaker match on ${weak.url} (${weak.reason})`,
       };
     }
+    const legalContradiction = postcodeContradictions[0];
+    if (legalContradiction) {
+      return {
+        status: "unverifiable",
+        checked_url: rootCheckedUrl,
+        urls_tried: urlsTried,
+        reason:
+          `only a weak match on ${weak.url} (${weak.reason}), and the terms/privacy page ` +
+          `${legalContradiction.url} gives a different postal code (${legalContradiction.reason}) — ` +
+          `such pages can list third parties' addresses, so cannot confidently judge, not treated as a mismatch`,
+      };
+    }
+    return matchResult(
+      weak.url,
+      weak.kind,
+      `${weak.reason}${budgetNote ? ` (${budgetNote} for a conflicting value)` : ""}`,
+    );
+  }
+  if (notChecked > 0) {
+    return {
+      status: "unverifiable",
+      checked_url: rootCheckedUrl,
+      urls_tried: urlsTried,
+      reason: `${budgetNote} before a verdict — cannot confidently judge, not treated as a mismatch`,
+    };
   }
 
   if (visibleChars < FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS) {
     return {
       status: "unverifiable",
-      checked_url: rootResult.finalUrl || input.root_url,
+      checked_url: rootCheckedUrl,
       urls_tried: urlsTried,
       reason: `fetched page(s) carry only ${visibleChars} visible chars of static text (< ${FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS}) — too little content to judge, not treated as a mismatch`,
     };
@@ -1871,9 +2165,12 @@ export async function computeFieldSpotCheck(
 
   return {
     status: "mismatch",
-    checked_url: rootResult.finalUrl || input.root_url,
+    checked_url: rootCheckedUrl,
     urls_tried: urlsTried,
-    reason: `not substantiated on the root page or any of ${subpages.length} followed subpage(s)`,
+    // The root page's own verdict reason is appended so a human reading the
+    // weekly report can see WHY (e.g. "street + house number not found" vs
+    // "different postal code"), not just that it failed.
+    reason: `not substantiated on the root page or any of ${subpages.length} followed subpage(s) — root page: ${rootVerdict.reason}`,
   };
 }
 

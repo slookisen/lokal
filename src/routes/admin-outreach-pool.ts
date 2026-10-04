@@ -15,6 +15,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb, POOL_CONTENT_THRESHOLD_SQL, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
+import { publicListableSql } from "../services/agent-visibility";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
@@ -173,6 +174,8 @@ router.get("/stats", (req: Request, res: Response) => {
     // count, i.e. after the sent-log exclusion too) now isolates the
     // sent-log exclusion specifically. Purely additive — no existing field's
     // name or value changes, no gate's behavior changes.
+    // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the VIEW
+    // now also applies the shared public-listability predicate — mirrored here.
     const activeProducerVetted = db
       .prepare(
         `SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''
@@ -180,7 +183,8 @@ router.get("/stats", (req: Request, res: Response) => {
            AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now', '-30 days')
            AND a.is_active = 1
            AND (a.role IS NULL OR a.role = 'producer')
-           AND (a.is_vetted IS NULL OR a.is_vetted = 1)`
+           AND (a.is_vetted IS NULL OR a.is_vetted = 1)
+           AND ${publicListableSql("a")}`
       )
       .get() as { c: number };
 

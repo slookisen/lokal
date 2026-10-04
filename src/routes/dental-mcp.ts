@@ -26,6 +26,7 @@ import {
   listChains,
   listSpecialistsForClinic,
 } from "../services/dental-store";
+import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 
 import { slugifyClinic } from "./dental-seo";
 import { dentalLimiter } from "../middleware/security";
@@ -204,7 +205,8 @@ function registerDentalTools(server: McpServer): void {
           ? getDentalAgentById(id)
           : null;
 
-        if (!agent) {
+        // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
+        if (!agent || isDentalSyntheticProbeId(agent.id)) {
           return {
             content: [{ type: "text" as const, text: "Klinikk ikke funnet." }],
             isError: true,

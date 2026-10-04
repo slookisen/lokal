@@ -33,6 +33,10 @@ import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/produc
 // subcategory taxonomy. PURE (drink-taxonomy.ts has zero imports), same
 // isolation rule as geo-distance.ts and product-glossary.ts above.
 import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink-taxonomy";
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
+// public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
+// imports), same isolation rule as geo-distance.ts above.
+import { publicListableSql, isPubliclyListable } from "./agent-visibility";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -68,6 +72,16 @@ export interface DiscoverMeta {
    * wiped 70-100% of otherwise-correct results with no signal that it happened.
    */
   tagsRelaxed?: boolean;
+}
+
+/**
+ * Input options for discover(). a2a spam guard (2026-10-04):
+ * `trackDiscovery:false` skips the discovery_count/times_discovered bump for
+ * calls whose results nobody is shown as a real buyer (spam/probe traffic,
+ * no-intent text, count-only queries). Default true.
+ */
+export interface DiscoverOptions {
+  trackDiscovery?: boolean;
 }
 
 class MarketplaceRegistry {
@@ -190,8 +204,9 @@ class MarketplaceRegistry {
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
-  discover(query: DiscoveryQuery, meta?: DiscoverMeta): DiscoveryResult[] {
+  discover(query: DiscoveryQuery, meta?: DiscoverMeta, opts: DiscoverOptions = {}): DiscoveryResult[] {
     const db = getDb();
+    const trackDiscovery = opts.trackDiscovery !== false;
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
     // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
@@ -204,7 +219,9 @@ class MarketplaceRegistry {
       // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
       // self-registered, not-yet-vetted row (is_vetted = 0) must not surface
       // on any public discovery surface, including this name-match path.
-      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[];
+      // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: nor may
+      // a catalog_hidden fixture or a non-RFB-vertical row (agent-visibility.ts).
+      const allRows = db.prepare(`SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[];
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
       console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
@@ -228,7 +245,7 @@ class MarketplaceRegistry {
           const geoFiltered = this.filterNameCandidatesByGeo(nameCandidates, query, meta);
           return this.buildNameMatchResults(
             geoFiltered, query, 0.9, `Navnematch: "${nameQuery}"`,
-            undefined, !!meta?.geoRelaxed,
+            undefined, !!meta?.geoRelaxed, trackDiscovery,
           );
         }
       }
@@ -284,7 +301,7 @@ class MarketplaceRegistry {
           if (fuzzyCandidates.length > 0) {
             const results = this.buildNameMatchResults(
               fuzzyCandidates, query, 0.75, `Mulig navnematch: "${nameQuery}"`, 10,
-              !!meta?.geoRelaxed,
+              !!meta?.geoRelaxed, trackDiscovery,
             );
             console.log(`[name-search-fuzzy] matched=${results.length} → ${results.map(r => r.agent.name).join(", ")}`);
             if (results.length > 0) return results;
@@ -297,7 +314,9 @@ class MarketplaceRegistry {
     // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
     // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
     // self-registered, not-yet-vetted rows from this public discovery path.
-    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1";
+    // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: plus the
+    // shared public-listability predicate (catalog_hidden + RFB vertical).
+    let sql = `SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
     const params: any[] = [];
 
     // 1. Filter by role
@@ -463,9 +482,6 @@ class MarketplaceRegistry {
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, productTerms, productMatchMap);
 
-      // Track discovery stats (async-safe â€" fire and forget)
-      this.incrementDiscovery(agent.id);
-
       return {
         agent: {
           id: agent.id,
@@ -503,7 +519,11 @@ class MarketplaceRegistry {
       results.sort((a, b) => documented(b) - documented(a));
     }
 
-    return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
+    const page = results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
+    // Count a discovery only for what is actually returned (a2a spam guard:
+    // this used to bump every CANDIDATE — ~5k row writes per unfiltered call).
+    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    return page;
   }
 
   // ─── Result location + the distance honesty rule ──────────
@@ -609,6 +629,7 @@ class MarketplaceRegistry {
     reason: string,
     maxResults?: number,
     geoRelaxed = false,
+    trackDiscovery = true,
   ): DiscoveryResult[] {
     const origin = query.location;
     const maxKm = query.maxDistanceKm;
@@ -638,7 +659,6 @@ class MarketplaceRegistry {
 
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
-      this.incrementDiscovery(agent.id);
       const distanceKm = distanceOf(agent);
       if (typeof distanceKm === "number") rankDistance.set(agent.id, distanceKm);
 
@@ -674,7 +694,9 @@ class MarketplaceRegistry {
       return da - db;
     });
 
-    return results.slice(0, Math.min(maxResults ?? Infinity, query.limit || 20));
+    const page = results.slice(0, Math.min(maxResults ?? Infinity, query.limit || 20));
+    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    return page;
   }
 
   // ─── Natural language query parsing ───────────────────────
@@ -1004,7 +1026,7 @@ class MarketplaceRegistry {
           // not-yet-vetted rows too — kept consistent with discover()'s own
           // is_vetted filter even though this candidate-detection step alone
           // can't leak a result (discover()'s actual lookup is gated too).
-          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[])
+          const allNames = (db.prepare(`SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[])
             .map(r => (r.name || "").toLowerCase());
 
           const nameMatches = nameCandidateWords.filter(word =>
@@ -1421,11 +1443,19 @@ class MarketplaceRegistry {
   // Unknown ids return false (not quarantined) so callers fall through to
   // their own normal "not found" handling instead of this helper
   // manufacturing a false positive.
+  //
+  // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: a row that
+  // fails the shared public-listability predicate (catalog_hidden fixture, or a
+  // dental/experiences row in `agents`) is treated the same way on these
+  // public by-id lookups (card/info/vcard/trust, /api/agents/:id/stats, the
+  // marketing lane). The order flow never goes through here — it uses
+  // /catalog/agents/:id/products, the cart routes and lokal_info by id.
   isQuarantinedFromPublicView(agentId: string): boolean {
     const db = getDb();
-    const row = db.prepare("SELECT origin, is_vetted FROM agents WHERE id = ?").get(agentId) as
-      { origin: string | null; is_vetted: number | null } | undefined;
+    const row = db.prepare("SELECT origin, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
+      { origin: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!row) return false;
+    if (!isPubliclyListable(row)) return true;
     return row.origin === "self_registered" && row.is_vetted !== 1;
   }
 
@@ -1556,7 +1586,10 @@ class MarketplaceRegistry {
     // marketplaceRegistry.getActiveAgents()) — the smallest of the publicly-visible
     // agent counts, because it's the only one that requires vetted + non-umbrella +
     // active all at once. See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
-    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 ORDER BY trust_score DESC, created_at DESC").all() as any[];
+    // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: + the shared
+    // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
+    // — this one line covers every public list surface built on this method.
+    const rows = db.prepare(`SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
@@ -1689,18 +1722,23 @@ class MarketplaceRegistry {
       return this._statsCache;
     }
     const db = getDb();
-    // Unfiltered COUNT(*) — includes inactive and umbrella-tagged agents. Consumed by
-    // /health's traffic.totalAgents AND /api/stats' registry.totalAgents (a2a.ts) — same
-    // cached call, same number, by construction. See dev-request
-    // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
-    const total = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
+    // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: all three
+    // counts below apply the shared public-listability predicate — the hidden
+    // test fixture and the dental/experiences rows that sit in `agents` are not
+    // RFB producers and must not inflate RFB's public numbers.
+    const listable = publicListableSql();
+    // COUNT(*) over every RFB-listable row — still includes inactive and umbrella-
+    // tagged agents. Consumed by /health's traffic.totalAgents AND /api/stats'
+    // registry.totalAgents (a2a.ts) — same cached call, same number, by construction.
+    // See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
+    const total = (db.prepare(`SELECT COUNT(*) as c FROM agents WHERE ${listable}`).get() as any).c;
     // Phase 5.11 A4.1: activeProducers stat should exclude umbrella-tagged agents
     // This is registry.activeProducers in /api/stats — a distinct, narrower count than
     // `total`/totalAgents above (is_active + non-umbrella producers only). See dev-request
     // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
-    const activeProducers = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1 AND umbrella_type IS NULL").get() as any).c;
+    const activeProducers = (db.prepare(`SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1 AND umbrella_type IS NULL AND ${listable}`).get() as any).c;
     // Phase 5.11 A4.1: cities stat should not count umbrella locations
-    const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL AND umbrella_type IS NULL").all() as any[];
+    const citiesRows = db.prepare(`SELECT DISTINCT city FROM agents WHERE city IS NOT NULL AND umbrella_type IS NULL AND ${listable}`).all() as any[];
     const totalListings = (db.prepare("SELECT COUNT(*) as c FROM listings").get() as any).c;
 
     // dev-request 2026-07-04-rfb-datakvalitet item 5 (stats-guard slice):
@@ -1840,13 +1878,23 @@ class MarketplaceRegistry {
     return this.generateApiKey();
   }
 
-  private incrementDiscovery(agentId: string): void {
+  // Bumps discovery_count/times_discovered for the RETURNED results only, all
+  // in one transaction (one fsync instead of three statements per agent).
+  private incrementDiscovery(agentIds: string[]): void {
+    if (agentIds.length === 0) return;
     try {
       const db = getDb();
-      db.prepare("UPDATE agents SET discovery_count = discovery_count + 1 WHERE id = ?").run(agentId);
+      const bumpAgent = db.prepare("UPDATE agents SET discovery_count = discovery_count + 1 WHERE id = ?");
       // Also update agent_metrics for social proof
-      db.prepare("INSERT OR IGNORE INTO agent_metrics (agent_id) VALUES (?)").run(agentId);
-      db.prepare("UPDATE agent_metrics SET times_discovered = times_discovered + 1, updated_at = datetime('now') WHERE agent_id = ?").run(agentId);
+      const ensureMetrics = db.prepare("INSERT OR IGNORE INTO agent_metrics (agent_id) VALUES (?)");
+      const bumpMetrics = db.prepare("UPDATE agent_metrics SET times_discovered = times_discovered + 1, updated_at = datetime('now') WHERE agent_id = ?");
+      db.transaction((ids: string[]) => {
+        for (const id of ids) {
+          bumpAgent.run(id);
+          ensureMetrics.run(id);
+          bumpMetrics.run(id);
+        }
+      })(agentIds);
     } catch { /* non-critical */ }
   }
 
@@ -2351,7 +2399,7 @@ export function findExplicitProducerNames(query: string, isGenericWord: (w: stri
   let rows: Array<{ name: string | null }>;
   try {
     rows = getDb()
-      .prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1")
+      .prepare(`SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`)
       .all() as Array<{ name: string | null }>;
   } catch {
     return []; // the lookup is an optimisation; the word-by-word passes still run

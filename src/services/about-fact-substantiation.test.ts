@@ -35,6 +35,15 @@
  *   H. Boundary-detection robustness: real HTML containing its own embedded
  *      newlines (pretty-printed markup, the normal case for a real fetched
  *      page) must not confuse the raw-HTML/flattened-text split.
+ *   I. `<br>` line breaks (W40 spot-check false-positive fix): sentences
+ *      written one per `<br>` line form one block (verbatim and paraphrase
+ *      accepted), while `<br>` next to an unpunctuated field-list line or at
+ *      a blank-line paragraph break stays a hard boundary (three
+ *      adversarial cases that a plain "drop <br> from the boundary set"
+ *      would wrongly accept).
+ *   J. The two helpers the spot-check route uses to stop the write-guard's
+ *      word-overlap branch from accepting a fact swap (W40 review fix):
+ *      isAboutCandidateVerbatimInSource, findAboutCandidateFactsAbsentFromSource.
  */
 
 export interface TestSummary {
@@ -429,6 +438,142 @@ export function runAboutFactSubstantiationTests(
     } catch (err: any) {
       failed++;
       failures.push("about-fact-substantiation (section H): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section I — `<br>` line breaks (W40 spot-check false-positive fix).
+    // `<br>` used to be a block boundary, so a paragraph written one
+    // sentence per line (real case: aukrust-nordgard.no) became one block
+    // PER SENTENCE and no block could ever carry enough of the candidate's
+    // vocabulary — even a verbatim copy was rejected. Now two `<br>` lines
+    // that are BOTH complete sentences stay one block; every other `<br>`
+    // (next to an unpunctuated field-list line, or a blank-line `<br><br>`
+    // paragraph break) is still a hard boundary. i-3/i-4/i-5 are the
+    // adversarial side: each would be wrongly accepted if `<br>` were simply
+    // dropped from the boundary set.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const brProse =
+        "<p>Lindstad Gård ligg ved Storelva i Sunndal kommune.<br />" +
+        "Garden har vore i drift sidan 1954, då Sigrid Holme starta med sauehald.<br />" +
+        "I dag driv familien eit variert gardsbruk med bær og grønsaker.</p>";
+      const brProseSource = withVisibleTextTail(
+        "<html><body><nav><a href='/'>Hjem</a><a href='/om'>Om</a></nav>" + brProse +
+          "<footer><p>Nordbygdvegen 8, 6210 Valldal</p><p>&copy; 2011 Lindstad Gård</p></footer></body></html>",
+      );
+
+      // i-1: the aukrust-nordgard.no shape — every fact in the FIRST line,
+      // then fact-free lines carrying most of the vocabulary. As one block
+      // per line, line 1 held under 20% of the candidate's context words.
+      const aukrustShapeSource = withVisibleTextTail(
+        "<html><body><p>Lindstad Gård ligg ved Storelva i Sunndal kommune (220 moh).<br />" +
+          "Solrike somrar og kalde vintrar gjev bæra ein særeigen smak og farge.<br />" +
+          "Vårt mål: Å dyrke god mat for folk i heile dalen!</p></body></html>",
+      );
+      let v = checkAboutCandidateFactSubstantiated(
+        "Lindstad Gård ligg ved Storelva i Sunndal kommune (220 moh). Solrike somrar og kalde vintrar gjev bæra ein særeigen smak og farge. " +
+          "Vårt mål: Å dyrke god mat for folk i heile dalen!",
+        aukrustShapeSource,
+      );
+      assertEq(v.substantiated, true, "i-1: verbatim copy of a one-sentence-per-line <br> paragraph, facts all in line 1 -> substantiated (was rejected)");
+
+      v = checkAboutCandidateFactSubstantiated(
+        "Lindstad Gård ligger ved Storelva i Sunndal kommune. Gården har vært i drift siden 1954, da Sigrid Holme startet med sauehold. " +
+          "I dag driver familien et variert gårdsbruk med bær og grønsaker.",
+        brProseSource,
+      );
+      assertEq(v.substantiated, true, "i-2: Bokmål paraphrase of the same Nynorsk <br> paragraph -> substantiated (the fact-level check's purpose)");
+
+      // i-3: footer field list written with <br> (no sentence punctuation on
+      // any line) + section C's footer-vocabulary-stuffing candidate (c-4).
+      // Merging these lines into one block would let the footer's own
+      // vocabulary corroborate the loaned street/place/year facts.
+      const brFooterSource = withVisibleTextTail(
+        rootHtml.replace(
+          /<footer>[\s\S]*<\/footer>/,
+          "<footer><p>Adresse: Vollanvegen 14, 6320 Isfjorden<br>Telefon: 71 23 45 67<br>E-post: post@vollangaard.no<br>" +
+            "Org.nr: 987654321<br>Åpningstider: Mandag til fredag 09:00-16:00<br>&copy; 2019 Vollan Gård</p></footer>",
+        ),
+      );
+      v = checkAboutCandidateFactSubstantiated(
+        "Vollan Gård AS ligger på adressen Vollanvegen 14 i Isfjorden. Bedriftens telefon og organisasjonsnummer finner du på nettsiden, " +
+          "og åpningstider gjelder mandag til fredag som normalt. Selskapet ble registrert i 2019.",
+        brFooterSource,
+      );
+      assertEq(v.substantiated, false, "i-3: <br>-separated footer field list stays line-by-line -> footer-vocabulary stuffing still NOT substantiated");
+
+      // i-4: a prose sentence and an unpunctuated address line in the SAME
+      // <p>, separated by one <br>: the address line must not join the
+      // prose block (else its street/place could be "corroborated" by the
+      // real sentence spliced into a fabricated candidate — section F's
+      // shape, via a <br> instead of a footer).
+      const brMixedSource = withVisibleTextTail(
+        "<html><body><p>Velkomen til oss.</p><p>I dag driv familien eit variert gardsbruk med bær, grønsaker og dyrehald, " +
+          "og tek imot skuleklassar og turistar gjennom sommarsesongen.<br>Nordbygdvegen 8, 6210 Valldal<br>Org.nr 912345678</p></body></html>",
+      );
+      v = checkAboutCandidateFactSubstantiated(
+        "Garden ved Nordbygdvegen i Valldal vart skipa av ein lokal familie. I dag driv familien eit variert gardsbruk med bær, " +
+          "grønsaker og dyrehald, og tek imot skuleklassar og turistar gjennom sommarsesongen.",
+        brMixedSource,
+      );
+      assertEq(v.substantiated, false, "i-4: unpunctuated address line after a prose sentence (single <br>) stays its own block -> loaned street/place NOT substantiated");
+
+      // i-5: a blank-line <br><br> paragraph break is a hard boundary even
+      // between two punctuated paragraphs.
+      const brParagraphsSource = withVisibleTextTail(
+        "<html><body><p>Vi er medlem av Bondens Marked Trøndelag sidan 2015.<br><br>" +
+          "I dag driv familien eit variert gardsbruk med bær, grønsaker og dyrehald, og tek imot skuleklassar og turistar gjennom sommarsesongen.</p></body></html>",
+      );
+      v = checkAboutCandidateFactSubstantiated(
+        "Bondens Marked Trøndelag vart grunnlagt på garden i 2015, og familien driv i dag eit variert gardsbruk med bær, grønsaker og dyrehald.",
+        brParagraphsSource,
+      );
+      assertEq(v.substantiated, false, "i-5: facts from one <br><br>-separated paragraph + vocabulary from the next -> NOT substantiated");
+    } catch (err: any) {
+      failed++;
+      failures.push("about-fact-substantiation (section I): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section J — helpers for the spot-check route's about check (W40
+    // review fix): isAboutCandidateVerbatimInSource and
+    // findAboutCandidateFactsAbsentFromSource ("is a fact mentioned on the
+    // page AT ALL", markup included).
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const { isAboutCandidateVerbatimInSource, findAboutCandidateFactsAbsentFromSource, ABOUT_FACT_MIN_FACTS } =
+        require("./about-fact-substantiation") as typeof import("./about-fact-substantiation");
+      assertEq(ABOUT_FACT_MIN_FACTS, 2, "j-1: the fact-level check needs >= 2 facts");
+      assertEq(isAboutCandidateVerbatimInSource("oldefar Ole  Dahle plantet EPLEHAGEN", sourceText), true,
+        "j-2: verbatim after normalisation (case, whitespace)");
+      assertEq(isAboutCandidateVerbatimInSource("oldefar Ole Dahle plantet pæretrær", sourceText), false, "j-3: not verbatim");
+      assertEq(isAboutCandidateVerbatimInSource("", sourceText), false, "j-4: empty candidate is never verbatim");
+
+      let r = findAboutCandidateFactsAbsentFromSource(
+        "Gården ved Rødvenfjorden i Rauma har vore i slekta sidan 1600-talet, og Ole Dahle planta eplehagen i 1932.",
+        sourceText,
+      );
+      assertEq(r.absent, [], "j-5: every fact (1600, 1932, rødvenfjorden, rauma, dahle) is on the page");
+      assertEq([...r.facts].sort(), ["1600", "1932", "dahle", "rauma", "rødvenfjorden"], "j-6: facts = numbers >= 3 digits + non-initial proper nouns >= 4 letters");
+      r = findAboutCandidateFactsAbsentFromSource(
+        "Gården ved Hardangerfjorden i Rauma har vore i slekta sidan 1600-talet, og Ole Dahle planta eplehagen i 1874.",
+        sourceText,
+      );
+      assertEq(r.absent, ["1874", "hardangerfjorden"], "j-7: swapped place and year are reported absent");
+      r = findAboutCandidateFactsAbsentFromSource(
+        "Me dyrkar grønsaker og er Debio-sertifisert.",
+        '<html><body><img src="/img/Debio_O-merke.png"></body></html>\n',
+      );
+      assertEq([r.facts, r.absent], [["debio-sertifisert"], []],
+        "j-8: a fact only in markup (an image name) counts as mentioned; a hyphenated proper noun by its leading name part");
+      r = findAboutCandidateFactsAbsentFromSource("Gården ligg i Lom ved Vågåvatnet.", "<p>Gården ligg i Lom.</p>");
+      assertEq(r.absent, ["vågåvatnet"], "j-9: a proper noun missing from the page");
+      assertEq(findAboutCandidateFactsAbsentFromSource("", sourceText), { facts: [], absent: [] }, "j-10: empty candidate");
+      assertEq(findAboutCandidateFactsAbsentFromSource("Gården har 1932 tre.", "<p>Eplehagen fra 19321.</p>").absent, ["1932"],
+        "j-11: a number must be a whole digit run (1932 is not in 19321)");
+    } catch (err: any) {
+      failed++;
+      failures.push("about-fact-substantiation (section J): unexpected error: " + String(err?.stack || err?.message || err));
     }
 
     return { passed, failed, failures };

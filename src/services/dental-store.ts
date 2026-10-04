@@ -29,6 +29,12 @@ import { mergeFieldProvenance } from "../routes/admin-knowledge";
 // exclusion behind this flag -- see the doc comment on the helper itself
 // for why it's a separate knob from the claim-pool's filter.
 import { DENTAL_CLINIC_CLASS_SQL } from "./dental-catalog-class";
+// dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: every
+// list/count/sitemap/poststed read below skips the synthetic schema-probe row
+// (see the constant's doc comment). Single-row lookups (getDentalAgentById/
+// ByOrgnr) deliberately do NOT -- the probe's PUT write path and by-id
+// read-back go through them; public callers check isDentalSyntheticProbeId().
+import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -1140,7 +1146,9 @@ export function listDentalAgents(
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
 
-  const where: string[] = [];
+  // Unconditional (not an opt): the synthetic probe row is never a clinic for
+  // any caller of this listing (GET /agents, GET /discover).
+  const where: string[] = [DENTAL_NOT_SYNTHETIC_PROBE_SQL];
   const params: Record<string, unknown> = {};
 
   if (opts.excludeParked && process.env.DENTAL_HOMEPAGE_PARKING_DISABLED !== "true") {
@@ -1202,7 +1210,7 @@ export function countDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
 
-  const where: string[] = [];
+  const where: string[] = [DENTAL_NOT_SYNTHETIC_PROBE_SQL];
   const params: Record<string, unknown> = {};
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
@@ -1249,6 +1257,7 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
   // fixtures predate catalog_class and are therefore NULL, not yet a proven
   // non-clinic).
   where.push(DENTAL_CLINIC_CLASS_SQL);
+  where.push(DENTAL_NOT_SYNTHETIC_PROBE_SQL);
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
@@ -1322,6 +1331,7 @@ export function listPublicDentalAgents(
   // unconditional honest-count filter as countPublicDentalAgents() above --
   // kept in sync so the count and the list it describes never diverge.
   where.push(DENTAL_CLINIC_CLASS_SQL);
+  where.push(DENTAL_NOT_SYNTHETIC_PROBE_SQL);
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
@@ -1377,6 +1387,7 @@ export function getAvailableSpecialties(candidates: string[]): string[] {
     `SELECT 1 FROM dental_agents
      WHERE verification_status != 'rejected'
        AND (is_inactive IS NULL OR is_inactive = 0)
+       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
        AND (available_specialties LIKE @s OR specialists LIKE @p OR nb_lower(specialists) LIKE @t)
      LIMIT 1`
   );
@@ -1406,7 +1417,7 @@ export function getDentalStats(): DentalStats {
   // above, so the frontpage/fylke counters never show a bigger number than
   // the filtered listing they sit next to.
   const base = "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
-    ` AND ${DENTAL_CLINIC_CLASS_SQL}`;
+    ` AND ${DENTAL_CLINIC_CLASS_SQL} AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
 
   const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
 
@@ -1464,9 +1475,13 @@ export interface DentalMarketplaceStats {
 export function getDentalMarketplaceStats(): DentalMarketplaceStats {
   const db = getDb("dental");
 
-  // totalAgents: unfiltered COUNT(*) — mirrors marketplaceRegistry.getStats()'s
+  // totalAgents: COUNT(*) — mirrors marketplaceRegistry.getStats()'s
   // `total` (includes rejected/closed rows), same "raw row count" meaning.
-  const totalAgents = (db.prepare("SELECT COUNT(*) AS c FROM dental_agents").get() as { c: number }).c;
+  // The synthetic probe row is not a clinic at all, so it is excluded from
+  // all three numbers here (its poststed "TEST" leaked into `cities`).
+  const totalAgents = (db.prepare(
+    `SELECT COUNT(*) AS c FROM dental_agents WHERE ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`
+  ).get() as { c: number }).c;
 
   // activeProducers: the same "real, currently-open clinic" gate as
   // getDentalStats()/getAvailableSpecialties() above (verification_status
@@ -1474,7 +1489,8 @@ export function getDentalMarketplaceStats(): DentalMarketplaceStats {
   // producer/umbrella distinction, so this is the closest honest analog to
   // marketplaceRegistry's activeProducers.
   const activeProducers = (db.prepare(
-    "SELECT COUNT(*) AS c FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)"
+    "SELECT COUNT(*) AS c FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+      ` AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`
   ).get() as { c: number }).c;
 
   // cities: dental_agents has NO `kommune` column (only postnummer/poststed/
@@ -1482,7 +1498,8 @@ export function getDentalMarketplaceStats(): DentalMarketplaceStats {
   // same active gate as activeProducers, same relationship as RFB's own
   // cities-exclude-umbrella filtering.
   const cityRows = db.prepare(
-    "SELECT DISTINCT poststed FROM dental_agents WHERE poststed IS NOT NULL AND verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)"
+    "SELECT DISTINCT poststed FROM dental_agents WHERE poststed IS NOT NULL AND verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+      ` AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`
   ).all() as Array<{ poststed: string }>;
   const cities = cityRows.map((r) => r.poststed);
 
@@ -2111,12 +2128,18 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
   // not a count shown to visitors) and `countRows` mirrors the old outer
   // query's filter (verification_status + DENTAL_CLINIC_CLASS_SQL, the actual
   // per-poststed count shown next to each city link).
+  //
+  // Both queries also skip the synthetic probe row
+  // (DENTAL_NOT_SYNTHETIC_PROBE_SQL): a poststed backed ONLY by probe rows
+  // ("TEST") must vanish from the city lists, the sitemap and /sted/:slug
+  // (which 404s for a poststed this function doesn't return).
   const fylkeModeRows = db.prepare(`
     SELECT poststed, fylke, COUNT(*) AS n
     FROM dental_agents
     WHERE verification_status != 'rejected'
       AND poststed IS NOT NULL AND poststed != ''
       AND fylke IS NOT NULL AND fylke != ''
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     GROUP BY poststed, fylke
   `).all() as Array<{ poststed: string; fylke: string; n: number }>;
 
@@ -2132,6 +2155,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     WHERE verification_status != 'rejected'
       AND poststed IS NOT NULL AND poststed != ''
       AND ${DENTAL_CLINIC_CLASS_SQL}
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     GROUP BY poststed
     HAVING n >= ?
     ORDER BY n DESC
@@ -2165,6 +2189,7 @@ export function listRelatedClinics(
       AND id != ?
       AND verification_status != 'rejected'
       ${catalogClassClause}
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     ORDER BY
       CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC,
       CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC,
@@ -2198,6 +2223,7 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
       AND org_nr IS NOT NULL AND org_nr != ''
       ${catalogClassClause}
       AND NOT ${DENTAL_THIN_PROFILE_SQL}
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     ORDER BY navn ASC
   `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
   return rows;
