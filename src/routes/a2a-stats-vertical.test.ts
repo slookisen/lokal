@@ -161,6 +161,11 @@ export async function runA2aStatsVerticalTests(opts: { log?: boolean } = {}): Pr
     insertDental.run({ id: "d-3", navn: "Tannlege 3", poststed: "Bergen", fylke: "Vestland", verification_status: "verified", is_inactive: 0 });
     insertDental.run({ id: "d-rejected", navn: "Tannlege Avvist", poststed: "Trondheim", fylke: "Trøndelag", verification_status: "rejected", is_inactive: 0 });
     insertDental.run({ id: "d-closed", navn: "Tannlege Nedlagt", poststed: "Stavanger", fylke: "Rogaland", verification_status: "verified", is_inactive: 1 });
+    // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
+    // synthetic schema-probe row (production shape: poststed/fylke "TEST",
+    // needs_review) is not a clinic and must not count anywhere in /api/stats
+    // — not even in the raw totalAgents — nor leak "TEST" into cities.
+    insertDental.run({ id: "persistence-probe-pr100b", navn: "PR-100b Persistence Probe", poststed: "TEST", fylke: "TEST", verification_status: "needs_review", is_inactive: 0 });
 
     // ── Experiences fixtures (in-memory, via EXPERIENCES_DB_PATH) ───────
     const experiencesDb = dbFactory.getDb("experiences");
@@ -215,7 +220,7 @@ export async function runA2aStatsVerticalTests(opts: { log?: boolean } = {}): Pr
     //    enough to hand-derive, so this doesn't just re-run the function
     //    under test against itself. ───────────────────────────────────────
     const expectedDental = {
-      totalAgents: 5,          // all 5 rows, including rejected + closed
+      totalAgents: 5,          // all 5 real rows, including rejected + closed (probe excluded)
       activeProducers: 3,      // d-1, d-2, d-3 (d-rejected, d-closed excluded)
       cities: ["Oslo", "Bergen"].sort(),
       totalListings: 3,        // same as activeProducers, no listings concept
@@ -232,10 +237,11 @@ export async function runA2aStatsVerticalTests(opts: { log?: boolean } = {}): Pr
       const res = await call("finn-tannlege.com");
       assertEq(res.status, 200, "dental-1: GET /api/stats on finn-tannlege.com -> 200");
       const registry = res.body?.data?.registry;
-      assertEq(registry?.totalAgents, expectedDental.totalAgents, "dental-2: totalAgents = COUNT(*) FROM dental_agents (5, incl. rejected/closed)");
+      assertEq(registry?.totalAgents, expectedDental.totalAgents, "dental-2: totalAgents = COUNT(*) FROM dental_agents (5, incl. rejected/closed, excl. the synthetic probe row)");
       assertEq(registry?.activeProducers, expectedDental.activeProducers, "dental-3: activeProducers excludes rejected + is_inactive rows (3)");
       assertEq([...(registry?.cities ?? [])].sort(), expectedDental.cities, "dental-4: cities = distinct poststed of ACTIVE rows only (Trondheim/Stavanger excluded)");
       assertEq(registry?.totalListings, expectedDental.totalListings, "dental-5: totalListings honestly mirrors activeProducers (no dental listings concept)");
+      assertTrue(!(registry?.cities ?? []).includes("TEST"), "dental-6: cities never includes the synthetic probe row's 'TEST' poststed");
     }
 
     // ── 2. Experiences hostname -> experience_providers-derived numbers ──

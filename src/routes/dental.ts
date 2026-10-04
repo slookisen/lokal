@@ -42,7 +42,7 @@ import {
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS } from "../services/dental-contamination";
+import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -163,10 +163,16 @@ router.get("/agents", (req: Request, res: Response) => {
 router.get("/agents/:id", (req: Request, res: Response) => {
   const id = req.params.id as string;
   // Allow lookup by org_nr too, mirrors marketplace UX.
-  const agent = /^\d{9}$/.test(id)
+  const byOrgnr = /^\d{9}$/.test(id);
+  const agent = byOrgnr
     ? getDentalAgentByOrgnr(id)
     : getDentalAgentById(id);
-  if (!agent) {
+  // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: an org_nr
+  // lookup (how outside consumers, e.g. the npm dental MCP client, resolve a
+  // clinic) never resolves to the synthetic probe row (org_nr 999999999).
+  // The by-id lookup is deliberately left alone: it is the enrichment
+  // routine's read-back of its own probe PUT (§3.3 STOPs the cycle on a 404).
+  if (!agent || (byOrgnr && isDentalSyntheticProbeId(agent.id))) {
     res.status(404).json({ error: "Not found" });
     return;
   }

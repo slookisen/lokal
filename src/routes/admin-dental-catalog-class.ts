@@ -30,6 +30,7 @@ import {
   DENTAL_CATALOG_CLASSES,
   type DentalCatalogClass,
 } from "../services/dental-catalog-class";
+import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "../services/dental-contamination";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -167,49 +168,54 @@ router.get("/parking-stats", (req: Request, res: Response) => {
   try {
     const db = getDb("dental");
     const one = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+    // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: every
+    // count below goes through `base`, which skips the synthetic schema-probe
+    // row -- it sets verification_status='needs_review' on itself every cycle
+    // and was inflating needs_review (and total/by_* breakdowns) by one.
+    const base = `FROM dental_agents WHERE ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
     const grouped = (col: string): Record<string, number> => {
       const out: Record<string, number> = {};
       const rows = db
-        .prepare(`SELECT COALESCE(${col}, '(null)') AS k, COUNT(*) AS n FROM dental_agents GROUP BY k ORDER BY n DESC`)
+        .prepare(`SELECT COALESCE(${col}, '(null)') AS k, COUNT(*) AS n ${base} GROUP BY k ORDER BY n DESC`)
         .all() as Array<{ k: string; n: number }>;
       for (const r of rows) out[r.k] = r.n;
       return out;
     };
-    const total = one("SELECT COUNT(*) AS n FROM dental_agents");
+    const total = one(`SELECT COUNT(*) AS n ${base}`);
     const parking = {
       extraction_parked_active: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE extraction_unreachable_since IS NOT NULL AND extraction_unreachable_since > datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND extraction_unreachable_since IS NOT NULL AND extraction_unreachable_since > datetime('now','-30 days')`,
       ),
       extraction_parked_expired: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE extraction_unreachable_since IS NOT NULL AND extraction_unreachable_since <= datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND extraction_unreachable_since IS NOT NULL AND extraction_unreachable_since <= datetime('now','-30 days')`,
       ),
       wrong_entity_parked_active: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE wrong_entity_unreachable_since IS NOT NULL AND wrong_entity_unreachable_since > datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND wrong_entity_unreachable_since IS NOT NULL AND wrong_entity_unreachable_since > datetime('now','-30 days')`,
       ),
       wrong_entity_parked_expired: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE wrong_entity_unreachable_since IS NOT NULL AND wrong_entity_unreachable_since <= datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND wrong_entity_unreachable_since IS NOT NULL AND wrong_entity_unreachable_since <= datetime('now','-30 days')`,
       ),
-      wrong_entity_streak_1plus: one("SELECT COUNT(*) AS n FROM dental_agents WHERE wrong_entity_streak >= 1"),
+      wrong_entity_streak_1plus: one(`SELECT COUNT(*) AS n ${base} AND wrong_entity_streak >= 1`),
       homepage_parked_active: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE homepage_unreachable_since IS NOT NULL AND homepage_unreachable_since > datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND homepage_unreachable_since IS NOT NULL AND homepage_unreachable_since > datetime('now','-30 days')`,
       ),
       homepage_parked_expired: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE homepage_unreachable_since IS NOT NULL AND homepage_unreachable_since <= datetime('now','-30 days')",
+        `SELECT COUNT(*) AS n ${base} AND homepage_unreachable_since IS NOT NULL AND homepage_unreachable_since <= datetime('now','-30 days')`,
       ),
-      thin_site: one("SELECT COUNT(*) AS n FROM dental_agents WHERE enrichment_state = 'thin_site'"),
-      needs_review: one("SELECT COUNT(*) AS n FROM dental_agents WHERE verification_status = 'needs_review'"),
-      rejected: one("SELECT COUNT(*) AS n FROM dental_agents WHERE verification_status = 'rejected'"),
-      is_inactive: one("SELECT COUNT(*) AS n FROM dental_agents WHERE is_inactive = 1"),
-      directory_url_moved: one("SELECT COUNT(*) AS n FROM dental_agents WHERE directory_url IS NOT NULL"),
-      currently_claimed: one("SELECT COUNT(*) AS n FROM dental_agents WHERE worker_id IS NOT NULL"),
+      thin_site: one(`SELECT COUNT(*) AS n ${base} AND enrichment_state = 'thin_site'`),
+      needs_review: one(`SELECT COUNT(*) AS n ${base} AND verification_status = 'needs_review'`),
+      rejected: one(`SELECT COUNT(*) AS n ${base} AND verification_status = 'rejected'`),
+      is_inactive: one(`SELECT COUNT(*) AS n ${base} AND is_inactive = 1`),
+      directory_url_moved: one(`SELECT COUNT(*) AS n ${base} AND directory_url IS NOT NULL`),
+      currently_claimed: one(`SELECT COUNT(*) AS n ${base} AND worker_id IS NOT NULL`),
     };
     const pool = {
       raw_with_hjemmeside_total: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE enrichment_state = 'raw' AND hjemmeside IS NOT NULL AND hjemmeside <> ''",
+        `SELECT COUNT(*) AS n ${base} AND enrichment_state = 'raw' AND hjemmeside IS NOT NULL AND hjemmeside <> ''`,
       ),
       raw_with_hjemmeside_claimable: one(
-        `SELECT COUNT(*) AS n FROM dental_agents
-          WHERE enrichment_state = 'raw' AND hjemmeside IS NOT NULL AND hjemmeside <> ''
+        `SELECT COUNT(*) AS n ${base}
+            AND enrichment_state = 'raw' AND hjemmeside IS NOT NULL AND hjemmeside <> ''
             AND (verification_status IS NULL OR verification_status NOT IN ('needs_review','rejected'))
             AND (is_inactive IS NULL OR is_inactive = 0)
             AND (extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))
@@ -218,10 +224,10 @@ router.get("/parking-stats", (req: Request, res: Response) => {
             AND (catalog_class IS NULL OR catalog_class IN ('klinikk','offentlig_klinikk','ukjent'))`,
       ),
       raw_without_hjemmeside: one(
-        "SELECT COUNT(*) AS n FROM dental_agents WHERE enrichment_state = 'raw' AND (hjemmeside IS NULL OR hjemmeside = '')",
+        `SELECT COUNT(*) AS n ${base} AND enrichment_state = 'raw' AND (hjemmeside IS NULL OR hjemmeside = '')`,
       ),
-      missing_adresse: one("SELECT COUNT(*) AS n FROM dental_agents WHERE adresse IS NULL OR adresse = ''"),
-      missing_lat: one("SELECT COUNT(*) AS n FROM dental_agents WHERE lat IS NULL"),
+      missing_adresse: one(`SELECT COUNT(*) AS n ${base} AND (adresse IS NULL OR adresse = '')`),
+      missing_lat: one(`SELECT COUNT(*) AS n ${base} AND lat IS NULL`),
     };
     res.json({
       success: true,

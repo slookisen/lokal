@@ -35735,6 +35735,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
+  //    synthetic schema-probe row is hidden from every public read surface
+  //    and admin count; its PUT write path + by-id read-back are unchanged ──
+  console.log("\n── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: synthetic probe row hidden ──");
+  try {
+    const { runDentalSyntheticProbeHiddenTests } = require("../src/routes/dental-synthetic-probe-hidden.test") as
+      typeof import("../src/routes/dental-synthetic-probe-hidden.test");
+    const dsph = await runDentalSyntheticProbeHiddenTests({ log: false });
+    passed += dsph.passed;
+    failed += dsph.failed;
+    for (const f of dsph.failures) failures.push("dental synthetic probe hidden: " + f);
+    console.log(`  dental synthetic probe hidden: ${dsph.passed} passed, ${dsph.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental synthetic probe hidden: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
