@@ -11,6 +11,7 @@ import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { publicListableSql } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -3639,6 +3640,7 @@ router.get("/find-match", (req: Request, res: Response) => {
     FROM agents a
     LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
     WHERE a.is_active = 1
+      AND ${publicListableSql("a")}  -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt
   `).all() as any[];
 
   const matches: any[] = [];

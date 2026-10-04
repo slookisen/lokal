@@ -33,6 +33,11 @@ import { computeEffectiveAvailability } from "../services/supply-graph";
 import { runProductCatalogSync } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { isValidLatLng } from "../utils/geo-query";
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
+// public-listability predicate (catalog_hidden fixture + RFB vertical) for the
+// public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
+// path /agents/:id/products deliberately does NOT use it.
+import { publicListableSql } from "../services/agent-visibility";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
 export const catalogRouter = Router();
@@ -115,6 +120,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND ${publicListableSql("a")}
       ${cityFilter}
   `).get(...params) as { total: number };
 
@@ -144,6 +150,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND ${publicListableSql("a")}
       ${cityFilter}
     ORDER BY p.updated_at DESC, p.id
     LIMIT ? OFFSET ?
@@ -238,6 +245,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND ${publicListableSql("a")}
     ORDER BY p.updated_at DESC, p.id
   `).all() as Array<{
     id: string;

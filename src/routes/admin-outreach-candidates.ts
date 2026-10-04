@@ -41,6 +41,7 @@ import { Router, Request, Response } from "express";
 import { getDb, isContentQualified } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { customerRuleSql } from "../services/customer-rule";
+import { publicListableSql } from "../services/agent-visibility";
 import {
   getRecentlyEmailedAddresses,
   getCrossPlatformSuppressors,
@@ -474,6 +475,9 @@ export function computeOutreachCandidates(
           AND a.is_active = 1
           AND (a.role IS NULL OR a.role = 'producer')
           AND (a.is_vetted IS NULL OR a.is_vetted = 1)
+          -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt:
+          -- mirrors the VIEW's shared public-listability predicate too.
+          AND ${publicListableSql("a")}
           AND k.verification_status = 'verified'
           AND k.enrichment_status = 'rich'
           AND k.url_last_status IS NOT NULL

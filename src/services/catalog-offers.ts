@@ -17,6 +17,10 @@
 // not a functional divergence from those two in the other direction; if
 // is_active ever needs to widen to match them exactly, that's a decision
 // for whoever owns this filter, not an oversight in this comment.
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: plus the ONE
+// shared public-listability predicate (agent-visibility.ts) — the hidden test
+// fixture and non-RFB-vertical rows are never offered here (nor via
+// lokal_find_offers); the fixture is reached by id instead.
 //
 // Geo: bounding-box pre-filter + haversine, using the ONE shared
 // implementation in geo-distance.ts (the same helper lokal_search's
@@ -39,6 +43,7 @@ import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
+import { publicListableSql } from "./agent-visibility";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -193,6 +198,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       AND a.lat IS NOT NULL AND a.lng IS NOT NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+      AND ${publicListableSql("a")}
       AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
       AND LOWER(p.name) LIKE ?
   `).all(

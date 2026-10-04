@@ -18,6 +18,13 @@
 // Reference: PHASE5-ENRICHMENT-REORG.md §8 + WO #8.
 
 import { getDb } from "../database/init";
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the batch
+// pickers below never select the catalog_hidden test fixture — its cross-check
+// status is owned by POST /admin/test-producer, and a verifier pass would
+// re-derive (demote) it. Only the catalog_hidden half of the shared predicate:
+// the verifier's vertical behaviour is unchanged by that dev-request. With no
+// hidden row the clause is "" and every picker's SQL is byte-identical.
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 import {
   crossSourceAgreement,
   aggregateVerdict,
@@ -415,6 +422,7 @@ export function computeEnrichmentStatus(input: {
 // Pick the next batch of agents to verify. Oldest-verified first;
 // http-failures bumped to the front so we re-check broken sites.
 export function pickBatch(db: any, limit = 30): any[] {
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -424,7 +432,7 @@ export function pickBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')
+        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')${hidden}
      -- dev-request 2026-08-23-terminal-unconfirmable: demonstrably
      -- unconfirmable agents (Brreg-dead, or zero identity sources on the
      -- second line) are removed from the hourly sweep permanently, same as
@@ -454,6 +462,7 @@ export function pickBatch(db: any, limit = 30): any[] {
 export function pickByIds(db: any, ids: string[]): any[] {
   if (!ids || ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -463,7 +472,7 @@ export function pickByIds(db: any, ids: string[]): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE a.id IN (${placeholders})`
+        WHERE a.id IN (${placeholders})${hidden}`
     )
     .all(...ids);
 }
@@ -495,6 +504,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
          OR k.domain_reconciliation_checked_at <= datetime('now','-30 days')
          OR k.verification_review_reason != COALESCE(k.domain_reconciliation_reason_snapshot, '')
        )`;
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -504,7 +514,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status IN ('review_required', 'data_insufficient')
+        WHERE k.verification_status IN ('review_required', 'data_insufficient')${hidden}
           ${parkingExclusion}
      ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
@@ -549,6 +559,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
 // before comparing, regardless of which format the column's own value is
 // in.
 export function pickStaleReviewRequiredBatch(db: any, cap = 40): any[] {
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -558,7 +569,7 @@ export function pickStaleReviewRequiredBatch(db: any, cap = 40): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status = 'review_required'
+        WHERE k.verification_status = 'review_required'${hidden}
           AND (
             k.last_verified_at IS NULL
             OR datetime(k.last_verified_at) <= datetime('now', '-7 days')
@@ -596,6 +607,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
   const parkingExclusion = process.env.PENDING_VERIFY_PARKING_DISABLED === "true"
     ? ""
     : `AND (k.pending_verify_parked_since IS NULL OR k.pending_verify_parked_since <= datetime('now','-30 days'))`;
+  const hidden = catalogHiddenIdExclusionSql(db, "a");
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
@@ -606,7 +618,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status = 'pending_verify'
-          AND k.verification_status NOT IN ('opt_out')
+          AND k.verification_status NOT IN ('opt_out')${hidden}
           ${parkingExclusion}
      ORDER BY COALESCE(k.sweep_processed_at, k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
@@ -689,7 +701,10 @@ export function pickBatchBiased(
               k.verification_status, k.enrichment_status,
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
-   INNER JOIN agent_knowledge k ON k.agent_id = a.id`;
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id${catalogHiddenIdExclusionSql(db, "a")}`;
+  // (The catalog_hidden exclusion — "" when there is no hidden row — sits in
+  // the INNER JOIN's ON clause: for an inner join that is the same as a WHERE
+  // term, and it reaches all five queries below through this shared prefix.)
 
   // ── Round-robin ordering (dev-request 2026-08-10-verifier-portkjede-og-
   // provenansrydding, skive F — Daniel: «Unngå å kjøre gjennom de samme
