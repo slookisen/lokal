@@ -28,8 +28,16 @@
  * is never turned into a guessed verdict here.
  *
  * Data sent: ONLY the stored about text and the text of the pages the route
- * already fetched (meta description + visible text, HTML stripped). No
- * agent id, producer name, phone/e-mail fields or any other DB value.
+ * already fetched (meta description + visible text, HTML stripped). That
+ * page text is whatever the producer publishes on its own site, so it can
+ * contain the producer's own published contact details (names, phone
+ * numbers, e-mail addresses in footers/contact pages). No value from the
+ * database other than the about text is sent: no agent id, no stored
+ * phone/e-mail/address, no contact_email.
+ *
+ * Prompt delimiters: `<` and `>` are replaced by spaces in the about text
+ * and in all page text (meta description included) before interpolation,
+ * so page content cannot close or forge the <side>/<lagret_tekst> blocks.
  *
  * Caching: successful verdicts are kept in a small in-process cache keyed on
  * a hash of (model, about text, page text), so a re-run of the same weekly
@@ -141,7 +149,18 @@ const TIMEOUT_VERDICT: AboutJudgeVerdictFailed = {
   reason: "judge_timeout — dommer-kall tidsavbrutt",
 };
 
-function buildPrompt(about: string, pages: AboutJudgePage[]): string {
+/** Replace `<` and `>` so interpolated text can never open, close or forge
+ *  one of the prompt's own delimiter tags. PURE. Exported for tests. */
+export function neutralizePromptDelimiters(text: string): string {
+  return (text || "").replace(/[<>]/g, " ");
+}
+
+function buildPrompt(rawAbout: string, rawPages: AboutJudgePage[]): string {
+  const about = neutralizePromptDelimiters(rawAbout);
+  const pages = rawPages.map((p) => ({
+    url: neutralizePromptDelimiters(p.url).replace(/"/g, "%22"),
+    text: neutralizePromptDelimiters(p.text),
+  }));
   const caps = allotPageBudgets(pages.map((p) => p.text.length), ABOUT_JUDGE_TOTAL_PAGE_CHARS);
   const pageBlocks = pages
     .map((p, i) => `<side nr="${i + 1}" url="${p.url}">\n${p.text.slice(0, caps[i])}\n</side>`)

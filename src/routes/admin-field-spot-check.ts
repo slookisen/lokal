@@ -204,6 +204,10 @@ export interface AboutSpotCheckOutcome extends FieldSpotCheckResult {
   judge: "llm" | "deterministic";
   /** The model's unsupported claims (judge "llm" + mismatch), else []. */
   unsupported_claims: string[];
+  /** Set when the judge was asked but could not answer (no API key,
+   *  timeout, network/HTTP/parse error); null otherwise — so a judge
+   *  outage is machine-visible in the weekly report, not silent. */
+  judge_failure: "unavailable" | "timeout" | "error" | null;
 }
 
 /** Was the deterministic about failure on PARAPHRASE grounds only? Precisely:
@@ -220,8 +224,13 @@ export function isAboutFailureParaphraseOnly(
   about: string | null | undefined,
   pages: readonly SpotCheckFetchedPage[],
 ): { paraphraseOnly: boolean; facts: string[]; absent: string[] } {
+  // Reader-visible text ONLY (meta description + body text, entities
+  // decoded). Raw markup is deliberately excluded: a fabricated fact that
+  // only occurs in a <script> config, an attribute or a font name must NOT
+  // count as "on the page", or a judge outage would downgrade a real
+  // mismatch to "unverifiable" (review B1).
   const combined = pages
-    .map((p) => `${p.html}\n${visibleTextOf(p.html)}\n${judgePageTextFromHtml(p.html)}`)
+    .map((p) => `${visibleTextOf(p.html)}\n${judgePageTextFromHtml(p.html)}`)
     .join("\n");
   const { facts, absent } = findAboutCandidateFactsAbsentFromSource(about, combined);
   return { paraphraseOnly: facts.length >= ABOUT_FACT_MIN_FACTS && absent.length === 0, facts, absent };
@@ -258,7 +267,12 @@ export async function resolveAboutSpotCheck(
   pages: readonly SpotCheckFetchedPage[],
   deps: { judge?: typeof judgeAboutAgainstPages } = {},
 ): Promise<AboutSpotCheckOutcome> {
-  const base: AboutSpotCheckOutcome = { ...deterministic, judge: "deterministic", unsupported_claims: [] };
+  const base: AboutSpotCheckOutcome = {
+    ...deterministic,
+    judge: "deterministic",
+    unsupported_claims: [],
+    judge_failure: null,
+  };
   const text = (about ?? "").trim();
   if (deterministic.status !== "mismatch" || !text || pages.length === 0) return base;
 
@@ -303,6 +317,7 @@ export async function resolveAboutSpotCheck(
   if (p.paraphraseOnly) {
     return {
       ...base,
+      judge_failure: verdict.failure,
       status: "unverifiable",
       reason:
         `LLM judge unavailable (${verdict.failure}: ${verdict.reason}); the deterministic failure is on paraphrase ` +
@@ -312,6 +327,7 @@ export async function resolveAboutSpotCheck(
   }
   return {
     ...base,
+    judge_failure: verdict.failure,
     reason:
       `${deterministic.reason} | LLM judge unavailable (${verdict.failure}: ${verdict.reason}); deterministic mismatch kept` +
       (p.absent.length > 0
@@ -856,7 +872,7 @@ router.post("/", async (req: Request, res: Response) => {
     const result: AboutSpotCheckOutcome =
       fieldName === "about"
         ? await resolveAboutSpotCheck(fieldValue, deterministic, fetchedPages)
-        : { ...deterministic, judge: "deterministic", unsupported_claims: [] };
+        : { ...deterministic, judge: "deterministic", unsupported_claims: [], judge_failure: null };
 
     res.json({
       success: true,
@@ -877,6 +893,9 @@ router.post("/", async (req: Request, res: Response) => {
       judge: result.judge,
       // about + judge "llm" + mismatch: the claims the pages do not support.
       unsupported_claims: result.unsupported_claims,
+      // about only: "unavailable" | "timeout" | "error" when the judge was
+      // asked but could not answer; null otherwise.
+      judge_failure: result.judge_failure,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
