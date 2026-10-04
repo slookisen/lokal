@@ -54,6 +54,9 @@
  *       .../gardssalg-outreach-lane {"paused": false} acknowledges every bounce
  *       known at the lift (dry + real run do not re-pause — AC1/AC2); a NEW
  *       bounce after the lift still auto-pauses; a no-op lift acks nothing
+ *   (m) tickGardssalgOutreachDaily: no run yet today -> runs and persists
+ *       the stamp (boot_job_state); a restart later in the window (memory
+ *       empty) -> skipped; the next day -> runs
  */
 
 export interface TestSummary {
@@ -207,6 +210,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       const {
         shouldRunGardssalgOutreachDaily,
         runGardssalgOutreachDaily,
+        tickGardssalgOutreachDaily,
         getGardssalgOutreachLaneState,
         setGardssalgOutreachLanePaused,
         findGardssalgOutreachRecentBounces,
@@ -622,6 +626,37 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       );
       assertEq(getGardssalgOutreachLaneState(expDb).bounce_ack_max_id, betaComplaintId, "l12: …and the auto-pause acknowledges it");
       assertEq(sent.length, sentBeforeL, "l13: nothing was e-mailed anywhere in (l)");
+
+      // ── (m) the 08:00Z tick persists "ran today": a deploy/restart later in
+      // the window does not run the job a second time that day ───────────
+      {
+        const stateKey = opplevelserMod.GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY;
+        const stamp = () =>
+          (rfbDb.prepare(`SELECT last_completed_at FROM boot_job_state WHERE job = ?`).get(stateKey) as { last_completed_at: string } | undefined)
+            ?.last_completed_at ?? null;
+        const runsBefore = runsFor().length;
+        const early = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T07:59:00Z"), lastRunAt: null });
+        assertEq([early.report, stamp()], [null, null], "m1: 07:59Z -> outside the window, nothing run, nothing stamped");
+        const first = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:09:00Z"), lastRunAt: null });
+        assertEq(
+          [first.report?.trigger, first.report?.envelope_recorded, first.lastRunAt?.toISOString(), stamp()],
+          ["cron", true, "2026-11-02T08:09:00.000Z", "2026-11-02T08:09:00.000Z"],
+          "m2: no run yet today -> the tick runs the job and persists the stamp",
+        );
+        const restarted = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:52:00Z"), lastRunAt: null });
+        assertEq(
+          [restarted.report, restarted.lastRunAt?.toISOString(), runsFor().length],
+          [null, "2026-11-02T08:09:00.000Z", runsBefore + 1],
+          "m3: restart at 08:52Z (memory empty) after the 08:09Z run -> skipped, no second envelope",
+        );
+        const nextDay = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T08:05:00Z"), lastRunAt: null });
+        assertEq([nextDay.report !== null, stamp()], [true, "2026-11-03T08:05:00.000Z"], "m4: next day 08:05Z -> runs again");
+        const indexSrc = require("fs").readFileSync(require("path").join(__dirname, "..", "index.ts"), "utf8") as string;
+        assertTrue(
+          indexSrc.includes("tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })"),
+          "m5: the 08:00Z tick in index.ts goes through tickGardssalgOutreachDaily",
+        );
+      }
     } catch (err) {
       failed++;
       failures.push(`✗ harness error: ${err instanceof Error ? err.stack || err.message : String(err)}`);

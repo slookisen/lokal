@@ -11,7 +11,9 @@
  *   - runExclusiveBootJob(): a FIFO gate so boot jobs never run concurrently.
  *   - persisted "last completed" timestamps (table boot_job_state, created in
  *     database/init.ts) + shouldSkipRecentRun(): lets url-backfill skip a
- *     restart that happens soon after its last completed run.
+ *     restart that happens soon after its last completed run. The two daily
+ *     outreach ticks use the same table (resolveDailyJobLastRunAt) so a
+ *     restart inside their send window does not run them twice in one day.
  *
  * Nothing here changes what a job computes — only when and in what slices.
  */
@@ -97,6 +99,21 @@ export function markJobCompleted(db: any, job: string, at: Date = new Date()): v
   } catch (err) {
     console.error(`[boot-job-state] could not persist completion of ${job} (non-fatal):`, err);
   }
+}
+
+/**
+ * A once-a-day cron tick's effective "last run": the later of this process's
+ * in-memory stamp and the persisted one, so a restart or deploy inside the
+ * job's window does not run a job again that already ran today (the two
+ * daily outreach sends, src/index.ts). A persisted stamp in the future (clock
+ * skew) is not trusted, same rule as shouldSkipRecentRun.
+ */
+export function resolveDailyJobLastRunAt(db: any, job: string, inMemory: Date | null, now: Date): Date | null {
+  const persisted = getJobLastCompletedAt(db, job);
+  const trusted = persisted && persisted.getTime() <= now.getTime() ? persisted : null;
+  if (!trusted) return inMemory;
+  if (!inMemory) return trusted;
+  return trusted.getTime() > inMemory.getTime() ? trusted : inMemory;
 }
 
 /** Parse the min-interval env value (hours); falls back to the default on junk. 0 disables skipping. */

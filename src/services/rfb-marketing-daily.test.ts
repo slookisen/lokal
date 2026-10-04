@@ -36,7 +36,9 @@
  *       a new bounce re-pauses; soft/old/other-vertical bounces ignored;
  *       lifting a routine's/human's pause acknowledges the bounces known at
  *       the lift (2026-10-04), a no-op lift acknowledges nothing
- *   (k) G3 health red → skip without pausing; /health threshold drift guard
+ *   (k) G3 health red → skip without pausing; /health threshold drift guard;
+ *       (k') tickRfbMarketingDaily persists "ran today" — a restart later in
+ *       the window skips, a health_red run does not stamp
  *   (l) G4 budget from the DB: RFB cap, OUTREACH_MAX_PER_DAY remainder,
  *       sends made elsewhere today
  *   (m) OUTREACH_PAUSED kill-switch
@@ -886,7 +888,49 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         [false, false, true, true],
         "k8: a health_red (or run_in_progress) skip does not use up the day's tick window",
       );
-      assertTrue(indexSrc.includes("if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;"), "k9: the 08:10Z tick stamps lastRunAt only through that rule");
+      // Updated 2026-10-04: the stamp logic moved from index.ts into
+      // tickRfbMarketingDaily (it is now also persisted) — the rule itself is
+      // asserted on behaviour in k11–k12 below instead of on index.ts text.
+      assertTrue(
+        indexSrc.includes("tickRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })"),
+        "k9: the 08:10Z tick in index.ts goes through tickRfbMarketingDaily (which stamps only through that rule)",
+      );
+    }
+
+    // ── (k') the 08:10Z tick persists "ran today" (boot_job_state): a deploy /
+    // restart later inside the window does not run the job a second time ──
+    freshDb();
+    seedProducer("k-2", "Tikk Gård", "tikk@gard-test.no");
+    seedProducer("k-3", "Takk Gård", "takk@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const t = makeTransport();
+      const stamp = () =>
+        (db.prepare(`SELECT last_completed_at FROM boot_job_state WHERE job = ?`).get(daily.RFB_MARKETING_DAILY_JOB_STATE_KEY) as
+          | { last_completed_at: string }
+          | undefined)?.last_completed_at ?? null;
+      const red = () => ({ red: true, reasons: ["memory critical"], rss_mb: 500, disk_used_pct: 10 });
+      const tick = (iso: string, health: () => any = healthy) =>
+        daily.tickRfbMarketingDaily({ now: new Date(iso), lastRunAt: null, deps: { sendRaw: t.sendRaw, healthProbe: health } });
+      const k10 = await tick("2026-11-02T08:09:00Z");
+      assertEq([k10.report, stamp()], [null, null], "k10: 08:09Z → before the window, nothing run or stamped");
+      const k11 = await tick("2026-11-02T08:12:00Z", red);
+      assertEq([k11.report?.skipped_reason, k11.lastRunAt, stamp()], ["health_red", null, null], "k11: a health_red run does not stamp (memory or DB)");
+      const k12 = await tick("2026-11-02T08:22:00Z");
+      assertEq(
+        [k12.report?.summary.sent, k12.lastRunAt?.toISOString(), stamp(), t.calls.length],
+        [1, "2026-11-02T08:22:00.000Z", "2026-11-02T08:22:00.000Z", 1],
+        "k12: no run yet today → the next tick runs, sends, and persists the stamp",
+      );
+      const runsAfterFirst = runsRows().length;
+      const k13 = await tick("2026-11-02T08:52:00Z");
+      assertEq(
+        [k13.report, k13.lastRunAt?.toISOString(), t.calls.length, runsRows().length],
+        [null, "2026-11-02T08:22:00.000Z", 1, runsAfterFirst],
+        "k13: restart at 08:52Z (memory empty) after the 08:22Z run → skipped: no e-mail, no second envelope",
+      );
+      const k14 = await tick("2026-11-03T08:15:00Z");
+      assertEq([k14.report !== null, stamp()], [true, "2026-11-03T08:15:00.000Z"], "k14: next day 08:15Z → runs again");
     }
 
     // ── (l) G4 — budget from the database ──────────────────────────────────

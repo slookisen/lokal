@@ -146,6 +146,7 @@ import {
 } from "../routes/admin-outreach-candidates";
 import { executeCompose, resolveDailyOutreachCap, type ComposeDeps, type ComposeOutcome } from "../routes/crm";
 import { diskUsage } from "../routes/admin-db-backup";
+import { markJobCompleted, resolveDailyJobLastRunAt } from "./boot-job-gate";
 import { emailService } from "./email-service";
 import { recordRun } from "./run-ledger";
 import { marketplaceRegistry } from "./marketplace-registry";
@@ -268,6 +269,36 @@ export function shouldRunRfbMarketingDaily(opts: {
  */
 export function rfbMarketingRunConsumesWindow(r: { skipped_reason: string | null }): boolean {
   return r.skipped_reason !== "run_in_progress" && r.skipped_reason !== "health_red";
+}
+
+/** boot_job_state key holding the 08:10Z tick's durable "ran today" stamp. */
+export const RFB_MARKETING_DAILY_JOB_STATE_KEY = "rfb-marketing-daily";
+
+/**
+ * One 10-minute cron tick (src/index.ts). `lastRunAt` is the process's own
+ * memory, which a deploy/restart wipes: a restart at 08:52Z after an 08:15Z
+ * run used to run the job a second time that day (first tick at boot+120s).
+ * The ledger kept that from exceeding the cap or re-mailing an address, but
+ * the second run still spent whatever budget was left and wrote a second
+ * envelope. The stamp is therefore also persisted (boot_job_state) and read
+ * back here. Both are written only for a run that consumes the window
+ * (rfbMarketingRunConsumesWindow) — a run_in_progress / health_red skip is
+ * retried on the next tick inside the window, as before. Returns the stamp
+ * to keep in memory and the report (null when the scheduling guard said
+ * "not now").
+ */
+export async function tickRfbMarketingDaily(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+  deps?: RfbMarketingDailyDeps;
+}): Promise<{ lastRunAt: Date | null; report: RfbMarketingDailyRunReport | null }> {
+  const db = getDb();
+  const lastRunAt = resolveDailyJobLastRunAt(db, RFB_MARKETING_DAILY_JOB_STATE_KEY, opts.lastRunAt, opts.now);
+  if (!shouldRunRfbMarketingDaily({ now: opts.now, lastRunAt })) return { lastRunAt, report: null };
+  const report = await runRfbMarketingDaily({ apply: true, trigger: "cron", now: opts.now, deps: opts.deps });
+  if (!rfbMarketingRunConsumesWindow(report)) return { lastRunAt, report };
+  markJobCompleted(db, RFB_MARKETING_DAILY_JOB_STATE_KEY, opts.now);
+  return { lastRunAt: opts.now, report };
 }
 
 function utcDay(d: Date): string {

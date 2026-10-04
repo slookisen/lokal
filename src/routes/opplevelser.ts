@@ -14943,6 +14943,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
 import { recordRun } from "../services/run-ledger";
+import { markJobCompleted, resolveDailyJobLastRunAt } from "../services/boot-job-gate";
 import {
   indexRfbByDomain,
   indexRfbByName,
@@ -20016,6 +20017,32 @@ export async function runGardssalgOutreachDaily(opts: {
   } finally {
     gardssalgOutreachDailyApplyInFlight = false;
   }
+}
+
+/** boot_job_state key (RFB db) holding the 08:00Z tick's durable "ran today" stamp. */
+export const GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY = "gardssalg-outreach-daily";
+
+/**
+ * One 10-minute cron tick (src/index.ts). `lastRunAt` is the process's own
+ * memory, which a deploy/restart wipes: a restart at 08:52Z after an 08:09Z
+ * run used to run the job a second time that day (first tick at boot+90s).
+ * The DB guards kept that from exceeding the cap, but the second run still
+ * spent whatever budget was left, re-ran the autosvar pass and wrote a
+ * second envelope. The stamp is therefore also persisted (boot_job_state)
+ * and read back here. It is written after every run that did not throw —
+ * exactly when the in-memory stamp always was; a throw is retried on the
+ * next tick. Returns the stamp to keep in memory and the report (null when
+ * the scheduling guard said "not now").
+ */
+export async function tickGardssalgOutreachDaily(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+}): Promise<{ lastRunAt: Date | null; report: GardssalgOutreachDailyRunReport | null }> {
+  const lastRunAt = resolveDailyJobLastRunAt(getRfbDb(), GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY, opts.lastRunAt, opts.now);
+  if (!shouldRunGardssalgOutreachDaily({ now: opts.now, lastRunAt })) return { lastRunAt, report: null };
+  const report = await runGardssalgOutreachDaily({ apply: true, trigger: "cron", now: opts.now });
+  markJobCompleted(getRfbDb(), GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY, opts.now);
+  return { lastRunAt: opts.now, report };
 }
 
 async function runGardssalgOutreachDailyOnce(
