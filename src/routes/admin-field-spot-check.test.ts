@@ -466,6 +466,27 @@ export async function runAdminFieldSpotCheckTests(
       "e2e-07: urls_tried reports root fetched first, then the one subpage that actually matched",
     );
 
+    // ── Optional `candidate`: checks a supplied value, read-only ─────────
+    assertEq(e2eResult.body?.candidate_source, "stored", "cand-01: no candidate -> candidate_source stored");
+    const candResult = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "fsc-vollan", field_name: "about", candidate: "Testtekst som ikke står på siden" },
+    });
+    assertEq(candResult.status, 200, "cand-02: candidate request -> 200");
+    assertEq(candResult.body?.candidate_source, "request", "cand-03: candidate_source request");
+    assertEq(candResult.body?.field_value, "Testtekst som ikke står på siden", "cand-04: field_value is the supplied candidate");
+    // No ANTHROPIC_API_KEY in tests: a deterministic miss is "unverifiable"; never "match".
+    assertEq(candResult.body?.status !== "match", true, "cand-05: unsupported candidate is never a match");
+    const storedAfter = db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get("fsc-vollan") as { about: string };
+    assertEq(storedAfter.about, ABOUT, "cand-06: stored about untouched by a candidate check");
+    const badCand = await callRoute(router, {
+      url: "/",
+      headers: { "x-admin-key": testKey, "content-type": "application/json" },
+      body: { agent_id: "fsc-vollan", field_name: "about", candidate: 42 },
+    });
+    assertEq(badCand.status, 400, "cand-07: non-string candidate -> 400");
+
     // ── Dental fallback (dev-request 2026-09-28-dental-field-spot-check-404) ──
     const dentalOk = await callRoute(router, {
       url: "/",

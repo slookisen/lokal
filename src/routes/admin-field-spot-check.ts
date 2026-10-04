@@ -660,9 +660,18 @@ interface KnowledgeRow {
 router.post("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { agent_id?: unknown; field_name?: unknown };
+  const body = (req.body ?? {}) as { agent_id?: unknown; field_name?: unknown; candidate?: unknown };
   const agentId = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
   const fieldName = typeof body.field_name === "string" ? body.field_name.trim() : "";
+  // Optional `candidate`: check this value instead of the stored one (still
+  // read-only — nothing is written). Lets an operator test a proposed
+  // correction, or a deliberately wrong text as a negative control for the
+  // about judge, against the producer's live pages before any write.
+  if (body.candidate !== undefined && (typeof body.candidate !== "string" || body.candidate.length > 3000)) {
+    res.status(400).json({ success: false, error: "candidate must be a string of at most 3000 characters" });
+    return;
+  }
+  const candidateOverride = typeof body.candidate === "string" ? body.candidate : null;
 
   if (!agentId) {
     res.status(400).json({ success: false, error: "agent_id (string) is required" });
@@ -735,7 +744,7 @@ router.post("/", async (req: Request, res: Response) => {
       return;
     }
 
-    const fieldValue = (knowledge as any)?.[column] ?? null;
+    const fieldValue = candidateOverride ?? (knowledge as any)?.[column] ?? null;
 
     // Per-field judgment of the stored value against each fetched page:
     //   about   — write-guard check first, fact-level check
@@ -777,6 +786,8 @@ router.post("/", async (req: Request, res: Response) => {
       agent_id: agentId,
       field_name: fieldName,
       field_value: fieldValue,
+      // "request" when the caller supplied `candidate`, else "stored".
+      candidate_source: candidateOverride !== null ? "request" : "stored",
       root_url: rootUrl,
       status: result.status,
       checked_url: result.checked_url,

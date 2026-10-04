@@ -263,6 +263,14 @@ export async function runAdminFieldSpotCheckAboutJudgeTests(opts: { log?: boolea
         !prompt.includes("Hemmeleg veg"),
         "aj-send-06: no DB personal/contact data (contact_email, agent id, stored address) is sent — only about + page text");
       assertTrue(prompt.length < 30_000, "aj-send-07: prompt within the page-text budget", String(prompt.length));
+      // 2026-10-04 (Saltfjell): judge each fact on its own, allow facts from
+      // different places to be combined, and no blanket "doubt = unsupported".
+      assertTrue(prompt.includes("sjekk hvert faktum for seg"), "aj-send-08: prompt asks for per-fact checking");
+      assertTrue(prompt.includes("settes sammen i én setning"), "aj-send-09: prompt allows facts combined from several places");
+      assertTrue(!prompt.includes("Ved tvil om en konkret faktapåstand, regn den som ikke støttet"),
+        "aj-send-10: blanket doubt-means-unsupported rule is gone");
+      assertTrue(prompt.includes("ikke å finne noe sted på sidene, er det ikke støttet"),
+        "aj-send-11: a concrete fact absent from all pages is still unsupported");
     }
 
     r = await spotCheck("aj-saltfjell", "about",
