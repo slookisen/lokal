@@ -1433,6 +1433,21 @@ console.log("── admin-runs-lock (orchestrator run-lock: /admin/runs/lock, /a
   console.log(`  admin-runs-lock: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── fleet plumbing 2026-10-04: claim-less envelopes (loop-dispatcher wakes,
+// daniel-manual-trigger, fire-markers) no longer clog the verifier queue —
+// POST stores them 'skipped', /pending excludes them + reports aged_out_count ──
+console.log("── admin-runs-verifier-queue (claim-less auto-skip, /pending aged_out_count) ──");
+{
+  const { runAdminRunsVerifierQueueTests } =
+    require("../src/routes/admin-runs-verifier-queue.test") as
+      typeof import("../src/routes/admin-runs-verifier-queue.test");
+  const r = runAdminRunsVerifierQueueTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-runs-verifier-queue: " + f);
+  console.log(`  admin-runs-verifier-queue: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
@@ -2211,9 +2226,11 @@ console.log("── PR-91: listPendingVerification verifier_checked_at guard ─
   const checkedFuture = new Date(Date.now() + 60_000).toISOString();    // 1 min ahead of started_at
   const checkedPast = new Date(Date.now() - 2 * 60_000).toISOString();  // before started_at
 
+  // Rows carry one claim: since 2026-10-04 listPendingVerification excludes
+  // claim-less runs (nothing to probe), and this guard is about verifiable work.
   const ins = memdbPR91.prepare(`
-    INSERT INTO runs (run_id, agent, started_at, status, verifier_state, verifier_checked_at)
-    VALUES (?, 'a', ?, 'completed', 'pending', ?)
+    INSERT INTO runs (run_id, agent, started_at, status, claims, verifier_state, verifier_checked_at)
+    VALUES (?, 'a', ?, 'completed', '[{"type":"commit","value":"x"}]', 'pending', ?)
   `);
   // Row 1: pending + verifier_checked_at set AFTER started_at → must be FILTERED OUT
   ins.run("pr91-checked-future", startedAt, checkedFuture);
