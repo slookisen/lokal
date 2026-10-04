@@ -18,7 +18,13 @@
  * And the NEGATIVE controls that must stay mismatches: 4 fabricated about
  * texts built from real tokens of the same sites, Kvestad's stored road
  * designation "Fv109, 5776 Nå" vs the page's "Reisetevegen 83", Aalan's
- * invented phone number, a wrong house number.
+ * invented phone number, a wrong house number, and (review fix) a wrong
+ * postal code "Reisetevegen 83, 5777 Nå" where the page gives the street in
+ * prose and "N-5776 NÅ" only in its contact block/footer. Two small
+ * synthetic sites (INLINE_PAGES, Kvestad's wording) pin the cross-page rule:
+ * a postal-code conflict on any fetched page outranks a page that shows the
+ * street + number with no postal code at all, in either fetch order. Also
+ * pinned: matched_page_kind and the terms/privacy-page note in the reason.
  *
  * Fixtures (tests/fixtures/field-spot-check/*.html): the real pages fetched
  * 2026-10-04 (aukrust-nordgard.no, oceanfood.no, borgundchili.no,
@@ -133,6 +139,25 @@ const PAGES: Record<string, [string, string?]> = {
   "https://saltfjellrein.no/": ["saltfjell-root.html"],
 };
 
+// Cross-page address scenarios (review fix): small synthetic sites served
+// through the SAME route and the SAME address check, built from the Kvestad
+// page's own wording. Not real pages — they pin the cross-page rule that a
+// postal-code conflict on one fetched page outranks a page that shows the
+// street + number with no postal code at all, in either fetch order.
+const INLINE_PAGES: Record<string, string> = {
+  // conflict on the ROOT, weak match on the terms page
+  "https://kryss-a.example/":
+    "<html><body><p>Gardsutsalet ligg på adressa Reisetevegen 83.</p><footer><p>Kvestad Sideri</p><p>N-5776 NÅ</p></footer>" +
+    '<a href="/salsvilkar">Salsvilkår</a></body></html>',
+  "https://kryss-a.example/salsvilkar":
+    "<html><body><h1>Salsvilkår</h1><p>Seljar er Kvestad Sideri, Reisetevegen 83, e-post post@kryss-a.example.</p></body></html>",
+  // weak match on the ROOT, conflict on the contact page
+  "https://kryss-b.example/":
+    '<html><body><p>Gardsutsalet ligg på adressa Reisetevegen 83.</p><a href="/kontakt-oss">Kontakt oss</a></body></html>',
+  "https://kryss-b.example/kontakt-oss":
+    "<html><body><h1>Kontakt</h1><p>Kvestad Sideri</p><p>Reisetevegen 83</p><p>N-5776 NÅ</p></body></html>",
+};
+
 // Stored values as of 2026-10-04 (GET /admin agent info) unless noted.
 const AUKRUST_ABOUT =
   "Aukrust Gard og Urteri ligg i Lom, ved foten av Lomseggen (2068 moh). Solrike dagar og tørt klima gjev plantene kraft og aroma. Vårt slagord: Å foreine det nyttige og det vakre!";
@@ -226,11 +251,17 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     seed("rp-aalan-w40", "Aalan Gård", "https://www.aalan.no", { address: "www.aalan.no - Lauvdalen 186, 8360 Bøstad" });
     seed("rp-kvestad", "Kvestad Sideri", "https://www.kvestadsideri.no", { address: "Fv109, 5776 Nå" });
     seed("rp-kvestad-real", "Kvestad Sideri", "https://www.kvestadsideri.no", { address: "Reisetevegen 83, 5776 Nå" });
+    seed("rp-kvestad-wrongpc", "Kvestad Sideri", "https://www.kvestadsideri.no", { address: "Reisetevegen 83, 5777 Nå" });
+    seed("rp-cross-a", "Kvestad Sideri", "https://kryss-a.example/", { address: "Reisetevegen 83, 5777 Nå" });
+    seed("rp-cross-a-ok", "Kvestad Sideri", "https://kryss-a.example/", { address: "Reisetevegen 83, 5776 Nå" });
+    seed("rp-cross-b", "Kvestad Sideri", "https://kryss-b.example/", { address: "Reisetevegen 83, 5777 Nå" });
     seed("rp-saltfjell-neg", "Saltfjell Reinprodukter", "https://saltfjellrein.no/", { about: NEG_ABOUT.saltfjell });
 
     (globalThis as any).fetch = (async (url: string | URL | Request) => {
       const u = String(url);
       fetched.push(u);
+      const inline = INLINE_PAGES[u];
+      if (inline !== undefined) return htmlResponse(200, inline);
       const page = PAGES[u];
       if (!page) return htmlResponse(404, "<html><body>Not found</body></html>");
       return htmlResponse(200, fixture(page[0]), page[1] ?? "");
@@ -252,6 +283,7 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     assertEq(r.body?.checked_url, "https://aukrust-nordgard.no/", "rp-about-03: Aukrust matched on the root page itself");
     assertTrue(/^write-guard check: candidate text found verbatim/.test(String(r.body?.reason)),
       "rp-about-04: Aukrust match comes from the write-guard's verbatim branch", String(r.body?.reason));
+    assertEq(r.body?.matched_page_kind, "root", "rp-about-04b: matched_page_kind 'root'");
 
     r = await spotCheck("rp-oceanfood", "about");
     assertEq(r.body?.status, "match", "rp-about-05: Oceanfood stored about (88% significant-word overlap) -> match");
@@ -291,6 +323,7 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     r = await spotCheck("rp-odhumbla", "phone");
     assertEq(r.body?.status, "match", "rp-sub-01: Ødhumbla phone found on /contact-1 -> match");
     assertEq(r.body?.checked_url, "https://www.oedhumbla.no/contact-1", "rp-sub-02: checked_url stamped to /contact-1");
+    assertEq(r.body?.matched_page_kind, "about_contact", "rp-sub-02b: matched_page_kind 'about_contact' (tier 1), no terms/privacy note");
     assertEq(r.body?.urls_tried, ["https://oedhumbla.no", "https://www.oedhumbla.no/about-1", "https://www.oedhumbla.no/contact-1"],
       "rp-sub-03: root (redirected to www) then /about-1, /contact-1 (same host as the post-redirect root)");
 
@@ -315,8 +348,11 @@ export async function runAdminFieldSpotCheckRealPagesTests(
       ],
       "rp-sub-10: about page first, then the terms/privacy pages in document order (dead /personvern does not stop the walk)",
     );
-    assertTrue(/no postal code next to it/.test(String(r.body?.reason)),
-      "rp-sub-11: terms page gives 'Vindhella 717' without a postal code -> street + number decide", String(r.body?.reason));
+    assertTrue(/page gives no postal code anywhere; stored 6888/.test(String(r.body?.reason)),
+      "rp-sub-11: terms page gives 'Vindhella 717' and no postal code anywhere -> street + number decide (weak match)", String(r.body?.reason));
+    assertEq(r.body?.matched_page_kind, "terms_privacy", "rp-sub-12: matched_page_kind 'terms_privacy' (tier 2)");
+    assertTrue(/^matched on a terms\/privacy page — such pages can also list third parties' contact details/.test(String(r.body?.reason)),
+      "rp-sub-13: a terms/privacy-page match says so in its reason, so the weekly report can tell it apart", String(r.body?.reason));
 
     // ── address NEGATIVE controls (b4) ─────────────────────────────────────
     r = await spotCheck("rp-kvestad", "address");
@@ -327,6 +363,32 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     assertEq(r.body?.status, "match", "rp-addr-03 (control): the page's own 'Reisetevegen 83' -> match");
     r = await spotCheck("rp-borgund-wrongnr", "address");
     assertEq(r.body?.status, "mismatch", "rp-addr-neg-04: right street, wrong house number (771 vs 717) -> mismatch");
+    // Review fix: the Kvestad page gives "Reisetevegen 83." in prose and
+    // "N-5776 NÅ" in its contact block/footer — no postal code right after
+    // the street, but the page clearly does not lack one.
+    r = await spotCheck("rp-kvestad-wrongpc", "address");
+    assertEq(r.body?.status, "mismatch", "rp-addr-neg-05: Kvestad stored 'Reisetevegen 83, 5777 Nå' (wrong postal code) vs page's N-5776 -> mismatch");
+    assertTrue(/page gives postal code 5776 and never the stored 5777/.test(String(r.body?.reason)),
+      "rp-addr-neg-06: the mismatch names the conflicting postal code", String(r.body?.reason));
+    r = await spotCheck("rp-kvestad-real", "address");
+    assertTrue(/stored postal code 5776 elsewhere on it/.test(String(r.body?.reason)),
+      "rp-addr-03b (control): the correct 5776 matches because the page gives it (not because the page lacks one)", String(r.body?.reason));
+
+    // Cross-page: a conflict on any fetched page outranks a weak match on
+    // another, whichever comes first.
+    r = await spotCheck("rp-cross-a", "address");
+    assertEq(r.body?.status, "mismatch", "rp-cross-01: conflict on the root (N-5776) + street-only terms page, stored 5777 -> mismatch");
+    assertEq(r.body?.urls_tried, ["https://kryss-a.example/", "https://kryss-a.example/salsvilkar"],
+      "rp-cross-02: the terms page was still fetched and judged");
+    assertTrue(/^contradicted on https:\/\/kryss-a\.example\/: .*outranks the weaker match on https:\/\/kryss-a\.example\/salsvilkar/.test(String(r.body?.reason)),
+      "rp-cross-03: the reason names the conflicting page and the weak match it outranks", String(r.body?.reason));
+    r = await spotCheck("rp-cross-a-ok", "address");
+    assertEq([r.body?.status, r.body?.checked_url], ["match", "https://kryss-a.example/"],
+      "rp-cross-04 (control): the same site with the stored 5776 -> match on the root");
+    r = await spotCheck("rp-cross-b", "address");
+    assertEq(r.body?.status, "mismatch", "rp-cross-05: weak match on the root, conflict on /kontakt-oss, stored 5777 -> mismatch (the weak match did not end the walk)");
+    assertEq(r.body?.urls_tried, ["https://kryss-b.example/", "https://kryss-b.example/kontakt-oss"],
+      "rp-cross-06: the contact page was fetched after the root's weak match");
 
     r = await spotCheck("rp-aalan", "phone");
     assertEq(r.body?.status, "mismatch", "rp-phone-neg-01: Aalan invented phone +47 76 08 45 34 -> mismatch");

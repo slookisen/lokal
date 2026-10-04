@@ -72,7 +72,7 @@ import { parseNameLocationSuffix } from "../services/location-suffix-parser";
 // fourth hand-rolled fetcher must never be added) and
 // checkAboutCandidateSubstantiatedBySource (the SAME substantiation judgment
 // already used at write-time — unchanged, reused, never re-implemented).
-import { fetchPage, visibleTextOf } from "../services/fetch-page";
+import { DEFAULT_FETCH_TIMEOUT_MS, fetchPage, visibleTextOf } from "../services/fetch-page";
 import {
   checkAboutCandidateSubstantiatedBySource,
   type AboutSubstantiationVerdict,
@@ -1715,7 +1715,11 @@ export async function resolveBrregLookup(
 // fetch-page.ts's discoverContentLinks header comment). The FIRST subpage
 // (in discovery order) the field is actually found on wins; provenance is
 // stamped to THAT page's URL, never the root, so a later re-check keeps
-// looking in the right place.
+// looking in the right place. Two refinements: a field check may report a
+// WEAK match (address street + number on a page with no postal code at all)
+// that does not end the walk and loses to a CONFLICT seen on any fetched
+// page (FieldSpotCheckVerdict); and the whole call has a wall-clock budget
+// (FIELD_SPOT_CHECK_BUDGET_MS) after which no further subpage is fetched.
 // ═══════════════════════════════════════════════════════════════════════
 
 /** How many same-domain subpages the field spot-check follows after the
@@ -1789,14 +1793,35 @@ export function fieldSpotCheckSubpageCandidates(
   maxSubpages = FIELD_SPOT_CHECK_MAX_SUBPAGES,
   opts: { extended?: boolean } = {},
 ): string[] {
+  return fieldSpotCheckSubpageCandidatesWithTier(rootHtml, rootUrl, maxSubpages, opts).map((c) => c.url);
+}
+
+/** A subpage candidate plus its tier: 1 = about/contact page, 2 =
+ *  terms/privacy page (extended mode only; the legacy mode is all tier 1). */
+export interface FieldSpotCheckSubpageCandidate {
+  url: string;
+  tier: 1 | 2;
+}
+
+/** fieldSpotCheckSubpageCandidates with each URL's tier kept, so
+ *  computeFieldSpotCheck can say when a match came from a terms/privacy page
+ *  (such pages can also list third parties' contact details: Forbrukerrådet,
+ *  Datatilsynet, the shop platform or payment provider). Same discovery
+ *  rules, same order, same cap. PURE. Exported for tests. */
+export function fieldSpotCheckSubpageCandidatesWithTier(
+  rootHtml: string,
+  rootUrl: string,
+  maxSubpages = FIELD_SPOT_CHECK_MAX_SUBPAGES,
+  opts: { extended?: boolean } = {},
+): FieldSpotCheckSubpageCandidate[] {
   let base: URL;
   try {
     base = new URL(withDefaultScheme(rootUrl));
   } catch {
     return [];
   }
-  const primary: string[] = [];
-  const legal: string[] = [];
+  const primary: FieldSpotCheckSubpageCandidate[] = [];
+  const legal: FieldSpotCheckSubpageCandidate[] = [];
   const seen = new Set<string>();
   for (const m of rootHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)) {
     if (primary.length >= maxSubpages) break; // tier 1 alone already fills the budget
@@ -1817,7 +1842,8 @@ export function fieldSpotCheckSubpageCandidates(
     const key = abs.toString();
     if (seen.has(key)) continue;
     seen.add(key);
-    (tier === 1 ? primary : legal).push(key);
+    if (tier === 1) primary.push({ url: key, tier: 1 });
+    else legal.push({ url: key, tier: 2 });
   }
   return [...primary, ...legal].slice(0, maxSubpages);
 }
@@ -1829,14 +1855,47 @@ export function fieldSpotCheckSubpageCandidates(
  *  either way and returns "unverifiable" instead of "mismatch". */
 export const FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS = 1200;
 
+/** Overall wall-clock budget for ONE computeFieldSpotCheck call. With up to
+ *  FIELD_SPOT_CHECK_MAX_SUBPAGES subpages after the root, and each fetchPage
+ *  call allowed its own 10 s timeout plus one transient retry, a single slow
+ *  site could otherwise hold a spot-check request for well over a minute
+ *  (admin-phone-context-gate-retro-scan.ts's comments record proxy timeouts
+ *  and 0-byte responses from exactly that kind of unbounded sequential
+ *  fetching). No subpage fetch starts once the budget is spent, and each
+ *  subpage fetch's own timeout is capped to what is left of it. Running out
+ *  before a verdict gives "unverifiable", never "mismatch". */
+export const FIELD_SPOT_CHECK_BUDGET_MS = 30_000;
+
+/** What a per-field `substantiate` judgment says about ONE fetched page.
+ *  The two optional flags let a field check express evidence that only
+ *  makes sense across pages (used by the address check in
+ *  admin-field-spot-check.ts; the about/phone checks never set them). */
+export interface FieldSpotCheckVerdict extends AboutSubstantiationVerdict {
+  /** Substantiated, but on weaker evidence (address: street + house number
+   *  found on a page that gives no postal code at all). A weak match does
+   *  NOT end the walk: the remaining candidate pages are still checked, and
+   *  a `conflict` on any fetched page turns the result into a mismatch. */
+  weak?: boolean;
+  /** NOT substantiated, and the page positively contradicts the stored
+   *  value (address: the same street + house number with a different postal
+   *  code). Overrides a weak match from any other page. */
+  conflict?: boolean;
+}
+
+/** Kind of page a match came from: the root page, an about/contact subpage
+ *  (tier 1) or a terms/privacy subpage (tier 2). */
+export type FieldSpotCheckPageKind = "root" | "about_contact" | "terms_privacy";
+
 export interface FieldSpotCheckResult {
   /** "match": substantiated on the root or a followed subpage.
-   *  "mismatch": not substantiated anywhere fetched — the only outcome that
-   *  should ever be escalated/paused downstream.
-   *  "unverifiable": the root page itself could not be fetched at all, so no
-   *  confident judgment either way was possible — NEVER treated as a
-   *  mismatch (same fail-closed-toward-no-action posture as the rest of
-   *  this file's checks). */
+   *  "mismatch": not substantiated anywhere fetched, or positively
+   *  contradicted on a fetched page — the only outcome that should ever be
+   *  escalated/paused downstream.
+   *  "unverifiable": the root page itself could not be fetched at all, the
+   *  fetched pages carry too little static text, or the time budget ran out
+   *  before a verdict — no confident judgment either way was possible, so
+   *  NEVER treated as a mismatch (same fail-closed-toward-no-action posture
+   *  as the rest of this file's checks). */
   status: "match" | "mismatch" | "unverifiable";
   /** The URL the field was actually found on (status "match"), or the root
    *  URL (status "mismatch"/"unverifiable") — this is what provenance
@@ -1845,7 +1904,16 @@ export interface FieldSpotCheckResult {
   /** Every URL actually fetched, in order (root first) — for logging/audit. */
   urls_tried: string[];
   reason: string;
+  /** Status "match" only: which kind of page the match came from. A
+   *  "terms_privacy" match is also called out in `reason`, so the weekly
+   *  report can tell these matches apart (such pages can list third
+   *  parties' contact details too). */
+  matched_page_kind?: FieldSpotCheckPageKind;
 }
+
+const TERMS_PRIVACY_MATCH_NOTE =
+  "matched on a terms/privacy page — such pages can also list third parties' contact details " +
+  "(Forbrukerrådet, Datatilsynet, the shop platform or payment provider), so confirm it is the producer's own";
 
 /**
  * Re-verify one field's stored value against its live source page(s):
@@ -1857,23 +1925,37 @@ export interface FieldSpotCheckResult {
  * checkAboutCandidateSubstantiatedBySource (about-source-substantiation.ts)
  * — reused UNCHANGED, per this fix's own scope: only WHICH pages get
  * fetched changes, never how a field is judged against page text.
+ *
+ * Cross-page evidence (FieldSpotCheckVerdict): a `weak` match does not stop
+ * the walk, and a `conflict` on any fetched page outranks a weak match, so a
+ * page that shows the address with a different postal code is never hidden
+ * by another page that shows the street + number without one. A full
+ * (non-weak) match still ends the walk at once, as before.
+ *
+ * Time budget: `input.budgetMs` (default FIELD_SPOT_CHECK_BUDGET_MS); see
+ * that constant. `deps.now` is a test seam (defaults to Date.now).
  */
 export async function computeFieldSpotCheck(
   input: {
     field_value: string | null;
     root_url: string;
     maxSubpages?: number;
+    budgetMs?: number;
   },
   deps: {
     fetchImpl?: typeof fetch;
     substantiate?: (
       candidate: string | null | undefined,
       sourceText: string | null | undefined,
-    ) => AboutSubstantiationVerdict;
+    ) => FieldSpotCheckVerdict;
+    now?: () => number;
   } = {},
 ): Promise<FieldSpotCheckResult> {
   const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
   const maxSubpages = input.maxSubpages ?? FIELD_SPOT_CHECK_MAX_SUBPAGES;
+  const budgetMs = input.budgetMs ?? FIELD_SPOT_CHECK_BUDGET_MS;
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
   const urlsTried: string[] = [];
   let visibleChars = 0;
 
@@ -1890,49 +1972,100 @@ export async function computeFieldSpotCheck(
       reason: `root page fetch failed (${rootResult.reason}) — cannot confidently judge, not treated as a mismatch`,
     };
   }
+  const rootCheckedUrl = rootResult.finalUrl || input.root_url;
+
+  const matchResult = (url: string, kind: FieldSpotCheckPageKind, reason: string): FieldSpotCheckResult => ({
+    status: "match",
+    checked_url: url,
+    urls_tried: urlsTried,
+    reason: kind === "terms_privacy" ? `${TERMS_PRIVACY_MATCH_NOTE}: ${reason}` : reason,
+    matched_page_kind: kind,
+  });
 
   visibleChars += visibleTextOf(rootResult.html).length;
   const rootSourceText = `${rootResult.html}\n${visibleTextOf(rootResult.html)}`;
-  const rootVerdict = substantiate(input.field_value, rootSourceText);
-  if (rootVerdict.substantiated) {
-    return {
-      status: "match",
-      checked_url: rootResult.finalUrl || input.root_url,
-      urls_tried: urlsTried,
-      reason: rootVerdict.reason,
-    };
+  const rootVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, rootSourceText);
+  if (rootVerdict.substantiated && !rootVerdict.weak) {
+    return matchResult(rootCheckedUrl, "root", rootVerdict.reason);
   }
 
-  const subpages = fieldSpotCheckSubpageCandidates(
-    rootResult.html,
-    rootResult.finalUrl || input.root_url,
-    maxSubpages,
-    { extended: true },
-  );
-  for (const subpageUrl of subpages) {
+  // The first weak match and the first conflict seen, in fetch order.
+  let weak: { url: string; kind: FieldSpotCheckPageKind; reason: string } | null = rootVerdict.substantiated
+    ? { url: rootCheckedUrl, kind: "root", reason: rootVerdict.reason }
+    : null;
+  let conflict: { url: string; reason: string } | null =
+    !rootVerdict.substantiated && rootVerdict.conflict ? { url: rootCheckedUrl, reason: rootVerdict.reason } : null;
+
+  const subpages = fieldSpotCheckSubpageCandidatesWithTier(rootResult.html, rootCheckedUrl, maxSubpages, {
+    extended: true,
+  });
+  let notChecked = 0;
+  for (let i = 0; i < subpages.length; i++) {
+    const { url: subpageUrl, tier } = subpages[i]!;
+    const remainingMs = budgetMs - (now() - startedAt);
+    if (remainingMs <= 0) {
+      notChecked = subpages.length - i;
+      break;
+    }
     const subResult = await fetchPage(subpageUrl, {
       userAgent: "Lokal-FieldSpotCheck/1.0",
       fetchImpl: deps.fetchImpl,
+      timeoutMs: Math.min(DEFAULT_FETCH_TIMEOUT_MS, remainingMs),
     });
     urlsTried.push(subpageUrl);
     if (!subResult.ok) continue; // one dead subpage link never aborts the others
     visibleChars += visibleTextOf(subResult.html).length;
     const subSourceText = `${subResult.html}\n${visibleTextOf(subResult.html)}`;
-    const subVerdict = substantiate(input.field_value, subSourceText);
-    if (subVerdict.substantiated) {
-      return {
-        status: "match",
-        checked_url: subResult.finalUrl || subpageUrl,
-        urls_tried: urlsTried,
-        reason: subVerdict.reason,
-      };
+    const subVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, subSourceText);
+    const pageUrl = subResult.finalUrl || subpageUrl;
+    const kind: FieldSpotCheckPageKind = tier === 2 ? "terms_privacy" : "about_contact";
+    if (subVerdict.substantiated && !subVerdict.weak) {
+      // The stored value itself is on this page. If another page contradicted
+      // it, the site disagrees with itself — still a match, but say so.
+      const note = conflict ? ` (note: ${conflict.url} contradicts it — ${conflict.reason})` : "";
+      return matchResult(pageUrl, kind, `${subVerdict.reason}${note}`);
     }
+    if (subVerdict.substantiated) {
+      weak ??= { url: pageUrl, kind, reason: subVerdict.reason };
+    } else if (subVerdict.conflict) {
+      conflict ??= { url: pageUrl, reason: subVerdict.reason };
+    }
+  }
+  const budgetNote =
+    notChecked > 0
+      ? `time budget (${budgetMs} ms) spent after ${urlsTried.length} page(s); ${notChecked} subpage(s) not checked`
+      : "";
+
+  if (conflict) {
+    return {
+      status: "mismatch",
+      checked_url: rootCheckedUrl,
+      urls_tried: urlsTried,
+      reason:
+        `contradicted on ${conflict.url}: ${conflict.reason}` +
+        (weak ? ` — this outranks the weaker match on ${weak.url} (${weak.reason})` : ""),
+    };
+  }
+  if (weak) {
+    return matchResult(
+      weak.url,
+      weak.kind,
+      `${weak.reason}${budgetNote ? ` (${budgetNote} for a conflicting value)` : ""}`,
+    );
+  }
+  if (notChecked > 0) {
+    return {
+      status: "unverifiable",
+      checked_url: rootCheckedUrl,
+      urls_tried: urlsTried,
+      reason: `${budgetNote} before a verdict — cannot confidently judge, not treated as a mismatch`,
+    };
   }
 
   if (visibleChars < FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS) {
     return {
       status: "unverifiable",
-      checked_url: rootResult.finalUrl || input.root_url,
+      checked_url: rootCheckedUrl,
       urls_tried: urlsTried,
       reason: `fetched page(s) carry only ${visibleChars} visible chars of static text (< ${FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS}) — too little content to judge, not treated as a mismatch`,
     };
@@ -1940,7 +2073,7 @@ export async function computeFieldSpotCheck(
 
   return {
     status: "mismatch",
-    checked_url: rootResult.finalUrl || input.root_url,
+    checked_url: rootCheckedUrl,
     urls_tried: urlsTried,
     // The root page's own verdict reason is appended so a human reading the
     // weekly report can see WHY (e.g. "street + house number not found" vs

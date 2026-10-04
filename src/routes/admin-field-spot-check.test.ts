@@ -251,6 +251,58 @@ export async function runAdminFieldSpotCheckTests(
     assertEq(addrOk("Ullstindvegen 1242/1246, 9020 Tromsdalen", "<p>Ullstindveien 1246, 9020 Tromsdalen</p>"), true,
       "addr-28: one number of a stored range on the page -> match");
 
+    // ── Address: postal code given ELSEWHERE on the page (W40 b4 review
+    //    fix). When no occurrence of street + number has a postal code right
+    //    after it, a different postal code anywhere on the page is still a
+    //    conflict; "page lacks a postal code" means the WHOLE page. ──────
+    const addrV = (stored: string, page: string) => routeMod.checkAddressSubstantiatedBySource(stored, page);
+    const kvestadLike =
+      "<p>Gardsutsalet ligg på adressa Reisetevegen 83.</p><footer><p>Kvestad Sideri</p><p>N-5776 NÅ</p></footer>";
+    let adv = addrV("Reisetevegen 83, 5777 Nå", kvestadLike);
+    assertEq(adv.substantiated, false, "addr-29: street + number in prose, page gives N-5776 in its footer, stored 5777 -> mismatch");
+    assertEq(adv.conflict, true, "addr-30: that mismatch is flagged as a conflict (outranks a weak match on another page)");
+    assertEq(/postal code 5776 and never the stored 5777/.test(adv.reason), true, "addr-31: the reason names the conflicting postal code");
+    adv = addrV("Reisetevegen 83, 5776 Nå", kvestadLike);
+    assertEq([adv.substantiated, adv.weak ?? false], [true, false], "addr-32: the stored 5776 elsewhere on the page -> full (not weak) match");
+    adv = addrV("Vindhella 717, 6888 Borgund", "<p>Selger er Brennande Bøtun AS, Vindhella 717, borgundchili@gmail.com</p>");
+    assertEq([adv.substantiated, adv.weak], [true, true], "addr-33: page gives no postal code anywhere -> WEAK match");
+    adv = addrV(
+      "Storgata 1, 0150 Oslo",
+      "<p>Storgata 1</p><p>© 2024 Gården. Publisert 23. august 2011 Eplemyntekake. Født 03.06.2020 Sidet. " +
+        "Borgund Chili 2026 Built with WooCommerce. Tlf 4163 4422 Kari.</p>",
+    );
+    assertEq([adv.substantiated, adv.weak], [true, true], "addr-34: years, dates, copyright and phone groups are not postal codes -> still the weak match");
+    adv = addrV("Storgata 1, 0150 Oslo", '<p>Storgata 1</p><script type="application/ld+json">{"address":{"postalCode":"0151"}}</script>');
+    assertEq([adv.substantiated, adv.conflict], [false, true], "addr-35: JSON-LD postalCode 0151 vs stored 0150 -> conflict");
+    adv = addrV("Storgata 1", kvestadLike.replace("Reisetevegen 83", "Storgata 1"));
+    assertEq([adv.substantiated, adv.weak ?? false], [true, false], "addr-36: a stored value without a postal code never conflicts with the page's");
+    adv = addrV("Storgata 1, 0150 Oslo", "<p>Storgata 1, 5003 Bergen</p>");
+    assertEq(adv.conflict, true, "addr-37: a different postal code right after it is a conflict too");
+    adv = addrV("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 18, 8360 Bøstad</p>");
+    assertEq(adv.conflict ?? false, false, "addr-38: street + number not on the page is a plain mismatch, not a conflict");
+
+    // findPagePostalCodes: what counts as a postal code the page gives.
+    const pcs = (page: string) => [...routeMod.findPagePostalCodes(page)].sort();
+    assertEq(pcs("<p>Kvestad Sideri</p><p>N-5776 NÅ</p>"), ["5776"], "pc-01: 'N-5776 NÅ'");
+    assertEq(pcs("<p>Lauvdalen 186<br>8360 Bøstad</p>"), ["8360"], "pc-02: code + place on the line after the street");
+    assertEq(pcs("<p>Fistervegen 64 4139 FISTER</p>"), ["4139"], "pc-03: upper-case place name");
+    assertEq(pcs("<p>Storgata 1, 2000 Lillestrøm</p>"), ["2000"], "pc-04: a year-like code (1700-2099) right after a street + number counts");
+    assertEq(pcs("<p>Postnr: 1940</p>"), ["1940"], "pc-05: a labelled postal code counts without a place word");
+    assertEq(pcs('<script type="application/ld+json">{"postalCode": "4071"}</script>'), ["4071"], "pc-06: schema.org JSON-LD postalCode");
+    assertEq(pcs('<span itemprop="postalCode">4071</span>'), ["4071"], "pc-07: schema.org microdata postalCode");
+    assertEq(pcs("<p>Postboks 4594 Nydalen, 0404 Oslo</p>"), ["0404"], "pc-08: a P.O.-box number is not a postal code; the code after it is");
+    assertEq(
+      pcs(
+        "<p>Borgund Chili 2026 Built with WooCommerce</p><p>Publisert 23. august 2011 Eplemyntekake</p>" +
+          "<p>Født 03.06.2020 Sidet</p><p>leverandørnummer er 8651 Hva er GS1?</p><p>© 2024 Saltfjell Reinprodukter</p>" +
+          "<p>Etablert 1998 Nordgard</p><p>Pris 1250 NOK</p><p>Tlf 4163 4422 Kari</p><p>+47 9758 8479 Ola</p>" +
+          "<p>Sesong 2019–2024 Hagen</p><p>Lomseggen (2068 moh)</p><p>Ope kl. 1200 Velkomen</p><p>Konto 1234.56.78901 Sparebank</p>",
+      ),
+      [],
+      "pc-09: years, dates, copyright, supplier/phone/account numbers, prices, heights and clock times are not postal codes",
+    );
+    assertEq(pcs(""), [], "pc-10: empty page -> none");
+
     // ── about: write-guard first, fact-level as extra chance (pure, W40 b1) ──
     const aboutCheck = (stored: string, page: string) => routeMod.checkAboutSpotCheckSubstantiated(stored, page);
     let av = aboutCheck("Vi produserer ekte gårdshonning fra egne bikuber.", "<p>Vi produserer ekte gårdshonning fra egne bikuber i Hallingdal.</p>");
