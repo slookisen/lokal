@@ -286,7 +286,10 @@ export interface RfbMarketingLaneState {
   changed_at: string | null;
   changed_by: string | null;
   reason: string | null;
-  /** Highest email_bounces.id already acted on by an auto-pause (see G3). */
+  /**
+   * Highest email_bounces.id already acted on: by an auto-pause (see G3), or
+   * by a human lifting a pause (POST /admin/rfb-marketing-lane {"paused": false}).
+   */
   bounce_ack_max_id: number | null;
 }
 
@@ -313,7 +316,8 @@ export function getRfbMarketingLaneState(db: Db): RfbMarketingLaneState {
  * Flip the lane. Anyone with the admin key may pause (routines included);
  * clearing a pause is Daniel's call — same rule as the Opplevagent lane.
  * `bounceAckMaxId` only ever moves UP (an auto-pause records the bounces it
- * acted on); omitted, the stored value is kept.
+ * acted on, a lift the bounces known when it was lifted — see
+ * routes/admin-rfb-marketing.ts); omitted, the stored value is kept.
  */
 export function setRfbMarketingLanePaused(
   db: Db,
@@ -357,7 +361,8 @@ export interface RfbMarketingBounceHit {
  * ledger ('reserved'/'sent'/'unknown' rows may have no sent-log row). The
  * gate never selects an already-bounced address, so a hit is a NEW bounce on
  * a recent send. Bounces with id <= ackMaxId already triggered an auto-pause
- * that a human then cleared; they are not fresh any more.
+ * that a human then cleared, or were known when a human lifted a pause; they
+ * are not fresh any more.
  */
 export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: number | null): RfbMarketingBounceHit[] {
   const since = new Date(now.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);

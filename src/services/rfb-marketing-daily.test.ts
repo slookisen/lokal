@@ -33,7 +33,9 @@
  *       thrown/ambiguous failure on day 1 → no e-mail on day 2; a failing
  *       transport with five candidates → exactly one attempt)
  *   (j) G3 bounce/complaint → auto-pause (apply only), ack survives unpause,
- *       a new bounce re-pauses; soft/old/other-vertical bounces ignored
+ *       a new bounce re-pauses; soft/old/other-vertical bounces ignored;
+ *       lifting a routine's/human's pause acknowledges the bounces known at
+ *       the lift (2026-10-04), a no-op lift acknowledges nothing
  *   (k) G3 health red → skip without pausing; /health threshold drift guard
  *   (l) G4 budget from the DB: RFB cap, OUTREACH_MAX_PER_DAY remainder,
  *       sends made elsewhere today
@@ -816,6 +818,39 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const b2 = bounce("mottaker@gard-test.no", "complaint");
       const again = await run(true, { transport: t, now: tomorrow() });
       assertEq([again.skipped_reason, again.auto_paused, daily.getRfbMarketingLaneState(db).bounce_ack_max_id], ["bounce_or_complaint_recent", true, b2], "j9: a new complaint on a recent recipient re-pauses");
+
+      // Ack on lift (dev-request 2026-10-03-opplevagent-lane-bounce-kvittering,
+      // RFB evaluated too): a pause set by a routine/human on a bounce wrote no
+      // ack, so G3 re-paused the lane on that same bounce at the next run.
+      freshDb();
+      seedProducer("j-2", "Løft Gård", "loft@gard-test.no");
+      seedProducer("j-3", "Etterpå Gård", "etterpa@gard-test.no");
+      seedRecentSend("tidligere@gard-test.no", 3);
+      const b3 = bounce("tidligere@gard-test.no", "hard");
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+      const laneRouter = adminRoutes.rfbMarketingLaneRouter as any;
+      const manual = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: true, by: "marketing-comms-agent", reason: "bounce" } });
+      assertEq([manual.body.paused, manual.body.bounce_ack_max_id, manual.body.acknowledged_bounces], [true, null, undefined], "j11: a routine's own pause writes no ack");
+      const lift = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "daniel" } });
+      assertEq(
+        [lift.body.paused, lift.body.bounce_ack_max_id, (lift.body.acknowledged_bounces as any[]).map((b) => [b.bounce_id, b.recipient_email])],
+        [false, b3, [[b3, "tidligere@gard-test.no"]]],
+        "j12: lifting it acknowledges the bounce G3 would see (echoed in the response)",
+      );
+      const t2 = makeTransport();
+      const dryAfterLift = await run(false, { transport: t2 });
+      assertEq([dryAfterLift.skipped_reason, dryAfterLift.recent_bounces], [null, []], "j13: a dry run right after the lift does not report the acknowledged bounce");
+      const afterLift = await run(true, { transport: t2 });
+      assertEq([afterLift.skipped_reason, afterLift.auto_paused, afterLift.summary.sent > 0], [null, false, true], "j14: the next real run does not re-pause on it and sends");
+      const b4 = bounce(String(t2.calls[0].to).toLowerCase(), "hard");
+      const noop = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "some-routine" } });
+      assertEq([noop.body.bounce_ack_max_id, noop.body.acknowledged_bounces], [b3, []], "j15: paused:false on a lane that is not paused acknowledges nothing");
+      const newBounce = await run(true, { transport: t2, now: tomorrow() });
+      assertEq(
+        [newBounce.skipped_reason, newBounce.auto_paused, newBounce.recent_bounces.map((b) => b.bounce_id), daily.getRfbMarketingLaneState(db).bounce_ack_max_id],
+        ["bounce_or_complaint_recent", true, [b4], b4],
+        "j16: a NEW bounce after the lift still auto-pauses (and only it is reported)",
+      );
 
       // Not fresh: soft bounce, send older than 48h, another platform's send.
       freshDb();
