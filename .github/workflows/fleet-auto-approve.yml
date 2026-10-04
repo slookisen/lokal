@@ -17,7 +17,10 @@ name: Fleet auto-approve
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    # ready_for_review: a PR approved while still a draft fails the merge step
+    # ("Pull request is a draft") and was never re-evaluated once undrafted
+    # (lokal#962, #967, 2026-10-02/03). Re-running on undraft closes that gap.
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
   check_suite:
