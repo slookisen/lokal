@@ -27,6 +27,14 @@
 // server-side from agent_knowledge, so the SKILL never has to know this
 // codebase's DB schema — it just names the agent and the field.
 //
+// Optional `candidate` (non-blank string, <= 3000 chars): checked INSTEAD of
+// the stored value, against the same live pages. Still read-only — nothing
+// is written or stored. For testing a proposed correction, or a deliberately
+// wrong text as a negative control for the about judge, before any write.
+// The response's `candidate_source` is "request" for such a check and
+// "stored" otherwise; only "stored" results describe what is on file (the
+// weekly spot-check sends no candidate).
+//
 // FIELD_COLUMN_MAP is a deliberate WHITELIST (not an arbitrary
 // `agent_knowledge[field_name]` lookup) — field_name comes straight from an
 // external caller's request body, and an unvalidated column name plugged
@@ -660,9 +668,21 @@ interface KnowledgeRow {
 router.post("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { agent_id?: unknown; field_name?: unknown };
+  const body = (req.body ?? {}) as { agent_id?: unknown; field_name?: unknown; candidate?: unknown };
   const agentId = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
   const fieldName = typeof body.field_name === "string" ? body.field_name.trim() : "";
+  // Optional `candidate`: check this value instead of the stored one (still
+  // read-only — nothing is written). Lets an operator test a proposed
+  // correction, or a deliberately wrong text as a negative control for the
+  // about judge, against the producer's live pages before any write.
+  if (
+    body.candidate !== undefined &&
+    (typeof body.candidate !== "string" || !body.candidate.trim() || body.candidate.length > 3000)
+  ) {
+    res.status(400).json({ success: false, error: "candidate must be a non-blank string of at most 3000 characters" });
+    return;
+  }
+  const candidateOverride = typeof body.candidate === "string" ? body.candidate : null;
 
   if (!agentId) {
     res.status(400).json({ success: false, error: "agent_id (string) is required" });
@@ -735,7 +755,7 @@ router.post("/", async (req: Request, res: Response) => {
       return;
     }
 
-    const fieldValue = (knowledge as any)?.[column] ?? null;
+    const fieldValue = candidateOverride ?? (knowledge as any)?.[column] ?? null;
 
     // Per-field judgment of the stored value against each fetched page:
     //   about   — write-guard check first, fact-level check
@@ -777,6 +797,8 @@ router.post("/", async (req: Request, res: Response) => {
       agent_id: agentId,
       field_name: fieldName,
       field_value: fieldValue,
+      // "request" when the caller supplied `candidate`, else "stored".
+      candidate_source: candidateOverride !== null ? "request" : "stored",
       root_url: rootUrl,
       status: result.status,
       checked_url: result.checked_url,
