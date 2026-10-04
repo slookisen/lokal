@@ -41,7 +41,10 @@
  *     mismatch, not a fabrication — the same kind of call profile-
  *     activity-service.ts already made (conversations.query_text over
  *     analytics_queries.agent_id) for the same "which table can actually
- *     answer this honestly" reason.
+ *     answer this honestly" reason. (2026-10-04: rows written since then DO
+ *     carry is_owner + traffic_category and a Referer-derived view_source —
+ *     see humanAgentViewSql in database/init.ts — but older rows do not, so
+ *     this file still reads analytics_page_views.)
  *
  *   - conversations: has NEITHER is_bot NOR is_owner (verified in init.ts —
  *     the same finding profile-activity-service.ts already documented for

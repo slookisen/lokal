@@ -40,7 +40,7 @@
  * raw-only on purpose — Skive 3 does not invent new rollup columns.
  */
 
-import { getDb } from "../database/init";
+import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { getRollupBoundaryDate, isAnalyticsRollupReadEnabled } from "./retention-service";
 import type { VerticalId } from "./analytics-service";
 
@@ -340,6 +340,8 @@ export function getPrunedQueryCountsByCity(cutoffIso: string, vertical?: Vertica
  * (AnalyticsService.getTopProducers). agent_view_daily has no agent_name
  * column (only agent_id) — callers must resolve the display name themselves
  * (e.g. from the `agents` table) for agent_ids that only appear here.
+ * Excludes the LEGACY_AGENT_VIEW_SOURCE bucket (unclassified pre-2026-10-04
+ * rows), mirroring the raw readers' humanAgentViewSql (database/init.ts).
  */
 export function getPrunedAgentViewRows(
   cutoffIso: string,
@@ -352,13 +354,13 @@ export function getPrunedAgentViewRows(
     return db.prepare(`
       SELECT agent_id, city, view_source, SUM(view_count) as view_count
       FROM agent_view_daily
-      WHERE day >= ? AND day < ?${V}
+      WHERE day >= ? AND day < ? AND view_source != ?${V}
       GROUP BY agent_id, city, view_source
-    `).all(w.fromDay, w.boundary, ...vp) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
+    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE, ...vp) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
   });
 }
 
-/** Pruned-day portion of agent_view_daily grouped by city (AnalyticsService.getCityStats.viewCount). */
+/** Pruned-day portion of agent_view_daily grouped by city (AnalyticsService.getCityStats.viewCount). Same legacy-bucket exclusion as above. */
 export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: VerticalId): Record<string, number> {
   return withPrunedWindow(cutoffIso, "analytics_agent_views", {} as Record<string, number>, (w) => {
     const db = getDb();
@@ -366,9 +368,9 @@ export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: Ver
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
       SELECT city, SUM(view_count) as c FROM agent_view_daily
-      WHERE day >= ? AND day < ? AND city != ''${V}
+      WHERE day >= ? AND day < ? AND city != '' AND view_source != ?${V}
       GROUP BY city
-    `).all(w.fromDay, w.boundary, ...vp) as Array<{ city: string; c: number }>;
+    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE, ...vp) as Array<{ city: string; c: number }>;
     const out: Record<string, number> = {};
     for (const r of rows) out[r.city] = r.c || 0;
     return out;

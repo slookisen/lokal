@@ -38,7 +38,7 @@
 //      Idempotent: rows with the same message_id are skipped.
 
 import { Router, Request, Response } from "express";
-import { getDb, isContentQualified } from "../database/init";
+import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { customerRuleSql } from "../services/customer-rule";
 import {
@@ -434,8 +434,10 @@ export function computeOutreachCandidates(
           -- feed the SAME dedupe tiebreaker and are explicitly documented to
           -- agree on a collision winner, so both must count lifetime views the
           -- same way once pruned raw rows live on in agent_view_daily.
-          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id), 0)
-           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id)) AS views_count,
+          -- 2026-10-04 (view-stats honesty): HUMAN views only on both halves
+          -- (humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE in database/init.ts).
+          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id AND d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'), 0)
+           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id AND ${humanAgentViewSql("v")})) AS views_count,
           ${suppressionCols}
         FROM outreach_ready_pool p
         INNER JOIN agents a ON a.id = p.agent_id
@@ -455,8 +457,8 @@ export function computeOutreachCandidates(
           k.google_rating,
           k.google_review_count,
           -- orch-pr-20260903-analytics-rollup-slice2: rollup + raw, see above.
-          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = a.id), 0)
-           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id)) AS views_count,
+          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = a.id AND d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'), 0)
+           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id AND ${humanAgentViewSql("v")})) AS views_count,
           ${suppressionCols}
         FROM agents a
         INNER JOIN agent_knowledge k ON k.agent_id = a.id

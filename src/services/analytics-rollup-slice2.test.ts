@@ -292,20 +292,26 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
       const newCreated = isoDaysAgo(1);
 
+      // 2026-10-04 (view-stats honesty): rows now carry traffic_category.
+      // The original fixture rows are stamped 'human' (what they model); the
+      // legacy NULL-category rows and the classified crawler rows below pin
+      // the new rollup filter.
       const ins = testDb.prepare(
-        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
-         VALUES (?, ?, ?, ?, 'rfb', ?)`,
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at, traffic_category)
+         VALUES (?, ?, ?, ?, 'rfb', ?, ?)`,
       );
-      for (let i = 0; i < 4; i++) ins.run("agent-a", "Gård A", "Oslo", "seo", oldCreated);
-      for (let i = 0; i < 2; i++) ins.run("agent-a", "Gård A", "Oslo", "direct", oldCreated);
-      for (let i = 0; i < 3; i++) ins.run("agent-b", "Gård B", null, null, oldCreated);
-      ins.run("agent-a", "Gård A", "Oslo", "seo", newCreated); // in-window, must survive
+      for (let i = 0; i < 4; i++) ins.run("agent-a", "Gård A", "Oslo", "seo", oldCreated, "human");
+      for (let i = 0; i < 2; i++) ins.run("agent-a", "Gård A", "Oslo", "direct", oldCreated, "human");
+      for (let i = 0; i < 3; i++) ins.run("agent-b", "Gård B", null, null, oldCreated, "human");
+      for (let i = 0; i < 2; i++) ins.run("agent-a", "Gård A", "Oslo", "seo", oldCreated, null);            // legacy
+      for (let i = 0; i < 3; i++) ins.run("agent-a", "Gård A", "Oslo", "seo", oldCreated, "search_engine"); // crawler
+      ins.run("agent-a", "Gård A", "Oslo", "seo", newCreated, "human"); // in-window, must survive
 
-      assertEq(count("analytics_agent_views"), 10, "agent-views setup: 10 seeded rows");
+      assertEq(count("analytics_agent_views"), 15, "agent-views setup: 15 seeded rows");
 
       const r = retention.rollupAndPruneAgentViews(DAYS_TO_KEEP, 7, false);
 
-      assertEq(r.rowsDeleted, 9, "agent-views: 9 out-of-window rows deleted");
+      assertEq(r.rowsDeleted, 14, "agent-views: 14 out-of-window rows deleted (crawler rows too, without rollup)");
       assertEq(count("analytics_agent_views"), 1, "agent-views: only the in-window row remains raw");
 
       const avd = testDb.prepare(
@@ -315,13 +321,15 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
         avd,
         [
           { agent_id: "agent-a", view_source: "direct", city: "Oslo", view_count: 2 },
+          // legacy NULL-category rows keep their history, in the bucket readers exclude
+          { agent_id: "agent-a", view_source: "legacy_unclassified", city: "Oslo", view_count: 2 },
           { agent_id: "agent-a", view_source: "seo", city: "Oslo", view_count: 4 },
           // NULL view_source -> 'unknown', NULL city -> ''
           { agent_id: "agent-b", view_source: "unknown", city: "", view_count: 3 },
         ],
-        "agent_view_daily: per agent/source/city counts match the seeded rows (NULLs coalesced)",
+        "agent_view_daily: per agent/source/city counts match the seeded human + legacy rows (NULLs coalesced, crawler rows not rolled up)",
       );
-      assertEq(sumOf("agent_view_daily", "view_count"), 9, "agent_view_daily: total equals the rolled-up row count");
+      assertEq(sumOf("agent_view_daily", "view_count"), 11, "agent_view_daily: total equals the rolled-up human + legacy row count");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -594,8 +602,8 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       const oldCreated = isoDaysAgo(DAYS_TO_KEEP + 30);
       const newCreated = isoDaysAgo(1);
       const insAv = testDb.prepare(
-        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
-         VALUES ('agent-pool', 'Pool Gård', 'Oslo', 'seo', 'rfb', ?)`,
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at, traffic_category)
+         VALUES ('agent-pool', 'Pool Gård', 'Oslo', 'seo', 'rfb', ?, 'human')`,
       );
       for (let i = 0; i < 5; i++) insAv.run(oldCreated);
       for (let i = 0; i < 2; i++) insAv.run(newCreated);
@@ -629,6 +637,19 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       const after = await viewsCount();
       assertEq(after, before, "outreach-pool: views_count UNCHANGED across a rollup+delete cycle (rollup + remaining raw)");
       assertEq(after, 7, "outreach-pool: views_count is still the full lifetime total (7), not the 2 surviving raw rows");
+
+      // 2026-10-04 (view-stats honesty): crawler, scraper, legacy (NULL
+      // category) and owner views never count toward views_count.
+      const insNonHuman = testDb.prepare(
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at, is_owner, traffic_category)
+         VALUES ('agent-pool', 'Pool Gård', 'Oslo', 'seo', 'rfb', ?, ?, ?)`,
+      );
+      insNonHuman.run(newCreated, 0, "ai_crawler");
+      insNonHuman.run(newCreated, 0, "search_engine");
+      insNonHuman.run(newCreated, 0, "scraper");
+      insNonHuman.run(newCreated, 0, null);
+      insNonHuman.run(newCreated, 1, "human");
+      assertEq(await viewsCount(), 7, "outreach-pool: crawler / scraper / legacy / owner views do not count toward views_count");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -881,9 +902,10 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
         insAgent.run(id, name, email, `key-${id}`);
         insKnowledge.run(id, email, "x".repeat(200));
       }
+      // 2026-10-04 (view-stats honesty): views_count counts human rows only.
       const insView = testDb.prepare(
-        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at)
-         VALUES (?, ?, 'Oslo', 'seo', 'rfb', ?)`,
+        `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id, created_at, traffic_category)
+         VALUES (?, ?, 'Oslo', 'seo', 'rfb', ?, 'human')`,
       );
       function insertViews(agentId: string, name: string, n: number, createdAt: string): void {
         for (let i = 0; i < n; i++) insView.run(agentId, name, createdAt);

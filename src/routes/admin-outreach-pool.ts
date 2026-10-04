@@ -14,7 +14,7 @@
 // Off via ?dedupe_by_email=false; defaults to true.
 
 import { Router, Request, Response } from "express";
-import { getDb, POOL_CONTENT_THRESHOLD_SQL } from "../database/init";
+import { getDb, POOL_CONTENT_THRESHOLD_SQL, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
@@ -655,8 +655,11 @@ router.get("/", (req: Request, res: Response) => {
             -- agent whose views predate the prune cutoff — and would shuffle
             -- dedupe winners as history ages out. Lifetime total = permanent
             -- rollup + whatever raw rows have not been pruned yet.
-            (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id), 0)
-             + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id)) AS views_count
+            -- 2026-10-04 (view-stats honesty): HUMAN views only on both halves
+            -- (humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE in database/init.ts)
+            -- — crawler, scraper and the old city-page-booked rows no longer count.
+            (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id AND d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'), 0)
+             + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id AND ${humanAgentViewSql("v")})) AS views_count
          FROM outreach_ready_pool p
          INNER JOIN agent_knowledge k ON k.agent_id = p.agent_id
          ORDER BY COALESCE(p.outreach_eligible_at, '9999-12-31') ASC

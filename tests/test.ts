@@ -24978,10 +24978,14 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       status TEXT DEFAULT 'pending'
     );
 
+    -- 2026-10-04 view-stats honesty (mirrors init.ts): views_count counts
+    -- is_owner = 0 AND traffic_category = 'human' rows only.
     CREATE TABLE analytics_agent_views (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT DEFAULT (datetime('now')),
+      is_owner INTEGER DEFAULT 0,
+      traffic_category TEXT
     );
 
     -- orch-pr-20260903-analytics-rollup-slice2 (mirrors init.ts): the
@@ -46107,5 +46111,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-agents-dump-contacted-map: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// 2026-10-04 view-stats honesty: producer view statistics count humans, not
+// bots or city pages — /:city no longer books a profile view, trackAgentView
+// stamps is_owner + traffic_category (+ Referer-derived view_source),
+// getTopProducers/getCityStats count human rows only, and
+// /api/agents/:id/stats buckets views with the shared traffic classifier
+// (+ velocity scrapers) behind a 120 s cache. Swaps the getDb() singleton
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── 2026-10-04 view-stats honesty: human-only producer view stats ──");
+  try {
+    const { runAgentStatsViewHonestyTests } = require("../src/routes/agent-stats-view-honesty.test") as
+      typeof import("../src/routes/agent-stats-view-honesty.test");
+    const vh = await runAgentStatsViewHonestyTests({ log: false });
+    passed += vh.passed;
+    failed += vh.failed;
+    for (const f of vh.failures) failures.push("agent-stats-view-honesty: " + f);
+    console.log(`  agent-stats-view-honesty: ${vh.passed} passed, ${vh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-stats-view-honesty: unexpected error: " + String(err?.message || err));
   }
 });

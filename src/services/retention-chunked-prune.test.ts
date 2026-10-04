@@ -92,7 +92,7 @@ export async function runRetentionChunkedPruneTests(opts: { log?: boolean } = {}
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const av = db.prepare(
-      `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, created_at) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, created_at, traffic_category) VALUES (?, ?, ?, ?, ?, ?)`
     );
     db.transaction(() => {
       for (let off = 130; off >= 100; off--) {
@@ -103,7 +103,8 @@ export async function runRetentionChunkedPruneTests(opts: { log?: boolean } = {}
           pv.run(`/p${i % 3}`, i % 2 ? "organic" : null, sess, ts, i % 11 === 0 ? 1 : 0, i % 6 === 0 ? "dental" : "rfb",
             i % 4 === 0 ? "newsletter" : null, i % 4 === 0 ? "email" : null);
           q.run(i % 2 ? "mcp" : "a2a", `q${i % 5}`, i % 3 ? "Oslo" : null, i % 7, i % 4 === 0 ? null : 10 + i, i % 2 ? "ClaudeBot" : null, ts, i % 13 === 0 ? 1 : 0, "rfb");
-          av.run(`agent${i % 3}`, "n", i % 2 ? "Bergen" : null, i % 2 ? "search" : null, ts);
+          av.run(`agent${i % 3}`, "n", i % 2 ? "Bergen" : null, i % 2 ? "search" : null, ts,
+            i % 5 === 0 ? null : i % 5 === 1 ? "search_engine" : "human");
         }
       }
       // In-window rows must survive untouched.
@@ -111,7 +112,7 @@ export async function runRetentionChunkedPruneTests(opts: { log?: boolean } = {}
         const ts = `${dayStr(off)} 12:00:00`;
         pv.run("/keep", "direct", "keep", ts, 0, "rfb", null, null);
         q.run("api", "keep", null, 1, 1, null, ts, 0, "rfb");
-        av.run("keep", "n", null, null, ts);
+        av.run("keep", "n", null, null, ts, "human");
       }
       if (withOdd) {
         // NULL / non-date / bare-date edge rows. 'garbage' sorts after any
@@ -119,7 +120,7 @@ export async function runRetentionChunkedPruneTests(opts: { log?: boolean } = {}
         for (const ts of [null, "garbage", "zzzz-zz-zz zz:zz:zz"]) {
           pv.run("/odd", "x", "odd", ts, 0, "rfb", null, null);
           q.run("api", "odd", null, 1, 1, null, ts, 0, "rfb");
-          av.run("odd", "n", null, null, ts);
+          av.run("odd", "n", null, null, ts, null);
         }
       }
     })();
@@ -192,10 +193,17 @@ export async function runRetentionChunkedPruneTests(opts: { log?: boolean } = {}
      FROM analytics_queries ${W} GROUP BY day, query, vertical_id
      ON CONFLICT(day, query, vertical_id) DO UPDATE SET query_count = query_count + excluded.query_count`,
   ];
+  // 2026-10-04 (view-stats honesty): the reference mirrors the CURRENT
+  // agent-view rollup filter (human + legacy-NULL rows only, legacy into the
+  // 'legacy_unclassified' bucket) — this suite proves chunking equivalence,
+  // not which rows the rollup keeps.
   const LEGACY_AV = [
     `INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count)
-     SELECT substr(created_at, 1, 10) as day, agent_id, COALESCE(view_source, 'unknown'), COALESCE(city, ''), COUNT(*)
-     FROM analytics_agent_views ${W} GROUP BY day, agent_id, view_source, city
+     SELECT substr(created_at, 1, 10) as day, agent_id,
+       CASE WHEN traffic_category IS NULL THEN 'legacy_unclassified' ELSE COALESCE(view_source, 'unknown') END,
+       COALESCE(city, ''), COUNT(*)
+     FROM analytics_agent_views ${W} AND (traffic_category IS NULL OR traffic_category = 'human')
+     GROUP BY 1, 2, 3, 4
      ON CONFLICT(day, agent_id, view_source, city) DO UPDATE SET view_count = view_count + excluded.view_count`,
   ];
 
