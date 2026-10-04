@@ -48,6 +48,15 @@
  *       domain_match fixture can be re-scanned by a later apply:true run
  *       here (the scan pool isn't date-scoped), so this is a deliberate
  *       belt-and-suspenders rather than a AC requirement.
+ *   (l) dev-request 2026-10-03-opplevagent-lane-bounce-kvittering: the
+ *       bounce_ack_max_id migration; an auto-pause acknowledges its bounce;
+ *       a pause set by hand/routine and then lifted via POST
+ *       .../gardssalg-outreach-lane {"paused": false} acknowledges every bounce
+ *       known at the lift (dry + real run do not re-pause — AC1/AC2); a NEW
+ *       bounce after the lift still auto-pauses; a no-op lift acks nothing
+ *   (m) tickGardssalgOutreachDaily: no run yet today -> runs and persists
+ *       the stamp (boot_job_state); a restart later in the window (memory
+ *       empty) -> skipped; the next day -> runs
  */
 
 export interface TestSummary {
@@ -201,8 +210,10 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       const {
         shouldRunGardssalgOutreachDaily,
         runGardssalgOutreachDaily,
+        tickGardssalgOutreachDaily,
         getGardssalgOutreachLaneState,
         setGardssalgOutreachLanePaused,
+        findGardssalgOutreachRecentBounces,
         GARDSSALG_OUTREACH_DAILY_AGENT,
       } = opplevelserMod;
 
@@ -521,6 +532,131 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         (ac3.autosvar_apply?.counts.would_apply ?? 0) + (ac3.autosvar_apply?.counts.already_set ?? 0) > 0,
         "k5: autosvar candidates are still genuinely detected in this dry run (not silently empty)",
       );
+
+      // ── (l) dev-request 2026-10-03-opplevagent-lane-bounce-kvittering:
+      // the lane remembers bounces a human has already lifted a pause for.
+      // Real clock again: alpha + beta were mailed in (e), alpha bounced in
+      // (g), all inside the 48h lookback ──────────────────────────────────
+      {
+        const initExp = require("../database/init-experiences") as typeof import("../database/init-experiences");
+        const oldDb = new Database(":memory:");
+        oldDb.exec(
+          `CREATE TABLE experience_outreach_lane_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1), paused INTEGER NOT NULL DEFAULT 0,
+             changed_at TEXT, changed_by TEXT, reason TEXT)`,
+        );
+        oldDb.prepare(`INSERT INTO experience_outreach_lane_state (id, paused, changed_by) VALUES (1, 1, 'old')`).run();
+        initExp.initExperiencesSchema(oldDb as any);
+        initExp.initExperiencesSchema(oldDb as any);
+        assertEq(
+          oldDb.prepare(`SELECT paused, changed_by, bounce_ack_max_id FROM experience_outreach_lane_state`).get(),
+          { paused: 1, changed_by: "old", bounce_ack_max_id: null },
+          "l0: migration adds bounce_ack_max_id to an existing lane table, idempotently, keeping the row",
+        );
+        oldDb.close();
+      }
+      const sentBeforeL = sent.length;
+      const insBounce = rfbDb.prepare(
+        `INSERT INTO email_bounces (email, bounced_at, resend_email_id, bounce_type, reason) VALUES (?, ?, ?, ?, 'test')`,
+      );
+      const alphaBounceId = (
+        rfbDb.prepare(`SELECT MAX(id) AS id FROM email_bounces WHERE email = 'post@alpha-sideri.no'`).get() as { id: number }
+      ).id;
+      assertEq(getGardssalgOutreachLaneState(expDb).bounce_ack_max_id, alphaBounceId, "l1: (g)'s auto-pause recorded the bounce it acted on");
+      assertEq(
+        findGardssalgOutreachRecentBounces(expDb, rfbDb, new Date(), null).map((b) => [b.bounce_id, b.recipient_email]),
+        [[alphaBounceId, "post@alpha-sideri.no"]],
+        "l2: without the ack the (g) bounce is still inside the 48h lookback",
+      );
+      const lDry1 = await runGardssalgOutreachDaily({ apply: false, trigger: "manual" });
+      assertEq(
+        [lDry1.skipped_reason === "bounce_or_complaint_recent", lDry1.recent_bounces],
+        [false, []],
+        "l3 (AC1): pause lifted in (i) -> the SAME bounce does not trip Guard 3 again",
+      );
+
+      // The 2026-10-03 case: the ROUTINE (not Guard 3) paused on a bounce, so
+      // no ack existed; Daniel lifts it.
+      const betaBounceId = Number(insBounce.run("post@beta-bryggeri.no", new Date().toISOString(), "em-l-beta-1", "hard").lastInsertRowid);
+      const lPause = await callRoute(opplevelserRouter, {
+        method: "POST", headers: auth, body: { paused: true, by: "opplevagent-outreach", reason: "bounce on beta" },
+      });
+      assertEq([lPause.body.paused, lPause.body.bounce_ack_max_id], [true, alphaBounceId], "l4: a pause set by hand/routine writes no ack");
+      assertEq(lPause.body.acknowledged_bounces, undefined, "l5: a pause response carries no acknowledged_bounces");
+      const lLift = await callRoute(opplevelserRouter, { method: "POST", headers: auth, body: { paused: false, by: "daniel" } });
+      assertEq(
+        [lLift.status, lLift.body.paused, lLift.body.changed_by, lLift.body.bounce_ack_max_id],
+        [200, false, "daniel", betaBounceId],
+        "l6: lifting the pause acknowledges the highest bounce id among the lane's recent recipients",
+      );
+      assertEq(
+        (lLift.body.acknowledged_bounces as any[]).map((b) => [b.bounce_id, b.recipient_email]).sort((a, b) => a[0] - b[0]),
+        [[alphaBounceId, "post@alpha-sideri.no"], [betaBounceId, "post@beta-bryggeri.no"]],
+        "l7: the lift response lists the bounces it acknowledged",
+      );
+      const lDry2 = await runGardssalgOutreachDaily({ apply: false, trigger: "manual" });
+      assertEq(
+        [lDry2.skipped_reason === "bounce_or_complaint_recent", lDry2.recent_bounces],
+        [false, []],
+        "l8 (AC2): a dry run right after the lift reports no bounce that was known at the lift",
+      );
+      const lApply = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+      assertEq(
+        [lApply.skipped_reason === "bounce_or_complaint_recent", lApply.auto_paused, getGardssalgOutreachLaneState(expDb).paused],
+        [false, false, false],
+        "l9 (AC1): a real run after the lift does not re-pause on the same bounce",
+      );
+
+      // A NEW bounce after the lift still pauses — and a paused:false on a lane
+      // that is not paused must not silence it.
+      const betaComplaintId = Number(
+        insBounce.run("post@beta-bryggeri.no", new Date().toISOString(), "em-l-beta-2", "complaint").lastInsertRowid,
+      );
+      const lNoop = await callRoute(opplevelserRouter, { method: "POST", headers: auth, body: { paused: false, by: "some-routine" } });
+      assertEq(
+        [lNoop.body.bounce_ack_max_id, lNoop.body.acknowledged_bounces],
+        [betaBounceId, []],
+        "l10: paused:false on a lane that is not paused acknowledges nothing",
+      );
+      const lNew = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+      assertEq(
+        [lNew.skipped_reason, lNew.auto_paused, lNew.recent_bounces.map((b) => [b.bounce_id, b.recipient_email])],
+        ["bounce_or_complaint_recent", true, [[betaComplaintId, "post@beta-bryggeri.no"]]],
+        "l11 (AC1): a NEW complaint after the lift auto-pauses, naming only the new bounce",
+      );
+      assertEq(getGardssalgOutreachLaneState(expDb).bounce_ack_max_id, betaComplaintId, "l12: …and the auto-pause acknowledges it");
+      assertEq(sent.length, sentBeforeL, "l13: nothing was e-mailed anywhere in (l)");
+
+      // ── (m) the 08:00Z tick persists "ran today": a deploy/restart later in
+      // the window does not run the job a second time that day ───────────
+      {
+        const stateKey = opplevelserMod.GARDSSALG_OUTREACH_DAILY_JOB_STATE_KEY;
+        const stamp = () =>
+          (rfbDb.prepare(`SELECT last_completed_at FROM boot_job_state WHERE job = ?`).get(stateKey) as { last_completed_at: string } | undefined)
+            ?.last_completed_at ?? null;
+        const runsBefore = runsFor().length;
+        const early = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T07:59:00Z"), lastRunAt: null });
+        assertEq([early.report, stamp()], [null, null], "m1: 07:59Z -> outside the window, nothing run, nothing stamped");
+        const first = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:09:00Z"), lastRunAt: null });
+        assertEq(
+          [first.report?.trigger, first.report?.envelope_recorded, first.lastRunAt?.toISOString(), stamp()],
+          ["cron", true, "2026-11-02T08:09:00.000Z", "2026-11-02T08:09:00.000Z"],
+          "m2: no run yet today -> the tick runs the job and persists the stamp",
+        );
+        const restarted = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:52:00Z"), lastRunAt: null });
+        assertEq(
+          [restarted.report, restarted.lastRunAt?.toISOString(), runsFor().length],
+          [null, "2026-11-02T08:09:00.000Z", runsBefore + 1],
+          "m3: restart at 08:52Z (memory empty) after the 08:09Z run -> skipped, no second envelope",
+        );
+        const nextDay = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T08:05:00Z"), lastRunAt: null });
+        assertEq([nextDay.report !== null, stamp()], [true, "2026-11-03T08:05:00.000Z"], "m4: next day 08:05Z -> runs again");
+        const indexSrc = require("fs").readFileSync(require("path").join(__dirname, "..", "index.ts"), "utf8") as string;
+        assertTrue(
+          indexSrc.includes("tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })"),
+          "m5: the 08:00Z tick in index.ts goes through tickGardssalgOutreachDaily",
+        );
+      }
     } catch (err) {
       failed++;
       failures.push(`✗ harness error: ${err instanceof Error ? err.stack || err.message : String(err)}`);

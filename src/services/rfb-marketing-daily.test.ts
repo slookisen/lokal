@@ -33,8 +33,12 @@
  *       thrown/ambiguous failure on day 1 → no e-mail on day 2; a failing
  *       transport with five candidates → exactly one attempt)
  *   (j) G3 bounce/complaint → auto-pause (apply only), ack survives unpause,
- *       a new bounce re-pauses; soft/old/other-vertical bounces ignored
- *   (k) G3 health red → skip without pausing; /health threshold drift guard
+ *       a new bounce re-pauses; soft/old/other-vertical bounces ignored;
+ *       lifting a routine's/human's pause acknowledges the bounces known at
+ *       the lift (2026-10-04), a no-op lift acknowledges nothing
+ *   (k) G3 health red → skip without pausing; /health threshold drift guard;
+ *       (k') tickRfbMarketingDaily persists "ran today" — a restart later in
+ *       the window skips, a health_red run does not stamp
  *   (l) G4 budget from the DB: RFB cap, OUTREACH_MAX_PER_DAY remainder,
  *       sends made elsewhere today
  *   (m) OUTREACH_PAUSED kill-switch
@@ -817,6 +821,39 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const again = await run(true, { transport: t, now: tomorrow() });
       assertEq([again.skipped_reason, again.auto_paused, daily.getRfbMarketingLaneState(db).bounce_ack_max_id], ["bounce_or_complaint_recent", true, b2], "j9: a new complaint on a recent recipient re-pauses");
 
+      // Ack on lift (dev-request 2026-10-03-opplevagent-lane-bounce-kvittering,
+      // RFB evaluated too): a pause set by a routine/human on a bounce wrote no
+      // ack, so G3 re-paused the lane on that same bounce at the next run.
+      freshDb();
+      seedProducer("j-2", "Løft Gård", "loft@gard-test.no");
+      seedProducer("j-3", "Etterpå Gård", "etterpa@gard-test.no");
+      seedRecentSend("tidligere@gard-test.no", 3);
+      const b3 = bounce("tidligere@gard-test.no", "hard");
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+      const laneRouter = adminRoutes.rfbMarketingLaneRouter as any;
+      const manual = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: true, by: "marketing-comms-agent", reason: "bounce" } });
+      assertEq([manual.body.paused, manual.body.bounce_ack_max_id, manual.body.acknowledged_bounces], [true, null, undefined], "j11: a routine's own pause writes no ack");
+      const lift = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "daniel" } });
+      assertEq(
+        [lift.body.paused, lift.body.bounce_ack_max_id, (lift.body.acknowledged_bounces as any[]).map((b) => [b.bounce_id, b.recipient_email])],
+        [false, b3, [[b3, "tidligere@gard-test.no"]]],
+        "j12: lifting it acknowledges the bounce G3 would see (echoed in the response)",
+      );
+      const t2 = makeTransport();
+      const dryAfterLift = await run(false, { transport: t2 });
+      assertEq([dryAfterLift.skipped_reason, dryAfterLift.recent_bounces], [null, []], "j13: a dry run right after the lift does not report the acknowledged bounce");
+      const afterLift = await run(true, { transport: t2 });
+      assertEq([afterLift.skipped_reason, afterLift.auto_paused, afterLift.summary.sent > 0], [null, false, true], "j14: the next real run does not re-pause on it and sends");
+      const b4 = bounce(String(t2.calls[0].to).toLowerCase(), "hard");
+      const noop = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "some-routine" } });
+      assertEq([noop.body.bounce_ack_max_id, noop.body.acknowledged_bounces], [b3, []], "j15: paused:false on a lane that is not paused acknowledges nothing");
+      const newBounce = await run(true, { transport: t2, now: tomorrow() });
+      assertEq(
+        [newBounce.skipped_reason, newBounce.auto_paused, newBounce.recent_bounces.map((b) => b.bounce_id), daily.getRfbMarketingLaneState(db).bounce_ack_max_id],
+        ["bounce_or_complaint_recent", true, [b4], b4],
+        "j16: a NEW bounce after the lift still auto-pauses (and only it is reported)",
+      );
+
       // Not fresh: soft bounce, send older than 48h, another platform's send.
       freshDb();
       seedRecentSend("soft@gard-test.no", 1);
@@ -851,7 +888,49 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         [false, false, true, true],
         "k8: a health_red (or run_in_progress) skip does not use up the day's tick window",
       );
-      assertTrue(indexSrc.includes("if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;"), "k9: the 08:10Z tick stamps lastRunAt only through that rule");
+      // Updated 2026-10-04: the stamp logic moved from index.ts into
+      // tickRfbMarketingDaily (it is now also persisted) — the rule itself is
+      // asserted on behaviour in k11–k12 below instead of on index.ts text.
+      assertTrue(
+        indexSrc.includes("tickRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })"),
+        "k9: the 08:10Z tick in index.ts goes through tickRfbMarketingDaily (which stamps only through that rule)",
+      );
+    }
+
+    // ── (k') the 08:10Z tick persists "ran today" (boot_job_state): a deploy /
+    // restart later inside the window does not run the job a second time ──
+    freshDb();
+    seedProducer("k-2", "Tikk Gård", "tikk@gard-test.no");
+    seedProducer("k-3", "Takk Gård", "takk@gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const t = makeTransport();
+      const stamp = () =>
+        (db.prepare(`SELECT last_completed_at FROM boot_job_state WHERE job = ?`).get(daily.RFB_MARKETING_DAILY_JOB_STATE_KEY) as
+          | { last_completed_at: string }
+          | undefined)?.last_completed_at ?? null;
+      const red = () => ({ red: true, reasons: ["memory critical"], rss_mb: 500, disk_used_pct: 10 });
+      const tick = (iso: string, health: () => any = healthy) =>
+        daily.tickRfbMarketingDaily({ now: new Date(iso), lastRunAt: null, deps: { sendRaw: t.sendRaw, healthProbe: health } });
+      const k10 = await tick("2026-11-02T08:09:00Z");
+      assertEq([k10.report, stamp()], [null, null], "k10: 08:09Z → before the window, nothing run or stamped");
+      const k11 = await tick("2026-11-02T08:12:00Z", red);
+      assertEq([k11.report?.skipped_reason, k11.lastRunAt, stamp()], ["health_red", null, null], "k11: a health_red run does not stamp (memory or DB)");
+      const k12 = await tick("2026-11-02T08:22:00Z");
+      assertEq(
+        [k12.report?.summary.sent, k12.lastRunAt?.toISOString(), stamp(), t.calls.length],
+        [1, "2026-11-02T08:22:00.000Z", "2026-11-02T08:22:00.000Z", 1],
+        "k12: no run yet today → the next tick runs, sends, and persists the stamp",
+      );
+      const runsAfterFirst = runsRows().length;
+      const k13 = await tick("2026-11-02T08:52:00Z");
+      assertEq(
+        [k13.report, k13.lastRunAt?.toISOString(), t.calls.length, runsRows().length],
+        [null, "2026-11-02T08:22:00.000Z", 1, runsAfterFirst],
+        "k13: restart at 08:52Z (memory empty) after the 08:22Z run → skipped: no e-mail, no second envelope",
+      );
+      const k14 = await tick("2026-11-03T08:15:00Z");
+      assertEq([k14.report !== null, stamp()], [true, "2026-11-03T08:15:00.000Z"], "k14: next day 08:15Z → runs again");
     }
 
     // ── (l) G4 — budget from the database ──────────────────────────────────

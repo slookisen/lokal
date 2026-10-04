@@ -146,6 +146,7 @@ import {
 } from "../routes/admin-outreach-candidates";
 import { executeCompose, resolveDailyOutreachCap, type ComposeDeps, type ComposeOutcome } from "../routes/crm";
 import { diskUsage } from "../routes/admin-db-backup";
+import { markJobCompleted, resolveDailyJobLastRunAt } from "./boot-job-gate";
 import { emailService } from "./email-service";
 import { recordRun } from "./run-ledger";
 import { marketplaceRegistry } from "./marketplace-registry";
@@ -270,6 +271,36 @@ export function rfbMarketingRunConsumesWindow(r: { skipped_reason: string | null
   return r.skipped_reason !== "run_in_progress" && r.skipped_reason !== "health_red";
 }
 
+/** boot_job_state key holding the 08:10Z tick's durable "ran today" stamp. */
+export const RFB_MARKETING_DAILY_JOB_STATE_KEY = "rfb-marketing-daily";
+
+/**
+ * One 10-minute cron tick (src/index.ts). `lastRunAt` is the process's own
+ * memory, which a deploy/restart wipes: a restart at 08:52Z after an 08:15Z
+ * run used to run the job a second time that day (first tick at boot+120s).
+ * The ledger kept that from exceeding the cap or re-mailing an address, but
+ * the second run still spent whatever budget was left and wrote a second
+ * envelope. The stamp is therefore also persisted (boot_job_state) and read
+ * back here. Both are written only for a run that consumes the window
+ * (rfbMarketingRunConsumesWindow) — a run_in_progress / health_red skip is
+ * retried on the next tick inside the window, as before. Returns the stamp
+ * to keep in memory and the report (null when the scheduling guard said
+ * "not now").
+ */
+export async function tickRfbMarketingDaily(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+  deps?: RfbMarketingDailyDeps;
+}): Promise<{ lastRunAt: Date | null; report: RfbMarketingDailyRunReport | null }> {
+  const db = getDb();
+  const lastRunAt = resolveDailyJobLastRunAt(db, RFB_MARKETING_DAILY_JOB_STATE_KEY, opts.lastRunAt, opts.now);
+  if (!shouldRunRfbMarketingDaily({ now: opts.now, lastRunAt })) return { lastRunAt, report: null };
+  const report = await runRfbMarketingDaily({ apply: true, trigger: "cron", now: opts.now, deps: opts.deps });
+  if (!rfbMarketingRunConsumesWindow(report)) return { lastRunAt, report };
+  markJobCompleted(db, RFB_MARKETING_DAILY_JOB_STATE_KEY, opts.now);
+  return { lastRunAt: opts.now, report };
+}
+
 function utcDay(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
@@ -286,7 +317,10 @@ export interface RfbMarketingLaneState {
   changed_at: string | null;
   changed_by: string | null;
   reason: string | null;
-  /** Highest email_bounces.id already acted on by an auto-pause (see G3). */
+  /**
+   * Highest email_bounces.id already acted on: by an auto-pause (see G3), or
+   * by a human lifting a pause (POST /admin/rfb-marketing-lane {"paused": false}).
+   */
   bounce_ack_max_id: number | null;
 }
 
@@ -313,7 +347,8 @@ export function getRfbMarketingLaneState(db: Db): RfbMarketingLaneState {
  * Flip the lane. Anyone with the admin key may pause (routines included);
  * clearing a pause is Daniel's call — same rule as the Opplevagent lane.
  * `bounceAckMaxId` only ever moves UP (an auto-pause records the bounces it
- * acted on); omitted, the stored value is kept.
+ * acted on, a lift the bounces known when it was lifted — see
+ * routes/admin-rfb-marketing.ts); omitted, the stored value is kept.
  */
 export function setRfbMarketingLanePaused(
   db: Db,
@@ -357,7 +392,8 @@ export interface RfbMarketingBounceHit {
  * ledger ('reserved'/'sent'/'unknown' rows may have no sent-log row). The
  * gate never selects an already-bounced address, so a hit is a NEW bounce on
  * a recent send. Bounces with id <= ackMaxId already triggered an auto-pause
- * that a human then cleared; they are not fresh any more.
+ * that a human then cleared, or were known when a human lifted a pause; they
+ * are not fresh any more.
  */
 export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: number | null): RfbMarketingBounceHit[] {
   const since = new Date(now.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);

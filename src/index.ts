@@ -59,7 +59,7 @@ import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
-import { shouldRunRfbMarketingDaily, runRfbMarketingDaily, rfbMarketingRunConsumesWindow } from "./services/rfb-marketing-daily";
+import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
@@ -1775,7 +1775,9 @@ if (
 // in runGardssalgOutreachDaily — the DB is the memory, so a restart or a
 // second tick inside the window cannot double-send. `lastRunAt` is only
 // stamped after a run that did not throw, so a transient DB error at 08:00
-// is retried on the next tick within the window.
+// is retried on the next tick within the window. The stamp is also persisted
+// (boot_job_state, via tickGardssalgOutreachDaily), so a deploy/restart later
+// inside the window does not run the job a second time that day.
 //
 // Disable on dev / CI (or as a deploy-level kill-switch) with
 // GARDSSALG_OUTREACH_DAILY_DISABLED=1. Manual/dry runs:
@@ -1788,10 +1790,11 @@ if (
   const gardssalgOutreachDailyTick = trackJob("gardssalg-outreach-daily", async () => {
     const now = new Date();
     try {
-      const { shouldRunGardssalgOutreachDaily, runGardssalgOutreachDaily } = await import("./routes/opplevelser");
-      if (!shouldRunGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })) return;
-      const r = await runGardssalgOutreachDaily({ apply: true, trigger: "cron", now });
-      lastGardssalgOutreachRunAt = now;
+      const { tickGardssalgOutreachDaily } = await import("./routes/opplevelser");
+      const t = await tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt });
+      lastGardssalgOutreachRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
       console.log(
         `[gardssalg-outreach-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
           `sent=${r.summary.sent} errors=${r.summary.error} budget=${r.budget} cap=${r.daily_cap} ` +
@@ -1821,6 +1824,8 @@ if (
 // before its e-mail leaves). `lastRunAt` is only stamped after a run that did
 // not throw and was not skipped for run_in_progress/health_red, so a transient
 // DB error or health dip at 08:10 is retried on the next tick in the window.
+// The stamp is also persisted (boot_job_state, via tickRfbMarketingDaily), so
+// a deploy/restart later inside the window does not run the job twice a day.
 // Statically imported (not `await import(...)`): one module instance, one
 // database/init singleton. Manual/dry runs: POST /admin/rfb-marketing-daily-run.
 if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
@@ -1828,12 +1833,14 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   const rfbMarketingDailyTick = trackJob("rfb-marketing-daily", async () => {
     const now = new Date();
     try {
-      if (!shouldRunRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt })) return;
-      const r = await runRfbMarketingDaily({ apply: true, trigger: "cron", now });
-      // Not today's run — retry on the next tick inside the window: a manual
-      // run that was still in flight, or a transient health_red (memory/disk
-      // "critical" at 08:10 must not cost the whole day).
-      if (rfbMarketingRunConsumesWindow(r)) lastRfbMarketingRunAt = now;
+      // Not today's run — tickRfbMarketingDaily leaves the stamp alone so the
+      // next tick inside the window retries: a manual run that was still in
+      // flight, or a transient health_red (memory/disk "critical" at 08:10
+      // must not cost the whole day) — rfbMarketingRunConsumesWindow.
+      const t = await tickRfbMarketingDaily({ now, lastRunAt: lastRfbMarketingRunAt });
+      lastRfbMarketingRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
       console.log(
         `[rfb-marketing-daily] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
           `stopped=${r.stopped_reason ?? "-"} sent=${r.summary.sent} errors=${r.summary.error} ` +

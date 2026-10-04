@@ -1706,6 +1706,13 @@ export function initExperiencesSchema(db: Database.Database): void {
   // job; the job itself sets it on a fresh hard bounce/complaint. Replaces
   // the A2A file controller/opplevagent-outreach-pause.yaml as the source of
   // truth. Additive only.
+  //
+  // bounce_ack_max_id (dev-request 2026-10-03-opplevagent-lane-bounce-
+  // kvittering): the highest email_bounces.id (RFB db) the lane has already
+  // acted on — written by the auto-pause AND when a pause is lifted — so a
+  // bounce a human has seen and cleared the pause for does not re-pause the
+  // lane on the next run. Same column as rfb_marketing_lane_state's
+  // (database/init.ts). Idempotent ALTER for databases created before it.
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS experience_outreach_lane_state (
@@ -1713,9 +1720,14 @@ export function initExperiencesSchema(db: Database.Database): void {
         paused INTEGER NOT NULL DEFAULT 0,
         changed_at TEXT,
         changed_by TEXT,
-        reason TEXT
+        reason TEXT,
+        bounce_ack_max_id INTEGER
       )
     `);
+    const laneCols = db.prepare(`PRAGMA table_info(experience_outreach_lane_state)`).all() as Array<{ name: string }>;
+    if (!laneCols.some((c) => c.name === "bounce_ack_max_id")) {
+      db.exec(`ALTER TABLE experience_outreach_lane_state ADD COLUMN bounce_ack_max_id INTEGER`);
+    }
   } catch (err) {
     console.error("Migration experience_outreach_lane_state failed:", err);
   }
