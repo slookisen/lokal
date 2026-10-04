@@ -8772,7 +8772,12 @@ console.log("── PR-29 related-producers tests ──");
       city TEXT,
       categories TEXT DEFAULT '[]',
       is_active INTEGER DEFAULT 1,
-      is_vetted INTEGER DEFAULT 1
+      is_vetted INTEGER DEFAULT 1,
+      -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the
+      -- related-producers SQL now also reads the shared public-listability
+      -- columns (same production defaults; no seeded row changes them).
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY REFERENCES agents(id),
@@ -10064,7 +10069,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       parent_umbrella_id TEXT,
       umbrella_member_count INTEGER,
       umbrella_scrape_config TEXT,
-      umbrella_venues TEXT
+      umbrella_venues TEXT,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -10326,7 +10334,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       trust_score REAL DEFAULT 0.5,
       umbrella_type TEXT,
       parent_umbrella_id TEXT,
-      umbrella_member_count INTEGER
+      umbrella_member_count INTEGER,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_affiliations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10484,7 +10495,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       url TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT 'producer',
       api_key TEXT UNIQUE NOT NULL, city TEXT, is_active INTEGER DEFAULT 1,
       is_verified INTEGER DEFAULT 0, trust_score REAL DEFAULT 0.5,
-      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_affiliations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10574,7 +10588,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       created_at TEXT DEFAULT (datetime('now')), last_seen_at TEXT,
       is_vetted INTEGER DEFAULT 1,
       umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
-      umbrella_scrape_config TEXT, umbrella_venues TEXT
+      umbrella_scrape_config TEXT, umbrella_venues TEXT,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
   `);
   a44db.prepare(`
@@ -11085,7 +11102,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
       role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
-      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
   `);
   const insA6 = a6db.prepare(`
@@ -11127,7 +11147,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
       role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
-      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
   `);
   a6db2.prepare(`
@@ -11145,7 +11168,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
       role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
-      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
   `);
   const ins3 = a6db3.prepare(`
@@ -11340,7 +11366,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT,
         is_active INTEGER DEFAULT 1, umbrella_type TEXT,
-        trust_score INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now'))
+        trust_score INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')),
+        -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+        catalog_hidden INTEGER NOT NULL DEFAULT 0,
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
       );
       CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY);
     `);
@@ -14449,7 +14478,10 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
         is_verified INTEGER DEFAULT 0,
         trust_score REAL DEFAULT 0.5,
         created_at TEXT DEFAULT (datetime('now')),
-        last_seen_at TEXT DEFAULT (datetime('now'))
+        last_seen_at TEXT DEFAULT (datetime('now')),
+        -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+        catalog_hidden INTEGER NOT NULL DEFAULT 0,
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
       );
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
@@ -14683,7 +14715,10 @@ console.log("\n── PR-72: search relevance — category beats city ──");
       parent_umbrella_id TEXT,
       umbrella_member_count INTEGER,
       umbrella_scrape_config TEXT,
-      umbrella_venues TEXT
+      umbrella_venues TEXT,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -15754,7 +15789,10 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
     CREATE TABLE agents (
       id TEXT PRIMARY KEY,
       name TEXT,
-      is_active INTEGER DEFAULT 1
+      is_active INTEGER DEFAULT 1,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -24890,7 +24928,10 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       -- an empty categories array is never suppressed (nothing to gate).
       categories TEXT DEFAULT '[]',
       created_at TEXT DEFAULT (datetime('now')),
-      last_seen_at TEXT DEFAULT (datetime('now'))
+      last_seen_at TEXT DEFAULT (datetime('now')),
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
 
     CREATE TABLE agent_knowledge (
@@ -25565,7 +25606,10 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
       is_active INTEGER DEFAULT 1,
       city TEXT,
-      umbrella_type TEXT
+      umbrella_type TEXT,
+      -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+      catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -37457,7 +37501,10 @@ console.log("\n── city-normalizer: normalizeCityLabel + getStats() byer-coun
         parent_umbrella_id TEXT,
         umbrella_member_count INTEGER,
         umbrella_scrape_config TEXT,
-        umbrella_venues TEXT
+        umbrella_venues TEXT,
+        -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
+        catalog_hidden INTEGER NOT NULL DEFAULT 0,
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
       );
       CREATE TABLE listings (id TEXT PRIMARY KEY);
     `);
@@ -46172,5 +46219,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-agents-dump-contacted-map: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt (+ RFB vertical
+// filter): one enumeration test that the catalog_hidden fixture is absent from
+// every public surface (control: present while not hidden) while a normal row
+// stays and a dental-vertical row never appears; POST /admin/test-producer
+// dry-run/apply/retire/refusal; the direct-id order flow; the three trust gates
+// byte-identical. Swaps the getDb() singleton, the order-notify send stub and
+// the geocoder fetch seam (all restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: hidden test producer + listing honesty ──");
+  try {
+    const { runRfbHiddenTestProducerTests } = require("../src/routes/rfb-hidden-test-producer.test") as
+      typeof import("../src/routes/rfb-hidden-test-producer.test");
+    const ht = await runRfbHiddenTestProducerTests({ log: false });
+    passed += ht.passed;
+    failed += ht.failed;
+    for (const f of ht.failures) failures.push("rfb-hidden-test-producer: " + f);
+    console.log(`  rfb-hidden-test-producer: ${ht.passed} passed, ${ht.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-hidden-test-producer: unexpected error: " + String(err?.message || err));
   }
 });

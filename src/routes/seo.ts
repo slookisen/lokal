@@ -32,6 +32,9 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
+// public-listability predicate (catalog_hidden fixture + RFB vertical).
+import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
@@ -4106,6 +4109,8 @@ export function getRelatedBySameCity(
   // raw SQL, not routed through getActiveAgents() — needs its own
   // is_vetted = 1 filter so a self-registered, not-yet-vetted producer's
   // name/preview never surfaces in another producer's "related" section.
+  // Same for the shared public-listability predicate (dev-request
+  // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt) — getRelatedBySameCategory too.
   return db.prepare(`
     SELECT a.id, a.name, a.city, a.description, a.categories,
            k.about, k.verification_status, k.enrichment_status
@@ -4116,6 +4121,7 @@ export function getRelatedBySameCity(
       AND a.is_active = 1
       AND a.role = 'producer'
       AND a.is_vetted = 1
+      AND ${publicListableSql("a")}
     ORDER BY
       CASE WHEN k.verification_status = 'verified' THEN 0 ELSE 1 END,
       CASE WHEN k.enrichment_status = 'rich' THEN 0
@@ -4154,6 +4160,7 @@ export function getRelatedBySameCategory(
       AND a.is_active = 1
       AND a.role = 'producer'
       AND a.is_vetted = 1
+      AND ${publicListableSql("a")}
       AND a.categories LIKE ?
     ORDER BY
       CASE WHEN ? IS NOT NULL AND a.city = ? THEN 1 ELSE 0 END,
@@ -4540,22 +4547,29 @@ function passesRoleGate(
 ): boolean {
   let roleGateUmbrellaType: string | null = null;
   let roleGateIsVetted = 1;
+  let roleGateListable = true;
   try {
     const row = getDb()
-      .prepare("SELECT umbrella_type, is_vetted FROM agents WHERE id = ?")
-      .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null } | undefined;
+      .prepare("SELECT umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
+      .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     roleGateUmbrellaType = row ? row.umbrella_type : null;
     // is_vetted defaults to 1 in the schema (see database/init.ts) — a
     // NULL/undefined read (shouldn't happen post-migration, but this
     // route never fabricates trust either way) is treated as vetted.
     roleGateIsVetted = row && row.is_vetted != null ? row.is_vetted : 1;
+    // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt (AC3):
+    // the hidden test fixture and dental/experiences rows in `agents` 404
+    // here exactly like an unknown slug (shared predicate, agent-visibility.ts).
+    roleGateListable = row ? isPubliclyListable(row) : true;
   } catch (e) {
     console.error("[seo] role-gate umbrella lookup failed:", e);
   }
   const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
   const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
-  if (failsRoleGate || !roleGateIsVetted) {
-    if (!roleGateIsVetted) {
+  if (failsRoleGate || !roleGateIsVetted || !roleGateListable) {
+    if (!roleGateListable) {
+      console.log(`[seo:listability-gate] suppressed hidden/non-RFB agent ${agent.id} on /produsent/${requestedSlug}`);
+    } else if (!roleGateIsVetted) {
       console.log(`[seo:quarantine-gate] suppressed not-yet-vetted agent ${agent.id} (${agent.name}) on /produsent/${requestedSlug}`);
     } else {
       console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${requestedSlug}`);
@@ -4872,6 +4886,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           FROM agents
           WHERE parent_umbrella_id = ?
             AND is_active = 1
+            AND ${publicListableSql()}
           ORDER BY name ASC
         `).all(agent.id) as any[];
         for (const r of rows) {
@@ -4897,6 +4912,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           WHERE aff.umbrella_id = ?
             AND aff.status = 'active'
             AND a.is_active = 1
+            AND ${publicListableSql("a")}
           ORDER BY a.trust_score DESC, a.name ASC
           LIMIT 100
         `).all(agent.id) as any[];
@@ -6090,6 +6106,15 @@ let sitemapCache: { xml: string; builtAt: number } | null = null;
 
 /** Test hook: drop the cached sitemap. */
 export function __resetSitemapCacheForTesting(): void {
+  sitemapCache = null;
+}
+
+/**
+ * Drop the cached sitemap so the next request rebuilds it — for an admin write
+ * that removes a producer from public listing (POST /admin/test-producer) and
+ * must not leave its /produsent/ URL in /sitemap.xml for up to one TTL.
+ */
+export function invalidateSitemapCache(): void {
   sitemapCache = null;
 }
 

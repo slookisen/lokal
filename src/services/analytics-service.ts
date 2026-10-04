@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
+import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { extractUtmFromQuery } from "../utils/utm-capture";
 import { classifyUA, uaFromSessionId } from "./traffic-classifier";
 import {
@@ -1024,13 +1025,28 @@ export class AnalyticsService {
       const V = vertical ? " AND vertical_id = ?" : "";
       const vp: string[] = vertical ? [vertical] : [];
 
+      // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: an
+      // `agents` row that fails the shared public-listability predicate (the
+      // hidden test fixture, a dental/experiences row in `agents`) is never a
+      // "top producer" — it would also become the visibility routine's runtime
+      // probe target, whose /api/agents/:id/stats now 404s for it. The ids are
+      // read up front (a handful of rows); with none, both queries below are
+      // byte-identical to before. A failed read (minimal contexts without the
+      // columns) means no exclusion, same posture as nameById below.
+      let hiddenIds: string[] = [];
+      try {
+        hiddenIds = (db.prepare(notPubliclyListableAgentIdsSql()).all() as Array<{ id: string }>).map(r => r.id);
+      } catch { /* agents.catalog_hidden/vertical_id unavailable in some minimal contexts */ }
+      const H = hiddenIds.length ? ` AND agent_id NOT IN (${hiddenIds.map(() => "?").join(",")})` : "";
+      const hiddenSet = new Set(hiddenIds);
+
       // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
       // foer-retention): check the pruned-day portion FIRST. When it's empty
       // (ANALYTICS_ROLLUP_READ=false, or the window hasn't reached the
       // retention boundary) the raw-only query below runs with its ORIGINAL
       // SQL-level LIMIT and reproduces the exact pre-Skive-3 output byte-for-
       // byte — no re-ranking risk on that (fast, common) path.
-      const prunedRows = getPrunedAgentViewRows(cutoff, vertical);
+      const prunedRows = getPrunedAgentViewRows(cutoff, vertical).filter(p => !hiddenSet.has(p.agent_id));
 
       const rawQuery = `
         SELECT
@@ -1044,13 +1060,13 @@ export class AnalyticsService {
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_source
         FROM analytics_agent_views aav
-        WHERE created_at > ?${V}
+        WHERE created_at > ?${V}${H}
         GROUP BY agent_id, agent_name, city
         ORDER BY view_count DESC
       `;
 
       if (prunedRows.length === 0) {
-        const results = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...vp, limit) as any[];
+        const results = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...vp, ...hiddenIds, limit) as any[];
         return results.map(r => ({
           agentId: r.agent_id,
           agentName: r.agent_name,
@@ -1063,7 +1079,7 @@ export class AnalyticsService {
       // Blending path: a pruned-day contribution could promote an agent past
       // the raw-only top N, so fetch ALL raw groups (no LIMIT) and re-rank in
       // JS after merging.
-      const rawResults = db.prepare(rawQuery).all(cutoff, ...vp) as any[];
+      const rawResults = db.prepare(rawQuery).all(cutoff, ...vp, ...hiddenIds) as any[];
 
       interface Acc { agentId: string; agentName: string; city: string | null; viewCount: number; topSource: string; }
       const byKey = new Map<string, Acc>();

@@ -48,6 +48,7 @@ import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { publicListableSql } from "../services/agent-visibility";
 
 const router = Router();
 
@@ -744,6 +745,7 @@ export function registerTools(
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
+          AND ${publicListableSql("p")}
         ORDER BY p.name ASC
         LIMIT ?
       `).all(umbrellaId, lim) as any[];

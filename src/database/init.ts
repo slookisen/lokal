@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { ensureProfileTranslationsSchema } from "../services/profile-translations";
+import { publicListableSql } from "../services/agent-visibility";
 
 // ─── Database Initialization ─────────────────────────────────
 // SQLite is the right call for phase 1-3:
@@ -2650,6 +2651,13 @@ function initSchema(db: Database.Database): void {
         AND a.is_active = 1
         AND (a.role IS NULL OR a.role = 'producer')
         AND (a.is_vetted IS NULL OR a.is_vetted = 1)
+        /* dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the
+           shared public-listability predicate (services/agent-visibility.ts) —
+           the hidden test fixture is never an outreach target, and neither is
+           a dental/experiences row that sits in agents (this is the RFB
+           pool). catalog_hidden is added further down this function; SQLite
+           resolves VIEW columns at query time, so the order is harmless. */
+        AND ${publicListableSql("a")}
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}
@@ -4790,6 +4798,22 @@ function initSchema(db: Database.Database): void {
          ON agents(origin, is_vetted, created_at) WHERE origin = 'self_registered' AND is_vetted = 0`
     );
   } catch { /* partial index unsupported or already created */ }
+
+  // ─── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt (Design 1)
+  // catalog_hidden: 1 = never on any public RFB list/search surface (search,
+  // lokal_search, catalog feed/offers, llms-full.txt, sitemap, /produsent/:slug,
+  // city/browse pages, stats, outreach pool, verifier batch …), while every
+  // direct-id order-flow path (/catalog/agents/:id/products, cart add/submit,
+  // /produsent/ordre/:token, admin inbox) keeps working. Same idea as
+  // experience_providers.catalog_hidden. DEFAULT 0, so every existing row is a
+  // no-op. The ONE place that reads it is services/agent-visibility.ts. The
+  // only writer is POST /admin/test-producer (routes/admin-test-producer.ts),
+  // which only ever touches the single origin='test_fixture' row.
+  // Rollback: the column is additive and may stay; retire the fixture with the
+  // endpoint (or UPDATE agents SET is_active=0 WHERE origin='test_fixture').
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* already exists — expected */ }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
