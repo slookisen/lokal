@@ -44,6 +44,8 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { getPageViewHealthCounts } from "./services/health-counts";
+import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
+import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
@@ -630,10 +632,16 @@ app.get("/health", (_req, res) => {
     if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
     else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }
 
-    // PR-92 (2026-06-01): raised 200 → 400 MB. Daily auto-prune now keeps DB bounded.
-    if (dbSizeMb > 400) { if (status !== "critical") status = "warning"; warnings.push(`DB large: ${dbSizeMb}MB`); }
-
-    if (pvCount > 500000) { warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`); }
+    // 2026-10-04: the static "DB large >400MB" / "analytics_page_views >500k rows"
+    // warnings are gone — the normal 60-day-retention steady state tripped them
+    // permanently, so status read 'warning' every day (noise). dbSizeMb and the row
+    // counts are still reported below as plain fields; the actionable signal is the
+    // daily auto-prune falling behind (see computePageViewPruneLag).
+    const pruneLag = computePageViewPruneLag(db, Date.now(), getRetentionWindowDays());
+    if (pruneLag.lagging) {
+      if (status !== "critical") status = "warning";
+      warnings.push(`Analytics auto-prune lagging: oldest page view ${pruneLag.oldestPageViewAgeDays}d old > ${pruneLag.retentionDays}d retention + ${PRUNE_LAG_GRACE_DAYS}d`);
+    }
 
     const disk = diskUsage(path.dirname(dbPath));
     if (disk && disk.used_pct >= 95) { status = "critical"; warnings.push(`Data volume ${disk.used_pct}% full — SQLite writes will fail when it fills`); }
@@ -670,6 +678,9 @@ app.get("/health", (_req, res) => {
         pageViews: pvCount,
         queries: queryCount,
         pageViewsCachedAgeMs: pvCounts.cachedAgeMs,
+        oldestPageViewAt: pruneLag.oldestPageViewAt,
+        oldestPageViewAgeDays: pruneLag.oldestPageViewAgeDays,
+        retentionDays: pruneLag.retentionDays,
       },
       writePath,
       disk: disk && {
