@@ -11,6 +11,8 @@
  *   - real browser UAs (desktop Chrome, iPhone Safari, Firefox) → human
  *   - session_id recovery when the UA itself contains colons
  *   - scanner folding: fake-stale-Chrome UA heuristic + scannerPaths opt
+ *   - 2026-10-04: new AI crawler tokens, aiVendorBucket, velocity heuristic
+ *     (isVelocityScraper + classifySession { velocity } → 'scraper')
  *
  * Pure module — no DB, no singleton swaps. Exported runTrafficClassifierTests
  * ({log}) -> TestSummary; wired into tests/test.ts.
@@ -22,6 +24,10 @@ import {
   classifySession,
   uaFromSessionId,
   isScannerUA,
+  aiVendorBucket,
+  isVelocityScraper,
+  SCRAPER_UNIQUE_PAGES_PER_10_MIN,
+  SCRAPER_PRODUSENT_PAGES_PER_HOUR,
   TrafficCategory,
 } from "./traffic-classifier";
 
@@ -234,6 +240,49 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   // scanner never claims a session already in a named bot bucket
   assertEq(classifySession("ip1:Mozilla/5.0 (compatible; GPTBot/1.4)", { scannerPaths: true }), "ai_crawler",
     "sc6 named bot stays in its bucket even with scanner paths");
+
+  // ── 2026-10-04 view-stats honesty: AI/agent-index crawlers seen on prod ──
+  // (real sample UAs from /admin/analytics/traffic-classification). Before:
+  // other_bot, or — MCPCensus / rokmcp-collector, no "bot" substring — human.
+  expectBucket("Mozilla/5.0 (compatible; ExaSearchBot/1.0; +https://crawler.exa.ai/)", "ai_crawler", "ai1 ExaSearchBot");
+  expectBucket(
+    "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Reflectionbot/1.0; +https://reflection.ai/bot) Chrome/151",
+    "ai_crawler", "ai2 Reflectionbot");
+  expectBucket("AgentFitBot/v3.40.2-ua9.41779c2 (+https://agentfit.dev/)", "ai_crawler", "ai3 AgentFitBot");
+  expectBucket("AgenstryBot/0.3.0 (+https://agenstry.com/bot)", "ai_crawler", "ai4 AgenstryBot");
+  expectBucket(
+    "MCPCensus/0.1.0 (+https://www.radixia.ai/census/crawler; census research; opt-out: census@radixia.ai)",
+    "ai_crawler", "ai5 MCPCensus (was human: no bot substring)");
+  expectBucket("rokmcp-collector/0.2 (+https://rokmcp.com/bot)", "ai_crawler", "ai6 rokmcp-collector (was human)");
+  expectBucket(
+    "WellknownBot/0.1 (+https://wellknown.network/bot; listing: https://wellknown.network/agents/finn-tannlege-mcp)",
+    "ai_crawler", "ai7 WellknownBot");
+
+  // ── aiVendorBucket: the ONE chatgpt/claude/other split ──────────────────
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; GPTBot/1.4)"), "chatgpt", "v1 GPTBot → chatgpt");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; ChatGPT-User/1.0)"), "chatgpt", "v2 ChatGPT-User → chatgpt");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; OAI-SearchBot/1.0)"), "chatgpt", "v3 OAI-SearchBot → chatgpt");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; Claude-User/1.0)"), "claude", "v4 Claude-User → claude");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; anthropic-ai/1.0)"), "claude", "v5 anthropic-ai → claude");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; ExaSearchBot/1.0)"), "other", "v6 ExaSearchBot → other");
+
+  // ── velocity heuristic (strict thresholds) ──────────────────────────────
+  assertEq(SCRAPER_UNIQUE_PAGES_PER_10_MIN, 60, "vel0 10-minute threshold is 60 unique pages");
+  assertEq(SCRAPER_PRODUSENT_PAGES_PER_HOUR, 200, "vel0 hourly threshold is 200 /produsent pages");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 61, produsentPagesInHour: 61 }), true, "vel1 61 unique pages / 10 min → scraper");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 60, produsentPagesInHour: 60 }), false, "vel2 exactly 60 / 10 min is not (strict >)");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 40, produsentPagesInHour: 201 }), true, "vel3 201 /produsent pages / hour → scraper");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 40, produsentPagesInHour: 200 }), false, "vel4 exactly 200 / hour is not");
+  assertEq(isVelocityScraper(null), false, "vel5 no velocity evidence → not a scraper");
+  const scraperVelocity = { uniquePagesIn10Min: 1570, produsentPagesInHour: 1570 };
+  assertEq(classifySession(`ip1:${realChrome}`, { velocity: scraperVelocity }), "scraper",
+    "vel6 browser-UA session at 1,570 pages in 7.5 min (prod 2026-10-03) → scraper");
+  assertEq(classifySession("ip1:desktop:2ffb0ccf37cd549d", { velocity: scraperVelocity }), "scraper",
+    "vel7 bucketed human session_id format → scraper too");
+  assertEq(classifySession(`ip1:${realChrome}`, { velocity: { uniquePagesIn10Min: 3, produsentPagesInHour: 3 } }), "human",
+    "vel8 slow browser session stays human");
+  assertEq(classifySession("ip1:Mozilla/5.0 (compatible; GPTBot/1.4)", { velocity: scraperVelocity }), "ai_crawler",
+    "vel9 named bot stays in its own bucket regardless of velocity");
 
   return { passed, failed, failures };
 }

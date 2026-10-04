@@ -26,6 +26,8 @@
  *   other_bot     generic bot/spider/crawl UAs not named above
  *   scanner       (classifySession only) vulnerability scanners — fake old
  *                 Chrome versions and/or wp-admin/.env-style probe paths
+ *   scraper       (classifySession only) browser-looking session whose
+ *                 request VELOCITY no human produces (isVelocityScraper)
  */
 
 export type TrafficCategory =
@@ -38,7 +40,7 @@ export type TrafficCategory =
   | "dev"
   | "other_bot";
 
-export type SessionCategory = TrafficCategory | "scanner";
+export type SessionCategory = TrafficCategory | "scanner" | "scraper";
 
 // ── Pattern lists ───────────────────────────────────────────────────────────
 // ORDER MATTERS: classifyUA checks these lists top-to-bottom, and ai_search
@@ -79,6 +81,16 @@ export const AI_CRAWLER_PATTERNS = [
   "YouBot",
   "cloud-crawler",
   "NotHumanSearch",
+  // 2026-10-04 (view-stats honesty): AI/agent-index crawlers seen on prod
+  // that previously fell into other_bot — or, for MCPCensus and
+  // rokmcp-collector (no bot/spider/crawl substring), straight into human.
+  "ExaSearchBot",
+  "Reflectionbot",
+  "AgentFitBot",
+  "AgenstryBot",
+  "MCPCensus",
+  "rokmcp-collector",
+  "WellknownBot",
 ] as const;
 
 export const SEARCH_ENGINE_PATTERNS = [
@@ -220,20 +232,63 @@ export function isScannerUA(userAgent: string): boolean {
 }
 
 /**
+ * Vendor split of an AI UA (ai_search / ai_crawler) into the chatgpt /
+ * claude / other buckets every AI-traffic breakdown reports. ONE definition,
+ * shared by AnalyticsService.getSummary.agentTraffic and the per-agent
+ * /api/agents/:id/stats aiBreakdown so the two can never disagree. Callers
+ * must only pass UAs that already classified as AI.
+ */
+export function aiVendorBucket(userAgent: string): "chatgpt" | "claude" | "other" {
+  const ua = userAgent || "";
+  if (/GPTBot|ChatGPT|OAI-SearchBot/i.test(ua)) return "chatgpt";
+  if (/Claude|anthropic/i.test(ua)) return "claude";
+  return "other";
+}
+
+// ── Velocity heuristic ──────────────────────────────────────────────────────
+// A browser UA proves nothing: on 2026-10-03 one session with an ordinary
+// desktop-Chrome UA fetched 1,570 /produsent pages in 7.5 minutes and was
+// counted as 1,570 "human" profile views. No person reads pages that fast,
+// so a session above EITHER threshold is a scraper, whatever its UA says.
+// Thresholds are strict (">"), and deliberately generous to real visitors.
+export const SCRAPER_UNIQUE_PAGES_PER_10_MIN = 60;
+export const SCRAPER_PRODUSENT_PAGES_PER_HOUR = 200;
+
+/** Per-session request-velocity aggregates (see getSessionVelocity in analytics-service.ts). */
+export interface SessionVelocity {
+  /** Distinct paths the session requested within one 10-minute window. */
+  uniquePagesIn10Min: number;
+  /** Distinct /produsent/* paths the session requested within one 60-minute window. */
+  produsentPagesInHour: number;
+}
+
+/** Pure velocity rule — usable wherever per-session aggregates exist. */
+export function isVelocityScraper(v: SessionVelocity | null | undefined): boolean {
+  if (!v) return false;
+  return v.uniquePagesIn10Min > SCRAPER_UNIQUE_PAGES_PER_10_MIN
+    || v.produsentPagesInHour > SCRAPER_PRODUSENT_PAGES_PER_HOUR;
+}
+
+/**
  * Classify a session by its session_id. Callers that know the session hit
  * scanner probe paths (SCANNER_PATH_PATTERNS) pass { scannerPaths: true } to
- * fold it into 'scanner'. Mirrors routes/analytics.ts's precedence: a named
- * bot/dev UA stays in its own bucket; 'scanner' only claims sessions that
- * would otherwise pass as human.
+ * fold it into 'scanner'; callers that have the session's velocity
+ * aggregates pass { velocity } to fold a scraper into 'scraper'. Mirrors
+ * routes/analytics.ts's precedence: a named bot/dev UA stays in its own
+ * bucket; 'scanner'/'scraper' only claim sessions that would otherwise pass
+ * as human.
  */
 export function classifySession(
   sessionId: string,
-  opts?: { scannerPaths?: boolean }
+  opts?: { scannerPaths?: boolean; velocity?: SessionVelocity | null }
 ): SessionCategory {
   const ua = uaFromSessionId(sessionId);
   const category = classifyUA(ua);
   if (category === "human" && (isScannerUA(ua) || opts?.scannerPaths)) {
     return "scanner";
+  }
+  if (category === "human" && isVelocityScraper(opts?.velocity)) {
+    return "scraper";
   }
   return category;
 }
