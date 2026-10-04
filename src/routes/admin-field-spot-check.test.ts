@@ -476,8 +476,12 @@ export async function runAdminFieldSpotCheckTests(
     assertEq(candResult.status, 200, "cand-02: candidate request -> 200");
     assertEq(candResult.body?.candidate_source, "request", "cand-03: candidate_source request");
     assertEq(candResult.body?.field_value, "Testtekst som ikke står på siden", "cand-04: field_value is the supplied candidate");
-    // No ANTHROPIC_API_KEY in tests: a deterministic miss is "unverifiable"; never "match".
-    assertEq(candResult.body?.status !== "match", true, "cand-05: unsupported candidate is never a match");
+    // The Vollan fixture pages carry fewer visible chars than
+    // FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS, so a text that is not found there
+    // is "unverifiable" (too little content to call a mismatch) and the LLM
+    // judge is never reached. The judge path for a candidate is covered in
+    // admin-field-spot-check-about-judge.test.ts (aj-cand-*).
+    assertEq(candResult.body?.status, "unverifiable", "cand-05: unsupported candidate on a thin page -> unverifiable, never match");
     const storedAfter = db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get("fsc-vollan") as { about: string };
     assertEq(storedAfter.about, ABOUT, "cand-06: stored about untouched by a candidate check");
     const badCand = await callRoute(router, {
@@ -486,6 +490,28 @@ export async function runAdminFieldSpotCheckTests(
       body: { agent_id: "fsc-vollan", field_name: "about", candidate: 42 },
     });
     assertEq(badCand.status, 400, "cand-07: non-string candidate -> 400");
+    const candCall = (agent_id: string, field_name: string, candidate: unknown) =>
+      callRoute(router, {
+        url: "/",
+        headers: { "x-admin-key": testKey, "content-type": "application/json" },
+        body: { agent_id, field_name, candidate },
+      });
+    assertEq((await candCall("fsc-vollan", "about", "x".repeat(3000))).status, 200, "cand-08: 3000-char candidate accepted");
+    assertEq((await candCall("fsc-vollan", "about", "x".repeat(3001))).status, 400, "cand-09: 3001-char candidate -> 400");
+    assertEq((await candCall("fsc-vollan", "about", "")).status, 400, "cand-10: empty candidate -> 400");
+    assertEq((await candCall("fsc-vollan", "about", "   ")).status, 400, "cand-11: blank candidate -> 400");
+    // phone + dental: the candidate replaces the stored value there too.
+    const dentalPhoneCand = await candCall("dental-ok", "phone", "41 63 44 22");
+    assertEq([dentalPhoneCand.status, dentalPhoneCand.body?.status, dentalPhoneCand.body?.candidate_source, dentalPhoneCand.body?.field_value],
+      [200, "match", "request", "41 63 44 22"], "cand-12: dental phone candidate on the page -> match, candidate_source request");
+    const dentalWrongPhone = await candCall("dental-ok", "phone", "+47 99 88 77 66");
+    assertEq([dentalWrongPhone.status, dentalWrongPhone.body?.status !== "match", dentalWrongPhone.body?.field_value],
+      [200, true, "+47 99 88 77 66"], "cand-13: dental phone candidate NOT on the page -> never match");
+    const rfbPhoneCand = await candCall("fsc-vollan", "phone", "+47 41 63 44 22");
+    assertEq([rfbPhoneCand.status, rfbPhoneCand.body?.candidate_source, rfbPhoneCand.body?.status !== "match"],
+      [200, "request", true], "cand-14: RFB phone candidate not on Vollan's pages -> never match");
+    const vollanPhone = db.prepare(`SELECT phone FROM agent_knowledge WHERE agent_id = ?`).get("fsc-vollan") as { phone: string | null };
+    assertEq(vollanPhone.phone, null, "cand-15: stored phone untouched by a phone candidate check");
 
     // ── Dental fallback (dev-request 2026-09-28-dental-field-spot-check-404) ──
     const dentalOk = await callRoute(router, {
