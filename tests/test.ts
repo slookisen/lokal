@@ -46139,3 +46139,26 @@ runSerial(async () => {
     failures.push("admin-agents-dump-contacted-map: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt (+ RFB vertical
+// filter): one enumeration test that the catalog_hidden fixture is absent from
+// every public surface (control: present while not hidden) while a normal row
+// stays and a dental-vertical row never appears; POST /admin/test-producer
+// dry-run/apply/retire/refusal; the direct-id order flow; the three trust gates
+// byte-identical. Swaps the getDb() singleton, the order-notify send stub and
+// the geocoder fetch seam (all restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: hidden test producer + listing honesty ──");
+  try {
+    const { runRfbHiddenTestProducerTests } = require("../src/routes/rfb-hidden-test-producer.test") as
+      typeof import("../src/routes/rfb-hidden-test-producer.test");
+    const ht = await runRfbHiddenTestProducerTests({ log: false });
+    passed += ht.passed;
+    failed += ht.failed;
+    for (const f of ht.failures) failures.push("rfb-hidden-test-producer: " + f);
+    console.log(`  rfb-hidden-test-producer: ${ht.passed} passed, ${ht.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-hidden-test-producer: unexpected error: " + String(err?.message || err));
+  }
+});
