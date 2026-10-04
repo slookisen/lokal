@@ -66,24 +66,33 @@ function rowToRecord(row: RunRow): RunRecord {
  * the same run_id is a no-op (we trust the first write). This means an
  * agent that crashes mid-write and retries cannot corrupt the ledger.
  *
- * Verifier columns (verifier_state, etc.) are NOT touched here — they're
- * the platform-verifier's domain. Default state is 'pending'.
+ * Verifier columns (verifier_state, etc.) are the platform-verifier's domain
+ * and default to 'pending'. The one exception is `opts.verifierState`, an
+ * insert-time initial state the POST /admin/runs handler sets to 'skipped' for
+ * claim-less envelopes (nothing to verify — see admin-runs.ts). Omitted → the
+ * column default; the INSERT is then byte-identical to before.
  */
-export function recordRun(envelope: RunEnvelope, db?: Database.Database): void {
+export function recordRun(
+  envelope: RunEnvelope,
+  db?: Database.Database,
+  opts: { verifierState?: VerifierState } = {},
+): void {
   const conn = db ?? getDb();
+  const vs = opts.verifierState;
   const stmt = conn.prepare(`
     INSERT INTO runs (
       run_id, vertical, agent, trigger_source,
       started_at, finished_at, status,
-      claims, evidence, next_suggested, errors, notes
+      claims, evidence, next_suggested, errors, notes${vs ? ", verifier_state" : ""}
     ) VALUES (
       @run_id, @vertical, @agent, @trigger_source,
       @started_at, @finished_at, @status,
-      @claims, @evidence, @next_suggested, @errors, @notes
+      @claims, @evidence, @next_suggested, @errors, @notes${vs ? ", @verifier_state" : ""}
     )
     ON CONFLICT(run_id) DO NOTHING
   `);
   stmt.run({
+    ...(vs ? { verifier_state: vs } : {}),
     run_id: envelope.run_id,
     vertical: envelope.vertical,
     agent: envelope.agent,
@@ -152,6 +161,13 @@ export function listRecentRuns(opts: {
  * issue. Decision: `failed` is terminal until a write op (orchestrator
  * resolves the issue, or manual review re-queues) clears it. Retrying a
  * deterministic upstream failure on a 1h cadence is just billable noise.
+ *
+ * Claim-less runs are excluded too (2026-10-04): loop-dispatcher wakes,
+ * daniel-manual-trigger and fire-markers carry zero claims, so there is nothing
+ * to probe — yet they were ~40% of envelopes and ate the verifier's 20-run cap
+ * while real claim-bearing runs aged out of the 48h window unverified. New
+ * claim-less POSTs are stored as 'skipped' (admin-runs.ts); this filter also
+ * drains the existing 'pending' ones without a data migration.
  */
 export function listPendingVerification(opts: {
   vertical?: string;
@@ -164,17 +180,9 @@ export function listPendingVerification(opts: {
   const limit = Math.min(opts.limit ?? 50, 500);
   const cutoff = new Date(Date.now() - maxAge * 3600_000).toISOString();
 
-  const where: string[] = [
-    "verifier_state = 'pending'",
-    "started_at >= ?",
-    "(verifier_checked_at IS NULL OR verifier_checked_at < started_at)",
-    "run_id NOT LIKE 'firemarker-%'",
-  ];
-  const params: unknown[] = [cutoff];
-  if (opts.vertical) {
-    where.push("vertical = ?");
-    params.push(opts.vertical);
-  }
+  const { where, params } = pendingWhere(opts.vertical);
+  where.push("started_at >= ?");
+  params.push(cutoff);
   const sql = `
     SELECT * FROM runs
     WHERE ${where.join(" AND ")}
@@ -187,8 +195,54 @@ export function listPendingVerification(opts: {
 }
 
 /**
+ * How many verifiable runs fell OUT of listPendingVerification's window
+ * unverified (same predicate, started_at older than maxAgeHours). Surfaced as
+ * `aged_out_count` on GET /admin/runs/pending so the verifier backlog is
+ * visible instead of silently expiring. Bounded by the run-ledger prune (30d).
+ */
+export function countAgedOutPending(opts: {
+  vertical?: string;
+  maxAgeHours?: number;
+  db?: Database.Database;
+} = {}): number {
+  const conn = opts.db ?? getDb();
+  const maxAge = opts.maxAgeHours ?? 48;
+  const cutoff = new Date(Date.now() - maxAge * 3600_000).toISOString();
+
+  const { where, params } = pendingWhere(opts.vertical);
+  where.push("started_at < ?");
+  params.push(cutoff);
+  return (conn
+    .prepare(`SELECT COUNT(*) AS c FROM runs WHERE ${where.join(" AND ")}`)
+    .get(...params) as { c: number }).c;
+}
+
+// json_valid() guard: json_array_length() throws on malformed JSON; in a WHERE
+// clause the AND short-circuits (see POOL_CONTENT_THRESHOLD_SQL in database/init.ts).
+const HAS_CLAIMS_SQL = "(json_valid(claims) AND json_array_length(claims) > 0)";
+
+/** Shared "awaiting the verifier" predicate (everything except the age bound). */
+function pendingWhere(vertical?: string): { where: string[]; params: unknown[] } {
+  const where: string[] = [
+    "verifier_state = 'pending'",
+    "(verifier_checked_at IS NULL OR verifier_checked_at < started_at)",
+    "run_id NOT LIKE 'firemarker-%'",
+    HAS_CLAIMS_SQL,
+  ];
+  const params: unknown[] = [];
+  if (vertical) {
+    where.push("vertical = ?");
+    params.push(vertical);
+  }
+  return { where, params };
+}
+
+/**
  * Find runs that look stale: claimed completed but verifier never touched
  * them, beyond a grace period. Caller is the stale-detector scheduled task.
+ * Claim-less runs are excluded for the same reason as in
+ * listPendingVerification: the verifier never picks them up, so they would
+ * otherwise sit here as permanent "stale" noise until the 30-day prune.
  */
 export function listStaleRuns(opts: {
   graceMinutes?: number;
@@ -204,6 +258,7 @@ export function listStaleRuns(opts: {
     "verifier_state = 'pending'",
     "finished_at < ?",
     "run_id NOT LIKE 'firemarker-%'",
+    HAS_CLAIMS_SQL,
   ];
   const params: unknown[] = [cutoff];
   if (opts.vertical) {

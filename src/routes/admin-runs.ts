@@ -20,6 +20,7 @@ import {
   recordRun,
   listRecentRuns,
   listPendingVerification,
+  countAgedOutPending,
   listStaleRuns,
   summariseRuns,
   recordVerifierResult,
@@ -122,9 +123,22 @@ router.post("/", (req: Request, res: Response) => {
     );
   }
 
+  // Claim-less envelopes (loop-dispatcher wakes, daniel-manual-trigger, …) have
+  // nothing for the verifier to probe; store them as 'skipped' so they never
+  // take a slot in its capped queue. Only when the caller didn't send its own
+  // verifier_state (agents can't SET the state — that stays the verifier's
+  // domain — but an explicit field opts out of the auto-skip and stays pending).
+  const autoSkip =
+    env.claims.length === 0 && (env as unknown as Record<string, unknown>).verifier_state === undefined;
+
   try {
-    recordRun(env);
-    res.json({ success: true, run_id: env.run_id, ...(repairs.length ? { normalized: repairs.length } : {}) });
+    recordRun(env, undefined, autoSkip ? { verifierState: "skipped" } : {});
+    res.json({
+      success: true,
+      run_id: env.run_id,
+      ...(repairs.length ? { normalized: repairs.length } : {}),
+      ...(autoSkip ? { verifier_state: "skipped", verifier_skip_reason: "no_claims" } : {}),
+    });
   } catch (err: any) {
     res.status(500).json({ error: "Record failed", detail: err.message });
   }
@@ -152,7 +166,9 @@ router.get("/", (req: Request, res: Response) => {
 });
 
 // ─── GET /admin/runs/pending ──────────────────────────────────
-// Verifier reads this to find runs that need probing.
+// Verifier reads this to find runs that need probing. Claim-less runs are
+// never listed (nothing to probe). `aged_out_count` = verifiable runs still
+// pending but older than max_age_hours — the backlog that expired unverified.
 router.get("/pending", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -164,7 +180,8 @@ router.get("/pending", (req: Request, res: Response) => {
 
   try {
     const runs = listPendingVerification({ vertical, maxAgeHours, limit });
-    res.json({ success: true, count: runs.length, runs });
+    const aged_out_count = countAgedOutPending({ vertical, maxAgeHours });
+    res.json({ success: true, count: runs.length, aged_out_count, max_age_hours: maxAgeHours, runs });
   } catch (err: any) {
     res.status(500).json({ error: "Pending failed", detail: err.message });
   }

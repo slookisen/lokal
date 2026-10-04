@@ -237,7 +237,7 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
       deferred.push({ agent: w.agent, reason: w.reason, why: "shadow mode" });
       continue;
     }
-    // Per-agent wake text — see fireTextFor() in services/loop-dispatch.ts (charter v2).
+    // Neutral wake metadata only (no grants/instructions) — see fireTextFor() in services/loop-dispatch.ts.
     const text = fireTextFor(w.agent, w.reason);
     const r = await fireRoutine(ref, text);
     fired.push({ agent: w.agent, reason: w.reason, ...r });
