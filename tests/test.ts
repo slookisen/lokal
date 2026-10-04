@@ -45835,6 +45835,27 @@ runSerial(async () => {
   }
 });
 
+// about spot-check LLM judge (false paraphrase mismatches — Ødhumbla,
+// Saltfjell, Borgund Chili): a deterministic about mismatch goes to the LLM
+// judge over the pages already fetched; judge unavailable -> paraphrase-only
+// failures "unverifiable", others stay "mismatch". Own in-memory DB +
+// globalThis.fetch stub (pages + api.anthropic.com) — tail position.
+runSerial(async () => {
+  console.log("\n── field spot-check: about LLM judge ──");
+  try {
+    const { runAdminFieldSpotCheckAboutJudgeTests } = require("../src/routes/admin-field-spot-check-about-judge.test") as
+      typeof import("../src/routes/admin-field-spot-check-about-judge.test");
+    const aj = await runAdminFieldSpotCheckAboutJudgeTests({ log: false });
+    passed += aj.passed;
+    failed += aj.failed;
+    for (const f of aj.failures) failures.push("admin-field-spot-check-about-judge: " + f);
+    console.log(`  admin-field-spot-check-about-judge: ${aj.passed} passed, ${aj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-field-spot-check-about-judge: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
 // point 3 (PR #909, round 4 of review — the one authorized exception to the
 // 3-round cap, scoped to exactly round 3's 3 CHANGES-REQUESTED findings):

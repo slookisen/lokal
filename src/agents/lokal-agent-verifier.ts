@@ -2003,6 +2003,12 @@ export async function computeFieldSpotCheck(
       sourceText: string | null | undefined,
     ) => FieldSpotCheckVerdict;
     now?: () => number;
+    /** Read-only observer: called once for every page that was fetched
+     *  successfully (root first, then subpages in fetch order) with its
+     *  raw HTML. Lets a caller re-use the pages this walk already fetched
+     *  (the about spot-check's LLM judge in admin-field-spot-check.ts)
+     *  without fetching them a second time. Never changes the verdict. */
+    onPage?: (page: { url: string; kind: FieldSpotCheckPageKind; html: string }) => void;
   } = {},
 ): Promise<FieldSpotCheckResult> {
   const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
@@ -2036,6 +2042,7 @@ export async function computeFieldSpotCheck(
     matched_page_kind: kind,
   });
 
+  deps.onPage?.({ url: rootCheckedUrl, kind: "root", html: rootResult.html });
   visibleChars += visibleTextOf(rootResult.html).length;
   const rootSourceText = `${rootResult.html}\n${visibleTextOf(rootResult.html)}`;
   const rootVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, rootSourceText);
@@ -2075,6 +2082,11 @@ export async function computeFieldSpotCheck(
     });
     urlsTried.push(subpageUrl);
     if (!subResult.ok) continue; // one dead subpage link never aborts the others
+    deps.onPage?.({
+      url: subResult.finalUrl || subpageUrl,
+      kind: tier === 2 ? "terms_privacy" : "about_contact",
+      html: subResult.html,
+    });
     visibleChars += visibleTextOf(subResult.html).length;
     const subSourceText = `${subResult.html}\n${visibleTextOf(subResult.html)}`;
     const subVerdict: FieldSpotCheckVerdict = substantiate(input.field_value, subSourceText);
