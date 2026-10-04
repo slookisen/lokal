@@ -13,6 +13,17 @@
  * /om, /om-oss, /kontakt, /about, /contact links discovered on the root
  * page itself before concluding "mismatch", and stamps `checked_url` to
  * wherever the field was actually found — never unconditionally the root.
+ * W40 false-positive fix (sub-05..sub-09, e2e-06): the spot-check now
+ * follows up to 5 subpages and also accepts prefixed about/contact pages
+ * (/kontakt-oss-2/, /contact-1, /about-1, /om-garden) and terms/privacy pages
+ * (/salsvilkar, /personvern, …) via fieldSpotCheckSubpageCandidates'
+ * `extended` mode; the function's default (legacy) mode is unchanged.
+ * W40 review fixes (tier-*, cross-*, budget-*): matched_page_kind + a
+ * terms/privacy note in the reason; a WEAK match never ends the walk and a
+ * CONFLICT on any fetched page outranks it (exercised with a marker-reading
+ * stub `substantiate`, independent of any one field check); the overall
+ * FIELD_SPOT_CHECK_BUDGET_MS wall-clock budget (fake clock via deps.now, and
+ * a subpage fetch whose timeout is capped to the remaining budget).
  *
  * fetchImpl is injected directly into computeFieldSpotCheck's deps (never
  * globalThis.fetch — this file's own stub convention, and the repo's stated
@@ -27,6 +38,8 @@
 import {
   computeFieldSpotCheck,
   fieldSpotCheckSubpageCandidates,
+  FIELD_SPOT_CHECK_BUDGET_MS,
+  FIELD_SPOT_CHECK_MAX_SUBPAGES,
   FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS,
 } from "./lokal-agent-verifier";
 
@@ -118,6 +131,162 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
       3,
     );
     assertEq(foundSamePage, ["https://gaarden.example/kontakt"], "sub-04: a self-link back to the root page is excluded (same page, not a new subpage)");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // fieldSpotCheckSubpageCandidates — `extended` mode (W40 false-positive
+  // fix: the value lived on /kontakt-oss-2/, /contact-1 and /salsvilkar,
+  // none of which the five exact segments matched). Used by
+  // computeFieldSpotCheck only; the default stays the legacy exact match.
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    const html =
+      '<html><body>' +
+      '<a href="/omvisning-servering/">Omvisning</a>' +
+      '<a href="/personvern">Personvern</a>' +
+      '<a href="/kontakt-oss-2/">Kontakt oss</a>' +
+      '<a href="/om-garden">Om gården</a>' +
+      '<a href="/omtale">Omtale</a>' +
+      '<a href="/produkter">Produkter</a>' +
+      '<a href="https://www.vollangaard.no/contact-1">www host</a>' +
+      '<a href="https://other-site.example/about-1">Ekstern</a>' +
+      '<a href="mailto:post@vollangaard.no">E-post</a>' +
+      '<a href="#kontakt">Anchor</a>' +
+      '<a href="/about-1">About</a>' +
+      '<a href="/salsvilkar">Salsvilkår</a>' +
+      '<a href="/kontakt-oss-2/#skjema">Kontakt oss (duplicate)</a>' +
+      '</body></html>';
+    assertEq(
+      fieldSpotCheckSubpageCandidates(html, "https://vollangaard.no/", 5, { extended: true }),
+      [
+        "https://vollangaard.no/kontakt-oss-2/",
+        "https://vollangaard.no/om-garden",
+        "https://vollangaard.no/about-1",
+        "https://vollangaard.no/personvern",
+        "https://vollangaard.no/salsvilkar",
+      ],
+      "sub-05: extended — prefixed about/contact pages first (document order), then terms/privacy pages (document order, even when linked earlier); " +
+        "excludes /omvisning-servering/ and /omtale ('om' + letters is not an about page), /produkter, another host (incl. www.), mailto:, anchors, duplicates",
+    );
+
+    assertEq(
+      fieldSpotCheckSubpageCandidates(html, "https://vollangaard.no/", 3),
+      [],
+      "sub-06: default (legacy) mode is unchanged — none of the prefixed/terms shapes match (admin-phone-context-gate-retro-scan.ts relies on this default)",
+    );
+
+    const shapes = [
+      "/contact-1", "/contactus", "/aboutus", "/about-us.html", "/kontaktinfo", "/kontakt-oss", "/om_oss", "/omoss", "/om.html",
+      "/en/contact", "/salgsvilkar", "/kjopsvilkar", "/kj%C3%B8psvilk%C3%A5r", "/personvernerklaering/",
+      "/vilkar", "/salgsbetingelser", "/omsorg", "/kontor", "/aboutique",
+    ];
+    const shapeHtml = "<html><body>" + shapes.map((p) => `<a href="${p}">x</a>`).join("") + "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(shapeHtml, "https://gaarden.example/", 50, { extended: true }),
+      [
+        "https://gaarden.example/contact-1",
+        "https://gaarden.example/contactus",
+        "https://gaarden.example/aboutus",
+        "https://gaarden.example/about-us.html",
+        "https://gaarden.example/kontaktinfo",
+        "https://gaarden.example/kontakt-oss",
+        "https://gaarden.example/om_oss",
+        "https://gaarden.example/omoss",
+        "https://gaarden.example/om.html",
+        "https://gaarden.example/en/contact",
+        "https://gaarden.example/aboutique",
+        "https://gaarden.example/salgsvilkar",
+        "https://gaarden.example/kjopsvilkar",
+        "https://gaarden.example/kj%C3%B8psvilk%C3%A5r",
+        "https://gaarden.example/personvernerklaering/",
+      ],
+      "sub-07: extended shapes — contact*/about*/kontakt* prefixes, om + separator, omoss*, percent-encoded kjøpsvilkår; " +
+        "NOT /vilkar, /salgsbetingelser, /omsorg, /kontor (about* is a plain prefix, so /aboutique is accepted — harmless extra fetch)",
+    );
+
+    const sixAbout =
+      "<html><body>" +
+      ["/salgsvilkar", "/kontakt", "/kontakt-oss", "/om-oss", "/about-us", "/contact-1", "/om-garden"].map((p) => `<a href="${p}">x</a>`).join("") +
+      "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(sixAbout, "https://gaarden.example/", FIELD_SPOT_CHECK_MAX_SUBPAGES, { extended: true }),
+      [
+        "https://gaarden.example/kontakt",
+        "https://gaarden.example/kontakt-oss",
+        "https://gaarden.example/om-oss",
+        "https://gaarden.example/about-us",
+        "https://gaarden.example/contact-1",
+      ],
+      "sub-08: the cap applies AFTER tier ordering — a terms link earlier in the page never displaces an about/contact page",
+    );
+    assertEq(FIELD_SPOT_CHECK_MAX_SUBPAGES, 5, "sub-09: the spot-check follows up to 5 subpages (was 3)");
+
+    // Review fix: prefix matching must not spend the subpage budget on
+    // files, WordPress system paths or listing items.
+    const noisy = [
+      "/wp-content/uploads/contact.pdf", "/produkt/kontaktgrill", "/contact.pdf", "/kontakt.jpg",
+      "/blogg/om-sommaren-pa-garden", "/2024/05/om-oss-og-dyra", "/wp-json/contact", "/produkter/om-oss",
+      "/product-page/kontaktlinse-etui", "/kontakt.html", "/om.php", "/pages/kontakt", "/kontakt-oss.aspx",
+      "/policies/personvern",
+    ];
+    const noisyHtml = "<html><body>" + noisy.map((p) => `<a href="${p}">x</a>`).join("") + "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(noisyHtml, "https://gaarden.example/", 50, { extended: true }),
+      [
+        "https://gaarden.example/kontakt.html",
+        "https://gaarden.example/om.php",
+        "https://gaarden.example/pages/kontakt",
+        "https://gaarden.example/kontakt-oss.aspx",
+        "https://gaarden.example/policies/personvern",
+      ],
+      "sub-10: extended — files (.pdf/.jpg), /wp-content//wp-json/ paths and items under a product/blog/year listing segment " +
+        "are not candidates; .html/.php/.aspx pages and pages nested under other segments (/pages/kontakt) still are",
+    );
+    assertEq(
+      fieldSpotCheckSubpageCandidates(
+        '<html><body><a href="/produkt/kontaktgrill">x</a><a href="/wp-content/uploads/contact.pdf">x</a><a href="/kontakt">x</a></body></html>',
+        "https://gaarden.example/",
+        1,
+        { extended: true },
+      ),
+      ["https://gaarden.example/kontakt"],
+      "sub-11: with a budget of one subpage, the real /kontakt page is not crowded out by a product or a PDF linked before it",
+    );
+  }
+
+  // e2e-06: computeFieldSpotCheck uses the extended discovery and the
+  // 5-subpage default: a value only on the 5th candidate page is found.
+  {
+    const PHONE = "41634422";
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u === "https://femsider.example/") {
+        return htmlResponse(
+          200,
+          '<html><body><p>Velkommen.</p>' +
+            ["/personvern", "/om-oss", "/kontakt-oss-2/", "/about-1", "/contact-1", "/salsvilkar"].map((p) => `<a href="${p}">x</a>`).join("") +
+            "</body></html>",
+        );
+      }
+      if (u === "https://femsider.example/personvern") return htmlResponse(200, `<html><body><p>Behandlingsansvarleg: Femsider AS, tlf ${PHONE}</p></body></html>`);
+      if (u === "https://femsider.example/salsvilkar") throw new Error("e2e-06: the 6th candidate must never be fetched (cap is 5)");
+      if (u.startsWith("https://femsider.example/")) return htmlResponse(200, "<html><body><p>Ingenting her.</p></body></html>");
+      throw new Error(`e2e-06: unexpected fetch to ${u}`);
+    }) as unknown as typeof fetch;
+    const result = await computeFieldSpotCheck({ field_value: PHONE, root_url: "https://femsider.example/" }, { fetchImpl });
+    assertEq(result.status, "match", "e2e-06a: value only on the privacy page (5th candidate, linked FIRST on the page) -> match");
+    assertEq(
+      result.urls_tried,
+      [
+        "https://femsider.example/",
+        "https://femsider.example/om-oss",
+        "https://femsider.example/kontakt-oss-2/",
+        "https://femsider.example/about-1",
+        "https://femsider.example/contact-1",
+        "https://femsider.example/personvern",
+      ],
+      "e2e-06b: root, then the 4 about/contact pages, then the first terms/privacy page — 5 subpages, /salsvilkar beyond the cap",
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -261,6 +430,247 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
     );
     assertEq(result.status, "match", "e2e-05a: a dead first subpage doesn't stop the walk — the second subpage still gets checked");
     assertEq(result.checked_url, "https://bakeri.example/about", "e2e-05b: checked_url stamped to the subpage that actually matched");
+    assertEq(result.matched_page_kind, "about_contact", "e2e-05c: matched_page_kind 'about_contact' for a tier-1 subpage");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // W40 review fixes: which kind of page matched, weak matches vs
+  // conflicts across pages, and the overall time budget.
+  // ═══════════════════════════════════════════════════════════════════
+
+  // tier-01: a match on a terms/privacy page is labelled as such (kind +
+  // reason), a root match as "root" — same scenario as e2e-06.
+  {
+    const PHONE = "41634422";
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u === "https://tier.example/") {
+        return htmlResponse(200, '<html><body><p>Velkommen.</p><a href="/om-oss">Om</a><a href="/personvern">Personvern</a></body></html>');
+      }
+      if (u === "https://tier.example/personvern") return htmlResponse(200, `<html><body><p>Behandlingsansvarleg: Tier AS, tlf ${PHONE}</p></body></html>`);
+      return htmlResponse(200, "<html><body><p>Ingenting her.</p></body></html>");
+    }) as unknown as typeof fetch;
+    const result = await computeFieldSpotCheck({ field_value: PHONE, root_url: "https://tier.example/" }, { fetchImpl });
+    assertEq([result.status, result.matched_page_kind], ["match", "terms_privacy"], "tier-01a: match on /personvern -> matched_page_kind 'terms_privacy'");
+    assertTrue(/^matched on a terms\/privacy page — such pages can also list third parties' contact details/.test(result.reason),
+      "tier-01b: the reason calls out the terms/privacy page, so the weekly report can tell these matches apart");
+    const rootOnly = await computeFieldSpotCheck(
+      { field_value: "Velkommen.", root_url: "https://tier.example/" },
+      { fetchImpl, substantiate: () => ({ substantiated: true, reason: "stub" }) },
+    );
+    assertEq([rootOnly.matched_page_kind, rootOnly.reason], ["root", "stub"], "tier-01c: a root match is 'root', reason unchanged");
+  }
+
+  // Cross-page weak/conflict: a stub `substantiate` that reads a marker the
+  // test puts in each page, so the rule is exercised independently of any
+  // one field check. [[STRONG]] = full match, [[WEAK]] = weak match,
+  // [[CONFLICT]] = positive contradiction, nothing = plain not-found.
+  const markerJudge = (_candidate: string | null | undefined, source: string | null | undefined) => {
+    const s = source ?? "";
+    if (s.includes("[[STRONG]]")) return { substantiated: true, reason: "strong" };
+    if (s.includes("[[WEAK]]")) return { substantiated: true, weak: true, reason: "weak" };
+    if (s.includes("[[CONFLICT]]")) return { substantiated: false, conflict: true, reason: "conflict" };
+    if (s.includes("[[PCX]]")) {
+      return { substantiated: false, postcodeContradiction: true, postcodes: ["6888"], reason: "pcx" };
+    }
+    return { substantiated: false, reason: "not found" };
+  };
+  const filler = "Vi selger egg og grønnsaker direkte fra gården. ".repeat(30);
+  const markerSite = (host: string, root: string, pages: Record<string, string>) => {
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      calls.push(u);
+      if (u === `https://${host}/`) {
+        return htmlResponse(200, `<html><body><p>${root} ${filler}</p>${Object.keys(pages).map((p) => `<a href="${p}">x</a>`).join("")}</body></html>`);
+      }
+      const path = u.slice(`https://${host}`.length);
+      if (path in pages) return htmlResponse(200, `<html><body><p>${pages[path]}</p></body></html>`);
+      throw new Error(`cross: unexpected fetch to ${u}`);
+    }) as unknown as typeof fetch;
+    return { calls, fetchImpl };
+  };
+  {
+    const site = markerSite("x1.example", "[[CONFLICT]]", { "/kontakt": "", "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://x1.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "cross-01: conflict on the root + weak match on a later page -> mismatch");
+    assertEq(r.checked_url, "https://x1.example/", "cross-02: a mismatch keeps checked_url at the root");
+    assertTrue(/^contradicted on https:\/\/x1\.example\/: conflict — this outranks the weaker match on https:\/\/x1\.example\/salsvilkar \(weak\)$/.test(r.reason),
+      "cross-03: reason names the conflicting page and the weak match it outranks");
+  }
+  {
+    const site = markerSite("x2.example", "[[WEAK]]", { "/kontakt": "", "/om-oss": "[[CONFLICT]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://x2.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "cross-04: weak match on the root + conflict on a later page -> mismatch");
+    assertEq(site.calls, ["https://x2.example/", "https://x2.example/kontakt", "https://x2.example/om-oss"],
+      "cross-05: a weak match does not end the walk — every candidate page is still fetched");
+  }
+  {
+    const site = markerSite("x3.example", "[[WEAK]]", { "/kontakt": "", "/om-oss": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://x3.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url, r.matched_page_kind, r.reason], ["match", "https://x3.example/", "root", "weak"],
+      "cross-06: a weak match with no conflict anywhere -> match, stamped to the page of the weak match");
+    assertEq(site.calls.length, 3, "cross-07: ... after all candidate pages were checked");
+  }
+  {
+    const site = markerSite("x4.example", "[[CONFLICT]]", { "/kontakt": "[[STRONG]]", "/om-oss": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://x4.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url], ["match", "https://x4.example/kontakt"],
+      "cross-08: a FULL match (the stored value itself on the page) still wins, and still ends the walk at once");
+    assertTrue(/^strong \(note: https:\/\/x4\.example\/ contradicts it — conflict\)$/.test(r.reason), "cross-09: ... with the contradiction noted in the reason");
+    assertEq(site.calls.length, 2, "cross-10: /om-oss never fetched after the full match");
+  }
+  {
+    const site = markerSite("x5.example", "[[CONFLICT]]", { "/kontakt": "" });
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://x5.example/" },
+      { fetchImpl: site.fetchImpl, substantiate: markerJudge },
+    );
+    assertEq(r.status, "mismatch", "cross-11: conflict alone -> mismatch");
+  }
+
+  // Cross-page postal-code contradiction (review fix): [[PCX]] = the page
+  // does NOT have the value but gives a postal code that is never the stored
+  // one. It decides nothing alone, but a result resting only on a weak match
+  // must not become a match over it.
+  {
+    const site = markerSite("p1.example", "[[PCX]]", { "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p1.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-01: postal-code contradiction on the root + weak match on a terms page -> mismatch (was match)");
+    assertEq(r.checked_url, "https://p1.example/", "pcx-02: a mismatch keeps checked_url at the root");
+    assertTrue(/^contradicted on https:\/\/p1\.example\/: pcx — this outranks the weaker match on https:\/\/p1\.example\/salsvilkar \(weak\)$/.test(r.reason),
+      "pcx-03: the reason names the contradicting page and the weak match it outranks");
+  }
+  {
+    const site = markerSite("p2.example", "[[WEAK]]", { "/kontakt": "[[PCX]]", "/om-oss": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p2.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-04: weak match on the root + contradiction on an about/contact page -> mismatch");
+    assertEq(site.calls.length, 3, "pcx-05: ... with every candidate page fetched");
+  }
+  {
+    const site = markerSite("p3.example", "", { "/personvern": "[[PCX]]", "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p3.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url], ["unverifiable", "https://p3.example/"],
+      "pcx-06: contradiction only on a terms/privacy page (could be a third party's address) + weak match -> unverifiable, never match");
+    assertTrue(/^only a weak match on https:\/\/p3\.example\/salsvilkar \(weak\), and the terms\/privacy page https:\/\/p3\.example\/personvern gives a different postal code \(pcx\)/.test(r.reason),
+      "pcx-07: the reason names both pages");
+  }
+  {
+    const site = markerSite("p4.example", "[[WEAK]]", { "/personvern": "[[PCX]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p4.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "unverifiable", "pcx-08: weak match on the root + contradiction only on a terms/privacy page -> unverifiable");
+  }
+  {
+    const site = markerSite("p5.example", "", { "/kontakt": "[[PCX]]", "/personvern": "[[PCX]]", "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p5.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-09: a contradiction on the producer's own contact page outranks the terms-page-only rule -> mismatch");
+    assertTrue(/^contradicted on https:\/\/p5\.example\/kontakt: pcx/.test(r.reason), "pcx-10: ... naming the contact page");
+  }
+  {
+    const site = markerSite("p6.example", "[[PCX]]", { "/kontakt": "[[STRONG]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p6.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url, r.reason], ["match", "https://p6.example/kontakt", "strong"],
+      "pcx-11: a FULL match is unaffected by a contradiction on another page");
+  }
+  {
+    const site = markerSite("p7.example", "[[PCX]]", { "/kontakt": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p7.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-12: a contradiction with no match anywhere -> the ordinary mismatch");
+    assertTrue(/root page: pcx$/.test(r.reason), "pcx-13: ... carrying the root page's own reason");
+  }
+  {
+    const site = markerSite("p8.example", "[[WEAK]]", { "/kontakt": "[[PCX]]", "/om-oss": "", "/about": "" });
+    let clock = 0;
+    const slowFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      clock += 14_000;
+      return (site.fetchImpl as any)(url, init);
+    }) as unknown as typeof fetch;
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://p8.example/" },
+      { fetchImpl: slowFetch, substantiate: markerJudge, now: () => clock },
+    );
+    assertEq([r.status, r.urls_tried.length], ["mismatch", 3],
+      "pcx-14: a contradiction seen before the time budget ran out still outranks the weak match");
+  }
+
+  // budget-*: the overall wall-clock budget. A fake clock advances 20 s per
+  // fetch; the default budget is 30 s.
+  {
+    const site = markerSite("slow.example", "", { "/kontakt": "", "/om-oss": "", "/about": "" });
+    let clock = 1_000_000;
+    const slowFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      clock += 20_000;
+      return (site.fetchImpl as any)(url, init);
+    }) as unknown as typeof fetch;
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://slow.example/" },
+      { fetchImpl: slowFetch, substantiate: markerJudge, now: () => clock },
+    );
+    assertEq(FIELD_SPOT_CHECK_BUDGET_MS, 30_000, "budget-01: default budget is 30 s");
+    assertEq(r.status, "unverifiable", "budget-02: budget spent before a verdict -> unverifiable, NOT mismatch");
+    assertEq(r.urls_tried, ["https://slow.example/", "https://slow.example/kontakt"],
+      "budget-03: root (t=20 s) + one subpage (started with 10 s left); no subpage starts after the budget is spent");
+    assertTrue(/^time budget \(30000 ms\) spent after 2 page\(s\); 2 subpage\(s\) not checked before a verdict/.test(r.reason),
+      "budget-04: the reason says how many pages were not checked");
+  }
+  {
+    const site = markerSite("slow2.example", "[[WEAK]]", { "/kontakt": "", "/om-oss": "", "/about": "" });
+    let clock = 0;
+    const slowFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      clock += 20_000;
+      return (site.fetchImpl as any)(url, init);
+    }) as unknown as typeof fetch;
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://slow2.example/" },
+      { fetchImpl: slowFetch, substantiate: markerJudge, now: () => clock },
+    );
+    assertEq(r.status, "match", "budget-05: a weak match already found when the budget runs out -> match");
+    assertTrue(/^weak \(time budget \(30000 ms\) spent after 2 page\(s\); 2 subpage\(s\) not checked for a conflicting value\)$/.test(r.reason),
+      "budget-06: ... and the reason says the remaining pages were not checked for a conflict");
+  }
+  {
+    const site = markerSite("slow3.example", "[[CONFLICT]]", { "/kontakt": "", "/om-oss": "" });
+    let clock = 0;
+    const slowFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      clock += 40_000;
+      return (site.fetchImpl as any)(url, init);
+    }) as unknown as typeof fetch;
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://slow3.example/" },
+      { fetchImpl: slowFetch, substantiate: markerJudge, now: () => clock },
+    );
+    assertEq([r.status, r.urls_tried.length], ["mismatch", 1], "budget-07: a conflict on the root is a verdict even when no subpage could be fetched in time");
+  }
+  {
+    // A custom budget, and a subpage fetch whose own timeout is capped to
+    // what is left of it: the stub would only answer after 5 s (a ref'd
+    // timer, which also keeps the event loop alive — AbortSignal.timeout's
+    // own timer is unref'd), so only the capped AbortSignal can end it early.
+    const calls: string[] = [];
+    let clock = 0;
+    const hangingFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      calls.push(u);
+      if (u === "https://heng.example/") {
+        clock += 1_000;
+        return htmlResponse(200, `<html><body><p>${filler}</p><a href="/kontakt">Kontakt</a></body></html>`);
+      }
+      return new Promise((resolve, reject) => {
+        const late = setTimeout(() => resolve(htmlResponse(200, "<html><body><p>[[STRONG]]</p></body></html>")), 5_000);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(late);
+          reject(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+        });
+      });
+    }) as unknown as typeof fetch;
+    const t0 = Date.now();
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://heng.example/", budgetMs: 1_150 },
+      { fetchImpl: hangingFetch, substantiate: markerJudge, now: () => clock },
+    );
+    const elapsed = Date.now() - t0;
+    assertTrue(elapsed < 2_000, `budget-08: a hanging subpage fetch is cut off by the remaining budget (150 ms + one retry), not the 10 s default (took ${elapsed} ms)`);
+    assertEq(r.status, "mismatch", "budget-09: the hanging subpage simply failed; the walk completed within budget -> ordinary verdict");
   }
 
   return { passed, failed, failures };

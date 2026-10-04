@@ -116,6 +116,9 @@ import {
 export type { AboutSubstantiationVerdict };
 
 const MIN_FACTS = 2;
+/** Fewer facts than this and checkAboutCandidateFactSubstantiated does not
+ *  judge at the fact level at all (it falls back to the write-guard check). */
+export const ABOUT_FACT_MIN_FACTS = MIN_FACTS;
 const FACT_COVERAGE_RATIO = 0.8;
 const MIN_PROPER_NOUN_LENGTH = 4;
 const MIN_DIGIT_RUN_LENGTH = 3;
@@ -144,8 +147,34 @@ const MIN_SIGNIFICANT_WORD_LENGTH = 4;
 // never become one giant "the whole page is this fact's local context"
 // block (that would just reintroduce round 3's global-overlap defeat under
 // a new name).
+//
+// `<br>` is deliberately NOT in this set (dev-request W40 spot-check
+// false-positive fix): it is an inline line break, not a block boundary.
+// When it was, a `<p>` that writes its sentences one per line with `<br>`
+// (real case: aukrust-nordgard.no's about paragraph, "…Lomseggen (2068
+// moh).<br />Solrike dagar …<br />Vårt slagord: …") was carved into one
+// block PER SENTENCE, and since `blockCorroborates` measures a block against
+// the WHOLE candidate's vocabulary, no single one-sentence block could ever
+// reach the bar — the stored about text was rejected even when it was a
+// VERBATIM copy of that paragraph. `<br>` is instead handled by
+// `splitOnHardLineBreaks` below: a single `<br>` between two lines that are
+// BOTH complete sentences (each ends with a sentence terminator) is a soft
+// break INSIDE prose (the lines stay one block, exactly as if the author had
+// written the same sentences inside one `<p>`), while every other `<br>` —
+// next to an unpunctuated line (address / phone / org-nr / opening-hours
+// field lists, i.e. every footer shape the adversarial cases in this
+// module's tests loan facts from) or a blank-line `<br><br>` paragraph
+// break — stays a hard boundary, so footer-style field lists are carved line
+// by line exactly as before.
 const BLOCK_TAG_RE =
-  /<\/?(?:p|div|li|td|th|tr|header|footer|nav|section|article|blockquote|address|h[1-6]|br)\b[^>]*>/gi;
+  /<\/?(?:p|div|li|td|th|tr|header|footer|nav|section|article|blockquote|address|h[1-6])\b[^>]*>/gi;
+const BR_TAG_RE = /<br\b[^>]*>/gi;
+// Sentence terminator, optionally followed by closing quotes/brackets, at the
+// very end of a line's normalised text.
+const ENDS_WITH_SENTENCE_TERMINATOR_RE = /[.!?…]["'»”’)\]]*$/;
+// Zero-width / BOM characters some page builders (Webflow, Wix) put on
+// otherwise-empty `<br>`-separated lines.
+const ZERO_WIDTH_RE = /[\u200b-\u200d\u2060\ufeff]/g;
 const MAX_BLOCK_CHARS_BEFORE_SENTENCE_SPLIT = 500;
 const SENTENCE_WINDOW_SIZE = 3;
 
@@ -303,12 +332,56 @@ function structuredPortion(sourceText: string): string {
   return htmlHalf;
 }
 
+/** Split one block-level chunk of raw HTML at its HARD `<br>` line breaks
+ *  only (see BLOCK_TAG_RE's comment). Two consecutive `<br>`-separated lines
+ *  are kept in one block ONLY when BOTH end with a sentence terminator —
+ *  i.e. prose written one sentence per line. Everywhere else the `<br>` is
+ *  a hard boundary, exactly as before: next to any unpunctuated line (field
+ *  lists — address, phone, org-nr, opening hours — so a street or postcode
+ *  line can never be glued onto a neighbouring prose sentence) and at a
+ *  blank-line `<br><br>` paragraph break. Never merges across a real
+ *  block-level tag (the caller has already split on those). PURE. */
+function splitOnHardLineBreaks(rawChunk: string): string[] {
+  const lines = rawChunk.split(BR_TAG_RE);
+  if (lines.length === 1) return lines;
+  const groups: string[] = [];
+  let current: string | null = null;
+  let currentText = "";
+  let blankLineSinceCurrent = false;
+  for (const line of lines) {
+    const lineText = normalizeForMatch(line.replace(/<[^>]+>/g, " ").replace(ZERO_WIDTH_RE, ""));
+    if (!lineText) {
+      // An empty line (`<br><br>`) is a paragraph break — never merge
+      // across it.
+      if (current !== null) blankLineSinceCurrent = true;
+      continue;
+    }
+    if (
+      current !== null &&
+      !blankLineSinceCurrent &&
+      ENDS_WITH_SENTENCE_TERMINATOR_RE.test(currentText) &&
+      ENDS_WITH_SENTENCE_TERMINATOR_RE.test(lineText)
+    ) {
+      current += " " + line;
+      currentText = lineText;
+      continue;
+    }
+    if (current !== null) groups.push(current);
+    current = line;
+    currentText = lineText;
+    blankLineSinceCurrent = false;
+  }
+  if (current !== null) groups.push(current);
+  return groups;
+}
+
 /** Divide `sourceText` into paragraph-/sentence-bounded "blocks" — carved
- *  from HTML block-level tag boundaries where the source carries markup,
- *  and from sentence-grouped windows for any leftover untagged text (never
- *  a fixed character count for either). PURE. */
+ *  from HTML block-level tag boundaries (plus hard `<br>` line breaks, see
+ *  `splitOnHardLineBreaks`) where the source carries markup, and from
+ *  sentence-grouped windows for any leftover untagged text (never a fixed
+ *  character count for either). PURE. */
 function blockify(sourceText: string): string[] {
-  const rawChunks = structuredPortion(sourceText).split(BLOCK_TAG_RE);
+  const rawChunks = structuredPortion(sourceText).split(BLOCK_TAG_RE).flatMap(splitOnHardLineBreaks);
   const blocks: string[] = [];
   for (const raw of rawChunks) {
     // Strip any remaining (non-block-level, e.g. <strong>/<a>/<span>) tags,
@@ -367,6 +440,52 @@ function blockCorroborates(block: string, contextWords: Set<string>): boolean {
   }
   const ratio = matched / contextWords.size;
   return matched >= LOCAL_MIN_CONTEXT_WORD_MATCHES && ratio >= LOCAL_CONTEXT_OVERLAP_RATIO;
+}
+
+/** Whether `candidate`, normalised (entities decoded, lowercased, NFKC,
+ *  whitespace collapsed), occurs verbatim inside `sourceText` normalised the
+ *  same way — the same test as the write-guard's own verbatim branch,
+ *  computed independently (this module keeps zero coupling to the write-
+ *  guard's internals, see STOPWORDS). PURE. Exported for the spot-check
+ *  route. */
+export function isAboutCandidateVerbatimInSource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): boolean {
+  const cand = normalizeForMatch(candidate ?? "");
+  return cand.length > 0 && normalizeForMatch(sourceText ?? "").includes(cand);
+}
+
+/** The candidate's own distinct facts — the SAME definition the fact-level
+ *  check uses (numbers with >= 3 digits; proper nouns: capitalized, not
+ *  sentence-initial, >= 4 letters) — and which of them occur NOWHERE in
+ *  `sourceText` at all (raw markup included, so a fact that is only in an
+ *  image name, alt text or meta tag still counts as present). A number is
+ *  present as a whole digit run; a proper noun when its leading name part
+ *  ("Galdhøpiggen" -> "galdhøpiggen"; "Debio-sertifisert" -> "debio") is a
+ *  whole token of the source. Deliberately lenient: it answers "does the page say anything
+ *  about this at all", not "is it corroborated" (that is
+ *  checkAboutCandidateFactSubstantiated's job).
+ *
+ *  Used by the spot-check route (W40 review fix) to stop the write-guard's
+ *  70% word-overlap branch from accepting a text with one or two facts
+ *  swapped for ones the page never mentions ("… ved foten av Galdhøpiggen
+ *  (2469 moh)" on a page that only says "Lomseggen (2068 moh)"). PURE. */
+export function findAboutCandidateFactsAbsentFromSource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): { facts: string[]; absent: string[] } {
+  const cand = (candidate ?? "").trim();
+  if (!cand) return { facts: [], absent: [] };
+  const { tokens } = extractCandidateFacts(cand);
+  const src = normalizeForMatch(sourceText ?? "");
+  const srcTokens = new Set(src.match(/[\p{L}\p{N}]+/gu) ?? []);
+  const absent = tokens.filter((token) => {
+    if (/^\d+$/.test(token)) return !new RegExp(`(?<!\\d)${token}(?!\\d)`).test(src);
+    const lead = normalizeForMatch(token).match(/[\p{L}\p{N}]+/u)?.[0];
+    return !lead || !srcTokens.has(lead);
+  });
+  return { facts: tokens, absent };
 }
 
 /**
