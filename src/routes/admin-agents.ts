@@ -62,6 +62,9 @@ import {
 // dev-request 2026-07-28) before it may be used anywhere — column write OR
 // provenance value.
 import { validatePhoneForWrite } from "../services/contact-normalizer";
+// W40 write guards (Kvestad Sideri): a Brreg street address corrects a stored
+// road-designation-only address in applyAgentBrregContact below.
+import { canCorrectRoadOnlyAddress } from "../services/street-address-parse";
 // Reused, unchanged, from the admin-knowledge factual-field write gate (see
 // POST /brreg-description-fallback below): canCorrectFactualField's
 // curated-lock refusal is the SAME hard rule every other admin write path
@@ -2433,8 +2436,8 @@ export function applyAgentBrregContact(
 ): string[] {
   const dryRun = !!opts.dryRun;
 
-  const agentRow = db.prepare(`SELECT id, claimed_at FROM agents WHERE id = ?`).get(agentId) as
-    | { id: string; claimed_at: string | null }
+  const agentRow = db.prepare(`SELECT id, name, claimed_at FROM agents WHERE id = ?`).get(agentId) as
+    | { id: string; name: string | null; claimed_at: string | null }
     | undefined;
   if (!agentRow) return [];
   if (agentRow.claimed_at) return []; // owner-claimed -> locked, mirrors applyAgentOrgNr
@@ -2443,8 +2446,8 @@ export function applyAgentBrregContact(
   const phoneVal = values.phone && values.phone.trim() !== "" ? values.phone.trim() : null;
   if (!addressVal && !phoneVal) return [];
 
-  const kRow = db.prepare(`SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
-    | { address: string | null; phone: string | null; field_provenance: string | null }
+  const kRow = db.prepare(`SELECT address, phone, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+    | { address: string | null; phone: string | null; field_provenance: string | null; curated_fields?: string | null }
     | undefined;
 
   let existingProv: Record<string, unknown> = {};
@@ -2461,7 +2464,30 @@ export function applyAgentBrregContact(
   const phoneProvNew = !!phoneVal && !agentKnowledgeHasBrregValueAlready(existingProv, "phone", phoneVal);
   const addressColumnBlank = !kRow?.address || kRow.address.trim() === "";
   const phoneColumnBlank = !kRow?.phone || kRow.phone.trim() === "";
-  const addressWouldFillColumn = !!addressVal && addressColumnBlank;
+  // W40 write guards (Kvestad Sideri): the one exception to fill-only — a
+  // stored road-designation-only address ("Fv109, 5776 Nå") is replaced by a
+  // Brreg street address WITH a house number (never over a curated lock or an
+  // owner-attested address; owner-claimed agents already returned above).
+  let addressCuratedLocked = false;
+  try {
+    const c = kRow?.curated_fields ? JSON.parse(kRow.curated_fields) : {};
+    addressCuratedLocked = !!(c && typeof c === "object" && (c as Record<string, unknown>).address);
+  } catch {
+    /* malformed curated_fields -> not locked */
+  }
+  const roadOnlyCorrectFrom =
+    !!addressVal && !addressColumnBlank &&
+    canCorrectRoadOnlyAddress({
+      currAddr: kRow!.address!,
+      incoming: addressVal,
+      incomingSourceType: "brreg",
+      ownName: agentRow.name,
+      existingAddressProvenance: existingProv.address,
+      isCurated: addressCuratedLocked,
+    })
+      ? kRow!.address!
+      : null;
+  const addressWouldFillColumn = !!addressVal && (addressColumnBlank || roadOnlyCorrectFrom !== null);
   const phoneWouldFillColumn = !!phoneVal && phoneColumnBlank;
 
   const touched: string[] = [];
@@ -2528,13 +2554,25 @@ export function applyAgentBrregContact(
     let addressColumnWritten = false;
     let phoneColumnWritten = false;
     if (addressVal) {
+      // W40 write guards: also matches the exact road-designation-only value
+      // decided above (re-checked here, so a concurrent change is never
+      // overwritten).
       const upd = db
         .prepare(
           `UPDATE agent_knowledge SET address = @val, updated_at = @now, data_enriched_at = @now
-            WHERE agent_id = @id AND (address IS NULL OR TRIM(address) = '')`,
+            WHERE agent_id = @id AND (address IS NULL OR TRIM(address) = ''
+                                      OR (@roadOnly IS NOT NULL AND address = @roadOnly))`,
         )
-        .run({ id: agentId, val: addressVal, now: nowIso });
+        .run({ id: agentId, val: addressVal, now: nowIso, roadOnly: roadOnlyCorrectFrom });
       addressColumnWritten = upd.changes > 0;
+      if (addressColumnWritten && roadOnlyCorrectFrom !== null) {
+        // A corrected (not merely filled) address moves the map pin — same
+        // reset PUT /admin/knowledge applies on a real address change.
+        db.prepare(
+          `UPDATE agents SET geo_precision = NULL, lat = NULL, lng = NULL, geocode_source = NULL,
+             geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
+        ).run(agentId);
+      }
     }
     if (phoneVal) {
       const upd = db

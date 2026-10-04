@@ -62,14 +62,13 @@ import {
   checkAboutCandidateSubstantiatedBySource,
   type AboutSubstantiationVerdict,
 } from "../services/about-source-substantiation";
-import {
-  canonicalizeAddressVariants,
-  foldAccentsForComparison,
-  normalizeAddress,
-  prepareAddressForComparison,
-  splitAddress,
-} from "../services/contact-normalizer";
+import { canonicalizeAddressVariants, foldAccentsForComparison } from "../services/contact-normalizer";
 import { decodeHtmlEntities } from "../services/search-enrich";
+import {
+  checkPhoneSubstantiatedBySource,
+  normalizePhoneToNationalDigits,
+} from "../services/phone-source-write-guard";
+import { parseStoredStreetAddress, type ParsedStreetAddress } from "../services/street-address-parse";
 
 const router = Router();
 
@@ -91,40 +90,11 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
-/** Normalize a stored phone number to 8 national digits: strip every
- *  non-digit, then strip a leading 0047/47 country code when exactly 8
- *  digits remain. Returns null when the value doesn't normalize to 8 digits
- *  (caller then falls back to the text check). PURE. Exported for tests. */
-export function normalizePhoneToNationalDigits(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const digits = value.replace(/\D/g, "");
-  if (/^\d{8}$/.test(digits)) return digits;
-  const m = /^(?:0047|47)(\d{8})$/.exec(digits);
-  return m ? m[1]! : null;
-}
-
-/** Phone-specific substantiation: the text-based default false-mismatches
- *  on formatting differences ("+47 41 63 44 22" vs "41634422"). Collapses
- *  separators (space/nbsp/dot/dash/parentheses/+) between digits on the page
- *  text, then requires the 8 national digits to be a WHOLE digit run —
- *  optionally prefixed by a 47/0047 country code — so a number embedded in
- *  a longer digit run (ids, other numbers) never matches. Falls back to the
- *  standard text check when the stored value isn't an 8-digit number. PURE.
- *  Exported for tests. */
-export function checkPhoneSubstantiatedBySource(
-  candidate: string | null | undefined,
-  sourceText: string | null | undefined,
-): AboutSubstantiationVerdict {
-  const national = normalizePhoneToNationalDigits(candidate);
-  if (!national) return checkAboutCandidateSubstantiatedBySource(candidate, sourceText);
-  const collapsed = (sourceText || "").replace(/(\d)[ \t\u00a0.\-()+]+(?=\d)/g, "$1");
-  for (const run of collapsed.match(/\d+/g) || []) {
-    if (run === national || run === "47" + national || run === "0047" + national) {
-      return { substantiated: true, reason: `phone ${national} found on page (digits normalized)` };
-    }
-  }
-  return { substantiated: false, reason: `phone ${national} not found on page as a whole 8-digit number` };
-}
+// normalizePhoneToNationalDigits / checkPhoneSubstantiatedBySource moved to
+// ../services/phone-source-write-guard.ts (shared with the enrichment phone
+// write guard); re-exported below unchanged for this route and its tests.
+export { normalizePhoneToNationalDigits, checkPhoneSubstantiatedBySource };
+export { parseStoredStreetAddress, type ParsedStreetAddress };
 
 /** `about`-specific substantiation (W40 false-positive fix, b1). FIRST the
  *  write-guard's own check (checkAboutCandidateSubstantiatedBySource:
@@ -338,25 +308,9 @@ export async function resolveAboutSpotCheck(
 
 // ── Address (W40 false-positive fix, b4) ─────────────────────────────────────
 
-/** Road designations ("Fv109", "Fv 109", "Rv. 7", "E6", "Fylkesvegen 109"):
- *  the number after one of these is a ROAD number, never a house number, so
- *  such a value has no street + house number to compare structurally. Tested
- *  against the street-name part AFTER normalizeAddress's canonicalization
- *  (which already turns "-vegen" into "-veien"). */
-const ROAD_DESIGNATION_RE = /^(?:fv|rv|ev|kv|e|fylkesvei(?:en)?|riksvei(?:en)?|europavei(?:en)?)\.?$/;
-
-/** "<street name> <house number>" as one comma segment, e.g. "lauvdalen
- *  186", "st. olavs gate 5b", "ullstindveien 1242/1246". */
-const STREET_AND_NUMBER_RE = /^(\p{L}[\p{L}\p{N}.' -]*?)\s+(\d{1,4}[a-zæøå]?(?:\/\d{1,4}[a-zæøå]?)?)$/u;
-
-/** A postal code written WITHOUT a comma straight after the house number,
- *  with no place name after it ("reiseteveien 83 5776", "… 83 n-5776").
- *  splitAddress only strips a postal tail after a comma or with a place
- *  word, so such a code stays in the street part and would be read as the
- *  house number (review fix). Requires a house number BEFORE the 4 digits,
- *  so a lone 4-digit house number ("ullstindveien 1242") is never taken for
- *  a postal code. Group 1 = street + number, 2 = postal code. */
-const UNSEPARATED_POSTCODE_TAIL_RE = /^(.*\s\d{1,4}[a-zæøå]?)\s+(?:no?-\s?)?(\d{4})$/u;
+// Road designations, "<street> <number>" parsing and parseStoredStreetAddress
+// moved to ../services/street-address-parse.ts (shared with the enrichment
+// write paths' road-designation guard); re-exported here unchanged.
 
 /** Words that, written right before a street name, make it a DIFFERENT
  *  street: "Lille Storgata" is not "Storgata", "Nedre Slottsgate" is not
@@ -371,62 +325,6 @@ const STREET_NAME_MODIFIER_WORDS = new Set([
   "nordre", "søndre", "sondre", "austre", "østre", "ostre", "vestre", "gamle", "nye",
 ]);
 
-export interface ParsedStreetAddress {
-  /** Normalized street name ("lauvdalen", "solsideveien"). */
-  street: string;
-  /** Normalized house number incl. letter suffix ("186", "20b", "1242/1246"). */
-  houseNumber: string;
-  /** 4-digit postal code, or null when the stored value carries none. */
-  postcode: string | null;
-}
-
-/** Parse a stored address into street name + house number + postal code
- *  using the SAME normalizer every other address comparison in this codebase
- *  uses (contact-normalizer.ts: prepareAddressForComparison → label/URL/
- *  own-name/company-form strip + accent fold; normalizeAddress →
- *  veg/vei + "12 a"/"12a" canonicalization; splitAddress → postal tail).
- *  Takes the LAST comma segment of the street part that ends in a house
- *  number, so a leading farm/company name ("Nordgard Aukrust, Solsidevegen
- *  449, 2686 Lom") is skipped. Returns null when there is no street + house
- *  number to compare (farm-name-only values like "Lønsdal, 8255 Røkland",
- *  road designations like "Fv109, 5776 Nå"). PURE. Exported for tests. */
-export function parseStoredStreetAddress(
-  raw: string | null | undefined,
-  ownName?: string | null,
-): ParsedStreetAddress | null {
-  if (typeof raw !== "string" || !raw.trim()) return null;
-  const norm = normalizeAddress(prepareAddressForComparison(raw, ownName)).normalize("NFC");
-  if (!norm) return null;
-  const split = splitAddress(norm);
-  const segments = split.street.split(",").map((s) => s.trim()).filter(Boolean);
-  for (let i = segments.length - 1; i >= 0; i--) {
-    // "reiseteveien 83 5776" (no comma, no place): the trailing 4 digits are
-    // the postal code, not the house number.
-    const tail = UNSEPARATED_POSTCODE_TAIL_RE.exec(segments[i]!);
-    const segment = tail ? tail[1]! : segments[i]!;
-    let postcode = tail ? tail[2]! : split.postcode;
-    const m = STREET_AND_NUMBER_RE.exec(segment);
-    if (!m) continue;
-    const name = m[1]!.trim();
-    if (ROAD_DESIGNATION_RE.test(name)) return null;
-    const houseNumber = m[2]!;
-    // splitAddress takes the first whole 4-digit run as the postal code even
-    // when it IS the house number ("ullstindveien 1242" -> postcode 1242),
-    // which would then "conflict" with the page's real postal code. A run
-    // that occurs only once in the value, as its house number, is not a
-    // postal code.
-    if (
-      !tail &&
-      postcode !== null &&
-      houseNumber.replace(/[a-zæøå]$/u, "") === postcode &&
-      (norm.match(new RegExp(`(?<![\\d/])${postcode}(?![\\d/])`, "g"))?.length ?? 0) === 1
-    ) {
-      postcode = null;
-    }
-    return { street: name, houseNumber, postcode };
-  }
-  return null;
-}
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

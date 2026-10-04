@@ -28,6 +28,14 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
+// W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
+import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
+import {
+  hasStreetAndHouseNumber,
+  isRoadDesignationOnlyAddress,
+  isStreetAddressPreferredSource,
+  canCorrectRoadOnlyAddress,
+} from "../services/street-address-parse";
 import { randomUUID } from "crypto";
 import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
@@ -1880,7 +1888,7 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
 // Admin key uses upsertKnowledge (dataSource: "auto") for enrichment.
 // Claim token / API key uses ownerUpdate (dataSource: "owner").
 
-router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
+router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
   const claimToken = (req.headers["x-claim-token"] as string) || "";
   const apiKey = (req.headers["x-api-key"] as string) || "";
   const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
@@ -1957,16 +1965,77 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     return;
   }
 
+  // ── Phone write guard (W40 RFB spot-check, Aalan Gård) ─────────────────
+  // ADMIN lane only — the claim-token / API-key lanes are the producer
+  // editing their own profile and are never gated here. Aalan Gård got an
+  // LLM-invented number through exactly this call (lokal-agent-enrichment
+  // PHASE 2D step 1, dataSource auto, no source_url). An admin phone value is
+  // now written only when it is SEEN on the page the write names:
+  // `phone_source_url` in the body (or a `field_provenance.phone` record with
+  // `source_url` for the same number), fetched server-side through the
+  // SSRF-guarded fetchPage with a per-host 429 cooldown; an unreadable page
+  // means "could not check" => not written (mirrors lokal#967). Exempt:
+  // clearing (""), re-sending the stored number, and an owner relay WITH
+  // `owner_relay_evidence: {channel, ref, received_at}` (CS writing what the
+  // producer told us by e-mail) — logged + audited. The admin key is shared
+  // by CS and the enrichment routine, so `dataSource: "owner"` alone (or an
+  // owner provenance record, which this route does not even persist) is NOT
+  // an exemption. See services/phone-source-write-guard.ts.
+  // A refused phone is dropped and the rest of the body is still written
+  // (HTTP 200 + `phone_write` + `phone_rejected_reason`); when the phone was
+  // the only field in the body the call is a 422 with the same fields.
+  let body: Record<string, unknown> = (req.body ?? {}) as Record<string, unknown>;
+  let phoneWrite: PhoneWriteVerdict | undefined;
+  let phoneBefore: string | null = null;
+  if (isAdmin && typeof body.phone === "string") {
+    const fp = body.field_provenance && typeof body.field_provenance === "object"
+      ? (body.field_provenance as Record<string, unknown>)
+      : undefined;
+    phoneBefore = knowledgeService.getKnowledge(agentId)?.phone ?? null;
+    phoneWrite = await guardAutoPhoneWrite({
+      phone: body.phone,
+      existingPhone: phoneBefore,
+      explicitSourceUrl: body.phone_source_url,
+      fieldProvenancePhone: fp?.phone,
+      ownerRelayEvidence: body.owner_relay_evidence,
+    });
+    if (!phoneWrite.allowed) {
+      console.log(
+        `[knowledge PUT] admin phone write REJECTED for agent ${agentId} — ${phoneWrite.outcome}` +
+          (phoneWrite.source_url ? ` (${phoneWrite.source_url})` : "") + "; not written",
+      );
+      const { phone: _dropped, ...rest } = body;
+      body = rest;
+      const otherKeys = Object.keys(body).filter(
+        (k) => !["dataSource", "phone_source_url", "field_provenance", "owner_relay_evidence"].includes(k) && body[k] !== undefined,
+      );
+      if (otherKeys.length === 0) {
+        res.status(422).json({
+          success: false,
+          error: "phone_not_substantiated",
+          phone_write: phoneWrite,
+          phone_rejected_reason: phoneWrite.outcome,
+        });
+        return;
+      }
+    }
+  }
+
   try {
     if (isAdmin) {
       // Admin enrichment — preserve dataSource as "auto" (or what's in body)
       knowledgeService.upsertKnowledge(agentId, {
-        ...req.body,
-        dataSource: req.body.dataSource || "auto",
+        ...(body as any),
+        dataSource: (body.dataSource as any) || "auto",
       });
     } else {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
+    }
+
+    // W40 write guards: every owner-relay phone write is logged + audited.
+    if (phoneWrite?.outcome === "owner_relay" && phoneWrite.owner_relay_evidence && typeof body.phone === "string") {
+      recordOwnerRelayPhoneAudit(getDb(), agentId, phoneBefore, body.phone, phoneWrite.owner_relay_evidence, "put_agents_knowledge");
     }
 
     // Recalculate trust score — completeness signal changes with every update
@@ -1977,6 +2046,9 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
       success: true,
       message: isAdmin ? "Kunnskapsdata beriket (auto)" : "Kunnskapsdata oppdatert",
       data: { ...updated, trustScore: newTrustScore },
+      // W40 write guards: present only on an admin call that carried `phone`.
+      ...(phoneWrite ? { phone_write: phoneWrite } : {}),
+      ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -2305,7 +2377,11 @@ router.post("/admin/register", (req: Request, res: Response) => {
 // Uses the existing bulkEnrich method (dataSource: "auto").
 // Requires ADMIN_KEY header.
 
-router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
+// W40 write guards: max concurrent source-page fetches for bulk-enrich's
+// phone checks.
+const BULK_PHONE_CHECK_CONCURRENCY = 3;
+
+router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
   const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
@@ -2366,6 +2442,38 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
       }
     }
 
+    // W40 write guards: same phone gate as PUT /agents/:id/knowledge's admin
+    // lane (this route is its batch sibling, always dataSource auto). Per
+    // entry: a phone needs `phone_source_url` (or a field_provenance.phone
+    // record with source_url) and must be seen on that page; otherwise only
+    // the phone is dropped from that entry and reported in phoneRejections.
+    // NO owner-relay exemption here at all (no owner_relay_evidence, no owner
+    // provenance record) — a batch is never a CS relay. Page checks run at
+    // most BULK_PHONE_CHECK_CONCURRENCY at a time.
+    const phoneRejections: Array<{ agentId: string; outcome: string; source_url: string | null }> = [];
+    const phoneEntries = enrichments.filter((e: any) => typeof e.data?.phone === "string");
+    let nextPhoneEntry = 0;
+    const phoneWorker = async (): Promise<void> => {
+      while (nextPhoneEntry < phoneEntries.length) {
+        const e: any = phoneEntries[nextPhoneEntry++];
+        const fp = e.data.field_provenance && typeof e.data.field_provenance === "object" ? e.data.field_provenance : undefined;
+        const verdict = await guardAutoPhoneWrite({
+          phone: e.data.phone,
+          existingPhone: knowledgeService.getKnowledge(e.agentId)?.phone ?? null,
+          explicitSourceUrl: e.data.phone_source_url,
+          fieldProvenancePhone: fp?.phone,
+        });
+        if (!verdict.allowed) {
+          console.log(`[admin/bulk-enrich] ${e.agentId} phone REJECTED — ${verdict.outcome}; not written`);
+          e.data = { ...e.data, phone: undefined };
+          phoneRejections.push({ agentId: e.agentId, outcome: verdict.outcome, source_url: verdict.source_url });
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BULK_PHONE_CHECK_CONCURRENCY, phoneEntries.length) }, () => phoneWorker()),
+    );
+
     const count = knowledgeService.bulkEnrich(enrichments);
 
     // Recalculate trust scores for all enriched agents
@@ -2385,6 +2493,8 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
         total: agents.length,
         trustScoresUpdated: trustUpdated,
         aboutCodeArtifactRejected: aboutRejected,
+        phoneRejected: phoneRejections.length,
+        phoneRejections,
       },
     });
   } catch (err: any) {
@@ -2499,6 +2609,22 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ─── W40 write guards: road-designation address correction ───────────────
+// Kvestad Sideri: the stored address `Fv109, 5776 Nå` (Google Places, a road
+// number without a house number) could never be replaced by the homepage's /
+// Brreg's `Reisetevegen 83, 5776 Nå`, because both enrichment address writes
+// below (google-rating-batch, homepage-provenance-batch) are fill-empty-only.
+// canCorrectRoadOnlyAddress (services/street-address-parse.ts) is the one
+// exception; a corrected address also resets the geocode, below.
+/** Same geocode reset PUT /admin/knowledge applies on a real address change
+ *  (dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet). */
+function invalidateAgentGeocode(db: ReturnType<typeof getDb>, agentId: string): void {
+  db.prepare(
+    `UPDATE agents SET geo_precision = NULL, lat = NULL, lng = NULL, geocode_source = NULL,
+       geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
+  ).run(agentId);
+}
 
 // ─── POST /admin/google-rating-batch — Batch fetch ratings ──
 // Accepts { agentIds: string[] }, fetches Google rating for each.
@@ -2790,7 +2916,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
           .prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?")
           .get(agentId) as { address?: string | null } | undefined;
         const addrIsEmpty = !(existingAddrRow?.address ?? "").toString().trim();
-        if (addrIsEmpty) {
+        // W40 write guards (Kvestad Sideri): also ask Brreg when the stored
+        // address is only a road designation ("Fv109, 5776 Nå") — a Brreg
+        // street address with a house number may correct it below.
+        const addrIsRoadOnly = !addrIsEmpty && isRoadDesignationOnlyAddress(existingAddrRow?.address, info.agent.name);
+        if (addrIsEmpty || addrIsRoadOnly) {
           try {
             const brregHit = await findOrgnumberByName(info.agent.name, info.knowledge.postalCode);
             if (brregHit?.address) brregAddr = brregHit.address;
@@ -2843,6 +2973,8 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       // ── PR-82: optional address/phone write + provenance merge ──
       let addressWritten = false;
       let phoneWritten = false;
+      let addressCorrected = false;
+      let addressSkippedReason: string | undefined;
       if (wantAddrPhone) {
         try {
           // measure 3: prefer the BRREG address looked up above — Google's
@@ -2859,14 +2991,15 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             // Re-read the row AFTER upsertKnowledge so we see any rating-row
             // inserts and the current address/phone column state.
             const row = db
-              .prepare("SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?")
-              .get(agentId) as { address?: string | null; phone?: string | null; field_provenance?: string | null } | undefined;
+              .prepare("SELECT address, phone, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?")
+              .get(agentId) as { address?: string | null; phone?: string | null; field_provenance?: string | null; curated_fields?: string | null } | undefined;
 
             const currAddr = (row?.address ?? "").toString().trim();
             const currPhone = (row?.phone ?? "").toString().trim();
 
-            // Decide which columns we're allowed to overwrite (empty only).
-            const writeAddr = !currAddr && !!gAddrRaw;
+            // Decide which columns we're allowed to overwrite (empty only —
+            // plus the W40 road-designation correction below).
+            let writeAddr = !currAddr && !!gAddrRaw;
             const writePhone = !currPhone && !!gPhone;
 
             // Build the incoming provenance payload — include EVERY field we
@@ -2895,6 +3028,54 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
               } catch { /* tolerate junk */ }
             }
+
+            // ── W40 write guards (Kvestad Sideri) ──────────────────────────
+            // (1) A Google address without street + house number ("Fv109,
+            //     5776 Nå") is not written into an empty column when a
+            //     homepage/Brreg street address WITH a house number is already
+            //     on record for this agent — the precise source wins; the
+            //     google_places provenance entry is still merged as before.
+            // (2) A stored road-designation-only address is CORRECTED by a
+            //     Brreg street address with a house number from this run
+            //     (streetAddressBeatsRoadDesignation) — never over a curated
+            //     lock or an owner-attested address.
+            const ownName = info.agent.name;
+            if (writeAddr && gAddrSource === "google_places" && !hasStreetAndHouseNumber(gAddrRaw, ownName)) {
+              const recs = Array.isArray(existingProv.address) ? (existingProv.address as unknown[]) : [];
+              const betterKnown = recs.some((r) => {
+                const o = (r && typeof r === "object" ? r : {}) as Record<string, unknown>;
+                return (
+                  isStreetAddressPreferredSource(typeof o.source_type === "string" ? o.source_type : null) &&
+                  typeof o.value === "string" &&
+                  hasStreetAndHouseNumber(o.value, ownName)
+                );
+              });
+              if (betterKnown) {
+                writeAddr = false;
+                addressSkippedReason = "google_address_without_street_number_better_source_on_record";
+              }
+            }
+            if (!writeAddr && currAddr && gAddrRaw) {
+              let curatedAddr = false;
+              try {
+                const c = row?.curated_fields ? JSON.parse(row.curated_fields) : {};
+                curatedAddr = !!(c && typeof c === "object" && (c as Record<string, unknown>).address);
+              } catch { /* malformed = not curated */ }
+              if (
+                canCorrectRoadOnlyAddress({
+                  currAddr,
+                  incoming: gAddrRaw,
+                  incomingSourceType: gAddrSource,
+                  ownName,
+                  existingAddressProvenance: existingProv.address,
+                  isCurated: curatedAddr,
+                })
+              ) {
+                writeAddr = true;
+                addressCorrected = true;
+              }
+            }
+
             let mergedProv = mergeFieldProvenance(existingProv, incomingProv);
 
             // ── Bug fix (dev-request 2026-09-05-google-rating-batch-
@@ -2992,6 +3173,8 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 params.push(agentId);
                 db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
               }
+              // A corrected (not merely filled) address moves the map pin.
+              if (addressCorrected) invalidateAgentGeocode(db, agentId);
             });
             tx();
             addressWritten = writeAddr;
@@ -3023,6 +3206,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         googleRating: requestEnterprise ? place.rating : (state?.existingRating ?? undefined),
         googleReviewCount: requestEnterprise ? (place.userRatingCount || 0) : (state?.existingReviewCount ?? undefined),
         ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
+        // W40 write guards: present only when they fired.
+        ...(addressCorrected ? { addressCorrected: true } : {}),
+        ...(addressSkippedReason ? { addressSkippedReason } : {}),
       });
 
       // Small delay to be nice to Google
@@ -7077,7 +7263,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // was replaced by a newly extracted guarded value under low_quality mode
     // (see processAgent's write transaction below); absent/false for every
     // other outcome, including the pre-existing fill-if-empty path.
-    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean; emailReplaced?: boolean }
+    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean; emailReplaced?: boolean; addressCorrected?: boolean }
     | { agentId: string; status: "no_data" }
     | { agentId: string; status: "ownership_unverified" }
     | { agentId: string; status: "fetch_error"; error: string }
@@ -7402,6 +7588,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // unconditionally for every agent processed.
     let curatedFieldsCache: ReturnType<typeof knowledgeService.getCuratedFields> | null = null;
     let emailReplaced = false;
+    let addressCorrected = false;
 
     // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
     // write-site (g)): mirrors write-site (f)'s already-fixed provenanceChanged
@@ -7439,6 +7626,26 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         sets.push("address = ?");
         params.push(extractedAddress);
         columnWritten = true;
+      } else if (currAddr && extractedAddress) {
+        // W40 write guards (Kvestad Sideri): the homepage's street address
+        // with a house number corrects a road-designation-only stored value.
+        if (curatedFieldsCache === null) curatedFieldsCache = knowledgeService.getCuratedFields(agentId);
+        if (
+          canCorrectRoadOnlyAddress({
+            currAddr,
+            incoming: extractedAddress,
+            incomingSourceType: "homepage",
+            ownName: producerName,
+            existingAddressProvenance: existingProv.address,
+            isCurated: !!curatedFieldsCache["address"],
+          })
+        ) {
+          sets.push("address = ?");
+          params.push(extractedAddress);
+          columnWritten = true;
+          addressCorrected = true;
+          invalidateAgentGeocode(db, agentId);
+        }
       }
       // orch-pr-<N> (2026-07-05): mirrors the phone/address backfill above.
       // Without this, an extracted+guarded email only ever lands in
@@ -7514,9 +7721,15 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     });
     tx();
 
-    return emailReplaced
-      ? { agentId, status: "enriched", fieldsFound, provenanceWritten: true, emailReplaced: true }
-      : { agentId, status: "enriched", fieldsFound, provenanceWritten: true };
+    return {
+      agentId,
+      status: "enriched",
+      fieldsFound,
+      provenanceWritten: true,
+      ...(emailReplaced ? { emailReplaced: true } : {}),
+      // W40 write guards: a road-designation-only address was corrected.
+      ...(addressCorrected ? { addressCorrected: true } : {}),
+    };
   }
 
   // Run with limited concurrency (≤3 at a time).
@@ -7581,6 +7794,10 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const emailReplaced = outcomes.filter(
     (o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched"
   ).reduce((acc, o) => acc + (o.emailReplaced ? 1 : 0), 0);
+  // W40 write guards: road-designation-only addresses corrected this run.
+  const addressCorrectedIds = outcomes
+    .filter((o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched" && !!(o as any).addressCorrected)
+    .map((o) => o.agentId);
 
   const byField: Record<string, number> = {};
   for (const o of outcomes) {
@@ -7603,6 +7820,8 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       ownership_unverified: ownershipUnverified,
       provenance_written: provenanceWritten,
       email_replaced: emailReplaced,
+      address_corrected: addressCorrectedIds.length,
+      address_corrected_ids: addressCorrectedIds,
       by_field: byField,
       errors,
       // Agents that crossed the 3-failure parking threshold during this run
