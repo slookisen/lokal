@@ -868,6 +868,18 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_blocklist ADD COLUMN linked_org_nr TEXT`);
   } catch { /* already exists — expected */ }
 
+  // ─── email_bounces.lane_at_send (bounce attribution, 2026-10-04) ────────
+  // Which outreach lane sent the mail that bounced: 'rfb' (the RFB daily job's
+  // ledger or any RFB outreach_sent_log row) or 'opplevagent' (the gårdssalg
+  // lane's experience_outreach_sent_log), else the sending vertical's id.
+  // Filled by the Resend webhook (services/resend-webhook.ts,
+  // resolveBounceSendAttribution) together with agent_id_at_send/batch_id,
+  // which until now were always NULL there. NULL = no matching send found.
+  // Additive, idempotent ALTER.
+  try {
+    db.exec(`ALTER TABLE email_bounces ADD COLUMN lane_at_send TEXT`);
+  } catch { /* already exists — expected */ }
+
   // ════════════════════════════════════════════════════════════
   // CRM: contacts, threads, messages, actions, outbox
   // Inbox-CRM for customer-service workflow.

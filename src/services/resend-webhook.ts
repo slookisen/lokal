@@ -41,6 +41,9 @@
 //          more events in the Resend dashboard is harmless).
 //      A failure anywhere rolls the whole event back (ledger row included),
 //      the route answers 500 and Svix retries — never a half-applied event.
+//   3. resolveBounceSendAttribution(): which of OUR sends bounced, so the
+//      email_bounces row carries agent_id_at_send / batch_id / lane_at_send
+//      (always NULL from this webhook before 2026-10-04). See its comment.
 //
 // Deliberately OUT of scope: catching up on bounces/complaints that happened
 // BEFORE the webhook was configured (would need Resend API polling —
@@ -55,6 +58,7 @@
 
 import crypto from "crypto";
 import { getDb } from "../database/init";
+import { getDb as getVerticalDb } from "../database/db-factory";
 import { bounceService } from "./bounce-service";
 import { normalizeEmail } from "./blocklist-service";
 
@@ -183,6 +187,17 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
   const ledger = db.prepare(
     `INSERT OR IGNORE INTO resend_webhook_events (svix_id, event_type, email, outcome) VALUES (?, ?, ?, ?)`,
   );
+  // Read-only and best effort, so it runs before (outside) the transaction
+  // and can never be the reason an event fails.
+  let attribution: BounceSendAttribution | null = null;
+  if (email && (outcome === "hard_bounce_recorded" || outcome === "complaint_recorded")) {
+    try {
+      const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
+      attribution = resolveBounceSendAttribution(email, new Date(acceptedAt ?? Date.now()));
+    } catch (err: any) {
+      console.warn(`[resend-webhook] send attribution failed (bounce recorded without it): ${err?.message ?? err}`);
+    }
+  }
   let duplicate = false;
   db.transaction(() => {
     if (ledger.run(svixId, type, email, outcome).changes === 0) {
@@ -201,6 +216,9 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       resendEmailId,
       bounceType: isComplaint ? "complaint" : "hard",
       reason: reason.slice(0, REASON_MAX_CHARS),
+      agentIdAtSend: attribution?.agentIdAtSend ?? undefined,
+      batchId: attribution?.batchId ?? undefined,
+      laneAtSend: attribution?.lane,
     });
     // Deliberately NO blocklist add() here (owner decision «1B»): the
     // email_bounces row above is what the outreach senders read; the general
@@ -217,7 +235,129 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
   console.log(
     `[resend-webhook] ${type} ${outcome}` +
       (email ? ` ${email}` : "") +
-      (type === "email.bounced" ? ` bounce_type=${bounceKind || "missing"}` : ""),
+      (type === "email.bounced" ? ` bounce_type=${bounceKind || "missing"}` : "") +
+      (attribution ? ` lane=${attribution.lane} agent=${attribution.agentIdAtSend ?? "-"} batch=${attribution.batchId ?? "-"}` : ""),
   );
   return { httpStatus: 200, body: { received: true, outcome, event_type: type } };
+}
+
+// ─── 3. Send attribution ────────────────────────────────────────────────
+// Which of our sends bounced. Resend's data.email_id cannot be looked up
+// directly: every send path goes through Resend's SMTP relay
+// (email-service.ts → nodemailer), and what we store is the SMTP Message-ID
+// nodemailer generated, not Resend's id (measured 2026-10-04: email_bounces
+// id 8 has resend_email_id 01a100c7-…, the CRM row of the send it belongs to
+// has id <fc2b3f2d-…@rettfrabonden.com>). So the send is resolved by
+// RECIPIENT + TIME: the latest outreach send to that address no later than
+// when Resend accepted the mail (data.created_at, else the event time; plus
+// BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS, since our timestamps are taken just
+// before the hand-off) and no earlier than BOUNCE_ATTRIBUTION_LOOKBACK_DAYS
+// before it. Sources:
+//   • rfb_marketing_send_ledger — the RFB daily job: agent_id, its run_id as
+//     the batch, lane 'rfb'
+//   • experience_outreach_sent_log (experiences db; only when
+//     ENABLE_EXPERIENCES=1, as everywhere else) — the Opplevagent gårdssalg
+//     lane: provider_id, the daily-run envelope whose [started_at,
+//     finished_at] covers the send as the batch (none for a pilot-send),
+//     lane 'opplevagent'
+//   • outreach_sent_log — any other outreach filed through the CRM
+//     (routine/manual compose, …): agent_id, no batch, lane from vertical_id
+//     ('experiences' → 'opplevagent')
+// When two sources hold the same send (within SAME_SEND_WINDOW_MS of the
+// latest), the lane's own ledger wins over outreach_sent_log: the sent-log
+// row of an RFB daily send has no run id, and that of an Opplevagent send
+// carries an RFB agent id matched by e-mail, not the provider.
+export const BOUNCE_ATTRIBUTION_LOOKBACK_DAYS = 30;
+export const BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS = 10 * 60_000;
+const SAME_SEND_WINDOW_MS = 5 * 60_000;
+// = GARDSSALG_OUTREACH_DAILY_AGENT (routes/opplevelser.ts) — not imported:
+// that is the 20k-line route module, far too heavy for the webhook.
+const OPPLEVAGENT_DAILY_AGENT = "opplevagent-outreach-platform";
+
+export interface BounceSendAttribution {
+  agentIdAtSend: string | null;
+  batchId: string | null;
+  /** 'rfb' | 'opplevagent' | another vertical id. */
+  lane: string;
+}
+
+/** SQLite "YYYY-MM-DD HH:MM:SS" (UTC, datetime('now')) or ISO-8601 → epoch ms; NaN when unusable. */
+function parseDbTime(v: unknown): number {
+  if (typeof v !== "string" || v === "") return NaN;
+  return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) ? Date.parse(v.replace(" ", "T") + "Z") : Date.parse(v);
+}
+
+function laneForVertical(vertical: string | null): string {
+  if (!vertical || vertical === "rfb") return "rfb";
+  return vertical === "experiences" ? "opplevagent" : vertical;
+}
+
+/**
+ * The send behind a bounce for `email` (normalized), or null when none of
+ * the sources holds one in the window. Read-only; throws only on a DB error
+ * (the caller records the bounce without attribution).
+ */
+export function resolveBounceSendAttribution(email: string, acceptedAt: Date): BounceSendAttribution | null {
+  const hi = acceptedAt.getTime() + BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS;
+  const lo = acceptedAt.getTime() - BOUNCE_ATTRIBUTION_LOOKBACK_DAYS * 86400_000;
+  // rank 0 = the lane's own ledger, 1 = outreach_sent_log.
+  const candidates: Array<{ at: number; rank: number; attribution: BounceSendAttribution }> = [];
+  const consider = (at: number, rank: number, attribution: BounceSendAttribution) => {
+    if (Number.isFinite(at) && at >= lo && at <= hi) candidates.push({ at, rank, attribution });
+  };
+  const db = getDb();
+
+  const ledgerRows = db
+    .prepare(
+      `SELECT agent_id, run_id, reserved_at FROM rfb_marketing_send_ledger
+        WHERE LOWER(recipient_email) = ? AND status IN ('reserved', 'sent', 'unknown')
+        ORDER BY id DESC LIMIT 20`,
+    )
+    .all(email) as Array<{ agent_id: string; run_id: string; reserved_at: string }>;
+  for (const r of ledgerRows) {
+    consider(parseDbTime(r.reserved_at), 0, { agentIdAtSend: r.agent_id, batchId: r.run_id, lane: "rfb" });
+  }
+
+  if (process.env.ENABLE_EXPERIENCES === "1") {
+    const sentRows = getVerticalDb("experiences")
+      .prepare(
+        `SELECT provider_id, sent_at FROM experience_outreach_sent_log
+          WHERE LOWER(recipient_email) = ? AND is_test = 0
+          ORDER BY id DESC LIMIT 20`,
+      )
+      .all(email) as Array<{ provider_id: string; sent_at: string }>;
+    const coveringRun = db.prepare(
+      `SELECT run_id FROM runs
+        WHERE agent = ?
+          AND replace(substr(started_at, 1, 19), 'T', ' ') <= @at
+          AND (finished_at IS NULL OR replace(substr(finished_at, 1, 19), 'T', ' ') >= @at)
+        ORDER BY started_at DESC LIMIT 1`,
+    );
+    for (const r of sentRows) {
+      const at = parseDbTime(r.sent_at);
+      if (!Number.isFinite(at)) continue;
+      const run = coveringRun.get(OPPLEVAGENT_DAILY_AGENT, { at: new Date(at).toISOString().slice(0, 19).replace("T", " ") }) as
+        | { run_id: string }
+        | undefined;
+      consider(at, 0, { agentIdAtSend: r.provider_id, batchId: run?.run_id ?? null, lane: "opplevagent" });
+    }
+  }
+
+  const sentLogRows = db
+    .prepare(
+      `SELECT agent_id, sent_at, vertical_id FROM outreach_sent_log
+        WHERE LOWER(TRIM(recipient_email)) = ?
+        ORDER BY id DESC LIMIT 20`,
+    )
+    .all(email) as Array<{ agent_id: string | null; sent_at: string; vertical_id: string | null }>;
+  for (const r of sentLogRows) {
+    consider(parseDbTime(r.sent_at), 1, { agentIdAtSend: r.agent_id, batchId: null, lane: laneForVertical(r.vertical_id) });
+  }
+
+  if (candidates.length === 0) return null;
+  const latest = Math.max(...candidates.map((c) => c.at));
+  const best = candidates
+    .filter((c) => c.at >= latest - SAME_SEND_WINDOW_MS)
+    .sort((a, b) => a.rank - b.rank || b.at - a.at)[0];
+  return best.attribution;
 }

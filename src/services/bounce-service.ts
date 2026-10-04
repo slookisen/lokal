@@ -14,6 +14,8 @@ export interface BounceRecord {
   reason?: string;
   agentIdAtSend?: string;
   batchId?: string;
+  /** Outreach lane of the send that bounced ('rfb' | 'opplevagent' | vertical id). */
+  laneAtSend?: string;
 }
 
 export const bounceService = {
@@ -22,8 +24,8 @@ export const bounceService = {
     const email = input.email.toLowerCase().trim();
     const result = db.prepare(`
       INSERT OR IGNORE INTO email_bounces
-        (email, bounced_at, resend_email_id, bounce_type, reason, agent_id_at_send, batch_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+        (email, bounced_at, resend_email_id, bounce_type, reason, agent_id_at_send, batch_id, lane_at_send)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       email,
       input.bouncedAt,
@@ -32,6 +34,7 @@ export const bounceService = {
       input.reason || null,
       input.agentIdAtSend || null,
       input.batchId || null,
+      input.laneAtSend || null,
     );
     return { inserted: result.changes > 0, existing: result.changes === 0 };
   },
