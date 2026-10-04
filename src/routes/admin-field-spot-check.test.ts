@@ -281,6 +281,50 @@ export async function runAdminFieldSpotCheckTests(
     adv = addrV("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 18, 8360 Bøstad</p>");
     assertEq(adv.conflict ?? false, false, "addr-38: street + number not on the page is a plain mismatch, not a conflict");
 
+    // ── Address: street + number NOT on the page, but a postal code is
+    //    (review fix, cross-page). The page reports it so computeFieldSpotCheck
+    //    can refuse to let a weak match on another page become a match. ──
+    adv = addrV("Vindhella 717, 6889 Borgund", "<p>Velkommen til Borgund Chili.</p><footer><p>Borgund Chili · 6888 Borgund</p></footer>");
+    assertEq([adv.substantiated, adv.conflict ?? false, adv.postcodeContradiction, adv.postcodes], [false, false, true, ["6888"]],
+      "addr-39: no street + number, page gives 6888 and never the stored 6889 -> not found + postcodeContradiction (not a conflict on its own)");
+    assertEq(/not found on page, and the page gives postal code 6888 and never the stored 6889/.test(adv.reason), true,
+      "addr-40: the reason names the page's postal code");
+    adv = addrV("Vindhella 717, 6888 Borgund", "<p>Velkommen til Borgund Chili.</p><footer><p>Borgund Chili · 6888 Borgund</p></footer>");
+    assertEq([adv.substantiated, adv.postcodeContradiction ?? false], [false, false], "addr-41: the page gives the stored 6888 -> plain not-found, no contradiction");
+    adv = addrV("Vindhella 717", "<p>Borgund Chili · 6888 Borgund</p>");
+    assertEq(adv.postcodeContradiction ?? false, false, "addr-42: a stored value without a postal code never contradicts");
+    adv = addrV("Vindhella 717, 6889 Borgund", "<p>Velkommen til Borgund Chili. © 2024 Borgund Chili</p>");
+    assertEq(adv.postcodeContradiction ?? false, false, "addr-43: a page that gives no postal code -> no contradiction");
+    adv = addrV("Fv109, 5776 Nå", "<p>Kvestad N-5777 NÅ</p>");
+    assertEq(adv.postcodeContradiction ?? false, false, "addr-44: the no-house-number text fallback never sets the flag (it never gives a weak match either)");
+
+    // ── Address: a street-name modifier word in front makes it another
+    //    street (review fix: "Lille Storgata 5" is not "Storgata 5"). ─────
+    assertEq(addrOk("Storgata 5, 0150 Oslo", "<p>Lille Storgata 5, 0150 Oslo</p>"), false, "addr-45: 'Lille Storgata 5' is not 'Storgata 5'");
+    assertEq(addrOk("Slottsgate 3, 0157 Oslo", "<p>Nedre Slottsgate 3, 0157 Oslo</p>"), false, "addr-46: 'Nedre Slottsgate 3' is not 'Slottsgate 3'");
+    assertEq(addrOk("Storgata 5, 0150 Oslo", "<p>Søndre Storgata 5<br>0150 Oslo</p>"), false, "addr-47: 'Søndre Storgata 5' is not 'Storgata 5'");
+    assertEq(addrOk("Lille Storgata 5, 0150 Oslo", "<p>Lille Storgata 5, 0150 Oslo</p>"), true, "addr-48: stored 'Lille Storgata 5' matches itself");
+    assertEq(addrOk("Storgata 5, 0150 Oslo", "<p>Lille Storgata 5, 0150 Oslo. Butikken ligg i Storgata 5, 0150 Oslo.</p>"), true,
+      "addr-49: a plain 'Storgata 5' elsewhere on the same page still matches");
+    assertEq(addrOk("Reisetevegen 83, 5776 Nå", "<p>Kvestad Sideri</p><p>Reisetevegen 83</p><p>N-5776 NÅ</p>"), true,
+      "addr-50: the producer's capitalized name right before the street (tags -> spaces) is NOT a modifier -> still a match");
+
+    // ── Address: postal code with no comma and no place (review fix) ─────
+    assertEq(routeMod.parseStoredStreetAddress("Reisetevegen 83 5776"), { street: "reiseteveien", houseNumber: "83", postcode: "5776" },
+      "addr-51: 'Reisetevegen 83 5776' -> house number 83, postal code 5776 (not house number 5776)");
+    assertEq(routeMod.parseStoredStreetAddress("Reisetevegen 83 N-5776"), { street: "reiseteveien", houseNumber: "83", postcode: "5776" },
+      "addr-52: 'N-' prefixed postal code without a comma");
+    assertEq(routeMod.parseStoredStreetAddress("Ullstindvegen 1242"), { street: "ullstindveien", houseNumber: "1242", postcode: null },
+      "addr-53: a lone 4-digit house number is still a house number, and not also the postal code");
+    assertEq(addrOk("Ullstindvegen 1242", "<p>Ullstindveien 1242, 9020 Tromsdalen</p>"), true,
+      "addr-53b: ... so stored 'Ullstindvegen 1242' does not 'conflict' with the page's 9020");
+    assertEq(routeMod.parseStoredStreetAddress("Ullstindvegen 1242, 1242 Sted"), { street: "ullstindveien", houseNumber: "1242", postcode: "1242" },
+      "addr-53c: a postal code that happens to equal the house number is kept when it is written as one");
+    assertEq(routeMod.parseStoredStreetAddress("Reisetevegen 83 5776 Nå"), { street: "reiseteveien", houseNumber: "83", postcode: "5776" },
+      "addr-54: with a place name it parsed before, and still does");
+    assertEq(addrOk("Reisetevegen 83 5776", "<p>Kvestad Sideri, Reisetevegen 83, N-5776 NÅ</p>"), true, "addr-55: 'Reisetevegen 83 5776' vs the Kvestad page -> match");
+    assertEq(addrOk("Reisetevegen 83 5777", "<p>Kvestad Sideri, Reisetevegen 83, N-5776 NÅ</p>"), false, "addr-56: 'Reisetevegen 83 5777' -> mismatch on the postal code");
+
     // findPagePostalCodes: what counts as a postal code the page gives.
     const pcs = (page: string) => [...routeMod.findPagePostalCodes(page)].sort();
     assertEq(pcs("<p>Kvestad Sideri</p><p>N-5776 NÅ</p>"), ["5776"], "pc-01: 'N-5776 NÅ'");
@@ -324,6 +368,19 @@ export async function runAdminFieldSpotCheckTests(
     av = aboutCheck("Gården har vært i familien til Kari Nordmann siden 1450.", vollanSrc);
     assertEq(av.substantiated, false, "about-05: fabricated name + year -> both checks reject -> mismatch");
     assertEq(/^write-guard check: .* \| fact-level check: /.test(av.reason), true, "about-06: mismatch reason carries both checks' reasons");
+
+    // Review fix: the write-guard's OVERLAP branch alone no longer decides
+    // when a fact of the candidate appears nowhere on the page.
+    const honeyPage = "<p>Vi produserer ekte gårdshonning fra egne bikuber i Hallingdal. Gården ligger ved Gol, og honningen slynges hver høst.</p>";
+    av = aboutCheck("Vi produserer ekte gårdshonning fra egne bikuber i Hallingdal, og honningen slynges hver høst ved Gol.", honeyPage);
+    assertEq([av.substantiated, /^write-guard check: close paraphrase/.test(av.reason)], [true, true],
+      "about-07: overlap hit whose facts are all on the page -> match via the write-guard");
+    av = aboutCheck("Vi produserer ekte gårdshonning fra egne bikuber i Valdres, og honningen slynges hver høst ved Gol.", honeyPage);
+    assertEq(av.substantiated, false, "about-08: same text with 'Hallingdal' swapped for 'Valdres' (not on the page) -> not accepted on overlap alone");
+    assertEq(/not accepted on word overlap alone: fact\(s\) valdres appear nowhere on the page/.test(av.reason), true,
+      "about-09: the reason names the unmentioned fact");
+    av = aboutCheck("vi produserer ekte gårdshonning fra egne bikuber i hallingdal.", "<p>Vi produserer ekte gårdshonning fra egne bikuber i Hallingdal.</p>");
+    assertEq(av.substantiated, true, "about-10: a verbatim hit is a match unconditionally");
 
     // ── Auth: admin not configured (no ADMIN_KEY/ANALYTICS_ADMIN_KEY at
     //    all) -> 503, checked BEFORE the X-Admin-Key comparison. ──────

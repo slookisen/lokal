@@ -41,6 +41,9 @@
  *      a blank-line paragraph break stays a hard boundary (three
  *      adversarial cases that a plain "drop <br> from the boundary set"
  *      would wrongly accept).
+ *   J. The two helpers the spot-check route uses to stop the write-guard's
+ *      word-overlap branch from accepting a fact swap (W40 review fix):
+ *      isAboutCandidateVerbatimInSource, findAboutCandidateFactsAbsentFromSource.
  */
 
 export interface TestSummary {
@@ -529,6 +532,48 @@ export function runAboutFactSubstantiationTests(
     } catch (err: any) {
       failed++;
       failures.push("about-fact-substantiation (section I): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section J — helpers for the spot-check route's about check (W40
+    // review fix): isAboutCandidateVerbatimInSource and
+    // findAboutCandidateFactsAbsentFromSource ("is a fact mentioned on the
+    // page AT ALL", markup included).
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const { isAboutCandidateVerbatimInSource, findAboutCandidateFactsAbsentFromSource, ABOUT_FACT_MIN_FACTS } =
+        require("./about-fact-substantiation") as typeof import("./about-fact-substantiation");
+      assertEq(ABOUT_FACT_MIN_FACTS, 2, "j-1: the fact-level check needs >= 2 facts");
+      assertEq(isAboutCandidateVerbatimInSource("oldefar Ole  Dahle plantet EPLEHAGEN", sourceText), true,
+        "j-2: verbatim after normalisation (case, whitespace)");
+      assertEq(isAboutCandidateVerbatimInSource("oldefar Ole Dahle plantet pæretrær", sourceText), false, "j-3: not verbatim");
+      assertEq(isAboutCandidateVerbatimInSource("", sourceText), false, "j-4: empty candidate is never verbatim");
+
+      let r = findAboutCandidateFactsAbsentFromSource(
+        "Gården ved Rødvenfjorden i Rauma har vore i slekta sidan 1600-talet, og Ole Dahle planta eplehagen i 1932.",
+        sourceText,
+      );
+      assertEq(r.absent, [], "j-5: every fact (1600, 1932, rødvenfjorden, rauma, dahle) is on the page");
+      assertEq([...r.facts].sort(), ["1600", "1932", "dahle", "rauma", "rødvenfjorden"], "j-6: facts = numbers >= 3 digits + non-initial proper nouns >= 4 letters");
+      r = findAboutCandidateFactsAbsentFromSource(
+        "Gården ved Hardangerfjorden i Rauma har vore i slekta sidan 1600-talet, og Ole Dahle planta eplehagen i 1874.",
+        sourceText,
+      );
+      assertEq(r.absent, ["1874", "hardangerfjorden"], "j-7: swapped place and year are reported absent");
+      r = findAboutCandidateFactsAbsentFromSource(
+        "Me dyrkar grønsaker og er Debio-sertifisert.",
+        '<html><body><img src="/img/Debio_O-merke.png"></body></html>\n',
+      );
+      assertEq([r.facts, r.absent], [["debio-sertifisert"], []],
+        "j-8: a fact only in markup (an image name) counts as mentioned; a hyphenated proper noun by its leading name part");
+      r = findAboutCandidateFactsAbsentFromSource("Gården ligg i Lom ved Vågåvatnet.", "<p>Gården ligg i Lom.</p>");
+      assertEq(r.absent, ["vågåvatnet"], "j-9: a proper noun missing from the page");
+      assertEq(findAboutCandidateFactsAbsentFromSource("", sourceText), { facts: [], absent: [] }, "j-10: empty candidate");
+      assertEq(findAboutCandidateFactsAbsentFromSource("Gården har 1932 tre.", "<p>Eplehagen fra 19321.</p>").absent, ["1932"],
+        "j-11: a number must be a whole digit run (1932 is not in 19321)");
+    } catch (err: any) {
+      failed++;
+      failures.push("about-fact-substantiation (section J): unexpected error: " + String(err?.stack || err?.message || err));
     }
 
     return { passed, failed, failures };

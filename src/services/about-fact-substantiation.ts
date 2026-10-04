@@ -116,6 +116,9 @@ import {
 export type { AboutSubstantiationVerdict };
 
 const MIN_FACTS = 2;
+/** Fewer facts than this and checkAboutCandidateFactSubstantiated does not
+ *  judge at the fact level at all (it falls back to the write-guard check). */
+export const ABOUT_FACT_MIN_FACTS = MIN_FACTS;
 const FACT_COVERAGE_RATIO = 0.8;
 const MIN_PROPER_NOUN_LENGTH = 4;
 const MIN_DIGIT_RUN_LENGTH = 3;
@@ -437,6 +440,52 @@ function blockCorroborates(block: string, contextWords: Set<string>): boolean {
   }
   const ratio = matched / contextWords.size;
   return matched >= LOCAL_MIN_CONTEXT_WORD_MATCHES && ratio >= LOCAL_CONTEXT_OVERLAP_RATIO;
+}
+
+/** Whether `candidate`, normalised (entities decoded, lowercased, NFKC,
+ *  whitespace collapsed), occurs verbatim inside `sourceText` normalised the
+ *  same way — the same test as the write-guard's own verbatim branch,
+ *  computed independently (this module keeps zero coupling to the write-
+ *  guard's internals, see STOPWORDS). PURE. Exported for the spot-check
+ *  route. */
+export function isAboutCandidateVerbatimInSource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): boolean {
+  const cand = normalizeForMatch(candidate ?? "");
+  return cand.length > 0 && normalizeForMatch(sourceText ?? "").includes(cand);
+}
+
+/** The candidate's own distinct facts — the SAME definition the fact-level
+ *  check uses (numbers with >= 3 digits; proper nouns: capitalized, not
+ *  sentence-initial, >= 4 letters) — and which of them occur NOWHERE in
+ *  `sourceText` at all (raw markup included, so a fact that is only in an
+ *  image name, alt text or meta tag still counts as present). A number is
+ *  present as a whole digit run; a proper noun when its leading name part
+ *  ("Galdhøpiggen" -> "galdhøpiggen"; "Debio-sertifisert" -> "debio") is a
+ *  whole token of the source. Deliberately lenient: it answers "does the page say anything
+ *  about this at all", not "is it corroborated" (that is
+ *  checkAboutCandidateFactSubstantiated's job).
+ *
+ *  Used by the spot-check route (W40 review fix) to stop the write-guard's
+ *  70% word-overlap branch from accepting a text with one or two facts
+ *  swapped for ones the page never mentions ("… ved foten av Galdhøpiggen
+ *  (2469 moh)" on a page that only says "Lomseggen (2068 moh)"). PURE. */
+export function findAboutCandidateFactsAbsentFromSource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): { facts: string[]; absent: string[] } {
+  const cand = (candidate ?? "").trim();
+  if (!cand) return { facts: [], absent: [] };
+  const { tokens } = extractCandidateFacts(cand);
+  const src = normalizeForMatch(sourceText ?? "");
+  const srcTokens = new Set(src.match(/[\p{L}\p{N}]+/gu) ?? []);
+  const absent = tokens.filter((token) => {
+    if (/^\d+$/.test(token)) return !new RegExp(`(?<!\\d)${token}(?!\\d)`).test(src);
+    const lead = normalizeForMatch(token).match(/[\p{L}\p{N}]+/u)?.[0];
+    return !lead || !srcTokens.has(lead);
+  });
+  return { facts: tokens, absent };
 }
 
 /**

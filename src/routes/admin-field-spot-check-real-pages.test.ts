@@ -23,7 +23,14 @@
  * prose and "N-5776 NÅ" only in its contact block/footer. Two small
  * synthetic sites (INLINE_PAGES, Kvestad's wording) pin the cross-page rule:
  * a postal-code conflict on any fetched page outranks a page that shows the
- * street + number with no postal code at all, in either fetch order. Also
+ * street + number with no postal code at all, in either fetch order. Three
+ * more (Borgund Chili's wording, second review round) split the address
+ * ACROSS pages — the postal code only on the root/contact page, the street
+ * only on the terms page: a stored postal code the site never gives is a
+ * mismatch, or "unverifiable" when the only other postal code is a third
+ * party's on a privacy page. Fact swaps in the real Aukrust text (one or two
+ * facts replaced, 87-95% word overlap) are mismatches, with the one swap the
+ * fact-level check itself tolerates pinned as a known limit. Also
  * pinned: matched_page_kind and the terms/privacy-page note in the reason.
  *
  * Fixtures (tests/fixtures/field-spot-check/*.html): the real pages fetched
@@ -156,6 +163,29 @@ const INLINE_PAGES: Record<string, string> = {
     '<html><body><p>Gardsutsalet ligg på adressa Reisetevegen 83.</p><a href="/kontakt-oss">Kontakt oss</a></body></html>',
   "https://kryss-b.example/kontakt-oss":
     "<html><body><h1>Kontakt</h1><p>Kvestad Sideri</p><p>Reisetevegen 83</p><p>N-5776 NÅ</p></body></html>",
+  // Review fix — the address split ACROSS pages: the root gives the postal
+  // code without the street (footer), the terms page the street without a
+  // postal code (Borgund Chili's own terms-page wording).
+  "https://kryss-c.example/":
+    "<html><body><p>Velkommen til Borgund Chili.</p><footer><p>Borgund Chili · 6888 Borgund</p></footer>" +
+    '<a href="/salsvilkar">Salsvilkår</a></body></html>',
+  "https://kryss-c.example/salsvilkar":
+    "<html><body><h1>Salsvilkår</h1><p>Seljar er Borgund Chili, Vindhella 717, post@kryss-c.example.</p></body></html>",
+  // ... the postal code on the contact page instead of the root
+  "https://kryss-d.example/":
+    '<html><body><p>Velkommen til Borgund Chili.</p><a href="/kontakt">Kontakt</a><a href="/salsvilkar">Salsvilkår</a></body></html>',
+  "https://kryss-d.example/kontakt":
+    "<html><body><h1>Kontakt</h1><p>Borgund Chili</p><p>6888 Borgund</p><p>post@kryss-d.example</p></body></html>",
+  "https://kryss-d.example/salsvilkar":
+    "<html><body><h1>Salsvilkår</h1><p>Seljar er Borgund Chili, Vindhella 717, post@kryss-d.example.</p></body></html>",
+  // ... and the only other postal code on a privacy page, as a third party's
+  // address (the supervisory authority)
+  "https://kryss-e.example/":
+    '<html><body><p>Velkommen til Borgund Chili.</p><a href="/personvern">Personvern</a><a href="/salsvilkar">Salsvilkår</a></body></html>',
+  "https://kryss-e.example/personvern":
+    "<html><body><h1>Personvern</h1><p>Du kan klage til Datatilsynet, Postboks 458 Sentrum, 0105 Oslo.</p></body></html>",
+  "https://kryss-e.example/salsvilkar":
+    "<html><body><h1>Salsvilkår</h1><p>Seljar er Borgund Chili, Vindhella 717, post@kryss-e.example.</p></body></html>",
 };
 
 // Stored values as of 2026-10-04 (GET /admin agent info) unless noted.
@@ -175,6 +205,20 @@ const NEG_ABOUT: Record<string, string> = {
     "Saltfjell Reinprodukter er eit økologisk Debio-sertifisert meieri i Bodø som lagar geitost frå Saltfjellet sidan 1952.",
   oceanfood:
     "Oceanfood AS driv lakseoppdrett i Lofoten og sel røykt laks til Japan; selskapet vart etablert i 1985 av Hans Olsen.",
+};
+
+// Fact swaps (review fix): the REAL Aukrust text with one or two facts
+// replaced — the write-guard's 70% overlap bar alone accepts all three.
+const SWAP_ABOUT = {
+  // mountain + height swapped (13/15 = 87% overlap)
+  galdhopiggen:
+    "Aukrust Gard og Urteri ligg i Lom ved foten av Galdhøpiggen (2469 moh). Solrike dagar og tørt klima gjev plantene kraft og aroma.",
+  // only the height swapped (19/20 = 95% overlap)
+  height:
+    "Aukrust Gard og Urteri ligg i Lom, ved foten av Lomseggen (2469 moh). Solrike dagar og tørt klima gjev plantene kraft og aroma. Vårt slagord: Å foreine det nyttige og det vakre!",
+  // only the village swapped: 4 of its 5 facts are still corroborated
+  vaga:
+    "Aukrust Gard og Urteri ligg i Vågå, ved foten av Lomseggen (2068 moh). Solrike dagar og tørt klima gjev plantene kraft og aroma. Vårt slagord: Å foreine det nyttige og det vakre!",
 };
 
 export async function runAdminFieldSpotCheckRealPagesTests(
@@ -256,6 +300,13 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     seed("rp-cross-a-ok", "Kvestad Sideri", "https://kryss-a.example/", { address: "Reisetevegen 83, 5776 Nå" });
     seed("rp-cross-b", "Kvestad Sideri", "https://kryss-b.example/", { address: "Reisetevegen 83, 5777 Nå" });
     seed("rp-saltfjell-neg", "Saltfjell Reinprodukter", "https://saltfjellrein.no/", { about: NEG_ABOUT.saltfjell });
+    seed("rp-cross-c", "Borgund Chili", "https://kryss-c.example/", { address: "Vindhella 717, 6889 Borgund" });
+    seed("rp-cross-c-ok", "Borgund Chili", "https://kryss-c.example/", { address: "Vindhella 717, 6888 Borgund" });
+    seed("rp-cross-d", "Borgund Chili", "https://kryss-d.example/", { address: "Vindhella 717, 6889 Borgund" });
+    seed("rp-cross-e", "Borgund Chili", "https://kryss-e.example/", { address: "Vindhella 717, 6888 Borgund" });
+    seed("rp-aukrust-swap", "Aukrust Gard og Urteri", "https://aukrust-nordgard.no/", { about: SWAP_ABOUT.galdhopiggen });
+    seed("rp-aukrust-swapnum", "Aukrust Gard og Urteri", "https://aukrust-nordgard.no/", { about: SWAP_ABOUT.height });
+    seed("rp-aukrust-swapvaga", "Aukrust Gard og Urteri", "https://aukrust-nordgard.no/", { about: SWAP_ABOUT.vaga });
 
     (globalThis as any).fetch = (async (url: string | URL | Request) => {
       const u = String(url);
@@ -318,6 +369,23 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     assertEq(r.body?.status, "mismatch", "rp-about-neg-05: fabricated Oceanfood salmon-farming story -> mismatch");
     assertTrue(/write-guard check: .*\| fact-level check: /.test(String(r.body?.reason)),
       "rp-about-neg-06: a mismatch reports BOTH checks' reasons", String(r.body?.reason));
+
+    // Fact swaps in the REAL Aukrust text (review fix): the write-guard's
+    // overlap branch alone would accept each of them.
+    r = await spotCheck("rp-aukrust-swap", "about");
+    assertEq(r.body?.status, "mismatch", "rp-about-swap-01: Lomseggen (2068 moh) swapped for Galdhøpiggen (2469 moh), 87% overlap -> mismatch");
+    assertTrue(/not accepted on word overlap alone: fact\(s\) 2469, galdhøpiggen appear nowhere on the page/.test(String(r.body?.reason)),
+      "rp-about-swap-02: the reason names the facts the page never mentions", String(r.body?.reason));
+    r = await spotCheck("rp-aukrust-swapnum", "about");
+    assertEq(r.body?.status, "mismatch", "rp-about-swap-03: only the height swapped (2068 -> 2469), 95% overlap -> mismatch");
+    // Known limit, pinned so it stays visible: one swapped fact out of five
+    // is within the fact-level check's own 80% tolerance, so it still
+    // passes — via the fact-level check (as before the W40 fix), no longer
+    // via the write-guard's overlap branch.
+    r = await spotCheck("rp-aukrust-swapvaga", "about");
+    assertEq(r.body?.status, "match", "rp-about-swap-04 (known limit): Lom swapped for Vågå, 4/5 facts corroborated -> still match");
+    assertTrue(/^fact-level check: fact-level match: 4\/5 distinct facts/.test(String(r.body?.reason)),
+      "rp-about-swap-05 (known limit): ... accepted by the fact-level check, not by word overlap", String(r.body?.reason));
 
     // ── subpages (b3) ──────────────────────────────────────────────────────
     r = await spotCheck("rp-odhumbla", "phone");
@@ -389,6 +457,25 @@ export async function runAdminFieldSpotCheckRealPagesTests(
     assertEq(r.body?.status, "mismatch", "rp-cross-05: weak match on the root, conflict on /kontakt-oss, stored 5777 -> mismatch (the weak match did not end the walk)");
     assertEq(r.body?.urls_tried, ["https://kryss-b.example/", "https://kryss-b.example/kontakt-oss"],
       "rp-cross-06: the contact page was fetched after the root's weak match");
+
+    // Review fix — the address split ACROSS pages: no page has the street
+    // AND a postal code, but the site does give a postal code, and never the
+    // stored one.
+    r = await spotCheck("rp-cross-c", "address");
+    assertEq(r.body?.status, "mismatch",
+      "rp-cross-07: root footer '6888 Borgund' (no street) + terms page 'Vindhella 717' (no postal code), stored 6889 -> mismatch (was match)");
+    assertTrue(/^contradicted on https:\/\/kryss-c\.example\/: .*page gives postal code 6888 and never the stored 6889 — this outranks the weaker match on https:\/\/kryss-c\.example\/salsvilkar/.test(String(r.body?.reason)),
+      "rp-cross-08: the reason names the root's 6888 and the weak match it outranks", String(r.body?.reason));
+    r = await spotCheck("rp-cross-c-ok", "address");
+    assertEq([r.body?.status, r.body?.checked_url, r.body?.matched_page_kind], ["match", "https://kryss-c.example/salsvilkar", "terms_privacy"],
+      "rp-cross-09 (control): the same site with the stored 6888 -> match on the terms page");
+    r = await spotCheck("rp-cross-d", "address");
+    assertEq(r.body?.status, "mismatch", "rp-cross-10: '6888 Borgund' on the contact page instead of the root, stored 6889 -> mismatch");
+    assertTrue(/^contradicted on https:\/\/kryss-d\.example\/kontakt: /.test(String(r.body?.reason)),
+      "rp-cross-11: ... naming the contact page", String(r.body?.reason));
+    r = await spotCheck("rp-cross-e", "address");
+    assertEq(r.body?.status, "unverifiable",
+      "rp-cross-12: the only other postal code is Datatilsynet's on the privacy page -> unverifiable (not match, not a false mismatch)");
 
     r = await spotCheck("rp-aalan", "phone");
     assertEq(r.body?.status, "mismatch", "rp-phone-neg-01: Aalan invented phone +47 76 08 45 34 -> mismatch");

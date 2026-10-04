@@ -41,7 +41,12 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { computeFieldSpotCheck, type FieldSpotCheckVerdict } from "../agents/lokal-agent-verifier";
-import { checkAboutCandidateFactSubstantiated } from "../services/about-fact-substantiation";
+import {
+  ABOUT_FACT_MIN_FACTS,
+  checkAboutCandidateFactSubstantiated,
+  findAboutCandidateFactsAbsentFromSource,
+  isAboutCandidateVerbatimInSource,
+} from "../services/about-fact-substantiation";
 import {
   checkAboutCandidateSubstantiatedBySource,
   type AboutSubstantiationVerdict,
@@ -112,27 +117,63 @@ export function checkPhoneSubstantiatedBySource(
 
 /** `about`-specific substantiation (W40 false-positive fix, b1). FIRST the
  *  write-guard's own check (checkAboutCandidateSubstantiatedBySource:
- *  verbatim, or >= 70% significant-word overlap) — anything the write-guard
- *  would accept as substantiated by this page is, by definition, not a data
- *  error, so it is a `match`. Only when that fails does the fact-level check
- *  (about-fact-substantiation.ts — tolerant of dialectal/paraphrase
- *  rewording, strict on locally-corroborated facts) get a second, extra
- *  chance. Before this, the route ran ONLY the fact-level check, which
- *  rejected texts the write-guard accepts (W40: Aukrust's verbatim
- *  meta-description/paragraph, Oceanfood's 88%-overlap text). Neither check
- *  is loosened by combining them: a candidate passes only if one of the two
- *  existing checks, unchanged, passes it. PURE. Exported for tests. */
+ *  verbatim, or >= 70% significant-word overlap); only when that does not
+ *  settle it does the fact-level check (about-fact-substantiation.ts —
+ *  tolerant of dialectal/paraphrase rewording, strict on locally-corroborated
+ *  facts) get a second, extra chance. Before this, the route ran ONLY the
+ *  fact-level check, which rejected texts the write-guard accepts (W40:
+ *  Aukrust's verbatim meta-description/paragraph, Oceanfood's 88%-overlap
+ *  text).
+ *
+ *  Review fix — the write-guard's two branches are not taken equally:
+ *    - verbatim hit -> `match`, unconditionally;
+ *    - overlap hit (>= 70% of the candidate's significant words appear
+ *      SOMEWHERE on the page) -> `match` only when none of the candidate's
+ *      facts (numbers >= 3 digits, proper nouns — the fact-level module's own
+ *      definition) is absent from the page entirely. The overlap bar alone
+ *      lets a real text with one or two facts swapped pass ("Aukrust Gard og
+ *      Urteri ligg i Lom ved foten av Galdhøpiggen (2469 moh) …" on a page
+ *      that says "Lomseggen (2068 moh)": 13/15 = 87%), and a stored value
+ *      already passed that same write-guard when it was written — so without
+ *      this, the spot-check could never catch anything the write path let
+ *      through. Oceanfood (88%; "Debio" is on the page in its logo markup)
+ *      still matches here.
+ *  When the overlap hit is set aside this way, only the fact-level check's
+ *  OWN fact-level judgment (>= 2 facts, >= 80% of them corroborated in their
+ *  local block) can still accept the text — exactly as the route judged
+ *  every about text before the W40 fix. Its "fewer than 2 facts -> fall back
+ *  to the write-guard" path is not run then, since it would only re-accept
+ *  the overlap hit just set aside (a one-fact swap: "… i Valdres …" for "…
+ *  i Hallingdal …"). So: match = verbatim, or overlap with every fact
+ *  mentioned on the page, or fact-level. (A swap the fact-level check itself
+ *  tolerates — one fact of >= 5 — still passes, as it did before the W40
+ *  fix; see the "known limit" test.) PURE. Exported for tests. */
 export function checkAboutSpotCheckSubstantiated(
   candidate: string | null | undefined,
   sourceText: string | null | undefined,
 ): AboutSubstantiationVerdict {
   const guard = checkAboutCandidateSubstantiatedBySource(candidate, sourceText);
-  if (guard.substantiated) return { substantiated: true, reason: `write-guard check: ${guard.reason}` };
+  let guardNote = `write-guard check: ${guard.reason}`;
+  if (guard.substantiated) {
+    if (isAboutCandidateVerbatimInSource(candidate, sourceText)) {
+      return { substantiated: true, reason: guardNote };
+    }
+    const { facts, absent } = findAboutCandidateFactsAbsentFromSource(candidate, sourceText);
+    if (absent.length === 0) return { substantiated: true, reason: guardNote };
+    guardNote +=
+      ` — not accepted on word overlap alone: fact(s) ${absent.join(", ")} appear nowhere on the page`;
+    if (facts.length < ABOUT_FACT_MIN_FACTS) {
+      return {
+        substantiated: false,
+        reason: `${guardNote} | fact-level check: not applicable (fewer than ${ABOUT_FACT_MIN_FACTS} facts to corroborate)`,
+      };
+    }
+  }
   const fact = checkAboutCandidateFactSubstantiated(candidate, sourceText);
   if (fact.substantiated) return { substantiated: true, reason: `fact-level check: ${fact.reason}` };
   return {
     substantiated: false,
-    reason: `write-guard check: ${guard.reason} | fact-level check: ${fact.reason}`,
+    reason: `${guardNote} | fact-level check: ${fact.reason}`,
   };
 }
 
@@ -148,6 +189,28 @@ const ROAD_DESIGNATION_RE = /^(?:fv|rv|ev|kv|e|fylkesvei(?:en)?|riksvei(?:en)?|e
 /** "<street name> <house number>" as one comma segment, e.g. "lauvdalen
  *  186", "st. olavs gate 5b", "ullstindveien 1242/1246". */
 const STREET_AND_NUMBER_RE = /^(\p{L}[\p{L}\p{N}.' -]*?)\s+(\d{1,4}[a-zæøå]?(?:\/\d{1,4}[a-zæøå]?)?)$/u;
+
+/** A postal code written WITHOUT a comma straight after the house number,
+ *  with no place name after it ("reiseteveien 83 5776", "… 83 n-5776").
+ *  splitAddress only strips a postal tail after a comma or with a place
+ *  word, so such a code stays in the street part and would be read as the
+ *  house number (review fix). Requires a house number BEFORE the 4 digits,
+ *  so a lone 4-digit house number ("ullstindveien 1242") is never taken for
+ *  a postal code. Group 1 = street + number, 2 = postal code. */
+const UNSEPARATED_POSTCODE_TAIL_RE = /^(.*\s\d{1,4}[a-zæøå]?)\s+(?:no?-\s?)?(\d{4})$/u;
+
+/** Words that, written right before a street name, make it a DIFFERENT
+ *  street: "Lille Storgata" is not "Storgata", "Nedre Slottsgate" is not
+ *  "Slottsgate" (review fix — the street match only required a non-letter
+ *  before the name). Lowercase, as the normalized page text is. A list
+ *  rather than "any capitalized word": on a real page the producer's own
+ *  name often sits right before the street once tags become spaces
+ *  ("Kvestad Sideri Reisetevegen 83"), and rejecting that would bring back
+ *  exactly the false mismatches this route was fixed for. */
+const STREET_NAME_MODIFIER_WORDS = new Set([
+  "lille", "litle", "vesle", "store", "nedre", "øvre", "ovre", "midtre", "indre", "ytre",
+  "nordre", "søndre", "sondre", "austre", "østre", "ostre", "vestre", "gamle", "nye",
+]);
 
 export interface ParsedStreetAddress {
   /** Normalized street name ("lauvdalen", "solsideveien"). */
@@ -175,14 +238,33 @@ export function parseStoredStreetAddress(
   if (typeof raw !== "string" || !raw.trim()) return null;
   const norm = normalizeAddress(prepareAddressForComparison(raw, ownName)).normalize("NFC");
   if (!norm) return null;
-  const { street, postcode } = splitAddress(norm);
-  const segments = street.split(",").map((s) => s.trim()).filter(Boolean);
+  const split = splitAddress(norm);
+  const segments = split.street.split(",").map((s) => s.trim()).filter(Boolean);
   for (let i = segments.length - 1; i >= 0; i--) {
-    const m = STREET_AND_NUMBER_RE.exec(segments[i]!);
+    // "reiseteveien 83 5776" (no comma, no place): the trailing 4 digits are
+    // the postal code, not the house number.
+    const tail = UNSEPARATED_POSTCODE_TAIL_RE.exec(segments[i]!);
+    const segment = tail ? tail[1]! : segments[i]!;
+    let postcode = tail ? tail[2]! : split.postcode;
+    const m = STREET_AND_NUMBER_RE.exec(segment);
     if (!m) continue;
     const name = m[1]!.trim();
     if (ROAD_DESIGNATION_RE.test(name)) return null;
-    return { street: name, houseNumber: m[2]!, postcode };
+    const houseNumber = m[2]!;
+    // splitAddress takes the first whole 4-digit run as the postal code even
+    // when it IS the house number ("ullstindveien 1242" -> postcode 1242),
+    // which would then "conflict" with the page's real postal code. A run
+    // that occurs only once in the value, as its house number, is not a
+    // postal code.
+    if (
+      !tail &&
+      postcode !== null &&
+      houseNumber.replace(/[a-zæøå]$/u, "") === postcode &&
+      (norm.match(new RegExp(`(?<![\\d/])${postcode}(?![\\d/])`, "g"))?.length ?? 0) === 1
+    ) {
+      postcode = null;
+    }
+    return { street: name, houseNumber, postcode };
   }
   return null;
 }
@@ -356,8 +438,17 @@ function storedPostcodeOnPage(code: string, pageCodes: ReadonlySet<string>, sour
  *               postal codes elsewhere and never the stored one (Kvestad:
  *               "Reisetevegen 83." in prose, "N-5776 NÅ" in the footer vs a
  *               stored 5777) — see findPagePostalCodes.
- *    mismatch = street + number not on the page.
- *  A stored value with no street + house number (farm-name-only, or a road
+ *    mismatch = street + number not on the page. If the page still gives
+ *               postal code(s) and never the stored one, the mismatch also
+ *               carries `postcodeContradiction: true` + `postcodes`: alone it
+ *               decides nothing, but computeFieldSpotCheck will not let a
+ *               WEAK match on another page become a match over it (a site
+ *               that writes "Vindhella 717" on its terms page and "6888
+ *               Borgund" only in its root footer does not substantiate a
+ *               stored 6889).
+ *  An occurrence right after a street-name modifier word ("lille", "nedre",
+ *  "søndre", … — STREET_NAME_MODIFIER_WORDS) is a different street and does
+ *  not count. A stored value with no street + house number (farm-name-only, or a road
  *  designation like "Fv109, 5776 Nå") cannot be compared structurally and
  *  falls back, unchanged, to the default text check — so "Fv109, 5776 Nå"
  *  against a page saying "Reisetevegen 83, 5776 NÅ" stays a mismatch. PURE.
@@ -402,6 +493,9 @@ export function checkAddressSubstantiatedBySource(
   let found = 0;
   const conflicting = new Set<string>();
   for (const m of normSrc.matchAll(re)) {
+    // "lille storgata 5" is another street than a stored "storgata 5".
+    const wordBefore = /(\p{L}+)\s*$/u.exec(normSrc.slice(Math.max(0, m.index! - 16), m.index!))?.[1];
+    if (wordBefore && STREET_NAME_MODIFIER_WORDS.has(wordBefore)) continue;
     found++;
     const after = normSrc.slice(m.index! + m[0].length, m.index! + m[0].length + 40);
     const pc = ADJACENT_POSTCODE_RE.exec(after)?.[1] ?? null;
@@ -415,6 +509,25 @@ export function checkAddressSubstantiatedBySource(
     conflicting.add(pc);
   }
   if (found === 0) {
+    // Not on this page — but the page may still give a postal code, which a
+    // WEAK match on another page must not be allowed to ignore (review fix:
+    // root footer "Borgund Chili · 6888 Borgund", terms page "Vindhella 717,
+    // post@…", stored 6889 — the site gives a postal code and never the
+    // stored one). computeFieldSpotCheck weighs this flag across pages.
+    if (parsed.postcode !== null) {
+      const pageCodes = findPagePostalCodes(src);
+      if (pageCodes.size > 0 && !storedPostcodeOnPage(parsed.postcode, pageCodes, src)) {
+        const codes = [...pageCodes].sort();
+        return {
+          substantiated: false,
+          postcodeContradiction: true,
+          postcodes: codes,
+          reason:
+            `address mismatch: street + house number "${label}" not found on page, ` +
+            `and the page gives postal code ${codes.join(", ")} and never the stored ${parsed.postcode}`,
+        };
+      }
+    }
     return {
       substantiated: false,
       reason: `address mismatch: street + house number "${label}" not found on page`,

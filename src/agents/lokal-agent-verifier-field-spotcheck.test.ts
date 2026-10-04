@@ -220,6 +220,38 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
       "sub-08: the cap applies AFTER tier ordering — a terms link earlier in the page never displaces an about/contact page",
     );
     assertEq(FIELD_SPOT_CHECK_MAX_SUBPAGES, 5, "sub-09: the spot-check follows up to 5 subpages (was 3)");
+
+    // Review fix: prefix matching must not spend the subpage budget on
+    // files, WordPress system paths or listing items.
+    const noisy = [
+      "/wp-content/uploads/contact.pdf", "/produkt/kontaktgrill", "/contact.pdf", "/kontakt.jpg",
+      "/blogg/om-sommaren-pa-garden", "/2024/05/om-oss-og-dyra", "/wp-json/contact", "/produkter/om-oss",
+      "/product-page/kontaktlinse-etui", "/kontakt.html", "/om.php", "/pages/kontakt", "/kontakt-oss.aspx",
+      "/policies/personvern",
+    ];
+    const noisyHtml = "<html><body>" + noisy.map((p) => `<a href="${p}">x</a>`).join("") + "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(noisyHtml, "https://gaarden.example/", 50, { extended: true }),
+      [
+        "https://gaarden.example/kontakt.html",
+        "https://gaarden.example/om.php",
+        "https://gaarden.example/pages/kontakt",
+        "https://gaarden.example/kontakt-oss.aspx",
+        "https://gaarden.example/policies/personvern",
+      ],
+      "sub-10: extended — files (.pdf/.jpg), /wp-content//wp-json/ paths and items under a product/blog/year listing segment " +
+        "are not candidates; .html/.php/.aspx pages and pages nested under other segments (/pages/kontakt) still are",
+    );
+    assertEq(
+      fieldSpotCheckSubpageCandidates(
+        '<html><body><a href="/produkt/kontaktgrill">x</a><a href="/wp-content/uploads/contact.pdf">x</a><a href="/kontakt">x</a></body></html>',
+        "https://gaarden.example/",
+        1,
+        { extended: true },
+      ),
+      ["https://gaarden.example/kontakt"],
+      "sub-11: with a budget of one subpage, the real /kontakt page is not crowded out by a product or a PDF linked before it",
+    );
   }
 
   // e2e-06: computeFieldSpotCheck uses the extended discovery and the
@@ -438,6 +470,9 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
     if (s.includes("[[STRONG]]")) return { substantiated: true, reason: "strong" };
     if (s.includes("[[WEAK]]")) return { substantiated: true, weak: true, reason: "weak" };
     if (s.includes("[[CONFLICT]]")) return { substantiated: false, conflict: true, reason: "conflict" };
+    if (s.includes("[[PCX]]")) {
+      return { substantiated: false, postcodeContradiction: true, postcodes: ["6888"], reason: "pcx" };
+    }
     return { substantiated: false, reason: "not found" };
   };
   const filler = "Vi selger egg og grønnsaker direkte fra gården. ".repeat(30);
@@ -492,6 +527,70 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
       { fetchImpl: site.fetchImpl, substantiate: markerJudge },
     );
     assertEq(r.status, "mismatch", "cross-11: conflict alone -> mismatch");
+  }
+
+  // Cross-page postal-code contradiction (review fix): [[PCX]] = the page
+  // does NOT have the value but gives a postal code that is never the stored
+  // one. It decides nothing alone, but a result resting only on a weak match
+  // must not become a match over it.
+  {
+    const site = markerSite("p1.example", "[[PCX]]", { "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p1.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-01: postal-code contradiction on the root + weak match on a terms page -> mismatch (was match)");
+    assertEq(r.checked_url, "https://p1.example/", "pcx-02: a mismatch keeps checked_url at the root");
+    assertTrue(/^contradicted on https:\/\/p1\.example\/: pcx — this outranks the weaker match on https:\/\/p1\.example\/salsvilkar \(weak\)$/.test(r.reason),
+      "pcx-03: the reason names the contradicting page and the weak match it outranks");
+  }
+  {
+    const site = markerSite("p2.example", "[[WEAK]]", { "/kontakt": "[[PCX]]", "/om-oss": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p2.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-04: weak match on the root + contradiction on an about/contact page -> mismatch");
+    assertEq(site.calls.length, 3, "pcx-05: ... with every candidate page fetched");
+  }
+  {
+    const site = markerSite("p3.example", "", { "/personvern": "[[PCX]]", "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p3.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url], ["unverifiable", "https://p3.example/"],
+      "pcx-06: contradiction only on a terms/privacy page (could be a third party's address) + weak match -> unverifiable, never match");
+    assertTrue(/^only a weak match on https:\/\/p3\.example\/salsvilkar \(weak\), and the terms\/privacy page https:\/\/p3\.example\/personvern gives a different postal code \(pcx\)/.test(r.reason),
+      "pcx-07: the reason names both pages");
+  }
+  {
+    const site = markerSite("p4.example", "[[WEAK]]", { "/personvern": "[[PCX]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p4.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "unverifiable", "pcx-08: weak match on the root + contradiction only on a terms/privacy page -> unverifiable");
+  }
+  {
+    const site = markerSite("p5.example", "", { "/kontakt": "[[PCX]]", "/personvern": "[[PCX]]", "/salsvilkar": "[[WEAK]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p5.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-09: a contradiction on the producer's own contact page outranks the terms-page-only rule -> mismatch");
+    assertTrue(/^contradicted on https:\/\/p5\.example\/kontakt: pcx/.test(r.reason), "pcx-10: ... naming the contact page");
+  }
+  {
+    const site = markerSite("p6.example", "[[PCX]]", { "/kontakt": "[[STRONG]]" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p6.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq([r.status, r.checked_url, r.reason], ["match", "https://p6.example/kontakt", "strong"],
+      "pcx-11: a FULL match is unaffected by a contradiction on another page");
+  }
+  {
+    const site = markerSite("p7.example", "[[PCX]]", { "/kontakt": "" });
+    const r = await computeFieldSpotCheck({ field_value: "v", root_url: "https://p7.example/" }, { fetchImpl: site.fetchImpl, substantiate: markerJudge });
+    assertEq(r.status, "mismatch", "pcx-12: a contradiction with no match anywhere -> the ordinary mismatch");
+    assertTrue(/root page: pcx$/.test(r.reason), "pcx-13: ... carrying the root page's own reason");
+  }
+  {
+    const site = markerSite("p8.example", "[[WEAK]]", { "/kontakt": "[[PCX]]", "/om-oss": "", "/about": "" });
+    let clock = 0;
+    const slowFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      clock += 14_000;
+      return (site.fetchImpl as any)(url, init);
+    }) as unknown as typeof fetch;
+    const r = await computeFieldSpotCheck(
+      { field_value: "v", root_url: "https://p8.example/" },
+      { fetchImpl: slowFetch, substantiate: markerJudge, now: () => clock },
+    );
+    assertEq([r.status, r.urls_tried.length], ["mismatch", 3],
+      "pcx-14: a contradiction seen before the time budget ran out still outranks the weak match");
   }
 
   // budget-*: the overall wall-clock budget. A fake clock advances 20 s per

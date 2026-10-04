@@ -1718,7 +1718,8 @@ export async function resolveBrregLookup(
 // looking in the right place. Two refinements: a field check may report a
 // WEAK match (address street + number on a page with no postal code at all)
 // that does not end the walk and loses to a CONFLICT seen on any fetched
-// page (FieldSpotCheckVerdict); and the whole call has a wall-clock budget
+// page, or to a page that gives only a different postal code
+// (FieldSpotCheckVerdict.postcodeContradiction); and the whole call has a wall-clock budget
 // (FIELD_SPOT_CHECK_BUDGET_MS) after which no further subpage is fetched.
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1747,8 +1748,26 @@ const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[
 const EXTENDED_PRIMARY_SEGMENT_RE = /^(?:om(?:[-_.].*)?|omoss.*|kontakt.*|contact.*|about.*)$/i;
 const EXTENDED_LEGAL_SEGMENT_RE = /^(?:salgsvilk[aå]r|salsvilk[aå]r|kj[oø]psvilk[aå]r|personvern).*$/i;
 
+// Extended-mode noise filters (review fix: prefix matching on every path
+// segment also took links like /wp-content/uploads/contact.pdf and
+// /produkt/kontaktgrill, which used up the subpage budget):
+//  - a segment with a file extension is a page only for these extensions
+//    ("om.html", "kontakt.php"); "contact.pdf", "kontakt.jpg" are files;
+//  - nothing under a WordPress system directory is a page to check;
+//  - segments AFTER a product/category/blog listing segment name that
+//    listing's items (a product called "Kontaktgrill", a post called
+//    "Om sommaren …"), never the site's own about/contact/terms page.
+const PAGE_FILE_EXTENSION_RE = /\.(?:html?|php|aspx?|jsp)$/i;
+const ANY_FILE_EXTENSION_RE = /\.[a-z0-9]{1,5}$/i;
+const WORDPRESS_SYSTEM_SEGMENT_RE = /^wp-(?:content|includes|json|admin)$/i;
+const LISTING_PARENT_SEGMENT_RE =
+  /^(?:produkt|produkter|product|products|product-page|product-category|product-tag|produktkategori|kategori|category|collections|tag|blog|blogg|blogs|nyheter|news|post|artikler|artikkel|oppskrift|oppskrifter|(?:19|20)\d{2})$/i;
+
 /** Tier of an (already same-host) pathname under the extended matching:
- *  1 = about/contact, 2 = terms/privacy, 0 = not a candidate. PURE. */
+ *  1 = about/contact, 2 = terms/privacy, 0 = not a candidate. Segments are
+ *  tested left to right up to the first listing segment (see the filters
+ *  above); a file segment is skipped, a WordPress system path is never a
+ *  candidate. PURE. */
 function extendedSubpageTier(pathname: string): 0 | 1 | 2 {
   let tier: 0 | 1 | 2 = 0;
   for (const rawSegment of pathname.split("/")) {
@@ -1759,6 +1778,9 @@ function extendedSubpageTier(pathname: string): 0 | 1 | 2 {
     } catch {
       // malformed escape: test the raw segment as-is
     }
+    if (WORDPRESS_SYSTEM_SEGMENT_RE.test(segment)) return 0;
+    if (LISTING_PARENT_SEGMENT_RE.test(segment)) break;
+    if (ANY_FILE_EXTENSION_RE.test(segment) && !PAGE_FILE_EXTENSION_RE.test(segment)) continue;
     if (EXTENDED_PRIMARY_SEGMENT_RE.test(segment)) return 1;
     if (EXTENDED_LEGAL_SEGMENT_RE.test(segment)) tier = 2;
   }
@@ -1781,7 +1803,9 @@ function extendedSubpageTier(pathname: string): 0 | 1 | 2 {
  *  EXTENDED_PRIMARY_SEGMENT_RE / EXTENDED_LEGAL_SEGMENT_RE. About/contact
  *  links come first, terms/privacy links after them (document order within
  *  each tier), so a footer full of legal links can never crowd the real
- *  contact page out of the `maxSubpages` budget.
+ *  contact page out of the `maxSubpages` budget. Files (".pdf", ".jpg"),
+ *  WordPress system paths and items under a product/category/blog listing
+ *  segment are not candidates (extendedSubpageTier).
  *
  *  Both modes: same host as the root only (never another domain — the
  *  SSRF/scope guard; fetchPage applies its own SSRF guard on top), http(s)
@@ -1880,6 +1904,17 @@ export interface FieldSpotCheckVerdict extends AboutSubstantiationVerdict {
    *  value (address: the same street + house number with a different postal
    *  code). Overrides a weak match from any other page. */
   conflict?: boolean;
+  /** NOT substantiated (address: street + house number not on this page),
+   *  but the page gives postal code(s) — `postcodes` — and never the stored
+   *  one. Alone it decides nothing (a page without the street is a plain
+   *  "not found"); it only stops a WEAK match on another page from becoming
+   *  a match: from the root or an about/contact page it turns that weak
+   *  match into a mismatch, from a terms/privacy page only (such pages can
+   *  list third parties' addresses) into "unverifiable". A full match is
+   *  unaffected. */
+  postcodeContradiction?: boolean;
+  /** With `postcodeContradiction`: the postal codes the page gives. */
+  postcodes?: string[];
 }
 
 /** Kind of page a match came from: the root page, an about/contact subpage
@@ -1929,8 +1964,12 @@ const TERMS_PRIVACY_MATCH_NOTE =
  * Cross-page evidence (FieldSpotCheckVerdict): a `weak` match does not stop
  * the walk, and a `conflict` on any fetched page outranks a weak match, so a
  * page that shows the address with a different postal code is never hidden
- * by another page that shows the street + number without one. A full
- * (non-weak) match still ends the walk at once, as before.
+ * by another page that shows the street + number without one. A result that
+ * would rest only on a weak match also yields to a `postcodeContradiction`
+ * (a page WITHOUT the street + number that gives a postal code, never the
+ * stored one): mismatch when that page is the root or an about/contact page,
+ * "unverifiable" when it is only a terms/privacy page. A full (non-weak)
+ * match still ends the walk at once, as before.
  *
  * Time budget: `input.budgetMs` (default FIELD_SPOT_CHECK_BUDGET_MS); see
  * that constant. `deps.now` is a test seam (defaults to Date.now).
@@ -1995,6 +2034,13 @@ export async function computeFieldSpotCheck(
     : null;
   let conflict: { url: string; reason: string } | null =
     !rootVerdict.substantiated && rootVerdict.conflict ? { url: rootCheckedUrl, reason: rootVerdict.reason } : null;
+  // Pages that do not have the value but give a postal code that is never
+  // the stored one (FieldSpotCheckVerdict.postcodeContradiction), in fetch
+  // order. Only consulted when the result would otherwise rest on a weak match.
+  const postcodeContradictions: { url: string; kind: FieldSpotCheckPageKind; reason: string }[] = [];
+  if (!rootVerdict.substantiated && !rootVerdict.conflict && rootVerdict.postcodeContradiction) {
+    postcodeContradictions.push({ url: rootCheckedUrl, kind: "root", reason: rootVerdict.reason });
+  }
 
   const subpages = fieldSpotCheckSubpageCandidatesWithTier(rootResult.html, rootCheckedUrl, maxSubpages, {
     extended: true,
@@ -2029,6 +2075,8 @@ export async function computeFieldSpotCheck(
       weak ??= { url: pageUrl, kind, reason: subVerdict.reason };
     } else if (subVerdict.conflict) {
       conflict ??= { url: pageUrl, reason: subVerdict.reason };
+    } else if (subVerdict.postcodeContradiction) {
+      postcodeContradictions.push({ url: pageUrl, kind, reason: subVerdict.reason });
     }
   }
   const budgetNote =
@@ -2047,6 +2095,35 @@ export async function computeFieldSpotCheck(
     };
   }
   if (weak) {
+    // The weak match rests on a page that gives no postal code at all. If
+    // another fetched page gives postal code(s) and never the stored one,
+    // the site does not substantiate the stored value: from the producer's
+    // own root/about/contact page that is a mismatch; from terms/privacy
+    // pages only (they can carry a third party's address — Forbrukerrådet,
+    // Datatilsynet, the shop platform) it is "unverifiable", never a match.
+    const ownContradiction = postcodeContradictions.find((c) => c.kind !== "terms_privacy");
+    if (ownContradiction) {
+      return {
+        status: "mismatch",
+        checked_url: rootCheckedUrl,
+        urls_tried: urlsTried,
+        reason:
+          `contradicted on ${ownContradiction.url}: ${ownContradiction.reason} — this outranks ` +
+          `the weaker match on ${weak.url} (${weak.reason})`,
+      };
+    }
+    const legalContradiction = postcodeContradictions[0];
+    if (legalContradiction) {
+      return {
+        status: "unverifiable",
+        checked_url: rootCheckedUrl,
+        urls_tried: urlsTried,
+        reason:
+          `only a weak match on ${weak.url} (${weak.reason}), and the terms/privacy page ` +
+          `${legalContradiction.url} gives a different postal code (${legalContradiction.reason}) — ` +
+          `such pages can list third parties' addresses, so cannot confidently judge, not treated as a mismatch`,
+      };
+    }
     return matchResult(
       weak.url,
       weak.kind,
