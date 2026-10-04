@@ -1466,6 +1466,30 @@ function initSchema(db: Database.Database): void {
     // Column already exists — idempotent, safe to ignore
   }
 
+  // ─── Add traffic_class to conversations (a2a spam guard, 2026-10-04) ──
+  // 'external' | 'probe' | 'spam' — what services/a2a-traffic-classifier.ts
+  // decided about the traffic that created the row. Internal-ness keeps its
+  // ONE home in is_internal above. Public counters/lists read the shared
+  // COUNTABLE_CONV_SQL predicate (is_internal=0 AND traffic_class='external').
+  // Same safety idiom as is_internal: additive, NOT NULL DEFAULT 'external'
+  // (every existing row stays publicly counted until the explicit admin
+  // backfill POST /admin/conversations/traffic-class-backfill moves it),
+  // idempotent on "duplicate column name". traffic_class_backfilled_at marks
+  // the rows that backfill changed, so its {reset:true} reverts exactly those.
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN traffic_class TEXT NOT NULL DEFAULT 'external'`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN traffic_class_backfilled_at TEXT`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_conversations_seller_traffic ON conversations(seller_agent_id, traffic_class)`);
+
   // ─── M1 (Phase 5.4a): magic_links.used_at ───────────────────
   // Tracks WHEN a magic-link token was actually used (clicked & redeemed).
   // Backfill for already-used rows: copy created_at as best-available estimate.

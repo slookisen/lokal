@@ -4,7 +4,14 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { buildSearchNote } from "../utils/geo-query";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
-import { conversationService, buildRequestMeta } from "../services/conversation-service";
+import { conversationService, buildRequestMeta, isInternalTraffic, type MessageType } from "../services/conversation-service";
+import {
+  classifyA2aTraffic,
+  hasDiscoveryIntent,
+  a2aConversationCap,
+  recordA2aGuardOutcome,
+} from "../services/a2a-traffic-classifier";
+import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
@@ -177,15 +184,20 @@ router.post("/a2a", (req: Request, res: Response) => {
   }
 
   try {
+    // A2A v1.0 renamed the core methods (SendMessage/GetTask/ListTasks); they
+    // used to fall through to -32601. Same handlers, same guards.
     switch (method) {
       case "message/send":
       case "tasks/send": // Backward-compat alias for older A2A clients (<0.3)
+      case "SendMessage": // A2A v1.0
         handleMessageSend(params, id, req, res);
         break;
       case "tasks/get":
+      case "GetTask": // A2A v1.0
         handleTasksGet(params, id, res);
         break;
       case "tasks/list":
+      case "ListTasks": // A2A v1.0
         handleTasksList(params, id, res);
         break;
       case "agent/authenticatedExtendedCard":
@@ -219,6 +231,10 @@ router.post("/a2a", (req: Request, res: Response) => {
 //   2. Structured:       { message: { data: { categories: [...] } } }
 //
 // Returns a task with results (or "working" status for async).
+
+const NO_INTENT_NOTE =
+  "Fant ingen matforespørsel i meldingen — prøv f.eks. «honning i Oslo». " +
+  "No food query detected in the message — try e.g. \"honey in Oslo\".";
 
 function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const message = params?.message;
@@ -278,6 +294,26 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     discoveryQuery = params;
   }
 
+  // ─── Spam guard (2026-10-04) ──────────────────────────────
+  // Classify the caller and check the query actually asks for something.
+  // Only external traffic WITH intent, under the per-ip_hash cap, may start
+  // conversations, count as a 'search' interaction and bump discovery
+  // counters. Everything else still gets a valid completed task (results for
+  // intent queries, an empty result + note for no-intent text) but leaves no
+  // public trace. Real buyer queries take exactly the old path.
+  const queryText = messageText || JSON.stringify(discoveryQuery);
+  const requestMeta = buildRequestMeta(req);
+  const trafficClass = classifyA2aTraffic({
+    text: queryText,
+    ua: requestMeta.userAgent,
+    hasStructuredData: !messageText,
+    isInternal: isInternalTraffic(requestMeta),
+  });
+  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText });
+  const capKey = req.ip ? hashIP(req.ip) : "unknown";
+  const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
+  const countable = trafficClass === "external" && hasIntent && !rateCapped;
+
   // Execute discovery
   const startTime = Date.now();
   try {
@@ -292,8 +328,13 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     // tagMap, Modes 2/3 via caller-supplied `tags`) never read
     // discoverMeta.tagsRelaxed — a dropped tag filter (step 4 of discover())
     // went unreported here, unlike every other discover() caller.
+    // No intent → no discover() at all: an empty query used to fall back to
+    // the nationwide trust ranking (full-table scan + ~1.2 s event-loop block
+    // per spam call) and hand the same three producers every payload.
     const discoverMeta: DiscoverMeta = {};
-    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const results = hasIntent
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable })
+      : [];
     const tagsRelaxed = !!discoverMeta.tagsRelaxed;
     const durationMs = Date.now() - startTime;
 
@@ -304,37 +345,40 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       agents: results,
     });
 
-    // Log the interaction (this powers the live dashboard)
-    const queryText = messageText || JSON.stringify(discoveryQuery);
-    interactionLogger.log("search", {
-      agentId: params?.agentId,
-      query: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
-      resultCount: results.length,
-      matchedAgentIds: results.map(r => r.agent.id),
-      metadata: {
-        taskId: task.id,
-        parsedQuery: messageText ? marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
-        method: "message/send",
-      },
-      ipAddress: req.ip,
-      durationMs,
-    });
+    // Log the interaction (this powers the live dashboard) — countable only.
+    if (countable) {
+      interactionLogger.log("search", {
+        agentId: params?.agentId,
+        query: queryText,
+        resultCount: results.length,
+        matchedAgentIds: results.map(r => r.agent.id),
+        metadata: {
+          taskId: task.id,
+          parsedQuery: discoveryQuery,
+          method: "message/send",
+        },
+        ipAddress: req.ip,
+        durationMs,
+      });
+    }
 
     // ─── Auto-start conversations with top matches ────────────
     // When an A2A agent searches, we create conversations with
     // the best matches so seller agents can auto-respond.
-    // This makes the system "alive" — every search creates dialog.
+    // This makes the system "alive" — every real search creates dialog.
     const conversations: any[] = [];
-    const topResults = results.slice(0, 3); // Top 3 matches get conversations
+    const topResults = countable ? results.slice(0, 3) : []; // Top 3 matches get conversations
+    if (topResults.length > 0) a2aConversationCap.record(capKey);
     for (const r of topResults) {
       try {
         const conv = conversationService.startConversation({
           buyerAgentId: params?.agentId || undefined,
           sellerAgentId: r.agent.id,
-          queryText: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
+          queryText,
           taskId: task.id,
           source: "a2a",
-          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+          requestMeta, // (item 3) internal-traffic classification
+          trafficClass,
           autoRespond: true, // Seller agent auto-replies
         });
         conversations.push({
@@ -347,13 +391,19 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
         });
       } catch { /* non-critical — don't break search if conv fails */ }
     }
+    recordA2aGuardOutcome(
+      trafficClass !== "external" ? trafficClass
+        : !hasIntent ? "no_intent"
+        : rateCapped ? "rate_capped"
+        : topResults.length > 0 ? "conversations" : "no_results",
+    );
 
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter: same
     // honest signal /search, /discover and the MCP tools already surface —
     // present only when the tag filter was actually dropped, so a
     // tagsRelaxed:false result is byte-identical to before this change.
     const relaxedFilters = tagsRelaxed ? ["tags"] : undefined;
-    const note = buildSearchNote({ tagsDropped: tagsRelaxed });
+    const note = hasIntent ? buildSearchNote({ tagsDropped: tagsRelaxed }) : NO_INTENT_NOTE;
 
     // A2A response format — now includes conversation links
     res.json({
@@ -371,7 +421,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
               count: results.length,
               agents: results,
               conversations,
-              parsedQuery: messageText ? marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
+              parsedQuery: discoveryQuery,
               relaxed_filters: relaxedFilters,
               note,
             },
@@ -395,7 +445,9 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
 // Part of the A2A task lifecycle (Gap 7 fix).
 
 function handleTasksGet(params: any, id: any, res: Response) {
-  const taskId = params?.taskId || params?.id;
+  // v1.0 GetTask may address the task by resource name "tasks/<id>".
+  const taskId = params?.taskId || params?.id
+    || (typeof params?.name === "string" ? params.name.replace(/^tasks\//, "") : undefined);
   if (!taskId) {
     res.json({
       jsonrpc: "2.0",
@@ -755,9 +807,23 @@ router.post("/api/conversations", (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: "sellerAgentId required" });
     return;
   }
+  // Spam guard: classified the same way as POST /a2a. Spam/probe is rejected
+  // (400, nothing stored — the opening system message would otherwise be
+  // broadcast on the public /api/live feed), like /:id/messages below.
+  const requestMeta = buildRequestMeta(req);
+  const trafficClass = classifyA2aTraffic({
+    text: typeof queryText === "string" ? queryText : undefined,
+    ua: requestMeta.userAgent,
+    isInternal: isInternalTraffic(requestMeta),
+  });
+  if (trafficClass === "spam" || trafficClass === "probe") {
+    res.status(400).json({ success: false, error: "Forespørselen ble avvist." });
+    return;
+  }
   const conversation = conversationService.startConversation({
     buyerAgentId, sellerAgentId, queryText,
-    requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+    requestMeta, // (item 3) internal-traffic classification
+    trafficClass,
   });
   res.json({ success: true, data: conversation });
 });
@@ -802,23 +868,67 @@ router.get("/api/conversations/:id", (req: Request, res: Response) => {
 });
 
 // POST /api/conversations/:id/messages — Add message to conversation
+// Auth hardening (spam guard, 2026-10-04): this used to accept ANY role from
+// anyone, so a caller could post as the seller or the platform. Now:
+//   • senderRole 'seller' / 'system' require a valid X-Admin-Key;
+//   • anonymous callers may only post 'buyer', ≤ MAX_ANON_MESSAGE_CHARS,
+//     their metadata is not stored (it is echoed by the public GET), and
+//     content the a2a classifier calls spam/probe is REJECTED with 400
+//     (nothing stored, nothing broadcast on /api/live).
+const MAX_ANON_MESSAGE_CHARS = 2000;
+const SENDER_ROLES = ["buyer", "seller", "system"];
+const MESSAGE_TYPES: MessageType[] = ["text", "offer", "accept", "reject", "info"];
+
 router.post("/api/conversations/:id/messages", (req: Request, res: Response) => {
-  const { senderRole, senderAgentId, content, messageType, metadata } = req.body;
+  const { senderRole, senderAgentId, content, messageType, metadata } = req.body || {};
   if (!content || !senderRole) {
     res.status(400).json({ success: false, error: "content and senderRole required" });
+    return;
+  }
+  if (typeof content !== "string" || !SENDER_ROLES.includes(senderRole)
+      || (messageType !== undefined && !MESSAGE_TYPES.includes(messageType))) {
+    res.status(400).json({ success: false, error: "invalid senderRole, messageType or content" });
+    return;
+  }
+  const requestMeta = buildRequestMeta(req);
+  const isAdmin = !!requestMeta.hasValidAdminKey;
+  if (senderRole !== "buyer" && !isAdmin) {
+    res.status(403).json({ success: false, error: "senderRole 'seller'/'system' krever X-Admin-Key" });
+    return;
+  }
+  if (!isAdmin) {
+    if (content.length > MAX_ANON_MESSAGE_CHARS) {
+      res.status(400).json({ success: false, error: `content max ${MAX_ANON_MESSAGE_CHARS} tegn` });
+      return;
+    }
+    const cls = classifyA2aTraffic({ text: content, ua: requestMeta.userAgent, isInternal: isInternalTraffic(requestMeta) });
+    if (cls === "spam" || cls === "probe") {
+      res.status(400).json({ success: false, error: "Meldingen ble avvist." });
+      return;
+    }
+  }
+  if (!conversationService.getConversation(req.params.id as string)) {
+    res.status(404).json({ success: false, error: "Conversation not found" });
     return;
   }
   const message = conversationService.addMessage({
     conversationId: req.params.id as string,
     senderRole, senderAgentId, content,
     messageType: messageType || "text",
-    metadata: metadata || {},
+    metadata: isAdmin ? (metadata || {}) : {},
   });
   res.json({ success: true, data: message });
 });
 
 // POST /api/conversations/:id/complete — Mark transaction as completed
+// Admin-only (spam guard, 2026-10-04): completing a deal bumps times_chosen /
+// total_revenue_nok and recalculates the seller's trust score, so an
+// anonymous caller could mint fake deals. Same X-Admin-Key check as /admin/*.
 router.post("/api/conversations/:id/complete", (req: Request, res: Response) => {
+  if (!buildRequestMeta(req).hasValidAdminKey) {
+    res.status(401).json({ success: false, error: "Krever X-Admin-Key" });
+    return;
+  }
   try {
     const conversation = conversationService.completeTransaction(req.params.id as string, {
       totalAmountNok: req.body.totalAmountNok,

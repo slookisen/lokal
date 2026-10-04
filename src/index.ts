@@ -52,6 +52,7 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
@@ -705,6 +706,9 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+// a2a spam guard (2026-10-04): POST /admin/conversations/traffic-class-backfill
+// (dry-run by default; {apply:true} writes; {reset:true,apply:true} reverts).
+app.use("/admin/conversations", adminLimiter, adminConversationsTrafficClassRoutes);
 // 2026-07-03 P1 (dev-requests/2026-06-30-platform-housekeeping-audit.md step 1):
 // read-only DB table-size diagnostic — GET /admin/db/table-sizes
 app.use("/admin/db", adminLimiter, adminDbTableSizesRoutes);

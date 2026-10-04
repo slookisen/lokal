@@ -51,6 +51,8 @@ function buildSchema(db: Database.Database): void {
       seller_agent_id TEXT,
       source TEXT DEFAULT 'api',
       query_text TEXT,
+      is_internal INTEGER NOT NULL DEFAULT 0,
+      traffic_class TEXT NOT NULL DEFAULT 'external',
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
@@ -138,6 +140,20 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     insertConv.run("c11", OTHER_AGENT, "web", "Har du økologiske egg?", "-1 days");
     insertConv.run("c12", OTHER_AGENT, "web", "Har du økologiske egg?", "-1 days");
     insertConv.run("c13", OTHER_AGENT, "web", "Har du økologiske egg?", "-1 days");
+    // a2a spam guard (2026-10-04): rows that would otherwise top the panel —
+    // classified spam (5x), our own internal traffic (4x), and junk payloads
+    // still marked external because they predate the backfill (4x each). None
+    // may surface as a term; the expected top-3 above stays unchanged.
+    const insertClassed = db.prepare(
+      `INSERT INTO conversations (id, seller_agent_id, source, query_text, is_internal, traffic_class, created_at)
+       VALUES (?, ?, 'a2a', ?, ?, ?, datetime('now', '-1 days'))`,
+    );
+    for (let i = 0; i < 5; i++) insertClassed.run(`sg-spam-${i}`, AGENT_ID, "紫薇社区邀约 ——Hermes紫薇", 0, "spam");
+    for (let i = 0; i < 4; i++) insertClassed.run(`sg-int-${i}`, AGENT_ID, "honning intern sjekk", 1, "external");
+    for (let i = 0; i < 4; i++) insertClassed.run(`sg-json-${i}`, AGENT_ID, '{"kind":"recontact-verify"}', 0, "external");
+    for (let i = 0; i < 4; i++) insertClassed.run(`sg-url-${i}`, AGENT_ID, "https://kunlunyaochi.com/x", 0, "external");
+    // A producer whose ONLY conversations are classified probe traffic.
+    insertClassed.run("sg-probe-only", "agent-probe-only", "ping", 0, "probe");
 
     const activity = getProfileActivity(db, AGENT_ID, PATH);
 
@@ -175,6 +191,15 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     assertEq(otherActivity.topQueryTerms.length, 1, "isolation: OTHER_AGENT sees only its own 4x term, not AGENT_ID's");
     assertEq(otherActivity.topQueryTerms[0].count, 4, "isolation: OTHER_AGENT's term count is 4, unaffected by AGENT_ID's rows");
     assertTrue(!otherActivity.platforms.includes("chatgpt"), "isolation: OTHER_AGENT gets no chatgpt badge (no matching page views on its path)");
+
+    // ── (e) a2a spam guard ────────────────────────────────────────────
+    assertTrue(
+      !activity.topQueryTerms.some(q => /紫薇|intern sjekk|recontact|kunlunyaochi/.test(q.term)),
+      "spam-guard: spam / internal / JSON / URL rows never surface as terms",
+    );
+    const probeOnly = getProfileActivity(db, "agent-probe-only", "/produsent/probe-only");
+    assertEq(probeOnly.topQueryTerms, [], "spam-guard: probe-only producer gets no query terms");
+    assertTrue(!probeOnly.platforms.includes("a2a"), "spam-guard: probe-only producer gets no A2A badge");
 
     const emptyActivity = getProfileActivity(db, "agent-nothing-seeded", "/produsent/does-not-exist");
     assertEq(emptyActivity.views30.human, 0, "empty-agent: 0 human views");

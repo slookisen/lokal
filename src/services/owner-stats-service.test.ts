@@ -57,6 +57,8 @@ function buildSchema(db: Database.Database): void {
       seller_agent_id TEXT,
       source TEXT,
       query_text TEXT,
+      is_internal INTEGER NOT NULL DEFAULT 0,
+      traffic_class TEXT NOT NULL DEFAULT 'external',
       created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE contact_clicks (
@@ -151,6 +153,16 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     insertConv.run("c7", AGENT_ID, "web", "a", "-7 days"); // single-char -> excluded from terms, still counts as a channel row
     // Noise on a different seller — must never count toward AGENT_ID's terms/channels.
     for (let i = 0; i < 4; i++) insertConv.run(`other-c${i}`, OTHER_AGENT, "web", "Har du økologiske egg?", "-1 days");
+    // a2a spam guard (2026-10-04): non-countable rows (classified spam/probe,
+    // our own internal traffic) must not reach the owner's terms or channel
+    // counts — every expectation below is unchanged by them.
+    const insertClassed = db.prepare(
+      `INSERT INTO conversations (id, seller_agent_id, source, query_text, is_internal, traffic_class, created_at)
+       VALUES (?, ?, 'a2a', ?, ?, ?, datetime('now', '-1 days'))`,
+    );
+    for (let i = 0; i < 6; i++) insertClassed.run(`sg-spam-${i}`, AGENT_ID, '{"module": "ziwei-comm-module/v1"}', 0, "spam");
+    for (let i = 0; i < 2; i++) insertClassed.run(`sg-probe-${i}`, AGENT_ID, "Reply with the single word OK", 0, "probe");
+    insertClassed.run("sg-internal", AGENT_ID, "Har du økologiske egg?", 1, "external");
 
     // ── Fixtures: contact_clicks ────────────────────────────────────
     const insertClick = db.prepare(

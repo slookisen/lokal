@@ -1721,7 +1721,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
           limit: 100, offset: 0,
         });
         if (productTerms) (countQuery as any)._productTerms = productTerms;
-        const countResults = marketplaceRegistry.discover(countQuery);
+        // Count-only: these rows are never shown, so they are not "discovered".
+        const countResults = marketplaceRegistry.discover(countQuery, undefined, { trackDiscovery: false });
         totalCount = countResults.length;
         totalAtMax = totalCount >= 100;
       } catch { /* keep results.length as fallback */ }

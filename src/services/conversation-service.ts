@@ -5,6 +5,15 @@ import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { formatAddressLine } from "../utils/address-format";
+import { trustScoreService } from "./trust-score-service";
+import {
+  COUNTABLE_CONV_SQL,
+  countableConvSql,
+  classifyA2aTrafficDetailed,
+  toStoredTrafficClass,
+  type A2aTrafficClass,
+  type StoredTrafficClass,
+} from "./a2a-traffic-classifier";
 
 // ─── Conversation Service ───────────────────────────────────
 // This is what makes Lokal an OPERATOR, not just a registry.
@@ -103,6 +112,37 @@ export function isInternalTraffic(meta?: RequestMeta | null): boolean {
   return false;
 }
 
+export type TrafficClassBucket = "external" | "probe" | "spam" | "internal";
+
+interface SellerSnapshot {
+  name: string | null;
+  trustBefore: number | null;
+  trustAfter?: number;
+  timesContactedBefore: number;
+  countableBefore: number;
+}
+
+export interface TrafficClassBackfillResult {
+  mode: "dry_run" | "apply";
+  action: "backfill" | "reset";
+  scanned: number;
+  reclassified: Record<string, number>;
+  by_rule: Record<string, number>;
+  counts_before: Record<TrafficClassBucket, number>;
+  counts_after: Record<TrafficClassBucket, number>;
+  affected_sellers: number;
+  top_affected_sellers: Array<{
+    seller_agent_id: string;
+    name: string | null;
+    conversations: number;
+    times_contacted_before: number;
+    times_contacted_after: number;
+    trust_score_before: number | null;
+    trust_score_after?: number;
+  }>;
+  notes: string[];
+}
+
 export interface Conversation {
   id: string;
   buyerAgentId?: string;
@@ -151,6 +191,9 @@ class ConversationService {
     source?: "a2a" | "mcp" | "web" | "api";
     clientIdentity?: string;   // e.g. "ChatGPT", "Claude Desktop", "Cursor"
     requestMeta?: RequestMeta; // classification signals from the live request (UA / admin-key / owner-cookie)
+    // a2a-traffic-classifier verdict. Default 'external'. 'internal' lands in
+    // is_internal (its one home); 'spam'/'probe' in traffic_class.
+    trafficClass?: A2aTrafficClass;
     autoRespond?: boolean;  // default true — seller agent replies automatically
     verticalId?: string;    // default 'rfb' — per-vertical scoping (Phase 4.6b)
   }): Conversation {
@@ -162,12 +205,14 @@ class ConversationService {
 
     // (item 3) Classify at write-time. Conservative: only confident-internal
     // requests are flagged; everything else stays 0 (external, publicly counted).
-    const isInternal = isInternalTraffic(opts.requestMeta) ? 1 : 0;
+    const isInternal = isInternalTraffic(opts.requestMeta) || opts.trafficClass === "internal" ? 1 : 0;
+    const trafficClass: StoredTrafficClass = toStoredTrafficClass(opts.trafficClass);
+    const countable = !isInternal && trafficClass === "external";
 
     db.prepare(`
-      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, is_internal, vertical_id, created_at, updated_at)
-      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId || null, opts.queryText || null, opts.taskId || null, source, isInternal, verticalId, now, now);
+      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, is_internal, traffic_class, vertical_id, created_at, updated_at)
+      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId || null, opts.queryText || null, opts.taskId || null, source, isInternal, trafficClass, verticalId, now, now);
 
     // Get seller info for the system message — only when there IS a seller
     // agent row to look up (see sellerAgentId doc above).
@@ -206,7 +251,8 @@ class ConversationService {
     // The seller agent "wakes up" and responds with what it knows.
     // This is template-based, using the knowledge we've enriched.
     // No-op without a real seller agent row (nothing to look up a knowledge base for).
-    if (opts.autoRespond !== false && opts.sellerAgentId) {
+    // Never for spam/probe — nobody is there to read it.
+    if (opts.autoRespond !== false && opts.sellerAgentId && trafficClass === "external") {
       const autoReply = this.generateSellerResponse(opts.sellerAgentId, opts.queryText);
       if (autoReply) {
         this.addMessage({
@@ -227,8 +273,9 @@ class ConversationService {
     // which are vertical-aware. Un-gating this for other verticals would leak
     // opplevagent query text/conversation ids onto RFB's public activity feed
     // and inflate its public counters, which is exactly the regression the
-    // vertical-filter work in this file exists to prevent.
-    if (verticalId === "rfb") {
+    // vertical-filter work in this file exists to prevent. Spam/probe rows
+    // stay off that public feed too.
+    if (verticalId === "rfb" && trafficClass === "external") {
       interactionLogger.log("message", {
         agentId: opts.buyerAgentId,
         query: opts.queryText,
@@ -237,8 +284,10 @@ class ConversationService {
       });
     }
 
-    // Update seller metrics — only when there IS a seller agent row.
-    if (opts.sellerAgentId) {
+    // Update seller metrics — only when there IS a seller agent row, and only
+    // for countable traffic (same predicate the traffic-class backfill
+    // recomputes times_contacted from).
+    if (opts.sellerAgentId && countable) {
       this.incrementMetric(opts.sellerAgentId, "times_contacted");
     }
 
@@ -559,8 +608,9 @@ class ConversationService {
     `;
     const params: any[] = [opts.verticalId || "rfb"];
 
-    // (item 3) Public list = external traffic only. Admin path opts-in to all.
-    if (!opts.includeInternal) { sql += " AND (c.is_internal IS NULL OR c.is_internal = 0)"; }
+    // (item 3) Public list = external traffic only (not internal, not
+    // classified spam/probe). Admin path opts-in to all.
+    if (!opts.includeInternal) { sql += ` AND ${countableConvSql("c")}`; }
     if (opts.status) { sql += " AND c.status = ?"; params.push(opts.status); }
     if (opts.source) { sql += " AND c.source = ?"; params.push(opts.source); }
     if (opts.agentId) {
@@ -589,14 +639,15 @@ class ConversationService {
 
   // ─── Conversation stats by source ─────────────────────────
   // (item 3) PUBLIC counters exclude internal fleet/verifier traffic by default
-  // — a verifier probe run must NOT increment the numbers a visitor sees. Pass
+  // — a verifier probe run must NOT increment the numbers a visitor sees — and
+  // classified spam/probe rows (COUNTABLE_CONV_SQL). Pass
   // { includeInternal: true } for the ADMIN view, which still shows full totals.
   // vertical-filter: same default-'rfb' contract as getConversation() above.
   getSourceStats(opts: { includeInternal?: boolean; verticalId?: string } = {}): { source: string; count: number; lastActivity: string }[] {
     const db = getDb();
     let where = "WHERE vertical_id = ?";
     const params: any[] = [opts.verticalId || "rfb"];
-    if (!opts.includeInternal) { where += " AND (is_internal IS NULL OR is_internal = 0)"; }
+    if (!opts.includeInternal) { where += ` AND ${COUNTABLE_CONV_SQL}`; }
     const rows = db.prepare(`
       SELECT COALESCE(source, 'api') as source, COUNT(*) as count,
         MAX(updated_at) as last_activity
@@ -652,6 +703,230 @@ class ConversationService {
     const db = getDb();
     const info = db.prepare(`UPDATE conversations SET is_internal = 0 WHERE is_internal = 1`).run();
     return { cleared: info.changes as number };
+  }
+
+  // ─── Traffic-class breakdown (admin) ─────────────────────────────────────
+  // Every conversation lands in exactly one bucket: is_internal wins, then
+  // traffic_class. Default vertical 'rfb' like every other reader here;
+  // allVerticals for the backfill, which scans every row.
+  getTrafficClassBreakdown(opts: { verticalId?: string; allVerticals?: boolean } = {}): Record<TrafficClassBucket, number> {
+    const db = getDb();
+    const where = opts.allVerticals ? "" : "WHERE vertical_id = ?";
+    const params = opts.allVerticals ? [] : [opts.verticalId || "rfb"];
+    const rows = db.prepare(`
+      SELECT CASE WHEN COALESCE(is_internal,0)=1 THEN 'internal' ELSE COALESCE(traffic_class,'external') END AS cls,
+        COUNT(*) AS n
+      FROM conversations ${where}
+      GROUP BY cls
+    `).all(...params) as Array<{ cls: string; n: number }>;
+    const out: Record<TrafficClassBucket, number> = { external: 0, probe: 0, spam: 0, internal: 0 };
+    for (const r of rows) if (r.cls in out) out[r.cls as TrafficClassBucket] = r.n;
+    return out;
+  }
+
+  // ─── traffic_class history backfill (a2a spam guard) ─────────────────────
+  // Re-applies a2a-traffic-classifier to every still-'external' row, from the
+  // UA persisted on its opening system message + query_text — the same inputs
+  // the write-time guard now sees. Same discipline as backfillInternalFlags():
+  //   • dry-run unless apply — reports what WOULD change, writes nothing
+  //   • never deletes; only ever moves 'external' → 'spam' | 'probe', and
+  //     stamps traffic_class_backfilled_at so resetTrafficClassBackfill() can
+  //     revert exactly the rows THIS backfill changed (idempotent: a second
+  //     run finds nothing left to move)
+  //   • internal rows (is_internal=1) are left alone — internal wins
+  // On apply it recomputes agent_metrics.times_contacted for every affected
+  // seller from its countable conversations, then re-runs the live trust
+  // score (trustScoreService.update) for them — the spam had pinned their
+  // contact signal at max. times_discovered is deliberately NOT touched: it
+  // is historically inflated (every discover() candidate used to be counted)
+  // and has no per-row source to recompute from.
+  backfillTrafficClass(opts: { apply?: boolean } = {}): TrafficClassBackfillResult {
+    const db = getDb();
+    const apply = !!opts.apply;
+    const countsBefore = this.getTrafficClassBreakdown({ allVerticals: true });
+    const rows = db.prepare(`
+      SELECT c.id as cid, c.seller_agent_id as seller, c.query_text as q, c.is_internal as internal,
+        (SELECT m.metadata FROM messages m
+           WHERE m.conversation_id = c.id AND m.sender_role = 'system'
+           ORDER BY m.created_at ASC LIMIT 1) as meta
+      FROM conversations c
+      WHERE COALESCE(c.traffic_class,'external') = 'external'
+    `).all() as Array<{ cid: string; seller: string | null; q: string | null; internal: number | null; meta: string | null }>;
+
+    const changes: Array<{ cid: string; seller: string | null; cls: "spam" | "probe" }> = [];
+    const byRule: Record<string, number> = {};
+    for (const r of rows) {
+      let ua: string | undefined;
+      try { ua = JSON.parse(r.meta || "{}").ua; } catch { ua = undefined; }
+      const verdict = classifyA2aTrafficDetailed({
+        text: r.q,
+        ua,
+        isInternal: r.internal === 1 || isInternalTraffic({ userAgent: ua }),
+      });
+      if (verdict.cls !== "spam" && verdict.cls !== "probe") continue;
+      changes.push({ cid: r.cid, seller: r.seller, cls: verdict.cls });
+      byRule[verdict.ruleId || verdict.cls] = (byRule[verdict.ruleId || verdict.cls] || 0) + 1;
+    }
+
+    const perSeller = new Map<string, number>();
+    for (const c of changes) if (c.seller) perSeller.set(c.seller, (perSeller.get(c.seller) || 0) + 1);
+    const sellers = this.snapshotSellers([...perSeller.keys()]);
+
+    if (apply && changes.length > 0) {
+      const now = new Date().toISOString();
+      const upd = db.prepare(`
+        UPDATE conversations SET traffic_class = ?, traffic_class_backfilled_at = ?
+        WHERE id = ? AND COALESCE(traffic_class,'external') = 'external'
+      `);
+      db.transaction(() => {
+        for (const c of changes) upd.run(c.cls, now, c.cid);
+        this.recountTimesContacted([...perSeller.keys()]);
+      })();
+      this.refreshTrust(sellers);
+    }
+
+    const counted = { spam: 0, probe: 0 };
+    for (const c of changes) counted[c.cls]++;
+    const countsAfter = apply
+      ? this.getTrafficClassBreakdown({ allVerticals: true })
+      : { ...countsBefore, external: countsBefore.external - changes.length, spam: countsBefore.spam + counted.spam, probe: countsBefore.probe + counted.probe };
+
+    return {
+      mode: apply ? "apply" : "dry_run",
+      action: "backfill",
+      scanned: rows.length,
+      reclassified: counted,
+      by_rule: byRule,
+      counts_before: countsBefore,
+      counts_after: countsAfter,
+      affected_sellers: perSeller.size,
+      top_affected_sellers: this.topAffected(perSeller, sellers, apply ? undefined : -1),
+      notes: [
+        "times_discovered is historically inflated (every discover() candidate was counted before the spam guard) and is deliberately left unchanged.",
+        ...(apply ? [] : ["dry-run: nothing written. Re-send with {\"apply\":true} to write."]),
+      ],
+    };
+  }
+
+  // Reversal: puts every row THIS backfill moved back to 'external' (rows
+  // stamped traffic_class_backfilled_at), then recomputes times_contacted
+  // and trust for those sellers. Dry-run unless apply, like the backfill.
+  resetTrafficClassBackfill(opts: { apply?: boolean } = {}): TrafficClassBackfillResult {
+    const db = getDb();
+    const apply = !!opts.apply;
+    const countsBefore = this.getTrafficClassBreakdown({ allVerticals: true });
+    const rows = db.prepare(`
+      SELECT id as cid, seller_agent_id as seller, traffic_class as cls, COALESCE(is_internal,0) as internal
+      FROM conversations WHERE traffic_class_backfilled_at IS NOT NULL
+    `).all() as Array<{ cid: string; seller: string | null; cls: string; internal: number }>;
+
+    const perSeller = new Map<string, number>();
+    for (const r of rows) if (r.seller) perSeller.set(r.seller, (perSeller.get(r.seller) || 0) + 1);
+    const sellers = this.snapshotSellers([...perSeller.keys()]);
+
+    if (apply && rows.length > 0) {
+      db.transaction(() => {
+        db.prepare(`
+          UPDATE conversations SET traffic_class = 'external', traffic_class_backfilled_at = NULL
+          WHERE traffic_class_backfilled_at IS NOT NULL
+        `).run();
+        this.recountTimesContacted([...perSeller.keys()]);
+      })();
+      this.refreshTrust(sellers);
+    }
+
+    const countsAfter = { ...countsBefore };
+    if (!apply) {
+      for (const r of rows) {
+        if (r.internal === 1) continue;
+        if (r.cls === "spam" || r.cls === "probe") { countsAfter[r.cls]--; countsAfter.external++; }
+      }
+    }
+    return {
+      mode: apply ? "apply" : "dry_run",
+      action: "reset",
+      scanned: rows.length,
+      reclassified: { external: rows.length },
+      by_rule: {},
+      counts_before: countsBefore,
+      counts_after: apply ? this.getTrafficClassBreakdown({ allVerticals: true }) : countsAfter,
+      affected_sellers: perSeller.size,
+      top_affected_sellers: this.topAffected(perSeller, sellers, apply ? undefined : 1),
+      notes: [
+        "times_contacted is recomputed from countable conversations, so after a reset it equals the live row count (rows pruned by tasks-prune are not resurrected).",
+        ...(apply ? [] : ["dry-run: nothing written. Re-send with {\"reset\":true,\"apply\":true} to write."]),
+      ],
+    };
+  }
+
+  // times_contacted := countable conversations for each seller.
+  private recountTimesContacted(sellerIds: string[]): void {
+    const db = getDb();
+    const now = new Date().toISOString();
+    const ensure = db.prepare(`INSERT OR IGNORE INTO agent_metrics (agent_id) VALUES (?)`);
+    const recount = db.prepare(`
+      UPDATE agent_metrics SET times_contacted = (
+        SELECT COUNT(*) FROM conversations WHERE seller_agent_id = ? AND ${COUNTABLE_CONV_SQL}
+      ), updated_at = ? WHERE agent_id = ?
+    `);
+    for (const id of sellerIds) {
+      ensure.run(id);
+      recount.run(id, now, id);
+    }
+  }
+
+  private snapshotSellers(sellerIds: string[]): Map<string, SellerSnapshot> {
+    const db = getDb();
+    const get = db.prepare(`
+      SELECT a.name, a.trust_score,
+        COALESCE(m.times_contacted, 0) AS times_contacted,
+        (SELECT COUNT(*) FROM conversations c WHERE c.seller_agent_id = a.id AND ${countableConvSql("c")}) AS countable
+      FROM agents a LEFT JOIN agent_metrics m ON m.agent_id = a.id
+      WHERE a.id = ?
+    `);
+    const out = new Map<string, SellerSnapshot>();
+    for (const id of sellerIds) {
+      const r = get.get(id) as { name: string; trust_score: number | null; times_contacted: number; countable: number } | undefined;
+      out.set(id, {
+        name: r?.name ?? null,
+        trustBefore: r?.trust_score ?? null,
+        timesContactedBefore: r?.times_contacted ?? 0,
+        countableBefore: r?.countable ?? 0,
+      });
+    }
+    return out;
+  }
+
+  private refreshTrust(sellers: Map<string, SellerSnapshot>): void {
+    for (const [id, s] of sellers) {
+      try { s.trustAfter = trustScoreService.update(id); } catch { /* non-critical — next boot recalculates all */ }
+    }
+  }
+
+  // Top-10 sellers by reclassified rows. `projectSign` is set on a dry run:
+  // the projected times_contacted is today's countable count −1×n (backfill)
+  // or +1×n (reset). On apply the real post-write value is read back.
+  private topAffected(perSeller: Map<string, number>, sellers: Map<string, SellerSnapshot>, projectSign?: number): TrafficClassBackfillResult["top_affected_sellers"] {
+    const db = getDb();
+    const readContacted = db.prepare(`SELECT times_contacted FROM agent_metrics WHERE agent_id = ?`);
+    return [...perSeller.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([id, n]) => {
+        const s = sellers.get(id);
+        const after = projectSign === undefined
+          ? ((readContacted.get(id) as { times_contacted: number } | undefined)?.times_contacted ?? 0)
+          : Math.max(0, (s?.countableBefore ?? 0) + projectSign * n);
+        return {
+          seller_agent_id: id,
+          name: s?.name ?? null,
+          conversations: n,
+          times_contacted_before: s?.timesContactedBefore ?? 0,
+          times_contacted_after: after,
+          trust_score_before: s?.trustBefore ?? null,
+          ...(s?.trustAfter !== undefined ? { trust_score_after: s.trustAfter } : {}),
+        };
+      });
   }
 
   // ─── Get agent metrics (seller dashboard / social proof) ─
