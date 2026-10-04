@@ -151,7 +151,28 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
   assertEq(addr.isRoadDesignationOnlyAddress("Rv. 7, 3570 Ål"), true, "A03: 'Rv. 7' is road-only");
   assertEq(addr.isRoadDesignationOnlyAddress("E6, 7500 Stjørdal"), true, "A04: 'E6' is road-only");
   assertEq(addr.isRoadDesignationOnlyAddress("Kv 12, 1234 Bygd"), true, "A05: 'Kv 12' is road-only");
-  assertEq(addr.isRoadDesignationOnlyAddress("Fylkesvegen 109, 5776 Nå"), true, "A06: 'Fylkesvegen 109' is road-only");
+  // Review fix: the WRITE path only treats ABBREVIATED designations as
+  // road-only — spelled-out names are real street names in many places.
+  assertEq(addr.isRoadDesignationOnlyAddress("Fylkesvegen 109, 5776 Nå"), false, "A06: spelled-out 'Fylkesvegen 109' is NOT road-only on the write path");
+  assertEq(addr.isRoadDesignationOnlyAddress("Riksvegen 15, 2390 Moelv"), false, "A06b: 'Riksvegen 15' is NOT road-only");
+  assertEq(addr.isRoadDesignationOnlyAddress("Europavegen 2, 7500 Stjørdal"), false, "A06c: 'Europavegen 2' is NOT road-only");
+  // Review fix B2: P.O. boxes and cadastral numbers are not physical streets.
+  assertEq(addr.hasStreetAndHouseNumber("Postboks 45, 5776 Nå"), false, "A06d: 'Postboks 45' is not a street address");
+  assertEq(addr.hasStreetAndHouseNumber("PB 45, 5776 Nå"), false, "A06e: 'PB 45' is not a street address");
+  assertEq(addr.hasStreetAndHouseNumber("Boks 3, 5776 Nå"), false, "A06f: 'Boks 3' is not a street address");
+  assertEq(addr.hasStreetAndHouseNumber("Gnr 12 Bnr 3, 5776 Nå"), false, "A06g: 'Gnr 12 Bnr 3' is not a street address");
+  assertEq(addr.hasStreetAndHouseNumber("gnr. 12/3, 5776 Nå"), false, "A06h: 'gnr. 12/3' is not a street address");
+  assertEq(addr.hasStreetAndHouseNumber("Boksveien 4, 1234 Bygd"), true, "A06i: a street merely starting with 'Boks' is still a street");
+  assertEq(
+    addr.streetAddressBeatsRoadDesignation({ existing: KVESTAD_ROAD, incoming: "Postboks 45, 5776 Nå", incomingSourceType: "brreg" }),
+    false,
+    "A06j: a Brreg 'Postboks 45' never beats Fv109",
+  );
+  {
+    const sp = require("./admin-field-spot-check") as typeof import("./admin-field-spot-check");
+    assertEq(sp.parseStoredStreetAddress("Postboks 45, 5776 Nå"), { street: "postboks", houseNumber: "45", postcode: "5776" },
+      "A06k: the spot-check parser itself is unchanged (byte-identical behaviour)");
+  }
   assertEq(addr.isRoadDesignationOnlyAddress("Kvestad Sideri, Fv109, 5776 Nå, Norway"), true, "A07: name-prefixed Google form is road-only");
   assertEq(addr.isRoadDesignationOnlyAddress("Fv109 5776 Nå"), true, "A08: comma-less 'Fv109 5776 Nå' is road-only");
   assertEq(addr.isRoadDesignationOnlyAddress(KVESTAD_STREET), false, "A09: real street + number is NOT road-only");
@@ -356,8 +377,25 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
     assertEq([g.allowed, g.outcome, fetchCalls.length], [true, "unchanged", 0], "B17: re-sending the stored number -> unchanged, no fetch");
     g = await guard.guardAutoPhoneWrite({ phone: "", existingPhone: "+4791234567" });
     assertEq([g.allowed, g.outcome], [true, "cleared"], "B18: clearing the phone is not gated");
-    g = await guard.guardAutoPhoneWrite({ phone: AALAN_REAL_PHONE, existingPhone: null, ownerRelay: true });
-    assertEq([g.allowed, g.outcome, fetchCalls.length], [true, "owner_relay", 0], "B19: owner relay is not gated");
+    const EVIDENCE = { channel: "email", ref: "<CAF1234@mail.gmail.com>", received_at: "2026-10-01T09:12:00Z" };
+    g = await guard.guardAutoPhoneWrite({ phone: AALAN_REAL_PHONE, existingPhone: null, ownerRelayEvidence: EVIDENCE });
+    assertEq([g.allowed, g.outcome, fetchCalls.length], [true, "owner_relay", 0], "B19: owner relay WITH evidence is not gated");
+    assertEq(g.owner_relay_evidence, EVIDENCE, "B19b: evidence echoed in the verdict");
+    g = await guard.guardAutoPhoneWrite({ phone: AALAN_REAL_PHONE, existingPhone: null, ownerRelayEvidence: { channel: "fax", ref: "x", received_at: "2026-10-01T09:12:00Z" } });
+    assertEq([g.allowed, g.outcome, g.owner_relay_evidence_rejected], [false, "rejected_no_source_url", "channel_must_be_email_phone_or_portal"],
+      "B19c: invalid evidence -> treated as a normal auto write (refused without a source)");
+    assertEq(guard.parseOwnerRelayEvidence({ channel: "email", ref: "  ", received_at: "2026-10-01T09:12:00Z" }), { ok: false, reason: "ref_required" }, "B19d: empty ref refused");
+    assertEq(guard.parseOwnerRelayEvidence({ channel: "portal", ref: "T-1", received_at: "yesterday" }), { ok: false, reason: "received_at_must_be_iso_timestamp" }, "B19e: unparseable received_at refused");
+    g = await guard.guardAutoPhoneWrite({
+      phone: AALAN_REAL_PHONE, existingPhone: null,
+      fieldProvenancePhone: [{ source_type: "owner", value: AALAN_REAL_PHONE }],
+    });
+    assertEq([g.allowed, g.outcome], [false, "rejected_no_source_url"], "B19f: owner provenance record alone is NOT an exemption by default");
+    g = await guard.guardAutoPhoneWrite({
+      phone: AALAN_REAL_PHONE, existingPhone: null, acceptOwnerProvenanceRecord: true,
+      fieldProvenancePhone: [{ source_type: "owner", value: AALAN_REAL_PHONE }],
+    });
+    assertEq(g.outcome, "owner_relay", "B19g: ... only for a caller that explicitly opts in");
 
     // ═════════════════════════════════════════════════════════════════════
     // Route-level tests (in-memory DB)
@@ -441,14 +479,29 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       r = await putAdminKnowledge({ agent_id: "aalan-1", phone: "91234567" });
       assertEq([r.status, r.body?.phone_write?.outcome, fetchCalls.length], [200, "unchanged", 0], "C14: same number re-sent -> unchanged, no fetch");
 
+      const audits = (id: string) =>
+        db.prepare(`SELECT field_name, old_value, new_value, changed_by, notes FROM agent_knowledge_audit WHERE agent_id = ?`).all(id) as any[];
       insertAgent("aalan-2", "Aalan Gård To");
       r = await putAdminKnowledge({
         agent_id: "aalan-2",
         phone: AALAN_REAL_PHONE,
         field_provenance: { phone: [{ source_type: "owner", value: AALAN_REAL_PHONE, fetched_at: "2026-09-30T00:00:00Z" }] },
       });
-      assertEq([r.status, r.body?.phone_write?.outcome], [200, "owner_relay"], "C15: owner-sourced provenance relay is not gated");
-      assertEq(knowledge("aalan-2")?.phone, AALAN_REAL_PHONE, "C16: owner relay phone written");
+      assertEq([r.status, r.body?.phone_rejected_reason], [422, "rejected_no_source_url"],
+        "C15: owner provenance record WITHOUT owner_relay_evidence is refused (spoofable on a shared admin key)");
+      assertEq(knowledge("aalan-2")?.phone ?? null, null, "C16: phone NOT written");
+      r = await putAdminKnowledge({
+        agent_id: "aalan-2",
+        phone: AALAN_REAL_PHONE,
+        owner_relay_evidence: { channel: "email", ref: "<msg-aalan-2@mail>", received_at: "2026-10-01T08:00:00Z" },
+      });
+      assertEq([r.status, r.body?.phone_write?.outcome], [200, "owner_relay"], "C16b: owner relay WITH evidence is written");
+      assertEq(r.body?.phone_write?.owner_relay_evidence?.ref, "<msg-aalan-2@mail>", "C16c: evidence echoed in phone_write");
+      assertEq(knowledge("aalan-2")?.phone, AALAN_REAL_PHONE, "C16d: owner relay phone written");
+      const a2 = audits("aalan-2");
+      assertEq(a2.length, 1, "C16e: exactly one audit row for the owner-relay write");
+      assertTrue(a2[0]?.field_name === "phone" && a2[0]?.changed_by === "admin" && String(a2[0]?.notes).includes("ref:<msg-aalan-2@mail>"),
+        "C16f: audit row records field, actor and the evidence ref");
 
       r = await putAdminKnowledge({ agent_id: "aalan-2", about: "Ingen telefon her, bare tekst om garden." });
       assertTrue(!Object.prototype.hasOwnProperty.call(r.body ?? {}, "phone_write"), "C17: phone_write absent when no phone in the call");
@@ -526,8 +579,24 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
 
       insertAgent("aalan-5", "Aalan Gård Fem");
       r = await putMarketplaceKnowledge("aalan-5", { phone: AALAN_REAL_PHONE, dataSource: "owner" });
-      assertEq([r.status, r.body?.phone_write?.outcome], [200, "owner_relay"], "D15: admin relay with dataSource owner (CS) is not gated");
-      assertEq(knowledge("aalan-5")?.phone, AALAN_REAL_PHONE, "D16: owner relay phone written");
+      assertEq([r.status, r.body?.phone_rejected_reason], [422, "rejected_no_source_url"],
+        "D15: admin key + dataSource owner WITHOUT evidence is refused");
+      assertEq(knowledge("aalan-5")?.phone ?? null, null, "D16: phone NOT written");
+      r = await putMarketplaceKnowledge("aalan-5", {
+        phone: AALAN_REAL_PHONE,
+        dataSource: "owner",
+        owner_relay_evidence: { channel: "email", ref: "<msg-aalan-5@mail>", received_at: "2026-10-01T08:00:00Z" },
+      });
+      assertEq([r.status, r.body?.phone_write?.outcome], [200, "owner_relay"], "D16b: owner relay WITH evidence is written");
+      assertEq(knowledge("aalan-5")?.phone, AALAN_REAL_PHONE, "D16c: phone written");
+      const a5 = audits("aalan-5");
+      assertTrue(a5.length === 1 && String(a5[0]?.notes).includes("lane:put_agents_knowledge"), "D16d: owner-relay write audited");
+      insertAgent("aalan-6", "Aalan Gård Seks");
+      r = await putMarketplaceKnowledge("aalan-6", {
+        phone: AALAN_REAL_PHONE,
+        owner_relay_evidence: { channel: "email", ref: "", received_at: "2026-10-01T08:00:00Z" },
+      });
+      assertEq([r.status, r.body?.phone_write?.owner_relay_evidence_rejected], [422, "ref_required"], "D16e: evidence with empty ref is refused");
 
       // ── POST /admin/bulk-enrich ─────────────────────────────────────────
       insertAgent("bulk-1", "Bulk Gård En");
@@ -548,6 +617,26 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       assertEq(knowledge("bulk-1")?.phone ?? null, null, "E03: bulk-1 phone NOT written");
       assertEq(knowledge("bulk-1")?.about, "Bulk en har honning.", "E04: bulk-1 about still written");
       assertEq(knowledge("bulk-2")?.phone, AALAN_REAL_PHONE, "E05: bulk-2 substantiated phone written");
+
+      insertAgent("bulk-3", "Bulk Gård Tre");
+      r = await callRoute(mpRouter, {
+        method: "POST",
+        url: "/admin/bulk-enrich",
+        headers: adminHeaders,
+        body: {
+          agents: [{
+            agentId: "bulk-3",
+            data: {
+              phone: AALAN_REAL_PHONE,
+              dataSource: "owner",
+              field_provenance: { phone: [{ source_type: "owner", value: AALAN_REAL_PHONE }] },
+              owner_relay_evidence: { channel: "email", ref: "<x@y>", received_at: "2026-10-01T08:00:00Z" },
+            },
+          }],
+        },
+      });
+      assertEq(r.body?.data?.phoneRejections?.[0]?.outcome, "rejected_no_source_url", "E06: bulk-enrich has NO owner exemption (provenance or evidence)");
+      assertEq(knowledge("bulk-3")?.phone ?? null, null, "E07: bulk-3 phone NOT written");
 
       // ── POST /admin/google-rating-batch (Kvestad) ───────────────────────
       let brregAdresse: string[] | null = null;
@@ -606,6 +695,26 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       assertEq(r.body?.data?.results?.[0]?.addressWritten, true, "G04: road-only Google value still fills an empty column when nothing better is on record");
       assertEq(knowledge("kv-g2")?.address, KVESTAD_ROAD, "G05: column holds the Google value");
 
+      // G2b: a homepage 'Postboks' record is NOT a better street address —
+      // the skip must not fire on it.
+      insertAgent("kv-g2b", "Kvestad Sideri Gee Tobe");
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance) VALUES (?, NULL, ?)`).run(
+        "kv-g2b",
+        JSON.stringify({ address: [{ source_type: "homepage", value: "Postboks 45, 5776 Nå", fetched_at: "2026-09-01T00:00:00Z" }] }),
+      );
+      r = await runBatch("kv-g2b");
+      assertEq([r.body?.data?.results?.[0]?.addressWritten, r.body?.data?.results?.[0]?.addressSkippedReason], [true, undefined],
+        "G05b: a Postboks provenance record does not count as a better street address");
+
+      // G2c: Brreg 'Postboks 45' must not correct a stored Fv109.
+      insertAgent("kv-g2c", "Kvestad Sideri Gee Toce");
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance) VALUES (?, ?, '{}')`).run("kv-g2c", KVESTAD_ROAD);
+      brregAdresse = ["Postboks 45"];
+      r = await runBatch("kv-g2c");
+      assertEq(r.body?.data?.results?.[0]?.addressCorrected, undefined, "G05c: Brreg 'Postboks 45' does not correct Fv109");
+      assertEq(knowledge("kv-g2c")?.address, KVESTAD_ROAD, "G05d: Fv109 kept");
+      brregAdresse = null;
+
       // G3: stored Fv109 + Brreg street address this run -> corrected, geocode reset.
       insertAgent("kv-g3", "Kvestad Sideri Gee Tre");
       db.prepare(`UPDATE agents SET lat = 60.1, lng = 6.5, geo_precision = 'postcode' WHERE id = ?`).run("kv-g3");
@@ -650,6 +759,10 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance) VALUES (?, ?, '{}')`).run("kv-b2", "Lønsdal, 8255 Røkland");
       adminAgents.applyAgentBrregContact(db as any, "kv-b2", { address: KVESTAD_STREET }, "https://data.brreg.no/x");
       assertEq(knowledge("kv-b2")?.address, "Lønsdal, 8255 Røkland", "H03: a farm-name address is not overwritten by Brreg (fill-only as before)");
+      insertAgent("kv-b3", "Kvestad Sideri Be Tre");
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance) VALUES (?, ?, '{}')`).run("kv-b3", KVESTAD_ROAD);
+      adminAgents.applyAgentBrregContact(db as any, "kv-b3", { address: "Postboks 45, 5776 Nå" }, "https://data.brreg.no/x");
+      assertEq(knowledge("kv-b3")?.address, KVESTAD_ROAD, "H04: Brreg backfill with a 'Postboks 45' postadresse does not correct Fv109");
     } finally {
       (globalThis as any).fetch = prevFetch;
       initMod.__setDbForTesting(prevDb as any);

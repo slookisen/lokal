@@ -136,7 +136,12 @@ import { looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../s
 // W40 RFB spot-check write guards: road-designation precedence for address
 // corrections + the phone-must-be-on-its-source-page gate for the PUT below.
 import { parseStoredStreetAddress, streetAddressBeatsRoadDesignation } from "../services/street-address-parse";
-import { guardAutoPhoneWrite, withoutPhoneProvenanceFor, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
+import {
+  guardAutoPhoneWrite,
+  recordOwnerRelayPhoneAudit,
+  withoutPhoneProvenanceFor,
+  type PhoneWriteVerdict,
+} from "../services/phone-source-write-guard";
 
 const router = Router();
 
@@ -694,6 +699,9 @@ type IncomingBody = {
   // W40 write guards: the page the `phone` value was read from. Alternatively
   // a field_provenance.phone record with `source_url` for the same number.
   phone_source_url?: string;
+  // W40 write guards: required for an owner-relayed phone (CS) —
+  // { channel: "email"|"phone"|"portal", ref, received_at }.
+  owner_relay_evidence?: unknown;
 };
 
 router.put("/", async (req: Request, res: Response) => {
@@ -791,13 +799,17 @@ router.put("/", async (req: Request, res: Response) => {
   // source_url for the same number) — fetched here through the SSRF-guarded
   // fetchPage, per-host 429 cooldown, unreadable page => not written. See
   // services/phone-source-write-guard.ts for the exempt cases (clearing,
-  // re-sending the stored number, an `owner`-sourced provenance record).
+  // re-sending the stored number, an owner relay carrying
+  // `owner_relay_evidence: {channel, ref, received_at}` — logged + audited;
+  // an `owner` provenance record alone is NOT an exemption, the admin key is
+  // shared by CS and the enrichment routine).
   // A refused phone is dropped from the write set (siblings still written,
   // same convention as website_rejected_reason) together with its own
   // provenance records; the response carries `phone_write` +
   // `phone_rejected_reason`, and the whole call is a 422 when the phone was
   // the only thing it would have written.
   let phoneWrite: PhoneWriteVerdict | undefined;
+  let phoneBefore: string | null = null;
   if (typeof body.phone === "string") {
     const existingPhoneRow = db.prepare("SELECT phone FROM agent_knowledge WHERE agent_id = ?").get(agentId) as
       | { phone?: string | null }
@@ -805,11 +817,13 @@ router.put("/", async (req: Request, res: Response) => {
     const fp = body.field_provenance && typeof body.field_provenance === "object"
       ? (body.field_provenance as Record<string, unknown>)
       : undefined;
+    phoneBefore = existingPhoneRow?.phone ?? null;
     phoneWrite = await guardAutoPhoneWrite({
       phone: body.phone,
-      existingPhone: existingPhoneRow?.phone ?? null,
+      existingPhone: phoneBefore,
       explicitSourceUrl: body.phone_source_url,
       fieldProvenancePhone: fp?.phone,
+      ownerRelayEvidence: body.owner_relay_evidence,
     });
     if (phoneWrite.allowed) {
       columnUpdates.push({ col: "phone", val: body.phone });
@@ -1331,6 +1345,13 @@ router.put("/", async (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: "write_failed", detail: err?.message ?? String(err) });
     return;
+  }
+
+  // W40 write guards: every owner-relay phone write that actually landed is
+  // logged + audited (an allow_correct refusal may still have dropped it).
+  const phoneLanded = columnUpdates.find((u) => u.col === "phone");
+  if (phoneWrite?.outcome === "owner_relay" && phoneWrite.owner_relay_evidence && phoneLanded) {
+    recordOwnerRelayPhoneAudit(db, agentId, phoneBefore, String(phoneLanded.val), phoneWrite.owner_relay_evidence, "put_admin_knowledge");
   }
 
   // Echo back what we ended up with — useful for the SKILL to log

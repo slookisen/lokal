@@ -29,7 +29,7 @@ import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
-import { guardAutoPhoneWrite, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
+import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
 import {
   hasStreetAndHouseNumber,
   isRoadDesignationOnlyAddress,
@@ -1975,24 +1975,29 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
   // `source_url` for the same number), fetched server-side through the
   // SSRF-guarded fetchPage with a per-host 429 cooldown; an unreadable page
   // means "could not check" => not written (mirrors lokal#967). Exempt:
-  // clearing (""), re-sending the stored number, and an explicit owner relay
-  // (`dataSource: "owner"` — CS writing what the producer told us by e-mail,
-  // stored as owner data) — see services/phone-source-write-guard.ts.
+  // clearing (""), re-sending the stored number, and an owner relay WITH
+  // `owner_relay_evidence: {channel, ref, received_at}` (CS writing what the
+  // producer told us by e-mail) — logged + audited. The admin key is shared
+  // by CS and the enrichment routine, so `dataSource: "owner"` alone (or an
+  // owner provenance record, which this route does not even persist) is NOT
+  // an exemption. See services/phone-source-write-guard.ts.
   // A refused phone is dropped and the rest of the body is still written
   // (HTTP 200 + `phone_write` + `phone_rejected_reason`); when the phone was
   // the only field in the body the call is a 422 with the same fields.
   let body: Record<string, unknown> = (req.body ?? {}) as Record<string, unknown>;
   let phoneWrite: PhoneWriteVerdict | undefined;
+  let phoneBefore: string | null = null;
   if (isAdmin && typeof body.phone === "string") {
     const fp = body.field_provenance && typeof body.field_provenance === "object"
       ? (body.field_provenance as Record<string, unknown>)
       : undefined;
+    phoneBefore = knowledgeService.getKnowledge(agentId)?.phone ?? null;
     phoneWrite = await guardAutoPhoneWrite({
       phone: body.phone,
-      existingPhone: knowledgeService.getKnowledge(agentId)?.phone ?? null,
+      existingPhone: phoneBefore,
       explicitSourceUrl: body.phone_source_url,
       fieldProvenancePhone: fp?.phone,
-      ownerRelay: body.dataSource === "owner",
+      ownerRelayEvidence: body.owner_relay_evidence,
     });
     if (!phoneWrite.allowed) {
       console.log(
@@ -2002,7 +2007,7 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       const { phone: _dropped, ...rest } = body;
       body = rest;
       const otherKeys = Object.keys(body).filter(
-        (k) => !["dataSource", "phone_source_url", "field_provenance"].includes(k) && body[k] !== undefined,
+        (k) => !["dataSource", "phone_source_url", "field_provenance", "owner_relay_evidence"].includes(k) && body[k] !== undefined,
       );
       if (otherKeys.length === 0) {
         res.status(422).json({
@@ -2026,6 +2031,11 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
     } else {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
+    }
+
+    // W40 write guards: every owner-relay phone write is logged + audited.
+    if (phoneWrite?.outcome === "owner_relay" && phoneWrite.owner_relay_evidence && typeof body.phone === "string") {
+      recordOwnerRelayPhoneAudit(getDb(), agentId, phoneBefore, body.phone, phoneWrite.owner_relay_evidence, "put_agents_knowledge");
     }
 
     // Recalculate trust score — completeness signal changes with every update
@@ -2367,6 +2377,10 @@ router.post("/admin/register", (req: Request, res: Response) => {
 // Uses the existing bulkEnrich method (dataSource: "auto").
 // Requires ADMIN_KEY header.
 
+// W40 write guards: max concurrent source-page fetches for bulk-enrich's
+// phone checks.
+const BULK_PHONE_CHECK_CONCURRENCY = 3;
+
 router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
   const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
@@ -2433,22 +2447,32 @@ router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
     // entry: a phone needs `phone_source_url` (or a field_provenance.phone
     // record with source_url) and must be seen on that page; otherwise only
     // the phone is dropped from that entry and reported in phoneRejections.
+    // NO owner-relay exemption here at all (no owner_relay_evidence, no owner
+    // provenance record) — a batch is never a CS relay. Page checks run at
+    // most BULK_PHONE_CHECK_CONCURRENCY at a time.
     const phoneRejections: Array<{ agentId: string; outcome: string; source_url: string | null }> = [];
-    for (const e of enrichments) {
-      if (typeof e.data?.phone !== "string") continue;
-      const fp = e.data.field_provenance && typeof e.data.field_provenance === "object" ? e.data.field_provenance : undefined;
-      const verdict = await guardAutoPhoneWrite({
-        phone: e.data.phone,
-        existingPhone: knowledgeService.getKnowledge(e.agentId)?.phone ?? null,
-        explicitSourceUrl: e.data.phone_source_url,
-        fieldProvenancePhone: fp?.phone,
-      });
-      if (!verdict.allowed) {
-        console.log(`[admin/bulk-enrich] ${e.agentId} phone REJECTED — ${verdict.outcome}; not written`);
-        e.data = { ...e.data, phone: undefined };
-        phoneRejections.push({ agentId: e.agentId, outcome: verdict.outcome, source_url: verdict.source_url });
+    const phoneEntries = enrichments.filter((e: any) => typeof e.data?.phone === "string");
+    let nextPhoneEntry = 0;
+    const phoneWorker = async (): Promise<void> => {
+      while (nextPhoneEntry < phoneEntries.length) {
+        const e: any = phoneEntries[nextPhoneEntry++];
+        const fp = e.data.field_provenance && typeof e.data.field_provenance === "object" ? e.data.field_provenance : undefined;
+        const verdict = await guardAutoPhoneWrite({
+          phone: e.data.phone,
+          existingPhone: knowledgeService.getKnowledge(e.agentId)?.phone ?? null,
+          explicitSourceUrl: e.data.phone_source_url,
+          fieldProvenancePhone: fp?.phone,
+        });
+        if (!verdict.allowed) {
+          console.log(`[admin/bulk-enrich] ${e.agentId} phone REJECTED — ${verdict.outcome}; not written`);
+          e.data = { ...e.data, phone: undefined };
+          phoneRejections.push({ agentId: e.agentId, outcome: verdict.outcome, source_url: verdict.source_url });
+        }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BULK_PHONE_CHECK_CONCURRENCY, phoneEntries.length) }, () => phoneWorker()),
+    );
 
     const count = knowledgeService.bulkEnrich(enrichments);
 

@@ -21,9 +21,16 @@
 //
 // Not gated (no invented-value risk, or not an enrichment lane):
 //   - owner edits (claim token / API key) — never call this;
-//   - an admin write explicitly relayed from the owner (dataSource "owner",
-//     or an `owner`-sourced provenance record for the same number) — CS
-//     corrections from the producer's own e-mail have no source page;
+//   - an admin write relayed from the owner WITH evidence — the caller passes
+//     `owner_relay_evidence: { channel: "email"|"phone"|"portal", ref:
+//     <message-id / ticket>, received_at }` (CS corrections from the
+//     producer's own e-mail have no source page). The admin key is shared by
+//     CS and the enrichment routine, so a body flag alone (dataSource
+//     "owner", an `owner` provenance record) is NOT enough — it would be a
+//     spoofable bypass. Every owner-relay write is logged and audited
+//     (recordOwnerRelayPhoneAudit). An `owner` provenance record only counts
+//     for a caller that opts in (acceptOwnerProvenanceRecord; no route does
+//     today);
 //   - clearing the phone (empty string) and re-sending the stored number;
 //   - server-side extractors that take the number FROM a fetched page
 //     (homepage-provenance-batch, rfb contact extraction) or from Google
@@ -34,6 +41,7 @@ import {
   type AboutSubstantiationVerdict,
 } from "./about-source-substantiation";
 import { DEFAULT_FETCH_TIMEOUT_MS, fetchPage, isSafeFetchUrl } from "./fetch-page";
+import { randomUUID } from "crypto";
 
 /** Normalize a stored phone number to 8 national digits: strip every
  *  non-digit, then strip a leading 0047/47 country code when exactly 8
@@ -177,6 +185,68 @@ export interface PhoneWriteVerdict {
   /** final URL after redirects, when the page was read */
   checked_url?: string;
   detail?: string;
+  /** echoed on an owner_relay write (what the relay was based on) */
+  owner_relay_evidence?: OwnerRelayEvidence;
+  /** why a supplied owner_relay_evidence was not accepted (write then went
+   *  through the normal source-page check) */
+  owner_relay_evidence_rejected?: string;
+}
+
+// ── Owner relay evidence ─────────────────────────────────────────────────────
+
+export interface OwnerRelayEvidence {
+  channel: "email" | "phone" | "portal";
+  /** message-id / ticket / thread id — something CS can look up */
+  ref: string;
+  /** ISO timestamp of when the owner's statement was received */
+  received_at: string;
+}
+
+const OWNER_RELAY_CHANNELS: ReadonlySet<string> = new Set(["email", "phone", "portal"]);
+const OWNER_RELAY_REF_MAX = 300;
+const OWNER_RELAY_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+/** Validate a caller-supplied `owner_relay_evidence`. PURE. */
+export function parseOwnerRelayEvidence(
+  raw: unknown,
+  now: number = Date.now(),
+): { ok: true; evidence: OwnerRelayEvidence } | { ok: false; reason: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "not_an_object" };
+  const o = raw as Record<string, unknown>;
+  const channel = typeof o.channel === "string" ? o.channel.trim().toLowerCase() : "";
+  if (!OWNER_RELAY_CHANNELS.has(channel)) return { ok: false, reason: "channel_must_be_email_phone_or_portal" };
+  const ref = typeof o.ref === "string" ? o.ref.trim() : "";
+  if (!ref) return { ok: false, reason: "ref_required" };
+  if (ref.length > OWNER_RELAY_REF_MAX) return { ok: false, reason: "ref_too_long" };
+  const receivedAt = typeof o.received_at === "string" ? o.received_at.trim() : "";
+  const t = receivedAt ? Date.parse(receivedAt) : NaN;
+  if (!Number.isFinite(t)) return { ok: false, reason: "received_at_must_be_iso_timestamp" };
+  if (t > now + OWNER_RELAY_FUTURE_SKEW_MS) return { ok: false, reason: "received_at_in_future" };
+  return { ok: true, evidence: { channel: channel as OwnerRelayEvidence["channel"], ref, received_at: receivedAt } };
+}
+
+/** Audit row + log line for an owner-relay phone write (agent_knowledge_audit,
+ *  the same table brreg-contact-backfill audits into). Best-effort: an audit
+ *  failure is logged, never fails the write that already happened. */
+export function recordOwnerRelayPhoneAudit(
+  db: { prepare(sql: string): { run(...args: unknown[]): unknown } },
+  agentId: string,
+  oldValue: string | null,
+  newValue: string,
+  evidence: OwnerRelayEvidence,
+  lane: string,
+): void {
+  const notes = `owner_relay lane:${lane} channel:${evidence.channel} ref:${evidence.ref} received_at:${evidence.received_at}`;
+  console.log(`[phone-guard] OWNER-RELAY phone write for agent ${agentId}: ${oldValue ?? "∅"} -> ${newValue} (${notes})`);
+  try {
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, 'phone', ?, ?, 'admin', NULL, datetime('now'), ?)`,
+    ).run(randomUUID(), agentId, oldValue, newValue, notes);
+  } catch (err) {
+    console.log(`[phone-guard] owner-relay audit insert FAILED for agent ${agentId}: ${String((err as Error)?.message ?? err)}`);
+  }
 }
 
 const PHONE_GUARD_USER_AGENT = "Lokal-RFB-PhoneGuard/1.0 (+https://rettfrabonden.com)";
@@ -250,7 +320,12 @@ export async function guardAutoPhoneWrite(opts: {
   existingPhone: string | null | undefined;
   explicitSourceUrl?: unknown;
   fieldProvenancePhone?: unknown;
-  ownerRelay?: boolean;
+  /** Raw `owner_relay_evidence` from the request — only callers that support
+   *  an owner relay pass it (the two PUT knowledge endpoints; never bulk). */
+  ownerRelayEvidence?: unknown;
+  /** Per-caller opt-in: an `owner` provenance record for the same number
+   *  counts as an owner relay. Default false; no route opts in today. */
+  acceptOwnerProvenanceRecord?: boolean;
 }): Promise<PhoneWriteVerdict> {
   const phone = opts.phone;
   if (!phone.trim()) return { allowed: true, outcome: "cleared", source_url: null };
@@ -258,12 +333,21 @@ export async function guardAutoPhoneWrite(opts: {
   if (existing && phoneIdentity(existing) === phoneIdentity(phone)) {
     return { allowed: true, outcome: "unchanged", source_url: null };
   }
-  if (opts.ownerRelay || hasOwnerPhoneProvenance(phone, opts.fieldProvenancePhone)) {
+  let evidenceRejected: string | undefined;
+  if (opts.ownerRelayEvidence !== undefined && opts.ownerRelayEvidence !== null) {
+    const ev = parseOwnerRelayEvidence(opts.ownerRelayEvidence);
+    if (ev.ok) {
+      return { allowed: true, outcome: "owner_relay", source_url: null, owner_relay_evidence: ev.evidence };
+    }
+    evidenceRejected = ev.reason;
+  }
+  if (opts.acceptOwnerProvenanceRecord && hasOwnerPhoneProvenance(phone, opts.fieldProvenancePhone)) {
     return { allowed: true, outcome: "owner_relay", source_url: null };
   }
   const sourceUrl = findPhoneSourceUrl(phone, {
     explicitSourceUrl: opts.explicitSourceUrl,
     fieldProvenancePhone: opts.fieldProvenancePhone,
   });
-  return verifyPhoneOnSourcePage(phone, sourceUrl);
+  const verdict = await verifyPhoneOnSourcePage(phone, sourceUrl);
+  return evidenceRejected ? { ...verdict, owner_relay_evidence_rejected: evidenceRejected } : verdict;
 }

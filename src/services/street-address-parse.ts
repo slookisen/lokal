@@ -99,11 +99,19 @@ export function parseStoredStreetAddress(
 
 // ── Road-designation-only detection (write guards) ───────────────────────────
 
-/** One comma segment that is ONLY a road designation + road number:
- *  "fv109", "fv 109", "rv. 7", "e6", "kv 12", "fylkesveien 109" (after
- *  normalizeAddress, which already turns "-vegen" into "-veien"). */
-const ROAD_DESIGNATION_SEGMENT_RE =
-  /^(?:fv|rv|ev|kv|e|fylkesvei(?:en)?|riksvei(?:en)?|europavei(?:en)?)\.?\s*\d{1,4}$/;
+/** One comma segment that is ONLY an ABBREVIATED road designation + road
+ *  number: "fv109", "fv 109", "rv. 7", "e6", "kv 12". Deliberately narrower
+ *  than the spot-check's ROAD_DESIGNATION_RE: spelled-out names ("Riksvegen
+ *  15", "Fylkesvegen 140", "Europavegen 2") are real street names in many
+ *  places, so the WRITE path never treats them as road-only. */
+const ROAD_DESIGNATION_SEGMENT_RE = /^(?:fv|rv|ev|kv|e)\.?\s*\d{1,4}$/;
+
+/** A parsed "street" that is not a physical street: a P.O. box ("Postboks
+ *  45", "PB 45", "Boks 3") or a cadastral number ("Gnr 12 Bnr 3", "gnr.
+ *  12/3"). A Brreg postadresse or a footer P.O. box must never replace a
+ *  road-only value. */
+const NON_PHYSICAL_STREET_RE = /^(?:postboks|pb\.?|boks|postb\.?|gnr\.?|g\.?nr|bnr)(?![\p{L}])/u;
+const CADASTRAL_TOKEN_RE = /(?<![\p{L}])(?:gnr|bnr|g\.nr|b\.nr)(?![\p{L}])/u;
 
 /** True when the address has NO street + house number (parseStoredStreetAddress
  *  returns null) AND one of its comma segments is a bare road designation
@@ -130,10 +138,19 @@ export function isRoadDesignationOnlyAddress(
     });
 }
 
-/** True when the address carries a real street name + house number
- *  ("Reisetevegen 83, 5776 Nå"). PURE. Exported for tests. */
+/** True when the address carries a real PHYSICAL street name + house number
+ *  ("Reisetevegen 83, 5776 Nå"). Built on parseStoredStreetAddress (kept
+ *  byte-identical for the spot-check) plus a physical-street filter: a P.O.
+ *  box or gnr/bnr value is not a street address here, even though the
+ *  spot-check's parser reads "Postboks 45" as street "postboks" + number 45.
+ *  PURE. Exported for tests. */
 export function hasStreetAndHouseNumber(raw: string | null | undefined, ownName?: string | null): boolean {
-  return parseStoredStreetAddress(raw, ownName) !== null;
+  const parsed = parseStoredStreetAddress(raw, ownName);
+  if (!parsed) return false;
+  if (NON_PHYSICAL_STREET_RE.test(parsed.street)) return false;
+  const norm = normalizeAddress(prepareAddressForComparison(raw as string, ownName)).normalize("NFC");
+  if (CADASTRAL_TOKEN_RE.test(splitAddress(norm).street)) return false;
+  return true;
 }
 
 /** Source types whose street address may replace a road-only value: the
