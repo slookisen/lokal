@@ -35,6 +35,7 @@ import { getDb } from "../database/db-factory";
 import { verifyOrgNumber, type BrregVerifyResult } from "./brreg-client";
 import { fetchPage, type FetchPageResult } from "./fetch-page";
 import { DENTAL_CLINIC_CLASS_SQL, type DentalCatalogClass } from "./dental-catalog-class";
+import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 import { listSpecialistsForClinic } from "./dental-store";
 
 // ── Tunables ─────────────────────────────────────────────────────────────
@@ -400,6 +401,9 @@ export function pickDentalVerifierBatch(
          FROM dental_agents
         WHERE ${DENTAL_CLINIC_CLASS_SQL}
           AND (is_inactive IS NULL OR is_inactive = 0)
+          -- The synthetic schema-probe row is not a clinic -- never verify
+          -- it (dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning).
+          AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
           -- A human/prior sweep explicitly rejected this row -- same
           -- junk-exclusion precedent as dental-claim-service.ts's own
           -- buildWhereClause() default (verification_status NOT IN

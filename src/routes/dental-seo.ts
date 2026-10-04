@@ -29,6 +29,7 @@ import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 // hjemmeside-cleanup sweep's own URL->hostname helper.
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
+import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 
 const router = Router();
 
@@ -1169,7 +1170,10 @@ function renderClinicProfile(
   req: Request,
   res: Response
 ): void {
-  if (agent.verification_status === "rejected") {
+  // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
+  // synthetic schema-probe row 404s exactly like a rejected clinic, on both
+  // /klinikk/id/:id and /klinikk/:slug (both render through here).
+  if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
     res.status(404).send(dentalShell(
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }

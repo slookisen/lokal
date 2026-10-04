@@ -27,6 +27,7 @@ import {
   getDentalAgentByOrgnr,
   getDentalStats,
 } from "../services/dental-store";
+import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
 
@@ -223,7 +224,9 @@ export function handleDentalMessageSend(
   const orgMatch = lowerText.match(/\b(\d{9})\b/);
   if (orgMatch) {
     try {
-      const clinic = getDentalAgentByOrgnr(orgMatch[1]!);
+      const found = getDentalAgentByOrgnr(orgMatch[1]!);
+      // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
+      const clinic = found && !isDentalSyntheticProbeId(found.id) ? found : null;
       if (!clinic) {
         return rpcOk(id, {
           taskId: `dental-info-${Date.now()}`,
