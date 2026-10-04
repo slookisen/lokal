@@ -13,6 +13,11 @@
  * /om, /om-oss, /kontakt, /about, /contact links discovered on the root
  * page itself before concluding "mismatch", and stamps `checked_url` to
  * wherever the field was actually found — never unconditionally the root.
+ * W40 false-positive fix (sub-05..sub-09, e2e-06): the spot-check now
+ * follows up to 5 subpages and also accepts prefixed about/contact pages
+ * (/kontakt-oss-2/, /contact-1, /about-1, /om-garden) and terms/privacy pages
+ * (/salsvilkar, /personvern, …) via fieldSpotCheckSubpageCandidates'
+ * `extended` mode; the function's default (legacy) mode is unchanged.
  *
  * fetchImpl is injected directly into computeFieldSpotCheck's deps (never
  * globalThis.fetch — this file's own stub convention, and the repo's stated
@@ -27,6 +32,7 @@
 import {
   computeFieldSpotCheck,
   fieldSpotCheckSubpageCandidates,
+  FIELD_SPOT_CHECK_MAX_SUBPAGES,
   FIELD_SPOT_CHECK_MIN_VISIBLE_CHARS,
 } from "./lokal-agent-verifier";
 
@@ -118,6 +124,130 @@ export async function runLokalAgentVerifierFieldSpotCheckTests(
       3,
     );
     assertEq(foundSamePage, ["https://gaarden.example/kontakt"], "sub-04: a self-link back to the root page is excluded (same page, not a new subpage)");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // fieldSpotCheckSubpageCandidates — `extended` mode (W40 false-positive
+  // fix: the value lived on /kontakt-oss-2/, /contact-1 and /salsvilkar,
+  // none of which the five exact segments matched). Used by
+  // computeFieldSpotCheck only; the default stays the legacy exact match.
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    const html =
+      '<html><body>' +
+      '<a href="/omvisning-servering/">Omvisning</a>' +
+      '<a href="/personvern">Personvern</a>' +
+      '<a href="/kontakt-oss-2/">Kontakt oss</a>' +
+      '<a href="/om-garden">Om gården</a>' +
+      '<a href="/omtale">Omtale</a>' +
+      '<a href="/produkter">Produkter</a>' +
+      '<a href="https://www.vollangaard.no/contact-1">www host</a>' +
+      '<a href="https://other-site.example/about-1">Ekstern</a>' +
+      '<a href="mailto:post@vollangaard.no">E-post</a>' +
+      '<a href="#kontakt">Anchor</a>' +
+      '<a href="/about-1">About</a>' +
+      '<a href="/salsvilkar">Salsvilkår</a>' +
+      '<a href="/kontakt-oss-2/#skjema">Kontakt oss (duplicate)</a>' +
+      '</body></html>';
+    assertEq(
+      fieldSpotCheckSubpageCandidates(html, "https://vollangaard.no/", 5, { extended: true }),
+      [
+        "https://vollangaard.no/kontakt-oss-2/",
+        "https://vollangaard.no/om-garden",
+        "https://vollangaard.no/about-1",
+        "https://vollangaard.no/personvern",
+        "https://vollangaard.no/salsvilkar",
+      ],
+      "sub-05: extended — prefixed about/contact pages first (document order), then terms/privacy pages (document order, even when linked earlier); " +
+        "excludes /omvisning-servering/ and /omtale ('om' + letters is not an about page), /produkter, another host (incl. www.), mailto:, anchors, duplicates",
+    );
+
+    assertEq(
+      fieldSpotCheckSubpageCandidates(html, "https://vollangaard.no/", 3),
+      [],
+      "sub-06: default (legacy) mode is unchanged — none of the prefixed/terms shapes match (admin-phone-context-gate-retro-scan.ts relies on this default)",
+    );
+
+    const shapes = [
+      "/contact-1", "/contactus", "/aboutus", "/about-us.html", "/kontaktinfo", "/kontakt-oss", "/om_oss", "/omoss", "/om.html",
+      "/en/contact", "/salgsvilkar", "/kjopsvilkar", "/kj%C3%B8psvilk%C3%A5r", "/personvernerklaering/",
+      "/vilkar", "/salgsbetingelser", "/omsorg", "/kontor", "/aboutique",
+    ];
+    const shapeHtml = "<html><body>" + shapes.map((p) => `<a href="${p}">x</a>`).join("") + "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(shapeHtml, "https://gaarden.example/", 50, { extended: true }),
+      [
+        "https://gaarden.example/contact-1",
+        "https://gaarden.example/contactus",
+        "https://gaarden.example/aboutus",
+        "https://gaarden.example/about-us.html",
+        "https://gaarden.example/kontaktinfo",
+        "https://gaarden.example/kontakt-oss",
+        "https://gaarden.example/om_oss",
+        "https://gaarden.example/omoss",
+        "https://gaarden.example/om.html",
+        "https://gaarden.example/en/contact",
+        "https://gaarden.example/aboutique",
+        "https://gaarden.example/salgsvilkar",
+        "https://gaarden.example/kjopsvilkar",
+        "https://gaarden.example/kj%C3%B8psvilk%C3%A5r",
+        "https://gaarden.example/personvernerklaering/",
+      ],
+      "sub-07: extended shapes — contact*/about*/kontakt* prefixes, om + separator, omoss*, percent-encoded kjøpsvilkår; " +
+        "NOT /vilkar, /salgsbetingelser, /omsorg, /kontor (about* is a plain prefix, so /aboutique is accepted — harmless extra fetch)",
+    );
+
+    const sixAbout =
+      "<html><body>" +
+      ["/salgsvilkar", "/kontakt", "/kontakt-oss", "/om-oss", "/about-us", "/contact-1", "/om-garden"].map((p) => `<a href="${p}">x</a>`).join("") +
+      "</body></html>";
+    assertEq(
+      fieldSpotCheckSubpageCandidates(sixAbout, "https://gaarden.example/", FIELD_SPOT_CHECK_MAX_SUBPAGES, { extended: true }),
+      [
+        "https://gaarden.example/kontakt",
+        "https://gaarden.example/kontakt-oss",
+        "https://gaarden.example/om-oss",
+        "https://gaarden.example/about-us",
+        "https://gaarden.example/contact-1",
+      ],
+      "sub-08: the cap applies AFTER tier ordering — a terms link earlier in the page never displaces an about/contact page",
+    );
+    assertEq(FIELD_SPOT_CHECK_MAX_SUBPAGES, 5, "sub-09: the spot-check follows up to 5 subpages (was 3)");
+  }
+
+  // e2e-06: computeFieldSpotCheck uses the extended discovery and the
+  // 5-subpage default: a value only on the 5th candidate page is found.
+  {
+    const PHONE = "41634422";
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u === "https://femsider.example/") {
+        return htmlResponse(
+          200,
+          '<html><body><p>Velkommen.</p>' +
+            ["/personvern", "/om-oss", "/kontakt-oss-2/", "/about-1", "/contact-1", "/salsvilkar"].map((p) => `<a href="${p}">x</a>`).join("") +
+            "</body></html>",
+        );
+      }
+      if (u === "https://femsider.example/personvern") return htmlResponse(200, `<html><body><p>Behandlingsansvarleg: Femsider AS, tlf ${PHONE}</p></body></html>`);
+      if (u === "https://femsider.example/salsvilkar") throw new Error("e2e-06: the 6th candidate must never be fetched (cap is 5)");
+      if (u.startsWith("https://femsider.example/")) return htmlResponse(200, "<html><body><p>Ingenting her.</p></body></html>");
+      throw new Error(`e2e-06: unexpected fetch to ${u}`);
+    }) as unknown as typeof fetch;
+    const result = await computeFieldSpotCheck({ field_value: PHONE, root_url: "https://femsider.example/" }, { fetchImpl });
+    assertEq(result.status, "match", "e2e-06a: value only on the privacy page (5th candidate, linked FIRST on the page) -> match");
+    assertEq(
+      result.urls_tried,
+      [
+        "https://femsider.example/",
+        "https://femsider.example/om-oss",
+        "https://femsider.example/kontakt-oss-2/",
+        "https://femsider.example/about-1",
+        "https://femsider.example/contact-1",
+        "https://femsider.example/personvern",
+      ],
+      "e2e-06b: root, then the 4 about/contact pages, then the first terms/privacy page — 5 subpages, /salsvilkar beyond the cap",
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════

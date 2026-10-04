@@ -45,6 +45,14 @@ import {
   checkAboutCandidateSubstantiatedBySource,
   type AboutSubstantiationVerdict,
 } from "../services/about-source-substantiation";
+import {
+  canonicalizeAddressVariants,
+  foldAccentsForComparison,
+  normalizeAddress,
+  prepareAddressForComparison,
+  splitAddress,
+} from "../services/contact-normalizer";
+import { decodeHtmlEntities } from "../services/search-enrich";
 
 const router = Router();
 
@@ -99,6 +107,199 @@ export function checkPhoneSubstantiatedBySource(
     }
   }
   return { substantiated: false, reason: `phone ${national} not found on page as a whole 8-digit number` };
+}
+
+/** `about`-specific substantiation (W40 false-positive fix, b1). FIRST the
+ *  write-guard's own check (checkAboutCandidateSubstantiatedBySource:
+ *  verbatim, or >= 70% significant-word overlap) — anything the write-guard
+ *  would accept as substantiated by this page is, by definition, not a data
+ *  error, so it is a `match`. Only when that fails does the fact-level check
+ *  (about-fact-substantiation.ts — tolerant of dialectal/paraphrase
+ *  rewording, strict on locally-corroborated facts) get a second, extra
+ *  chance. Before this, the route ran ONLY the fact-level check, which
+ *  rejected texts the write-guard accepts (W40: Aukrust's verbatim
+ *  meta-description/paragraph, Oceanfood's 88%-overlap text). Neither check
+ *  is loosened by combining them: a candidate passes only if one of the two
+ *  existing checks, unchanged, passes it. PURE. Exported for tests. */
+export function checkAboutSpotCheckSubstantiated(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+): AboutSubstantiationVerdict {
+  const guard = checkAboutCandidateSubstantiatedBySource(candidate, sourceText);
+  if (guard.substantiated) return { substantiated: true, reason: `write-guard check: ${guard.reason}` };
+  const fact = checkAboutCandidateFactSubstantiated(candidate, sourceText);
+  if (fact.substantiated) return { substantiated: true, reason: `fact-level check: ${fact.reason}` };
+  return {
+    substantiated: false,
+    reason: `write-guard check: ${guard.reason} | fact-level check: ${fact.reason}`,
+  };
+}
+
+// ── Address (W40 false-positive fix, b4) ─────────────────────────────────────
+
+/** Road designations ("Fv109", "Fv 109", "Rv. 7", "E6", "Fylkesvegen 109"):
+ *  the number after one of these is a ROAD number, never a house number, so
+ *  such a value has no street + house number to compare structurally. Tested
+ *  against the street-name part AFTER normalizeAddress's canonicalization
+ *  (which already turns "-vegen" into "-veien"). */
+const ROAD_DESIGNATION_RE = /^(?:fv|rv|ev|kv|e|fylkesvei(?:en)?|riksvei(?:en)?|europavei(?:en)?)\.?$/;
+
+/** "<street name> <house number>" as one comma segment, e.g. "lauvdalen
+ *  186", "st. olavs gate 5b", "ullstindveien 1242/1246". */
+const STREET_AND_NUMBER_RE = /^(\p{L}[\p{L}\p{N}.' -]*?)\s+(\d{1,4}[a-zæøå]?(?:\/\d{1,4}[a-zæøå]?)?)$/u;
+
+export interface ParsedStreetAddress {
+  /** Normalized street name ("lauvdalen", "solsideveien"). */
+  street: string;
+  /** Normalized house number incl. letter suffix ("186", "20b", "1242/1246"). */
+  houseNumber: string;
+  /** 4-digit postal code, or null when the stored value carries none. */
+  postcode: string | null;
+}
+
+/** Parse a stored address into street name + house number + postal code
+ *  using the SAME normalizer every other address comparison in this codebase
+ *  uses (contact-normalizer.ts: prepareAddressForComparison → label/URL/
+ *  own-name/company-form strip + accent fold; normalizeAddress →
+ *  veg/vei + "12 a"/"12a" canonicalization; splitAddress → postal tail).
+ *  Takes the LAST comma segment of the street part that ends in a house
+ *  number, so a leading farm/company name ("Nordgard Aukrust, Solsidevegen
+ *  449, 2686 Lom") is skipped. Returns null when there is no street + house
+ *  number to compare (farm-name-only values like "Lønsdal, 8255 Røkland",
+ *  road designations like "Fv109, 5776 Nå"). PURE. Exported for tests. */
+export function parseStoredStreetAddress(
+  raw: string | null | undefined,
+  ownName?: string | null,
+): ParsedStreetAddress | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const norm = normalizeAddress(prepareAddressForComparison(raw, ownName)).normalize("NFC");
+  if (!norm) return null;
+  const { street, postcode } = splitAddress(norm);
+  const segments = street.split(",").map((s) => s.trim()).filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const m = STREET_AND_NUMBER_RE.exec(segments[i]!);
+    if (!m) continue;
+    const name = m[1]!.trim();
+    if (ROAD_DESIGNATION_RE.test(name)) return null;
+    return { street: name, houseNumber: m[2]!, postcode };
+  }
+  return null;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Page text normalized the same way as the stored side: tags -> spaces,
+ *  entities decoded, accents folded, lowercased, whitespace collapsed,
+ *  veg/vei + house-letter variants canonicalized. PURE. */
+function normalizeSourceForAddress(sourceText: string): string {
+  return canonicalizeAddressVariants(
+    foldAccentsForComparison(decodeHtmlEntities(sourceText.replace(/<[^>]+>/g, " ")))
+      .toLowerCase()
+      .normalize("NFC")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+// A postal code written DIRECTLY after the street + house number on the page
+// (after separators only, optionally "N-"/"NO-"-prefixed): "Lauvdalen 186
+// 8360 Bøstad", "Storgata 1, 0150 Oslo", "Reisetevegen 83, N-5776 Nå". A
+// longer digit run (phone number) never counts.
+const ADJACENT_POSTCODE_RE = /^[\s,.;:|·•/–—-]*(?:no?-\s?)?(\d{4})(?!\d)/;
+
+/** Address-specific substantiation (W40 false-positive fix, b4). The
+ *  default text check (>= 70% significant-word overlap) both MISSES real
+ *  matches (house numbers under 4 digits never count as significant words,
+ *  formatting/label noise counts against the value) and can PASS wrong ones
+ *  (a different house number on the same street is invisible to it). This
+ *  compares the parts that identify a place instead:
+ *    match    = the page has the stored street name immediately followed by
+ *               the stored house number (whole number — "186" never matches
+ *               "1860" or "186b"), AND either the stored value has no postal
+ *               code, or the page gives the SAME postal code right after it,
+ *               or the page gives NO postal code right after it (e.g. a
+ *               terms page's "Vindhella 717, borgundchili@gmail.com").
+ *    mismatch = street + number not on the page, or the page only ever
+ *               gives a DIFFERENT postal code right after it.
+ *  A stored value with no street + house number (farm-name-only, or a road
+ *  designation like "Fv109, 5776 Nå") cannot be compared structurally and
+ *  falls back, unchanged, to the default text check — so "Fv109, 5776 Nå"
+ *  against a page saying "Reisetevegen 83, 5776 NÅ" stays a mismatch. PURE.
+ *  Exported for tests. */
+export function checkAddressSubstantiatedBySource(
+  candidate: string | null | undefined,
+  sourceText: string | null | undefined,
+  opts: { ownName?: string | null } = {},
+): AboutSubstantiationVerdict {
+  const parsed = parseStoredStreetAddress(candidate, opts.ownName);
+  if (!parsed) {
+    const fallback = checkAboutCandidateSubstantiatedBySource(candidate, sourceText);
+    return {
+      substantiated: fallback.substantiated,
+      reason: `no street + house number in stored address — text check: ${fallback.reason}`,
+    };
+  }
+  const src = (sourceText ?? "").trim();
+  if (!src) {
+    return { substantiated: false, reason: "no source text available to verify against — cannot verify, fail-closed" };
+  }
+  const normSrc = normalizeSourceForAddress(src);
+  const streetPattern = parsed.street.split(/\s+/).map(escapeRegExp).join("\\s*");
+  const numberVariants = parsed.houseNumber.includes("/")
+    ? [parsed.houseNumber, ...parsed.houseNumber.split("/")]
+    : [parsed.houseNumber];
+  // Whole house number only: "186" never matches "1860" or "186b", and a
+  // bare number never matches one the page writes with a separate house
+  // letter ("20 B" — letters a-h only, so the preposition "i" in "… 717 i
+  // Borgund" is not mistaken for one). "20b" matches "20b" and "20 b".
+  const numberPattern = numberVariants
+    .map((n) => {
+      const m = /^(\d+)([a-zæøå]?)$/.exec(n);
+      if (!m) return `${escapeRegExp(n)}(?![\\p{L}\\p{N}])`;
+      return m[2]
+        ? `${m[1]}\\s?${m[2]}(?![\\p{L}\\p{N}])`
+        : `${m[1]}(?![\\p{L}\\p{N}])(?!\\s[a-h](?![\\p{L}\\p{N}]))`;
+    })
+    .join("|");
+  const re = new RegExp(`(?<![\\p{L}\\p{N}])${streetPattern}\\s*,?\\s*(?:${numberPattern})`, "gu");
+  const label = `${parsed.street} ${parsed.houseNumber}`;
+  let found = 0;
+  const conflicting = new Set<string>();
+  for (const m of normSrc.matchAll(re)) {
+    found++;
+    const after = normSrc.slice(m.index! + m[0].length, m.index! + m[0].length + 40);
+    const pc = ADJACENT_POSTCODE_RE.exec(after)?.[1] ?? null;
+    if (pc === null) continue;
+    if (parsed.postcode === null || pc === parsed.postcode) {
+      return {
+        substantiated: true,
+        reason: `address match: street + house number "${label}" with postal code ${pc} found on page`,
+      };
+    }
+    conflicting.add(pc);
+  }
+  if (found === 0) {
+    return {
+      substantiated: false,
+      reason: `address mismatch: street + house number "${label}" not found on page`,
+    };
+  }
+  if (conflicting.size > 0) {
+    return {
+      substantiated: false,
+      reason:
+        `address mismatch: "${label}" found on page but only with a different postal code ` +
+        `(${[...conflicting].join(", ")}; stored ${parsed.postcode})`,
+    };
+  }
+  return {
+    substantiated: true,
+    reason:
+      `address match: street + house number "${label}" found on page ` +
+      `(page gives no postal code next to it${parsed.postcode ? `; stored ${parsed.postcode}` : ""})`,
+  };
 }
 
 /** Whitelisted spot-checkable fields -> their agent_knowledge column. Only
@@ -204,26 +405,28 @@ router.post("/", async (req: Request, res: Response) => {
 
     const fieldValue = (knowledge as any)?.[column] ?? null;
 
-    // dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about
-    // (Del B): `about` alone gets the fact-level substantiation check
-    // (about-fact-substantiation.ts) — tolerant of dialectal/paraphrase
-    // rewording as long as the candidate's own distinct facts (place names,
-    // founder names, years) are genuinely, locally corroborated on the
-    // fetched page(s). `phone`/`address` are UNCHANGED: no deps override,
-    // same default (checkAboutCandidateSubstantiatedBySource) as before —
-    // this fix's own scope is `about` only, per the dev-request.
-    const result =
+    // Per-field judgment of the stored value against each fetched page:
+    //   about   — write-guard check first, fact-level check
+    //             (about-fact-substantiation.ts, dev-request
+    //             2026-09-24-stikkproeve-undersider-og-faktanivaa-about Del B)
+    //             as an extra chance (checkAboutSpotCheckSubstantiated).
+    //   phone   — normalized 8-digit national number (#933).
+    //   address — street name + house number + postal code
+    //             (checkAddressSubstantiatedBySource), the producer's own
+    //             name stripped from the front of the stored value.
+    // W40 false-positive fix: 12 of 14 W40 "mismatches" were this route
+    // judging/fetching wrongly, not bad data — see each function's comment.
+    const ownName = agent.name;
+    const substantiate =
       fieldName === "about"
-        ? await computeFieldSpotCheck(
-            { field_value: fieldValue, root_url: rootUrl },
-            { substantiate: checkAboutCandidateFactSubstantiated },
-          )
+        ? checkAboutSpotCheckSubstantiated
         : fieldName === "phone"
-          ? await computeFieldSpotCheck(
-              { field_value: fieldValue, root_url: rootUrl },
-              { substantiate: checkPhoneSubstantiatedBySource },
-            )
-          : await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl });
+          ? checkPhoneSubstantiatedBySource
+          : fieldName === "address"
+            ? (candidate: string | null | undefined, sourceText: string | null | undefined) =>
+                checkAddressSubstantiatedBySource(candidate, sourceText, { ownName })
+            : undefined; // unreachable today (FIELD_COLUMN_MAP whitelist) — computeFieldSpotCheck's default
+    const result = await computeFieldSpotCheck({ field_value: fieldValue, root_url: rootUrl }, { substantiate });
 
     res.json({
       success: true,

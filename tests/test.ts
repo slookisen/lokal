@@ -45688,6 +45688,29 @@ runSerial(async () => {
   }
 });
 
+// W40 field spot-check false-positive fix: POST /admin/field-spot-check driven
+// end-to-end over trimmed copies of the REAL producer pages behind the W40
+// false mismatches (tests/fixtures/field-spot-check/) — about write-guard-
+// first, prefixed/terms subpages, structured address — plus the negative
+// controls (fabricated about texts, road designation vs street address,
+// invented phone) that must stay mismatches. Own in-memory DB +
+// globalThis.fetch stub — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── W40 field spot-check false positives: admin route over real pages ──");
+  try {
+    const { runAdminFieldSpotCheckRealPagesTests } = require("../src/routes/admin-field-spot-check-real-pages.test") as
+      typeof import("../src/routes/admin-field-spot-check-real-pages.test");
+    const rp = await runAdminFieldSpotCheckRealPagesTests({ log: false });
+    passed += rp.passed;
+    failed += rp.failed;
+    for (const f of rp.failures) failures.push("admin-field-spot-check-real-pages: " + f);
+    console.log(`  admin-field-spot-check-real-pages: ${rp.passed} passed, ${rp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-field-spot-check-real-pages: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
 // point 3 (PR #909, round 4 of review — the one authorized exception to the
 // 3-round cap, scoped to exactly round 3's 3 CHANGES-REQUESTED findings):

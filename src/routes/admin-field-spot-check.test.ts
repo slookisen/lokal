@@ -205,6 +205,74 @@ export async function runAdminFieldSpotCheckTests(
       "phone-11: non-8-digit fallback equals standard text check verdict",
     );
 
+    // ── Address: street + house number + postal code (pure, W40 b4) ───
+    const addrOk = (stored: string, page: string, ownName?: string) =>
+      routeMod.checkAddressSubstantiatedBySource(stored, page, { ownName }).substantiated;
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", "<p>Adresse:<br />Lauvdalen 186<br />8360 Bøstad</p>"), true,
+      "addr-01: street + number + same postal code (split over <br> lines) -> match");
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 1860, 8360 Bøstad</p>"), false, "addr-02: 186 vs 1860 -> mismatch");
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 18, 8360 Bøstad</p>"), false, "addr-03: 186 vs 18 -> mismatch");
+    assertEq(addrOk("Lauvdalen 18, 8360 Bøstad", "<p>Lauvdalen 186, 8360 Bøstad</p>"), false, "addr-04: 18 vs 186 -> mismatch (the old word-overlap check ignored <4-digit numbers)");
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 186b, 8360 Bøstad</p>"), false, "addr-05: house letter on the page only (186b) -> mismatch");
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 186 B, 8360 Bøstad</p>"), false, "addr-06: house letter on the page only (186 B) -> mismatch");
+    assertEq(addrOk("Storgata 20 B, 0150 Oslo", "<p>Storgata 20b, 0150 Oslo</p>"), true, "addr-07: '20 B' vs '20b' -> match");
+    assertEq(addrOk("Storgata 1, 0150 Oslo", "<p>Storgata 1, 5003 Bergen</p>"), false, "addr-08: same street + number, DIFFERENT postal code next to it -> mismatch");
+    assertEq(addrOk("Vindhella 717, 6888 Borgund", "<p>Selger er Brennande Bøtun AS, Vindhella 717, borgundchili@gmail.com, +47 975 88 479</p>"), true,
+      "addr-09: page gives street + number with NO postal code next to it -> match");
+    assertEq(addrOk("Storgata 1", "<p>Storgata 1, 0150 Oslo</p>"), true, "addr-10: stored value without postal code -> street + number decide");
+    assertEq(addrOk("Solsidevegen 449, 2686 Lom", "<p>Aukrust Gard og Urteri, Solsideveien 449 - 2686 Lom</p>"), true, "addr-11: -vegen vs -veien spelling -> match");
+    assertEq(addrOk("Nordgard Aukrust, Solsidevegen 449, 2686 Lom", "<p>Solsidevegen 449 - 2686 Lom</p>"), true,
+      "addr-12: leading farm-name segment skipped, street segment compared");
+    assertEq(addrOk("Aalan Gård Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 186 8360 Bøstad</p>", "Aalan Gård"), true,
+      "addr-13: producer's own name in front of the street is stripped (same normalizer as everywhere else)");
+    assertEq(addrOk("www.aalan.no - Lauvdalen 186, 8360 Bøstad", "<p>Lauvdalen 186 8360 Bøstad</p>"), true, "addr-14: 'www.domain - ' prefix stripped");
+    assertEq(addrOk("Reisetevegen 83, 5776 Nå", "<p>Kvestad Sideri, Reisetevegen 83, N-5776 NÅ</p>"), true, "addr-15: 'N-5776' postal code form -> match");
+    assertEq(addrOk("Reisetevegen 83, 5777 Nå", "<p>Kvestad Sideri, Reisetevegen 83, N-5776 NÅ</p>"), false, "addr-16: 'N-5776' next to it vs stored 5777 -> mismatch");
+    assertEq(addrOk("Dal 5, 1234 Sted", "<p>Lauvdal 5, 1234 Sted</p>"), false, "addr-17: street name must start at a word boundary ('Dal' is not 'Lauvdal')");
+    assertEq(addrOk("Storgata 1, 0150 Oslo", "<p>Storgata 1 97588479</p>"), true, "addr-18: an 8-digit phone after the number is not read as a postal code");
+    assertEq(addrOk("Storgata 5, 0150 Oslo", "<p>Vi held til i Storgata 5 i Oslo.</p>"), true, "addr-19: the preposition 'i' after the number is not a house letter");
+    assertEq(addrOk("Lauvdalen 186, 8360 Bøstad", ""), false, "addr-20: empty source -> not substantiated (fail-closed)");
+    // Road designation / no house number: not structurally comparable ->
+    // the unchanged default text check decides.
+    assertEq(routeMod.parseStoredStreetAddress("Fv109, 5776 Nå"), null, "addr-21: 'Fv109' is a road designation, not street + number");
+    assertEq(routeMod.parseStoredStreetAddress("Fv 109, 5776 Nå"), null, "addr-22: 'Fv 109' (spaced) is still a road designation");
+    assertEq(routeMod.parseStoredStreetAddress("Rv. 7, 3570 Ål"), null, "addr-23: 'Rv. 7' is a road designation");
+    assertEq(routeMod.parseStoredStreetAddress("Lønsdal, 8255 Røkland"), null, "addr-24: farm-name-only address has no house number");
+    assertEq(addrOk("Fv109, 5776 Nå", "<p>Gardsutsalet ligg på adressa Reisetevegen 83.</p><p>Kvestad N-5776 NÅ</p>"), false,
+      "addr-25: Kvestad 'Fv109, 5776 Nå' vs page with a real street address -> mismatch");
+    assertEq(
+      routeMod.checkAddressSubstantiatedBySource("Lønsdal, 8255 Røkland", "<p>SALTFJELL REINPRODUKTER Lønsdal 8255 RØKLAND</p>").substantiated,
+      require("../services/about-source-substantiation").checkAboutCandidateSubstantiatedBySource(
+        "Lønsdal, 8255 Røkland", "<p>SALTFJELL REINPRODUKTER Lønsdal 8255 RØKLAND</p>").substantiated,
+      "addr-26: no-house-number fallback gives exactly the default text check's verdict",
+    );
+    assertEq(routeMod.parseStoredStreetAddress("Ullstindvegen 1242/1246, 9020 Tromsdalen"),
+      { street: "ullstindveien", houseNumber: "1242/1246", postcode: "9020" }, "addr-27: house-number range parsed");
+    assertEq(addrOk("Ullstindvegen 1242/1246, 9020 Tromsdalen", "<p>Ullstindveien 1246, 9020 Tromsdalen</p>"), true,
+      "addr-28: one number of a stored range on the page -> match");
+
+    // ── about: write-guard first, fact-level as extra chance (pure, W40 b1) ──
+    const aboutCheck = (stored: string, page: string) => routeMod.checkAboutSpotCheckSubstantiated(stored, page);
+    let av = aboutCheck("Vi produserer ekte gårdshonning fra egne bikuber.", "<p>Vi produserer ekte gårdshonning fra egne bikuber i Hallingdal.</p>");
+    assertEq(av.substantiated, true, "about-01: write-guard accepts (verbatim) -> match");
+    assertEq(/^write-guard check: /.test(av.reason), true, "about-02: reason names the write-guard check");
+    const vollanPage =
+      "<html><body><p>Vollan Gård ligger vakkert til ved Rødvenfjorden i Rauma kommune, omgitt av bratte fjell og frodig kulturlandskap. " +
+      "Gården har vært i samme slekt siden 1600-tallet, og har gjennom generasjoner vært et sentralt tun i bygda. " +
+      "Historien forteller at oldefar Ole Dahle plantet eplehagen rundt 1932, og epletrærne han satte den gangen bærer fortsatt frukt hver høst. " +
+      "Familien driver i dag et allsidig gårdsbruk med både frukt, bær og tradisjonelt jordbruk.</p></body></html>";
+    const vollanSrc = `${vollanPage}\n${vollanPage.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()}`;
+    av = aboutCheck(
+      "Vollan Gård ligg ved Rødvenfjorden i Rauma kommune og har vore i same slekt sidan 1600-talet. " +
+        "Oldefar Ole Dahle planta eplehagen kring 1932, og familien driv framleis garden med tradisjonelt jordbruk og fruktdyrking.",
+      vollanSrc,
+    );
+    assertEq(av.substantiated, true, "about-03: Nynorsk paraphrase — write-guard rejects, fact-level check accepts -> match");
+    assertEq(/^fact-level check: fact-level match/.test(av.reason), true, "about-04: reason names the fact-level check");
+    av = aboutCheck("Gården har vært i familien til Kari Nordmann siden 1450.", vollanSrc);
+    assertEq(av.substantiated, false, "about-05: fabricated name + year -> both checks reject -> mismatch");
+    assertEq(/^write-guard check: .* \| fact-level check: /.test(av.reason), true, "about-06: mismatch reason carries both checks' reasons");
+
     // ── Auth: admin not configured (no ADMIN_KEY/ANALYTICS_ADMIN_KEY at
     //    all) -> 503, checked BEFORE the X-Admin-Key comparison. ──────
     const savedAdminKey = process.env.ADMIN_KEY;

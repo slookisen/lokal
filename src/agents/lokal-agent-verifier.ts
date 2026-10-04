@@ -1703,9 +1703,13 @@ export async function resolveBrregLookup(
 // checkAboutCandidateSubstantiatedBySource, reused as-is, unchanged; see its
 // own file for that contract). It fetches the root page first exactly as
 // before; only when the field isn't substantiated there does it follow up
-// to `maxSubpages` (default 3) same-domain links discovered on the root
-// page itself whose path matches /om, /om-oss, /kontakt, /about or
-// /contact — link-driven, not blind-guessed, same discipline
+// to `maxSubpages` (default FIELD_SPOT_CHECK_MAX_SUBPAGES = 5; was 3 before
+// the W40 false-positive fix) same-domain links discovered on the root page
+// itself whose path looks like an about/contact page (/om, /om-oss,
+// /om-garden, /kontakt, /kontakt-oss-2, /about-1, /contact-1, …) or a
+// terms/privacy page (/salgsvilkar, /salsvilkar, /kjopsvilkar, /personvern…;
+// see fieldSpotCheckSubpageCandidates' `extended` mode) — link-driven, not
+// blind-guessed, same discipline
 // buildPageEvidence() already established elsewhere in this codebase (blind
 // fixed-path guessing measured a 100% miss rate on real producer sites; see
 // fetch-page.ts's discoverContentLinks header comment). The FIRST subpage
@@ -1714,14 +1718,76 @@ export async function resolveBrregLookup(
 // looking in the right place.
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Same-domain link on the root page whose path matches one of the spot-
- *  check's five accepted subpage shapes — om, om-oss, kontakt, about,
- *  contact — as a whole path SEGMENT (never a substring, so "/om-garden" or
- *  "/produkter" do not match). PURE, no network. Exported for tests. */
+/** How many same-domain subpages the field spot-check follows after the
+ *  root page (W40 false-positive fix: raised from 3 — with the extended
+ *  matching below a site's about/contact pages AND its terms/privacy pages
+ *  can all be candidates, e.g. borgundchili.no: /om-oss, /personvern,
+ *  /salsvilkar, where only the last one carries the address). */
+export const FIELD_SPOT_CHECK_MAX_SUBPAGES = 5;
+
+// Legacy (default) shape: exactly om | om-oss | kontakt | about | contact
+// as a whole path SEGMENT (never a substring, so "/om-garden" or
+// "/produkter" do not match).
+const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[?#])/i;
+
+// Extended shapes (opts.extended — the read-only field spot-check only; see
+// fieldSpotCheckSubpageCandidates). Matched against ONE decoded path segment
+// at a time. Tier 1 = about/contact pages: "om" exactly or followed by a
+// separator ("om-oss", "om-garden", "om_oss", "om.html") or "omoss…" —
+// deliberately NOT a bare "om" prefix, which would also take "/omvisning",
+// "/omtale", "/omsetning"; "kontakt…", "contact…", "about…" as plain
+// prefixes ("kontakt-oss-2", "kontaktinfo", "contact-1", "about-1",
+// "aboutus"). Tier 2 = terms/privacy pages, which Norwegian web shops are
+// legally required to carry the seller's name, address, org.nr and phone on
+// (salgs-/sals-/kjøpsvilkår, personvern…).
+const EXTENDED_PRIMARY_SEGMENT_RE = /^(?:om(?:[-_.].*)?|omoss.*|kontakt.*|contact.*|about.*)$/i;
+const EXTENDED_LEGAL_SEGMENT_RE = /^(?:salgsvilk[aå]r|salsvilk[aå]r|kj[oø]psvilk[aå]r|personvern).*$/i;
+
+/** Tier of an (already same-host) pathname under the extended matching:
+ *  1 = about/contact, 2 = terms/privacy, 0 = not a candidate. PURE. */
+function extendedSubpageTier(pathname: string): 0 | 1 | 2 {
+  let tier: 0 | 1 | 2 = 0;
+  for (const rawSegment of pathname.split("/")) {
+    if (!rawSegment) continue;
+    let segment = rawSegment;
+    try {
+      segment = decodeURIComponent(rawSegment); // "kj%C3%B8psvilk%C3%A5r" -> "kjøpsvilkår"
+    } catch {
+      // malformed escape: test the raw segment as-is
+    }
+    if (EXTENDED_PRIMARY_SEGMENT_RE.test(segment)) return 1;
+    if (EXTENDED_LEGAL_SEGMENT_RE.test(segment)) tier = 2;
+  }
+  return tier;
+}
+
+/** Same-domain links on the root page that look like the page a field's
+ *  value is likely to live on, in the order they should be fetched. PURE, no
+ *  network. Exported for tests.
+ *
+ *  Default (legacy) matching: one of the five exact segments om, om-oss,
+ *  kontakt, about, contact — in document order. This default is what
+ *  admin-phone-context-gate-retro-scan.ts (a route with a write/apply mode)
+ *  relies on, and is deliberately left unchanged.
+ *
+ *  `opts.extended` (used by computeFieldSpotCheck, the READ-ONLY weekly
+ *  spot-check — W40 false-positive fix, where 3 of the false mismatches had
+ *  the value on /kontakt-oss-2/, /contact-1 and /salsvilkar): accepts the
+ *  prefixed about/contact shapes and the terms/privacy pages described at
+ *  EXTENDED_PRIMARY_SEGMENT_RE / EXTENDED_LEGAL_SEGMENT_RE. About/contact
+ *  links come first, terms/privacy links after them (document order within
+ *  each tier), so a footer full of legal links can never crowd the real
+ *  contact page out of the `maxSubpages` budget.
+ *
+ *  Both modes: same host as the root only (never another domain — the
+ *  SSRF/scope guard; fetchPage applies its own SSRF guard on top), http(s)
+ *  only, pure in-page anchors and links back to the root page itself are
+ *  skipped, duplicates collapsed. */
 export function fieldSpotCheckSubpageCandidates(
   rootHtml: string,
   rootUrl: string,
-  maxSubpages = 3,
+  maxSubpages = FIELD_SPOT_CHECK_MAX_SUBPAGES,
+  opts: { extended?: boolean } = {},
 ): string[] {
   let base: URL;
   try {
@@ -1729,11 +1795,11 @@ export function fieldSpotCheckSubpageCandidates(
   } catch {
     return [];
   }
-  const SUBPAGE_SEGMENT_RE = /(?:^|\/)(?:om|om-oss|kontakt|about|contact)(?:\/|$|[?#])/i;
-  const found: string[] = [];
+  const primary: string[] = [];
+  const legal: string[] = [];
   const seen = new Set<string>();
   for (const m of rootHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)) {
-    if (found.length >= maxSubpages) break;
+    if (primary.length >= maxSubpages) break; // tier 1 alone already fills the budget
     const raw = m[1]!;
     if (raw.startsWith("#")) continue; // pure in-page anchor, no new page
     let abs: URL;
@@ -1746,13 +1812,14 @@ export function fieldSpotCheckSubpageCandidates(
     if (abs.host !== base.host) continue; // same-domain only
     abs.hash = "";
     if (abs.pathname === base.pathname && abs.search === base.search) continue; // same page as root
-    if (!SUBPAGE_SEGMENT_RE.test(abs.pathname)) continue;
+    const tier = opts.extended ? extendedSubpageTier(abs.pathname) : SUBPAGE_SEGMENT_RE.test(abs.pathname) ? 1 : 0;
+    if (tier === 0) continue;
     const key = abs.toString();
     if (seen.has(key)) continue;
     seen.add(key);
-    found.push(key);
+    (tier === 1 ? primary : legal).push(key);
   }
-  return found;
+  return [...primary, ...legal].slice(0, maxSubpages);
 }
 
 /** dev-request 2026-09-24-stikkproeve-undersider-og-faktanivaa-about (FUNN
@@ -1783,9 +1850,10 @@ export interface FieldSpotCheckResult {
 /**
  * Re-verify one field's stored value against its live source page(s):
  * fetch `root_url` first; if the field isn't substantiated there, follow up
- * to `maxSubpages` same-domain /om, /om-oss, /kontakt, /about, /contact
- * links discovered ON the root page and check each in turn, stopping at the
- * first match. `substantiate` defaults to
+ * to `maxSubpages` (default 5) same-domain about/contact and terms/privacy
+ * links discovered ON the root page (fieldSpotCheckSubpageCandidates,
+ * `extended` mode) and check each in turn, stopping at the first match.
+ * `substantiate` defaults to
  * checkAboutCandidateSubstantiatedBySource (about-source-substantiation.ts)
  * — reused UNCHANGED, per this fix's own scope: only WHICH pages get
  * fetched changes, never how a field is judged against page text.
@@ -1805,7 +1873,7 @@ export async function computeFieldSpotCheck(
   } = {},
 ): Promise<FieldSpotCheckResult> {
   const substantiate = deps.substantiate ?? checkAboutCandidateSubstantiatedBySource;
-  const maxSubpages = input.maxSubpages ?? 3;
+  const maxSubpages = input.maxSubpages ?? FIELD_SPOT_CHECK_MAX_SUBPAGES;
   const urlsTried: string[] = [];
   let visibleChars = 0;
 
@@ -1839,6 +1907,7 @@ export async function computeFieldSpotCheck(
     rootResult.html,
     rootResult.finalUrl || input.root_url,
     maxSubpages,
+    { extended: true },
   );
   for (const subpageUrl of subpages) {
     const subResult = await fetchPage(subpageUrl, {
@@ -1873,7 +1942,10 @@ export async function computeFieldSpotCheck(
     status: "mismatch",
     checked_url: rootResult.finalUrl || input.root_url,
     urls_tried: urlsTried,
-    reason: `not substantiated on the root page or any of ${subpages.length} followed subpage(s)`,
+    // The root page's own verdict reason is appended so a human reading the
+    // weekly report can see WHY (e.g. "street + house number not found" vs
+    // "different postal code"), not just that it failed.
+    reason: `not substantiated on the root page or any of ${subpages.length} followed subpage(s) — root page: ${rootVerdict.reason}`,
   };
 }
 
