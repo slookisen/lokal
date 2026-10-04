@@ -133,6 +133,10 @@ import { checkAboutCandidateSubstantiatedBySource } from "../services/about-sour
 // same rejection message shape as marketplace.ts's three gates; see the
 // write site below (agentColumnUpdates) for the call.
 import { looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
+// W40 RFB spot-check write guards: road-designation precedence for address
+// corrections + the phone-must-be-on-its-source-page gate for the PUT below.
+import { parseStoredStreetAddress, streetAddressBeatsRoadDesignation } from "../services/street-address-parse";
+import { guardAutoPhoneWrite, withoutPhoneProvenanceFor, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
 
 const router = Router();
 
@@ -429,6 +433,37 @@ export const CONTENT_FIELDS: readonly string[] = ["about", "products", "descript
 
 export type CorrectDecision = { allowed: boolean; reason: string };
 
+/** True when `incomingValue` has a street + house number, `existingValue` is
+ *  a road designation only, and the incoming provenance holds a homepage/
+ *  Brreg record for that same street + house number. PURE. */
+function incomingAddressRecordBeatsRoadDesignation(
+  existingValue: string | null | undefined,
+  incomingValue: string | null | undefined,
+  incomingFieldProvenance: unknown,
+  ownName?: string | null,
+): boolean {
+  if (typeof incomingValue !== "string" || !Array.isArray(incomingFieldProvenance)) return false;
+  const want = parseStoredStreetAddress(incomingValue, ownName);
+  if (!want) return false;
+  return incomingFieldProvenance.some((r) => {
+    if (!r || typeof r !== "object") return false;
+    const o = r as Record<string, unknown>;
+    if (typeof o.value !== "string") return false;
+    const got = parseStoredStreetAddress(o.value, ownName);
+    return (
+      !!got &&
+      got.street === want.street &&
+      got.houseNumber === want.houseNumber &&
+      streetAddressBeatsRoadDesignation({
+        existing: existingValue,
+        incoming: o.value,
+        incomingSourceType: typeof o.source_type === "string" ? o.source_type : null,
+        ownName,
+      })
+    );
+  });
+}
+
 /**
  * Decide whether a factual field's populated legacy value may be SAFELY
  * overwritten by an incoming value. Pure function — exported for unit-testing.
@@ -464,6 +499,13 @@ export function canCorrectFactualField(opts: {
   // byte-for-byte unchanged. The curated-lock refusal above still applies
   // absolutely — this flag never bypasses it.
   isPureAdd?: boolean;
+  // W40 RFB spot-check write guards (Kvestad Sideri): the stored and the
+  // incoming column VALUES, for the address road-designation precedence rule
+  // below. Optional — call sites that do not pass them keep the exact
+  // provenance-only behaviour they had.
+  existingValue?: string | null;
+  incomingValue?: string | null;
+  ownName?: string | null;
 }): CorrectDecision {
   const { field, existingFieldProvenance, websiteOwnershipUnverified, incomingFieldProvenance, isCurated, isPureAdd } = opts;
 
@@ -486,6 +528,22 @@ export function canCorrectFactualField(opts: {
 
   const existing = summariseProvenance(existingFieldProvenance);
   const incoming = summariseProvenance(incomingFieldProvenance);
+
+  // ── Street address beats a road designation (W40 write guards) ─────────────
+  // Kvestad Sideri: Google Places gave `Fv109, 5776 Nå` (a road number, no
+  // house number); the homepage and Brreg both say `Reisetevegen 83, 5776 Nå`.
+  // A stored address that is ONLY a road designation is imprecise by
+  // construction, so a street address WITH a house number, carried by a
+  // homepage/Brreg provenance record for that same street + number, may
+  // replace it — whatever Tier-A count the road value had. Never over an
+  // owner-attested (Tier-S) value; the curated lock above stays absolute.
+  if (
+    field === "address" &&
+    !existing.hasTierS &&
+    incomingAddressRecordBeatsRoadDesignation(opts.existingValue, opts.incomingValue, incomingFieldProvenance, opts.ownName)
+  ) {
+    return { allowed: true, reason: "ok_street_address_over_road_designation" };
+  }
 
   // ── PR-A: preferred homepage CONTENT override ──────────────────────────────
   // For CONTENT fields (about/products/description/categories), a single
@@ -633,9 +691,12 @@ type IncomingBody = {
   // orch-pr-17: opt-in flag to enable the SAFE correct-not-just-add overwrite
   // path for factual fields. Default OFF (also accepted as ?allow_correct=1).
   allow_correct?: boolean;
+  // W40 write guards: the page the `phone` value was read from. Alternatively
+  // a field_provenance.phone record with `source_url` for the same number.
+  phone_source_url?: string;
 };
 
-router.put("/", (req: Request, res: Response) => {
+router.put("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
@@ -666,8 +727,8 @@ router.put("/", (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const agentRow = db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId) as
-    | { id: string }
+  const agentRow = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as
+    | { id: string; name?: string | null }
     | undefined;
   if (!agentRow) {
     res.status(404).json({ error: "agent not found" });
@@ -723,7 +784,60 @@ router.put("/", (req: Request, res: Response) => {
   // Touches ONLY that trailing token; the rest of the string is untouched.
   if (typeof body.address === "string")
     columnUpdates.push({ col: "address", val: stripTrailingNorgeSuffix(body.address) });
-  if (typeof body.phone === "string") columnUpdates.push({ col: "phone", val: body.phone });
+  // ── Phone write guard (W40 RFB spot-check, Aalan Gård) ─────────────────
+  // This endpoint is the admin/auto enrichment lane (X-Admin-Key only). A
+  // phone value is written only when it is SEEN on the source page the write
+  // names (phone_source_url, or a field_provenance.phone record with
+  // source_url for the same number) — fetched here through the SSRF-guarded
+  // fetchPage, per-host 429 cooldown, unreadable page => not written. See
+  // services/phone-source-write-guard.ts for the exempt cases (clearing,
+  // re-sending the stored number, an `owner`-sourced provenance record).
+  // A refused phone is dropped from the write set (siblings still written,
+  // same convention as website_rejected_reason) together with its own
+  // provenance records; the response carries `phone_write` +
+  // `phone_rejected_reason`, and the whole call is a 422 when the phone was
+  // the only thing it would have written.
+  let phoneWrite: PhoneWriteVerdict | undefined;
+  if (typeof body.phone === "string") {
+    const existingPhoneRow = db.prepare("SELECT phone FROM agent_knowledge WHERE agent_id = ?").get(agentId) as
+      | { phone?: string | null }
+      | undefined;
+    const fp = body.field_provenance && typeof body.field_provenance === "object"
+      ? (body.field_provenance as Record<string, unknown>)
+      : undefined;
+    phoneWrite = await guardAutoPhoneWrite({
+      phone: body.phone,
+      existingPhone: existingPhoneRow?.phone ?? null,
+      explicitSourceUrl: body.phone_source_url,
+      fieldProvenancePhone: fp?.phone,
+    });
+    if (phoneWrite.allowed) {
+      columnUpdates.push({ col: "phone", val: body.phone });
+    } else {
+      console.log(
+        `[admin-knowledge] phone write REJECTED for agent ${agentId} — ${phoneWrite.outcome}` +
+          (phoneWrite.source_url ? ` (${phoneWrite.source_url})` : "") + "; not written",
+      );
+      if (fp && fp.phone !== undefined) {
+        body.field_provenance = { ...fp, phone: withoutPhoneProvenanceFor(fp.phone, body.phone) } as IncomingProvenance;
+      }
+      const otherWriteKeys = [
+        "about", "address", "email", "postalCode", "website", "products", "openingHours",
+        "description", "categories", "city",
+      ].filter((k) => (body as Record<string, unknown>)[k] !== undefined);
+      const otherProvKeys = fp ? Object.keys(fp).filter((k) => k !== "phone") : [];
+      if (otherWriteKeys.length === 0 && otherProvKeys.length === 0) {
+        res.status(422).json({
+          success: false,
+          error: "phone_not_substantiated",
+          agent_id: agentId,
+          phone_write: phoneWrite,
+          phone_rejected_reason: phoneWrite.outcome,
+        });
+        return;
+      }
+    }
+  }
   if (typeof body.email === "string") columnUpdates.push({ col: "email", val: body.email });
   if (typeof body.postalCode === "string")
     columnUpdates.push({ col: "postal_code", val: body.postalCode });
@@ -1060,6 +1174,11 @@ router.put("/", (req: Request, res: Response) => {
         websiteOwnershipUnverified: woUnverified,
         incomingFieldProvenance: incomingProv[u.col],
         isCurated: !!curated[u.col],
+        // W40 write guards: lets a homepage/Brreg street address replace a
+        // road-designation-only address (canCorrectFactualField's own rule).
+        existingValue: typeof oldVal === "string" ? oldVal : null,
+        incomingValue: newStr,
+        ownName: agentRow.name ?? null,
       });
       if (decision.allowed) {
         keptUpdates.push(u);
@@ -1249,6 +1368,12 @@ router.put("/", (req: Request, res: Response) => {
     // absent, or canCorrectFactualField refused it) — absent (not null) on
     // every ordinary call, same convention as website_rejected_reason above.
     ...(cityRejectedReason ? { city_rejected_reason: cityRejectedReason } : {}),
+    // W40 write guards: present only when the call carried a `phone` — the
+    // guard's verdict (outcome: verified / unchanged / cleared / owner_relay /
+    // rejected_no_source_url / rejected_source_url_invalid /
+    // rejected_not_on_source_page / fetch_failed / cooldown_skipped).
+    ...(phoneWrite ? { phone_write: phoneWrite } : {}),
+    ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
   });
 });
 

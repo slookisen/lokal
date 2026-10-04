@@ -7135,8 +7135,24 @@ const _pr24Promise = (async function runPr24Tests() {
       }
 
       // ── pr24-5: PUT with field_provenance for new agent populates column ──
+      // W40 write guards: the phone record now names its source page
+      // (source_url) and that page — stubbed via the guard's test hook — shows
+      // the number; an unsourced phone is refused (see
+      // src/routes/w40-write-guards.test.ts). Everything else asserted here is
+      // unchanged.
       {
-        const resp = await pr24Req("PUT", "/admin/knowledge", {
+        const pr24PhoneGuard = require("../src/services/phone-source-write-guard") as typeof import("../src/services/phone-source-write-guard");
+        pr24PhoneGuard.__setPhoneGuardFetchImplForTesting((async (url: string) => {
+          const bytes = new TextEncoder().encode("<html><body><p>Lokal gård, Storgata 5. Tlf +47 12 34 56 78</p></body></html>");
+          return {
+            ok: true, status: 200, statusText: "OK", url: String(url), redirected: false,
+            headers: { get: (n: string) => (n.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+            arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+          } as any;
+        }) as any);
+        let resp: any;
+        try {
+        resp = await pr24Req("PUT", "/admin/knowledge", {
           agent_id: "pr24-a",
           about: "Lokal gård.",
           address: "Storgata 5, 1234 Bygda",
@@ -7149,11 +7165,14 @@ const _pr24Promise = (async function runPr24Tests() {
             },
             phone: {
               sources: [
-                { source_type: "homepage", captured_at: "2026-05-11T08:00:00Z", raw_value: "+47 12345678" },
+                { source_type: "homepage", captured_at: "2026-05-11T08:00:00Z", raw_value: "+47 12345678", source_url: "https://pr24-a.example.no/kontakt" },
               ],
             },
           },
         }, PR24_KEY, true);
+        } finally {
+          pr24PhoneGuard.__setPhoneGuardFetchImplForTesting(null);
+        }
         assertEq(resp.status, 200, "pr24-5: PUT returns 200");
         assertEq(resp.body?.success, true, "pr24-5: success=true");
         const prov = getProv("pr24-a");
@@ -46300,5 +46319,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("agent-stats-view-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// W40 RFB spot-check write guards: (A) a road-designation-only address
+// (Kvestad Sideri, "Fv109, 5776 Nå" from Google Places) is not written over a
+// known homepage/Brreg street address and is corrected by one; (B) an
+// admin/auto phone write must name a source page that shows the number
+// (Aalan Gård — LLM-invented number). Swaps the getDb() singleton and the
+// global fetch (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── W40 write guards: road-designation address + phone-on-source-page ──");
+  try {
+    const { runW40WriteGuardsTests } = require("../src/routes/w40-write-guards.test") as
+      typeof import("../src/routes/w40-write-guards.test");
+    const wg = await runW40WriteGuardsTests({ log: false });
+    passed += wg.passed;
+    failed += wg.failed;
+    for (const f of wg.failures) failures.push("w40-write-guards: " + f);
+    console.log(`  w40-write-guards: ${wg.passed} passed, ${wg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("w40-write-guards: unexpected error: " + String(err?.message || err));
   }
 });

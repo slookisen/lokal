@@ -953,15 +953,34 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       ).run();
       {
         const normalAbout2 = "Vi tilbyr egg, honning og bær rett fra gårdsbutikken hver helg.";
-        const r = await invokeHandler(bulkEnrichHandler, makeReq({
-          body: {
-            agents: [
-              { agentId: "f3-bulk-codeart", data: { about: REAL_HELIOS_ABOUT, phone: "87654321" } },
-              { agentId: "f3-bulk-normal", data: { about: normalAbout2 } },
-            ],
-          },
-          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
-        }));
+        // W40 write guards: an admin/auto phone write must now name a source
+        // page that shows the number (services/phone-source-write-guard.ts).
+        // The page is stubbed here so this test keeps proving what it always
+        // did — the per-field `about` drop leaves the agent's OTHER field
+        // (a legitimately sourced phone) enriched.
+        const phoneGuard = require("../services/phone-source-write-guard") as typeof import("../services/phone-source-write-guard");
+        phoneGuard.__setPhoneGuardFetchImplForTesting((async (url: string) => {
+          const bytes = new TextEncoder().encode("<html><body><p>F3 Bulk Codeart — ring 87 65 43 21</p></body></html>");
+          return {
+            ok: true, status: 200, statusText: "OK", url: String(url), redirected: false,
+            headers: { get: (n: string) => (n.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+            arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+          } as any;
+        }) as any);
+        let r: any;
+        try {
+          r = await invokeHandler(bulkEnrichHandler, makeReq({
+            body: {
+              agents: [
+                { agentId: "f3-bulk-codeart", data: { about: REAL_HELIOS_ABOUT, phone: "87654321", phone_source_url: "https://f3-bulk-codeart.example.test/kontakt" } },
+                { agentId: "f3-bulk-normal", data: { about: normalAbout2 } },
+              ],
+            },
+            headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+          }));
+        } finally {
+          phoneGuard.__setPhoneGuardFetchImplForTesting(null);
+        }
         assertEq(r.status, 200, "f3: POST /admin/bulk-enrich — batch with one code-artifact about → still 200");
         assertEq(r.body?.data?.aboutCodeArtifactRejected, 1, "f3b: response reports exactly 1 about candidate rejected by the code-artifact detector");
         const codeartRow = testDb.prepare("SELECT about, phone FROM agent_knowledge WHERE agent_id = 'f3-bulk-codeart'").get() as any;
