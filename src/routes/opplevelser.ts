@@ -2463,6 +2463,11 @@ router.post(
       res.json({
         success: true,
         limit,
+        // The cursor this call started from (null = the start of the backlog).
+        // A caller that previews with an omitted-`after` dry-run (which
+        // persists next_after) passes this back as an explicit `after` on
+        // the apply, so the apply writes exactly the batch it previewed.
+        after_used: after ?? null,
         status_before: statusBefore,
         status_after: statusAfter,
         ...result,
@@ -2572,6 +2577,11 @@ router.post(
       res.json({
         success: true,
         limit,
+        // The cursor this call started from (null = the start of the backlog).
+        // A caller that previews with an omitted-`after` dry-run (which
+        // persists next_after) passes this back as an explicit `after` on
+        // the apply, so the apply writes exactly the batch it previewed.
+        after_used: after ?? null,
         status_before: statusBefore,
         status_after: statusAfter,
         ...result,

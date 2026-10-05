@@ -705,6 +705,7 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
           "owf-s2: a DRY-RUN call with omitted `after` still PERSISTS its own next_after (mirrors gardssalg-website-verification-remediation's own dry-run persistence)",
         );
         assertEq(s1.body.next_after, "zzz-01", "owf-s2b: next_after is the last id this call scanned");
+        assertEq(s1.body.after_used, "zzz-00", "owf-s2c: after_used reports the cursor this omitted-after call started from (the primed zzz-00)");
 
         // s2: OMITTED `after` again -> resumes from the persisted cursor
         // (zzz-01), processes zzz-02, not zzz-01 again.
@@ -719,6 +720,8 @@ export function runOpplevelserExperienceOrgnrFromWebsiteTests(
         const s3 = await callRoute(opplevelserRouter, { url: ROUTE, headers: adminHeaders, body: { limit: 1, after: "zzz-00" } });
         const s3Ids = (s3.body.planned as any[]).map((p: any) => p.provider_id);
         assertTrue(s3Ids.includes("zzz-01"), `owf-s4: explicit \`after\` is purely request-driven — ignores the persisted cursor entirely (got ${JSON.stringify(s3Ids)})`);
+        assertEq(s3.body.after_used, "zzz-00", "owf-s4b: an explicit after is echoed back as after_used");
+        assertTrue(s3Ids.join() === s1Ids.join(), `owf-s4c: passing s1's after_used back as an explicit after re-targets exactly s1's batch (got ${JSON.stringify(s3Ids)} vs ${JSON.stringify(s1Ids)})`);
         assertEq(
           sweepState.getExperienceOrgnrSweepAfter(expDb, "orgnr_from_website"),
           "zzz-02",
