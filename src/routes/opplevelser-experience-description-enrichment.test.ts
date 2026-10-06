@@ -76,7 +76,13 @@ import {
   judgeExperienceDescriptionCandidate,
   selectExperienceDescriptionTier,
   EXP_DESC_GENERATED_PROVENANCE_SENTINEL,
+  isRetryableDescriptionFailure,
+  isRetryableDescriptionJudgeFailure,
+  shouldRecordDescriptionAttempt,
+  experienceDescriptionFactsFingerprint,
   type ExperienceDescriptionCandidate,
+  type ExperienceDescriptionOutcome,
+  type ExpDescGenFailReason,
 } from "./opplevelser";
 
 export interface TestSummary {
@@ -1093,8 +1099,16 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       // ── ed-r3: candidate-set composition (unscoped scan). ─────────────
       {
         const r = await post({ dry_run: true, ids: [] });
-        assertEq(r.body.candidates, 4,
-          "ed-r3a: candidates = rich1 + rich2 + thin + junk (good/merged/manual/claim excluded)");
+        // dev-request 2026-10-06-experiences-beskrivelsessteg-4c-kohode-
+        // blokkering: `candidates` now means "eligible after publish gate,
+        // cooldown AND thin-data precheck" — the thin row is still in the
+        // gated set (candidates_before_cooldown) but no longer occupies a
+        // candidate/batch slot.
+        assertEq(r.body.candidates_before_cooldown, 4,
+          "ed-r3a: candidates_before_cooldown = rich1 + rich2 + thin + junk (good/merged/manual/claim excluded)");
+        assertEq(r.body.candidates, 3,
+          "ed-r3a2: candidates = rich1 + rich2 + junk (thin dropped by the precheck)");
+        assertEq(r.body.skipped_thin_data_precheck, 1, "ed-r3a3: the thin row is counted in skipped_thin_data_precheck");
       }
       for (const [label, id] of [
         ["ed-r3b: a GOOD existing description", idGood],
@@ -1113,12 +1127,18 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       {
         const before = dumpAll();
         const r = await post({ dry_run: false, ids: [idThin] });
+        // dev-request 2026-10-06-experiences-beskrivelsessteg-4c-kohode-
+        // blokkering: the thin row is now dropped by the zero-network tier
+        // precheck BEFORE batching instead of being processed into a
+        // thin_data skip — same zero-LLM, zero-write guarantee, but it no
+        // longer burns a batch slot.
         assertEq(r.status, 200, "ed-r4a: 200 (never throws)");
-        assertEq(r.body.candidates, 1, "ed-r4b: the thin row IS a candidate (its description is NULL)");
-        assertEq(r.body.processed, 1, "ed-r4c: processed: 1");
+        assertEq(r.body.candidates_before_cooldown, 1, "ed-r4b: the thin row IS in the gated set (its description is NULL)");
+        assertEq(r.body.skipped_thin_data_precheck, 1, "ed-r4c: ...but the precheck drops it before batching");
+        assertEq(r.body.processed, 0, "ed-r4c2: processed: 0 (no batch slot used)");
         assertEq(r.body.written, 0, "ed-r4d: written: 0");
-        assertEq(r.body.skipped, 1, "ed-r4e: skipped: 1");
-        assertEq(r.body.skipped_reasons.thin_data, 1, "ed-r4f: skip reason is thin_data");
+        assertEq(r.body.skipped, 0, "ed-r4e: skipped: 0 (never entered the batch)");
+        assertEq(r.body.skipped_reasons.thin_data, 0, "ed-r4f: skipped_reasons.thin_data kept for compatibility, now 0");
         assertEq(descOf(idThin), null, "ed-r4g: description still NULL");
         assertEq(dumpAll(), before, "ed-r4h: NOT ONE row changed (fetch stubs would have thrown on any call)");
       }
@@ -1301,6 +1321,12 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
 
       // ── ed-r14: dry_run sample cap (3). ───────────────────────────────
       {
+        // Fixture top-up (dev-request 2026-10-06-experiences-beskrivelses-
+        // steg-4c-kohode-blokkering): idRich2 now rests in the attempt
+        // cooldown after ed-r9's judge AVVIS and idThin is dropped by the
+        // precheck, so only ed-r13's 2 leftovers remain eligible in the
+        // unscoped scan — add fresh rich rows so the sample cap is what bites.
+        for (let i = 0; i < 2; i++) expStore.createExperience(richSeed({ title: `Ekstratur nummer ${i}` }) as any);
         const r = await post({ dry_run: true });
         assertTrue(r.body.candidates >= 3, "ed-r14a: more candidates remain than the sample cap");
         assertEq(r.body.sample.length, 3, "ed-r14b: dry-run sample capped at EXP_DESC_DRY_RUN_SAMPLE (3)");
@@ -1549,6 +1575,439 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section G — kø-hode-blokkering pure helpers (dev-request
+    // 2026-10-06-experiences-beskrivelsessteg-4c-kohode-blokkering):
+    // failure classification, attempt-recording predicate, facts fingerprint.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      // ── qh-1: every ExpDescGenFailReason classified explicitly. Typed as
+      //    Record<ExpDescGenFailReason, boolean> so a NEW enum value fails
+      //    tsc here until this table (and the function) classify it. ──────
+      const expected: Record<ExpDescGenFailReason, boolean> = {
+        // infra -> retry next call, never recorded
+        no_api_key: true,
+        network_error: true,
+        http_error: true,
+        unparseable_json: true,
+        unexpected_response_shape: true,
+        // content/quality -> recorded, rests in the cooldown
+        thin_data: false,
+        empty_response: false,
+        sentinel: false,
+        sentinel_smuggled: false,
+        char_cap_exceeded: false,
+        below_word_floor: false,
+        above_word_ceiling: false,
+        ungrounded_numbers: false,
+        no_title_node: false,
+        fetch_failed: false,
+      };
+      for (const [reason, retry] of Object.entries(expected) as Array<[ExpDescGenFailReason, boolean]>) {
+        assertEq(isRetryableDescriptionFailure(reason), retry, `qh-1: isRetryableDescriptionFailure("${reason}") === ${retry}`);
+      }
+      assertEq(isRetryableDescriptionFailure("brand_new_reason" as unknown as ExpDescGenFailReason), true,
+        "qh-1z: an unknown runtime value fails toward retry, never toward rest");
+
+      // ── qh-2: the judge's OWN infra branches are recognised as retryable
+      //    (driven through the real judge so drift in either place fails). ─
+      {
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key-qh";
+        const infra: Array<[string, typeof fetch]> = [
+          ["network throw", (async () => { throw new Error("boom"); }) as unknown as typeof fetch],
+          ["non-200", (async () => ({ ok: false, status: 503, json: async () => ({}) })) as unknown as typeof fetch],
+          ["unparseable body", (async () => ({ ok: true, status: 200, json: async () => { throw new Error("x"); } })) as unknown as typeof fetch],
+          ["bad shape", (async () => ({ ok: true, status: 200, json: async () => ({ content: { bad: 1 } }) })) as unknown as typeof fetch],
+        ];
+        for (const [label, f] of infra) {
+          const v = await judgeExperienceDescriptionCandidate(FAKTALINJE_FIXTURE, "Tittel: X", f);
+          assertEq(v.approved, false, `qh-2: judge ${label} -> not approved`);
+          assertTrue(isRetryableDescriptionJudgeFailure(v.reasoning), `qh-2: judge ${label} reasoning recognised as infra ("${v.reasoning}")`);
+        }
+        delete process.env.ANTHROPIC_API_KEY;
+        const noKey = await judgeExperienceDescriptionCandidate(FAKTALINJE_FIXTURE, "Tittel: X", (async () => { throw new Error("must not call"); }) as unknown as typeof fetch);
+        assertTrue(isRetryableDescriptionJudgeFailure(noKey.reasoning), "qh-2: judge missing key reasoning recognised as infra");
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key-qh";
+        const content: Array<[string, string]> = [
+          ["AVVIS", "AVVIS\nTeksten inneholder en oppdiktet pris."],
+          ["AVVIS without reasoning", "AVVIS"],
+          ["ambiguous verdict", "KANSKJE\nusikker"],
+        ];
+        for (const [label, text] of content) {
+          const f = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text }] }) })) as unknown as typeof fetch;
+          const v = await judgeExperienceDescriptionCandidate(FAKTALINJE_FIXTURE, "Tittel: X", f);
+          assertEq(v.approved, false, `qh-2: judge ${label} -> not approved`);
+          assertEq(isRetryableDescriptionJudgeFailure(v.reasoning), false, `qh-2: judge ${label} is a CONTENT outcome (recorded)`);
+        }
+        assertEq(isRetryableDescriptionJudgeFailure(null), false, "qh-2z: null reasoning is not infra");
+      }
+
+      // ── qh-3: shouldRecordDescriptionAttempt over synthesized outcomes. ──
+      {
+        const base: ExperienceDescriptionOutcome = {
+          id: "x", title: "X", fact_count: 8, level: "faktalinje", reasoning: "r", thin: false,
+          proposed_description: null, word_count: 0, judge_approved: null, judge_reasoning: null,
+          skip_reason: null, generation_fail_reason: null, homepage_url: null,
+        };
+        assertEq(shouldRecordDescriptionAttempt({ ...base, proposed_description: "Tekst.", judge_approved: true }), false, "qh-3a: a written outcome is never recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, level: "skip", thin: true, skip_reason: "thin_data" }), true, "qh-3b: thin_data is recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, skip_reason: "generation_failed", generation_fail_reason: "sentinel" }), true, "qh-3c: sentinel is recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, skip_reason: "generation_failed", generation_fail_reason: "below_word_floor" }), true, "qh-3d: below_word_floor is recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, skip_reason: "generation_failed", generation_fail_reason: "http_error" }), false, "qh-3e: http_error is NOT recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, skip_reason: "generation_failed", generation_fail_reason: "no_api_key" }), false, "qh-3f: no_api_key is NOT recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, skip_reason: "generation_failed", generation_fail_reason: null }), false, "qh-3g: generation_failed without a reason is NOT recorded (fail toward retry)");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, proposed_description: "T", judge_approved: false, judge_reasoning: "Oppdiktet pris.", skip_reason: "judge_rejected" }), true, "qh-3h: a real judge AVVIS is recorded");
+        assertEq(shouldRecordDescriptionAttempt({ ...base, proposed_description: "T", judge_approved: false, judge_reasoning: "dommer-API svarte status 500 — avvist fail-closed", skip_reason: "judge_rejected" }), false, "qh-3i: a judge infra failure is NOT recorded");
+      }
+
+      // ── qh-4: facts fingerprint — stable, and moves with every input the
+      //    tier selection / generators read. ────────────────────────────
+      {
+        const a = richCandidate();
+        const fp = experienceDescriptionFactsFingerprint(a);
+        assertTrue(/^[0-9a-f]{64}$/.test(fp), "qh-4a: sha256 hex");
+        assertEq(experienceDescriptionFactsFingerprint(a), fp, "qh-4b: stable across calls");
+        assertEq(experienceDescriptionFactsFingerprint({ ...a }), fp, "qh-4c: stable across an equal copy");
+        assertEq(experienceDescriptionFactsFingerprint({ ...a, description: JUNK_EXISTING_DESCRIPTION, content_field_evidence: "{}" }), fp,
+          "qh-4d: NOT moved by fields the generators never read (description/evidence)");
+        assertTrue(experienceDescriptionFactsFingerprint({ ...a, price_from: 990 }) !== fp, "qh-4e: price_from change moves it");
+        assertTrue(experienceDescriptionFactsFingerprint({ ...a, title: "Annen tittel" }) !== fp, "qh-4f: title change moves it");
+        assertTrue(experienceDescriptionFactsFingerprint({ ...a, meeting_point: "Kaien" }) !== fp, "qh-4g: meeting_point change moves it");
+        assertTrue(experienceDescriptionFactsFingerprint({ ...a, provider_hjemmeside: "ny.example" }) !== fp, "qh-4h: provider_hjemmeside change moves it");
+        assertTrue(experienceDescriptionFactsFingerprint({ ...a, provider_field_provenance: verifiedFieldProvenance() }) !== fp, "qh-4i: provider_field_provenance change moves it");
+        assertEq(experienceDescriptionFactsFingerprint({ ...a, provider_hjemmeside: null, provider_field_provenance: null }),
+          experienceDescriptionFactsFingerprint({ ...a, provider_hjemmeside: undefined, provider_field_provenance: undefined }),
+          "qh-4j: null and undefined provider fields fingerprint identically");
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("experience-description-enrichment (section G): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section F — the route's kø-hode-blokkering fix (dev-request
+    // 2026-10-06-experiences-beskrivelsessteg-4c-kohode-blokkering): publish
+    // gate, thin-data precheck, attempt cooldown, worst-first ordering,
+    // preview_only. A FRESH in-memory experiences DB (same setup idiom as
+    // section D) so the UNSCOPED scan these tests need sees only rows seeded
+    // here. Ids are supplied explicitly ("qh-…") so `ORDER BY e.id` is
+    // deterministic.
+    // ═══════════════════════════════════════════════════════════════════
+    {
+      const prevExperiencesDbPathF = process.env.EXPERIENCES_DB_PATH;
+      const prevAdminKeyF = process.env.ADMIN_KEY;
+      const ADMIN_KEY_QH = process.env.ADMIN_KEY || "experience-description-qh-test-key";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      process.env.ADMIN_KEY = ADMIN_KEY_QH;
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key-route-qh";
+      const dbFactoryPathF = require.resolve("../database/db-factory");
+      const experienceStorePathF = require.resolve("../services/experience-store");
+      const opplevelserPathF = require.resolve("./opplevelser");
+      for (const p of [dbFactoryPathF, experienceStorePathF, opplevelserPathF]) delete require.cache[p];
+      let restoreMainDbF: (() => void) | null = null;
+
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+        const expDb = dbFactory.getDb("experiences");
+        const expStore = require("../services/experience-store") as typeof import("../services/experience-store");
+        restoreMainDbF = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
+        const router = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+
+        const appSettings: Record<string, unknown> = {};
+        const setStub = (stub: typeof fetch | undefined): void => { appSettings["experienceDescriptionFetchImpl"] = stub; };
+        appSettings["experienceDescriptionHomepageFetchImpl"] =
+          (async () => { throw new Error("section F: homepage fetch must NOT be called"); }) as unknown as typeof fetch;
+        const post = (body: any): Promise<RouteResult> => {
+          process.env.ADMIN_KEY = ADMIN_KEY_QH;
+          return callRoute(router, appSettings, { headers: { "x-admin-key": ADMIN_KEY_QH }, body });
+        };
+        const counters = { generate: 0, judge: 0 };
+        const okJson = (text: string) => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text }] }) });
+        function makeStub(o: { generate?: () => Promise<any>; judge?: () => Promise<any> } = {}): typeof fetch {
+          return (async (_url: any, init: any) => {
+            const prompt = String(JSON.parse(init.body).messages[0].content);
+            if (prompt.includes("Du er faktakontrollør")) {
+              counters.judge++;
+              return o.judge ? await o.judge() : okJson("GODKJENN\nOK.");
+            }
+            counters.generate++;
+            return o.generate ? await o.generate() : okJson(FAKTALINJE_FIXTURE);
+          }) as unknown as typeof fetch;
+        }
+        const neverCall = (label: string): typeof fetch =>
+          (async () => { throw new Error(`${label}: fetch must NOT be called`); }) as unknown as typeof fetch;
+        const sentinelStub = () => makeStub({ generate: async () => okJson("UTILSTREKKELIG_GRUNNLAG") });
+        const resetCounters = () => { counters.generate = 0; counters.judge = 0; };
+        const dumpAll = (): string =>
+          JSON.stringify(expDb.prepare("SELECT id, description, content_field_evidence, content_source, updated_at FROM experiences ORDER BY id").all());
+        const dumpAttempts = (): string =>
+          JSON.stringify(expDb.prepare("SELECT * FROM experience_description_attempts ORDER BY experience_id").all());
+        const attemptOf = (id: string): any =>
+          expDb.prepare("SELECT * FROM experience_description_attempts WHERE experience_id = ?").get(id);
+        const descOf = (id: string): string | null =>
+          ((expDb.prepare("SELECT description FROM experiences WHERE id = ?").get(id) as any)?.description ?? null);
+
+        const providerId = expStore.createProvider({
+          navn: "Køtest AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        const richSeed = (id: string, over: Record<string, unknown> = {}) => ({
+          id, title: `Kajakktur ${id}`, provider_id: providerId, kommune: "Bergen", fylke: "Vestland",
+          category: "natur_friluft", subcategory: "kajakk", season: ["summer"],
+          indoor_outdoor: "outdoor" as const, duration_min: 120, duration_max: 180,
+          group_min: 2, group_max: 8, price_band: "standard", price_from: 890,
+          price_unit: "per_person", languages: ["norsk", "engelsk"],
+          accessibility: ["rullestolvennlig"], meeting_point: "Bryggen",
+          booking_url: "https://example.no/book",
+          verification_status: "verified" as const, confidence: "high" as const,
+          ...over,
+        });
+        const seedRich = (id: string, over: Record<string, unknown> = {}): string =>
+          expStore.createExperience(richSeed(id, over) as any);
+
+        // ── qh-r1: publish gate — unpublished rows are never candidates,
+        //    not in the unscoped scan and not via `ids`. ──────────────────
+        const idUnverified = seedRich("qh-a-unverified");
+        expDb.prepare("UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?").run(idUnverified);
+        const hiddenProvider = expStore.createProvider({
+          navn: "Skjult AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET catalog_hidden = 1 WHERE id = ?").run(hiddenProvider);
+        const idHidden = seedRich("qh-a-hidden", { provider_id: hiddenProvider });
+        const deadProvider = expStore.createProvider({
+          navn: "Opphørt AS", kommune: "Bergen", fylke: "Vestland",
+          brreg_verified: 1, brreg_active: 0, verification_status: "verified",
+        });
+        expDb.prepare("UPDATE experience_providers SET brreg_active = 0 WHERE id = ?").run(deadProvider);
+        const idDead = seedRich("qh-a-brreg-inactive", { provider_id: deadProvider });
+        const idLowConf = seedRich("qh-a-lowconf");
+        expDb.prepare("UPDATE experiences SET confidence = 'low' WHERE id = ?").run(idLowConf);
+        const unpublished = [idUnverified, idHidden, idDead, idLowConf];
+        setStub(neverCall("qh-r1"));
+        {
+          const r = await post({ preview_only: true });
+          assertEq(r.status, 200, "qh-r1a: 200");
+          assertEq(r.body.candidates_before_cooldown, 0, "qh-r1b: no unpublished row enters the gated set (unscoped)");
+          assertEq(r.body.candidate_ids_preview, [], "qh-r1c: candidate_ids_preview empty");
+        }
+        for (const id of unpublished) {
+          const r = await post({ dry_run: false, ids: [id] });
+          assertEq(r.body.candidates_before_cooldown, 0, `qh-r1d: ${id} not a candidate via ids either`);
+          assertEq(r.body.processed, 0, `qh-r1e: ${id} not processed via ids`);
+        }
+
+        // ── qh-r2: preview_only — zero LLM calls, zero writes, even with
+        //    dry_run:false alongside it; non-boolean "true" is NOT preview. ─
+        const idPreview = seedRich("qh-b-preview");
+        {
+          setStub(neverCall("qh-r2"));
+          const before = dumpAll() + dumpAttempts();
+          const r = await post({ preview_only: true });
+          assertEq(r.body.preview_only, true, "qh-r2a: preview_only echoed");
+          assertEq(r.body.dry_run, true, "qh-r2b: a preview is a dry run");
+          assertEq(r.body.candidates, 1, "qh-r2c: candidates counted");
+          assertEq(r.body.candidate_ids_preview, [idPreview], "qh-r2d: candidate_ids_preview lists the eligible id");
+          assertEq(r.body.sample, [], "qh-r2e: no sample (no LLM call)");
+          const r2 = await post({ preview_only: true, dry_run: false });
+          assertEq(r2.body.dry_run, true, "qh-r2f: preview_only wins over dry_run:false — never writes");
+          assertEq(dumpAll() + dumpAttempts(), before, "qh-r2g: ZERO writes (rows + attempts) — neverCall stub would have thrown on any LLM call");
+          setStub(makeStub());
+          resetCounters();
+          const r3 = await post({ preview_only: "true" });
+          assertEq(r3.body.preview_only, undefined, 'qh-r2h: preview_only:"true" (string) is NOT a preview');
+          assertEq(r3.body.sample.length, 1, "qh-r2i: ...it is the normal 3-row-capped dry-run sample");
+          assertEq(r3.body.candidate_ids_preview, [idPreview], "qh-r2j: dry-run response carries candidate_ids_preview too");
+          assertEq(counters.generate, 1, "qh-r2k: normal dry run still calls the generator");
+          // Consume the row so it does not interfere with later blocks.
+          const w = await post({ dry_run: false, ids: [idPreview] });
+          assertEq(w.body.written, 1, "qh-r2l: cleanup write");
+        }
+
+        // ── qh-r3: thin rows never occupy batch slots. 10 thin + 3 rich ->
+        //    one apply call processes exactly the 3 rich rows. ─────────────
+        const thinIds: string[] = [];
+        for (let i = 0; i < 10; i++) {
+          // "qh-c0…" sorts BEFORE the rich "qh-c1…" ids, i.e. the thin rows
+          // sit at the head of the old ORDER BY e.id queue.
+          thinIds.push(expStore.createExperience({
+            id: `qh-c0-thin-${String(i).padStart(2, "0")}`, title: `Tynn ${i}`, kommune: "Oslo", fylke: "Oslo",
+            category: "kultur_historie", verification_status: "verified", confidence: "high",
+          } as any));
+        }
+        const richIds = ["qh-c1-rich-0", "qh-c1-rich-1", "qh-c1-rich-2"].map((id) => seedRich(id));
+        {
+          setStub(makeStub());
+          resetCounters();
+          const r = await post({ dry_run: false });
+          assertEq(r.body.skipped_thin_data_precheck, 10, "qh-r3a: skipped_thin_data_precheck = 10");
+          assertEq(r.body.processed, 3, "qh-r3b: processed = the 3 rich rows only");
+          assertEq(r.body.processed_ids, richIds, "qh-r3c: processed_ids = the rich ids, in order");
+          assertEq(r.body.written, 3, "qh-r3d: written 3");
+          assertEq(counters.generate, 3, "qh-r3e: generator called for the rich rows only");
+          assertEq(counters.judge, 3, "qh-r3f: judge called for the rich rows only");
+          assertEq(r.body.skipped_reasons.thin_data, 0, "qh-r3g: skipped_reasons.thin_data still present, now 0");
+          assertTrue(thinIds.every((id) => attemptOf(id) === undefined), "qh-r3h: thin rows never got an attempt row (never processed)");
+        }
+
+        // ── qh-r4 (AC1): every LLM call returns the sentinel; 25 eligible
+        //    rows -> call 1 processes 10, call 2 the NEXT 10, call 3 the
+        //    last 5 — no overlap. ─────────────────────────────────────────
+        const ac1Ids: string[] = [];
+        for (let i = 0; i < 25; i++) ac1Ids.push(seedRich(`qh-d-ac1-${String(i).padStart(2, "0")}`));
+        {
+          setStub(sentinelStub());
+          const r1 = await post({ dry_run: false });
+          const r2 = await post({ dry_run: false });
+          const r3 = await post({ dry_run: false });
+          assertEq(r1.body.processed_ids, ac1Ids.slice(0, 10), "qh-r4a: call 1 processes ids 0-9");
+          assertEq(r2.body.processed_ids, ac1Ids.slice(10, 20), "qh-r4b: call 2 processes ids 10-19 (different ids)");
+          assertEq(r3.body.processed_ids, ac1Ids.slice(20, 25), "qh-r4c: call 3 processes the last 5");
+          const overlap = (r1.body.processed_ids as string[]).filter((id) => (r2.body.processed_ids as string[]).includes(id));
+          assertEq(overlap, [], "qh-r4d: no overlap between call 1 and call 2");
+          assertEq(r1.body.candidates, 25, "qh-r4e: call 1 candidates = 25");
+          assertEq(r2.body.skipped_recently_attempted, 10, "qh-r4f: call 2 skips the 10 recently attempted");
+          assertEq(r2.body.candidates, 15, "qh-r4g: call 2 candidates = 15");
+          assertEq(r2.body.candidates_before_cooldown, 35, "qh-r4h: candidates_before_cooldown = 25 rich + 10 thin");
+          assertEq(r3.body.skipped_recently_attempted, 20, "qh-r4i: call 3 skips 20");
+          assertEq(r1.body.skipped_reasons.generation_fail_reasons.sentinel, 10, "qh-r4j: sentinel breakdown intact");
+          const a0 = attemptOf(ac1Ids[0]);
+          assertEq(a0?.outcome, "generation_failed", "qh-r4k: attempt row outcome");
+          assertEq(a0?.reason, "sentinel", "qh-r4l: attempt row reason");
+          assertTrue(typeof a0?.facts_fingerprint === "string" && a0.facts_fingerprint.length === 64, "qh-r4m: attempt row carries the fingerprint");
+          const r4 = await post({ dry_run: false });
+          assertEq(r4.body.processed, 0, "qh-r4n: call 4 has nothing left — the queue is drained, not re-looped");
+          assertEq(r4.body.skipped_recently_attempted, 25, "qh-r4o: all 25 resting in the cooldown");
+        }
+
+        // ── qh-r5: infra failures never create an attempt row — the same
+        //    row is processed again on the next call. ──────────────────────
+        const idInfra = seedRich("qh-e-infra");
+        {
+          setStub(makeStub({ generate: async () => ({ ok: false, status: 500, json: async () => ({}) }) }));
+          const r1 = await post({ dry_run: false });
+          assertEq(r1.body.processed_ids, [idInfra], "qh-r5a: HTTP 500 call processes the row");
+          assertEq(attemptOf(idInfra), undefined, "qh-r5b: http_error creates NO attempt row");
+          const r2 = await post({ dry_run: false });
+          assertEq(r2.body.processed_ids, [idInfra], "qh-r5c: ...and the same row is processed again next call");
+
+          delete process.env.ANTHROPIC_API_KEY;
+          setStub(neverCall("qh-r5 no key"));
+          const r3 = await post({ dry_run: false });
+          assertEq(r3.body.processed_ids, [idInfra], "qh-r5d: missing API key call processes the row");
+          assertEq(r3.body.skipped_reasons.generation_fail_reasons.no_api_key, 1, "qh-r5e: reason no_api_key");
+          assertEq(attemptOf(idInfra), undefined, "qh-r5f: no_api_key creates NO attempt row");
+          process.env.ANTHROPIC_API_KEY = "test-anthropic-key-route-qh";
+
+          setStub(makeStub({ judge: async () => ({ ok: false, status: 502, json: async () => ({}) }) }));
+          const r4 = await post({ dry_run: false });
+          assertEq(r4.body.processed_ids, [idInfra], "qh-r5g: judge-502 call processes the row");
+          assertEq(r4.body.skipped_reasons.judge_rejected, 1, "qh-r5h: judge infra surfaces as judge_rejected (unchanged)");
+          assertEq(attemptOf(idInfra), undefined, "qh-r5i: a judge INFRA failure creates NO attempt row");
+
+          setStub(makeStub({ judge: async () => okJson("AVVIS\nOppdiktet pris.") }));
+          const r5 = await post({ dry_run: false });
+          assertEq(r5.body.processed_ids, [idInfra], "qh-r5j: real AVVIS call processes the row");
+          assertEq(attemptOf(idInfra)?.outcome, "judge_rejected", "qh-r5k: a real judge AVVIS IS recorded");
+          const r6 = await post({ dry_run: false });
+          assertEq(r6.body.processed, 0, "qh-r5l: ...and rests in the cooldown afterwards");
+        }
+
+        // ── qh-r6: cooldown lifts on a fact change (before 30 days) and
+        //    after 30 days; a 29-day-old unchanged attempt still rests. ─────
+        {
+          setStub(neverCall("qh-r6"));
+          expDb.prepare("UPDATE experiences SET price_from = 990 WHERE id = ?").run(ac1Ids[0]);
+          expDb.prepare("UPDATE experience_description_attempts SET attempted_at = datetime('now', '-31 days') WHERE experience_id = ?").run(ac1Ids[1]);
+          expDb.prepare("UPDATE experience_description_attempts SET attempted_at = datetime('now', '-29 days') WHERE experience_id = ?").run(ac1Ids[2]);
+          const r = await post({ preview_only: true });
+          const preview = r.body.candidate_ids_preview as string[];
+          assertTrue(preview.includes(ac1Ids[0]), "qh-r6a: a changed fact (price_from) makes an attempted row eligible again before 30 days");
+          assertTrue(preview.includes(ac1Ids[1]), "qh-r6b: an attempt older than 30 days is eligible again");
+          assertTrue(!preview.includes(ac1Ids[2]), "qh-r6c: a 29-day-old attempt with unchanged facts still rests");
+          assertTrue(!preview.includes(ac1Ids[3]), "qh-r6d: a fresh unchanged attempt still rests");
+          assertEq(preview, [ac1Ids[0], ac1Ids[1]], "qh-r6e: exactly those two are eligible");
+          assertEq(r.body.skipped_recently_attempted, 24, "qh-r6f: 23 ac1 + idInfra still resting");
+        }
+
+        // ── qh-r7: `ids` bypasses the cooldown but never the publish gate. ─
+        {
+          setStub(neverCall("qh-r7"));
+          const r = await post({ preview_only: true, ids: [ac1Ids[3], idUnverified] });
+          assertEq(r.body.candidate_ids_preview, [ac1Ids[3]], "qh-r7a: a cooled-down row named in ids IS eligible; the unpublished one is not");
+          assertEq(r.body.skipped_recently_attempted, 0, "qh-r7b: no cooldown skip with explicit ids");
+          assertEq(r.body.candidates_before_cooldown, 1, "qh-r7c: the unpublished id never entered the gated set");
+        }
+
+        // ── qh-r8: a successful write removes the attempt row; the now-good
+        //    description is never a candidate again. ───────────────────────
+        {
+          setStub(makeStub());
+          assertTrue(attemptOf(ac1Ids[2]) !== undefined, "qh-r8a: precondition — attempt row exists");
+          const r = await post({ dry_run: false, ids: [ac1Ids[2]] });
+          assertEq(r.body.written, 1, "qh-r8b: written via ids despite the cooldown");
+          assertEq(descOf(ac1Ids[2]), FAKTALINJE_FIXTURE, "qh-r8c: description written");
+          assertEq(attemptOf(ac1Ids[2]), undefined, "qh-r8d: attempt row deleted on the successful write");
+          setStub(neverCall("qh-r8 after"));
+          const r2 = await post({ preview_only: true, ids: [ac1Ids[2]] });
+          assertEq(r2.body.candidates_before_cooldown, 0, "qh-r8e: a good description is never a candidate again");
+        }
+
+        // ── qh-r9: dry-run (default, with LLM sample) never writes attempt
+        //    rows, even when the sample fails on a content gate. ───────────
+        {
+          setStub(sentinelStub());
+          const before = dumpAttempts();
+          const r = await post({ dry_run: true });
+          assertTrue(r.body.sample.length >= 1, "qh-r9a: dry run sampled at least one row");
+          assertEq(r.body.sample[0].generation_fail_reason, "sentinel", "qh-r9b: the sample failed on the sentinel");
+          assertEq(dumpAttempts(), before, "qh-r9c: ZERO attempt rows written by a dry run");
+        }
+
+        // ── qh-r10: worst-first — blank/junk rows come before faktalinje->
+        //    kildetro upgrade candidates, regardless of id order. ──────────
+        {
+          const upProvider = expStore.createProvider({
+            navn: "Oppgradering AS", kommune: "Bergen", fylke: "Vestland",
+            brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+          });
+          expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+            .run("oppgradering.example", verifiedFieldProvenance(), upProvider);
+          // Upgrade candidates get the LOWEST ids ("qh-0…"), blank rows higher.
+          const upIds = ["qh-0-up-0", "qh-0-up-1"].map((id) => seedRich(id, { provider_id: upProvider }));
+          for (const id of upIds) {
+            expDb.prepare("UPDATE experiences SET description = ?, content_field_evidence = ? WHERE id = ?")
+              .run(FAKTALINJE_FIXTURE, JSON.stringify({ description: EXP_DESC_GENERATED_PROVENANCE_SENTINEL }), id);
+          }
+          const blankIds = ["qh-z-blank-0", "qh-z-blank-1"].map((id) => seedRich(id));
+          const junkId = seedRich("qh-z-junk", { description: JUNK_EXISTING_DESCRIPTION });
+          setStub(neverCall("qh-r10"));
+          const r = await post({ preview_only: true, ids: [...upIds, ...blankIds, junkId] });
+          assertEq(r.body.candidate_ids_preview, [...blankIds, junkId, ...upIds],
+            "qh-r10a: blank/junk first (id order within), upgrades after (id order within)");
+        }
+
+        dbFactory.__resetDbFactoryForTesting();
+      } catch (err: any) {
+        failed++;
+        failures.push("experience-description-enrichment (section F): unexpected error: " + String(err?.stack || err?.message || err));
+      } finally {
+        if (restoreMainDbF) restoreMainDbF();
+        globalThis.fetch = prevFetch;
+        if (prevExperiencesDbPathF === undefined) delete process.env.EXPERIENCES_DB_PATH;
+        else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPathF;
+        if (prevAdminKeyF === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKeyF;
+        if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+        for (const p of [dbFactoryPathF, experienceStorePathF, opplevelserPathF]) delete require.cache[p];
+      }
     }
 
     return { passed, failed, failures };
