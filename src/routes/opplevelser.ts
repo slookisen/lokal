@@ -33098,6 +33098,15 @@ export function experienceDescriptionNeedsEnrichment(desc: string | null | undef
 /** Cooldown window for an attempted-but-not-written row (Daniel's choice:
  *  "until the row's source facts change, max 30 days"). */
 const EXP_DESC_ATTEMPT_COOLDOWN_DAYS = 30;
+/** Shorter window for outcomes that hinge on the provider's homepage being
+ *  reachable/non-empty right now (kildetro `fetch_failed`, kildetro
+ *  `empty_response`) rather than on the row's own facts — a site that was
+ *  down or served an empty shell is likelier to recover within a week than
+ *  a sentinel/word-floor verdict is to flip, and the facts fingerprint does
+ *  not cover homepage content, so only the clock can lift these. Review
+ *  follow-up on dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+ *  kohode-blokkering. */
+const EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS = 7;
 /** How many eligible ids a dry-run/preview response lists. */
 const EXP_DESC_CANDIDATE_PREVIEW_CAP = 20;
 
@@ -33210,6 +33219,36 @@ export function experienceDescriptionFactsFingerprint(row: ExperienceDescription
     row.provider_field_provenance ?? "",
   ]);
   return expDescCreateHash("sha256").update(material, "utf8").digest("hex");
+}
+
+/**
+ * The `reason` value stored in experience_description_attempts for a
+ * recorded outcome. `generation_failed` stores `<level>:<generation_fail_
+ * reason>` (e.g. "faktalinje:sentinel", "kildetro:fetch_failed") so the
+ * cooldown window can be derived at READ time from what was stored — the
+ * bare reason alone cannot tell a kildetro "homepage had no text"
+ * empty_response from a faktalinje empty LLM reply. `judge_rejected`
+ * stores the judge's reasoning; `thin_data` stores null.
+ */
+export function experienceDescriptionAttemptReason(outcome: ExperienceDescriptionOutcome): string | null {
+  if (outcome.skip_reason === "generation_failed" && outcome.generation_fail_reason) {
+    return `${outcome.level}:${outcome.generation_fail_reason}`;
+  }
+  if (outcome.skip_reason === "judge_rejected") return outcome.judge_reasoning ?? null;
+  return null;
+}
+
+/**
+ * Cooldown window in days for a stored attempt, computed from its stored
+ * `outcome` + `reason` (see experienceDescriptionAttemptReason()). The
+ * homepage-dependent kildetro outcomes get EXP_DESC_ATTEMPT_COOLDOWN_SHORT_
+ * DAYS (7); every other content outcome EXP_DESC_ATTEMPT_COOLDOWN_DAYS (30).
+ */
+export function experienceDescriptionAttemptCooldownDays(outcome: string, reason: string | null): number {
+  if (outcome === "generation_failed" && (reason === "kildetro:fetch_failed" || reason === "kildetro:empty_response")) {
+    return EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS;
+  }
+  return EXP_DESC_ATTEMPT_COOLDOWN_DAYS;
 }
 
 router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
@@ -33340,19 +33379,32 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     (a, b) => Number(needsEnrichment.get(b.id)) - Number(needsEnrichment.get(a.id))
   );
 
-  // Cooldown: skip a row attempted (content outcome, apply run) within the
-  // last EXP_DESC_ATTEMPT_COOLDOWN_DAYS whose facts fingerprint is still the
+  // Cooldown: skip a row attempted (content outcome, apply run) within its
+  // window — experienceDescriptionAttemptCooldownDays() of the stored
+  // outcome/reason: 7 days for the homepage-dependent kildetro outcomes,
+  // else EXP_DESC_ATTEMPT_COOLDOWN_DAYS — whose facts fingerprint is still the
   // one recorded at that attempt — i.e. nothing the generators read has
   // changed since, so the same outcome is the expected one. An explicit
   // `ids` list BYPASSES the cooldown (the operator asked for those rows by
   // name) but never the publish gate above.
   const recentAttempts = new Map<string, string>();
   if (!ids) {
+    // Both windows evaluated in SQL (one clock, SQLite's), the choice
+    // between them made per row in JS from the stored outcome/reason.
     const attemptRows = db.prepare(
-      `SELECT experience_id, facts_fingerprint FROM experience_description_attempts
+      `SELECT experience_id, facts_fingerprint, outcome, reason,
+              (attempted_at > datetime('now', ?)) AS within_short
+         FROM experience_description_attempts
         WHERE attempted_at > datetime('now', ?)`
-    ).all(`-${EXP_DESC_ATTEMPT_COOLDOWN_DAYS} days`) as Array<{ experience_id: string; facts_fingerprint: string }>;
-    for (const a of attemptRows) recentAttempts.set(a.experience_id, a.facts_fingerprint);
+    ).all(
+      `-${EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS} days`,
+      `-${EXP_DESC_ATTEMPT_COOLDOWN_DAYS} days`
+    ) as Array<{ experience_id: string; facts_fingerprint: string; outcome: string; reason: string | null; within_short: number }>;
+    for (const a of attemptRows) {
+      const days = experienceDescriptionAttemptCooldownDays(a.outcome, a.reason);
+      if (days <= EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS && !a.within_short) continue; // short window already over
+      recentAttempts.set(a.experience_id, a.facts_fingerprint);
+    }
   }
   let skippedRecentlyAttempted = 0;
   let skippedThinDataPrecheck = 0;
@@ -33380,6 +33432,10 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     // filter only (the pre-2026-10-06 meaning of `candidates`, minus the
     // unpublished rows the gate now removes).
     candidates: eligibleRows.length,
+    // Of `candidates`, the rows whose description is blank/junk (the
+    // placeholder lede shows on a public page) — i.e. excluding the
+    // faktalinje->kildetro upgrade rows, which already carry honest copy.
+    candidates_blank_or_junk: eligibleRows.filter((r) => needsEnrichment.get(r.id)).length,
     candidates_before_cooldown: candidateRows.length,
     skipped_recently_attempted: skippedRecentlyAttempted,
     skipped_thin_data_precheck: skippedThinDataPrecheck,
@@ -33484,7 +33540,7 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
         upsertAttempt.run(
           row.id,
           outcome.skip_reason ?? "unknown",
-          outcome.generation_fail_reason ?? (outcome.skip_reason === "judge_rejected" ? (outcome.judge_reasoning ?? null) : null),
+          experienceDescriptionAttemptReason(outcome),
           experienceDescriptionFactsFingerprint(row)
         );
       }
@@ -33505,6 +33561,10 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     skipped: skippedCount,
     remaining: Math.max(0, eligibleRows.length - outcomes.length),
     skipped_reasons: {
+      // DEPRECATED (dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+      // kohode-blokkering): kept for response compatibility only. Normally
+      // 0 now — the thin-data precheck drops `skip`-tier rows before
+      // batching; read `skipped_thin_data_precheck` instead.
       thin_data: outcomes.filter((o) => o.skip_reason === "thin_data").length,
       generation_failed: outcomes.filter((o) => o.skip_reason === "generation_failed").length,
       judge_rejected: outcomes.filter((o) => o.skip_reason === "judge_rejected").length,

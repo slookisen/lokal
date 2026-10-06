@@ -80,6 +80,8 @@ import {
   isRetryableDescriptionJudgeFailure,
   shouldRecordDescriptionAttempt,
   experienceDescriptionFactsFingerprint,
+  experienceDescriptionAttemptReason,
+  experienceDescriptionAttemptCooldownDays,
   type ExperienceDescriptionCandidate,
   type ExperienceDescriptionOutcome,
   type ExpDescGenFailReason,
@@ -1662,6 +1664,27 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(shouldRecordDescriptionAttempt({ ...base, proposed_description: "T", judge_approved: false, judge_reasoning: "dommer-API svarte status 500 — avvist fail-closed", skip_reason: "judge_rejected" }), false, "qh-3i: a judge infra failure is NOT recorded");
       }
 
+      // ── qh-3b: stored attempt reason + per-outcome cooldown window
+      //    (review follow-up: homepage-dependent kildetro outcomes 7 days,
+      //    every other content outcome 30). ─────────────────────────────
+      {
+        const base: ExperienceDescriptionOutcome = {
+          id: "x", title: "X", fact_count: 8, level: "kildetro", reasoning: "r", thin: false,
+          proposed_description: null, word_count: 0, judge_approved: null, judge_reasoning: null,
+          skip_reason: "generation_failed", generation_fail_reason: "fetch_failed", homepage_url: null,
+        };
+        assertEq(experienceDescriptionAttemptReason(base), "kildetro:fetch_failed", "qh-3b1: generation_failed stores <level>:<reason>");
+        assertEq(experienceDescriptionAttemptReason({ ...base, level: "faktalinje", generation_fail_reason: "empty_response" }), "faktalinje:empty_response", "qh-3b2: faktalinje empty_response keeps its tier");
+        assertEq(experienceDescriptionAttemptReason({ ...base, skip_reason: "judge_rejected", generation_fail_reason: null, judge_reasoning: "Oppdiktet." }), "Oppdiktet.", "qh-3b3: judge_rejected stores the judge reasoning");
+        assertEq(experienceDescriptionAttemptReason({ ...base, level: "skip", skip_reason: "thin_data", generation_fail_reason: null }), null, "qh-3b4: thin_data stores null");
+        assertEq(experienceDescriptionAttemptCooldownDays("generation_failed", "kildetro:fetch_failed"), 7, "qh-3b5: kildetro fetch_failed -> 7 days");
+        assertEq(experienceDescriptionAttemptCooldownDays("generation_failed", "kildetro:empty_response"), 7, "qh-3b6: kildetro empty_response -> 7 days");
+        assertEq(experienceDescriptionAttemptCooldownDays("generation_failed", "faktalinje:empty_response"), 30, "qh-3b7: faktalinje empty_response -> 30 days");
+        assertEq(experienceDescriptionAttemptCooldownDays("generation_failed", "faktalinje:sentinel"), 30, "qh-3b8: sentinel -> 30 days");
+        assertEq(experienceDescriptionAttemptCooldownDays("judge_rejected", "kildetro:fetch_failed"), 30, "qh-3b9: the short window keys on outcome AND reason");
+        assertEq(experienceDescriptionAttemptCooldownDays("thin_data", null), 30, "qh-3b10: thin_data -> 30 days");
+      }
+
       // ── qh-4: facts fingerprint — stable, and moves with every input the
       //    tier selection / generators read. ────────────────────────────
       {
@@ -1879,7 +1902,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           assertEq(r1.body.skipped_reasons.generation_fail_reasons.sentinel, 10, "qh-r4j: sentinel breakdown intact");
           const a0 = attemptOf(ac1Ids[0]);
           assertEq(a0?.outcome, "generation_failed", "qh-r4k: attempt row outcome");
-          assertEq(a0?.reason, "sentinel", "qh-r4l: attempt row reason");
+          assertEq(a0?.reason, "faktalinje:sentinel", "qh-r4l: attempt row reason (<level>:<generation_fail_reason>)");
           assertTrue(typeof a0?.facts_fingerprint === "string" && a0.facts_fingerprint.length === 64, "qh-r4m: attempt row carries the fingerprint");
           const r4 = await post({ dry_run: false });
           assertEq(r4.body.processed, 0, "qh-r4n: call 4 has nothing left — the queue is drained, not re-looped");
@@ -1919,21 +1942,61 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           assertEq(r6.body.processed, 0, "qh-r5l: ...and rests in the cooldown afterwards");
         }
 
-        // ── qh-r6: cooldown lifts on a fact change (before 30 days) and
-        //    after 30 days; a 29-day-old unchanged attempt still rests. ─────
+        // ── qh-r6: cooldown windows, SELF-CONTAINED (review follow-up):
+        //    its own fresh rows, its own attempts, and every count asserted
+        //    as a delta against a baseline preview taken here — nothing
+        //    depends on rows left by earlier qh blocks. A fact change lifts
+        //    the 30-day cooldown early; >30 days lifts it; 29 days and fresh
+        //    hold it; kildetro fetch_failed uses the 7-day window (6 days
+        //    holds, 8 days lifts). ───────────────────────────────────────
         {
+          const ownFakta = ["qh-f-0-changed", "qh-f-1-expired31", "qh-f-2-held29", "qh-f-3-fresh"].map((id) => seedRich(id));
+          const ktProvider6 = expStore.createProvider({
+            navn: "Nede Hjemmeside AS", kommune: "Bergen", fylke: "Vestland",
+            brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+          });
+          expDb.prepare("UPDATE experience_providers SET hjemmeside = ?, field_provenance = ? WHERE id = ?")
+            .run("nede-hjemmeside.example", verifiedFieldProvenance(), ktProvider6);
+          const idKt6d = seedRich("qh-f-4-kt-6d", { provider_id: ktProvider6 });
+          const idKt8d = seedRich("qh-f-5-kt-8d", { provider_id: ktProvider6 });
+          const own = [...ownFakta, idKt6d, idKt8d];
+
+          setStub(neverCall("qh-r6 baseline"));
+          const baseline = await post({ preview_only: true });
+          const baselineSkipped = baseline.body.skipped_recently_attempted as number;
+          assertTrue(own.every((id) => (baseline.body.candidate_ids_preview as string[]).includes(id)), "qh-r6a: all own rows eligible before any attempt");
+
+          // Record the attempts: faktalinje rows end in the sentinel, the
+          // kildetro rows in fetch_failed (homepage answers 500).
+          setStub(sentinelStub());
+          appSettings["experienceDescriptionHomepageFetchImpl"] =
+            (async () => ({ ok: false, status: 500, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } })) as unknown as typeof fetch;
+          const rec = await post({ dry_run: false, ids: own });
+          assertEq(rec.body.processed_ids, own, "qh-r6b: attempts recorded for all own rows");
+          assertEq(attemptOf(ownFakta[0])?.reason, "faktalinje:sentinel", "qh-r6c: faktalinje attempt reason");
+          assertEq(attemptOf(idKt6d)?.reason, "kildetro:fetch_failed", "qh-r6d: kildetro attempt reason");
+          appSettings["experienceDescriptionHomepageFetchImpl"] =
+            (async () => { throw new Error("section F: homepage fetch must NOT be called"); }) as unknown as typeof fetch;
+
+          const setAge = (id: string, days: number) =>
+            expDb.prepare("UPDATE experience_description_attempts SET attempted_at = datetime('now', ?) WHERE experience_id = ?").run(`-${days} days`, id);
+          expDb.prepare("UPDATE experiences SET price_from = 990 WHERE id = ?").run(ownFakta[0]);
+          setAge(ownFakta[1], 31);
+          setAge(ownFakta[2], 29);
+          setAge(idKt6d, 6);
+          setAge(idKt8d, 8);
+
           setStub(neverCall("qh-r6"));
-          expDb.prepare("UPDATE experiences SET price_from = 990 WHERE id = ?").run(ac1Ids[0]);
-          expDb.prepare("UPDATE experience_description_attempts SET attempted_at = datetime('now', '-31 days') WHERE experience_id = ?").run(ac1Ids[1]);
-          expDb.prepare("UPDATE experience_description_attempts SET attempted_at = datetime('now', '-29 days') WHERE experience_id = ?").run(ac1Ids[2]);
           const r = await post({ preview_only: true });
           const preview = r.body.candidate_ids_preview as string[];
-          assertTrue(preview.includes(ac1Ids[0]), "qh-r6a: a changed fact (price_from) makes an attempted row eligible again before 30 days");
-          assertTrue(preview.includes(ac1Ids[1]), "qh-r6b: an attempt older than 30 days is eligible again");
-          assertTrue(!preview.includes(ac1Ids[2]), "qh-r6c: a 29-day-old attempt with unchanged facts still rests");
-          assertTrue(!preview.includes(ac1Ids[3]), "qh-r6d: a fresh unchanged attempt still rests");
-          assertEq(preview, [ac1Ids[0], ac1Ids[1]], "qh-r6e: exactly those two are eligible");
-          assertEq(r.body.skipped_recently_attempted, 24, "qh-r6f: 23 ac1 + idInfra still resting");
+          assertTrue(preview.includes(ownFakta[0]), "qh-r6e: a changed fact (price_from) makes an attempted row eligible again before 30 days");
+          assertTrue(preview.includes(ownFakta[1]), "qh-r6f: an attempt older than 30 days is eligible again");
+          assertTrue(!preview.includes(ownFakta[2]), "qh-r6g: a 29-day-old attempt with unchanged facts still rests");
+          assertTrue(!preview.includes(ownFakta[3]), "qh-r6h: a fresh unchanged attempt still rests");
+          assertTrue(!preview.includes(idKt6d), "qh-r6i: kildetro fetch_failed 6 days old still rests (7-day window)");
+          assertTrue(preview.includes(idKt8d), "qh-r6j: kildetro fetch_failed 8 days old is eligible again (7-day window over)");
+          assertEq(r.body.skipped_recently_attempted - baselineSkipped, 3,
+            "qh-r6k: exactly three own rows (held29, fresh, kt-6d) added to skipped_recently_attempted");
         }
 
         // ── qh-r7: `ids` bypasses the cooldown but never the publish gate. ─
@@ -1988,9 +2051,34 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
           const blankIds = ["qh-z-blank-0", "qh-z-blank-1"].map((id) => seedRich(id));
           const junkId = seedRich("qh-z-junk", { description: JUNK_EXISTING_DESCRIPTION });
           setStub(neverCall("qh-r10"));
-          const r = await post({ preview_only: true, ids: [...upIds, ...blankIds, junkId] });
+          const unpublishedBlank = seedRich("qh-z-blank-unpublished");
+          expDb.prepare("UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?").run(unpublishedBlank);
+          const r = await post({ preview_only: true, ids: [...upIds, ...blankIds, junkId, unpublishedBlank] });
           assertEq(r.body.candidate_ids_preview, [...blankIds, junkId, ...upIds],
             "qh-r10a: blank/junk first (id order within), upgrades after (id order within)");
+          // candidates_blank_or_junk (review follow-up) = published rows
+          // without a usable description; the upgrade rows and the
+          // unpublished blank row are not counted.
+          assertEq(r.body.candidates, 5, "qh-r10b: candidates = 2 blank + 1 junk + 2 upgrades");
+          assertEq(r.body.candidates_blank_or_junk, 3, "qh-r10c: candidates_blank_or_junk = 2 blank + 1 junk (upgrades and the unpublished row excluded)");
+
+          // Worst-first WITHOUT `ids` too: the upgrade rows have the lowest
+          // ids in the whole DB, yet every blank/junk eligible row precedes
+          // them in the unscoped preview.
+          const u = await post({ preview_only: true });
+          const up = u.body.candidate_ids_preview as string[];
+          assertTrue(upIds.every((id) => up.includes(id)), "qh-r10d: unscoped preview contains the upgrade rows");
+          assertTrue([...blankIds, junkId].every((id) => up.includes(id)), "qh-r10e: unscoped preview contains the blank/junk rows");
+          const firstUp = Math.min(...upIds.map((id) => up.indexOf(id)));
+          assertTrue(up.slice(0, firstUp).every((id) => !upIds.includes(id)) && up.slice(firstUp).every((id) => upIds.includes(id)),
+            "qh-r10f: unscoped — every blank/junk row before every upgrade row");
+          assertEq(u.body.candidates_blank_or_junk, u.body.candidates - upIds.length,
+            "qh-r10g: unscoped candidates_blank_or_junk = candidates minus the upgrade rows");
+          setStub(sentinelStub());
+          const d = await post({ dry_run: true, ids: [...upIds, junkId] });
+          assertEq(d.body.candidates_blank_or_junk, 1, "qh-r10h: dry-run response carries candidates_blank_or_junk");
+          const a = await post({ dry_run: false, ids: [junkId] });
+          assertEq(a.body.candidates_blank_or_junk, 1, "qh-r10i: apply response carries candidates_blank_or_junk");
         }
 
         dbFactory.__resetDbFactoryForTesting();
