@@ -87,6 +87,11 @@ export const DentalAgentSchema = z.object({
   // updateDentalAgent()'s own unconditional `updated_at = datetime('now')`
   // stamp (never via this schema/PUT body -- see DENTAL_AGENT_WRITABLE_FIELDS).
   updated_at: z.string().optional().nullable(),
+  // dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A):
+  // read-only on this schema -- hydrated so the profile page can show a
+  // "Nedlagt" notice + noindex; written only by /admin/dental/mark-inactive
+  // and the verifier, never via this schema/PUT body.
+  is_inactive: z.union([z.literal(0), z.literal(1)]).optional().nullable(),
   treatments: z.array(z.string()).optional(),
   helfo_agreement: HelfoAgreementSchema.optional(),
   languages_spoken: z.array(z.string()).optional(),
@@ -285,6 +290,7 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     // V's "10% sample of last-24h commits" selector) could never read the
     // real timestamp updateDentalAgent() already stamps on every write.
     updated_at: (row.updated_at as string | null) ?? null,
+    is_inactive: row.is_inactive === 1 ? 1 : 0,
     treatments: parseJsonArray(row.treatments),
     helfo_agreement:
       (row.helfo_agreement as DentalAgent["helfo_agreement"]) ?? undefined,
@@ -2159,6 +2165,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     WHERE verification_status != 'rejected'
       AND poststed IS NOT NULL AND poststed != ''
       AND fylke IS NOT NULL AND fylke != ''
+      AND (is_inactive IS NULL OR is_inactive = 0)
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     GROUP BY poststed, fylke
   `).all() as Array<{ poststed: string; fylke: string; n: number }>;
@@ -2175,6 +2182,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     WHERE verification_status != 'rejected'
       AND poststed IS NOT NULL AND poststed != ''
       AND ${DENTAL_CLINIC_CLASS_SQL}
+      AND (is_inactive IS NULL OR is_inactive = 0)
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     GROUP BY poststed
     HAVING n >= ?
@@ -2208,6 +2216,7 @@ export function listRelatedClinics(
     WHERE poststed = ?
       AND id != ?
       AND verification_status != 'rejected'
+      AND (is_inactive IS NULL OR is_inactive = 0)
       ${catalogClassClause}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     ORDER BY
@@ -2241,6 +2250,7 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
     FROM dental_agents
     WHERE verification_status != 'rejected'
       AND org_nr IS NOT NULL AND org_nr != ''
+      AND (is_inactive IS NULL OR is_inactive = 0)
       ${catalogClassClause}
       AND NOT ${DENTAL_THIN_PROFILE_SQL}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
