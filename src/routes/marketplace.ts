@@ -2022,6 +2022,15 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
   }
 
   try {
+    // A corrected address must move the map pin. PUT /admin/knowledge and the
+    // homepage/google batch writers already reset the geocode on a real
+    // address change, but this route — the one customer service uses for
+    // corrections — did not: after a correction the producer kept its old
+    // coordinate (Snill Bie and Myrvold Gård, 2026-10-05: pins 321 and
+    // 398 km away from the corrected address, still matched by radius
+    // searches in the wrong county). Compared before/after the write so a
+    // re-sent identical address never resets a good geocode.
+    const placeBefore = knowledgeService.getKnowledge(agentId);
     if (isAdmin) {
       // Admin enrichment — preserve dataSource as "auto" (or what's in body)
       knowledgeService.upsertKnowledge(agentId, {
@@ -2032,6 +2041,12 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
     }
+
+    const placeAfter = knowledgeService.getKnowledge(agentId);
+    const addressMoved =
+      (placeBefore?.address ?? "") !== (placeAfter?.address ?? "") ||
+      (placeBefore?.postalCode ?? "") !== (placeAfter?.postalCode ?? "");
+    if (addressMoved) invalidateAgentGeocode(getDb(), agentId);
 
     // W40 write guards: every owner-relay phone write is logged + audited.
     if (phoneWrite?.outcome === "owner_relay" && phoneWrite.owner_relay_evidence && typeof body.phone === "string") {
@@ -2046,6 +2061,8 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       success: true,
       message: isAdmin ? "Kunnskapsdata beriket (auto)" : "Kunnskapsdata oppdatert",
       data: { ...updated, trustScore: newTrustScore },
+      // Same flag PUT /admin/knowledge reports; absent when nothing moved.
+      ...(addressMoved ? { geocode_invalidated: true } : {}),
       // W40 write guards: present only on an admin call that carried `phone`.
       ...(phoneWrite ? { phone_write: phoneWrite } : {}),
       ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
@@ -2625,6 +2642,32 @@ function invalidateAgentGeocode(db: ReturnType<typeof getDb>, agentId: string): 
        geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
   ).run(agentId);
 }
+
+// ─── POST /admin/agents/:id/geocode-reset — re-geocode one producer ──
+// Clears one producer's coordinate and its geocode attempt counter, so the
+// geocode worker picks it up again on its next tick. For a correction whose
+// address text did not change but whose pin is wrong (Sørmo Gård, 2026-10-05:
+// pin left in Alta by the old name suffix, row parked after failed attempts
+// on a misspelt poststed). The only other levers were the global unpark
+// (every parked row at once) and the address-precision backfill, which never
+// looks at a centroid-precision row.
+router.post("/admin/agents/:id/geocode-reset", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+  const agentId = req.params.id as string;
+  const db = getDb();
+  const before = db
+    .prepare("SELECT lat, lng, geo_precision, geocode_attempts FROM agents WHERE id = ?")
+    .get(agentId) as { lat: number | null; lng: number | null; geo_precision: string | null; geocode_attempts: number | null } | undefined;
+  if (!before) { res.status(404).json({ success: false, error: "Agent ikke funnet" }); return; }
+  invalidateAgentGeocode(db, agentId);
+  res.json({ success: true, data: { agent_id: agentId, before } });
+});
 
 // ─── POST /admin/google-rating-batch — Batch fetch ratings ──
 // Accepts { agentIds: string[] }, fetches Google rating for each.

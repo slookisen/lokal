@@ -45008,6 +45008,27 @@ runSerial(async () => {
   }
 });
 
+// 2026-10-05 catalogue corrections (Snill Bie, Myrvold Gård, Sørmo Gård):
+// the customer-service correction route PUT /api/marketplace/agents/:id/
+// knowledge resets the geocode on an address change too, and
+// POST /admin/agents/:id/geocode-reset re-queues one producer.
+runSerial(async () => {
+  console.log("\n── 2026-10-05: marketplace knowledge PUT geocode invalidation + single-agent reset ──");
+  try {
+    const { runMarketplaceKnowledgeGeocodeInvalidateTests } =
+      require("../src/routes/marketplace-knowledge-geocode-invalidate.test") as
+        typeof import("../src/routes/marketplace-knowledge-geocode-invalidate.test");
+    const mgi = await runMarketplaceKnowledgeGeocodeInvalidateTests({ log: false });
+    passed += mgi.passed;
+    failed += mgi.failed;
+    for (const f of mgi.failures) failures.push("marketplace-knowledge-geocode-invalidate: " + f);
+    console.log(`  marketplace-knowledge-geocode-invalidate: ${mgi.passed} passed, ${mgi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-knowledge-geocode-invalidate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet: the
 // one-time backfill batch for the pre-existing backlog (rows corrected
 // BEFORE the invalidation above shipped) — POST /admin/agents/geocode-
