@@ -2833,8 +2833,17 @@ function descriptionMentionsExperienceTitle(description: string, title: string):
   return pool.some((t) => descTokens.has(t));
 }
 
+/** The URL crFetchHomepageContent() actually requests for a stored
+ *  hjemmeside value (bare host -> https://). Extracted (dev-request
+ *  2026-10-07-experiences-beskrivelser-via-claude-code-uten-api) so GET
+ *  /admin/experiences-description-candidates reports exactly the URL the
+ *  kildetro path would fetch. */
+function crHomepageFetchUrl(homepageUrl: string): string {
+  return /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
+}
+
 async function crFetchHomepageContent(homepageUrl: string, fetchImpl?: typeof fetch): Promise<CrFetchOutcome> {
-  const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
+  const fetchUrl = crHomepageFetchUrl(homepageUrl);
   const primary = await crFetchPage(fetchUrl, fetchImpl);
   if (!primary.ok) {
     return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
@@ -32291,6 +32300,20 @@ export type ExperienceDescriptionTier = "kildetro" | "faktalinje" | "skip";
  */
 export const EXP_DESC_GENERATED_PROVENANCE_SENTINEL = "generated:katalogfelt-llm";
 
+/**
+ * Provenance marker for a `faktalinje` description written through POST
+ * /admin/experiences-description-write — text generated OUTSIDE this server
+ * by a Claude Code client (dev-request 2026-10-07-experiences-beskrivelser-
+ * via-claude-code-uten-api) and only gate-checked + stored here. Same "not a
+ * URL" contract as EXP_DESC_GENERATED_PROVENANCE_SENTINEL above (and the
+ * same "generated:" shape, so hostFromUrlLike()-based checks such as
+ * isContentFieldHomepageSourced() classify it identically), deliberately a
+ * DIFFERENT value so these rows can be told apart and reset together.
+ * experience-store.ts keeps a byte-identical local copy for
+ * description_kind (import-cycle reasons, see its comment).
+ */
+export const EXP_DESC_CLAUDE_CODE_PROVENANCE_SENTINEL = "generated:claude-code";
+
 /** The row shape the generator/judge are grounded on — the SAME field set
  *  routes/experiences-seo.ts builds its `facts`/`badges` from. */
 export type ExperienceDescriptionCandidate = {
@@ -32602,6 +32625,125 @@ export type ExpDescGenFailReason =
   | "no_title_node"
   | "fetch_failed";
 
+// ─── Prompt builders (dev-request 2026-10-07-experiences-beskrivelser-via-
+// claude-code-uten-api) ──────────────────────────────────────────────────
+// The three prompt texts below were inline template literals in
+// generateExperienceDescriptionNoDetailed(), generateExperienceDescription-
+// Kildetro() and judgeExperienceDescriptionCandidate(). They are moved here
+// VERBATIM (same characters, same interpolations) so GET /admin/experiences-
+// description-candidates can hand a Claude Code client the exact same
+// generator/judge instructions instead of a drifting copy. The three callers
+// build byte-identical prompts to before.
+
+/** The `faktalinje` generator prompt for a rendered facts block. */
+export function buildExperienceDescriptionFaktalinjePrompt(factsBlock: string): string {
+  return `Du skriver et kort faktasammendrag for opplevagent.no, en norsk markedsplass for opplevelser. Skriv ÉN til TO setninger om opplevelsen under.
+
+ABSOLUTTE REGLER:
+- Bruk KUN faktaopplysningene i listen nedenfor. Du har ingen annen kunnskap om denne opplevelsen.
+- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
+- Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
+- Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
+- Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten — heller ikke et sted du "vet" ligger i nærheten eller naturlig hører med. Står det ikke i listen, finnes det ikke i teksten.
+- Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region.
+- Ikke bruk adjektiver eller vurderende ord (for eksempel "flott", "unik", "fantastisk") med mindre ordet er direkte forankret i en oppgitt fakta.
+- Skriv på norsk bokmål, i sammenhengende setninger. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være ÉN til TO setninger, og ALDRI mer enn ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord totalt.
+- Ikke gjenta setninger eller fyll ut med tomme fraser.
+- Hvis faktagrunnlaget er for tynt til å skrive noe meningsfylt uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+
+Fakta:
+${factsBlock}
+
+Svar med kun selve setningen/setningene (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+}
+
+/** The `kildetro` generator prompt for an experience title and the (already
+ *  capped) homepage visible text. */
+export function buildExperienceDescriptionKildetroPrompt(title: string, cappedSource: string): string {
+  return `Du skriver en kort produktbeskrivelse for opplevagent.no, en norsk markedsplass for opplevelser. Beskrivelsen skal handle om opplevelsen «${title}».
+
+Kilden under er teksten på tilbyderens EGEN hjemmeside — det eneste du vet om opplevelsen.
+
+ABSOLUTTE REGLER:
+- Bruk KUN opplysninger som faktisk står i kildeteksten under. Du har ingen annen kunnskap om denne opplevelsen eller tilbyderen.
+- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall som ikke står i kildeteksten.
+- Ikke gjett, ikke anta, ikke lån detaljer fra liknende opplevelser du kjenner til.
+- Teksten skal handle om AKKURAT denne opplevelsen — ikke generell «om oss»-markedsføring om bedriften som helhet, med mindre kilden faktisk beskriver denne opplevelsen spesifikt.
+- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være minst ${EXP_DESC_KILDETRO_MIN_WORDS} ord og høyst ${EXP_DESC_KILDETRO_MAX_WORDS} ord.
+- Ikke gjenta setninger eller fyll ut med tomme fraser.
+- Hvis kildeteksten ikke inneholder noe brukbart om nettopp DENNE opplevelsen, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+
+Kildetekst (tilbyderens hjemmeside):
+${cappedSource}
+
+Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+}
+
+/** The judge prompt — `faktalinje` mode when `groundTruthText` is omitted,
+ *  `kildetro` ("dommer med fasit") mode when provided. Applies the same caps
+ *  the judge always applied (candidate to EXP_DESC_MAX_CHARS, ground truth to
+ *  GARDSSALG_REWRITE_SOURCE_CHAR_CAP). */
+export function buildExperienceDescriptionJudgePrompt(
+  candidateText: string,
+  factsBlock: string,
+  groundTruthText?: string
+): string {
+  const capped = (candidateText || "").slice(0, EXP_DESC_MAX_CHARS);
+  const prompt = groundTruthText
+    ? `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av kildeteksten under, som er hentet fra tilbyderens EGEN hjemmeside og er FASIT for hva som er sant om opplevelsen.
+
+Kildetekst (tilbyderens hjemmeside — fasit):
+${groundTruthText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP)}
+
+Kandidattekst:
+${capped}
+
+Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i kandidatteksten kan spores direkte til kildeteksten over.
+- Kandidatteksten inneholder ingen konkrete opplysninger som IKKE finnes i kildeteksten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
+- Kandidatteksten handler om AKKURAT denne opplevelsen — ikke bare generell «om oss»-markedsføring om bedriften som helhet.
+- Teksten er sammenhengende, ekte norsk prosa på 60-150 ord — ikke fyllstoff, ikke gjentatte setninger.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${EXP_DESC_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${EXP_DESC_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`
+    : `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
+
+Faktaliste (alt som er kjent):
+${factsBlock}
+
+Kandidattekst:
+${capped}
+
+Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i teksten (pris, varighet, gruppestørrelse, sted, sesong, inne/ute, språk, tilgjengelighet, oppmøtested, bestilling, tilbydernavn) stemmer med faktalisten.
+- Teksten inneholder ingen konkrete opplysninger som IKKE står i faktalisten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
+- Teksten er kort, sammenhengende, ekte norsk prosa (én til to setninger, høyst ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord) — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${EXP_DESC_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${EXP_DESC_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`;
+  return prompt;
+}
+
 /**
  * `faktalinje` generator — 1-2 setninger, <=EXP_DESC_FAKTALINJE_MAX_WORDS ord,
  * for providers with no usable homepage source. Historically this function
@@ -32624,25 +32766,7 @@ export async function generateExperienceDescriptionNoDetailed(
   if (!apiKey) return { text: null, reason: "no_api_key" };
 
   const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
-  const prompt = `Du skriver et kort faktasammendrag for opplevagent.no, en norsk markedsplass for opplevelser. Skriv ÉN til TO setninger om opplevelsen under.
-
-ABSOLUTTE REGLER:
-- Bruk KUN faktaopplysningene i listen nedenfor. Du har ingen annen kunnskap om denne opplevelsen.
-- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
-- Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
-- Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
-- Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten — heller ikke et sted du "vet" ligger i nærheten eller naturlig hører med. Står det ikke i listen, finnes det ikke i teksten.
-- Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region.
-- Ikke bruk adjektiver eller vurderende ord (for eksempel "flott", "unik", "fantastisk") med mindre ordet er direkte forankret i en oppgitt fakta.
-- Skriv på norsk bokmål, i sammenhengende setninger. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
-- Teksten skal være ÉN til TO setninger, og ALDRI mer enn ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord totalt.
-- Ikke gjenta setninger eller fyll ut med tomme fraser.
-- Hvis faktagrunnlaget er for tynt til å skrive noe meningsfylt uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
-
-Fakta:
-${factsBlock}
-
-Svar med kun selve setningen/setningene (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+  const prompt = buildExperienceDescriptionFaktalinjePrompt(factsBlock);
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -32720,24 +32844,7 @@ export async function generateExperienceDescriptionKildetro(
   const cappedSource = (homepageText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
   if (!cappedSource.trim()) return { text: null, reason: "empty_response" };
 
-  const prompt = `Du skriver en kort produktbeskrivelse for opplevagent.no, en norsk markedsplass for opplevelser. Beskrivelsen skal handle om opplevelsen «${row.title}».
-
-Kilden under er teksten på tilbyderens EGEN hjemmeside — det eneste du vet om opplevelsen.
-
-ABSOLUTTE REGLER:
-- Bruk KUN opplysninger som faktisk står i kildeteksten under. Du har ingen annen kunnskap om denne opplevelsen eller tilbyderen.
-- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall som ikke står i kildeteksten.
-- Ikke gjett, ikke anta, ikke lån detaljer fra liknende opplevelser du kjenner til.
-- Teksten skal handle om AKKURAT denne opplevelsen — ikke generell «om oss»-markedsføring om bedriften som helhet, med mindre kilden faktisk beskriver denne opplevelsen spesifikt.
-- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
-- Teksten skal være minst ${EXP_DESC_KILDETRO_MIN_WORDS} ord og høyst ${EXP_DESC_KILDETRO_MAX_WORDS} ord.
-- Ikke gjenta setninger eller fyll ut med tomme fraser.
-- Hvis kildeteksten ikke inneholder noe brukbart om nettopp DENNE opplevelsen, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
-
-Kildetekst (tilbyderens hjemmeside):
-${cappedSource}
-
-Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+  const prompt = buildExperienceDescriptionKildetroPrompt(row.title, cappedSource);
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -32830,57 +32937,7 @@ export async function judgeExperienceDescriptionCandidate(
     return { approved: false, reasoning: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
   }
 
-  const capped = (candidateText || "").slice(0, EXP_DESC_MAX_CHARS);
-  const prompt = groundTruthText
-    ? `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av kildeteksten under, som er hentet fra tilbyderens EGEN hjemmeside og er FASIT for hva som er sant om opplevelsen.
-
-Kildetekst (tilbyderens hjemmeside — fasit):
-${groundTruthText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP)}
-
-Kandidattekst:
-${capped}
-
-Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
-- Hver konkrete opplysning i kandidatteksten kan spores direkte til kildeteksten over.
-- Kandidatteksten inneholder ingen konkrete opplysninger som IKKE finnes i kildeteksten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
-- Kandidatteksten handler om AKKURAT denne opplevelsen — ikke bare generell «om oss»-markedsføring om bedriften som helhet.
-- Teksten er sammenhengende, ekte norsk prosa på 60-150 ord — ikke fyllstoff, ikke gjentatte setninger.
-- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
-
-Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
-${EXP_DESC_JUDGE_APPROVE_TOKEN}
-<kort begrunnelse>
-
-eller
-
-${EXP_DESC_JUDGE_REJECT_TOKEN}
-<kort begrunnelse>
-
-Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`
-    : `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
-
-Faktaliste (alt som er kjent):
-${factsBlock}
-
-Kandidattekst:
-${capped}
-
-Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
-- Hver konkrete opplysning i teksten (pris, varighet, gruppestørrelse, sted, sesong, inne/ute, språk, tilgjengelighet, oppmøtested, bestilling, tilbydernavn) stemmer med faktalisten.
-- Teksten inneholder ingen konkrete opplysninger som IKKE står i faktalisten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
-- Teksten er kort, sammenhengende, ekte norsk prosa (én til to setninger, høyst ${EXP_DESC_FAKTALINJE_MAX_WORDS} ord) — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
-- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
-
-Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
-${EXP_DESC_JUDGE_APPROVE_TOKEN}
-<kort begrunnelse>
-
-eller
-
-${EXP_DESC_JUDGE_REJECT_TOKEN}
-<kort begrunnelse>
-
-Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`;
+  const prompt = buildExperienceDescriptionJudgePrompt(candidateText, factsBlock, groundTruthText);
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -33251,82 +33308,91 @@ export function experienceDescriptionAttemptCooldownDays(outcome: string, reason
   return EXP_DESC_ATTEMPT_COOLDOWN_DAYS;
 }
 
-router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown; preview_only?: unknown };
-  // STRICT-FALSE parse — identical idiom to /admin/experiences-title-no-backfill
-  // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
-  // "" / undefined all mean dry run.
-  const dryRun = body.dry_run !== false;
-  // STRICT-TRUE parse (dev-request 2026-10-06-experiences-beskrivelsessteg-
-  // 4c-kohode-blokkering): ONLY the JSON boolean true asks for the zero-LLM
-  // preview (counts + candidate_ids_preview, no generator/judge call, no
-  // write). It wins over dry_run:false — a preview never writes — but it is
-  // meant to be sent with a dry run; the write-pause fence below still keys
-  // off dry_run alone, unchanged.
-  const previewOnly = body.preview_only === true;
+/** The two description UPDATE statements, hoisted VERBATIM out of the 4c
+ *  apply path (dev-request 2026-10-07-experiences-beskrivelser-via-claude-
+ *  code-uten-api) so POST /admin/experiences-description-write writes with
+ *  exactly the same SQL: `faktalinje` touches description + evidence only,
+ *  `kildetro` additionally stamps content_source = 'provider_site'. */
+const EXP_DESC_UPDATE_FAKTALINJE_SQL =
+  "UPDATE experiences SET description = ?, content_field_evidence = ?, updated_at = datetime('now') WHERE id = ?";
+const EXP_DESC_UPDATE_KILDETRO_SQL =
+  "UPDATE experiences SET description = ?, content_field_evidence = ?, content_source = 'provider_site', updated_at = datetime('now') WHERE id = ?";
 
-  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
-  // is never blocked.
-  if (!dryRun) {
-    const pauseBlock = experiencesWritePauseBlock();
-    if (pauseBlock) {
-      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
-      return;
-    }
-  }
+/** Attempt-row upsert/delete, hoisted VERBATIM out of the 4c apply path
+ *  (dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-
+ *  api) so the write route's `skip` items record attempts identically. */
+const EXP_DESC_ATTEMPT_UPSERT_SQL =
+  `INSERT INTO experience_description_attempts (experience_id, attempted_at, outcome, reason, facts_fingerprint)
+     VALUES (?, datetime('now'), ?, ?, ?)
+     ON CONFLICT(experience_id) DO UPDATE SET
+       attempted_at = excluded.attempted_at,
+       outcome = excluded.outcome,
+       reason = excluded.reason,
+       facts_fingerprint = excluded.facts_fingerprint`;
+const EXP_DESC_ATTEMPT_DELETE_SQL = "DELETE FROM experience_description_attempts WHERE experience_id = ?";
 
-  // Optional priority list. Parameterised placeholders only — never string
-  // interpolation of caller data into SQL (same discipline as the
-  // providerIds handling on the gårdssalg admin endpoints above).
-  //
-  // A MALFORMED `ids` is a 400, not a silent fall-through to the unfiltered
-  // catalog scan: "I asked for three named rows and instead got a full-batch
-  // spend across the whole catalog" is exactly the runaway this cap family
-  // exists to prevent. Omitting the key (or sending an explicitly empty
-  // array) remains the way to ask for the unfiltered scan.
-  let ids: string[] | null = null;
-  if (body.ids !== undefined && body.ids !== null) {
-    if (!Array.isArray(body.ids)) {
-      res.status(400).json({ error: "ids must be an array of experience ids" });
-      return;
-    }
-    if (body.ids.length > 0) {
-      ids = (body.ids as unknown[])
-        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
-        .map((v) => v.trim());
-      if (ids.length > EXP_DESC_IDS_CAP) {
-        res.status(400).json({ error: `Too many ids (max ${EXP_DESC_IDS_CAP} per call)` });
-        return;
-      }
-      if (ids.length === 0) {
-        res.status(400).json({ error: "ids contained no usable experience id" });
-        return;
-      }
-    }
-  }
-
-  // Per-app-instance fetch injection seam, same shape as the title-no
-  // backfill's `titleNoBackfillFetchImpl`: tests set it on their OWN Express
-  // app instance, production never does, so this falls back to global fetch.
-  const fetchImpl =
-    ((req.app?.get?.("experienceDescriptionFetchImpl")) as typeof fetch | undefined) ?? fetch;
-  // A SEPARATE seam for the `kildetro` path's homepage fetch (dev-request
-  // 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro) — kildetro
-  // spends TWO independent network calls per row (homepage fetch + LLM), so
-  // tests need to stub each independently rather than one stub having to
-  // distinguish both kinds of request.
-  const homepageFetchImpl =
-    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
-
-  const db = getExpDb("experiences");
-  const sql =
-    `SELECT e.id, e.title, e.description, e.category, e.subcategory, e.season,
+/** The candidate row's column list — ONE copy shared by the queue scan and
+ *  the write route's per-id lookup (dev-request 2026-10-07-experiences-
+ *  beskrivelser-via-claude-code-uten-api), so a fingerprint computed on
+ *  either side reads exactly the same fields. Uses aliases `e`/`p`. */
+const EXP_DESC_CANDIDATE_SELECT_COLUMNS =
+  `e.id, e.title, e.description, e.category, e.subcategory, e.season,
             e.indoor_outdoor, e.duration_min, e.duration_max, e.group_min, e.group_max,
             e.price_band, e.price_from, e.price_unit, e.languages, e.accessibility,
             e.meeting_point, e.kommune, e.fylke, e.booking_url,
             e.content_source, e.content_field_evidence,
             p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified,
-            p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside
+            p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside`;
+
+/** True for either GENERATED (non-homepage) description provenance marker:
+ *  the 4c in-server LLM writer's EXP_DESC_GENERATED_PROVENANCE_SENTINEL and
+ *  the Claude Code write route's EXP_DESC_CLAUDE_CODE_PROVENANCE_SENTINEL
+ *  (dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-
+ *  api). Both mark a `faktalinje` row; both are eligible for the kildetro
+ *  auto-supersede upgrade below. */
+export function isExperienceDescriptionGeneratedProvenance(value: unknown): boolean {
+  return value === EXP_DESC_GENERATED_PROVENANCE_SENTINEL || value === EXP_DESC_CLAUDE_CODE_PROVENANCE_SENTINEL;
+}
+
+/**
+ * The candidate predicate for a (gated) row: blank/junk description, OR the
+ * faktalinje->kildetro auto-supersede upgrade (see the comment at its call
+ * site in selectExperienceDescriptionQueue). Shared with the write route so a
+ * pre-written description can only land where the 4c writer itself would
+ * have been allowed to write.
+ */
+export function isExperienceDescriptionCandidateRow(r: ExperienceDescriptionCandidate): boolean {
+  if (experienceDescriptionNeedsEnrichment(r.description)) return true;
+  const evidence = expDescParseFieldEvidence(r.content_field_evidence);
+  if (!isExperienceDescriptionGeneratedProvenance(evidence.description)) return false;
+  return selectExperienceDescriptionTier(r).level === "kildetro";
+}
+
+/**
+ * The 4c candidate queue — publish gate, manual/claim exclusion, blank/junk
+ * filter + kildetro upgrade rule, worst-first ordering, attempt cooldown
+ * (bypassed when `ids` is given) and the thin-data precheck. Extracted
+ * VERBATIM from POST /admin/experiences-description-enrichment (dev-request
+ * 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api) so that
+ * route and GET /admin/experiences-description-candidates share one
+ * implementation. Pure read: no fetch, no LLM, no write.
+ */
+export function selectExperienceDescriptionQueue(
+  db: ReturnType<typeof getExpDb>,
+  ids: string[] | null
+): {
+  candidateRows: ExperienceDescriptionCandidate[];
+  eligibleRows: ExperienceDescriptionCandidate[];
+  queueCounts: {
+    candidates: number;
+    candidates_blank_or_junk: number;
+    candidates_before_cooldown: number;
+    skipped_recently_attempted: number;
+    skipped_thin_data_precheck: number;
+  };
+} {
+  const sql =
+    `SELECT ${EXP_DESC_CANDIDATE_SELECT_COLUMNS}
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
       WHERE ${PUBLISH_GATE_SQL}
@@ -33357,12 +33423,7 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // already-`kildetro` row (a real URL, never the sentinel, in evidence) is
   // never re-selected here, and a still-ineligible `faktalinje` row is never
   // re-run over itself.
-  const candidateRows = scanned.filter((r) => {
-    if (experienceDescriptionNeedsEnrichment(r.description)) return true;
-    const evidence = expDescParseFieldEvidence(r.content_field_evidence);
-    if (evidence.description !== EXP_DESC_GENERATED_PROVENANCE_SENTINEL) return false;
-    return selectExperienceDescriptionTier(r).level === "kildetro";
-  });
+  const candidateRows = scanned.filter(isExperienceDescriptionCandidateRow);
 
   // ── Kø-hode-blokkering fix (dev-request 2026-10-06-experiences-
   //    beskrivelsessteg-4c-kohode-blokkering) — everything from here to the
@@ -33440,6 +33501,82 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     skipped_recently_attempted: skippedRecentlyAttempted,
     skipped_thin_data_precheck: skippedThinDataPrecheck,
   };
+  return { candidateRows, eligibleRows, queueCounts };
+}
+
+router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown; preview_only?: unknown };
+  // STRICT-FALSE parse — identical idiom to /admin/experiences-title-no-backfill
+  // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
+  // "" / undefined all mean dry run.
+  const dryRun = body.dry_run !== false;
+  // STRICT-TRUE parse (dev-request 2026-10-06-experiences-beskrivelsessteg-
+  // 4c-kohode-blokkering): ONLY the JSON boolean true asks for the zero-LLM
+  // preview (counts + candidate_ids_preview, no generator/judge call, no
+  // write). It wins over dry_run:false — a preview never writes — but it is
+  // meant to be sent with a dry run; the write-pause fence below still keys
+  // off dry_run alone, unchanged.
+  const previewOnly = body.preview_only === true;
+
+  // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
+  // is never blocked.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  // Optional priority list. Parameterised placeholders only — never string
+  // interpolation of caller data into SQL (same discipline as the
+  // providerIds handling on the gårdssalg admin endpoints above).
+  //
+  // A MALFORMED `ids` is a 400, not a silent fall-through to the unfiltered
+  // catalog scan: "I asked for three named rows and instead got a full-batch
+  // spend across the whole catalog" is exactly the runaway this cap family
+  // exists to prevent. Omitting the key (or sending an explicitly empty
+  // array) remains the way to ask for the unfiltered scan.
+  let ids: string[] | null = null;
+  if (body.ids !== undefined && body.ids !== null) {
+    if (!Array.isArray(body.ids)) {
+      res.status(400).json({ error: "ids must be an array of experience ids" });
+      return;
+    }
+    if (body.ids.length > 0) {
+      ids = (body.ids as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim());
+      if (ids.length > EXP_DESC_IDS_CAP) {
+        res.status(400).json({ error: `Too many ids (max ${EXP_DESC_IDS_CAP} per call)` });
+        return;
+      }
+      if (ids.length === 0) {
+        res.status(400).json({ error: "ids contained no usable experience id" });
+        return;
+      }
+    }
+  }
+
+  // Per-app-instance fetch injection seam, same shape as the title-no
+  // backfill's `titleNoBackfillFetchImpl`: tests set it on their OWN Express
+  // app instance, production never does, so this falls back to global fetch.
+  const fetchImpl =
+    ((req.app?.get?.("experienceDescriptionFetchImpl")) as typeof fetch | undefined) ?? fetch;
+  // A SEPARATE seam for the `kildetro` path's homepage fetch (dev-request
+  // 2026-09-02-experiences-beskrivelsesnivaa-kort-og-kildetro) — kildetro
+  // spends TWO independent network calls per row (homepage fetch + LLM), so
+  // tests need to stub each independently rather than one stub having to
+  // distinguish both kinds of request.
+  const homepageFetchImpl =
+    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
+
+  const db = getExpDb("experiences");
+  // Candidate selection lives in selectExperienceDescriptionQueue() (dev-
+  // request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api) so
+  // this route and GET /admin/experiences-description-candidates can never
+  // drift on which rows, in which order, are eligible.
+  const { candidateRows, eligibleRows, queueCounts } = selectExperienceDescriptionQueue(db, ids);
 
   if (previewOnly) {
     // Zero LLM calls, zero writes — counts and the next ids in line only.
@@ -33491,12 +33628,8 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // gated strictly behind level === "kildetro") — `faktalinje`'s write stays
   // byte-identical to the retired single tier's write (sentinel evidence, no
   // content_source change).
-  const setDescriptionFaktalinje = db.prepare(
-    "UPDATE experiences SET description = ?, content_field_evidence = ?, updated_at = datetime('now') WHERE id = ?"
-  );
-  const setDescriptionKildetro = db.prepare(
-    "UPDATE experiences SET description = ?, content_field_evidence = ?, content_source = 'provider_site', updated_at = datetime('now') WHERE id = ?"
-  );
+  const setDescriptionFaktalinje = db.prepare(EXP_DESC_UPDATE_FAKTALINJE_SQL);
+  const setDescriptionKildetro = db.prepare(EXP_DESC_UPDATE_KILDETRO_SQL);
   const tx = db.transaction(() => {
     for (const { row, outcome } of writable) {
       const evidence = expDescParseFieldEvidence(row.content_field_evidence);
@@ -33520,16 +33653,8 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   // that ended in a CONTENT outcome (shouldRecordDescriptionAttempt) is
   // upserted with its current facts fingerprint, and an infra failure
   // records nothing so the row is retried on the very next call.
-  const upsertAttempt = db.prepare(
-    `INSERT INTO experience_description_attempts (experience_id, attempted_at, outcome, reason, facts_fingerprint)
-     VALUES (?, datetime('now'), ?, ?, ?)
-     ON CONFLICT(experience_id) DO UPDATE SET
-       attempted_at = excluded.attempted_at,
-       outcome = excluded.outcome,
-       reason = excluded.reason,
-       facts_fingerprint = excluded.facts_fingerprint`
-  );
-  const deleteAttempt = db.prepare("DELETE FROM experience_description_attempts WHERE experience_id = ?");
+  const upsertAttempt = db.prepare(EXP_DESC_ATTEMPT_UPSERT_SQL);
+  const deleteAttempt = db.prepare(EXP_DESC_ATTEMPT_DELETE_SQL);
   const writtenIds = new Set(writable.map(({ row }) => row.id));
   const attemptTx = db.transaction(() => {
     batch.forEach((row, i) => {
@@ -33590,6 +33715,450 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
       }, {}),
     },
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api
+// GET  /admin/experiences-description-candidates
+// POST /admin/experiences-description-write
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// WHY. Daniel will not pay for API credit when his Max subscription already
+// covers Claude usage, and a subscription login cannot be used from this
+// server (Anthropic allows subscription OAuth only in claude.ai and Claude
+// Code). So the flow is inverted: a Claude Code client (a session now, a
+// Cloud Routine later) writes the description and has an independent judge
+// review it; THIS server only (a) exposes the same candidate queue + facts
+// the 4c writer above would use, and (b) stores pre-written text after
+// running it through the same deterministic gates 4c applies to its own
+// generator output. NO code path below calls an LLM — the only network call
+// is the kildetro path's homepage fetch, through the existing
+// crFetchHomepageContent() contract and the same
+// `experienceDescriptionHomepageFetchImpl` test seam.
+//
+// SAFETY POSTURE — identical to 4c's (see "SAFETY POSTURE" above), with one
+// deliberate difference: the judge verdict is the CLIENT's. The server cannot
+// re-run a judge without an LLM, so it requires `judge.approved === true`
+// and re-checks everything that is deterministic (publish gate, candidate
+// rule, facts fingerprint, tier, sentinel, word/char bounds, ungrounded
+// numbers, kildetro title-token + its own homepage fetch). A stale
+// fingerprint means the facts the client wrote from are no longer the row's
+// facts — rejected, never written.
+
+const EXP_DESC_CANDIDATES_DEFAULT_LIMIT = 20;
+const EXP_DESC_CANDIDATES_MAX_LIMIT = 50;
+const EXP_DESC_WRITE_MAX_ITEMS = 25;
+/** Placeholders a client substitutes in the prompt texts the candidates
+ *  route returns: the homepage visible text it fetched itself (kildetro
+ *  generator + judge), and the candidate text under review (judge). */
+export const EXP_DESC_HOMEPAGE_TEXT_PLACEHOLDER = "{{HJEMMESIDE_TEKST}}";
+export const EXP_DESC_JUDGE_CANDIDATE_PLACEHOLDER = "{{KANDIDATTEKST}}";
+
+/** The fixed set of content reasons a client may report for a `skip` item —
+ *  each one is a content/quality outcome under isRetryableDescription-
+ *  Failure()'s classification (plus judge_rejected/thin_data), never an
+ *  infra failure: a client's own network/API trouble is simply not reported,
+ *  so the row stays eligible. */
+export const EXP_DESC_WRITE_SKIP_REASONS = [
+  "sentinel",
+  "judge_rejected",
+  "below_word_floor",
+  "above_word_ceiling",
+  "ungrounded_numbers",
+  "thin_data",
+  "no_title_node",
+  "fetch_failed",
+  "empty_response",
+] as const;
+export type ExpDescWriteSkipReason = (typeof EXP_DESC_WRITE_SKIP_REASONS)[number];
+
+/** Word/char bounds per tier — the same constants the two generators
+ *  enforce. faktalinje has no floor beyond non-empty (word_min 1), exactly
+ *  like generateExperienceDescriptionNoDetailed(). */
+export function experienceDescriptionLevelBounds(
+  level: "kildetro" | "faktalinje"
+): { word_min: number; word_max: number; char_max: number } {
+  return level === "kildetro"
+    ? { word_min: EXP_DESC_KILDETRO_MIN_WORDS, word_max: EXP_DESC_KILDETRO_MAX_WORDS, char_max: EXP_DESC_MAX_CHARS }
+    : { word_min: 1, word_max: EXP_DESC_FAKTALINJE_MAX_WORDS, char_max: EXP_DESC_MAX_CHARS };
+}
+
+/**
+ * The network-free gates for a pre-written description, in the SAME order
+ * the generators apply them to their own output: empty, sentinel (bare or
+ * smuggled — either way the text is not a description), char cap, word
+ * floor/ceiling, and for kildetro the title-token rule. Returns the reject
+ * reason, or null when every gate passes. Numbers are checked separately
+ * (prewrittenDescriptionHasUngroundedNumbers) because kildetro needs the
+ * homepage text first.
+ */
+export function checkPrewrittenExperienceDescriptionShape(
+  text: string,
+  level: "kildetro" | "faktalinje",
+  title: string
+): string | null {
+  const cleaned = text.trim();
+  if (!cleaned) return "empty_description";
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return "sentinel";
+  const b = experienceDescriptionLevelBounds(level);
+  if (cleaned.length > b.char_max) return "char_cap_exceeded";
+  const words = expDescWordCount(cleaned);
+  if (words < b.word_min) return "below_word_floor";
+  if (words > b.word_max) return "above_word_ceiling";
+  if (level === "kildetro" && !descriptionMentionsExperienceTitle(cleaned, title)) return "no_title_node";
+  return null;
+}
+
+/**
+ * Ungrounded-number gate for a pre-written description. faktalinje: every
+ * number must appear in the facts block (same as the generator). kildetro:
+ * in the facts block OR the homepage visible text the SERVER fetched.
+ *
+ * Judgement call: the FULL extracted homepage text is used here, not the
+ * GARDSSALG_REWRITE_SOURCE_CHAR_CAP slice the in-server kildetro generator is
+ * prompted with — a Claude Code client reads the homepage itself and may
+ * legitimately quote a number from further down the page; the property that
+ * matters is "the number is on the provider's own page", which the full text
+ * proves just as well.
+ */
+export function prewrittenDescriptionHasUngroundedNumbers(
+  text: string,
+  level: "kildetro" | "faktalinje",
+  factsBlock: string,
+  homepageText: string | null
+): boolean {
+  const grounding = level === "kildetro" ? `${factsBlock}\n${homepageText ?? ""}` : factsBlock;
+  return expDescHasUngroundedNumbers(text.trim(), grounding);
+}
+
+/** Attempt-row outcome/reason for a client-reported `skip` item, in the same
+ *  format the 4c apply path stores (experienceDescriptionAttemptReason):
+ *  `<level>:<reason>`, so experienceDescriptionAttemptCooldownDays() gives
+ *  kildetro fetch_failed/empty_response the 7-day window and everything else
+ *  30 days. */
+export function experienceDescriptionSkipAttempt(
+  level: ExperienceDescriptionTier,
+  reason: ExpDescWriteSkipReason
+): { outcome: string; reason: string } {
+  const outcome = reason === "thin_data" ? "thin_data" : reason === "judge_rejected" ? "judge_rejected" : "generation_failed";
+  return { outcome, reason: `${level}:${reason}` };
+}
+
+router.get("/admin/experiences-description-candidates", requireAdmin, (req: Request, res: Response) => {
+  // `?limit=` default 20, clamped to 1..50; anything non-numeric -> default.
+  const rawLimit = Number.parseInt(String((req.query as Record<string, unknown> | undefined)?.limit ?? ""), 10);
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(EXP_DESC_CANDIDATES_MAX_LIMIT, Math.max(1, rawLimit))
+    : EXP_DESC_CANDIDATES_DEFAULT_LIMIT;
+
+  const db = getExpDb("experiences");
+  // The SAME queue as the 4c route (no `ids` -> cooldown applies). Pure
+  // read: no fetch, no LLM, no write.
+  const { eligibleRows, queueCounts } = selectExperienceDescriptionQueue(db, null);
+
+  const items = eligibleRows.slice(0, limit).map((row) => {
+    // eligibleRows never contains a `skip`-tier row (thin-data precheck).
+    const level = selectExperienceDescriptionTier(row).level as "kildetro" | "faktalinje";
+    const factsBlock = renderExperienceDescriptionFactsBlock(row, buildExperienceDescriptionFacts(row));
+    return {
+      id: row.id,
+      title: row.title,
+      level,
+      facts_block: factsBlock,
+      provider_navn: row.provider_navn ?? null,
+      homepage_url: level === "kildetro" ? crHomepageFetchUrl((row.provider_hjemmeside ?? "").trim()) : null,
+      facts_fingerprint: experienceDescriptionFactsFingerprint(row),
+      ...experienceDescriptionLevelBounds(level),
+      // The exact generator/judge instructions the in-server path uses, from
+      // the shared prompt builders. kildetro generator + both judge prompts
+      // carry placeholders the client fills in (see `rules.placeholders`).
+      generator_prompt: level === "faktalinje"
+        ? buildExperienceDescriptionFaktalinjePrompt(factsBlock)
+        : buildExperienceDescriptionKildetroPrompt(row.title, EXP_DESC_HOMEPAGE_TEXT_PLACEHOLDER),
+      judge_prompt: level === "faktalinje"
+        ? buildExperienceDescriptionJudgePrompt(EXP_DESC_JUDGE_CANDIDATE_PLACEHOLDER, factsBlock)
+        : buildExperienceDescriptionJudgePrompt(EXP_DESC_JUDGE_CANDIDATE_PLACEHOLDER, factsBlock, EXP_DESC_HOMEPAGE_TEXT_PLACEHOLDER),
+    };
+  });
+
+  res.json({
+    success: true,
+    limit,
+    ...queueCounts,
+    returned: items.length,
+    rules: {
+      sentinel: EXP_DESC_SENTINEL,
+      judge_tokens: { approve: EXP_DESC_JUDGE_APPROVE_TOKEN, reject: EXP_DESC_JUDGE_REJECT_TOKEN },
+      judge_required: "an independent judge must return approve; send judge.approved === true or the item is rejected",
+      levels: {
+        kildetro: {
+          ...experienceDescriptionLevelBounds("kildetro"),
+          source: "the provider's own homepage text only (homepage_url)",
+          title_token_required: true,
+          numbers_grounded_in: "facts_block or homepage text",
+        },
+        faktalinje: {
+          ...experienceDescriptionLevelBounds("faktalinje"),
+          source: "facts_block only",
+          title_token_required: false,
+          numbers_grounded_in: "facts_block",
+        },
+      },
+      numbers: "every digit run in the description must appear in its grounding text (digit-group separators are normalised); spell numbers out where natural",
+      homepage_source_char_cap: GARDSSALG_REWRITE_SOURCE_CHAR_CAP,
+      placeholders: {
+        homepage_text: EXP_DESC_HOMEPAGE_TEXT_PLACEHOLDER,
+        judge_candidate: EXP_DESC_JUDGE_CANDIDATE_PLACEHOLDER,
+      },
+      skip_reasons: EXP_DESC_WRITE_SKIP_REASONS,
+      max_items_per_write: EXP_DESC_WRITE_MAX_ITEMS,
+      write_endpoint: "/api/opplevelser/admin/experiences-description-write",
+    },
+    items,
+  });
+});
+
+type ExpDescWriteItem =
+  | {
+      id: string;
+      facts_fingerprint: string;
+      outcome: "write";
+      level: "kildetro" | "faktalinje";
+      description: string;
+      judge: { approved?: unknown; model?: unknown; reasoning?: unknown };
+      homepage_url: string | null;
+    }
+  | { id: string; facts_fingerprint: string; outcome: "skip"; reason: ExpDescWriteSkipReason };
+
+/** Structural validation of one item. A malformed item is a 400 for the
+ *  whole call (a client bug, not a content outcome); content gates are per
+ *  item. Returns the parsed item or an error string. */
+function parseExpDescWriteItem(raw: unknown, index: number): ExpDescWriteItem | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return `items[${index}] must be an object`;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || r.id.trim() === "") return `items[${index}].id must be a non-empty string`;
+  if (typeof r.facts_fingerprint !== "string" || r.facts_fingerprint.trim() === "") {
+    return `items[${index}].facts_fingerprint must be a non-empty string`;
+  }
+  const id = r.id.trim();
+  const facts_fingerprint = r.facts_fingerprint.trim();
+  if (r.outcome === "skip") {
+    if (typeof r.reason !== "string" || !(EXP_DESC_WRITE_SKIP_REASONS as readonly string[]).includes(r.reason)) {
+      return `items[${index}].reason must be one of ${EXP_DESC_WRITE_SKIP_REASONS.join(", ")}`;
+    }
+    return { id, facts_fingerprint, outcome: "skip", reason: r.reason as ExpDescWriteSkipReason };
+  }
+  if (r.outcome !== "write") return `items[${index}].outcome must be "write" or "skip"`;
+  if (r.level !== "kildetro" && r.level !== "faktalinje") return `items[${index}].level must be "kildetro" or "faktalinje"`;
+  if (typeof r.description !== "string") return `items[${index}].description must be a string`;
+  if (!r.judge || typeof r.judge !== "object" || Array.isArray(r.judge)) return `items[${index}].judge must be an object`;
+  if (r.homepage_url !== undefined && r.homepage_url !== null && typeof r.homepage_url !== "string") {
+    return `items[${index}].homepage_url must be a string when present`;
+  }
+  return {
+    id,
+    facts_fingerprint,
+    outcome: "write",
+    level: r.level,
+    description: r.description,
+    judge: r.judge as { approved?: unknown },
+    homepage_url: typeof r.homepage_url === "string" && r.homepage_url.trim() !== "" ? r.homepage_url.trim() : null,
+  };
+}
+
+type ExpDescWriteResult = {
+  id: string;
+  result: "written" | "rejected" | "skipped_recorded" | "would_write" | "would_record_skip";
+  reason?: string;
+};
+
+router.post("/admin/experiences-description-write", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown };
+  // STRICT-FALSE parse — same idiom as the 4c route: only the JSON boolean
+  // false writes.
+  const dryRun = body.dry_run !== false;
+
+  // Enrichment write-pause fence — apply only, exactly like 4c.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > EXP_DESC_WRITE_MAX_ITEMS) {
+    res.status(400).json({ error: `items must be an array of 1..${EXP_DESC_WRITE_MAX_ITEMS} items` });
+    return;
+  }
+  const items: ExpDescWriteItem[] = [];
+  for (let i = 0; i < body.items.length; i++) {
+    const parsed = parseExpDescWriteItem(body.items[i], i);
+    if (typeof parsed === "string") {
+      res.status(400).json({ error: parsed });
+      return;
+    }
+    items.push(parsed);
+  }
+  const seen = new Set<string>();
+  for (const it of items) {
+    if (seen.has(it.id)) {
+      res.status(400).json({ error: `duplicate id in items: ${it.id}` });
+      return;
+    }
+    seen.add(it.id);
+  }
+
+  // The kildetro homepage fetch uses the SAME seam as 4c. There is no LLM
+  // seam on this route because nothing here ever calls an LLM.
+  const homepageFetchImpl =
+    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
+
+  const db = getExpDb("experiences");
+  // Per-id lookup WITHOUT the publish gate in WHERE, so a rejection can say
+  // WHY (not_found vs. not_published); the gate is evaluated as a column.
+  // Parameterised placeholders only.
+  type LookupRow = ExperienceDescriptionCandidate & { expdesc_published: number | null };
+  const lookupSql = (n: number) =>
+    `SELECT ${EXP_DESC_CANDIDATE_SELECT_COLUMNS}, (${PUBLISH_GATE_SQL}) AS expdesc_published
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.id IN (${Array.from({ length: n }, () => "?").join(",")})`;
+  const lookup = (ids: string[]): Map<string, LookupRow> =>
+    new Map((db.prepare(lookupSql(ids.length)).all(...ids) as LookupRow[]).map((r) => [r.id, r]));
+
+  /** Row-level eligibility shared by write and skip items, and re-run
+   *  inside the write transaction. Returns a reject reason or null. */
+  const rowRejectReason = (row: LookupRow | undefined, fingerprint: string): string | null => {
+    if (!row) return "not_found";
+    if (Number(row.expdesc_published) !== 1) return "not_published";
+    if (row.content_source === "manual" || row.content_source === "claim") return "manual_or_claim";
+    if (!isExperienceDescriptionCandidateRow(row)) return "not_candidate";
+    if (experienceDescriptionFactsFingerprint(row) !== fingerprint) return "stale_fingerprint";
+    return null;
+  };
+
+  const rows = lookup(items.map((it) => it.id));
+  const results: ExpDescWriteResult[] = [];
+  const pendingWrites: Array<{ item: ExpDescWriteItem & { outcome: "write" }; text: string; evidenceDescription: string }> = [];
+  const pendingSkips: Array<{ id: string; outcome: string; reason: string; fingerprint: string }> = [];
+
+  for (const item of items) {
+    const row = rows.get(item.id);
+    const rowReason = rowRejectReason(row, item.facts_fingerprint);
+    if (rowReason || !row) {
+      results.push({ id: item.id, result: "rejected", reason: rowReason ?? "not_found" });
+      continue;
+    }
+    const currentLevel = selectExperienceDescriptionTier(row).level;
+
+    if (item.outcome === "skip") {
+      const attempt = experienceDescriptionSkipAttempt(currentLevel, item.reason);
+      if (dryRun) {
+        results.push({ id: item.id, result: "would_record_skip", reason: item.reason });
+      } else {
+        pendingSkips.push({ id: item.id, ...attempt, fingerprint: item.facts_fingerprint });
+        results.push({ id: item.id, result: "skipped_recorded", reason: item.reason });
+      }
+      continue;
+    }
+
+    if (item.level !== currentLevel) {
+      results.push({ id: item.id, result: "rejected", reason: "level_mismatch" });
+      continue;
+    }
+    if (item.judge.approved !== true) {
+      results.push({ id: item.id, result: "rejected", reason: "judge_not_approved" });
+      continue;
+    }
+    const text = item.description.trim();
+    const shapeReason = checkPrewrittenExperienceDescriptionShape(text, item.level, row.title);
+    if (shapeReason) {
+      results.push({ id: item.id, result: "rejected", reason: shapeReason });
+      continue;
+    }
+    const factsBlock = renderExperienceDescriptionFactsBlock(row, buildExperienceDescriptionFacts(row));
+
+    if (item.level === "faktalinje") {
+      if (prewrittenDescriptionHasUngroundedNumbers(text, "faktalinje", factsBlock, null)) {
+        results.push({ id: item.id, result: "rejected", reason: "ungrounded_numbers" });
+        continue;
+      }
+      pendingWrites.push({ item, text, evidenceDescription: EXP_DESC_CLAUDE_CODE_PROVENANCE_SENTINEL });
+      results.push({ id: item.id, result: dryRun ? "would_write" : "written" });
+      continue;
+    }
+
+    // kildetro: the client's homepage_url (optional) must name the same host
+    // the server is about to fetch — a description grounded in some OTHER
+    // site must not be stamped with this provider's homepage provenance.
+    const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+    if (item.homepage_url && hostFromUrlLike(item.homepage_url) !== hostFromUrlLike(hjemmeside)) {
+      results.push({ id: item.id, result: "rejected", reason: "homepage_mismatch" });
+      continue;
+    }
+    let fetched: CrFetchOutcome;
+    try {
+      fetched = await crFetchHomepageContent(hjemmeside, homepageFetchImpl);
+    } catch {
+      results.push({ id: item.id, result: "rejected", reason: "fetch_failed" });
+      continue;
+    }
+    if (!fetched.ok) {
+      results.push({ id: item.id, result: "rejected", reason: "fetch_failed" });
+      continue;
+    }
+    const homepageText = extractVisibleText(fetched.combinedHtml);
+    if (prewrittenDescriptionHasUngroundedNumbers(text, "kildetro", factsBlock, homepageText)) {
+      results.push({ id: item.id, result: "rejected", reason: "ungrounded_numbers" });
+      continue;
+    }
+    pendingWrites.push({ item, text, evidenceDescription: fetched.fetchUrl });
+    results.push({ id: item.id, result: dryRun ? "would_write" : "written" });
+  }
+
+  if (!dryRun && (pendingWrites.length > 0 || pendingSkips.length > 0)) {
+    // ONE transaction, the SAME two UPDATE statements as 4c. Each write
+    // re-checks its row first: the kildetro homepage fetch above is async,
+    // so another writer could have filled/changed the row in between — a
+    // changed row is rejected, never overwritten.
+    const setDescriptionFaktalinje = db.prepare(EXP_DESC_UPDATE_FAKTALINJE_SQL);
+    const setDescriptionKildetro = db.prepare(EXP_DESC_UPDATE_KILDETRO_SQL);
+    const upsertAttempt = db.prepare(EXP_DESC_ATTEMPT_UPSERT_SQL);
+    const deleteAttempt = db.prepare(EXP_DESC_ATTEMPT_DELETE_SQL);
+    const tx = db.transaction(() => {
+      const fresh = lookup([...pendingWrites.map((w) => w.item.id), ...pendingSkips.map((k) => k.id)]);
+      for (const w of pendingWrites) {
+        const row = fresh.get(w.item.id);
+        if (rowRejectReason(row, w.item.facts_fingerprint) || !row || selectExperienceDescriptionTier(row).level !== w.item.level) {
+          const r = results.find((x) => x.id === w.item.id);
+          if (r) { r.result = "rejected"; r.reason = "changed_during_call"; }
+          continue;
+        }
+        const evidence = expDescParseFieldEvidence(row.content_field_evidence);
+        evidence.description = w.evidenceDescription;
+        if (w.item.level === "kildetro") {
+          setDescriptionKildetro.run(w.text, JSON.stringify(evidence), row.id);
+        } else {
+          setDescriptionFaktalinje.run(w.text, JSON.stringify(evidence), row.id);
+        }
+        deleteAttempt.run(row.id);
+      }
+      for (const k of pendingSkips) {
+        upsertAttempt.run(k.id, k.outcome, k.reason, k.fingerprint);
+      }
+    });
+    tx();
+  }
+
+  const totals = { written: 0, rejected: 0, skipped_recorded: 0, would_write: 0, would_record_skip: 0 };
+  for (const r of results) totals[r.result]++;
+  // One summary line per call: ids + results only, never description text.
+  console.log(
+    `[experiences-description-write] dry_run=${dryRun} ` +
+      results.map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}`).join(" ")
+  );
+  res.json({ success: true, dry_run: dryRun, totals, results });
 });
 
 export default router;
