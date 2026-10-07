@@ -43276,6 +43276,25 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/experiences-data-corrections (+ /revert): source-backed
+// factual corrections of opplevagent rows with an audit table and revert.
+// Own in-memory experiences DB; any fetch is counted and asserted zero.
+runSerial(async () => {
+  console.log("\n── experiences-data-corrections ──");
+  try {
+    const { runOpplevelserExperienceDataCorrectionsTests } = require("../src/routes/opplevelser-experience-data-corrections.test") as
+      typeof import("../src/routes/opplevelser-experience-data-corrections.test");
+    const dc = await runOpplevelserExperienceDataCorrectionsTests({ log: false });
+    passed += dc.passed;
+    failed += dc.failed;
+    for (const f of dc.failures) failures.push("experience-data-corrections: " + f);
+    console.log(`  experience-data-corrections: ${dc.passed} passed, ${dc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-data-corrections: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: the
 // hourly proposals job (GitHub contents API -> shared write function) + its
 // status GET. Own in-memory experiences DB; GitHub is a stub; any request to
