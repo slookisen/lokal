@@ -637,6 +637,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // convention as the description-code-artifact sweep's own test file
         // above).
         "routes/opplevelser-experience-brreg-recheck-backfill.test.ts",
+        // experiences-description-write (dev-request 2026-10-07-experiences-
+        // beskrivelser-via-claude-code-uten-api): another route gated by the
+        // SAME shared opplevelser.ts helper, plus its own test file, which
+        // sets/clears the pause via the service to prove the wiring.
+        "routes/opplevelser-experience-description-write.test.ts",
         // experiences-orgnr-from-website (dev-request 2026-09-14-opplevagent-
         // karantene-utgang-brreg-krav, Trinn A): a 20th route gated by the
         // SAME shared opplevelser.ts helper, plus its own test file, which

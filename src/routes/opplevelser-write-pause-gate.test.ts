@@ -129,6 +129,8 @@ function gatedRoutes(hjemmeside: string): GatedRoute[] {
     { path: "/admin/content-refresh", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
     { path: "/admin/gardssalg-content-refresh", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
     { path: "/admin/experiences-description-enrichment", flag: "dry_run (strict-false)", applyBody: { dry_run: false, ids: ["wpg-nope"] }, dryRunBody: { ids: ["wpg-nope"] } },
+    // dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api
+    { path: "/admin/experiences-description-write", flag: "dry_run (strict-false)", applyBody: { dry_run: false, items: [{ id: "wpg-nope", facts_fingerprint: "x", outcome: "skip", reason: "sentinel" }] }, dryRunBody: { items: [{ id: "wpg-nope", facts_fingerprint: "x", outcome: "skip", reason: "sentinel" }] } },
     { path: "/admin/experiences-title-no-backfill", flag: "dry_run (strict-false)", applyBody: { dry_run: false }, dryRunBody: {} },
     { path: "/admin/experiences-content-judge-sweep", flag: "apply (=== true)", applyBody: { apply: true }, dryRunBody: {} },
     { path: "/admin/experiences-dedup-backfill", flag: "(none — always writes)", applyBody: {}, dryRunBody: null },

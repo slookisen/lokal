@@ -43241,6 +43241,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api:
+// GET /admin/experiences-description-candidates + POST /admin/experiences-
+// description-write — the no-LLM Claude Code description flow. Own
+// in-memory experiences DB; globalThis.fetch and the homepage seam fail (and
+// count) any request to api.anthropic.com.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api: experiences-description-write ──");
+  try {
+    const { runOpplevelserExperienceDescriptionWriteTests } = require("../src/routes/opplevelser-experience-description-write.test") as
+      typeof import("../src/routes/opplevelser-experience-description-write.test");
+    const cw = await runOpplevelserExperienceDescriptionWriteTests({ log: false });
+    passed += cw.passed;
+    failed += cw.failed;
+    for (const f of cw.failures) failures.push("experience-description-write: " + f);
+    console.log(`  experience-description-write: ${cw.passed} passed, ${cw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-description-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
 // 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
 // /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —

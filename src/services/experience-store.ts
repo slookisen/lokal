@@ -2693,11 +2693,20 @@ export function parseContentFieldEvidence(raw: string | null | undefined): Recor
 // SENTINEL's sibling constants. MUST stay byte-identical to the route's own
 // constant — both are covered by the description-enrichment test suite.
 const DESCRIPTION_KIND_FAKTALINJE_SENTINEL = "generated:katalogfelt-llm";
+// dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api:
+// local copy of routes/opplevelser.ts's EXP_DESC_CLAUDE_CODE_PROVENANCE_
+// SENTINEL (same import-cycle reasoning as above) — a faktalinje written by
+// a Claude Code client through POST /admin/experiences-description-write is
+// the same short generated-facts tier and gets the same badge. MUST stay
+// byte-identical to the route's constant (covered by the write-route tests).
+const DESCRIPTION_KIND_FAKTALINJE_CLAUDE_CODE_SENTINEL = "generated:claude-code";
 
 /**
  * `description_kind` for a hydrated row (dev-request 2026-09-02-experiences-
  * beskrivelsesnivaa-kort-og-kildetro): "faktalinje" iff `description`'s
- * provenance entry is exactly the generated-facts sentinel, else null. A
+ * provenance entry is exactly one of the generated-facts sentinels (the 4c
+ * in-server writer's, or — dev-request 2026-10-07-experiences-beskrivelser-
+ * via-claude-code-uten-api — the Claude Code write route's), else null. A
  * `kildetro` row (a real homepage URL in evidence) intentionally also
  * resolves to null here — the badge only needs to flag the lower-trust
  * faktalinje case; a `kildetro` row renders with no badge, same as any other
@@ -2705,7 +2714,10 @@ const DESCRIPTION_KIND_FAKTALINJE_SENTINEL = "generated:katalogfelt-llm";
  */
 function descriptionKindOf(contentFieldEvidenceRaw: string | null | undefined): "faktalinje" | null {
   const evidence = parseContentFieldEvidence(contentFieldEvidenceRaw);
-  return evidence.description === DESCRIPTION_KIND_FAKTALINJE_SENTINEL ? "faktalinje" : null;
+  return evidence.description === DESCRIPTION_KIND_FAKTALINJE_SENTINEL ||
+    evidence.description === DESCRIPTION_KIND_FAKTALINJE_CLAUDE_CODE_SENTINEL
+    ? "faktalinje"
+    : null;
 }
 
 /** The provider-level homepage domain a field's evidence is compared
