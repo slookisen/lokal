@@ -34308,6 +34308,7 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
 // corrections audit row whose `column_changes` the revert route replays
 // backwards.
 
+import type { BrregVerifyResult, BrregAddress } from "../services/brreg-client";
 import {
   findKommune2024Matches,
   kommune2024DisplayName,
@@ -34704,6 +34705,19 @@ function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } |
   return null;
 }
 
+class ExpDcItemRollback extends Error {}
+
+type ExpDcBrregVerdict = { verify: BrregVerifyResult; address: BrregAddress | null };
+
+/** Brreg's registered name vs the provider name the item gives: the same
+ *  token-overlap rule the manual org.nr. approval path uses
+ *  (brregNameOverlapsProviderName — legal-form/filler words never count),
+ *  with IKS also stripped. */
+export function expDcBrregNameMatches(given: string, brregName: string | null): boolean {
+  const strip = (s: string | null) => (s ?? "").replace(/\b(iks|ks|ba|sa|as|asa)\b/gi, " ");
+  return brregNameOverlapsProviderName(strip(given), strip(brregName));
+}
+
 /** Field -> the experiences columns it writes, for content_field_evidence. */
 const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
   kommune: ["kommune"],
@@ -34723,11 +34737,11 @@ const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
  * back, so a preview can never drift from what apply would do. The caller
  * owns auth and the write-pause fence. Never calls the network.
  */
-export function applyExperienceDataCorrections(
+export async function applyExperienceDataCorrections(
   db: ReturnType<typeof getExpDb>,
   body: { items?: unknown; batch_label?: unknown },
-  opts: { dryRun: boolean; logTag?: string }
-): ExperienceDataCorrectionsResult {
+  opts: { dryRun: boolean; logTag?: string; brregFetchImpl?: typeof fetch }
+): Promise<ExperienceDataCorrectionsResult> {
   const rawItems = body.items;
   if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXP_DC_MAX_ITEMS) {
     return { ok: false, error: `items must be an array of 1..${EXP_DC_MAX_ITEMS} items` };
@@ -34845,6 +34859,38 @@ export function applyExperienceDataCorrections(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
   );
 
+  // Brreg pre-resolution — the ONLY network this route makes, and never
+  // inside the SQLite transaction. Every org.nr. a provider item names that
+  // no existing provider row already carries is looked up once (an existing
+  // org_nr match wins with no network call at all).
+  const brregVerdicts = new Map<string, ExpDcBrregVerdict>();
+  {
+    const brregFetch = opts.brregFetchImpl ?? fetch;
+    const orgs = new Set<string>();
+    for (const it of live) {
+      if (it.field !== "provider" || it.action !== "correct") continue;
+      const parsed = expDcParseProvider(String(it.new_value));
+      if (!parsed.org_nr) continue;
+      const known = db.prepare("SELECT 1 FROM experience_providers WHERE org_nr = ?").get(parsed.org_nr);
+      if (!known) orgs.add(parsed.org_nr);
+    }
+    for (const org of orgs) {
+      const verify = await verifyOrgNumber(org, brregFetch);
+      const address = verify.exists && verify.active ? await fetchBrregBusinessAddress(org, brregFetch) : null;
+      brregVerdicts.set(org, { verify, address });
+    }
+  }
+  const publishState = (id: string) =>
+    db.prepare(
+      `SELECT (${PUBLISH_GATE_SQL}) AS pub, e.verification_status, e.confidence, e.canonical_id,
+              p.id AS provider_id, p.brreg_active, p.catalog_hidden
+         FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE e.id = ?`
+    ).get(id) as {
+      pub: number; verification_status: string | null; confidence: string | null; canonical_id: string | null;
+      provider_id: string | null; brreg_active: number | null; catalog_hidden: number | null;
+    } | undefined;
+
   const tx = db.transaction(() => {
     const original = loadRows([...new Set(live.map((it) => it.id))]);
 
@@ -34862,6 +34908,12 @@ export function applyExperienceDataCorrections(
         continue;
       }
 
+      // Each item runs in its OWN savepoint (a nested db.transaction), so
+      // one that would take a published row off the catalog is rolled back
+      // alone — never-unpublish rule — while earlier/later items stand.
+      const pubBefore = Number(publishState(it.id)?.pub) === 1;
+      try {
+      db.transaction(() => {
       const sourceUrl = String(it.source_url).trim();
       const warnings: ExpDcWarning[] = [];
       const changes: ExpDcColumnChange[] = [];
@@ -35032,6 +35084,24 @@ export function applyExperienceDataCorrections(
             break;
           }
           if (target && target.id === row.provider_id) { rejected = { reason: "no_op" }; break; }
+          let brregNew: ExpDcBrregVerdict | null = null;
+          if (!target) {
+            if (!parsed.org_nr) {
+              rejected = { reason: "provider_needs_orgnr", detail: `no existing provider named ${parsed.name}; a new provider needs an org.nr. Brønnøysund can verify` };
+              break;
+            }
+            brregNew = brregVerdicts.get(parsed.org_nr) ?? null;
+            const v = brregNew?.verify;
+            if (!v || !v.exists) { rejected = { reason: "provider_unverified", detail: `org.nr. ${parsed.org_nr} not found in Brreg` }; break; }
+            if (!v.active) {
+              rejected = { reason: "provider_unverified", detail: `org.nr. ${parsed.org_nr} is not active in Brreg (${v.flag ?? (v.slettetDato ? "dissolved" : "konkurs/avvikling")})` };
+              break;
+            }
+            if (!expDcBrregNameMatches(parsed.name, v.name)) {
+              rejected = { reason: "provider_unverified", detail: `Brreg name ${JSON.stringify(v.name)} does not match ${JSON.stringify(parsed.name)}` };
+              break;
+            }
+          }
           let targetId: string;
           if (target) {
             targetId = target.id;
@@ -35043,28 +35113,46 @@ export function applyExperienceDataCorrections(
               navn: { source_url: sourceUrl, fetched_at: fetchedAt },
               created_by: { source: "data_correction", batch_id: batchId, experience_id: it.id, at: fetchedAt },
             };
-            if (parsed.org_nr) provProvenance.org_nr = { source_url: sourceUrl, fetched_at: fetchedAt };
+            const v = brregNew!.verify;
+            const brregUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(parsed.org_nr!)}`;
+            provProvenance.org_nr = { source_url: brregUrl, fetched_at: fetchedAt };
+            provProvenance.navn = { source_url: brregUrl, fetched_at: fetchedAt, requested_name: parsed.name, requested_name_source: sourceUrl };
+            const addr = brregNew!.address;
+            // The same Brreg fields setBrregVerification() (experience-store)
+            // stamps on a verified provider — brreg_verified, brreg_active,
+            // org_nr, brreg_checked_at — plus Brreg's registered name, first
+            // NACE code and business address. brreg_active=1 is what keeps the
+            // row inside PUBLISH_GATE_SQL.
             const values = {
               id: targetId,
-              navn: parsed.name,
+              navn: v.name ?? parsed.name,
               org_nr: parsed.org_nr,
               source: "data_correction",
               verification_status: "pending_verify",
               field_provenance: JSON.stringify(provProvenance),
+              brreg_verified: 1,
+              brreg_active: 1,
+              brreg_checked_at: fetchedAt,
+              naeringskode: v.nace[0] ?? null,
+              adresse: addr?.adresse ?? null,
+              postnummer: addr?.postnummer ?? null,
+              poststed: addr?.poststed ?? null,
             };
             db.prepare(
-              `INSERT INTO experience_providers (id, navn, org_nr, source, verification_status, field_provenance)
-               VALUES (@id, @navn, @org_nr, @source, @verification_status, @field_provenance)`
+              `INSERT INTO experience_providers (id, navn, org_nr, source, verification_status, field_provenance,
+                 brreg_verified, brreg_active, brreg_checked_at, naeringskode, adresse, postnummer, poststed)
+               VALUES (@id, @navn, @org_nr, @source, @verification_status, @field_provenance,
+                 @brreg_verified, @brreg_active, @brreg_checked_at, @naeringskode, @adresse, @postnummer, @poststed)`
             ).run(values);
             changes.push({ table: "experience_providers", row_id: targetId, op: "insert", values });
-            warnings.push({ code: "provider_created", provider_id: targetId, name: parsed.name, org_nr: parsed.org_nr });
+            warnings.push({ code: "provider_created", provider_id: targetId, name: values.navn, org_nr: parsed.org_nr });
             // Keep the name index in step so a second item naming the same
             // provider in this request links to this row instead of creating
             // a duplicate.
             if (providerNameIndex) {
               const k = expDcNormalise(parsed.name);
               const list = providerNameIndex.get(k) ?? [];
-              list.push({ id: targetId, navn: parsed.name, org_nr: parsed.org_nr, hjemmeside: null, field_provenance: values.field_provenance, claimed_at: null, content_source: null, merged_into: null, is_test_provider: null });
+              list.push({ id: targetId, navn: values.navn, org_nr: parsed.org_nr, hjemmeside: null, field_provenance: values.field_provenance, claimed_at: null, content_source: null, merged_into: null, is_test_provider: null });
               providerNameIndex.set(k, list);
             }
           }
@@ -35076,7 +35164,7 @@ export function applyExperienceDataCorrections(
 
       if (rejected) {
         reject(it, rejected.reason, rejected.detail);
-        continue;
+        return;
       }
 
       // Experience-column writes + per-field provenance.
@@ -35124,6 +35212,18 @@ export function applyExperienceDataCorrections(
       }
       if (orig.canonical_id) warnings.push({ code: "row_is_merged_duplicate", canonical_id: orig.canonical_id });
 
+      if (pubBefore) {
+        const st = publishState(it.id);
+        if (Number(st?.pub) !== 1) {
+          throw new ExpDcItemRollback(
+            `row would leave the public catalog: verification_status=${st?.verification_status ?? null}, ` +
+              `confidence=${st?.confidence ?? null}, canonical_id=${st?.canonical_id ?? null}, ` +
+              `provider_id=${st?.provider_id ?? null}, provider.brreg_active=${st?.brreg_active ?? null}, ` +
+              `provider.catalog_hidden=${st?.catalog_hidden ?? null}`
+          );
+        }
+      }
+
       const correctionId = crypto.randomUUID();
       insertAudit.run(
         correctionId, batchId, batchLabel, it.id, field, it.action,
@@ -35136,6 +35236,14 @@ export function applyExperienceDataCorrections(
       r.warnings.push(...warnings);
       r.column_changes = changes;
       if (!dryRun) r.correction_id = correctionId;
+      })();
+      } catch (err) {
+        if (!(err instanceof ExpDcItemRollback)) throw err;
+        // The savepoint undid this item's writes (incl. a provider row it
+        // created) — drop the name index so it is rebuilt from the DB.
+        providerNameIndex = null;
+        reject(it, "would_unpublish", err.message);
+      }
     }
 
     // fylke_mismatch: the kommune's SSB fylke vs the row's fylke AFTER every
@@ -35335,7 +35443,7 @@ export function revertExperienceDataCorrections(
   return { ok: true, dry_run: dryRun, revert_batch_id: dryRun ? null : revertBatchId, totals, results };
 }
 
-router.post("/admin/experiences-data-corrections", requireAdmin, (req: Request, res: Response) => {
+router.post("/admin/experiences-data-corrections", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown; batch_label?: unknown };
   // STRICT-FALSE parse — only the JSON boolean false writes.
   const dryRun = body.dry_run !== false;
@@ -35346,7 +35454,11 @@ router.post("/admin/experiences-data-corrections", requireAdmin, (req: Request, 
       return;
     }
   }
-  const out = applyExperienceDataCorrections(getExpDb("experiences"), body, { dryRun });
+  // Brreg seam (tests stub it, like the description-write homepage seam).
+  // Brreg is the only network call this route ever makes.
+  const brregFetchImpl =
+    ((req.app?.get?.("experienceDataCorrectionsBrregFetchImpl")) as typeof fetch | undefined) ?? fetch;
+  const out = await applyExperienceDataCorrections(getExpDb("experiences"), body, { dryRun, brregFetchImpl });
   if (!out.ok) {
     res.status(400).json({ error: out.error });
     return;

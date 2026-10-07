@@ -58,7 +58,7 @@ function callRoute(
       query: {},
       headers: opts.headers || {},
       body: opts.body,
-      app: { get: () => undefined },
+      app: { get: (k: string) => ROUTE_APP_SETTINGS[k] },
       get() { return undefined; },
     };
     const res: any = {
@@ -74,6 +74,37 @@ function callRoute(
 }
 
 const SRC = "https://kilde.example/side";
+const ROUTE_APP_SETTINGS: Record<string, unknown> = {};
+
+/** Brreg enheter fixtures for the stubbed GET /enheter/{orgNr}. */
+const BRREG_FIXTURES: Record<string, Record<string, unknown>> = {
+  "123123123": { organisasjonsnummer: "123123123", navn: "HELT NY TILBYDER AS", naeringskode1: { kode: "79.120" },
+    forretningsadresse: { adresse: ["Nyveien 1"], postnummer: "5003", poststed: "BERGEN", kommune: "BERGEN" } },
+  "946175986": { organisasjonsnummer: "946175986", navn: "SKIFORENINGEN", naeringskode1: { kode: "93.120" },
+    forretningsadresse: { adresse: ["Kongeveien 5"], postnummer: "0787", poststed: "OSLO" } },
+  "976912450": { organisasjonsnummer: "976912450", navn: "STIFTELSEN NORSK MARITIMT MUSEUM", naeringskode1: { kode: "91.021" },
+    forretningsadresse: { adresse: ["Bygdøynesveien 37"], postnummer: "0286", poststed: "OSLO" } },
+  "931735357": { organisasjonsnummer: "931735357", navn: "FJORD TOURS AS", naeringskode1: { kode: "79.120" },
+    forretningsadresse: { adresse: ["Strandkaien 1"], postnummer: "5013", poststed: "BERGEN" } },
+  "222333444": { organisasjonsnummer: "222333444", navn: "KONKURS TURER AS", konkurs: true },
+  "333444555": { organisasjonsnummer: "333444555", navn: "SLETTET TURER AS", slettedato: "2024-01-01" },
+  "444555666": { organisasjonsnummer: "444555666", navn: "AVVIKLING TURER AS", underAvvikling: true },
+  "555666777": { organisasjonsnummer: "555666777", navn: "HELT ANNET SELSKAP AS", naeringskode1: { kode: "79.120" } },
+  "666777888": { organisasjonsnummer: "666777888", navn: "AUST-AGDER MUSEUM OG ARKIV IKS", naeringskode1: { kode: "91.021" },
+    forretningsadresse: { adresse: ["Vitensenteret 1"], postnummer: "4838", poststed: "ARENDAL" } },
+};
+const brregRequests: string[] = [];
+let anthropicRequests = 0;
+const brregStub = (async (url: any) => {
+  const u = String(url);
+  if (u.includes("api.anthropic.com")) { anthropicRequests++; throw new Error("LLM call through the Brreg seam"); }
+  brregRequests.push(u);
+  if (!u.startsWith("https://data.brreg.no/")) throw new Error(`non-Brreg URL through the Brreg seam: ${u}`);
+  const m = /\/enheter\/(\d{9})$/.exec(u);
+  const fx = m ? BRREG_FIXTURES[m[1]] : undefined;
+  if (!fx) return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+  return { ok: true, status: 200, json: async () => fx } as unknown as Response;
+}) as unknown as typeof fetch;
 const QUOTE = "Sitat fra kilden.";
 
 export function runOpplevelserExperienceDataCorrectionsTests(
@@ -180,6 +211,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
     let networkCalls = 0;
     globalThis.fetch = (async (url: any) => {
       networkCalls++;
+      if (String(url).includes("api.anthropic.com")) anthropicRequests++;
       throw new Error(`fetch must not be called (${String(url)})`);
     }) as typeof fetch;
 
@@ -192,16 +224,20 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       restoreMainDb = init.__pinInMemoryDbForTesting();
       const pauseSvc = require("../services/enrichment-write-pause") as typeof import("../services/enrichment-write-pause");
       const opp = require("./opplevelser") as typeof import("./opplevelser");
+      const brregClient = require("../services/brreg-client") as typeof import("../services/brreg-client");
+      brregClient.__clearBrregVerifyCacheForTesting();
+      brregClient.__clearBrregAddressCacheForTesting();
+      ROUTE_APP_SETTINGS["experienceDataCorrectionsBrregFetchImpl"] = brregStub;
       const router = opp.default as any;
       const auth = { "x-admin-key": ADMIN_KEY_DC };
       const post = (url: string, body: any) => {
         process.env.ADMIN_KEY = ADMIN_KEY_DC;
         return callRoute(router, { method: "POST", url, headers: auth, body });
       };
-      const apply = (items: any[], extra: Record<string, unknown> = {}) =>
-        opp.applyExperienceDataCorrections(expDb as any, { items, ...extra }, { dryRun: false }) as any;
-      const preview = (items: any[]) =>
-        opp.applyExperienceDataCorrections(expDb as any, { items }, { dryRun: true }) as any;
+      const apply = async (items: any[], extra: Record<string, unknown> = {}): Promise<any> =>
+        opp.applyExperienceDataCorrections(expDb as any, { items, ...extra }, { dryRun: false, brregFetchImpl: brregStub });
+      const preview = async (items: any[]): Promise<any> =>
+        opp.applyExperienceDataCorrections(expDb as any, { items }, { dryRun: true, brregFetchImpl: brregStub });
       const revert = (body: any, dryRun = false) =>
         opp.revertExperienceDataCorrections(expDb as any, body, { dryRun }) as any;
       const dumpAll = (): string =>
@@ -263,11 +299,11 @@ export function runOpplevelserExperienceDataCorrectionsTests(
 
       // ── dc-r1: structural 400s (function + route). ──────────────────
       {
-        assertEq(opp.applyExperienceDataCorrections(expDb as any, { items: [] }, { dryRun: true }), { ok: false, error: "items must be an array of 1..50 items" }, "dc-r1a: empty items -> error");
-        assertTrue(!(opp.applyExperienceDataCorrections(expDb as any, { items: Array.from({ length: 51 }, () => item("dc-a", "title", "x", "yyy")) }, { dryRun: true }) as any).ok, "dc-r1b: 51 items -> error");
-        assertTrue(!(opp.applyExperienceDataCorrections(expDb as any, { items: ["x"] }, { dryRun: true }) as any).ok, "dc-r1c: non-object item -> error");
-        assertTrue(!(opp.applyExperienceDataCorrections(expDb as any, { items: [{ field: "title" }] }, { dryRun: true }) as any).ok, "dc-r1d: missing id -> error");
-        assertTrue(!(opp.applyExperienceDataCorrections(expDb as any, { items: [item("dc-a", "title", "x", "yyy")], batch_label: 5 }, { dryRun: true }) as any).ok, "dc-r1e: non-string batch_label -> error");
+        assertEq((await opp.applyExperienceDataCorrections(expDb as any, { items: [] }, { dryRun: true })), { ok: false, error: "items must be an array of 1..50 items" }, "dc-r1a: empty items -> error");
+        assertTrue(!((await opp.applyExperienceDataCorrections(expDb as any, { items: Array.from({ length: 51 }, () => item("dc-a", "title", "x", "yyy")) }, { dryRun: true })) as any).ok, "dc-r1b: 51 items -> error");
+        assertTrue(!((await opp.applyExperienceDataCorrections(expDb as any, { items: ["x"] }, { dryRun: true })) as any).ok, "dc-r1c: non-object item -> error");
+        assertTrue(!((await opp.applyExperienceDataCorrections(expDb as any, { items: [{ field: "title" }] }, { dryRun: true })) as any).ok, "dc-r1d: missing id -> error");
+        assertTrue(!((await opp.applyExperienceDataCorrections(expDb as any, { items: [item("dc-a", "title", "x", "yyy")], batch_label: 5 }, { dryRun: true })) as any).ok, "dc-r1e: non-string batch_label -> error");
         const r = await post("/admin/experiences-data-corrections", { items: "nope" });
         assertEq(r.status, 400, "dc-r1f: route answers 400 on a structural error");
         const unauth = await callRoute(router, { method: "POST", url: "/admin/experiences-data-corrections", headers: {}, body: { items: [] } });
@@ -304,17 +340,17 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           ["no_op", [item("dc-a", "kommune", "Bergen", "bergen")]],
         ];
         for (const [reason, items] of cases) {
-          const out = apply(items);
+          const out = (await apply(items));
           const label = `${reason} (${items[0].field}=${JSON.stringify(items[0].new_value ?? null)})`;
           assertEq(out.results.map((r: any) => [r.result, r.reason]), items.map(() => ["rejected", reason]), `dc-r2a: ${label}`);
           assertEq([out.totals.rejected, out.totals.applied, out.batch_id === null], [items.length, 0, false], `dc-r2b: totals for ${label}`);
         }
         assertEq(dumpAll(), before, "dc-r2d: nothing written when every item is rejected");
-        const stale = apply([item("dc-a", "title", "Feil tittel", "Ny tittel")]);
+        const stale = (await apply([item("dc-a", "title", "Feil tittel", "Ny tittel")]));
         assertTrue(String(stale.results[0].detail).includes("Kajakktur i fjorden"), "dc-r2e: stale detail shows the current value");
         // Mixed request: a reject does not abort the other items.
         seed("dc-mix");
-        const mix = apply([item("dc-mix", "fylke", "Vestland", "Viken"), item("dc-mix", "price_from", 890, 990)]);
+        const mix = (await apply([item("dc-mix", "fylke", "Vestland", "Viken"), item("dc-mix", "price_from", 890, 990)]));
         assertEq(mix.results.map((r: any) => r.result), ["rejected", "applied"], "dc-r2f: per-item reject does not abort the rest");
         assertEq(rowOf("dc-mix").price_from, 990, "dc-r2g: the valid item was written");
       }
@@ -327,7 +363,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           item("dc-solo", "provider", "Solo Tilbyder AS", "Helt Ny Tilbyder AS (org.nr. 123123123)"),
           item("dc-solo", "homepage_url", "https://solo.example/en/", "https://helt-ny.example/"),
         ];
-        const out = preview(items);
+        const out = (await preview(items));
         assertEq(out.results.map((r: any) => r.result), ["would_apply", "would_apply", "would_apply"], "dc-r3a: dry run evaluates every item");
         assertEq(out.batch_id, null, "dc-r3b: dry run has no batch_id");
         assertTrue(out.results[1].warnings.some((w: any) => w.code === "provider_created"), "dc-r3c: dry run previews provider creation");
@@ -358,7 +394,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       {
         seed("dc-m1", { season: ["vaar", "sommer", "host"], kommune: "Svolvaer", fylke: "Nordland", price_unit: null, price_from: 120 });
         expDb.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run("Kajakktur på norsk", "dc-m1");
-        const out = preview([
+        const out = (await preview([
           item("dc-m1", "kommune", "Svolvaer, Nordland", "Vågan"),          // rendered "Sted"
           item("dc-m1", "fylke", "NORDLAND", "Troms"),                     // raw, case-folded
           item("dc-m1", "season", "vaar, sommer, host", "hele året"),     // raw codes as text
@@ -367,27 +403,27 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           item("dc-m1", "title", "Kajakktur på norsk", "Kajakktur i Vågan"), // title_no
           item("dc-m1", "homepage_url", "https://delt.example/", "https://delt-ny.example/"), // trailing slash
           item("dc-m1", "provider", "Delt Tilbyder AS", "Øvrig Turselskap AS"),
-        ]);
+        ]));
         assertEq(out.results.map((r: any) => r.result), Array(8).fill("would_apply"), "dc-r5a: rendered/raw/case/slash forms all match");
-        const out2 = preview([
+        const out2 = (await preview([
           item("dc-a", "season", "sommer", "vinter"),                       // rendered label
           item("dc-a", "duration", "60", 90),                               // raw
           item("dc-a", "price_from", "fra 890 kroner per person", 990),     // rendered with unit
           item("dc-a", "price_from", "890", 990, { id: "dc-b" }),           // raw
           item("dc-a", "provider", "Delt Tilbyder AS (verifisert mot Brønnøysundregistrene)", "Øvrig Turselskap AS"),
-        ]);
+        ]));
         assertEq(out2.results.map((r: any) => r.result), Array(5).fill("would_apply"), "dc-r5b: more rendered/raw forms match");
         seed("dc-m2", { season: ["spring", "autumn"] });
-        assertEq(preview([item("dc-m2", "season", "høst, vår", "sommer")]).results[0].result, "would_apply", "dc-r5c: season expected is order-insensitive + spelling-equivalent");
-        assertEq(preview([item("dc-m2", "season", "høst", "sommer")]).results[0].reason, "stale_expected_current", "dc-r5d: a season SUBSET is stale");
-        assertEq(preview([item("dc-noprov", "kommune", "null", "Voss")]).results[0].reason, "stale_expected_current", "dc-r5e: 'null' does not match a non-empty kommune");
+        assertEq((await preview([item("dc-m2", "season", "høst, vår", "sommer")])).results[0].result, "would_apply", "dc-r5c: season expected is order-insensitive + spelling-equivalent");
+        assertEq((await preview([item("dc-m2", "season", "høst", "sommer")])).results[0].reason, "stale_expected_current", "dc-r5d: a season SUBSET is stale");
+        assertEq((await preview([item("dc-noprov", "kommune", "null", "Voss")])).results[0].reason, "stale_expected_current", "dc-r5e: 'null' does not match a non-empty kommune");
         seed("dc-m3", { kommune: null, price_from: null, duration_min: null, duration_max: null, season: [] });
-        const out3 = preview([
+        const out3 = (await preview([
           item("dc-m3", "kommune", "", "Luster"),
           item("dc-m3", "price_from", null, 795),
           item("dc-m3", "duration", "null", "omtrent 120 minutter"),
           item("dc-m3", "season", "", "sommer"),
-        ]);
+        ]));
         assertEq(out3.results.map((r: any) => r.result), Array(4).fill("would_apply"), "dc-r5f: ''/null/'null' all match an empty field");
       }
 
@@ -399,13 +435,13 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         expDb.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run("Kajakktur (no)", "dc-w1");
         const fpBefore = fpOf("dc-w1");
         evBefore = JSON.parse(rowOf("dc-w1").content_field_evidence || "{}");
-        const out = apply([
+        const out = (await apply([
           item("dc-w1", "season", "sommer", "vår, sommer, høst, vinter"),
           item("dc-w1", "duration", "omtrent 60 minutter", "omtrent 120 minutter"),
           item("dc-w1", "price_from", 890, "1 700"),
           item("dc-w1", "title", "Kajakktur i fjorden", "  Kajakktur  i Hardangerfjorden "),
           item("dc-w1", "kommune", "Bergen", "Sandefjord"),
-        ], { batch_label: "test-batch" });
+        ], { batch_label: "test-batch" }));
         firstBatch = out.batch_id;
         assertTrue(typeof out.batch_id === "string" && out.batch_id.startsWith("data-corrections-"), "dc-r6a: apply returns a batch_id");
         assertEq(out.batch_label, "test-batch", "dc-r6b: batch_label echoed");
@@ -440,26 +476,26 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       // ── dc-r7: duration / price clear; fylke together with kommune. ─
       {
         seed("dc-w2", { fylke: "Vestfold og Telemark", kommune: "Stokke" });
-        const out = apply([
+        const out = (await apply([
           item("dc-w2", "kommune", "Stokke", "Sandefjord"),
           item("dc-w2", "fylke", "Vestfold og Telemark", "Vestfold"),
           clearItem("dc-w2", "duration", "omtrent 60 minutter"),
           clearItem("dc-w2", "price_from", "fra 890 kroner per person"),
-        ]);
+        ]));
         assertEq(out.results.map((r: any) => r.result), Array(4).fill("applied"), "dc-r7a: applied");
         assertTrue(!out.results[0].warnings.some((w: any) => w.code === "fylke_mismatch"), "dc-r7b: no fylke_mismatch when the same request corrects fylke");
         const row = rowOf("dc-w2");
         assertEq([row.kommune, row.fylke, row.duration_min, row.duration_max, row.price_from], ["Sandefjord", "Vestfold", null, null, null], "dc-r7c: values written / cleared");
-        assertEq(preview([clearItem("dc-w2", "price_from", "")]).results[0].reason, "no_op", "dc-r7d: clearing an empty price is no_op");
+        assertEq((await preview([clearItem("dc-w2", "price_from", "")])).results[0].reason, "no_op", "dc-r7d: clearing an empty price is no_op");
         seed("dc-w3", { fylke: "Møre og Romsdal", kommune: "Ulstein" });
-        const h = apply([item("dc-w3", "kommune", "Ulstein", "Herøy")]);
+        const h = (await apply([item("dc-w3", "kommune", "Ulstein", "Herøy")]));
         assertEq([h.results[0].result, rowOf("dc-w3").kommune, h.results[0].warnings.length], ["applied", "Herøy", 0], "dc-r7e: Herøy disambiguated by the row's fylke, no mismatch");
       }
 
       // ── dc-r8: homepage_url — shared provider rules, verification reset. ─
       {
         const otherCount = (expDb.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ? AND id != 'dc-a'").get(provShared) as any).n;
-        const out = apply([item("dc-a", "homepage_url", "https://delt.example", "https://www.delt-ny.example/")]);
+        const out = (await apply([item("dc-a", "homepage_url", "https://delt.example", "https://www.delt-ny.example/")]));
         assertEq(out.results[0].result, "applied", "dc-r8a: root URL on a shared provider applies");
         const w = out.results[0].warnings.find((x: any) => x.code === "shared_provider_root_url");
         assertEq(w && w.other_experiences, otherCount, "dc-r8b: warning lists the count of other affected experiences");
@@ -470,12 +506,12 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq([fp.hjemmeside?.source_url, fp.hjemmeside_verification], [SRC, undefined], "dc-r8e: field_provenance.hjemmeside set, verification removed");
         // Unshared provider, deep URL on the same host -> applies, keeps verification.
         const fpSoloBefore = fpOf("dc-solo");
-        const o2 = apply([item("dc-solo", "homepage_url", "https://solo.example/en/", "https://solo.example/opplevelser/kajakk")]);
+        const o2 = (await apply([item("dc-solo", "homepage_url", "https://solo.example/en/", "https://solo.example/opplevelser/kajakk")]));
         assertEq(o2.results[0].result, "applied", "dc-r8f: deep URL on an unshared provider applies");
         assertTrue(!o2.results[0].warnings.some((x: any) => x.code === "hjemmeside_verification_reset"), "dc-r8g: same host -> verification kept");
         assertTrue(JSON.parse(provOf(provSolo).field_provenance).hjemmeside_verification?.verified === true, "dc-r8h: verification still present");
         assertTrue(fpOf("dc-solo") !== fpSoloBefore, "dc-r8i: provider homepage change moves the facts fingerprint");
-        assertEq(preview([item("dc-solo", "homepage_url", "https://solo.example/opplevelser/kajakk", "https://SOLO.example/opplevelser/kajakk/")]).results[0].reason, "no_op", "dc-r8j: same URL modulo case/slash -> no_op");
+        assertEq((await preview([item("dc-solo", "homepage_url", "https://solo.example/opplevelser/kajakk", "https://SOLO.example/opplevelser/kajakk/")])).results[0].reason, "no_op", "dc-r8j: same URL modulo case/slash -> no_op");
       }
 
       // ── dc-r9: provider — relink existing by name / org.nr., create new. ─
@@ -484,31 +520,35 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         seed("dc-p2");
         seed("dc-p3");
         seed("dc-p4", { description: "Arrangeres av Delt Tilbyder AS." });
-        const out = apply([
+        const out = (await apply([
           item("dc-p1", "provider", "Delt Tilbyder AS", "øvrig turselskap as"),
           item("dc-p2", "provider", "Delt Tilbyder AS", "Annet Navn (org.nr. 911222333)"),
           item("dc-p3", "provider", "Delt Tilbyder AS", "Skiforeningen (Skimuseet Holmenkollen), org.nr. 946175986"),
-          item("dc-p4", "provider", "Delt Tilbyder AS", "Norsk Maritimt Museum"),
+          item("dc-p4", "provider", "Delt Tilbyder AS", "Norsk Maritimt Museum (org.nr. 976912450)"),
           item("dc-p4", "homepage_url", "https://www.delt-ny.example/", "https://marmuseum.no"),
-        ]);
+        ]));
         assertEq(out.results.map((r: any) => r.result), Array(5).fill("applied"), "dc-r9a: all applied");
         assertEq(rowOf("dc-p1").provider_id, provOther, "dc-r9b: exact case-insensitive name -> existing provider");
         assertEq(rowOf("dc-p2").provider_id, provOther, "dc-r9c: org.nr. wins over the name");
         assertEq(provOf(provOther).navn, "Øvrig Turselskap AS", "dc-r9d: the existing provider is not renamed");
         const p3 = provOf(rowOf("dc-p3").provider_id);
-        assertEq([p3.navn, p3.org_nr, p3.source, p3.hjemmeside, p3.brreg_verified], ["Skiforeningen (Skimuseet Holmenkollen)", "946175986", "data_correction", null, 0], "dc-r9e: new provider row with minimal fields");
+        assertEq([p3.navn, p3.org_nr, p3.source, p3.hjemmeside, p3.brreg_verified, p3.brreg_active, p3.naeringskode, p3.adresse, p3.postnummer, p3.poststed],
+          ["SKIFORENINGEN", "946175986", "data_correction", null, 1, 1, "93.120", "Kongeveien 5", "0787", "OSLO"], "dc-r9e: new provider row carries the verified Brreg fields (name from Brreg)");
+        assertTrue(typeof p3.brreg_checked_at === "string" && p3.brreg_checked_at.length > 0, "dc-r9e2: brreg_checked_at stamped");
         assertEq(JSON.parse(p3.field_provenance).created_by.source, "data_correction", "dc-r9f: provenance marks data_correction");
         assertEq(rowOf("dc-p3").provider_match_status, "matched", "dc-r9g: provider_match_status = matched");
         const p4prov = rowOf("dc-p4").provider_id;
         assertTrue(p4prov !== provShared, "dc-r9h: dc-p4 relinked");
         assertEq(provOf(p4prov).hjemmeside, "https://marmuseum.no", "dc-r9i: homepage item in the same request lands on the NEW provider");
         assertEq(provOf(provShared).hjemmeside, "https://www.delt-ny.example/", "dc-r9j: the old shared provider's homepage is untouched");
-        assertTrue(out.results[3].warnings.some((w: any) => w.code === "unpublished_after_correction"), "dc-r9k: a new (not brreg_active) provider unpublishes the row -> warning");
+        assertTrue(!out.results[3].warnings.some((w: any) => w.code === "unpublished_after_correction"), "dc-r9k: a Brreg-verified new provider keeps the row published");
+        assertEq(Number((expDb.prepare(`SELECT (${expStore.PUBLISH_GATE_SQL}) AS pub FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id WHERE e.id = 'dc-p4'`).get() as any).pub), 1, "dc-r9k2: dc-p4 still passes PUBLISH_GATE_SQL");
+        assertTrue(!brregRequests.some((u) => u.includes("911222333")), "dc-r9k3: an existing provider's org_nr match makes no Brreg call");
         assertTrue(out.results[3].warnings.some((w: any) => w.code === "description_mentions_old_value"), "dc-r9l: description mentions old provider name");
         const ins = JSON.parse((expDb.prepare("SELECT column_changes FROM experience_data_corrections WHERE id = ?").get(out.results[2].correction_id) as any).column_changes);
         assertTrue(ins.some((c: any) => c.op === "insert" && c.table === "experience_providers"), "dc-r9m: audit records the created provider");
-        assertEq(preview([item("dc-p1", "provider", "Øvrig Turselskap AS", "Øvrig Turselskap AS")]).results[0].reason, "no_op", "dc-r9n: relink to the current provider is no_op");
-        const claimedRelink = preview([item("dc-claimed", "provider", "Eid Tilbyder AS", "Øvrig Turselskap AS")]);
+        assertEq((await preview([item("dc-p1", "provider", "Øvrig Turselskap AS", "Øvrig Turselskap AS")])).results[0].reason, "no_op", "dc-r9n: relink to the current provider is no_op");
+        const claimedRelink = (await preview([item("dc-claimed", "provider", "Eid Tilbyder AS", "Øvrig Turselskap AS")]));
         assertEq(claimedRelink.results[0].reason, "owner_managed", "dc-r9o: moving a row away from a claimed provider -> owner_managed");
       }
 
@@ -521,7 +561,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         ).run("dc-q1", fp0);
         const inQueue = () => opp.selectExperienceDescriptionQueue(expDb as any, null).eligibleRows.some((r: any) => r.id === "dc-q1");
         assertEq(inQueue(), false, "dc-r10a: recently attempted row is held back by the cooldown");
-        apply([item("dc-q1", "kommune", "Bergen", "Voss")]);
+        (await apply([item("dc-q1", "kommune", "Bergen", "Voss")]));
         assertTrue(fpOf("dc-q1") !== fp0, "dc-r10b: fingerprint changed");
         assertEq(inQueue(), true, "dc-r10c: the corrected row re-enters the description queue");
       }
@@ -589,7 +629,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         seed("csv-dur", { duration_min: 5, duration_max: 5 });
         const csvItem = (id: string, felt: string, naa: string, foreslaatt: string, handling = "correct") =>
           handling === "clear" ? clearItem(id, felt, naa) : item(id, felt, naa, foreslaatt);
-        const out = preview([
+        const out = (await preview([
           csvItem("csv-sunnmor", "kommune", "Ulstein", "Herøy"),
           csvItem("csv-sunnmor", "title", "Sunnmørsbadet — Aquatic & Wellness Centre in Ulsteinvik", "Sunnmørsbadet — Aquatic & Wellness Centre in Fosnavåg"),
           csvItem("csv-sunnmor", "season", "vår, høst", "vår, sommer, høst, vinter"),
@@ -604,7 +644,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           csvItem("csv-fjord", "provider", "Fjord Tours / Norled", "Fjord Tours AS (org.nr. 931735357)"),
           csvItem("csv-fjord", "duration", "60", "", "clear"),
           csvItem("csv-dur", "duration", "omtrent 5 minutter", "", "clear"),
-        ]);
+        ]));
         assertEq(out.results.map((r: any) => `${r.id}.${r.field}=${r.result}${r.reason ? ":" + r.reason + ":" + r.detail : ""}`),
           out.results.map((r: any) => `${r.id}.${r.field}=would_apply`), "dc-r13a: every CSV-shaped item would apply");
         assertTrue(out.results[0].warnings.length === 0, "dc-r13b: Herøy in Møre og Romsdal — no fylke_mismatch");
@@ -612,6 +652,63 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq(out.results[4].column_changes.find((c: any) => c.column === "season")?.new, JSON.stringify(["year_round"]), "dc-r13d: hele året -> [\"year_round\"]");
       }
 
+      // ── dc-r15: Brreg gate for new providers + never-unpublish. ─────
+      {
+        const provOf2 = (id: string) => rowOf(id).provider_id;
+        for (const id of ["dc-g1", "dc-g2", "dc-g3", "dc-g4", "dc-g5", "dc-g6", "dc-g7", "dc-g8"]) seed(id);
+        const before = dumpAll();
+        const cases: Array<[string, string, string]> = [
+          ["dc-g1", "Ukjent Opplevelse AS", "provider_needs_orgnr"],
+          ["dc-g2", "Finnes Ikke AS (org.nr. 111222333)", "provider_unverified"],
+          ["dc-g3", "Konkurs Turer AS (org.nr. 222333444)", "provider_unverified"],
+          ["dc-g4", "Slettet Turer AS (org.nr. 333444555)", "provider_unverified"],
+          ["dc-g5", "Avvikling Turer AS (org.nr. 444555666)", "provider_unverified"],
+          ["dc-g6", "Fjelltur Bergen AS (org.nr. 555666777)", "provider_unverified"],
+        ];
+        for (const [id, nv, reason] of cases) {
+          const out = await apply([item(id, "provider", "Delt Tilbyder AS", nv)]);
+          assertEq([out.results[0].result, out.results[0].reason], ["rejected", reason], `dc-r15a: ${nv} -> ${reason}`);
+        }
+        assertEq(dumpAll(), before, "dc-r15b: no provider row and no link written for any rejected provider item");
+        // IKS is ignored in the name comparison.
+        const iks = await apply([item("dc-g7", "provider", "Delt Tilbyder AS", "Aust-Agder museum og arkiv IKS (org.nr. 666777888)")]);
+        assertEq(iks.results[0].result, "applied", "dc-r15c: IKS name matches Brreg (legal form ignored)");
+        assertEq(provOf(provOf2("dc-g7")).navn, "AUST-AGDER MUSEUM OG ARKIV IKS", "dc-r15d: name taken from Brreg");
+        assertTrue(opp.expDcBrregNameMatches("Fjord Tours AS", "FJORD TOURS AS") && !opp.expDcBrregNameMatches("Fjelltur AS", "HELT ANNET SELSKAP AS"),
+          "dc-r15e: name-overlap helper");
+        // Existing org_nr match wins with no Brreg request.
+        const nBefore = brregRequests.length;
+        const ex = await apply([item("dc-g8", "provider", "Delt Tilbyder AS", "Et Helt Annet Navn (org.nr. 999888777)")]);
+        assertEq([ex.results[0].result, provOf2("dc-g8"), brregRequests.length - nBefore], ["applied", provSolo, 0], "dc-r15f: existing org_nr -> relink, zero Brreg calls");
+
+        // never-unpublish: relink a published row to an existing provider
+        // that is not brreg_active=1 -> would_unpublish, item rolled back,
+        // the other item in the same request still applies.
+        const provInactive = expStore.createProvider({ navn: "Inaktiv Tilbyder AS", brreg_verified: 1, brreg_active: 0 } as any);
+        seed("dc-u1");
+        const u = await apply([
+          item("dc-u1", "price_from", 890, 990),
+          item("dc-u1", "provider", "Delt Tilbyder AS", "Inaktiv Tilbyder AS"),
+        ]);
+        assertEq(u.results.map((r: any) => [r.result, r.reason ?? null]), [["applied", null], ["rejected", "would_unpublish"]], "dc-r15g: would_unpublish rejects only that item");
+        assertTrue(String(u.results[1].detail).includes("brreg_active=0"), "dc-r15h: detail names the failing gate input");
+        assertEq([rowOf("dc-u1").provider_id, rowOf("dc-u1").price_from], [provShared, 990], "dc-r15i: provider link untouched, price written");
+        assertEq((expDb.prepare("SELECT COUNT(*) AS n FROM experience_data_corrections WHERE experience_id = 'dc-u1'").get() as any).n, 1, "dc-r15j: no audit row for the rolled-back item");
+        const ud = await preview([item("dc-u1", "provider", "Delt Tilbyder AS", "Inaktiv Tilbyder AS")]);
+        assertEq(ud.results[0].reason, "would_unpublish", "dc-r15k: dry run reports would_unpublish too");
+        // An already-unpublished row may move; becoming published is a warning.
+        seed("dc-u2", { provider_id: provInactive });
+        const up = await apply([item("dc-u2", "provider", "Inaktiv Tilbyder AS", "Øvrig Turselskap AS")]);
+        assertEq(up.results[0].result, "applied", "dc-r15l: unpublished row may be relinked");
+        assertTrue(up.results[0].warnings.some((w: any) => w.code === "published_after_correction"), "dc-r15m: published_after_correction warning");
+        // Route uses the Brreg seam from app settings.
+        seed("dc-u3");
+        const rr = await post("/admin/experiences-data-corrections", { dry_run: false, items: [item("dc-u3", "provider", "Delt Tilbyder AS", "Fjord Tours AS (org.nr. 931735357)")] });
+        assertEq([rr.status, rr.body.results?.[0]?.result], [200, "applied"], "dc-r15n: route verifies via the Brreg seam");
+        assertTrue(brregRequests.every((x) => x.startsWith("https://data.brreg.no/")), "dc-r15o: the Brreg seam only ever saw data.brreg.no");
+      }
+
+      assertEq(anthropicRequests, 0, "dc-r14b: ZERO requests to api.anthropic.com");
       assertEq(networkCalls, 0, "dc-r14: ZERO network requests across every path above");
       dbFactory.__resetDbFactoryForTesting();
     } catch (err: any) {
