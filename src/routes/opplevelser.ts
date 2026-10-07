@@ -32209,6 +32209,9 @@ import {
 // dev-request 2026-10-06-experiences-beskrivelsessteg-4c-kohode-blokkering:
 // sha256 for experienceDescriptionFactsFingerprint() (attempt cooldown).
 import { createHash as expDescCreateHash } from "node:crypto";
+// dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: status
+// GET for the proposals job (the job itself only type-imports this module).
+import { getExperienceDescriptionProposalsStatus } from "../services/experience-description-proposals-job";
 
 // Batch cap: HALF of TITLE_NO_BATCH_CAP (20). This feature spends TWO LLM
 // calls per row (generate + judge) instead of one, and the generate call
@@ -33998,56 +34001,59 @@ type ExpDescWriteResult = {
   reason?: string;
 };
 
-router.post("/admin/experiences-description-write", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown };
-  // STRICT-FALSE parse — same idiom as the 4c route: only the JSON boolean
-  // false writes.
-  const dryRun = body.dry_run !== false;
+/** Result of applyPrewrittenExperienceDescriptions(): a structural error
+ *  (the route answers 400; the proposals job records it) or per-item
+ *  results + totals. */
+export type PrewrittenExperienceDescriptionsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      totals: { written: number; rejected: number; skipped_recorded: number; would_write: number; would_record_skip: number };
+      results: ExpDescWriteResult[];
+    };
 
-  // Enrichment write-pause fence — apply only, exactly like 4c.
-  if (!dryRun) {
-    const pauseBlock = experiencesWritePauseBlock();
-    if (pauseBlock) {
-      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
-      return;
-    }
-  }
-
-  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > EXP_DESC_WRITE_MAX_ITEMS) {
-    res.status(400).json({ error: `items must be an array of 1..${EXP_DESC_WRITE_MAX_ITEMS} items` });
-    return;
+/**
+ * The whole core of POST /admin/experiences-description-write — structural
+ * validation (1..25 items, ≤10 kildetro writes, no duplicate ids), every
+ * per-item gate, the kildetro homepage fetch, the write/attempt transaction
+ * and the one-line summary log. Extracted VERBATIM from the route (dev-
+ * request 2026-10-07-experiences-beskrivelser-forslagsko-steg2) so the
+ * route and the server-side proposals job (services/experience-description-
+ * proposals-job.ts) store text through exactly the same code. NEVER calls an
+ * LLM. The caller owns auth and the write-pause fence.
+ */
+export async function applyPrewrittenExperienceDescriptions(
+  db: ReturnType<typeof getExpDb>,
+  rawItems: unknown,
+  opts: { dryRun: boolean; homepageFetchImpl: typeof fetch; logTag?: string }
+): Promise<PrewrittenExperienceDescriptionsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXP_DESC_WRITE_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXP_DESC_WRITE_MAX_ITEMS} items` };
   }
   const items: ExpDescWriteItem[] = [];
-  for (let i = 0; i < body.items.length; i++) {
-    const parsed = parseExpDescWriteItem(body.items[i], i);
+  for (let i = 0; i < rawItems.length; i++) {
+    const parsed = parseExpDescWriteItem(rawItems[i], i);
     if (typeof parsed === "string") {
-      res.status(400).json({ error: parsed });
-      return;
+      return { ok: false, error: parsed };
     }
     items.push(parsed);
   }
   const kildetroWrites = items.filter((it) => it.outcome === "write" && it.level === "kildetro").length;
   if (kildetroWrites > EXP_DESC_WRITE_MAX_KILDETRO_ITEMS) {
-    res.status(400).json({
+    return {
+      ok: false,
       error: `Too many kildetro write items (${kildetroWrites}); max ${EXP_DESC_WRITE_MAX_KILDETRO_ITEMS} per call — each one fetches the provider homepage`,
-    });
-    return;
+    };
   }
   const seen = new Set<string>();
   for (const it of items) {
     if (seen.has(it.id)) {
-      res.status(400).json({ error: `duplicate id in items: ${it.id}` });
-      return;
+      return { ok: false, error: `duplicate id in items: ${it.id}` };
     }
     seen.add(it.id);
   }
 
-  // The kildetro homepage fetch uses the SAME seam as 4c. There is no LLM
-  // seam on this route because nothing here ever calls an LLM.
-  const homepageFetchImpl =
-    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
-
-  const db = getExpDb("experiences");
+  const { dryRun, homepageFetchImpl } = opts;
   // Per-id lookup WITHOUT the publish gate in WHERE, so a rejection can say
   // WHY (not_found vs. not_published); the gate is evaluated as a column.
   // Parameterised placeholders only.
@@ -34202,12 +34208,51 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
     }
   }
   console.log(
-    `[experiences-description-write] dry_run=${dryRun} ` +
+    `[${opts.logTag ?? "experiences-description-write"}] dry_run=${dryRun} ` +
       results
         .map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}${judgeModelOf.has(r.id) ? "@" + judgeModelOf.get(r.id) : ""}`)
         .join(" ")
   );
-  res.json({ success: true, dry_run: dryRun, totals, results });
+  return { ok: true, totals, results };
+}
+
+router.post("/admin/experiences-description-write", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown };
+  // STRICT-FALSE parse — same idiom as the 4c route: only the JSON boolean
+  // false writes.
+  const dryRun = body.dry_run !== false;
+
+  // Enrichment write-pause fence — apply only, exactly like 4c.
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  // The kildetro homepage fetch uses the SAME seam as 4c. There is no LLM
+  // seam on this route because nothing here ever calls an LLM.
+  const homepageFetchImpl =
+    ((req.app?.get?.("experienceDescriptionHomepageFetchImpl")) as typeof fetch | undefined) ?? fetch;
+
+  // Everything else lives in applyPrewrittenExperienceDescriptions() (dev-
+  // request 2026-10-07-experiences-beskrivelser-forslagsko-steg2), shared
+  // with the proposals job.
+  const out = await applyPrewrittenExperienceDescriptions(getExpDb("experiences"), body.items, { dryRun, homepageFetchImpl });
+  if (!out.ok) {
+    res.status(400).json({ error: out.error });
+    return;
+  }
+  res.json({ success: true, dry_run: dryRun, totals: out.totals, results: out.results });
+});
+
+// dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: read-
+// only status of the server-side proposals job — whether it is enabled,
+// whether a GitHub token is configured (bool only, never the value) and the
+// last 20 processed proposal files with their totals / error.
+router.get("/admin/experiences-description-proposals-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceDescriptionProposalsStatus(getExpDb("experiences") as any) });
 });
 
 export default router;

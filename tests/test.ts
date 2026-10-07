@@ -43262,6 +43262,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: the
+// hourly proposals job (GitHub contents API -> shared write function) + its
+// status GET. Own in-memory experiences DB; GitHub is a stub; any request to
+// api.anthropic.com is counted and asserted zero.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: experience-description-proposals-job ──");
+  try {
+    const { runExperienceDescriptionProposalsJobTests } = require("../src/services/experience-description-proposals-job.test") as
+      typeof import("../src/services/experience-description-proposals-job.test");
+    const pj = await runExperienceDescriptionProposalsJobTests({ log: false });
+    passed += pj.passed;
+    failed += pj.failed;
+    for (const f of pj.failures) failures.push("experience-description-proposals-job: " + f);
+    console.log(`  experience-description-proposals-job: ${pj.passed} passed, ${pj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-description-proposals-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
 // 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
 // /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —

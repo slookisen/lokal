@@ -2169,6 +2169,33 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_description_attempts failed:", err);
   }
 
+  // ─── experience_description_proposal_files (dev-request
+  // 2026-10-07-experiences-beskrivelser-forslagsko-steg2) ─────────────────
+  // One row per proposal file (A2A `experiences-proposals/<UTC-date>/
+  // <run-id>.json`) the server-side proposals job (services/experience-
+  // description-proposals-job.ts) has processed — the "each file at most
+  // once" ledger. `path` is the key: a path already recorded is never
+  // processed again, even if its sha changed (a changed proposal must use a
+  // new file name). `result_json` holds the per-file outcome (totals + per-
+  // item results, or the validation error) for the status GET. Recorded
+  // only AFTER a file was fetched and evaluated — a GitHub error or timeout
+  // records nothing, so the file is retried on the next tick. No FK, same
+  // reasoning as experience_description_attempts above. Additive only;
+  // dropping the table is the rollback (every file would be eligible again,
+  // and re-applying is safe because a written row is no longer a candidate).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_description_proposal_files (
+        path TEXT PRIMARY KEY,
+        sha TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        result_json TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_description_proposal_files failed:", err);
+  }
+
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV
   // translations of experience + gårdssalg-provider prose, staged
