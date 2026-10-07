@@ -29,6 +29,7 @@ import {
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 
 import { slugifyClinic } from "./dental-seo";
+import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { dentalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
@@ -102,7 +103,11 @@ export function buildSearchResults(
   return agents.map((a) => {
     const badges: string[] = [];
     if (a.helfo_agreement === "true") badges.push("Helfo-avtale");
-    if (a.acute_vakt === 1) badges.push("Akuttvakt");
+    {
+      const acute = resolveAcuteClaim(a);
+      if (acute === "vakt") badges.push("Akuttvakt");
+      else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
+    }
     if (a.verification_status === "verified") badges.push("Verifisert");
     if (a.available_specialties?.length) badges.push("Spesialist");
 
@@ -219,7 +224,9 @@ export function registerDentalTools(server: McpServer): void {
 
         const badges: string[] = [];
         if (agent.helfo_agreement === "true") badges.push("Helfo-avtale");
-        if (agent.acute_vakt === 1) badges.push("Akuttvakt");
+        const acute = resolveAcuteClaim(agent);
+        if (acute === "vakt") badges.push("Akuttvakt");
+        else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
         if (agent.verification_status === "verified") badges.push("Verifisert");
 
         const result = {
@@ -235,7 +242,8 @@ export function registerDentalTools(server: McpServer): void {
           epost: agent.epost,
           hjemmeside: agent.hjemmeside,
           helfo_agreement: agent.helfo_agreement,
-          acute_vakt: agent.acute_vakt,
+          // Skive B: raw flag only exposed when backed by provenance.
+          acute_vakt: agent.acute_vakt === 1 && hasAcuteVaktProvenance(agent.field_provenance) ? 1 : null,
           chain_brand: agent.chain_brand,
           is_chain_member: agent.is_chain_member,
           available_specialties: agent.available_specialties,

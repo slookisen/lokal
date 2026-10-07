@@ -18,6 +18,7 @@ import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
@@ -336,8 +337,12 @@ export function buildClinicDescription(
   }
 
   // Acute
-  if (agent.acute_vakt === 1) {
+  // Skive B: «tannlegevakt» only with acute_vakt provenance; soft claim otherwise.
+  const acuteClaim = resolveAcuteClaim(agent);
+  if (acuteClaim === "vakt") {
     parts.push("Tilbyr tannlegevakt ved akutte smerter og skader.");
+  } else if (acuteClaim === "accepts") {
+    parts.push("Tar imot akuttpasienter.");
   }
 
   // Specialties
@@ -740,8 +745,11 @@ function clinicCard(
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-avtale</span>`);
-  if (agent.acute_vakt === 1)
-    badges.push(`<span class="badge badge-akutt">Akuttvakt</span>`);
+  {
+    const acute = resolveAcuteClaim(agent);
+    if (acute === "vakt") badges.push(`<span class="badge badge-akutt">Akuttvakt</span>`);
+    else if (acute === "accepts") badges.push(`<span class="badge badge-akutt">${ACUTE_ACCEPTS_LABEL}</span>`);
+  }
   if (agent.chain_brand)
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
@@ -1201,8 +1209,11 @@ function renderClinicProfile(
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (!inactive && agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-direkteoppgjør</span>`);
-  if (!inactive && agent.acute_vakt === 1)
-    badges.push(`<span class="badge badge-akutt">Akuttvakt</span>`);
+  if (!inactive) {
+    const acute = resolveAcuteClaim(agent);
+    if (acute === "vakt") badges.push(`<span class="badge badge-akutt">Akuttvakt</span>`);
+    else if (acute === "accepts") badges.push(`<span class="badge badge-akutt">${ACUTE_ACCEPTS_LABEL}</span>`);
+  }
   if (agent.chain_brand)
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
