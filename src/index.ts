@@ -1780,6 +1780,41 @@ if (
   }), 60 * 60_000);
 }
 
+// ─── dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2:
+// experience description proposals job ───────────────────────────────
+//
+// Hourly: reads description proposal files a Cloud Routine (Max
+// subscription) committed to slookisen/A2A `experiences-proposals/` and
+// stores them through the same shared function as POST /admin/experiences-
+// description-write. Never calls an LLM. The tick itself checks
+// EXPERIENCE_PROPOSALS_JOB_ENABLED === "true" (OFF by default — flipping it
+// off is the rollback), the experiences write-pause and A2A_READ_PAT, so a
+// disabled job is a silent no-op tick. First tick 5 minutes after boot (not
+// at boot), hourly after that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceProposalsRunning = false;
+  const experienceProposalsTick = trackJob("experience-proposals", async () => {
+    if (experienceProposalsRunning) return;
+    experienceProposalsRunning = true;
+    try {
+      const { tickExperienceDescriptionProposals } = await import("./services/experience-description-proposals-job");
+      const r = await tickExperienceDescriptionProposals();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-proposals] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-proposals] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceProposalsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceProposalsTick(); }, 5 * 60_000);
+  setInterval(() => { void experienceProposalsTick(); }, 60 * 60_000);
+}
+
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
 // (option A, Daniel GO 2026-09-05): gårdssalg outreach is sent by the
 // platform itself once a day ──────────────────────────────────────────

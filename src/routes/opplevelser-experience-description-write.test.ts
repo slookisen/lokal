@@ -183,6 +183,17 @@ export function runOpplevelserExperienceDescriptionWriteTests(
         ["dash list", "En tur:\n- padling\n- lunsj"],
         ["star list", "* padling"],
         ["junk", JUNK_DESCRIPTION],
+        ["javascript: scheme", "Klikk javascript:alert(1) for mer."],
+        ["inline event handler", "Bildet onerror=alert(1) vises her."],
+        ["event handler with space", "Knappen onclick = noe skjer."],
+        // Re-review: the line-start markdown gate must keep matching any
+        // non-line-break indent and a lone/NBSP-separated list marker.
+        ["NBSP-indented heading", "En tur.\n\u00a0# Overskrift"],
+        ["NBSP-indented dash list", "En tur:\n\u00a0- padling"],
+        ["dash + NBSP", "En tur:\n-\u00a0padling"],
+        ["lone dash line", "En tur\n-\nmed lunsj"],
+        ["form-feed-indented heading", "En tur.\n\f# Overskrift"],
+        ["vertical-tab-indented star list", "En tur:\n\u000b* padling"],
       ] as Array<[string, string]>) {
         assertTrue(experienceDescriptionTextHasMarkupOrJunk(txt), `p1l: markup_or_junk detects ${label}`);
         assertEq(checkPrewrittenExperienceDescriptionShape(txt, "faktalinje", T), "markup_or_junk", `p1m: shape gate rejects ${label} as markup_or_junk`);
@@ -190,6 +201,23 @@ export function runOpplevelserExperienceDescriptionWriteTests(
       assertEq(experienceDescriptionTextHasMarkupOrJunk(FAKTALINJE_TEXT), false, "p1n: plain faktalinje prose is not markup");
       assertEq(experienceDescriptionTextHasMarkupOrJunk(KILDETRO_TEXT), false, "p1o: plain kildetro prose is not markup");
       assertEq(experienceDescriptionTextHasMarkupOrJunk("En tur med lunsj - og kaffe etterpå."), false, "p1p: a mid-sentence dash is not a list");
+
+      // Length is checked BEFORE any regex (review B1): an 80 000-char,
+      // newline-heavy text is rejected fast as char_cap_exceeded, and a
+      // whitespace-heavy text just under the cap is scanned in linear time.
+      {
+        const huge = "a\n".repeat(40000);
+        const t0 = Date.now();
+        const reason = checkPrewrittenExperienceDescriptionShape(huge, "faktalinje", T);
+        const ms = Date.now() - t0;
+        assertEq(reason, "char_cap_exceeded", "p1q: an 80 000-char newline-heavy text -> char_cap_exceeded");
+        assertTrue(ms < 200, `p1r: ...rejected in < 200 ms (took ${ms} ms)`);
+        const nearCap = `a${" \n".repeat(5900)}b`;
+        const t1 = Date.now();
+        checkPrewrittenExperienceDescriptionShape(nearCap, "kildetro", T);
+        const ms1 = Date.now() - t1;
+        assertTrue(ms1 < 200, `p1s: a whitespace-heavy text under the cap is scanned in < 200 ms (took ${ms1} ms)`);
+      }
 
       const facts = "Tittel: X\nPris: fra 890 kroner per person";
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Fra 890 kroner.", "faktalinje", facts, null), false, "p2a: a facts number is grounded");

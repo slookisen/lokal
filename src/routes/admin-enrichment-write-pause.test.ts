@@ -660,6 +660,12 @@ export async function runAdminEnrichmentWritePauseTests(
         // and checks the SAME gate first, exactly as the route does — plus the
         // two test files that set pause state via the service to prove it.
         "routes/homepage-content-refresh-extraction-parity.test.ts",
+        // experience-description-proposals-job (dev-request 2026-10-07-
+        // experiences-beskrivelser-forslagsko-steg2): the hourly job checks
+        // the experiences pause before fetching/applying; its test file sets
+        // the pause via the service to prove that.
+        "services/experience-description-proposals-job.test.ts",
+        "services/experience-description-proposals-job.ts",
         "services/rfb-marketing-daily.test.ts",
         "services/rfb-marketing-daily.ts",
       ].sort(),
