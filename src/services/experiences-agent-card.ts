@@ -12,6 +12,7 @@
  */
 
 import { signAgentCard } from "./agent-card-signing";
+import { registeredMcpTools } from "./mcp-tool-manifest";
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
@@ -27,8 +28,14 @@ function baseUrl(): string {
   return OPPLEVAGENT_BASE_URL.replace(/\/$/, "");
 }
 
-export function getExperiencesAgentCard(): object {
+/**
+ * @param honestCount the ONE catalog number (services/honest-count.ts): published
+ *   experiences. Passed in by the route handlers so the card itself stays DB-free;
+ *   when absent the card carries no count — it never guesses one.
+ */
+export function getExperiencesAgentCard(honestCount?: number | null): object {
   const url = baseUrl();
+  const hasCount = typeof honestCount === "number" && honestCount >= 0;
   const card = {
     name: "Opplevagent",
     description:
@@ -37,7 +44,8 @@ export function getExperiencesAgentCard(): object {
       "gruppestørrelse, alder og pris. " +
       "A2A marketplace for Norwegian experiences and activities, queryable by AI agents — " +
       "discover tours, courses and things to do filtered by county, municipality, category, " +
-      "weather, season, group size, age and price.",
+      "weather, season, group size, age and price." +
+      (hasCount ? ` Katalog / catalog: ${honestCount} publiserte opplevelser / published experiences.` : ""),
     url: `${url}/a2a`,
     // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
     // dual-published alongside legacy `authentication` below (additive-only —
@@ -163,6 +171,11 @@ export function getExperiencesAgentCard(): object {
       // already live server-side — docs only, no new behavior).
       provenancePage: `${url}/proveniens`,
     },
+    // Catalog size + the MCP tools the live /mcp server registers (generated from the
+    // registered tools, services/mcp-tool-manifest.ts; locked by discovery-truth.test.ts).
+    ...(hasCount ? { "x-catalog": { vertical: "experiences", honestCount } } : {}),
+    "x-mcp-tools": registeredMcpTools("experiences").map((t) => t.name),
+    // Channels verified live on 2026-10-07 (HTTP 200 / registry lookup).
     "x-distribution": [
       {
         channel: "custom-gpt",
@@ -170,6 +183,41 @@ export function getExperiencesAgentCard(): object {
         install: OPPLEVAGENT_CUSTOM_GPT_URL,
         status: "live",
         description: "ChatGPT Custom GPT — Opplevagent experiences discovery; 3 Actions on opplevagent.no/openapi.json (discover/categories/get).",
+      },
+      {
+        channel: "npm",
+        url: "https://www.npmjs.com/package/opplevagent-mcp",
+        install: "npx opplevagent-mcp",
+        status: "live",
+        description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
+      },
+      {
+        channel: "official-mcp-registry",
+        url: "https://registry.modelcontextprotocol.io/v0/servers?search=opplevagent",
+        install: "npx opplevagent-mcp",
+        status: "live",
+        description: "Official Model Context Protocol Registry — io.github.slookisen/opplevagent-mcp.",
+      },
+      {
+        channel: "mcp-so",
+        url: "https://mcp.so/servers/opplevagent-mcp",
+        install: "npx opplevagent-mcp",
+        status: "live",
+        description: "mcp.so MCP servers directory listing.",
+      },
+      {
+        channel: "a2a-registry",
+        url: "https://a2aregistry.org/agents/38eee4e2-cb59-4562-90d1-416ce91ca2bd",
+        install: `${url}/.well-known/agent-card.json`,
+        status: "live",
+        description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
+      },
+      {
+        channel: "agenstry",
+        url: "https://agenstry.com/agents/opplevagent.no",
+        install: `${url}/.well-known/agent-card.json`,
+        status: "live",
+        description: "Agenstry A2A agent directory — auto-indexed from agent-card.json.",
       },
     ],
   };

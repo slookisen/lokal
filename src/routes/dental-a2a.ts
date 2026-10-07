@@ -28,6 +28,7 @@ import {
   getDentalStats,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
 
@@ -308,7 +309,7 @@ router.use(dentalLimiter);
 
 // ─── GET /a2a — health check & agent card ────────────────────
 router.get("/a2a", (_req: Request, res: Response) => {
-  res.json(getDentalAgentCard());
+  res.json(getDentalAgentCard(safeHonestCatalogCount("dental")));
 });
 
 // ─── POST /a2a — JSON-RPC 2.0 dispatcher ─────────────────────

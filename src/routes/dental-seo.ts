@@ -21,6 +21,9 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { safeHonestCatalogCount } from "../services/honest-count";
+import { buildRobotsGroups } from "../services/robots-policy";
+import { registeredMcpTools } from "../services/mcp-tool-manifest";
 // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
 // the existing pure classifiers rather than reinventing name-word / host
 // checks. DENTAL_NAME_WORDS is the SAME "does this name read as a dental
@@ -1793,37 +1796,13 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
   res.send(`# finn-tannlege.com — robots.txt
 # Uavhengig oversikt over tannlegeklinikker i Norge.
 # AI-agenter er velkomne til å indeksere og sitere data fra denne tjenesten.
-
-User-agent: *
-Allow: /
+# Content-Signal: søk og AI-input er tillatt, trening av modeller er ikke (ai-train=no).
 
 # LLM-vennlige endepunkter
 # Oversikt:      ${DENTAL_BASE_URL}/llms.txt
 # API:           ${DENTAL_BASE_URL}/api/tannlege/agents
 
-User-agent: GPTBot
-Allow: /
-
-User-agent: OAI-SearchBot
-Allow: /
-
-User-agent: ClaudeBot
-Allow: /
-
-User-agent: anthropic-ai
-Allow: /
-
-User-agent: PerplexityBot
-Allow: /
-
-User-agent: Google-Extended
-Allow: /
-
-User-agent: Googlebot
-Allow: /
-
-User-agent: Bingbot
-Allow: /
+${buildRobotsGroups("")}
 
 Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 `);
@@ -1834,8 +1813,8 @@ Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 // ═══════════════════════════════════════════════════════════
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
-  let stats = { total: 0 };
-  try { stats = getCachedDentalStats(); } catch { /* ok */ }
+  // ONE catalog number (services/honest-count.ts), read live — not via the 60 s SSR stats cache.
+  const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -1875,11 +1854,7 @@ MCP Server Card:      ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 npm-pakke (stdio):    npx finn-tannlege-mcp
 
 Tilgjengelige MCP-tools:
-- tannlege_search   — søk klinikker (fritekst, fylke, spesialitet, Helfo, akutt)
-- tannlege_info     — full klinikkprofil via org_nr eller id
-- tannlege_stats    — aggregerte markedsstatistikker
-- tannlege_akutt    — finn akuttvakt-klinikker
-- tannlege_kjeder   — list alle tannlegekjeder med antall lokasjoner
+${registeredMcpTools("dental").map((t) => `- ${t.name} — ${t.description}`).join("\n")}
 
 Claude Desktop-konfig:
   {
@@ -2459,7 +2434,7 @@ router.get("/.well-known/agent-card.json", agentCardUsageLogger("dental"), (_req
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
-  res.json(getDentalAgentCard());
+  res.json(getDentalAgentCard(safeHonestCatalogCount("dental")));
 });
 
 // GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
@@ -2469,8 +2444,13 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
   res.json(getJWKS());
 });
 
-// GET /.well-known/agents.txt — AI Agent Discovery File (parity with rfb + opplevagent)
-router.get("/.well-known/agents.txt", (_req: Request, res: Response) => {
+// GET /.well-known/agents.txt + root alias /agents.txt — AI Agent Discovery File
+// (parity with rfb discovery.ts and opplevagent experiences-seo.ts, which both
+// serve the root alias; dev-request 2026-09-08-discovery-paritet-og-ett-katalogtall
+// item 1). There is NO booking capability on finn-tannlege.com: none of the five
+// MCP tools books anything (clinics are contacted directly), so the file must not
+// claim it — the description/categories used to say "book"/"booking".
+function serveDentalAgentsTxt(_req: Request, res: Response): void {
   res.header("Content-Type", "text/plain; charset=utf-8");
   res.header("Cache-Control", "public, max-age=3600");
   res.send(`# agents.txt — finn-tannlege.com
@@ -2479,20 +2459,71 @@ router.get("/.well-known/agents.txt", (_req: Request, res: Response) => {
 User-agent: *
 Allow-actions: search, read, discover, compare
 Disallow-actions: modify, delete, register-without-key
-Agent-card: https://finn-tannlege.com/.well-known/agent-card.json
-MCP-endpoint: https://finn-tannlege.com/mcp
-MCP-server-card: https://finn-tannlege.com/.well-known/mcp/server-card.json
-A2A-endpoint: https://finn-tannlege.com/a2a
-API-base: https://finn-tannlege.com/api/tannleger
+Agent-card: ${DENTAL_BASE_URL}/.well-known/agent-card.json
+MCP-endpoint: ${DENTAL_BASE_URL}/mcp
+MCP-server-card: ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
+A2A-endpoint: ${DENTAL_BASE_URL}/a2a
+API-base: ${DENTAL_BASE_URL}/api/tannleger
 Name: Finn Tannlege
-Description: Norwegian dental practice directory — find, compare, and book dentists
+Description: Norwegian dental practice directory — find and compare dental clinics (read-only; no online booking, contact the clinic directly)
 Languages: no, en
-Categories: dental, healthcare, directory, norway, booking
+Categories: dental, healthcare, directory, norway
 Region: NO
 Rate-limit: 300 requests per 15 minutes (general)
 Rate-limit: 500 requests per hour (admin)
 Contact: https://github.com/slookisen/lokal/issues
 `);
+}
+router.get("/.well-known/agents.txt", serveDentalAgentsTxt);
+router.get("/agents.txt", serveDentalAgentsTxt);
+
+// GET /.well-known/openai-apps-challenge — OpenAI Apps Directory domain
+// verification (same literal-body pattern as rettfrabonden.com and
+// opplevagent.no). The token is issued by OpenAI's Apps form for THIS domain
+// and is deliberately not invented here: set DENTAL_OPENAI_APPS_CHALLENGE_TOKEN
+// (Fly env) when the token is issued; until then the route answers 404 so a
+// verifier never reads a wrong token.
+router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) => {
+  const token = (process.env.DENTAL_OPENAI_APPS_CHALLENGE_TOKEN || "").trim();
+  res.header("Content-Type", "text/plain");
+  res.header("X-Content-Type-Options", "nosniff");
+  if (!token) {
+    res.status(404).send("openai-apps-challenge token not configured");
+    return;
+  }
+  res.header("Cache-Control", "public, max-age=300");
+  res.send(token);
+});
+
+// GET /.well-known/ai-plugin.json — ChatGPT plugin manifest (parity with rfb
+// discovery.ts). OpenAI no longer loads plugins, but AI-discovery indexes still
+// scan the file as a machine-readable API-contract signal and it points at the
+// OpenAPI spec the Custom GPT's Actions use.
+router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
+  const total = safeHonestCatalogCount("dental");
+  res.header("Content-Type", "application/json");
+  res.header("Cache-Control", "public, max-age=3600");
+  res.header("X-Content-Type-Options", "nosniff");
+  res.json({
+    schema_version: "v1",
+    name_for_human: "Finn-tannlege",
+    name_for_model: "finn_tannlege",
+    description_for_human:
+      "Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akuttvakt.",
+    description_for_model:
+      "Plugin for searching and comparing Norwegian dental clinics. " +
+      (total ? `Provides access to ${total.toLocaleString("nb")} clinics ` : "Provides access to clinics ") +
+      "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency-duty " +
+      "(akuttvakt). Read-only: it does not book appointments — users contact the clinic directly.",
+    auth: { type: "none" },
+    api: {
+      type: "openapi",
+      url: `${DENTAL_BASE_URL}/openapi.json`,
+    },
+    logo_url: `${DENTAL_BASE_URL}/favicon.svg`,
+    contact_url: `${DENTAL_BASE_URL}/kontakt`,
+    legal_info_url: `${DENTAL_BASE_URL}/om`,
+  });
 });
 
 // GET /agent-card.json — alias (some crawlers skip well-known prefix)
@@ -2500,7 +2531,7 @@ router.get("/agent-card.json", agentCardUsageLogger("dental"), (_req: Request, r
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
-  res.json(getDentalAgentCard());
+  res.json(getDentalAgentCard(safeHonestCatalogCount("dental")));
 });
 
 // GET /openapi.json — OpenAPI 3.1 spec for finn-tannlege.com
@@ -2518,9 +2549,9 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 // rettfrabonden.com, but with finn-tannlege.com's own branding, endpoint,
 // and MCP tools (see dental-mcp.ts's registerDentalTools).
 function dentalMcpServerCard() {
-  let stats = { total: 0 };
-  try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
-  const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "6,900+";
+  // ONE catalog number (services/honest-count.ts): same as llms.txt, agent card, /api/stats, /health.
+  const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
+  const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "thousands of";
 
   return {
     // $schema deliberately omitted: the URL previously advertised here
@@ -2566,13 +2597,9 @@ function dentalMcpServerCard() {
       resources: { listChanged: false, subscribe: false },
       prompts: { listChanged: false },
     },
-    tools: [
-      { name: "tannlege_search", description: "Search Norwegian dental clinics by free text, county (fylke), specialty, Helfo agreement, and emergency-duty filters." },
-      { name: "tannlege_info", description: "Fetch full profile for a single dental clinic by organisation number (org_nr) or UUID." },
-      { name: "tannlege_stats", description: "Fetch aggregated Norwegian dental market statistics — totals, per-county breakdown, Helfo/chain/emergency-duty counts." },
-      { name: "tannlege_akutt", description: "Find dental clinics offering emergency-duty (akuttvakt) treatment, optionally filtered by county." },
-      { name: "tannlege_kjeder", description: "List Norwegian dental chains (kjeder) with a count of clinic locations per chain." },
-    ],
+    // Generated from the tools the live /mcp server registers (services/mcp-tool-manifest.ts);
+    // locked by src/routes/discovery-truth.test.ts against a real tools/list.
+    tools: registeredMcpTools("dental"),
     authentication: {
       schemes: ["none"],
       description: "All MCP tools are read-only and require no authentication.",

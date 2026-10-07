@@ -48,6 +48,7 @@ import {
   type GardssalgSearchFilter,
 } from "../services/experience-store";
 import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from "../services/norway-fylke";
+import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
@@ -732,7 +733,7 @@ router.use(jsonRpcLimiter);
 
 // ─── GET /a2a — health check & agent card ────────────────────
 router.get("/a2a", (_req: Request, res: Response) => {
-  res.json(getExperiencesAgentCard());
+  res.json(getExperiencesAgentCard(safeHonestCatalogCount("experiences")));
 });
 
 // ─── POST /a2a — JSON-RPC 2.0 dispatcher ─────────────────────
