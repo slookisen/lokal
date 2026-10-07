@@ -131,6 +131,8 @@ function gatedRoutes(hjemmeside: string): GatedRoute[] {
     { path: "/admin/experiences-description-enrichment", flag: "dry_run (strict-false)", applyBody: { dry_run: false, ids: ["wpg-nope"] }, dryRunBody: { ids: ["wpg-nope"] } },
     // dev-request 2026-10-07-experiences-beskrivelser-via-claude-code-uten-api
     { path: "/admin/experiences-description-write", flag: "dry_run (strict-false)", applyBody: { dry_run: false, items: [{ id: "wpg-nope", facts_fingerprint: "x", outcome: "skip", reason: "sentinel" }] }, dryRunBody: { items: [{ id: "wpg-nope", facts_fingerprint: "x", outcome: "skip", reason: "sentinel" }] } },
+    { path: "/admin/experiences-data-corrections", flag: "dry_run (strict-false)", applyBody: { dry_run: false, items: [{ id: "wpg-nope", field: "title", action: "correct", expected_current: "x", new_value: "Ny tittel", source_url: "https://wpg.example", quote: "q", confidence: "high" }] }, dryRunBody: { items: [{ id: "wpg-nope", field: "title", action: "correct", expected_current: "x", new_value: "Ny tittel", source_url: "https://wpg.example", quote: "q", confidence: "high" }] } },
+    { path: "/admin/experiences-data-corrections/revert", flag: "dry_run (strict-false)", applyBody: { dry_run: false, batch_id: "wpg-nope" }, dryRunBody: { batch_id: "wpg-nope" } },
     { path: "/admin/experiences-title-no-backfill", flag: "dry_run (strict-false)", applyBody: { dry_run: false }, dryRunBody: {} },
     { path: "/admin/experiences-content-judge-sweep", flag: "apply (=== true)", applyBody: { apply: true }, dryRunBody: {} },
     { path: "/admin/experiences-dedup-backfill", flag: "(none — always writes)", applyBody: {}, dryRunBody: null },

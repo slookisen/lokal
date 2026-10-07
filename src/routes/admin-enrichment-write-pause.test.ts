@@ -642,6 +642,10 @@ export async function runAdminEnrichmentWritePauseTests(
         // SAME shared opplevelser.ts helper, plus its own test file, which
         // sets/clears the pause via the service to prove the wiring.
         "routes/opplevelser-experience-description-write.test.ts",
+        // experiences-data-corrections (+ /revert): two more routes gated by
+        // the SAME shared opplevelser.ts helper, plus their own test file,
+        // which sets/clears the pause via the service to prove the wiring.
+        "routes/opplevelser-experience-data-corrections.test.ts",
         // experiences-orgnr-from-website (dev-request 2026-09-14-opplevagent-
         // karantene-utgang-brreg-krav, Trinn A): a 20th route gated by the
         // SAME shared opplevelser.ts helper, plus its own test file, which
