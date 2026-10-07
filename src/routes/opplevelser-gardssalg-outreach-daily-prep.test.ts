@@ -409,7 +409,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         booking_live: 0, catalog_hidden: 0, slug: "karantene-gard", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1, antall_ansatte: 3, naeringskode: null,
       });
-      const quarantineSentAt = "2026-08-08T09:00:00.000Z"; // recent -> inside the 60-day cooldown
+      const quarantineSentAt = new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString(); // 10 days ago -> inside the 60-day cooldown whatever today is
       expDb
         .prepare(
           `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, channel, is_test)
