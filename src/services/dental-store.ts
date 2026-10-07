@@ -1407,6 +1407,27 @@ export interface DentalStats {
 }
 
 /** Aggregate stats for the finn-tannlege.com frontpage. Excludes rejected and inactive rows. */
+/**
+ * Shared SQL tail ("FROM dental_agents WHERE ...") for the honest public
+ * clinic set: not rejected, not permanently closed, a real clinic class, not
+ * the synthetic probe row. Used by getDentalStats() and by
+ * countHonestDentalClinics() so every surface counts the SAME rows.
+ */
+const DENTAL_HONEST_BASE_SQL =
+  "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+  ` AND ${DENTAL_CLINIC_CLASS_SQL} AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
+
+/**
+ * The ONE dental catalog number (dev-request 2026-09-08-discovery-paritet-og-
+ * ett-katalogtall, item 6): honest, publishable clinics. Read by
+ * services/honest-count.ts for llms.txt, agent card, /api/stats, /health,
+ * mcp.json and server-card.
+ */
+export function countHonestDentalClinics(): number {
+  const db = getDb("dental");
+  return (db.prepare(`SELECT COUNT(*) AS n ${DENTAL_HONEST_BASE_SQL}`).get() as { n: number }).n;
+}
+
 export function getDentalStats(): DentalStats {
   const db = getDb("dental");
   // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
@@ -1416,10 +1437,9 @@ export function getDentalStats(): DentalStats {
   // unconditional honest-count catalog_class filter as listPublicDentalAgents()
   // above, so the frontpage/fylke counters never show a bigger number than
   // the filtered listing they sit next to.
-  const base = "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
-    ` AND ${DENTAL_CLINIC_CLASS_SQL} AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
+  const base = DENTAL_HONEST_BASE_SQL;
 
-  const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
+  const total = countHonestDentalClinics();
 
   const perFylkeRows = db.prepare(
     `SELECT fylke, COUNT(*) AS n ${base} AND fylke IS NOT NULL GROUP BY fylke ORDER BY n DESC`

@@ -11417,13 +11417,13 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     const card = regMod56.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
     const dist = card["x-distribution"];
     assertTrue(
-      Array.isArray(dist) && dist.length === 9,
-      `pr-56: getRegistryCard() emits x-distribution with 9 entries (got ${Array.isArray(dist) ? dist.length : typeof dist})`
+      Array.isArray(dist) && dist.length === 8,
+      `pr-56: getRegistryCard() emits x-distribution with 8 entries (acp-product-feed removed while the feed has 0 rows) (got ${Array.isArray(dist) ? dist.length : typeof dist})`
     );
     const channels = (dist || []).map((d: any) => d.channel).sort();
     assertTrue(
-      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "acp-product-feed", "agenstry", "custom-gpt", "glama", "mcp-so", "npm", "official-mcp-registry", "smithery"]),
-      `pr-56: x-distribution channels are exactly [a2a-registry, acp-product-feed, agenstry, custom-gpt, glama, mcp-so, npm, official-mcp-registry, smithery] (got ${JSON.stringify(channels)})`
+      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "agenstry", "custom-gpt", "glama", "mcp-so", "npm", "official-mcp-registry", "smithery"]),
+      `pr-56: x-distribution channels are exactly [a2a-registry, agenstry, custom-gpt, glama, mcp-so, npm, official-mcp-registry, smithery] (got ${JSON.stringify(channels)})`
     );
     const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
     assertTrue(
@@ -20151,7 +20151,10 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
       toolNames.includes("get_experience"),
       `mcpcard-exp-${p}: tools list includes discover_experiences, list_experience_categories, get_experience`
     );
-    assertEq((parsed.tools as any[]).length, 3, `mcpcard-exp-${p}: exactly 3 tools listed`);
+    // 2026-10-07 (discovery-truth): the card now lists every tool the live /mcp registers (5 incl.
+    // discover_gardssalg + book_gardssalg), generated from the registration — exact equality with
+    // tools/list is locked in src/routes/discovery-truth.test.ts.
+    assertEq((parsed.tools as any[]).length, 5, `mcpcard-exp-${p}: all 5 registered tools listed`);
     assertTrue(!/Rett fra Bonden|Finn-tannlege/i.test(r.body), `mcpcard-exp-${p}: does NOT leak rfb/dental identity`);
   }
 
@@ -46362,5 +46365,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("w40-write-guards: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-08-discovery-paritet-og-ett-katalogtall (phase 1) + 2026-10-06
+// addendum: ONE catalog number per vertical across llms.txt / agent card / mcp.json /
+// server-card / agents.json / /api/stats / /health, tool lists == live tools/list for
+// all three domains, no phantom tools / negotiation capability / empty ACP channel,
+// dental agents.txt alias + ai-plugin + apps-challenge, robots.txt AI-agent parity.
+// Swaps the getDb() singleton + vertical DB env paths (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── discovery-truth: one catalog number + tool lists == live tools/list + phase-1 parity ──");
+  try {
+    const { runDiscoveryTruthTests } = require("../src/routes/discovery-truth.test") as
+      typeof import("../src/routes/discovery-truth.test");
+    const dt = await runDiscoveryTruthTests({ log: false });
+    passed += dt.passed;
+    failed += dt.failed;
+    for (const f of dt.failures) failures.push("discovery-truth: " + f);
+    console.log(`  discovery-truth: ${dt.passed} passed, ${dt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("discovery-truth: unexpected error: " + String(err?.message || err));
   }
 });

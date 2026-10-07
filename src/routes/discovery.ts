@@ -18,6 +18,13 @@ import { slugify } from "../utils/slug";
 import { getConfig } from "../config/vertical-config";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { isJunkDescription } from "../services/description-quality";
+import { safeHonestCatalogCount } from "../services/honest-count";
+import { registeredMcpTools } from "../services/mcp-tool-manifest";
+
+/** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
+function rfbCatalogCount(fallback: number): number {
+  return safeHonestCatalogCount("rfb") ?? fallback;
+}
 
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -140,9 +147,9 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
 
 <!-- generated-at: ${new Date().toISOString()} -->
 
-> Norges første agent-til-agent (A2A) markedsplass for lokal mat. Vi kobler forbrukere direkte med ${agents.length}+ lokale ${getConfig().domain_dictionary.entity_plural_long} — gårder, bondensmarkeder, REKO-ringer, gårdsbutikker og kooperativer over hele Norge. Ingen mellomledd, ingen reklame, bare ekte mat rett fra bonden.
+> Norges første agent-til-agent (A2A) markedsplass for lokal mat. Vi kobler forbrukere direkte med ${rfbCatalogCount(agents.length)}+ lokale ${getConfig().domain_dictionary.entity_plural_long} — gårder, bondensmarkeder, REKO-ringer, gårdsbutikker og kooperativer over hele Norge. Ingen mellomledd, ingen reklame, bare ekte mat rett fra bonden.
 
-> Norway's first agent-to-agent (A2A) marketplace for local food. We connect consumers directly with ${agents.length}+ local food producers — farms, farmers' markets, REKO rings, farm shops, and cooperatives across Norway.
+> Norway's first agent-to-agent (A2A) marketplace for local food. We connect consumers directly with ${rfbCatalogCount(agents.length)}+ local food producers — farms, farmers' markets, REKO rings, farm shops, and cooperatives across Norway.
 
 ## Hva er dette?
 
@@ -150,7 +157,7 @@ ${getConfig().display_name} er en åpen plattform som lar AI-agenter finne, samm
 
 ## Nøkkeltall
 
-- ${agents.length} registrerte produsenter
+- ${rfbCatalogCount(agents.length)} registrerte produsenter
 - ${cities.size} byer dekket
 - ${categories.size} matkategorier
 - Oppdateres daglig med nye produsenter og data
@@ -216,9 +223,7 @@ Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
 Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
 1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
-   tilgjengelige skills (\`lokal_search\`, \`lokal_discover\`, \`lokal_info\`,
-   \`lokal_find_offers\`, \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`,
-   \`lokal_stats\`, \`lokal_list_umbrellas\`, \`lokal_bm_next_markets\`).
+   tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
 2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
@@ -348,7 +353,7 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
     const lines: string[] = [
       `# ${getConfig().display_name} — Komplett produsentoversikt`,
       ``,
-      `> ${agents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. Oppdatert ${new Date().toISOString().split("T")[0]}.`,
+      `> ${rfbCatalogCount(agents.length)} lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. Oppdatert ${new Date().toISOString().split("T")[0]}.`,
       ``,
       `## Alle produsenter`,
       ``,
@@ -443,7 +448,7 @@ router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) =
       name: `${getConfig().display_name} — Lokal Mat MCP`,
       version: "1.0.0",
       description: "MCP server for local food in Norway. Search and discover " +
-        `${stats.totalAgents || "1,290+"}` +
+        `${rfbCatalogCount(stats.totalAgents) || "1,290+"}` +
         " local food producers — farms, markets, REKO rings. " +
         "Supports natural language search in Norwegian and English.",
       homepage: BASE_URL,
@@ -459,24 +464,8 @@ router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) =
       resources: true,
       prompts: false,
     },
-    tools: [
-      {
-        name: "lokal_search",
-        description: "Search for local food producers using natural language (Norwegian or English)",
-      },
-      {
-        name: "lokal_discover",
-        description: "Discover producers by category, city, tags, and location with structured filters",
-      },
-      {
-        name: "lokal_info",
-        description: "Get detailed info about a specific producer — address, products, hours, ratings",
-      },
-      {
-        name: "lokal_register",
-        description: "Register a new food producer in the marketplace",
-      },
-    ],
+    // Generated from the registered MCP tools (services/mcp-tool-manifest.ts).
+    tools: registeredMcpTools("rfb"),
     security: {
       authentication: "none",
       note: "Read operations are open. Write operations require an API key.",
@@ -548,7 +537,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
     description_for_model:
       "Plugin for searching and discovering local food producers in Norway. " +
-      `Provides access to ${stats.totalAgents || "1,290+"} verified producers ` +
+      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified producers ` +
       "including farms, farmers' markets, REKO rings, farm shops, and " +
       "cooperatives. Use the search endpoint for natural-language queries " +
       "(Norwegian or English) and the agents endpoint for structured lookups " +
@@ -585,7 +574,7 @@ function serveApiIndex(_req: Request, res: Response): void {
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
-      `${stats.totalAgents || "1,290+"} verified agents across farms, markets, ` +
+      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified agents across farms, markets, ` +
       "REKO rings, and cooperatives.",
     documentation: `${BASE_URL}/openapi.json`,
     protocols: {
@@ -671,7 +660,7 @@ API-base: ${BASE_URL}/api/marketplace
 
 # Capabilities
 Name: ${getConfig().display_name}
-Description: Local food marketplace with ${agents.length}+ producers in Norway
+Description: Local food marketplace with ${rfbCatalogCount(agents.length)}+ producers in Norway
 Languages: no, en
 Categories: food, marketplace, local-commerce, organic, farm-direct
 Region: NO
@@ -698,7 +687,7 @@ router.get("/.well-known/agents.json", (_req: Request, res: Response) => {
   res.json({
     schema_version: "1.0",
     name: `${getConfig().display_name}`,
-    description: `Local food marketplace with ${agents.length}+ producers in Norway`,
+    description: `Local food marketplace with ${rfbCatalogCount(agents.length)}+ producers in Norway`,
     url: BASE_URL,
     capabilities: {
       search: { endpoint: `${BASE_URL}/api/marketplace/search`, method: "GET" },

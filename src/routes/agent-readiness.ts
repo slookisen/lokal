@@ -19,6 +19,8 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { safeHonestCatalogCount } from "../services/honest-count";
+import { registeredMcpTools } from "../services/mcp-tool-manifest";
 
 const router = Router();
 
@@ -30,7 +32,11 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 // We already run an MCP HTTP server at /mcp. This card lets agents
 // discover it without hitting the endpoint first.
 function mcpServerCard() {
-  const stats = marketplaceRegistry.getStats();
+  // ONE catalog number (services/honest-count.ts) — same as llms.txt, agent card,
+  // agents.json and /api/stats' data.honestCount. Falls back to the legacy raw
+  // count only if the honest query is unavailable.
+  const honest = safeHonestCatalogCount("rfb");
+  const stats = { totalAgents: honest ?? marketplaceRegistry.getStats().totalAgents };
 
   return {
     // $schema deliberately omitted: the URL previously advertised here
@@ -48,7 +54,7 @@ function mcpServerCard() {
     title: "Lokal — A2A marketplace for local food in Norway",
     version: "1.0.0",
     description:
-      `Discover and negotiate with ${stats.totalAgents || "1,290+"} verified Norwegian food producers. ` +
+      `Discover ${stats.totalAgents || "1,290+"} verified Norwegian food producers. ` +
       "Search by category, region, certification, and trust score. Supports " +
       "natural-language queries in Norwegian and English.",
     homepage: BASE_URL,
@@ -76,13 +82,10 @@ function mcpServerCard() {
       resources: { listChanged: false, subscribe: false },
       prompts: { listChanged: false },
     },
-    tools: [
-      { name: "search_producers", description: "Natural-language search across all producers." },
-      { name: "discover_by_category", description: "Find producers by category and region." },
-      { name: "get_producer", description: "Fetch full details for a specific producer." },
-      { name: "register_producer", description: "Register a new food producer agent." },
-      { name: "start_negotiation", description: "Open a buyer–seller negotiation channel." },
-    ],
+    // Generated from the tools the live /mcp server actually registers
+    // (services/mcp-tool-manifest.ts) — never hand-written. Locked by
+    // src/routes/discovery-truth.test.ts against a real tools/list.
+    tools: registeredMcpTools("rfb"),
     authentication: {
       schemes: ["apiKey"],
       header: "X-API-Key",
@@ -146,8 +149,7 @@ router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) 
 // Used by agent runtimes (Claude, ChatGPT, Cursor, etc.) to populate
 // skill pickers and action menus.
 function agentSkillsIndex() {
-  const stats = marketplaceRegistry.getStats();
-  const count = stats.totalAgents || "1,290+";
+  const count = safeHonestCatalogCount("rfb") ?? marketplaceRegistry.getStats().totalAgents ?? "1,290+";
   return {
     $schema: "https://agentskills.io/schemas/v0.2.0/index.schema.json",
     version: "0.2.0",
@@ -167,7 +169,7 @@ function agentSkillsIndex() {
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         invocation: {
-          mcp: { server: `${BASE_URL}/mcp`, tool: "search_producers" },
+          mcp: { server: `${BASE_URL}/mcp`, tool: "lokal_search" },
           a2a: { endpoint: `${BASE_URL}/a2a`, method: "message/send" },
           rest: { endpoint: `${BASE_URL}/api/marketplace/search`, method: "GET" },
         },
@@ -196,21 +198,8 @@ function agentSkillsIndex() {
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         invocation: {
-          mcp: { server: `${BASE_URL}/mcp`, tool: "discover_by_category" },
+          mcp: { server: `${BASE_URL}/mcp`, tool: "lokal_discover" },
           rest: { endpoint: `${BASE_URL}/api/marketplace/search`, method: "GET" },
-        },
-      },
-      {
-        id: "agent-conversation",
-        name: "Start Agent Negotiation",
-        description:
-          "Initiate a buyer-seller conversation. Offer / accept / reject flow with full transaction tracking.",
-        url: `${BASE_URL}/.well-known/agent-skills/agent-conversation`,
-        tags: ["negotiate", "conversation", "order", "transaction"],
-        inputModes: ["application/json"],
-        outputModes: ["application/json"],
-        invocation: {
-          a2a: { endpoint: `${BASE_URL}/a2a`, method: "message/send" },
         },
       },
     ],
@@ -235,7 +224,7 @@ const SKILL_DETAILS: Record<string, { id: string; title: string; mcpTool?: strin
   "discover-local-food-agents": {
     id: "discover-local-food-agents",
     title: "Discover Local Food Agents",
-    mcpTool: "search_producers",
+    mcpTool: "lokal_search",
     rest: "/api/marketplace/search",
   },
   "register-food-agent": {
@@ -246,13 +235,8 @@ const SKILL_DETAILS: Record<string, { id: string; title: string; mcpTool?: strin
   "search-compare-food": {
     id: "search-compare-food",
     title: "Search & Compare Local Food",
-    mcpTool: "discover_by_category",
+    mcpTool: "lokal_discover",
     rest: "/api/marketplace/search",
-  },
-  "agent-conversation": {
-    id: "agent-conversation",
-    title: "Start Agent Negotiation",
-    rest: "/api/marketplace/conversations",
   },
 };
 

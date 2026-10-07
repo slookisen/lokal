@@ -175,6 +175,9 @@ import {
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
+import { safeHonestCatalogCount } from "../services/honest-count";
+import { buildRobotsGroups } from "../services/robots-policy";
+import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
 import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-palette";
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
@@ -2497,46 +2500,13 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
   res.send(`# opplevagent.no — robots.txt
 # A2A-markedsplass for norske opplevelser og aktiviteter.
 # AI-agenter er velkomne til å indeksere og sitere data fra denne tjenesten.
-
-User-agent: *
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
+# Content-Signal: søk og AI-input er tillatt, trening av modeller er ikke (ai-train=no).
 
 # LLM-vennlige endepunkter
 # Oversikt:      ${url}/llms.txt
 # Discovery:     ${url}/api/opplevelser/discover
 
-User-agent: GPTBot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: OAI-SearchBot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: ClaudeBot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: anthropic-ai
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: PerplexityBot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: Google-Extended
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: Googlebot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
-
-User-agent: Bingbot
-Allow: /
-${GARDSSALG_ROBOTS_DISALLOWS}
+${buildRobotsGroups(GARDSSALG_ROBOTS_DISALLOWS)}
 
 Sitemap: ${url}/sitemap.xml
 `);
@@ -2718,6 +2688,13 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
   const url = baseUrl();
+  // ONE catalog number (services/honest-count.ts): published experiences — the same
+  // number the agent card, MCP server card and /api/stats quote. Omitted (never
+  // guessed) when the experiences DB is not available.
+  const catalogCount = safeHonestCatalogCount("experiences");
+  const catalogLine = catalogCount !== null
+    ? `\nKatalogen inneholder ${catalogCount.toLocaleString("nb")} publiserte opplevelser (Brreg-verifiserte tilbydere).\n`
+    : "";
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.send(`# opplevagent.no — LLM-oversikt
 
@@ -2727,7 +2704,7 @@ Opplevagent er en A2A-markedsplass for norske opplevelser og aktiviteter,
 bygget for å bli oppdaget og spurt av AI-agenter. Tjenesten lar agenter finne
 turer, kurs og opplevelser filtrert på fylke, kommune, kategori, vær, sesong,
 gruppestørrelse, alder, pris, varighet og språk.
-
+${catalogLine}
 ## ChatGPT Custom GPT
 
 ChatGPT Custom GPT — Opplevagent: https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge
@@ -2739,9 +2716,7 @@ MCP Server Card:                  ${url}/.well-known/mcp/server-card.json
 Koble til: lim inn https://opplevagent.no/mcp i Claude Desktop / ChatGPT som MCP-URL.
 
 Tilgjengelige MCP-verktøy:
-- discover_experiences         — finn opplevelser etter fylke, kategori, vær, sesong, pris, nær-meg (lat/lng/radius_km) m.m.
-- list_experience_categories   — hent alle kategorier med antall verifiserte opplevelser
-- get_experience               — hent fullstendig detalj for én opplevelse via UUID
+${registeredMcpTools("experiences").map((t) => `- ${t.name} — ${t.description}`).join("\n")}
 
 MCP Streamable HTTP krever et initialize-håndtrykk før tools/call — et bart
 tools/call uten forutgående initialize svarer med JSON-RPC-feil -32000
@@ -2999,7 +2974,7 @@ router.get("/.well-known/agent-card.json", agentCardUsageLogger("experiences"), 
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
-  res.json(getExperiencesAgentCard());
+  res.json(getExperiencesAgentCard(safeHonestCatalogCount("experiences")));
 });
 
 // GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
@@ -3017,7 +2992,7 @@ router.get("/agent-card.json", agentCardUsageLogger("experiences"), (_req: Reque
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
-  res.json(getExperiencesAgentCard());
+  res.json(getExperiencesAgentCard(safeHonestCatalogCount("experiences")));
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -3039,8 +3014,8 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 // MCP tools (see experiences-mcp.ts's registerExperienceTools).
 function experiencesMcpServerCard() {
   const url = baseUrl();
-  let total = 0;
-  try { total = countPublishedExperiences(); } catch { /* experiences db may not be ready */ }
+  // ONE catalog number (services/honest-count.ts): same as llms.txt, agent card, /api/stats, /health.
+  const total = safeHonestCatalogCount("experiences") ?? 0;
   const totalLabel = total > 0 ? total.toLocaleString("nb") : "hundreds of";
 
   return {
@@ -3088,11 +3063,9 @@ function experiencesMcpServerCard() {
       resources: { listChanged: false, subscribe: false },
       prompts: { listChanged: false },
     },
-    tools: [
-      { name: "discover_experiences", description: "Search Norwegian experiences by county, municipality, category, weather, season, indoor/outdoor, group size, age, price, duration, and near-me (lat/lng/radius)." },
-      { name: "list_experience_categories", description: "List all experience categories with the count of verified experiences in each." },
-      { name: "get_experience", description: "Fetch full details for a single experience by its UUID." },
-    ],
+    // Generated from the tools the live /mcp server registers (services/mcp-tool-manifest.ts);
+    // locked by src/routes/discovery-truth.test.ts against a real tools/list.
+    tools: registeredMcpTools("experiences"),
     authentication: {
       schemes: ["none"],
       description: "All MCP tools are read-only and require no authentication.",

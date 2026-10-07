@@ -123,7 +123,7 @@ export function buildSearchResults(
 
 // ─── Tool registrations ──────────────────────────────────────
 
-function registerDentalTools(server: McpServer): void {
+export function registerDentalTools(server: McpServer): void {
   // Tool 1: tannlege_search
   server.registerTool(
     "tannlege_search",

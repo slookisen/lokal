@@ -7,6 +7,7 @@
  */
 
 import { signAgentCard } from "./agent-card-signing";
+import { registeredMcpTools } from "./mcp-tool-manifest";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
@@ -16,8 +17,14 @@ function baseUrl(): string {
   return DENTAL_BASE_URL.replace(/\/$/, "");
 }
 
-export function getDentalAgentCard(): object {
+/**
+ * @param honestCount the ONE catalog number (services/honest-count.ts), passed in by
+ *   the route handlers. The card itself stays DB-free (see header); when no count is
+ *   supplied it simply carries none — it never guesses one.
+ */
+export function getDentalAgentCard(honestCount?: number | null): object {
   const url = baseUrl();
+  const hasCount = typeof honestCount === "number" && honestCount >= 0;
   const card = {
     name: "Finn-tannlege",
     // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
@@ -31,7 +38,8 @@ export function getDentalAgentCard(): object {
     // agent/visitor the real, honestly-filtered count.
     description:
       "A2A-markedsplass for norske tannlegeklinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
-      "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-duty data.",
+      "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-duty data." +
+      (hasCount ? ` Katalog / catalog: ${honestCount} klinikker / clinics.` : ""),
     url: `${url}/a2a`,
     // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
     // dual-published alongside legacy `authentication` below (additive-only —
@@ -157,6 +165,12 @@ export function getDentalAgentCard(): object {
       // behavior).
       provenancePage: `${url}/proveniens`,
     },
+    // Catalog size + the MCP tools the live /mcp server registers (generated from the
+    // registered tools, services/mcp-tool-manifest.ts; locked by discovery-truth.test.ts).
+    ...(hasCount ? { "x-catalog": { vertical: "dental", honestCount } } : {}),
+    "x-mcp-tools": registeredMcpTools("dental").map((t) => t.name),
+    // Channels verified live on 2026-10-07 (HTTP 200 / registry lookup). mcp.so is NOT
+    // listed: https://mcp.so/server/finn-tannlege-mcp returned 404 — add it when it is.
     "x-distribution": [
       {
         channel: "custom-gpt",
@@ -164,6 +178,34 @@ export function getDentalAgentCard(): object {
         install: "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge",
         status: "live",
         description: "ChatGPT Custom GPT — Finn tannlege i Norge clinic discovery; Actions on finn-tannlege.com/openapi.json.",
+      },
+      {
+        channel: "npm",
+        url: "https://www.npmjs.com/package/finn-tannlege-mcp",
+        install: "npx finn-tannlege-mcp",
+        status: "live",
+        description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
+      },
+      {
+        channel: "official-mcp-registry",
+        url: "https://registry.modelcontextprotocol.io/v0/servers?search=finn-tannlege",
+        install: "npx finn-tannlege-mcp",
+        status: "live",
+        description: "Official Model Context Protocol Registry — io.github.slookisen/finn-tannlege-mcp.",
+      },
+      {
+        channel: "a2a-registry",
+        url: "https://a2aregistry.org/agents/cd035cbe-46f9-4591-889e-e4fa20663113",
+        install: `${url}/.well-known/agent-card.json`,
+        status: "live",
+        description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
+      },
+      {
+        channel: "agenstry",
+        url: "https://agenstry.com/agents/finn-tannlege.com",
+        install: `${url}/.well-known/agent-card.json`,
+        status: "live",
+        description: "Agenstry A2A agent directory — auto-indexed from agent-card.json.",
       },
     ],
   };
