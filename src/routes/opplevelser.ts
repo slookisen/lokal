@@ -33812,9 +33812,15 @@ export function experienceDescriptionTextHasMarkupOrJunk(text: string): boolean 
   if (expDescIsJunk(t)) return true;
   if (/[<>]/.test(t)) return true;
   if (/http|www\./i.test(t)) return true;
+  // Script-ish payloads (review N3): a javascript: scheme or an inline
+  // event-handler attribute (onclick=, onerror= ...).
+  if (/javascript:/i.test(t)) return true;
+  if (/\bon\w+\s*=/i.test(t)) return true;
   if (t.includes("**") || t.includes("`")) return true;
-  if (/^\s*#/m.test(t)) return true;
-  if (/^\s*[-*]\s/m.test(t)) return true;
+  // Line-start markdown. `[ \t]*` (never `\s*`) so the scan cannot run
+  // across line breaks — linear on any input.
+  if (/^[ \t]*#/m.test(t)) return true;
+  if (/^[ \t]*[-*][ \t]/m.test(t)) return true;
   return false;
 }
 
@@ -33825,10 +33831,14 @@ export function checkPrewrittenExperienceDescriptionShape(
 ): string | null {
   const cleaned = text.trim();
   if (!cleaned) return "empty_description";
-  if (cleaned.includes(EXP_DESC_SENTINEL)) return "sentinel";
-  if (experienceDescriptionTextHasMarkupOrJunk(cleaned)) return "markup_or_junk";
+  // Length FIRST (review B1, dev-request 2026-10-07-experiences-beskrivelser-
+  // forslagsko-steg2): the sentinel/markup/junk scans below never see input
+  // over the tier's char cap, so an oversized client text is rejected in
+  // linear time before any regex runs.
   const b = experienceDescriptionLevelBounds(level);
   if (cleaned.length > b.char_max) return "char_cap_exceeded";
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return "sentinel";
+  if (experienceDescriptionTextHasMarkupOrJunk(cleaned)) return "markup_or_junk";
   const words = expDescWordCount(cleaned);
   if (words < b.word_min) return "below_word_floor";
   if (words > b.word_max) return "above_word_ceiling";

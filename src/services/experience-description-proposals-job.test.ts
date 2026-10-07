@@ -143,7 +143,7 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
     }) as unknown as typeof fetch;
 
     // ── GitHub contents-API stub. ──────────────────────────────────────
-    type Entry = { name: string; path: string; type: "dir" | "file"; sha: string };
+    type Entry = { name: string; path: string; type: "dir" | "file"; sha: string; size?: number };
     const gh = {
       dirs: new Map<string, Entry[]>(),
       files: new Map<string, { sha: string; text: string }>(),
@@ -181,13 +181,13 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
     function setRoot(names: Array<[string, "dir" | "file"]>): void {
       gh.dirs.set(ROOT, names.map(([name, type]) => ({ name, path: `${ROOT}/${name}`, type, sha: `sha-${name}` })));
     }
-    function putFile(date: string, name: string, content: unknown, sha = `sha-${date}-${name}`): string {
+    function putFile(date: string, name: string, content: unknown, sha = `sha-${date}-${name}`, listedSize?: number): string {
       const path = `${ROOT}/${date}/${name}`;
       const text = typeof content === "string" ? content : JSON.stringify(content);
       gh.files.set(path, { sha, text });
       const list = gh.dirs.get(`${ROOT}/${date}`) ?? [];
       const others = list.filter((e) => e.path !== path);
-      gh.dirs.set(`${ROOT}/${date}`, [...others, { name, path, type: "file", sha }]);
+      gh.dirs.set(`${ROOT}/${date}`, [...others, { name, path, type: "file", sha, size: listedSize ?? Buffer.byteLength(text) }]);
       return path;
     }
     const fetchCount = (path: string) => gh.calls.filter((c) => c === path).length;
@@ -299,7 +299,11 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         assertEq(r.processed.map((p: any) => p.path), [pA, pB], "pj-2b: oldest date first, file names ascending, max 2");
         assertEq(r.processed.map((p: any) => p.status), ["applied", "error"], "pj-2c: a applied, b error");
         assertEq(r.written, 2, "pj-2d: two rows written from a.json");
-        assertTrue(!gh.calls.includes(`${ROOT}/2026-09-23`), "pj-2e: the 14-day-old dir is never listed");
+        // The 14-day-old dir is listed at most once, read-only, for the N6
+        // "dropped by the window" log line — its files are never fetched
+        // (pj-2g) and never processed.
+        assertTrue(fetchCount(`${ROOT}/2026-09-23`) <= 1, "pj-2e: the 14-day-old dir is only listed for the dropped-file count");
+        assertTrue(!r.processed.some((p: any) => p.path.startsWith(`${ROOT}/2026-09-23/`)), "pj-2e2: nothing from the old dir is processed");
         assertTrue(!gh.calls.includes(`${ROOT}/notes`), "pj-2f: a non-date dir is never listed");
         assertEq(fetchCount(pOld), 0, "pj-2g: a file in the old dir is never fetched");
         assertTrue(gh.headersOk, "pj-2h: every GitHub request carries Bearer auth + User-Agent");
@@ -319,6 +323,10 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         ], "pj-2p: envelope claims");
         assertEq([runs[0].vertical, runs[0].status], ["experiences", "partial"], "pj-2q: vertical experiences, partial (one file errored)");
         assertTrue(r.envelope_recorded, "pj-2r: report says envelope recorded");
+        assertEq(JSON.parse(runs[0].evidence), [
+          { claim_idx: 0, ids: [idA1, idA2] },
+          { claim_idx: 1, ids: [pA, pB] },
+        ], "pj-2s: evidence carries the written experience ids (claim 0) and the processed paths (claim 1)");
       }
 
       // ── pj-3: second tick — only c.json; a/b never refetched. ────────
@@ -399,6 +407,7 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         assertEq(r1.processed, [], "pj-7a: file fetch HTTP 500 -> nothing processed");
         assertTrue(r1.github_error !== null, "pj-7b: github_error reported");
         assertEq(fileRow(pG), undefined, "pj-7c: nothing recorded for the failing file");
+        assertEq(r1.failures.map((x: any) => [x.path, x.fail_count]), [[pG, 1]], "pj-7c2: the failure is counted per path");
         gh.fail.delete(pG);
         gh.hang.add(pG);
         const r2 = await tick({ timeoutMs: 30 });
@@ -409,13 +418,106 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         gh.fail.add(ROOT);
         const r3 = await tick();
         assertEq(r3.skipped_reason, "github_error", "pj-7g: root listing 500 -> github_error");
+        const failedRuns = () => runsFor().filter((x) => x.status === "failed");
+        assertEq(failedRuns().length, 1, "pj-7g2: every GitHub call failed -> one `failed` envelope");
+        await tick();
+        assertEq(failedRuns().length, 1, "pj-7g3: ...at most once per UTC day");
         gh.fail.delete(ROOT);
         const r4 = await tick();
         assertEq(r4.processed.map((p: any) => [p.path, p.status]), [[pG, "applied"]], "pj-7h: the file is processed on the next healthy tick");
         assertEq(rowOf(idE1).description, FAKTALINJE_TEXT, "pj-7i: and written");
+        assertEq(expDb.prepare("SELECT * FROM experience_description_proposal_failures WHERE path = ?").get(pG), undefined,
+          "pj-7i2: the failure counter is cleared once the file is processed");
         gh.dirs.delete(ROOT);
         const r5 = await tick();
         assertEq([r5.skipped_reason, r5.processed.length], [null, 0], "pj-7j: a missing proposals dir (404) is a quiet idle tick");
+      }
+
+      // Restore the tree for the review follow-up blocks below.
+      setRoot([["2026-09-23", "dir"], ["2026-09-24", "dir"], ["2026-10-07", "dir"], ["notes", "dir"], ["README.md", "file"]]);
+
+      // ── pj-11 (review B2): an always-failing file never blocks the files
+      //    behind it, and becomes a permanent error after 3 ticks. ────────
+      {
+        const idH = seed("pj-h1");
+        const pH = putFile("2026-10-07", "h-always-fail.json", file([writeItem(idH)]));
+        const idI = seed("pj-i1");
+        const pI = putFile("2026-10-07", "i-ok.json", file([writeItem(idI)]));
+        gh.fail.add(pH);
+        const t1 = await tick();
+        assertEq(t1.failures.map((x: any) => [x.path, x.fail_count]), [[pH, 1]], "pj-11a: tick 1 — h fails (1/3)");
+        assertEq(t1.processed.map((p: any) => [p.path, p.status]), [[pI, "applied"]], "pj-11b: ...and i, behind it, is processed in the same tick");
+        assertEq(runsFor()[runsFor().length - 1].status, "partial", "pj-11c: envelope is partial while a file is failing");
+        const t2 = await tick();
+        assertEq(t2.failures.map((x: any) => x.fail_count), [2], "pj-11d: tick 2 — 2/3");
+        assertEq(fileRow(pH), undefined, "pj-11e: not yet recorded");
+        const t3 = await tick();
+        assertEq(t3.failures.map((x: any) => x.fail_count), [3], "pj-11f: tick 3 — 3/3");
+        const fh = JSON.parse(fileRow(pH).result_json);
+        assertEq(fh.status, "error", "pj-11g: recorded as a permanent error");
+        assertTrue(String(fh.error).startsWith("failed 3 times"), "pj-11h: error says it failed 3 times");
+        const before = fetchCount(pH);
+        await tick();
+        assertEq(fetchCount(pH), before, "pj-11i: a permanently failed file is never fetched again");
+        assertEq(rowOf(idH).description, null, "pj-11j: nothing written for it");
+        gh.fail.delete(pH);
+      }
+
+      // ── pj-12 (review B1): size cap — by listing size (never fetched)
+      //    and by decoded content (listing lied). ─────────────────────────
+      {
+        const pBig = putFile("2026-10-07", "j-big.json", file([]), undefined, 70_000);
+        const bigItems = Array.from({ length: 20 }, (_, i) => writeItem(idE1, { id: `big-${i}`, description: "x".repeat(4000) }));
+        const pLie = putFile("2026-10-07", "k-lying.json", file(bigItems), undefined, 100);
+        const before = dumpAll();
+        const r = await tick();
+        assertEq(r.processed.map((p: any) => [p.path, p.status, p.error]), [[pBig, "error", "file too large"], [pLie, "error", "file too large"]],
+          "pj-12a: both recorded as permanent 'file too large'");
+        assertEq(fetchCount(pBig), 0, "pj-12b: a file listed over 64 KB is never fetched");
+        assertEq(fetchCount(pLie), 1, "pj-12c: the lying listing is fetched once, then capped on its decoded size");
+        assertEq(dumpAll(), before, "pj-12d: nothing written");
+      }
+
+      // ── pj-13 (review N2): an exception in apply() is a per-file failure,
+      //    the next file is still processed, envelope partial. ────────────
+      {
+        const idM = seed("pj-m1");
+        const pL = putFile("2026-10-07", "l-throws.json", file([{ id: "throw-me", facts_fingerprint: "x", outcome: "skip", reason: "sentinel" }]));
+        const pM = putFile("2026-10-07", "m-ok.json", file([writeItem(idM)]));
+        const realApply = opp.applyPrewrittenExperienceDescriptions;
+        const throwingApply = (async (db: any, items: any, o: any) => {
+          if (Array.isArray(items) && items[0]?.id === "throw-me") throw new Error("boom in apply");
+          return realApply(db, items, o);
+        }) as any;
+        const r = await tick({ apply: throwingApply });
+        assertEq(r.failures.map((x: any) => [x.path, x.fail_count]), [[pL, 1]], "pj-13a: apply exception counted as a failure");
+        assertTrue(String(r.failures[0].error).includes("boom in apply"), "pj-13b: failure carries the exception message");
+        assertEq(r.processed.map((p: any) => [p.path, p.status]), [[pM, "applied"]], "pj-13c: the next file is still processed");
+        assertEq(rowOf(idM).description, FAKTALINJE_TEXT, "pj-13d: and written");
+        const last = runsFor()[runsFor().length - 1];
+        assertEq(last.status, "partial", "pj-13e: envelope written, partial");
+        assertTrue(JSON.parse(last.errors).some((e: any) => String(e.message).includes("boom in apply")), "pj-13f: envelope errors include the apply failure");
+        // Retire the throwing file so it does not interfere below.
+        gh.dirs.set(`${ROOT}/2026-10-07`, (gh.dirs.get(`${ROOT}/2026-10-07`) ?? []).filter((e) => e.path !== pL));
+      }
+
+      // ── pj-14 (review N1 + N6): no query string in error messages; one
+      //    log line counting unprocessed files dropped by the 14-day window. ─
+      {
+        const lines: string[] = [];
+        const prevLog = console.log;
+        console.log = (...a: any[]) => { lines.push(a.map(String).join(" ")); };
+        try {
+          await tick();
+        } finally {
+          console.log = prevLog;
+        }
+        assertTrue(lines.some((l) => /1 unprocessed proposal file\(s\) dropped by the 14-day window/.test(l)),
+          "pj-14a: the old dir's unprocessed file is reported as dropped");
+        assertEq(fetchCount(pOld), 0, "pj-14b: ...but never fetched");
+        const qFetch = (async () => { throw new Error("socket hang up"); }) as unknown as typeof fetch;
+        const r = await tick({ fetchImpl: qFetch });
+        assertTrue(r.github_error !== null && !String(r.github_error).includes("?"), "pj-14c: error message has no query string");
       }
 
       // ── pj-8: status GET shape + admin gate. ────────────────────────

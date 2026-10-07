@@ -2195,6 +2195,23 @@ export function initExperiencesSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration experience_description_proposal_files failed:", err);
   }
+  // Per-path transient failure counter for the same job (review follow-up,
+  // same dev-request): a GitHub error/timeout (or an exception in the apply
+  // step) on ONE file bumps fail_count here instead of blocking the queue;
+  // at 3 the job records the file as a permanent error in the table above
+  // and deletes its row here. Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_description_proposal_failures (
+        path TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL,
+        last_error TEXT,
+        last_failed_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_description_proposal_failures failed:", err);
+  }
 
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV

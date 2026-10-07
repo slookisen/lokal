@@ -32,8 +32,19 @@
 // records every processed path; a recorded path is skipped forever, even if
 // its sha changed (logged — a changed proposal must use a new name). A file
 // is recorded only AFTER it was fetched and evaluated (applied, or rejected
-// as invalid); a GitHub error/timeout records nothing, so it is retried on
-// the next tick. Re-applying after a crash between apply and record is safe:
+// as invalid); a GitHub error/timeout on ONE file records nothing final —
+// it bumps that path's fail_count (experience_description_proposal_failures)
+// and the tick moves on to the next file, so one broken file never blocks
+// the queue (review B2). After EXPERIENCE_PROPOSALS_MAX_FAILURES (3) the
+// file is recorded as a permanent error. An exception from the apply step
+// counts the same way. A failing ROOT listing aborts the tick (nothing to
+// iterate); when every GitHub call of a tick failed, one `failed` envelope
+// is written per UTC day.
+//
+// SIZE. Proposal files are tiny (≤25 short items). A file whose listed
+// `size` — or decoded content — exceeds EXPERIENCE_PROPOSALS_MAX_FILE_BYTES
+// (64 KB) is recorded as a permanent error WITHOUT being fetched/parsed;
+// there is no raw download_url fallback (review B1). Re-applying after a crash between apply and record is safe:
 // a written row is no longer a candidate (rejected not_candidate), and a
 // skip item just refreshes its attempt row.
 //
@@ -56,6 +67,14 @@ export const EXPERIENCE_PROPOSALS_MAX_AGE_DAYS = 14;
 export const EXPERIENCE_PROPOSALS_FILES_PER_TICK = 2;
 export const EXPERIENCE_PROPOSALS_REQUEST_TIMEOUT_MS = 20_000;
 export const EXPERIENCE_PROPOSALS_AGENT = "experience-proposals-job";
+export const EXPERIENCE_PROPOSALS_MAX_FILE_BYTES = 64 * 1024;
+export const EXPERIENCE_PROPOSALS_MAX_FAILURES = 3;
+/** Fetch attempts per tick (successes + per-file failures) — bounds the
+ *  tick's runtime when several files fail in a row. */
+export const EXPERIENCE_PROPOSALS_MAX_ATTEMPTS_PER_TICK = 4;
+/** How many of the most recent date dirs that fell OUT of the 14-day window
+ *  are inspected (read-only) to log how many unprocessed files they hold. */
+const EXPERIENCE_PROPOSALS_STALE_DIRS_INSPECTED = 3;
 const USER_AGENT = "lokal-experience-proposals-job";
 const GITHUB_API = "https://api.github.com";
 
@@ -94,6 +113,9 @@ export interface ExperienceProposalsTickReport {
   github_error: string | null;
   files_listed: number;
   processed: ExperienceProposalFileOutcome[];
+  /** Per-file failures this tick (GitHub error/timeout, or an exception in
+   *  apply) — not recorded as processed unless fail_count reached the cap. */
+  failures: Array<{ path: string; fail_count: number; error: string }>;
   written: number;
   envelope_recorded: boolean;
 }
@@ -125,19 +147,24 @@ export function validateExperienceProposalFile(parsed: unknown): { items: unknow
 
 class GithubFetchError extends Error {}
 
-async function githubGet(
-  fetchImpl: typeof fetch,
-  token: string,
-  url: string,
-  timeoutMs: number,
-): Promise<Response> {
+/** Per-tick GitHub context: counts calls and failed calls so a tick in which
+ *  EVERY GitHub call failed can be told apart (review N5). */
+type GhCtx = { fetchImpl: typeof fetch; token: string; timeoutMs: number; calls: number; failures: number };
+
+/** Error-message form of a URL: never the query string (review N1). */
+function safeUrl(url: string): string {
+  return url.split("?")[0].split("#")[0];
+}
+
+async function githubGet(ctx: GhCtx, url: string): Promise<Response> {
+  ctx.calls++;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const timer = setTimeout(() => ctrl.abort(), ctx.timeoutMs);
   try {
-    return await fetchImpl(url, {
+    return await ctx.fetchImpl(url, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${ctx.token}`,
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": USER_AGENT,
@@ -145,62 +172,75 @@ async function githubGet(
       signal: ctrl.signal,
     });
   } catch (err) {
-    throw new GithubFetchError(`request failed for ${url}: ${String((err as Error)?.message ?? err)}`);
+    ctx.failures++;
+    throw new GithubFetchError(`request failed for ${safeUrl(url)}: ${String((err as Error)?.message ?? err)}`);
   } finally {
     clearTimeout(timer);
   }
 }
 
-type ContentsEntry = { name: string; path: string; type: string; sha: string };
+type ContentsEntry = { name: string; path: string; type: string; sha: string; size: number };
 
-async function listContents(
-  fetchImpl: typeof fetch,
-  token: string,
-  path: string,
-  timeoutMs: number,
-): Promise<ContentsEntry[] | null> {
-  const url = `${GITHUB_API}/repos/${EXPERIENCE_PROPOSALS_REPO}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
-  const res = await githubGet(fetchImpl, token, url, timeoutMs);
+function contentsUrl(path: string): string {
+  return `${GITHUB_API}/repos/${EXPERIENCE_PROPOSALS_REPO}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+async function listContents(ctx: GhCtx, path: string): Promise<ContentsEntry[] | null> {
+  const res = await githubGet(ctx, contentsUrl(path));
   if (res.status === 404) return null; // directory not created yet — nothing to do
-  if (!res.ok) throw new GithubFetchError(`GET ${path} -> HTTP ${res.status}`);
+  if (!res.ok) {
+    ctx.failures++;
+    throw new GithubFetchError(`GET ${path} -> HTTP ${res.status}`);
+  }
   let body: unknown;
   try {
     body = await res.json();
   } catch {
+    ctx.failures++;
     throw new GithubFetchError(`GET ${path} -> unparseable JSON`);
   }
-  if (!Array.isArray(body)) throw new GithubFetchError(`GET ${path} -> not a directory listing`);
+  if (!Array.isArray(body)) {
+    ctx.failures++;
+    throw new GithubFetchError(`GET ${path} -> not a directory listing`);
+  }
   return (body as Array<Record<string, unknown>>)
     .filter((e) => typeof e?.name === "string" && typeof e?.path === "string" && typeof e?.type === "string" && typeof e?.sha === "string")
-    .map((e) => ({ name: e.name as string, path: e.path as string, type: e.type as string, sha: e.sha as string }));
+    .map((e) => ({
+      name: e.name as string,
+      path: e.path as string,
+      type: e.type as string,
+      sha: e.sha as string,
+      size: typeof e.size === "number" && Number.isFinite(e.size) ? e.size : 0,
+    }));
 }
 
-async function fetchFileText(
-  fetchImpl: typeof fetch,
-  token: string,
-  path: string,
-  timeoutMs: number,
-): Promise<string> {
-  const url = `${GITHUB_API}/repos/${EXPERIENCE_PROPOSALS_REPO}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
-  const res = await githubGet(fetchImpl, token, url, timeoutMs);
-  if (!res.ok) throw new GithubFetchError(`GET ${path} -> HTTP ${res.status}`);
+const TOO_LARGE = Symbol("too_large");
+
+/** The file's text from the contents API's inline base64 `content` only —
+ *  no download_url fallback (a proposal over 1 MB is never valid). Returns
+ *  TOO_LARGE when the encoded or decoded content exceeds the byte cap. */
+async function fetchFileText(ctx: GhCtx, path: string): Promise<string | typeof TOO_LARGE> {
+  const res = await githubGet(ctx, contentsUrl(path));
+  if (!res.ok) {
+    ctx.failures++;
+    throw new GithubFetchError(`GET ${path} -> HTTP ${res.status}`);
+  }
   let body: any;
   try {
     body = await res.json();
   } catch {
+    ctx.failures++;
     throw new GithubFetchError(`GET ${path} -> unparseable JSON`);
   }
-  if (body && body.encoding === "base64" && typeof body.content === "string" && body.content !== "") {
-    return Buffer.from(body.content.replace(/\s+/g, ""), "base64").toString("utf8");
+  if (!body || body.encoding !== "base64" || typeof body.content !== "string" || body.content === "") {
+    ctx.failures++;
+    throw new GithubFetchError(`GET ${path} -> no inline base64 content`);
   }
-  // Files over 1 MB come back without inline content — fall back to the raw
-  // download URL (same token, same timeout).
-  if (body && typeof body.download_url === "string" && body.download_url) {
-    const raw = await githubGet(fetchImpl, token, body.download_url, timeoutMs);
-    if (!raw.ok) throw new GithubFetchError(`GET raw ${path} -> HTTP ${raw.status}`);
-    return await raw.text();
-  }
-  throw new GithubFetchError(`GET ${path} -> no content`);
+  // base64 is 4/3 of the payload (+ line breaks) — reject before decoding.
+  if (body.content.length > Math.ceil(EXPERIENCE_PROPOSALS_MAX_FILE_BYTES * 1.4) + 1024) return TOO_LARGE;
+  const buf = Buffer.from(body.content.replace(/\s+/g, ""), "base64");
+  if (buf.length > EXPERIENCE_PROPOSALS_MAX_FILE_BYTES) return TOO_LARGE;
+  return buf.toString("utf8");
 }
 
 /** One tick. Never throws for an expected failure — the report says what
@@ -211,11 +251,12 @@ export async function tickExperienceDescriptionProposals(
   const env = deps.env ?? process.env;
   const now = deps.now ?? new Date();
   const startedAt = now.toISOString();
+  const today = startedAt.slice(0, 10);
   // run-YYYY-MM-DD-<agent>-<seq>-<vertical>; seq = HHMMSSmmm + a short random
   // suffix, because recordRun() is ON CONFLICT(run_id) DO NOTHING and two
   // ticks must never share an id.
   const runId =
-    `run-${startedAt.slice(0, 10)}-${EXPERIENCE_PROPOSALS_AGENT}-` +
+    `run-${today}-${EXPERIENCE_PROPOSALS_AGENT}-` +
     `${startedAt.replace(/[^0-9]/g, "").slice(8, 17)}${randomUUID().slice(0, 6)}-experiences`;
   const report: ExperienceProposalsTickReport = {
     run_id: runId,
@@ -223,6 +264,7 @@ export async function tickExperienceDescriptionProposals(
     github_error: null,
     files_listed: 0,
     processed: [],
+    failures: [],
     written: 0,
     envelope_recorded: false,
   };
@@ -244,33 +286,88 @@ export async function tickExperienceDescriptionProposals(
     return report;
   }
 
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const ctx: GhCtx = {
+    fetchImpl: deps.fetchImpl ?? fetch,
+    token,
+    timeoutMs: deps.timeoutMs ?? EXPERIENCE_PROPOSALS_REQUEST_TIMEOUT_MS,
+    calls: 0,
+    failures: 0,
+  };
   const homepageFetchImpl = deps.homepageFetchImpl ?? fetch;
-  const timeoutMs = deps.timeoutMs ?? EXPERIENCE_PROPOSALS_REQUEST_TIMEOUT_MS;
   const expDb = deps.expDb ?? (getExpDbDefault("experiences") as unknown as Database.Database);
   const apply: ApplyFn =
     deps.apply ?? ((await import("../routes/opplevelser")).applyPrewrittenExperienceDescriptions as unknown as ApplyFn);
 
   const processedSha = (path: string): string | undefined =>
     (expDb.prepare("SELECT sha FROM experience_description_proposal_files WHERE path = ?").get(path) as { sha: string } | undefined)?.sha;
-  const recordFile = expDb.prepare(
+  const recordFileStmt = expDb.prepare(
     `INSERT INTO experience_description_proposal_files (path, sha, processed_at, result_json)
      VALUES (?, ?, datetime('now'), ?)
      ON CONFLICT(path) DO NOTHING`,
   );
+  const clearFailure = expDb.prepare("DELETE FROM experience_description_proposal_failures WHERE path = ?");
+  const bumpFailure = expDb.prepare(
+    `INSERT INTO experience_description_proposal_failures (path, fail_count, last_error, last_failed_at)
+     VALUES (?, 1, ?, datetime('now'))
+     ON CONFLICT(path) DO UPDATE SET
+       fail_count = fail_count + 1, last_error = excluded.last_error, last_failed_at = excluded.last_failed_at`,
+  );
+  const failCountOf = (path: string): number =>
+    (expDb.prepare("SELECT fail_count FROM experience_description_proposal_failures WHERE path = ?").get(path) as { fail_count: number } | undefined)?.fail_count ?? 0;
+  const writtenIds: string[] = [];
 
+  const recordFile = (f: ContentsEntry, outcome: ExperienceProposalFileOutcome, resultJson: unknown): void => {
+    recordFileStmt.run(f.path, f.sha, JSON.stringify(resultJson));
+    clearFailure.run(f.path);
+    report.processed.push(outcome);
+  };
+  const recordError = (f: ContentsEntry, error: string): void =>
+    recordFile(f, { path: f.path, sha: f.sha, status: "error", error }, { status: "error", error });
+  /** One failure for this path; at the cap the file becomes a permanent error. */
+  const registerFailure = (f: ContentsEntry, error: string): void => {
+    bumpFailure.run(f.path, error.slice(0, 500));
+    const n = failCountOf(f.path);
+    report.failures.push({ path: f.path, fail_count: n, error });
+    console.log(`[experience-proposals] ${f.path} failed (${n}/${EXPERIENCE_PROPOSALS_MAX_FAILURES}): ${error}`);
+    if (n >= EXPERIENCE_PROPOSALS_MAX_FAILURES) {
+      recordError(f, `failed ${n} times; last error: ${error}`.slice(0, 500));
+    }
+  };
+
+  // 1. Root listing — a failure here aborts the tick (nothing to iterate).
+  let root: ContentsEntry[] | null;
   try {
-    // 1. Pick up to N unprocessed files, oldest date dir first.
-    const root = await listContents(fetchImpl, token, EXPERIENCE_PROPOSALS_DIR, timeoutMs);
-    const dateDirs = (root ?? [])
-      .filter((e) => e.type === "dir" && experienceProposalsDateIsRecent(e.name, now))
+    root = await listContents(ctx, EXPERIENCE_PROPOSALS_DIR);
+  } catch (err) {
+    if (!(err instanceof GithubFetchError)) throw err;
+    report.github_error = err.message;
+    report.skipped_reason = "github_error";
+    console.log(`[experience-proposals] GitHub error on the proposals listing — tick aborted, retried next tick: ${err.message}`);
+    root = null;
+  }
+
+  if (!report.skipped_reason) {
+    const dateEntries = (root ?? []).filter((e) => e.type === "dir" && /^\d{4}-\d{2}-\d{2}$/.test(e.name));
+    const dateDirs = dateEntries
+      .filter((e) => experienceProposalsDateIsRecent(e.name, now))
       .sort((a, b) => a.name.localeCompare(b.name));
-    const todo: ContentsEntry[] = [];
+
+    // 2. Candidates: every unrecorded .json file in the recent dirs, oldest
+    //    dir first, names ascending. A failing date-dir listing is skipped
+    //    (noted), the other dirs still count.
+    const candidates: ContentsEntry[] = [];
     for (const dir of dateDirs) {
-      if (todo.length >= EXPERIENCE_PROPOSALS_FILES_PER_TICK) break;
-      const files = ((await listContents(fetchImpl, token, dir.path, timeoutMs)) ?? [])
-        .filter((e) => e.type === "file" && e.name.endsWith(".json"))
-        .sort((a, b) => a.name.localeCompare(b.name));
+      let files: ContentsEntry[];
+      try {
+        files = ((await listContents(ctx, dir.path)) ?? [])
+          .filter((e) => e.type === "file" && e.name.endsWith(".json"))
+          .sort((a, b) => a.name.localeCompare(b.name));
+      } catch (err) {
+        if (!(err instanceof GithubFetchError)) throw err;
+        report.github_error = err.message;
+        console.log(`[experience-proposals] GitHub error listing ${dir.path} — skipped this tick: ${err.message}`);
+        continue;
+      }
       for (const f of files) {
         report.files_listed++;
         const seenSha = processedSha(f.path);
@@ -280,19 +377,65 @@ export async function tickExperienceDescriptionProposals(
           }
           continue;
         }
-        if (todo.length < EXPERIENCE_PROPOSALS_FILES_PER_TICK) todo.push(f);
+        candidates.push(f);
       }
     }
 
-    // 2. Process them, one at a time (sequential kildetro fetches inside).
-    for (const f of todo) {
+    // N6: one line on how many unprocessed files the 14-day window dropped
+    // (bounded: only the most recent few out-of-window dirs are listed).
+    const staleDirs = dateEntries
+      .filter((e) => !experienceProposalsDateIsRecent(e.name, now) && e.name < today)
+      .sort((a, b) => b.name.localeCompare(a.name));
+    if (staleDirs.length > 0) {
+      let dropped = 0;
+      for (const dir of staleDirs.slice(0, EXPERIENCE_PROPOSALS_STALE_DIRS_INSPECTED)) {
+        try {
+          const files = ((await listContents(ctx, dir.path)) ?? []).filter((e) => e.type === "file" && e.name.endsWith(".json"));
+          dropped += files.filter((f) => processedSha(f.path) === undefined).length;
+        } catch {
+          /* best-effort count only */
+        }
+      }
+      if (dropped > 0) {
+        const more = staleDirs.length - Math.min(staleDirs.length, EXPERIENCE_PROPOSALS_STALE_DIRS_INSPECTED);
+        console.log(
+          `[experience-proposals] ${dropped} unprocessed proposal file(s) dropped by the ${EXPERIENCE_PROPOSALS_MAX_AGE_DAYS}-day window` +
+            (more > 0 ? ` (plus ${more} older dir(s) not inspected)` : ""),
+        );
+      }
+    }
+
+    // 3. Process: up to FILES_PER_TICK evaluated files, at most
+    //    MAX_ATTEMPTS_PER_TICK fetch attempts; a per-file failure never
+    //    blocks the files behind it.
+    let evaluated = 0;
+    let attempts = 0;
+    for (const f of candidates) {
+      if (evaluated >= EXPERIENCE_PROPOSALS_FILES_PER_TICK || attempts >= EXPERIENCE_PROPOSALS_MAX_ATTEMPTS_PER_TICK) break;
       if (enrichmentWritePauseBlock(mainDb, "experiences")) {
         console.log("[experience-proposals] write-pause became active mid-tick — remaining files left for a later tick");
         break;
       }
-      const text = await fetchFileText(fetchImpl, token, f.path, timeoutMs); // throws -> not recorded, retried
-      let outcome: ExperienceProposalFileOutcome;
-      let resultJson: unknown;
+      // Too large by the listing's own size: permanent error, never fetched.
+      if (f.size > EXPERIENCE_PROPOSALS_MAX_FILE_BYTES) {
+        recordError(f, "file too large");
+        continue;
+      }
+      attempts++;
+      let text: string | typeof TOO_LARGE;
+      try {
+        text = await fetchFileText(ctx, f.path);
+      } catch (err) {
+        if (!(err instanceof GithubFetchError)) throw err;
+        report.github_error = err.message;
+        registerFailure(f, err.message);
+        continue;
+      }
+      if (text === TOO_LARGE) {
+        recordError(f, "file too large");
+        evaluated++;
+        continue;
+      }
       let parsed: unknown;
       let parseError: string | null = null;
       try {
@@ -302,33 +445,63 @@ export async function tickExperienceDescriptionProposals(
       }
       const v = parseError ? { error: parseError } : validateExperienceProposalFile(parsed);
       if ("error" in v) {
-        outcome = { path: f.path, sha: f.sha, status: "error", error: v.error };
-        resultJson = { status: "error", error: v.error };
-      } else {
-        const out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: "experience-proposals" });
-        if (!out.ok) {
-          outcome = { path: f.path, sha: f.sha, status: "error", error: out.error };
-          resultJson = { status: "error", error: out.error };
-        } else {
-          outcome = { path: f.path, sha: f.sha, status: "applied", totals: out.totals };
-          resultJson = { status: "applied", totals: out.totals, results: out.results };
-          report.written += out.totals.written;
-        }
+        recordError(f, v.error);
+        evaluated++;
+        continue;
       }
-      recordFile.run(f.path, f.sha, JSON.stringify(resultJson));
-      report.processed.push(outcome);
+      let out: PrewrittenExperienceDescriptionsResult;
+      try {
+        out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: "experience-proposals" });
+      } catch (err) {
+        // review N2: an unexpected exception in the apply step is a per-file
+        // failure (same cap), never a tick-killer.
+        registerFailure(f, `apply failed: ${String((err as Error)?.message ?? err)}`);
+        continue;
+      }
+      if (!out.ok) {
+        recordError(f, out.error);
+      } else {
+        recordFile(f, { path: f.path, sha: f.sha, status: "applied", totals: out.totals }, { status: "applied", totals: out.totals, results: out.results });
+        report.written += out.totals.written;
+        for (const r of out.results) if (r.result === "written") writtenIds.push(r.id);
+      }
+      evaluated++;
     }
-  } catch (err) {
-    if (!(err instanceof GithubFetchError)) throw err;
-    report.github_error = err.message;
-    if (report.processed.length === 0) report.skipped_reason = "github_error";
-    console.log(`[experience-proposals] GitHub error — nothing recorded for the failing file, retried next tick: ${err.message}`);
   }
 
-  // 3. Run-ledger envelope for a tick that did work.
-  if (report.processed.length > 0) {
-    const errors = report.processed.filter((p) => p.status === "error");
-    try {
+  // 4. Run-ledger envelope.
+  const allGithubFailed = ctx.calls > 0 && ctx.failures >= ctx.calls && report.processed.length === 0;
+  const errorsOut = [
+    ...report.processed.filter((p) => p.status === "error").map((p) => ({ message: p.error ?? "error", meta: { path: p.path } })),
+    ...report.failures.map((x) => ({ message: x.error, meta: { path: x.path, fail_count: x.fail_count } })),
+    ...(report.github_error ? [{ message: report.github_error, meta: {} }] : []),
+  ];
+  const claims = [
+    { type: "db_state_change" as const, value: report.written, meta: { kind: "experiences_content_enriched", source: "proposals_job" } },
+    { type: "db_state_change" as const, value: report.processed.length, meta: { kind: "proposals_processed" } },
+  ];
+  try {
+    if (allGithubFailed) {
+      // At most ONE `failed` envelope per UTC day: a fixed run_id per day,
+      // and recordRun() ignores a repeat.
+      recordRun(
+        {
+          run_id: `run-${today}-${EXPERIENCE_PROPOSALS_AGENT}-github-failed-experiences`,
+          vertical: "experiences",
+          agent: EXPERIENCE_PROPOSALS_AGENT,
+          trigger_source: "cron",
+          started_at: startedAt,
+          finished_at: new Date().toISOString(),
+          status: "failed",
+          claims,
+          evidence: [],
+          notes: `every GitHub call of the tick failed (${ctx.failures}/${ctx.calls}); first failing tick of the day`.slice(0, 490),
+          errors: errorsOut,
+        },
+        mainDb(),
+      );
+      report.envelope_recorded = true;
+    } else if (report.processed.length > 0 || report.failures.length > 0) {
       recordRun(
         {
           run_id: runId,
@@ -337,31 +510,24 @@ export async function tickExperienceDescriptionProposals(
           trigger_source: "cron",
           started_at: startedAt,
           finished_at: new Date().toISOString(),
-          status: errors.length > 0 || report.github_error ? "partial" : "completed",
-          claims: [
-            { type: "db_state_change", value: report.written, meta: { kind: "experiences_content_enriched", source: "proposals_job" } },
-            { type: "db_state_change", value: report.processed.length, meta: { kind: "proposals_processed" } },
+          status: errorsOut.length > 0 ? "partial" : "completed",
+          claims,
+          evidence: [
+            { claim_idx: 0, ids: writtenIds },
+            { claim_idx: 1, ids: report.processed.map((p) => p.path) },
           ],
-          evidence: [{ claim_idx: 1, ids: report.processed.map((p) => p.path) }],
-          notes: report.processed
-            .map((p) => `${p.path}: ${p.status}${p.totals ? ` written=${p.totals.written} rejected=${p.totals.rejected} skipped=${p.totals.skipped_recorded}` : ` (${p.error})`}`)
-            .join("; ")
-            .slice(0, 490),
-          ...(errors.length > 0 || report.github_error
-            ? {
-                errors: [
-                  ...errors.map((p) => ({ message: p.error ?? "error", meta: { path: p.path } })),
-                  ...(report.github_error ? [{ message: report.github_error, meta: {} }] : []),
-                ],
-              }
-            : {}),
+          notes: [
+            ...report.processed.map((p) => `${p.path}: ${p.status}${p.totals ? ` written=${p.totals.written} rejected=${p.totals.rejected} skipped=${p.totals.skipped_recorded}` : ` (${p.error})`}`),
+            ...report.failures.map((x) => `${x.path}: failure ${x.fail_count}/${EXPERIENCE_PROPOSALS_MAX_FAILURES}`),
+          ].join("; ").slice(0, 490),
+          ...(errorsOut.length > 0 ? { errors: errorsOut } : {}),
         },
         mainDb(),
       );
       report.envelope_recorded = true;
-    } catch (err) {
-      console.error("[experience-proposals] run-ledger envelope failed (non-fatal):", err);
     }
+  } catch (err) {
+    console.error("[experience-proposals] run-ledger envelope failed (non-fatal):", err);
   }
   return report;
 }
