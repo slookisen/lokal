@@ -2135,6 +2135,40 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── experience_description_attempts (dev-request
+  // 2026-10-06-experiences-beskrivelsessteg-4c-kohode-blokkering) ─────────
+  // Per-experience attempt marker for POST /admin/experiences-description-
+  // enrichment (routes/opplevelser.ts). Before this table the endpoint kept
+  // no memory of a row it had already tried: a row ending in a CONTENT
+  // outcome (the LLM's own sentinel, a word-floor miss, a judge AVVIS, ...)
+  // came straight back at the head of the `ORDER BY e.id` queue on the next
+  // call, so the same handful of rows burned every batch and the writer
+  // stalled (1 description written in 47 runs). One row per experience,
+  // upserted ONLY on an apply run, ONLY for a content/quality outcome
+  // (isRetryableDescriptionFailure() decides — infra failures are never
+  // recorded so they retry on the next call), and deleted again the moment
+  // a description is successfully written. facts_fingerprint is
+  // experienceDescriptionFactsFingerprint() of the row at attempt time: the
+  // cooldown only holds while the fingerprint still matches AND attempted_at
+  // is within the last 30 days, so a changed source fact re-qualifies the
+  // row immediately. Deliberately NO FOREIGN KEY to experiences — same
+  // reasoning as experience_outreach_sent_log above (diagnostic/cooldown
+  // state, never a referential claim). Additive only; dropping the table is
+  // the rollback (the route then simply sees no attempts).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_description_attempts (
+        experience_id TEXT PRIMARY KEY,
+        attempted_at TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        facts_fingerprint TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_description_attempts failed:", err);
+  }
+
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV
   // translations of experience + gårdssalg-provider prose, staged

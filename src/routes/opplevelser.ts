@@ -32197,6 +32197,9 @@ import {
   parseContentFieldEvidence as expDescParseFieldEvidence,
   gardssalgSharedDomainReason as expDescSharedDomainReason,
 } from "../services/experience-store";
+// dev-request 2026-10-06-experiences-beskrivelsessteg-4c-kohode-blokkering:
+// sha256 for experienceDescriptionFactsFingerprint() (attempt cooldown).
+import { createHash as expDescCreateHash } from "node:crypto";
 
 // Batch cap: HALF of TITLE_NO_BATCH_CAP (20). This feature spends TWO LLM
 // calls per row (generate + judge) instead of one, and the generate call
@@ -33072,12 +33075,195 @@ export function experienceDescriptionNeedsEnrichment(desc: string | null | undef
   return expDescIsJunk(t);
 }
 
+// ─── Kø-hode-blokkering (dev-request 2026-10-06-experiences-beskrivelses-
+// steg-4c-kohode-blokkering) ─────────────────────────────────────────────
+// PROBLEM. This endpoint stalled — 1 description written in 47 runs since
+// 2026-09-12 while 416 of 557 PUBLISHED experiences still lacked one —
+// because of queue-head blocking, three causes stacked:
+//   1. the candidate scan had no publish gate (~1850 candidates vs. 557
+//      published), so unpublished rows sat at the head of `ORDER BY e.id`;
+//   2. `skip`-tier (thin data) rows were sliced INTO the 10-row batch and
+//      burned slots every run without ever reaching an LLM (4 of 10 slots,
+//      identical across 11 consecutive runs);
+//   3. a row ending in a content outcome (sentinel, below_word_floor, judge
+//      AVVIS, ...) was never remembered, so the SAME rows were retried in
+//      the SAME order on every call.
+// FIX. (1) PUBLISH_GATE_SQL on the candidate scan; (2) a zero-network tier
+// precheck BEFORE batching; (3) experience_description_attempts (see
+// init-experiences.ts) with a cooldown "until the row's source facts change,
+// max 30 days" (Daniel's choice); plus worst-first ordering and more
+// observability in the response. Every safety gate, the generator/judge and
+// the write statements above/below are untouched.
+
+/** Cooldown window for an attempted-but-not-written row (Daniel's choice:
+ *  "until the row's source facts change, max 30 days"). */
+const EXP_DESC_ATTEMPT_COOLDOWN_DAYS = 30;
+/** Shorter window for outcomes that hinge on the provider's homepage being
+ *  reachable/non-empty right now (kildetro `fetch_failed`, kildetro
+ *  `empty_response`) rather than on the row's own facts — a site that was
+ *  down or served an empty shell is likelier to recover within a week than
+ *  a sentinel/word-floor verdict is to flip, and the facts fingerprint does
+ *  not cover homepage content, so only the clock can lift these. Review
+ *  follow-up on dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+ *  kohode-blokkering. */
+const EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS = 7;
+/** How many eligible ids a dry-run/preview response lists. */
+const EXP_DESC_CANDIDATE_PREVIEW_CAP = 20;
+
+/**
+ * True when a `generation_failed` outcome is an INFRASTRUCTURE failure —
+ * nothing about the row itself is wrong, so the row must be retried on the
+ * very next call and NO attempt row is recorded. False when it is a CONTENT/
+ * QUALITY outcome — the model saw the row and the result failed a gate; the
+ * same inputs will very likely fail the same way again, so the row rests in
+ * the cooldown until its facts change (or 30 days pass).
+ *
+ * Exhaustive switch with a `never` default so a new ExpDescGenFailReason
+ * value fails `tsc` here until someone classifies it explicitly.
+ *
+ * Judgement calls (dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+ * kohode-blokkering):
+ *   - `empty_response` → CONTENT. Its dominant deterministic cause is the
+ *     kildetro path's "homepage produced no visible text" short-circuit
+ *     (generateExperienceDescriptionKildetro), which would otherwise re-burn
+ *     a homepage fetch for the same row every call — exactly the head-of-
+ *     queue pattern this fix removes. Worst case for a transient empty LLM
+ *     reply is one row resting until a fact changes / 30 days.
+ *   - `fetch_failed` → CONTENT, per the dev-request spec (a homepage that
+ *     could not be fetched/classified is a row-level property far more often
+ *     than a blip; the 30-day ceiling bounds the cost of the rare blip).
+ *   - `thin_data` → CONTENT. Unreachable in practice now (the precheck drops
+ *     `skip`-tier rows before batching and the faktalinje tier floor equals
+ *     the generator floor), classified for completeness.
+ */
+export function isRetryableDescriptionFailure(reason: ExpDescGenFailReason): boolean {
+  switch (reason) {
+    case "no_api_key":
+    case "network_error":
+    case "http_error":
+    case "unparseable_json":
+    case "unexpected_response_shape":
+      return true;
+    case "thin_data":
+    case "empty_response":
+    case "sentinel":
+    case "sentinel_smuggled":
+    case "char_cap_exceeded":
+    case "below_word_floor":
+    case "above_word_ceiling":
+    case "ungrounded_numbers":
+    case "no_title_node":
+    case "fetch_failed":
+      return false;
+    default: {
+      const exhaustive: never = reason;
+      void exhaustive;
+      return true; // unknown at runtime -> fail toward "retry", never toward "rest"
+    }
+  }
+}
+
+/**
+ * The judge collapses EVERY failure into `approved: false` (skip_reason
+ * "judge_rejected") — including its own infrastructure failures (missing
+ * key, network throw, non-200, unparseable body, unexpected shape). Those
+ * must NOT rest the row in the cooldown. judgeExperienceDescriptionCandidate()
+ * is deliberately left byte-for-byte unchanged, so this recognises its fixed
+ * fail-closed infra reasoning strings by prefix; a unit test drives every
+ * infra branch of the real judge through this predicate so drift in either
+ * place fails the suite. An ambiguous/garbled verdict from a model that DID
+ * answer ("uventet/tvetydig dommersvar") is a content outcome, not infra.
+ */
+const EXP_DESC_JUDGE_INFRA_REASONING_PREFIXES = [
+  "ANTHROPIC_API_KEY mangler",
+  "nettverksfeil under dommer-kall",
+  "dommer-API svarte status",
+  "ikke-parsbar JSON fra dommer-API",
+  "uventet svarformat fra dommer-API",
+];
+export function isRetryableDescriptionJudgeFailure(reasoning: string | null | undefined): boolean {
+  const r = reasoning ?? "";
+  return EXP_DESC_JUDGE_INFRA_REASONING_PREFIXES.some((p) => r.startsWith(p));
+}
+
+/**
+ * Should this (not-written) outcome be recorded in
+ * experience_description_attempts? Only content/quality outcomes — see
+ * isRetryableDescriptionFailure() / isRetryableDescriptionJudgeFailure().
+ * Returns false for a written outcome and for anything unclassifiable.
+ */
+export function shouldRecordDescriptionAttempt(outcome: ExperienceDescriptionOutcome): boolean {
+  if (outcome.judge_approved === true && !!outcome.proposed_description) return false;
+  if (outcome.skip_reason === "thin_data") return true;
+  if (outcome.skip_reason === "judge_rejected") return !isRetryableDescriptionJudgeFailure(outcome.judge_reasoning);
+  if (outcome.skip_reason === "generation_failed") {
+    return outcome.generation_fail_reason != null && !isRetryableDescriptionFailure(outcome.generation_fail_reason);
+  }
+  return false;
+}
+
+/**
+ * Stable sha256 hex over EXACTLY the inputs tier selection + both generators
+ * read: the rendered facts block (title + every fact-field, the same text
+ * the faktalinje generator and the judge are grounded on) plus the
+ * provider's hjemmeside and field_provenance (which decide kildetro vs.
+ * faktalinje vs. skip). A change in any of them changes the fingerprint and
+ * lifts the cooldown for that row. JSON array encoding keeps field
+ * boundaries unambiguous; null/undefined normalise to "".
+ */
+export function experienceDescriptionFactsFingerprint(row: ExperienceDescriptionCandidate): string {
+  const factsBlock = renderExperienceDescriptionFactsBlock(row, buildExperienceDescriptionFacts(row));
+  const material = JSON.stringify([
+    factsBlock,
+    row.provider_hjemmeside ?? "",
+    row.provider_field_provenance ?? "",
+  ]);
+  return expDescCreateHash("sha256").update(material, "utf8").digest("hex");
+}
+
+/**
+ * The `reason` value stored in experience_description_attempts for a
+ * recorded outcome. `generation_failed` stores `<level>:<generation_fail_
+ * reason>` (e.g. "faktalinje:sentinel", "kildetro:fetch_failed") so the
+ * cooldown window can be derived at READ time from what was stored — the
+ * bare reason alone cannot tell a kildetro "homepage had no text"
+ * empty_response from a faktalinje empty LLM reply. `judge_rejected`
+ * stores the judge's reasoning; `thin_data` stores null.
+ */
+export function experienceDescriptionAttemptReason(outcome: ExperienceDescriptionOutcome): string | null {
+  if (outcome.skip_reason === "generation_failed" && outcome.generation_fail_reason) {
+    return `${outcome.level}:${outcome.generation_fail_reason}`;
+  }
+  if (outcome.skip_reason === "judge_rejected") return outcome.judge_reasoning ?? null;
+  return null;
+}
+
+/**
+ * Cooldown window in days for a stored attempt, computed from its stored
+ * `outcome` + `reason` (see experienceDescriptionAttemptReason()). The
+ * homepage-dependent kildetro outcomes get EXP_DESC_ATTEMPT_COOLDOWN_SHORT_
+ * DAYS (7); every other content outcome EXP_DESC_ATTEMPT_COOLDOWN_DAYS (30).
+ */
+export function experienceDescriptionAttemptCooldownDays(outcome: string, reason: string | null): number {
+  if (outcome === "generation_failed" && (reason === "kildetro:fetch_failed" || reason === "kildetro:empty_response")) {
+    return EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS;
+  }
+  return EXP_DESC_ATTEMPT_COOLDOWN_DAYS;
+}
+
 router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown };
+  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown; preview_only?: unknown };
   // STRICT-FALSE parse — identical idiom to /admin/experiences-title-no-backfill
   // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
   // "" / undefined all mean dry run.
   const dryRun = body.dry_run !== false;
+  // STRICT-TRUE parse (dev-request 2026-10-06-experiences-beskrivelsessteg-
+  // 4c-kohode-blokkering): ONLY the JSON boolean true asks for the zero-LLM
+  // preview (counts + candidate_ids_preview, no generator/judge call, no
+  // write). It wins over dry_run:false — a preview never writes — but it is
+  // meant to be sent with a dry run; the write-pause fence below still keys
+  // off dry_run alone, unchanged.
+  const previewOnly = body.preview_only === true;
 
   // Enrichment write-pause fence (del 1) — apply (dry_run:false) only; dry-run
   // is never blocked.
@@ -33143,8 +33329,16 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
             p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
-      WHERE e.canonical_id IS NULL
+      WHERE ${PUBLISH_GATE_SQL}
         AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))` +
+    // Publish gate (dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+    // kohode-blokkering): PUBLISH_GATE_SQL (which already carries the
+    // `e.canonical_id IS NULL` clause this WHERE used to state on its own,
+    // and references `p` from the LEFT JOIN above) applies to the unscoped
+    // scan AND to an explicit `ids` list alike — an unpublished row renders
+    // no page, so prose written onto it buys nothing and would surface
+    // unreviewed the day the row is promoted. Naming a row in `ids` lifts
+    // the cooldown below, never this gate.
     (ids ? ` AND e.id IN (${ids.map(() => "?").join(",")})` : "") +
     ` ORDER BY e.id`;
   const scanned = (ids ? db.prepare(sql).all(...ids) : db.prepare(sql).all()) as ExperienceDescriptionCandidate[];
@@ -33170,10 +33364,103 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     return selectExperienceDescriptionTier(r).level === "kildetro";
   });
 
+  // ── Kø-hode-blokkering fix (dev-request 2026-10-06-experiences-
+  //    beskrivelsessteg-4c-kohode-blokkering) — everything from here to the
+  //    batch slice is pure/zero-network and decides WHICH rows reach the LLM.
+  //
+  // Worst-first: a blank/junk description (the placeholder lede is showing
+  // on a public page RIGHT NOW) outranks a faktalinje->kildetro tier upgrade
+  // (the page already has honest copy). Array.prototype.sort is stable, so
+  // within each group the SQL's `ORDER BY e.id` is preserved.
+  const needsEnrichment = new Map<string, boolean>(
+    candidateRows.map((r) => [r.id, experienceDescriptionNeedsEnrichment(r.description)])
+  );
+  const orderedRows = [...candidateRows].sort(
+    (a, b) => Number(needsEnrichment.get(b.id)) - Number(needsEnrichment.get(a.id))
+  );
+
+  // Cooldown: skip a row attempted (content outcome, apply run) within its
+  // window — experienceDescriptionAttemptCooldownDays() of the stored
+  // outcome/reason: 7 days for the homepage-dependent kildetro outcomes,
+  // else EXP_DESC_ATTEMPT_COOLDOWN_DAYS — whose facts fingerprint is still the
+  // one recorded at that attempt — i.e. nothing the generators read has
+  // changed since, so the same outcome is the expected one. An explicit
+  // `ids` list BYPASSES the cooldown (the operator asked for those rows by
+  // name) but never the publish gate above.
+  const recentAttempts = new Map<string, string>();
+  if (!ids) {
+    // Both windows evaluated in SQL (one clock, SQLite's), the choice
+    // between them made per row in JS from the stored outcome/reason.
+    const attemptRows = db.prepare(
+      `SELECT experience_id, facts_fingerprint, outcome, reason,
+              (attempted_at > datetime('now', ?)) AS within_short
+         FROM experience_description_attempts
+        WHERE attempted_at > datetime('now', ?)`
+    ).all(
+      `-${EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS} days`,
+      `-${EXP_DESC_ATTEMPT_COOLDOWN_DAYS} days`
+    ) as Array<{ experience_id: string; facts_fingerprint: string; outcome: string; reason: string | null; within_short: number }>;
+    for (const a of attemptRows) {
+      const days = experienceDescriptionAttemptCooldownDays(a.outcome, a.reason);
+      if (days <= EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS && !a.within_short) continue; // short window already over
+      recentAttempts.set(a.experience_id, a.facts_fingerprint);
+    }
+  }
+  let skippedRecentlyAttempted = 0;
+  let skippedThinDataPrecheck = 0;
+  const eligibleRows: ExperienceDescriptionCandidate[] = [];
+  for (const row of orderedRows) {
+    const fp = recentAttempts.get(row.id);
+    if (fp !== undefined && fp === experienceDescriptionFactsFingerprint(row)) {
+      skippedRecentlyAttempted++;
+      continue;
+    }
+    // Thin-data precheck: a `skip`-tier row never calls the LLM anyway
+    // (enrichOneExperienceDescription short-circuits it), so letting it
+    // into the batch only burned a slot every run. Same pure, zero-network
+    // selectExperienceDescriptionTier() the cascade itself calls, so the
+    // precheck and the cascade can never disagree on which rows are `skip`.
+    if (selectExperienceDescriptionTier(row).level === "skip") {
+      skippedThinDataPrecheck++;
+      continue;
+    }
+    eligibleRows.push(row);
+  }
+  const queueCounts = {
+    // `candidates` = eligible after publish gate, junk filter, cooldown and
+    // thin-data precheck; `candidates_before_cooldown` = after gate + junk
+    // filter only (the pre-2026-10-06 meaning of `candidates`, minus the
+    // unpublished rows the gate now removes).
+    candidates: eligibleRows.length,
+    // Of `candidates`, the rows whose description is blank/junk (the
+    // placeholder lede shows on a public page) — i.e. excluding the
+    // faktalinje->kildetro upgrade rows, which already carry honest copy.
+    candidates_blank_or_junk: eligibleRows.filter((r) => needsEnrichment.get(r.id)).length,
+    candidates_before_cooldown: candidateRows.length,
+    skipped_recently_attempted: skippedRecentlyAttempted,
+    skipped_thin_data_precheck: skippedThinDataPrecheck,
+  };
+
+  if (previewOnly) {
+    // Zero LLM calls, zero writes — counts and the next ids in line only.
+    // `sample` stays present (empty) so a caller parsing the dry-run shape
+    // never trips on a missing key.
+    res.json({
+      success: true,
+      dry_run: true,
+      preview_only: true,
+      ...queueCounts,
+      batch_cap: EXP_DESC_BATCH_CAP,
+      candidate_ids_preview: eligibleRows.slice(0, EXP_DESC_CANDIDATE_PREVIEW_CAP).map((r) => r.id),
+      sample: [],
+    });
+    return;
+  }
+
   if (dryRun) {
     // slice() of an empty array iterates zero times -> zero LLM calls, same
     // documented behavior as the title-no backfill's empty-candidate case.
-    const sample = candidateRows.slice(0, EXP_DESC_DRY_RUN_SAMPLE);
+    const sample = eligibleRows.slice(0, EXP_DESC_DRY_RUN_SAMPLE);
     const proposals: ExperienceDescriptionOutcome[] = [];
     for (const row of sample) {
       proposals.push(await enrichOneExperienceDescription(row, fetchImpl, homepageFetchImpl));
@@ -33181,14 +33468,15 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
     res.json({
       success: true,
       dry_run: true,
-      candidates: candidateRows.length,
+      ...queueCounts,
       batch_cap: EXP_DESC_BATCH_CAP,
+      candidate_ids_preview: eligibleRows.slice(0, EXP_DESC_CANDIDATE_PREVIEW_CAP).map((r) => r.id),
       sample: proposals,
     });
     return;
   }
 
-  const batch = candidateRows.slice(0, EXP_DESC_BATCH_CAP);
+  const batch = eligibleRows.slice(0, EXP_DESC_BATCH_CAP);
   const outcomes: ExperienceDescriptionOutcome[] = [];
   for (const row of batch) {
     outcomes.push(await enrichOneExperienceDescription(row, fetchImpl, homepageFetchImpl));
@@ -33224,18 +33512,59 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
   });
   tx();
 
+  // Attempt bookkeeping (dev-request 2026-10-06-experiences-beskrivelses-
+  // steg-4c-kohode-blokkering) — apply runs only (the dry-run/preview
+  // branches returned above and never reach this). A separate transaction
+  // AFTER the description writes, so the write transaction above stays
+  // exactly as it was: a written row loses any old attempt marker, a row
+  // that ended in a CONTENT outcome (shouldRecordDescriptionAttempt) is
+  // upserted with its current facts fingerprint, and an infra failure
+  // records nothing so the row is retried on the very next call.
+  const upsertAttempt = db.prepare(
+    `INSERT INTO experience_description_attempts (experience_id, attempted_at, outcome, reason, facts_fingerprint)
+     VALUES (?, datetime('now'), ?, ?, ?)
+     ON CONFLICT(experience_id) DO UPDATE SET
+       attempted_at = excluded.attempted_at,
+       outcome = excluded.outcome,
+       reason = excluded.reason,
+       facts_fingerprint = excluded.facts_fingerprint`
+  );
+  const deleteAttempt = db.prepare("DELETE FROM experience_description_attempts WHERE experience_id = ?");
+  const writtenIds = new Set(writable.map(({ row }) => row.id));
+  const attemptTx = db.transaction(() => {
+    batch.forEach((row, i) => {
+      const outcome = outcomes[i];
+      if (writtenIds.has(row.id)) {
+        deleteAttempt.run(row.id);
+      } else if (shouldRecordDescriptionAttempt(outcome)) {
+        upsertAttempt.run(
+          row.id,
+          outcome.skip_reason ?? "unknown",
+          experienceDescriptionAttemptReason(outcome),
+          experienceDescriptionFactsFingerprint(row)
+        );
+      }
+    });
+  });
+  attemptTx();
+
   const written = writable.length;
   const skippedCount = outcomes.length - written;
 
   res.json({
     success: true,
     dry_run: false,
-    candidates: candidateRows.length,
+    ...queueCounts,
     processed: outcomes.length,
+    processed_ids: batch.map((r) => r.id),
     written,
     skipped: skippedCount,
-    remaining: Math.max(0, candidateRows.length - outcomes.length),
+    remaining: Math.max(0, eligibleRows.length - outcomes.length),
     skipped_reasons: {
+      // DEPRECATED (dev-request 2026-10-06-experiences-beskrivelsessteg-4c-
+      // kohode-blokkering): kept for response compatibility only. Normally
+      // 0 now — the thin-data precheck drops `skip`-tier rows before
+      // batching; read `skipped_thin_data_precheck` instead.
       thin_data: outcomes.filter((o) => o.skip_reason === "thin_data").length,
       generation_failed: outcomes.filter((o) => o.skip_reason === "generation_failed").length,
       judge_rejected: outcomes.filter((o) => o.skip_reason === "judge_rejected").length,
