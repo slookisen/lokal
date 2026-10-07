@@ -35806,6 +35806,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental inactive hidden: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive B): akutt-påstander bare med proveniens ──");
+  try {
+    const { runDentalAcuteClaimTests } = require("../src/routes/dental-acute-claim.test") as
+      typeof import("../src/routes/dental-acute-claim.test");
+    const dac = await runDentalAcuteClaimTests({ log: false });
+    passed += dac.passed;
+    failed += dac.failed;
+    for (const f of dac.failures) failures.push("dental acute claim: " + f);
+    console.log(`  dental acute claim: ${dac.passed} passed, ${dac.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
