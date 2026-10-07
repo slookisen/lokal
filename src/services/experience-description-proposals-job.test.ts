@@ -504,20 +504,45 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
       // ── pj-14 (review N1 + N6): no query string in error messages; one
       //    log line counting unprocessed files dropped by the 14-day window. ─
       {
-        const lines: string[] = [];
-        const prevLog = console.log;
-        console.log = (...a: any[]) => { lines.push(a.map(String).join(" ")); };
-        try {
-          await tick();
-        } finally {
-          console.log = prevLog;
-        }
-        assertTrue(lines.some((l) => /1 unprocessed proposal file\(s\) dropped by the 14-day window/.test(l)),
-          "pj-14a: the old dir's unprocessed file is reported as dropped");
+        job.__resetExperienceProposalsDroppedLogForTesting();
+        const capture = async (): Promise<string[]> => {
+          const lines: string[] = [];
+          const prevLog = console.log;
+          console.log = (...a: any[]) => { lines.push(a.map(String).join(" ")); };
+          try {
+            await tick();
+          } finally {
+            console.log = prevLog;
+          }
+          return lines;
+        };
+        const dropRe = /1 unprocessed proposal file\(s\) dropped by the 14-day window/;
+        const lines = await capture();
+        assertTrue(lines.some((l) => dropRe.test(l)), "pj-14a: the old dir's unprocessed file is reported as dropped");
+        const oldListings = fetchCount(`${ROOT}/2026-09-23`);
+        const lines2 = await capture();
+        assertTrue(!lines2.some((l) => dropRe.test(l)), "pj-14a2: ...at most once per UTC day");
+        assertEq(fetchCount(`${ROOT}/2026-09-23`), oldListings, "pj-14a3: and the old dir is not listed again that day");
         assertEq(fetchCount(pOld), 0, "pj-14b: ...but never fetched");
         const qFetch = (async () => { throw new Error("socket hang up"); }) as unknown as typeof fetch;
         const r = await tick({ fetchImpl: qFetch });
         assertTrue(r.github_error !== null && !String(r.github_error).includes("?"), "pj-14c: error message has no query string");
+      }
+
+      // ── pj-15 (re-review): root listing OK but every date-dir listing
+      //    fails -> nothing processed, yet a `partial` envelope is written. ─
+      {
+        gh.fail.add(`${ROOT}/2026-09-24`);
+        gh.fail.add(`${ROOT}/2026-10-07`);
+        const before = runsFor().length;
+        const r = await tick();
+        assertEq([r.processed.length, r.failures.length], [0, 0], "pj-15a: nothing processed, no per-file failures");
+        assertTrue(r.github_error !== null, "pj-15b: github_error reported");
+        assertEq(runsFor().length, before + 1, "pj-15c: one envelope written");
+        const last = runsFor()[runsFor().length - 1];
+        assertEq([last.run_id, last.status], [r.run_id, "partial"], "pj-15d: this tick's envelope, status partial");
+        gh.fail.delete(`${ROOT}/2026-09-24`);
+        gh.fail.delete(`${ROOT}/2026-10-07`);
       }
 
       // ── pj-8: status GET shape + admin gate. ────────────────────────

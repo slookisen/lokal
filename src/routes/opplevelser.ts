@@ -33807,6 +33807,8 @@ export function experienceDescriptionLevelBounds(
  *  junk guard (isJunkDescription), angle brackets (HTML), a link (`http`,
  *  `www.`), or markdown (`**`, backticks, a line starting with `#`, or a
  *  `- `/`* ` list line). Any hit -> the text is not plain prose. */
+const EXP_DESC_MD_HEADING_LINE_RE = new RegExp("^[^\\S\\r\\n\\u2028\\u2029]*#", "m");
+const EXP_DESC_MD_LIST_LINE_RE = new RegExp("^[^\\S\\r\\n\\u2028\\u2029]*[-*]\\s", "m");
 export function experienceDescriptionTextHasMarkupOrJunk(text: string): boolean {
   const t = text.trim();
   if (expDescIsJunk(t)) return true;
@@ -33817,10 +33819,13 @@ export function experienceDescriptionTextHasMarkupOrJunk(text: string): boolean 
   if (/javascript:/i.test(t)) return true;
   if (/\bon\w+\s*=/i.test(t)) return true;
   if (t.includes("**") || t.includes("`")) return true;
-  // Line-start markdown. `[ \t]*` (never `\s*`) so the scan cannot run
-  // across line breaks — linear on any input.
-  if (/^[ \t]*#/m.test(t)) return true;
-  if (/^[ \t]*[-*][ \t]/m.test(t)) return true;
+  // Line-start markdown. The indent class is "any whitespace EXCEPT a line
+  // break" (so NBSP/\f/\v indents still count, as with the original \s*),
+  // which cannot run across lines — linear on any input. The trailing \s
+  // keeps a lone "-"/"*" line and "-" + NBSP matching (re-review of the
+  // review-B1 change).
+  if (EXP_DESC_MD_HEADING_LINE_RE.test(t)) return true;
+  if (EXP_DESC_MD_LIST_LINE_RE.test(t)) return true;
   return false;
 }
 

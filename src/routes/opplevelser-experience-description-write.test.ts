@@ -186,6 +186,14 @@ export function runOpplevelserExperienceDescriptionWriteTests(
         ["javascript: scheme", "Klikk javascript:alert(1) for mer."],
         ["inline event handler", "Bildet onerror=alert(1) vises her."],
         ["event handler with space", "Knappen onclick = noe skjer."],
+        // Re-review: the line-start markdown gate must keep matching any
+        // non-line-break indent and a lone/NBSP-separated list marker.
+        ["NBSP-indented heading", "En tur.\n\u00a0# Overskrift"],
+        ["NBSP-indented dash list", "En tur:\n\u00a0- padling"],
+        ["dash + NBSP", "En tur:\n-\u00a0padling"],
+        ["lone dash line", "En tur\n-\nmed lunsj"],
+        ["form-feed-indented heading", "En tur.\n\f# Overskrift"],
+        ["vertical-tab-indented star list", "En tur:\n\u000b* padling"],
       ] as Array<[string, string]>) {
         assertTrue(experienceDescriptionTextHasMarkupOrJunk(txt), `p1l: markup_or_junk detects ${label}`);
         assertEq(checkPrewrittenExperienceDescriptionShape(txt, "faktalinje", T), "markup_or_junk", `p1m: shape gate rejects ${label} as markup_or_junk`);

@@ -216,6 +216,14 @@ async function listContents(ctx: GhCtx, path: string): Promise<ContentsEntry[] |
 
 const TOO_LARGE = Symbol("too_large");
 
+/** UTC day the N6 "dropped by the window" line was last logged — at most one
+ *  such line (and its read-only stale-dir listings) per day per process. */
+let droppedLogDay: string | null = null;
+/** Test hook: forget that today's dropped-count line was logged. */
+export function __resetExperienceProposalsDroppedLogForTesting(): void {
+  droppedLogDay = null;
+}
+
 /** The file's text from the contents API's inline base64 `content` only —
  *  no download_url fallback (a proposal over 1 MB is never valid). Returns
  *  TOO_LARGE when the encoded or decoded content exceeds the byte cap. */
@@ -334,6 +342,10 @@ export async function tickExperienceDescriptionProposals(
     }
   };
 
+  // Root listing succeeded but EVERY date-dir listing failed: nothing was
+  // processed, yet the tick is not healthy — gets a `partial` envelope.
+  let allDateDirListingsFailed = false;
+
   // 1. Root listing — a failure here aborts the tick (nothing to iterate).
   let root: ContentsEntry[] | null;
   try {
@@ -356,6 +368,7 @@ export async function tickExperienceDescriptionProposals(
     //    dir first, names ascending. A failing date-dir listing is skipped
     //    (noted), the other dirs still count.
     const candidates: ContentsEntry[] = [];
+    let dateDirListFailures = 0;
     for (const dir of dateDirs) {
       let files: ContentsEntry[];
       try {
@@ -365,6 +378,7 @@ export async function tickExperienceDescriptionProposals(
       } catch (err) {
         if (!(err instanceof GithubFetchError)) throw err;
         report.github_error = err.message;
+        dateDirListFailures++;
         console.log(`[experience-proposals] GitHub error listing ${dir.path} — skipped this tick: ${err.message}`);
         continue;
       }
@@ -382,11 +396,14 @@ export async function tickExperienceDescriptionProposals(
     }
 
     // N6: one line on how many unprocessed files the 14-day window dropped
-    // (bounded: only the most recent few out-of-window dirs are listed).
+    // (bounded: only the most recent few out-of-window dirs are listed), at
+    // most once per UTC day.
     const staleDirs = dateEntries
       .filter((e) => !experienceProposalsDateIsRecent(e.name, now) && e.name < today)
       .sort((a, b) => b.name.localeCompare(a.name));
-    if (staleDirs.length > 0) {
+    allDateDirListingsFailed = dateDirs.length > 0 && dateDirListFailures === dateDirs.length;
+    if (staleDirs.length > 0 && droppedLogDay !== today) {
+      droppedLogDay = today;
       let dropped = 0;
       for (const dir of staleDirs.slice(0, EXPERIENCE_PROPOSALS_STALE_DIRS_INSPECTED)) {
         try {
@@ -501,7 +518,7 @@ export async function tickExperienceDescriptionProposals(
         mainDb(),
       );
       report.envelope_recorded = true;
-    } else if (report.processed.length > 0 || report.failures.length > 0) {
+    } else if (report.processed.length > 0 || report.failures.length > 0 || allDateDirListingsFailed) {
       recordRun(
         {
           run_id: runId,
