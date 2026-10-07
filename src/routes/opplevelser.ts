@@ -32353,7 +32353,33 @@ export type ExperienceDescriptionCandidate = {
   // "verified" (isHjemmesideVerified fails closed on null/undefined too).
   provider_field_provenance?: string | null;
   provider_hjemmeside?: string | null;
+  // The experience's OWN product page on the provider's site (set through
+  // POST /admin/experiences-data-corrections, field source_page_url). When
+  // its host still equals the hjemmeside host, kildetro fetches this page
+  // instead of the provider's root homepage — see
+  // experienceKildetroSourceUrl(). Optional for the same fixture reason as
+  // the two provider fields above.
+  source_page_url?: string | null;
 };
+
+/**
+ * The page the kildetro tier fetches for a row: the experience's own
+ * `source_page_url` when it is set AND its host (www-insensitive, via
+ * hostFromUrlLike) equals the provider hjemmeside's host; otherwise the
+ * provider hjemmeside itself, exactly as before. A product page on another
+ * host is never used (the ownership verification behind kildetro is for the
+ * hjemmeside host only). Returns the raw stored value; crFetchHomepageContent
+ * / crHomepageFetchUrl add the scheme as they always have.
+ */
+export function experienceKildetroSourceUrl(row: ExperienceDescriptionCandidate): string {
+  const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+  const page = (row.source_page_url ?? "").trim();
+  if (page && hjemmeside) {
+    const pageHost = hostFromUrlLike(page);
+    if (pageHost && pageHost === hostFromUrlLike(hjemmeside)) return page;
+  }
+  return hjemmeside;
+}
 
 // Norwegian display labels. Intentional small duplication of the maps in
 // routes/experiences-seo.ts (CATEGORY_LABELS / SEASON_LABELS / ioLabel /
@@ -33078,7 +33104,9 @@ export async function enrichOneExperienceDescription(
   }
 
   // level === "kildetro" ──────────────────────────────────────────────────
-  const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+  // The experience's own product page when set on the same host, else the
+  // provider hjemmeside (experienceKildetroSourceUrl).
+  const hjemmeside = experienceKildetroSourceUrl(row);
   let fetched: CrFetchOutcome;
   try {
     fetched = await crFetchHomepageContent(hjemmeside, homepageFetchImpl);
@@ -33273,11 +33301,17 @@ export function shouldRecordDescriptionAttempt(outcome: ExperienceDescriptionOut
  */
 export function experienceDescriptionFactsFingerprint(row: ExperienceDescriptionCandidate): string {
   const factsBlock = renderExperienceDescriptionFactsBlock(row, buildExperienceDescriptionFacts(row));
-  const material = JSON.stringify([
+  const parts = [
     factsBlock,
     row.provider_hjemmeside ?? "",
     row.provider_field_provenance ?? "",
-  ]);
+  ];
+  // source_page_url joins the material ONLY when set, so every row without
+  // one keeps a byte-identical fingerprint (and its cooldown) — setting or
+  // changing it lifts the cooldown like any other input change.
+  const sourcePage = (row.source_page_url ?? "").trim();
+  if (sourcePage) parts.push(sourcePage);
+  const material = JSON.stringify(parts);
   return expDescCreateHash("sha256").update(material, "utf8").digest("hex");
 }
 
@@ -33345,7 +33379,8 @@ const EXP_DESC_CANDIDATE_SELECT_COLUMNS =
             e.meeting_point, e.kommune, e.fylke, e.booking_url,
             e.content_source, e.content_field_evidence,
             p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified,
-            p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside`;
+            p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside,
+            e.source_page_url`;
 
 /** True for either GENERATED (non-homepage) description provenance marker:
  *  the 4c in-server LLM writer's EXP_DESC_GENERATED_PROVENANCE_SENTINEL and
@@ -33638,7 +33673,7 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
       const evidence = expDescParseFieldEvidence(row.content_field_evidence);
       if (outcome.level === "kildetro") {
         // Real homepage URL actually used — never the generated sentinel.
-        evidence.description = outcome.homepage_url || (row.provider_hjemmeside ?? "");
+        evidence.description = outcome.homepage_url || experienceKildetroSourceUrl(row);
         setDescriptionKildetro.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
       } else {
         evidence.description = EXP_DESC_GENERATED_PROVENANCE_SENTINEL;
@@ -33908,7 +33943,7 @@ router.get("/admin/experiences-description-candidates", requireAdmin, (req: Requ
       level,
       facts_block: factsBlock,
       provider_navn: row.provider_navn ?? null,
-      homepage_url: level === "kildetro" ? crHomepageFetchUrl((row.provider_hjemmeside ?? "").trim()) : null,
+      homepage_url: level === "kildetro" ? crHomepageFetchUrl(experienceKildetroSourceUrl(row)) : null,
       facts_fingerprint: experienceDescriptionFactsFingerprint(row),
       ...experienceDescriptionLevelBounds(level),
       // The exact generator/judge instructions the in-server path uses, from
@@ -34146,7 +34181,10 @@ export async function applyPrewrittenExperienceDescriptions(
     // kildetro: the client's homepage_url (optional) must name the same host
     // the server is about to fetch — a description grounded in some OTHER
     // site must not be stamped with this provider's homepage provenance.
-    const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+    // The page fetched is the row's own same-host source_page_url when set
+    // (experienceKildetroSourceUrl), so its host — hence the check below —
+    // is always the hjemmeside host.
+    const hjemmeside = experienceKildetroSourceUrl(row);
     if (item.homepage_url && hostFromUrlLike(item.homepage_url) !== hostFromUrlLike(hjemmeside)) {
       results.push({ id: item.id, result: "rejected", reason: "homepage_mismatch" });
       continue;
@@ -34325,6 +34363,7 @@ export const EXP_DATA_CORRECTION_FIELDS = [
   "price_from",
   "homepage_url",
   "provider",
+  "source_page_url",
 ] as const;
 export type ExpDataCorrectionField = (typeof EXP_DATA_CORRECTION_FIELDS)[number];
 const EXP_DC_MAX_ITEMS = 50;
@@ -34332,7 +34371,7 @@ const EXP_DC_REVERT_MAX_IDS = 500;
 /** Fields an item may `clear` (set to NULL). The rest are either NOT NULL
  *  (title), structural (provider) or location fields a page should never
  *  lose outright. */
-const EXP_DC_CLEARABLE_FIELDS: ReadonlySet<string> = new Set(["season", "duration", "price_from", "homepage_url"]);
+const EXP_DC_CLEARABLE_FIELDS: ReadonlySet<string> = new Set(["season", "duration", "price_from", "homepage_url", "source_page_url"]);
 /** Fields whose OLD value is looked for in the row's description text
  *  (warning `description_mentions_old_value`). */
 const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "kommune", "price_from", "provider"]);
@@ -34340,7 +34379,7 @@ const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "
  *  below is checked against these lists first. */
 const EXP_DC_EXPERIENCE_COLUMNS: ReadonlySet<string> = new Set([
   "kommune", "fylke", "title", "title_no", "season", "duration_min", "duration_max",
-  "price_from", "provider_id", "provider_match_status", "content_field_evidence",
+  "price_from", "provider_id", "provider_match_status", "content_field_evidence", "source_page_url",
 ]);
 const EXP_DC_PROVIDER_COLUMNS: ReadonlySet<string> = new Set(["hjemmeside", "field_provenance"]);
 
@@ -34639,6 +34678,8 @@ function expDcCurrentForms(field: ExpDataCorrectionField, row: ExpDcRow): string
     }
     case "homepage_url":
       return [row.provider_hjemmeside ?? ""];
+    case "source_page_url":
+      return [row.source_page_url ?? ""];
     case "provider":
       return [row.provider_navn ?? "", expDcFact(row, "Tilbyder") ?? ""];
   }
@@ -34656,7 +34697,7 @@ export function expDcExpectedMatches(field: ExpDataCorrectionField, row: ExpDcRo
       }
     }
   }
-  if (field === "homepage_url") {
+  if (field === "homepage_url" || field === "source_page_url") {
     return forms.some((f) => expDcUrlNormalise(f) === expDcUrlNormalise(expected));
   }
   const e = expDcNormalise(expected);
@@ -34727,6 +34768,7 @@ const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
   duration: ["duration_min", "duration_max"],
   price_from: ["price_from"],
   provider: ["provider_id"],
+  source_page_url: ["source_page_url"],
 };
 
 /**
@@ -34902,7 +34944,7 @@ export async function applyExperienceDataCorrections(
       // The row as it is NOW (an earlier item in this request may have
       // changed it — e.g. a provider relink before a homepage_url item).
       const row = loadRow(it.id)!;
-      if (field === "homepage_url" && !row.provider_id) { reject(it, "no_provider"); continue; }
+      if ((field === "homepage_url" || field === "source_page_url") && !row.provider_id) { reject(it, "no_provider"); continue; }
       if (!expDcExpectedMatches(field, orig, it.expected_current)) {
         reject(it, "stale_expected_current", `current: ${JSON.stringify(expDcCurrentForms(field, orig).filter((f) => f !== ""))}`);
         continue;
@@ -35047,6 +35089,34 @@ export async function applyExperienceDataCorrections(
             }
             setProviderColumn(prov.id, "field_provenance", JSON.stringify(provenance));
           }
+          break;
+        }
+        case "source_page_url": {
+          // Per experience, so a shared provider is fine. Must live on the
+          // provider's own hjemmeside host (www-insensitive) and be a real
+          // sub-page — the root IS the hjemmeside already.
+          let page: string | null = null;
+          if (it.action === "correct") {
+            const prov = getProvider(row.provider_id!);
+            const hj = (prov?.hjemmeside ?? "").trim();
+            if (!hj) { rejected = { reason: "invalid_value", detail: "provider has no hjemmeside to anchor source_page_url" }; break; }
+            if (!expDcIsHttpUrl(nv)) { rejected = { reason: "invalid_value", detail: "source_page_url must be an http(s) URL" }; break; }
+            page = String(nv).trim();
+            if (hostFromUrlLike(page) !== hostFromUrlLike(hj)) {
+              rejected = { reason: "invalid_value", detail: `source_page_url host ${hostFromUrlLike(page)} != provider hjemmeside host ${hostFromUrlLike(hj)}` };
+              break;
+            }
+            const pathname = new URL(page).pathname;
+            if (pathname === "" || pathname === "/") {
+              rejected = { reason: "invalid_value", detail: "source_page_url must be a sub-page (non-root path)" };
+              break;
+            }
+          }
+          if (page === null ? (row.source_page_url ?? "").trim() === "" : expDcUrlNormalise(row.source_page_url) === expDcUrlNormalise(page)) {
+            rejected = { reason: "no_op" };
+            break;
+          }
+          expWrites.push(["source_page_url", page]);
           break;
         }
         case "provider": {

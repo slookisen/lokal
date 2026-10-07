@@ -482,6 +482,13 @@ export function initExperiencesSchema(db: Database.Database): void {
   // Same additive/idempotent idiom as the dedup-cols block above.
   const titleNoCols = [
     "ALTER TABLE experiences ADD COLUMN title_no TEXT",
+    // source_page_url: the experience's OWN product page on its provider's
+    // site (set only through POST /admin/experiences-data-corrections,
+    // field source_page_url). When its host equals the provider hjemmeside
+    // host, the kildetro description tier fetches this page instead of the
+    // provider's root homepage (experienceKildetroSourceUrl in
+    // routes/opplevelser.ts). NULL = use the hjemmeside, as before.
+    "ALTER TABLE experiences ADD COLUMN source_page_url TEXT",
   ];
   for (const stmt of titleNoCols) {
     try { db.exec(stmt); } catch { /* already present */ }

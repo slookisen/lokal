@@ -23,6 +23,7 @@
  * (write-pause lookups), the router driven via router.handle().
  */
 
+import { createHash } from "node:crypto";
 import {
   expDcSeasonCodes,
   expDcParseDuration,
@@ -47,7 +48,7 @@ interface RouteResult {
 
 function callRoute(
   router: any,
-  opts: { method: "GET" | "POST"; url: string; headers?: Record<string, string>; body?: any },
+  opts: { method: "GET" | "POST"; url: string; headers?: Record<string, string>; body?: any; query?: Record<string, string> },
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
     const req: any = {
@@ -55,7 +56,7 @@ function callRoute(
       url: opts.url,
       originalUrl: opts.url,
       path: opts.url,
-      query: {},
+      query: opts.query || {},
       headers: opts.headers || {},
       body: opts.body,
       app: { get: (k: string) => ROUTE_APP_SETTINGS[k] },
@@ -706,6 +707,125 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         const rr = await post("/admin/experiences-data-corrections", { dry_run: false, items: [item("dc-u3", "provider", "Delt Tilbyder AS", "Fjord Tours AS (org.nr. 931735357)")] });
         assertEq([rr.status, rr.body.results?.[0]?.result], [200, "applied"], "dc-r15n: route verifies via the Brreg seam");
         assertTrue(brregRequests.every((x) => x.startsWith("https://data.brreg.no/")), "dc-r15o: the Brreg seam only ever saw data.brreg.no");
+      }
+
+      // ── dc-r16: source_page_url — field validation + kildetro wiring. ─
+      {
+        const verified = JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified" } });
+        const provKt = expStore.createProvider({ navn: "Kildetur Fjord AS", brreg_verified: 1, brreg_active: 1, hjemmeside: "https://www.kilde-tur.example" } as any);
+        expDb.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(verified, provKt);
+        const PAGE = "https://kilde-tur.example/opplevelser/kajakk";
+        seed("dc-k1", { provider_id: provKt, description: null });
+        seed("dc-k2", { provider_id: provKt, description: null });
+        seed("dc-k3", { provider_id: provKt, description: null });
+        seed("dc-k4", { provider_id: provKt, description: null });
+        const sp = (id: string, expected: unknown, nv: unknown) => item(id, "source_page_url", expected, nv);
+
+        // Validation.
+        const v = async (it: any) => { const o = await preview([it]); return [o.results[0].result, o.results[0].reason ?? null]; };
+        assertEq(await v(sp("dc-k1", "", "https://kilde-tur.example/")), ["rejected", "invalid_value"], "dc-r16a: root path -> invalid_value");
+        assertEq(await v(sp("dc-k1", "", "https://annen-tur.example/opplevelser/kajakk")), ["rejected", "invalid_value"], "dc-r16b: other host -> invalid_value");
+        assertEq(await v(sp("dc-k1", "", "ftp://kilde-tur.example/x")), ["rejected", "invalid_value"], "dc-r16c: non-http(s) -> invalid_value");
+        assertEq(await v(sp("dc-noprov", "", PAGE)), ["rejected", "no_provider"], "dc-r16d: no provider -> no_provider");
+        seed("dc-k-nohj", { provider_id: provOther });
+        assertEq(await v(sp("dc-k-nohj", "", "https://x.example/side")), ["rejected", "invalid_value"], "dc-r16e: provider without hjemmeside -> invalid_value");
+        assertEq(await v(sp("dc-k1", "https://feil.example/x", PAGE)), ["rejected", "stale_expected_current"], "dc-r16f: expected_current is the raw column (empty)");
+        assertEq(await v(sp("dc-k1", null, PAGE)), ["would_apply", null], "dc-r16g: www-insensitive host, shared provider allowed");
+
+        // Fingerprint: rows without source_page_url keep the exact pre-change
+        // material; setting it changes the fingerprint.
+        const rowJoin = (id: string): any => expDb.prepare(
+          `SELECT e.*, p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified,
+                  p.field_provenance AS provider_field_provenance, p.hjemmeside AS provider_hjemmeside
+             FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id WHERE e.id = ?`).get(id);
+        const legacyFp = (r: any) => createHash("sha256").update(JSON.stringify([
+          opp.renderExperienceDescriptionFactsBlock(r, opp.buildExperienceDescriptionFacts(r)),
+          r.provider_hjemmeside ?? "", r.provider_field_provenance ?? "",
+        ]), "utf8").digest("hex");
+        for (const id of ["dc-k1", "dc-k2", "dc-a", "dc-noprov"]) {
+          assertEq(opp.experienceDescriptionFactsFingerprint(rowJoin(id)), legacyFp(rowJoin(id)), `dc-r16h: ${id} without source_page_url keeps a byte-identical fingerprint`);
+        }
+
+        // Cooldown re-entry.
+        const fpK1 = opp.experienceDescriptionFactsFingerprint(rowJoin("dc-k1"));
+        expDb.prepare("INSERT INTO experience_description_attempts (experience_id, attempted_at, outcome, reason, facts_fingerprint) VALUES (?, datetime('now'), 'generation_failed', 'kildetro:sentinel', ?)")
+          .run("dc-k1", fpK1);
+        const queued = (id: string) => opp.selectExperienceDescriptionQueue(expDb as any, null).eligibleRows.some((r: any) => r.id === id);
+        assertEq(queued("dc-k1"), false, "dc-r16i: dc-k1 held back by the cooldown");
+        const applied = await apply([sp("dc-k1", "", PAGE), sp("dc-k3", "", PAGE)]);
+        assertEq(applied.results.map((r: any) => r.result), ["applied", "applied"], "dc-r16j: source_page_url applied");
+        assertEq(rowOf("dc-k1").source_page_url, PAGE, "dc-r16k: column written");
+        assertEq(JSON.parse(rowOf("dc-k1").content_field_evidence).source_page_url, SRC, "dc-r16l: evidence recorded");
+        assertTrue(opp.experienceDescriptionFactsFingerprint(rowJoin("dc-k1")) !== fpK1, "dc-r16m: fingerprint changed for the row with source_page_url");
+        assertEq(queued("dc-k1"), true, "dc-r16n: the row re-enters the queue after source_page_url is set");
+        assertEq(opp.experienceKildetroSourceUrl(rowJoin("dc-k1")), PAGE, "dc-r16o: kildetro source = product page");
+        assertEq(opp.experienceKildetroSourceUrl(rowJoin("dc-k2")), "https://www.kilde-tur.example", "dc-r16p: no source_page_url -> hjemmeside");
+        // Host mismatch (e.g. the provider homepage later moved) -> fallback.
+        expDb.prepare("UPDATE experiences SET source_page_url = ? WHERE id = 'dc-k4'").run("https://annen-tur.example/opplevelser/kajakk");
+        assertEq(opp.experienceKildetroSourceUrl(rowJoin("dc-k4")), "https://www.kilde-tur.example", "dc-r16q: different host -> falls back to hjemmeside");
+
+        // Candidates + description-write through the routes.
+        expDb.prepare("UPDATE experiences SET description = ? WHERE id NOT IN ('dc-k1','dc-k2','dc-k3','dc-k4')")
+          .run("En rolig og fin tur langs kysten sammen med erfarne lokale guider som kjenner området godt.");
+        const fetched: string[] = [];
+        const PAGE_HTML = "<html><body><p>Kajakktur i fjorden: rolig padling for hele familien med guide fra brygga.</p></body></html>";
+        const ROOT_HTML = "<html><body><p>Kildetur Fjord tilbyr kajakktur og mange andre turer langs kysten.</p></body></html>";
+        const hpStub = (async (url: any) => {
+          if (String(url).includes("api.anthropic.com")) { anthropicRequests++; throw new Error("LLM via homepage seam"); }
+          fetched.push(String(url));
+          const u = new URL(String(url));
+          const html = u.pathname === "/opplevelser/kajakk" ? PAGE_HTML : (u.pathname === "/" || u.pathname === "") ? ROOT_HTML : null;
+          if (!html) return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } } as unknown as Response;
+          const bytes = new TextEncoder().encode(html);
+          return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer, url: String(url),
+            headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) } } as unknown as Response;
+        }) as unknown as typeof fetch;
+        ROUTE_APP_SETTINGS["experienceDescriptionHomepageFetchImpl"] = hpStub;
+        const cand = await callRoute(router, { method: "GET", url: "/admin/experiences-description-candidates", headers: auth, query: { limit: "50" } });
+        const ci = (id: string) => (cand.body.items as any[]).find((x) => x.id === id);
+        assertEq([ci("dc-k1")?.level, ci("dc-k1")?.homepage_url], ["kildetro", PAGE], "dc-r16r: candidates homepage_url = the product page that will be fetched");
+        assertEq(ci("dc-k2")?.homepage_url, "https://www.kilde-tur.example", "dc-r16s: candidates homepage_url = root when unset");
+        assertEq(ci("dc-k4")?.homepage_url, "https://www.kilde-tur.example", "dc-r16t: candidates homepage_url = root when hosts differ");
+        const KT = "Vi tilbyr en kajakktur i rolig sjø for både nybegynnere og erfarne padlere, og turen starter ved brygga rett ved sjøen der guiden ønsker alle velkommen.";
+        const KT_TEXT = [KT, KT, KT].join(" ");
+        const wItem = (id: string, homepage_url: string) => ({
+          id, facts_fingerprint: ci(id).facts_fingerprint, outcome: "write", level: "kildetro",
+          description: KT_TEXT, judge: { approved: true }, homepage_url,
+        });
+        fetched.length = 0;
+        const w = await post("/admin/experiences-description-write", { dry_run: false, items: [wItem("dc-k1", PAGE), wItem("dc-k4", "https://www.kilde-tur.example/")] });
+        assertEq(w.body.results, [{ id: "dc-k1", result: "written" }, { id: "dc-k4", result: "written" }], "dc-r16u: description-write accepts the same-host product URL");
+        assertEq(fetched[0], PAGE, "dc-r16v: kildetro fetched the product page first for dc-k1");
+        assertTrue(fetched.includes("https://www.kilde-tur.example"), "dc-r16w: dc-k4 (host mismatch) fetched the root homepage");
+        assertEq(JSON.parse(rowOf("dc-k1").content_field_evidence).description, PAGE, "dc-r16x: kildetro provenance = the fetched product URL");
+        assertEq(JSON.parse(rowOf("dc-k4").content_field_evidence).description, "https://www.kilde-tur.example", "dc-r16y: fallback provenance = root URL");
+
+        // The proposals job's shared apply path.
+        const job = require("../services/experience-description-proposals-job") as typeof import("../services/experience-description-proposals-job");
+        const fpK3 = opp.experienceDescriptionFactsFingerprint(rowJoin("dc-k3"));
+        const fileText = JSON.stringify({ schema: "experiences-description-proposals/v1", run_id: "dc-run", created_at: "2026-10-07T00:00:00Z",
+          items: [{ id: "dc-k3", facts_fingerprint: fpK3, outcome: "write", level: "kildetro", description: KT_TEXT, judge: { approved: true }, homepage_url: PAGE }] });
+        const ghStub = (async (url: any) => {
+          const u = String(url);
+          if (u.includes("api.anthropic.com")) { anthropicRequests++; throw new Error("LLM via github seam"); }
+          const path = decodeURIComponent(new URL(u).pathname.replace("/repos/slookisen/A2A/contents/", ""));
+          if (path === "experiences-proposals") return { ok: true, status: 200, json: async () => [{ name: "2026-10-07", path: "experiences-proposals/2026-10-07", type: "dir", sha: "d1" }] } as unknown as Response;
+          if (path === "experiences-proposals/2026-10-07") return { ok: true, status: 200, json: async () => [{ name: "dc.json", path: "experiences-proposals/2026-10-07/dc.json", type: "file", sha: "f1", size: fileText.length }] } as unknown as Response;
+          if (path === "experiences-proposals/2026-10-07/dc.json") return { ok: true, status: 200, json: async () => ({ encoding: "base64", content: Buffer.from(fileText).toString("base64"), sha: "f1" }) } as unknown as Response;
+          return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+        }) as unknown as typeof fetch;
+        fetched.length = 0;
+        const rep = await job.tickExperienceDescriptionProposals({
+          fetchImpl: ghStub, homepageFetchImpl: hpStub, now: new Date("2026-10-07T12:00:00Z"),
+          env: { EXPERIENCE_PROPOSALS_JOB_ENABLED: "true", A2A_READ_PAT: "test-pat" }, expDb: expDb as any, mainDb: () => init.getDb(),
+        } as any);
+        assertEq(rep.written, 1, "dc-r16z: proposals job wrote the kildetro description");
+        assertEq(fetched[0], PAGE, "dc-r16z2: ...after fetching the product page");
+        assertEq(JSON.parse(rowOf("dc-k3").content_field_evidence).description, PAGE, "dc-r16z3: ...with the product page as provenance");
+
+        // Revert of a source_page_url correction restores NULL.
+        const rv = revert({ correction_ids: [applied.results[1].correction_id] });
+        assertEq([rv.results[0].result, rowOf("dc-k3").source_page_url], ["reverted", null], "dc-r16z4: revert restores NULL");
       }
 
       assertEq(anthropicRequests, 0, "dc-r14b: ZERO requests to api.anthropic.com");
