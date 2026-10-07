@@ -33,6 +33,7 @@
 
 import {
   checkPrewrittenExperienceDescriptionShape,
+  experienceDescriptionTextHasMarkupOrJunk,
   prewrittenDescriptionHasUngroundedNumbers,
   experienceDescriptionSkipAttempt,
   isExperienceDescriptionGeneratedProvenance,
@@ -170,12 +171,35 @@ export function runOpplevelserExperienceDescriptionWriteTests(
       const longWords = Array.from({ length: 80 }, () => "kajakktur" + "x".repeat(150)).join(" ");
       assertEq(checkPrewrittenExperienceDescriptionShape(longWords, "kildetro", T), "char_cap_exceeded", "p1k: >12000 chars -> char_cap_exceeded");
 
+      // Markup / junk gate (review follow-up).
+      for (const [label, txt] of [
+        ["html tag", "Turen er <b>flott</b> for alle."],
+        ["angle bracket", "Turen passer for alle > åtte."],
+        ["link http", "Les mer på http og bestill."],
+        ["link www", "Se www.example.no for mer."],
+        ["bold markdown", "Turen er **flott** for alle."],
+        ["backtick", "Turen er `flott` for alle."],
+        ["heading", "# Kajakktur\nEn fin tur."],
+        ["dash list", "En tur:\n- padling\n- lunsj"],
+        ["star list", "* padling"],
+        ["junk", JUNK_DESCRIPTION],
+      ] as Array<[string, string]>) {
+        assertTrue(experienceDescriptionTextHasMarkupOrJunk(txt), `p1l: markup_or_junk detects ${label}`);
+        assertEq(checkPrewrittenExperienceDescriptionShape(txt, "faktalinje", T), "markup_or_junk", `p1m: shape gate rejects ${label} as markup_or_junk`);
+      }
+      assertEq(experienceDescriptionTextHasMarkupOrJunk(FAKTALINJE_TEXT), false, "p1n: plain faktalinje prose is not markup");
+      assertEq(experienceDescriptionTextHasMarkupOrJunk(KILDETRO_TEXT), false, "p1o: plain kildetro prose is not markup");
+      assertEq(experienceDescriptionTextHasMarkupOrJunk("En tur med lunsj - og kaffe etterpå."), false, "p1p: a mid-sentence dash is not a list");
+
       const facts = "Tittel: X\nPris: fra 890 kroner per person";
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Fra 890 kroner.", "faktalinje", facts, null), false, "p2a: a facts number is grounded");
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Fra 1500 kroner.", "faktalinje", facts, "1500"), true, "p2b: faktalinje ignores homepage text");
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Fra 1500 kroner.", "kildetro", facts, "Prisen er 1 500 kroner"), false, "p2c: kildetro accepts a homepage number (separator-normalised)");
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Fra 890 kroner.", "kildetro", facts, "ingen tall"), false, "p2d: kildetro accepts a facts number");
       assertEq(prewrittenDescriptionHasUngroundedNumbers("Tar 777 minutter.", "kildetro", facts, "ingen tall"), true, "p2e: kildetro rejects a number in neither");
+      // Same 6000-char homepage slice as the 4c generator/judge.
+      assertEq(prewrittenDescriptionHasUngroundedNumbers("Tar 777 minutter.", "kildetro", facts, `${"a".repeat(5990)} 777 minutter`), false, "p2f: a homepage number inside the first 6000 chars is grounded");
+      assertEq(prewrittenDescriptionHasUngroundedNumbers("Tar 777 minutter.", "kildetro", facts, `${"a".repeat(6000)} 777 minutter`), true, "p2g: a homepage number beyond the 6000-char cap is NOT grounded");
 
       assertEq(experienceDescriptionSkipAttempt("faktalinje", "sentinel"), { outcome: "generation_failed", reason: "faktalinje:sentinel" }, "p3a: sentinel -> generation_failed, <level>:<reason>");
       assertEq(experienceDescriptionSkipAttempt("kildetro", "judge_rejected"), { outcome: "judge_rejected", reason: "kildetro:judge_rejected" }, "p3b: judge_rejected outcome");
@@ -223,16 +247,17 @@ export function runOpplevelserExperienceDescriptionWriteTests(
       if (isLlmUrl(url)) llmCalls++;
       throw new Error(`global fetch must not be called (${String(url)})`);
     }) as typeof fetch;
-    function homepageStub(mode: "ok" | "fail"): typeof fetch {
+    function homepageStub(mode: "ok" | "fail", html: string = HOMEPAGE_HTML, onFetch?: () => void): typeof fetch {
       return (async (url: any) => {
         if (isLlmUrl(url)) { llmCalls++; throw new Error("LLM call through the homepage seam"); }
         homepageCalls++;
+        if (onFetch) onFetch();
         let u: URL;
         try { u = new URL(String(url)); } catch {
           return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } } as unknown as Response;
         }
         if (mode === "ok" && (u.pathname === "/" || u.pathname === "")) {
-          const bytes = new TextEncoder().encode(HOMEPAGE_HTML);
+          const bytes = new TextEncoder().encode(html);
           return {
             ok: true, status: 200, arrayBuffer: async () => bytes.buffer,
             headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
@@ -450,6 +475,11 @@ export function runOpplevelserExperienceDescriptionWriteTests(
         ["cw-r5s", writeItem(idK1, { level: "kildetro", description: KILDETRO_INVENTED_NUMBER }), "ungrounded_numbers"],
         ["cw-r5t", writeItem(idK1, { level: "kildetro", description: KILDETRO_TEXT, homepage_url: "https://annen-side.example" }), "homepage_mismatch"],
         ["cw-r5u", writeItem(idK1, { level: "kildetro", description: Array.from({ length: 80 }, () => "kajakktur" + "x".repeat(150)).join(" ") }), "char_cap_exceeded"],
+        ["cw-r5x", writeItem(idF1, { description: "Turen er <b>flott</b> for alle." }), "markup_or_junk"],
+        ["cw-r5y", writeItem(idF1, { description: "Les mer på www.kajakk.no om turen." }), "markup_or_junk"],
+        ["cw-r5z", writeItem(idF1, { description: "En tur:\n- padling\n- lunsj" }), "markup_or_junk"],
+        ["cw-r5aa", writeItem(idF1, { description: JUNK_DESCRIPTION }), "markup_or_junk"],
+        ["cw-r5ab", writeItem(idK1, { level: "kildetro", description: `**Kajakktur** ${KILDETRO_TEXT}` }), "markup_or_junk"],
       ];
       for (const [label, item, reason] of rejectCases) {
         const before = dumpAll() + dumpAttempts();
@@ -583,6 +613,69 @@ export function runOpplevelserExperienceDescriptionWriteTests(
         assertEq(r.body.results.map((x: any) => x.result), ["written", "rejected", "skipped_recorded"], "cw-r12a: per-item results");
         assertEq(r.body.totals, { written: 1, rejected: 1, skipped_recorded: 1, would_write: 0, would_record_skip: 0 }, "cw-r12b: totals");
         assertEq(rowOf(idF4).description, null, "cw-r12c: the rejected row is untouched");
+      }
+
+      // ── cw-r14: admin gate on both routes. ───────────────────────────
+      for (const [label, headers] of [["no key", {}], ["wrong key", { "x-admin-key": "wrong-key" }]] as Array<[string, Record<string, string>]>) {
+        process.env.ADMIN_KEY = ADMIN_KEY_CW;
+        const g = await callRoute(router, appSettings, { method: "GET", url: "/admin/experiences-description-candidates", headers });
+        assertEq(g.status, 403, `cw-r14a: GET candidates with ${label} -> 403`);
+        const before = dumpAll() + dumpAttempts();
+        const w = await callRoute(router, appSettings, { method: "POST", url: "/admin/experiences-description-write", headers, body: { dry_run: false, items: [skipItem(idF4)] } });
+        assertEq(w.status, 403, `cw-r14b: POST write with ${label} -> 403`);
+        assertEq(dumpAll() + dumpAttempts(), before, `cw-r14c: nothing written with ${label}`);
+      }
+
+      // ── cw-r15: at most 10 kildetro write items per call (whole-call 400). ─
+      {
+        const kItems = Array.from({ length: 11 }, (_, i) => ({ id: `k-${i}`, facts_fingerprint: "x", outcome: "write", level: "kildetro", description: KILDETRO_TEXT, judge: { approved: true } }));
+        const r = await write({ dry_run: true, items: kItems });
+        assertEq(r.status, 400, "cw-r15a: 11 kildetro write items -> 400");
+        assertTrue(String(r.body.error).includes("max 10"), "cw-r15b: the error names the kildetro limit");
+        const ok = await write({ dry_run: true, items: kItems.slice(0, 10) });
+        assertEq(ok.status, 200, "cw-r15c: 10 kildetro write items -> 200");
+        const g = await getCandidates();
+        assertEq(g.body.rules.max_kildetro_write_items_per_call, 10, "cw-r15d: rules carry the kildetro limit");
+        assertTrue(typeof g.body.rules.retry_after_timeout === "string", "cw-r15e: rules carry the re-fetch-after-timeout note");
+      }
+
+      // ── cw-r16: the console summary carries judge.model per id, never text. ─
+      {
+        const lines: string[] = [];
+        const prevLog = console.log;
+        console.log = (...a: any[]) => { lines.push(a.map(String).join(" ")); };
+        try {
+          await write({ items: [writeItem(idF4, { judge: { approved: true, model: "claude-opus-test", reasoning: "OK" } })] });
+        } finally {
+          console.log = prevLog;
+        }
+        const line = lines.find((l) => l.startsWith("[experiences-description-write]")) ?? "";
+        assertTrue(line.includes(`${idF4}=would_write@claude-opus-test`), "cw-r16a: summary line has id=result@model");
+        assertTrue(!line.includes(FAKTALINJE_TEXT.slice(0, 20)), "cw-r16b: no description text in the summary line");
+      }
+
+      // ── cw-r17: kildetro homepage with NO visible text -> rejected
+      //    empty_homepage_text, nothing written, no attempt. ─────────────
+      {
+        const idK4 = seed("cw-k4", { provider_id: providerK });
+        appSettings["experienceDescriptionHomepageFetchImpl"] = homepageStub("ok", "<html><body><script>x</script></body></html>");
+        const before = dumpAll() + dumpAttempts();
+        const r = await write({ dry_run: false, items: [writeItem(idK4, { level: "kildetro", description: KILDETRO_TEXT })] });
+        assertEq(r.body.results, [{ id: idK4, result: "rejected", reason: "empty_homepage_text" }], "cw-r17a: empty homepage text -> empty_homepage_text");
+        assertEq(dumpAll() + dumpAttempts(), before, "cw-r17b: row and attempts unchanged");
+        appSettings["experienceDescriptionHomepageFetchImpl"] = homepageStub("ok");
+
+        // ── cw-r18: TOCTOU — the row changes WHILE its homepage is being
+        //    fetched -> rejected changed_during_call, row not overwritten. ──
+        appSettings["experienceDescriptionHomepageFetchImpl"] = homepageStub("ok", HOMEPAGE_HTML, () => {
+          expDb.prepare("UPDATE experiences SET description = ? WHERE id = ?").run(GOOD_DESCRIPTION, idK4);
+        });
+        const r2 = await write({ dry_run: false, items: [writeItem(idK4, { level: "kildetro", description: KILDETRO_TEXT })] });
+        assertEq(r2.body.results, [{ id: idK4, result: "rejected", reason: "changed_during_call" }], "cw-r18a: concurrent change -> changed_during_call");
+        assertEq(rowOf(idK4).description, GOOD_DESCRIPTION, "cw-r18b: the concurrently written description is NOT overwritten");
+        assertEq(rowOf(idK4).content_source, null, "cw-r18c: content_source untouched");
+        assertEq(r2.body.totals.written, 0, "cw-r18d: totals.written 0");
+        appSettings["experienceDescriptionHomepageFetchImpl"] = homepageStub("ok");
       }
 
       // ── cw-r13: no LLM call anywhere in this suite. ─────────────────

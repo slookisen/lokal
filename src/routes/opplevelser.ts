@@ -33748,6 +33748,10 @@ router.post("/admin/experiences-description-enrichment", requireAdmin, async (re
 const EXP_DESC_CANDIDATES_DEFAULT_LIMIT = 20;
 const EXP_DESC_CANDIDATES_MAX_LIMIT = 50;
 const EXP_DESC_WRITE_MAX_ITEMS = 25;
+/** Each kildetro write-item costs a homepage fetch (primary page + sub-page
+ *  crawl), so a call carries at most this many to keep the request well
+ *  inside a client/proxy timeout (review follow-up). */
+const EXP_DESC_WRITE_MAX_KILDETRO_ITEMS = 10;
 /** Placeholders a client substitutes in the prompt texts the candidates
  *  route returns: the homepage visible text it fetched itself (kildetro
  *  generator + judge), and the candidate text under review (judge). */
@@ -33788,10 +33792,29 @@ export function experienceDescriptionLevelBounds(
  * the generators apply them to their own output: empty, sentinel (bare or
  * smuggled — either way the text is not a description), char cap, word
  * floor/ceiling, and for kildetro the title-token rule. Returns the reject
- * reason, or null when every gate passes. Numbers are checked separately
+ * reason, or null when every gate passes. Review follow-up (same dev-
+ * request): a `markup_or_junk` gate right after the sentinel — the 4c
+ * generator is TOLD to emit plain prose (no headings, lists, markdown,
+ * links, HTML) and its judge enforces it, but a client-written text gets no
+ * server-side judge, so the deterministic half of that rule is checked here. Numbers are checked separately
  * (prewrittenDescriptionHasUngroundedNumbers) because kildetro needs the
  * homepage text first.
  */
+/** Markup / junk detector for a pre-written description: the render-time
+ *  junk guard (isJunkDescription), angle brackets (HTML), a link (`http`,
+ *  `www.`), or markdown (`**`, backticks, a line starting with `#`, or a
+ *  `- `/`* ` list line). Any hit -> the text is not plain prose. */
+export function experienceDescriptionTextHasMarkupOrJunk(text: string): boolean {
+  const t = text.trim();
+  if (expDescIsJunk(t)) return true;
+  if (/[<>]/.test(t)) return true;
+  if (/http|www\./i.test(t)) return true;
+  if (t.includes("**") || t.includes("`")) return true;
+  if (/^\s*#/m.test(t)) return true;
+  if (/^\s*[-*]\s/m.test(t)) return true;
+  return false;
+}
+
 export function checkPrewrittenExperienceDescriptionShape(
   text: string,
   level: "kildetro" | "faktalinje",
@@ -33800,6 +33823,7 @@ export function checkPrewrittenExperienceDescriptionShape(
   const cleaned = text.trim();
   if (!cleaned) return "empty_description";
   if (cleaned.includes(EXP_DESC_SENTINEL)) return "sentinel";
+  if (experienceDescriptionTextHasMarkupOrJunk(cleaned)) return "markup_or_junk";
   const b = experienceDescriptionLevelBounds(level);
   if (cleaned.length > b.char_max) return "char_cap_exceeded";
   const words = expDescWordCount(cleaned);
@@ -33812,14 +33836,12 @@ export function checkPrewrittenExperienceDescriptionShape(
 /**
  * Ungrounded-number gate for a pre-written description. faktalinje: every
  * number must appear in the facts block (same as the generator). kildetro:
- * in the facts block OR the homepage visible text the SERVER fetched.
- *
- * Judgement call: the FULL extracted homepage text is used here, not the
- * GARDSSALG_REWRITE_SOURCE_CHAR_CAP slice the in-server kildetro generator is
- * prompted with — a Claude Code client reads the homepage itself and may
- * legitimately quote a number from further down the page; the property that
- * matters is "the number is on the provider's own page", which the full text
- * proves just as well.
+ * in the facts block OR the first GARDSSALG_REWRITE_SOURCE_CHAR_CAP characters
+ * of the homepage visible text the SERVER fetched — the same slice the 4c
+ * kildetro generator is prompted with and its judge grades against (and the
+ * `homepage_source_char_cap` the candidates route publishes in `rules`), so
+ * a client and the in-server path ground on exactly the same text. A number
+ * that only appears further down the page is rejected (review follow-up).
  */
 export function prewrittenDescriptionHasUngroundedNumbers(
   text: string,
@@ -33827,7 +33849,9 @@ export function prewrittenDescriptionHasUngroundedNumbers(
   factsBlock: string,
   homepageText: string | null
 ): boolean {
-  const grounding = level === "kildetro" ? `${factsBlock}\n${homepageText ?? ""}` : factsBlock;
+  const grounding = level === "kildetro"
+    ? `${factsBlock}\n${(homepageText ?? "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP)}`
+    : factsBlock;
   return expDescHasUngroundedNumbers(text.trim(), grounding);
 }
 
@@ -33912,6 +33936,8 @@ router.get("/admin/experiences-description-candidates", requireAdmin, (req: Requ
       },
       skip_reasons: EXP_DESC_WRITE_SKIP_REASONS,
       max_items_per_write: EXP_DESC_WRITE_MAX_ITEMS,
+      max_kildetro_write_items_per_call: EXP_DESC_WRITE_MAX_KILDETRO_ITEMS,
+      retry_after_timeout: "if a write call times out, re-fetch candidates and resend only the ids still listed — re-runs are safe because a written row is no longer a candidate (rejected not_candidate)",
       write_endpoint: "/api/opplevelser/admin/experiences-description-write",
     },
     items,
@@ -33999,6 +34025,13 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
       return;
     }
     items.push(parsed);
+  }
+  const kildetroWrites = items.filter((it) => it.outcome === "write" && it.level === "kildetro").length;
+  if (kildetroWrites > EXP_DESC_WRITE_MAX_KILDETRO_ITEMS) {
+    res.status(400).json({
+      error: `Too many kildetro write items (${kildetroWrites}); max ${EXP_DESC_WRITE_MAX_KILDETRO_ITEMS} per call — each one fetches the provider homepage`,
+    });
+    return;
   }
   const seen = new Set<string>();
   for (const it of items) {
@@ -34109,6 +34142,13 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
       continue;
     }
     const homepageText = extractVisibleText(fetched.combinedHtml);
+    // A homepage that fetched fine but yields no visible text (a script-only
+    // shell, an empty body) cannot ground a kildetro description at all —
+    // the 4c generator short-circuits the same case to empty_response.
+    if (!homepageText.trim()) {
+      results.push({ id: item.id, result: "rejected", reason: "empty_homepage_text" });
+      continue;
+    }
     if (prewrittenDescriptionHasUngroundedNumbers(text, "kildetro", factsBlock, homepageText)) {
       results.push({ id: item.id, result: "rejected", reason: "ungrounded_numbers" });
       continue;
@@ -34153,10 +34193,19 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
 
   const totals = { written: 0, rejected: 0, skipped_recorded: 0, would_write: 0, would_record_skip: 0 };
   for (const r of results) totals[r.result]++;
-  // One summary line per call: ids + results only, never description text.
+  // One summary line per call: ids + results (+ the client's judge.model
+  // for write items, sanitised/truncated), never description text.
+  const judgeModelOf = new Map<string, string>();
+  for (const it of items) {
+    if (it.outcome === "write" && typeof it.judge.model === "string" && it.judge.model.trim() !== "") {
+      judgeModelOf.set(it.id, it.judge.model.replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, 60));
+    }
+  }
   console.log(
     `[experiences-description-write] dry_run=${dryRun} ` +
-      results.map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}`).join(" ")
+      results
+        .map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}${judgeModelOf.has(r.id) ? "@" + judgeModelOf.get(r.id) : ""}`)
+        .join(" ")
   );
   res.json({ success: true, dry_run: dryRun, totals, results });
 });
