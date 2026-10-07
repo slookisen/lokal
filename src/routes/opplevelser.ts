@@ -2651,6 +2651,11 @@ type CrFetchOutcome =
       primaryHtml: string;
       combinedHtml: string;
       fetchUrl: string;
+      /** Final URL of the primary page after redirects — set ONLY by
+       *  crFetchHomepageContent (additive/optional; `finalUrl` below stays
+       *  crFetchGardssalgContent-only). Read by fetchExperienceKildetroSource
+       *  to detect a product page that redirects off the provider's host. */
+      primaryFinalUrl?: string;
       // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1
       // (diagnose): ADDITIVE, optional — which of GARDSSALG_CONTENT_PATHS were
       // actually fetched/included for this call. Only ever populated by
@@ -2876,7 +2881,7 @@ async function crFetchHomepageContent(homepageUrl: string, fetchImpl?: typeof fe
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pages };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, primaryFinalUrl: primary.finalUrl || fetchUrl, pages };
 }
 
 router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Response) => {
@@ -32375,10 +32380,60 @@ export function experienceKildetroSourceUrl(row: ExperienceDescriptionCandidate)
   const hjemmeside = (row.provider_hjemmeside ?? "").trim();
   const page = (row.source_page_url ?? "").trim();
   if (page && hjemmeside) {
-    const pageHost = hostFromUrlLike(page);
-    if (pageHost && pageHost === hostFromUrlLike(hjemmeside)) return page;
+    const pageHost = expDcUrlHost(page);
+    if (pageHost && pageHost === expDcUrlHost(hjemmeside)) return page;
   }
   return hjemmeside;
+}
+
+/**
+ * The comparison host of a URL for this feature, by the WHATWG parser the
+ * fetch itself uses (`new URL(x).hostname`), lower-cased with one leading
+ * `www.` removed. A bare host ("example.no") gets https:// first, exactly as
+ * crHomepageFetchUrl() does before fetching. null — never a host — for
+ * anything that parses differently in different parsers or names more than
+ * a host: a backslash, a username/password, a non-default port, a non-http(s)
+ * scheme, or an unparseable value.
+ */
+export function expDcUrlHost(raw: string | null | undefined): string | null {
+  const t = (raw ?? "").trim();
+  if (!t || t.includes("\\")) return null;
+  let u: URL;
+  try {
+    u = new URL(/^https?:\/\//i.test(t) ? t : `https://${t}`);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.username || u.password || u.port) return null;
+  const host = u.hostname.toLowerCase().replace(/^www\./, "");
+  return host || null;
+}
+
+/**
+ * Fetch the kildetro source for a row: the same-host product page when set
+ * (experienceKildetroSourceUrl), else the provider hjemmeside — through the
+ * unchanged crFetchHomepageContent() contract. If the product page REDIRECTS
+ * to a different host, its text is discarded and the hjemmeside root is
+ * fetched instead. `provenanceUrl` is the URL whose text is actually used
+ * (the product page's final same-host URL, or the root's fetchUrl exactly as
+ * before).
+ */
+async function fetchExperienceKildetroSource(
+  row: ExperienceDescriptionCandidate,
+  homepageFetchImpl: typeof fetch | undefined
+): Promise<{ fetched: CrFetchOutcome; provenanceUrl: string }> {
+  const root = (row.provider_hjemmeside ?? "").trim();
+  const src = experienceKildetroSourceUrl(row);
+  if (src !== root) {
+    const page = await crFetchHomepageContent(src, homepageFetchImpl);
+    if (!page.ok) return { fetched: page, provenanceUrl: src };
+    const finalUrl = page.primaryFinalUrl || page.fetchUrl;
+    if (expDcUrlHost(finalUrl) === expDcUrlHost(root)) return { fetched: page, provenanceUrl: finalUrl };
+    // Redirected off the provider's host — fall back to the root homepage.
+  }
+  const fetched = await crFetchHomepageContent(root, homepageFetchImpl);
+  return { fetched, provenanceUrl: fetched.ok ? fetched.fetchUrl : root };
 }
 
 // Norwegian display labels. Intentional small duplication of the maps in
@@ -33106,10 +33161,12 @@ export async function enrichOneExperienceDescription(
   // level === "kildetro" ──────────────────────────────────────────────────
   // The experience's own product page when set on the same host, else the
   // provider hjemmeside (experienceKildetroSourceUrl).
-  const hjemmeside = experienceKildetroSourceUrl(row);
   let fetched: CrFetchOutcome;
+  let kildetroProvenanceUrl = "";
   try {
-    fetched = await crFetchHomepageContent(hjemmeside, homepageFetchImpl);
+    const src = await fetchExperienceKildetroSource(row, homepageFetchImpl);
+    fetched = src.fetched;
+    kildetroProvenanceUrl = src.provenanceUrl;
   } catch {
     // fetchPage()/crFetchHomepageContent() never throw in practice (they
     // return a classified failure) — this catch is the same defensive
@@ -33135,7 +33192,7 @@ export async function enrichOneExperienceDescription(
     return {
       ...base, thin: false, proposed_description: null, word_count: 0,
       judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
-      generation_fail_reason: genFailReason, homepage_url: fetched.fetchUrl,
+      generation_fail_reason: genFailReason, homepage_url: kildetroProvenanceUrl,
     };
   }
 
@@ -33150,7 +33207,7 @@ export async function enrichOneExperienceDescription(
     judge_reasoning: verdict.reasoning,
     skip_reason: verdict.approved ? null : "judge_rejected",
     generation_fail_reason: null,
-    homepage_url: verdict.approved ? fetched.fetchUrl : null,
+    homepage_url: verdict.approved ? kildetroProvenanceUrl : null,
   };
 }
 
@@ -34190,8 +34247,11 @@ export async function applyPrewrittenExperienceDescriptions(
       continue;
     }
     let fetched: CrFetchOutcome;
+    let kildetroProvenanceUrl: string;
     try {
-      fetched = await crFetchHomepageContent(hjemmeside, homepageFetchImpl);
+      const src = await fetchExperienceKildetroSource(row, homepageFetchImpl);
+      fetched = src.fetched;
+      kildetroProvenanceUrl = src.provenanceUrl;
     } catch {
       results.push({ id: item.id, result: "rejected", reason: "fetch_failed" });
       continue;
@@ -34212,7 +34272,7 @@ export async function applyPrewrittenExperienceDescriptions(
       results.push({ id: item.id, result: "rejected", reason: "ungrounded_numbers" });
       continue;
     }
-    pendingWrites.push({ item, text, evidenceDescription: fetched.fetchUrl });
+    pendingWrites.push({ item, text, evidenceDescription: kildetroProvenanceUrl });
     results.push({ id: item.id, result: dryRun ? "would_write" : "written" });
   }
 
@@ -34394,6 +34454,11 @@ export type ExpDcColumnChange =
       json_key?: string;
       old: unknown;
       new: unknown;
+      /** The column's exact stored value before / after this correction's
+       *  write (whole JSON text for a json_key change) — revert writes
+       *  old_raw back verbatim while the column still equals new_raw. */
+      old_raw?: unknown;
+      new_raw?: unknown;
     }
   | { table: "experience_providers"; row_id: string; op: "insert"; values: Record<string, unknown> };
 
@@ -34413,7 +34478,7 @@ export type ExpDcItemResult = {
 };
 
 export type ExperienceDataCorrectionsResult =
-  | { ok: false; error: string }
+  | { ok: false; error: string; pauseBlock?: unknown }
   | {
       ok: true;
       dry_run: boolean;
@@ -34434,6 +34499,7 @@ type ExpDcItem = {
   source_url: unknown;
   quote: unknown;
   confidence: unknown;
+  allow_shared_provider: boolean;
 };
 
 type ExpDcRow = ExperienceDescriptionCandidate & {
@@ -34512,6 +34578,15 @@ export function expDcSeasonCodes(raw: unknown): string[] | null {
     if (!code) return null;
     codes.add(code);
   }
+  return [...codes].sort();
+}
+
+/** Season codes in the form this feature stores and compares: all four
+ *  seasons (or any year_round) -> ["year_round"], so the page says
+ *  "Hele året"; otherwise the sorted codes unchanged. */
+export function expDcSeasonCanon(codes: string[]): string[] {
+  if (codes.includes("year_round")) return ["year_round"];
+  if (EXP_DC_SEASON_ORDER.every((c) => codes.includes(c))) return ["year_round"];
   return [...codes].sort();
 }
 
@@ -34693,7 +34768,7 @@ export function expDcExpectedMatches(field: ExpDataCorrectionField, row: ExpDcRo
     if (want) {
       for (const f of forms) {
         const have = expDcSeasonCodes(f);
-        if (have && JSON.stringify(have) === JSON.stringify(want)) return true;
+        if (have && JSON.stringify(expDcSeasonCanon(have)) === JSON.stringify(expDcSeasonCanon(want))) return true;
       }
     }
   }
@@ -34719,11 +34794,18 @@ function expDcParseItem(raw: unknown, index: number): ExpDcItem | string {
     source_url: r.source_url,
     quote: r.quote,
     confidence: r.confidence,
+    allow_shared_provider: r.allow_shared_provider === true,
   };
 }
 
 /** Item-level checks that need no DB: returns a reject reason/detail. */
 function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } | null {
+  // Length caps FIRST, before any regex/URL parse sees the input.
+  const over = (v: unknown, max: number) => typeof v === "string" && v.length > max;
+  if (over(it.new_value, 500)) return { reason: "invalid_item", detail: "new_value longer than 500 characters" };
+  if (over(it.expected_current, 500)) return { reason: "invalid_item", detail: "expected_current longer than 500 characters" };
+  if (over(it.quote, 2000)) return { reason: "invalid_item", detail: "quote longer than 2000 characters" };
+  if (over(it.source_url, 2048)) return { reason: "invalid_item", detail: "source_url longer than 2048 characters" };
   if (!(EXP_DATA_CORRECTION_FIELDS as readonly string[]).includes(it.field)) return { reason: "unknown_field", detail: it.field };
   if (it.action !== "correct" && it.action !== "clear") return { reason: "unknown_action", detail: it.action };
   if (it.confidence !== "high") return { reason: "confidence_not_high", detail: String(it.confidence ?? "") };
@@ -34748,15 +34830,46 @@ function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } |
 
 class ExpDcItemRollback extends Error {}
 
-type ExpDcBrregVerdict = { verify: BrregVerifyResult; address: BrregAddress | null };
+type ExpDcBrregVerdict = { verify: BrregVerifyResult; address: BrregAddress | null; unavailable: boolean };
 
 /** Brreg's registered name vs the provider name the item gives: the same
  *  token-overlap rule the manual org.nr. approval path uses
  *  (brregNameOverlapsProviderName — legal-form/filler words never count),
  *  with IKS also stripped. */
+const EXP_DC_NAME_LEGAL_FORMS = new Set(["as", "asa", "sa", "ba", "da", "ans", "iks", "ks", "enk", "og", "the"]);
+/** Words that describe WHAT an organisation is, not WHICH one: they never
+ *  count as agreement on their own (brregNameOverlapsProviderName's filler
+ *  list plus museum/stiftelse/university/tours/fjord words). */
+const EXP_DC_NAME_FILLER = new Set([
+  "norge", "norway", "gard", "gaard", "sider", "cider", "sideri", "cideri", "bryggeri", "mikrobryggeri",
+  "handbryggeri", "brygghus", "brenneri", "destilleri", "distillery", "vingard", "mjoderi", "safteri",
+  "gardsutsalg", "frukt", "museum", "museet", "stiftelsen", "universitetet", "tours", "fjord",
+]);
+function expDcNameTokens(s: string | null | undefined): string[] {
+  const base = (s ?? "").normalize("NFC").toLowerCase()
+    .replace(/ø/g, "o").replace(/æ/g, "ae").replace(/å/g, "a")
+    .replace(/[^a-z0-9]+/g, " ").trim();
+  return [...new Set(base.split(/\s+/).filter((t) => t.length > 2 && !EXP_DC_NAME_LEGAL_FORMS.has(t)))];
+}
+
+/**
+ * Name agreement between a provider name and a reference name (Brreg's
+ * registered name, or an existing provider row's name). True when the two
+ * normalised names are equal (legal forms ignored), or when they share at
+ * least two distinct non-filler tokens, or when the shared non-filler tokens
+ * are MORE than half of the shorter name's tokens. So "Stavanger Museum" does
+ * not match "STAVANGER TAXI AS" (one shared token = exactly half), while
+ * "Skiforeningen (Skimuseet Holmenkollen)" matches "SKIFORENINGEN".
+ */
 export function expDcBrregNameMatches(given: string, brregName: string | null): boolean {
-  const strip = (s: string | null) => (s ?? "").replace(/\b(iks|ks|ba|sa|as|asa)\b/gi, " ");
-  return brregNameOverlapsProviderName(strip(given), strip(brregName));
+  const a = expDcNameTokens(given);
+  const b = expDcNameTokens(brregName);
+  if (a.length === 0 || b.length === 0) return false;
+  if (a.join(" ") === b.join(" ")) return true;
+  const bSet = new Set(b);
+  const shared = a.filter((t) => bSet.has(t) && !EXP_DC_NAME_FILLER.has(t)).length;
+  if (shared >= 2) return true;
+  return shared >= 1 && shared * 2 > Math.min(a.length, b.length);
 }
 
 /** Field -> the experiences columns it writes, for content_field_evidence. */
@@ -34782,7 +34895,7 @@ const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
 export async function applyExperienceDataCorrections(
   db: ReturnType<typeof getExpDb>,
   body: { items?: unknown; batch_label?: unknown },
-  opts: { dryRun: boolean; logTag?: string; brregFetchImpl?: typeof fetch }
+  opts: { dryRun: boolean; logTag?: string; brregFetchImpl?: typeof fetch; writePauseCheck?: () => unknown }
 ): Promise<ExperienceDataCorrectionsResult> {
   const rawItems = body.items;
   if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXP_DC_MAX_ITEMS) {
@@ -34917,10 +35030,30 @@ export async function applyExperienceDataCorrections(
       if (!known) orgs.add(parsed.org_nr);
     }
     for (const org of orgs) {
-      const verify = await verifyOrgNumber(org, brregFetch);
-      const address = verify.exists && verify.active ? await fetchBrregBusinessAddress(org, brregFetch) : null;
-      brregVerdicts.set(org, { verify, address });
+      // verifyOrgNumber() maps a network error / 5xx to the same safe
+      // default as a 404; observe the transport here so "Brreg is down" is
+      // reported as brreg_unavailable, not as "org.nr. does not exist".
+      const seen = { unavailable: false };
+      const observed = (async (url: any, init?: any) => {
+        try {
+          const r = await brregFetch(url, init);
+          if (!r.ok && r.status !== 404) seen.unavailable = true;
+          return r;
+        } catch (err) {
+          seen.unavailable = true;
+          throw err;
+        }
+      }) as typeof fetch;
+      const verify = await verifyOrgNumber(org, observed);
+      const address = verify.exists && verify.active ? await fetchBrregBusinessAddress(org, observed) : null;
+      brregVerdicts.set(org, { verify, address, unavailable: seen.unavailable && !verify.exists });
     }
+  }
+  // Re-check the write-pause AFTER the Brreg awaits: a pause set while we
+  // were waiting on the network must still stop this apply.
+  if (!dryRun && opts.writePauseCheck) {
+    const block = opts.writePauseCheck();
+    if (block) return { ok: false, error: "experiences write-pause is active", pauseBlock: block };
   }
   const publishState = (id: string) =>
     db.prepare(
@@ -34944,9 +35077,20 @@ export async function applyExperienceDataCorrections(
       // The row as it is NOW (an earlier item in this request may have
       // changed it — e.g. a provider relink before a homepage_url item).
       const row = loadRow(it.id)!;
-      if ((field === "homepage_url" || field === "source_page_url") && !row.provider_id) { reject(it, "no_provider"); continue; }
-      if (!expDcExpectedMatches(field, orig, it.expected_current)) {
-        reject(it, "stale_expected_current", `current: ${JSON.stringify(expDcCurrentForms(field, orig).filter((f) => f !== ""))}`);
+      const providerScoped = field === "homepage_url" || field === "source_page_url";
+      if (providerScoped) {
+        // These fields act on the provider the row points to NOW; if this
+        // request tried to relink the row and that failed, the item was
+        // written for a provider the row does not have.
+        const dep = items.find((x) => x.id === it.id && x.field === "provider" && results[x.index].result === "rejected");
+        if (dep) { reject(it, "depends_on_rejected_provider", `provider item #${dep.index} was rejected (${results[dep.index].reason})`); continue; }
+      }
+      if (providerScoped && !row.provider_id) { reject(it, "no_provider"); continue; }
+      // Stale-guard: the ORIGINAL row for row fields; the CURRENT row (after
+      // earlier items, e.g. a relink) for the provider-scoped fields.
+      const guardRow = providerScoped ? row : orig;
+      if (!expDcExpectedMatches(field, guardRow, it.expected_current)) {
+        reject(it, "stale_expected_current", `current: ${JSON.stringify(expDcCurrentForms(field, guardRow).filter((f) => f !== ""))}`);
         continue;
       }
 
@@ -35001,15 +35145,18 @@ export async function applyExperienceDataCorrections(
               rejected = { reason: "invalid_value", detail: "hele året cannot be combined with other seasons" };
               break;
             }
-            const ordered4 = codes.includes("year_round")
+            const canon = expDcSeasonCanon(codes);
+            const ordered4 = canon.includes("year_round")
               ? ["year_round"]
-              : EXP_DC_SEASON_ORDER.filter((c) => codes.includes(c));
+              : EXP_DC_SEASON_ORDER.filter((c) => canon.includes(c));
             stored = JSON.stringify(ordered4);
           }
-          const curCodes = expDcSeasonCodes(row.season);
-          const newCodes = stored === null ? [] : expDcSeasonCodes(stored);
-          const curEmpty = expDescJsonArray(row.season).length === 0;
-          if (stored === null ? curEmpty : (curCodes && JSON.stringify(curCodes) === JSON.stringify(newCodes))) {
+          // no_op only when the STORED form would not change: a row holding
+          // all four seasons (or Norwegian spellings) is rewritten to the
+          // canonical form, which is a real change.
+          const curRaw = expDescJsonArray(row.season);
+          const curEmpty = curRaw.length === 0;
+          if (stored === null ? curEmpty : JSON.stringify(curRaw) === stored) {
             rejected = { reason: "no_op" };
             break;
           }
@@ -35051,9 +35198,15 @@ export async function applyExperienceDataCorrections(
           if (!prov) { rejected = { reason: "no_provider" }; break; }
           if (providerIsOwnerManaged(prov)) { rejected = { reason: "owner_managed", detail: "provider is owner-claimed/managed" }; break; }
           let url: string | null = null;
+          let newHost: string | null = null;
           if (it.action === "correct") {
             if (!expDcIsHttpUrl(nv)) { rejected = { reason: "invalid_value", detail: "homepage_url must be an http(s) URL" }; break; }
             url = String(nv).trim();
+            newHost = expDcUrlHost(url);
+            if (!newHost) { rejected = { reason: "invalid_value", detail: "homepage_url must not contain a backslash, user info or a non-default port" }; break; }
+            // A homepage is the site ROOT; a product page goes in
+            // source_page_url (per experience).
+            if (!expDcIsRootUrl(url)) { rejected = { reason: "invalid_value", detail: "homepage_url must be a root URL (path / or empty); use source_page_url for a product page" }; break; }
           }
           if (url === null ? (prov.hjemmeside ?? "").trim() === "" : expDcUrlNormalise(prov.hjemmeside) === expDcUrlNormalise(url)) {
             rejected = { reason: "no_op" };
@@ -35061,33 +35214,41 @@ export async function applyExperienceDataCorrections(
           }
           const others = (db.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ? AND id != ?")
             .get(prov.id, it.id) as { n: number }).n;
+          const oldHjem = (prov.hjemmeside ?? "").trim();
+          const hostChanges = oldHjem !== "" && expDcUrlHost(oldHjem) !== newHost;
           if (others > 0) {
-            if (url === null || !expDcIsRootUrl(url)) {
-              rejected = { reason: "shared_provider", detail: `provider ${prov.id} is linked to ${others} other experience(s); only a root URL may be set on a shared provider` };
+            if (hostChanges && !it.allow_shared_provider) {
+              rejected = {
+                reason: "shared_provider_host_change",
+                detail: `provider ${prov.id} is linked to ${others} other experience(s); changing its homepage host ${expDcUrlHost(oldHjem)} -> ${newHost ?? "(none)"} needs allow_shared_provider: true`,
+              };
               break;
             }
             warnings.push({ code: "shared_provider_root_url", provider_id: prov.id, other_experiences: others });
           }
           const provenance = expDcJsonObject(prov.field_provenance);
-          changes.push({ table: "experience_providers", row_id: prov.id, column: "hjemmeside", old: prov.hjemmeside, new: url });
+          changes.push({ table: "experience_providers", row_id: prov.id, column: "hjemmeside", old: prov.hjemmeside, new: url, old_raw: prov.hjemmeside, new_raw: url });
           setProviderColumn(prov.id, "hjemmeside", url);
           if (provenance === null) {
             warnings.push({ code: "provenance_not_recorded", detail: "provider field_provenance is not a JSON object" });
           } else {
+            const provChanges: ExpDcColumnChange[] = [];
             const oldEntry = Object.prototype.hasOwnProperty.call(provenance, "hjemmeside") ? provenance.hjemmeside : null;
             const newEntry = { source_url: sourceUrl, fetched_at: new Date().toISOString() };
             provenance.hjemmeside = newEntry;
-            changes.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside", old: oldEntry, new: newEntry });
+            provChanges.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside", old: oldEntry, new: newEntry });
             // An ownership verification describes the OLD site; it must not
             // carry over to a different host (it would make the row kildetro
             // on an unverified homepage).
             if (Object.prototype.hasOwnProperty.call(provenance, "hjemmeside_verification")
-                && hostFromUrlLike(prov.hjemmeside ?? "") !== hostFromUrlLike(url ?? "")) {
-              changes.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside_verification", old: provenance.hjemmeside_verification, new: null });
+                && expDcUrlHost(prov.hjemmeside ?? "") !== newHost) {
+              provChanges.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside_verification", old: provenance.hjemmeside_verification, new: null });
               delete provenance.hjemmeside_verification;
               warnings.push({ code: "hjemmeside_verification_reset" });
             }
-            setProviderColumn(prov.id, "field_provenance", JSON.stringify(provenance));
+            const newRaw = JSON.stringify(provenance);
+            for (const c of provChanges) changes.push({ ...c, old_raw: prov.field_provenance, new_raw: newRaw } as ExpDcColumnChange);
+            setProviderColumn(prov.id, "field_provenance", newRaw);
           }
           break;
         }
@@ -35102,8 +35263,10 @@ export async function applyExperienceDataCorrections(
             if (!hj) { rejected = { reason: "invalid_value", detail: "provider has no hjemmeside to anchor source_page_url" }; break; }
             if (!expDcIsHttpUrl(nv)) { rejected = { reason: "invalid_value", detail: "source_page_url must be an http(s) URL" }; break; }
             page = String(nv).trim();
-            if (hostFromUrlLike(page) !== hostFromUrlLike(hj)) {
-              rejected = { reason: "invalid_value", detail: `source_page_url host ${hostFromUrlLike(page)} != provider hjemmeside host ${hostFromUrlLike(hj)}` };
+            const pageHost = expDcUrlHost(page);
+            if (!pageHost) { rejected = { reason: "invalid_value", detail: "source_page_url must not contain a backslash, user info or a non-default port" }; break; }
+            if (pageHost !== expDcUrlHost(hj)) {
+              rejected = { reason: "invalid_value", detail: `source_page_url host ${pageHost} != provider hjemmeside host ${expDcUrlHost(hj) ?? "(unparseable)"}` };
               break;
             }
             const pathname = new URL(page).pathname;
@@ -35131,10 +35294,17 @@ export async function applyExperienceDataCorrections(
           if (parsed.org_nr) {
             target = db.prepare(
               `SELECT id, navn, org_nr, hjemmeside, field_provenance, claimed_at, content_source, merged_into, is_test_provider
-                 FROM experience_providers WHERE org_nr = ?`
+                 FROM experience_providers WHERE org_nr = ? ORDER BY merged_into IS NOT NULL LIMIT 1`
             ).get(parsed.org_nr) as ExpDcProviderRow | undefined;
             if (target && target.merged_into) {
               rejected = { reason: "invalid_value", detail: `provider with org.nr. ${parsed.org_nr} is merged into ${target.merged_into}` };
+              break;
+            }
+            // An org.nr. alone never relinks: the existing row must also be
+            // the organisation the item NAMES (a typo'd/other org.nr. would
+            // otherwise silently attach the row to an unrelated provider).
+            if (target && !expDcBrregNameMatches(parsed.name, target.navn) && expDcNormalise(parsed.name) !== expDcNormalise(target.navn)) {
+              rejected = { reason: "provider_name_mismatch", detail: `org.nr. ${parsed.org_nr} belongs to existing provider ${JSON.stringify(target.navn)} (${target.id}), not ${JSON.stringify(parsed.name)}` };
               break;
             }
             if (!target) {
@@ -35162,6 +35332,7 @@ export async function applyExperienceDataCorrections(
             }
             brregNew = brregVerdicts.get(parsed.org_nr) ?? null;
             const v = brregNew?.verify;
+            if (brregNew?.unavailable) { rejected = { reason: "provider_unverified", detail: "brreg_unavailable" }; break; }
             if (!v || !v.exists) { rejected = { reason: "provider_unverified", detail: `org.nr. ${parsed.org_nr} not found in Brreg` }; break; }
             if (!v.active) {
               rejected = { reason: "provider_unverified", detail: `org.nr. ${parsed.org_nr} is not active in Brreg (${v.flag ?? (v.slettetDato ? "dissolved" : "konkurs/avvikling")})` };
@@ -35186,7 +35357,9 @@ export async function applyExperienceDataCorrections(
             const v = brregNew!.verify;
             const brregUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(parsed.org_nr!)}`;
             provProvenance.org_nr = { source_url: brregUrl, fetched_at: fetchedAt };
-            provProvenance.navn = { source_url: brregUrl, fetched_at: fetchedAt, requested_name: parsed.name, requested_name_source: sourceUrl };
+            // Display name = the name the item gives (org.nr. stripped);
+            // Brreg's registered name is kept as provenance — it was the gate.
+            provProvenance.navn = { source_url: sourceUrl, fetched_at: fetchedAt, brreg_name: v.name, brreg_url: brregUrl };
             const addr = brregNew!.address;
             // The same Brreg fields setBrregVerification() (experience-store)
             // stamps on a verified provider — brreg_verified, brreg_active,
@@ -35195,7 +35368,7 @@ export async function applyExperienceDataCorrections(
             // row inside PUBLISH_GATE_SQL.
             const values = {
               id: targetId,
-              navn: v.name ?? parsed.name,
+              navn: parsed.name,
               org_nr: parsed.org_nr,
               source: "data_correction",
               verification_status: "pending_verify",
@@ -35240,7 +35413,7 @@ export async function applyExperienceDataCorrections(
       // Experience-column writes + per-field provenance.
       for (const [column, value] of expWrites) {
         const old = readColumn("experiences", it.id, column);
-        changes.push({ table: "experiences", row_id: it.id, column, old, new: value });
+        changes.push({ table: "experiences", row_id: it.id, column, old, new: value, old_raw: old, new_raw: value });
         setExperienceColumn(it.id, column, value);
       }
       const evidenceKeys = EXP_DC_EVIDENCE_KEYS[field];
@@ -35250,12 +35423,15 @@ export async function applyExperienceDataCorrections(
         if (ev === null) {
           warnings.push({ code: "provenance_not_recorded", detail: "content_field_evidence is not a JSON object" });
         } else {
+          const evChanges: ExpDcColumnChange[] = [];
           for (const k of evidenceKeys) {
             const oldK = Object.prototype.hasOwnProperty.call(ev, k) ? ev[k] : null;
             ev[k] = sourceUrl;
-            changes.push({ table: "experiences", row_id: it.id, column: "content_field_evidence", json_key: k, old: oldK, new: sourceUrl });
+            evChanges.push({ table: "experiences", row_id: it.id, column: "content_field_evidence", json_key: k, old: oldK, new: sourceUrl });
           }
-          setExperienceColumn(it.id, "content_field_evidence", JSON.stringify(ev));
+          const evNewRaw = JSON.stringify(ev);
+          for (const c of evChanges) changes.push({ ...c, old_raw: evRaw, new_raw: evNewRaw } as ExpDcColumnChange);
+          setExperienceColumn(it.id, "content_field_evidence", evNewRaw);
         }
       }
       // Touch updated_at even for a provider-only write (homepage_url), so
@@ -35365,6 +35541,35 @@ export async function applyExperienceDataCorrections(
   return { ok: true, dry_run: dryRun, batch_id: dryRun ? null : batchId, batch_label: batchLabel, totals, results };
 }
 
+/** One key of a JSON-object column set back to `old` (null = remove). */
+function expDcRestoreJsonKey(cur: unknown, key: string, old: unknown): string | null {
+  const obj = expDcJsonObject(cur as string | null) ?? {};
+  if (old === null || old === undefined) delete obj[key];
+  else obj[key] = old;
+  return Object.keys(obj).length === 0 ? null : JSON.stringify(obj);
+}
+
+/** Every row, in any table with a FOREIGN KEY to experience_providers, that
+ *  points at `providerId` — as [{table, column, count}]. Read from the
+ *  schema (PRAGMA foreign_key_list) so a new child table is covered without
+ *  touching this code. */
+function expDcProviderReferences(
+  db: ReturnType<typeof getExpDb>,
+  providerId: string
+): Array<{ table: string; column: string; count: number }> {
+  const out: Array<{ table: string; column: string; count: number }> = [];
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+  for (const { name } of tables) {
+    const fks = db.prepare(`PRAGMA foreign_key_list("${name.replace(/"/g, '""')}")`).all() as Array<{ table: string; from: string; to: string | null }>;
+    for (const fk of fks) {
+      if (fk.table !== "experience_providers" || (fk.to && fk.to !== "id")) continue;
+      const n = (db.prepare(`SELECT COUNT(*) AS n FROM "${name.replace(/"/g, '""')}" WHERE "${fk.from.replace(/"/g, '""')}" = ?`).get(providerId) as { n: number }).n;
+      if (n > 0) out.push({ table: name, column: fk.from, count: n });
+    }
+  }
+  return out;
+}
+
 export type ExpDcRevertItemResult = {
   correction_id: string;
   experience_id: string | null;
@@ -35454,47 +35659,69 @@ export function revertExperienceDataCorrections(
         res.reason = "corrupt_audit_row";
         continue;
       }
-      // 1) Every column must still hold what the correction wrote.
-      let changedSince: string | null = null;
-      for (const c of changes) {
-        if ("op" in c) continue;
-        const cur = readColumn(c.table, c.row_id, c.column);
-        if (!cur.exists) { changedSince = `${c.table}.${c.column} row ${c.row_id} no longer exists`; break; }
-        if (c.json_key) {
-          const obj = expDcJsonObject(cur.v as string | null);
-          const v = obj && Object.prototype.hasOwnProperty.call(obj, c.json_key) ? obj[c.json_key] : null;
-          if (!obj || !expDcSameValue(v, c.new)) { changedSince = `${c.table}.${c.column}.${c.json_key}`; break; }
-        } else if (!expDcSameValue(cur.v, c.new)) {
-          changedSince = `${c.table}.${c.column}`;
-          break;
-        }
-      }
-      if (changedSince) { res.reason = "changed_since"; res.detail = changedSince; continue; }
-      // 2) Restore, newest change first.
-      for (const c of [...changes].reverse()) {
-        if ("op" in c) {
-          const refs = (db.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ?").get(c.row_id) as { n: number }).n;
-          if (refs === 0) {
-            db.prepare("DELETE FROM experience_providers WHERE id = ?").run(c.row_id);
-            res.warnings.push({ code: "created_provider_deleted", provider_id: c.row_id });
-          } else {
-            res.warnings.push({ code: "created_provider_kept", provider_id: c.row_id, linked_experiences: refs });
+      // Each correction is reverted in its OWN savepoint, so a failure in
+      // one (e.g. a constraint) leaves the others untouched.
+      try {
+        db.transaction(() => {
+          // 1) Every column must still hold what the correction wrote, and a
+          //    provider row it created must still be exactly as inserted.
+          let changedSince: string | null = null;
+          for (const c of changes) {
+            if ("op" in c) {
+              const prow = db.prepare("SELECT * FROM experience_providers WHERE id = ?").get(c.row_id) as Record<string, unknown> | undefined;
+              if (!prow) continue; // already gone — nothing to delete
+              const diff = Object.entries(c.values).find(([k, v]) => !expDcSameValue(prow[k], v));
+              if (diff) { changedSince = `experience_providers.${diff[0]} of created provider ${c.row_id}`; break; }
+              continue;
+            }
+            const cur = readColumn(c.table, c.row_id, c.column);
+            if (!cur.exists) { changedSince = `${c.table}.${c.column} row ${c.row_id} no longer exists`; break; }
+            if (c.json_key) {
+              if (c.new_raw !== undefined && expDcSameValue(cur.v, c.new_raw)) continue;
+              const obj = expDcJsonObject(cur.v as string | null);
+              const v = obj && Object.prototype.hasOwnProperty.call(obj, c.json_key) ? obj[c.json_key] : null;
+              if (!obj || !expDcSameValue(v, c.new)) { changedSince = `${c.table}.${c.column}.${c.json_key}`; break; }
+            } else if (!expDcSameValue(cur.v, c.new)) {
+              changedSince = `${c.table}.${c.column}`;
+              break;
+            }
           }
-          continue;
-        }
-        let value: unknown = c.old;
-        if (c.json_key) {
-          const obj = expDcJsonObject(readColumn(c.table, c.row_id, c.column).v as string | null) ?? {};
-          if (c.old === null || c.old === undefined) delete obj[c.json_key];
-          else obj[c.json_key] = c.old;
-          value = Object.keys(obj).length === 0 ? null : JSON.stringify(obj);
-        }
-        db.prepare(`UPDATE ${c.table} SET ${c.column} = ?, updated_at = datetime('now') WHERE id = ?`).run(value === undefined ? null : value, c.row_id);
+          if (changedSince) { res.reason = "changed_since"; res.detail = changedSince; return; }
+          // 2) Restore, newest change first. A column still holding new_raw
+          //    gets old_raw back byte for byte; a JSON column another writer
+          //    has touched since (other keys) is restored key by key.
+          for (const c of [...changes].reverse()) {
+            if ("op" in c) {
+              const refs = expDcProviderReferences(db, c.row_id);
+              if (refs.length === 0) {
+                db.prepare("DELETE FROM experience_providers WHERE id = ?").run(c.row_id);
+                res.warnings.push({ code: "created_provider_deleted", provider_id: c.row_id });
+              } else {
+                res.warnings.push({ code: "created_provider_kept", provider_id: c.row_id, referenced_by: refs });
+              }
+              continue;
+            }
+            const cur = readColumn(c.table, c.row_id, c.column).v;
+            let value: unknown = c.old;
+            if (c.old_raw !== undefined && c.new_raw !== undefined) {
+              if (expDcSameValue(cur, c.old_raw) && typeof cur === typeof c.old_raw) continue; // already restored (sibling key)
+              if (expDcSameValue(cur, c.new_raw)) value = c.old_raw;
+              else if (c.json_key) value = expDcRestoreJsonKey(cur, c.json_key, c.old);
+            } else if (c.json_key) {
+              value = expDcRestoreJsonKey(cur, c.json_key, c.old);
+            }
+            db.prepare(`UPDATE ${c.table} SET ${c.column} = ?, updated_at = datetime('now') WHERE id = ?`).run(value === undefined ? null : value, c.row_id);
+          }
+          db.prepare("UPDATE experiences SET updated_at = datetime('now') WHERE id = ?").run(a.experience_id);
+          db.prepare("UPDATE experience_data_corrections SET reverted_at = datetime('now'), revert_batch_id = ? WHERE id = ?")
+            .run(revertBatchId, a.id);
+          res.result = dryRun ? "would_revert" : "reverted";
+        })();
+      } catch (err) {
+        res.result = "rejected";
+        res.reason = "revert_failed";
+        res.detail = String((err as Error)?.message ?? err);
       }
-      db.prepare("UPDATE experiences SET updated_at = datetime('now') WHERE id = ?").run(a.experience_id);
-      db.prepare("UPDATE experience_data_corrections SET reverted_at = datetime('now'), revert_batch_id = ? WHERE id = ?")
-        .run(revertBatchId, a.id);
-      res.result = dryRun ? "would_revert" : "reverted";
     }
     if (dryRun) throw new ExpDcDryRunRollback();
   });
@@ -35528,7 +35755,15 @@ router.post("/admin/experiences-data-corrections", requireAdmin, async (req: Req
   // Brreg is the only network call this route ever makes.
   const brregFetchImpl =
     ((req.app?.get?.("experienceDataCorrectionsBrregFetchImpl")) as typeof fetch | undefined) ?? fetch;
-  const out = await applyExperienceDataCorrections(getExpDb("experiences"), body, { dryRun, brregFetchImpl });
+  const out = await applyExperienceDataCorrections(getExpDb("experiences"), body, {
+    dryRun,
+    brregFetchImpl,
+    writePauseCheck: () => experiencesWritePauseBlock(),
+  });
+  if (!out.ok && out.pauseBlock) {
+    res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(out.pauseBlock);
+    return;
+  }
   if (!out.ok) {
     res.status(400).json({ error: out.error });
     return;

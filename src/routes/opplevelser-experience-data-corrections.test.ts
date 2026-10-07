@@ -24,6 +24,7 @@
  */
 
 import { createHash } from "node:crypto";
+import * as opp0 from "./opplevelser";
 import {
   expDcSeasonCodes,
   expDcParseDuration,
@@ -95,6 +96,8 @@ const BRREG_FIXTURES: Record<string, Record<string, unknown>> = {
     forretningsadresse: { adresse: ["Vitensenteret 1"], postnummer: "4838", poststed: "ARENDAL" } },
 };
 const brregRequests: string[] = [];
+const BRREG_FAIL = new Set<string>();
+const BRREG_THROW = new Set<string>();
 let anthropicRequests = 0;
 const brregStub = (async (url: any) => {
   const u = String(url);
@@ -102,6 +105,8 @@ const brregStub = (async (url: any) => {
   brregRequests.push(u);
   if (!u.startsWith("https://data.brreg.no/")) throw new Error(`non-Brreg URL through the Brreg seam: ${u}`);
   const m = /\/enheter\/(\d{9})$/.exec(u);
+  if (m && BRREG_FAIL.has(m[1])) return { ok: false, status: 503, json: async () => ({}) } as unknown as Response;
+  if (m && BRREG_THROW.has(m[1])) throw new Error("ECONNRESET");
   const fx = m ? BRREG_FIXTURES[m[1]] : undefined;
   if (!fx) return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
   return { ok: true, status: 200, json: async () => fx } as unknown as Response;
@@ -188,6 +193,18 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       assertTrue("error" in expDcResolveKommune("Sandefjord, Telemark", null), "dc-p5j: kommune/fylke hint conflict -> error");
       assertEq(expDcResolveKommune("midt-telemark", null), { kommune: "Midt-Telemark", fylke: "Telemark" }, "dc-p5k: case fold, canonical spelling stored");
 
+      assertEq(opp0.expDcUrlHost("https://www.Example.no/x"), "example.no", "dc-p8a: WHATWG host, lower-case, www stripped");
+      assertEq(opp0.expDcUrlHost("example.no"), "example.no", "dc-p8b: bare host gets https://");
+      assertEq(opp0.expDcUrlHost("https://evil.com\\@example.no/x"), null, "dc-p8c: backslash -> null");
+      assertEq(opp0.expDcUrlHost("https://user:pw@example.no/x"), null, "dc-p8d: userinfo -> null");
+      assertEq(opp0.expDcUrlHost("https://example.no:8080/x"), null, "dc-p8e: non-default port -> null");
+      assertEq(opp0.expDcUrlHost("https://example.no:443/x"), "example.no", "dc-p8f: default port is fine");
+      assertEq(opp0.expDcBrregNameMatches("Stavanger Museum", "STAVANGER TAXI AS"), false, "dc-p9a: one shared token (half) is not a match");
+      assertEq(opp0.expDcBrregNameMatches("Skiforeningen (Skimuseet Holmenkollen)", "SKIFORENINGEN"), true, "dc-p9b: >half of the shorter name");
+      assertEq(opp0.expDcBrregNameMatches("Fjord Tours AS", "FJORD TOURS AS"), true, "dc-p9c: equal normalised names (filler-only)");
+      assertEq(opp0.expDcBrregNameMatches("Norsk Maritimt Museum", "STIFTELSEN NORSK MARITIMT MUSEUM"), true, "dc-p9d: two shared tokens");
+      assertEq(opp0.expDcBrregNameMatches("Bergen Fjord Tours", "STAVANGER FJORD TOURS AS"), false, "dc-p9e: filler words never bind");
+      assertEq(opp0.expDcSeasonCanon(["autumn", "spring", "summer", "winter"]), ["year_round"], "dc-p10a: all four -> year_round");
       assertEq(expDcCanonicalFylke("vestfold"), "Vestfold", "dc-p6a: canonical fylke");
       assertEq(expDcCanonicalFylke("Viken"), null, "dc-p6b: 2020-era Viken is not accepted");
       assertEq(expDcCanonicalFylke("Vestfold og Telemark"), null, "dc-p6c: Vestfold og Telemark is not accepted");
@@ -327,7 +344,15 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           ["stale_expected_current", [item("dc-a", "title", "Feil tittel", "Ny tittel")]],
           ["invalid_value", [item("dc-a", "season", "sommer", "monsun")]],
           ["no_provider", [item("dc-noprov", "homepage_url", null, "https://ny.example")]],
-          ["shared_provider", [item("dc-a", "homepage_url", "https://delt.example", "https://delt.example/side")]],
+          ["shared_provider_host_change", [item("dc-a", "homepage_url", "https://delt.example", "https://annen.example/")]],
+          ["invalid_value", [item("dc-a", "homepage_url", "https://delt.example", "https://delt.example/side")]],
+          ["invalid_value", [item("dc-a", "homepage_url", "https://delt.example", "https://evil.com\\@delt.example/")]],
+          ["invalid_value", [item("dc-a", "homepage_url", "https://delt.example", "https://user:pw@delt.example/")]],
+          ["invalid_value", [item("dc-a", "homepage_url", "https://delt.example", "https://delt.example:8443/")]],
+          ["invalid_item", [item("dc-a", "title", "Kajakktur i fjorden", "x".repeat(501))]],
+          ["invalid_item", [item("dc-a", "title", "y".repeat(501), "Ny tittel")]],
+          ["invalid_item", [item("dc-a", "title", "Kajakktur i fjorden", "Ny tittel", { quote: "q".repeat(2001) })]],
+          ["invalid_item", [item("dc-a", "title", "Kajakktur i fjorden", "Ny tittel", { source_url: "https://k.example/" + "a".repeat(2048) })]],
           ["no_op", [item("dc-a", "price_from", "fra 890 kroner per person", 890)]],
           ["owner_managed", [item("dc-claimed", "homepage_url", "", "https://eid.example")]],
           ["ambiguous_provider", [item("dc-solo", "provider", "Solo Tilbyder AS", "Tvilling AS")]],
@@ -362,7 +387,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         const items = [
           item("dc-a", "kommune", "Bergen, Vestland", "Voss"),
           item("dc-solo", "provider", "Solo Tilbyder AS", "Helt Ny Tilbyder AS (org.nr. 123123123)"),
-          item("dc-solo", "homepage_url", "https://solo.example/en/", "https://helt-ny.example/"),
+          item("dc-solo", "homepage_url", null, "https://helt-ny.example/"),
         ];
         const out = (await preview(items));
         assertEq(out.results.map((r: any) => r.result), ["would_apply", "would_apply", "would_apply"], "dc-r3a: dry run evaluates every item");
@@ -402,10 +427,9 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           item("dc-m1", "duration", "omtrent 60 minutter", 90),            // rendered
           item("dc-m1", "price_from", "fra 120 kroner", 150),              // rendered (no unit)
           item("dc-m1", "title", "Kajakktur på norsk", "Kajakktur i Vågan"), // title_no
-          item("dc-m1", "homepage_url", "https://delt.example/", "https://delt-ny.example/"), // trailing slash
           item("dc-m1", "provider", "Delt Tilbyder AS", "Øvrig Turselskap AS"),
         ]));
-        assertEq(out.results.map((r: any) => r.result), Array(8).fill("would_apply"), "dc-r5a: rendered/raw/case/slash forms all match");
+        assertEq(out.results.map((r: any) => r.result), Array(7).fill("would_apply"), "dc-r5a: rendered/raw/case/slash forms all match");
         const out2 = (await preview([
           item("dc-a", "season", "sommer", "vinter"),                       // rendered label
           item("dc-a", "duration", "60", 90),                               // raw
@@ -448,7 +472,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq(out.batch_label, "test-batch", "dc-r6b: batch_label echoed");
         assertEq(out.results.map((r: any) => r.result), Array(5).fill("applied"), "dc-r6c: all applied");
         const row = rowOf("dc-w1");
-        assertEq(row.season, JSON.stringify(["spring", "summer", "autumn", "winter"]), "dc-r6d: season stored as English codes in calendar order");
+        assertEq(row.season, JSON.stringify(["year_round"]), "dc-r6d: all four seasons stored as [\"year_round\"] (page shows Hele året)");
         assertEq([row.duration_min, row.duration_max], [120, 120], "dc-r6e: duration_min = duration_max = 120");
         assertEq(row.price_from, 1700, "dc-r6f: price_from 1700");
         assertEq(row.price_band, "standard", "dc-r6g: price_band untouched");
@@ -495,9 +519,13 @@ export function runOpplevelserExperienceDataCorrectionsTests(
 
       // ── dc-r8: homepage_url — shared provider rules, verification reset. ─
       {
+        assertEq((await preview([item("dc-m1", "homepage_url", "https://delt.example/", "https://www.delt.example/")])).results[0].result, "would_apply",
+          "dc-r8-0: same-host root fix on a shared provider is allowed (expected matched modulo trailing slash)");
+        const blocked = await apply([item("dc-a", "homepage_url", "https://delt.example", "https://www.delt-ny.example/")]);
+        assertEq(blocked.results[0].reason, "shared_provider_host_change", "dc-r8-1: host change on a shared provider needs allow_shared_provider");
         const otherCount = (expDb.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ? AND id != 'dc-a'").get(provShared) as any).n;
-        const out = (await apply([item("dc-a", "homepage_url", "https://delt.example", "https://www.delt-ny.example/")]));
-        assertEq(out.results[0].result, "applied", "dc-r8a: root URL on a shared provider applies");
+        const out = (await apply([item("dc-a", "homepage_url", "https://delt.example", "https://www.delt-ny.example/", { allow_shared_provider: true })]));
+        assertEq(out.results[0].result, "applied", "dc-r8a: host change on a shared provider applies with allow_shared_provider");
         const w = out.results[0].warnings.find((x: any) => x.code === "shared_provider_root_url");
         assertEq(w && w.other_experiences, otherCount, "dc-r8b: warning lists the count of other affected experiences");
         assertTrue(out.results[0].warnings.some((x: any) => x.code === "hjemmeside_verification_reset"), "dc-r8c: host changed -> verification reset");
@@ -507,12 +535,13 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq([fp.hjemmeside?.source_url, fp.hjemmeside_verification], [SRC, undefined], "dc-r8e: field_provenance.hjemmeside set, verification removed");
         // Unshared provider, deep URL on the same host -> applies, keeps verification.
         const fpSoloBefore = fpOf("dc-solo");
-        const o2 = (await apply([item("dc-solo", "homepage_url", "https://solo.example/en/", "https://solo.example/opplevelser/kajakk")]));
-        assertEq(o2.results[0].result, "applied", "dc-r8f: deep URL on an unshared provider applies");
+        assertEq((await preview([item("dc-solo", "homepage_url", "https://solo.example/en/", "https://solo.example/opplevelser/kajakk")])).results[0].reason, "invalid_value", "dc-r8f0: a non-root homepage_url is invalid_value");
+        const o2 = (await apply([item("dc-solo", "homepage_url", "https://solo.example/en/", "https://solo.example/")]));
+        assertEq(o2.results[0].result, "applied", "dc-r8f: root fix on an unshared provider applies");
         assertTrue(!o2.results[0].warnings.some((x: any) => x.code === "hjemmeside_verification_reset"), "dc-r8g: same host -> verification kept");
         assertTrue(JSON.parse(provOf(provSolo).field_provenance).hjemmeside_verification?.verified === true, "dc-r8h: verification still present");
         assertTrue(fpOf("dc-solo") !== fpSoloBefore, "dc-r8i: provider homepage change moves the facts fingerprint");
-        assertEq((await preview([item("dc-solo", "homepage_url", "https://solo.example/opplevelser/kajakk", "https://SOLO.example/opplevelser/kajakk/")])).results[0].reason, "no_op", "dc-r8j: same URL modulo case/slash -> no_op");
+        assertEq((await preview([item("dc-solo", "homepage_url", "https://solo.example/", "https://SOLO.example")])).results[0].reason, "no_op", "dc-r8j: same URL modulo case/slash -> no_op");
       }
 
       // ── dc-r9: provider — relink existing by name / org.nr., create new. ─
@@ -523,10 +552,10 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         seed("dc-p4", { description: "Arrangeres av Delt Tilbyder AS." });
         const out = (await apply([
           item("dc-p1", "provider", "Delt Tilbyder AS", "øvrig turselskap as"),
-          item("dc-p2", "provider", "Delt Tilbyder AS", "Annet Navn (org.nr. 911222333)"),
+          item("dc-p2", "provider", "Delt Tilbyder AS", "Øvrig Turselskap (org.nr. 911222333)"),
           item("dc-p3", "provider", "Delt Tilbyder AS", "Skiforeningen (Skimuseet Holmenkollen), org.nr. 946175986"),
           item("dc-p4", "provider", "Delt Tilbyder AS", "Norsk Maritimt Museum (org.nr. 976912450)"),
-          item("dc-p4", "homepage_url", "https://www.delt-ny.example/", "https://marmuseum.no"),
+          item("dc-p4", "homepage_url", "", "https://marmuseum.no"),
         ]));
         assertEq(out.results.map((r: any) => r.result), Array(5).fill("applied"), "dc-r9a: all applied");
         assertEq(rowOf("dc-p1").provider_id, provOther, "dc-r9b: exact case-insensitive name -> existing provider");
@@ -534,7 +563,8 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq(provOf(provOther).navn, "Øvrig Turselskap AS", "dc-r9d: the existing provider is not renamed");
         const p3 = provOf(rowOf("dc-p3").provider_id);
         assertEq([p3.navn, p3.org_nr, p3.source, p3.hjemmeside, p3.brreg_verified, p3.brreg_active, p3.naeringskode, p3.adresse, p3.postnummer, p3.poststed],
-          ["SKIFORENINGEN", "946175986", "data_correction", null, 1, 1, "93.120", "Kongeveien 5", "0787", "OSLO"], "dc-r9e: new provider row carries the verified Brreg fields (name from Brreg)");
+          ["Skiforeningen (Skimuseet Holmenkollen)", "946175986", "data_correction", null, 1, 1, "93.120", "Kongeveien 5", "0787", "OSLO"], "dc-r9e: new provider row: request name, verified Brreg fields");
+        assertEq(JSON.parse(p3.field_provenance).navn.brreg_name, "SKIFORENINGEN", "dc-r9e3: Brreg's name kept in field_provenance");
         assertTrue(typeof p3.brreg_checked_at === "string" && p3.brreg_checked_at.length > 0, "dc-r9e2: brreg_checked_at stamped");
         assertEq(JSON.parse(p3.field_provenance).created_by.source, "data_correction", "dc-r9f: provenance marks data_correction");
         assertEq(rowOf("dc-p3").provider_match_status, "matched", "dc-r9g: provider_match_status = matched");
@@ -636,7 +666,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           csvItem("csv-sunnmor", "season", "vår, høst", "vår, sommer, høst, vinter"),
           csvItem("csv-go2", "kommune", "Svolvaer, Nordland", "Vågan (Svolvær), Nordland"),
           csvItem("csv-go2", "season", "vaar, sommer, host", "hele året"),
-          csvItem("csv-go2", "homepage_url", "", "https://www.go2lofoten.no/turer-og-aktiviteter-i-lofoten/trollfjord-havorn-safari/"),
+          csvItem("csv-go2", "homepage_url", "", "https://www.go2lofoten.no/"),
           csvItem("csv-go2", "duration", "", "omtrent 120 minutter"),
           csvItem("csv-go2", "price_from", "", "795"),
           csvItem("csv-stokke", "fylke", "Vestfold og Telemark", "Vestfold"),
@@ -674,12 +704,12 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         // IKS is ignored in the name comparison.
         const iks = await apply([item("dc-g7", "provider", "Delt Tilbyder AS", "Aust-Agder museum og arkiv IKS (org.nr. 666777888)")]);
         assertEq(iks.results[0].result, "applied", "dc-r15c: IKS name matches Brreg (legal form ignored)");
-        assertEq(provOf(provOf2("dc-g7")).navn, "AUST-AGDER MUSEUM OG ARKIV IKS", "dc-r15d: name taken from Brreg");
+        assertEq(provOf(provOf2("dc-g7")).navn, "Aust-Agder museum og arkiv IKS", "dc-r15d: display name = request name (org.nr. stripped)");
         assertTrue(opp.expDcBrregNameMatches("Fjord Tours AS", "FJORD TOURS AS") && !opp.expDcBrregNameMatches("Fjelltur AS", "HELT ANNET SELSKAP AS"),
           "dc-r15e: name-overlap helper");
         // Existing org_nr match wins with no Brreg request.
         const nBefore = brregRequests.length;
-        const ex = await apply([item("dc-g8", "provider", "Delt Tilbyder AS", "Et Helt Annet Navn (org.nr. 999888777)")]);
+        const ex = await apply([item("dc-g8", "provider", "Delt Tilbyder AS", "Solo Tilbyder (org.nr. 999888777)")]);
         assertEq([ex.results[0].result, provOf2("dc-g8"), brregRequests.length - nBefore], ["applied", provSolo, 0], "dc-r15f: existing org_nr -> relink, zero Brreg calls");
 
         // never-unpublish: relink a published row to an existing provider
@@ -774,10 +804,12 @@ export function runOpplevelserExperienceDataCorrectionsTests(
           if (String(url).includes("api.anthropic.com")) { anthropicRequests++; throw new Error("LLM via homepage seam"); }
           fetched.push(String(url));
           const u = new URL(String(url));
-          const html = u.pathname === "/opplevelser/kajakk" ? PAGE_HTML : (u.pathname === "/" || u.pathname === "") ? ROOT_HTML : null;
+          const html = (u.pathname === "/opplevelser/kajakk" || u.pathname === "/opplevelser/flyttet") ? PAGE_HTML : (u.pathname === "/" || u.pathname === "") ? ROOT_HTML : null;
           if (!html) return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => null } } as unknown as Response;
           const bytes = new TextEncoder().encode(html);
-          return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer, url: String(url),
+          // /opplevelser/flyttet "redirects" to another host.
+          const finalUrl = u.pathname === "/opplevelser/flyttet" ? "https://annen-tur.example/landing" : String(url);
+          return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer, url: finalUrl,
             headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) } } as unknown as Response;
         }) as unknown as typeof fetch;
         ROUTE_APP_SETTINGS["experienceDescriptionHomepageFetchImpl"] = hpStub;
@@ -823,9 +855,113 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         assertEq(fetched[0], PAGE, "dc-r16z2: ...after fetching the product page");
         assertEq(JSON.parse(rowOf("dc-k3").content_field_evidence).description, PAGE, "dc-r16z3: ...with the product page as provenance");
 
+        // N1: a product page that redirects off the provider's host -> its
+        // text is dropped, the root homepage is fetched and stamped instead.
+        expDb.prepare("UPDATE experiences SET source_page_url = ? WHERE id = 'dc-k2'").run("https://kilde-tur.example/opplevelser/flyttet");
+        const cand2 = await callRoute(router, { method: "GET", url: "/admin/experiences-description-candidates", headers: auth, query: { limit: "50" } });
+        const k2 = (cand2.body.items as any[]).find((x) => x.id === "dc-k2");
+        fetched.length = 0;
+        const wr = await post("/admin/experiences-description-write", { dry_run: false, items: [{
+          id: "dc-k2", facts_fingerprint: k2.facts_fingerprint, outcome: "write", level: "kildetro",
+          description: KT_TEXT, judge: { approved: true }, homepage_url: k2.homepage_url }] });
+        assertEq(wr.body.results, [{ id: "dc-k2", result: "written" }], "dc-r16z5: written");
+        assertEq(fetched.slice(0, 1), ["https://kilde-tur.example/opplevelser/flyttet"], "dc-r16z6: product page fetched first");
+        assertTrue(fetched.includes("https://www.kilde-tur.example"), "dc-r16z7: ...then the root after the cross-host redirect");
+        assertEq(JSON.parse(rowOf("dc-k2").content_field_evidence).description, "https://www.kilde-tur.example", "dc-r16z8: provenance = the root whose text was used");
+
         // Revert of a source_page_url correction restores NULL.
         const rv = revert({ correction_ids: [applied.results[1].correction_id] });
         assertEq([rv.results[0].result, rowOf("dc-k3").source_page_url], ["reverted", null], "dc-r16z4: revert restores NULL");
+      }
+
+      // ── dc-r17: review fixes (B1–B4, N1–N9). ───────────────────────
+      {
+        // B1: a rejected provider item blocks the dependent homepage item.
+        seed("dc-b1");
+        const b1 = await apply([
+          item("dc-b1", "provider", "Delt Tilbyder AS", "Ukjent Selskap AS"),
+          item("dc-b1", "homepage_url", "https://www.delt-ny.example/", "https://ukjent.example/"),
+        ]);
+        assertEq(b1.results.map((r: any) => r.reason), ["provider_needs_orgnr", "depends_on_rejected_provider"], "dc-r17a: homepage item depends on the rejected provider item");
+        assertEq(provOf(provShared).hjemmeside, "https://www.delt-ny.example/", "dc-r17b: the old shared provider's homepage is untouched");
+        // B1: stale guard uses the provider the row points to after the relink.
+        seed("dc-b2");
+        const b2 = await preview([
+          item("dc-b2", "provider", "Delt Tilbyder AS", "Øvrig Turselskap AS"),
+          item("dc-b2", "homepage_url", "https://www.delt-ny.example/", "https://ovrig.example/"),
+        ]);
+        assertEq(b2.results[1].reason, "stale_expected_current", "dc-r17c: expected_current checked against the NEW provider (which has no homepage)");
+        // B2: org.nr. of an existing, differently named provider.
+        seed("dc-b3");
+        const b3 = await apply([item("dc-b3", "provider", "Delt Tilbyder AS", "Noe Helt Annet AS (org.nr. 911222333)")]);
+        assertEq(b3.results[0].reason, "provider_name_mismatch", "dc-r17d: org.nr. match needs a name match");
+        assertTrue(String(b3.results[0].detail).includes("Øvrig Turselskap AS"), "dc-r17e: detail names the existing provider");
+        // B3: backslash / userinfo in source_page_url.
+        seed("dc-b4", { provider_id: provSolo });
+        for (const bad of ["https://evil.com\\@solo.example/x", "https://solo.example@evil.com/x", "https://u:p@solo.example/x", "https://solo.example:8080/x"]) {
+          const r = await preview([item("dc-b4", "source_page_url", "", bad)]);
+          assertEq([r.results[0].result, r.results[0].reason], ["rejected", "invalid_value"], `dc-r17f: ${bad} rejected`);
+        }
+        const rowB4 = { provider_hjemmeside: "https://solo.example/", source_page_url: "https://evil.com\\@solo.example/x" } as any;
+        assertEq(opp.experienceKildetroSourceUrl(rowB4), "https://solo.example/", "dc-r17g: kildetro never fetches a backslash URL");
+        // N9: Brreg unavailable is distinct from not found.
+        BRREG_FAIL.add("777888999");
+        const n9 = await apply([item("dc-b1", "provider", "Delt Tilbyder AS", "Nede Turer AS (org.nr. 777888999)")]);
+        assertEq([n9.results[0].reason, n9.results[0].detail], ["provider_unverified", "brreg_unavailable"], "dc-r17h: Brreg 5xx -> brreg_unavailable");
+        BRREG_THROW.add("888999000");
+        const n9b = await apply([item("dc-b1", "provider", "Delt Tilbyder AS", "Nede Turer AS (org.nr. 888999000)")]);
+        assertEq(n9b.results[0].detail, "brreg_unavailable", "dc-r17i: Brreg network error -> brreg_unavailable");
+        // N6: a pause set while Brreg is being called stops the apply.
+        const mainDb = init.getDb();
+        seed("dc-n6");
+        ROUTE_APP_SETTINGS["experienceDataCorrectionsBrregFetchImpl"] = (async (u: any, i: any) => {
+          pauseSvc.setEnrichmentWritePause(mainDb as any, { vertical: "experiences", enabled: true, reason: "n6" }, "verifier");
+          return brregStub(u, i);
+        }) as any;
+        brregClient.__clearBrregVerifyCacheForTesting();
+        const beforeN6 = dumpAll();
+        const n6 = await post("/admin/experiences-data-corrections", { dry_run: false, items: [item("dc-n6", "provider", "Delt Tilbyder AS", "Helt Ny Tilbyder AS (org.nr. 123123123)")] });
+        assertEq(n6.status, 423, "dc-r17j: pause set during the Brreg await -> 423");
+        assertEq(dumpAll(), beforeN6, "dc-r17k: nothing written");
+        pauseSvc.setEnrichmentWritePause(mainDb as any, { vertical: "experiences", enabled: false, cleared_by: "daniel" }, "verifier");
+        ROUTE_APP_SETTINGS["experienceDataCorrectionsBrregFetchImpl"] = brregStub;
+        // Season: expected in all-four form matches a stored year_round.
+        seed("dc-s4", { season: ["year_round"] });
+        assertEq((await preview([item("dc-s4", "season", "vår, sommer, høst, vinter", "sommer")])).results[0].result, "would_apply", "dc-r17l: all-four expected matches stored year_round");
+        // N2: byte-exact revert of JSON columns.
+        const provBx = expStore.createProvider({ navn: "Byte Eksakt AS", brreg_verified: 1, brreg_active: 1, hjemmeside: "https://bx.example" } as any);
+        const fpRaw = '{"hjemmeside_verification": {"verified": true}, "navn": {"x": 1}}';
+        expDb.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(fpRaw, provBx);
+        seed("dc-bx", { provider_id: provBx });
+        const ceRaw = '{ "kommune": "a" }';
+        expDb.prepare("UPDATE experiences SET content_field_evidence = ? WHERE id = 'dc-bx'").run(ceRaw);
+        const bx = await apply([item("dc-bx", "homepage_url", "https://bx.example", "https://annen-bx.example/"), item("dc-bx", "price_from", 890, 300), item("dc-bx", "duration", 60, 90)]);
+        assertEq(bx.results.map((r: any) => r.result), ["applied", "applied", "applied"], "dc-r17m: applied");
+        const rvx = revert({ batch_id: bx.batch_id });
+        assertEq(rvx.totals.reverted, 3, "dc-r17n: reverted");
+        assertEq(provOf(provBx).field_provenance, fpRaw, "dc-r17o: field_provenance restored byte for byte");
+        assertEq(rowOf("dc-bx").content_field_evidence, ceRaw, "dc-r17p: content_field_evidence restored byte for byte");
+        // N3: created provider with an FK child is kept on revert.
+        seed("dc-fk");
+        const fk = await apply([item("dc-fk", "provider", "Delt Tilbyder AS", "Helt Ny Tilbyder AS (org.nr. 123123123)")]);
+        assertEq(fk.results[0].result, "applied", "dc-r17q: provider created");
+        const created = rowOf("dc-fk").provider_id;
+        expDb.prepare("INSERT INTO experience_provider_field_write_audit (id, provider_id, field_name, old_value, new_value) VALUES (?, ?, 'x', NULL, 'y')").run("fk-child-1", created);
+        const rfk = revert({ correction_ids: [fk.results[0].correction_id] });
+        assertEq([rfk.results[0].result, rowOf("dc-fk").provider_id], ["reverted", provShared], "dc-r17r: link restored");
+        const kept = rfk.results[0].warnings.find((w: any) => w.code === "created_provider_kept");
+        assertTrue(!!provOf(created) && !!kept && kept.referenced_by.some((x: any) => x.table === "experience_provider_field_write_audit"), "dc-r17s: provider kept, FK child table named");
+        // N3: a created provider changed since -> changed_since (insert step checked).
+        seed("dc-fk2");
+        const fk2 = await apply([item("dc-fk2", "provider", "Delt Tilbyder AS", "Skiforeningen (org.nr. 946175986)")]);
+        const created2 = rowOf("dc-fk2").provider_id;
+        if (fk2.results[0].result === "applied") {
+          expDb.prepare("UPDATE experience_providers SET navn = 'Endret' WHERE id = ?").run(created2);
+          const r2 = revert({ correction_ids: [fk2.results[0].correction_id] });
+          assertEq(r2.results[0].reason, "changed_since", "dc-r17t: edited created provider -> changed_since");
+        } else {
+          assertTrue(false, `dc-r17t: setup failed (${fk2.results[0].reason})`);
+        }
       }
 
       assertEq(anthropicRequests, 0, "dc-r14b: ZERO requests to api.anthropic.com");
