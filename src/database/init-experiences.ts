@@ -2213,6 +2213,45 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_description_proposal_failures failed:", err);
   }
 
+  // ─── experience_data_corrections (POST /admin/experiences-data-corrections,
+  // routes/opplevelser.ts) ───────────────────────────────────────────────
+  // One row per APPLIED, source-backed factual correction of one logical
+  // field (kommune, fylke, title, season, duration, price_from,
+  // homepage_url, provider) on one experience. `column_changes` is a JSON
+  // array of every physical write the correction made ({table, row_id,
+  // column, json_key?, old, new} per column, plus {op:"insert"} for a
+  // provider row it created), which is exactly what the revert route reads
+  // back — in reverse order, and only while each column still holds the
+  // recorded `new` value. `reverted_at`/`revert_batch_id` mark a reverted
+  // correction (never deleted). No FK, same reasoning as
+  // experience_description_attempts above (an audit row must outlive
+  // nothing and block nothing). Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_data_corrections (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        batch_label TEXT,
+        experience_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        action TEXT NOT NULL,
+        expected_current TEXT,
+        new_value TEXT,
+        column_changes TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        quote TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+        reverted_at TEXT,
+        revert_batch_id TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_data_corrections_batch ON experience_data_corrections(batch_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_data_corrections_experience ON experience_data_corrections(experience_id)`);
+  } catch (err) {
+    console.error("Migration experience_data_corrections failed:", err);
+  }
+
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV
   // translations of experience + gårdssalg-provider prose, staged

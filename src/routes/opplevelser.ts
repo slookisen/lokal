@@ -34262,6 +34262,1118 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
   res.json({ success: true, dry_run: dryRun, totals: out.totals, results: out.results });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /admin/experiences-data-corrections
+// POST /admin/experiences-data-corrections/revert
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// WHY. A verified list of factual errors on opplevagent rows (wrong kommune,
+// title, season, duration, price, homepage, provider — each item backed by a
+// source URL and a verbatim quote, checked by hand) has to land in the DB
+// without a one-off SQL script. This route applies such a list item by item,
+// with the same safety posture as the other admin writers in this file:
+// admin auth, the experiences write-pause fence (apply only), STRICT-FALSE
+// `dry_run` (only the JSON boolean `false` writes), per-item results, one
+// transaction per call, and NO network or LLM call of any kind.
+//
+// Each item names ONE logical field. The field -> column mapping is the one
+// the description pipeline's facts block (buildExperienceDescriptionFacts /
+// renderExperienceDescriptionFactsBlock, above) reads, so a correction
+// changes exactly what the public page and the facts fingerprint see:
+//
+//   kommune      -> experiences.kommune (validated against the vendored SSB
+//                   kommune table, services/fylke-2024-migration.ts)
+//   fylke        -> experiences.fylke (one of the 15 canonical 2024 fylker)
+//   title        -> experiences.title (the facts block's "Tittel"); a stale
+//                   experiences.title_no (the /no display title, generated
+//                   from the old title) is cleared to NULL so the page falls
+//                   back to the corrected title until the title_no backfill
+//                   regenerates it. slug is NEVER touched.
+//   season       -> experiences.season (JSON array of the English codes
+//                   summer/winter/spring/autumn/year_round)
+//   duration     -> experiences.duration_min + duration_max
+//   price_from   -> experiences.price_from (price_band untouched — nothing in
+//                   this codebase derives it from price_from)
+//   homepage_url -> experience_providers.hjemmeside (the facts fingerprint's
+//                   provider_hjemmeside) + field_provenance.hjemmeside
+//   provider     -> experiences.provider_id (+ provider_match_status) —
+//                   relink to an existing provider (org.nr. or exact name) or
+//                   a new minimal provider row; an existing provider is never
+//                   renamed or modified.
+//
+// `expected_current` is a stale-guard: the client says what it believes the
+// field shows now, and the item is rejected (`stale_expected_current`) unless
+// that matches EITHER the raw DB value OR the rendered facts-block value,
+// after normalisation. Every applied item writes one experience_data_
+// corrections audit row whose `column_changes` the revert route replays
+// backwards.
+
+import {
+  findKommune2024Matches,
+  kommune2024DisplayName,
+  sameKommuneName,
+} from "../services/fylke-2024-migration";
+import { __FYLKE_INTERNAL as EXP_DC_FYLKE_INTERNAL, key as expDcFylkeKey } from "../services/norway-fylke";
+
+export const EXP_DATA_CORRECTION_FIELDS = [
+  "kommune",
+  "fylke",
+  "title",
+  "season",
+  "duration",
+  "price_from",
+  "homepage_url",
+  "provider",
+] as const;
+export type ExpDataCorrectionField = (typeof EXP_DATA_CORRECTION_FIELDS)[number];
+const EXP_DC_MAX_ITEMS = 50;
+const EXP_DC_REVERT_MAX_IDS = 500;
+/** Fields an item may `clear` (set to NULL). The rest are either NOT NULL
+ *  (title), structural (provider) or location fields a page should never
+ *  lose outright. */
+const EXP_DC_CLEARABLE_FIELDS: ReadonlySet<string> = new Set(["season", "duration", "price_from", "homepage_url"]);
+/** Fields whose OLD value is looked for in the row's description text
+ *  (warning `description_mentions_old_value`). */
+const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "kommune", "price_from", "provider"]);
+/** Columns this feature may write — every dynamic column name in an UPDATE
+ *  below is checked against these lists first. */
+const EXP_DC_EXPERIENCE_COLUMNS: ReadonlySet<string> = new Set([
+  "kommune", "fylke", "title", "title_no", "season", "duration_min", "duration_max",
+  "price_from", "provider_id", "provider_match_status", "content_field_evidence",
+]);
+const EXP_DC_PROVIDER_COLUMNS: ReadonlySet<string> = new Set(["hjemmeside", "field_provenance"]);
+
+export type ExpDcColumnChange =
+  | {
+      table: "experiences" | "experience_providers";
+      row_id: string;
+      column: string;
+      /** Set when the change is ONE key of a JSON-object column
+       *  (content_field_evidence / field_provenance): old/new are that key's
+       *  values (null = key absent). */
+      json_key?: string;
+      old: unknown;
+      new: unknown;
+    }
+  | { table: "experience_providers"; row_id: string; op: "insert"; values: Record<string, unknown> };
+
+export type ExpDcWarning = { code: string; [k: string]: unknown };
+
+export type ExpDcItemResult = {
+  index: number;
+  id: string;
+  field: string;
+  action: string;
+  result: "would_apply" | "applied" | "rejected";
+  reason?: string;
+  detail?: string;
+  warnings: ExpDcWarning[];
+  column_changes: ExpDcColumnChange[];
+  correction_id?: string;
+};
+
+export type ExperienceDataCorrectionsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      dry_run: boolean;
+      batch_id: string | null;
+      batch_label: string | null;
+      totals: { items: number; would_apply: number; applied: number; rejected: number; warnings: number };
+      results: ExpDcItemResult[];
+    };
+
+type ExpDcItem = {
+  index: number;
+  id: string;
+  field: string;
+  action: string;
+  expected_current: unknown;
+  has_expected_current: boolean;
+  new_value: unknown;
+  source_url: unknown;
+  quote: unknown;
+  confidence: unknown;
+};
+
+type ExpDcRow = ExperienceDescriptionCandidate & {
+  title_no: string | null;
+  provider_id: string | null;
+  provider_match_status: string | null;
+  canonical_id: string | null;
+  expdc_published: number | null;
+};
+
+type ExpDcProviderRow = {
+  id: string;
+  navn: string;
+  org_nr: string | null;
+  hjemmeside: string | null;
+  field_provenance: string | null;
+  claimed_at: string | null;
+  content_source: string | null;
+  merged_into: string | null;
+  is_test_provider: number | null;
+};
+
+class ExpDcDryRunRollback extends Error {}
+
+// ── Normalisation helpers (pure, exported for tests) ─────────────────────
+
+/** Comparison form for expected_current: trimmed, whitespace collapsed,
+ *  case-folded; null/undefined/""/"null" all read as "". */
+export function expDcNormalise(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  const s = String(v).normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+  return s === "null" ? "" : s;
+}
+
+/** URL comparison form: expDcNormalise + one trailing slash dropped. */
+function expDcUrlNormalise(v: unknown): string {
+  return expDcNormalise(v).replace(/\/$/, "");
+}
+
+const EXP_DC_SEASON_ORDER = ["spring", "summer", "autumn", "winter"] as const;
+const EXP_DC_SEASON_SPELLINGS: Record<string, string> = {
+  spring: "spring", "vår": "spring", vaar: "spring", var: "spring",
+  summer: "summer", sommer: "summer",
+  autumn: "autumn", fall: "autumn", "høst": "autumn", host: "autumn", haust: "autumn",
+  winter: "winter", vinter: "winter",
+  year_round: "year_round", all_year: "year_round", "helår": "year_round", "heilår": "year_round",
+  "hele året": "year_round", "hele_året": "year_round", "hele aret": "year_round", "heile året": "year_round",
+  "hele_aret": "year_round", "year round": "year_round", "all year": "year_round",
+};
+
+/**
+ * Season text -> sorted, de-duplicated list of canonical codes, or null when
+ * any token is unknown. Accepts the DB's raw JSON array (any mix of the
+ * spellings enrichment paths have written: "vaar", "host", "winter", ...) as
+ * well as the rendered facts-block label list ("vår, sommer, høst") and a
+ * bare "hele året". Empty input -> [].
+ */
+export function expDcSeasonCodes(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return [];
+  let tokens: string[];
+  const text = String(raw).normalize("NFC").trim();
+  if (text === "" || text.toLowerCase() === "null") return [];
+  if (text.startsWith("[")) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { return null; }
+    if (!Array.isArray(parsed)) return null;
+    tokens = parsed.map((t) => String(t));
+  } else {
+    tokens = text.split(/,|;|\/|\bog\b|\band\b|&/i);
+  }
+  const codes = new Set<string>();
+  for (const t of tokens) {
+    const k = t.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!k) continue;
+    const code = EXP_DC_SEASON_SPELLINGS[k];
+    if (!code) return null;
+    codes.add(code);
+  }
+  return [...codes].sort();
+}
+
+/** Duration text -> {min,max} minutes, or null. Accepts an integer, "N",
+ *  "omtrent N minutter", "ca. N min", or a range "A-B minutter". */
+export function expDcParseDuration(raw: unknown): { min: number; max: number } | null {
+  if (typeof raw === "number") {
+    return Number.isInteger(raw) ? { min: raw, max: raw } : null;
+  }
+  if (typeof raw !== "string") return null;
+  const s = raw.normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+  const unit = "(?:\\s*(?:minutter|minutt|min\\.?))?";
+  const prefix = "(?:(?:omtrent|ca\\.?|cirka|rundt)\\s*)?";
+  const range = new RegExp(`^${prefix}(\\d+)\\s*[-–]\\s*(\\d+)${unit}$`).exec(s);
+  if (range) return { min: Number(range[1]), max: Number(range[2]) };
+  const single = new RegExp(`^${prefix}(\\d+)${unit}$`).exec(s);
+  if (single) return { min: Number(single[1]), max: Number(single[1]) };
+  return null;
+}
+
+/** Price text -> integer kroner, or null. Accepts an integer, "150",
+ *  "1 700", "fra 150 kroner", "150 kr", "150 NOK". */
+export function expDcParsePrice(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isInteger(raw) ? raw : null;
+  if (typeof raw !== "string") return null;
+  const s = raw.normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+  const m = /^(?:fra\s+)?(\d{1,3}(?:[ . ]\d{3})+|\d+)(?:\s*(?:kroner|kr\.?|nok|,-))?$/.exec(s);
+  if (!m) return null;
+  return Number(m[1].replace(/[ . ]/g, ""));
+}
+
+/** Provider text -> {name, org_nr}. "Fjord Tours AS (org.nr. 931735357)" and
+ *  "Skiforeningen (Skimuseet Holmenkollen), org.nr. 946175986" both work. */
+export function expDcParseProvider(raw: string): { name: string; org_nr: string | null } {
+  const s = raw.normalize("NFC").replace(/\s+/g, " ").trim();
+  const re = /[,;]?\s*\(?\s*org\.?\s*-?\s*n(?:r|ummer)\.?\s*:?\s*(\d{3}\s?\d{3}\s?\d{3})\s*\)?/i;
+  const m = re.exec(s);
+  if (!m) return { name: s, org_nr: null };
+  const name = (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length))
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,;]+|[\s,;]+$/g, "")
+    .trim();
+  return { name, org_nr: m[1].replace(/\s/g, "") };
+}
+
+/** Strict fylke parse: only one of the 15 canonical 2024 fylker (case /
+ *  æøå-fold insensitive) — a 2020-era merged name is NOT accepted. */
+export function expDcCanonicalFylke(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const k = expDcFylkeKey(raw);
+  if (!k) return null;
+  return EXP_DC_FYLKE_INTERNAL.CANONICAL_FYLKER.find((f) => expDcFylkeKey(f) === k) ?? null;
+}
+
+/**
+ * Kommune text -> the stored kommune name + the fylke the SSB table puts it
+ * in, or a reject detail. Accepts "Herøy", "Vågan (Svolvær), Nordland",
+ * "Øvre Eiker (Buskerud)": the part before a comma is the kommune, a
+ * trailing parenthetical or the part after the comma is a hint that is used
+ * only when it names a fylke. A name the table holds twice (Herøy, Våler) is
+ * resolved by a fylke hint or `fallbackFylke` (the row's fylke after this
+ * request), never guessed.
+ */
+export function expDcResolveKommune(
+  raw: string,
+  fallbackFylke: string | null
+): { kommune: string; fylke: string } | { error: string } {
+  let base = raw.normalize("NFC").replace(/\s+/g, " ").trim();
+  const hints: string[] = [];
+  const comma = base.indexOf(",");
+  if (comma >= 0) {
+    hints.push(base.slice(comma + 1).trim());
+    base = base.slice(0, comma).trim();
+  }
+  const paren = /^(.*?)\s*\(([^)]*)\)\s*$/.exec(base);
+  if (paren) {
+    hints.push(paren[2].trim());
+    base = paren[1].trim();
+  }
+  if (!base || base.length > 80) return { error: "kommune_empty_or_too_long" };
+  const hintFylker = hints.map(expDcCanonicalFylke).filter((f): f is string => !!f);
+  let matches = findKommune2024Matches(base);
+  if (matches.length === 0) return { error: `unknown_kommune:${base}` };
+  if (matches.length > 1) {
+    const by = hintFylker.length > 0 ? hintFylker[0] : expDcCanonicalFylke(fallbackFylke);
+    if (by) matches = matches.filter((m) => expDcFylkeKey(m.fylkesnavn) === expDcFylkeKey(by));
+    if (matches.length !== 1) return { error: `ambiguous_kommune:${base}` };
+  }
+  const hit = matches[0];
+  for (const hf of hintFylker) {
+    if (expDcFylkeKey(hf) !== expDcFylkeKey(hit.fylkesnavn)) {
+      return { error: `kommune_fylke_conflict:${base} is in ${hit.fylkesnavn}, not ${hf}` };
+    }
+  }
+  const kommune = sameKommuneName(base, hit.kommunenavn) ? kommune2024DisplayName(hit.kommunenavn) : base;
+  return { kommune, fylke: hit.fylkesnavn };
+}
+
+function expDcIsHttpUrl(v: unknown): v is string {
+  if (typeof v !== "string" || v.trim() === "" || /\s/.test(v.trim())) return false;
+  try {
+    const u = new URL(v.trim());
+    return (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname;
+  } catch {
+    return false;
+  }
+}
+
+function expDcIsRootUrl(v: string): boolean {
+  const u = new URL(v.trim());
+  return (u.pathname === "" || u.pathname === "/") && !u.search && !u.hash;
+}
+
+function expDcFact(row: ExperienceDescriptionCandidate, label: string): string | null {
+  const hit = buildExperienceDescriptionFacts(row).find(([k]) => k === label);
+  return hit ? hit[1] : null;
+}
+
+function expDcJsonObject(raw: string | null | undefined): Record<string, unknown> | null {
+  const t = (raw ?? "").trim();
+  if (!t) return {};
+  try {
+    const parsed = JSON.parse(t);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null; // malformed — callers never overwrite it
+  }
+}
+
+function expDcSameValue(a: unknown, b: unknown): boolean {
+  const na = a === undefined ? null : a;
+  const nb = b === undefined ? null : b;
+  if (na === null || nb === null) return na === nb;
+  if (typeof na === "object" || typeof nb === "object") return JSON.stringify(na) === JSON.stringify(nb);
+  return String(na) === String(nb);
+}
+
+/**
+ * The raw-DB and rendered-facts-block forms of one logical field, used for
+ * the expected_current stale-guard. Several forms per field are fine — a
+ * match on ANY of them is accepted.
+ */
+function expDcCurrentForms(field: ExpDataCorrectionField, row: ExpDcRow): string[] {
+  switch (field) {
+    case "kommune":
+      return [row.kommune ?? "", expDcFact(row, "Sted") ?? ""];
+    case "fylke":
+      return [row.fylke ?? "", expDcFact(row, "Sted") ?? ""];
+    case "title":
+      return row.title_no ? [row.title ?? "", row.title_no] : [row.title ?? ""];
+    case "season":
+      return [row.season ?? "", expDcFact(row, "Sesong") ?? ""];
+    case "duration": {
+      const raw = row.duration_min && row.duration_max && row.duration_min !== row.duration_max
+        ? `${row.duration_min}-${row.duration_max}`
+        : String(row.duration_min || row.duration_max || "");
+      return [raw, expDcFact(row, "Varighet") ?? ""];
+    }
+    case "price_from": {
+      const rendered = expDcFact(row, "Pris") ?? "";
+      const forms = [row.price_from == null ? "" : String(row.price_from), rendered];
+      if (row.price_from) forms.push(`fra ${row.price_from} kroner`);
+      return forms;
+    }
+    case "homepage_url":
+      return [row.provider_hjemmeside ?? ""];
+    case "provider":
+      return [row.provider_navn ?? "", expDcFact(row, "Tilbyder") ?? ""];
+  }
+}
+
+/** True when `expected` matches any current form of the field. */
+export function expDcExpectedMatches(field: ExpDataCorrectionField, row: ExpDcRow, expected: unknown): boolean {
+  const forms = expDcCurrentForms(field, row);
+  if (field === "season") {
+    const want = expDcSeasonCodes(expected);
+    if (want) {
+      for (const f of forms) {
+        const have = expDcSeasonCodes(f);
+        if (have && JSON.stringify(have) === JSON.stringify(want)) return true;
+      }
+    }
+  }
+  if (field === "homepage_url") {
+    return forms.some((f) => expDcUrlNormalise(f) === expDcUrlNormalise(expected));
+  }
+  const e = expDcNormalise(expected);
+  return forms.some((f) => expDcNormalise(f) === e);
+}
+
+function expDcParseItem(raw: unknown, index: number): ExpDcItem | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return `items[${index}] must be an object`;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || r.id.trim() === "") return `items[${index}].id must be a non-empty string`;
+  return {
+    index,
+    id: r.id.trim(),
+    field: typeof r.field === "string" ? r.field.trim() : String(r.field ?? ""),
+    action: typeof r.action === "string" ? r.action.trim() : String(r.action ?? ""),
+    expected_current: r.expected_current,
+    has_expected_current: Object.prototype.hasOwnProperty.call(r, "expected_current"),
+    new_value: r.new_value,
+    source_url: r.source_url,
+    quote: r.quote,
+    confidence: r.confidence,
+  };
+}
+
+/** Item-level checks that need no DB: returns a reject reason/detail. */
+function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } | null {
+  if (!(EXP_DATA_CORRECTION_FIELDS as readonly string[]).includes(it.field)) return { reason: "unknown_field", detail: it.field };
+  if (it.action !== "correct" && it.action !== "clear") return { reason: "unknown_action", detail: it.action };
+  if (it.confidence !== "high") return { reason: "confidence_not_high", detail: String(it.confidence ?? "") };
+  if (!expDcIsHttpUrl(it.source_url)) return { reason: "invalid_source_url" };
+  if (typeof it.quote !== "string" || it.quote.trim() === "") return { reason: "missing_quote" };
+  if (!it.has_expected_current) return { reason: "invalid_item", detail: "expected_current is required (null for an empty field)" };
+  const ec = it.expected_current;
+  if (ec !== null && typeof ec !== "string" && typeof ec !== "number") {
+    return { reason: "invalid_item", detail: "expected_current must be a string, number or null" };
+  }
+  if (it.action === "clear" && !EXP_DC_CLEARABLE_FIELDS.has(it.field)) {
+    return { reason: "invalid_value", detail: `clear is not supported for ${it.field}` };
+  }
+  if (it.action === "correct") {
+    const nv = it.new_value;
+    if ((typeof nv !== "string" || nv.trim() === "") && typeof nv !== "number") {
+      return { reason: "invalid_value", detail: "new_value must be a non-empty string or a number" };
+    }
+  }
+  return null;
+}
+
+/** Field -> the experiences columns it writes, for content_field_evidence. */
+const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
+  kommune: ["kommune"],
+  fylke: ["fylke"],
+  title: ["title"],
+  season: ["season"],
+  duration: ["duration_min", "duration_max"],
+  price_from: ["price_from"],
+  provider: ["provider_id"],
+};
+
+/**
+ * The whole core of POST /admin/experiences-data-corrections. Structural
+ * validation (1..50 items, each an object with an id) is a 400 (`ok:false`);
+ * everything else is per item. ALL items run inside ONE transaction; a
+ * dry run executes exactly the same code and then rolls the transaction
+ * back, so a preview can never drift from what apply would do. The caller
+ * owns auth and the write-pause fence. Never calls the network.
+ */
+export function applyExperienceDataCorrections(
+  db: ReturnType<typeof getExpDb>,
+  body: { items?: unknown; batch_label?: unknown },
+  opts: { dryRun: boolean; logTag?: string }
+): ExperienceDataCorrectionsResult {
+  const rawItems = body.items;
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXP_DC_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXP_DC_MAX_ITEMS} items` };
+  }
+  let batchLabel: string | null = null;
+  if (body.batch_label !== undefined && body.batch_label !== null) {
+    if (typeof body.batch_label !== "string" || body.batch_label.length > 200) {
+      return { ok: false, error: "batch_label must be a string of at most 200 characters" };
+    }
+    batchLabel = body.batch_label.trim() || null;
+  }
+  const items: ExpDcItem[] = [];
+  for (let i = 0; i < rawItems.length; i++) {
+    const parsed = expDcParseItem(rawItems[i], i);
+    if (typeof parsed === "string") return { ok: false, error: parsed };
+    items.push(parsed);
+  }
+
+  const { dryRun } = opts;
+  const batchId = `data-corrections-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID().slice(0, 8)}`;
+  const results: ExpDcItemResult[] = items.map((it) => ({
+    index: it.index,
+    id: it.id,
+    field: it.field,
+    action: it.action,
+    result: "rejected" as const,
+    warnings: [],
+    column_changes: [],
+  }));
+  const reject = (it: ExpDcItem, reason: string, detail?: string) => {
+    const r = results[it.index];
+    r.result = "rejected";
+    r.reason = reason;
+    if (detail !== undefined) r.detail = detail;
+  };
+
+  // Static checks + duplicate id+field (every occurrence is rejected — the
+  // request is ambiguous about which one is meant).
+  const pairCount = new Map<string, number>();
+  for (const it of items) pairCount.set(`${it.id}\u0000${it.field}`, (pairCount.get(`${it.id}\u0000${it.field}`) ?? 0) + 1);
+  const live: ExpDcItem[] = [];
+  for (const it of items) {
+    const sr = expDcStaticReject(it);
+    if (sr) { reject(it, sr.reason, sr.detail); continue; }
+    if ((pairCount.get(`${it.id}\u0000${it.field}`) ?? 0) > 1) { reject(it, "duplicate_item"); continue; }
+    live.push(it);
+  }
+
+  const rowSql = (n: number) =>
+    `SELECT ${EXP_DESC_CANDIDATE_SELECT_COLUMNS}, e.title_no, e.provider_id, e.provider_match_status, e.canonical_id,
+            (${PUBLISH_GATE_SQL}) AS expdc_published
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.id IN (${Array.from({ length: n }, () => "?").join(",")})`;
+  const loadRows = (ids: string[]): Map<string, ExpDcRow> =>
+    ids.length === 0 ? new Map() : new Map((db.prepare(rowSql(ids.length)).all(...ids) as ExpDcRow[]).map((r) => [r.id, r]));
+  const loadRow = (id: string): ExpDcRow | undefined => loadRows([id]).get(id);
+  const getProvider = (id: string): ExpDcProviderRow | undefined =>
+    db.prepare(
+      `SELECT id, navn, org_nr, hjemmeside, field_provenance, claimed_at, content_source, merged_into, is_test_provider
+         FROM experience_providers WHERE id = ?`
+    ).get(id) as ExpDcProviderRow | undefined;
+  const providerIsOwnerManaged = (p: ExpDcProviderRow | undefined): boolean =>
+    !!p && (p.claimed_at != null || p.content_source === "manual" || p.content_source === "claim");
+  let providerNameIndex: Map<string, ExpDcProviderRow[]> | null = null;
+  const providersByName = (name: string): ExpDcProviderRow[] => {
+    if (!providerNameIndex) {
+      providerNameIndex = new Map();
+      const all = db.prepare(
+        `SELECT id, navn, org_nr, hjemmeside, field_provenance, claimed_at, content_source, merged_into, is_test_provider
+           FROM experience_providers WHERE merged_into IS NULL`
+      ).all() as ExpDcProviderRow[];
+      for (const p of all) {
+        const k = expDcNormalise(p.navn);
+        if (!k) continue;
+        const list = providerNameIndex.get(k) ?? [];
+        list.push(p);
+        providerNameIndex.set(k, list);
+      }
+    }
+    return providerNameIndex.get(expDcNormalise(name)) ?? [];
+  };
+
+  const setExperienceColumn = (id: string, column: string, value: unknown): void => {
+    if (!EXP_DC_EXPERIENCE_COLUMNS.has(column)) throw new Error(`column not writable: ${column}`);
+    db.prepare(`UPDATE experiences SET ${column} = ?, updated_at = datetime('now') WHERE id = ?`).run(value, id);
+  };
+  const setProviderColumn = (id: string, column: string, value: unknown): void => {
+    if (!EXP_DC_PROVIDER_COLUMNS.has(column)) throw new Error(`column not writable: ${column}`);
+    db.prepare(`UPDATE experience_providers SET ${column} = ?, updated_at = datetime('now') WHERE id = ?`).run(value, id);
+  };
+  const readColumn = (table: "experiences" | "experience_providers", id: string, column: string): unknown => {
+    const allowed = table === "experiences" ? EXP_DC_EXPERIENCE_COLUMNS : EXP_DC_PROVIDER_COLUMNS;
+    if (!allowed.has(column)) throw new Error(`column not readable: ${column}`);
+    const r = db.prepare(`SELECT ${column} AS v FROM ${table} WHERE id = ?`).get(id) as { v: unknown } | undefined;
+    return r ? r.v : undefined;
+  };
+
+  // Provider items run first (stable), so a homepage_url item for the same
+  // experience lands on the NEW provider; results stay in request order.
+  const ordered = [...live].sort((a, b) => Number(b.field === "provider") - Number(a.field === "provider"));
+  // The request's own fylke corrections, for kommune disambiguation.
+  const requestFylke = new Map<string, string>();
+  for (const it of live) {
+    if (it.field === "fylke" && it.action === "correct") {
+      const f = expDcCanonicalFylke(it.new_value);
+      if (f) requestFylke.set(it.id, f);
+    }
+  }
+  const kommuneImplied: Array<{ it: ExpDcItem; fylke: string }> = [];
+  const insertAudit = db.prepare(
+    `INSERT INTO experience_data_corrections
+       (id, batch_id, batch_label, experience_id, field, action, expected_current, new_value,
+        column_changes, source_url, quote, confidence, applied_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+  );
+
+  const tx = db.transaction(() => {
+    const original = loadRows([...new Set(live.map((it) => it.id))]);
+
+    for (const it of ordered) {
+      const field = it.field as ExpDataCorrectionField;
+      const orig = original.get(it.id);
+      if (!orig) { reject(it, "not_found"); continue; }
+      if (isExperienceOwnerLocked(orig)) { reject(it, "owner_managed", `content_source=${orig.content_source}`); continue; }
+      // The row as it is NOW (an earlier item in this request may have
+      // changed it — e.g. a provider relink before a homepage_url item).
+      const row = loadRow(it.id)!;
+      if (field === "homepage_url" && !row.provider_id) { reject(it, "no_provider"); continue; }
+      if (!expDcExpectedMatches(field, orig, it.expected_current)) {
+        reject(it, "stale_expected_current", `current: ${JSON.stringify(expDcCurrentForms(field, orig).filter((f) => f !== ""))}`);
+        continue;
+      }
+
+      const sourceUrl = String(it.source_url).trim();
+      const warnings: ExpDcWarning[] = [];
+      const changes: ExpDcColumnChange[] = [];
+      // Planned experiences-column writes for this item: [column, newValue].
+      const expWrites: Array<[string, unknown]> = [];
+      let rejected: { reason: string; detail?: string } | null = null;
+      const nv = it.new_value;
+
+      switch (field) {
+        case "kommune": {
+          const res = expDcResolveKommune(String(nv), requestFylke.get(it.id) ?? row.fylke);
+          if ("error" in res) { rejected = { reason: "invalid_value", detail: res.error }; break; }
+          if ((row.kommune ?? "") === res.kommune) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["kommune", res.kommune]);
+          kommuneImplied.push({ it, fylke: res.fylke });
+          break;
+        }
+        case "fylke": {
+          const f = expDcCanonicalFylke(nv);
+          if (!f) { rejected = { reason: "invalid_value", detail: `not a 2024 fylke: ${String(nv)}` }; break; }
+          if ((row.fylke ?? "") === f) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["fylke", f]);
+          break;
+        }
+        case "title": {
+          const t = String(nv).normalize("NFC").replace(/\s+/g, " ").trim();
+          if (t.length < 3 || t.length > 200) { rejected = { reason: "invalid_value", detail: "title must be 3..200 characters" }; break; }
+          if (/[<>]/.test(t)) { rejected = { reason: "invalid_value", detail: "title must not contain < or >" }; break; }
+          if (row.title === t) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["title", t]);
+          if (row.title_no != null) {
+            expWrites.push(["title_no", null]);
+            warnings.push({ code: "title_no_cleared", old_title_no: row.title_no });
+          }
+          break;
+        }
+        case "season": {
+          let stored: string | null = null;
+          if (it.action === "correct") {
+            const codes = expDcSeasonCodes(nv);
+            if (!codes || codes.length === 0) { rejected = { reason: "invalid_value", detail: `unknown season: ${String(nv)}` }; break; }
+            if (codes.includes("year_round") && codes.length > 1) {
+              rejected = { reason: "invalid_value", detail: "hele året cannot be combined with other seasons" };
+              break;
+            }
+            const ordered4 = codes.includes("year_round")
+              ? ["year_round"]
+              : EXP_DC_SEASON_ORDER.filter((c) => codes.includes(c));
+            stored = JSON.stringify(ordered4);
+          }
+          const curCodes = expDcSeasonCodes(row.season);
+          const newCodes = stored === null ? [] : expDcSeasonCodes(stored);
+          const curEmpty = expDescJsonArray(row.season).length === 0;
+          if (stored === null ? curEmpty : (curCodes && JSON.stringify(curCodes) === JSON.stringify(newCodes))) {
+            rejected = { reason: "no_op" };
+            break;
+          }
+          expWrites.push(["season", stored]);
+          break;
+        }
+        case "duration": {
+          if (it.action === "clear") {
+            if (row.duration_min == null && row.duration_max == null) { rejected = { reason: "no_op" }; break; }
+            expWrites.push(["duration_min", null], ["duration_max", null]);
+            break;
+          }
+          const d = expDcParseDuration(nv);
+          if (!d || d.min < 1 || d.max > 10080 || d.min > d.max) {
+            rejected = { reason: "invalid_value", detail: "duration must be 1..10080 minutes (integer, \"N\" or \"omtrent N minutter\")" };
+            break;
+          }
+          if (row.duration_min === d.min && row.duration_max === d.max) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["duration_min", d.min], ["duration_max", d.max]);
+          break;
+        }
+        case "price_from": {
+          if (it.action === "clear") {
+            if (row.price_from == null) { rejected = { reason: "no_op" }; break; }
+            expWrites.push(["price_from", null]);
+            break;
+          }
+          const p = expDcParsePrice(nv);
+          if (p === null || p < 1 || p > 1_000_000) {
+            rejected = { reason: "invalid_value", detail: "price_from must be an integer 1..1000000" };
+            break;
+          }
+          if (row.price_from === p) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["price_from", p]);
+          break;
+        }
+        case "homepage_url": {
+          const prov = getProvider(row.provider_id!);
+          if (!prov) { rejected = { reason: "no_provider" }; break; }
+          if (providerIsOwnerManaged(prov)) { rejected = { reason: "owner_managed", detail: "provider is owner-claimed/managed" }; break; }
+          let url: string | null = null;
+          if (it.action === "correct") {
+            if (!expDcIsHttpUrl(nv)) { rejected = { reason: "invalid_value", detail: "homepage_url must be an http(s) URL" }; break; }
+            url = String(nv).trim();
+          }
+          if (url === null ? (prov.hjemmeside ?? "").trim() === "" : expDcUrlNormalise(prov.hjemmeside) === expDcUrlNormalise(url)) {
+            rejected = { reason: "no_op" };
+            break;
+          }
+          const others = (db.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ? AND id != ?")
+            .get(prov.id, it.id) as { n: number }).n;
+          if (others > 0) {
+            if (url === null || !expDcIsRootUrl(url)) {
+              rejected = { reason: "shared_provider", detail: `provider ${prov.id} is linked to ${others} other experience(s); only a root URL may be set on a shared provider` };
+              break;
+            }
+            warnings.push({ code: "shared_provider_root_url", provider_id: prov.id, other_experiences: others });
+          }
+          const provenance = expDcJsonObject(prov.field_provenance);
+          changes.push({ table: "experience_providers", row_id: prov.id, column: "hjemmeside", old: prov.hjemmeside, new: url });
+          setProviderColumn(prov.id, "hjemmeside", url);
+          if (provenance === null) {
+            warnings.push({ code: "provenance_not_recorded", detail: "provider field_provenance is not a JSON object" });
+          } else {
+            const oldEntry = Object.prototype.hasOwnProperty.call(provenance, "hjemmeside") ? provenance.hjemmeside : null;
+            const newEntry = { source_url: sourceUrl, fetched_at: new Date().toISOString() };
+            provenance.hjemmeside = newEntry;
+            changes.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside", old: oldEntry, new: newEntry });
+            // An ownership verification describes the OLD site; it must not
+            // carry over to a different host (it would make the row kildetro
+            // on an unverified homepage).
+            if (Object.prototype.hasOwnProperty.call(provenance, "hjemmeside_verification")
+                && hostFromUrlLike(prov.hjemmeside ?? "") !== hostFromUrlLike(url ?? "")) {
+              changes.push({ table: "experience_providers", row_id: prov.id, column: "field_provenance", json_key: "hjemmeside_verification", old: provenance.hjemmeside_verification, new: null });
+              delete provenance.hjemmeside_verification;
+              warnings.push({ code: "hjemmeside_verification_reset" });
+            }
+            setProviderColumn(prov.id, "field_provenance", JSON.stringify(provenance));
+          }
+          break;
+        }
+        case "provider": {
+          const cur = row.provider_id ? getProvider(row.provider_id) : undefined;
+          if (providerIsOwnerManaged(cur)) { rejected = { reason: "owner_managed", detail: "current provider is owner-claimed/managed" }; break; }
+          const parsed = expDcParseProvider(String(nv));
+          if (parsed.name.length < 2 || parsed.name.length > 200) {
+            rejected = { reason: "invalid_value", detail: "provider name must be 2..200 characters" };
+            break;
+          }
+          let target: ExpDcProviderRow | undefined;
+          if (parsed.org_nr) {
+            target = db.prepare(
+              `SELECT id, navn, org_nr, hjemmeside, field_provenance, claimed_at, content_source, merged_into, is_test_provider
+                 FROM experience_providers WHERE org_nr = ?`
+            ).get(parsed.org_nr) as ExpDcProviderRow | undefined;
+            if (target && target.merged_into) {
+              rejected = { reason: "invalid_value", detail: `provider with org.nr. ${parsed.org_nr} is merged into ${target.merged_into}` };
+              break;
+            }
+            if (!target) {
+              const sameName = providersByName(parsed.name);
+              if (sameName.length > 0) warnings.push({ code: "similar_provider_exists", provider_ids: sameName.map((p) => p.id) });
+            }
+          } else {
+            const hits = providersByName(parsed.name);
+            if (hits.length > 1) {
+              rejected = { reason: "ambiguous_provider", detail: `${hits.length} providers named ${parsed.name}: ${hits.map((p) => p.id).join(", ")}` };
+              break;
+            }
+            target = hits[0];
+          }
+          if (target && Number(target.is_test_provider) === 1) {
+            rejected = { reason: "invalid_value", detail: "target provider is a test provider" };
+            break;
+          }
+          if (target && target.id === row.provider_id) { rejected = { reason: "no_op" }; break; }
+          let targetId: string;
+          if (target) {
+            targetId = target.id;
+            if (providerIsOwnerManaged(target)) warnings.push({ code: "target_provider_owner_managed", provider_id: target.id });
+          } else {
+            targetId = crypto.randomUUID();
+            const fetchedAt = new Date().toISOString();
+            const provProvenance: Record<string, unknown> = {
+              navn: { source_url: sourceUrl, fetched_at: fetchedAt },
+              created_by: { source: "data_correction", batch_id: batchId, experience_id: it.id, at: fetchedAt },
+            };
+            if (parsed.org_nr) provProvenance.org_nr = { source_url: sourceUrl, fetched_at: fetchedAt };
+            const values = {
+              id: targetId,
+              navn: parsed.name,
+              org_nr: parsed.org_nr,
+              source: "data_correction",
+              verification_status: "pending_verify",
+              field_provenance: JSON.stringify(provProvenance),
+            };
+            db.prepare(
+              `INSERT INTO experience_providers (id, navn, org_nr, source, verification_status, field_provenance)
+               VALUES (@id, @navn, @org_nr, @source, @verification_status, @field_provenance)`
+            ).run(values);
+            changes.push({ table: "experience_providers", row_id: targetId, op: "insert", values });
+            warnings.push({ code: "provider_created", provider_id: targetId, name: parsed.name, org_nr: parsed.org_nr });
+            // Keep the name index in step so a second item naming the same
+            // provider in this request links to this row instead of creating
+            // a duplicate.
+            if (providerNameIndex) {
+              const k = expDcNormalise(parsed.name);
+              const list = providerNameIndex.get(k) ?? [];
+              list.push({ id: targetId, navn: parsed.name, org_nr: parsed.org_nr, hjemmeside: null, field_provenance: values.field_provenance, claimed_at: null, content_source: null, merged_into: null, is_test_provider: null });
+              providerNameIndex.set(k, list);
+            }
+          }
+          expWrites.push(["provider_id", targetId]);
+          if (row.provider_match_status !== "matched") expWrites.push(["provider_match_status", "matched"]);
+          break;
+        }
+      }
+
+      if (rejected) {
+        reject(it, rejected.reason, rejected.detail);
+        continue;
+      }
+
+      // Experience-column writes + per-field provenance.
+      for (const [column, value] of expWrites) {
+        const old = readColumn("experiences", it.id, column);
+        changes.push({ table: "experiences", row_id: it.id, column, old, new: value });
+        setExperienceColumn(it.id, column, value);
+      }
+      const evidenceKeys = EXP_DC_EVIDENCE_KEYS[field];
+      if (evidenceKeys) {
+        const evRaw = readColumn("experiences", it.id, "content_field_evidence") as string | null;
+        const ev = expDcJsonObject(evRaw);
+        if (ev === null) {
+          warnings.push({ code: "provenance_not_recorded", detail: "content_field_evidence is not a JSON object" });
+        } else {
+          for (const k of evidenceKeys) {
+            const oldK = Object.prototype.hasOwnProperty.call(ev, k) ? ev[k] : null;
+            ev[k] = sourceUrl;
+            changes.push({ table: "experiences", row_id: it.id, column: "content_field_evidence", json_key: k, old: oldK, new: sourceUrl });
+          }
+          setExperienceColumn(it.id, "content_field_evidence", JSON.stringify(ev));
+        }
+      }
+      // Touch updated_at even for a provider-only write (homepage_url), so
+      // the experience row itself records that its facts changed.
+      if (expWrites.length === 0) {
+        db.prepare("UPDATE experiences SET updated_at = datetime('now') WHERE id = ?").run(it.id);
+      }
+
+      // Warnings computed from the ORIGINAL row.
+      if (EXP_DC_DESCRIPTION_CHECK_FIELDS.has(field)) {
+        const oldValue = field === "title" ? orig.title
+          : field === "kommune" ? orig.kommune
+          : field === "price_from" ? (orig.price_from == null ? null : String(orig.price_from))
+          : orig.provider_navn;
+        const desc = orig.description ?? "";
+        if (oldValue && oldValue.trim() !== "" && desc) {
+          const needle = oldValue.trim().toLowerCase();
+          const hay = desc.toLowerCase();
+          const hit = /^\d+$/.test(needle)
+            ? new RegExp(`(^|\\D)${needle}(\\D|$)`).test(hay.replace(/(\d)[ . ](?=\d{3}\b)/g, "$1"))
+            : hay.includes(needle);
+          if (hit) warnings.push({ code: "description_mentions_old_value", old_value: oldValue.trim() });
+        }
+      }
+      if (orig.canonical_id) warnings.push({ code: "row_is_merged_duplicate", canonical_id: orig.canonical_id });
+
+      const correctionId = crypto.randomUUID();
+      insertAudit.run(
+        correctionId, batchId, batchLabel, it.id, field, it.action,
+        it.expected_current === null || it.expected_current === undefined ? null : String(it.expected_current),
+        it.new_value === null || it.new_value === undefined ? null : String(it.new_value),
+        JSON.stringify(changes), sourceUrl, String(it.quote).trim(), "high"
+      );
+      const r = results[it.index];
+      r.result = dryRun ? "would_apply" : "applied";
+      r.warnings.push(...warnings);
+      r.column_changes = changes;
+      if (!dryRun) r.correction_id = correctionId;
+    }
+
+    // fylke_mismatch: the kommune's SSB fylke vs the row's fylke AFTER every
+    // item of this request (so a fylke item in the same request counts,
+    // whichever order it came in). Reported, never auto-changed.
+    for (const { it, fylke } of kommuneImplied) {
+      const r = results[it.index];
+      if (r.result === "rejected") continue;
+      const after = loadRow(it.id);
+      const rowFylke = after?.fylke ?? null;
+      if (expDcFylkeKey(rowFylke ?? "") !== expDcFylkeKey(fylke)) {
+        r.warnings.push({ code: "fylke_mismatch", implied_fylke: fylke, row_fylke: rowFylke });
+      }
+    }
+
+    // Publish-state flips (e.g. a relink to a provider that is not
+    // brreg_active=1 takes the row off the public catalog).
+    const touched = [...new Set(results.filter((r) => r.result !== "rejected").map((r) => r.id))];
+    const after = loadRows(touched);
+    for (const id of touched) {
+      const before = Number(original.get(id)?.expdc_published) === 1;
+      const now = Number(after.get(id)?.expdc_published) === 1;
+      if (before !== now) {
+        for (const r of results) {
+          if (r.id === id && r.result !== "rejected") {
+            r.warnings.push({ code: now ? "published_after_correction" : "unpublished_after_correction" });
+          }
+        }
+      }
+    }
+
+    if (dryRun) throw new ExpDcDryRunRollback();
+  });
+  try {
+    tx();
+  } catch (err) {
+    if (!(err instanceof ExpDcDryRunRollback)) throw err;
+  }
+
+  const totals = { items: results.length, would_apply: 0, applied: 0, rejected: 0, warnings: 0 };
+  for (const r of results) {
+    totals[r.result]++;
+    totals.warnings += r.warnings.length;
+  }
+  console.log(
+    `[${opts.logTag ?? "experiences-data-corrections"}] dry_run=${dryRun} batch=${dryRun ? "-" : batchId} ` +
+      results.map((r) => `${r.id}.${r.field}=${r.result}${r.reason ? ":" + r.reason : ""}`).join(" ")
+  );
+  return { ok: true, dry_run: dryRun, batch_id: dryRun ? null : batchId, batch_label: batchLabel, totals, results };
+}
+
+export type ExpDcRevertItemResult = {
+  correction_id: string;
+  experience_id: string | null;
+  field: string | null;
+  result: "would_revert" | "reverted" | "rejected";
+  reason?: string;
+  detail?: string;
+  warnings: ExpDcWarning[];
+};
+
+export type ExperienceDataCorrectionsRevertResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      dry_run: boolean;
+      revert_batch_id: string | null;
+      totals: { items: number; would_revert: number; reverted: number; rejected: number };
+      results: ExpDcRevertItemResult[];
+    };
+
+/**
+ * The core of POST /admin/experiences-data-corrections/revert: restores the
+ * recorded old values of the selected corrections (a whole `batch_id`, or
+ * explicit `correction_ids`, or both = intersection), newest first, each
+ * column only while it still holds the value the correction wrote — a
+ * correction with ANY column changed since is left alone (`changed_since`).
+ * A provider row a correction created is deleted once no experience links
+ * to it any more. One transaction; a dry run rolls back. Caller owns auth
+ * and the write-pause fence.
+ */
+export function revertExperienceDataCorrections(
+  db: ReturnType<typeof getExpDb>,
+  body: { batch_id?: unknown; correction_ids?: unknown },
+  opts: { dryRun: boolean; logTag?: string }
+): ExperienceDataCorrectionsRevertResult {
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() !== "" ? body.batch_id.trim() : null;
+  if (body.batch_id !== undefined && body.batch_id !== null && batchId === null) {
+    return { ok: false, error: "batch_id must be a non-empty string" };
+  }
+  let ids: string[] | null = null;
+  if (body.correction_ids !== undefined && body.correction_ids !== null) {
+    if (!Array.isArray(body.correction_ids) || body.correction_ids.length < 1 || body.correction_ids.length > EXP_DC_REVERT_MAX_IDS
+        || !body.correction_ids.every((x) => typeof x === "string" && x.trim() !== "")) {
+      return { ok: false, error: `correction_ids must be an array of 1..${EXP_DC_REVERT_MAX_IDS} non-empty strings` };
+    }
+    ids = [...new Set((body.correction_ids as string[]).map((x) => x.trim()))];
+  }
+  if (!batchId && !ids) return { ok: false, error: "batch_id or correction_ids is required" };
+
+  const { dryRun } = opts;
+  const revertBatchId = `data-corrections-revert-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID().slice(0, 8)}`;
+  const results: ExpDcRevertItemResult[] = [];
+
+  type AuditRow = { id: string; experience_id: string; field: string; column_changes: string; reverted_at: string | null };
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (batchId) { where.push("batch_id = ?"); params.push(batchId); }
+  if (ids) { where.push(`id IN (${ids.map(() => "?").join(",")})`); params.push(...ids); }
+
+  const readColumn = (table: string, id: string, column: string): { exists: boolean; v: unknown } => {
+    const allowed = table === "experiences" ? EXP_DC_EXPERIENCE_COLUMNS : table === "experience_providers" ? EXP_DC_PROVIDER_COLUMNS : null;
+    if (!allowed || !allowed.has(column)) throw new Error(`column not readable: ${table}.${column}`);
+    const r = db.prepare(`SELECT ${column} AS v FROM ${table} WHERE id = ?`).get(id) as { v: unknown } | undefined;
+    return r ? { exists: true, v: r.v } : { exists: false, v: undefined };
+  };
+
+  const tx = db.transaction(() => {
+    const rows = db.prepare(
+      `SELECT id, experience_id, field, column_changes, reverted_at FROM experience_data_corrections
+        WHERE ${where.join(" AND ")} ORDER BY rowid DESC`
+    ).all(...params) as AuditRow[];
+    if (ids) {
+      const found = new Set(rows.map((r) => r.id));
+      for (const id of ids) {
+        if (!found.has(id)) results.push({ correction_id: id, experience_id: null, field: null, result: "rejected", reason: "not_found", warnings: [] });
+      }
+    }
+    for (const a of rows) {
+      const res: ExpDcRevertItemResult = { correction_id: a.id, experience_id: a.experience_id, field: a.field, result: "rejected", warnings: [] };
+      results.push(res);
+      if (a.reverted_at) { res.reason = "already_reverted"; continue; }
+      let changes: ExpDcColumnChange[];
+      try {
+        changes = JSON.parse(a.column_changes) as ExpDcColumnChange[];
+        if (!Array.isArray(changes)) throw new Error("not an array");
+      } catch {
+        res.reason = "corrupt_audit_row";
+        continue;
+      }
+      // 1) Every column must still hold what the correction wrote.
+      let changedSince: string | null = null;
+      for (const c of changes) {
+        if ("op" in c) continue;
+        const cur = readColumn(c.table, c.row_id, c.column);
+        if (!cur.exists) { changedSince = `${c.table}.${c.column} row ${c.row_id} no longer exists`; break; }
+        if (c.json_key) {
+          const obj = expDcJsonObject(cur.v as string | null);
+          const v = obj && Object.prototype.hasOwnProperty.call(obj, c.json_key) ? obj[c.json_key] : null;
+          if (!obj || !expDcSameValue(v, c.new)) { changedSince = `${c.table}.${c.column}.${c.json_key}`; break; }
+        } else if (!expDcSameValue(cur.v, c.new)) {
+          changedSince = `${c.table}.${c.column}`;
+          break;
+        }
+      }
+      if (changedSince) { res.reason = "changed_since"; res.detail = changedSince; continue; }
+      // 2) Restore, newest change first.
+      for (const c of [...changes].reverse()) {
+        if ("op" in c) {
+          const refs = (db.prepare("SELECT COUNT(*) AS n FROM experiences WHERE provider_id = ?").get(c.row_id) as { n: number }).n;
+          if (refs === 0) {
+            db.prepare("DELETE FROM experience_providers WHERE id = ?").run(c.row_id);
+            res.warnings.push({ code: "created_provider_deleted", provider_id: c.row_id });
+          } else {
+            res.warnings.push({ code: "created_provider_kept", provider_id: c.row_id, linked_experiences: refs });
+          }
+          continue;
+        }
+        let value: unknown = c.old;
+        if (c.json_key) {
+          const obj = expDcJsonObject(readColumn(c.table, c.row_id, c.column).v as string | null) ?? {};
+          if (c.old === null || c.old === undefined) delete obj[c.json_key];
+          else obj[c.json_key] = c.old;
+          value = Object.keys(obj).length === 0 ? null : JSON.stringify(obj);
+        }
+        db.prepare(`UPDATE ${c.table} SET ${c.column} = ?, updated_at = datetime('now') WHERE id = ?`).run(value === undefined ? null : value, c.row_id);
+      }
+      db.prepare("UPDATE experiences SET updated_at = datetime('now') WHERE id = ?").run(a.experience_id);
+      db.prepare("UPDATE experience_data_corrections SET reverted_at = datetime('now'), revert_batch_id = ? WHERE id = ?")
+        .run(revertBatchId, a.id);
+      res.result = dryRun ? "would_revert" : "reverted";
+    }
+    if (dryRun) throw new ExpDcDryRunRollback();
+  });
+  try {
+    tx();
+  } catch (err) {
+    if (!(err instanceof ExpDcDryRunRollback)) throw err;
+  }
+
+  const totals = { items: results.length, would_revert: 0, reverted: 0, rejected: 0 };
+  for (const r of results) totals[r.result]++;
+  console.log(
+    `[${opts.logTag ?? "experiences-data-corrections-revert"}] dry_run=${dryRun} ` +
+      results.map((r) => `${r.correction_id}=${r.result}${r.reason ? ":" + r.reason : ""}`).join(" ")
+  );
+  return { ok: true, dry_run: dryRun, revert_batch_id: dryRun ? null : revertBatchId, totals, results };
+}
+
+router.post("/admin/experiences-data-corrections", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown; batch_label?: unknown };
+  // STRICT-FALSE parse — only the JSON boolean false writes.
+  const dryRun = body.dry_run !== false;
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+  const out = applyExperienceDataCorrections(getExpDb("experiences"), body, { dryRun });
+  if (!out.ok) {
+    res.status(400).json({ error: out.error });
+    return;
+  }
+  const { ok: _ok, ...payload } = out;
+  res.json({ success: true, ...payload });
+});
+
+router.post("/admin/experiences-data-corrections/revert", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; batch_id?: unknown; correction_ids?: unknown };
+  const dryRun = body.dry_run !== false;
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+  const out = revertExperienceDataCorrections(getExpDb("experiences"), body, { dryRun });
+  if (!out.ok) {
+    res.status(400).json({ error: out.error });
+    return;
+  }
+  const { ok: _ok, ...payload } = out;
+  res.json({ success: true, ...payload });
+});
+
 // dev-request 2026-10-07-experiences-beskrivelser-forslagsko-steg2: read-
 // only status of the server-side proposals job — whether it is enabled,
 // whether a GitHub token is configured (bool only, never the value) and the

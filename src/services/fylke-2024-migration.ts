@@ -206,3 +206,37 @@ export function resolveKommunenummerForName(kommune: string): ResolveKommunenumm
   if (matches.length === 1) return { kommunenummer: matches[0].kommunenummer };
   return { needs_review: `ambiguous_or_unknown_kommune:${value}` };
 }
+
+/**
+ * findKommune2024Matches(name) — every vendored-table row whose kommune name
+ * matches `name` under the SAME kommuneKey()/KOMMUNE_NAME_ALIASES fold the
+ * two resolvers above use. Unlike resolveFylke2024() it returns ALL matches
+ * (0, 1 or — for the genuine Herøy/Våler name collisions — 2), so a caller
+ * that has its own disambiguating evidence (an explicit fylke) can pick one;
+ * it never picks itself. Rows come back verbatim (kommunenavn keeps the
+ * table's " (<fylke>)" disambiguator). Pure, no DB access.
+ *
+ * Added for POST /admin/experiences-data-corrections (routes/opplevelser.ts),
+ * which validates a corrected `kommune` against this table.
+ */
+export function findKommune2024Matches(name: string): KommuneFylke2024Row[] {
+  const value = typeof name === "string" ? name.trim() : "";
+  if (!value) return [];
+  let qKey = kommuneKey(value);
+  if (!qKey) return [];
+  if (qKey in KOMMUNE_NAME_ALIASES) qKey = KOMMUNE_NAME_ALIASES[qKey];
+  return loadRows().filter((r) => r && typeof r.kommunenavn === "string" && kommuneKey(r.kommunenavn) === qKey);
+}
+
+/** The table's own kommune name with its " (<fylke>)" disambiguator removed
+ *  ("Herøy (Nordland)" -> "Herøy"). Exported alongside
+ *  findKommune2024Matches() for the same caller. */
+export function kommune2024DisplayName(kommunenavn: string): string {
+  return stripKommuneDisambiguator(kommunenavn).trim();
+}
+
+/** True when `a` and `b` are the same kommune name under kommuneKey()'s fold
+ *  (case, æ/ø/å transliteration, punctuation, trailing disambiguator). */
+export function sameKommuneName(a: string, b: string): boolean {
+  return kommuneKey(a) !== "" && kommuneKey(a) === kommuneKey(b);
+}
