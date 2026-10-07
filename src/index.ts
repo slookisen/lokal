@@ -47,6 +47,7 @@ import { getPageViewHealthCounts } from "./services/health-counts";
 import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
 import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
+import { honestCatalogCounts } from "./services/honest-count";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
@@ -702,6 +703,10 @@ app.get("/health", (_req, res) => {
         totalAgents: stats.totalAgents,
         activeCities: stats.cities.length,
       },
+      // ONE catalog number per vertical (services/honest-count.ts) — identical to the
+      // count llms.txt, the agent card, mcp.json/server-card and /api/stats' honestCount
+      // quote. Legacy fields above keep their documented meaning.
+      catalog: honestCatalogCounts(),
       // Numbers only here (public endpoint); per-stall request/job detail is
       // admin-only at GET /admin/analytics/ops/event-loop.
       eventLoop: getEventLoopSummary(),

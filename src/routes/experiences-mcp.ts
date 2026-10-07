@@ -535,7 +535,7 @@ function registerWidgetResource(
   );
 }
 
-function registerExperienceTools(
+export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
   getRequestMeta?: () => RequestMeta | undefined,

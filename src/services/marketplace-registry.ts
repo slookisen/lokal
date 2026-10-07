@@ -37,6 +37,8 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
 import { publicListableSql, isPubliclyListable } from "./agent-visibility";
+import { safeHonestCatalogCount } from "./honest-count";
+import { registeredMcpTools } from "./mcp-tool-manifest";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1104,7 +1106,11 @@ class MarketplaceRegistry {
   // ─── Registry-level Agent Card (Lokal itself) ──────────────
 
   getRegistryCard(baseUrl: string): object {
-    const stats = this.getStats();
+    // ONE catalog number (services/honest-count.ts) on every discovery surface;
+    // falls back to the legacy raw count only if the honest query is unavailable.
+    const rawStats = this.getStats();
+    const honestCount = safeHonestCatalogCount("rfb");
+    const stats = { ...rawStats, totalAgents: honestCount ?? rawStats.totalAgents };
     return {
       // ─── A2A spec-compliant fields ─────────────────────────
       // WHY bilingual: Consumer agents (Claude, GPT, Gemini, etc.)
@@ -1225,7 +1231,7 @@ class MarketplaceRegistry {
           name: "Register Food Producer Agent / Registrer matagent",
           description: "Register a new food producer, farm, shop, or cooperative as an agent in the Rett fra Bonden marketplace. " +
             "Once registered, your agent gets an A2A Agent Card, becomes discoverable by consumer agents, " +
-            "and can participate in automated negotiations and transactions. " +
+            "and can be found and contacted through the marketplace. " +
             "Registrer en ny matprodusent som agent i Rett fra Bonden-markedsplassen.",
           tags: [
             "register", "onboard", "producer", "farm", "shop", "cooperative",
@@ -1243,10 +1249,9 @@ class MarketplaceRegistry {
           name: "Search & Compare Local Food / Søk og sammenlign",
           description: "Natural language search across all producers. Compare prices, delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
-            "Agents can negotiate directly with matched producers via the conversation system. " +
             "Søk, sammenlign priser, leveringsalternativer og tilgjengelighet.",
           tags: [
-            "search", "compare", "price", "delivery", "availability", "negotiate",
+            "search", "compare", "price", "delivery", "availability",
             "søk", "sammenlign", "pris", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
@@ -1254,24 +1259,6 @@ class MarketplaceRegistry {
           examples: [
             "compare cheese prices in Oslo",
             "finn billig honning nær Trondheim",
-          ],
-        },
-        {
-          id: "agent-conversation",
-          name: "Start Agent Negotiation / Start forhandling",
-          description: "Initiate a buyer-seller conversation between agents. " +
-            "Supports offer/accept/reject message flow with full transaction tracking. " +
-            "Consumer agents can negotiate prices, quantities, and delivery terms. " +
-            "Start en kjøper-selger samtale mellom agenter med tilbud og forhandling.",
-          tags: [
-            "negotiate", "conversation", "order", "buy", "transaction",
-            "forhandling", "samtale", "bestilling", "kjøp", "handel",
-          ],
-          inputModes: ["application/json"],
-          outputModes: ["application/json"],
-          examples: [
-            "negotiate delivery of 5kg tomatoes",
-            "bestill 2kg ost med levering",
           ],
         },
       ],
@@ -1383,13 +1370,9 @@ class MarketplaceRegistry {
           status: "live",
           description: "Agenstry A2A agent directory — auto-indexed from agent-card.json. 1,750+ agents indexed; drift-monitored.",
         },
-        {
-          channel: "acp-product-feed",
-          url: `${baseUrl}/api/marketplace/catalog/acp-feed.csv`,
-          install: `${baseUrl}/api/marketplace/catalog/acp-feed.csv`,
-          status: "live",
-          description: "ACP-conformant (OpenAI Agentic Commerce Protocol, non-Ads) CSV product feed for ChatGPT Shopping discovery — RFB-only, discovery-only (no checkout).",
-        },
+        // acp-product-feed (/api/marketplace/catalog/acp-feed.csv) is deliberately NOT
+        // advertised here while the feed has 0 rows (dev-request 2026-09-08-discovery-
+        // paritet-og-ett-katalogtall, item 3); re-add it when it serves rows.
       ],
 
       // ─── Lokal-specific metadata ───────────────────────────
@@ -1402,6 +1385,9 @@ class MarketplaceRegistry {
           activeProducers: stats.activeProducers,
           cities: stats.cities,
         },
+        // Generated from the tools the live /mcp server registers
+        // (services/mcp-tool-manifest.ts); locked by discovery-truth.test.ts.
+        mcpTools: registeredMcpTools("rfb").map((t) => t.name),
         // Semantic categories for automated matching
         serviceCategories: [
           "food-marketplace", "local-commerce", "farm-direct",

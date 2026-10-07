@@ -1,3 +1,4 @@
+import { safeHonestCatalogCount } from "../services/honest-count";
 import { Router, Request, Response } from "express";
 import { agentCardService, store } from "../services";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
@@ -719,11 +720,19 @@ router.get("/api/stats", (req: Request, res: Response) => {
     statsVertical === "experiences" ? (require("../services/experience-store") as typeof import("../services/experience-store")).getExperiencesMarketplaceStats() :
     marketplaceRegistry.getStats();
 
+  // ONE catalog number per vertical (services/honest-count.ts) — the same value
+  // llms.txt, the agent card, mcp.json/server-card and /health quote. `registry.*`
+  // above keeps its documented legacy semantics (raw/active row counts) untouched.
+  const honestVertical = statsVertical ?? "rfb";
+  const honestCount = safeHonestCatalogCount(honestVertical);
+
   res.json({
     success: true,
     data: {
       ...legacyStats,
       registry: registryStats,
+      honestCount,
+      honestCountVertical: honestVertical,
     },
   });
 });
