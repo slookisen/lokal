@@ -1190,12 +1190,18 @@ function renderClinicProfile(
     : `${DENTAL_BASE_URL}/klinikk/id/${agent.id}`;
 
   // ── Header badges
+  // dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A): a
+  // permanently-closed clinic still renders (so inbound links don't 404) but
+  // shows a "Nedlagt" notice, no positive badges, and noindex.
+  const inactive = agent.is_inactive === 1;
   const badges: string[] = [];
-  if (agent.verification_status === "verified")
+  if (inactive)
+    badges.push(`<span class="badge" style="background:#FEE2E2;color:#7F1D1D;border:1px solid #FECACA">Nedlagt</span>`);
+  if (!inactive && agent.verification_status === "verified")
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
-  if (agent.helfo_agreement === "true")
+  if (!inactive && agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-direkteoppgjør</span>`);
-  if (agent.acute_vakt === 1)
+  if (!inactive && agent.acute_vakt === 1)
     badges.push(`<span class="badge badge-akutt">Akuttvakt</span>`);
   if (agent.chain_brand)
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
@@ -1467,7 +1473,12 @@ function renderClinicProfile(
   // Scaffolding only — no DB write from the CTA itself, just a mailto: link
   // a real owner can use; a future slice can turn this into a real claim flow.
   const thin = isThinDentalProfile(agent);
-  const thinProfileCta = thin
+  const inactiveNotice = inactive
+    ? `<div class="section-box" role="status" style="border:1px solid #FECACA;background:#FEF2F2">
+    <p style="font-size:.95rem;margin:0;color:#7F1D1D"><strong>Nedlagt.</strong> Denne klinikken er registrert som nedlagt og tar ikke lenger imot pasienter. Informasjonen under er historisk.</p>
+  </div>`
+    : "";
+  const thinProfileCta = thin && !inactive
     ? `<div class="section-box" style="border:1px solid #FDE68A;background:#FFFBEB">
     <p style="font-size:.95rem;margin:0;color:var(--g700)">
       Ufullstendig oppføring — er dette din klinikk?
@@ -1497,6 +1508,7 @@ function renderClinicProfile(
     </div>
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
+    ${inactiveNotice}
     ${thinProfileCta}
     ${omOssSection}
     ${keyInfoSection}
@@ -1515,7 +1527,7 @@ function renderClinicProfile(
   res.send(dentalShell(html, {
     title: `${profileTitleCore} | Finn-tannlege.com`,
     description: metaDesc,
-    ...(thin ? { robots: "noindex,follow" } : {}),
+    ...(thin || inactive ? { robots: "noindex,follow" } : {}),
     canonical,
     jsonLd: jsonLdArr,
   }));
@@ -2421,6 +2433,8 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     title: `Tannlege i ${escapeHtml(titledSted)} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
     canonical: canonicalUrl,
+    // skive A: a /sted page with 0 active clinics must never be indexable.
+    ...(total === 0 ? { robots: "noindex,follow" } : {}),
     jsonLd: [itemList, stedBreadcrumb],
   }));
 });

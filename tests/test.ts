@@ -35792,6 +35792,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental synthetic probe hidden: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A): nedlagte klinikker skjult ──");
+  try {
+    const { runDentalInactiveHiddenTests } = require("../src/routes/dental-inactive-hidden.test") as
+      typeof import("../src/routes/dental-inactive-hidden.test");
+    const dih = await runDentalInactiveHiddenTests({ log: false });
+    passed += dih.passed;
+    failed += dih.failed;
+    for (const f of dih.failures) failures.push("dental inactive hidden: " + f);
+    console.log(`  dental inactive hidden: ${dih.passed} passed, ${dih.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental inactive hidden: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
