@@ -156,17 +156,17 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
 
   try {
     // ── (1) 3 prior sends, 0 inbound -> suppressed (default threshold 3) ──
-    insertVerifiedPoolAgent("mt-suppressed", "MaxTouch Suppressed AS", "suppressed@mtv-test.no");
-    insertPriorContacts("mt-suppressed", "suppressed@mtv-test.no", 3, 100);
+    insertVerifiedPoolAgent("mt-suppressed", "MaxTouch Suppressed AS", "post@suppressed.mtv-test.no");
+    insertPriorContacts("mt-suppressed", "post@suppressed.mtv-test.no", 3, 100);
 
     // ── (2) 3 prior sends, 1 inbound reply -> NOT suppressed (reply lifts it) ──
-    insertVerifiedPoolAgent("mt-replied", "MaxTouch Replied AS", "replied@mtv-test.no");
-    insertPriorContacts("mt-replied", "replied@mtv-test.no", 3, 100);
-    insertInboundReply("mt-replied", "replied@mtv-test.no");
+    insertVerifiedPoolAgent("mt-replied", "MaxTouch Replied AS", "post@replied.mtv-test.no");
+    insertPriorContacts("mt-replied", "post@replied.mtv-test.no", 3, 100);
+    insertInboundReply("mt-replied", "post@replied.mtv-test.no");
 
     // ── (3) 2 prior sends (below threshold), 0 inbound -> NOT suppressed ──
-    insertVerifiedPoolAgent("mt-below", "MaxTouch Below AS", "below@mtv-test.no");
-    insertPriorContacts("mt-below", "below@mtv-test.no", 2, 100);
+    insertVerifiedPoolAgent("mt-below", "MaxTouch Below AS", "post@below.mtv-test.no");
+    insertPriorContacts("mt-below", "post@below.mtv-test.no", 2, 100);
 
     // ══ pure classifier boundary check (unambiguous, no other suppression
     // bucket in the way): 3 sends + 1 inbound reply -> NOT suppressed. ══════
@@ -205,11 +205,11 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
     const emails1 = (res1.body?.candidates || []).map((c: any) => c.email.toLowerCase());
 
     assertEq(
-      emails1.includes("suppressed@mtv-test.no"),
+      emails1.includes("post@suppressed.mtv-test.no"),
       false,
       "1b: 3 prior sends + 0 inbound -> excluded from mode=second candidates",
     );
-    // NOTE: replied@mtv-test.no is excluded from `candidates` regardless of
+    // NOTE: post@replied.mtv-test.no is excluded from `candidates` regardless of
     // max-touch-vern — this gate ALSO has a pre-existing, independent
     // suppressedForReplied bucket (row.has_replied) that excludes any address
     // with an inbound message, for a different reason (a replied producer is
@@ -220,7 +220,7 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
     // never double-counted or mis-reasoned as "max_touch_suppressed".
     const maxTouchEmails = (res1.body?.max_touch_suppressed?.producers || []).map((p: any) => p.email.toLowerCase());
     assertEq(
-      maxTouchEmails.includes("replied@mtv-test.no"),
+      maxTouchEmails.includes("post@replied.mtv-test.no"),
       false,
       "2a: 3 prior sends + 1 inbound reply -> NOT attributed to max_touch_suppressed (reply lifts THAT suppression; " +
         "it is excluded for the separate, pre-existing 'replied' reason instead — see suppressed_counts.replied)",
@@ -228,10 +228,10 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
     assertEq(
       (res1.body?.suppressed_counts?.replied ?? 0) >= 1,
       true,
-      "2b: suppressed_counts.replied reflects the replied@mtv-test.no catch (the actual, unrelated reason)",
+      "2b: suppressed_counts.replied reflects the post@replied.mtv-test.no catch (the actual, unrelated reason)",
     );
     assertEq(
-      emails1.includes("below@mtv-test.no"),
+      emails1.includes("post@below.mtv-test.no"),
       true,
       "3a: 2 prior sends (below threshold 3) -> NOT suppressed, stays a candidate",
     );
@@ -248,18 +248,18 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
       "1d: max_touch_suppressed.count === 1",
     );
     const producer1 = (res1.body?.max_touch_suppressed?.producers || [])[0];
-    assertEq(producer1?.email, "suppressed@mtv-test.no", "1e: max_touch_suppressed.producers names the address");
+    assertEq(producer1?.email, "post@suppressed.mtv-test.no", "1e: max_touch_suppressed.producers names the address");
     assertEq(producer1?.reason, "max_touch_suppressed", "1f: producer entry carries reason:max_touch_suppressed");
     assertEq(producer1?.send_count, 3, "1g: producer entry carries send_count:3");
     assertEq(producer1?.threshold, 3, "1h: producer entry carries threshold:3");
 
     // ══ (4) mode=first completely unaffected ══════════════════════════════
-    insertVerifiedPoolAgent("mt-firsttouch", "MaxTouch First Touch AS", "firsttouch@mtv-test.no");
+    insertVerifiedPoolAgent("mt-firsttouch", "MaxTouch First Touch AS", "post@firsttouch.mtv-test.no");
     const res1First = callRouteSync(candidatesRouter, { query: { mode: "first" }, headers: auth });
     assertEq(res1First.status, 200, "4a: GET mode=first -> 200");
     const firstEmails = (res1First.body?.candidates || []).map((c: any) => c.email.toLowerCase());
     assertEq(
-      firstEmails.includes("firsttouch@mtv-test.no"),
+      firstEmails.includes("post@firsttouch.mtv-test.no"),
       true,
       "4b: a never-contacted agent is unaffected by max-touch-vern in mode=first",
     );
@@ -284,7 +284,7 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
     });
     const emails2 = (res2.body?.candidates || []).map((c: any) => c.email.toLowerCase());
     assertEq(
-      emails2.includes("below@mtv-test.no"),
+      emails2.includes("post@below.mtv-test.no"),
       false,
       "5c: with threshold lowered to 2, the 2-prior-sends address is NOW suppressed — SAME process, no restart",
     );
@@ -304,7 +304,7 @@ export function runAdminOutreachCandidatesMaxTouchVernTests(opts: { log?: boolea
     });
     const emails3 = (res3.body?.candidates || []).map((c: any) => c.email.toLowerCase());
     assertEq(
-      emails3.includes("suppressed@mtv-test.no"),
+      emails3.includes("post@suppressed.mtv-test.no"),
       true,
       "6c: with the gate disabled, even the 3-prior-sends/0-inbound address stays a candidate",
     );

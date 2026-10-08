@@ -100,32 +100,32 @@ export function runAdminOutreachCandidatesMode2OrderingTests(opts: { log?: boole
   try {
     // Three eligible second-touch producers, all contacted >60d ago, at DIFFERENT
     // times: A longest ago (133d), B (102d), C most-recent-but-still->60d (72d).
-    insertVerifiedPoolAgent("oa-A", "Prod A eldst", "a@prod-test.no");
-    insertPriorContact("oa-A", "a@prod-test.no", 133);
-    insertVerifiedPoolAgent("oa-B", "Prod B midt", "b@prod-test.no");
-    insertPriorContact("oa-B", "b@prod-test.no", 102);
-    insertVerifiedPoolAgent("oa-C", "Prod C nyest", "c@prod-test.no");
-    insertPriorContact("oa-C", "c@prod-test.no", 72);
+    insertVerifiedPoolAgent("oa-A", "Prod A eldst", "post@a.prod-test.no");
+    insertPriorContact("oa-A", "post@a.prod-test.no", 133);
+    insertVerifiedPoolAgent("oa-B", "Prod B midt", "post@b.prod-test.no");
+    insertPriorContact("oa-B", "post@b.prod-test.no", 102);
+    insertVerifiedPoolAgent("oa-C", "Prod C nyest", "post@c.prod-test.no");
+    insertPriorContact("oa-C", "post@c.prod-test.no", 72);
 
     // A blocklisted producer, old contact — must be EXCLUDED despite being overdue.
-    insertVerifiedPoolAgent("oa-BL", "Prod Blocklisted", "blocked@prod-test.no");
-    insertPriorContact("oa-BL", "blocked@prod-test.no", 150);
+    insertVerifiedPoolAgent("oa-BL", "Prod Blocklisted", "post@blocked.prod-test.no");
+    insertPriorContact("oa-BL", "post@blocked.prod-test.no", 150);
     db.prepare(`
       INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-      VALUES ('email', 'blocked@prod-test.no', 'test: blocklist mode=second ordering')
+      VALUES ('email', 'post@blocked.prod-test.no', 'test: blocklist mode=second ordering')
     `).run();
 
     // A producer who already REPLIED, old contact — must be EXCLUDED.
-    insertVerifiedPoolAgent("oa-RE", "Prod Replied", "replied@prod-test.no");
-    insertPriorContact("oa-RE", "replied@prod-test.no", 150);
+    insertVerifiedPoolAgent("oa-RE", "Prod Replied", "post@replied.prod-test.no");
+    insertPriorContact("oa-RE", "post@replied.prod-test.no", 150);
     db.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name) VALUES (?,?,?,?,?)`)
-      .run("c-RE", "producer", "oa-RE", "replied@prod-test.no", "Prod Replied");
+      .run("c-RE", "producer", "oa-RE", "post@replied.prod-test.no", "Prod Replied");
     db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, status, assigned_to) VALUES (?,?,?,?,?,?)`)
       .run("thread-RE", "c-RE", "Svar", "innkommende", "in_progress", "claude");
     db.prepare(`
       INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, subject, body_text, received_at, delivery_status)
       VALUES (?,?,?,?,?,?,?,?,?)
-    `).run("m-RE-in", "thread-RE", "in", "replied@prod-test.no", JSON.stringify(["kontakt@rettfrabonden.com"]),
+    `).run("m-RE-in", "thread-RE", "in", "post@replied.prod-test.no", JSON.stringify(["kontakt@rettfrabonden.com"]),
            "Svar", "hei", "2026-05-01T00:00:00Z", "sent");
 
     const router = require("./admin-outreach-candidates").default;
@@ -135,13 +135,13 @@ export function runAdminOutreachCandidatesMode2OrderingTests(opts: { log?: boole
 
     const emails = (res.body?.candidates || []).map((c: any) => c.email.toLowerCase());
     // (1) THE ordering: oldest-contacted first → A (133d), B (102d), C (72d).
-    assertEq(emails, ["a@prod-test.no", "b@prod-test.no", "c@prod-test.no"],
+    assertEq(emails, ["post@a.prod-test.no", "post@b.prod-test.no", "post@c.prod-test.no"],
       "mode2-ordering: candidates ordered oldest-last-contact first (A→B→C)");
 
     // (3) Suppressions untouched: blocklisted + replied excluded despite being overdue.
-    assertEq(emails.includes("blocked@prod-test.no"), false,
+    assertEq(emails.includes("post@blocked.prod-test.no"), false,
       "mode2-ordering: blocklisted producer excluded (suppression unchanged by ordering)");
-    assertEq(emails.includes("replied@prod-test.no"), false,
+    assertEq(emails.includes("post@replied.prod-test.no"), false,
       "mode2-ordering: already-replied producer excluded (suppression unchanged by ordering)");
     assertEq(res.body?.suppressed_counts?.blocklisted >= 1, true,
       "mode2-ordering: suppressed_counts.blocklisted reflects the blocklist catch");
@@ -151,7 +151,7 @@ export function runAdminOutreachCandidatesMode2OrderingTests(opts: { log?: boole
     // (2) limit cap respects the order — top-1 is the oldest (A).
     const resCap = callRouteSync(router, { query: { mode: "second", cooldown_days: "60", limit: "1" }, headers: { "x-admin-key": testKey } });
     const capEmails = (resCap.body?.candidates || []).map((c: any) => c.email.toLowerCase());
-    assertEq(capEmails, ["a@prod-test.no"],
+    assertEq(capEmails, ["post@a.prod-test.no"],
       "mode2-ordering: a limit=1 batch returns the SINGLE most-overdue producer (A)");
   } catch (err) {
     failed++;

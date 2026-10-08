@@ -161,6 +161,7 @@ import {
   selectHomepageContentRefreshTargetsByIds,
 } from "../routes/admin-knowledge";
 import { slugify } from "../utils/slug";
+import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "./recipient-policy";
 import {
   RFB_OUTREACH_TEMPLATE_ID,
   isValidRfbProfileUrl,
@@ -1741,6 +1742,10 @@ async function runRfbMarketingDailyGuarded(opts: {
     const email = String(cand.email ?? "").trim().toLowerCase();
     const row: RfbMarketingResultRow = { agent_id: cand.agent_id, name: cand.name, recipient_email: email, touch, status: "skipped" };
     if (!email || seenEmails.has(email)) return { kind: "skip", row: { ...row, reason: "duplicate_email_in_run" } };
+    // mfl. § 15 recipient policy (dev-request 2026-10-06-mottakerpolicy-kald-
+    // utsending-mfl-15): the gate already filters, this is the fail-closed
+    // backstop. A skip row: no reservation, no compose, no budget, no touch.
+    if (!isColdRecipientAllowed(email)) return { kind: "skip", row: { ...row, reason: PERSONAL_ADDRESS_REASON } };
     seenEmails.add(email);
     const ledgerBlock = ledgerBlocksRecipient(db, email, cand.agent_id, now, cooldownDays);
     if (ledgerBlock) return { kind: "skip", row: { ...row, reason: ledgerBlock } };

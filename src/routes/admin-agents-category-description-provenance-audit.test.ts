@@ -345,14 +345,14 @@ export async function runAdminAgentsCategoryDescriptionProvenanceAuditTests(
     insertPoolEligibleAgent({
       id: "soli-brug-pool",
       name: "Soli Brug Pool",
-      email: "soli@prod-test.no",
+      email: "post@soli.prod-test.no",
       categories: ["fish"],
       // no field_provenance.categories at all — the real-world NACE-seeded shape
     });
     insertPoolEligibleAgent({
       id: "corroborated-pool",
       name: "Korrobert Gård",
-      email: "korrobert@prod-test.no",
+      email: "post@korrobert.prod-test.no",
       categories: ["vegetables"],
       fieldProvenance: {
         categories: [{ value: "vegetables", source_type: "website_homepage", fetched_at: "2026-01-01" }],
@@ -361,7 +361,7 @@ export async function runAdminAgentsCategoryDescriptionProvenanceAuditTests(
     insertPoolEligibleAgent({
       id: "no-categories-pool",
       name: "Ingen Kategori Gård",
-      email: "ingenkat@prod-test.no",
+      email: "post@ingenkat.prod-test.no",
       categories: [],
     });
 

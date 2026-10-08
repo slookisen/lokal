@@ -384,8 +384,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (b) G1 — env switch ────────────────────────────────────────────────
     freshDb();
-    seedProducer("p-a", "Alfa Gård", "alfa@gard-test.no");
-    seedProducer("p-b", "Beta Gård", "beta@gard-test.no");
+    seedProducer("p-a", "Alfa Gård", "post@alfa.gard-test.no");
+    seedProducer("p-b", "Beta Gård", "post@beta.gard-test.no");
     setEnv({ RFB_MARKETING_DAILY_CAP: "5" });
     {
       const t = makeTransport();
@@ -472,8 +472,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // Haugerud Gård (Regenerativt): the canonical-url addendum's å example.
     seedProducer("f-0000-000a", "Haugerud Gård (Regenerativt)", "post@haugerud-test.no");
     seedProducer("f-0000-000b", "Bakke Honning", "Post@Bakke-Test.no");
-    seedProducer("s-0000-0001", "Gammel Gård", "gammel@gard-test.no", { secondTouchDaysAgo: 120 });
-    seedProducer("s-0000-0002", "Nyere Gård", "nyere@gard-test.no", { secondTouchDaysAgo: 80 });
+    seedProducer("s-0000-0001", "Gammel Gård", "post@gammel.gard-test.no", { secondTouchDaysAgo: 120 });
+    seedProducer("s-0000-0002", "Nyere Gård", "post@nyere.gard-test.no", { secondTouchDaysAgo: 80 });
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     const eTransport = makeTransport();
     const eNow = new Date();
@@ -484,7 +484,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.summary.sent, r.summary.first_touch_sent, r.summary.second_touch_sent], [3, 2, 1], "e3: 3 sent — both first-touch, then the oldest second-touch");
       assertEq(
         eTransport.calls.map((c) => c.to),
-        ["post@haugerud-test.no", "Post@Bakke-Test.no", "gammel@gard-test.no"],
+        ["post@haugerud-test.no", "Post@Bakke-Test.no", "post@gammel.gard-test.no"],
         "e4: order: first-touch (gate order), then second-touch oldest-contacted-first",
       );
       const hauge = tmpl.renderRfbOutreachEmail({
@@ -507,12 +507,12 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         [
           ["post@haugerud-test.no", "sent", "first"],
           ["post@bakke-test.no", "sent", "first"],
-          ["gammel@gard-test.no", "sent", "second"],
+          ["post@gammel.gard-test.no", "sent", "second"],
         ],
         "e13: one ledger row per send, reserved then flipped to sent",
       );
       assertEq(
-        [oslFor("post@haugerud-test.no"), oslFor("post@bakke-test.no"), oslFor("gammel@gard-test.no"), oslFor("nyere@gard-test.no")],
+        [oslFor("post@haugerud-test.no"), oslFor("post@bakke-test.no"), oslFor("post@gammel.gard-test.no"), oslFor("post@nyere.gard-test.no")],
         [1, 1, 1, 0],
         "e14: outreach_sent_log recorded each send (compose's queued→sent trigger), nothing else",
       );
@@ -543,7 +543,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
       const r3 = await run(true, { transport: eTransport });
       assertEq([r3.sent_today_before, r3.budget, r3.summary.sent], [3, 2, 1], "f4: cap raised to 5 → only the one remaining candidate is sent");
-      assertEq(eTransport.calls[3].to, "nyere@gard-test.no", "f5: the remaining second-touch candidate");
+      assertEq(eTransport.calls[3].to, "post@nyere.gard-test.no", "f5: the remaining second-touch candidate");
       const perRecipient = new Map<string, number>();
       for (const c of eTransport.calls) perRecipient.set(String(c.to).toLowerCase(), (perRecipient.get(String(c.to).toLowerCase()) ?? 0) + 1);
       assertEq([...perRecipient.values()].every((n) => n === 1), true, "f6: no recipient ever received two e-mails");
@@ -552,34 +552,74 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
       // A crash between reservation and outcome leaves 'reserved': it counts as
       // sent for the budget and blocks that address on later days too.
-      seedProducer("n-0000-0001", "Krasj Gård", "krasj@gard-test.no");
+      seedProducer("n-0000-0001", "Krasj Gård", "post@krasj.gard-test.no");
       db.prepare(
         `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
-         VALUES (?, 'run-crashed', 'n-0000-0001', 'krasj@gard-test.no', 'first', 'B', 'reserved', ?)`,
+         VALUES (?, 'run-crashed', 'n-0000-0001', 'post@krasj.gard-test.no', 'first', 'B', 'reserved', ?)`,
       ).run(day(new Date()), new Date().toISOString());
       const r5 = await run(true, { transport: eTransport });
       assertEq([r5.skipped_reason, r5.sent_today_before], ["daily_cap_already_sent", 5], "f8: a crash-left 'reserved' row counts toward today's cap");
       // N-A: r5's start-of-run sweep already wrote the crash-left row into
       // outreach_sent_log, so from here on every reader counts it as a contact.
       assertEq(
-        [r5.sent_log_reconciliation?.inserted, reconciledFor("krasj@gard-test.no").map((x) => [x.notes, x.vertical_id])],
+        [r5.sent_log_reconciliation?.inserted, reconciledFor("post@krasj.gard-test.no").map((x) => [x.notes, x.vertical_id])],
         [1, [["rfb-marketing-platform:reserved_outcome_unknown", "rfb"]]],
         "f8b: the crash-left 'reserved' row is reconciled into outreach_sent_log at the start of the next run",
       );
       const r6 = await run(true, { transport: eTransport, now: tomorrow() });
       const krasj = r6.results.find((x) => x.agent_id === "n-0000-0001");
       assertEq(
-        [krasj, r6.sent_log_reconciliation?.inserted, reconciledFor("krasj@gard-test.no").length],
+        [krasj, r6.sent_log_reconciliation?.inserted, reconciledFor("post@krasj.gard-test.no").length],
         [undefined, 0, 1],
         "f9: next day the reserved address is no longer even a candidate (gate sees the reconciled row); the sweep is idempotent",
       );
-      assertEq(eTransport.calls.some((c) => c.to === "krasj@gard-test.no"), false, "f10: never e-mailed");
+      assertEq(eTransport.calls.some((c) => c.to === "post@krasj.gard-test.no"), false, "f10: never e-mailed");
+    }
+
+    // ── (e2) mottakerpolicy (mfl. § 15): personal addresses are held back ──
+    // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15. Cold mail
+    // only to GENERAL role addresses; a held row is not reserved, not sent and
+    // consumes no touch. Free-mail is never general, even with a generic name.
+    freshDb();
+    seedProducer("pa-1", "Generell Gård", "post@pa-general.gard-test.no");
+    seedProducer("pa-2", "Personlig Gård", "ola.nordmann@pa-personal.gard-test.no");
+    seedProducer("pa-3", "Gmail Gård", "kontakt@gmail.com");
+    seedProducer("pa-4", "Generell Andre Gård", "post@pa-second.gard-test.no", { secondTouchDaysAgo: 120 });
+    seedProducer("pa-5", "Personlig Andre Gård", "kari@pa-second2.gard-test.no", { secondTouchDaysAgo: 120 });
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "10" });
+    {
+      const dry = await run(false, { transport: makeTransport() });
+      assertEq(
+        dry.results.map((x) => [x.agent_id, x.touch, x.status]),
+        [["pa-1", "first", "would_send"], ["pa-4", "second", "would_send"]],
+        "pa1: dry run lists only the general addresses (first and second touch)",
+      );
+      assertEq((dry.gate?.first?.suppressed_counts as any)?.personal_address, 2, "pa2: first-touch gate counts the 2 held addresses (personal + free-mail) in suppressed_counts.personal_address");
+      assertTrue(((dry.gate?.second?.suppressed_counts as any)?.personal_address ?? 0) >= 1, "pa3: second-touch gate counts held addresses too");
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq(t.calls.map((c) => c.to), ["post@pa-general.gard-test.no", "post@pa-second.gard-test.no"], "pa4: apply mails only the general addresses");
+      assertEq(
+        [r.summary.sent, r.summary.first_touch_sent, r.summary.second_touch_sent],
+        [2, 1, 1],
+        "pa5: general first and second touch both still go out",
+      );
+      assertEq(
+        ledger().map((l) => l.recipient_email).sort(),
+        ["post@pa-general.gard-test.no", "post@pa-second.gard-test.no"],
+        "pa6: held addresses get no ledger row (no reservation, no touch consumed)",
+      );
+      assertEq(
+        [oslFor("ola.nordmann@pa-personal.gard-test.no"), oslFor("kontakt@gmail.com"), oslFor("kari@pa-second2.gard-test.no")],
+        [0, 0, 0],
+        "pa7: no outreach_sent_log row for a held address",
+      );
     }
 
     // ── (g) reserve-before-send fails closed ───────────────────────────────
     freshDb();
-    seedProducer("g-1", "Første Gård", "first@gard-test.no");
-    seedProducer("g-2", "Andre Gård", "second@gard-test.no");
+    seedProducer("g-1", "Første Gård", "post@first.gard-test.no");
+    seedProducer("g-2", "Andre Gård", "post@second.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     db.exec(`CREATE TRIGGER t_ledger_insert_fails BEFORE INSERT ON rfb_marketing_send_ledger
              BEGIN SELECT RAISE(ABORT, 'simulated disk full'); END;`);
@@ -599,8 +639,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (h) the 2026-09-27 gårdssalg bug class is NOT copied ───────────────
     freshDb();
-    seedProducer("h-1", "Disk Gård", "disk@gard-test.no");
-    seedProducer("h-2", "Neste Gård", "neste@gard-test.no");
+    seedProducer("h-1", "Disk Gård", "post@disk.gard-test.no");
+    seedProducer("h-2", "Neste Gård", "post@neste.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     db.exec(`CREATE TRIGGER t_sent_flip_fails BEFORE UPDATE OF delivery_status ON crm_messages
              WHEN NEW.delivery_status = 'sent'
@@ -612,9 +652,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.results[0].status, typeof r.results[0].post_send_error], ["sent", "string"], "h2: reported as SENT with the post-send error");
       assertEq(r.stopped_reason, "post_send_record_failed", "h3: run stops on a failed post-send write");
       assertEq(ledger().map((l) => l.status), ["sent"], "h4: the job's own ledger knows it was sent");
-      assertEq(oslFor("disk@gard-test.no"), 0, "h5: compose's trigger never wrote its row (the exact 2026-09-27 gap)…");
+      assertEq(oslFor("post@disk.gard-test.no"), 0, "h5: compose's trigger never wrote its row (the exact 2026-09-27 gap)…");
       assertEq(
-        [r.results[0].sent_log_reconciled, reconciledFor("disk@gard-test.no").map((x) => [x.agent_id, x.notes, x.vertical_id, x.channel])],
+        [r.results[0].sent_log_reconciled, reconciledFor("post@disk.gard-test.no").map((x) => [x.agent_id, x.notes, x.vertical_id, x.channel])],
         ["inserted", [["h-1", "rfb-marketing-platform:post_send_reconciled", "rfb", "email"]]],
         "h5c: …so the job reconciled it into outreach_sent_log at finalize time (N-A)",
       );
@@ -622,7 +662,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       db.exec(`DROP TRIGGER t_sent_flip_fails`);
       const gateAgain = aoc.computeOutreachCandidates(db, { mode: "first", cooldownDays: 60, limit: 100 });
       assertEq(
-        gateAgain.candidates.some((c) => c.email === "disk@gard-test.no"),
+        gateAgain.candidates.some((c) => c.email === "post@disk.gard-test.no"),
         false,
         "h6: the gate alone no longer selects the address (before N-A it did — only the ledger kept it out)",
       );
@@ -632,14 +672,14 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         [undefined, 0],
         "h7: next day it is not a candidate at all; nothing left to reconcile",
       );
-      assertEq(t.calls.filter((c) => c.to === "disk@gard-test.no").length, 1, "h8: the producer got exactly ONE e-mail");
-      assertEq(t.calls.filter((c) => c.to === "neste@gard-test.no").length, 1, "h9: the rest of the list still goes out");
+      assertEq(t.calls.filter((c) => c.to === "post@disk.gard-test.no").length, 1, "h8: the producer got exactly ONE e-mail");
+      assertEq(t.calls.filter((c) => c.to === "post@neste.gard-test.no").length, 1, "h9: the rest of the list still goes out");
     }
 
     // ── (i) ledger UPDATE fails after a send ───────────────────────────────
     freshDb();
-    seedProducer("i-1", "Ledger Gård", "ledger@gard-test.no");
-    seedProducer("i-2", "Etter Gård", "etter@gard-test.no");
+    seedProducer("i-1", "Ledger Gård", "post@ledger.gard-test.no");
+    seedProducer("i-2", "Etter Gård", "post@etter.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     db.exec(`CREATE TRIGGER t_ledger_update_fails BEFORE UPDATE ON rfb_marketing_send_ledger
              BEGIN SELECT RAISE(ABORT, 'simulated disk full'); END;`);
@@ -655,11 +695,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const again = await run(true, { transport: t });
       assertEq(again.sent_today_before, 1, "i5: the reserved row counts as today's send (not double-counted with its sent-log row)");
       assertEq(
-        [again.results.some((x) => x.agent_id === "i-1"), oslFor("ledger@gard-test.no")],
+        [again.results.some((x) => x.agent_id === "i-1"), oslFor("post@ledger.gard-test.no")],
         [false, 1],
         "i6: compose's own records (outreach_sent_log) keep it out of the gate — the ledger is a second, independent memory",
       );
-      assertEq(t.calls.map((c) => c.to), ["ledger@gard-test.no", "etter@gard-test.no"], "i7: only the other producer is sent on the retry");
+      assertEq(t.calls.map((c) => c.to), ["post@ledger.gard-test.no", "post@etter.gard-test.no"], "i7: only the other producer is sent on the retry");
     }
 
     // A transport failure AFTER the hand-off has an UNKNOWN outcome (the
@@ -667,8 +707,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // ONCE: the address counts as contacted — today's budget and the cooldown
     // block — it is never retried, and the run stops at the first such failure.
     freshDb();
-    seedProducer("i-3", "Feil Gård", "feil@gard-test.no");
-    seedProducer("i-4", "Frisk Gård", "frisk@gard-test.no");
+    seedProducer("i-3", "Feil Gård", "post@feil.gard-test.no");
+    seedProducer("i-4", "Frisk Gård", "post@frisk.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const failingCalls: string[] = [];
@@ -676,7 +716,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         calls: [] as Array<Record<string, any>>,
         sendRaw: async (o: any) => {
           failingCalls.push(o.to);
-          return o.to === "feil@gard-test.no"
+          return o.to === "post@feil.gard-test.no"
             ? { success: false, error: "smtp 451 try later" }
             : { success: true, messageId: "stub-frisk" };
         },
@@ -687,7 +727,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         [["i-3", "unknown", "transport_failed:smtp 451 try later", "unknown"]],
         "i8: a transport failure is an UNKNOWN delivery (never 'error'-and-retry, never 'sent')",
       );
-      assertEq([r.stopped_reason, failingCalls], ["transport_failed", ["feil@gard-test.no"]], "i9: the run stops at the first transport failure — the next address is not tried");
+      assertEq([r.stopped_reason, failingCalls], ["transport_failed", ["post@feil.gard-test.no"]], "i9: the run stops at the first transport failure — the next address is not tried");
       assertEq([ledger().map((l) => l.status), r.summary.unknown, r.summary.sent], [["unknown"], 1, 0], "i10: ledger 'unknown'; the summary counts it as unknown, not sent");
       const env = runsRows()[0];
       const unknownClaim = (JSON.parse(env.claims) as Array<any>).find((c) => c.meta?.kind === "rfb_marketing_unknown_delivery");
@@ -696,25 +736,25 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const same = await run(true, { transport: t });
       assertEq(same.sent_today_before, 1, "i12: the unknown delivery counts toward today's budget");
       assertEq(
-        [r.results[0].sent_log_reconciled, reconciledFor("feil@gard-test.no").map((x) => [x.agent_id, x.message_id.startsWith("rfb-ledger-"), x.notes])],
+        [r.results[0].sent_log_reconciled, reconciledFor("post@feil.gard-test.no").map((x) => [x.agent_id, x.message_id.startsWith("rfb-ledger-"), x.notes])],
         ["inserted", [["i-3", true, "rfb-marketing-platform:unknown_delivery"]]],
         "i12b: the unknown delivery is written into outreach_sent_log at finalize time (N-A)",
       );
       assertEq(same.results.find((x) => x.agent_id === "i-3"), undefined, "i13: no second attempt at the same address the same day (the gate no longer offers it)");
-      assertEq(t.calls.map((c) => c.to), ["frisk@gard-test.no"], "i14: the same-day rerun sends only the producer never tried");
+      assertEq(t.calls.map((c) => c.to), ["post@frisk.gard-test.no"], "i14: the same-day rerun sends only the producer never tried");
       const nextDay = await run(true, { transport: t, now: tomorrow() });
       assertEq(
         [nextDay.results.find((x) => x.agent_id === "i-3"), nextDay.skipped_reason],
         [undefined, "no_candidates"],
         "i15: next day the unknown address is not offered at all (outreach_sent_log) — not retried",
       );
-      assertEq(failingCalls.concat(t.calls.map((c) => c.to)), ["feil@gard-test.no", "frisk@gard-test.no"], "i16: feil@ was handed to the transport exactly once, ever");
+      assertEq(failingCalls.concat(t.calls.map((c) => c.to)), ["post@feil.gard-test.no", "post@frisk.gard-test.no"], "i16: feil@ was handed to the transport exactly once, ever");
     }
 
     // B1 regression: an AMBIGUOUS failure — the connection drops after DATA,
     // sendRaw throws — on day 1 → no e-mail to that address on day 2.
     freshDb();
-    seedProducer("v-1", "Tvil Gård", "tvil@gard-test.no");
+    seedProducer("v-1", "Tvil Gård", "post@tvil.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       const wire: string[] = [];
@@ -736,11 +776,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const t2 = makeTransport();
       const d2 = await run(true, { transport: t2, now: tomorrow() });
       assertEq(
-        [t2.calls.length, d2.results.find((x) => x.agent_id === "v-1"), reconciledFor("tvil@gard-test.no").length],
+        [t2.calls.length, d2.results.find((x) => x.agent_id === "v-1"), reconciledFor("post@tvil.gard-test.no").length],
         [0, undefined, 1],
         "i19: day 2 — no e-mail to that address (reconciled into outreach_sent_log on day 1)",
       );
-      assertEq(wire, ["tvil@gard-test.no"], "i20: exactly one hand-off to the transport, ever");
+      assertEq(wire, ["post@tvil.gard-test.no"], "i20: exactly one hand-off to the transport, ever");
     }
 
     // B2: a transport that keeps failing is tried ONCE per run — not once per
@@ -748,7 +788,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // it was handed stays blocked.
     freshDb();
     const b2Names = ["Aust", "Berg", "Dal", "Eng", "Fjell"];
-    b2Names.forEach((n, i) => seedProducer(`x-${i + 1}`, `${n} Gård`, `${n.toLowerCase()}@gard-test.no`));
+    b2Names.forEach((n, i) => seedProducer(`x-${i + 1}`, `${n} Gård`, `post@${n.toLowerCase()}.gard-test.no`));
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "10" });
     {
       const wire: string[] = [];
@@ -762,17 +802,17 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const r = await run(true, { transport: broken as any });
       assertEq([wire.length, r.compose_attempts, r.stopped_reason], [1, 1, "transport_failed"], "i21: five candidates, failing transport → exactly ONE attempt, then stop");
       assertEq(counts().crm_threads, 1, "i22: exactly one CRM thread (not one per candidate)");
-      assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["aust@gard-test.no", "unknown"]], "i23: one ledger row, 'unknown'");
+      assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["post@aust.gard-test.no", "unknown"]], "i23: one ledger row, 'unknown'");
       const t = makeTransport();
       const next = await run(true, { transport: t, now: tomorrow() });
       assertEq(
-        [next.results.find((x) => x.agent_id === "x-1"), reconciledFor("aust@gard-test.no").length],
+        [next.results.find((x) => x.agent_id === "x-1"), reconciledFor("post@aust.gard-test.no").length],
         [undefined, 1],
         "i24: next day the address it was handed is not offered again (reconciled)",
       );
       assertEq(
         t.calls.map((c) => c.to),
-        ["berg@gard-test.no", "dal@gard-test.no", "eng@gard-test.no", "fjell@gard-test.no"],
+        ["post@berg.gard-test.no", "post@dal.gard-test.no", "post@eng.gard-test.no", "post@fjell.gard-test.no"],
         "i25: …and only the four never-tried producers are e-mailed",
       );
     }
@@ -794,9 +834,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
       // dry run first: detects, never writes the pause
       freshDb();
-      seedProducer("j-1", "Mottaker Gård", "mottaker@gard-test.no");
-      seedRecentSend("old@gard-test.no", 2);
-      const bId = bounce("old@gard-test.no", "hard");
+      seedProducer("j-1", "Mottaker Gård", "post@mottaker.gard-test.no");
+      seedRecentSend("post@old.gard-test.no", 2);
+      const bId = bounce("post@old.gard-test.no", "hard");
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
       const t = makeTransport();
       const dry = await run(false, { transport: t });
@@ -805,8 +845,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const r = await run(true, { transport: t });
       const lane = daily.getRfbMarketingLaneState(db);
       assertEq([r.skipped_reason, r.auto_paused, lane.paused], ["bounce_or_complaint_recent", true, true], "j2: apply → auto-pause + skip");
-      assertEq(r.recent_bounces.map((b) => [b.recipient_email, b.bounce_type]), [["old@gard-test.no", "hard"]], "j3: names the bounced recipient");
-      assertTrue(String(lane.reason).includes("old@gard-test.no") && lane.changed_by === "rfb-marketing-platform", "j4: pause reason names the address and the job");
+      assertEq(r.recent_bounces.map((b) => [b.recipient_email, b.bounce_type]), [["post@old.gard-test.no", "hard"]], "j3: names the bounced recipient");
+      assertTrue(String(lane.reason).includes("post@old.gard-test.no") && lane.changed_by === "rfb-marketing-platform", "j4: pause reason names the address and the job");
       assertEq(lane.bounce_ack_max_id, bId, "j5: the bounce is recorded as acted on");
       assertEq(t.calls.length, 0, "j6: nothing sent");
 
@@ -817,7 +857,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([after.skipped_reason, after.summary.sent], [null, 1], "j8: acknowledged bounce does not re-trigger; the run sends");
 
       // A NEW complaint on the address just mailed → pause again.
-      const b2 = bounce("mottaker@gard-test.no", "complaint");
+      const b2 = bounce("post@mottaker.gard-test.no", "complaint");
       const again = await run(true, { transport: t, now: tomorrow() });
       assertEq([again.skipped_reason, again.auto_paused, daily.getRfbMarketingLaneState(db).bounce_ack_max_id], ["bounce_or_complaint_recent", true, b2], "j9: a new complaint on a recent recipient re-pauses");
 
@@ -825,10 +865,10 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       // RFB evaluated too): a pause set by a routine/human on a bounce wrote no
       // ack, so G3 re-paused the lane on that same bounce at the next run.
       freshDb();
-      seedProducer("j-2", "Løft Gård", "loft@gard-test.no");
-      seedProducer("j-3", "Etterpå Gård", "etterpa@gard-test.no");
-      seedRecentSend("tidligere@gard-test.no", 3);
-      const b3 = bounce("tidligere@gard-test.no", "hard");
+      seedProducer("j-2", "Løft Gård", "post@loft.gard-test.no");
+      seedProducer("j-3", "Etterpå Gård", "post@etterpa.gard-test.no");
+      seedRecentSend("post@tidligere.gard-test.no", 3);
+      const b3 = bounce("post@tidligere.gard-test.no", "hard");
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
       const laneRouter = adminRoutes.rfbMarketingLaneRouter as any;
       const manual = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: true, by: "marketing-comms-agent", reason: "bounce" } });
@@ -836,7 +876,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const lift = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "daniel" } });
       assertEq(
         [lift.body.paused, lift.body.bounce_ack_max_id, (lift.body.acknowledged_bounces as any[]).map((b) => [b.bounce_id, b.recipient_email])],
-        [false, b3, [[b3, "tidligere@gard-test.no"]]],
+        [false, b3, [[b3, "post@tidligere.gard-test.no"]]],
         "j12: lifting it acknowledges the bounce G3 would see (echoed in the response)",
       );
       const t2 = makeTransport();
@@ -856,18 +896,18 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
       // Not fresh: soft bounce, send older than 48h, another platform's send.
       freshDb();
-      seedRecentSend("soft@gard-test.no", 1);
-      bounce("soft@gard-test.no", "soft");
-      seedRecentSend("gammel@gard-test.no", 72);
-      bounce("gammel@gard-test.no", "hard");
-      seedRecentSend("opplev@gard-test.no", 1, "experiences");
-      bounce("opplev@gard-test.no", "hard");
+      seedRecentSend("post@soft.gard-test.no", 1);
+      bounce("post@soft.gard-test.no", "soft");
+      seedRecentSend("post@gammel.gard-test.no", 72);
+      bounce("post@gammel.gard-test.no", "hard");
+      seedRecentSend("post@opplev.gard-test.no", 1, "experiences");
+      bounce("post@opplev.gard-test.no", "hard");
       assertEq(daily.findRfbMarketingRecentBounces(db, new Date(), null), [], "j10: soft / >48h / non-rfb sends never trigger");
     }
 
     // ── (k) G3 — health red ────────────────────────────────────────────────
     freshDb();
-    seedProducer("k-1", "Helse Gård", "helse@gard-test.no");
+    seedProducer("k-1", "Helse Gård", "post@helse.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const t = makeTransport();
@@ -900,8 +940,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // ── (k') the 08:10Z tick persists "ran today" (boot_job_state): a deploy /
     // restart later inside the window does not run the job a second time ──
     freshDb();
-    seedProducer("k-2", "Tikk Gård", "tikk@gard-test.no");
-    seedProducer("k-3", "Takk Gård", "takk@gard-test.no");
+    seedProducer("k-2", "Tikk Gård", "post@tikk.gard-test.no");
+    seedProducer("k-3", "Takk Gård", "post@takk.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       const t = makeTransport();
@@ -935,9 +975,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (l) G4 — budget from the database ──────────────────────────────────
     freshDb();
-    seedProducer("l-1", "Budsjett En", "b1@gard-test.no");
-    seedProducer("l-2", "Budsjett To", "b2@gard-test.no");
-    seedProducer("l-3", "Budsjett Tre", "b3@gard-test.no");
+    seedProducer("l-1", "Budsjett En", "post@b1.gard-test.no");
+    seedProducer("l-2", "Budsjett To", "post@b2.gard-test.no");
+    seedProducer("l-3", "Budsjett Tre", "post@b3.gard-test.no");
     {
       const today = day(new Date());
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3", OUTREACH_MAX_PER_DAY: "2" });
@@ -949,8 +989,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r2.skipped_reason, t.calls.length], ["outreach_max_per_day_reached", 1], "l2: global cap spent → skipped");
 
       freshDb();
-      seedProducer("l-4", "Budsjett Fire", "b4@gard-test.no");
-      seedProducer("l-5", "Budsjett Fem", "b5@gard-test.no");
+      seedProducer("l-4", "Budsjett Fire", "post@b4.gard-test.no");
+      seedProducer("l-5", "Budsjett Fem", "post@b5.gard-test.no");
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
       db.prepare(
         `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
@@ -963,7 +1003,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (m) OUTREACH_PAUSED ────────────────────────────────────────────────
     freshDb();
-    seedProducer("m-1", "Pause Gård", "pause@gard-test.no");
+    seedProducer("m-1", "Pause Gård", "post@pause.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", OUTREACH_PAUSED: "true" });
     {
       const t = makeTransport();
@@ -973,22 +1013,22 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (n) held + refused rows; the budget backfills ─────────────────────
     freshDb();
-    seedProducer("n-1", "Engelsk Gård", "english@gard-test.no", { about: ENGLISH_ABOUT });
-    seedProducer("n-2", "Kort Gård", "kort@gard-test.no", {
+    seedProducer("n-1", "Engelsk Gård", "post@english.gard-test.no", { about: ENGLISH_ABOUT });
+    seedProducer("n-2", "Kort Gård", "post@kort.gard-test.no", {
       about: "Liten gård.",
       products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Ull" }]),
     });
     // Three old Opplevagent sends: passes the RFB first-touch gate (the pool only
     // excludes rfb sends; outside the cross-platform window), but compose's
     // max-touch-vern (any vertical, no reply ever) refuses the send.
-    seedProducer("n-3", "Mye Kontaktet Gård", "maxtouch@gard-test.no", {
+    seedProducer("n-3", "Mye Kontaktet Gård", "post@maxtouch.gard-test.no", {
       priorSends: [
         { daysAgo: 100, vertical: "experiences" },
         { daysAgo: 130, vertical: "experiences" },
         { daysAgo: 160, vertical: "experiences" },
       ],
     });
-    seedProducer("n-4", "God Gård", "god@gard-test.no");
+    seedProducer("n-4", "God Gård", "post@god.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       const t = makeTransport();
@@ -1005,8 +1045,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       );
       assertEq(r.held_for_reenrichment.map((h) => [h.agent_id, h.reason]), [["n-1", "not_norwegian"], ["n-2", "for_kort"]], "n2: held list in the SKILL's held-for-reenrichment vocabulary");
       assertEq([r.summary.sent, r.summary.held, r.summary.refused, r.stopped_reason], [1, 2, 1, null], "n3: summary; a per-recipient refusal does not stop the loop");
-      assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["maxtouch@gard-test.no", "refused"], ["god@gard-test.no", "sent"]], "n4: the refused attempt is in the ledger as refused (not counted, not blocking)");
-      assertEq(t.calls.map((c) => c.to), ["god@gard-test.no"], "n5: only the good candidate was e-mailed");
+      assertEq(ledger().map((l) => [l.recipient_email, l.status]), [["post@maxtouch.gard-test.no", "refused"], ["post@god.gard-test.no", "sent"]], "n4: the refused attempt is in the ledger as refused (not counted, not blocking)");
+      assertEq(t.calls.map((c) => c.to), ["post@god.gard-test.no"], "n5: only the good candidate was e-mailed");
       const env = runsRows()[0];
       const claims = JSON.parse(env.claims) as Array<any>;
       const byKind = (k: string) => claims.find((c) => c.meta?.kind === k);
@@ -1032,9 +1072,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         { daysAgo: 160, vertical: "experiences" },
       ];
       for (let i = 1; i <= extra + 2; i++) {
-        seedProducer(`y-${i}`, `Nekt Gård ${String.fromCharCode(64 + i)}`, `nekt${i}@gard-test.no`, { priorSends: maxTouched });
+        seedProducer(`y-${i}`, `Nekt Gård ${String.fromCharCode(64 + i)}`, `post@nekt${i}.gard-test.no`, { priorSends: maxTouched });
       }
-      seedProducer("y-good", "Siste Gård", "siste@gard-test.no");
+      seedProducer("y-good", "Siste Gård", "post@siste.gard-test.no");
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
       const t = makeTransport();
       const r = await run(true, { transport: t });
@@ -1049,8 +1089,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (v) a database error mid-run → db_error, envelope still written ────
     freshDb();
-    seedProducer("z-1", "Tabell Gård", "tabell@gard-test.no");
-    seedProducer("z-2", "Borte Gård", "borte@gard-test.no");
+    seedProducer("z-1", "Tabell Gård", "post@tabell.gard-test.no");
+    seedProducer("z-2", "Borte Gård", "post@borte.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const t = makeTransport();
@@ -1068,7 +1108,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.envelope_recorded, runsRows()[0]?.status], [true, "partial"], "v3: the envelope is still written — 'partial'");
     }
     freshDb();
-    seedProducer("z-3", "Andre Runde Gård", "runde@gard-test.no", { secondTouchDaysAgo: 90 });
+    seedProducer("z-3", "Andre Runde Gård", "post@runde.gard-test.no", { secondTouchDaysAgo: 90 });
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     db.exec(`DROP TABLE outreach_max_touch_vern_config`);
     {
@@ -1081,9 +1121,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (w) mid-run pause; the cap re-checked inside the reservation ───────
     freshDb();
-    seedProducer("pm-1", "Pause En", "pm1@gard-test.no");
-    seedProducer("pm-2", "Pause To", "pm2@gard-test.no");
-    seedProducer("pm-3", "Pause Tre", "pm3@gard-test.no");
+    seedProducer("pm-1", "Pause En", "post@pm1.gard-test.no");
+    seedProducer("pm-2", "Pause To", "post@pm2.gard-test.no");
+    seedProducer("pm-3", "Pause Tre", "post@pm3.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const t = makeTransport();
@@ -1099,9 +1139,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([ledger().length, runsRows()[0]?.status], [1, "partial"], "w2: no further reservation; envelope 'partial'");
     }
     freshDb();
-    seedProducer("cc-1", "Kappløp En", "cc1@gard-test.no");
-    seedProducer("cc-2", "Kappløp To", "cc2@gard-test.no");
-    seedProducer("cc-3", "Kappløp Tre", "cc3@gard-test.no");
+    seedProducer("cc-1", "Kappløp En", "post@cc1.gard-test.no");
+    seedProducer("cc-2", "Kappløp To", "post@cc2.gard-test.no");
+    seedProducer("cc-3", "Kappløp Tre", "post@cc3.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
     {
       const t = makeTransport();
@@ -1125,8 +1165,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (x) no_sendable_candidates; the ledger blocks by agent too ─────────
     freshDb();
-    seedProducer("nn-1", "Engelsk To", "eng2@gard-test.no", { about: ENGLISH_ABOUT });
-    seedProducer("nn-2", "Kort To", "kort2@gard-test.no", {
+    seedProducer("nn-1", "Engelsk To", "post@eng2.gard-test.no", { about: ENGLISH_ABOUT });
+    seedProducer("nn-2", "Kort To", "post@kort2.gard-test.no", {
       about: "Liten gård.",
       products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Ull" }]),
     });
@@ -1138,8 +1178,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(r.gate?.first?.count, 2, "x2: …the gate did return them");
     }
     freshDb();
-    seedProducer("ag-1", "Ny Adresse Gård", "ny@gard-test.no");
-    seedProducer("ag-2", "Samme Dag Gård", "samme-ny@gard-test.no");
+    seedProducer("ag-1", "Ny Adresse Gård", "post@ny.gard-test.no");
+    seedProducer("ag-2", "Samme Dag Gård", "post@samme-ny.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const insLedger = db.prepare(
@@ -1147,8 +1187,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
          VALUES (?, 'run-old', ?, ?, 'first', 'A', ?, ?)`,
       );
       const tenDaysAgo = new Date(Date.now() - 10 * 86400_000);
-      insLedger.run(day(tenDaysAgo), "ag-1", "gammel@gard-test.no", "sent", tenDaysAgo.toISOString());
-      insLedger.run(day(new Date()), "ag-2", "samme-gammel@gard-test.no", "refused", new Date().toISOString());
+      insLedger.run(day(tenDaysAgo), "ag-1", "post@gammel.gard-test.no", "sent", tenDaysAgo.toISOString());
+      insLedger.run(day(new Date()), "ag-2", "post@samme-gammel.gard-test.no", "refused", new Date().toISOString());
       const t = makeTransport();
       const r = await run(true, { transport: t });
       assertEq(
@@ -1177,16 +1217,16 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       daily.runRfbMarketingDaily({ apply, trigger: "manual", now: new Date(), deps: { sendRaw: t.sendRaw, healthProbe: healthy, ...deps } });
 
     freshDb();
-    seedProducer("z-1", "En Gård", "en@gard-test.no");
-    seedProducer("z-2", "To Gård", "to@gard-test.no");
-    seedProducer("z-3", "Tre Gård", "tre@gard-test.no");
-    seedProducer("z-4", "Fire Gård", "fire@gard-test.no");
+    seedProducer("z-1", "En Gård", "post@en.gard-test.no");
+    seedProducer("z-2", "To Gård", "post@to.gard-test.no");
+    seedProducer("z-3", "Tre Gård", "post@tre.gard-test.no");
+    seedProducer("z-4", "Fire Gård", "post@fire.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
     {
       // z-1 already mailed by this job today (ledger) → skipped before any crawl.
       db.prepare(
         `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
-         VALUES (?, 'run-earlier', 'z-1', 'en@gard-test.no', 'first', 'A', 'refused', ?)`,
+         VALUES (?, 'run-earlier', 'z-1', 'post@en.gard-test.no', 'first', 'A', 'refused', ?)`,
       ).run(day(new Date()), new Date().toISOString());
       const dryRec = recorder();
       const dry = await runZ(false, { homepageRefresh: dryRec.fn });
@@ -1195,7 +1235,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const t = makeTransport();
       const r = await runZ(true, { homepageRefresh: rec.fn }, t);
       assertEq(rec.calls.map((c) => c.agentId), ["z-2", "z-3"], "z2: refreshed exactly the candidates that were then sent — not the ledger-blocked one, not the rest of the list");
-      assertEq(t.calls.map((c) => c.to), ["to@gard-test.no", "tre@gard-test.no"], "z3: …and those two were sent (cap 2)");
+      assertEq(t.calls.map((c) => c.to), ["post@to.gard-test.no", "post@tre.gard-test.no"], "z3: …and those two were sent (cap 2)");
       assertEq(
         [r.homepage_refresh?.mode, r.homepage_refresh?.attempted, r.homepage_refresh?.unchanged, r.homepage_refresh?.max_refreshes],
         ["applied", 2, 2, 2 + daily.RFB_MARKETING_EXTRA_REFRESHES],
@@ -1212,8 +1252,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // Fresh content decides held vs sent: the refresh runs BEFORE the content check.
     freshDb();
-    seedProducer("z-5", "Tynn Gård", "tynn@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
-    seedProducer("z-6", "Tynn Igjen", "tynnigjen@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("z-5", "Tynn Gård", "post@tynn.gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("z-6", "Tynn Igjen", "post@tynnigjen.gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const rec = recorder((d, agentId) => {
@@ -1236,8 +1276,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // A failed / throwing refresh never blocks the send and never marks the run troubled.
     freshDb();
-    seedProducer("z-7", "Feil Refresh", "feilrefresh@gard-test.no");
-    seedProducer("z-8", "Kast Refresh", "kastrefresh@gard-test.no");
+    seedProducer("z-7", "Feil Refresh", "post@feilrefresh.gard-test.no");
+    seedProducer("z-8", "Kast Refresh", "post@kastrefresh.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const rec = recorder((_d, agentId) => {
@@ -1246,7 +1286,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       });
       const t = makeTransport();
       const r = await runZ(true, { homepageRefresh: rec.fn }, t);
-      assertEq(t.calls.map((c) => c.to), ["feilrefresh@gard-test.no", "kastrefresh@gard-test.no"], "z11: both sent despite a failed and a throwing refresh");
+      assertEq(t.calls.map((c) => c.to), ["post@feilrefresh.gard-test.no", "post@kastrefresh.gard-test.no"], "z11: both sent despite a failed and a throwing refresh");
       assertEq(
         [r.results[1].homepage_refresh?.outcome, (r.results[1].homepage_refresh?.error ?? "").startsWith("refresh_threw"), r.homepage_refresh?.failed],
         ["failed", true, 2],
@@ -1257,8 +1297,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // Bounded: the refresh COUNT (held candidates spend refreshes) and the TOTAL time budget.
     freshDb();
-    for (let i = 1; i <= 12; i++) seedProducer(`zb-${String(i).padStart(2, "0")}`, `Tynn ${i}`, `tynn${i}@gard-test.no`, { about: THIN, description: THIN, products: PRODUCTS3 });
-    seedProducer("zb-13", "God Gård", "god@gard-test.no");
+    for (let i = 1; i <= 12; i++) seedProducer(`zb-${String(i).padStart(2, "0")}`, `Tynn ${i}`, `post@tynn${i}.gard-test.no`, { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("zb-13", "God Gård", "post@god.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       const rec = recorder();
@@ -1267,12 +1307,12 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const max = 1 + daily.RFB_MARKETING_EXTRA_REFRESHES;
       assertEq(
         [rec.calls.length, r.homepage_refresh?.attempted, r.homepage_refresh?.skipped_refresh_budget, t.calls.map((c) => c.to)],
-        [max, max, 13 - max, ["god@gard-test.no"]],
+        [max, max, 13 - max, ["post@god.gard-test.no"]],
         "z14: at most budget + RFB_MARKETING_EXTRA_REFRESHES refreshes; the rest go on with the content they have (the good one is still sent)",
       );
     }
     freshDb();
-    for (let i = 1; i <= 4; i++) seedProducer(`zt-${i}`, `Tid ${i}`, `tid${i}@gard-test.no`);
+    for (let i = 1; i <= 4; i++) seedProducer(`zt-${i}`, `Tid ${i}`, `post@tid${i}.gard-test.no`);
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "4" });
     {
       const rec = recorder(async () => {
@@ -1293,8 +1333,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // The REAL refresh path (refreshHomepageContent) with a stub fetch:
     // content written from the homepage, curated locks kept, write-pause honoured, timeout.
     freshDb();
-    seedProducer("zr-1", "Hjemmeside Gård", "hjemme@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
-    seedProducer("zr-2", "Låst Gård", "laast@gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("zr-1", "Hjemmeside Gård", "post@hjemme.gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
+    seedProducer("zr-2", "Låst Gård", "post@laast.gard-test.no", { about: THIN, description: THIN, products: PRODUCTS3 });
     db.prepare(`UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = 'zr-2'`).run(JSON.stringify({ about: true, description: true }));
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
@@ -1320,10 +1360,10 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([k2.a, k2.d], [THIN, THIN], "z20: the locked columns are untouched in the database");
       assertTrue(fetched.length > 0, "z21: the injected fetch (not the network) served the crawl");
       const k1c = db.prepare(`SELECT email FROM agent_knowledge WHERE agent_id = 'zr-1'`).get() as any;
-      assertEq(k1c.email, "hjemme@gard-test.no", "z22: contact fields untouched");
+      assertEq(k1c.email, "post@hjemme.gard-test.no", "z22: contact fields untouched");
     }
     freshDb();
-    seedProducer("zp-1", "Pause Gård", "pause@gard-test.no");
+    seedProducer("zp-1", "Pause Gård", "post@pause.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const ewp = require("./enrichment-write-pause") as typeof import("./enrichment-write-pause");
@@ -1342,7 +1382,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       );
     }
     freshDb();
-    seedProducer("zh-1", "Heng Gård", "heng@gard-test.no");
+    seedProducer("zh-1", "Heng Gård", "post@heng.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const hanging = ((_u: string, init?: { signal?: AbortSignal }) =>
@@ -1373,9 +1413,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // reason hijacked_homepage, counted separately — and the next candidate
     // is still sent. A transient refresh failure still sends.
     freshDb();
-    seedProducer("zs-1", "Kapret Gård", "kapret@gard-test.no");
-    seedProducer("zs-2", "Ekte Gård", "ekte@gard-test.no");
-    seedProducer("zs-3", "Treg Gård", "treg@gard-test.no");
+    seedProducer("zs-1", "Kapret Gård", "post@kapret.gard-test.no");
+    seedProducer("zs-2", "Ekte Gård", "post@ekte.gard-test.no");
+    seedProducer("zs-3", "Treg Gård", "post@treg.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "2" });
     {
       const rec = recorder((_d, agentId) => {
@@ -1394,10 +1434,10 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         ],
         "zs1: a hijacked homepage is held; the next candidates (transient timeout / failure) are still sent",
       );
-      assertEq(t.calls.map((c) => c.to), ["ekte@gard-test.no", "treg@gard-test.no"], "zs2: the hijacked candidate is never handed to the transport");
-      assertEq(ledger().map((l) => l.recipient_email).includes("kapret@gard-test.no"), false, "zs3: no reservation for the hijacked candidate");
+      assertEq(t.calls.map((c) => c.to), ["post@ekte.gard-test.no", "post@treg.gard-test.no"], "zs2: the hijacked candidate is never handed to the transport");
+      assertEq(ledger().map((l) => l.recipient_email).includes("post@kapret.gard-test.no"), false, "zs3: no reservation for the hijacked candidate");
       assertEq(
-        db.prepare(`SELECT COUNT(*) AS n FROM outreach_sent_log WHERE LOWER(recipient_email) = 'kapret@gard-test.no' OR agent_id = 'zs-1'`).get(),
+        db.prepare(`SELECT COUNT(*) AS n FROM outreach_sent_log WHERE LOWER(recipient_email) = 'post@kapret.gard-test.no' OR agent_id = 'zs-1'`).get(),
         { n: 0 },
         "zs4: nothing recorded as sent for it",
       );
@@ -1456,7 +1496,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (N) N-A: possible contacts reconciled into outreach_sent_log ───────
     freshDb();
-    seedProducer("na-1", "Ukjent Gård", "ukjent@gard-test.no");
+    seedProducer("na-1", "Ukjent Gård", "post@ukjent.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       // Day 0 = 61 days ago: the transport fails after the hand-off → 'unknown'.
@@ -1464,7 +1504,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       const failing = { calls: [] as any[], sendRaw: async () => ({ success: false, error: "smtp 451" }) };
       const r0 = await daily.runRfbMarketingDaily({ apply: true, trigger: "manual", now: day0, deps: { sendRaw: failing.sendRaw as any, healthProbe: healthy } });
       assertEq([r0.results[0]?.status, r0.results[0]?.sent_log_reconciled], ["unknown", "inserted"], "N1: day 0 — unknown delivery, reconciled at finalize time");
-      const rec = reconciledFor("ukjent@gard-test.no");
+      const rec = reconciledFor("post@ukjent.gard-test.no");
       assertEq(
         [rec.length, rec[0]?.sent_at.slice(0, 10), rec[0]?.sent_at.includes("T")],
         [1, day(day0), false],
@@ -1490,8 +1530,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       );
     }
     freshDb();
-    seedProducer("na-2", "Idem Gård", "idem@gard-test.no");
-    seedProducer("na-3", "Normal Gård", "normal@gard-test.no");
+    seedProducer("na-2", "Idem Gård", "post@idem.gard-test.no");
+    seedProducer("na-3", "Normal Gård", "post@normal.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const nowIso = new Date().toISOString();
@@ -1499,13 +1539,13 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at, updated_at, error)
          VALUES (?, 'run-x', ?, ?, 'first', 'A', ?, ?, ?, ?)`,
       );
-      ins.run(day(new Date()), "na-2", "idem@gard-test.no", "unknown", nowIso, nowIso, "transport_failed:x");
+      ins.run(day(new Date()), "na-2", "post@idem.gard-test.no", "unknown", nowIso, nowIso, "transport_failed:x");
       ins.run(day(new Date(Date.now() - 86400_000)), "ghost-agent", "ghost@nowhere.test", "reserved", nowIso, null, null);
       const s1 = daily.reconcileRfbMarketingSentLog(db);
       const s2 = daily.reconcileRfbMarketingSentLog(db);
       const s3 = daily.reconcileRfbMarketingSentLog(db);
       assertEq(
-        [s1.inserted, s1.no_agent, s2.inserted, s2.already_present, s3.inserted, reconciledFor("idem@gard-test.no").length],
+        [s1.inserted, s1.no_agent, s2.inserted, s2.already_present, s3.inserted, reconciledFor("post@idem.gard-test.no").length],
         [1, 1, 0, 1, 0, 1],
         "N6: idempotent — three sweeps, one row; an address with no agent on file writes nothing",
       );
@@ -1517,11 +1557,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       // A normal send (compose's trigger row exists) forced into the sweep → already_present, no duplicate.
       const t = makeTransport();
       const r = await run(true, { transport: t });
-      assertEq(t.calls.map((c) => c.to), ["normal@gard-test.no"], "N8: the reconciled address is not mailed; the other one is");
-      db.prepare(`UPDATE rfb_marketing_send_ledger SET error = 'forced' WHERE recipient_email = 'normal@gard-test.no'`).run();
+      assertEq(t.calls.map((c) => c.to), ["post@normal.gard-test.no"], "N8: the reconciled address is not mailed; the other one is");
+      db.prepare(`UPDATE rfb_marketing_send_ledger SET error = 'forced' WHERE recipient_email = 'post@normal.gard-test.no'`).run();
       const s4 = daily.reconcileRfbMarketingSentLog(db);
       assertEq(
-        [s4.inserted, oslFor("normal@gard-test.no"), reconciledFor("normal@gard-test.no").length],
+        [s4.inserted, oslFor("post@normal.gard-test.no"), reconciledFor("post@normal.gard-test.no").length],
         [0, 1, 0],
         "N9: a send compose's trigger already recorded is never duplicated",
       );
@@ -1529,20 +1569,20 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       // Compose's email-keyed (cross-platform) cooldown counts the reconciled row.
       const crm = require("../routes/crm") as typeof import("../routes/crm");
       const c = await crm.executeCompose(
-        { to: "idem@gard-test.no", subject: "s", bodyText: "b", intent: "resend_send", category: "marketing", createdBy: "claude", vertical: "rfb" },
+        { to: "post@idem.gard-test.no", subject: "s", bodyText: "b", intent: "resend_send", category: "marketing", createdBy: "claude", vertical: "rfb" },
         { sendRaw: makeTransport().sendRaw },
       );
       assertEq([c.httpStatus, (c.body as any).error], [429, "cooldown_suppressed"], "N11: compose's cooldown refuses the reconciled address");
     }
     // A sweep that cannot write is reported, never fatal, and retried next run.
     freshDb();
-    seedProducer("na-4", "Senere Gård", "senere@gard-test.no");
+    seedProducer("na-4", "Senere Gård", "post@senere.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
     {
       const nowIso = new Date().toISOString();
       db.prepare(
         `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at)
-         VALUES (?, 'run-y', 'na-4', 'senere@gard-test.no', 'first', 'A', 'reserved', ?)`,
+         VALUES (?, 'run-y', 'na-4', 'post@senere.gard-test.no', 'first', 'A', 'reserved', ?)`,
       ).run(day(new Date(Date.now() - 86400_000)), nowIso);
       db.exec(`CREATE TRIGGER t_osl_insert_fails BEFORE INSERT ON outreach_sent_log
                WHEN NEW.notes LIKE 'rfb-marketing-platform:%'
@@ -1556,14 +1596,14 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       );
       db.exec(`DROP TRIGGER t_osl_insert_fails`);
       const r2 = await run(true, { transport: t });
-      assertEq([r2.sent_log_reconciliation?.inserted, reconciledFor("senere@gard-test.no").length, t.calls.length], [1, 1, 0], "N13: the next run's sweep writes it");
+      assertEq([r2.sent_log_reconciliation?.inserted, reconciledFor("post@senere.gard-test.no").length, t.calls.length], [1, 1, 0], "N13: the next run's sweep writes it");
     }
 
     // ── (o) in-process mutex ───────────────────────────────────────────────
     freshDb();
-    seedProducer("o-1", "Samtidig En", "o1@gard-test.no");
-    seedProducer("o-2", "Samtidig To", "o2@gard-test.no");
-    seedProducer("o-3", "Samtidig Tre", "o3@gard-test.no");
+    seedProducer("o-1", "Samtidig En", "post@o1.gard-test.no");
+    seedProducer("o-2", "Samtidig To", "post@o2.gard-test.no");
+    seedProducer("o-3", "Samtidig Tre", "post@o3.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const t = makeTransport();
@@ -1577,7 +1617,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     // The route passes no deps, so the default health probe would read THIS
     // test process's memory — replace it for the duration of this block.
     freshDb();
-    seedProducer("q-1", "Rute Gård", "rute@gard-test.no");
+    seedProducer("q-1", "Rute Gård", "post@rute.gard-test.no");
     daily.__setRfbMarketingHealthProbeForTesting(healthy);
     {
       const router = adminRoutes.rfbMarketingDailyRunRouter as any;
@@ -1597,9 +1637,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (q) canonical URL = the agent card's canonicalUrl ──────────────────
     freshDb();
-    seedProducer("u-1", "Haugerud Gård (Regenerativt)", "hg@gard-test.no");
-    seedProducer("u-2", "Ærlige Øyvind's Gårdsbutikk", "oy@gard-test.no");
-    seedProducer("u-3", "—", "dash@gard-test.no");
+    seedProducer("u-1", "Haugerud Gård (Regenerativt)", "post@hg.gard-test.no");
+    seedProducer("u-2", "Ærlige Øyvind's Gårdsbutikk", "post@oy.gard-test.no");
+    seedProducer("u-3", "—", "post@dash.gard-test.no");
     db.prepare(`UPDATE agents SET origin = 'self_registered', is_vetted = 0 WHERE id = 'u-2'`).run();
     {
       const marketplaceRouter = require("../routes/marketplace").default as any;
@@ -1633,7 +1673,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     {
       const ins = db.prepare(
         `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, status, reserved_at)
-         VALUES ('2026-10-01', 'r', 'a', 'same@gard-test.no', 'first', 'failed', '2026-10-01T08:10:00.000Z')`,
+         VALUES ('2026-10-01', 'r', 'a', 'post@same.gard-test.no', 'first', 'failed', '2026-10-01T08:10:00.000Z')`,
       );
       ins.run();
       let threw = false;
@@ -1647,7 +1687,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (s) default transport wiring through emailService ──────────────────
     freshDb();
-    seedProducer("w-1", "Wire Gård", "wire@gard-test.no");
+    seedProducer("w-1", "Wire Gård", "post@wire.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     {
       const mails: Array<Record<string, any>> = [];
@@ -1674,8 +1714,8 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
 
     // ── (t) G1b — a real run needs a live transport ────────────────────────
     freshDb();
-    seedProducer("t-1", "Levende Gård", "levende@gard-test.no");
-    seedProducer("t-2", "Neste Levende Gård", "levende2@gard-test.no");
+    seedProducer("t-1", "Levende Gård", "post@levende.gard-test.no");
+    seedProducer("t-2", "Neste Levende Gård", "post@levende2.gard-test.no");
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     {
       const prevForce = process.env.EMAIL_FORCE_DRY_RUN;
@@ -1688,10 +1728,10 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         process.env.EMAIL_FORCE_DRY_RUN = "true";
         emailSvc.isConfigured = false;
         emailSvc.transporter = emailSvc.envTransporter;
-        const dryAnswer = await svc.sendRaw({ to: "x@gard-test.no", subject: "s", textContent: "t" } as any);
+        const dryAnswer = await svc.sendRaw({ to: "post@x.gard-test.no", subject: "s", textContent: "t" } as any);
         assertEq([svc.isLiveTransport(), dryAnswer.messageId], [false, "DRY_RUN"], "t1: SMTP not configured → not live (sendRaw answers DRY_RUN)");
         emailSvc.isConfigured = true;
-        const forcedAnswer = await svc.sendRaw({ to: "x@gard-test.no", subject: "s", textContent: "t" } as any);
+        const forcedAnswer = await svc.sendRaw({ to: "post@x.gard-test.no", subject: "s", textContent: "t" } as any);
         assertEq([svc.isLiveTransport(), forcedAnswer.messageId], [false, "DRY_RUN"], "t2: configured but forced dry-run (test env) → not live (DRY_RUN)");
         delete process.env.EMAIL_FORCE_DRY_RUN;
         assertEq(svc.isLiveTransport(), true, "t3: configured, env transporter, not forced → live");
