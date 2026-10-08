@@ -48,6 +48,7 @@ import {
   outreachSentLogHasVerticalColumn,
 } from "../services/outreach-suppression-signals";
 import { dedupeByEmail } from "../services/marketing-dedupe";
+import { isColdRecipientAllowed } from "../services/recipient-policy";
 import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 import {
   getOutreachMaxTouchVernConfig,
@@ -640,6 +641,8 @@ export function computeOutreachCandidates(
     let recentCrmSendCount = 0;
     // dev-request 2026-08-29-outreach-max-touch-vern counter + detail list
     let maxTouchSuppressedCount = 0;
+    // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15 counter
+    let personalAddressCount = 0;
     const maxTouchSuppressedList: Array<{
       agent_id: string;
       email: string;
@@ -748,6 +751,10 @@ export function computeOutreachCandidates(
           threshold: maxTouchStatus.threshold,
         });
       }
+      // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15 (mfl. § 15):
+      // cold marketing mail only to GENERAL role addresses (post@, info@, …).
+      // Fail-closed — see services/recipient-policy.ts. Applies in both modes.
+      const suppressedForPersonalAddress = !isColdRecipientAllowed(row.email);
       // steg 4 / 4e — see the map construction above.
       const crossPlatformHit = crossPlatformSuppressors.get(row.email.trim().toLowerCase());
       const suppressedForCrossPlatform = crossPlatformHit !== undefined;
@@ -771,6 +778,7 @@ export function computeOutreachCandidates(
       if (suppressedForCategoriesNotCorroborated) categoriesNotCorroboratedCount++;
       if (suppressedForRecentCrmSend) recentCrmSendCount++;
       if (suppressedForMaxTouch) maxTouchSuppressedCount++;
+      if (suppressedForPersonalAddress) personalAddressCount++;
 
       if (
         !suppressedForContacted &&
@@ -784,7 +792,8 @@ export function computeOutreachCandidates(
         !suppressedForCategoriesNotCorroborated &&
         !suppressedForRecentCrmSend &&
         !suppressedForCrossPlatform &&
-        !suppressedForMaxTouch
+        !suppressedForMaxTouch &&
+        !suppressedForPersonalAddress
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -927,6 +936,9 @@ export function computeOutreachCandidates(
         // reasons, not a partition, so they are not expected to sum to the
         // suppressed total.
         cross_platform_cooldown: crossPlatformSkipped.length,
+        // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15: held back
+        // because the address is not a general role address (mfl. § 15).
+        personal_address: personalAddressCount,
       },
       // 4e proper: the count alone would still leave "hvorfor" unanswered, so
       // the suppressing platform is named per producer. Bounded at 100 so a wide

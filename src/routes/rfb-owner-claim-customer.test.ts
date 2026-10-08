@@ -78,8 +78,8 @@ export async function runRfbOwnerClaimCustomerTests(opts: { log?: boolean } = {}
     );
     function seed(id: string, o: { claimedAt?: string | null; claimedVia?: string | null; origin?: string } = {}): void {
       seq++;
-      insA.run(id, `Gård ${id}`, `${id}@gard-test.no`, `key-${id}`, o.claimedAt ?? null, o.claimedVia ?? null, o.origin ?? "discovery");
-      insK.run(id, `${id}@gard-test.no`, GOOD_ABOUT, `2026-01-01 00:00:${String(seq % 60).padStart(2, "0")}`);
+      insA.run(id, `Gård ${id}`, `post@${id}.gard-test.no`, `key-${id}`, o.claimedAt ?? null, o.claimedVia ?? null, o.origin ?? "discovery");
+      insK.run(id, `post@${id}.gard-test.no`, GOOD_ABOUT, `2026-01-01 00:00:${String(seq % 60).padStart(2, "0")}`);
     }
     function claim(id: string, agentId: string, status: string, verifiedAt: string | null, code = "123456"): void {
       db.prepare(

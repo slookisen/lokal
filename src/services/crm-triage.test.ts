@@ -658,8 +658,8 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
                         url_last_status, url_last_probed)
                       VALUES (?,?,?, 'verified','rich',200,datetime('now'))`).run(id, email, "x".repeat(200));
         };
-        mkEligible("tr-cand-clean", "ren@gaard.no");
-        mkEligible("tr-cand-overlap", "overlapp2@gaard.no");
+        mkEligible("tr-cand-clean", "post@ren.gaard.no");
+        mkEligible("tr-cand-overlap", "post@overlapp2.gaard.no");
 
         // Baseline FIRST — an assertion that the fixture qualifies at all.
         // Without it, "the overlap producer is absent" would pass for any
@@ -678,7 +678,7 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
         // Now Opplevagent cold-mails one of them.
         db.prepare(
           `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
-           VALUES ('tr-cand-overlap','overlapp2@gaard.no', datetime('now','-5 days'), 'email','tr-osl-3','tr','experiences')`,
+           VALUES ('tr-cand-overlap','post@overlapp2.gaard.no', datetime('now','-5 days'), 'email','tr-osl-3','tr','experiences')`,
         ).run();
 
         const after = await getCandidates("mode=first&limit=500");
@@ -702,7 +702,7 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
         // producer, which is worse than no counter — it looks like data.
         db.prepare(
           `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
-           VALUES ('tr-cand-clean','ren@gaard.no', datetime('now','-5 days'), 'email','tr-osl-4','tr','rfb')`,
+           VALUES ('tr-cand-clean','post@ren.gaard.no', datetime('now','-5 days'), 'email','tr-osl-4','tr','rfb')`,
         ).run();
         const after2 = await getCandidates("mode=first&limit=500");
         assertEq(after2.status, 200, "tr59d: …and still answers 200 here too");

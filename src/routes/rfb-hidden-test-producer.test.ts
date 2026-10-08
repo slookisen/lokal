@@ -99,7 +99,7 @@ const DENTAL_ID = "lh-dental";
 const NORMAL_NAME = "Normal Gard Listetest";
 const FIXTURE_NAME = "Test Gard Listetest";
 const DENTAL_NAME = "Dentix Tannhelse Listetest";
-const FIXTURE_EMAIL = "fixture-inbox@example.no";
+const FIXTURE_EMAIL = "post@fixture-inbox.example.no";
 
 function seedProducer(
   db: Database.Database,
@@ -114,8 +114,8 @@ function seedProducer(
   ).run(
     o.id, o.name,
     "Lokal produsent av poteter og grønnsaker i Oslo-området, med gårdsutsalg hver lørdag.",
-    `${o.id}@example.no`, `https://${o.id}.example.no`, `key-${o.id}`, OSLO.lat, OSLO.lng,
-    o.trust ?? 0.7, o.origin ?? "discovery", o.vertical ?? "rfb", `${o.id}@example.no`,
+    `post@${o.id}.example.no`, `https://${o.id}.example.no`, `key-${o.id}`, OSLO.lat, OSLO.lng,
+    o.trust ?? 0.7, o.origin ?? "discovery", o.vertical ?? "rfb", `post@${o.id}.example.no`,
   );
   db.prepare(
     `INSERT INTO agent_knowledge
@@ -128,7 +128,7 @@ function seedProducer(
     // gate's unrelated categories_not_corroborated suppression stays out of
     // the way and the outreach surface is a real (non-vacuous) check.
     JSON.stringify({ categories: [{ source_type: "website_homepage", source_url: `https://${o.id}.example.no` }] }),
-    `${o.id}@example.no`, `https://${o.id}.example.no`,
+    `post@${o.id}.example.no`, `https://${o.id}.example.no`,
     "Vi er en liten familiegård som dyrker poteter, gulrøtter og kål, og selger direkte fra gården hele året.",
     JSON.stringify([
       { name: "Listepoteter", price: "30 kr/kg", category: "vegetables" },
@@ -538,7 +538,7 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
         db.prepare(
           `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, categories, tags, trust_score, is_active, umbrella_type)
            VALUES (?, ?, 'Et nettverk av lokale gårder rundt Oslo.', 'test', ?, ?, 'producer', ?, 'Oslo', '[]', '[]', 0.8, 1, 'market_network')`,
-        ).run(u.id, u.name, `${u.id}@example.no`, `https://${u.id}.example.no`, `key-${u.id}`);
+        ).run(u.id, u.name, `post@${u.id}.example.no`, `https://${u.id}.example.no`, `key-${u.id}`);
       }
       const insAff = db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, labels) VALUES (?, ?, 'active', 'admin', '[]')");
       for (const id of ALL) insAff.run(id, UMB_AFF.id);
@@ -586,7 +586,7 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       assertEq(added?.success, true, `ac2-4: lokal_cart_add_item accepted the hidden fixture's product by id (${JSON.stringify(added?.error ?? "")})`);
       const before = sent.length;
       const submitted = JSON.parse(await toolText("lokal_cart_submit", {
-        cart_id: cartId, buyer_ref: buyerRef, buyer_name: "Test Kjøper", buyer_email: "kjoper@example.no", contact_consent: true,
+        cart_id: cartId, buyer_ref: buyerRef, buyer_name: "Test Kjøper", buyer_email: "post@kjoper.example.no", contact_consent: true,
       }));
       assertEq(submitted?.success, true, `ac2-5: lokal_cart_submit succeeded (${JSON.stringify(submitted?.error ?? "")})`);
       assertEq((submitted?.contact_handoffs ?? []).length, 0, "ac2-6: 0 contact handoffs");

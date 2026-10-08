@@ -106,11 +106,11 @@ export function runAdminOutreachGateTynneProfilerTests(opts: { log?: boolean } =
 
   try {
     // ── Test 1: VIEW mutation pin — partial excluded, rich included ─────────
-    insertAgent("otp-rich", "Rik Profil Gård", "rich@prod-test.no");
-    insertKnowledge("otp-rich", "rich@prod-test.no", "rich", { about: "x".repeat(200), products: ["a", "b", "c"] });
+    insertAgent("otp-rich", "Rik Profil Gård", "post@rich.prod-test.no");
+    insertKnowledge("otp-rich", "post@rich.prod-test.no", "rich", { about: "x".repeat(200), products: ["a", "b", "c"] });
 
-    insertAgent("otp-partial", "Tynn Profil Gård", "partial@prod-test.no");
-    insertKnowledge("otp-partial", "partial@prod-test.no", "partial", { about: "kort", products: [] });
+    insertAgent("otp-partial", "Tynn Profil Gård", "post@partial.prod-test.no");
+    insertKnowledge("otp-partial", "post@partial.prod-test.no", "partial", { about: "kort", products: [] });
 
     const candidatesRouter = require("./admin-outreach-candidates").default;
     const res1 = callRouteSync(candidatesRouter, {
@@ -120,9 +120,9 @@ export function runAdminOutreachGateTynneProfilerTests(opts: { log?: boolean } =
     assertEq(res1.status, 200, "outreach-candidates mode=first → 200");
 
     const emails1 = ((res1.body?.candidates || []) as Array<{ email: string }>).map((c) => c.email.toLowerCase());
-    assertEq(emails1.includes("rich@prod-test.no"), true, "outreach_ready_pool: rich profile is a candidate");
+    assertEq(emails1.includes("post@rich.prod-test.no"), true, "outreach_ready_pool: rich profile is a candidate");
     assertEq(
-      emails1.includes("partial@prod-test.no"),
+      emails1.includes("post@partial.prod-test.no"),
       false,
       "outreach_ready_pool: partial profile is NOT a candidate (mutation pin — revert VIEW's enrichment_status='rich' line to turn this red)",
     );
@@ -142,8 +142,8 @@ export function runAdminOutreachGateTynneProfilerTests(opts: { log?: boolean } =
     // ── Test 2: /audit distribution + thin_or_partial_sends listing ─────────
     // A third agent, 'thin', with a prior send — plus the rich/partial agents
     // above also getting sends, to exercise all three buckets at once.
-    insertAgent("otp-thin", "Tynnest Profil", "thin@prod-test.no");
-    insertKnowledge("otp-thin", "thin@prod-test.no", "thin", { about: "", products: [] });
+    insertAgent("otp-thin", "Tynnest Profil", "post@thin.prod-test.no");
+    insertKnowledge("otp-thin", "post@thin.prod-test.no", "thin", { about: "", products: [] });
 
     function insertSend(agentId: string, daysAgo: number): void {
       db.prepare(`

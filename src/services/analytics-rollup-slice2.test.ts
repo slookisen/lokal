@@ -921,18 +921,18 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       const newCreated = isoDaysAgo(1);
 
       // mode=first fixture: never contacted → visible through outreach_ready_pool.
-      insertPoolAgent("cs1-target", "Aa Rollup Target", "cand-first@prod-test.no");
-      insertPoolAgent("cs1-probe", "Zz Probe", "cand-first@prod-test.no");
+      insertPoolAgent("cs1-target", "Aa Rollup Target", "post@cand-first.prod-test.no");
+      insertPoolAgent("cs1-probe", "Zz Probe", "post@cand-first.prod-test.no");
       insertViews("cs1-target", "Aa Rollup Target", 5, oldCreated); // → agent_view_daily
       insertViews("cs1-target", "Aa Rollup Target", 2, newCreated); // → stays raw
 
       // mode=second fixture: contacted 120 days ago (>60d cooldown), so the
       // outreach_ready_pool VIEW excludes it and the mode=second branch is the
       // ONLY query that can return it.
-      insertPoolAgent("cs2-target", "Aa Rollup Target 2", "cand-second@prod-test.no");
-      insertPoolAgent("cs2-probe", "Zz Probe 2", "cand-second@prod-test.no");
-      insertPriorContact("cs2-target", "cand-second@prod-test.no", 120);
-      insertPriorContact("cs2-probe", "cand-second@prod-test.no", 120);
+      insertPoolAgent("cs2-target", "Aa Rollup Target 2", "post@cand-second.prod-test.no");
+      insertPoolAgent("cs2-probe", "Zz Probe 2", "post@cand-second.prod-test.no");
+      insertPriorContact("cs2-target", "post@cand-second.prod-test.no", 120);
+      insertPriorContact("cs2-probe", "post@cand-second.prod-test.no", 120);
       insertViews("cs2-target", "Aa Rollup Target 2", 5, oldCreated);
       insertViews("cs2-target", "Aa Rollup Target 2", 2, newCreated);
 
@@ -983,26 +983,26 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
 
       // ── mode=first branch ──────────────────────────────────────────────────
       assertEq(
-        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        await candidateWinnerFor("first", "post@cand-first.prod-test.no"),
         "cs1-target",
         "outreach-candidates mode=first: rollup-backed agent (5 rolled up + 2 raw = 7) beats a 7-raw-view probe on the SAME email — a raw-only COUNT(*) would see 2 and lose",
       );
       insertViews("cs1-probe", "Zz Probe", 1, newCreated); // probe now 8
       assertEq(
-        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        await candidateWinnerFor("first", "post@cand-first.prod-test.no"),
         "cs1-probe",
         "outreach-candidates mode=first: an 8-raw-view probe wins — brackets the rollup-backed views_count at exactly 7, not higher",
       );
 
       // ── mode=second branch ─────────────────────────────────────────────────
       assertEq(
-        await candidateWinnerFor("second", "cand-second@prod-test.no"),
+        await candidateWinnerFor("second", "post@cand-second.prod-test.no"),
         "cs2-target",
         "outreach-candidates mode=second: SAME rollup+raw views_count in the second SQL branch (7 beats a 7-raw probe on name asc)",
       );
       insertViews("cs2-probe", "Zz Probe 2", 1, newCreated); // probe now 8
       assertEq(
-        await candidateWinnerFor("second", "cand-second@prod-test.no"),
+        await candidateWinnerFor("second", "post@cand-second.prod-test.no"),
         "cs2-probe",
         "outreach-candidates mode=second: an 8-raw-view probe wins — brackets the second branch's views_count at exactly 7 too",
       );
@@ -1023,10 +1023,10 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
         poolRes as any,
       );
       const poolWinner = ((poolRes.body?.agents || []) as Array<any>)
-        .find((a) => (a.email || "").toLowerCase() === "cand-first@prod-test.no")?.agent_id;
+        .find((a) => (a.email || "").toLowerCase() === "post@cand-first.prod-test.no")?.agent_id;
       assertEq(
         poolWinner,
-        await candidateWinnerFor("first", "cand-first@prod-test.no"),
+        await candidateWinnerFor("first", "post@cand-first.prod-test.no"),
         "views_count parity: outreach-pool and outreach-candidates pick the SAME winner for the same email after a prune cycle",
       );
     }
@@ -1077,8 +1077,8 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
          VALUES (?, ?, 'Oslo', 'seo', 'rfb', ?)`,
       );
 
-      insertOptOutAgent("optout-1", "Opt Out Gård", "optout@prod-test.no");
-      insertOptOutAgent("keep-1", "Keep Gård", "keep@prod-test.no");
+      insertOptOutAgent("optout-1", "Opt Out Gård", "post@optout.prod-test.no");
+      insertOptOutAgent("keep-1", "Keep Gård", "post@keep.prod-test.no");
       for (let i = 0; i < 5; i++) insView.run("optout-1", "Opt Out Gård", oldCreated);
       for (let i = 0; i < 2; i++) insView.run("optout-1", "Opt Out Gård", newCreated);
       for (let i = 0; i < 3; i++) insView.run("keep-1", "Keep Gård", oldCreated);
@@ -1129,7 +1129,7 @@ export async function runAnalyticsRollupSlice2Tests(opts: { log?: boolean } = {}
       // agent_id reuse: a NEW agent registered under the same id must start at
       // views_count 0. Without the agent_view_daily delete above, the pool would
       // report the opted-out producer's 5 rolled-up views for a different farm.
-      insertOptOutAgent("optout-1", "Ny Gård samme id", "ny@prod-test.no");
+      insertOptOutAgent("optout-1", "Ny Gård samme id", "post@ny.prod-test.no");
       const poolRouter3 = (require("../routes/admin-outreach-pool") as any).default;
       const poolHandler3 = poolRouter3.stack
         .filter((l: any) => l.route && l.route.path === "/" && l.route.methods?.get)

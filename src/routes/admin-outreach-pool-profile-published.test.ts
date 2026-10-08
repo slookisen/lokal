@@ -141,16 +141,16 @@ export function runOutreachPoolProfilePublishedTests(opts: { log?: boolean } = {
 
     try {
       // ── p1: is_active=0 -> excluded ─────────────────────────────────────
-      insertPoolAgent("opp-inactive", "Inaktiv Gård", "inactive@opp-test.no", { is_active: 0 });
+      insertPoolAgent("opp-inactive", "Inaktiv Gård", "post@inactive.opp-test.no", { is_active: 0 });
 
       // ── p2: is_vetted=0 (quarantined, mocked-unpublished-slug case) -> excluded ─
-      insertPoolAgent("opp-unvetted", "Ukvitert Gård", "unvetted@opp-test.no", { is_vetted: 0 });
+      insertPoolAgent("opp-unvetted", "Ukvitert Gård", "post@unvetted.opp-test.no", { is_vetted: 0 });
 
       // ── p3: role='logistics' (non-producer, non-umbrella) -> excluded ──────
-      insertPoolAgent("opp-logistics", "Logistikk-Bøtte", "logistics@opp-test.no", { role: "logistics" });
+      insertPoolAgent("opp-logistics", "Logistikk-Bøtte", "post@logistics.opp-test.no", { role: "logistics" });
 
       // ── p4: fully-qualified control -> still appears (no regression) ───────
-      insertPoolAgent("opp-control", "Kontroll Gård", "control@opp-test.no");
+      insertPoolAgent("opp-control", "Kontroll Gård", "post@control.opp-test.no");
 
       const viewRows = db
         .prepare(`SELECT agent_id FROM outreach_ready_pool ORDER BY email`)
@@ -190,7 +190,7 @@ export function runOutreachPoolProfilePublishedTests(opts: { log?: boolean } = {
       // ── p5: role=NULL (legacy) is tolerated, same as passesRoleGate ─────────
       db.prepare(`
         INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
-        VALUES ('opp-legacy-role', 'Legacy Rolle Gård', 'test producer', 'test', 'legacy@opp-test.no', 'https://example.no', 'producer', 'key-opp-legacy-role', 1)
+        VALUES ('opp-legacy-role', 'Legacy Rolle Gård', 'test producer', 'test', 'post@legacy.opp-test.no', 'https://example.no', 'producer', 'key-opp-legacy-role', 1)
       `).run();
       // role is NOT NULL in the schema (CHECK constraint) — simulate the
       // "legacy row with no meaningful role" case the same way passesRoleGate's
@@ -206,7 +206,7 @@ export function runOutreachPoolProfilePublishedTests(opts: { log?: boolean } = {
         INSERT INTO agent_knowledge
           (agent_id, email, field_provenance, verification_status, enrichment_status,
            url_last_status, url_last_probed, about, products)
-        VALUES ('opp-legacy-role', 'legacy@opp-test.no', '{}', 'verified', 'rich', 200, datetime('now'), ?, ?)
+        VALUES ('opp-legacy-role', 'post@legacy.opp-test.no', '{}', 'verified', 'rich', 200, datetime('now'), ?, ?)
       `).run("x".repeat(200), JSON.stringify([{ name: "a" }, { name: "b" }, { name: "c" }]));
       const viewRows2 = db.prepare(`SELECT agent_id FROM outreach_ready_pool`).all() as Array<{ agent_id: string }>;
       assertTrue(
@@ -223,9 +223,9 @@ export function runOutreachPoolProfilePublishedTests(opts: { log?: boolean } = {
       }
       // opp-unvetted already exists (is_vetted=0) — give it a prior contact
       // >60d ago so it would otherwise qualify for a mode=second re-touch.
-      insertPriorContact("opp-unvetted", "unvetted@opp-test.no", 90);
+      insertPriorContact("opp-unvetted", "post@unvetted.opp-test.no", 90);
       // opp-control too, as the positive control for mode=second.
-      insertPriorContact("opp-control", "control@opp-test.no", 90);
+      insertPriorContact("opp-control", "post@control.opp-test.no", 90);
 
       delete require.cache[require.resolve("./admin-outreach-candidates")];
       const candidatesMod = require("./admin-outreach-candidates");

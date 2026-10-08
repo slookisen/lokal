@@ -25170,12 +25170,12 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   //   E - crm_contacts.status = 'blocked' → suppressed in both (opted-out)
   //   F - claimed_at is set → suppressed in both (customer)
 
-  seedPoolAgent("oa-A", "clean@test.no", "Agent A Clean");
-  seedPoolAgent("oa-B", "recent@test.no", "Agent B Recent");
-  seedPoolAgent("oa-C", "old@test.no", "Agent C Old");
-  seedPoolAgent("oa-D", "replied@test.no", "Agent D Replied");
-  seedPoolAgent("oa-E", "optout@test.no", "Agent E OptOut");
-  seedPoolAgent("oa-F", "customer@test.no", "Agent F Customer");
+  seedPoolAgent("oa-A", "post@clean.test.no", "Agent A Clean");
+  seedPoolAgent("oa-B", "post@recent.test.no", "Agent B Recent");
+  seedPoolAgent("oa-C", "post@old.test.no", "Agent C Old");
+  seedPoolAgent("oa-D", "post@replied.test.no", "Agent D Replied");
+  seedPoolAgent("oa-E", "post@optout.test.no", "Agent E OptOut");
+  seedPoolAgent("oa-F", "post@customer.test.no", "Agent F Customer");
 
   // B: recent log entry (1 day ago — within 60d cooldown)
   orchDb.prepare(`
@@ -25190,12 +25190,12 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   `).run();
 
   // D: crm_contact with inbound message
-  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name) VALUES ('cc-D', 'producer', 'oa-D', 'replied@test.no', 'D')`).run();
+  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name) VALUES ('cc-D', 'producer', 'oa-D', 'post@replied.test.no', 'D')`).run();
   orchDb.prepare(`INSERT INTO crm_threads (id, contact_id) VALUES ('ct-D', 'cc-D')`).run();
-  orchDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email) VALUES ('cm-D', 'ct-D', 'in', 'replied@test.no')`).run();
+  orchDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email) VALUES ('cm-D', 'ct-D', 'in', 'post@replied.test.no')`).run();
 
   // E: crm_contact with blocked status
-  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name, status) VALUES ('cc-E', 'producer', 'oa-E', 'optout@test.no', 'E', 'blocked')`).run();
+  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name, status) VALUES ('cc-E', 'producer', 'oa-E', 'post@optout.test.no', 'E', 'blocked')`).run();
 
   // F: customer (claimed_at set)
   orchDb.prepare(`UPDATE agents SET claimed_at = datetime('now') WHERE id = 'oa-F'`).run();
@@ -25349,12 +25349,12 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
 
   // ── Test 8: import endpoint — upsert and idempotency ────────────────────────
   // Seed agent G for import testing
-  seedPoolAgent("oa-G", "import-test@test.no", "Agent G Import");
+  seedPoolAgent("oa-G", "post@import-test.test.no", "Agent G Import");
 
   const importBody = {
     entries: [
       {
-        email: "import-test@test.no",
+        email: "post@import-test.test.no",
         name: "Agent G Import",
         sentAt: new Date(Date.now() - 90 * 86400 * 1000).toISOString(),
         batch: "batch-2025-01",
@@ -25392,10 +25392,10 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
 
   // ── Test 9: hard-bounce exclusion ───────────────────────────────────────────
   // Seed agent H (clean), then hard-bounce its email
-  seedPoolAgent("oa-H", "bounced@test.no", "Agent H Bounced");
+  seedPoolAgent("oa-H", "post@bounced.test.no", "Agent H Bounced");
   orchDb.prepare(`
     INSERT INTO email_bounces (email, bounced_at, bounce_type)
-    VALUES ('bounced@test.no', datetime('now'), 'hard')
+    VALUES ('post@bounced.test.no', datetime('now'), 'hard')
   `).run();
   {
     const r = await req3("GET", "/admin/outreach-candidates?mode=first");
@@ -25411,7 +25411,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     INSERT INTO agent_knowledge
       (agent_id, email, verification_status, enrichment_status,
        url_last_status, url_last_probed, outreach_eligible_at)
-    VALUES ('oa-I', 'kopt@test.no', 'opt_out', 'rich', 200, datetime('now'), datetime('now'))
+    VALUES ('oa-I', 'post@kopt.test.no', 'opt_out', 'rich', 200, datetime('now'), datetime('now'))
   `).run();
   // Note: opt_out means verification_status != 'verified' so the VIEW already excludes it.
   // But the endpoint also explicitly checks verification_status = 'opt_out'.
@@ -25455,15 +25455,15 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     `).run(id, email, website);
   }
 
-  seedPoolAgentWithWebsite("oa-J", "blocked-by-email@test.no", "Agent J Blocklisted Email", "https://agentj.no");
-  seedPoolAgentWithWebsite("oa-K", "agentk@test.no", "Agent K Blocklisted Domain", "https://blocked-domain.no");
-  seedPoolAgentWithWebsite("oa-L", "agentl@test.no", "Agent L Blocklisted AgentId", "https://agentl.no");
-  seedPoolAgentWithWebsite("oa-M", "safe-agent-m@test.no", "Agent M Safe", "https://safem.no");
+  seedPoolAgentWithWebsite("oa-J", "post@blocked-by-email.test.no", "Agent J Blocklisted Email", "https://agentj.no");
+  seedPoolAgentWithWebsite("oa-K", "post@agentk.test.no", "Agent K Blocklisted Domain", "https://blocked-domain.no");
+  seedPoolAgentWithWebsite("oa-L", "post@agentl.test.no", "Agent L Blocklisted AgentId", "https://agentl.no");
+  seedPoolAgentWithWebsite("oa-M", "post@safe-agent-m.test.no", "Agent M Safe", "https://safem.no");
 
   // Insert blocklist rows directly (bypassing the service add() to avoid import complexity)
   orchDb.prepare(`
     INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('email', 'blocked-by-email@test.no', 'test: blocklist by email')
+    VALUES ('email', 'post@blocked-by-email.test.no', 'test: blocklist by email')
   `).run();
   orchDb.prepare(`
     INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
@@ -25508,10 +25508,10 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
 
   // ── blocklist Test 5: mode=second also suppresses blocklisted agents
   // Seed agent N (email-blocklisted) with an old sent_log entry so it qualifies for mode=second
-  seedPoolAgentWithWebsite("oa-N", "blocked-second@test.no", "Agent N Blocklisted Second", "https://agentn.no");
+  seedPoolAgentWithWebsite("oa-N", "post@blocked-second.test.no", "Agent N Blocklisted Second", "https://agentn.no");
   orchDb.prepare(`
     INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('email', 'blocked-second@test.no', 'test: blocklist mode=second')
+    VALUES ('email', 'post@blocked-second.test.no', 'test: blocklist mode=second')
   `).run();
   // Old sent_log entry (90 days) so N passes the cooldown check
   orchDb.prepare(`
@@ -25536,9 +25536,9 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   //        → suppressed + counted under suppressed_counts.website_unverified.
   //   R  — verification_review_reason.inference_only_fields = ["products"]
   //        → suppressed + counted under suppressed_counts.inference_only.
-  seedPoolAgent("oa-P", "gmail-producer@gmail.com", "Agent P Gmail Verified Site");
-  seedPoolAgent("oa-Q", "q@bondegard.no", "Agent Q Wrong Entity Site");
-  seedPoolAgent("oa-R", "r@bondegard.no", "Agent R Inference Products");
+  seedPoolAgent("oa-P", "post@p-verified-site.no", "Agent P Verified Site");
+  seedPoolAgent("oa-Q", "post@q.bondegard.no", "Agent Q Wrong Entity Site");
+  seedPoolAgent("oa-R", "post@r.bondegard.no", "Agent R Inference Products");
 
   // P: a VERIFIED own-site + real Tier-A products provenance. website_ownership
   //    is present with status:"verified" (NOT "unverified") so it is never a
@@ -25569,7 +25569,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     const r = await req3("GET", "/admin/outreach-candidates?mode=first");
     assertTrue(r.status === 200, "orch-pr-17-A0: mode=first → 200");
     const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(ids.includes("oa-P"), "orch-pr-17-A1: gmail producer w/ verified own-site NOT suppressed (still candidate)");
+    assertTrue(ids.includes("oa-P"), "orch-pr-17-A1: producer w/ verified own-site NOT suppressed (still candidate)");
   }
 
   // A2: website_ownership=unverified agent Q is suppressed + counted.
@@ -25588,19 +25588,18 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     assertTrue(r.body.suppressed_counts.inference_only >= 1, "orch-pr-17-A5: suppressed_counts.inference_only >= 1 (R)");
   }
 
-  // A4: free-mail is NOT a suppression reason on its own — both the gmail
-  //     control (P) is in candidates AND the new counts never count P.
+  // A4: the data-quality counters never count P (a clean, general-address
+  //     producer with a verified own-site).
   {
     const r = await req3("GET", "/admin/outreach-candidates?mode=first");
     const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    // P (gmail) present; clean baseline agent A (test.no) also present → free-mail
-    // and non-free-mail both pass when data-quality is clean.
-    assertTrue(ids.includes("oa-P") && ids.includes("oa-A"), "orch-pr-17-A6: free-mail not downgraded — gmail P and A both candidates");
+    // P present; clean baseline agent A also present.
+    assertTrue(ids.includes("oa-P") && ids.includes("oa-A"), "orch-pr-17-A6: verified-site producer P and clean A both candidates");
   }
 
   // A5: a non-factual inference flag does NOT suppress (only products/address/phone do).
   //     Seed S with inference_only_fields=["about"] — must STAY a candidate.
-  seedPoolAgent("oa-S", "s@bondegard.no", "Agent S Inference About Only");
+  seedPoolAgent("oa-S", "post@s.bondegard.no", "Agent S Inference About Only");
   orchDb.prepare(`UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'oa-S'`).run(
     JSON.stringify({ inference_only_fields: ["about"] }),
   );
@@ -42121,6 +42120,23 @@ runSerial(async () => {
     failed++;
     failures.push("mcp-protocol-version: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ mcp-protocol-version: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15: recipient-policy classifier ──");
+  try {
+    const { runRecipientPolicyTests } = require("../src/services/recipient-policy.test") as
+      typeof import("../src/services/recipient-policy.test");
+    const rp = runRecipientPolicyTests();
+    passed += rp.passed;
+    failed += rp.failed;
+    for (const f of rp.failures) failures.push("recipient-policy: " + f);
+    console.log(`  recipient-policy: ${rp.passed} passed, ${rp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("recipient-policy: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ recipient-policy: unexpected error: ${String(err?.message || err)}`);
   }
 });
 

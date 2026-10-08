@@ -131,14 +131,14 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     // through to name-asc tiebreak). "Zzz Higher Engagement" has real, higher
     // views_count and must win under the FIXED behavior — proving parity with
     // outreach-ready-pool's real engagement-based tiebreak.
-    insertVerifiedPoolAgent("gi-A", "Aaa Alphabetically First", "shared@prod-test.no");
-    insertVerifiedPoolAgent("gi-Z", "Zzz Higher Engagement", "shared@prod-test.no");
+    insertVerifiedPoolAgent("gi-A", "Aaa Alphabetically First", "post@shared.prod-test.no");
+    insertVerifiedPoolAgent("gi-Z", "Zzz Higher Engagement", "post@shared.prod-test.no");
     insertViews("gi-Z", "Zzz Higher Engagement", 25);
     insertViews("gi-A", "Aaa Alphabetically First", 2);
 
     // A normal, uncontested single-agent-per-email producer (regression pin for
     // the common case — must still come back untouched).
-    insertVerifiedPoolAgent("gi-solo", "Solo Producer", "solo@prod-test.no");
+    insertVerifiedPoolAgent("gi-solo", "Solo Producer", "post@solo.prod-test.no");
 
     const candidatesRouter = require("./admin-outreach-candidates").default;
     const poolRouter = require("./admin-outreach-pool").default;
@@ -150,7 +150,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     assertEq(resCandidates.status, 200, "gate-integrity: GET mode=first → 200");
 
     const candList = (resCandidates.body?.candidates || []) as Array<{ agent_id: string; email: string }>;
-    const sharedEmailWinner = candList.find((c) => c.email.toLowerCase() === "shared@prod-test.no");
+    const sharedEmailWinner = candList.find((c) => c.email.toLowerCase() === "post@shared.prod-test.no");
     assertEq(
       sharedEmailWinner?.agent_id,
       "gi-Z",
@@ -174,7 +174,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const resPool = callRouteSync(poolRouter, { headers: { "x-admin-key": testKey } });
     assertEq(resPool.status, 200, "gate-integrity: GET outreach-ready-pool → 200");
     const poolAgents = (resPool.body?.agents || []) as Array<{ agent_id: string; email: string }>;
-    const poolSharedWinner = poolAgents.find((a) => (a.email || "").toLowerCase() === "shared@prod-test.no");
+    const poolSharedWinner = poolAgents.find((a) => (a.email || "").toLowerCase() === "post@shared.prod-test.no");
     assertEq(
       poolSharedWinner?.agent_id,
       sharedEmailWinner?.agent_id,
@@ -182,7 +182,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     );
 
     // Test 2 — regression pin: normal single-agent-per-email case unaffected.
-    const soloCandidate = candList.find((c) => c.email.toLowerCase() === "solo@prod-test.no");
+    const soloCandidate = candList.find((c) => c.email.toLowerCase() === "post@solo.prod-test.no");
     assertEq(soloCandidate?.agent_id, "gi-solo", "gate-integrity: single-agent-per-email case still works unchanged");
 
     // gate_integrity_violations must be present and 0 in the normal case (Fix 2
@@ -209,7 +209,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const failVerification = coreEligibilityCheck({
       verification_status: "pending_verify",
       enrichment_status: "rich",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
     });
     assertEq(failVerification.ok, false, "coreEligibilityCheck: fails when verification_status != 'verified'");
@@ -222,7 +222,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const failEnrichment = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "thin",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
     });
     assertEq(failEnrichment.ok, false, "coreEligibilityCheck: fails when enrichment_status is 'thin'");
@@ -245,7 +245,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const failPartialThin = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "partial",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
     });
     assertEq(
@@ -266,7 +266,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const passPartialAbout = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "partial",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
       about: "x".repeat(90),
       products: [],
@@ -287,7 +287,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const passPartialProducts = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "partial",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
       about: "kort",
       products: [{ name: "a" }, { name: "b" }, { name: "c" }],
@@ -303,7 +303,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const failPartialContent = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "partial",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
       about: "x".repeat(40),
       products: [{ name: "Poteter" }],
@@ -335,7 +335,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
       const viaCheck = coreEligibilityCheck({
         verification_status: "verified",
         enrichment_status: "partial",
-        email: "x@example.no",
+        email: "post@x.example.no",
         umbrella_type: null,
         about: fx.about,
         products: fx.products,
@@ -363,7 +363,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const failUmbrella = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "rich",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: "chain",
     });
     assertEq(failUmbrella.ok, false, "coreEligibilityCheck: fails when umbrella_type is not null");
@@ -374,7 +374,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     const passes = coreEligibilityCheck({
       verification_status: "verified",
       enrichment_status: "rich",
-      email: "x@example.no",
+      email: "post@x.example.no",
       umbrella_type: null,
     });
     assertEq(passes.ok, true, "coreEligibilityCheck: passes a fully-eligible row");

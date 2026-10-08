@@ -792,6 +792,7 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
 import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd } from "../services/blocklist-service";
+import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "../services/recipient-policy";
 // GET /admin/gardssalg-outreach-candidates (near computeGardssalgOutreach-
 // SendEligibility, below) reuses the SAME email-collision dedupe RFB's
 // admin-outreach-candidates.ts uses — not gardssalg-outreach-dedupe.ts's
@@ -17960,6 +17961,14 @@ export function computeGardssalgOutreachSendEligibility(
       continue;
     }
 
+    // ── Recipient policy (dev-request 2026-10-06-mottakerpolicy-kald-utsending-
+    // mfl-15, markedsføringsloven § 15): cold mail only to GENERAL role
+    // addresses. Fail-closed; sendGardssalgOutreachToEligibleProvider re-checks.
+    if (!isColdRecipientAllowed(email)) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: PERSONAL_ADDRESS_REASON });
+      continue;
+    }
+
     const blockCheck = isBlocked({ email });
     if (blockCheck.blocked) {
       out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "blocklisted" });
@@ -18258,6 +18267,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     let blocklistedCount = 0;
     let crossPlatformCooldownCount = 0;
     let preflightNoGoCount = 0;
+    let personalAddressCount = 0;
 
     type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
     const survivors: Candidate[] = [];
@@ -18278,6 +18288,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           blocklisted: blocklistedCount,
           cross_platform_cooldown: crossPlatformCooldownCount,
           preflight_no_go: preflightNoGoCount,
+          personal_address: personalAddressCount,
         },
       });
 
@@ -18402,6 +18413,8 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           hardBouncedCount++;
         } else if (e.reason === "replied") {
           repliedCount++;
+        } else if (e.reason === PERSONAL_ADDRESS_REASON) {
+          personalAddressCount++;
         } else if (e.reason === "max_touch_reached") {
           contactedOrCooldownCount++;
         } else if (e.reason === "cooldown_suppressed") {
@@ -18439,6 +18452,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         const email = (base?.epost ?? "").trim();
         if (!email) {
           preflightNoGoCount++; // no_email — folded into preflight_no_go, see above
+          continue;
+        }
+        if (!isColdRecipientAllowed(email)) {
+          personalAddressCount++; // mfl. § 15 recipient policy (mode=second)
           continue;
         }
         const lastSent = sentByEmail.get(email.toLowerCase());
@@ -18526,6 +18543,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         blocklisted: blocklistedCount,
         cross_platform_cooldown: crossPlatformCooldownCount,
         preflight_no_go: preflightNoGoCount,
+        personal_address: personalAddressCount,
       },
     });
   } catch (err: any) {
@@ -18813,6 +18831,13 @@ export async function sendGardssalgOutreachToEligibleProvider(
   // sentAt and its fallback messageId are derived from the same instant.
   const sentAtIso = new Date().toISOString();
   const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  // Send-time recipient-policy re-check (mfl. § 15, fail-closed): a skip, not a
+  // batch stop — nothing written, no reservation, no touch consumed.
+  if (!isColdRecipientAllowed(email)) {
+    console.warn(`[${opts.source}] recipient is not a general role address — NOT sending`, { providerId, email });
+    return { provider_id: providerId, status: "skipped", reason: PERSONAL_ADDRESS_REASON };
+  }
 
   // Send-time bounce re-check (owner decision 2026-09-29 «1B»): the caller's
   // eligibility pass already dropped hard-bounced/complained addresses, but a
