@@ -23,6 +23,22 @@ export const URL_BACKFILL_DEFAULT_MIN_INTERVAL_HOURS = 12;
 /** url-backfill starts this long after boot (was 5 s). */
 export const URL_BACKFILL_BOOT_DELAY_MS = 5 * 60 * 1000;
 
+// ── Boot staggering (dev-request 2026-10-08-serverheng-hovedtraad-oppstart-
+//    statistikk-samtaler, slice 2). Spread the heavy boot work so a deploy no
+//    longer produces one long stall right after listen. Only WHEN things start
+//    changes — never what they compute.
+export const TRUST_RECALC_JOB = "boot-trust-recalc";
+/** boot-trust-recalc starts this long after listen (was 2 s). Before url-backfill (5 min). */
+export const TRUST_RECALC_BOOT_DELAY_MS = 4 * 60 * 1000;
+/** boot-trust-recalc is skipped when it completed within this many hours (persisted in boot_job_state). */
+export const TRUST_RECALC_MIN_INTERVAL_HOURS = 24;
+/** First prewarm of the three off-thread traffic-stats scans (was immediately). */
+export const TRAFFIC_PREWARM_BOOT_DELAY_MS = 60 * 1000;
+/** First geocode ticks, staggered so they never start together (were all +30 s). The agents worker
+// owns its +9 min constant (AGENTS_GEOCODE_BOOT_DELAY_MS). */
+export const DENTAL_GEOCODE_BOOT_DELAY_MS = 3 * 60 * 1000;
+export const EXPERIENCES_GEOCODE_BOOT_DELAY_MS = 6 * 60 * 1000;
+
 /** Resolve on the next macrotask so queued I/O and timers can run. */
 export function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -129,4 +145,38 @@ export function shouldSkipRecentRun(opts: { lastCompletedAt: Date | null; now: D
   const ageMs = opts.now.getTime() - opts.lastCompletedAt.getTime();
   if (ageMs < 0) return false; // clock skew / future stamp: do not trust it
   return ageMs < opts.minIntervalHours * 3600_000;
+}
+
+/**
+ * Schedule boot-trust-recalc: runs after `delayMs`, inside the exclusive boot
+ * gate, and is skipped when the persisted last completion is younger than
+ * `minIntervalHours`. Completion is stamped only after a successful run, so a
+ * failed recalculation is retried on the next boot. Returns the timer handle.
+ */
+export function scheduleBootTrustRecalc(deps: {
+  getDb: () => any;
+  recalc: () => Promise<unknown>;
+  log?: (msg: string) => void;
+  now?: () => Date;
+  setTimeoutFn?: (fn: () => void, ms: number) => any;
+  delayMs?: number;
+  minIntervalHours?: number;
+}): any {
+  const log = deps.log ?? ((m: string) => console.log(m));
+  const now = deps.now ?? (() => new Date());
+  const st = deps.setTimeoutFn ?? setTimeout;
+  const minHours = deps.minIntervalHours ?? TRUST_RECALC_MIN_INTERVAL_HOURS;
+  return st(() => {
+    void runExclusiveBootJob(async () => {
+      const last = getJobLastCompletedAt(deps.getDb(), TRUST_RECALC_JOB);
+      if (shouldSkipRecentRun({ lastCompletedAt: last, now: now(), minIntervalHours: minHours })) {
+        log(`[boot-trust-recalc] skipped — last completed run ${last!.toISOString()} is < ${minHours}h old`);
+        return;
+      }
+      await deps.recalc();
+      markJobCompleted(deps.getDb(), TRUST_RECALC_JOB, now());
+    }).catch((err: unknown) => {
+      console.error("Trust recalc failed (non-fatal):", err);
+    });
+  }, deps.delayMs ?? TRUST_RECALC_BOOT_DELAY_MS);
 }

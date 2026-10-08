@@ -12,8 +12,10 @@
 // one refresh per minute still stalling the loop for ~1.8 s. With a
 // file-backed DB the refresh now runs in the off-thread stats worker
 // (offthread-stats.ts): /health serves the cached numbers and a stale value
-// triggers a background refresh. The very first call after boot fills the
-// cache synchronously once, so /health never reports placeholder zeros.
+// triggers a background refresh. The very first call after boot used to fill
+// the cache synchronously once (a ~16 s main-thread stall on prod); it now
+// returns null for the counts until the background refresh lands, so /health
+// never blocks and never reports placeholder zeros.
 // In-memory DBs, OFFTHREAD_STATS_DISABLED=1 and a broken worker keep the
 // original synchronous 60 s cache.
 //
@@ -28,10 +30,16 @@ export const HEALTH_COUNTS_TTL_MS = 60_000;
 const HEALTH_COUNTS_RETRY_MS = 60_000;
 const KEY = "page-views";
 
+/**
+ * The three fields are `null` only on the off-thread path, from the very
+ * first call after boot until the background count has landed (slice 2 of
+ * dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler:
+ * the former synchronous first fill blocked the main thread ~16 s at boot).
+ */
 export interface PageViewHealthCounts {
-  pageViews: number;
-  lastHourPageViews: number;
-  cachedAgeMs: number;
+  pageViews: number | null;
+  lastHourPageViews: number | null;
+  cachedAgeMs: number | null;
 }
 
 export interface PageViewHealthCounterDeps {
@@ -76,10 +84,11 @@ export function createPageViewHealthCounter(deps: PageViewHealthCounterDeps): Pa
           offThreadDbPath = db.name;
         }
         if (!offThread.has(KEY)) {
-          // First call after boot: one synchronous fill (exact numbers).
-          const v = deps.computeSync(db, nowMs);
-          offThread.set(KEY, v);
-          return { pageViews: v.pageViews, lastHourPageViews: v.lastHourPageViews, cachedAgeMs: 0 };
+          // First call after boot: never count on the main thread. Kick off
+          // the background refresh (offThread.get schedules it) and report
+          // null until it lands; the next /health probe gets the numbers.
+          offThread.get(KEY);
+          return { pageViews: null, lastHourPageViews: null, cachedAgeMs: null };
         }
         const hit = offThread.get(KEY)!;
         return {

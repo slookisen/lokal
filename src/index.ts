@@ -145,6 +145,8 @@ import { trustScoreService } from "./services/trust-score-service";
 import {
   runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, shouldSkipRecentRun,
   resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
+  scheduleBootTrustRecalc, TRAFFIC_PREWARM_BOOT_DELAY_MS, DENTAL_GEOCODE_BOOT_DELAY_MS,
+  EXPERIENCES_GEOCODE_BOOT_DELAY_MS,
 } from "./services/boot-job-gate";
 import { syncDebioVerifications } from "./services/debio-verification-service";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
@@ -1360,23 +1362,24 @@ app.listen(Number(PORT), HOST, async () => {
   // dev-request 2026-10-02-boot-jobber-event-loop-stall-etter-deploy: runs in
   // short slices (yielding to the event loop between them) behind the shared
   // boot-job gate, so it never blocks >500 ms nor overlaps url-backfill.
-  setTimeout(() => {
-    void runExclusiveBootJob(trackJob("boot-trust-recalc", async () => {
-      try {
-        console.log("📊 Recalculating trust scores (background, chunked)...");
-        const trustResult = await trustScoreService.recalculateAllChunked({ chunkSize: 20, pauseMs: 5 });
-        console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
-      } catch (err) {
-        console.error("Trust recalc failed (non-fatal):", err);
-      }
-    }));
-  }, 2000); // 2 second delay — let health checks pass first
+  // Slice 2 of dev-request 2026-10-08-serverheng-...: starts 4 min after listen
+  // (was 2 s) and is skipped when it completed within the last 24 h
+  // (boot_job_state, same pattern as url-backfill).
+  scheduleBootTrustRecalc({
+    getDb: () => getDb(),
+    recalc: trackJob("boot-trust-recalc", async () => {
+      console.log("📊 Recalculating trust scores (background, chunked)...");
+      const trustResult = await trustScoreService.recalculateAllChunked({ chunkSize: 20, pauseMs: 5 });
+      console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+    }),
+  });
 
   // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy: the homepage
   // traffic strips are computed off the main thread (offthread-stats.ts).
   // Start the first computation for all three hosts now so they show real
   // numbers as early as possible; until it lands they render zeros.
-  prewarmTrafficStats(["rfb", "dental", "experiences"]);
+  // Slice 2: delayed ~60 s so the three full scans do not start with the boot stall.
+  setTimeout(() => prewarmTrafficStats(["rfb", "dental", "experiences"]), TRAFFIC_PREWARM_BOOT_DELAY_MS);
 
   // ─── PR-21 / WO-19 (2026-05-10): link-freshness backfill ────────────
   // On every boot, probe every agent currently in the outreach pool.
@@ -1723,7 +1726,7 @@ if (
   process.env.RFB_DISABLE_DENTAL_GEOCODE !== "1" &&
   process.env.ENABLE_DENTAL === "1"
 ) {
-  // First tick at boot + 30s (lets the volume mount and db-factory init).
+  // First tick at boot + 3 min (staggered, slice 2 of 2026-10-08-serverheng-...).
   setTimeout(trackJob("dental-geocode", async () => {
     try {
       const { geocodeTick } = await import("./services/dental-geocode-worker");
@@ -1736,7 +1739,7 @@ if (
     } catch (err) {
       console.error("[dental-geocode] boot-tick failed:", err);
     }
-  }), 30_000);
+  }), DENTAL_GEOCODE_BOOT_DELAY_MS);
 
   // Subsequent ticks hourly.
   setInterval(trackJob("dental-geocode", async () => {
@@ -1773,7 +1776,7 @@ if (
   process.env.RFB_DISABLE_EXPERIENCES_GEOCODE !== "1" &&
   process.env.ENABLE_EXPERIENCES === "1"
 ) {
-  // First tick at boot + 30s (lets the volume mount and db-factory init).
+  // First tick at boot + 6 min (staggered, slice 2 of 2026-10-08-serverheng-...).
   setTimeout(trackJob("experiences-geocode", async () => {
     try {
       const { experiencesGeocodeTick } = await import("./services/experiences-geocode-worker");
@@ -1791,7 +1794,7 @@ if (
     } catch (err) {
       console.error("[experiences-geocode] boot-tick failed:", err);
     }
-  }), 30_000);
+  }), EXPERIENCES_GEOCODE_BOOT_DELAY_MS);
 
   // Subsequent ticks hourly.
   setInterval(trackJob("experiences-geocode", async () => {

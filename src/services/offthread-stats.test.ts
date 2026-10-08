@@ -279,14 +279,21 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     });
 
     const first = counter.get(FILE_DB, t, 60_000);
-    ok(eq(first, { pageViews: 100, lastHourPageViews: 5, cachedAgeMs: 0 }) && syncCalls.length === 1 && offCalls.length === 0,
-      "P1: the first call after boot fills synchronously once (exact numbers, no placeholder zeros)", { first, syncCalls, offCalls });
+    ok(eq(first, { pageViews: null, lastHourPageViews: null, cachedAgeMs: null }) && syncCalls.length === 0 && eq(offCalls, [{ dbPath: "/data/lokal.db", nowMs: t }]),
+      "P1: the first call after boot returns null counts and starts the off-thread count (no synchronous count)", { first, syncCalls, offCalls });
+    const stillNull = counter.get(FILE_DB, t + 1_000, 60_000);
+    ok(stillNull.pageViews === null && offCalls.length === 1 && syncCalls.length === 0,
+      "P1b: still null while that count is in flight (no second refresh)", { stillNull, offCalls });
+    off.resolve({ pageViews: 100, lastHourPageViews: 5 });
+    await counter.settled();
     t += 30_000;
     const cached = counter.get(FILE_DB, t, 60_000);
-    ok(cached.cachedAgeMs === 30_000 && syncCalls.length === 1 && offCalls.length === 0, "P2: within the TTL the cached counts are served", { cached });
+    ok(cached.pageViews === 100 && cached.cachedAgeMs === 30_000 && syncCalls.length === 0 && offCalls.length === 1,
+      "P2: within the TTL the cached counts are served", { cached });
     t += 30_000;
+    off = deferred<PageViewCounts>();
     const stale = counter.get(FILE_DB, t, 60_000);
-    ok(stale.pageViews === 100 && stale.cachedAgeMs === 60_000 && syncCalls.length === 1 && eq(offCalls, [{ dbPath: "/data/lokal.db", nowMs: t }]),
+    ok(stale.pageViews === 100 && stale.cachedAgeMs === 60_000 && syncCalls.length === 0 && offCalls.length === 2 && offCalls[1].nowMs === t,
       "P3: at the TTL the stale counts are served and the refresh runs off-thread, not synchronously", { stale, syncCalls, offCalls });
     off.resolve({ pageViews: 130, lastHourPageViews: 9 });
     await counter.settled();
@@ -295,7 +302,7 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
 
     usable = false;
     const syncPath = counter.get(FILE_DB, t, 60_000);
-    ok(syncPath.pageViews === 100 && syncCalls.length === 2, "P5: the fallback path keeps the original synchronous 60 s cache", { syncPath, syncCalls });
+    ok(syncPath.pageViews === 100 && syncCalls.length === 1, "P5: the fallback path keeps the original synchronous 60 s cache", { syncPath, syncCalls });
   }
 
   // ── U: offThreadStatsUsable (synchronous: env restored before any await) ──
