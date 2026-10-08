@@ -138,9 +138,27 @@ export interface SlowRequestRecord {
 export interface SlowJobRecord {
   at: string;
   name: string;
+  /** Wall-clock time from start to settle (an async job's awaits count). */
   durationMs: number;
+  /**
+   * Time the job held the event loop: the synchronous part of `fn` (up to its
+   * return / first await). For a sync job this equals durationMs. Only this
+   * part can explain a stall; continuations after an await are not measured.
+   */
+  blockingMs: number;
   ok: boolean;
 }
+
+/** One event handed to the persistence sink (see services/event-loop-persist.ts). */
+export interface EventLoopEvent {
+  /** Epoch ms of the event (stall detection / request or job start). */
+  ts: number;
+  kind: "stall" | "request" | "job";
+  durationMs: number;
+  label: string;
+  extra?: Record<string, unknown>;
+}
+export type EventLoopEventSink = (e: EventLoopEvent) => void;
 
 export interface EventLoopSummary {
   monitoring: boolean;
@@ -170,6 +188,22 @@ const activeJobs = new Map<number, ActiveJob>();
 const stalls: StallRecord[] = [];
 const slowRequests: SlowRequestRecord[] = [];
 const slowJobs: SlowJobRecord[] = [];
+
+let sink: EventLoopEventSink | null = null;
+
+/** Register (or clear with null) the persistence sink. Must be cheap and must not throw. */
+export function setEventLoopEventSink(fn: EventLoopEventSink | null): void {
+  sink = fn;
+}
+
+function emit(e: EventLoopEvent): void {
+  if (!sink) return;
+  try {
+    sink(e);
+  } catch {
+    // persistence must never throw into the event loop
+  }
+}
 
 let histogram: IntervalHistogram | null = null;
 let heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -262,6 +296,13 @@ function beat(): void {
       .map((f) => ({ kind: f.kind, label: f.label, startedAt: iso(f.startedAt), durationMs: f.durationMs })),
   };
   pushCapped(stalls, record);
+  emit({
+    ts: at,
+    kind: "stall",
+    durationMs: lagMs,
+    label: "event-loop-stall",
+    extra: { inflight: record.inflight, inflightTotal: record.inflightTotal, activeJobs: record.activeJobs, finishedDuringBlock: record.finishedDuringBlock },
+  });
   const reqs = record.inflight.map((r) => `${r.method} ${r.host}${r.path} (${r.ageMs}ms)`).join(", ") || "none";
   const jobs = record.activeJobs.map((j) => `${j.name} (${j.ageMs}ms)`).join(", ") || "none";
   const fin = record.finishedDuringBlock.map((f) => `${f.kind === "job" ? "job " : ""}${f.label} (${f.durationMs}ms)`).join(", ") || "none";
@@ -331,6 +372,7 @@ export function requestTrackerMiddleware(req: any, res: any, next: () => void): 
       status,
       durationMs,
     });
+    emit({ ts: entry.startedAt, kind: "request", durationMs, label: `${entry.method} ${entry.host}${entry.path}`, extra: { status } });
     deps.log(`[slow-request] ${entry.method} ${entry.host}${entry.path} ${status} ${durationMs}ms`);
   };
   if (typeof res.once === "function") {
@@ -352,13 +394,19 @@ export function trackJob<A extends unknown[], R>(name: string, fn: (...args: A) 
     const id = ++seq;
     const startedAt = deps.now();
     activeJobs.set(id, { name, startedAt });
+    // blockingMs = time spent synchronously inside fn (set right after it
+    // returns/throws). durationMs = wall clock until the job settles. Stall
+    // suspects (noteFinish) use blockingMs, so an async job that merely awaits
+    // for a long time is not blamed for a stall.
+    let blockingMs = 0;
     const settle = (ok: boolean) => {
       activeJobs.delete(id);
       const finishedAt = deps.now();
       const durationMs = finishedAt - startedAt;
-      noteFinish({ kind: "job", label: name, startedAt, finishedAt, durationMs });
+      noteFinish({ kind: "job", label: name, startedAt, finishedAt, durationMs: blockingMs });
       if (durationMs < cfg.slowJobMs) return;
-      pushCapped(slowJobs, { at: iso(startedAt), name, durationMs, ok });
+      pushCapped(slowJobs, { at: iso(startedAt), name, durationMs, blockingMs, ok });
+      emit({ ts: startedAt, kind: "job", durationMs, label: name, extra: { blockingMs, ok } });
       deps.log(`[slow-job] ${name} ${durationMs}ms ok=${ok}`);
     };
 
@@ -366,9 +414,11 @@ export function trackJob<A extends unknown[], R>(name: string, fn: (...args: A) 
     try {
       result = fn(...args);
     } catch (err) {
+      blockingMs = deps.now() - startedAt;
       settle(false);
       throw err;
     }
+    blockingMs = deps.now() - startedAt;
     if (result && typeof (result as any).then === "function") {
       // Return the DERIVED promise (not a side branch): it carries the same
       // value/rejection, and a rejection the caller ignores stays unhandled,
@@ -436,6 +486,7 @@ export function __resetEventLoopMonitorForTesting(): void {
   slowRequests.length = 0;
   slowJobs.length = 0;
   recentFinishes.length = 0;
+  sink = null;
   lastBeatAt = 0;
 }
 

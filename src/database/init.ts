@@ -5087,6 +5087,28 @@ function initSchema(db: Database.Database): void {
     console.error("Migration boot_job_state failed:", err);
   }
 
+  // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler
+  // (slice 1): persisted event-loop stalls / slow requests / slow jobs, so the
+  // monitor's evidence survives a restart (services/event-loop-persist.ts).
+  // ts is ISO-8601 UTC (lexicographically sortable); 14-day retention prune.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS event_loop_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        label TEXT,
+        git_sha TEXT,
+        booted_at TEXT,
+        extra TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_event_loop_events_ts ON event_loop_events(ts);
+    `);
+  } catch (err) {
+    console.error("Migration event_loop_events failed:", err);
+  }
+
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already
   // exists (base CREATE TABLE above) — these three columns are the SAME

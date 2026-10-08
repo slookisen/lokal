@@ -32349,6 +32349,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of elm.failures) failures.push("event-loop-monitor: " + f);
     console.log(`  event-loop-monitor: ${elm.passed} passed, ${elm.failed} failed`);
 
+    console.log("\n── event-loop-persist: persisted stalls/slow work, since_hours, prune, trackJob wall vs blocking ──");
+    const { runEventLoopPersistTests } = require("../src/services/event-loop-persist.test") as
+      typeof import("../src/services/event-loop-persist.test");
+    const elp = await runEventLoopPersistTests({ log: false });
+    passed += elp.passed;
+    failed += elp.failed;
+    for (const f of elp.failures) failures.push("event-loop-persist: " + f);
+    console.log(`  event-loop-persist: ${elp.passed} passed, ${elp.failed} failed`);
+
     // dev-request 2026-10-02-boot-jobber-event-loop-stall-etter-deploy: boot jobs
     // run in slices behind an exclusive gate; url-backfill skips a recent restart.
     console.log("\n── boot-job-gate: chunked boot jobs, exclusive gate, url-backfill skip ──");
