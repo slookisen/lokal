@@ -641,7 +641,7 @@ export function computeOutreachCandidates(
     let recentCrmSendCount = 0;
     // dev-request 2026-08-29-outreach-max-touch-vern counter + detail list
     let maxTouchSuppressedCount = 0;
-    // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15 counter
+    // recipient-policy counter (lokal#997 key; malformed addresses only since 2026-10-08)
     let personalAddressCount = 0;
     const maxTouchSuppressedList: Array<{
       agent_id: string;

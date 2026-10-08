@@ -502,6 +502,11 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertEq(full.body.excluded.length, 3, "c9: excluded has exactly 3 rows (macks, quarantine, prov-d-unverified)");
       assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3, daily_cap: 4 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets) + daily_cap (env unset -> default 4)");
       assertEq(full.body.missing, { count: 0, reason: null }, "c11: full batch -> missing.count 0, reason null");
+      assertEq(
+        full.body.recipient_address_types,
+        { general_role_address: 3, personal_local_part: 0, free_mail_domain: 1, malformed_or_empty: 0 },
+        "c11b: recipient_address_types counts the 4 selected candidates (a is free-mail; b, c, e are general)",
+      );
       assertEq(full.body.dry, false, "c12: dry:false (eligible_total > 0)");
 
       // dev-request 2026-10-08-mottakerpolicy-alle-adresser: the send function
