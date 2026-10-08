@@ -27,6 +27,7 @@ import * as http from "http";
 import * as path from "path";
 import express from "express";
 import {
+  COUNT_RETRY_MS,
   COUNT_TTL_MS,
   createAgentplatformHostGate,
   createAgentplatformRouter,
@@ -107,6 +108,10 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
       www.status === 301 && www.headers.location === "https://agentplatform.no/en?x=1",
       `${www.status} ${www.headers.location}`,
     );
+    for (const h of ["AgentPlatform.NO", "agentplatform.no."]) {
+      const r = await get("/", h);
+      check(`a3c: host ${JSON.stringify(h)} (case / trailing dot) is served, not passed to the rfb routers`, r.status === 200 && r.body.includes('<html lang="nb">'), String(r.status));
+    }
     for (const h of ["agentplattform.no", "www.agentplattform.no"]) {
       const r = await get("/kontakt?a=b", h);
       check(`a3b: ${h} (Norwegian spelling) → 301 https://agentplatform.no<path+query>`, r.status === 301 && r.headers.location === "https://agentplatform.no/kontakt?a=b", `${r.status} ${r.headers.location}`);
@@ -138,8 +143,14 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
         `c1: front page links to https://${d}/ with utm_source=agentplatform.no`,
         home.body.includes(`href="https://${d}/?utm_source=agentplatform.no&amp;utm_medium=referral&amp;utm_campaign=paraply"`),
       );
+    }
+    for (const d of ["rettfrabonden.com", "opplevagent.no"]) {
       check(`c2: /en links to the English entry https://${d}/en`, en.body.includes(`href="https://${d}/en?utm_source=agentplatform.no`));
     }
+    check(
+      "c2b: /en links to finn-tannlege.com's root (the service has no English site)",
+      en.body.includes('href="https://finn-tannlege.com/?utm_source=agentplatform.no') && !en.body.includes("https://finn-tannlege.com/en"),
+    );
     check("c3: counts rendered with a no-break space (1 809, 5 446, 712)", home.body.includes("1 809") && home.body.includes("5 446") && home.body.includes(">712<"));
     check('c4: "Over 7 900 oppføringer" rounds the sum (7 967) DOWN', home.body.includes("Over 7 900 oppføringer"));
     check("c5: formatCount / floorForClaim", formatCount(1809) === "1 809" && formatCount(712) === "712" && formatCount(1234567) === "1 234 567" && floorForClaim(7967) === 7900 && floorForClaim(812) === 812);
@@ -163,6 +174,41 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
     check("c7: missing count → no 'tannlegeklinikker' number line", !/<strong>[^<]*<\/strong><span>tannlegeklinikker/.test(sparseHome));
     check('c8: missing count → no "Over N oppføringer" claim', !sparseHome.includes("oppføringer</li>"));
     check("c9: missing count never prints null/NaN/undefined", !/>(null|NaN|undefined)</.test(sparseHome));
+
+    // A count of 0 is hidden like a missing one, and a missing count is retried
+    // after COUNT_RETRY_MS instead of being cached for the full COUNT_TTL_MS.
+    let zeroReads = 0;
+    let zeroNow = 5_000_000;
+    const zeroRouter = createAgentplatformRouter({
+      readCount: (v) => {
+        zeroReads++;
+        return v === "experiences" ? 0 : counts[v] ?? null;
+      },
+      now: () => zeroNow,
+    });
+    const zeroApp = express();
+    zeroApp.use(createAgentplatformHostGate(zeroRouter));
+    const s3 = http.createServer(zeroApp);
+    await new Promise<void>((r) => s3.listen(0, "127.0.0.1", () => r()));
+    const p3 = (s3.address() as any).port;
+    const getZero = (): Promise<string> =>
+      new Promise((resolve, reject) => {
+        http.get({ host: "127.0.0.1", port: p3, path: "/", headers: { host: "agentplatform.no" } }, (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        }).on("error", reject);
+      });
+    const zeroHome = await getZero();
+    check("c10: a count of 0 is hidden (no '0 opplevelser', no '<strong>0<')", !/<strong>0<\/strong>/.test(zeroHome) && !zeroHome.includes(">0 opplevelser<"));
+    const afterFirst = zeroReads;
+    zeroNow += COUNT_RETRY_MS - 1;
+    await getZero();
+    check("c11: a missing count stays cached just under COUNT_RETRY_MS", zeroReads === afterFirst, `${afterFirst} → ${zeroReads}`);
+    zeroNow += 1;
+    await getZero();
+    check("c12: …and is re-read at COUNT_RETRY_MS, well before COUNT_TTL_MS", zeroReads === afterFirst + 3 && COUNT_RETRY_MS < COUNT_TTL_MS, `${afterFirst} → ${zeroReads}`);
+    await new Promise<void>((r) => s3.close(() => r()));
 
     // ── (d) cache ─────────────────────────────────────────────────────────
     const before = reads;
@@ -193,6 +239,7 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
     try { ld = ldMatch ? JSON.parse(ldMatch[1]) : null; } catch { ld = null; }
     check("e5: Organization JSON-LD parses and carries the org.nr", !!ld && ld["@type"] === "Organization" && ld.identifier?.value === COMPANY_INFO.orgNr);
     check("e6: JSON-LD has no streetAddress", !!ld && !("streetAddress" in (ld.address || {})));
+    check("e6b: JSON-LD uses only schema.org-valid properties (no `owns` with WebSite)", !!ld && !("owns" in ld) && Array.isArray(ld.brand) && ld.brand.length === 3);
     check("e7: footer shows legal name + org.nr linked to /kontakt", home.body.includes(`<a href="/kontakt">${COMPANY_INFO.legalName} · Org.nr. ${COMPANY_INFO.orgNrDisplay}</a>`));
     check("e8: /contact and /privacy redirect to the English pages", (await get("/contact")).headers.location === "/en/contact" && (await get("/privacy")).headers.location === "/en/privacy");
 
@@ -217,12 +264,14 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
       ["/favicon-512.png", /^image\/png/],
       ["/apple-touch-icon.png", /^image\/png/],
       ["/og.png", /^image\/png/],
-      ["/assets/geist-latin-wght.woff2", /^font\/woff2/],
+      ["/assets/geist-5.3.0-latin-wght.woff2", /^font\/woff2/],
     ];
     for (const [p, type] of assets) {
       const r = await get(p);
       check(`g4: ${p} → 200 ${type.source}`, r.status === 200 && type.test(String(r.headers["content-type"])), `${r.status} ${r.headers["content-type"]}`);
     }
+    check("g4b: the unversioned font path is not served", (await get("/assets/geist-latin-wght.woff2")).status === 404);
+    check('g4c: privacy copy says "ikke noe innhold" (neuter), never "ingen innhold"', personvern.body.includes("ikke noe innhold fra tredjeparter") && !personvern.body.includes("ingen innhold"));
     check("g5: the OFL licence ships next to the Geist font", fs.existsSync(path.join(__dirname, "..", "public", "agentplatform-geist-OFL.txt")));
   } finally {
     await new Promise<void>((r) => server.close(() => r()));

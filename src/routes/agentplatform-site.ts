@@ -56,6 +56,8 @@ interface Service {
   countLabel: Text;
   /** Short form for the hero illustration ("1 809 produsenter"). */
   shortLabel: Text;
+  /** The service has an English site under /en (finn-tannlege.com does not). */
+  hasEnglish: boolean;
   /** CSS custom-property suffix: --svc-<key> / --svc-<key>-ink. */
   key: string;
   /** Inline SVG; `uid` keeps gradient ids unique when a mark appears more than once on a page. */
@@ -63,9 +65,11 @@ interface Service {
 }
 
 const UTM = "utm_source=agentplatform.no&utm_medium=referral&utm_campaign=paraply";
+/** Versioned (Geist 5.3.0) because it is cached for a year. */
+export const FONT_URL = "/assets/geist-5.3.0-latin-wght.woff2";
 
-export function serviceUrl(domain: string, lang: Lang): string {
-  return `https://${domain}/${lang === "en" ? "en" : ""}?${UTM}`;
+export function serviceUrl(s: Pick<Service, "domain" | "hasEnglish">, lang: Lang): string {
+  return `https://${s.domain}/${lang === "en" && s.hasEnglish ? "en" : ""}?${UTM}`;
 }
 
 // The three services' own app icons (their live /favicon.svg), redrawn without
@@ -79,6 +83,7 @@ export const SERVICES: Service[] = [
     vertical: "rfb",
     name: "Rett fra Bonden",
     domain: "rettfrabonden.com",
+    hasEnglish: true,
     key: "rfb",
     category: { nb: "Lokal mat", en: "Local food" },
     description: {
@@ -93,6 +98,7 @@ export const SERVICES: Service[] = [
     vertical: "experiences",
     name: "Opplevagent",
     domain: "opplevagent.no",
+    hasEnglish: true,
     key: "oa",
     category: { nb: "Opplevelser", en: "Experiences" },
     description: {
@@ -107,6 +113,7 @@ export const SERVICES: Service[] = [
     vertical: "dental",
     name: "Finn-tannlege",
     domain: "finn-tannlege.com",
+    hasEnglish: false,
     key: "ft",
     category: { nb: "Tannhelse", en: "Dental care" },
     description: {
@@ -149,6 +156,8 @@ export function floorForClaim(n: number): number {
 
 // ─── Live catalog counts (honest-count.ts), cached ──────────────────────────
 export const COUNT_TTL_MS = 10 * 60_000;
+/** A missing count (e.g. a vertical DB not ready at cold start) is retried sooner. */
+export const COUNT_RETRY_MS = 30_000;
 export type ServiceCounts = Record<CatalogVertical, number | null>;
 
 export interface AgentplatformDeps {
@@ -157,15 +166,17 @@ export interface AgentplatformDeps {
 }
 
 function makeCountCache(deps: AgentplatformDeps) {
-  let cache: { at: number; counts: ServiceCounts } | null = null;
+  let cache: { at: number; ttl: number; counts: ServiceCounts } | null = null;
   return (): ServiceCounts => {
     const now = deps.now();
-    if (!cache || now - cache.at >= COUNT_TTL_MS) {
+    if (!cache || now - cache.at >= cache.ttl) {
       const read = (v: CatalogVertical) => {
         const n = deps.readCount(v);
         return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : null;
       };
-      cache = { at: now, counts: { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") } };
+      const counts = { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") };
+      const anyMissing = Object.values(counts).some((n) => n == null);
+      cache = { at: now, ttl: anyMissing ? COUNT_RETRY_MS : COUNT_TTL_MS, counts };
     }
     return cache.counts;
   };
@@ -203,13 +214,13 @@ const T = {
     servicesLead: "Tre uavhengige oversikter, bygget på samme plattform og med de samme kravene til kvalitet.",
     visit: (name: string) => `Gå til ${name}`,
     platformKicker: "Plattformen",
-    platformTitle: "Laget for hvordan folk leter i dag",
+    platformTitle: "Laget for måten folk leter på i dag",
     platformLead:
-      "Stadig flere spør en AI-assistent i stedet for å søke selv. Vi bygger tjenester som gir gode svar begge veier.",
+      "Stadig flere spør en AI-assistent i stedet for å søke selv. Tjenestene våre er laget for begge deler.",
     pillars: [
       {
         title: "Verifiserte tilbydere",
-        body: "Vi sjekker tilbyderne mot Brønnøysundregistrene og deres egne nettsider, og holder oppføringene oppdatert.",
+        body: "Vi sjekker tilbyderne mot Brønnøysundregistrene og tilbydernes egne nettsider, og holder oppføringene oppdatert.",
       },
       {
         title: "Åpent for AI-agenter",
@@ -296,7 +307,7 @@ const T = {
     platformKicker: "The platform",
     platformTitle: "Built for how people search today",
     platformLead:
-      "More and more people ask an AI assistant instead of searching themselves. Our services give good answers either way.",
+      "More and more people ask an AI assistant instead of searching themselves. Our services are built for both.",
     pillars: [
       {
         title: "Verified providers",
@@ -358,7 +369,7 @@ const T = {
 
 // ─── Styles ─────────────────────────────────────────────────────────────────
 const CSS = `
-@font-face{font-family:"Geist";src:url("/assets/geist-latin-wght.woff2") format("woff2");font-weight:100 900;font-style:normal;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"Geist";src:url("${FONT_URL}") format("woff2");font-weight:100 900;font-style:normal;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
 :root{
   --bg:#f8f7f3;--bg-2:#f1efe8;--surface:#ffffff;--ink:#0b1b2b;--ink-2:#334155;--muted:#5b6474;--line:#e3e0d7;--line-2:#d6d2c6;
   --brand:#0b1b2b;--on-brand:#ffffff;--focus:#2563eb;
@@ -425,7 +436,7 @@ a{color:inherit}
 .hero-lines{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
 .orbit{fill:none;stroke:var(--line-2);stroke-width:1;vector-effect:non-scaling-stroke;stroke-dasharray:2 6}
 .orbit-2{opacity:.6}
-.flow{fill:none;stroke:var(--ink-2);stroke-opacity:.35;stroke-width:1.5;vector-effect:non-scaling-stroke;stroke-dasharray:5 7;stroke-linecap:round;animation:flow 2.4s linear infinite}
+.flow{fill:none;stroke:var(--ink-2);stroke-opacity:.35;stroke-width:1.5;vector-effect:non-scaling-stroke;stroke-dasharray:5 7;stroke-linecap:round;animation:flow 2.4s linear 2}
 .flow-2{animation-delay:-.8s}.flow-3{animation-delay:-1.6s}
 @keyframes flow{to{stroke-dashoffset:-24}}
 .hub{position:absolute;left:50%;top:50%;width:116px;height:116px;transform:translate(-50%,-50%);border-radius:30px;box-shadow:0 0 0 1px var(--hub-edge),0 0 0 12px color-mix(in srgb,var(--ink) 5%,transparent),0 0 0 26px color-mix(in srgb,var(--ink) 3%,transparent),0 30px 60px -24px rgba(11,27,43,.55)}
@@ -526,7 +537,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 @media (max-width:980px){.about{grid-template-columns:1fr;gap:36px}}
 .about p:not(.kicker){color:var(--ink-2);font-size:18px;margin:20px 0 0;max-width:60ch}
 .facts-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:8px 28px;box-shadow:var(--shadow)}
-.facts-card h3{font-size:13px;font-weight:650;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:20px 0 4px}
+.facts-card .facts-h{font-size:13px;font-weight:650;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:20px 0 4px}
 .facts-card dl{margin:0}
 .facts-card div{display:grid;grid-template-columns:minmax(150px,auto) 1fr;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
 .facts-card div:first-child{border-top:0}
@@ -542,16 +553,19 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 /* Contact */
 .contact{background:var(--surface);border:1px solid var(--line);border-radius:28px;padding:56px;display:grid;grid-template-columns:1.3fr auto;gap:32px;align-items:center;box-shadow:var(--shadow);position:relative;overflow:hidden}
 .contact::before{content:"";position:absolute;right:-120px;top:-120px;width:360px;height:360px;border-radius:50%;background:radial-gradient(closest-side,color-mix(in srgb,var(--svc-ft) 14%,transparent),transparent);pointer-events:none}
+.contact>div{min-width:0}
 .contact h2{margin:0}
 .contact p{color:var(--ink-2);margin:14px 0 0;max-width:56ch}
 .contact .note{font-size:15px;color:var(--muted)}
 @media (max-width:860px){.contact{grid-template-columns:1fr;padding:36px 28px}}
+.btn-mail span{overflow-wrap:anywhere;min-width:0}
+@media (max-width:400px){.contact{padding:32px 20px}.btn-mail{padding:0 16px;font-size:15px}}
 
 /* Footer */
 .ftr{border-top:1px solid var(--line);margin-top:88px;padding:56px 0 40px;color:var(--muted);font-size:15px}
 .ftr-grid{display:grid;grid-template-columns:1.6fr 1fr 1fr;gap:40px}
 @media (max-width:760px){.ftr-grid{grid-template-columns:1fr 1fr}.ftr-brand{grid-column:1/-1}}
-.ftr h4{color:var(--ink);font-size:14px;font-weight:650;margin:0 0 14px}
+.ftr .ftr-h{color:var(--ink);font-size:14px;letter-spacing:0;font-weight:650;margin:0 0 14px}
 .ftr ul{list-style:none;margin:0;padding:0;display:grid;gap:10px}
 .ftr a{text-decoration:none;color:var(--muted)}
 .ftr a:hover{color:var(--ink)}
@@ -562,7 +576,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 /* Text pages (privacy, 404) */
 .page{padding:72px 0 24px}
 .page .wrap{max-width:760px}
-.page h1{font-size:clamp(34px,5vw,52px);letter-spacing:-.03em;line-height:1.08;font-weight:650;margin:12px 0 0}
+.page h1{overflow-wrap:break-word;hyphens:auto;font-size:clamp(28px,5vw,52px);letter-spacing:-.03em;line-height:1.08;font-weight:650;margin:12px 0 0}
 .page h2{font-size:24px;letter-spacing:-.02em;margin:44px 0 0}
 .page p,.page li{color:var(--ink-2)}
 .page ul{padding-left:22px}
@@ -624,8 +638,8 @@ function footer(lang: Lang): string {
   return `<footer class="ftr"><div class="wrap">
 <div class="ftr-grid">
 <div class="ftr-brand"><a class="brand" href="${home}">${AGENTPLATFORM_MARK}<span>agentplatform<span>.no</span></span></a><p>${t.footerTagline}</p></div>
-<div><h4>${t.footerServices}</h4><ul>${SERVICES.map((s) => `<li><a href="${esc(serviceUrl(s.domain, lang))}">${esc(s.name)}</a></li>`).join("")}</ul></div>
-<div><h4>${t.footerCompany}</h4><ul><li><a href="${anchor("om")}">${t.navAbout}</a></li><li><a href="${t.contactHref}">${t.navContact}</a></li><li><a href="${t.privacyHref}">${t.footerPrivacy}</a></li><li><a href="${t.langSwitchHref}" hreflang="${t.langSwitchHreflang}" lang="${t.langSwitchHreflang}">${t.langSwitch}</a></li></ul></div>
+<div><h2 class="ftr-h">${t.footerServices}</h2><ul>${SERVICES.map((s) => `<li><a href="${esc(serviceUrl(s, lang))}">${esc(s.name)}</a></li>`).join("")}</ul></div>
+<div><h2 class="ftr-h">${t.footerCompany}</h2><ul><li><a href="${anchor("om")}">${t.navAbout}</a></li><li><a href="${t.contactHref}">${t.navContact}</a></li><li><a href="${t.privacyHref}">${t.footerPrivacy}</a></li><li><a href="${t.langSwitchHref}" hreflang="${t.langSwitchHreflang}" lang="${t.langSwitchHreflang}">${t.langSwitch}</a></li></ul></div>
 </div>
 <div class="ftr-base"><span>© ${year} <a href="${t.contactHref}">${COMPANY.legalName} · ${lang === "en" ? "Org. no." : "Org.nr."} ${COMPANY.orgNrDisplay}</a></span><span>${t.footerRegistered}</span></div>
 </div></footer>`;
@@ -651,7 +665,7 @@ ${o.noindex ? `<meta name="robots" content="noindex">` : `<link rel="canonical" 
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-192.png" type="image/png" sizes="192x192">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="preload" href="/assets/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="${FONT_URL}" as="font" type="font/woff2" crossorigin>
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Agentplatform.no">
 <meta property="og:locale" content="${t.ogLocale}">
@@ -700,7 +714,6 @@ function organizationJsonLd(lang: Lang): object {
     },
     sameAs: [COMPANY.brregUrl],
     brand: SERVICES.map((s) => ({ "@type": "Brand", name: s.name, url: `https://${s.domain}` })),
-    owns: SERVICES.map((s) => ({ "@type": "WebSite", name: s.name, url: `https://${s.domain}` })),
   };
 }
 
@@ -717,7 +730,7 @@ export function renderHome(lang: Lang, counts: ServiceCounts): string {
 
   const cards = SERVICES.map((s) => {
     const n = counts[s.vertical];
-    const href = serviceUrl(s.domain, lang);
+    const href = serviceUrl(s, lang);
     return `<a class="card svc-${s.key}" href="${esc(href)}">
 <div class="card-top"><span class="card-mark">${s.mark("card")}</span><span class="chip">${esc(s.category[lang])}</span></div>
 <h3>${esc(s.name)}</h3>
@@ -758,7 +771,7 @@ ${NODE_POS.map((n, i) => `<path class="flow flow-${i + 1}" d="M50 50 L${n.x} ${n
 ${SERVICES.map((s, i) => {
   const n = counts[s.vertical];
   const sub = n != null ? `${formatCount(n)} ${s.shortLabel[lang]}` : s.category[lang];
-  return `<a class="node svc-${s.key}" href="${esc(serviceUrl(s.domain, lang))}" tabindex="-1" style="left:${NODE_POS[i].x}%;top:${NODE_POS[i].y}%">${s.mark("hero")}<span><b>${esc(s.name)}</b><small>${esc(sub)}</small></span></a>`;
+  return `<a class="node svc-${s.key}" href="${esc(serviceUrl(s, lang))}" tabindex="-1" style="left:${NODE_POS[i].x}%;top:${NODE_POS[i].y}%">${s.mark("hero")}<span><b>${esc(s.name)}</b><small>${esc(sub)}</small></span></a>`;
 }).join("")}
 </div>`;
 
@@ -768,7 +781,7 @@ ${SERVICES.map((s, i) => {
 <h1>${escKeep(t.heroTitle)}</h1>
 <p class="lead">${esc(t.heroLead)}</p>
 <div class="ctas"><a class="btn btn-primary" href="#tjenester">${t.heroCtaPrimary}${ARROW}</a><a class="btn btn-ghost" href="#om">${t.heroCtaSecondary}</a></div>
-<nav class="quick" aria-label="${t.quickLabel}">${SERVICES.map((s) => `<a class="svc-${s.key}" href="${esc(serviceUrl(s.domain, lang))}">${s.mark("quick")}<span>${esc(s.name)}</span></a>`).join("")}</nav>
+<nav class="quick" aria-label="${t.quickLabel}">${SERVICES.map((s) => `<a class="svc-${s.key}" href="${esc(serviceUrl(s, lang))}">${s.mark("quick")}<span>${esc(s.name)}</span></a>`).join("")}</nav>
 <ul class="facts">${heroFacts.map((f) => `<li>${esc(String(f))}</li>`).join("")}</ul>
 </div>${heroArt}</div></section>
 
@@ -794,7 +807,7 @@ ${cards}
 
 <section id="om" aria-labelledby="om-h"><div class="wrap about">
 <div><p class="kicker">${t.aboutKicker}</p><h2 id="om-h">${t.aboutTitle}</h2>${t.aboutBody.map((p) => `<p>${esc(p)}</p>`).join("")}</div>
-<div class="facts-card"><h3>${t.factsTitle}</h3><dl>
+<div class="facts-card"><h3 class="facts-h">${t.factsTitle}</h3><dl>
 <div><dt>${t.factName}</dt><dd>${COMPANY.legalName}</dd></div>
 <div><dt>${t.factOrg}</dt><dd><a href="${COMPANY.brregUrl}" title="${esc(t.factOrgLinkTitle)}">${COMPANY.orgNrDisplay}</a></dd></div>
 <div><dt>${t.factFounded}</dt><dd>${t.factFoundedValue}</dd></div>
@@ -806,7 +819,7 @@ ${cards}
 <section id="kontakt" aria-labelledby="kontakt-h" style="padding-top:0"><div class="wrap">
 <div class="contact">
 <div><h2 id="kontakt-h">${t.contactTitle}</h2><p>${esc(t.contactBody)}</p><p class="note">${esc(t.contactNote)}</p></div>
-<div><a class="btn btn-primary" href="mailto:${COMPANY.email}">${MAIL}${COMPANY.email}</a></div>
+<div><a class="btn btn-primary btn-mail" href="mailto:${COMPANY.email}">${MAIL}<span>${COMPANY.email}</span></a></div>
 </div>
 </div></section>`;
 
@@ -830,7 +843,7 @@ export function renderPrivacy(lang: Lang): string {
 <h1>Personvernerklæring for agentplatform.no</h1>
 <p class="updated">Sist oppdatert 8. oktober 2026</p>
 <h2>Kort fortalt</h2>
-<p>Denne siden bruker ingen informasjonskapsler (cookies), ingen analyseverktøy og ingen innhold fra tredjeparter. Vi lagrer ikke besøksstatistikk for agentplatform.no.</p>
+<p>Denne siden bruker ingen informasjonskapsler (cookies), ingen analyseverktøy og ikke noe innhold fra tredjeparter. Vi lagrer ikke besøksstatistikk for agentplatform.no.</p>
 <h2>Behandlingsansvarlig</h2>
 <p>${COMPANY.legalName}, org.nr. ${COMPANY.orgNrDisplay}, ${ADDRESS_LINE}. E-post: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a>.</p>
 <h2>Hva som behandles når du besøker siden</h2>
@@ -870,7 +883,7 @@ export function renderPrivacy(lang: Lang): string {
     description:
       lang === "en"
         ? "How Agentplatform.no AS handles personal data on agentplatform.no: no cookies, no analytics, no third-party content."
-        : "Slik behandler Agentplatform.no AS personopplysninger på agentplatform.no: ingen informasjonskapsler, ingen analyse, ingen tredjepartsinnhold.",
+        : "Slik behandler Agentplatform.no AS personopplysninger på agentplatform.no: ingen informasjonskapsler, ingen analyse og ikke noe innhold fra tredjeparter.",
     canonicalPath: lang === "en" ? "/en/privacy" : "/personvern",
     alternates: { nb: "/personvern", en: "/en/privacy" },
     body: lang === "en" ? en : nb,
@@ -888,8 +901,8 @@ export function renderContact(lang: Lang): string {
 <p class="kicker">${t.navContact}</p>
 <h1>${t.contactPageTitle}</h1>
 <p>${t.contactPageLead}</p>
-<div class="ctas"><a class="btn btn-primary" href="mailto:${COMPANY.email}">${MAIL}${COMPANY.email}</a></div>
-<div class="facts-card" style="margin-top:40px"><h3>${t.factsTitle}</h3><dl>
+<div class="ctas"><a class="btn btn-primary btn-mail" href="mailto:${COMPANY.email}">${MAIL}<span>${COMPANY.email}</span></a></div>
+<div class="facts-card" style="margin-top:40px"><h2 class="facts-h">${t.factsTitle}</h2><dl>
 <div><dt>${t.factName}</dt><dd>${COMPANY.legalName}</dd></div>
 <div><dt>${t.factOrg}</dt><dd><a href="${COMPANY.brregUrl}" title="${esc(t.factOrgLinkTitle)}">${COMPANY.orgNrDisplay}</a></dd></div>
 <div><dt>${t.factRegister}</dt><dd>${t.factRegisterValue}</dd></div>
@@ -918,7 +931,7 @@ export function renderContact(lang: Lang): string {
 export function renderNotFound(lang: Lang): string {
   const t = T[lang];
   const links = SERVICES.map(
-    (s) => `<a href="${esc(serviceUrl(s.domain, lang))}">${s.mark("nf")}<span>${esc(s.name)}</span></a>`,
+    (s) => `<a href="${esc(serviceUrl(s, lang))}">${s.mark("nf")}<span>${esc(s.name)}</span></a>`,
   ).join("");
   const body = `<div class="page"><div class="wrap">
 <p class="kicker">404</p>
@@ -996,10 +1009,11 @@ ${urls}
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
 function servePublicFile(fileName: string, contentType: string, maxAge: number) {
+  let cached: Buffer | null = null; // read once, then served from memory (< 250 KB in total)
   return (_req: Request, res: Response, next: NextFunction) => {
     let data: Buffer;
     try {
-      data = fs.readFileSync(path.join(PUBLIC_DIR, fileName));
+      data = cached ?? (cached = fs.readFileSync(path.join(PUBLIC_DIR, fileName)));
     } catch {
       return next(); // missing on disk → branded 404, never a crash
     }
@@ -1058,7 +1072,7 @@ export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> 
   router.get("/apple-touch-icon.png", servePublicFile("agentplatform-apple-touch-icon.png", "image/png", 86400));
   router.get("/og.png", servePublicFile("agentplatform-og.png", "image/png", 86400));
   router.get(
-    "/assets/geist-latin-wght.woff2",
+    FONT_URL,
     servePublicFile("agentplatform-geist-latin-wght.woff2", "font/woff2", 31536000),
   );
 
@@ -1077,7 +1091,8 @@ export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> 
  */
 export function createAgentplatformHostGate(router: Router = createAgentplatformRouter()): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
-    const host = req.hostname;
+    // Hostnames are case-insensitive and may carry the root's trailing dot.
+    const host = (req.hostname || "").toLowerCase().replace(/\.$/, "");
     if (AGENTPLATFORM_REDIRECT_HOSTS.has(host)) {
       return res.redirect(301, `${AGENTPLATFORM_BASE_URL}${req.originalUrl}`);
     }
