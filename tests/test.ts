@@ -42157,7 +42157,7 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
-  console.log("\n── dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15: recipient-policy classifier ──");
+  console.log("\n── dev-request 2026-10-08-mottakerpolicy-alle-adresser: recipient policy (all valid addresses) ──");
   try {
     const { runRecipientPolicyTests } = require("../src/services/recipient-policy.test") as
       typeof import("../src/services/recipient-policy.test");

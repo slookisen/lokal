@@ -48,7 +48,7 @@ import {
   outreachSentLogHasVerticalColumn,
 } from "../services/outreach-suppression-signals";
 import { dedupeByEmail } from "../services/marketing-dedupe";
-import { isColdRecipientAllowed } from "../services/recipient-policy";
+import { countRecipientAddressTypes, isColdRecipientAllowed } from "../services/recipient-policy";
 import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 import {
   getOutreachMaxTouchVernConfig,
@@ -751,9 +751,9 @@ export function computeOutreachCandidates(
           threshold: maxTouchStatus.threshold,
         });
       }
-      // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15 (mfl. § 15):
-      // cold marketing mail only to GENERAL role addresses (post@, info@, …).
-      // Fail-closed — see services/recipient-policy.ts. Applies in both modes.
+      // Recipient policy (dev-request 2026-10-08-mottakerpolicy-alle-adresser):
+      // every well-formed address may be mailed; only a malformed one is held
+      // here. See services/recipient-policy.ts. Applies in both modes.
       const suppressedForPersonalAddress = !isColdRecipientAllowed(row.email);
       // steg 4 / 4e — see the map construction above.
       const crossPlatformHit = crossPlatformSuppressors.get(row.email.trim().toLowerCase());
@@ -936,10 +936,13 @@ export function computeOutreachCandidates(
         // reasons, not a partition, so they are not expected to sum to the
         // suppressed total.
         cross_platform_cooldown: crossPlatformSkipped.length,
-        // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15: held back
-        // because the address is not a general role address (mfl. § 15).
+        // Key kept from lokal#997. Under the 2026-10-08 policy (all valid
+        // addresses) it only counts a malformed or empty address.
         personal_address: personalAddressCount,
       },
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
+      // address each selected candidate has (reporting only, not a filter).
+      recipient_address_types: countRecipientAddressTypes(finalCandidates.map((c) => c.email)),
       // 4e proper: the count alone would still leave "hvorfor" unanswered, so
       // the suppressing platform is named per producer. Bounded at 100 so a wide
       // overlap cannot balloon the response; `truncated` says when it bit,
