@@ -27,6 +27,7 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
+import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
 import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
@@ -2966,7 +2967,24 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         if (addrIsEmpty || addrIsRoadOnly) {
           try {
             const brregHit = await findOrgnumberByName(info.agent.name, info.knowledge.postalCode);
-            if (brregHit?.address) brregAddr = brregHit.address;
+            if (brregHit?.address) {
+              // dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse (Mål 3):
+              // a pure name hit on a company elsewhere in the country must not
+              // supply the address (Snill Bie → SNILLE AATEIGEN, Fåberg).
+              const ownerRow = getDb()
+                .prepare("SELECT org_nr, city FROM agents WHERE id = ?")
+                .get(agentId) as { org_nr?: string | null; city?: string | null } | undefined;
+              const verdict = checkBrregNameHitAddress({
+                producerOrgNr: ownerRow?.org_nr,
+                producerPostal: info.knowledge.postalCode,
+                producerCity: ownerRow?.city ?? info.agent.city,
+                hitOrgNr: brregHit.orgnumber,
+                hitPostal: brregHit.brreg_postal,
+                hitPoststed: brregHit.brreg_poststed,
+              });
+              if (verdict.accept) brregAddr = brregHit.address;
+              else console.warn(`[brreg-address-guard] rejected name hit for agent ${agentId}: ${verdict.reason} (hit ${brregHit.orgnumber} "${brregHit.name}", ${brregHit.brreg_postal ?? "-"} ${brregHit.brreg_poststed ?? "-"})`);
+            }
           } catch {
             // Brreg lookup failure is non-fatal — fall through to Google's answer.
           }
