@@ -28,7 +28,7 @@ import {
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 
-import { slugifyClinic } from "./dental-seo";
+import { clinicProfileUrl } from "./dental-seo";
 import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { dentalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -38,9 +38,6 @@ const router = Router();
 
 // Apply rate limiting to all routes on this router (same pattern as dental-a2a.ts)
 router.use(dentalLimiter);
-
-const DENTAL_BASE_URL =
-  process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
 // ─── Zod input schemas (exported for testing — pr114-01) ─────
 
@@ -111,7 +108,6 @@ export function buildSearchResults(
     if (a.verification_status === "verified") badges.push("Verifisert");
     if (a.available_specialties?.length) badges.push("Spesialist");
 
-    const slug = slugifyClinic(a.navn, a.org_nr ?? null);
     return {
       navn: a.navn,
       org_nr: a.org_nr,
@@ -121,7 +117,7 @@ export function buildSearchResults(
       hjemmeside: a.hjemmeside,
       helfo_agreement: a.helfo_agreement,
       badges,
-      profil_url: `${DENTAL_BASE_URL}/klinikk/${slug}`,
+      profil_url: clinicProfileUrl(a),
     };
   });
 }
@@ -219,8 +215,7 @@ export function registerDentalTools(server: McpServer): void {
         }
 
         const specialists = listSpecialistsForClinic(agent.id);
-        const slug = slugifyClinic(agent.navn, agent.org_nr ?? null);
-        const profil_url = `${DENTAL_BASE_URL}/klinikk/${slug}`;
+        const profil_url = clinicProfileUrl(agent);
 
         const badges: string[] = [];
         if (agent.helfo_agreement === "true") badges.push("Helfo-avtale");

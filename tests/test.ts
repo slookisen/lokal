@@ -35820,6 +35820,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-10-06-dental-profil-url-og-sitemap-uten-orgnr (skive A): clinicProfileUrl ──");
+  try {
+    const { runDentalProfileUrlTests } = require("../src/routes/dental-profile-url.test") as
+      typeof import("../src/routes/dental-profile-url.test");
+    const dpu = await runDentalProfileUrlTests({ log: false });
+    passed += dpu.passed;
+    failed += dpu.failed;
+    for (const f of dpu.failures) failures.push("dental profile url: " + f);
+    console.log(`  dental profile url: ${dpu.passed} passed, ${dpu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental profile url: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
   try {
     const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
