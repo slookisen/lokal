@@ -940,9 +940,6 @@ export function computeOutreachCandidates(
         // addresses) it only counts a malformed or empty address.
         personal_address: personalAddressCount,
       },
-      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
-      // address each selected candidate has (reporting only, not a filter).
-      recipient_address_types: countRecipientAddressTypes(finalCandidates.map((c) => c.email)),
       // 4e proper: the count alone would still leave "hvorfor" unanswered, so
       // the suppressing platform is named per producer. Bounded at 100 so a wide
       // overlap cannot balloon the response; `truncated` says when it bit,
@@ -995,6 +992,10 @@ export function computeOutreachCandidates(
           "without resetting the send-count history. Threshold/on-off are admin-configurable, no " +
           "deploy needed — GET/POST /admin/outreach-max-touch-vern.",
       },
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
+      // address each selected candidate has (reporting only, not a filter).
+      // Last key, so the existing body key order is unchanged.
+      recipient_address_types: countRecipientAddressTypes(finalCandidates.map((c) => c.email)),
     };
 }
 
