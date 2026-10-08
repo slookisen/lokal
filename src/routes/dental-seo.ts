@@ -1492,7 +1492,7 @@ function renderClinicProfile(
       return dot > 60 ? t.slice(0, dot + 1) : t + "…";
     }
     if (nonClinic) {
-      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring fra Brønnøysundregistrene.`;
+      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
     return buildClinicDescription(agent, nearbyCount, true);
   })();
