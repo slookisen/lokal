@@ -107,7 +107,20 @@ const FRESHNESS_TIERS = [
 
 const FRESHNESS_FLOOR = 0.05;
 
+// Prepared statements cached per DB handle: calculate() runs ~10 lookups per
+// agent and used to re-prepare each one every time (boot-trust-recalc, slice 2
+// of dev-request 2026-10-08-serverheng-...). Same SQL, same results.
+const stmtCache = new WeakMap<object, Map<string, any>>();
+
 class TrustScoreService {
+
+  private stmt(db: any, sql: string): any {
+    let m = stmtCache.get(db);
+    if (!m) { m = new Map(); stmtCache.set(db, m); }
+    let st = m.get(sql);
+    if (!st) { st = db.prepare(sql); m.set(sql, st); }
+    return st;
+  }
 
   // ─── Calculate trust score for a single agent ──────────────
   calculate(agentId: string): number {
@@ -268,7 +281,7 @@ class TrustScoreService {
 
   private verificationSignal(agentId: string): number {
     const db = getDb();
-    const agent = db.prepare("SELECT is_verified FROM agents WHERE id = ?").get(agentId) as any;
+    const agent = this.stmt(db, "SELECT is_verified FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) return 0;
 
     // Fully verified (claimed + code verified) = 1.0
@@ -278,7 +291,7 @@ class TrustScoreService {
     if (this.isAgentClaimed(agentId)) return 0.4;
 
     // Has a pending claim = 0.15 (shows intent)
-    const pendingClaim = db.prepare(
+    const pendingClaim = this.stmt(db, 
       "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status IN ('pending', 'code_sent')"
     ).get(agentId) as any;
     if (pendingClaim.c > 0) return 0.15;
@@ -289,12 +302,12 @@ class TrustScoreService {
 
   private completenessSignal(agentId: string): number {
     const db = getDb();
-    const row = db.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
+    const row = this.stmt(db, "SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
 
     // No knowledge record at all = base from agent table only
     if (!row) {
       // Check if the agent at least has basic fields
-      const agent = db.prepare("SELECT description, city, categories, tags FROM agents WHERE id = ?").get(agentId) as any;
+      const agent = this.stmt(db, "SELECT description, city, categories, tags FROM agents WHERE id = ?").get(agentId) as any;
       if (!agent) return 0;
 
       let filled = 0;
@@ -331,9 +344,9 @@ class TrustScoreService {
     const db = getDb();
 
     // Find the most recent activity timestamp across all tables
-    const agent = db.prepare("SELECT last_seen_at, created_at FROM agents WHERE id = ?").get(agentId) as any;
-    const knowledge = db.prepare("SELECT owner_updated_at, last_enriched_at, updated_at FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
-    const metrics = db.prepare("SELECT last_interaction_at FROM agent_metrics WHERE agent_id = ?").get(agentId) as any;
+    const agent = this.stmt(db, "SELECT last_seen_at, created_at FROM agents WHERE id = ?").get(agentId) as any;
+    const knowledge = this.stmt(db, "SELECT owner_updated_at, last_enriched_at, updated_at FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
+    const metrics = this.stmt(db, "SELECT last_interaction_at FROM agent_metrics WHERE agent_id = ?").get(agentId) as any;
 
     const timestamps = [
       agent?.last_seen_at,
@@ -359,7 +372,7 @@ class TrustScoreService {
 
   private interactionSignal(agentId: string): number {
     const db = getDb();
-    const metrics = db.prepare(
+    const metrics = this.stmt(db, 
       "SELECT times_discovered, times_contacted, times_chosen FROM agent_metrics WHERE agent_id = ?"
     ).get(agentId) as any;
 
@@ -399,7 +412,7 @@ class TrustScoreService {
     // when review-count is low (Bayesian-ish — protects against
     // 1-review cherry-picks while letting well-rated agents reach 1.0).
     const db = getDb();
-    const k = db.prepare(
+    const k = this.stmt(db, 
       "SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?"
     ).get(agentId) as any;
 
@@ -423,7 +436,7 @@ class TrustScoreService {
 
   private isAgentClaimed(agentId: string): boolean {
     const db = getDb();
-    const row = db.prepare(
+    const row = this.stmt(db, 
       "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
     ).get(agentId) as any;
     return row.c > 0;

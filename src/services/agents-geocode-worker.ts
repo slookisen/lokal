@@ -232,7 +232,8 @@ export const AGENTS_GEOCODE_MAX_ATTEMPTS = 5;
  */
 export const AGENTS_GEOCODE_BACKLOG_INTERVAL_MS = 60_000;
 export const AGENTS_GEOCODE_IDLE_INTERVAL_MS = 60 * 60_000;
-export const AGENTS_GEOCODE_BOOT_DELAY_MS = 30_000;
+/** Staggered after dental (+3 min) and experiences (+6 min): first tick at +9 min (was +30 s). */
+export const AGENTS_GEOCODE_BOOT_DELAY_MS = 9 * 60_000;
 
 export type AgentsGeocodeDeps = GeocodeDeps & {
   /** Report what would change; write nothing (not even the attempt stamp). */

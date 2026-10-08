@@ -10,7 +10,7 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
-import { getPageViewHealthCounts, __resetHealthCountsCacheForTesting, HEALTH_COUNTS_TTL_MS } from "./health-counts";
+import { getPageViewHealthCounts, __resetHealthCountsCacheForTesting, HEALTH_COUNTS_TTL_MS, createPageViewHealthCounter } from "./health-counts";
 import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./health-counts-compute";
 
 export interface TestSummary {
@@ -70,6 +70,32 @@ export async function runHealthCountsTests(opts: { log?: boolean } = {}): Promis
     const e = getPageViewHealthCounts(db, now + 5_000, 0);
     const f = getPageViewHealthCounts(db, now + 5_000, 0);
     assertTrue(e.cachedAgeMs === 0 && f.cachedAgeMs === 0, "H5: ttl 0 disables caching");
+
+
+    // ── Slice 2 (2026-10-08): off-thread first call returns null, never counts on the main thread ──
+    {
+      let syncCalls = 0;
+      let resolveRefresh: (v: { pageViews: number; lastHourPageViews: number }) => void = () => {};
+      let clock = now;
+      const counter = createPageViewHealthCounter({
+        offThreadUsable: () => true,
+        runOffThread: () => new Promise((res) => { resolveRefresh = res as any; }),
+        computeSync: () => { syncCalls++; return { pageViews: -1, lastHourPageViews: -1 }; },
+        now: () => clock, offThreadTtlMs: 60_000, retryAfterMs: 60_000, log: () => {},
+      });
+      const fdb: any = { name: "/tmp/fake.db" };
+      const first = counter.get(fdb, clock, 60_000);
+      assertTrue(first.pageViews === null && first.lastHourPageViews === null && first.cachedAgeMs === null && syncCalls === 0,
+        "S1: first off-thread call returns null counts and does NOT run the synchronous count");
+      const again = counter.get(fdb, clock, 60_000);
+      assertTrue(again.pageViews === null && syncCalls === 0, "S2: still null while the background count is in flight");
+      resolveRefresh({ pageViews: 1234, lastHourPageViews: 56 });
+      await counter.settled();
+      clock += 5_000;
+      const ready = counter.get(fdb, clock, 60_000);
+      assertTrue(ready.pageViews === 1234 && ready.lastHourPageViews === 56 && ready.cachedAgeMs === 5_000 && syncCalls === 0,
+        "S3: once the background count lands the numbers are served with their age");
+    }
 
     // ── Prune-lag (2026-10-04): replaces the static "DB large >400MB" / ">500k rows"
     //    warnings that the 60-day steady state tripped permanently. ──
