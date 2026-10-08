@@ -39,6 +39,7 @@
  *     exposed via GET /admin/profile-translations/status.
  */
 
+import { trackJob } from "./event-loop-monitor";
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import type Database from "better-sqlite3";
@@ -427,7 +428,7 @@ export function startProfileTranslationsStaleSweep(): NodeJS.Timeout | null {
     console.log("[profile-translations-stale-sweep] disabled by PROFILE_TRANSLATIONS_STALE_SWEEP_ENABLED=false");
     return null;
   }
-  const run = () => {
+  const run = trackJob("profile-translations-stale-sweep", () => {
     try {
       const r = staleSweepTick();
       for (const [platform, res] of Object.entries(r)) {
@@ -438,7 +439,7 @@ export function startProfileTranslationsStaleSweep(): NodeJS.Timeout | null {
     } catch (err) {
       console.error("[profile-translations-stale-sweep] tick failed:", err);
     }
-  };
+  });
   const timer = setInterval(run, STALE_SWEEP_INTERVAL_MS);
   setTimeout(run, 30_000);
   return timer;

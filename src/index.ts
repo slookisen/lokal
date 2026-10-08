@@ -43,6 +43,7 @@ import { langMiddleware } from "./i18n/middleware";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
+import { startEventLoopPersistence, pruneEventLoopEvents } from "./services/event-loop-persist";
 import { getPageViewHealthCounts } from "./services/health-counts";
 import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
 import { getRetentionWindowDays } from "./services/traffic-stats-compute";
@@ -193,6 +194,13 @@ app.set("trust proxy", true);
 // the in-flight set. Details: src/services/event-loop-monitor.ts.
 // Report: GET /admin/analytics/ops/event-loop. Kill switch: EVENT_LOOP_MONITOR_DISABLED=1.
 startEventLoopMonitor();
+// Slice 1 of 2026-10-08-serverheng…: persist stalls/slow requests/slow jobs to
+// event_loop_events (buffered, flushed every 5 s; DB resolved lazily at flush).
+startEventLoopPersistence({
+  getDb: () => getDb(),
+  gitSha: process.env.GIT_SHA || "unknown",
+  bootedAt: new Date().toISOString(),
+});
 app.use(requestTrackerMiddleware);
 
 // ─── www → apex redirect ────────────────────────────────────
@@ -1514,6 +1522,15 @@ app.listen(Number(PORT), HOST, async () => {
         );
       } catch (err) {
         console.error("[cart-contact-sweep] failed (non-fatal):", err);
+      }
+
+      // Slice 1 of 2026-10-08-serverheng…: 14-day retention for event_loop_events
+      // (batched DELETE ... LIMIT with a macrotask yield between batches).
+      try {
+        const evDeleted = await pruneEventLoopEvents(getDb());
+        if (evDeleted > 0) console.log(`[event-loop-persist] pruned ${evDeleted} rows older than 14d`);
+      } catch (err) {
+        console.error("[event-loop-persist] prune failed (non-fatal):", err);
       }
     };
 

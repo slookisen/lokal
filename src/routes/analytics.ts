@@ -6,6 +6,7 @@ import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
 import { getEventLoopReport } from "../services/event-loop-monitor";
+import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
 import { getOffThreadStatsState } from "../services/offthread-stats";
 import {
   isRollupTableName,
@@ -1481,12 +1482,31 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
  * Returns the delay percentiles, the most recent stalls (newest first) each
  * with the requests in flight + background jobs running when it happened,
  * the slowest requests/jobs, and what is in flight right now.
- * In-memory only — resets on restart. Source: src/services/event-loop-monitor.ts.
+ * The ring buffers are in-memory (reset on restart); add ?since_hours=N to also get
+ * the persisted rows (14-day retention). Source: src/services/event-loop-monitor.ts.
  */
-router.get("/ops/event-loop", (_req: Request, res: Response) => {
+router.get("/ops/event-loop", (req: Request, res: Response) => {
+  // ?since_hours=N (1..336): ALSO return the persisted rows (event_loop_events)
+  // for the last N hours, which survive restarts. No param = unchanged output.
+  let persisted: Record<string, unknown> | undefined;
+  const rawSince = req.query ? req.query.since_hours : undefined;
+  if (rawSince !== undefined) {
+    const n = Number(Array.isArray(rawSince) ? rawSince[0] : rawSince);
+    if (!Number.isFinite(n) || n < 1 || n > MAX_SINCE_HOURS) {
+      res.status(400).json({ success: false, error: `since_hours must be a number between 1 and ${MAX_SINCE_HOURS}` });
+      return;
+    }
+    try {
+      const events = readPersistedEventLoopEvents(getDb(), n);
+      persisted = { sinceHours: n, count: events.length, events, writer: getEventLoopPersistStats() };
+    } catch (err) {
+      persisted = { sinceHours: n, error: String(err) };
+    }
+  }
   res.json({
     timestamp: new Date().toISOString(),
     ...getEventLoopReport(),
+    ...(persisted ? { persisted } : {}),
     // Off-thread stats worker (traffic strips + /health counts): broken=true
     // means it fell back to the synchronous path (src/services/offthread-stats.ts).
     offThreadStats: getOffThreadStatsState(),
