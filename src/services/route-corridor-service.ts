@@ -708,7 +708,9 @@ export function loadRfbCandidates(
  * The gates replicate discoverExperiences() (experience-store.ts:1138-1145)
  * verbatim — verified, decent confidence, provider active in Brreg, and not a
  * dedup loser (`canonical_id IS NULL`). A corridor page is a publishing surface
- * like any other; it does not get to show rows the catalogue hides.
+ * like any other; it does not get to show rows the catalogue hides — which
+ * includes a single experience hidden on its own (`experiences.catalog_hidden
+ * = 1`, set by POST /admin/experiences-data-corrections field `visibility`).
  */
 export function loadExperienceCandidates(
   box: { minLat: number; maxLat: number; minLng: number; maxLng: number },
@@ -724,6 +726,7 @@ export function loadExperienceCandidates(
           AND e.confidence IN ('high','medium')
           AND e.canonical_id IS NULL
           AND (p.brreg_active IS NULL OR p.brreg_active = 1)
+          AND (e.catalog_hidden IS NULL OR e.catalog_hidden != 1)
           AND e.loc_lat IS NOT NULL AND e.loc_lon IS NOT NULL
           AND e.loc_lat BETWEEN ? AND ?
           AND e.loc_lon BETWEEN ? AND ?`,

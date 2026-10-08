@@ -5,8 +5,11 @@
  *   POST /api/opplevelser/admin/experiences-data-corrections/revert
  *
  * (source-backed factual corrections of kommune / fylke / title / season /
- * duration / price_from / homepage_url / provider on opplevagent rows, with
- * an audit table and a revert route).
+ * duration / price_from / homepage_url / provider / source_page_url on
+ * opplevagent rows, plus `visibility` hide/unhide of a whole row, with an
+ * audit table and a revert route). dc-r18 also proves a hidden row is gone
+ * from every public read (store, routes, MCP tools, description queue,
+ * requarantine reconstruction).
  *
  * Sections:
  *   P — pure helpers (season codes, duration/price/provider parsing, kommune
@@ -23,7 +26,7 @@
  * (write-pause lookups), the router driven via router.handle().
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as opp0 from "./opplevelser";
 import {
   expDcSeasonCodes,
@@ -224,7 +227,8 @@ export function runOpplevelserExperienceDataCorrectionsTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
-    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+    const experiencesMcpPath = require.resolve("./experiences-mcp");
+    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, experiencesMcpPath]) delete require.cache[p];
     let restoreMainDb: (() => void) | null = null;
     let networkCalls = 0;
     globalThis.fetch = (async (url: any) => {
@@ -964,6 +968,244 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         }
       }
 
+      // ── dc-r18: visibility — hide / unhide / revert, every public read. ─
+      {
+        const hide = (id: string, reason: unknown = "discontinued", over: Record<string, unknown> = {}) => ({
+          id, field: "visibility", action: "hide", expected_current: "visible", new_value: reason,
+          source_url: SRC, quote: QUOTE, confidence: "high", ...over,
+        });
+        const unhide = (id: string, over: Record<string, unknown> = {}) => ({
+          id, field: "visibility", action: "unhide", expected_current: "hidden",
+          source_url: SRC, quote: QUOTE, confidence: "high", ...over,
+        });
+        const pubOf = (id: string): number => Number((expDb.prepare(
+          `SELECT (${expStore.PUBLISH_GATE_SQL}) AS pub FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id WHERE e.id = ?`,
+        ).get(id) as any).pub);
+        const rowSansUpdated = (id: string): string => {
+          const { updated_at: _u, ...rest } = rowOf(id);
+          return JSON.stringify(rest);
+        };
+        // The MCP server, registered exactly as the /mcp endpoint does, over
+        // an in-memory transport (same scaffold as discovery-truth.test.ts).
+        const expMcp = require("./experiences-mcp") as typeof import("./experiences-mcp");
+        const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js") as typeof import("@modelcontextprotocol/sdk/server/mcp.js");
+        const { Client } = require("@modelcontextprotocol/sdk/client/index.js") as typeof import("@modelcontextprotocol/sdk/client/index.js");
+        const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js") as typeof import("@modelcontextprotocol/sdk/inMemory.js");
+        const mcpCall = async (name: string, args: Record<string, unknown>): Promise<any> => {
+          const server = new McpServer({ name: "dc-visibility", version: "0.0.0" });
+          expMcp.registerExperienceTools(server);
+          const [ct, st] = InMemoryTransport.createLinkedPair();
+          const client = new Client({ name: "dc-visibility-test", version: "0.0.0" });
+          await Promise.all([server.connect(st), client.connect(ct)]);
+          try {
+            return await client.callTool({ name, arguments: args });
+          } finally {
+            await client.close();
+            await server.close();
+          }
+        };
+        const mcpText = (r: any): string => JSON.stringify(r?.content ?? []) + JSON.stringify(r?.structuredContent ?? null);
+        const getRoute = (url: string, query: Record<string, string> = {}) => callRoute(router, { method: "GET", url, query });
+
+        const VIS = randomUUID(); // UUID: the MCP get_experience tool validates the id format
+        seed(VIS, { kommune: "Lærdal", category: "dc_vis_kategori", description: null, slug: "slug-dc-vis" });
+        seed("dc-vis-nr", { verification_status: "needs_review" });
+        seed("dc-vis-combo");
+        seed("dc-vis-mix");
+        seed("dc-vis-rev");
+        seed("dc-vis-owner", { content_source: "manual" });
+
+        // (a) every reject; nothing written.
+        {
+          const before = dumpAll();
+          const cases: Array<[string, any[]]> = [
+            ["invalid_value", [hide(VIS, "moved_away")]],
+            ["invalid_value", [hide(VIS, null)]],
+            ["invalid_item", [hide(VIS, "discontinued", { expected_current: "hidden" })]],
+            ["invalid_value", [unhide(VIS, { new_value: "discontinued" })]],
+            ["unknown_action", [hide(VIS, "discontinued", { action: "correct" })]],
+            ["unknown_action", [item(VIS, "title", "Kajakktur i fjorden", "Ny tittel", { action: "hide" })]],
+            ["confidence_not_high", [hide(VIS, "discontinued", { confidence: "medium" })]],
+            ["missing_quote", [hide(VIS, "discontinued", { quote: " " })]],
+            ["invalid_source_url", [hide(VIS, "discontinued", { source_url: "nope" })]],
+            ["not_found", [hide("dc-vis-missing")]],
+            ["owner_managed", [hide("dc-vis-owner")]],
+            ["stale_expected_current", [unhide(VIS)]],
+            ["duplicate_item", [hide(VIS), unhide(VIS)]],
+          ];
+          for (const [reason, items] of cases) {
+            const out = await apply(items);
+            assertEq(out.results.map((r: any) => [r.result, r.reason]), items.map(() => ["rejected", reason]), `dc-r18a: ${reason} (${items[0].field}/${items[0].action} ${JSON.stringify(items[0].new_value ?? null)})`);
+          }
+          assertTrue(String((await preview([unhide(VIS)])).results[0].detail).includes("visible"), "dc-r18a2: stale detail names the current state (visible)");
+          assertEq(dumpAll(), before, "dc-r18a3: nothing written by any rejected visibility item");
+        }
+
+        // Baseline: the row is public everywhere before the hide.
+        const countBefore = expStore.countPublishedExperiences();
+        assertEq(pubOf(VIS), 1, "dc-r18b0: fixture is published");
+        assertEq(expStore.getPublishedExperienceById(VIS)?.id, VIS, "dc-r18b0b: served by id before the hide");
+        assertTrue(mcpText(await mcpCall("discover_experiences", { kommune: "Lærdal" })).includes(VIS), "dc-r18b0c: MCP discover_experiences finds it before the hide");
+        assertEq(opp.selectExperienceDescriptionQueue(expDb as any, [VIS]).candidateRows.map((r: any) => r.id), [VIS], "dc-r18b0d: it is a description candidate before the hide");
+        const rowBefore = rowSansUpdated(VIS);
+
+        // (b) dry run writes nothing (function + route).
+        {
+          const before = dumpAll();
+          const d = await preview([hide(VIS)]);
+          assertEq([d.results[0].result, d.batch_id], ["would_apply", null], "dc-r18b: dry-run hide would apply");
+          assertTrue(d.results[0].warnings.some((w: any) => w.code === "hidden" && w.was_published === true), "dc-r18b2: dry run previews the hidden warning");
+          const r = await post("/admin/experiences-data-corrections", { items: [hide(VIS)] });
+          assertEq([r.status, r.body.dry_run, r.body.results?.[0]?.result], [200, true, "would_apply"], "dc-r18b3: route without dry_run:false is a dry run");
+          assertEq(dumpAll(), before, "dc-r18b4: dry runs wrote nothing");
+          assertEq(pubOf(VIS), 1, "dc-r18b5: still published after the dry runs");
+        }
+
+        // (c) write-pause blocks the apply.
+        {
+          const mainDb = init.getDb();
+          pauseSvc.setEnrichmentWritePause(mainDb as any, { vertical: "experiences", enabled: true, reason: "dc-r18" }, "verifier");
+          const before = dumpAll();
+          const p = await post("/admin/experiences-data-corrections", { dry_run: false, items: [hide(VIS)] });
+          assertEq(p.status, 423, "dc-r18c: hide apply under an experiences pause -> 423");
+          assertEq(dumpAll(), before, "dc-r18c2: nothing written while paused");
+          pauseSvc.setEnrichmentWritePause(mainDb as any, { vertical: "experiences", enabled: false, cleared_by: "daniel" }, "verifier");
+        }
+
+        // (d) apply the hide through the route.
+        let hideCorrection = "";
+        {
+          const r = await post("/admin/experiences-data-corrections", { dry_run: false, items: [hide(VIS, " Discontinued ")] });
+          const res0 = r.body.results?.[0];
+          assertEq([r.status, res0?.result], [200, "applied"], "dc-r18d: hide applied");
+          hideCorrection = res0?.correction_id;
+          const row = rowOf(VIS);
+          assertEq([row.catalog_hidden, row.hidden_reason], [1, "discontinued"], "dc-r18d2: catalog_hidden=1, reason code normalised");
+          assertTrue(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(String(row.hidden_at)), "dc-r18d3: hidden_at stamped (datetime('now') form)");
+          assertEq(JSON.parse(row.content_field_evidence).catalog_hidden, SRC, "dc-r18d4: content_field_evidence.catalog_hidden = source_url");
+          const w = res0.warnings;
+          assertTrue(w.some((x: any) => x.code === "hidden" && x.was_published === true && x.reason === "discontinued"), "dc-r18d5: hidden warning says it was published");
+          assertTrue(w.some((x: any) => x.code === "unpublished_after_correction"), "dc-r18d6: unpublished_after_correction warning");
+          assertTrue(!w.some((x: any) => x.code === "not_published_before"), "dc-r18d7: no not_published_before on a published row");
+          const aud = expDb.prepare("SELECT * FROM experience_data_corrections WHERE id = ?").get(hideCorrection) as any;
+          assertEq([aud.field, aud.action, aud.expected_current, aud.source_url, aud.quote, aud.confidence], ["visibility", "hide", "visible", SRC, QUOTE, "high"], "dc-r18d8: audit row");
+          const cc = JSON.parse(aud.column_changes);
+          assertTrue(cc.some((c: any) => c.column === "catalog_hidden" && c.old === 0 && c.new === 1), "dc-r18d9: column_changes records catalog_hidden 0 -> 1");
+          assertEq(pubOf(VIS), 0, "dc-r18d10: the row now fails PUBLISH_GATE_SQL");
+          assertTrue(!brregRequests.some((u) => u.includes(VIS)), "dc-r18d11: no Brreg traffic for a visibility item");
+        }
+
+        // (e) absent from every public read.
+        {
+          assertEq(expStore.getPublishedExperienceById(VIS), null, "dc-r18e: getPublishedExperienceById -> null");
+          assertEq(expStore.getPublishedExperienceBySlug("slug-dc-vis"), null, "dc-r18e2: getPublishedExperienceBySlug -> null");
+          assertEq((await getRoute(`/${VIS}`)).status, 404, "dc-r18e3: GET /api/opplevelser/:id -> 404");
+          assertTrue(!expStore.discoverExperiences({ kommune: "Lærdal" }, 50).some((r) => r.id === VIS), "dc-r18e4: discoverExperiences excludes it");
+          const disc = await getRoute("/discover", { kommune: "Lærdal", limit: "50" });
+          assertTrue(disc.status === 200 && !JSON.stringify(disc.body).includes(VIS), "dc-r18e5: GET /discover excludes it");
+          assertTrue(!expStore.listPublishedExperienceSlugs().some((r) => r.slug === "slug-dc-vis"), "dc-r18e6: sitemap slug list excludes it");
+          assertEq(expStore.countPublishedExperiences(), countBefore - 1, "dc-r18e7: published count drops by one");
+          assertTrue(!expStore.listCategories().some((c) => c.category === "dc_vis_kategori"), "dc-r18e8: listCategories excludes its category");
+          const cats = await getRoute("/categories");
+          assertTrue(!JSON.stringify(cats.body).includes("dc_vis_kategori"), "dc-r18e9: GET /categories excludes it");
+          const g = await mcpCall("get_experience", { id: VIS });
+          assertTrue(g.isError === true && !mcpText(g).includes("Kajakktur"), "dc-r18e10: MCP get_experience answers not-found");
+          assertTrue(!mcpText(await mcpCall("discover_experiences", { kommune: "Lærdal" })).includes(VIS), "dc-r18e11: MCP discover_experiences excludes it");
+          assertTrue(!mcpText(await mcpCall("list_experience_categories", {})).includes("dc_vis_kategori"), "dc-r18e12: MCP list_experience_categories excludes its category");
+          assertEq(opp.selectExperienceDescriptionQueue(expDb as any, [VIS]).candidateRows.length, 0, "dc-r18e13: not a description candidate, even named by id");
+          const cand = await callRoute(router, { method: "GET", url: "/admin/experiences-description-candidates", headers: auth, query: { limit: "50" } });
+          assertTrue(cand.status === 200 && !(cand.body.items as any[]).some((x) => x.id === VIS), "dc-r18e14: GET /admin/experiences-description-candidates excludes it");
+          const fp = fpOf(VIS);
+          const pw = await opp.applyPrewrittenExperienceDescriptions(expDb as any, [{
+            id: VIS, facts_fingerprint: fp, outcome: "write", level: "faktalinje",
+            description: "Kajakktur i fjorden i Lærdal.", judge: { approved: true },
+          }], { dryRun: true, homepageFetchImpl: globalThis.fetch });
+          assertEq(pw.ok ? pw.results[0] : null, { id: VIS, result: "rejected", reason: "not_published" }, "dc-r18e15: the write/proposals apply path rejects it as not_published");
+        }
+
+        // (f) hide on an already-unpublished row: allowed, with a warning;
+        // the requarantine reconstruction never counts it as published.
+        {
+          const IN = "2026-09-13 10:30:00";
+          const rq = (id: string) => expDb.prepare(
+            "UPDATE experiences SET evidence_url = ?, admission_verdict = ?, admission_checked_at = ? WHERE id = ?",
+          ).run(`http://localhost/${id}`, "mismatch: (2026-09-13, dead page misjudged)", IN, id);
+          seed("dc-vis-rq-visible", { verification_status: "needs_review" });
+          rq("dc-vis-rq-visible");
+          rq("dc-vis-nr");
+          const h = await apply([hide("dc-vis-nr", "provider_not_found")]);
+          assertEq(h.results[0].result, "applied", "dc-r18f: hide on a needs_review row applies");
+          assertTrue(h.results[0].warnings.some((x: any) => x.code === "not_published_before"), "dc-r18f2: not_published_before warning");
+          assertTrue(h.results[0].warnings.some((x: any) => x.code === "hidden" && x.was_published === false), "dc-r18f3: hidden warning says it was not published");
+          const st = await callRoute(router, {
+            method: "GET", url: "/admin/experiences-status-transitions", headers: auth,
+            query: { from: "verified", to: "needs_review", since: "2026-09-13T10:00:00Z", until: "2026-09-13T11:00:00Z" },
+          });
+          const flag = (id: string) => (st.body.rows as any[]).find((x) => x.id === id)?.would_publish_if_verified;
+          assertEq([flag("dc-vis-rq-visible"), flag("dc-vis-nr")], [true, false], "dc-r18f4: status-transitions: the hidden row is not would_publish_if_verified");
+          const rj = await post("/admin/experiences-requarantine-rejudge", { since: "2026-09-13T10:00:00Z", until: "2026-09-13T11:00:00Z", dry_run: false });
+          assertEq(rj.status, 200, "dc-r18f5: rejudge ran");
+          assertEq([rowOf("dc-vis-rq-visible").verification_status, rowOf("dc-vis-nr").verification_status], ["verified", "needs_review"],
+            "dc-r18f6: rejudge restores the visible dead-page row but never the hidden one");
+          assertEq([pubOf("dc-vis-nr"), rowOf("dc-vis-nr").catalog_hidden], [0, 1], "dc-r18f7: the hidden row stays hidden and unpublished");
+        }
+
+        // (g) never-unpublish still holds for every OTHER item; a hide is
+        // applied after the other items of its row.
+        {
+          const c = await apply([
+            item("dc-vis-combo", "provider", "Delt Tilbyder AS", "Inaktiv Tilbyder AS"),
+            hide("dc-vis-combo", "closed_or_bankrupt"),
+          ]);
+          assertEq(c.results.map((r: any) => [r.result, r.reason ?? null]), [["rejected", "would_unpublish"], ["applied", null]],
+            "dc-r18g: the unpublishing relink is still rejected; the hide in the same request applies");
+          assertEq([rowOf("dc-vis-combo").provider_id, rowOf("dc-vis-combo").catalog_hidden], [provShared, 1], "dc-r18g2: provider untouched, row hidden");
+          const m = await apply([hide("dc-vis-mix", "junk_title"), item("dc-vis-mix", "price_from", 890, 990)]);
+          assertEq(m.results.map((r: any) => [r.field, r.result]), [["visibility", "applied"], ["price_from", "applied"]], "dc-r18g3: hide + another field for the same id both apply (results in request order)");
+          const order = (expDb.prepare("SELECT field FROM experience_data_corrections WHERE batch_id = ? ORDER BY rowid").all(m.batch_id) as any[]).map((a) => a.field);
+          assertEq(order, ["price_from", "visibility"], "dc-r18g4: the hide was applied last for its id");
+          assertEq([rowOf("dc-vis-mix").price_from, rowOf("dc-vis-mix").catalog_hidden], [990, 1], "dc-r18g5: both written");
+        }
+
+        // (h) unhide, then revert unhide + hide -> byte-exact original.
+        {
+          const u = await apply([unhide(VIS)]);
+          assertEq(u.results[0].result, "applied", "dc-r18h: unhide applied");
+          const uw = u.results[0].warnings.find((x: any) => x.code === "unhidden");
+          assertEq([uw?.previous_reason, uw?.published_now], ["discontinued", true], "dc-r18h2: unhidden warning (previous reason, published again)");
+          assertTrue(u.results[0].warnings.some((x: any) => x.code === "published_after_correction"), "dc-r18h3: published_after_correction warning");
+          assertEq([rowOf(VIS).catalog_hidden, rowOf(VIS).hidden_reason, rowOf(VIS).hidden_at], [0, null, null], "dc-r18h4: unhide clears the three columns");
+          assertEq(expStore.getPublishedExperienceById(VIS)?.id, VIS, "dc-r18h5: served by id again");
+          const hiddenAt = (JSON.parse((expDb.prepare("SELECT column_changes FROM experience_data_corrections WHERE id = ?").get(hideCorrection) as any).column_changes) as any[])
+            .find((c) => c.column === "hidden_at")?.new;
+          const ru = revert({ correction_ids: [u.results[0].correction_id] });
+          assertEq(ru.results[0].result, "reverted", "dc-r18h6: unhide reverted");
+          assertEq([rowOf(VIS).catalog_hidden, rowOf(VIS).hidden_reason, rowOf(VIS).hidden_at], [1, "discontinued", hiddenAt], "dc-r18h7: reverting the unhide re-hides with the original reason and time");
+          assertEq(expStore.getPublishedExperienceById(VIS), null, "dc-r18h8: hidden again");
+          const dryRev = revert({ correction_ids: [hideCorrection] }, true);
+          assertEq([dryRev.results[0].result, rowOf(VIS).catalog_hidden], ["would_revert", 1], "dc-r18h9: dry-run revert of the hide writes nothing");
+          const rh = revert({ correction_ids: [hideCorrection] });
+          assertEq(rh.results[0].result, "reverted", "dc-r18h10: hide reverted");
+          assertEq(rowSansUpdated(VIS), rowBefore, "dc-r18h11: revert of the hide restores the row byte for byte (updated_at aside)");
+          assertEq(expStore.getPublishedExperienceBySlug("slug-dc-vis")?.id, VIS, "dc-r18h12: the row is public again");
+          assertTrue(mcpText(await mcpCall("discover_experiences", { kommune: "Lærdal" })).includes(VIS), "dc-r18h13: MCP discover_experiences finds it again");
+        }
+
+        // (i) revert of a hide after someone changed the row meanwhile.
+        {
+          const h = await apply([hide("dc-vis-rev", "not_yet_open")]);
+          assertEq(h.results[0].result, "applied", "dc-r18i: hide applied");
+          expDb.prepare("UPDATE experiences SET catalog_hidden = 0 WHERE id = 'dc-vis-rev'").run();
+          const r = revert({ correction_ids: [h.results[0].correction_id] });
+          assertEq([r.results[0].result, r.results[0].reason, r.results[0].detail], ["rejected", "changed_since", "experiences.catalog_hidden"], "dc-r18i2: hand-unhidden row -> changed_since");
+          assertEq([rowOf("dc-vis-rev").catalog_hidden, rowOf("dc-vis-rev").hidden_reason], [0, "not_yet_open"], "dc-r18i3: nothing restored");
+          // A batch revert of the combo hide works and re-shows the row.
+          const comboBatch = (expDb.prepare("SELECT batch_id FROM experience_data_corrections WHERE experience_id = 'dc-vis-combo' AND field = 'visibility'").get() as any).batch_id;
+          const rb = revert({ batch_id: comboBatch });
+          assertEq([rb.totals.reverted, pubOf("dc-vis-combo")], [1, 1], "dc-r18i4: batch revert of a hide re-publishes the row");
+        }
+      }
+
       assertEq(anthropicRequests, 0, "dc-r14b: ZERO requests to api.anthropic.com");
       assertEq(networkCalls, 0, "dc-r14: ZERO network requests across every path above");
       dbFactory.__resetDbFactoryForTesting();
@@ -977,7 +1219,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, experiencesMcpPath]) delete require.cache[p];
     }
 
     return { passed, failed, failures };

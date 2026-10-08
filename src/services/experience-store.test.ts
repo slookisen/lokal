@@ -1349,6 +1349,147 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     }
   }
 
+  // ── PUBLISH_GATE_SQL: a single experience hidden on its own ─────────────
+  // (experiences.catalog_hidden = 1, set by POST /admin/experiences-data-
+  // corrections field `visibility`). The hidden row must be absent from
+  // every public read — discover (+ relaxed + count), by-id, by-slug,
+  // sitemap, browse lists/counts/FAQ stats, map points, search, related,
+  // provider pages, categories (incl. the join-less listCategories), the
+  // marketplace stats, the corridor (/reise) candidates and the translation
+  // source set — while the SAME provider's visible row stays. NULL and 0
+  // both read as visible. The dedup pass leaves a hidden row out of any
+  // merge, and PUBLISH_GATE_SQL_EXCEPT_STATUS (the requarantine "was it
+  // published" reconstruction) treats it as not published.
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+      const corridor = require("./route-corridor-service") as typeof import("./route-corridor-service");
+      const translations = require("./profile-translations") as typeof import("./profile-translations");
+
+      const HIDDEN_CLAUSE = "(e.catalog_hidden IS NULL OR e.catalog_hidden != 1)";
+      assertTrue(expStore.PUBLISH_GATE_SQL.includes(HIDDEN_CLAUSE), "eh-0a: PUBLISH_GATE_SQL carries the experience catalog_hidden clause");
+      assertTrue(expStore.PUBLISH_GATE_SQL_EXCEPT_STATUS.includes(HIDDEN_CLAUSE), "eh-0b: ...and so does PUBLISH_GATE_SQL_EXCEPT_STATUS");
+      assertEq(translations.OPPLEVAGENT_PUBLISH_GATE_SQL, expStore.PUBLISH_GATE_SQL, "eh-0c: the translations' inlined gate still equals PUBLISH_GATE_SQL");
+
+      const provMixed = expStore.createProvider({
+        navn: "Blandet Tur AS", kommune: "Tromsø", fylke: "Troms",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      const provOnlyHidden = expStore.createProvider({
+        navn: "Bare Skjult AS", kommune: "Alta", fylke: "Finnmark",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      db.prepare("UPDATE experience_providers SET slug = 'bare-skjult' WHERE id = ?").run(provOnlyHidden);
+      const mk = (title: string, slug: string, over: Record<string, unknown> = {}) =>
+        expStore.createExperience({
+          title, slug, provider_id: provMixed, provider_match_status: "matched",
+          kommune: "Tromsø", fylke: "Troms", category: "safari", price_from: 900,
+          verification_status: "verified", confidence: "high", loc_lat: 69.65, loc_lon: 18.96, geo_precision: "address",
+          description: "En lang nok beskrivelse av en hvalsafari langs kysten med erfarne guider om bord.",
+          ...over,
+        } as any);
+      const visibleId = mk("Synlig hvalsafari", "eh-synlig");
+      const visibleNullId = mk("Synlig nordlystur", "eh-synlig-null");
+      db.prepare("UPDATE experiences SET catalog_hidden = NULL WHERE id = ?").run(visibleNullId);
+      const hiddenId = mk("Skjult isbjørnsafari", "eh-skjult", { kommune: "Karlsøy", category: "isbjornsafari", price_from: 100 });
+      const hiddenOnlyId = mk("Skjult laksefiske", "eh-skjult-alta", { provider_id: provOnlyHidden, kommune: "Alta", fylke: "Finnmark", category: "fiske" });
+      const hideSql = db.prepare("UPDATE experiences SET catalog_hidden = 1, hidden_reason = 'discontinued', hidden_at = datetime('now') WHERE id = ?");
+      hideSql.run(hiddenId);
+      hideSql.run(hiddenOnlyId);
+      // A dedup-merged row whose canonical is the hidden row.
+      const dupId = mk("Skjult isbjørnsafari (dup)", "eh-skjult-dup");
+      db.prepare("UPDATE experiences SET canonical_id = ? WHERE id = ?").run(hiddenId, dupId);
+
+      const rawHidden = expStore.getExperienceById(hiddenId);
+      assertEq([rawHidden?.verification_status, rawHidden?.confidence], ["verified", "high"], "eh-1a: the hidden fixture passes every other gate clause (raw read)");
+
+      const visibleSet = [visibleId, visibleNullId].sort();
+      assertEq(expStore.discoverExperiences({}, 50).map((r) => r.id).sort(), visibleSet, "eh-2a: discoverExperiences returns only the visible rows (catalog_hidden 0 and NULL)");
+      assertEq(expStore.countDiscoverExperiences({}), 2, "eh-2b: countDiscoverExperiences excludes the hidden rows");
+      assertTrue(!expStore.discoverExperiencesRelaxed({ fylke: "Finnmark", category: "fiske" }, 50).results.some((r) => r.id === hiddenOnlyId), "eh-2c: relaxed discover never surfaces a hidden row");
+      assertEq(expStore.getPublishedExperienceById(hiddenId), null, "eh-3a: by-id -> null for the hidden row");
+      assertEq(expStore.getPublishedExperienceBySlug("eh-skjult"), null, "eh-3b: by-slug -> null for the hidden row");
+      assertEq(expStore.getPublishedExperienceById(visibleNullId)?.id, visibleNullId, "eh-3c: catalog_hidden NULL is visible by id");
+      assertEq(expStore.resolveCanonicalSlugForDuplicate("eh-skjult-dup"), null, "eh-3d: a duplicate whose canonical is hidden does not 301 to it");
+      assertEq(expStore.listPublishedExperienceSlugs().map((r) => r.slug).sort(), ["eh-synlig", "eh-synlig-null"], "eh-4a: sitemap slugs exclude the hidden rows");
+      assertEq(expStore.countPublishedExperiences(), 2, "eh-4b: countPublishedExperiences (home counter, llms.txt, agent card) excludes them");
+      assertEq(expStore.listPublishedExperiences({}, 50).map((r: any) => r.slug).sort(), ["eh-synlig", "eh-synlig-null"], "eh-4c: browse listing excludes them");
+      assertEq(expStore.countPublishedKommuner(), 1, "eh-4d: kommune counter excludes the hidden rows' kommuner");
+      assertEq(expStore.countPublishedProviders(), 1, "eh-4e: a provider whose only experience is hidden is not counted");
+      assertEq(expStore.listPublishedProviders().map((r: any) => r.id), [provMixed], "eh-4f: provider list (sitemap) excludes it");
+      assertEq(expStore.getPublishedProviderById(provOnlyHidden), null, "eh-4g: its /tilbyder page by id 404s");
+      assertEq(expStore.getPublishedProviderBySlug("bare-skjult"), null, "eh-4h: ...and by slug");
+      assertEq(expStore.listPublishedCategories().map((c) => c.category), ["safari"], "eh-4i: published categories exclude the hidden rows' categories");
+      assertEq(expStore.listPublishedFylker().map((c) => c.fylke), ["Troms"], "eh-4j: published fylker exclude them");
+      assertEq(expStore.listPublishedKommuner().map((c) => c.kommune), ["Tromsø"], "eh-4k: published kommuner exclude them");
+      assertEq(expStore.listCategories().map((c) => c.category), ["safari"], "eh-4l: listCategories (/categories, MCP, A2A) excludes them");
+      assertEq(expStore.getCategoryFaqStats("safari").minPriceFrom, 900, "eh-4m: FAQ stats exclude the hidden row's price");
+      assertEq(expStore.listProduktByCombos().map((r: any) => `${r.category}/${r.kommune}`), ["safari/Tromsø"], "eh-4n: category x kommune combos exclude them");
+      assertEq(expStore.searchPublishedExperiences("skjult").length, 0, "eh-5a: search never finds a hidden row");
+      assertEq(expStore.searchPublishedExperiences("synlig").length, 2, "eh-5b: ...but finds the visible ones");
+      assertTrue(!expStore.listPublishedExperienceMapPoints({}).some((r) => r.slug.startsWith("eh-skjult")), "eh-5c: map points exclude them");
+      assertTrue(!expStore.getRelatedPublishedExperiences("safari", visibleId, 10).some((r) => r.slug.startsWith("eh-skjult")), "eh-5d: related list excludes them");
+      assertEq(expStore.getExperiencesMarketplaceStats().totalListings, 2, "eh-5e: marketplace stats (/api/stats) exclude them");
+      const box = { minLat: 60, maxLat: 72, minLng: 10, maxLng: 30 };
+      assertEq(corridor.loadExperienceCandidates(box, db).map((c) => c.id).sort(), visibleSet, "eh-6a: /reise corridor candidates exclude the hidden rows");
+      const srcIds = new Set(translations.collectSourceItems(db as any, "opplevagent").map((s) => s.entity_id));
+      assertTrue(srcIds.has(visibleId) && !srcIds.has(hiddenId) && !srcIds.has(hiddenOnlyId), "eh-6b: the translation source set excludes the hidden rows");
+
+      // Requarantine reconstruction: a needs_review row that would pass the
+      // gate if verified — but is hidden — is NOT "was published".
+      const nrId = mk("Karantene hvalsafari", "eh-karantene", { verification_status: "needs_review" });
+      const wouldPublish = (id: string) => Number((db.prepare(
+        `SELECT (${expStore.PUBLISH_GATE_SQL_EXCEPT_STATUS}) AS w FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id WHERE e.id = ?`,
+      ).get(id) as any).w);
+      assertEq(wouldPublish(nrId), 1, "eh-7a: a visible needs_review row reconstructs as would-publish");
+      hideSql.run(nrId);
+      assertEq(wouldPublish(nrId), 0, "eh-7b: the same row hidden does not");
+
+      // Dedup: a hidden row takes no part in a merge; unhiding it lets the
+      // next pass merge as before.
+      const provDd = expStore.createProvider({ navn: "Kon-Tiki Museet AS", kommune: "Oslo", fylke: "Oslo", brreg_verified: 1, brreg_active: 1, verification_status: "verified" });
+      const ddRich = expStore.createExperience({
+        title: "Kon-Tiki Museum Oslo — Official Site", provider_id: provDd, kommune: "Oslo", fylke: "Oslo",
+        verification_status: "verified", confidence: "high", duration_min: 60, price_from: 150, booking_url: "https://kon-tiki.no/book",
+        description: "Kon-Tiki Museet viser Thor Heyerdahls originale flåter og fartøy, med utstillinger om ekspedisjonene hans over Stillehavet.",
+      } as any);
+      const ddThin = expStore.createExperience({
+        title: "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…", provider_id: provDd, kommune: "Oslo", fylke: "Oslo",
+        verification_status: "verified", confidence: "medium", description: "Kort.",
+      } as any);
+      hideSql.run(ddRich);
+      const { runDedupPass } = require("./experience-dedup") as typeof import("./experience-dedup");
+      const canon = (id: string) => (db.prepare("SELECT canonical_id FROM experiences WHERE id = ?").get(id) as any).canonical_id;
+      runDedupPass(db);
+      assertEq([canon(ddRich), canon(ddThin)], [null, null], "eh-8a: dedup does not merge the visible twin into the hidden row");
+      db.prepare("UPDATE experiences SET catalog_hidden = 0, hidden_reason = NULL, hidden_at = NULL WHERE id = ?").run(ddRich);
+      runDedupPass(db);
+      assertEq([canon(ddRich), canon(ddThin)], [null, ddRich], "eh-8b: once unhidden, the next pass merges the pair as before");
+    } catch (err: any) {
+      failed++;
+      failures.push("publish-gate-experience-catalog-hidden (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
   return { passed, failed, failures };
 }
 
