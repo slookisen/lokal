@@ -40,9 +40,21 @@
  * raw-only on purpose — Skive 3 does not invent new rollup columns.
  */
 
-import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
-import { getRollupBoundaryDate, isAnalyticsRollupReadEnabled } from "./retention-service";
+import type Database from "better-sqlite3";
+import { LEGACY_AGENT_VIEW_SOURCE } from "../database/analytics-sql";
+import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn } from "./analytics-rollup-boundary";
 import type { VerticalId } from "./analytics-service";
+
+type Db = Database.Database;
+
+// dev-request 2026-10-08-serverheng (skive 3): every reader below takes an
+// optional explicit `db` handle, and database/init is only loaded lazily when
+// none is passed. The off-thread stats worker (offthread-stats-worker.ts)
+// imports this module and always passes its own read-only connection, so it
+// never opens (or migrates) the main read-write DB.
+function defaultDb(): Db {
+  return (require("../database/init") as typeof import("../database/init")).getDb();
+}
 
 type RawTable = "analytics_page_views" | "analytics_queries" | "analytics_agent_views";
 
@@ -60,10 +72,10 @@ interface PrunedWindow {
  * SQLite-format datetime string ("YYYY-MM-DD HH:MM:SS") — same shape every
  * caller already computes for its raw `created_at > cutoff` query.
  */
-function resolvePrunedWindow(cutoffIso: string, table: RawTable, dbHandle?: ReturnType<typeof getDb>): PrunedWindow | null {
+function resolvePrunedWindow(cutoffIso: string, table: RawTable, dbHandle?: Db): PrunedWindow | null {
   if (!isAnalyticsRollupReadEnabled()) return null;
   const fromDay = cutoffIso.slice(0, 10);
-  const boundary = getRollupBoundaryDate(table, dbHandle);
+  const boundary = rollupBoundaryDateOn(dbHandle ?? defaultDb(), table);
   if (fromDay >= boundary) return null; // entire window is still in raw
   return { fromDay, boundary };
 }
@@ -80,13 +92,13 @@ function withPrunedWindow<T>(
   cutoffIso: string,
   table: RawTable,
   fallback: T,
-  fn: (w: PrunedWindow, db: ReturnType<typeof getDb>) => T,
-  dbHandle?: ReturnType<typeof getDb>
+  fn: (w: PrunedWindow, db: Db) => T,
+  dbHandle?: Db
 ): T {
   const w = resolvePrunedWindow(cutoffIso, table, dbHandle);
   if (!w) return fallback;
   try {
-    return fn(w, dbHandle ?? getDb());
+    return fn(w, dbHandle ?? defaultDb());
   } catch (err) {
     console.error("[analytics-rollup-reads] blend query failed, falling back to raw-only:", err);
     return fallback;
@@ -98,9 +110,8 @@ function withPrunedWindow<T>(
 // ═════════════════════════════════════════════════════════════════
 
 /** Pruned-day portion of a plain page-view count (AnalyticsService.getPageViewCount). */
-export function getPrunedPageViewCount(cutoffIso: string, vertical?: VerticalId): number {
-  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w) => {
-    const db = getDb();
+export function getPrunedPageViewCount(cutoffIso: string, vertical?: VerticalId, db?: Db): number {
+  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const row = db.prepare(`
@@ -108,13 +119,12 @@ export function getPrunedPageViewCount(cutoffIso: string, vertical?: VerticalId)
       WHERE day >= ? AND day < ?${V}
     `).get(w.fromDay, w.boundary, ...vp) as { c: number };
     return row.c || 0;
-  });
+  }, db);
 }
 
 /** Pruned-day portion of page views grouped by `source` (AnalyticsService.getSummary.trafficBySource). */
-export function getPrunedPageViewsBySource(cutoffIso: string, vertical?: VerticalId): Record<string, number> {
-  return withPrunedWindow(cutoffIso, "analytics_page_views", {} as Record<string, number>, (w) => {
-    const db = getDb();
+export function getPrunedPageViewsBySource(cutoffIso: string, vertical?: VerticalId, db?: Db): Record<string, number> {
+  return withPrunedWindow(cutoffIso, "analytics_page_views", {} as Record<string, number>, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
@@ -125,7 +135,7 @@ export function getPrunedPageViewsBySource(cutoffIso: string, vertical?: Vertica
     const out: Record<string, number> = {};
     for (const r of rows) out[r.source] = r.c || 0;
     return out;
-  });
+  }, db);
 }
 
 /**
@@ -148,7 +158,7 @@ export function getPrunedPageViewsBySource(cutoffIso: string, vertical?: Vertica
  */
 export function getPrunedChatgptClaudeCounts(
   cutoffIso: string,
-  opts: { path?: string; vertical?: VerticalId; db?: ReturnType<typeof getDb> } = {}
+  opts: { path?: string; vertical?: VerticalId; db?: Db } = {}
 ): { chatgpt: number; claude: number } {
   const zero = { chatgpt: 0, claude: 0 };
   return withPrunedWindow(cutoffIso, "analytics_page_views", zero, (w, db) => {
@@ -187,10 +197,10 @@ export function getPrunedChatgptClaudeCounts(
 export function getPrunedPageViewsByPath(
   cutoffIso: string,
   vertical: VerticalId | undefined,
-  excludeLikePatterns: string[]
+  excludeLikePatterns: string[],
+  db?: Db
 ): Array<{ path: string; views: number; visitors: number }> {
-  return withPrunedWindow(cutoffIso, "analytics_page_views", [], (w) => {
-    const db = getDb();
+  return withPrunedWindow(cutoffIso, "analytics_page_views", [], (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const excl = excludeLikePatterns.length
@@ -203,7 +213,7 @@ export function getPrunedPageViewsByPath(
       GROUP BY path
     `).all(w.fromDay, w.boundary, ...vp, ...excludeLikePatterns) as Array<{ path: string; views: number; visitors: number }>;
     return rows;
-  });
+  }, db);
 }
 
 /**
@@ -221,11 +231,11 @@ export function getPrunedPageViewsByPath(
 export function getPrunedExactPathViewCount(
   paths: string[],
   cutoffIso: string,
-  opts: { source?: string } = {}
+  opts: { source?: string } = {},
+  db?: Db
 ): number {
   if (paths.length === 0) return 0;
-  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w) => {
-    const db = getDb();
+  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w, db) => {
     const placeholders = paths.map(() => "?").join(",");
     const sourceClause = opts.source ? " AND source = ?" : "";
     const params: string[] = [...paths, w.fromDay, w.boundary];
@@ -235,7 +245,7 @@ export function getPrunedExactPathViewCount(
       WHERE path IN (${placeholders}) AND day >= ? AND day < ?${sourceClause}
     `).get(...params) as { c: number };
     return row.c || 0;
-  });
+  }, db);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -253,9 +263,8 @@ export function getPrunedExactPathViewCount(
  * from an aggregate table, and matches the dev-request's own "combine (sum)"
  * blending instruction.
  */
-export function getPrunedSessionsTotal(cutoffIso: string, vertical?: VerticalId): number {
-  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w) => {
-    const db = getDb();
+export function getPrunedSessionsTotal(cutoffIso: string, vertical?: VerticalId, db?: Db): number {
+  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const row = db.prepare(`
@@ -263,7 +272,7 @@ export function getPrunedSessionsTotal(cutoffIso: string, vertical?: VerticalId)
       WHERE day >= ? AND day < ?${V}
     `).get(w.fromDay, w.boundary, ...vp) as { c: number };
     return row.c || 0;
-  });
+  }, db);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -271,9 +280,8 @@ export function getPrunedSessionsTotal(cutoffIso: string, vertical?: VerticalId)
 // ═════════════════════════════════════════════════════════════════
 
 /** Pruned-day portion of a total query count (AnalyticsService.getSummary.totalQueries). */
-export function getPrunedQueryCount(cutoffIso: string, vertical?: VerticalId): number {
-  return withPrunedWindow(cutoffIso, "analytics_queries", 0, (w) => {
-    const db = getDb();
+export function getPrunedQueryCount(cutoffIso: string, vertical?: VerticalId, db?: Db): number {
+  return withPrunedWindow(cutoffIso, "analytics_queries", 0, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const row = db.prepare(`
@@ -281,13 +289,12 @@ export function getPrunedQueryCount(cutoffIso: string, vertical?: VerticalId): n
       WHERE day >= ? AND day < ?${V}
     `).get(w.fromDay, w.boundary, ...vp) as { c: number };
     return row.c || 0;
-  });
+  }, db);
 }
 
 /** Pruned-day portion of query_daily grouped by agent_id (getSummary's agentQueryResult back-compat fold). */
-export function getPrunedQueryCountsByAgent(cutoffIso: string, vertical?: VerticalId): Array<{ agent_id: string; count: number }> {
-  return withPrunedWindow(cutoffIso, "analytics_queries", [], (w) => {
-    const db = getDb();
+export function getPrunedQueryCountsByAgent(cutoffIso: string, vertical?: VerticalId, db?: Db): Array<{ agent_id: string; count: number }> {
+  return withPrunedWindow(cutoffIso, "analytics_queries", [], (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
@@ -296,13 +303,12 @@ export function getPrunedQueryCountsByAgent(cutoffIso: string, vertical?: Vertic
       GROUP BY agent_id
     `).all(w.fromDay, w.boundary, ...vp) as Array<{ agent_id: string; c: number }>;
     return rows.map(r => ({ agent_id: r.agent_id, count: r.c || 0 }));
-  });
+  }, db);
 }
 
 /** Pruned-day portion of top search terms (AnalyticsService.getSummary.topSearchTerms), from query_text_daily. */
-export function getPrunedTopQueryTerms(cutoffIso: string, vertical?: VerticalId): Array<{ query: string; count: number }> {
-  return withPrunedWindow(cutoffIso, "analytics_queries", [], (w) => {
-    const db = getDb();
+export function getPrunedTopQueryTerms(cutoffIso: string, vertical?: VerticalId, db?: Db): Array<{ query: string; count: number }> {
+  return withPrunedWindow(cutoffIso, "analytics_queries", [], (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
@@ -311,13 +317,12 @@ export function getPrunedTopQueryTerms(cutoffIso: string, vertical?: VerticalId)
       GROUP BY query
     `).all(w.fromDay, w.boundary, ...vp) as Array<{ query: string; c: number }>;
     return rows.map(r => ({ query: r.query, count: r.c || 0 }));
-  });
+  }, db);
 }
 
 /** Pruned-day portion of query_daily grouped by city (AnalyticsService.getCityStats.searchQueries). */
-export function getPrunedQueryCountsByCity(cutoffIso: string, vertical?: VerticalId): Record<string, number> {
-  return withPrunedWindow(cutoffIso, "analytics_queries", {} as Record<string, number>, (w) => {
-    const db = getDb();
+export function getPrunedQueryCountsByCity(cutoffIso: string, vertical?: VerticalId, db?: Db): Record<string, number> {
+  return withPrunedWindow(cutoffIso, "analytics_queries", {} as Record<string, number>, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
@@ -328,7 +333,7 @@ export function getPrunedQueryCountsByCity(cutoffIso: string, vertical?: Vertica
     const out: Record<string, number> = {};
     for (const r of rows) out[r.city] = r.c || 0;
     return out;
-  });
+  }, db);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -345,10 +350,10 @@ export function getPrunedQueryCountsByCity(cutoffIso: string, vertical?: Vertica
  */
 export function getPrunedAgentViewRows(
   cutoffIso: string,
-  vertical?: VerticalId
+  vertical?: VerticalId,
+  db?: Db
 ): Array<{ agent_id: string; city: string; view_source: string; view_count: number }> {
-  return withPrunedWindow(cutoffIso, "analytics_agent_views", [], (w) => {
-    const db = getDb();
+  return withPrunedWindow(cutoffIso, "analytics_agent_views", [], (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     return db.prepare(`
@@ -357,13 +362,12 @@ export function getPrunedAgentViewRows(
       WHERE day >= ? AND day < ? AND view_source != ?${V}
       GROUP BY agent_id, city, view_source
     `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE, ...vp) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
-  });
+  }, db);
 }
 
 /** Pruned-day portion of agent_view_daily grouped by city (AnalyticsService.getCityStats.viewCount). Same legacy-bucket exclusion as above. */
-export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: VerticalId): Record<string, number> {
-  return withPrunedWindow(cutoffIso, "analytics_agent_views", {} as Record<string, number>, (w) => {
-    const db = getDb();
+export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: VerticalId, db?: Db): Record<string, number> {
+  return withPrunedWindow(cutoffIso, "analytics_agent_views", {} as Record<string, number>, (w, db) => {
     const V = vertical ? " AND vertical_id = ?" : "";
     const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
@@ -374,7 +378,7 @@ export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: Ver
     const out: Record<string, number> = {};
     for (const r of rows) out[r.city] = r.c || 0;
     return out;
-  });
+  }, db);
 }
 
 // Exposed for tests that want to assert the exact boundary/window resolution
