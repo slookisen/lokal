@@ -252,6 +252,37 @@ export async function runDentalSeoProfilkvalitetTests(
       !!hjemmesideEntryMatch && hjemmesideEntryMatch[1].includes("generisk-klinikk.example.no"),
       "Hjemmeside value is still the clinic's real homepage"
     );
+
+    // ── Skive C: non-clinic classes get noindex, no Dentist JSON-LD ─────
+    const mkRow = (navn: string, org: string, cls: string | null) => {
+      const id = store.createDentalAgent({
+        navn, org_nr: org, poststed: "BERGEN", fylke: "Vestland",
+        adresse: "Storgata 1", telefon: "55123456", hjemmeside: "https://eksempel.example.no",
+      } as any);
+      if (cls) db.prepare("UPDATE dental_agents SET catalog_class = ? WHERE id = ?").run(cls, id);
+      return id;
+    };
+    let orgSeq = 918900100;
+    for (const cls of ["person_enk", "lab_leverandor", "holding"]) {
+      const id = mkRow(`Testenhet ${cls}`, String(orgSeq++), cls);
+      const r = await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` });
+      assertTrue(r.body.includes('<meta name="robots" content="noindex,follow">'), `skive C ${cls}: noindex,follow`);
+      assertTrue(!r.body.includes('"Dentist"'), `skive C ${cls}: no Dentist JSON-LD`);
+      const t = (r.body.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
+      assertTrue(!t.includes("Tannlegeklinikk"), `skive C ${cls}: title not 'Tannlegeklinikk'`);
+    }
+    for (const cls of ["klinikk", "offentlig_klinikk", "ukjent", null]) {
+      const id = mkRow(`Bergen Tannlegesenter ${cls}`, String(orgSeq++), cls);
+      const r = await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` });
+      assertTrue(!r.body.includes('<meta name="robots" content="noindex,follow">'), `skive C clinic (${cls}): stays indexable`);
+      assertTrue(r.body.includes('"Dentist"'), `skive C clinic (${cls}): keeps Dentist JSON-LD`);
+      assertTrue(r.body.includes("Tannlegeklinikk i Bergen"), `skive C clinic (${cls}): keeps clinic title`);
+    }
+    const labRow = db.prepare("SELECT id FROM dental_agents WHERE catalog_class = 'lab_leverandor'").get() as { id: string };
+    const labHtml = (await callRoute(dentalSeoRouter, { path: `/klinikk/id/${labRow.id}` })).body;
+    assertTrue(/<title>Testenhet lab_leverandor i Bergen \| Finn-tannlege.com<\/title>/.test(labHtml), "skive C lab: neutral title '<navn> i <by>'");
+    const sm = await callRoute(dentalSeoRouter, { path: "/sitemap.xml" });
+    assertTrue(!sm.body.includes("testenhet"), "skive C: non-clinics absent from sitemap");
   } catch (err: any) {
     failed++;
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.stack || err?.message || err));
