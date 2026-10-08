@@ -218,6 +218,22 @@ export function slugifyClinic(navn: string, orgNr?: string | null): string {
   return slug;
 }
 
+/**
+ * Public profile URL for a clinic row. /klinikk/:slug only resolves when the
+ * slug carries a 9-digit org.nr (parseClinicSlug -> getDentalAgentByOrgnr);
+ * rows without one are served at /klinikk/id/:id. Use this everywhere a
+ * profile link is built so MCP, A2A and SEO never emit a 404 URL.
+ */
+export function clinicProfileUrl(
+  agent: { id: string; navn: string; org_nr?: string | null }
+): string {
+  const orgDigits = agent.org_nr ? agent.org_nr.replace(/\s/g, "") : "";
+  if (/^\d{9}$/.test(orgDigits)) {
+    return `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(agent.navn, agent.org_nr)}`;
+  }
+  return `${DENTAL_BASE_URL}/klinikk/id/${agent.id}`;
+}
+
 export function parseClinicSlug(
   slug: string
 ): { orgNr: string } | null {
@@ -1205,9 +1221,7 @@ function renderClinicProfile(
   }
 
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
-  const canonical = agent.org_nr
-    ? `${DENTAL_BASE_URL}/klinikk/${slug}`
-    : `${DENTAL_BASE_URL}/klinikk/id/${agent.id}`;
+  const canonical = clinicProfileUrl(agent);
 
   // ── Header badges
   // dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A): a
@@ -1646,9 +1660,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     itemListElement: agents.slice(0, 25).map((a, i) => ({
       "@type": "ListItem",
       position: offset + i + 1,
-      url: a.org_nr
-        ? `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(a.navn, a.org_nr)}`
-        : `${DENTAL_BASE_URL}/klinikk/id/${a.id}`,
+      url: clinicProfileUrl(a),
       name: a.navn,
     })),
   };
@@ -2316,9 +2328,7 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
     itemListElement: agents.slice(0, 50).map((a, i) => ({
       "@type": "ListItem",
       position: i + 1,
-      url: a.org_nr
-        ? `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(a.navn, a.org_nr)}`
-        : `${DENTAL_BASE_URL}/klinikk/id/${a.id}`,
+      url: clinicProfileUrl(a),
       name: a.navn,
     })),
   };
@@ -2422,9 +2432,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     itemListElement: agents.slice(0, 25).map((a, i) => ({
       "@type": "ListItem",
       position: offset + i + 1,
-      url: a.org_nr
-        ? `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(a.navn, a.org_nr)}`
-        : `${DENTAL_BASE_URL}/klinikk/id/${a.id}`,
+      url: clinicProfileUrl(a),
       name: a.navn,
     })),
   };
