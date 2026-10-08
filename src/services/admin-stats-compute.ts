@@ -658,7 +658,7 @@ export function computeTopPages(db: Db, hours: number, limit: number, vertical: 
     WHERE created_at > ? AND ${NOT_OWNER}${V}
       AND (${scannerExclusion})
     GROUP BY path
-    ORDER BY views DESC
+    ORDER BY views DESC, path ${vertical ? "DESC" : "ASC"}
   `;
 
   if (prunedPages.length === 0) {

@@ -492,6 +492,22 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
       ok(bad === null, "Q5: /pages (INDEXED BY the time-window index) returns the same rows and ranking as the old query", bad);
     }
 
+    // Q5b: ties around the LIMIT cut pick the same pages as the old query (tie-breaker on path).
+    {
+      let bad: unknown = null;
+      for (const hours of [24, 720]) {
+        for (const v of [undefined, "dental"] as const) {
+          for (const limit of [3, 5, 20]) {
+            const cutoff = sqliteTs(nowMs - hours * 3600_000);
+            const old = oldPageRows(qdb, cutoff, limit, v).map((x: any) => x.path);
+            const neu = computeTopPages(qdb, hours, limit, v, nowMs).map((x: any) => x.path);
+            if (!eq(old, neu)) bad = bad ?? { hours, v, limit, old, neu };
+          }
+        }
+      }
+      ok(bad === null, "Q5b: /pages with a small LIMIT returns the same pages in the same order as the old query (ties)", bad);
+    }
+
     // Q6/Q7: EXPLAIN QUERY PLAN — the time-window index, not a full walk of source/path.
     {
       const plan = (sql: string, ...p: unknown[]) =>
