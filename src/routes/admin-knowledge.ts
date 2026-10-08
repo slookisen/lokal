@@ -1674,7 +1674,7 @@ export const homepageContentRefreshRouter = Router();
 // Norwegian display label per platform category (for the products[].name field;
 // products is stored as ProductInfo[] = [{name, category, seasonal}]). Aligned
 // with routes/seo.ts CATEGORY_LABELS_NO.
-const CATEGORY_LABEL_NO: Readonly<Record<string, string>> = {
+export const CATEGORY_LABEL_NO: Readonly<Record<string, string>> = {
   meat: "Kjøtt",
   dairy: "Meieri",
   vegetables: "Grønnsaker",

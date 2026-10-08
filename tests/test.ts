@@ -1309,6 +1309,19 @@ console.log("── admin-outreach-candidates (mode=second oldest-contacted-firs
   console.log(`  admin-outreach-candidates-mode2-ordering: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-10-08-outreach-sperre-generiske-produkter ──
+console.log("── admin-outreach-candidates (generic category-name products suppressed) ──");
+{
+  const { runAdminOutreachCandidatesGenericProductsTests } =
+    require("../src/routes/admin-outreach-candidates-generic-products.test") as
+      typeof import("../src/routes/admin-outreach-candidates-generic-products.test");
+  const r = runAdminOutreachCandidatesGenericProductsTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-generic-products: " + f);
+  console.log(`  admin-outreach-candidates-generic-products: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-08-29-outreach-max-touch-vern: mode=second exclusion +
 // admin lever (Part A) ──────────────────────────────────────────────────
 console.log("── admin-outreach-candidates (max-touch-vern: mode=second exclusion + admin lever) ──");
