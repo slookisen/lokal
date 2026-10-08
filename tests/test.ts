@@ -46499,3 +46499,25 @@ runSerial(async () => {
     failures.push("discovery-truth: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-08-agentplatform-no-paraplyside: the agentplatform.no
+// company site — host gate (www → apex, other hosts untouched), no rfb/API/MCP
+// pass-through on that host, service links + cached honest counts, street
+// address only on /kontakt + /personvern, no third parties, and the gate
+// mounted before analytics in index.ts. Opens local HTTP servers only — no
+// shared globals swapped — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── agentplatform.no company site + host gate ──");
+  try {
+    const { runAgentplatformSiteTests } = require("../src/routes/agentplatform-site.test") as
+      typeof import("../src/routes/agentplatform-site.test");
+    const ap = await runAgentplatformSiteTests({ log: false });
+    passed += ap.passed;
+    failed += ap.failed;
+    for (const f of ap.failures) failures.push("agentplatform-site: " + f);
+    console.log(`  agentplatform-site: ${ap.passed} passed, ${ap.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agentplatform-site: unexpected error: " + String(err?.message || err));
+  }
+});

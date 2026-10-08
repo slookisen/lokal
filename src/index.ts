@@ -73,6 +73,7 @@ import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status
 import ownerPortalRoutes from "./routes/owner-portal";
 import gardssalgClaimRoutes from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
+import { createAgentplatformHostGate } from "./routes/agentplatform-site";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
@@ -246,6 +247,17 @@ app.use(aiCrawlerAllowlist);
 // aiCrawlerAllowlist just above). Absent header → next() immediately, no
 // other effect whatsoever — see middleware/consumer-identity.ts.
 app.use(consumerIdentity);
+
+// ─── agentplatform.no host routing (company site) ───────────────────────
+// A2A dev-request 2026-10-08-agentplatform-no-paraplyside. The umbrella page
+// for Agentplatform.no AS, which owns the three services. Mounted HERE —
+// after security headers/CORS but BEFORE analytics, Link headers and every
+// rfb/dental/experiences router — so (a) a visit is never logged as rfb
+// traffic (getVerticalFromHost defaults to rfb) and the page stays cookie-
+// and tracking-free as its /personvern says, and (b) nothing else answers on
+// this host: no /api, /mcp, /a2a or /.well-known passes through; unknown
+// paths get the site's own 404. Other hosts fall straight through.
+app.use(createAgentplatformHostGate());
 
 // Analytics middleware (before routes, after security)
 app.use(analyticsService.middleware());
