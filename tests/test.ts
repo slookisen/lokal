@@ -42609,6 +42609,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse Mål 1: GET
+// /admin/agents/fylke-contradiction-audit (read-only fylke-motsigelse revisjon).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse (Mål 1) ──");
+  try {
+    const { runAdminAgentsFylkeContradictionAuditTests } =
+      require("../src/routes/admin-agents-fylke-contradiction-audit.test") as
+        typeof import("../src/routes/admin-agents-fylke-contradiction-audit.test");
+    const fca = await runAdminAgentsFylkeContradictionAuditTests({ log: false });
+    passed += fca.passed;
+    failed += fca.failed;
+    for (const f of fca.failures) failures.push("fylke-contradiction-audit: " + f);
+    console.log(`  fylke-contradiction-audit: ${fca.passed} passed, ${fca.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fylke-contradiction-audit: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-19-field-provenance-legacy-shape-audit: GET
 // /admin/agent-audit/field-provenance-legacy-shape (src/routes/admin-agent-audit.ts) —
 // read-only audit finding agent_knowledge/dental_agents rows still holding a
