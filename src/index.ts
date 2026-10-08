@@ -93,6 +93,7 @@ import adminAgentsInternalNoteSweepRoutes from "./routes/admin-agents-internal-n
 import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-correction";
 import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
 import adminAgentsCategoryDescriptionProvenanceAuditRoutes from "./routes/admin-agents-category-description-provenance-audit";
+import adminAgentsFylkeContradictionAuditRoutes from "./routes/admin-agents-fylke-contradiction-audit";
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
@@ -793,6 +794,10 @@ app.use(
 // discovery-og-naerhetssok, Fase 5c): read-only drink-venue coverage report
 // over RFB producers, by canonical subcategory + city. Same ordering rule as
 // the siblings above — mount BEFORE /admin/agents.
+// GET /admin/agents/fylke-contradiction-audit (dev-request 2026-10-06-rfb-brreg-navnetreff-
+// feil-adresse, Mål 1): read-only list of RFB producers whose name suffix and city point to
+// different fylker. Mount BEFORE /admin/agents like the siblings above.
+app.use("/admin/agents/fylke-contradiction-audit", adminLimiter, adminAgentsFylkeContradictionAuditRoutes);
 app.use("/admin/agents/drink-coverage", adminLimiter, adminDrinkCoverageRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause

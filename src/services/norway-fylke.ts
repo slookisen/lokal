@@ -215,6 +215,7 @@ const CITY_TO_FYLKE_RAW: Record<string, string> = {
   // Innlandet (Hedmark + Oppland merged)
   "Hamar": "Innlandet",
   "Lillehammer": "Innlandet",
+  "Fåberg": "Innlandet", // Lillehammer kommune (dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse)
   "Gjøvik": "Innlandet",
   "Elverum": "Innlandet",
   "Kongsvinger": "Innlandet",
@@ -285,6 +286,7 @@ const CITY_TO_FYLKE_RAW: Record<string, string> = {
 
   // Vestland (Hordaland + Sogn og Fjordane merged)
   "Bergen": "Vestland",
+  "Bømlo": "Vestland", // dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse
   "Voss": "Vestland",
   "Sogndal": "Vestland",
   "Stryn": "Vestland",
