@@ -32,6 +32,12 @@ import { safeHonestCatalogCount, type CatalogVertical } from "../services/honest
 import { COMPANY_INFO } from "../config/company-info";
 
 export const AGENTPLATFORM_HOSTS = new Set(["agentplatform.no", "www.agentplatform.no"]);
+/**
+ * Hosts that only ever redirect to the apex: www, and the Norwegian spelling
+ * agentplattform.no (not registered yet, 2026-10-08 — once it is, DNS + a Fly
+ * certificate are all it needs; see A2A runbooks/2026-10-08-agentplatform-no-dns-sertifikat-epost.md).
+ */
+export const AGENTPLATFORM_REDIRECT_HOSTS = new Set(["www.agentplatform.no", "agentplattform.no", "www.agentplattform.no"]);
 export const AGENTPLATFORM_BASE_URL = "https://agentplatform.no";
 
 // Company facts live in config/company-info.ts (shared with the product sites).
@@ -435,7 +441,7 @@ a{color:inherit}
 .node span{display:grid;line-height:1.25}
 .node b{font-size:15px;font-weight:650;letter-spacing:-.01em}
 .node small{font-size:13px;color:var(--ci);font-weight:550;font-variant-numeric:tabular-nums}
-.hero h1{font-size:clamp(38px,5.6vw,66px);line-height:1.04;letter-spacing:-.035em;font-weight:650;margin:24px 0 0;max-width:19ch;text-wrap:balance}
+.hero h1{font-size:clamp(38px,5vw,60px);line-height:1.04;letter-spacing:-.035em;font-weight:650;margin:24px 0 0;max-width:19ch;text-wrap:balance}
 .lead{font-size:clamp(18px,2vw,21px);line-height:1.55;color:var(--ink-2);max-width:60ch;margin:24px 0 0;text-wrap:pretty}
 .ctas{display:flex;flex-wrap:wrap;gap:12px;margin-top:36px}
 .btn{display:inline-flex;align-items:center;gap:10px;min-height:52px;padding:0 24px;border-radius:14px;font-weight:600;font-size:16px;text-decoration:none;transition:transform .15s,background .15s,border-color .15s,box-shadow .15s}
@@ -1067,15 +1073,15 @@ export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> 
 
 /**
  * Host gate for index.ts. Requests for any other host fall straight through.
- * www.agentplatform.no → https://agentplatform.no (301), like the other gates.
+ * www.agentplatform.no and agentplattform.no → https://agentplatform.no (301).
  */
 export function createAgentplatformHostGate(router: Router = createAgentplatformRouter()): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const host = req.hostname;
-    if (!AGENTPLATFORM_HOSTS.has(host)) return next();
-    if (host === "www.agentplatform.no") {
+    if (AGENTPLATFORM_REDIRECT_HOSTS.has(host)) {
       return res.redirect(301, `${AGENTPLATFORM_BASE_URL}${req.originalUrl}`);
     }
+    if (!AGENTPLATFORM_HOSTS.has(host)) return next();
     return router(req, res, next);
   };
 }

@@ -107,6 +107,10 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
       www.status === 301 && www.headers.location === "https://agentplatform.no/en?x=1",
       `${www.status} ${www.headers.location}`,
     );
+    for (const h of ["agentplattform.no", "www.agentplattform.no"]) {
+      const r = await get("/kontakt?a=b", h);
+      check(`a3b: ${h} (Norwegian spelling) → 301 https://agentplatform.no<path+query>`, r.status === 301 && r.headers.location === "https://agentplatform.no/kontakt?a=b", `${r.status} ${r.headers.location}`);
+    }
     for (const h of ["rettfrabonden.com", "opplevagent.no", "finn-tannlege.com", "lokal.fly.dev"]) {
       const r = await get("/", h);
       check(`a4: host ${h} falls through the gate untouched`, r.status === 418 && r.body === "fell-through");
