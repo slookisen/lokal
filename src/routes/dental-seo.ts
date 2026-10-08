@@ -31,7 +31,7 @@ import { registeredMcpTools } from "../services/mcp-tool-manifest";
 // clinic" word list the catalog-class classifier used to decide
 // catalog_class='person_enk' in the first place. normalizeHostname is the
 // hjemmeside-cleanup sweep's own URL->hostname helper.
-import { DENTAL_NAME_WORDS, isPublicDentalServiceHost } from "../services/dental-catalog-class";
+import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 
@@ -161,6 +161,18 @@ function isSoleProprietorProfile(agent: DentalAgent): boolean {
   if (agent.catalog_class === "person_enk") return true;
   const form = (agent.organisasjonsform ?? "").trim().toUpperCase();
   return form === "ENK" && !nameHasDentalWord(agent.navn);
+}
+
+// dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive C): a row the
+// classifier has POSITIVELY placed outside the clinic classes (person_enk,
+// lab_leverandor, holding -- everything in DENTAL_CATALOG_CLASSES except the
+// clinic classes and "ukjent") is not a clinic. NULL / "ukjent" stay clinics
+// (same lenient bias as DENTAL_CLINIC_CLASS_SQL). Stored class only: no
+// organisasjonsform/name fallback, so this is the narrow set.
+const NON_CLINIC_CLASSES = new Set(["person_enk", "lab_leverandor", "holding"]);
+function isNonClinicProfile(agent: DentalAgent): boolean {
+  const c = agent.catalog_class ?? null;
+  return c !== null && NON_CLINIC_CLASSES.has(c) && !(DENTAL_CLINIC_CLASSES as readonly string[]).includes(c);
 }
 
 // ─── dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d) ─────
@@ -1461,7 +1473,11 @@ function renderClinicProfile(
   if (isValidLocality(agent.fylke)) profileBreadcrumbItems.push({ name: agent.fylke!, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke!)}` });
   if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
   profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
-  const jsonLdArr = [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
+  // skive C: a non-clinic must not claim to be a schema.org Dentist.
+  const nonClinic = isNonClinicProfile(agent);
+  const jsonLdArr = nonClinic
+    ? [breadcrumbJsonLd(profileBreadcrumbItems)]
+    : [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
 
   // ── orch-PR-20260613: unique meta description
   // Use rich om_oss (when not a placeholder) or a structured-field summary.
@@ -1474,6 +1490,9 @@ function renderClinicProfile(
       let t = richDesc.slice(0, 157);
       const dot = t.lastIndexOf(".");
       return dot > 60 ? t.slice(0, dot + 1) : t + "…";
+    }
+    if (nonClinic) {
+      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring fra Brønnøysundregistrene.`;
     }
     return buildClinicDescription(agent, nearbyCount, true);
   })();
@@ -1504,7 +1523,11 @@ function renderClinicProfile(
   // word in its name is a single dentist, not a clinic -- "Tannlege <navn> i
   // <by>" rather than the generic clinic template. Non-ENK case is
   // byte-identical to before this dev-request.
-  const profileTitleCore = isSoleProprietorProfile(agent)
+  // skive C: lab/holding get a neutral title; person_enk keeps the
+  // sole-proprietor wording (display-name decision for ENK is a separate item).
+  const profileTitleCore = nonClinic && agent.catalog_class !== "person_enk"
+    ? `${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
+    : isSoleProprietorProfile(agent)
     ? `Tannlege ${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
     : `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`;
 
@@ -1538,7 +1561,7 @@ function renderClinicProfile(
   res.send(dentalShell(html, {
     title: `${profileTitleCore} | Finn-tannlege.com`,
     description: metaDesc,
-    ...(thin || inactive ? { robots: "noindex,follow" } : {}),
+    ...(thin || inactive || nonClinic ? { robots: "noindex,follow" } : {}),
     canonical,
     jsonLd: jsonLdArr,
   }));
