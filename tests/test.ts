@@ -1487,6 +1487,39 @@ const _brregVerifySlice1Promise: Promise<void> = (async () => {
   }
 })();
 
+// ── dev-request 2026-10-06-rfb-brreg-navnetreff-feil-adresse (Mål 3): ────
+// checkBrregNameHitAddress() — a Brreg address from a pure name hit is only
+// accepted when the company is demonstrably the producer's own.
+console.log("── brreg-address-guard: checkBrregNameHitAddress unit tests ──");
+{
+  const { checkBrregNameHitAddress } = require("../src/services/brreg-address-guard") as
+    typeof import("../src/services/brreg-address-guard");
+  const snill = checkBrregNameHitAddress({
+    producerOrgNr: null, producerPostal: "5430", producerCity: "Bergen",
+    hitOrgNr: "920331076", hitPostal: "2609", hitPoststed: "Lillehammer",
+  });
+  assertEq(snill.accept, false, "brreg-guard: Snill Bie-type name hit in another fylke is rejected");
+  assertEq(snill.reason, "fylke_mismatch", "brreg-guard: rejection reason is fylke_mismatch");
+  assertEq(checkBrregNameHitAddress({
+    producerOrgNr: "920 331 076", hitOrgNr: "920331076", hitPostal: "2609", hitPoststed: "Lillehammer",
+  }).reason, "org_nr_linked", "brreg-guard: linked org.nr is accepted regardless of place");
+  assertEq(checkBrregNameHitAddress({
+    producerPostal: "5430", producerCity: "Nowhere", hitPostal: "5430", hitPoststed: "Nowhere else",
+  }).reason, "same_postal", "brreg-guard: identical postal code is accepted");
+  assertEq(checkBrregNameHitAddress({
+    producerPostal: "5430", producerCity: "Bergen", hitPostal: "5003", hitPoststed: "Bergen",
+  }).accept, true, "brreg-guard: same fylke (different postal) is accepted");
+  assertEq(checkBrregNameHitAddress({
+    producerPostal: "5430", producerCity: null, hitPostal: "2635", hitPoststed: "Tretten",
+  }).reason, "unverifiable", "brreg-guard: unknown producer place is rejected as unverifiable");
+  assertEq(checkBrregNameHitAddress({
+    producerOrgNr: "123", hitOrgNr: "123", producerCity: "Bergen", hitPostal: "2609", hitPoststed: "Lillehammer",
+  }).accept, false, "brreg-guard: a short/invalid org.nr never counts as a link");
+  assertEq(checkBrregNameHitAddress({
+    hitOrgNr: "920331076", hitPostal: "2609", hitPoststed: "Lillehammer",
+  }).reason, "no_producer_location", "brreg-guard: producer with no place on record has nothing to contradict");
+}
+
 // ── dev-request 2026-07-06-rfb-salgskanal-kategorier (datamodel + ────────
 // auto-matcher slice): matchSalgskanalCategories() pure-function unit tests
 // (salgskanal-matcher.ts). Synchronous (no I/O); wrapped in an async IIFE
