@@ -100,6 +100,8 @@ export function getDb(): Database.Database {
     // Try WAL mode first (best perf), fall back to DELETE if filesystem doesn't support it
     try {
       db.pragma("journal_mode = WAL");
+      // Cap the -wal file left on disk after a checkpoint (64 MB).
+      db.pragma("journal_size_limit = 67108864");
     } catch {
       console.log("⚠️  WAL mode not supported on this filesystem, using DELETE journal mode");
       db.pragma("journal_mode = DELETE");

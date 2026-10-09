@@ -79,6 +79,8 @@ export function getDb(vertical: string): DbHandle {
   // same defensive pattern as init.ts.
   try {
     db.pragma("journal_mode = WAL");
+    // Cap the -wal file left on disk after a checkpoint (64 MB).
+    db.pragma("journal_size_limit = 67108864");
   } catch {
     console.log(
       `[${vertical}] WAL mode not supported on this filesystem, using DELETE journal mode`
@@ -104,6 +106,21 @@ export function getDb(vertical: string): DbHandle {
 
   handles.set(vertical, db);
   return db;
+}
+
+/**
+ * Already-open handles (rfb + any cached vertical). Never opens a new
+ * connection for a vertical that has not been requested yet.
+ */
+export function getOpenDbHandles(): Array<{ vertical: string; db: DbHandle }> {
+  const out: Array<{ vertical: string; db: DbHandle }> = [];
+  try {
+    out.push({ vertical: "rfb", db: getRfbDb() });
+  } catch {
+    // rfb handle unavailable — skip
+  }
+  for (const [vertical, db] of handles) out.push({ vertical, db });
+  return out;
 }
 
 /**
