@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
+import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
@@ -710,6 +711,7 @@ app.get("/health", (_req, res) => {
         oldestPageViewAt: pruneLag.oldestPageViewAt,
         oldestPageViewAgeDays: pruneLag.oldestPageViewAgeDays,
         retentionDays: pruneLag.retentionDays,
+        walBytes: getWalSizes(),
       },
       writePath,
       disk: disk && {
@@ -1549,6 +1551,20 @@ app.listen(Number(PORT), HOST, async () => {
         if (built.length > 0) console.log(`[night-indexes] built ${built.join(", ")}`);
       } catch (err) {
         console.error("[night-indexes] failed (non-fatal):", err);
+      }
+
+      // S1 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: truncate the WAL
+      // of every open DB in the 03:00 window (never 07–09 UTC). Never throws.
+      try {
+        const cp = runWalCheckpoints(new Date());
+        for (const r of cp) {
+          console.log(
+            `[wal-checkpoint] ${r.vertical} ok=${r.ok} walBytes ${r.walBytesBefore} -> ${r.walBytesAfter}` +
+            (r.error ? ` error=${r.error}` : "")
+          );
+        }
+      } catch (err) {
+        console.error("[wal-checkpoint] failed (non-fatal):", err);
       }
     };
 

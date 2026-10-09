@@ -32400,6 +32400,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of s5.failures) failures.push("serverheng-slice5: " + f);
     console.log(`  serverheng-slice5: ${s5.passed} passed, ${s5.failed} failed`);
 
+    console.log("\n── wal-maintenance: journal_size_limit, WAL checkpoint, WAL size ──");
+    const { runWalMaintenanceTests } = require("../src/services/wal-maintenance.test") as
+      typeof import("../src/services/wal-maintenance.test");
+    const wal1 = await runWalMaintenanceTests({ log: false });
+    passed += wal1.passed;
+    failed += wal1.failed;
+    for (const f of wal1.failures) failures.push("wal-maintenance: " + f);
+    console.log(`  wal-maintenance: ${wal1.passed} passed, ${wal1.failed} failed`);
+
     console.log("\n── health-write-probe: cached write-path probe for /health ──");
     const { runHealthWriteProbeTests } = require("../src/services/health-write-probe.test") as
       typeof import("../src/services/health-write-probe.test");
