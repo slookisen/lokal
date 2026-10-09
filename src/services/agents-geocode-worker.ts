@@ -221,6 +221,29 @@ const CENTROID_THROTTLE_MS = 350;
 export const AGENTS_GEOCODE_MAX_ATTEMPTS = 5;
 
 /**
+ * Drop a leading care-of segment ("c/o Siri-Mette Woll, Gamle E6 95" →
+ * "Gamle E6 95") before the Kartverket address lookup. The care-of names a
+ * recipient, not a place; left in, the street lookup missed, the row fell
+ * through to the city centroid, and "Åsen" resolved to an Åsen in Innlandet
+ * instead of Hammer Gård's Åsen in Levanger — so the farm showed up in
+ * "Which farms in Innlandet sell lamb?" (ChatGPT app pre-submission review,
+ * 2026-10-09). Same pattern experiences-geocode-worker.ts already strips
+ * (dev-request 2026-09-11 fix 2). Only the geocoder input changes; the stored
+ * address text is untouched.
+ *
+ * Kept when the care-of names a company ("c/o Falstads Regnskapsservice AS,
+ * Kirkegata 75A"): that street is the accountant's office, not the farm, and
+ * geocoding it would claim address precision for the wrong building. Those
+ * rows keep the approximate city fallback they had before.
+ */
+const CARE_OF_COMPANY = /\b(?:as|asa|ans|da|sa|ba|enk|regnskap\w*|revisjon\w*|revisor\w*)\b/i;
+export function stripCareOfPrefix(address: string): string {
+  const m = address.match(/^\s*(?:c\s?\/\s?o|v\s?\/)\s+([^,]+),\s*/i);
+  if (!m || CARE_OF_COMPANY.test(m[1])) return address;
+  return address.slice(m[0].length);
+}
+
+/**
  * Cadence. A backfill wants "fast while there is work, quiet when there is
  * not" — see backfill-scheduler.ts for why a fixed hourly setInterval was the
  * wrong shape and what it measured at.
@@ -838,7 +861,7 @@ async function runAgentsGeocodeTick(
         // ceiling. Wrapping here rather than estimating "1 request per row" is
         // the difference between a bound and a hope: a row that walks the whole
         // ladder costs four requests, and at limit=200 that is 800.
-        const hit = await geocodeOne(address, postal, city, {
+        const hit = await geocodeOne(stripCareOfPrefix(address), postal, city, {
           ...deps,
           fetchImpl: budgetedFetch(deps.fetchImpl ?? fetch, sleep),
         });

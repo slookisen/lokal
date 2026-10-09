@@ -16,6 +16,8 @@
  * Asserted here (each maps to the build spec's test list):
  *   w1-w4   address hit → geo_precision='address' + real coordinates
  *   w5-w7   lookup miss → row untouched, attempt STILL stamped (so it rotates)
+ *   co1-co4 a care-of person is stripped before the address lookup; a
+ *           care-of company (accountant's office) is kept
  *   w8-w10  no coordinates at all → city-centroid tier, honestly tagged 'city'
  *   w11-w13 never downgrade: an existing 'address' row is not even selected
  *   w14-w16 idempotent re-run changes nothing
@@ -188,6 +190,25 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
         assertTrue(!!miss.geocode_attempted_at,
           "w7: …but its attempt IS stamped, so the selector rotates past it instead of re-picking it forever");
         assertTrue(r.processed >= 2, `w7b: both rows were processed (processed=${r.processed})`);
+      }
+
+      // ── co1-co4: a care-of prefix is stripped before the address lookup ──
+      // ChatGPT app pre-submission review 2026-10-09: Hammer Gård's address
+      // "c/o Siri-Mette Woll, Gamle E6 95" missed the street lookup, fell to
+      // the "Åsen" centroid and landed in Innlandet instead of Levanger.
+      {
+        const before = addressUrls.length;
+        seed({ id: "co-hammer", name: "Hammer Gård", city: "Åsen", address: "c/o Siri-Mette Woll, Gamle E6 95", postal_code: "7630" });
+        await worker.agentsGeocodeTick(50, deps);
+        const urls = addressUrls.slice(before);
+        assertTrue(urls.some((u) => /Gamle E6 95/.test(u)) && !urls.some((u) => /Siri-Mette/.test(u)),
+          `co1: the Kartverket address query carries the street, not the care-of recipient (got ${JSON.stringify(urls)})`);
+        assertEq(rowOf("co-hammer").geo_precision, "address", "co2: …so the row is placed at address precision, not a same-named place's centroid");
+        assertEq(worker.stripCareOfPrefix("Cobberveien 2, 1234 Oslo"), "Cobberveien 2, 1234 Oslo",
+          "co3: an address that merely starts with the letters 'co' is left alone");
+        assertEq(worker.stripCareOfPrefix("c/o Falstads Regnskapsservice AS, Kirkegata 75A"),
+          "c/o Falstads Regnskapsservice AS, Kirkegata 75A",
+          "co4: a care-of company (an accountant's office) is kept, so the farm is not pinned to that building");
       }
 
       // ── w8-w10: no coordinates at all → honest city centroid ─────

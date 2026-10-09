@@ -890,6 +890,19 @@ class MarketplaceRegistry {
       }
     }
     if (detectedCategories.length > 0) parsed.categories = detectedCategories;
+    // A meat compound also matches the animal's other product names:
+    // «reinkjøtt» must find a producer whose list says «Reinsdyrkjøtt»,
+    // «lammekjøtt» one that sells «Lammelår» (product matching is a
+    // substring test). ChatGPT app pre-submission review 2026-10-09:
+    // «reinkjøtt Finnmark» labelled Finnmark Kjøtt AS a category-only match.
+    const MEAT_COMPOUND_STEMS: Record<string, string> = {
+      reinkjøtt: "rein", reinsdyrkjøtt: "rein", lammekjøtt: "lam",
+      elgkjøtt: "elg", hjortekjøtt: "hjort", viltkjøtt: "vilt",
+    };
+    for (const term of [...productTerms]) {
+      const stem = MEAT_COMPOUND_STEMS[term];
+      if (stem && !productTerms.includes(stem)) productTerms.push(stem);
+    }
     if (productTerms.length > 0) parsed._productTerms = productTerms;
 
     // Fase 5b: WHICH of the six canonical drink subcategories, when the
