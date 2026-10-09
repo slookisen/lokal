@@ -20,6 +20,7 @@ import { interactionLogger } from "../services/interaction-logger";
 import { redactPII } from "../utils/pii-redact";
 import { parseUserAgent, analyticsService, MIN_HUMAN_REFERRAL_COUNT } from "../services/analytics-service";
 import type { HumanReferralPattern } from "../services/analytics-service";
+import { companyFooterLineHtml } from "../services/company-legal";
 
 const router = Router();
 
@@ -607,6 +608,8 @@ const CHAT_CSS = `
   .ft-inner { max-width: 900px; margin: 0 auto; text-align: center; }
   .ft-brand { font-weight: 800; margin-bottom: 4px; }
   .ft-desc { font-size: 0.8rem; opacity: 0.5; }
+  .ft-company { margin-top: 10px; font-size: 0.75rem; opacity: 0.55; }
+  .ft-company a { color: inherit; text-decoration: underline; }
 
   @media (max-width: 768px) {
     .nav { padding: 0 16px; }
@@ -715,6 +718,7 @@ function chatShell(
     <div class="ft-inner">
       <div class="ft-brand">Rett fra Bonden</div>
       <div class="ft-desc">Agent-til-agent samtaler &mdash; AI som snakker med AI for &aring; finne lokal mat.</div>
+      <div class="ft-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
     </div>
   </footer>
 </body>

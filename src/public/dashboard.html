@@ -1192,6 +1192,13 @@
       opacity: 0.8;
     }
 
+    /* Company line (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
+       The text is a literal copy of companyFooterLineHtml() in
+       src/services/company-legal.ts — src/routes/company-legal-sites.test.ts
+       fails if the two ever drift apart. */
+    .company-line { font-size: 0.8rem; opacity: 0.6; margin-top: 0.4rem; }
+    .company-line a { color: inherit; text-decoration: underline; }
+
     /* Loading spinner */
     .spinner {
       border: 3px solid var(--border-gray);
@@ -1517,6 +1524,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
   <footer>
     <p>LOKAL &mdash; Agent-registeret for norsk mat &middot; A2A Protocol</p>
     <p style="margin-top: 0.5rem; font-size: 0.85rem; opacity: 0.6;">Gjør matprodusenter synlige for morgendagens AI-assistenter</p>
+    <p class="company-line">En tjeneste fra <a href="https://agentplatform.no">AGENTPLATFORM.NO AS</a> · <a href="/kontakt">Org.nr. 938 635 676</a></p>
   </footer>
 
   <script>

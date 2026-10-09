@@ -1100,6 +1100,13 @@
       text-decoration: underline !important;
     }
 
+    /* Company line (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
+       The text is a literal copy of companyFooterLineHtml() in
+       src/services/company-legal.ts — src/routes/company-legal-sites.test.ts
+       fails if the two ever drift apart. */
+    .company-line { font-size: 0.8rem; opacity: 0.6; margin-top: 0.4rem; }
+    .company-line a { color: inherit; text-decoration: underline; }
+
     /* Loading spinner */
     .spinner {
       border: 3px solid var(--border-gray);
@@ -1426,6 +1433,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         <a href="/.well-known/agent-card.json" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">A2A</a>
       </div>
       <p style="font-size:0.8rem;opacity:0.4;">&copy; 2026 Rett fra Bonden. Åpen kildekode.</p>
+      <p class="company-line">En tjeneste fra <a href="https://agentplatform.no">AGENTPLATFORM.NO AS</a> · <a href="/kontakt">Org.nr. 938 635 676</a></p>
     </div>
   </footer>
 

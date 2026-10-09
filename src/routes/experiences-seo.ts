@@ -178,6 +178,19 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
+// A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
+// footer line, /kontakt facts, /personvern controller, /vilkar operator,
+// JSON-LD parentOrganization and the MCP server-card vendor all come from
+// COMPANY_INFO via these helpers.
+import {
+  agentCardProvider,
+  companyContactBlockHtml,
+  companyControllerSentenceHtml,
+  companyFooterLineHtml,
+  companyOperatorSentence,
+  parentOrganizationJsonLd,
+  toSiteLang,
+} from "../services/company-legal";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
 import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-palette";
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
@@ -470,6 +483,7 @@ function oaSiteFooter(opts: { lang?: Lang } = {}): string {
   </div>
   <div class="footer-bottom">
     <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">${S.footPrivacy}</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">${S.footTerms}</a></span>
+    <span class="footer-company">${companyFooterLineHtml(toSiteLang(lang), { contactHref: lang === "en" ? "/en/kontakt" : "/kontakt" })}</span>
     <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.footVerified}</span>
   </div>
 </footer>`;
@@ -531,6 +545,7 @@ const OA_CHROME_CSS = `
   .footer-col a:hover{color:#fff}
   .footer-col a code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
   .footer-bottom{max-width:var(--maxw);margin:34px auto 0;padding:18px 24px 0;border-top:1px solid rgba(255,255,255,.12);font-size:.8rem;color:rgba(255,255,255,.46);display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;justify-content:space-between}
+  .footer-bottom .footer-company a{color:rgba(255,255,255,.62)}
   .footer-bottom .verified{display:inline-flex;align-items:center;gap:7px}
   .footer-bottom .verified svg{color:var(--teal-400);flex:0 0 15px}
 `;
@@ -2005,6 +2020,8 @@ router.get("/", (req: Request, res: Response) => {
       description:
         "A2A-markedsplass for norske opplevelser og aktiviteter. Tilbydere verifiseres mot Brønnøysundregistrene.",
       logo: `${url}/favicon.svg`,
+      // T2: the company that owns and operates opplevagent.no.
+      parentOrganization: parentOrganizationJsonLd(),
     },
   ];
   const ldScripts = jsonLd
@@ -3045,9 +3062,11 @@ function experiencesMcpServerCard() {
     },
     documentation: `${url}/llms.txt`,
     icon: `${url}/favicon.svg`,
+    // T3: the organisation behind the server is the company (same as the agent
+    // card's provider); `name`/`title` above keep the brand.
     vendor: {
-      name: "Opplevagent",
-      url,
+      name: agentCardProvider().organization,
+      url: agentCardProvider().url,
     },
     license: "MIT",
     endpoints: [
@@ -4155,6 +4174,7 @@ function browseFooter(): string {
   return `<footer class="site-foot"><div class="foot-inner">
   <span>© ${new Date().getFullYear()} Opplevagent — norske opplevelser, håndplukket og verifisert.</span>
   <span><a href="/opplevelser">Alle opplevelser</a> · <a href="/reise">Langs ruten</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
+  <span class="foot-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</span>
 </div></footer>`;
 }
 
@@ -6238,6 +6258,7 @@ ${BROWSE_CSS}
 </main>
 <footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
   <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
+  <div style="margin-top:6px">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
 </footer>
 <script>
 (function () {
@@ -6492,6 +6513,7 @@ ${BROWSE_CSS}
 </main>
 <footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
   <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
+  <div style="margin-top:6px">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
 </footer>
 </body>
 </html>`;
@@ -8866,9 +8888,9 @@ router.get("/logo.svg", (_req: Request, res: Response) => {
 });
 
 // ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
-const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}`;
+const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}.legal-company{margin-top:.35rem}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}`;
 function legalPage(title: string, bodyHtml: string): string {
-  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg">${pwaHeadTags()}<style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a></footer></body></html>`;
+  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg">${pwaHeadTags()}<style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a><div class="legal-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div></footer></body></html>`;
 }
 
 router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
@@ -8885,7 +8907,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <h2>Hva vi IKKE samler inn</h2><ul><li>Ingen sporingscookies.</li><li>Ingen tredjeparts analyseverktøy.</li><li>Ingen betalinger eller kortdata — booking skjer hos tilbyderen.</li><li>Vi selger ikke data til tredjepart.</li></ul>
 <h2>Lagringstid</h2><ul><li><strong>Opplevelsesdata</strong> fra offentlige kilder lagres så lenge opplevelsen er aktiv i katalogen.</li><li><strong>Agent-forespørsler</strong> (loggen over, uten personopplysninger) slettes ikke automatisk i dag.</li><li><strong>Besøksforespørsler</strong> (navn, e-post, telefon, ønsket tid, antall personer og kommentar) slettes ikke automatisk i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. Den samme e-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</li><li><strong>Tilbyder-henvendelser</strong>: e-postadressen lagres til eierskapet er bekreftet eller avvist.</li></ul>
 <h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Har du sendt en besøksforespørsel, kan du på samme adresse be om innsyn i, retting av eller sletting av opplysningene dine.</p>
-<h2>Kontakt</h2><p>E-post: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operatør: Daniel Fredriksen, Norge.</p>
+<h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
 <h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 3 October 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
@@ -8897,7 +8919,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <h2>What we do NOT collect</h2><ul><li>No tracking cookies.</li><li>No third-party analytics.</li><li>No payments or card data — booking happens on the provider's site.</li><li>We do not sell data to third parties.</li></ul>
 <h2>Retention</h2><ul><li><strong>Experience data</strong> from public sources is kept while the experience is active in the catalogue.</li><li><strong>Agent requests</strong> (the log above, without personal data) are not deleted automatically today.</li><li><strong>Visit requests</strong> (name, email, phone, requested time, party size and note) are not deleted automatically today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</li><li><strong>Provider claims</strong>: the email address is kept until ownership is confirmed or rejected.</li></ul>
 <h2>Your rights</h2><p>Providers may request removal or correction at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. If you sent a visit request, you can ask for access to, correction of or deletion of your details at the same address.</p>
-<h2>Contact</h2><p>Email: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operator: Daniel Fredriksen, Norway.</p>`));
+<h2>Contact</h2><p>${companyControllerSentenceHtml("en", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>`));
 });
 
 router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, res: Response) => {
@@ -8906,6 +8928,7 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
   res.send(legalPage("Vilkår / Terms of Service", `<div class="lang"><a href="#en">English</a></div>
 <h1>Vilkår for bruk</h1><p><strong>Sist oppdatert:</strong> 3. oktober 2026</p>
 <p>Velkommen til Opplevagent (opplevagent.no). Disse vilkårene gjelder for alle som bruker plattformen — sluttbrukere, tilbydere og AI-agenter som kaller våre MCP- eller A2A-endepunkter. Ved å bruke tjenesten aksepterer du vilkårene.</p>
+<p>${companyOperatorSentence("nb")}</p>
 <h2>1. Hva tjenesten er</h2><p>Opplevagent er et oppdagelseslag for norske opplevelser. Vi eksponerer en katalog gjennom MCP, A2A JSON-RPC og en REST-API slik at agenter og mennesker kan finne turer, kurs, severdigheter og aktiviteter. Booking og betaling av opplevelser skjer hos tilbyderen. Opplevagent tar aldri imot betaling eller kortdata.</p>
 <h2>1a. Besøksforespørsler til gårdssalg</h2><p>For gårdssalg-produsenter som har slått det på, kan du — på nettsiden eller via en AI-assistent — sende en besøksforespørsel. Opplevagent formidler da forespørselen din (navn, e-post, eventuelt telefon, ønsket tid, antall personer og kommentar) på e-post til produsenten, og du får en kvittering med en statuslenke. En forespørsel er <strong>ikke</strong> en bekreftet booking: produsenten avgjør selv om, og når, besøket kan skje, og svarer deg direkte. Opplevagent kan ikke bekrefte et besøk på produsentens vegne. Eventuell betaling skjer hos produsenten ved besøket. Se <a href="/personvern">personvern</a> for hvordan opplysningene behandles.</p>
 <h2>2. Akseptabel bruk</h2><ul><li>Bruk API-ene, MCP-serveren og nettsiden til å finne og utforske opplevelser.</li><li>Integrer tjenesten i egne agenter innenfor rimelige rater.</li><li>Overhold robots.txt og rate-limitene.</li></ul>
@@ -8913,10 +8936,11 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>4. Nøyaktighet</h2><p>Data er samlet fra offentlige kilder. <strong>Tjenesten leveres «som den er».</strong> Verifiser pris, sesong og bookinglenker direkte med tilbyderen før du booker.</p>
 <h2>5. Ansvarsbegrensning</h2><p>Opplevagent er ikke ansvarlig for bookinger, besøk, gjennomføring, kvalitet eller uenigheter mellom brukere og tilbydere eller produsenter. Opplevagent formidler besøksforespørsler, men er ikke ansvarlig for produsentens svar.</p>
 <h2>6. Tilbyderrettigheter</h2><p>Oppdater, fjern eller overta din oppføring via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Se også <a href="/personvern">personvern</a>.</p>
-<h2>7. Gjeldende rett</h2><p>Norsk rett. Tvister løses ved Daniels alminnelige verneting.</p>
+<h2>7. Gjeldende rett</h2><p>Norsk rett. Tvister løses ved selskapets alminnelige verneting.</p>
 <hr>
 <h1 id="en">Terms of Service</h1><p><strong>Last updated:</strong> 3 October 2026</p>
 <p>Welcome to Opplevagent (opplevagent.no). These terms apply to everyone who uses the platform — end-users, providers, and AI agents calling our MCP or A2A endpoints. By using the service you accept these terms.</p>
+<p>${companyOperatorSentence("en")}</p>
 <h2>1. What the service is</h2><p>Opplevagent is a discovery layer for Norwegian experiences. We expose a directory via MCP, A2A JSON-RPC, and a REST API so agents and humans can find tours, courses, attractions, and activities. Experiences are booked and paid for with the provider. Opplevagent never takes payments or card data.</p>
 <h2>1a. Farm-sale visit requests</h2><p>For farm-sale (gårdssalg) producers who have switched it on, you can send a visit request — on the website or through an AI assistant. Opplevagent then forwards your request (name, email, optional phone, requested time, party size and note) by email to the producer, and you receive a receipt with a status link. A request is <strong>not</strong> a confirmed booking: the producer alone decides whether and when the visit can happen and replies to you directly. Opplevagent cannot confirm a visit on the producer's behalf. Any payment happens with the producer at the visit. See the <a href="/privacy">privacy policy</a> for how the details are handled.</p>
 <h2>2. Acceptable use</h2><ul><li>Use the APIs, MCP server, and website to find and explore experiences.</li><li>Integrate the service into your own agents within reasonable rate limits.</li><li>Respect robots.txt and published rate limits.</li></ul>
@@ -8924,7 +8948,7 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>4. Accuracy</h2><p>Data is gathered from public sources. <strong>The service is provided "as is".</strong> Verify price, season, and booking links directly with the provider before booking.</p>
 <h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, visits, conduct of experiences, quality, or disputes between users and providers or producers. Opplevagent passes visit requests on but is not responsible for the producer's answer.</p>
 <h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
-<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at Daniel's ordinary venue.</p>`));
+<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at the company's ordinary venue.</p>`));
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -9368,8 +9392,12 @@ ${hitCards}
 // GET /kontakt — public contact form (opplevagent.no)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/kontakt", (_req: Request, res: Response) => {
+router.get("/kontakt", (req: Request, res: Response) => {
   const url = baseUrl();
+  // The company facts (ehandelsloven § 8 / foretaksregisterloven § 7-2) follow
+  // the URL language: /en/kontakt (where the English footer line points) gets
+  // them in English; the rest of the page is Norwegian-only, as before.
+  const coLang = toSiteLang(req.lang);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
 <html lang="no">
@@ -9406,6 +9434,12 @@ input:focus,textarea:focus{outline:none;border-color:#12a594;box-shadow:0 0 0 3p
 .btn{background:#0b2e29;color:#fff;padding:12px 28px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px;font-family:inherit;transition:background .15s}
 .btn:hover{background:#0f5a50}
 .btn:disabled{opacity:.6;cursor:not-allowed}
+.co-sec{margin-top:48px;padding-top:24px;border-top:1px solid var(--line)}
+.co-sec h2{font-size:1.15rem;font-weight:800;color:#0b2e29;margin-bottom:12px}
+.co-facts{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;font-size:.92rem}
+.co-facts dt{font-weight:600;color:#544a3e}
+.co-facts dd{margin:0}
+@media(max-width:480px){.co-facts{grid-template-columns:1fr;gap:2px}.co-facts dd{margin-bottom:8px}}
 </style>
 </head>
 <body>
@@ -9446,6 +9480,11 @@ ${oaSiteNav({})}
 
     <button type="submit" class="btn">Send melding</button>
   </form>
+
+  <section class="co-sec" id="selskap"${coLang === "en" ? ' lang="en"' : ""}>
+    <h2>${coLang === "en" ? "Company information" : "Selskapsinformasjon"}</h2>
+    ${companyContactBlockHtml(coLang, { siteEmail: "kontakt@opplevagent.no", className: "co-facts" })}
+  </section>
 </div>
 
 ${oaSiteFooter({})}
@@ -9530,6 +9569,7 @@ a:hover{text-decoration:none}
 .gom-faq-item h3{font-size:.98rem;font-weight:700;color:#0b2e29;margin-bottom:5px}
 .gom-faq-item p{font-size:.9rem;color:#3a4a3f;margin:0}
 .gom-footer{max-width:760px;margin:0 auto;padding:24px 24px 48px;font-size:.82rem;color:#7a7163}
+.gom-company{margin-top:6px}
 @media (max-width:600px){.gom-hero h1{font-size:1.6rem}}
 `;
 
@@ -9650,7 +9690,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
     <h2>Frequently asked questions</h2>
     ${faqHtml}
   </section>
-  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a></footer>` : `
+  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a><div class="gom-company">${companyFooterLineHtml("en", { contactHref: "/en/kontakt" })}</div></footer>` : `
   <section class="gom-hero">
     <h1>Oppdag norske opplevelser via opplevagent-mcp</h1>
     <p>Be Claude, ChatGPT eller en annen MCP-kompatibel AI-assistent om å søke i Opplevagents håndplukkede, Brreg-verifiserte katalog over norske opplevelser og aktiviteter.</p>
@@ -9695,7 +9735,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
     <h2>Ofte stilte spørsmål</h2>
     ${faqHtml}
   </section>
-  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a></footer>`;
+  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a><div class="gom-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div></footer>`;
 
   const title = en
     ? "Discover experiences via opplevagent-mcp | Opplevagent"

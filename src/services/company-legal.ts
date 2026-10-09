@@ -15,6 +15,15 @@ import { COMPANY_INFO } from "../config/company-info";
 
 export type SiteLang = "nb" | "en";
 
+/**
+ * The sites' own language codes ("no" / "nb" / "en" / "sv" / undefined) → the
+ * helpers' SiteLang. Only English gets the English wording; Norwegian and
+ * Swedish pages (and anything unknown) get the Norwegian legal lines.
+ */
+export function toSiteLang(lang: string | null | undefined): SiteLang {
+  return lang === "en" ? "en" : "nb";
+}
+
 const C = COMPANY_INFO;
 
 function esc(s: string): string {

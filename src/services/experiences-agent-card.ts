@@ -13,6 +13,7 @@
 
 import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
+import { agentCardProvider } from "./company-legal";
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
@@ -55,10 +56,9 @@ export function getExperiencesAgentCard(honestCount?: number | null): object {
     additionalInterfaces: [
       { url: `${url}/api/opplevelser`, transport: "HTTP+JSON" },
     ],
-    provider: {
-      organization: "Opplevagent",
-      url,
-    },
+    // T3 (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
+    // the provider is the company that operates the service; `name` keeps the brand.
+    provider: agentCardProvider(),
     version: "0.1.0",
     capabilities: {
       streaming: false,

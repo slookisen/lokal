@@ -21,6 +21,7 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { agentCardProvider } from "../services/company-legal";
 
 const router = Router();
 
@@ -64,9 +65,12 @@ function mcpServerCard() {
     },
     documentation: `${BASE_URL}/teknologi`,
     icon: `${BASE_URL}/favicon.ico`,
+    // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as): the
+    // organisation behind the server is the company, same as the agent card's
+    // provider; `name`/`title` above keep the brand.
     vendor: {
-      name: "Rett fra Bonden",
-      url: BASE_URL,
+      name: agentCardProvider().organization,
+      url: agentCardProvider().url,
     },
     license: "MIT",
     endpoints: [
@@ -154,8 +158,8 @@ function agentSkillsIndex() {
     $schema: "https://agentskills.io/schemas/v0.2.0/index.schema.json",
     version: "0.2.0",
     provider: {
-      name: "Rett fra Bonden",
-      url: BASE_URL,
+      name: agentCardProvider().organization,
+      url: agentCardProvider().url,
       description: "A2A marketplace for local Norwegian food producers.",
     },
     skills: [

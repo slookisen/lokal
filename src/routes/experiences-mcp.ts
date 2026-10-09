@@ -136,6 +136,7 @@ import {
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
+import { companyFooterLineHtml } from "../services/company-legal";
 
 const router = Router();
 
@@ -1476,7 +1477,8 @@ router.get(["/", "/mcp"], async (req: Request, res: Response) => {
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;color:#1a1a1a;line-height:1.6}
 h1{font-size:1.5rem;margin-bottom:.25rem}p{margin:.75rem 0}code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:.9em}
 pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:16px;overflow-x:auto;font-size:.85rem}
-a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decoration:none;font-size:.9rem}</style>
+a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decoration:none;font-size:.9rem}
+.company-line{margin-top:32px;padding-top:12px;border-top:1px solid #e1e4e8;font-size:.8rem;color:#666}.company-line a{color:inherit}</style>
 </head>
 <body>
 <h1>Opplevagent MCP-endepunkt</h1>
@@ -1497,6 +1499,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'</pre>
 <p>Se også: <a href="/.well-known/agent-card.json">Agent Card</a> · <a href="/openapi.json">OpenAPI 3.1</a> · <a href="/llms.txt">llms.txt</a></p>
 <a class="back" href="/">← Tilbake til Opplevagent</a>
+<footer class="company-line">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</footer>
 </body></html>`);
       return;
     }

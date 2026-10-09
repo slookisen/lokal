@@ -46659,5 +46659,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("agentplatform-partners: unexpected error: " + String(err?.message || err));
+// A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
+// AGENTPLATFORM.NO AS on rettfrabonden.com, opplevagent.no and finn-tannlege.com —
+// footer line (NO/EN) on every site, /kontakt § 8 facts with each site's own
+// e-mail, /personvern controller, /vilkar operator + «selskapets alminnelige
+// verneting», parentOrganization JSON-LD, agent-card provider / server-card
+// vendor, street address only on /kontakt + /personvern, no hard-coded org.nr.
+// outside company-info.ts (+ drift lock on the static public HTML copies).
+// Swaps the getDb() singleton + vertical DB env paths (restored in finally) and
+// opens a local HTTP server — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── company-legal-sites: operator facts on the three product sites ──");
+  try {
+    const { runCompanyLegalSitesTests } = require("../src/routes/company-legal-sites.test") as
+      typeof import("../src/routes/company-legal-sites.test");
+    const cl = await runCompanyLegalSitesTests({ log: false });
+    passed += cl.passed;
+    failed += cl.failed;
+    for (const f of cl.failures) failures.push("company-legal-sites: " + f);
+    console.log(`  company-legal-sites: ${cl.passed} passed, ${cl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("company-legal-sites: unexpected error: " + String(err?.message || err));
   }
 });

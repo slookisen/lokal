@@ -8,6 +8,7 @@
 
 import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
+import { agentCardProvider } from "./company-legal";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
@@ -49,10 +50,9 @@ export function getDentalAgentCard(honestCount?: number | null): object {
     additionalInterfaces: [
       { url: `${url}/api/tannlege`, transport: "HTTP+JSON" },
     ],
-    provider: {
-      organization: "Finn-tannlege",
-      url,
-    },
+    // T3 (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
+    // the provider is the company that operates the service; `name` keeps the brand.
+    provider: agentCardProvider(),
     version: "0.1.0",
     capabilities: {
       streaming: false,
