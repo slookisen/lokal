@@ -57,7 +57,37 @@ import {
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
 } from "../services/outreach-max-touch-vern";
 
+import { isCategoryWord } from "./seo";
+import { CATEGORY_LABEL_NO } from "./admin-knowledge";
+
 const router = Router();
+
+// dev-request 2026-10-08-outreach-sperre-generiske-produkter: true iff the
+// agent_knowledge.products JSON is non-empty and EVERY product name (trimmed,
+// case-insensitive) is a platform category display name — the page-facing
+// names from routes/seo.ts (isCategoryWord) plus the labels the enrichment
+// writes into products[].name (admin-knowledge CATEGORY_LABEL_NO, e.g.
+// "Bakervarer"). Empty / absent / malformed → false (never suppresses).
+const CATEGORY_LABEL_NAMES: ReadonlySet<string> = new Set(
+  Object.values(CATEGORY_LABEL_NO).map((n) => n.trim().toLowerCase()),
+);
+export function productsAreGenericCategoryNames(productsJson: string | null | undefined): boolean {
+  if (!productsJson) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(productsJson);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return false;
+  for (const p of parsed) {
+    const name = typeof p === "string" ? p : p && typeof (p as any).name === "string" ? (p as any).name : "";
+    const norm = name.trim().toLowerCase();
+    if (!norm) return false;
+    if (!isCategoryWord(norm) && !CATEGORY_LABEL_NAMES.has(norm)) return false;
+  }
+  return true;
+}
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -392,7 +422,8 @@ export function computeOutreachCandidates(
       k.verification_review_reason AS verification_review_reason,
       -- dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit:
       -- raw column read by categoriesLackWebsiteCorroboration below.
-      a.categories AS categories
+      a.categories AS categories,
+      k.products AS products
     `;
 
     type PoolRow = {
@@ -408,6 +439,7 @@ export function computeOutreachCandidates(
       field_provenance: string | null;
       verification_review_reason: string | null;
       categories: string | null;
+      products: string | null;
       // Fix 1 (gate-integrity dedupe tiebreak parity, 2026-07-15): these three
       // mirror admin-outreach-pool.ts exactly so dedupeByEmail()'s tiebreak sees
       // real engagement/rating data here too, instead of silently defaulting to
@@ -643,6 +675,7 @@ export function computeOutreachCandidates(
     let maxTouchSuppressedCount = 0;
     // recipient-policy counter (lokal#997 key; malformed addresses only since 2026-10-08)
     let personalAddressCount = 0;
+    let genericProductsOnlyCount = 0;
     const maxTouchSuppressedList: Array<{
       agent_id: string;
       email: string;
@@ -767,6 +800,10 @@ export function computeOutreachCandidates(
         });
       }
 
+      // dev-request 2026-10-08-outreach-sperre-generiske-produkter: every
+      // product is a bare category name → the profile shows obvious errors.
+      const suppressedForGenericProducts = productsAreGenericCategoryNames(row.products);
+
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
       if (suppressedForOptOut) optedOutCount++;
@@ -779,6 +816,7 @@ export function computeOutreachCandidates(
       if (suppressedForRecentCrmSend) recentCrmSendCount++;
       if (suppressedForMaxTouch) maxTouchSuppressedCount++;
       if (suppressedForPersonalAddress) personalAddressCount++;
+      if (suppressedForGenericProducts) genericProductsOnlyCount++;
 
       if (
         !suppressedForContacted &&
@@ -793,7 +831,8 @@ export function computeOutreachCandidates(
         !suppressedForRecentCrmSend &&
         !suppressedForCrossPlatform &&
         !suppressedForMaxTouch &&
-        !suppressedForPersonalAddress
+        !suppressedForPersonalAddress &&
+        !suppressedForGenericProducts
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -939,6 +978,8 @@ export function computeOutreachCandidates(
         // Key kept from lokal#997. Under the 2026-10-08 policy (all valid
         // addresses) it only counts a malformed or empty address.
         personal_address: personalAddressCount,
+        // dev-request 2026-10-08-outreach-sperre-generiske-produkter
+        generic_products_only: genericProductsOnlyCount,
       },
       // 4e proper: the count alone would still leave "hvorfor" unanswered, so
       // the suppressing platform is named per producer. Bounded at 100 so a wide
