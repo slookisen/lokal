@@ -405,6 +405,14 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
       const lambIds = lamb.map(r => r.agent.id);
       ok(lambIds.indexOf("pm-documented") >= 0 && lambIds.indexOf("pm-documented") < lambIds.indexOf("pm-category-only"),
         `pm1: "lam" ranks the producer that lists Lammekjøtt above the meat-only one (got ${JSON.stringify(lambIds)})`);
+      // «reinkjøtt» finds a product list that says «Reinsdyrkjøtt» (2026-10-09).
+      seedAgent({ id: "pm-rein", name: "Viddas Rein Fixture", categories: ["meat"] });
+      db.prepare("INSERT INTO agent_knowledge (agent_id, products) VALUES (?, ?)").run(
+        "pm-rein", JSON.stringify([{ name: "Reinsdyrkjøtt" }]));
+      const rein = marketplaceRegistry.discover(
+        { ...marketplaceRegistry.parseNaturalQuery("reinkjøtt"), limit: 10 } as any);
+      ok(rein[0]?.agent.id === "pm-rein" && rein[0].matchReasons.some(m => m.startsWith("Produkter:")),
+        `pm3: "reinkjøtt" documents a «Reinsdyrkjøtt» product list (got ${JSON.stringify(rein.map(r => r.agent.id))})`);
       ok(lamb.find(r => r.agent.id === "pm-documented")!.matchReasons.some(m => m.startsWith("Produkter:"))
         && !lamb.find(r => r.agent.id === "pm-category-only")!.matchReasons.some(m => m.startsWith("Produkter:")),
         "pm2: only the documented producer carries a «Produkter:» match reason (what lokal_search labels on)");
