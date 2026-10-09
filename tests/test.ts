@@ -32391,6 +32391,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of hc.failures) failures.push("health-counts: " + f);
     console.log(`  health-counts: ${hc.passed} passed, ${hc.failed} failed`);
 
+    console.log("\n── serverheng slice 5: outreach bulk lookups, daily bbox repair, /health cheap counts ──");
+    const { runServerhengSlice5Tests } = require("../src/services/serverheng-slice5.test") as
+      typeof import("../src/services/serverheng-slice5.test");
+    const s5 = await runServerhengSlice5Tests({ log: false });
+    passed += s5.passed;
+    failed += s5.failed;
+    for (const f of s5.failures) failures.push("serverheng-slice5: " + f);
+    console.log(`  serverheng-slice5: ${s5.passed} passed, ${s5.failed} failed`);
+
     console.log("\n── health-write-probe: cached write-path probe for /health ──");
     const { runHealthWriteProbeTests } = require("../src/services/health-write-probe.test") as
       typeof import("../src/services/health-write-probe.test");

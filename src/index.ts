@@ -49,7 +49,7 @@ import { getPageViewHealthCounts } from "./services/health-counts";
 import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
 import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
-import { honestCatalogCounts } from "./services/honest-count";
+import { getHealthCatalog, getHealthQueryCount } from "./services/health-cheap-counts";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { prewarmAgentToolCalls } from "./services/agent-usage";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
@@ -638,7 +638,8 @@ app.get("/health", (_req, res) => {
     // See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet for why this differs
     // from traffic.totalAgents (below) and from llms.txt's producer count.
     const agentCount = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get() as any).c;
-    const queryCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
+    // slice 5 (serverheng): cached SWR count, null until the first background count lands.
+    const queryCount = getHealthQueryCount(db);
 
     // analytics_page_views totals (~1.2 M rows): cached for 60 s so /health
     // itself never blocks the shared event loop on a cold full count —
@@ -731,7 +732,7 @@ app.get("/health", (_req, res) => {
       // ONE catalog number per vertical (services/honest-count.ts) — identical to the
       // count llms.txt, the agent card, mcp.json/server-card and /api/stats' honestCount
       // quote. Legacy fields above keep their documented meaning.
-      catalog: honestCatalogCounts(),
+      catalog: getHealthCatalog(),
       // Numbers only here (public endpoint); per-stall request/job detail is
       // admin-only at GET /admin/analytics/ops/event-loop.
       eventLoop: getEventLoopSummary(),
