@@ -25,6 +25,9 @@ export const COMPANY_INFO = Object.freeze({
   /** Groups of three, as written on Norwegian sites. */
   orgNrDisplay: "938 635 676",
   register: "Foretaksregisteret",
+  /** Organisasjonsform and hovedkontor: required on the sites next to name and org.nr. (foretaksregisterloven). */
+  organizationForm: Object.freeze({ nb: "Aksjeselskap", en: "Private limited company (AS)" }),
+  headOffice: "Oslo",
   registeredDate: "2026-10-07",
   foundedDate: "2026-10-03",
   /** Not in Merverdiavgiftsregisteret: never print "MVA" after the org.nr while false. */
@@ -38,6 +41,13 @@ export const COMPANY_INFO = Object.freeze({
   website: "https://agentplatform.no",
   email: "kontakt@agentplatform.no",
   brregUrl: "https://virksomhet.brreg.no/nb/oppslag/enheter/938635676",
+  /** Daglig leder and styreleder (public in Brreg). Shown on agentplatform.no (Daniel live 2026-10-09). */
+  founder: Object.freeze({
+    name: "Daniel Fredriksen",
+    role: Object.freeze({ nb: "Gründer og daglig leder", en: "Founder and CEO" }),
+    /** Profile URL, or null until Daniel confirms it — the link is rendered only when set. */
+    linkedin: null as string | null,
+  }),
 });
 
 export type CompanyInfo = typeof COMPANY_INFO;
