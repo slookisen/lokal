@@ -296,6 +296,9 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
       const origRead = reader.read.bind(reader);
       reader.read = ((query: any, sync: () => any) => origRead(query, () => { computeSyncCalls++; return sync(); })) as typeof reader.read;
       const cache = createHtmlCache(60_000);
+      const setKeys: string[] = [];
+      const origSet = cache.set.bind(cache);
+      cache.set = ((k: string, v: string) => { setKeys.push(k); return origSet(k, v); }) as typeof cache.set;
       const app = express();
       app.set(STRIP_READER_APP_KEY, reader);
       app.set(HTML_CACHE_APP_KEY, cache);
@@ -335,12 +338,12 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
       ok(mcp.status === 200 && mcp.body.includes("Endret") && mcp.body !== up.body && mcp2.body === mcp.body,
         "R4: each kilde has its own cache entry");
 
-      label = "Forste";
+      const setsBeforeOdd = setKeys.length;
       const odd1 = await get("/samtaler?kilde=%3Cx%3E");
-      label = "Andre";
       const odd2 = await get("/samtaler?kilde=%3Cx%3E");
-      ok(odd1.status === 200 && odd1.body.includes("Forste") && odd2.status === 200 && odd2.body.includes("Andre"),
-        "R5: an unknown kilde is never cached");
+      // Asserted on the cache writes themselves: which strip label a refresh returns is timing-dependent.
+      ok(odd1.status === 200 && odd2.status === 200 && setKeys.length === setsBeforeOdd,
+        "R5: an unknown kilde is never cached", { setKeys });
 
       mode = "fail";
       const stillCached = await get("/samtaler");
