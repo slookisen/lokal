@@ -250,7 +250,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
 
     // /health serves the shared helper (index.ts boots the whole app, so it is asserted on source)
     const indexSrc = fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8");
-    assertTrue(indexSrc.includes("catalog: honestCatalogCounts()"), "count-9: /health's `catalog` is honestCatalogCounts()");
+    assertTrue(indexSrc.includes("catalog: getHealthCatalog()") && fs.readFileSync(path.join(__dirname, "..", "services", "health-cheap-counts.ts"), "utf8").includes("honestCatalogCounts"), "count-9: /health's `catalog` is honestCatalogCounts() (via the cached health-cheap-counts wrapper)");
 
     // rfb surfaces
     {

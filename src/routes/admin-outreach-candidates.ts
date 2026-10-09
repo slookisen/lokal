@@ -408,12 +408,13 @@ export function computeOutreachCandidates(
         )
       ) THEN 1 ELSE 0 END AS is_opted_out,
       CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS is_customer,
+      -- serverheng slice 5: hard-bounce match is resolved ONCE per run from a
+      -- single email_bounces scan (Set below) instead of an unindexed
+      -- correlated EXISTS per pool row. email_norm is the SQL-side
+      -- LOWER(TRIM()) so the match is byte-identical to the old predicate.
       -- TODO bounce-suppression: also cross-check by agent_id for non-direct-match bounces
-      CASE WHEN EXISTS (
-        SELECT 1 FROM email_bounces eb
-        WHERE LOWER(TRIM(eb.email)) = LOWER(TRIM(k.email))
-          AND eb.bounce_type IN ('hard', 'complaint')
-      ) THEN 1 ELSE 0 END AS is_hard_bounced,
+      0 AS is_hard_bounced,
+      LOWER(TRIM(k.email)) AS email_norm,
       -- orch-pr-17: raw data-quality columns read by the JS post-filter below.
       -- field_provenance carries website_ownership.status; verification_review_reason
       -- carries PR-16's inference_only_fields. Both default to '{}' so they are
@@ -436,6 +437,7 @@ export function computeOutreachCandidates(
       is_opted_out: number;
       is_customer: number;
       is_hard_bounced: number;
+      email_norm: string | null;
       field_provenance: string | null;
       verification_review_reason: string | null;
       categories: string | null;
@@ -470,8 +472,7 @@ export function computeOutreachCandidates(
           -- same way once pruned raw rows live on in agent_view_daily.
           -- 2026-10-04 (view-stats honesty): HUMAN views only on both halves
           -- (humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE in database/init.ts).
-          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = p.agent_id AND d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'), 0)
-           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id AND ${humanAgentViewSql("v")})) AS views_count,
+          0 AS views_count, -- filled once per run below (serverheng slice 5)
           ${suppressionCols}
         FROM outreach_ready_pool p
         INNER JOIN agents a ON a.id = p.agent_id
@@ -491,8 +492,7 @@ export function computeOutreachCandidates(
           k.google_rating,
           k.google_review_count,
           -- orch-pr-20260903-analytics-rollup-slice2: rollup + raw, see above.
-          (SELECT COALESCE((SELECT SUM(view_count) FROM agent_view_daily d WHERE d.agent_id = a.id AND d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'), 0)
-           + (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id AND ${humanAgentViewSql("v")})) AS views_count,
+          0 AS views_count, -- filled once per run below (serverheng slice 5)
           ${suppressionCols}
         FROM agents a
         INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -522,6 +522,42 @@ export function computeOutreachCandidates(
           AND k.url_last_probed > datetime('now', '-30 days')
         ORDER BY k.outreach_eligible_at ASC NULLS LAST
       `).all() as PoolRow[];
+    }
+
+    // serverheng slice 5: lifetime human views (rollup + raw) and hard-bounce
+    // emails are read ONCE per run (one GROUP BY each + one Set), not by a
+    // correlated subquery per pool row. Same predicates as before, so the
+    // per-row values are identical. Rows are only patched when present.
+    {
+      const viewsByAgent = new Map<string, number>();
+      for (const r of db.prepare(`
+        SELECT d.agent_id AS agent_id, SUM(d.view_count) AS n
+        FROM agent_view_daily d
+        WHERE d.view_source != '${LEGACY_AGENT_VIEW_SOURCE}'
+        GROUP BY d.agent_id
+      `).all() as Array<{ agent_id: string; n: number | null }>) {
+        viewsByAgent.set(r.agent_id, r.n ?? 0);
+      }
+      for (const r of db.prepare(`
+        SELECT v.agent_id AS agent_id, COUNT(*) AS n
+        FROM analytics_agent_views v
+        WHERE ${humanAgentViewSql("v")}
+        GROUP BY v.agent_id
+      `).all() as Array<{ agent_id: string; n: number }>) {
+        viewsByAgent.set(r.agent_id, (viewsByAgent.get(r.agent_id) ?? 0) + r.n);
+      }
+      const hardBouncedEmails = new Set<string>();
+      for (const r of db.prepare(`
+        SELECT DISTINCT LOWER(TRIM(email)) AS e
+        FROM email_bounces
+        WHERE bounce_type IN ('hard', 'complaint')
+      `).all() as Array<{ e: string | null }>) {
+        if (r.e !== null) hardBouncedEmails.add(r.e);
+      }
+      for (const row of rows) {
+        row.views_count = viewsByAgent.get(row.agent_id) ?? 0;
+        row.is_hard_bounced = row.email_norm !== null && hardBouncedEmails.has(row.email_norm) ? 1 : 0;
+      }
     }
 
     // ── Step 2: load outreach_sent_log data for mode-based filtering ──────────

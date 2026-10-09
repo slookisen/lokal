@@ -50,6 +50,11 @@ import {
 } from "./dental-geocode-worker";
 import { geocodingService } from "./geocoding-service";
 import { isPlausibleNorwayCoord, NORWAY_BBOX } from "./geo-distance";
+import { getJobLastCompletedAt, markJobCompleted, shouldSkipRecentRun } from "./boot-job-gate";
+
+/** serverheng slice 5: Step 0 (bbox repair) runs daily, not every tick. */
+export const EXPERIENCES_BBOX_REPAIR_JOB = "experiences-geocode-bbox-repair";
+export const EXPERIENCES_BBOX_REPAIR_MIN_INTERVAL_HOURS = 24;
 
 const VERTICAL = "experiences";
 
@@ -622,7 +627,8 @@ export type { GeocodeDeps };
  */
 export async function experiencesGeocodeTick(
   limit: number = 50,
-  deps: GeocodeDeps = {}
+  deps: GeocodeDeps = {},
+  opts: { bboxRepairMinIntervalHours?: number } = {}
 ): Promise<ExperiencesGeocodeResult> {
   const start = Date.now();
   const db = getDb(VERTICAL);
@@ -681,19 +687,28 @@ export async function experiencesGeocodeTick(
         AND (loc_lat NOT BETWEEN ${NORWAY_BBOX.minLat} AND ${NORWAY_BBOX.maxLat}
              OR loc_lon NOT BETWEEN ${NORWAY_BBOX.minLon} AND ${NORWAY_BBOX.maxLon})`
   );
-  try {
-    stats.providers_coords_reset = resetProviderCoords.run().changes;
-    stats.experiences_coords_reset = resetExperienceCoords.run().changes;
-    if (stats.providers_coords_reset || stats.experiences_coords_reset) {
-      console.log(
-        `[experiences-geocode] cleared impossible coordinates: ` +
-        `providers=${stats.providers_coords_reset} experiences=${stats.experiences_coords_reset} ` +
-        `(rows return to the normal geocode ladder)`
-      );
+  // serverheng slice 5: the two full-table bbox UPDATEs run at most once per
+  // BBOX_REPAIR_JOB interval (boot_job_state, default 24 h) instead of every
+  // hourly tick. A poisoned coordinate is therefore healed within a day;
+  // completion is stamped only when both statements succeeded.
+  const bboxMinHours = opts.bboxRepairMinIntervalHours ?? EXPERIENCES_BBOX_REPAIR_MIN_INTERVAL_HOURS;
+  const bboxLast = getJobLastCompletedAt(db, EXPERIENCES_BBOX_REPAIR_JOB);
+  if (!shouldSkipRecentRun({ lastCompletedAt: bboxLast, now: new Date(), minIntervalHours: bboxMinHours })) {
+    try {
+      stats.providers_coords_reset = resetProviderCoords.run().changes;
+      stats.experiences_coords_reset = resetExperienceCoords.run().changes;
+      if (stats.providers_coords_reset || stats.experiences_coords_reset) {
+        console.log(
+          `[experiences-geocode] cleared impossible coordinates: ` +
+          `providers=${stats.providers_coords_reset} experiences=${stats.experiences_coords_reset} ` +
+          `(rows return to the normal geocode ladder)`
+        );
+      }
+      markJobCompleted(db, EXPERIENCES_BBOX_REPAIR_JOB);
+    } catch (err) {
+      stats.errors++;
+      console.error("[experiences-geocode] coordinate repair sweep failed:", err);
     }
-  } catch (err) {
-    stats.errors++;
-    console.error("[experiences-geocode] coordinate repair sweep failed:", err);
   }
 
   // ─── Step A — provider address geocoding ───────────────────────────
