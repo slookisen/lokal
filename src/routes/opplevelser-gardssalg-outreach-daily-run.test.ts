@@ -391,10 +391,24 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(claims[0].value, 2, "e13: emails_sent = 2");
       assertEq(claims[1].meta?.kind, "gardssalg_outreach_first_touch_sent", "e14: first-touch claim present");
       assertEq(claims[1].value, 2, "e15: first_touch_sent = 2");
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: address types of the run's candidates.
+      assertEq(
+        real.recipient_address_types,
+        { general_role_address: 2, personal_local_part: 0, free_mail_domain: 0, malformed_or_empty: 0 },
+        "e15b: report.recipient_address_types counts the 2 candidates",
+      );
+      const typesClaim = claims.find((c) => c.meta?.kind === "gardssalg_outreach_recipient_address_types");
+      assertEq(typesClaim?.value, 2, "e15c: envelope carries the address-type claim, value = candidates");
+      assertEq(typesClaim?.meta?.counts, real.recipient_address_types, "e15d: envelope counts equal the report's");
 
       // ── (f) budget / idempotency ───────────────────────────────────────
       const again = await runGardssalgOutreachDaily({ apply: true, trigger: "cron" });
       assertEq(again.skipped_reason, "no_candidates", "f1: same day again -> both in cooldown -> no_candidates");
+      assertEq(
+        again.recipient_address_types,
+        { general_role_address: 0, personal_local_part: 0, free_mail_domain: 0, malformed_or_empty: 0 },
+        "f1b: a skipped run reports every address type at 0",
+      );
       assertEq(again.sent_today_before, 2, "f2: reports the two already sent today");
       assertEq(again.budget, 2, "f3: budget is cap minus sent today");
       assertEq(sentLogCount(), 2, "f4: nothing re-sent");
@@ -429,8 +443,8 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(prep.status, 200, "h5: daily-prep route still 200 after extraction");
       assertEq(
         Object.keys(prep.body).filter((k) => k !== "refill_hints"),
-        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count"],
-        "h6: daily-prep response shape unchanged",
+        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count", "recipient_address_types"],
+        "h6: daily-prep response shape unchanged (recipient_address_types appended last, 2026-10-08)",
       );
       assertEq(prep.body.pool.daily_cap, 4, "h7: daily-prep still reports the cap");
       assertEq(prep.body.candidates.length, 0, "h8: both providers now in cooldown -> no candidates");

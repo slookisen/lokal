@@ -792,7 +792,12 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
 import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd } from "../services/blocklist-service";
-import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "../services/recipient-policy";
+import {
+  countRecipientAddressTypes,
+  isColdRecipientAllowed,
+  PERSONAL_ADDRESS_REASON,
+  type RecipientAddressType,
+} from "../services/recipient-policy";
 // GET /admin/gardssalg-outreach-candidates (near computeGardssalgOutreach-
 // SendEligibility, below) reuses the SAME email-collision dedupe RFB's
 // admin-outreach-candidates.ts uses — not gardssalg-outreach-dedupe.ts's
@@ -17961,9 +17966,9 @@ export function computeGardssalgOutreachSendEligibility(
       continue;
     }
 
-    // ── Recipient policy (dev-request 2026-10-06-mottakerpolicy-kald-utsending-
-    // mfl-15, markedsføringsloven § 15): cold mail only to GENERAL role
-    // addresses. Fail-closed; sendGardssalgOutreachToEligibleProvider re-checks.
+    // ── Recipient policy (dev-request 2026-10-08-mottakerpolicy-alle-adresser):
+    // every well-formed address, personal and free-mail included; only a
+    // malformed one is held. sendGardssalgOutreachToEligibleProvider re-checks.
     if (!isColdRecipientAllowed(email)) {
       out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: PERSONAL_ADDRESS_REASON });
       continue;
@@ -18290,6 +18295,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           preflight_no_go: preflightNoGoCount,
           personal_address: personalAddressCount,
         },
+        recipient_address_types: countRecipientAddressTypes([]),
       });
 
     if (outreachReadyIds.length === 0) {
@@ -18455,7 +18461,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           continue;
         }
         if (!isColdRecipientAllowed(email)) {
-          personalAddressCount++; // mfl. § 15 recipient policy (mode=second)
+          personalAddressCount++; // recipient policy (mode=second; all valid addresses since 2026-10-08)
           continue;
         }
         const lastSent = sentByEmail.get(email.toLowerCase());
@@ -18545,6 +18551,9 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         preflight_no_go: preflightNoGoCount,
         personal_address: personalAddressCount,
       },
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
+      // address each selected candidate has (reporting only, not a filter).
+      recipient_address_types: countRecipientAddressTypes(capped.map((c) => c.email)),
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
@@ -18832,10 +18841,11 @@ export async function sendGardssalgOutreachToEligibleProvider(
   const sentAtIso = new Date().toISOString();
   const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-  // Send-time recipient-policy re-check (mfl. § 15, fail-closed): a skip, not a
-  // batch stop — nothing written, no reservation, no touch consumed.
+  // Send-time recipient-policy re-check (dev-request 2026-10-08-mottakerpolicy-
+  // alle-adresser: only a malformed address is held): a skip, not a batch stop
+  // — nothing written, no reservation, no touch consumed.
   if (!isColdRecipientAllowed(email)) {
-    console.warn(`[${opts.source}] recipient is not a general role address — NOT sending`, { providerId, email });
+    console.warn(`[${opts.source}] recipient address is malformed — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: PERSONAL_ADDRESS_REASON };
   }
 
@@ -19687,6 +19697,9 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     ...(refillHints ? { refill_hints: refillHints } : {}),
     active_contact_email_overrides: activeContactEmailOverrides,
     second_line_verified_count: secondLineVerifiedCount,
+    // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
+    // address each selected candidate has (reporting only, not a filter).
+    recipient_address_types: countRecipientAddressTypes(candidates.map((c) => c.recipient_email)),
   };
   return { response, selected };
 }
@@ -20006,6 +20019,9 @@ export interface GardssalgOutreachDailyRunReport {
   auto_paused: boolean;
   recent_bounces: GardssalgOutreachBounceHit[];
   candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second" }>;
+  // dev-request 2026-10-08-mottakerpolicy-alle-adresser: address types of
+  // `candidates` (reporting only; all zero on a skip). Also in the envelope.
+  recipient_address_types: Record<RecipientAddressType, number>;
   results: GardssalgOutreachSendResultRow[];
   summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
   // Incident 2026-09-27/28 (sent_log reserve-before-send), derived from
@@ -20139,6 +20155,7 @@ async function runGardssalgOutreachDailyOnce(
       auto_paused: partial.auto_paused ?? false,
       recent_bounces: partial.recent_bounces ?? [],
       candidates: partial.candidates ?? [],
+      recipient_address_types: countRecipientAddressTypes((partial.candidates ?? []).map((c) => c.recipient_email)),
       results,
       summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
       errors: results
@@ -20223,6 +20240,13 @@ async function runGardssalgOutreachDailyOnce(
             },
             { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
             { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
+            // dev-request 2026-10-08-mottakerpolicy-alle-adresser: the address
+            // types of this run's candidates, for reply-rate per type later.
+            {
+              type: "custom",
+              value: report.candidates.length,
+              meta: { kind: "gardssalg_outreach_recipient_address_types", counts: report.recipient_address_types },
+            },
           ],
           evidence: [{ claim_idx: 0, ids: sentIds }],
           notes,

@@ -278,6 +278,23 @@ export function runOpplevelserGardssalgOutreachCandidatesTests(
         "b3: never-contacted provider is ABSENT from mode=second",
       );
 
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: a personal address
+      // (here on the producer's own domain) is a candidate like any other, and
+      // the response reports the address types of what it selected.
+      mkOutreachReady({ id: "prov-personal", navn: "Personlig Adresse Gård", epost: "ola@prov-personal.example.no" });
+      const firstPersonal = await callRoute(opplevelserRouter, { headers: auth, query: { mode: "first" } });
+      assertTrue(
+        (firstPersonal.body.candidates as any[]).some((c) => c.provider_id === "prov-personal"),
+        "b3b: a personal address appears under mode=first (all valid addresses, 2026-10-08)",
+      );
+      assertEq(firstPersonal.body.suppressed_counts.personal_address, 0, "b3c: suppressed_counts.personal_address is 0");
+      assertTrue(
+        firstPersonal.body.recipient_address_types?.personal_local_part >= 1 &&
+          firstPersonal.body.recipient_address_types?.general_role_address >= 1,
+        "b3d: recipient_address_types counts the personal and the general candidate",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-personal'`).run();
+
       // ── (c) contacted 10 days ago -> absent from BOTH modes ─────────────
       mkOutreachReady({ id: "prov-10d", navn: "Ti Dager Gård", epost: "post@fixture-10d.no" });
       insertSentRow("prov-10d", "post@fixture-10d.no", 10);

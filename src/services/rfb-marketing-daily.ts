@@ -1123,6 +1123,8 @@ export interface RfbMarketingGateSummary {
   count: number;
   paused: boolean;
   suppressed_counts: unknown;
+  /** Address types of the gate's selected candidates (reporting only). */
+  recipient_address_types: unknown;
   cross_platform_cooldown: {
     count: unknown;
     by_vertical: unknown;
@@ -1223,6 +1225,7 @@ function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
     count: r.count,
     paused: r.paused === true,
     suppressed_counts: r.suppressed_counts ?? null,
+    recipient_address_types: r.recipient_address_types ?? null,
     cross_platform_cooldown: {
       count: xp.count ?? null,
       by_vertical: xp.by_vertical ?? null,
@@ -1742,9 +1745,10 @@ async function runRfbMarketingDailyGuarded(opts: {
     const email = String(cand.email ?? "").trim().toLowerCase();
     const row: RfbMarketingResultRow = { agent_id: cand.agent_id, name: cand.name, recipient_email: email, touch, status: "skipped" };
     if (!email || seenEmails.has(email)) return { kind: "skip", row: { ...row, reason: "duplicate_email_in_run" } };
-    // mfl. § 15 recipient policy (dev-request 2026-10-06-mottakerpolicy-kald-
-    // utsending-mfl-15): the gate already filters, this is the fail-closed
-    // backstop. A skip row: no reservation, no compose, no budget, no touch.
+    // Recipient policy (dev-request 2026-10-08-mottakerpolicy-alle-adresser:
+    // every well-formed address, personal and free-mail included): the gate
+    // already filters, this is the backstop for a malformed address. A skip
+    // row: no reservation, no compose, no budget, no touch.
     if (!isColdRecipientAllowed(email)) return { kind: "skip", row: { ...row, reason: PERSONAL_ADDRESS_REASON } };
     seenEmails.add(email);
     const ledgerBlock = ledgerBlocksRecipient(db, email, cand.agent_id, now, cooldownDays);

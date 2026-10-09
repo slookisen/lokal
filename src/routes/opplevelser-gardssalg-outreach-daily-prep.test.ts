@@ -446,11 +446,11 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
 
       const full = await callRoute(opplevelserRouter, { headers: auth });
       assertEq(full.status, 200, "b1: full batch -> 200");
-      assertEq(full.body.candidates.length, 3, "b2: exactly 3 candidates (prov-a-freemail is held back by the mfl. § 15 recipient policy; never more than DAILY_PREP_MAX_CANDIDATES)");
+      assertEq(full.body.candidates.length, 4, "b2: exactly 4 candidates (prov-a-freemail is a candidate again under the 2026-10-08 all-valid-addresses policy; never more than DAILY_PREP_MAX_CANDIDATES)");
       assertEq(
         (full.body.candidates as any[]).map((c) => c.provider_id),
-        ["prov-b-homepage", "prov-c-samedomain", "prov-e-overflow"],
-        "b3: the 3 remaining eligible ids in ascending id order — prov-d-unverified excluded by the new " +
+        ["prov-a-freemail", "prov-b-homepage", "prov-c-samedomain", "prov-e-overflow"],
+        "b3: the 4 remaining eligible ids in ascending id order — prov-d-unverified excluded by the new " +
           "address-domain check, prov-e-overflow backfills into its slot (genuine batch-assembly-time backfill)",
       );
 
@@ -466,9 +466,9 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       }
 
       const byId = new Map((full.body.candidates as any[]).map((c) => [c.provider_id, c]));
-      // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15: a free-mail
-      // address (alpha.freemail@gmail.com) is a personal mailbox -> held back.
-      assertTrue(!byId.has("prov-a-freemail"), "b6: prov-a-freemail is NOT a candidate (personal address, mfl. § 15)");
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: a free-mail address
+      // (alpha.freemail@gmail.com) is mailed like any other valid address.
+      assertEq(byId.get("prov-a-freemail")?.address_basis, "freemail_pointing_to_producer", "b6: prov-a-freemail is a candidate again, address_basis freemail_pointing_to_producer");
       assertEq(byId.get("prov-b-homepage")?.address_basis, "published_on_producer_site", "b7: prov-b-homepage address_basis");
       assertEq(byId.get("prov-c-samedomain")?.address_basis, "same_domain_as_website", "b8: prov-c-samedomain address_basis");
       assertEq(byId.get("prov-e-overflow")?.address_basis, "same_domain_as_website", "b9: prov-e-overflow address_basis (the backfilled candidate)");
@@ -498,22 +498,27 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertTrue(!excludedById.has("prov-e-overflow"), "c6b: prov-e-overflow is NOT excluded anymore — it backfilled into a candidate slot instead");
       assertTrue(!excludedById.has("prov-needs-enrichment"), "c7: a needs_enrichment-tier row (never outreach_ready) is absent from excluded");
       assertTrue(!byId.has("prov-needs-enrichment"), "c8: a needs_enrichment-tier row is absent from candidates too");
-      assertEq(excludedById.get("prov-a-freemail")?.reason, "personal_address", "c8b: prov-a-freemail excluded, reason personal_address");
-      assertEq(full.body.excluded.length, 4, "c9: excluded has exactly 4 rows (macks, quarantine, prov-d-unverified, prov-a-freemail)");
-      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 4, selected: 3, excluded_total: 4, daily_cap: 4 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets) + daily_cap (env unset -> default 4)");
-      assertEq(full.body.missing, { count: 1, reason: "fewer_than_cap" }, "c11: 3 candidates vs cap 4 -> missing.count 1, fewer_than_cap");
+      assertTrue(!excludedById.has("prov-a-freemail"), "c8b: prov-a-freemail is not excluded (all valid addresses, 2026-10-08)");
+      assertEq(full.body.excluded.length, 3, "c9: excluded has exactly 3 rows (macks, quarantine, prov-d-unverified)");
+      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3, daily_cap: 4 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets) + daily_cap (env unset -> default 4)");
+      assertEq(full.body.missing, { count: 0, reason: null }, "c11: full batch -> missing.count 0, reason null");
+      assertEq(
+        full.body.recipient_address_types,
+        { general_role_address: 3, personal_local_part: 0, free_mail_domain: 1, malformed_or_empty: 0 },
+        "c11b: recipient_address_types counts the 4 selected candidates (a is free-mail; b, c, e are general)",
+      );
       assertEq(full.body.dry, false, "c12: dry:false (eligible_total > 0)");
 
-      // mfl. § 15 (dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15):
-      // the send function re-checks the recipient policy, fail-closed — even
-      // when a caller hands it an "eligible" row for a personal address
-      // nothing is reserved, sent or logged (the g1 count below still holds).
+      // dev-request 2026-10-08-mottakerpolicy-alle-adresser: the send function
+      // still re-checks the recipient policy — a malformed address handed in as
+      // "eligible" is skipped and nothing is reserved, sent or logged (the g1
+      // count below still holds).
       const heldSend = await opplevelserModule.sendGardssalgOutreachToEligibleProvider(
         expDb,
-        { provider_id: "prov-a-freemail", eligible: true, status: "would_send", navn: "Alfa", slug: "alpha-freemail-gard", epost: "alpha.freemail@gmail.com" },
+        { provider_id: "prov-a-freemail", eligible: true, status: "would_send", navn: "Alfa", slug: "alpha-freemail-gard", epost: "ikke-en-adresse" },
         { template: "standard", isTest: false, source: "daily-prep-test" },
       );
-      assertEq([heldSend.status, heldSend.reason], ["skipped", "personal_address"], "c13: send path refuses a personal address (skipped, personal_address)");
+      assertEq([heldSend.status, heldSend.reason], ["skipped", "personal_address"], "c13: send path refuses a malformed address (skipped, personal_address bucket)");
 
       // ══ (g) no write occurred from any of the calls above ═══════════════
       const afterLogCount = (

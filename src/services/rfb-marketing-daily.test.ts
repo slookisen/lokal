@@ -576,10 +576,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(eTransport.calls.some((c) => c.to === "post@krasj.gard-test.no"), false, "f10: never e-mailed");
     }
 
-    // ── (e2) mottakerpolicy (mfl. § 15): personal addresses are held back ──
-    // dev-request 2026-10-06-mottakerpolicy-kald-utsending-mfl-15. Cold mail
-    // only to GENERAL role addresses; a held row is not reserved, not sent and
-    // consumes no touch. Free-mail is never general, even with a generic name.
+    // ── (e2) mottakerpolicy: every well-formed address goes out ─────────────
+    // dev-request 2026-10-08-mottakerpolicy-alle-adresser (replaces the strict
+    // mode of 2026-10-06-mottakerpolicy-kald-utsending-mfl-15). Personal and
+    // free-mail addresses are mailed like general ones; only a malformed
+    // address is held. The gate reports the address types it selected.
     freshDb();
     seedProducer("pa-1", "Generell Gård", "post@pa-general.gard-test.no");
     seedProducer("pa-2", "Personlig Gård", "ola.nordmann@pa-personal.gard-test.no");
@@ -590,29 +591,40 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     {
       const dry = await run(false, { transport: makeTransport() });
       assertEq(
-        dry.results.map((x) => [x.agent_id, x.touch, x.status]),
-        [["pa-1", "first", "would_send"], ["pa-4", "second", "would_send"]],
-        "pa1: dry run lists only the general addresses (first and second touch)",
+        dry.results.map((x) => `${x.agent_id}:${x.touch}:${x.status}`).sort(),
+        ["pa-1:first:would_send", "pa-2:first:would_send", "pa-3:first:would_send", "pa-4:second:would_send", "pa-5:second:would_send"],
+        "pa1: dry run lists general, personal and free-mail addresses (first and second touch)",
       );
-      assertEq((dry.gate?.first?.suppressed_counts as any)?.personal_address, 2, "pa2: first-touch gate counts the 2 held addresses (personal + free-mail) in suppressed_counts.personal_address");
-      assertTrue(((dry.gate?.second?.suppressed_counts as any)?.personal_address ?? 0) >= 1, "pa3: second-touch gate counts held addresses too");
+      assertEq((dry.gate?.first?.suppressed_counts as any)?.personal_address, 0, "pa2: first-touch gate holds no address (suppressed_counts.personal_address 0)");
+      assertEq((dry.gate?.second?.suppressed_counts as any)?.personal_address ?? 0, 0, "pa3: second-touch gate holds no address either");
+      assertEq(
+        dry.gate?.first?.recipient_address_types,
+        { general_role_address: 1, personal_local_part: 1, free_mail_domain: 1, malformed_or_empty: 0 },
+        "pa3b: first-touch gate reports the address types it selected",
+      );
       const t = makeTransport();
       const r = await run(true, { transport: t });
-      assertEq(t.calls.map((c) => c.to), ["post@pa-general.gard-test.no", "post@pa-second.gard-test.no"], "pa4: apply mails only the general addresses");
+      assertEq(
+        t.calls.map((c) => c.to).sort(),
+        [
+          "kari@pa-second2.gard-test.no",
+          "kontakt@gmail.com",
+          "ola.nordmann@pa-personal.gard-test.no",
+          "post@pa-general.gard-test.no",
+          "post@pa-second.gard-test.no",
+        ],
+        "pa4: apply mails every address, personal and free-mail included",
+      );
       assertEq(
         [r.summary.sent, r.summary.first_touch_sent, r.summary.second_touch_sent],
-        [2, 1, 1],
-        "pa5: general first and second touch both still go out",
+        [5, 3, 2],
+        "pa5: first and second touch both go out for every address type",
       );
-      assertEq(
-        ledger().map((l) => l.recipient_email).sort(),
-        ["post@pa-general.gard-test.no", "post@pa-second.gard-test.no"],
-        "pa6: held addresses get no ledger row (no reservation, no touch consumed)",
-      );
+      assertEq(ledger().length, 5, "pa6: every sent address has its ledger row");
       assertEq(
         [oslFor("ola.nordmann@pa-personal.gard-test.no"), oslFor("kontakt@gmail.com"), oslFor("kari@pa-second2.gard-test.no")],
-        [0, 0, 0],
-        "pa7: no outreach_sent_log row for a held address",
+        [1, 1, 1],
+        "pa7: personal and free-mail sends are logged in outreach_sent_log like any other",
       );
     }
 
