@@ -32,6 +32,13 @@ import type { VerticalId } from "./analytics-service";
 import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { classifyUA, uaFromSessionId, aiVendorBucket } from "./traffic-classifier";
+import { slugify } from "../utils/slug";
+import {
+  aggregateHumanReferrals,
+  externalReferrerSqlFilter,
+  type HumanReferralPattern,
+  type HumanReferralRow,
+} from "./human-referrals";
 import {
   getPrunedPageViewCount,
   getPrunedPageViewsBySource,
@@ -813,6 +820,50 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
   return out;
 }
 
+// ── /samtaler "Menneskelige besøk" strip ──────────────────────────────
+
+/**
+ * Same result as AnalyticsService.getHumanReferralPatterns (which stays as the
+ * main-thread path for in-memory DBs / the kill switch), with two cheaper
+ * reads: the time-window index is named, and rows whose referrer is an own
+ * domain are excluded in SQL (aggregateHumanReferrals would drop them anyway,
+ * see externalReferrerSqlFilter) instead of being pulled into JS first.
+ */
+export function computeHumanReferralPatterns(
+  db: Db,
+  hoursBack: number,
+  vertical: VerticalId | undefined,
+  nowMs: number,
+): HumanReferralPattern[] {
+  const cutoff = cutoffFor(nowMs, hoursBack);
+  const V = vertical ? " AND vertical_id = ?" : "";
+  const vp: string[] = vertical ? [vertical] : [];
+  const own = externalReferrerSqlFilter();
+
+  const rows = db.prepare(`
+    SELECT referrer, path, session_id, is_owner
+    FROM analytics_page_views${pageViewsWindowIndexHint(db, vertical)}
+    WHERE created_at > ?
+      AND (is_owner IS NULL OR is_owner = 0)
+      AND referrer IS NOT NULL AND TRIM(referrer) != ''${V}${own.sql}
+  `).all(cutoff, ...vp, ...own.params) as HumanReferralRow[];
+
+  if (rows.length === 0) return [];
+
+  // slug→name map from PUBLIC agent names (same as the main-thread path).
+  const producerNameBySlug = new Map<string, string>();
+  try {
+    const agents = db.prepare(`SELECT name FROM agents`).all() as Array<{ name: string }>;
+    for (const a of agents) {
+      if (!a.name) continue;
+      const s = slugify(a.name);
+      if (s && !producerNameBySlug.has(s)) producerNameBySlug.set(s, a.name);
+    }
+  } catch { /* agents table not present in some minimal contexts — degrade to unnamed */ }
+
+  return aggregateHumanReferrals(rows, { producerNameBySlug });
+}
+
 // ── Worker task dispatch ──────────────────────────────────────────────
 
 /** One admin-dashboard read; JSON-serialisable (it crosses the worker boundary and is the cache key). */
@@ -823,7 +874,9 @@ export type AdminStatsQuery =
   | { name: "cities"; hours: number; vertical?: VerticalId }
   | { name: "visitors"; hours: number; limit: number; vertical?: VerticalId }
   | { name: "pages"; hours: number; limit: number; vertical?: VerticalId }
-  | { name: "umbrellaTraffic"; sinceHours: number };
+  | { name: "umbrellaTraffic"; sinceHours: number }
+  // /samtaler referral strip (skive 4); cached 30–60 min by samtaler-strip.ts.
+  | { name: "humanReferrals"; hours: number; vertical?: VerticalId };
 
 /** GET /admin/analytics/summary's three numbers (24 h summary, 30-day visits, 24 h UTM). */
 export interface Summary24Result {
@@ -852,6 +905,8 @@ export function runAdminStatsQuery(db: Db, query: AdminStatsQuery, nowMs: number
       return computeTopPages(db, query.hours, query.limit, query.vertical, nowMs);
     case "umbrellaTraffic":
       return computeUmbrellaTraffic(db, query.sinceHours, nowMs);
+    case "humanReferrals":
+      return computeHumanReferralPatterns(db, query.hours, query.vertical, nowMs);
     default:
       throw new Error(`unknown admin stats query: ${JSON.stringify(query)}`);
   }

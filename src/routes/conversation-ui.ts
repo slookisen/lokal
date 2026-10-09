@@ -18,7 +18,8 @@ import { randomUUID } from "crypto";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { interactionLogger } from "../services/interaction-logger";
 import { redactPII } from "../utils/pii-redact";
-import { parseUserAgent, analyticsService, MIN_HUMAN_REFERRAL_COUNT } from "../services/analytics-service";
+import { parseUserAgent, MIN_HUMAN_REFERRAL_COUNT } from "../services/analytics-service";
+import { readHumanReferralStrip, samtalerHtmlCacheFor } from "../services/samtaler-strip";
 import type { HumanReferralPattern } from "../services/analytics-service";
 
 const router = Router();
@@ -725,7 +726,7 @@ function chatShell(
 // GET /samtaler — Conversation list
 // ═══════════════════════════════════════════════════════════════
 
-router.get("/samtaler", (req: Request, res: Response) => {
+router.get("/samtaler", async (req: Request, res: Response) => {
   try {
     // ─── Source filter from query param ──────────────────────────
     const activeSource = (req.query.kilde as string) || "";
@@ -741,6 +742,21 @@ router.get("/samtaler", (req: Request, res: Response) => {
     // ignored and the public (external-only) view is served.
     const meta = buildRequestMeta(req);
     const isAdminView = req.query.admin === "1" && (!!meta.hasValidAdminKey || !!meta.ownerCookie);
+
+    // ─── Finished-HTML cache (serverheng skive 4) ────────────────
+    // The public page is the same for everyone, so it is reused for ~60 s per
+    // source filter. Not cached: the credentialed admin view, and an unknown
+    // ?kilde= value (it is echoed in the empty-state text; keeps the key set
+    // bounded to "", a2a, mcp, web, api).
+    const htmlCache = samtalerHtmlCacheFor(req.app);
+    const cacheable = !isAdminView && (activeSource === "" || filterSource !== undefined);
+    if (cacheable) {
+      const cached = htmlCache.get(activeSource);
+      if (cached !== undefined) {
+        res.send(cached);
+        return;
+      }
+    }
 
     // ─── Stats per source (always show all, regardless of filter) ─
     const sourceStats = conversationService.getSourceStats({ includeInternal: isAdminView });
@@ -870,12 +886,19 @@ router.get("/samtaler", (req: Request, res: Response) => {
     // ─── "Menneskelige besøk" strip (item 6) ────────────────────
     // Separate, clearly-labeled section: aggregated + anonymized human-referral
     // patterns (≥ MIN_HUMAN_REFERRAL_COUNT, internal/bot excluded, no PII).
-    // Independent of the AI-channel filter above; failure here must never break
-    // the conversation list.
+    // Independent of the AI-channel filter above. Computed in the off-thread
+    // stats worker behind an SWR cache (services/samtaler-strip.ts); when the
+    // worker fails and nothing recent is cached the page is a 503, never a
+    // synchronous recompute on the main thread.
+    const strip = await readHumanReferralStrip(req.app);
+    if (!strip.ok) {
+      console.error("[samtaler] human-visits strip unavailable:", strip.error);
+      res.status(503).set("Retry-After", "30").send("Samtaler er midlertidig utilgjengelig. Prøv igjen om litt.");
+      return;
+    }
     let humanVisitsHtml = "";
     try {
-      const patterns = analyticsService.getHumanReferralPatterns({ hoursBack: 24 * 30 });
-      humanVisitsHtml = renderHumanVisitsStrip(patterns);
+      humanVisitsHtml = renderHumanVisitsStrip(strip.value);
     } catch (e) {
       console.error("[samtaler] human-visits strip failed:", e);
     }
@@ -912,6 +935,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
       </script>
     `, { canonicalPath: "/samtaler" });
 
+    if (cacheable) htmlCache.set(activeSource, html);
     res.send(html);
   } catch (err: any) {
     console.error("Error rendering /samtaler:", err);
