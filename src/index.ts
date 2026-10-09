@@ -51,6 +51,7 @@ import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
 import { honestCatalogCounts } from "./services/honest-count";
 import { prewarmTrafficStats } from "./services/traffic-stats";
+import { prewarmAgentToolCalls } from "./services/agent-usage";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
@@ -1381,6 +1382,9 @@ app.listen(Number(PORT), HOST, async () => {
   // numbers as early as possible; until it lands they render zeros.
   // Slice 2: delayed ~60 s so the three full scans do not start with the boot stall.
   setTimeout(() => prewarmTrafficStats(["rfb", "dental", "experiences"]), TRAFFIC_PREWARM_BOOT_DELAY_MS);
+  // agentplatform.no/partnere: the 30-day MCP tool-call count (agent-usage.ts),
+  // same worker, same delay — one indexed COUNT, far lighter than the scans above.
+  setTimeout(() => prewarmAgentToolCalls(), TRAFFIC_PREWARM_BOOT_DELAY_MS);
 
   // ─── PR-21 / WO-19 (2026-05-10): link-freshness backfill ────────────
   // On every boot, probe every agent currently in the outreach pool.

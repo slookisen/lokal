@@ -34,6 +34,17 @@ import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+// A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
+// footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
+// and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
+import {
+  agentCardProvider,
+  companyContactBlockHtml,
+  companyControllerSentenceHtml,
+  companyFooterLineHtml,
+  parentOrganizationJsonLd,
+  toSiteLang,
+} from "../services/company-legal";
 
 const router = Router();
 
@@ -640,10 +651,20 @@ a:hover{text-decoration:underline}
 .footer-col a{display:block;color:rgba(255,255,255,.6);font-size:.85rem;margin-bottom:6px;text-decoration:none}
 .footer-col a:hover{color:var(--white)}
 .footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
+.footer-company{margin-top:6px}
+.footer-company a{color:rgba(255,255,255,.65);text-decoration:underline}
 
 /* SPECIALTY CHIPS */
 .spec-chip{display:inline-block;padding:7px 18px;border-radius:20px;background:var(--section-bg);border:1px solid var(--g200);color:var(--navy);font-size:.83rem;font-weight:500;text-decoration:none;transition:all .15s}
 .spec-chip:hover{background:var(--teal-700);color:var(--white);border-color:var(--teal-700);text-decoration:none}
+
+/* COMPANY FACTS (/kontakt) */
+.co-sec{margin-top:48px;padding-top:24px;border-top:1px solid var(--g200)}
+.co-sec h2{font-size:1.15rem;font-weight:700;color:var(--navy);margin-bottom:12px}
+.co-facts{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;font-size:.92rem;margin:0}
+.co-facts dt{font-weight:600;color:var(--navy)}
+.co-facts dd{margin:0;color:var(--g700)}
+@media(max-width:480px){.co-facts{grid-template-columns:1fr;gap:2px}.co-facts dd{margin-bottom:8px}}
 
 /* EMPTY STATE */
 .empty-state{text-align:center;padding:64px 24px}
@@ -693,6 +714,7 @@ function dentalFooter(): string {
   <div class="footer-bottom">
     &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a><br>
     En del av A2A-nettverket: <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot; <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a> &mdash; Bygget for både mennesker og AI-agenter
+    <div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
   </div>
 </footer>`;
 }
@@ -889,6 +911,8 @@ router.get("/", (_req: Request, res: Response) => {
       name: "Finn-tannlege",
       url: DENTAL_BASE_URL,
       logo: DENTAL_BASE_URL + "/favicon.svg",
+      // T2: the company that owns and operates finn-tannlege.com.
+      parentOrganization: parentOrganizationJsonLd(),
     },
   ];
 
@@ -2165,7 +2189,7 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/personvern", (_req: Request, res: Response) => {
-  const updatedDate = "2026-06-04";
+  const updatedDate = "2026-10-09"; // operator → AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as)
   const html = `
 <main>
   <div class="content-page">
@@ -2173,7 +2197,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p style="font-size:.85rem;color:var(--g500)">Sist oppdatert: ${updatedDate}</p>
 
     <h2>Behandlingsansvarlig</h2>
-    <p>Finn-tannlege.com er behandlingsansvarlig for personopplysninger behandlet på denne tjenesten. Kontakt oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>.</p>
+    <p>${companyControllerSentenceHtml("nb", { siteName: "Finn-tannlege.com", siteEmail: "kontakt@finn-tannlege.com" })}</p>
 
     <h2>Hvilke data behandler vi?</h2>
     <p>Vi behandler <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>:</p>
@@ -2635,9 +2659,11 @@ function dentalMcpServerCard() {
     },
     documentation: `${DENTAL_BASE_URL}/llms.txt`,
     icon: `${DENTAL_BASE_URL}/favicon.svg`,
+    // T3: the organisation behind the server is the company (same as the agent
+    // card's provider); `name`/`title` above keep the brand.
     vendor: {
-      name: "Finn-tannlege",
-      url: DENTAL_BASE_URL,
+      name: agentCardProvider().organization,
+      url: agentCardProvider().url,
     },
     license: "MIT",
     endpoints: [
@@ -2725,7 +2751,11 @@ router.get("/.well-known/glama.json", (_req: Request, res: Response) => {
 // GET /kontakt — public contact form (finn-tannlege.com)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/kontakt", (_req: Request, res: Response) => {
+router.get("/kontakt", (req: Request, res: Response) => {
+  // The company facts (ehandelsloven § 8 / foretaksregisterloven § 7-2) follow
+  // the URL language (/en/kontakt → English); the rest of the page is
+  // Norwegian-only, as before.
+  const coLang = toSiteLang(req.lang);
   const content = `
 <main>
   <div class="container" style="max-width:640px;margin:0 auto;padding:40px 24px 80px">
@@ -2763,6 +2793,11 @@ router.get("/kontakt", (_req: Request, res: Response) => {
 
       <button type="submit" class="btn-primary" style="display:inline-flex;align-items:center;gap:8px">Send melding</button>
     </form>
+
+    <section class="co-sec" id="selskap"${coLang === "en" ? ' lang="en"' : ""}>
+      <h2>${coLang === "en" ? "Company information" : "Selskapsinformasjon"}</h2>
+      ${companyContactBlockHtml(coLang, { siteEmail: "kontakt@finn-tannlege.com", className: "co-facts" })}
+    </section>
   </div>
 </main>
 

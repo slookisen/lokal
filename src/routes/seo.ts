@@ -106,6 +106,16 @@ import { formatAddressLine } from "../utils/address-format";
 export { formatAddressLine };
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
+// A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
+// the operator facts (footer line, /kontakt facts, /personvern controller,
+// JSON-LD parentOrganization) all come from COMPANY_INFO via these helpers.
+import {
+  companyContactBlockHtml,
+  companyControllerSentenceHtml,
+  companyFooterLineHtml,
+  parentOrganizationJsonLd,
+  toSiteLang,
+} from "../services/company-legal";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -599,6 +609,8 @@ const CSS = `
   .ft-col a { display: block; font-size: 0.85rem; color: rgba(255,255,255,0.65); margin-bottom: 7px; }
   .ft-col a:hover { color: white; text-decoration: none; }
   .ft-bottom { max-width: 1100px; margin: 24px auto 0; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 0.75rem; opacity: 0.35; text-align: center; }
+  .ft-company { max-width: 1100px; margin: 6px auto 0; font-size: 0.75rem; opacity: 0.55; text-align: center; }
+  .ft-company a { color: inherit; text-decoration: underline; }
 
   /* Responsive */
   @media (max-width: 768px) {
@@ -776,6 +788,7 @@ function shell(
       </div>
     </div>
     <div class="ft-bottom">${escapeHtml(t(lang, "footer.copyright", { year: new Date().getFullYear() }))}</div>
+    <div class="ft-company">${companyFooterLineHtml(toSiteLang(lang), { contactHref: localizedPath("/kontakt", lang) })}</div>
   </footer>
   ${langSwitcherJs}
 </body>
@@ -1392,6 +1405,17 @@ router.get("/", (req: Request, res: Response) => {
         "query-input": "required name=search_term_string"
       }
     };
+    // T2 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
+    // the site's own Organization, owned by Agentplatform.no AS — the same
+    // WebSite + Organization pair opplevagent.no and finn-tannlege.com publish.
+    const orgJsonLd = {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "name": `${getConfig().display_name}`,
+      "url": BASE_URL,
+      "logo": `${BASE_URL}/logo-512.png`,
+      "parentOrganization": parentOrganizationJsonLd(),
+    };
 
     const numFmt = lang === "en" ? "en-US" : "nb-NO";
 
@@ -1543,7 +1567,7 @@ ${umbrellaSectionHtml}
       t(lang, "home.title"),
       t(lang, "home.description", { count: totalAgents }),
       content,
-      { canonical: BASE_URL + (lang === "en" ? "/en" : ""), jsonLd, extraCss: LANDING_CSS, lang, pathForAlternate: "/" }
+      { canonical: BASE_URL + (lang === "en" ? "/en" : ""), jsonLd: [jsonLd, orgJsonLd], extraCss: LANDING_CSS, lang, pathForAlternate: "/" }
     ));
   } catch (err) {
     console.error("SEO / error:", err);
@@ -2896,7 +2920,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
   <section class="pv-sec">
     <h2>Who we are</h2>
-    <p>${brand} is an open catalogue of local ${getConfig().domain_dictionary.entity_plural_long} in Norway, available at rettfrabonden.com. The service is run as an independent project. Contact: kontakt@${getConfig().domain}.</p>
+    <p>${brand} is an open catalogue of local ${getConfig().domain_dictionary.entity_plural_long} in Norway, available at rettfrabonden.com. ${companyControllerSentenceHtml("en", { siteName: getConfig().display_name, siteEmail: `kontakt@${getConfig().domain}` })}</p>
 
     <h2>What we collect</h2>
     <p>We collect different types of data depending on how you use the service. Here is the full overview:</p>
@@ -3021,7 +3045,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Changes to this policy</h2>
     <p>If we change how we handle data, we update this page. We have no newsletter or popup notifications \u2014 check this page if you're wondering.</p>
 
-    <p class="pv-updated">Last updated: 3 October 2026</p>
+    <p class="pv-updated">Last updated: 9 October 2026</p>
   </section>` : `
   <section class="pv-hero">
     <h1>Personvern</h1>
@@ -3030,7 +3054,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
   <section class="pv-sec">
     <h2>Hvem vi er</h2>
-    <p>${brand} er en åpen katalog over lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@${getConfig().domain}.</p>
+    <p>${brand} er en åpen katalog over lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, tilgjengelig på rettfrabonden.com. ${companyControllerSentenceHtml("nb", { siteName: getConfig().display_name, siteEmail: `kontakt@${getConfig().domain}` })}</p>
 
     <h2>Hva vi samler inn</h2>
     <p>Vi samler inn forskjellige typer data avhengig av hvordan du bruker tjenesten. Her er en fullstendig oversikt:</p>
@@ -3156,7 +3180,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Endringer i denne policyen</h2>
     <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
 
-    <p class="pv-updated">Sist oppdatert: 3. oktober 2026</p>
+    <p class="pv-updated">Sist oppdatert: 9. oktober 2026</p>
   </section>`;
 
   res.send(shell(
@@ -6420,6 +6444,16 @@ Sitemap: ${BASE_URL}/sitemap.xml
 });
 
 // ─── /kontakt — public contact form (RFB / rettfrabonden.com) ───
+// Also the page with every fact ehandelsloven § 8 / foretaksregisterloven
+// § 7-2 ask for (company name, form, head office, address, register + org.nr.,
+// VAT status, e-mail) — rendered from COMPANY_INFO via company-legal.ts.
+const CONTACT_COMPANY_CSS = `
+  .co-sec h2 { font-size: 1.15rem; margin-bottom: 12px; }
+  .co-facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; font-size: 0.92rem; margin: 0; }
+  .co-facts dt { font-weight: 600; color: var(--g700, #374151); }
+  .co-facts dd { margin: 0; }
+  @media (max-width: 480px) { .co-facts { grid-template-columns: 1fr; gap: 2px; } .co-facts dd { margin-bottom: 8px; } }
+`;
 
 router.get("/kontakt", (req: Request, res: Response) => {
   const lang = req.lang;
@@ -6470,6 +6504,11 @@ router.get("/kontakt", (req: Request, res: Response) => {
   </form>
 </section>
 
+<section class="om-sec co-sec" id="selskap" style="max-width:640px;margin:0 auto;padding:0 24px 64px">
+  <h2>${en ? "Company information" : "Selskapsinformasjon"}</h2>
+  ${companyContactBlockHtml(toSiteLang(lang), { siteEmail: `kontakt@${getConfig().domain}`, className: "co-facts" })}
+</section>
+
 <script>
 (function(){
   var form = document.getElementById('contact-form');
@@ -6510,6 +6549,7 @@ router.get("/kontakt", (req: Request, res: Response) => {
       canonical: `${BASE_URL}/kontakt`,
       pathForAlternate: "/kontakt",
       lang,
+      extraCss: CONTACT_COMPANY_CSS,
     }),
   );
 });

@@ -192,6 +192,10 @@
     .completion-bar-label { display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--gray-500); margin-bottom: 4px; }
     .completion-bar-track { height: 8px; background: var(--gray-200); border-radius: 4px; overflow: hidden; }
     .completion-bar-fill { height: 100%; background: var(--forest); border-radius: 4px; transition: width 0.4s ease; }
+
+    /* ── Company line (operator facts, see the footer comment) ── */
+    .company-foot { max-width: 900px; margin: 2rem auto 0; padding: 1rem 1.5rem 2rem; border-top: 1px solid var(--gray-200); text-align: center; font-size: 0.8rem; color: var(--gray-500); }
+    .company-foot a { color: inherit; text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -864,6 +868,15 @@
     </div>
   </div>
 
+  <!-- Company line (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
+       Literal copies of companyFooterLineHtml("nb"/"en") in src/services/company-legal.ts;
+       src/routes/company-legal-sites.test.ts fails if they drift. applyLang() shows the
+       one matching the page language. -->
+  <footer class="company-foot">
+    <p class="company-line" data-company-lang="no">En tjeneste fra <a href="https://agentplatform.no">AGENTPLATFORM.NO AS</a> · <a href="/kontakt">Org.nr. 938 635 676</a></p>
+    <p class="company-line hidden" data-company-lang="en" lang="en">A service from <a href="https://agentplatform.no">AGENTPLATFORM.NO AS</a> · <a href="/en/kontakt">Org. no. 938 635 676</a></p>
+  </footer>
+
   <script>
     // ═══════════════════════════════════════════════════════════════
     // Rett fra Bonden Seller Dashboard — Full client-side app
@@ -1076,6 +1089,9 @@
         el.placeholder = t(el.getAttribute('data-i18n-placeholder'));
       });
       document.getElementById('langToggle').textContent = state.lang === 'no' ? 'EN' : 'NO';
+      document.querySelectorAll('[data-company-lang]').forEach(function(el) {
+        el.classList.toggle('hidden', el.getAttribute('data-company-lang') !== state.lang);
+      });
       // Rebuild month checkboxes if visible
       buildMonthCheckboxes();
       // Rebuild hours grid

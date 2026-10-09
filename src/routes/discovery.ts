@@ -20,6 +20,7 @@ import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { isJunkDescription } from "../services/description-quality";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { companyFooterLineHtml, companyOperatorSentence } from "../services/company-legal";
 
 /** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
 function rfbCatalogCount(fallback: number): number {
@@ -930,13 +931,14 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
   .lang-switch { text-align: right; margin-bottom: 1rem; font-size: 0.9rem; }
   .lang-switch a { color: #2d5016; }
   footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd; font-size: 0.85rem; color: #666; }
+  footer .company-line { margin-top: 0.4rem; }
 </style>
 </head>
 <body>
 <div class="lang-switch"><a href="#en">English</a></div>
 
 <h1>Vilkår for bruk</h1>
-<p><strong>Sist oppdatert:</strong> 24. september 2026</p>
+<p><strong>Sist oppdatert:</strong> 9. oktober 2026</p>
 
 <p>Velkommen til ${getConfig().display_name} (rettfrabonden.com). Disse vilkårene gjelder for alle som bruker
 plattformen — enten du er sluttbruker, produsent, eller en AI-agent som kaller våre MCP- eller A2A-endepunkter.
@@ -987,16 +989,16 @@ på <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}
 endring regnes som aksept.</p>
 
 <h2>8. Gjeldende rett</h2>
-<p>Disse vilkårene reguleres av norsk rett. Tvister skal løses ved Daniels alminnelige verneting.</p>
+<p>Disse vilkårene reguleres av norsk rett. Tvister skal løses ved selskapets alminnelige verneting.</p>
 
 <h2>9. Kontakt</h2>
 <p>E-post: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
-Operatør: Daniel Fredriksen, Norge.</p>
+${companyOperatorSentence("nb")}</p>
 
 <hr>
 
 <h1 id="en">Terms of Service</h1>
-<p><strong>Last updated:</strong> 24 September 2026</p>
+<p><strong>Last updated:</strong> 9 October 2026</p>
 
 <p>Welcome to ${getConfig().display_name} (rettfrabonden.com). These terms apply to everyone who uses the
 platform — end-users, producers, and AI agents calling our MCP or A2A endpoints. By using the
@@ -1046,17 +1048,18 @@ buyers and producers. We facilitate discovery — we are not a party to the purc
 changes counts as acceptance.</p>
 
 <h2>8. Governing law</h2>
-<p>These terms are governed by Norwegian law. Disputes shall be resolved at Daniel's ordinary venue.</p>
+<p>These terms are governed by Norwegian law. Disputes shall be resolved at the company's ordinary venue.</p>
 
 <h2>9. Contact</h2>
 <p>Email: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
-Operator: Daniel Fredriksen, Norway.</p>
+${companyOperatorSentence("en")}</p>
 
 <footer>
   ${getConfig().display_name} · <a href="/">rettfrabonden.com</a> ·
   <a href="/privacy">Privacy</a> ·
   <a href="/.well-known/agent-card.json">Agent Card</a> ·
   <a href="https://github.com/slookisen/lokal">Source</a>
+  <div class="company-line">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
 </footer>
 </body>
 </html>`);

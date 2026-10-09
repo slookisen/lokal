@@ -39,6 +39,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 import { publicListableSql, isPubliclyListable } from "./agent-visibility";
 import { safeHonestCatalogCount } from "./honest-count";
 import { registeredMcpTools } from "./mcp-tool-manifest";
+import { agentCardProvider } from "./company-legal";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1133,9 +1134,11 @@ class MarketplaceRegistry {
       // without them, registry records show "None" / fallback rendering.
       homepage: baseUrl,
       iconUrl: `${baseUrl}/logo.svg`,
+      // T3 (A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
+      // the provider is the company that operates the service (from COMPANY_INFO);
+      // the card's own `name` keeps the brand.
       provider: {
-        organization: "Rett fra Bonden",
-        url: baseUrl,
+        ...agentCardProvider(),
         contactUrl: `${baseUrl}/docs`,
         description: "Open agent-to-agent food marketplace operator. " +
           "Norges første A2A-markedsplass for lokal mat.",
