@@ -44,6 +44,7 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { startEventLoopPersistence, pruneEventLoopEvents } from "./services/event-loop-persist";
+import { ensureNightIndexes } from "./services/night-indexes";
 import { getPageViewHealthCounts } from "./services/health-counts";
 import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health-counts-compute";
 import { getRetentionWindowDays } from "./services/traffic-stats-compute";
@@ -1534,6 +1535,15 @@ app.listen(Number(PORT), HOST, async () => {
         if (evDeleted > 0) console.log(`[event-loop-persist] pruned ${evDeleted} rows older than 14d`);
       } catch (err) {
         console.error("[event-loop-persist] prune failed (non-fatal):", err);
+      }
+
+      // Slice 4 of 2026-10-08-serverheng…: big-table indexes are built here, in
+      // the 03:00 window, not at boot (services/night-indexes.ts).
+      try {
+        const built = ensureNightIndexes(getDb());
+        if (built.length > 0) console.log(`[night-indexes] built ${built.join(", ")}`);
+      } catch (err) {
+        console.error("[night-indexes] failed (non-fatal):", err);
       }
     };
 

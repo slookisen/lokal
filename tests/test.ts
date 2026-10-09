@@ -32428,6 +32428,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ast.failures) failures.push("admin-stats: " + f);
     console.log(`  admin-stats: ${ast.passed} passed, ${ast.failed} failed`);
 
+    // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler,
+    // skive 4: /samtaler referral strip in the stats worker with SWR, HTML cached
+    // per kilde, conversations index built in the night window. Same sequential
+    // block as admin-stats (both use the worker manager).
+    console.log("\n── samtaler-strip: /samtaler off the main thread ──");
+    const { runSamtalerStripTests } = require("../src/services/samtaler-strip.test") as
+      typeof import("../src/services/samtaler-strip.test");
+    const sst = await runSamtalerStripTests({ log: false });
+    passed += sst.passed;
+    failed += sst.failed;
+    for (const f of sst.failures) failures.push("samtaler-strip: " + f);
+    console.log(`  samtaler-strip: ${sst.passed} passed, ${sst.failed} failed`);
+
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
     // wrapper over the EXISTING booking chain (BookingInputSchema,
