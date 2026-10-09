@@ -8897,7 +8897,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 3. oktober 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 9. oktober 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
@@ -8909,7 +8909,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Har du sendt en besøksforespørsel, kan du på samme adresse be om innsyn i, retting av eller sletting av opplysningene dine.</p>
 <h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 3 October 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 9 October 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
@@ -8926,7 +8926,7 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Vilkår / Terms of Service", `<div class="lang"><a href="#en">English</a></div>
-<h1>Vilkår for bruk</h1><p><strong>Sist oppdatert:</strong> 3. oktober 2026</p>
+<h1>Vilkår for bruk</h1><p><strong>Sist oppdatert:</strong> 9. oktober 2026</p>
 <p>Velkommen til Opplevagent (opplevagent.no). Disse vilkårene gjelder for alle som bruker plattformen — sluttbrukere, tilbydere og AI-agenter som kaller våre MCP- eller A2A-endepunkter. Ved å bruke tjenesten aksepterer du vilkårene.</p>
 <p>${companyOperatorSentence("nb")}</p>
 <h2>1. Hva tjenesten er</h2><p>Opplevagent er et oppdagelseslag for norske opplevelser. Vi eksponerer en katalog gjennom MCP, A2A JSON-RPC og en REST-API slik at agenter og mennesker kan finne turer, kurs, severdigheter og aktiviteter. Booking og betaling av opplevelser skjer hos tilbyderen. Opplevagent tar aldri imot betaling eller kortdata.</p>
@@ -8938,7 +8938,7 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>6. Tilbyderrettigheter</h2><p>Oppdater, fjern eller overta din oppføring via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Se også <a href="/personvern">personvern</a>.</p>
 <h2>7. Gjeldende rett</h2><p>Norsk rett. Tvister løses ved selskapets alminnelige verneting.</p>
 <hr>
-<h1 id="en">Terms of Service</h1><p><strong>Last updated:</strong> 3 October 2026</p>
+<h1 id="en">Terms of Service</h1><p><strong>Last updated:</strong> 9 October 2026</p>
 <p>Welcome to Opplevagent (opplevagent.no). These terms apply to everyone who uses the platform — end-users, providers, and AI agents calling our MCP or A2A endpoints. By using the service you accept these terms.</p>
 <p>${companyOperatorSentence("en")}</p>
 <h2>1. What the service is</h2><p>Opplevagent is a discovery layer for Norwegian experiences. We expose a directory via MCP, A2A JSON-RPC, and a REST API so agents and humans can find tours, courses, attractions, and activities. Experiences are booked and paid for with the provider. Opplevagent never takes payments or card data.</p>

@@ -3045,7 +3045,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Changes to this policy</h2>
     <p>If we change how we handle data, we update this page. We have no newsletter or popup notifications \u2014 check this page if you're wondering.</p>
 
-    <p class="pv-updated">Last updated: 3 October 2026</p>
+    <p class="pv-updated">Last updated: 9 October 2026</p>
   </section>` : `
   <section class="pv-hero">
     <h1>Personvern</h1>
@@ -3180,7 +3180,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h2>Endringer i denne policyen</h2>
     <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
 
-    <p class="pv-updated">Sist oppdatert: 3. oktober 2026</p>
+    <p class="pv-updated">Sist oppdatert: 9. oktober 2026</p>
   </section>`;
 
   res.send(shell(

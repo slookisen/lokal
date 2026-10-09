@@ -198,7 +198,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
       `/personvern (${lang}): no longer shows the stale 16 April 2026 "last updated" date`
     );
     assertTrue(
-      lang === "no" ? /Sist oppdatert: 3\. oktober 2026/.test(body) : /Last updated: 3 October 2026/.test(body),
+      // 2026-10-09: controller changed to AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
+      lang === "no" ? /Sist oppdatert: 9\. oktober 2026/.test(body) : /Last updated: 9 October 2026/.test(body),
       `/personvern (${lang}): "last updated" date reflects this change`
     );
     // ChatGPT app re-review 2026-10-03: lokal_cart_submit takes optional
@@ -245,7 +246,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
         "/vilkar: no longer shows the stale 20 April 2026 \"last updated\" date"
       );
       assertTrue(
-        /Sist oppdatert:<\/strong> 24\. september 2026/.test(r.body) && /Last updated:<\/strong> 24 September 2026/.test(r.body),
+        // 2026-10-09: operator changed to AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
+        /Sist oppdatert:<\/strong> 9\. oktober 2026/.test(r.body) && /Last updated:<\/strong> 9 October 2026/.test(r.body),
         "/vilkar: \"last updated\" date reflects this change (both languages)"
       );
     }

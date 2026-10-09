@@ -938,7 +938,7 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <div class="lang-switch"><a href="#en">English</a></div>
 
 <h1>Vilkår for bruk</h1>
-<p><strong>Sist oppdatert:</strong> 24. september 2026</p>
+<p><strong>Sist oppdatert:</strong> 9. oktober 2026</p>
 
 <p>Velkommen til ${getConfig().display_name} (rettfrabonden.com). Disse vilkårene gjelder for alle som bruker
 plattformen — enten du er sluttbruker, produsent, eller en AI-agent som kaller våre MCP- eller A2A-endepunkter.
@@ -998,7 +998,7 @@ ${companyOperatorSentence("nb")}</p>
 <hr>
 
 <h1 id="en">Terms of Service</h1>
-<p><strong>Last updated:</strong> 24 September 2026</p>
+<p><strong>Last updated:</strong> 9 October 2026</p>
 
 <p>Welcome to ${getConfig().display_name} (rettfrabonden.com). These terms apply to everyone who uses the
 platform — end-users, producers, and AI agents calling our MCP or A2A endpoints. By using the

@@ -2189,7 +2189,7 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/personvern", (_req: Request, res: Response) => {
-  const updatedDate = "2026-06-04";
+  const updatedDate = "2026-10-09"; // operator → AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as)
   const html = `
 <main>
   <div class="content-page">
