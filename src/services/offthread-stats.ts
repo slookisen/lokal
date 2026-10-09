@@ -27,6 +27,15 @@
 //
 // Known interaction: a manual/weekly `wal_checkpoint(TRUNCATE)` waits (up to
 // the 5 s busy timeout) for a worker read in progress to finish.
+//
+// Lanes (dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-
+// samtaler, skive 3): tasks run in one of two workers. The "background" lane
+// carries the periodic refreshes (trafficStats, pageViewCounts) exactly as
+// before; the "admin" lane carries the admin-dashboard statistics
+// (kind "adminStats", see admin-stats.ts) in its own worker with its own
+// read-only connection, so an admin request never queues behind an 8–23 s
+// traffic-stats refresh. Admin tasks are never marked broken: their callers
+// have no synchronous fallback to switch to (a failure is a 503 there).
 
 import { Worker } from "worker_threads";
 import * as path from "path";
@@ -43,33 +52,53 @@ export const OFFTHREAD_TASK_TIMEOUT_MS = 300_000;
 /** V8 old-space cap for the worker, so a runaway query cannot eat the 1 GB machine. */
 const WORKER_MAX_OLD_GEN_MB = 256;
 
+export type StatsLane = "background" | "admin";
+const LANES: StatsLane[] = ["background", "admin"];
+
 type Pending = {
   key: string;
+  /** False for admin-lane tasks: failures are counted but never trip the fallback. */
+  breakable: boolean;
   postedAt: number;
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
 };
 
-let worker: Worker | null = null;
-let workerDbPath: string | null = null;
+type LaneState = {
+  worker: Worker | null;
+  workerDbPath: string | null;
+  pending: Map<number, Pending>;
+};
+
+const lanes: Record<StatsLane, LaneState> = {
+  background: { worker: null, workerDbPath: null, pending: new Map() },
+  admin: { worker: null, workerDbPath: null, pending: new Map() },
+};
 let nextId = 1;
-const pending = new Map<number, Pending>();
 const failuresByTask = new Map<string, number>();
 const lastRuns = new Map<string, { at: string; durationMs: number; ok: boolean; error?: string }>();
 const brokenKeys = new Map<string, string>(); // task key -> reason
-let workerScriptOverride: string | null = null;
+const workerScriptOverride: Record<StatsLane, string | null> = { background: null, admin: null };
 const walModeByDb = new WeakMap<object, boolean>();
 let lastWalMode: boolean | null = null;
 let walErrorLogged = false;
 
 /** Stable per-task key used for failure accounting and the admin report. */
 export function statsTaskKey(task: StatsTask): string {
-  return task.kind === "trafficStats" ? `trafficStats:${task.vertical ?? "all"}` : task.kind;
+  if (task.kind === "trafficStats") return `trafficStats:${task.vertical ?? "all"}`;
+  if (task.kind === "adminStats") return `adminStats:${task.query.name}`;
+  return task.kind;
 }
 
-function workerScriptPath(): string {
-  if (workerScriptOverride) return workerScriptOverride;
+/** Which worker a task runs in. Unknown kinds stay on the background lane. */
+export function statsTaskLane(task: StatsTask): StatsLane {
+  return task.kind === "adminStats" ? "admin" : "background";
+}
+
+function workerScriptPath(lane: StatsLane): string {
+  const override = workerScriptOverride[lane];
+  if (override) return override;
   // Same extension as this module: .ts under tsx (prod runs `tsx src/index.ts`),
   // .js under a compiled `node dist/index.js`.
   return path.join(__dirname, "offthread-stats-worker" + path.extname(__filename));
@@ -101,6 +130,16 @@ function isWalMode(db: Database.Database): boolean {
  */
 export function offThreadStatsUsable(db: Database.Database, key?: string): boolean {
   if (key === undefined ? brokenKeys.size > 0 : brokenKeys.has(key)) return false;
+  return offThreadStatsEnvUsable(db);
+}
+
+/**
+ * The environment half of offThreadStatsUsable(), without the broken-task
+ * check: kill switch off, file-backed DB, WAL mode. Used by the admin
+ * statistics (admin-stats.ts), which keep using the worker after failures
+ * and answer 503 instead of falling back to the main thread.
+ */
+export function offThreadStatsEnvUsable(db: Database.Database): boolean {
   if (process.env.OFFTHREAD_STATS_DISABLED === "1") return false;
   if (db.memory) return false;
   const name = db.name;
@@ -108,11 +147,11 @@ export function offThreadStatsUsable(db: Database.Database, key?: string): boole
   return isWalMode(db);
 }
 
-function recordFailure(key: string, err: Error, durationMs: number): void {
+function recordFailure(key: string, err: Error, durationMs: number, breakable: boolean): void {
   const n = (failuresByTask.get(key) ?? 0) + 1;
   failuresByTask.set(key, n);
   lastRuns.set(key, { at: new Date().toISOString(), durationMs, ok: false, error: err.message });
-  if (!brokenKeys.has(key) && n >= OFFTHREAD_MAX_CONSECUTIVE_FAILURES) {
+  if (breakable && !brokenKeys.has(key) && n >= OFFTHREAD_MAX_CONSECUTIVE_FAILURES) {
     brokenKeys.set(key, err.message);
     console.error(
       `[offthread-stats] ${key} failed ${n} times in a row (last: ${err.message}); ` +
@@ -131,27 +170,30 @@ function recordSuccess(key: string, durationMs: number): void {
  * charges each task's key (worker crashed/exited while it was queued);
  * otherwise they are rejected without blame (worker deliberately replaced).
  */
-function failAllPending(err: Error, countAsFailure: boolean): void {
+function failAllPending(lane: StatsLane, err: Error, countAsFailure: boolean): void {
   const now = Date.now();
+  const pending = lanes[lane].pending;
   for (const [id, p] of pending) {
     clearTimeout(p.timer);
     pending.delete(id);
-    if (countAsFailure) recordFailure(p.key, err, now - p.postedAt);
+    if (countAsFailure) recordFailure(p.key, err, now - p.postedAt, p.breakable);
     p.reject(err);
   }
 }
 
 /** Keeps the process alive exactly while a task is pending (0->1 ref, back to 0 unref). */
-function syncRef(): void {
-  if (!worker) return;
-  if (pending.size > 0) worker.ref();
-  else worker.unref();
+function syncRef(lane: StatsLane): void {
+  const st = lanes[lane];
+  if (!st.worker) return;
+  if (st.pending.size > 0) st.worker.ref();
+  else st.worker.unref();
 }
 
-function dropWorker(): void {
-  const w = worker;
-  worker = null;
-  workerDbPath = null;
+function dropWorker(lane: StatsLane): void {
+  const st = lanes[lane];
+  const w = st.worker;
+  st.worker = null;
+  st.workerDbPath = null;
   if (w) {
     w.removeAllListeners();
     // Keep a no-op error listener: terminate() on a worker that is still
@@ -161,13 +203,14 @@ function dropWorker(): void {
   }
 }
 
-function ensureWorker(dbPath: string): Worker {
-  if (worker && workerDbPath === dbPath) return worker;
-  if (worker) {
-    failAllPending(new Error("stats worker replaced (DB path changed)"), false);
-    dropWorker();
+function ensureWorker(lane: StatsLane, dbPath: string): Worker {
+  const st = lanes[lane];
+  if (st.worker && st.workerDbPath === dbPath) return st.worker;
+  if (st.worker) {
+    failAllPending(lane, new Error("stats worker replaced (DB path changed)"), false);
+    dropWorker(lane);
   }
-  const script = workerScriptPath();
+  const script = workerScriptPath(lane);
   const options = {
     workerData: { dbPath },
     resourceLimits: { maxOldGenerationSizeMb: WORKER_MAX_OLD_GEN_MB },
@@ -186,10 +229,10 @@ function ensureWorker(dbPath: string): Worker {
     : new Worker(script, options);
   w.unref(); // ref()ed only while tasks are pending (see syncRef)
   w.on("message", (res: StatsWorkerResponse) => {
-    const p = pending.get(res.id);
+    const p = st.pending.get(res.id);
     if (!p) return;
-    pending.delete(res.id);
-    syncRef();
+    st.pending.delete(res.id);
+    syncRef(lane);
     clearTimeout(p.timer);
     const durationMs = Date.now() - p.postedAt;
     if (res.ok) {
@@ -197,30 +240,30 @@ function ensureWorker(dbPath: string): Worker {
       p.resolve(res.result);
     } else {
       const err = new Error(res.error);
-      recordFailure(p.key, err, durationMs);
+      recordFailure(p.key, err, durationMs, p.breakable);
       p.reject(err);
     }
   });
   w.on("error", (e: Error) => {
-    if (worker !== w) return;
-    dropWorker();
-    failAllPending(new Error(`stats worker error: ${e.message}`), true);
+    if (st.worker !== w) return;
+    dropWorker(lane);
+    failAllPending(lane, new Error(`stats worker error: ${e.message}`), true);
   });
   w.on("exit", (code) => {
-    if (worker !== w) return;
-    dropWorker();
-    failAllPending(new Error(`stats worker exited (code ${code})`), true);
+    if (st.worker !== w) return;
+    dropWorker(lane);
+    failAllPending(lane, new Error(`stats worker exited (code ${code})`), true);
   });
-  worker = w;
-  workerDbPath = dbPath;
+  st.worker = w;
+  st.workerDbPath = dbPath;
   return w;
 }
 
 /**
- * Runs one stats task in the worker against the DB file at `dbPath`.
- * Rejects on task error, worker crash, or timeout (the worker is then
- * replaced on the next call). Durations include time queued behind other
- * tasks in the worker.
+ * Runs one stats task in its lane's worker (statsTaskLane) against the DB
+ * file at `dbPath`. Rejects on task error, worker crash, or timeout (the
+ * worker is then replaced on the next call). Durations include time queued
+ * behind other tasks in the same lane's worker.
  */
 export function runStatsTaskOffThread<T>(
   dbPath: string,
@@ -228,12 +271,15 @@ export function runStatsTaskOffThread<T>(
   timeoutMs: number = OFFTHREAD_TASK_TIMEOUT_MS
 ): Promise<T> {
   const key = statsTaskKey(task);
+  const lane = statsTaskLane(task);
+  const breakable = lane !== "admin";
+  const pending = lanes[lane].pending;
   let w: Worker;
   try {
-    w = ensureWorker(dbPath);
+    w = ensureWorker(lane, dbPath);
   } catch (e) {
     const err = new Error(`stats worker could not start: ${e instanceof Error ? e.message : String(e)}`);
-    recordFailure(key, err, 0);
+    recordFailure(key, err, 0, breakable);
     return Promise.reject(err);
   }
   const id = nextId++;
@@ -242,18 +288,18 @@ export function runStatsTaskOffThread<T>(
     const timer = setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
-      syncRef();
+      syncRef(lane);
       const err = new Error(`stats task ${key} timed out after ${timeoutMs} ms`);
-      recordFailure(key, err, Date.now() - postedAt);
+      recordFailure(key, err, Date.now() - postedAt, breakable);
       // A task that overruns this long is stuck; replace the worker. Tasks
       // queued behind it are rejected without blame and retried on their
       // next read.
-      dropWorker();
-      failAllPending(new Error(`stats worker replaced after ${key} timed out`), false);
+      dropWorker(lane);
+      failAllPending(lane, new Error(`stats worker replaced after ${key} timed out`), false);
       reject(err);
     }, timeoutMs);
     timer.unref();
-    pending.set(id, { key, postedAt, resolve: resolve as (v: unknown) => void, reject, timer });
+    pending.set(id, { key, breakable, postedAt, resolve: resolve as (v: unknown) => void, reject, timer });
     if (pending.size === 1) w.ref();
     const req: StatsWorkerRequest = { id, task };
     w.postMessage(req);
@@ -261,8 +307,12 @@ export function runStatsTaskOffThread<T>(
 }
 
 export interface OffThreadStatsState {
+  /** True when any lane's worker is running. */
   workerRunning: boolean;
+  /** Tasks pending across all lanes. */
   pendingTasks: number;
+  /** Per-lane worker state (background = periodic refreshes, admin = admin dashboard). */
+  lanes: Record<StatsLane, { workerRunning: boolean; pendingTasks: number }>;
   /** Highest current run of consecutive failures across tasks. */
   consecutiveFailures: number;
   failuresByTask: Record<string, number>;
@@ -282,9 +332,12 @@ export interface OffThreadStatsState {
 export function getOffThreadStatsState(): OffThreadStatsState {
   let max = 0;
   for (const n of failuresByTask.values()) max = Math.max(max, n);
+  const laneState = {} as Record<StatsLane, { workerRunning: boolean; pendingTasks: number }>;
+  for (const l of LANES) laneState[l] = { workerRunning: lanes[l].worker !== null, pendingTasks: lanes[l].pending.size };
   return {
-    workerRunning: worker !== null,
-    pendingTasks: pending.size,
+    workerRunning: LANES.some((l) => lanes[l].worker !== null),
+    pendingTasks: LANES.reduce((n, l) => n + lanes[l].pending.size, 0),
+    lanes: laneState,
     consecutiveFailures: max,
     failuresByTask: Object.fromEntries(failuresByTask),
     lastRuns: Object.fromEntries(lastRuns),
@@ -307,6 +360,13 @@ export interface SwrCacheOptions<V> {
   retryAfterMs?: number;
   now?: () => number;
   onError?: (key: string, err: unknown) => void;
+  /**
+   * Optional cap on stored values. When a new key would exceed it, the
+   * least recently written key is dropped. Unset = unbounded (the fixed-key
+   * caches); the admin statistics use it because their keys carry
+   * caller-chosen window sizes.
+   */
+  maxEntries?: number;
 }
 
 export interface SwrHit<V> {
@@ -354,7 +414,7 @@ export function createSwrCache<V>(opts: SwrCacheOptions<V>): SwrCache<V> {
     const tracked: Promise<void> = p.then(
       (value) => {
         if (gen !== generation) return;
-        entries.set(key, { value, at: now() });
+        store(key, value);
         lastFailureAt.delete(key);
       },
       (err) => {
@@ -373,6 +433,19 @@ export function createSwrCache<V>(opts: SwrCacheOptions<V>): SwrCache<V> {
     return tracked;
   }
 
+  function store(key: string, value: V): void {
+    // Re-insert so Map order is "least recently written first".
+    entries.delete(key);
+    entries.set(key, { value, at: now() });
+    if (opts.maxEntries !== undefined) {
+      while (entries.size > Math.max(1, opts.maxEntries)) {
+        const oldest = entries.keys().next().value as string;
+        entries.delete(oldest);
+        lastFailureAt.delete(oldest);
+      }
+    }
+  }
+
   return {
     get(key) {
       const e = entries.get(key);
@@ -381,7 +454,7 @@ export function createSwrCache<V>(opts: SwrCacheOptions<V>): SwrCache<V> {
       return e ? { value: e.value, ageMs: Math.max(0, t - e.at) } : undefined;
     },
     set(key, value) {
-      entries.set(key, { value, at: now() });
+      store(key, value);
     },
     has(key) {
       return entries.has(key);
@@ -402,19 +475,26 @@ export function createSwrCache<V>(opts: SwrCacheOptions<V>): SwrCache<V> {
 // ── Test hooks ────────────────────────────────────────────────────────
 
 export function __resetOffThreadStatsForTesting(): void {
-  failAllPending(new Error("reset for testing"), false);
-  dropWorker();
+  for (const l of LANES) {
+    failAllPending(l, new Error("reset for testing"), false);
+    dropWorker(l);
+  }
   failuresByTask.clear();
   lastRuns.clear();
   brokenKeys.clear();
   lastWalMode = null;
   walErrorLogged = false;
-  workerScriptOverride = null;
+  for (const l of LANES) workerScriptOverride[l] = null;
 }
 
-/** Points the manager at a different worker script (e.g. one that fails to load). */
-export function __setWorkerScriptForTesting(scriptPath: string | null): void {
-  failAllPending(new Error("stats worker replaced for testing"), false);
-  dropWorker();
-  workerScriptOverride = scriptPath;
+/**
+ * Points the manager at a different worker script (e.g. one that fails to
+ * load), for one lane or (no lane) for both.
+ */
+export function __setWorkerScriptForTesting(scriptPath: string | null, lane?: StatsLane): void {
+  for (const l of lane ? [lane] : LANES) {
+    failAllPending(l, new Error("stats worker replaced for testing"), false);
+    dropWorker(l);
+    workerScriptOverride[l] = scriptPath;
+  }
 }

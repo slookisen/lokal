@@ -4,7 +4,19 @@ import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/analytics-service";
 import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
-import { getPrunedPageViewsByPath, getPrunedExactPathViewCount } from "../services/analytics-rollup-reads";
+import {
+  computeVisitors,
+  computeTopPages,
+  computeUmbrellaTraffic,
+  type AdminStatsQuery,
+  type AdminSummary,
+  type Summary24Result,
+  type TopProducerRow,
+  type CityStatsRow,
+  type TopPageRow,
+  type UmbrellaTrafficBucket,
+} from "../services/admin-stats-compute";
+import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
 import { getOffThreadStatsState } from "../services/offthread-stats";
@@ -73,6 +85,26 @@ function verticalFilter(req: Request): { sql: string; params: string[] } {
  */
 
 const router = Router();
+
+// ─── Admin statistics off the main thread (serverheng skive 3) ──
+// /summary, /summary/:hours, /producers, /cities, /visitors, /pages and
+// /umbrella-traffic read through the admin stats reader (services/admin-stats.ts):
+// the queries run in the off-thread stats worker's admin lane with a
+// stale-while-revalidate cache (served values are at most 10 min old). The
+// closure passed to it is each route's original synchronous path, used only
+// for in-memory DBs, OFFTHREAD_STATS_DISABLED=1 and non-WAL DBs. A worker
+// failure with nothing recent enough cached is a 503, never a synchronous
+// fallback on the main thread.
+function readStats<T>(req: Request, query: AdminStatsQuery, computeSync: () => T) {
+  return adminStatsReaderFor(req.app).read<T>(query, computeSync);
+}
+
+function sendAdminStatsUnavailable(res: Response, error: string): void {
+  res.status(503).set("Retry-After", "30").json({
+    error: "Statistics temporarily unavailable (stats worker failed); try again shortly",
+    detail: error,
+  });
+}
 
 // ─── Simple auth check ──────────────────────────────────────────
 // In production, replace with proper JWT or session auth
@@ -200,18 +232,25 @@ router.post("/tag-owner", (req: Request, res: Response) => {
  * High-level analytics for the last 24 hours, plus a trailing-30-day `monthly_visits`
  * count (consumed by marketing-comms-agent's social-proof line).
  */
-router.get("/summary", (req: Request, res: Response) => {
+router.get("/summary", async (req: Request, res: Response) => {
   const vertical = parseVertical(req);
-  const summary = analyticsService.getSummary(24, vertical);
-  const monthlyVisits = analyticsService.getPageViewCount(24 * 30, vertical);
+  const r = await readStats<Summary24Result>(req, { name: "summary24", vertical }, () => ({
+    summary: analyticsService.getSummary(24, vertical),
+    monthlyVisits: analyticsService.getPageViewCount(24 * 30, vertical),
+    // B4 (additive): inbound utm_* attribution for the same 24h window.
+    utm: analyticsService.getUtmBreakdown(24, vertical),
+  }));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
+  }
   res.json({
     timeframe: "last 24 hours",
     vertical: vertical || "all",
     timestamp: new Date().toISOString(),
-    ...summary,
-    monthly_visits: monthlyVisits,
-    // B4 (additive): inbound utm_* attribution for the same 24h window.
-    utm: analyticsService.getUtmBreakdown(24, vertical),
+    ...r.value.summary,
+    monthly_visits: r.value.monthlyVisits,
+    utm: r.value.utm,
   });
 });
 
@@ -232,16 +271,22 @@ router.get("/utm", (req: Request, res: Response) => {
  * GET /admin/analytics/summary/:hours
  * High-level analytics for the last N hours
  */
-router.get("/summary/:hours", (req: Request, res: Response) => {
+router.get("/summary/:hours", async (req: Request, res: Response) => {
   const hoursParam = req.params.hours as string;
   const hours = Math.max(1, Math.min(87600, parseInt(hoursParam) || 24));
   const vertical = parseVertical(req);
-  const summary = analyticsService.getSummary(hours, vertical);
+  const r = await readStats<AdminSummary>(req, { name: "summary", hours, vertical }, () =>
+    analyticsService.getSummary(hours, vertical)
+  );
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
+  }
   res.json({
     timeframe: `last ${hours} hours`,
     vertical: vertical || "all",
     timestamp: new Date().toISOString(),
-    ...summary,
+    ...r.value,
   });
 });
 
@@ -252,11 +297,19 @@ router.get("/summary/:hours", (req: Request, res: Response) => {
  *   limit=20 (default)
  *   hours=24 (default)
  */
-router.get("/producers", (req: Request, res: Response) => {
+router.get("/producers", async (req: Request, res: Response) => {
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  const vertical = parseVertical(req);
 
-  const producers = analyticsService.getTopProducers(limit, hours, parseVertical(req));
+  const r = await readStats<TopProducerRow[]>(req, { name: "producers", limit, hours, vertical }, () =>
+    analyticsService.getTopProducers(limit, hours, vertical)
+  );
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
+  }
+  const producers = r.value;
   res.json({
     timeframe: `last ${hours} hours`,
     count: producers.length,
@@ -272,10 +325,18 @@ router.get("/producers", (req: Request, res: Response) => {
  * Query params:
  *   hours=24 (default)
  */
-router.get("/cities", (req: Request, res: Response) => {
+router.get("/cities", async (req: Request, res: Response) => {
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  const vertical = parseVertical(req);
 
-  const cities = analyticsService.getCityStats(hours, parseVertical(req));
+  const r = await readStats<CityStatsRow[]>(req, { name: "cities", hours, vertical }, () =>
+    analyticsService.getCityStats(hours, vertical)
+  );
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
+  }
+  const cities = r.value;
   res.json({
     timeframe: `last ${hours} hours`,
     count: cities.length,
@@ -585,39 +646,24 @@ router.get("/health", (_req: Request, res: Response) => {
  * GET /admin/analytics/visitors
  * Detailed visitor list with session info
  */
-router.get("/visitors", (req: Request, res: Response) => {
+router.get("/visitors", async (req: Request, res: Response) => {
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
   const limit = Math.min(200, parseInt(req.query.limit as string) || 50);
+  const vertical = parseVertical(req);
 
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    const visitors = db.prepare(`
-      SELECT
-        session_id as ipHash,
-        COUNT(*) as pageViews,
-        COUNT(DISTINCT path) as uniquePages,
-        MIN(created_at) as firstSeen,
-        MAX(created_at) as lastSeen,
-        source,
-        CASE
-          WHEN session_id LIKE '%mobile%' OR session_id LIKE '%iphone%' THEN 'mobile'
-          WHEN session_id LIKE '%tablet%' OR session_id LIKE '%ipad%' THEN 'tablet'
-          ELSE 'desktop'
-        END as device
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
-      GROUP BY session_id
-      ORDER BY pageViews DESC
-      LIMIT ?
-    `).all(cutoff, ...verticalFilter(req).params, limit) as any[];
-
-    res.json({ visitors });
-  } catch (err) {
-    console.error("[analytics] visitors error:", err);
-    res.json({ visitors: [] });
+  const r = await readStats<any[]>(req, { name: "visitors", hours, limit, vertical }, () => {
+    try {
+      return computeVisitors(getDb(), hours, limit, vertical, Date.now());
+    } catch (err) {
+      console.error("[analytics] visitors error:", err);
+      return [];
+    }
+  });
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  res.json({ visitors: r.value });
 });
 
 /**
@@ -653,72 +699,26 @@ router.get("/hourly", (req: Request, res: Response) => {
  * GET /admin/analytics/pages
  * Top pages by view count
  */
-router.get("/pages", (req: Request, res: Response) => {
+router.get("/pages", async (req: Request, res: Response) => {
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+  const vertical = parseVertical(req);
 
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    // Exclude automated vulnerability-scanner paths. These paths are hit by
-    // bots looking for vulnerable WordPress/PHP installs and aren't signal for
-    // what real users or AI agents are reading. They were previously polluting
-    // the top-20 (103 views on /wordpress/wp-admin/setup-config.php, etc).
-    const SCANNER_PATTERNS = [
-      "%wp-admin%", "%wp-login%", "%wp-includes%", "%wordpress%",
-      "%wlwmanifest%", "%xmlrpc%", "%/.env%", "%/.git%",
-      "%phpunit%", "%phpinfo%", "%setup-config%",
-    ];
-    const scannerExclusion = SCANNER_PATTERNS.map(() => "path NOT LIKE ?").join(" AND ");
-
-    // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
-    // foer-retention): check the pruned-day portion FIRST (same scanner-path
-    // exclusion, so a pruned scanner hit can't leak back in). When it's empty
-    // (ANALYTICS_ROLLUP_READ=false, or the window hasn't reached the
-    // retention boundary) the raw-only query below runs with its ORIGINAL
-    // SQL-level LIMIT and reproduces the exact pre-Skive-3 output byte-for-
-    // byte — no re-ranking risk on that (fast, common) path.
-    const prunedPages = getPrunedPageViewsByPath(cutoff, verticalFilter(req).params[0] as VerticalId | undefined, SCANNER_PATTERNS);
-
-    const rawQuery = `
-      SELECT
-        path,
-        COUNT(*) as views,
-        COUNT(DISTINCT session_id) as visitors
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
-        AND (${scannerExclusion})
-      GROUP BY path
-      ORDER BY views DESC
-    `;
-
-    let pages: Array<{ path: string; views: number; visitors: number }>;
-    if (prunedPages.length === 0) {
-      pages = db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS, limit) as any[];
-    } else {
-      // Blending path: a pruned-day contribution could promote a path past
-      // the raw-only top N, so fetch ALL raw groups (no LIMIT) and re-rank.
-      const rawPages = db.prepare(rawQuery).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS) as any[];
-      const byPath = new Map<string, { path: string; views: number; visitors: number }>();
-      for (const p of rawPages) byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
-      for (const p of prunedPages) {
-        const existing = byPath.get(p.path);
-        if (existing) {
-          existing.views += p.views;
-          existing.visitors += p.visitors; // approximation — see helper's doc comment
-        } else {
-          byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
-        }
-      }
-      pages = [...byPath.values()].sort((a, b) => b.views - a.views).slice(0, limit);
+  // Query (scanner-path exclusion, time-window index, rollup blend):
+  // computeTopPages in services/admin-stats-compute.ts.
+  const r = await readStats<TopPageRow[]>(req, { name: "pages", hours, limit, vertical }, () => {
+    try {
+      return computeTopPages(getDb(), hours, limit, vertical, Date.now());
+    } catch (err) {
+      console.error("[analytics] pages error:", err);
+      return [];
     }
-
-    res.json({ pages });
-  } catch (err) {
-    console.error("[analytics] pages error:", err);
-    res.json({ pages: [] });
+  });
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  res.json({ pages: r.value });
 });
 
 // ─── Device classification for /devices (Enheter widget) ────────────────
@@ -1707,7 +1707,7 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 //   since_hours=24 (default, min 1, max 87600 = 10y)
 //
 // Response shape — see PR-74 spec in repo notes.
-router.get("/umbrella-traffic", (req: Request, res: Response) => {
+router.get("/umbrella-traffic", async (req: Request, res: Response) => {
   // Markedsnettverk (umbrellas) are an rfb-only concept. Never expose on a
   // locked secondary host even though the dashboard hides the panel there.
   if (lockedVerticalForHost(req)) {
@@ -1728,171 +1728,22 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
   }
   const sinceHours = Math.max(1, Math.min(87600, parseInt(String(rawHours || "24"), 10) || 24));
 
+  // Per umbrella: members via agent_affiliations, then four counts over
+  // analytics_page_views on the exact /produsent/<slug> paths (the path
+  // column is indexed), blended with the pruned-day rollup where the rollup
+  // matches 1:1. Queries: computeUmbrellaTraffic in admin-stats-compute.ts.
   try {
-    const db = getDb();
-
-    // Slugify mirror of src/utils/slug.ts. Inline here because SQLite
-    // can't call into TS — we slugify each umbrella + member name in
-    // JS and then query with the resulting paths. The path column is
-    // indexed (idx_analytics_page_views_path).
-    const slugify = (text: string): string =>
-      (text || "")
-        .normalize("NFC")
-        .toLowerCase()
-        .replace(/æ/g, "ae")
-        .replace(/ø/g, "o")
-        .replace(/å/g, "a")
-        .replace(/ä/g, "a")
-        .replace(/ö/g, "o")
-        .replace(/ü/g, "u")
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
-
-    // ── 1. List umbrellas ─────────────────────────────────────
-    const umbrellas = db.prepare(`
-      SELECT id, name, umbrella_type
-      FROM agents
-      WHERE umbrella_type IS NOT NULL
-        AND (is_active IS NULL OR is_active = 1)
-      ORDER BY name
-    `).all() as Array<{ id: string; name: string; umbrella_type: string }>;
-
-    if (umbrellas.length === 0) {
-      res.json({ success: true, since_hours: sinceHours, umbrellas: [] });
+    const r = await readStats<UmbrellaTrafficBucket[]>(req, { name: "umbrellaTraffic", sinceHours }, () =>
+      computeUmbrellaTraffic(getDb(), sinceHours, Date.now())
+    );
+    if (!r.ok) {
+      sendAdminStatsUnavailable(res, r.error);
       return;
     }
-
-    // ── 2. For each umbrella, gather members + counts ─────────
-    // We intentionally run one round-trip per umbrella. There are
-    // typically <30 umbrellas across the whole platform and the
-    // per-umbrella query is bounded by the size of its membership
-    // list, so a single batched IN-clause would be a wash on cost
-    // and significantly less readable.
-    const cutoff = sqliteDatetime(new Date(Date.now() - sinceHours * 3600 * 1000));
-
-    // AI / bot UA tokens — match the bucket used elsewhere in this
-    // file (producer-outcomes) so the meaning of "AI bot view" is
-    // consistent across widgets.
-    const AI_TOKENS = [
-      "GPTBot", "ChatGPT", "OAI-SearchBot",
-      "ClaudeBot", "Claude-User", "Anthropic",
-      "Googlebot", "Google-Extended", "Gemini",
-      "PerplexityBot", "Perplexity-User",
-      "Bytespider", "CCBot", "Applebot", "YandexBot", "bingbot",
-    ];
-    const aiClause = AI_TOKENS.map(() => "session_id LIKE ?").join(" OR ");
-    const aiParams = AI_TOKENS.map(t => `%${t}%`);
-
-    const memberCountStmt = db.prepare(`
-      SELECT COUNT(*) as c FROM agent_affiliations
-      WHERE umbrella_id = ? AND status = 'active'
-    `);
-    const memberNamesStmt = db.prepare(`
-      SELECT a.name FROM agent_affiliations af
-      JOIN agents a ON a.id = af.producer_id
-      WHERE af.umbrella_id = ? AND af.status = 'active'
-    `);
-
-    type Bucket = {
-      id: string;
-      name: string;
-      umbrella_type: string;
-      active_members: number;
-      pageViews_total: number;
-      pageViews_via_profile: number;
-      pageViews_via_members: number;
-      ai_bot_pageviews: number;
-      search_referrals: number;
-    };
-
-    const out: Bucket[] = [];
-
-    for (const u of umbrellas) {
-      const activeMembers = (memberCountStmt.get(u.id) as { c: number }).c;
-      const memberNames = memberNamesStmt.all(u.id) as Array<{ name: string }>;
-
-      const umbrellaPath = `/produsent/${slugify(u.name)}`;
-      const memberPaths = memberNames
-        .map(m => `/produsent/${slugify(m.name)}`)
-        .filter(p => p !== "/produsent/"); // skip blank-name members
-
-      // pageViews_via_profile — hits on umbrella's own /produsent/<slug>
-      const profileRow = db.prepare(`
-        SELECT COUNT(*) as c FROM analytics_page_views
-        WHERE path = ?
-          AND created_at > ?
-          AND (is_owner IS NULL OR is_owner = 0)
-      `).get(umbrellaPath, cutoff) as { c: number };
-      // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
-      // foer-retention): page_view_daily's `path` column matches these exact
-      // paths 1:1, so via_profile/via_members/search_referrals blend cleanly
-      // with the pruned-day rollup portion (+0, unchanged, when the flag is
-      // off or the window hasn't reached the retention boundary).
-      const pageViews_via_profile = profileRow.c + getPrunedExactPathViewCount([umbrellaPath], cutoff);
-
-      // pageViews_via_members — hits on any member's /produsent/<slug>
-      let pageViews_via_members = 0;
-      if (memberPaths.length > 0) {
-        const placeholders = memberPaths.map(() => "?").join(",");
-        const memberRow = db.prepare(`
-          SELECT COUNT(*) as c FROM analytics_page_views
-          WHERE path IN (${placeholders})
-            AND created_at > ?
-            AND (is_owner IS NULL OR is_owner = 0)
-        `).get(...memberPaths, cutoff) as { c: number };
-        pageViews_via_members = memberRow.c + getPrunedExactPathViewCount(memberPaths, cutoff);
-      }
-
-      // ai_bot_pageviews — either channel, UA matches known bot token.
-      // NOT blended: this AI_TOKENS allow-list (Googlebot, Gemini,
-      // PerplexityBot, …) does not line up 1:1 with rollup's bot_type
-      // buckets beyond chatgpt/claude (see getPrunedChatgptClaudeCounts's
-      // doc comment in analytics-rollup-reads.ts for why) — a partial blend
-      // here would silently change WHICH bots count, not just how far back
-      // the count reaches. Documented known gap: stays raw-only, same as
-      // pre-Skive-3 (undercounts once the window reaches past the retention
-      // boundary, but never crashes or drops to a fabricated zero).
-      const allPaths = [umbrellaPath, ...memberPaths];
-      const pathPlaceholders = allPaths.map(() => "?").join(",");
-      const aiRow = db.prepare(`
-        SELECT COUNT(*) as c FROM analytics_page_views
-        WHERE path IN (${pathPlaceholders})
-          AND created_at > ?
-          AND (is_owner IS NULL OR is_owner = 0)
-          AND (${aiClause})
-      `).get(...allPaths, cutoff, ...aiParams) as { c: number };
-      const ai_bot_pageviews = aiRow.c;
-
-      // search_referrals — either channel, source = 'search'
-      const searchRow = db.prepare(`
-        SELECT COUNT(*) as c FROM analytics_page_views
-        WHERE path IN (${pathPlaceholders})
-          AND created_at > ?
-          AND (is_owner IS NULL OR is_owner = 0)
-          AND source = 'search'
-      `).get(...allPaths, cutoff) as { c: number };
-      const search_referrals = searchRow.c + getPrunedExactPathViewCount(allPaths, cutoff, { source: "search" });
-
-      out.push({
-        id: u.id,
-        name: u.name,
-        umbrella_type: u.umbrella_type,
-        active_members: activeMembers,
-        pageViews_total: pageViews_via_profile + pageViews_via_members,
-        pageViews_via_profile,
-        pageViews_via_members,
-        ai_bot_pageviews,
-        search_referrals,
-      });
-    }
-
-    // Sorted by total pageViews descending — most-trafficked first
-    out.sort((a, b) => b.pageViews_total - a.pageViews_total);
-
     res.json({
       success: true,
       since_hours: sinceHours,
-      umbrellas: out,
+      umbrellas: r.value,
     });
   } catch (err: any) {
     res.status(500).json({ error: "Query failed", detail: err.message });

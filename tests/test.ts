@@ -32413,6 +32413,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ots.failures) failures.push("offthread-stats: " + f);
     console.log(`  offthread-stats: ${ots.passed} passed, ${ots.failed} failed`);
 
+    // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-
+    // samtaler, skive 3: admin-dashboard statistics in the stats worker's own
+    // lane with SWR; grouped /cities + /producers queries; INDEXED BY the
+    // time-window index; 503 on worker failure. Runs after offthread-stats
+    // (both reset the worker manager) in this same sequential block. Routes
+    // get their reader via app.set(), so no global is swapped.
+    console.log("\n── admin-stats: admin statistics off the main thread ──");
+    const { runAdminStatsTests } = require("../src/services/admin-stats.test") as
+      typeof import("../src/services/admin-stats.test");
+    const ast = await runAdminStatsTests({ log: false });
+    passed += ast.passed;
+    failed += ast.failed;
+    for (const f of ast.failures) failures.push("admin-stats: " + f);
+    console.log(`  admin-stats: ${ast.passed} passed, ${ast.failed} failed`);
+
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
     // wrapper over the EXISTING booking chain (BookingInputSchema,
