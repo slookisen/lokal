@@ -46659,6 +46659,9 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("agentplatform-partners: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // AGENTPLATFORM.NO AS on rettfrabonden.com, opplevagent.no and finn-tannlege.com —
 // footer line (NO/EN) on every site, /kontakt § 8 facts with each site's own
