@@ -251,7 +251,7 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
     log: () => {},
   });
   off.prewarm();
-  check("e6: prewarm() starts the off-thread refresh (not ready before it lands)", offCalls === 1);
+  check("e6: prewarm() starts the off-thread refresh, and the figure is not ready before it lands", offCalls === 1 && off.snapshot().ready === false && offCalls === 1);
   await off.settled();
   const o1 = off.snapshot();
   const o2 = off.snapshot();
