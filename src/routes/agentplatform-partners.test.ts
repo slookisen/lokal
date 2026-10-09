@@ -143,11 +143,19 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
 
     // ── (d) front page founder + teaser ──────────────────────────────────
     check("d1: founder name and role in Om oss", home.body.includes("<strong>Daniel Fredriksen</strong><span>Gründer og daglig leder"));
-    check("d2: no LinkedIn link while COMPANY_INFO.founder.linkedin is null", !home.body.includes("linkedin.com"));
+    check(
+      "d2: LinkedIn link next to the founder, and nowhere else on the page",
+      home.body.includes('<a href="https://www.linkedin.com/in/danielfredriksen" rel="me noopener">LinkedIn-profil</a>') &&
+        (home.body.match(/linkedin\.com/g) || []).length === 2, // founder link + JSON-LD sameAs
+    );
     const ld = home.body.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
     let json: any = null;
     try { json = ld ? JSON.parse(ld[1]) : null; } catch { json = null; }
-    check("d3: JSON-LD founder Person", json?.founder?.["@type"] === "Person" && json?.founder?.name === "Daniel Fredriksen");
+    check(
+      "d3: JSON-LD founder Person with LinkedIn sameAs",
+      json?.founder?.["@type"] === "Person" && json?.founder?.name === "Daniel Fredriksen" &&
+        json?.founder?.sameAs?.[0] === "https://www.linkedin.com/in/danielfredriksen",
+    );
     check("d4: partner teaser on the front page links to /partnere", home.body.includes('<a class="teaser" href="/partnere">'));
     const enHome = await get("/en");
     check("d5: English front page: founder role + teaser to /en/partners", enHome.body.includes("Founder and CEO") && enHome.body.includes('<a class="teaser" href="/en/partners">'));

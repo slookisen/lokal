@@ -45,8 +45,8 @@ export const COMPANY_INFO = Object.freeze({
   founder: Object.freeze({
     name: "Daniel Fredriksen",
     role: Object.freeze({ nb: "Gründer og daglig leder", en: "Founder and CEO" }),
-    /** Profile URL, or null until Daniel confirms it — the link is rendered only when set. */
-    linkedin: null as string | null,
+    /** Profile URL (Daniel live 2026-10-09). Set to null to hide the link. */
+    linkedin: "https://www.linkedin.com/in/danielfredriksen" as string | null,
   }),
 });
 
