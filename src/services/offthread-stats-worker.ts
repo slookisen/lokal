@@ -23,12 +23,15 @@ import type { VerticalId } from "./analytics-service";
 import { computeTrafficStats } from "./traffic-stats-compute";
 import { computePageViewCounts } from "./health-counts-compute";
 import { runAdminStatsQuery, type AdminStatsQuery } from "./admin-stats-compute";
+import { computeAgentToolCalls } from "./agent-usage-compute";
 
 export type StatsTask =
   | { kind: "trafficStats"; vertical?: VerticalId; windowDays: number }
   | { kind: "pageViewCounts"; nowMs: number }
   // Admin-dashboard statistics (admin-stats.ts); runs in the "admin" lane's worker.
-  | { kind: "adminStats"; query: AdminStatsQuery; nowMs: number };
+  | { kind: "adminStats"; query: AdminStatsQuery; nowMs: number }
+  // Public tool-call count for agentplatform.no (agent-usage.ts).
+  | { kind: "agentToolCalls"; nowMs: number; windowDays: number };
 
 export interface StatsWorkerRequest {
   id: number;
@@ -47,6 +50,8 @@ export function runStatsTask(db: Database.Database, task: StatsTask): unknown {
       return computePageViewCounts(db, task.nowMs);
     case "adminStats":
       return runAdminStatsQuery(db, task.query, task.nowMs);
+    case "agentToolCalls":
+      return computeAgentToolCalls(db, task.nowMs, task.windowDays);
     default:
       throw new Error(`unknown stats task: ${JSON.stringify(task)}`);
   }

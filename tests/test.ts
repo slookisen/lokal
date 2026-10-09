@@ -46640,3 +46640,24 @@ runSerial(async () => {
     failures.push("agentplatform-site: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-09-agentplatform-partnerside: /partnere on
+// agentplatform.no (figures with definitions, hidden when missing or zero,
+// investor disclaimer, no prices or partner names), founder on the front page,
+// and the off-thread "agentToolCalls" count (real MCP tool calls only).
+// Local HTTP server + an in-memory DB of its own — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── agentplatform.no partner page + agent tool-call count ──");
+  try {
+    const { runAgentplatformPartnersTests } = require("../src/routes/agentplatform-partners.test") as
+      typeof import("../src/routes/agentplatform-partners.test");
+    const pp = await runAgentplatformPartnersTests({ log: false });
+    passed += pp.passed;
+    failed += pp.failed;
+    for (const f of pp.failures) failures.push("agentplatform-partners: " + f);
+    console.log(`  agentplatform-partners: ${pp.passed} passed, ${pp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agentplatform-partners: unexpected error: " + String(err?.message || err));
+  }
+});

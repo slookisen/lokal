@@ -30,6 +30,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { safeHonestCatalogCount, type CatalogVertical } from "../services/honest-count";
 import { COMPANY_INFO } from "../config/company-info";
+import { getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { getAgentToolCallsSnapshot } from "../services/agent-usage";
 
 export const AGENTPLATFORM_HOSTS = new Set(["agentplatform.no", "www.agentplatform.no"]);
 /**
@@ -160,9 +162,85 @@ export const COUNT_TTL_MS = 10 * 60_000;
 export const COUNT_RETRY_MS = 30_000;
 export type ServiceCounts = Record<CatalogVertical, number | null>;
 
+export interface TrafficReading {
+  realVisitors: number;
+  aiCrawlerViews: number;
+  windowDays: number;
+}
+
+export interface AgentCallReading {
+  toolCalls: number;
+  windowDays: number;
+}
+
 export interface AgentplatformDeps {
   readCount: (v: CatalogVertical) => number | null;
+  /** Cached off-thread traffic stats for one service; null until they are ready. */
+  readTraffic: (v: CatalogVertical) => TrafficReading | null;
+  /** Cached off-thread tool-call count; null until it is ready. */
+  readAgentCalls: () => AgentCallReading | null;
   now: () => number;
+}
+
+function defaultReadTraffic(v: CatalogVertical): TrafficReading | null {
+  try {
+    const snap = getTrafficStatsSnapshot(v);
+    if (!snap.ready) return null;
+    return { realVisitors: snap.stats.realVisitors, aiCrawlerViews: snap.stats.aiCrawlerViews, windowDays: snap.stats.windowDays };
+  } catch {
+    return null;
+  }
+}
+
+function defaultReadAgentCalls(): AgentCallReading | null {
+  try {
+    const snap = getAgentToolCallsSnapshot();
+    return snap.ready ? { toolCalls: snap.stats.toolCalls, windowDays: snap.stats.windowDays } : null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Platform metrics for /partnere (Daniel live 2026-10-09) ─────────────────
+// Every number is shown only when it is real: all three services must report
+// (a sum over two of three would understate silently and is hidden instead),
+// and 0 is treated as "no data", never printed.
+export interface PlatformMetrics {
+  catalogTotal: number | null;
+  humanVisits: number | null;
+  aiCrawlerViews: number | null;
+  trafficWindowDays: number | null;
+  agentToolCalls: number | null;
+  agentWindowDays: number | null;
+}
+
+export function collectPlatformMetrics(deps: Pick<AgentplatformDeps, "readTraffic" | "readAgentCalls">, counts: ServiceCounts): PlatformMetrics {
+  const verticals: CatalogVertical[] = ["rfb", "experiences", "dental"];
+  const catalog = verticals.map((v) => counts[v]);
+  const catalogTotal = catalog.every((n) => n != null) ? catalog.reduce((a: number, n) => a + (n as number), 0) : null;
+  const traffic = verticals.map((v) => deps.readTraffic(v));
+  const allTraffic = traffic.every((t) => t != null) ? (traffic as TrafficReading[]) : null;
+  const humanVisits = allTraffic ? allTraffic.reduce((a, t) => a + t.realVisitors, 0) : null;
+  const aiCrawlerViews = allTraffic ? allTraffic.reduce((a, t) => a + t.aiCrawlerViews, 0) : null;
+  const windows = allTraffic ? new Set(allTraffic.map((t) => t.windowDays)) : null;
+  const trafficWindowDays = windows && windows.size === 1 ? [...windows][0] : null;
+  const agent = deps.readAgentCalls();
+  const positive = (n: number | null) => (n != null && Number.isFinite(n) && n > 0 ? n : null);
+  return {
+    catalogTotal: positive(catalogTotal),
+    humanVisits: trafficWindowDays ? positive(humanVisits) : null,
+    aiCrawlerViews: trafficWindowDays ? positive(aiCrawlerViews) : null,
+    trafficWindowDays,
+    agentToolCalls: agent ? positive(agent.toolCalls) : null,
+    agentWindowDays: agent ? agent.windowDays : null,
+  };
+}
+
+/** "At least" display: 123 456 → 123 000, 5 527 → 5 500, 812 → 812 (always rounded down). */
+export function floorForTile(n: number): number {
+  if (n >= 10_000) return Math.floor(n / 1000) * 1000;
+  if (n >= 1000) return Math.floor(n / 100) * 100;
+  return n;
 }
 
 function makeCountCache(deps: AgentplatformDeps) {
@@ -195,6 +273,69 @@ const T = {
     navPlatform: "Plattformen",
     navAbout: "Om oss",
     navContact: "Kontakt",
+    navPartners: "Partnere",
+    partnersHref: "/partnere",
+    teaserKicker: "Samarbeid",
+    teaserTitle: "For plattformer og bransjeaktører",
+    teaserBody:
+      "Representerer du produsenter, gårder, opplevelsestilbydere eller klinikker? Vi kan gjøre tilbudene synlige for AI-assistenter – i våre tjenester, eller koblet til deres egen tjeneste etter avtale.",
+    teaserCta: "Les om partnerskap",
+    founderLabel: "Daglig leder",
+    founderLinkedIn: "LinkedIn-profil",
+    pTitle: "Partnerskap – Agentplatform.no AS",
+    pDescription:
+      "Samarbeid med Agentplatform.no AS: gjør produsenter, opplevelser og andre lokale tilbud synlige for AI-assistenter. Tall, samarbeidsform og kontakt.",
+    pKicker: "For partnere",
+    pH1: "Gjør tilbydere synlige der folk spør AI-assistenter",
+    pLead:
+      "Vi samarbeider med plattformer, organisasjoner og bransjeaktører som representerer lokale tilbydere. Sammen sørger vi for at tilbudene blir funnet – både av folk som søker selv, og av ChatGPT, Claude og andre assistenter som søker for dem.",
+    pCta: "Ta kontakt",
+    pCtaSecondary: "Se tallene",
+    pMailSubject: "Samarbeid",
+    pOfferKicker: "Hva vi kan tilby",
+    pOfferTitle: "Tre måter å samarbeide på",
+    pOffers: [
+      {
+        title: "Synlighet i tjenestene våre",
+        body: "Tilbyderne dere representerer presenteres samlet i Rett fra Bonden, Opplevagent eller Finn-tannlege, med kontrollerte opplysninger og lenke tilbake til dere.",
+      },
+      {
+        title: "Agent-tilgang til katalogen deres",
+        body: "Vi kan gjøre katalogen deres søkbar for AI-agenter gjennom MCP og A2A, koblet til deres egen tjeneste etter avtale.",
+      },
+      {
+        title: "Data og grensesnitt",
+        body: "Åpne grensesnitt og strukturerte data om tilbudene, til bruk i egne tjenester etter avtale.",
+      },
+    ],
+    pMetricsKicker: "Plattformen i tall",
+    pMetricsTitle: "Bruk vi kan dokumentere",
+    pMetricsLead:
+      "Tallene hentes automatisk fra plattformens egen statistikk og gjelder Rett fra Bonden, Opplevagent og Finn-tannlege samlet. De rundes ned.",
+    mCatalogLabel: "oppføringer i katalogene",
+    mCatalogDef: "Aktive, publiserte oppføringer akkurat nå.",
+    mHumanLabel: (d: number) => `besøk fra mennesker siste ${d} dager`,
+    mHumanDef: "Økter som ikke er identifisert som roboter, crawlere eller søkemotorer.",
+    mCrawlerLabel: (d: number) => `sidevisninger fra AI-crawlere siste ${d} dager`,
+    mCrawlerDef: "Henting fra kjente KI-crawlere som GPTBot og ClaudeBot.",
+    mAgentLabel: (d: number) => `verktøykall fra AI-agenter siste ${d} dager`,
+    mAgentDef: "Kall til søke- og oppslagsverktøyene via MCP. Oppkobling og kjente register- og overvåkingsprober er holdt utenfor.",
+    pStepsKicker: "Slik samarbeider vi",
+    pStepsTitle: "Fra samtale til avtale",
+    pSteps: [
+      { title: "Samtale", body: "Vi går gjennom hvem dere representerer og hva dere vil oppnå." },
+      { title: "Pilot", body: "Et avgrenset utvalg tilbydere, med målbar effekt før dere bestemmer dere." },
+      { title: "Avtale", body: "En fast avtale tilpasset omfanget." },
+    ],
+    pInvKicker: "For investorer",
+    pInvTitle: "Tidlig fase, åpen for de riktige partnerne",
+    pInvBody:
+      "Agentplatform.no AS eies i dag av gründeren og er i en tidlig fase. Vi er åpne for dialog med strategiske investorer som kan bidra med kunder, bransjetilgang eller distribusjon, og som deler målet om å gjøre lokale tilbydere synlige for AI-assistenter.",
+    pInvCta: "Ta kontakt for en samtale",
+    pInvMailSubject: "Investering",
+    pDisclaimer: "Informasjonen på denne siden er ikke et tilbud om kjøp eller tegning av aksjer i Agentplatform.no AS.",
+    pContactTitle: "La oss snakke sammen",
+    pContactBody: "Fortell kort hvem dere er og hva dere ønsker å få til, så tar vi kontakt for en samtale.",
     langSwitch: "English",
     langSwitchShort: "EN",
     langSwitchHref: "/en",
@@ -286,6 +427,69 @@ const T = {
     navPlatform: "Platform",
     navAbout: "About",
     navContact: "Contact",
+    navPartners: "Partners",
+    partnersHref: "/en/partners",
+    teaserKicker: "Partnerships",
+    teaserTitle: "For platforms and industry players",
+    teaserBody:
+      "Do you represent producers, farms, experience providers or clinics? We can make their offerings visible to AI assistants – in our services, or connected to your own service by agreement.",
+    teaserCta: "Read about partnerships",
+    founderLabel: "CEO",
+    founderLinkedIn: "LinkedIn profile",
+    pTitle: "Partnerships – Agentplatform.no AS",
+    pDescription:
+      "Partner with Agentplatform.no AS: make producers, experiences and other local offerings visible to AI assistants. Figures, ways of working and contact.",
+    pKicker: "For partners",
+    pH1: "Make providers visible where people ask AI assistants",
+    pLead:
+      "We work with platforms, organisations and industry players that represent local providers. Together we make sure their offerings are found – by people searching themselves, and by ChatGPT, Claude and other assistants searching for them.",
+    pCta: "Get in touch",
+    pCtaSecondary: "See the figures",
+    pMailSubject: "Partnership",
+    pOfferKicker: "What we offer",
+    pOfferTitle: "Three ways to work together",
+    pOffers: [
+      {
+        title: "Visibility in our services",
+        body: "The providers you represent are presented together in Rett fra Bonden, Opplevagent or Finn-tannlege, with checked details and a link back to you.",
+      },
+      {
+        title: "Agent access to your catalogue",
+        body: "We can make your catalogue searchable for AI agents through MCP and A2A, connected to your own service by agreement.",
+      },
+      {
+        title: "Data and interfaces",
+        body: "Open interfaces and structured data about the offerings, for use in your own services by agreement.",
+      },
+    ],
+    pMetricsKicker: "The platform in figures",
+    pMetricsTitle: "Usage we can document",
+    pMetricsLead:
+      "The figures come automatically from the platform's own statistics and cover Rett fra Bonden, Opplevagent and Finn-tannlege together. They are rounded down.",
+    mCatalogLabel: "listings in the directories",
+    mCatalogDef: "Active, published listings right now.",
+    mHumanLabel: (d: number) => `visits from people in the last ${d} days`,
+    mHumanDef: "Sessions not identified as bots, crawlers or search engines.",
+    mCrawlerLabel: (d: number) => `page views by AI crawlers in the last ${d} days`,
+    mCrawlerDef: "Fetches by known AI crawlers such as GPTBot and ClaudeBot.",
+    mAgentLabel: (d: number) => `tool calls from AI agents in the last ${d} days`,
+    mAgentDef: "Calls to the search and lookup tools over MCP. Connection set-up and known registry and monitoring probes are excluded.",
+    pStepsKicker: "How we work",
+    pStepsTitle: "From conversation to agreement",
+    pSteps: [
+      { title: "Conversation", body: "We go through who you represent and what you want to achieve." },
+      { title: "Pilot", body: "A limited set of providers, with measurable effect before you decide." },
+      { title: "Agreement", body: "A fixed agreement sized to the scope." },
+    ],
+    pInvKicker: "For investors",
+    pInvTitle: "Early stage, open to the right partners",
+    pInvBody:
+      "Agentplatform.no AS is currently owned by its founder and is at an early stage. We are open to conversations with strategic investors who can contribute customers, industry access or distribution, and who share the goal of making local providers visible to AI assistants.",
+    pInvCta: "Get in touch for a conversation",
+    pInvMailSubject: "Investment",
+    pDisclaimer: "The information on this page is not an offer to buy or subscribe for shares in Agentplatform.no AS.",
+    pContactTitle: "Let's talk",
+    pContactBody: "Tell us briefly who you are and what you want to achieve, and we will get back to you for a conversation.",
     langSwitch: "Norsk",
     langSwitchShort: "NO",
     langSwitchHref: "/",
@@ -587,6 +791,50 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 .nf-links a:hover{border-color:var(--line-2)}
 .nf-links svg{width:32px;height:32px;border-radius:8px}
 
+/* Partner teaser (front page) */
+.teaser{display:flex;align-items:center;justify-content:space-between;gap:32px;flex-wrap:wrap;padding:40px 44px;border-radius:28px;text-decoration:none;color:inherit;background:linear-gradient(120deg,var(--svc-rfb-tint),var(--svc-oa-tint) 55%,var(--svc-ft-tint));border:1px solid var(--line);transition:transform .2s,box-shadow .2s}
+.teaser:hover{transform:translateY(-2px);box-shadow:var(--shadow-hover)}
+.teaser h2{margin-top:8px}
+.teaser p:not(.kicker){color:var(--ink-2);max-width:62ch;margin:12px 0 0}
+.teaser .go{font-weight:600;white-space:nowrap}
+.teaser:hover .go svg{transform:translateX(4px)}
+@media (max-width:560px){.teaser{padding:28px 22px}}
+.founder{display:flex;flex-direction:column;gap:2px;margin-top:28px;padding-left:16px;border-left:3px solid var(--line-2)}
+.founder strong{font-weight:650}
+.founder span{color:var(--muted);font-size:15px}
+.founder a{color:inherit}
+
+/* Partner page */
+.hero-sub{padding:72px 0 40px}
+.hero-sub h1{font-size:clamp(34px,4.6vw,56px);max-width:20ch}
+.offers{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+@media (max-width:980px){.offers{grid-template-columns:1fr}}
+.offer{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:28px;box-shadow:var(--shadow)}
+.offer-n{font-size:13px;font-weight:650;letter-spacing:.12em;color:var(--muted)}
+.offer h3{font-size:21px;letter-spacing:-.01em;font-weight:650;margin:14px 0 0}
+.offer p{color:var(--ink-2);margin:8px 0 0;font-size:16px}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-top:44px}
+@media (max-width:1080px){.metrics{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.metrics{grid-template-columns:1fr}}
+.metric{display:flex;flex-direction:column;gap:6px;padding:24px;border:1px solid var(--band-line);border-radius:var(--radius);background:rgba(255,255,255,.03)}
+.metric strong{font-size:34px;letter-spacing:-.03em;font-weight:650;color:#fff;font-variant-numeric:tabular-nums}
+.metric .m-label{color:var(--band-ink);font-weight:550}
+.metric .m-def{color:var(--band-muted);font-size:14px;line-height:1.5}
+.steps{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);gap:20px;counter-reset:none}
+@media (max-width:980px){.steps{grid-template-columns:1fr}}
+.steps li{display:flex;gap:16px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+.step-n{flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:var(--brand);color:var(--on-brand);font-weight:650}
+.steps h3{margin:4px 0 0;font-size:19px;font-weight:650}
+.steps p{margin:6px 0 0;color:var(--ink-2);font-size:16px}
+.invest{border:1px solid var(--line);border-radius:28px;padding:44px;background:var(--bg-2)}
+.invest h2{margin-top:8px}
+.invest p:not(.kicker){color:var(--ink-2);max-width:66ch;margin:14px 0 0}
+.inline-cta{display:inline-flex;align-items:center;gap:8px;font-weight:600;color:var(--ink);text-decoration:none}
+.inline-cta svg{width:18px;height:18px;transition:transform .2s}
+.inline-cta:hover svg{transform:translateX(3px)}
+.invest .disclaimer{font-size:14px;color:var(--muted);margin-top:24px}
+@media (max-width:560px){.invest{padding:28px 22px}}
+
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
 @media (max-width:560px){.wrap{padding:0 20px}.hero{padding:56px 0 48px}section{padding:64px 0}.band{margin:0 8px;border-radius:24px;padding:64px 0}.card{padding:24px}}
 `;
@@ -625,6 +873,7 @@ function header(lang: Lang, solid: boolean): string {
 <a class="opt" href="${anchor("tjenester")}">${t.navServices}</a>
 <a class="opt" href="${anchor("plattformen")}">${t.navPlatform}</a>
 <a class="opt" href="${anchor("om")}">${t.navAbout}</a>
+<a class="opt" href="${t.partnersHref}">${t.navPartners}</a>
 <a class="opt" href="${t.contactHref}">${t.navContact}</a>
 <a class="lang" href="${t.langSwitchHref}" hreflang="${t.langSwitchHreflang}" lang="${t.langSwitchHreflang}"><span aria-hidden="true">${t.langSwitchShort}</span><span class="sr">${t.langSwitch}</span></a>
 </nav></div></header>`;
@@ -639,7 +888,7 @@ function footer(lang: Lang): string {
 <div class="ftr-grid">
 <div class="ftr-brand"><a class="brand" href="${home}">${AGENTPLATFORM_MARK}<span>agentplatform<span>.no</span></span></a><p>${t.footerTagline}</p></div>
 <div><h2 class="ftr-h">${t.footerServices}</h2><ul>${SERVICES.map((s) => `<li><a href="${esc(serviceUrl(s, lang))}">${esc(s.name)}</a></li>`).join("")}</ul></div>
-<div><h2 class="ftr-h">${t.footerCompany}</h2><ul><li><a href="${anchor("om")}">${t.navAbout}</a></li><li><a href="${t.contactHref}">${t.navContact}</a></li><li><a href="${t.privacyHref}">${t.footerPrivacy}</a></li><li><a href="${t.langSwitchHref}" hreflang="${t.langSwitchHreflang}" lang="${t.langSwitchHreflang}">${t.langSwitch}</a></li></ul></div>
+<div><h2 class="ftr-h">${t.footerCompany}</h2><ul><li><a href="${anchor("om")}">${t.navAbout}</a></li><li><a href="${t.partnersHref}">${t.navPartners}</a></li><li><a href="${t.contactHref}">${t.navContact}</a></li><li><a href="${t.privacyHref}">${t.footerPrivacy}</a></li><li><a href="${t.langSwitchHref}" hreflang="${t.langSwitchHreflang}" lang="${t.langSwitchHreflang}">${t.langSwitch}</a></li></ul></div>
 </div>
 <div class="ftr-base"><span>© ${year} <a href="${t.contactHref}">${COMPANY.legalName} · ${lang === "en" ? "Org. no." : "Org.nr."} ${COMPANY.orgNrDisplay}</a></span><span>${t.footerRegistered}</span></div>
 </div></footer>`;
@@ -713,6 +962,12 @@ function organizationJsonLd(lang: Lang): object {
       addressCountry: COMPANY.address.countryCode,
     },
     sameAs: [COMPANY.brregUrl],
+    founder: {
+      "@type": "Person",
+      name: COMPANY.founder.name,
+      jobTitle: COMPANY.founder.role[lang],
+      ...(COMPANY.founder.linkedin ? { sameAs: [COMPANY.founder.linkedin] } : {}),
+    },
     brand: SERVICES.map((s) => ({ "@type": "Brand", name: s.name, url: `https://${s.domain}` })),
   };
 }
@@ -805,12 +1060,21 @@ ${cards}
 </table>
 </div></section>
 
+<section id="samarbeid" aria-labelledby="samarbeid-h" style="padding-top:0"><div class="wrap">
+<a class="teaser" href="${t.partnersHref}">
+<div><p class="kicker">${t.teaserKicker}</p><h2 id="samarbeid-h">${t.teaserTitle}</h2><p>${esc(t.teaserBody)}</p></div>
+<span class="go">${t.teaserCta}${ARROW}</span>
+</a>
+</div></section>
+
 <section id="om" aria-labelledby="om-h"><div class="wrap about">
-<div><p class="kicker">${t.aboutKicker}</p><h2 id="om-h">${t.aboutTitle}</h2>${t.aboutBody.map((p) => `<p>${esc(p)}</p>`).join("")}</div>
+<div><p class="kicker">${t.aboutKicker}</p><h2 id="om-h">${t.aboutTitle}</h2>${t.aboutBody.map((p) => `<p>${esc(p)}</p>`).join("")}
+${founderBlock(lang)}</div>
 <div class="facts-card"><h3 class="facts-h">${t.factsTitle}</h3><dl>
 <div><dt>${t.factName}</dt><dd>${COMPANY.legalName}</dd></div>
 <div><dt>${t.factOrg}</dt><dd><a href="${COMPANY.brregUrl}" title="${esc(t.factOrgLinkTitle)}">${COMPANY.orgNrDisplay}</a></dd></div>
 <div><dt>${t.factFounded}</dt><dd>${t.factFoundedValue}</dd></div>
+<div><dt>${t.founderLabel}</dt><dd>${esc(COMPANY.founder.name)}</dd></div>
 <div><dt>${t.factRegister}</dt><dd>${t.factRegisterValue}</dd></div>
 <div><dt>${t.factEmail}</dt><dd><a href="mailto:${COMPANY.email}">${COMPANY.email}</a></dd></div>
 </dl><p class="facts-more"><a href="${t.contactHref}">${t.factsMore}${ARROW}</a></p></div>
@@ -831,6 +1095,93 @@ ${cards}
     alternates: { nb: "/", en: "/en" },
     body,
     jsonLd: organizationJsonLd(lang),
+  });
+}
+
+function founderBlock(lang: Lang): string {
+  const t = T[lang];
+  const f = COMPANY.founder;
+  const li = f.linkedin
+    ? ` · <a href="${esc(f.linkedin)}" rel="me noopener">${t.founderLinkedIn}</a>`
+    : "";
+  return `<p class="founder"><strong>${esc(f.name)}</strong><span>${esc(f.role[lang])}${li}</span></p>`;
+}
+
+function mailtoHref(subject: string): string {
+  return `mailto:${COMPANY.email}?subject=${encodeURIComponent(subject)}`;
+}
+
+// ─── Partners (+ a short section for investors) ─────────────────────────────
+// A2A dev-request 2026-10-09-agentplatform-partnerside. Deliberately NOT on the
+// page: prices, valuation, funding applications, names of prospective partners,
+// and how the platform is operated. No offer of shares (see pDisclaimer).
+export function renderPartners(lang: Lang, metrics: PlatformMetrics): string {
+  const t = T[lang];
+  const tiles: string[] = [];
+  const tile = (value: string, label: string, def: string) =>
+    `<div class="metric"><strong>${value}</strong><span class="m-label">${esc(label)}</span><span class="m-def">${esc(def)}</span></div>`;
+  if (metrics.catalogTotal != null) tiles.push(tile(formatCount(metrics.catalogTotal), t.mCatalogLabel, t.mCatalogDef));
+  if (metrics.humanVisits != null && metrics.trafficWindowDays != null)
+    tiles.push(tile(`${formatCount(floorForTile(metrics.humanVisits))}+`, t.mHumanLabel(metrics.trafficWindowDays), t.mHumanDef));
+  if (metrics.aiCrawlerViews != null && metrics.trafficWindowDays != null)
+    tiles.push(tile(`${formatCount(floorForTile(metrics.aiCrawlerViews))}+`, t.mCrawlerLabel(metrics.trafficWindowDays), t.mCrawlerDef));
+  if (metrics.agentToolCalls != null && metrics.agentWindowDays != null)
+    tiles.push(tile(`${formatCount(floorForTile(metrics.agentToolCalls))}+`, t.mAgentLabel(metrics.agentWindowDays), t.mAgentDef));
+
+  const offers = t.pOffers
+    .map((o, i) => `<div class="offer"><span class="offer-n">0${i + 1}</span><h3>${esc(o.title)}</h3><p>${esc(o.body)}</p></div>`)
+    .join("");
+  const steps = t.pSteps
+    .map((st, i) => `<li><span class="step-n">${i + 1}</span><div><h3>${esc(st.title)}</h3><p>${esc(st.body)}</p></div></li>`)
+    .join("");
+
+  const body = `
+<section class="hero hero-sub"><div class="wrap">
+<p class="kicker">${t.pKicker}</p>
+<h1>${escKeep(t.pH1)}</h1>
+<p class="lead">${esc(t.pLead)}</p>
+<div class="ctas"><a class="btn btn-primary" href="${esc(mailtoHref(t.pMailSubject))}">${MAIL}${t.pCta}</a>${tiles.length ? `<a class="btn btn-ghost" href="#tall">${t.pCtaSecondary}</a>` : ""}</div>
+</div></section>
+
+<section aria-labelledby="tilbud-h" style="padding-top:24px"><div class="wrap">
+<div class="sec-head"><p class="kicker">${t.pOfferKicker}</p><h2 id="tilbud-h">${t.pOfferTitle}</h2></div>
+<div class="offers">${offers}</div>
+</div></section>
+
+${tiles.length ? `<section class="band" id="tall" aria-labelledby="tall-h"><div class="wrap">
+<p class="kicker">${t.pMetricsKicker}</p><h2 id="tall-h">${t.pMetricsTitle}</h2><p class="sec-lead">${esc(t.pMetricsLead)}</p>
+<div class="metrics">${tiles.join("")}</div>
+</div></section>` : ""}
+
+<section aria-labelledby="steg-h"><div class="wrap">
+<div class="sec-head"><p class="kicker">${t.pStepsKicker}</p><h2 id="steg-h">${t.pStepsTitle}</h2></div>
+<ol class="steps">${steps}</ol>
+</div></section>
+
+<section id="investorer" aria-labelledby="inv-h" style="padding-top:0"><div class="wrap">
+<div class="invest">
+<p class="kicker">${t.pInvKicker}</p>
+<h2 id="inv-h">${t.pInvTitle}</h2>
+<p>${esc(t.pInvBody)}</p>
+<p><a class="inline-cta" href="${esc(mailtoHref(t.pInvMailSubject))}">${t.pInvCta}${ARROW}</a></p>
+<p class="disclaimer">${esc(t.pDisclaimer)}</p>
+</div>
+</div></section>
+
+<section aria-labelledby="pkontakt-h" style="padding-top:0"><div class="wrap">
+<div class="contact">
+<div><h2 id="pkontakt-h">${t.pContactTitle}</h2><p>${esc(t.pContactBody)}</p></div>
+<div><a class="btn btn-primary btn-mail" href="${esc(mailtoHref(t.pMailSubject))}">${MAIL}<span>${COMPANY.email}</span></a></div>
+</div>
+</div></section>`;
+
+  return shell({
+    lang,
+    title: t.pTitle,
+    description: t.pDescription,
+    canonicalPath: t.partnersHref,
+    alternates: { nb: "/partnere", en: "/en/partners" },
+    body,
   });
 }
 
@@ -970,6 +1321,9 @@ ${s.description.en}${n != null ? ` Catalog: ${n} ${s.countLabel.en}.` : ""}
 
 ${SERVICES.map(line).join("\n\n")}
 
+## Partnerships
+- Platforms, organisations and industry players that represent local providers: ${AGENTPLATFORM_BASE_URL}/en/partners
+
 ## Company
 - Legal name: ${COMPANY.legalName}
 - Organisation number: ${COMPANY.orgNr} (${COMPANY.brregUrl})
@@ -987,6 +1341,7 @@ Sitemap: ${AGENTPLATFORM_BASE_URL}/sitemap.xml
 function renderSitemap(): string {
   const pages: Array<{ nb: string; en: string }> = [
     { nb: "/", en: "/en" },
+    { nb: "/partnere", en: "/en/partners" },
     { nb: "/kontakt", en: "/en/contact" },
     { nb: "/personvern", en: "/en/privacy" },
   ];
@@ -1034,6 +1389,8 @@ function sendHtml(res: Response, status: number, html: string, lang: Lang, maxAg
 export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> = {}): Router {
   const deps: AgentplatformDeps = {
     readCount: overrides.readCount ?? safeHonestCatalogCount,
+    readTraffic: overrides.readTraffic ?? defaultReadTraffic,
+    readAgentCalls: overrides.readAgentCalls ?? defaultReadAgentCalls,
     now: overrides.now ?? Date.now,
   };
   const getCounts = makeCountCache(deps);
@@ -1041,6 +1398,11 @@ export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> 
 
   router.get("/", (_req, res) => sendHtml(res, 200, renderHome("nb", getCounts()), "nb"));
   router.get("/en", (_req, res) => sendHtml(res, 200, renderHome("en", getCounts()), "en"));
+  router.get("/partnere", (_req, res) => sendHtml(res, 200, renderPartners("nb", collectPlatformMetrics(deps, getCounts())), "nb"));
+  router.get("/en/partners", (_req, res) => sendHtml(res, 200, renderPartners("en", collectPlatformMetrics(deps, getCounts())), "en"));
+  router.get(["/partners", "/en/partnere", "/investorer", "/investors", "/en/investors"], (req, res) =>
+    res.redirect(301, req.path === "/investorer" ? "/partnere#investorer" : req.path.includes("invest") ? "/en/partners#investorer" : "/en/partners"),
+  );
   router.get("/kontakt", (_req, res) => sendHtml(res, 200, renderContact("nb"), "nb", 3600));
   router.get("/en/contact", (_req, res) => sendHtml(res, 200, renderContact("en"), "en", 3600));
   router.get(["/contact", "/en/kontakt"], (_req, res) => res.redirect(301, "/en/contact"));
