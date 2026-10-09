@@ -109,6 +109,7 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
     check("b3: AI-crawler views 162 099 → 162 000+", nb.body.includes("<strong>162 000+</strong><span class=\"m-label\">sidevisninger fra AI-crawlere siste 60 dager</span>"));
     check("b4: agent tool calls 5 527 → 5 500+ with 30-day label", nb.body.includes("<strong>5 500+</strong><span class=\"m-label\">verktøykall fra AI-agenter siste 30 dager</span>"));
     check("b5: every tile has a definition", (nb.body.match(/class="m-def"/g) || []).length === 4);
+    check("b5b: the tool-call definition names what is counted (incl. cart and ordering)", nb.body.includes("søk, oppslag, handlekurv og bestilling") && en.body.includes("search, lookup, cart and ordering"));
     check("b6: floorForTile rounds down", floorForTile(162_099) === 162_000 && floorForTile(5_527) === 5_500 && floorForTile(812) === 812 && floorForTile(10_999) === 10_000);
     check("b7: never 'AI-brukere' / 'AI users'", !/AI-brukere|AI users/i.test(nb.body + en.body));
 
@@ -224,6 +225,41 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
     now: () => now, syncTtlMs: 1, offThreadTtlMs: 1, retryAfterMs: 1, log: () => {},
   });
   check("e5: no DB → not ready (figure hidden), never throws", broken.snapshot().ready === false);
+
+  // Production path: off-thread. Not ready until the first refresh lands, then
+  // served from cache without recomputing; prewarm() starts the refresh early;
+  // the main thread never computes.
+  let offCalls = 0;
+  let syncCalls = 0;
+  let offClock = now;
+  const fakeFileDb = { name: "/data/lokal.db" } as unknown as Database.Database;
+  const off = createAgentUsageReader({
+    getDb: () => fakeFileDb,
+    offThreadUsable: (_d, key) => key === "agentToolCalls",
+    runOffThread: async (_p, _n, windowDays) => {
+      offCalls++;
+      return { toolCalls: 42, windowDays };
+    },
+    computeSync: () => {
+      syncCalls++;
+      return { toolCalls: 1, windowDays: 30 };
+    },
+    now: () => offClock,
+    syncTtlMs: 1,
+    offThreadTtlMs: 3_600_000,
+    retryAfterMs: 60_000,
+    log: () => {},
+  });
+  off.prewarm();
+  check("e6: prewarm() starts the off-thread refresh (not ready before it lands)", offCalls === 1);
+  await off.settled();
+  const o1 = off.snapshot();
+  const o2 = off.snapshot();
+  check("e7: off-thread value served from cache, no second refresh, main thread never computes", o1.ready && o1.stats.toolCalls === 42 && o2.stats.toolCalls === 42 && offCalls === 1 && syncCalls === 0);
+  offClock += 3_600_000;
+  off.snapshot();
+  await off.settled();
+  check("e8: a stale value triggers one background refresh", offCalls === 2 && syncCalls === 0);
   db.close();
 
   return summary;

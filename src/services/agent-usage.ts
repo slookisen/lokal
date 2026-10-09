@@ -42,6 +42,8 @@ export interface AgentUsageReaderDeps {
 
 export interface AgentUsageReader {
   snapshot(): AgentToolCallSnapshot;
+  /** Schedules the off-thread refresh when the worker path is in use; never computes synchronously. */
+  prewarm(): void;
   /** Test hook: resolves once an in-flight off-thread refresh settles. */
   settled(): Promise<void>;
   reset(): void;
@@ -93,6 +95,20 @@ export function createAgentUsageReader(deps: AgentUsageReaderDeps): AgentUsageRe
         return { stats: EMPTY, ready: false };
       }
     },
+    prewarm() {
+      let db: Database.Database;
+      try {
+        db = deps.getDb();
+      } catch {
+        return;
+      }
+      if (!deps.offThreadUsable(db, KEY)) return;
+      if (offThreadDbPath !== db.name) {
+        offThread.clear();
+        offThreadDbPath = db.name;
+      }
+      offThread.get(KEY);
+    },
     settled() {
       return offThread.settled(KEY);
     },
@@ -119,6 +135,11 @@ const defaultReader = createAgentUsageReader({
 
 export function getAgentToolCallsSnapshot(): AgentToolCallSnapshot {
   return defaultReader.snapshot();
+}
+
+/** Starts the first off-thread count after boot, so /partnere has the figure early. */
+export function prewarmAgentToolCalls(): void {
+  defaultReader.prewarm();
 }
 
 /** Test-only. */
