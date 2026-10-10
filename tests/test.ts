@@ -32409,6 +32409,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of wal1.failures) failures.push("wal-maintenance: " + f);
     console.log(`  wal-maintenance: ${wal1.passed} passed, ${wal1.failed} failed`);
 
+    console.log("\n── offsite-backup: SigV4, Tigris upload, retention, restore test ──");
+    const { runOffsiteBackupTests } = require("../src/services/offsite-backup.test") as
+      typeof import("../src/services/offsite-backup.test");
+    const off1 = await runOffsiteBackupTests({ log: false });
+    passed += off1.passed;
+    failed += off1.failed;
+    for (const f of off1.failures) failures.push("offsite-backup: " + f);
+    console.log(`  offsite-backup: ${off1.passed} passed, ${off1.failed} failed`);
+
     console.log("\n── health-write-probe: cached write-path probe for /health ──");
     const { runHealthWriteProbeTests } = require("../src/services/health-write-probe.test") as
       typeof import("../src/services/health-write-probe.test");

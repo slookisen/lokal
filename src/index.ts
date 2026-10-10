@@ -3,6 +3,7 @@ import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
+import { createOffsiteBackupTick, getOffsiteBackupStatus } from "./services/offsite-backup";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
@@ -712,6 +713,7 @@ app.get("/health", (_req, res) => {
         oldestPageViewAgeDays: pruneLag.oldestPageViewAgeDays,
         retentionDays: pruneLag.retentionDays,
         walBytes: getWalSizes(),
+        offsiteBackup: getOffsiteBackupStatus(),
       },
       writePath,
       disk: disk && {
@@ -1572,6 +1574,17 @@ app.listen(Number(PORT), HOST, async () => {
     setInterval(trackJob("auto-prune", autoPruneTick), 60 * 60_000);
   }
 });
+
+// ─── Grunnmur S2 (2026-10-10): nightly offsite DB backup to Fly Tigris ──
+//
+// Hourly wakeup; services/offsite-backup.ts only runs in the 04 UTC hour (after the
+// 03 UTC prune + WAL checkpoint), at most once per night, plus a weekly restore test
+// (Sunday). A no-op until the five Tigris secrets are set. Persisted stamps in
+// boot_job_state stop a restart inside the hour from running it twice.
+// Disable by setting RFB_DISABLE_OFFSITE_BACKUP=1 (e.g. on local dev / CI).
+if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
+  setInterval(trackJob("offsite-backup", createOffsiteBackupTick(() => getDb())), 60 * 60_000);
+}
 
 // ─── PR-95 (2026-06-01): daily Debio verification sync ──────────────
 //

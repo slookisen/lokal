@@ -36,10 +36,13 @@
 // - Retention (readdir + sort + unlink of everything past the 10 newest) is
 //   synchronous, but only ever touches the small `backups/` directory
 //   listing, never the live multi-hundred-MB DB file — bounded, cheap work.
-// - Known limitation (documented, not hidden — see the dev-request's own
-//   FUNN block): backups live on the SAME Fly volume as the live DB. This
-//   protects against a bad mutation/apply, NOT against loss of the whole
-//   volume. Off-box (S3/object storage) export is an explicit non-goal here.
+// - Backups made by THIS route live on the SAME Fly volume as the live DB:
+//   they protect against a bad mutation/apply, not against loss of the whole
+//   volume. Off-box copies are made by the nightly Fly Tigris job in
+//   services/offsite-backup.ts (slice S2 of dev-request
+//   2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok; Daniel lifted the old
+//   "off-box is a non-goal" line on 2026-10-09). Its status and manual
+//   triggers are the /offsite-backup routes at the bottom of this file.
 //
 // ─── `?db=` parameter (follow-up slice, 2026-09-13) ────────────
 // This route originally only ever backed up lokal.db. The experiences/
@@ -78,6 +81,17 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import {
+  OFFSITE_VERTICALS,
+  OffsiteVertical,
+  getOffsiteBackupStatus,
+  isOffsiteBlockedHour,
+  isOffsiteRunning,
+  isOffsiteVertical,
+  listObjects,
+  readS3Config,
+  startManualRun,
+} from "../services/offsite-backup";
 
 const router = Router();
 
@@ -448,5 +462,63 @@ router.get("/backup", (req: Request, res: Response) => {
 
   res.json({ success: true, backups });
 });
+
+// ─── Offsite backup to Fly Tigris (services/offsite-backup.ts) ─────
+//
+// GET  /offsite-backup[?list=1]                    status; ?list=1 also lists the bucket
+// POST /offsite-backup?vertical=<v|all>              start a backup now (202, runs in background)
+// POST /offsite-backup/restore-test?vertical=<v|all> start a restore test now (202)
+// Manual runs are refused 07–09 UTC (send window) and while a run is in progress.
+
+function parseOffsiteVerticals(raw: unknown, res: Response): OffsiteVertical[] | null {
+  if (raw === "all") return [...OFFSITE_VERTICALS];
+  if (isOffsiteVertical(raw)) return [raw];
+  res.status(400).json({ error: `vertical query param is required: one of ${OFFSITE_VERTICALS.join(", ")} or all` });
+  return null;
+}
+
+router.get("/offsite-backup", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const status = getOffsiteBackupStatus();
+  const cfg = readS3Config();
+  if (req.query.list !== "1" || !cfg) {
+    res.json({ success: true, status });
+    return;
+  }
+  (async () => {
+    const objects: Record<string, { key: string; size: number; lastModified: string }[]> = {};
+    for (const v of OFFSITE_VERTICALS) {
+      objects[v] = (await listObjects(cfg, `db/${v}/`))
+        .sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
+        .map((o) => ({ key: o.key, size: o.size, lastModified: o.lastModified.toISOString() }));
+    }
+    res.json({ success: true, status, objects });
+  })().catch((err: any) => {
+    res.status(502).json({ success: false, status, error: `bucket listing failed: ${err?.message || String(err)}` });
+  });
+});
+
+function startOffsite(kind: "backup" | "restore", req: Request, res: Response): void {
+  if (!requireAdmin(req, res)) return;
+  const verticals = parseOffsiteVerticals(req.query.vertical, res);
+  if (!verticals) return;
+  if (!readS3Config()) {
+    res.status(503).json({ error: "Offsite backup not configured (Tigris secrets missing)" });
+    return;
+  }
+  if (isOffsiteBlockedHour(new Date())) {
+    res.status(409).json({ error: "Manual offsite runs are not allowed 07–09 UTC" });
+    return;
+  }
+  if (isOffsiteRunning()) {
+    res.status(409).json({ error: "An offsite backup or restore test is already running" });
+    return;
+  }
+  startManualRun(kind, verticals);
+  res.status(202).json({ success: true, started: kind, verticals, status: "GET /admin/db/offsite-backup" });
+}
+
+router.post("/offsite-backup", (req: Request, res: Response) => startOffsite("backup", req, res));
+router.post("/offsite-backup/restore-test", (req: Request, res: Response) => startOffsite("restore", req, res));
 
 export default router;
