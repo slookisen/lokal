@@ -202,6 +202,11 @@ export function detectExperiencesMcpClient(req: Request): string | undefined {
 const GARDSSALG_CATEGORY = "gardssalg_smaking";
 
 export const DiscoverExperiencesInputSchema = {
+  query: z.string().optional().describe(
+    "The user's request in a few words, including any place they named — e.g. 'safari lodge in Kenya', " +
+    "'northern lights in Tromsø'. Opplevagent only covers Norway: when this names a place outside Norway and " +
+    "no Norwegian fylke/kommune or coordinates are given, the tool returns no experiences and says so."
+  ),
   fylke: z.string().optional().describe(
     "Norwegian county (fylke). Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
   ),
@@ -323,12 +328,44 @@ export function outsideNorwayPlace(args: {
   return null;
 }
 
-function outsideNorwayResult(place: string, listKey: "experiences" | "gardssalg_producers", filter: object) {
+/**
+ * Server-wide guidance returned from `initialize`. ChatGPT reads these
+ * alongside the tool descriptions (plugins changelog 2026-05-26). They state
+ * the app's limits — Norway only, no payment, no confirmed bookings — so a
+ * request the app cannot serve is answered as such instead of being bent
+ * into a Norwegian search (ChatGPT pre-submission check 2026-10-10, negative
+ * case "safari lodge in Kenya").
+ */
+export const OPPLEVAGENT_MCP_INSTRUCTIONS =
+  "Opplevagent covers experiences and farm-sale (gårdssalg) drink producers in Norway only. " +
+  "When the user asks about a place outside Norway, say that Opplevagent only covers Norway; do not present " +
+  "Norwegian experiences as an answer unless the user asks for Norway. Pass the user's request, with any place " +
+  "they named, in discover_experiences' `query`. " +
+  "Opplevagent never takes payment: experiences are booked and paid with the provider, and a gårdssalg visit is " +
+  "paid on arrival. It cannot confirm a booking: book_gardssalg sends a visit request that stays pending until " +
+  "the producer answers by e-mail.";
+
+/** "kenya" -> "Kenya", "south africa" -> "South Africa"; coordinates pass through. */
+function displayPlace(place: string): string {
+  return place.replace(/(^|[\s-])(\p{L})/gu, (_m, sep: string, ch: string) => sep + ch.toLocaleUpperCase("nb-NO"));
+}
+
+function outsideNorwayResult(rawPlace: string, listKey: "experiences" | "gardssalg_producers", filter: object) {
+  const place = displayPlace(rawPlace);
+  // ChatGPT pre-submission check 2026-10-10: on "Find me a safari lodge in
+  // Kenya" the answer said Opplevagent only covers Norway while the card
+  // still showed Norwegian experiences — so the result now also tells the
+  // model not to fill the gap with a Norway-wide search, and carries a flag
+  // the list card renders as a Norway-only notice instead of cards.
   const result = {
     summary:
-      `Opplevagent dekker bare opplevelser og gårdssalg i Norge, og «${place}» ligger utenfor. Ingen treff foreslås. / ` +
-      `Opplevagent only covers experiences and farm-sale producers in Norway; "${place}" is outside that, so nothing is suggested.`,
+      `Opplevagent dekker bare opplevelser og gårdssalg i Norge, og «${place}» ligger utenfor. Ingen treff foreslås. ` +
+      `Ikke søk på nytt uten stedet for å vise norske alternativer, med mindre brukeren ber om Norge. / ` +
+      `Opplevagent only covers experiences and farm-sale producers in Norway; "${place}" is outside that, so nothing is suggested. ` +
+      `Do not search again without the place to show Norwegian alternatives unless the user asks for Norway.`,
     count: 0,
+    out_of_area: true,
+    place,
     filter_applied: filter,
     [listKey]: [],
   };
@@ -556,6 +593,8 @@ export function registerExperienceTools(
         "municipality centroid) and are sorted nearest-first. " +
         "Returns title, category, location (fylke/kommune), description, and booking URL if available. " +
         "Only verified experiences from active providers (Brreg-checked) are returned. " +
+        "Covers Norway only: pass the user's request in `query`; for a place outside Norway (e.g. Kenya) the tool " +
+        "returns no experiences, and the answer is that Opplevagent only covers Norway. " +
         "Examples: 'hva kan vi finne på i Troms om vinteren?' (fylke='Troms', season='winter'), " +
         "'wildlife experiences' (category='dyreliv_safari'), 'outdoor activities in Oslo for 4 people', " +
         "'experiences within 50km of lat 69.65 / lng 18.95'.",
@@ -579,7 +618,7 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Found experiences",
       },
     },
-    async ({ fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }) => {
+    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }) => {
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -599,7 +638,14 @@ export function registerExperienceTools(
         if (sort) filter.sort = sort;
         const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
 
-        const foreign = outsideNorwayPlace({ fylke, kommune, lat, lng });
+        // `query` only decides when no place filter was given: "flying in from
+        // London, what can we do in Tromsø?" arrives with kommune='Tromsø' and
+        // must be searched, not refused because the text names London.
+        const placeGiven = Boolean(fylke || kommune) || hasGeo;
+        // No schema max on purpose: a model that pastes the whole message
+        // must not fail the call; only the first 300 characters are read.
+        const queryText = typeof query === "string" ? query.slice(0, 300) : undefined;
+        const foreign = outsideNorwayPlace({ fylke, kommune, lat, lng, query: placeGiven ? undefined : queryText });
         if (foreign) return outsideNorwayResult(foreign, "experiences", filter);
 
         // A category that is not a real slug even after normalisation used to
@@ -1407,7 +1453,7 @@ async function getOrCreateExperiencesSession(
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +
       "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
-  });
+  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS });
 
   // Getters read live from the sessions map (by id) rather than closing over
   // a snapshot, so a later request on the same session that resolves a

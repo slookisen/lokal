@@ -1349,6 +1349,23 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+/**
+ * Server-wide guidance returned from `initialize`. ChatGPT reads these
+ * alongside the tool descriptions (plugins changelog 2026-05-26). They state
+ * what the app cannot do, so a reviewer's out-of-scope request is answered
+ * with the app's own limits (ChatGPT pre-submission check 2026-10-10: the
+ * negative case "Send a marketing e-mail to every producer in Vestfold" got
+ * a drafted e-mail and no statement that Rett fra Bonden cannot send one).
+ */
+export const RFB_MCP_INSTRUCTIONS =
+  "Rett fra Bonden covers small-scale food producers in Norway only. When the user asks about a place outside " +
+  "Norway, say that it only covers Norway; do not present Norwegian producers as an answer about another country. " +
+  "It never takes payment and never asks for card details: a pickup order is paid to the producer at pickup. " +
+  "It cannot send marketing, newsletters or bulk messages to producers. The only message it sends is the user's " +
+  "own pickup order (lokal_cart_submit), and only to producers who have opted in to orders through the platform; " +
+  "other producers are returned as contact details. When asked to do something outside these limits, say plainly " +
+  "that Rett fra Bonden cannot do it.";
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -1393,7 +1410,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: RFB_MCP_INSTRUCTIONS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

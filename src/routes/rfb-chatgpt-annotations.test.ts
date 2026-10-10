@@ -150,6 +150,40 @@ export async function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}
       assertTrue(/only covers small-scale food producers in Norway/.test(offers?.content?.[0]?.text ?? ""),
         "n5: lokal_find_offers near 'Rome' gets the same answer");
     }
+
+    // ── Server instructions (ChatGPT pre-submission check 2026-10-10): the
+    // negative case "Send a marketing e-mail to every producer in Vestfold"
+    // got a drafted e-mail and no statement of the app's limits. initialize
+    // now returns instructions that state them. ──
+    {
+      const express = require("express");
+      const http = require("http");
+      const mcpRouter = (require("./mcp") as { default: any }).default;
+      const app = express();
+      app.use(express.json());
+      app.use("/mcp", mcpRouter);
+      const srv = http.createServer(app);
+      await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+      try {
+        const res = await fetch(`http://127.0.0.1:${srv.address().port}/mcp`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: "init", method: "initialize",
+            params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "rfb-instructions-test", version: "1.0.0" } },
+          }),
+        });
+        const text = await res.text();
+        const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
+        const ins = (JSON.parse(dataLine ? dataLine.slice(6) : text)?.result?.instructions ?? "") as string;
+        assertTrue(/in Norway only/.test(ins), "i1: initialize instructions say Rett fra Bonden covers Norway only");
+        assertTrue(/never takes payment/.test(ins), "i2: … that it never takes payment");
+        assertTrue(/cannot send marketing, newsletters or bulk messages/.test(ins) && /opted in/.test(ins),
+          "i3: … that it cannot send marketing or bulk messages, only the user's own order to opted-in producers");
+      } finally {
+        srv.close();
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("rfb-chatgpt-annotations: unexpected error: " + String(err?.stack || err?.message || err));
