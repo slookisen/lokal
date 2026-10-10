@@ -20,7 +20,7 @@ type Stored = { body: Buffer; lastModified: Date; meta: string | null };
 function startFakeS3(bucket: string, secret: string, ob: typeof import("./offsite-backup")) {
   const store = new Map<string, Stored>();
   const log: Array<{ method: string; key: string; status: number }> = [];
-  const state = { failPut: false, now: new Date("2026-10-10T04:00:05Z"), pageSize: 2 };
+  const state = { failPut: false, failPutTimes: 0, putStatus: 500, failList: false, now: new Date("2026-10-10T04:00:05Z"), pageSize: 2 };
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -61,7 +61,11 @@ function startFakeS3(bucket: string, secret: string, ob: typeof import("./offsit
       if (expect.authorization !== auth) return send(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>");
 
       if (req.method === "PUT") {
-        if (state.failPut) return send(500, "<Error><Code>InternalError</Code></Error>");
+        if (state.failPut || state.failPutTimes > 0) {
+          if (state.failPutTimes > 0) state.failPutTimes--;
+          const code = state.putStatus === 403 ? "AccessDenied" : "InternalError";
+          return send(state.putStatus, `<Error><Code>${code}</Code><Message>details tid_LOCAL req-123</Message></Error>`);
+        }
         if (crypto.createHash("sha256").update(body).digest("hex") !== req.headers["x-amz-content-sha256"]) {
           return send(400, "<Error><Code>XAmzContentSHA256Mismatch</Code></Error>");
         }
@@ -73,6 +77,7 @@ function startFakeS3(bucket: string, secret: string, ob: typeof import("./offsit
         return send(204);
       }
       if (req.method === "GET" && query["list-type"] === "2") {
+        if (state.failList) return send(500, "<Error><Code>InternalError</Code></Error>");
         const all = [...store.keys()].filter((k) => k.startsWith(query.prefix || "")).sort();
         const start = query["continuation-token"] ? Number(query["continuation-token"].replace("tok/", "")) : 0;
         const page = all.slice(start, start + state.pageSize);
@@ -163,14 +168,24 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
   const weeklyKept = kept.filter((o) => o.key !== "db/rfb/notes.txt").slice(7).map((o) => ob.isoWeekKey(o.lastModified));
   ok(new Set(weeklyKept).size === 4, "retention: weekly copies are in 4 distinct ISO weeks");
   ok(ob.selectBackupsToDelete(objs.slice(0, 5)).length === 0, "retention: nothing deleted below the daily cap");
+  const sameDay: any[] = [];
+  for (let h = 0; h < 6; h++) {
+    const d = new Date(Date.UTC(2026, 9, 10, 4 + h));
+    sameDay.push({ key: ob.backupObjectKey("rfb", d), size: 1, lastModified: d });
+  }
+  const delSame = ob.selectBackupsToDelete([...sameDay, ...objs.slice(1)]);
+  ok(delSame.length === 5 + (objs.length - 1 - 6 - 4 - 1) && !delSame.includes(sameDay[5].key) &&
+    objs.slice(1, 7).every((o) => !delSame.includes(o.key)),
+    "retention is per UTC day: 6 runs on one day keep only that day's newest and push out no older day");
 
   // ── (5) schedule ──────────────────────────────────────────────
   const at = (s: string) => new Date(s);
   ok(ob.shouldRunOffsiteBackup(at("2026-10-10T04:10:00Z"), null), "backup runs in the 04 UTC hour");
-  ok(!ob.shouldRunOffsiteBackup(at("2026-10-10T03:59:00Z"), null) && !ob.shouldRunOffsiteBackup(at("2026-10-10T05:00:00Z"), null), "backup does not run outside 04 UTC");
+  ok(ob.shouldRunOffsiteBackup(at("2026-10-10T05:50:00Z"), null), "backup still catches up at 05:50 UTC");
+  ok(!ob.shouldRunOffsiteBackup(at("2026-10-10T03:59:00Z"), null) && !ob.shouldRunOffsiteBackup(at("2026-10-10T06:00:00Z"), null), "backup does not run outside 04–05 UTC");
   ok(!ob.shouldRunOffsiteBackup(at("2026-10-10T04:40:00Z"), at("2026-10-10T04:05:00Z")), "backup not twice in the same window");
   ok(ob.shouldRunOffsiteBackup(at("2026-10-11T04:01:00Z"), at("2026-10-10T04:20:00Z")), "backup runs again the next night");
-  ok(ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), null) && !ob.shouldRunRestoreTest(at("2026-10-10T04:10:00Z"), null), "restore test only Sunday 04 UTC");
+  ok(ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), null) && !ob.shouldRunRestoreTest(at("2026-10-10T04:10:00Z"), null), "restore test only Sunday 04–05 UTC");
   ok(!ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), at("2026-10-06T04:00:00Z")), "restore test at most weekly");
   ok(ob.isOffsiteBlockedHour(at("2026-10-10T08:00:00Z")) && !ob.isOffsiteBlockedHour(at("2026-10-10T04:00:00Z")), "07–09 UTC is blocked for manual runs");
 
@@ -183,7 +198,7 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
   const env = { AWS_ACCESS_KEY_ID: "tid_LOCAL", AWS_SECRET_ACCESS_KEY: SECRET, AWS_ENDPOINT_URL_S3: `http://127.0.0.1:${port}`, AWS_REGION: "auto", BUCKET_NAME: "bkt" };
   const lcfg = ob.readS3Config(env as any)!;
   const tmpDir = path.join(tmp, "work");
-  const deps = { connectHost: "127.0.0.1", tmpDir, now: () => new Date("2026-10-10T04:00:05.123Z") };
+  const deps = { connectHost: "127.0.0.1", tmpDir, retryDelaysMs: [0, 0], now: () => new Date("2026-10-10T04:00:05.123Z") };
   const live = new Database(path.join(tmp, "dental.db"));
   try {
     live.pragma("journal_mode = WAL");
@@ -199,8 +214,11 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     }
     fake.store.set("db/dental/notes.txt", { body: Buffer.from("keep"), lastModified: new Date("2020-01-01T00:00:00Z"), meta: null });
 
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "dental-orphan-from-a-dead-run.db"), "x".repeat(1000));
     const r = await ob.backupOneDb(target, lcfg, deps);
     ok(r.ok && r.key === "db/dental/dental-2026-10-10T04-00-05-123Z.db.gz", `backup ok with dated key (${r.error ?? r.key})`);
+    ok(r.attempts === 1, "backup uploaded on the first attempt");
     const stored = r.key ? fake.store.get(r.key) : undefined;
     ok(!!stored && stored.meta === r.sha256 && crypto.createHash("sha256").update(stored.body).digest("hex") === r.sha256, "uploaded object sha256 = meta = result");
     let restoredRows = -1;
@@ -212,7 +230,7 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
       c.close();
     }
     ok(restoredRows === 500, "uploaded object gunzips to a valid DB with all rows");
-    ok(fs.readdirSync(tmpDir).length === 0, "temp files removed after a successful backup");
+    ok(fs.readdirSync(tmpDir).length === 0, "temp files (and a dead run's orphan) removed after a successful backup");
     const expectDeleted = [1, 2, 3].map((d) => ob.backupObjectKey("dental", new Date(Date.UTC(2026, 8, d, 4)))).sort();
     ok(JSON.stringify([...(r.deleted ?? [])].sort()) === JSON.stringify(expectDeleted), "retention after upload: deletes only the 3 oldest W36 copies (list paginated)");
     ok(fake.store.has("db/dental/notes.txt"), "foreign object in the bucket untouched");
@@ -233,14 +251,44 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     ok(!bad2.ok && !!bad2.error, "restore test: a non-DB object fails");
     ok(fs.readdirSync(tmpDir).length === 0, "temp files removed after failed restore tests");
 
-    // upload failure: no retention, temp files gone
+    // transient 5xx: retried, then succeeds
+    const putsOf = () => fake.log.filter((l) => l.method === "PUT").length;
+    fake.state.failPutTimes = 1;
+    let p0 = putsOf();
+    const retried = await ob.backupOneDb(target, lcfg, { ...deps, now: () => new Date("2026-10-10T05:00:05.000Z") });
+    ok(retried.ok && retried.attempts === 2 && putsOf() - p0 === 2, "a transient 500 is retried and the upload succeeds");
+
+    // persistent 5xx: 3 attempts, then failure; no retention, temp files gone, no raw S3 body
     fake.state.failPut = true;
     const before = fake.store.size;
+    p0 = putsOf();
     const f = await ob.backupOneDb(target, lcfg, { ...deps, now: () => new Date("2026-10-11T04:00:05.000Z") });
-    ok(!f.ok && /HTTP 500/.test(f.error || ""), "backup reports an upload failure");
+    ok(!f.ok && f.error === "S3 PUT db/dental/dental-2026-10-11T04-00-05-000Z.db.gz -> HTTP 500 InternalError", `backup reports an upload failure with status + code only (${f.error})`);
+    ok(putsOf() - p0 === 3, "persistent 500: exactly 3 attempts");
+    ok(!/tid_LOCAL|req-123|details/.test(f.error || ""), "S3 error body text is not echoed");
     ok(fake.store.size === before, "no object deleted when the upload fails");
     ok(fs.readdirSync(tmpDir).length === 0, "temp files removed after a failed upload");
+
+    // 4xx: not retried
+    fake.state.putStatus = 403;
+    p0 = putsOf();
+    const f403 = await ob.backupOneDb(target, lcfg, deps);
+    ok(!f403.ok && /HTTP 403 AccessDenied$/.test(f403.error || "") && putsOf() - p0 === 1, "a 403 is not retried");
     fake.state.failPut = false;
+    fake.state.putStatus = 500;
+
+    // the copy itself fails (source file missing): nothing uploaded, temp dir clean
+    p0 = putsOf();
+    const gone = await ob.backupOneDb({ vertical: "dental", db: { name: path.join(tmp, "missing.db") } }, lcfg, deps);
+    ok(!gone.ok && !!gone.error && putsOf() === p0 && fs.readdirSync(tmpDir).length === 0, "copy failure: no upload, temp dir clean");
+
+    // listing fails after a good upload: backup ok, retention skipped
+    fake.state.failList = true;
+    const sizeBefore = fake.store.size;
+    const lf = await ob.backupOneDb(target, lcfg, { ...deps, now: () => new Date("2026-10-11T04:30:05.000Z") });
+    ok(lf.ok && /HTTP 500/.test(lf.retentionError || "") && (lf.deleted ?? []).length === 0 && fake.store.size === sizeBefore + 1,
+      "listing failure after upload: backup ok, nothing deleted, retentionError reported");
+    fake.state.failList = false;
 
     // low disk: nothing written, nothing sent
     const puts = fake.log.filter((l) => l.method === "PUT").length;
@@ -261,9 +309,39 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     ok(st.configured && st.running === null && st.lastSuccessAt?.dental === "2026-10-12T04:00:05.000Z" && st.lastSuccessAt?.rfb === null,
       "status: configured, last success per DB from boot_job_state");
     ok(!JSON.stringify(st).includes(SECRET) && !JSON.stringify(st).includes("tid_LOCAL"), "status never contains credentials");
+    const pub = ob.getOffsiteBackupHealth({ env: env as any, stateDb });
+    ok(pub.configured && pub.lastSuccessAt?.dental === "2026-10-12T04:00:05.000Z" && pub.lastBackupOk.dental === true &&
+      !/db\/dental\/|gzBytes|error/.test(JSON.stringify(pub)), "/health subset: timestamps and ok flags only, no keys/sizes/errors");
     const rr = await ob.runRestoreTestNow({ env: env as any, stateDb, verticals: ["dental"], getTarget: () => target, deps });
     ok(rr.results[0]?.ok === true && ob.getOffsiteBackupStatus({ env: env as any, stateDb }).lastRestoreOkAt?.dental !== null, "run: restore test recorded");
     stateDb.close();
+
+    // scheduler tick: once per night in 04–05 UTC, restore test on Sunday, catch-up after a missed tick
+    ob.__resetOffsiteBackupForTesting();
+    const tickDb = new Database(":memory:");
+    let tickNow = new Date("2026-10-10T04:10:00.000Z"); // Saturday
+    const tick = ob.createOffsiteBackupTick({
+      getStateDb: () => tickDb,
+      now: () => tickNow,
+      run: { env: env as any, verticals: ["dental"], getTarget: () => target, deps: { ...deps, now: () => tickNow } },
+    });
+    const gets = () => fake.log.filter((l) => l.method === "GET" && l.key.endsWith(".db.gz")).length;
+    p0 = putsOf();
+    await tick();
+    ok(putsOf() - p0 === 1, "tick at 04:10 Saturday: one backup");
+    tickNow = new Date("2026-10-10T04:25:00.000Z");
+    await tick();
+    ok(putsOf() - p0 === 1, "tick at 04:25: no second backup that night");
+    tickNow = new Date("2026-10-10T12:00:00.000Z");
+    await tick();
+    ok(putsOf() - p0 === 1, "tick at noon: nothing");
+    const g0 = gets();
+    tickNow = new Date("2026-10-11T05:40:00.000Z"); // Sunday, late in the window (e.g. after a restart)
+    await tick();
+    ok(putsOf() - p0 === 2 && gets() - g0 === 1, "tick at 05:40 Sunday: catches up the backup, then runs the restore test");
+    ok(ob.getOffsiteBackupStatus({ env: env as any, stateDb: tickDb }).lastRestoreOkAt?.dental === "2026-10-11T05:40:00.000Z", "tick: restore test stamped");
+    ok((await ob.runOffsiteBackupNow({ env: {} as any, stateDb: tickDb })).skipped === "not_configured", "tick/run without secrets stays a no-op");
+    tickDb.close();
   } finally {
     try { live.close(); } catch { /* ignore */ }
     await new Promise<void>((r) => fake.server.close(() => r()));

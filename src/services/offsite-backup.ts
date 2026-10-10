@@ -5,15 +5,18 @@
 // Until now every backup lived on the same Fly volume as the live DBs
 // (src/routes/admin-db-backup.ts), so losing the volume or the machine lost both.
 //
-// Nightly, in the 04 UTC hour (after the 03 UTC prune + WAL checkpoint, never 07–09 UTC),
+// Nightly, in the 04–05 UTC window (after the 03 UTC prune + WAL checkpoint, never 07–09 UTC),
 // for each DB file — rfb (lokal.db), dental.db, experiences.db — one after the other:
-//   better-sqlite3 .backup() (SQLite online backup, chunked between event-loop turns)
+//   SQLite online backup in a worker thread (own connection, offsite-backup-worker.ts)
 //   -> temp file on the volume -> gzip level 1 (zlib runs on the libuv threadpool)
-//   -> streamed sha256 -> PUT to the private Tigris bucket -> temp files removed
-//   -> bucket retention: the 7 newest objects + the newest object of each of the
-//      4 most recent older ISO weeks. Retention runs only after a successful upload.
-// Weekly (Sunday, same hour): restore test — download the newest object per DB, check its
+//   -> streamed sha256 -> PUT to the private Tigris bucket (up to 3 attempts)
+//   -> temp files removed (async) -> bucket retention: the newest object of each of the
+//      7 most recent UTC days + the newest of each of the 4 most recent older ISO weeks.
+//      Retention runs only after a successful upload.
+// Weekly (Sunday, same window): restore test — download the newest object per DB, check its
 // sha256, gunzip to a temp file, PRAGMA integrity_check in a worker thread, delete the file.
+// Nothing heavy runs on the main thread: the copy, its fsync and integrity_check are in a
+// worker, gzip/gunzip on the threadpool, file deletes via fs.promises.
 //
 // Credentials come only from the five secrets `fly storage create` defines
 // (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_REGION, BUCKET_NAME).
@@ -152,6 +155,8 @@ export interface S3Deps {
   now?: () => Date;
   /** Socket idle timeout. */
   timeoutMs?: number;
+  /** Waits between PUT attempts (default 5 s, 15 s → 3 attempts). */
+  retryDelaysMs?: number[];
 }
 
 export interface S3Response {
@@ -181,6 +186,12 @@ interface SendOpts {
 }
 
 const MAX_BUFFERED_BODY = 8 * 1024 * 1024;
+
+export class S3Error extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
 
 async function s3Send(cfg: S3Config, method: string, key: string, opts: SendOpts, deps: S3Deps): Promise<S3Response> {
   const vh = virtualHost(cfg);
@@ -242,8 +253,9 @@ async function s3Send(cfg: S3Config, method: string, key: string, opts: SendOpts
           const body = Buffer.concat(chunks);
           if (status < 200 || status >= 300) {
             settled = true;
-            const detail = body.toString("utf8").replace(/\s+/g, " ").slice(0, 300);
-            reject(new Error(`S3 ${method} ${key || "/"} -> HTTP ${status}${detail ? ": " + detail : ""}`));
+            // Only the S3 error <Code> — never the raw body (it can echo request details).
+            const code = /<Code>([A-Za-z0-9.]{1,64})<\/Code>/.exec(body.toString("utf8"))?.[1];
+            reject(new S3Error(`S3 ${method} ${key || "/"} -> HTTP ${status}${code ? " " + code : ""}`, status));
             return;
           }
           settled = true;
@@ -272,20 +284,34 @@ export function sha256File(filePath: string): Promise<string> {
   });
 }
 
+/** Network errors and 5xx are retried; a 4xx is not (it will not fix itself). */
+function isRetryable(err: unknown): boolean {
+  return !(err instanceof S3Error) || err.status >= 500;
+}
+
+/** PUT is idempotent (same key, same body), so a failed attempt is simply repeated. */
 export async function putObjectFromFile(
   cfg: S3Config,
   key: string,
   filePath: string,
   deps: S3Deps = {},
-): Promise<{ size: number; sha256: string }> {
+): Promise<{ size: number; sha256: string; attempts: number }> {
   const size = fs.statSync(filePath).size;
   const sha256 = await sha256File(filePath);
-  await s3Send(cfg, "PUT", key, {
-    payloadHash: sha256,
-    bodyFile: filePath,
-    headers: { "content-type": "application/gzip", "x-amz-meta-sha256": sha256 },
-  }, deps);
-  return { size, sha256 };
+  const delays = deps.retryDelaysMs ?? [5_000, 15_000];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await s3Send(cfg, "PUT", key, {
+        payloadHash: sha256,
+        bodyFile: filePath,
+        headers: { "content-type": "application/gzip", "x-amz-meta-sha256": sha256 },
+      }, deps);
+      return { size, sha256, attempts: attempt };
+    } catch (err) {
+      if (attempt > delays.length || !isRetryable(err)) throw err;
+      await new Promise((r) => setTimeout(r, delays[attempt - 1]));
+    }
+  }
 }
 
 export interface S3Object {
@@ -374,20 +400,30 @@ export function isoWeekKey(d: Date): string {
 }
 
 /**
- * Keys to delete: everything except the `keepDaily` newest objects and the newest object of
- * each of the `keepWeekly` most recent ISO weeks among the rest. Only backup keys
- * (OBJECT_KEY_RE) are ever considered, so a foreign object in the bucket is never deleted.
+ * Keys to delete: everything except the newest object of each of the `keepDays` most recent
+ * UTC days, and the newest object of each of the `keepWeeks` most recent ISO weeks among the
+ * older days. Several runs on one day (e.g. manual ones) therefore never push out older days.
+ * Only backup keys (OBJECT_KEY_RE) are ever considered, so a foreign object is never deleted.
  */
-export function selectBackupsToDelete(objects: S3Object[], keepDaily = 7, keepWeekly = 4): string[] {
+export function selectBackupsToDelete(objects: S3Object[], keepDays = 7, keepWeeks = 4): string[] {
   const ours = objects
     .filter((o) => OBJECT_KEY_RE.test(o.key))
     .sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime() || (a.key < b.key ? 1 : -1));
-  const keep = new Set(ours.slice(0, keepDaily).map((o) => o.key));
+  const dayOf = (o: S3Object) => o.lastModified.toISOString().slice(0, 10);
+  const keep = new Set<string>();
+  const days = new Set<string>();
+  for (const o of ours) {
+    if (days.has(dayOf(o))) continue;
+    if (days.size >= keepDays) break;
+    days.add(dayOf(o));
+    keep.add(o.key);
+  }
   const weeks = new Set<string>();
-  for (const o of ours.slice(keepDaily)) {
+  for (const o of ours) {
+    if (days.has(dayOf(o))) continue;
     const w = isoWeekKey(o.lastModified);
     if (weeks.has(w)) continue;
-    if (weeks.size >= keepWeekly) break;
+    if (weeks.size >= keepWeeks) break;
     weeks.add(w);
     keep.add(o.key);
   }
@@ -396,8 +432,17 @@ export function selectBackupsToDelete(objects: S3Object[], keepDaily = 7, keepWe
 
 // ── Schedule ──────────────────────────────────────────────────────────
 
-/** 04 UTC: after the 03 UTC prune + WAL checkpoint, before the 07–09 UTC send window. */
-export const OFFSITE_BACKUP_HOUR_UTC = 4;
+/** 04–05 UTC: after the 03 UTC prune + WAL checkpoint, before the 07–09 UTC send window.
+ * Two hours so a restart or a late tick inside the window still catches up that night. */
+export const OFFSITE_WINDOW_START_UTC = 4;
+export const OFFSITE_WINDOW_END_UTC = 5;
+/** Scheduler tick interval (src/index.ts). */
+export const OFFSITE_TICK_MS = 15 * 60_000;
+
+function inOffsiteWindow(now: Date): boolean {
+  const h = now.getUTCHours();
+  return h >= OFFSITE_WINDOW_START_UTC && h <= OFFSITE_WINDOW_END_UTC;
+}
 
 export function isOffsiteBlockedHour(now: Date): boolean {
   const h = now.getUTCHours();
@@ -405,12 +450,12 @@ export function isOffsiteBlockedHour(now: Date): boolean {
 }
 
 export function shouldRunOffsiteBackup(now: Date, lastRunAt: Date | null): boolean {
-  if (now.getUTCHours() !== OFFSITE_BACKUP_HOUR_UTC) return false;
+  if (!inOffsiteWindow(now)) return false;
   return !lastRunAt || now.getTime() - lastRunAt.getTime() >= 20 * 3600_000;
 }
 
 export function shouldRunRestoreTest(now: Date, lastRunAt: Date | null): boolean {
-  if (now.getUTCDay() !== 0 || now.getUTCHours() !== OFFSITE_BACKUP_HOUR_UTC) return false;
+  if (now.getUTCDay() !== 0 || !inOffsiteWindow(now)) return false;
   return !lastRunAt || now.getTime() - lastRunAt.getTime() >= 6 * 24 * 3600_000;
 }
 
@@ -418,7 +463,8 @@ export function shouldRunRestoreTest(now: Date, lastRunAt: Date | null): boolean
 
 export interface BackupTarget {
   vertical: OffsiteVertical;
-  db: { name: string; backup(destination: string): Promise<unknown> };
+  /** Only the file path is used: the copy is made by a worker over its own connection. */
+  db: { name: string };
 }
 
 export interface OffsiteDeps extends S3Deps {
@@ -447,9 +493,10 @@ function fileSize(p: string): number {
   }
 }
 
-function safeUnlink(p: string): void {
+/** Deleting a ~1 GB file can take hundreds of ms in the kernel: always off the main thread. */
+async function rmQuiet(p: string): Promise<void> {
   try {
-    fs.unlinkSync(p);
+    await fs.promises.rm(p, { force: true });
   } catch {
     /* already gone */
   }
@@ -459,10 +506,55 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function tmpDirFor(dbFile: string, deps: OffsiteDeps): string {
+/**
+ * The temp dir is used only by this module and runs never overlap (`running`), so anything
+ * left there is from a run that died (OOM, restart, deploy) and is removed before a new run.
+ */
+async function prepareTmpDir(dbFile: string, deps: OffsiteDeps): Promise<string> {
   const dir = deps.tmpDir ?? path.join(path.dirname(dbFile), "backups", "offsite-tmp");
-  fs.mkdirSync(dir, { recursive: true });
+  await fs.promises.mkdir(dir, { recursive: true });
+  for (const name of await fs.promises.readdir(dir)) await rmQuiet(path.join(dir, name));
   return dir;
+}
+
+/** Runs one op of offsite-backup-worker.ts in a fresh worker thread. */
+function runInWorker(data: { op: "backup" | "integrity"; dbPath: string; destPath?: string }, timeoutMs: number): Promise<string[]> {
+  const script = path.join(__dirname, "offsite-backup-worker" + path.extname(__filename));
+  const options = { workerData: data, resourceLimits: { maxOldGenerationSizeMb: 128 } };
+  // Same bootstrap as offthread-stats.ts: tsx's hooks do not reach worker threads, so a .ts
+  // entry registers tsx's require hook inside the worker first.
+  const w = script.endsWith(".ts")
+    ? new Worker(`require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
+        ...options,
+        eval: true,
+      })
+    : new Worker(script, options);
+  return new Promise<string[]>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+      void w.terminate().catch(() => {});
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error(`${data.op} worker timed out`))), timeoutMs);
+    w.on("message", (m: { ok: boolean; result?: string[]; error?: string }) =>
+      finish(() => (m.ok ? resolve(m.result ?? []) : reject(new Error(m.error || `${data.op} failed`)))),
+    );
+    w.on("error", (e: Error) => finish(() => reject(e)));
+    w.on("exit", (code) => finish(() => reject(new Error(`${data.op} worker exited (code ${code})`))));
+  });
+}
+
+/** SQLite online backup of a live DB file to destPath, in a worker thread. */
+export async function backupFileInWorker(dbPath: string, destPath: string, timeoutMs = 30 * 60_000): Promise<void> {
+  await runInWorker({ op: "backup", dbPath, destPath }, timeoutMs);
+}
+
+/** PRAGMA integrity_check on a DB file, in a worker thread. */
+export function integrityCheckInWorker(dbPath: string, timeoutMs = 30 * 60_000): Promise<string[]> {
+  return runInWorker({ op: "integrity", dbPath }, timeoutMs);
 }
 
 export interface DbBackupResult {
@@ -472,6 +564,7 @@ export interface DbBackupResult {
   dbBytes?: number;
   gzBytes?: number;
   sha256?: string;
+  attempts?: number;
   deleted?: string[];
   retentionError?: string;
   skipped?: "low_disk";
@@ -491,7 +584,7 @@ export async function backupOneDb(t: BackupTarget, cfg: S3Config, deps: OffsiteD
   let gzPath = "";
   try {
     const dbFile = t.db.name;
-    const dir = tmpDirFor(dbFile, deps);
+    const dir = await prepareTmpDir(dbFile, deps);
     const liveBytes = fileSize(dbFile) + fileSize(dbFile + "-wal");
     const needed = 2 * liveBytes + OFFSITE_FREE_SPACE_MARGIN_BYTES;
     const free = (deps.freeBytes ?? freeBytesAt)(dir);
@@ -501,12 +594,12 @@ export async function backupOneDb(t: BackupTarget, cfg: S3Config, deps: OffsiteD
     const key = backupObjectKey(t.vertical, now);
     rawPath = path.join(dir, path.basename(key, ".gz"));
     gzPath = rawPath + ".gz";
-    await t.db.backup(rawPath);
+    await backupFileInWorker(dbFile, rawPath);
     const dbBytes = fileSize(rawPath);
     await pipeline(fs.createReadStream(rawPath), zlib.createGzip({ level: 1 }), fs.createWriteStream(gzPath));
-    safeUnlink(rawPath);
-    const { size: gzBytes, sha256 } = await putObjectFromFile(cfg, key, gzPath, deps);
-    safeUnlink(gzPath);
+    await rmQuiet(rawPath);
+    const { size: gzBytes, sha256, attempts } = await putObjectFromFile(cfg, key, gzPath, deps);
+    await rmQuiet(gzPath);
 
     // Retention only after a successful upload; a retention error never fails the backup.
     const deleted: string[] = [];
@@ -521,46 +614,16 @@ export async function backupOneDb(t: BackupTarget, cfg: S3Config, deps: OffsiteD
     } catch (err) {
       retentionError = errMsg(err);
     }
-    return done({ ok: true, key, dbBytes, gzBytes, sha256, deleted, ...(retentionError ? { retentionError } : {}) });
+    return done({ ok: true, key, dbBytes, gzBytes, sha256, attempts, deleted, ...(retentionError ? { retentionError } : {}) });
   } catch (err) {
     return done({ ok: false, error: errMsg(err) });
   } finally {
-    if (rawPath) safeUnlink(rawPath);
-    if (gzPath) safeUnlink(gzPath);
+    if (rawPath) await rmQuiet(rawPath);
+    if (gzPath) await rmQuiet(gzPath);
   }
 }
 
 // ── Restore test ──────────────────────────────────────────────────────
-
-/** Runs PRAGMA integrity_check on a DB file in a worker thread (never on the main thread). */
-export function integrityCheckInWorker(dbPath: string, timeoutMs = 30 * 60_000): Promise<string[]> {
-  const script = path.join(__dirname, "offsite-backup-worker" + path.extname(__filename));
-  const options = { workerData: { dbPath }, resourceLimits: { maxOldGenerationSizeMb: 128 } };
-  // Same bootstrap as offthread-stats.ts: tsx's hooks do not reach worker threads, so a .ts
-  // entry registers tsx's require hook inside the worker first.
-  const w = script.endsWith(".ts")
-    ? new Worker(`require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
-        ...options,
-        eval: true,
-      })
-    : new Worker(script, options);
-  return new Promise<string[]>((resolve, reject) => {
-    let settled = false;
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      fn();
-      void w.terminate().catch(() => {});
-    };
-    const timer = setTimeout(() => finish(() => reject(new Error("integrity_check timed out"))), timeoutMs);
-    w.on("message", (m: { ok: boolean; result?: string[]; error?: string }) =>
-      finish(() => (m.ok ? resolve(m.result ?? []) : reject(new Error(m.error || "integrity_check failed")))),
-    );
-    w.on("error", (e: Error) => finish(() => reject(e)));
-    w.on("exit", (code) => finish(() => reject(new Error(`integrity worker exited (code ${code})`))));
-  });
-}
 
 export interface RestoreTestResult {
   vertical: OffsiteVertical;
@@ -591,7 +654,7 @@ export async function restoreTestOne(
     if (objs.length === 0) return done({ ok: false, skipped: "no_backup" });
     objs.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime() || (a.key < b.key ? 1 : -1));
     const newest = objs[0];
-    const dir = tmpDirFor(liveDbFile, deps);
+    const dir = await prepareTmpDir(liveDbFile, deps);
     const needed = newest.size + Math.ceil(1.2 * fileSize(liveDbFile)) + OFFSITE_FREE_SPACE_MARGIN_BYTES;
     const free = (deps.freeBytes ?? freeBytesAt)(dir);
     if (free !== null && free < needed) {
@@ -605,18 +668,18 @@ export async function restoreTestOne(
       if (actual !== metaSha256) return done({ ok: false, key: newest.key, error: "sha256 mismatch after download" });
     }
     await pipeline(fs.createReadStream(gzPath), zlib.createGunzip(), fs.createWriteStream(rawPath));
-    safeUnlink(gzPath);
+    await rmQuiet(gzPath);
     const rows = await integrityCheckInWorker(rawPath);
     const integrity = rows.join("; ") || "(empty)";
     return done({ ok: integrity === "ok", key: newest.key, integrity });
   } catch (err) {
     return done({ ok: false, error: errMsg(err) });
   } finally {
-    if (gzPath) safeUnlink(gzPath);
+    if (gzPath) await rmQuiet(gzPath);
     if (rawPath) {
-      safeUnlink(rawPath);
-      safeUnlink(rawPath + "-wal");
-      safeUnlink(rawPath + "-shm");
+      await rmQuiet(rawPath);
+      await rmQuiet(rawPath + "-wal");
+      await rmQuiet(rawPath + "-shm");
     }
   }
 }
@@ -636,7 +699,7 @@ let statusCache: { lastSuccessAt: Record<string, string | null>; lastRestoreOkAt
 function defaultTarget(vertical: OffsiteVertical): BackupTarget {
   // Lazy require: keeps this module loadable in tests without opening the prod DBs.
   const factory = require("../database/db-factory") as typeof import("../database/db-factory");
-  return { vertical, db: factory.getDb(vertical) as unknown as BackupTarget["db"] };
+  return { vertical, db: { name: factory.getDb(vertical).name } };
 }
 
 function defaultStateDb(): StateDb {
@@ -658,7 +721,7 @@ function loadStatusCache(stateDb: StateDb): NonNullable<typeof statusCache> {
 
 export interface OffsiteRunOptions {
   verticals?: OffsiteVertical[];
-  /** Scheduled runs also stamp the whole-run job so a restart inside the hour does not re-run it. */
+  /** Scheduled runs also stamp the whole-run job so a restart inside the window does not re-run it. */
   scheduled?: boolean;
   env?: NodeJS.ProcessEnv;
   getTarget?: (v: OffsiteVertical) => BackupTarget;
@@ -738,7 +801,20 @@ export function isOffsiteRunning(): boolean {
   return running !== null;
 }
 
-/** Cheap status for /health and the admin route (no network; boot_job_state read once). */
+/** Public subset for /health: timestamps and ok flags only (no keys, sizes or error text). */
+export function getOffsiteBackupHealth(opts: { env?: NodeJS.ProcessEnv; stateDb?: StateDb } = {}) {
+  const full = getOffsiteBackupStatus(opts);
+  return {
+    configured: full.configured,
+    running: full.running,
+    lastSuccessAt: full.lastSuccessAt,
+    lastRestoreOkAt: full.lastRestoreOkAt,
+    lastBackupOk: Object.fromEntries(lastBackupResults.map((r) => [r.vertical, r.ok])),
+    lastRestoreOk: Object.fromEntries(lastRestoreResults.map((r) => [r.vertical, r.ok])),
+  };
+}
+
+/** Full status for the admin route (no network; boot_job_state read once). */
 export function getOffsiteBackupStatus(opts: { env?: NodeJS.ProcessEnv; stateDb?: StateDb } = {}) {
   const configured = readS3Config(opts.env) !== null;
   let cache: typeof statusCache = null;
@@ -747,26 +823,34 @@ export function getOffsiteBackupStatus(opts: { env?: NodeJS.ProcessEnv; stateDb?
   } catch {
     cache = null;
   }
-  const brief = (r: DbBackupResult | RestoreTestResult) => ({
-    vertical: r.vertical,
-    ok: r.ok,
-    ...(r.skipped ? { skipped: r.skipped } : {}),
-    ...(r.error ? { error: r.error.slice(0, 200) } : {}),
-  });
   return {
     configured,
     running,
     lastSuccessAt: cache?.lastSuccessAt ?? null,
     lastRestoreOkAt: cache?.lastRestoreOkAt ?? null,
-    lastBackup: lastBackupResults.map(brief),
-    lastRestore: lastRestoreResults.map(brief),
+    lastBackup: lastBackupResults.map((r) => ({
+      vertical: r.vertical,
+      ok: r.ok,
+      ...(r.key ? { key: r.key, dbBytes: r.dbBytes, gzBytes: r.gzBytes, attempts: r.attempts } : {}),
+      ...(r.skipped ? { skipped: r.skipped } : {}),
+      ...(r.error ? { error: r.error.slice(0, 200) } : {}),
+      ...(r.retentionError ? { retentionError: r.retentionError.slice(0, 200) } : {}),
+    })),
+    lastRestore: lastRestoreResults.map((r) => ({
+      vertical: r.vertical,
+      ok: r.ok,
+      ...(r.key ? { key: r.key } : {}),
+      ...(r.integrity ? { integrity: r.integrity.slice(0, 200) } : {}),
+      ...(r.skipped ? { skipped: r.skipped } : {}),
+      ...(r.error ? { error: r.error.slice(0, 200) } : {}),
+    })),
   };
 }
 
 function logBackup(r: DbBackupResult): void {
   console.log(
     `[offsite-backup] ${r.vertical} ok=${r.ok} key=${r.key ?? "-"} dbBytes=${r.dbBytes ?? "-"} gzBytes=${r.gzBytes ?? "-"} ` +
-      `deleted=${r.deleted?.length ?? 0} ms=${r.durationMs}` +
+      `attempts=${r.attempts ?? "-"} deleted=${r.deleted?.length ?? 0} ms=${r.durationMs}` +
       (r.skipped ? ` skipped=${r.skipped}` : "") +
       (r.error ? ` error=${r.error}` : "") +
       (r.retentionError ? ` retentionError=${r.retentionError}` : ""),
@@ -789,19 +873,26 @@ export function startManualRun(kind: "backup" | "restore", verticals: OffsiteVer
   run.catch((err) => console.error(`[offsite-${kind}] manual run failed (non-fatal):`, err));
 }
 
-/** Hourly scheduler tick for src/index.ts. Never throws. */
-export function createOffsiteBackupTick(getStateDb: () => StateDb = defaultStateDb): () => Promise<void> {
+export interface OffsiteTickOptions {
+  getStateDb?: () => StateDb;
+  now?: () => Date;
+  /** Passed through to the runs (tests: env, targets, deps). */
+  run?: Omit<OffsiteRunOptions, "scheduled" | "stateDb">;
+}
+
+/** Scheduler tick for src/index.ts (every OFFSITE_TICK_MS). Never throws. */
+export function createOffsiteBackupTick(opts: OffsiteTickOptions = {}): () => Promise<void> {
   return async () => {
     try {
-      if (!readS3Config() || running) return;
-      const now = new Date();
-      const stateDb = getStateDb();
+      if (!readS3Config(opts.run?.env) || running) return;
+      const now = (opts.now ?? (() => new Date()))();
+      const stateDb = (opts.getStateDb ?? defaultStateDb)();
       if (shouldRunOffsiteBackup(now, getJobLastCompletedAt(stateDb, JOB_BACKUP))) {
-        const s = await runOffsiteBackupNow({ scheduled: true, stateDb });
+        const s = await runOffsiteBackupNow({ ...opts.run, scheduled: true, stateDb });
         s.results.forEach(logBackup);
       }
       if (shouldRunRestoreTest(now, getJobLastCompletedAt(stateDb, JOB_RESTORE))) {
-        const s = await runRestoreTestNow({ scheduled: true, stateDb });
+        const s = await runRestoreTestNow({ ...opts.run, scheduled: true, stateDb });
         s.results.forEach(logRestore);
       }
     } catch (err) {
