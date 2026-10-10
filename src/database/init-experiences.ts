@@ -467,6 +467,32 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Per-experience catalog visibility (POST /admin/experiences-data-
+  // corrections, field `visibility`, actions hide/unhide) ──────────────────
+  // catalog_hidden: 1 takes ONE experience off every public surface — it is
+  //   a clause of PUBLISH_GATE_SQL / PUBLISH_GATE_SQL_EXCEPT_STATUS
+  //   (experience-store.ts), so /discover, the detail pages, the sitemap,
+  //   the counts, MCP/A2A and the description queue all drop it, and a
+  //   requarantine reconstruction never counts it as "was published". The
+  //   row itself is kept (nothing is deleted), so unhide or a revert of the
+  //   hide brings it back exactly as it was. NULL/0 = visible. Same name and
+  //   "(... IS NULL OR ... != 1)" read form as the provider-level
+  //   experience_providers.catalog_hidden below.
+  // hidden_reason: the reason code the hide gave (discontinued |
+  //   not_yet_open | junk_title | provider_not_found | closed_or_bankrupt).
+  // hidden_at: when the hide was applied (datetime('now') format).
+  // All three are written and cleared only by the data-corrections route,
+  // which audits every change in experience_data_corrections. Additive and
+  // idempotent; setting catalog_hidden back to 0 is the rollback.
+  const experienceVisibilityCols = [
+    "ALTER TABLE experiences ADD COLUMN catalog_hidden INTEGER DEFAULT 0",
+    "ALTER TABLE experiences ADD COLUMN hidden_reason TEXT",
+    "ALTER TABLE experiences ADD COLUMN hidden_at TEXT",
+  ];
+  for (const stmt of experienceVisibilityCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── Norwegian display-title column (dev-request 2026-07-04-opplevagent-
   // dedup-og-norske-titler, item 2, 2026-07-12) ─────────────────────────────
   // title_no: LLM-generated natural Norwegian display title for a CANONICAL
@@ -2224,7 +2250,7 @@ export function initExperiencesSchema(db: Database.Database): void {
   // routes/opplevelser.ts) ───────────────────────────────────────────────
   // One row per APPLIED, source-backed factual correction of one logical
   // field (kommune, fylke, title, season, duration, price_from,
-  // homepage_url, provider) on one experience. `column_changes` is a JSON
+  // homepage_url, provider, source_page_url, visibility) on one experience. `column_changes` is a JSON
   // array of every physical write the correction made ({table, row_id,
   // column, json_key?, old, new} per column, plus {op:"insert"} for a
   // provider row it created), which is exactly what the revert route reads

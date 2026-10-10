@@ -34447,6 +34447,17 @@ router.post("/admin/experiences-description-write", requireAdmin, async (req: Re
 //                   relink to an existing provider (org.nr. or exact name) or
 //                   a new minimal provider row; an existing provider is never
 //                   renamed or modified.
+//   visibility   -> experiences.catalog_hidden + hidden_reason + hidden_at,
+//                   with action `hide` (expected_current "visible",
+//                   new_value = a reason code, EXP_DC_HIDE_REASONS) or
+//                   `unhide` (expected_current "hidden", no new_value). A
+//                   hidden row fails PUBLISH_GATE_SQL, so it leaves every
+//                   public surface while the row itself is kept; unhide or a
+//                   revert of the hide brings it back unchanged. This is the
+//                   ONE item kind allowed to take a published row off the
+//                   catalog (the never-unpublish rule below exempts exactly
+//                   visibility:hide). Never calls Brreg, never touches a
+//                   provider; applied after every other item of the request.
 //
 // `expected_current` is a stale-guard: the client says what it believes the
 // field shows now, and the item is rejected (`stale_expected_current`) unless
@@ -34473,8 +34484,18 @@ export const EXP_DATA_CORRECTION_FIELDS = [
   "homepage_url",
   "provider",
   "source_page_url",
+  "visibility",
 ] as const;
 export type ExpDataCorrectionField = (typeof EXP_DATA_CORRECTION_FIELDS)[number];
+/** Reason codes a `visibility` / `hide` item may give (its new_value),
+ *  stored in experiences.hidden_reason. */
+export const EXP_DC_HIDE_REASONS = [
+  "discontinued",
+  "not_yet_open",
+  "junk_title",
+  "provider_not_found",
+  "closed_or_bankrupt",
+] as const;
 const EXP_DC_MAX_ITEMS = 50;
 const EXP_DC_REVERT_MAX_IDS = 500;
 /** Fields an item may `clear` (set to NULL). The rest are either NOT NULL
@@ -34489,6 +34510,7 @@ const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "
 const EXP_DC_EXPERIENCE_COLUMNS: ReadonlySet<string> = new Set([
   "kommune", "fylke", "title", "title_no", "season", "duration_min", "duration_max",
   "price_from", "provider_id", "provider_match_status", "content_field_evidence", "source_page_url",
+  "catalog_hidden", "hidden_reason", "hidden_at",
 ]);
 const EXP_DC_PROVIDER_COLUMNS: ReadonlySet<string> = new Set(["hjemmeside", "field_provenance"]);
 
@@ -34556,6 +34578,9 @@ type ExpDcRow = ExperienceDescriptionCandidate & {
   provider_id: string | null;
   provider_match_status: string | null;
   canonical_id: string | null;
+  catalog_hidden: number | null;
+  hidden_reason: string | null;
+  hidden_at: string | null;
   expdc_published: number | null;
 };
 
@@ -34806,6 +34831,8 @@ function expDcCurrentForms(field: ExpDataCorrectionField, row: ExpDcRow): string
       return [row.source_page_url ?? ""];
     case "provider":
       return [row.provider_navn ?? "", expDcFact(row, "Tilbyder") ?? ""];
+    case "visibility":
+      return [Number(row.catalog_hidden) === 1 ? "hidden" : "visible"];
   }
 }
 
@@ -34856,7 +34883,11 @@ function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } |
   if (over(it.quote, 2000)) return { reason: "invalid_item", detail: "quote longer than 2000 characters" };
   if (over(it.source_url, 2048)) return { reason: "invalid_item", detail: "source_url longer than 2048 characters" };
   if (!(EXP_DATA_CORRECTION_FIELDS as readonly string[]).includes(it.field)) return { reason: "unknown_field", detail: it.field };
-  if (it.action !== "correct" && it.action !== "clear") return { reason: "unknown_action", detail: it.action };
+  if (it.field === "visibility") {
+    if (it.action !== "hide" && it.action !== "unhide") return { reason: "unknown_action", detail: it.action };
+  } else if (it.action !== "correct" && it.action !== "clear") {
+    return { reason: "unknown_action", detail: it.action };
+  }
   if (it.confidence !== "high") return { reason: "confidence_not_high", detail: String(it.confidence ?? "") };
   if (!expDcIsHttpUrl(it.source_url)) return { reason: "invalid_source_url" };
   if (typeof it.quote !== "string" || it.quote.trim() === "") return { reason: "missing_quote" };
@@ -34864,6 +34895,24 @@ function expDcStaticReject(it: ExpDcItem): { reason: string; detail?: string } |
   const ec = it.expected_current;
   if (ec !== null && typeof ec !== "string" && typeof ec !== "number") {
     return { reason: "invalid_item", detail: "expected_current must be a string, number or null" };
+  }
+  if (it.field === "visibility") {
+    // hide only acts on a visible row and unhide only on a hidden one; the
+    // stale-guard then checks that against the row.
+    const want = it.action === "hide" ? "visible" : "hidden";
+    if (expDcNormalise(ec) !== want) {
+      return { reason: "invalid_item", detail: `expected_current must be "${want}" for ${it.action}` };
+    }
+    const nv = it.new_value;
+    if (it.action === "hide") {
+      const code = typeof nv === "string" ? nv.trim().toLowerCase() : "";
+      if (!(EXP_DC_HIDE_REASONS as readonly string[]).includes(code)) {
+        return { reason: "invalid_value", detail: `hide reason (new_value) must be one of: ${EXP_DC_HIDE_REASONS.join(", ")}` };
+      }
+    } else if (nv !== undefined && nv !== null && !(typeof nv === "string" && nv.trim() === "")) {
+      return { reason: "invalid_value", detail: "unhide takes no new_value" };
+    }
+    return null;
   }
   if (it.action === "clear" && !EXP_DC_CLEARABLE_FIELDS.has(it.field)) {
     return { reason: "invalid_value", detail: `clear is not supported for ${it.field}` };
@@ -34931,6 +34980,7 @@ const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
   price_from: ["price_from"],
   provider: ["provider_id"],
   source_page_url: ["source_page_url"],
+  visibility: ["catalog_hidden"],
 };
 
 /**
@@ -34996,6 +35046,7 @@ export async function applyExperienceDataCorrections(
 
   const rowSql = (n: number) =>
     `SELECT ${EXP_DESC_CANDIDATE_SELECT_COLUMNS}, e.title_no, e.provider_id, e.provider_match_status, e.canonical_id,
+            e.catalog_hidden, e.hidden_reason, e.hidden_at,
             (${PUBLISH_GATE_SQL}) AS expdc_published
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
@@ -35045,8 +35096,12 @@ export async function applyExperienceDataCorrections(
   };
 
   // Provider items run first (stable), so a homepage_url item for the same
-  // experience lands on the NEW provider; results stay in request order.
-  const ordered = [...live].sort((a, b) => Number(b.field === "provider") - Number(a.field === "provider"));
+  // experience lands on the NEW provider; visibility items run last, so a
+  // hide is applied after every other correction of its row (whose own
+  // never-unpublish check therefore still sees the row as published);
+  // results stay in request order.
+  const expDcItemRank = (x: ExpDcItem): number => (x.field === "provider" ? 0 : x.field === "visibility" ? 2 : 1);
+  const ordered = [...live].sort((a, b) => expDcItemRank(a) - expDcItemRank(b));
   // The request's own fylke corrections, for kommune disambiguation.
   const requestFylke = new Map<string, string>();
   for (const it of live) {
@@ -35107,11 +35162,13 @@ export async function applyExperienceDataCorrections(
   const publishState = (id: string) =>
     db.prepare(
       `SELECT (${PUBLISH_GATE_SQL}) AS pub, e.verification_status, e.confidence, e.canonical_id,
+              e.catalog_hidden AS experience_catalog_hidden,
               p.id AS provider_id, p.brreg_active, p.catalog_hidden
          FROM experiences e LEFT JOIN experience_providers p ON p.id = e.provider_id
         WHERE e.id = ?`
     ).get(id) as {
       pub: number; verification_status: string | null; confidence: string | null; canonical_id: string | null;
+      experience_catalog_hidden: number | null;
       provider_id: string | null; brreg_active: number | null; catalog_hidden: number | null;
     } | undefined;
 
@@ -35452,6 +35509,21 @@ export async function applyExperienceDataCorrections(
           if (row.provider_match_status !== "matched") expWrites.push(["provider_match_status", "matched"]);
           break;
         }
+        case "visibility": {
+          // The stale-guard above already proved the row is visible (hide)
+          // or hidden (unhide); the static check validated the reason code.
+          if (it.action === "hide") {
+            const code = String(nv).trim().toLowerCase();
+            const at = new Date().toISOString().slice(0, 19).replace("T", " ");
+            expWrites.push(["catalog_hidden", 1], ["hidden_reason", code], ["hidden_at", at]);
+            warnings.push({ code: "hidden", reason: code, was_published: pubBefore });
+            if (!pubBefore) warnings.push({ code: "not_published_before" });
+          } else {
+            expWrites.push(["catalog_hidden", 0], ["hidden_reason", null], ["hidden_at", null]);
+            warnings.push({ code: "unhidden", previous_reason: row.hidden_reason ?? null, hidden_at: row.hidden_at ?? null });
+          }
+          break;
+        }
       }
 
       if (rejected) {
@@ -35507,16 +35579,26 @@ export async function applyExperienceDataCorrections(
       }
       if (orig.canonical_id) warnings.push({ code: "row_is_merged_duplicate", canonical_id: orig.canonical_id });
 
-      if (pubBefore) {
+      // never-unpublish: exactly a visibility:hide item is exempt — taking
+      // the row off the catalog is what it is for. Every other item (incl.
+      // one for the same row in the same request, which runs BEFORE the
+      // hide) is still rolled back when it would unpublish.
+      const isHide = field === "visibility" && it.action === "hide";
+      if (pubBefore && !isHide) {
         const st = publishState(it.id);
         if (Number(st?.pub) !== 1) {
           throw new ExpDcItemRollback(
             `row would leave the public catalog: verification_status=${st?.verification_status ?? null}, ` +
               `confidence=${st?.confidence ?? null}, canonical_id=${st?.canonical_id ?? null}, ` +
+              `catalog_hidden=${st?.experience_catalog_hidden ?? null}, ` +
               `provider_id=${st?.provider_id ?? null}, provider.brreg_active=${st?.brreg_active ?? null}, ` +
               `provider.catalog_hidden=${st?.catalog_hidden ?? null}`
           );
         }
+      }
+      if (field === "visibility" && it.action === "unhide") {
+        const w = warnings.find((x) => x.code === "unhidden");
+        if (w) w.published_now = Number(publishState(it.id)?.pub) === 1;
       }
 
       const correctionId = crypto.randomUUID();

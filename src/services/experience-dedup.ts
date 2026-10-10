@@ -543,6 +543,9 @@ export interface DedupCandidateRow extends ExperienceRichnessInput {
   title_no?: string | null;
   kommune: string | null;
   created_at?: string | null;
+  /** experiences.catalog_hidden (1 = hidden on its own via the data-
+   *  corrections `visibility` field). Read by runDedupPass() only. */
+  catalog_hidden?: number | null;
 }
 
 /**
@@ -642,7 +645,7 @@ const DEDUP_CANDIDATE_COLUMNS = `
   e.group_min, e.group_max, e.age_suitability, e.min_age, e.price_band,
   e.price_from, e.price_unit, e.languages, e.accessibility, e.booking_url,
   e.booking_type, e.loc_lat, e.loc_lon, e.meeting_point, e.evidence_url,
-  e.confidence, e.verification_status, e.created_at
+  e.confidence, e.verification_status, e.created_at, e.catalog_hidden
 `;
 
 /**
@@ -716,7 +719,13 @@ export interface DedupPassResult {
  * entirely) — a second run makes zero writes.
  */
 export function runDedupPass(db: Database.Database): DedupPassResult {
-  const rows = loadDedupCandidates(db);
+  // A row hidden on its own (experiences.catalog_hidden = 1) takes no part
+  // in a merge: as canonical it would pull its visible twins off the
+  // catalog with it, and as a duplicate it would gain a canonical_id that
+  // outlives an unhide. The re-harvest guard (findExistingCandidateMatch
+  // below) still sees hidden rows, so a re-harvest of a hidden listing
+  // never inserts a fresh, visible copy of it.
+  const rows = loadDedupCandidates(db).filter((r) => Number(r.catalog_hidden) !== 1);
   const corpus = loadCorpusTokenCounts(db);
   const groups = groupDuplicateCandidates(rows, corpus);
 

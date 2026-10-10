@@ -262,7 +262,11 @@ export const OPPLEVAGENT_PUBLISH_GATE_SQL =
   // dev-request 2026-09-02-experiences-skrivepause-catalog-hidden-og-
   // rapportspraak Del 2: a catalog_hidden provider's experiences are not
   // published anywhere, so they must not be translated either. LEFT-JOIN-safe.
-  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1)";
+  "AND (p.catalog_hidden IS NULL OR p.catalog_hidden != 1) " +
+  // A single experience hidden on its own (experiences.catalog_hidden = 1,
+  // POST /admin/experiences-data-corrections field `visibility`) is not
+  // published either, so it is not translated.
+  "AND (e.catalog_hidden IS NULL OR e.catalog_hidden != 1)";
 
 const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", aring: "å", Aring: "Å", oslash: "ø", Oslash: "Ø", aelig: "æ", AElig: "Æ", eacute: "é", ouml: "ö", auml: "ä", uuml: "ü", ndash: "–", mdash: "—", hellip: "…" };
 /** Decode HTML entities a scraped source may carry ("G&#229;rd", "&amp;") — the

@@ -353,7 +353,10 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
             confidence TEXT,
             canonical_id TEXT,
             provider_id TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            -- per-experience visibility flag, referenced by the gate's
+            -- experience catalog_hidden clause (NULL = visible).
+            catalog_hidden INTEGER
           );
           -- PUBLISH_GATE_SQL LEFT JOINs this table even when every row here
           -- leaves provider_id NULL (its "p.id IS NULL OR ..." branch is what

@@ -714,12 +714,21 @@ export function getPublishedExperienceById(
 // without restating them — PUBLISH_GATE_SQL's own exported STRING VALUE is
 // unchanged (same clauses, same " AND " join), so every existing caller
 // keeps behaving byte-for-byte identically.
+//
+// The last clause is the PER-EXPERIENCE visibility flag (experiences.
+// catalog_hidden, set/cleared only by POST /admin/experiences-data-
+// corrections, field `visibility`): one discontinued or broken listing can
+// be taken off every public surface without touching its provider. It sits
+// in the OTHER clauses on purpose, so PUBLISH_GATE_SQL_EXCEPT_STATUS carries
+// it too — a reconstruction of "was this row published" (requarantine
+// rejudge) must never count a hidden row as published and restore it.
 const PUBLISH_GATE_STATUS_CLAUSE = "e.verification_status = 'verified'";
 const PUBLISH_GATE_OTHER_CLAUSES = [
   "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
   "(p.id IS NULL OR p.brreg_active = 1)",
   "e.canonical_id IS NULL",
   "(p.catalog_hidden IS NULL OR p.catalog_hidden != 1)",
+  "(e.catalog_hidden IS NULL OR e.catalog_hidden != 1)",
 ];
 export const PUBLISH_GATE_SQL = [PUBLISH_GATE_STATUS_CLAUSE, ...PUBLISH_GATE_OTHER_CLAUSES].join(" AND ");
 
@@ -741,7 +750,7 @@ export const PUBLISH_GATE_SQL = [PUBLISH_GATE_STATUS_CLAUSE, ...PUBLISH_GATE_OTH
 // a stored fact; see that route's own doc comment for the full reasoning and
 // the acknowledged edge case (a row that was needs_review for an unrelated
 // reason AND happens to satisfy every other clause today would also pass
-// this check — believed rare, since PUBLISH_GATE_SQL's own four other
+// this check — believed rare, since PUBLISH_GATE_SQL's own other
 // clauses are exactly the "would already be showing" bar).
 export const PUBLISH_GATE_SQL_EXCEPT_STATUS = PUBLISH_GATE_OTHER_CLAUSES.join(" AND ");
 
@@ -1945,11 +1954,17 @@ export function buildNarrowingSuggestions(
   return suggestions.slice(0, limit);
 }
 
+// Public (GET /api/opplevelser/categories, MCP list_experience_categories,
+// the A2A categories answer, the homepage category cards). Provider-join-
+// less, so it does not carry the provider clauses of PUBLISH_GATE_SQL, but
+// it does drop a row hidden on its own (experiences.catalog_hidden = 1) —
+// a hidden listing must not be counted anywhere it is not shown.
 export function listCategories(): Array<{ category: string; count: number }> {
   const db = getDb(VERTICAL);
   return db.prepare(`
     SELECT category, COUNT(*) as count FROM experiences
     WHERE category IS NOT NULL AND verification_status = 'verified' AND canonical_id IS NULL
+      AND (catalog_hidden IS NULL OR catalog_hidden != 1)
     GROUP BY category ORDER BY count DESC
   `).all() as Array<{ category: string; count: number }>;
 }
@@ -1979,17 +1994,19 @@ export function resolveCanonicalSlugForDuplicate(slug: string): string | null {
     .prepare("SELECT id, canonical_id FROM experiences WHERE slug = ?")
     .get(slug) as { id: string; canonical_id: string | null } | undefined;
   if (!row || !row.canonical_id) return null;
-  const getById = db.prepare("SELECT slug, canonical_id FROM experiences WHERE id = ?");
+  const getById = db.prepare("SELECT slug, canonical_id, catalog_hidden FROM experiences WHERE id = ?");
   const visited = new Set<string>([row.id]);
   let currentId: string = row.canonical_id;
   for (;;) {
     if (visited.has(currentId)) return null; // cycle — no terminal row exists
     visited.add(currentId);
     const current = getById.get(currentId) as
-      | { slug: string | null; canonical_id: string | null }
+      | { slug: string | null; canonical_id: string | null; catalog_hidden: number | null }
       | undefined;
     if (!current) return null; // dangling canonical_id
-    if (!current.canonical_id) return current.slug ?? null; // terminal row
+    // A hidden terminal row (experiences.catalog_hidden = 1) has no live
+    // page — 404 directly instead of a 301 to a 404.
+    if (!current.canonical_id) return Number(current.catalog_hidden) === 1 ? null : current.slug ?? null; // terminal row
     currentId = current.canonical_id;
   }
 }
