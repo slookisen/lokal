@@ -165,15 +165,24 @@ export async function runRfbChatgptAnnotationsTests(opts: { log?: boolean } = {}
       const srv = http.createServer(app);
       await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
       try {
-        const res = await fetch(`http://127.0.0.1:${srv.address().port}/mcp`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: "init", method: "initialize",
-            params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "rfb-instructions-test", version: "1.0.0" } },
-          }),
+        // node:http, not global fetch: other suites in tests/test.ts stub fetch.
+        const body = JSON.stringify({
+          jsonrpc: "2.0", id: "init", method: "initialize",
+          params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "rfb-instructions-test", version: "1.0.0" } },
         });
-        const text = await res.text();
+        const text = await new Promise<string>((resolve, reject) => {
+          const req = http.request({
+            host: "127.0.0.1", port: srv.address().port, path: "/mcp", method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "Content-Length": Buffer.byteLength(body) },
+          }, (res: any) => {
+            let data = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk: string) => { data += chunk; });
+            res.on("end", () => resolve(data));
+          });
+          req.on("error", reject);
+          req.end(body);
+        });
         const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
         const ins = (JSON.parse(dataLine ? dataLine.slice(6) : text)?.result?.instructions ?? "") as string;
         assertTrue(/in Norway only/.test(ins), "i1: initialize instructions say Rett fra Bonden covers Norway only");
