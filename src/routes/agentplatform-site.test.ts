@@ -36,6 +36,7 @@ import {
   formatCount,
 } from "./agentplatform-site";
 import { COMPANY_INFO } from "../config/company-info";
+import { companyVatStatus } from "../services/company-legal";
 
 export interface TestSummary {
   passed: number;
@@ -231,6 +232,13 @@ export async function runAgentplatformSiteTests(opts: { log?: boolean } = {}): P
     check("e3: /kontakt and /en/contact → 200 with name, org.nr, address, email, register", [kontakt, contactEn].every(
       (r) => r.status === 200 && r.body.includes(COMPANY_INFO.legalName) && r.body.includes(COMPANY_INFO.orgNrDisplay) && r.body.includes(street) && r.body.includes(COMPANY_INFO.email),
     ) && kontakt.body.includes("Foretaksregisteret"));
+    check("e3b: /kontakt and /en/contact add organisation form, head office and VAT status (foretaksregisterloven § 7-2, ehandelsloven § 8)",
+      kontakt.body.includes(`<dt>Organisasjonsform</dt><dd>${COMPANY_INFO.organizationForm.nb}</dd>`) &&
+      kontakt.body.includes(`<dt>Hovedkontor</dt><dd>${COMPANY_INFO.headOffice}</dd>`) &&
+      kontakt.body.includes(`<dt>MVA</dt><dd>${companyVatStatus("nb")}</dd>`) &&
+      contactEn.body.includes(`<dt>Organisation form</dt><dd>${COMPANY_INFO.organizationForm.en}</dd>`) &&
+      contactEn.body.includes(`<dt>Head office</dt><dd>${COMPANY_INFO.headOffice}</dd>`) &&
+      contactEn.body.includes(`<dt>VAT</dt><dd>${companyVatStatus("en")}</dd>`));
     check("e4: /personvern and /en/privacy name the controller with org.nr and address", [personvern, privacy].every(
       (r) => r.status === 200 && r.body.includes(COMPANY_INFO.legalName) && r.body.includes(COMPANY_INFO.orgNrDisplay) && r.body.includes(street),
     ));

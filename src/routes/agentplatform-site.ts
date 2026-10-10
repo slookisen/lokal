@@ -30,6 +30,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { safeHonestCatalogCount, type CatalogVertical } from "../services/honest-count";
 import { COMPANY_INFO } from "../config/company-info";
+import { companyVatStatus } from "../services/company-legal";
 import { getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { getAgentToolCallsSnapshot } from "../services/agent-usage";
 
@@ -394,6 +395,9 @@ const T = {
     factEmail: "E-post",
     factRegister: "Registrert i",
     factRegisterValue: "Foretaksregisteret",
+    factForm: "Organisasjonsform",
+    factHeadOffice: "Hovedkontor",
+    factVat: "MVA",
     factsMore: "All kontaktinformasjon",
     contactHref: "/kontakt",
     footerRegistered: "Registrert i Foretaksregisteret",
@@ -548,6 +552,9 @@ const T = {
     factEmail: "Email",
     factRegister: "Registered in",
     factRegisterValue: "the Register of Business Enterprises",
+    factForm: "Organisation form",
+    factHeadOffice: "Head office",
+    factVat: "VAT",
     factsMore: "Full contact details",
     contactHref: "/en/contact",
     footerRegistered: "Registered in the Norwegian Register of Business Enterprises",
@@ -1255,9 +1262,12 @@ export function renderContact(lang: Lang): string {
 <div class="ctas"><a class="btn btn-primary btn-mail" href="mailto:${COMPANY.email}">${MAIL}<span>${COMPANY.email}</span></a></div>
 <div class="facts-card" style="margin-top:40px"><h2 class="facts-h">${t.factsTitle}</h2><dl>
 <div><dt>${t.factName}</dt><dd>${COMPANY.legalName}</dd></div>
+<div><dt>${t.factForm}</dt><dd>${esc(COMPANY.organizationForm[lang])}</dd></div>
 <div><dt>${t.factOrg}</dt><dd><a href="${COMPANY.brregUrl}" title="${esc(t.factOrgLinkTitle)}">${COMPANY.orgNrDisplay}</a></dd></div>
 <div><dt>${t.factRegister}</dt><dd>${t.factRegisterValue}</dd></div>
+<div><dt>${t.factHeadOffice}</dt><dd>${esc(COMPANY.headOffice)}</dd></div>
 <div><dt>${t.factAddress}</dt><dd>${ADDRESS_LINE}${lang === "en" ? ", Norway" : ""}</dd></div>
+<div><dt>${t.factVat}</dt><dd>${esc(companyVatStatus(lang))}</dd></div>
 <div><dt>${t.factEmail}</dt><dd><a href="mailto:${COMPANY.email}">${COMPANY.email}</a></dd></div>
 </dl></div>
 <h2>${t.contactPageServicesTitle}</h2>
