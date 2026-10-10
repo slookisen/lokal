@@ -466,9 +466,15 @@ function noteAttempt(v: OffsiteVertical, now: Date): void {
   nightAttempts.set(v, { night, n: a && a.night === night ? a.n + 1 : 1 });
 }
 
-export function shouldRunOffsiteBackup(now: Date, lastRunAt: Date | null): boolean {
+/**
+ * Due when inside tonight's window and the last success is from before the window opened.
+ * A success earlier the same day (e.g. a manual run at 14 UTC after a deploy) therefore never
+ * skips the next night; a success inside the window counts as tonight's backup.
+ */
+export function shouldRunOffsiteBackup(now: Date, lastSuccessAt: Date | null): boolean {
   if (!inOffsiteWindow(now)) return false;
-  return !lastRunAt || now.getTime() - lastRunAt.getTime() >= 20 * 3600_000;
+  const windowStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), OFFSITE_WINDOW_START_UTC);
+  return !lastSuccessAt || lastSuccessAt.getTime() < windowStart;
 }
 
 export function shouldRunRestoreTest(now: Date, lastRunAt: Date | null): boolean {

@@ -201,6 +201,9 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
   ok(!ob.shouldRunOffsiteBackup(at("2026-10-10T03:59:00Z"), null) && !ob.shouldRunOffsiteBackup(at("2026-10-10T06:00:00Z"), null), "backup does not run outside 04–05 UTC");
   ok(!ob.shouldRunOffsiteBackup(at("2026-10-10T04:40:00Z"), at("2026-10-10T04:05:00Z")), "backup not twice in the same window");
   ok(ob.shouldRunOffsiteBackup(at("2026-10-11T04:01:00Z"), at("2026-10-10T04:20:00Z")), "backup runs again the next night");
+  ok(ob.shouldRunOffsiteBackup(at("2026-10-11T04:05:00Z"), at("2026-10-10T14:00:00Z")) &&
+    ob.shouldRunOffsiteBackup(at("2026-10-11T04:05:00Z"), at("2026-10-11T02:30:00Z")),
+    "a daytime or 02 UTC manual success does not skip the next night");
   ok(ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), null) && !ob.shouldRunRestoreTest(at("2026-10-10T04:10:00Z"), null), "restore test only Sunday 04–05 UTC");
   ok(!ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), at("2026-10-06T04:00:00Z")), "restore test at most weekly");
   ok(ob.isOffsiteBlockedHour(at("2026-10-10T08:00:00Z")) && ob.isOffsiteBlockedHour(at("2026-10-10T03:30:00Z")) &&
@@ -382,6 +385,26 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     ok(ob.getOffsiteBackupStatus({ env: env as any, stateDb: tickDb }).lastRestoreOkAt?.dental === "2026-10-11T05:40:00.000Z", "tick: restore test stamped");
     ok((await ob.runOffsiteBackupNow({ env: {} as any, stateDb: tickDb })).skipped === "not_configured", "tick/run without secrets stays a no-op");
     tickDb.close();
+
+    // a manual success at 14 UTC must not skip the next night (review round 3)
+    ob.__resetOffsiteBackupForTesting();
+    const manDb = new Database(":memory:");
+    tickNow = new Date("2026-10-15T14:00:00.000Z");
+    const man = await ob.runOffsiteBackupNow({ env: env as any, stateDb: manDb, verticals: ["dental"], getTarget: () => target, deps: { ...deps, now: () => tickNow } });
+    ok(man.results[0]?.ok === true, "manual run at 14:00 succeeded");
+    const tick3 = ob.createOffsiteBackupTick({
+      getStateDb: () => manDb,
+      now: () => tickNow,
+      run: { env: env as any, verticals: ["dental"], getTarget: () => target, deps: { ...deps, now: () => tickNow } },
+    });
+    p0 = putsOf();
+    tickNow = new Date("2026-10-16T04:05:00.000Z");
+    await tick3();
+    ok(putsOf() - p0 === 1, "night after a 14:00 manual run: the scheduled backup still runs");
+    tickNow = new Date("2026-10-16T04:20:00.000Z");
+    await tick3();
+    ok(putsOf() - p0 === 1, "…and only once that night");
+    manDb.close();
 
     // a failed night: one retry later in the window, then no more attempts that night
     ob.__resetOffsiteBackupForTesting();
