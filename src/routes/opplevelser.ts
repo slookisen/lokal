@@ -148,6 +148,9 @@ import {
   // catalog-wide audit behind POST /admin/gardssalg-contact-email-audit).
   flagGardssalgContactEmailForReview,
   selectGardssalgProvidersForContactEmailAudit,
+  pageContainsExactEmail,
+  applyGardssalgEpostHomepageProof,
+  isSourceOnWebsiteDomain,
   // dev-request 2026-08-18-gardssalg-set-contact-phone — same gap, phone
   // field (Monkey Brew case: producer replied with a corrected phone number,
   // no write path existed).
@@ -11044,6 +11047,142 @@ router.post("/admin/gardssalg-set-contact-email", requireAdmin, (req: Request, r
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-epost-homepage-proof (admin) ─────
+//
+// dev-request 2026-10-10-opplevagent-adressekontroll-leser-epost-kilde, §3.
+// Existing rows carry an epost source without `value` (or none), so the
+// address basis can never reach "published_on_producer_site" for them. This
+// route fetches the producer's OWN pages (front page + the same contact-ish
+// subpages as gardssalg-contact-extraction, via the same SSRF-safe
+// fetchPage()/cooldown helper) and, only if the EXACT current address is
+// there, writes field_provenance.epost = {source_url, fetched_at,
+// source_type:"homepage", value}. The address itself is NEVER changed.
+// Not found -> no write, reported as `ikke_funnet`.
+//
+// Dry-run by default (apply=1/true), max 20 rows per call, shares the
+// contact-extraction run lock (both are fetch-heavy). Cohort: rows with
+// hjemmeside + epost whose address basis is still "unverified"; narrow with
+// providerIds. Do not apply in the 08:00-08:59Z send window.
+const GS_EPOST_PROOF_MAX = 20;
+router.post("/admin/gardssalg-epost-homepage-proof", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown; providerIds?: unknown };
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
+    req.query?.apply === "1" || req.query?.apply === "true";
+  const dryRun = !apply;
+  const limit =
+    typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), GS_EPOST_PROOF_MAX) : GS_EPOST_PROOF_MAX;
+  const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+  let providerIds: Set<string> | null = null;
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+      .map((v) => v.trim());
+    if (ids.length === 0) {
+      res.status(400).json({ error: "providerIds must contain at least one non-blank string" });
+      return;
+    }
+    providerIds = new Set(ids);
+  }
+
+  if (gsCxLock) {
+    const lockAgeMs = Date.now() - gsCxLock.startedAt;
+    if (lockAgeMs < gsCxLockMaxMs()) {
+      res.status(409).json({
+        error: "run_in_progress",
+        detail: "en contact-extraction/epost-proof-kjøring pågår allerede — vent til den er ferdig",
+        started_at: new Date(gsCxLock.startedAt).toISOString(),
+        run_id: gsCxLock.runId,
+        lock_age_ms: lockAgeMs,
+      });
+      return;
+    }
+  }
+  gsCxLock = { startedAt: Date.now(), runId: crypto.randomUUID() };
+  try {
+    const batchId = `epost-homepage-proof-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+    const cohort = selectGardssalgProvidersForContactEmailAudit().filter((r) => {
+      if (providerIds && !providerIds.has(r.id)) return false;
+      return computeGardssalgAddressBasis(r.epost, r.hjemmeside, r.field_provenance) === "unverified";
+    });
+    const targets = cohort.slice(offset, offset + limit);
+
+    const funnet: Array<{ provider_id: string; navn: string; epost: string; source_url: string; written: boolean }> = [];
+    const ikkeFunnet: Array<{ provider_id: string; navn: string; epost: string; pages_read: number }> = [];
+    const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
+    const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
+    const writeRefused: Array<{ provider_id: string; reason: string }> = [];
+    const errors: Array<{ provider_id: string; error: string }> = [];
+
+    let clientDisconnected = false;
+    for (const t of targets) {
+      if ((req as any).aborted === true || res.writableEnded || (res as any).destroyed === true) {
+        clientDisconnected = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, gsCxRowDelayMs));
+      try {
+        const front = await gsCxFetchPage(t.hjemmeside);
+        if (front.kind === "cooldown_skipped") {
+          cooldownSkipped.push({ provider_id: t.id, navn: t.navn, host: front.host });
+          continue;
+        }
+        if (front.kind === "failed") {
+          fetchFailed.push({ provider_id: t.id, navn: t.navn });
+          continue;
+        }
+        const host = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(t.hjemmeside) || "";
+        const pages: Array<{ url: string; html: string }> = [];
+        for (const sub of gardssalgContactPageLinks(front.html, host, GS_CX_MAX_CONTACT_PAGES)) {
+          const o = await gsCxFetchPage(sub);
+          if (o.kind === "ok") pages.push({ url: o.finalUrl, html: o.html });
+        }
+        pages.push({ url: front.finalUrl, html: front.html });
+
+        // Only a page on the website's own domain counts as evidence (a
+        // redirect to a foreign host is not "the producer's own site").
+        const hit = pages.find(
+          (pg) => isSourceOnWebsiteDomain(pg.url, t.hjemmeside) && pageContainsExactEmail(pg.html, t.epost),
+        );
+        if (!hit) {
+          ikkeFunnet.push({ provider_id: t.id, navn: t.navn, epost: t.epost, pages_read: pages.length });
+          continue;
+        }
+        let written = false;
+        if (apply) {
+          const w = applyGardssalgEpostHomepageProof(t.id, t.epost, hit.url, batchId);
+          if (w.ok) written = true;
+          else writeRefused.push({ provider_id: t.id, reason: w.reason });
+        }
+        funnet.push({ provider_id: t.id, navn: t.navn, epost: t.epost, source_url: hit.url, written });
+      } catch (err: any) {
+        errors.push({ provider_id: t.id, error: String(err?.message || err) });
+      }
+    }
+
+    res.json({
+      dry_run: dryRun,
+      batch_id: batchId,
+      limit,
+      offset,
+      cohort_total: cohort.length,
+      processed: funnet.length + ikkeFunnet.length + fetchFailed.length + cooldownSkipped.length + errors.length,
+      funnet_count: funnet.length,
+      written_count: funnet.filter((f) => f.written).length,
+      ikke_funnet_count: ikkeFunnet.length,
+      funnet,
+      ikke_funnet: ikkeFunnet,
+      fetch_failed: fetchFailed,
+      cooldown_skipped: cooldownSkipped,
+      write_refused: writeRefused,
+      errors,
+      ...(clientDisconnected ? { aborted: "client_disconnected" } : {}),
+    });
+  } finally {
+    gsCxLock = null;
+  }
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-contact-email-audit (admin) ──────
 //
 // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(c),
@@ -19292,6 +19431,26 @@ export function computeGardssalgAddressBasis(
           : undefined;
       if (hasHomepageEvidence(emailProvenance, epost, websiteHost)) {
         return "published_on_producer_site";
+      }
+      // Gardssalg stores its own email source under `epost` (single object or
+      // list). Thin adapter onto hasHomepageEvidence: a record counts only
+      // when it carries `value` == current address AND source_url is on the
+      // website's (equivalent) domain. A record without `value` never counts
+      // (fail closed). A record whose source_type is something other than
+      // "homepage" is not coerced.
+      const epostProvenance =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>).epost
+          : undefined;
+      if (epostProvenance) {
+        const list: unknown[] = Array.isArray(epostProvenance) ? epostProvenance : [epostProvenance];
+        const adapted = list
+          .filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+          .filter((r) => r.source_type === undefined || r.source_type === "homepage")
+          .map((r) => ({ ...r, source_type: "homepage" }));
+        if (hasHomepageEvidence(adapted, epost, websiteHost)) {
+          return "published_on_producer_site";
+        }
       }
     } catch {
       // Malformed field_provenance JSON -> fail closed, fall through to the
