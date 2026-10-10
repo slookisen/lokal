@@ -91,6 +91,24 @@
     <xhtml:link rel="alternate" hreflang="x-default" href="https://rettfrabonden.com/personvern"/>
   </url>
   <url>
+    <loc>https://rettfrabonden.com/kjopsvilkar</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.5</priority>
+    <lastmod>{TODAY}</lastmod>
+    <xhtml:link rel="alternate" hreflang="nb" href="https://rettfrabonden.com/kjopsvilkar"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://rettfrabonden.com/en/kjopsvilkar"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://rettfrabonden.com/kjopsvilkar"/>
+  </url>
+  <url>
+    <loc>https://rettfrabonden.com/en/kjopsvilkar</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.5</priority>
+    <lastmod>{TODAY}</lastmod>
+    <xhtml:link rel="alternate" hreflang="nb" href="https://rettfrabonden.com/kjopsvilkar"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://rettfrabonden.com/en/kjopsvilkar"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://rettfrabonden.com/kjopsvilkar"/>
+  </url>
+  <url>
     <loc>https://rettfrabonden.com/proveniens</loc>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>

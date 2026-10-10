@@ -38079,7 +38079,7 @@ console.log("\n── mcp-usage-guides: GET /guide-mat-ai (rettfrabonden.com) �
     // the geo-faq-cc/geo-afo blocks' `expSeoSrcAfo.includes(...)` checks).
     const fsGma = require("fs");
     const seoSrcGma = fsGma.readFileSync("src/routes/seo.ts", "utf8");
-    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/proveniens"]'),
+    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/kjopsvilkar", "/proveniens"]'),
       "gma-15: sitemap.xml's corePaths array includes /guide-mat-ai");
 
     console.log("  mcp-usage-guides (rfb): OK (16 tests: route-registered/200-no/canonical-no/faq-no/title-no/real-tools/teknologi-crosslink/200-en/canonical-en/faq-en/title-en/tools-en/faq-builder-valid/faq-count/faq-shape/sitemap-corepaths)");
