@@ -17,6 +17,22 @@ export interface TestSummary { passed: number; failed: number; failures: string[
 
 type Stored = { body: Buffer; lastModified: Date; meta: string | null };
 
+/** Calls an Express router directly (same seam as src/routes/admin-db-backup.test.ts). */
+function callRoute(router: any, method: string, url: string, headers: Record<string, string> = {}): Promise<{ status: number; body: any }> {
+  return new Promise((resolve) => {
+    const query: Record<string, string> = {};
+    const qi = url.indexOf("?");
+    if (qi !== -1) for (const pair of url.slice(qi + 1).split("&")) { const [k, v] = pair.split("="); query[k] = decodeURIComponent(v ?? ""); }
+    const req: any = { method, url, query, headers };
+    const res: any = {
+      statusCode: 200,
+      status(code: number) { this.statusCode = code; return this; },
+      json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+    };
+    router.handle(req, res, (err?: any) => resolve({ status: err ? 500 : 404, body: { error: String(err ?? "no route") } }));
+  });
+}
+
 function startFakeS3(bucket: string, secret: string, ob: typeof import("./offsite-backup")) {
   const store = new Map<string, Stored>();
   const log: Array<{ method: string; key: string; status: number }> = [];
@@ -187,9 +203,33 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
   ok(ob.shouldRunOffsiteBackup(at("2026-10-11T04:01:00Z"), at("2026-10-10T04:20:00Z")), "backup runs again the next night");
   ok(ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), null) && !ob.shouldRunRestoreTest(at("2026-10-10T04:10:00Z"), null), "restore test only Sunday 04–05 UTC");
   ok(!ob.shouldRunRestoreTest(at("2026-10-11T04:10:00Z"), at("2026-10-06T04:00:00Z")), "restore test at most weekly");
-  ok(ob.isOffsiteBlockedHour(at("2026-10-10T08:00:00Z")) && !ob.isOffsiteBlockedHour(at("2026-10-10T04:00:00Z")), "07–09 UTC is blocked for manual runs");
+  ok(ob.isOffsiteBlockedHour(at("2026-10-10T08:00:00Z")) && ob.isOffsiteBlockedHour(at("2026-10-10T03:30:00Z")) &&
+    !ob.isOffsiteBlockedHour(at("2026-10-10T04:00:00Z")) && !ob.isOffsiteBlockedHour(at("2026-10-10T12:00:00Z")),
+    "03 UTC and 07–09 UTC are blocked for manual runs");
 
-  // ── (6) end-to-end against a fake S3 ──────────────────────────
+  // ── (6) admin routes: auth, validation, not configured (no DB, no network) ──
+  {
+    const keys = ["ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL_S3", "AWS_REGION", "BUCKET_NAME"];
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      for (const k of keys) delete process.env[k];
+      process.env.ADMIN_KEY = "test-admin";
+      const router = (require("../routes/admin-db-backup") as typeof import("../routes/admin-db-backup")).default;
+      ok((await callRoute(router, "POST", "/offsite-backup?vertical=dental")).status === 403, "admin POST without key -> 403");
+      ok((await callRoute(router, "GET", "/offsite-backup")).status === 403, "admin GET without key -> 403");
+      ok((await callRoute(router, "POST", "/offsite-backup/restore-test?vertical=dental", { "x-admin-key": "wrong" })).status === 403, "admin restore-test with wrong key -> 403");
+      const auth = { "x-admin-key": "test-admin" };
+      ok((await callRoute(router, "POST", "/offsite-backup", auth)).status === 400, "admin POST without vertical -> 400");
+      ok((await callRoute(router, "POST", "/offsite-backup?vertical=lokal", auth)).status === 400, "admin POST with unknown vertical -> 400");
+      const nc = await callRoute(router, "POST", "/offsite-backup?vertical=all", auth);
+      ok(nc.status === 503 && /not configured/.test(nc.body?.error || ""), "admin POST without Tigris secrets -> 503, nothing started");
+      ok(!ob.isOffsiteRunning(), "no run started by the refused requests");
+    } finally {
+      for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    }
+  }
+
+  // ── (7) end-to-end against a fake S3 ──────────────────────────
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "offsite-s2-"));
   const SECRET = "tsec_LOCAL/+secret";
   const fake = startFakeS3("bkt", SECRET, ob);
@@ -342,6 +382,32 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     ok(ob.getOffsiteBackupStatus({ env: env as any, stateDb: tickDb }).lastRestoreOkAt?.dental === "2026-10-11T05:40:00.000Z", "tick: restore test stamped");
     ok((await ob.runOffsiteBackupNow({ env: {} as any, stateDb: tickDb })).skipped === "not_configured", "tick/run without secrets stays a no-op");
     tickDb.close();
+
+    // a failed night: one retry later in the window, then no more attempts that night
+    ob.__resetOffsiteBackupForTesting();
+    const failDb = new Database(":memory:");
+    tickNow = new Date("2026-10-13T04:05:00.000Z");
+    const tick2 = ob.createOffsiteBackupTick({
+      getStateDb: () => failDb,
+      now: () => tickNow,
+      run: { env: env as any, verticals: ["dental"], getTarget: () => target, deps: { ...deps, now: () => tickNow } },
+    });
+    fake.state.failPut = true;
+    p0 = putsOf();
+    await tick2();
+    ok(putsOf() - p0 === 3, "failed night: first scheduled attempt (3 PUT tries)");
+    tickNow = new Date("2026-10-13T04:20:00.000Z");
+    await tick2();
+    ok(putsOf() - p0 === 6, "failed night: one retry at the next tick");
+    tickNow = new Date("2026-10-13T04:35:00.000Z");
+    await tick2();
+    ok(putsOf() - p0 === 6, "failed night: no third attempt");
+    fake.state.failPut = false;
+    tickNow = new Date("2026-10-14T04:05:00.000Z");
+    await tick2();
+    ok(putsOf() - p0 === 7 && ob.getOffsiteBackupStatus({ env: env as any, stateDb: failDb }).lastSuccessAt?.dental === "2026-10-14T04:05:00.000Z",
+      "next night: backed up again");
+    failDb.close();
   } finally {
     try { live.close(); } catch { /* ignore */ }
     await new Promise<void>((r) => fake.server.close(() => r()));

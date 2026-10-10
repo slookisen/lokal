@@ -444,9 +444,26 @@ function inOffsiteWindow(now: Date): boolean {
   return h >= OFFSITE_WINDOW_START_UTC && h <= OFFSITE_WINDOW_END_UTC;
 }
 
+/** Manual runs are refused at 03 UTC (prune + WAL checkpoint, which a long read snapshot in the
+ * backup worker would make wait) and 07–09 UTC (send window). */
 export function isOffsiteBlockedHour(now: Date): boolean {
   const h = now.getUTCHours();
-  return h >= 7 && h <= 9;
+  return h === 3 || (h >= 7 && h <= 9);
+}
+
+/** Scheduled attempts per DB per night (in memory): one retry later in the window, no more. */
+export const OFFSITE_MAX_ATTEMPTS_PER_NIGHT = 2;
+const nightAttempts = new Map<string, { night: string; n: number }>();
+
+function attemptsTonight(v: OffsiteVertical, now: Date): number {
+  const a = nightAttempts.get(v);
+  return a && a.night === now.toISOString().slice(0, 10) ? a.n : 0;
+}
+
+function noteAttempt(v: OffsiteVertical, now: Date): void {
+  const night = now.toISOString().slice(0, 10);
+  const a = nightAttempts.get(v);
+  nightAttempts.set(v, { night, n: a && a.night === night ? a.n + 1 : 1 });
 }
 
 export function shouldRunOffsiteBackup(now: Date, lastRunAt: Date | null): boolean {
@@ -880,15 +897,25 @@ export interface OffsiteTickOptions {
   run?: Omit<OffsiteRunOptions, "scheduled" | "stateDb">;
 }
 
-/** Scheduler tick for src/index.ts (every OFFSITE_TICK_MS). Never throws. */
+/**
+ * Scheduler tick for src/index.ts (every OFFSITE_TICK_MS). Never throws.
+ * Each DB is due on its own success stamp, so a DB whose backup failed (e.g. a short Tigris
+ * outage) is tried once more later in the window; the others are not copied again.
+ */
 export function createOffsiteBackupTick(opts: OffsiteTickOptions = {}): () => Promise<void> {
   return async () => {
     try {
       if (!readS3Config(opts.run?.env) || running) return;
       const now = (opts.now ?? (() => new Date()))();
       const stateDb = (opts.getStateDb ?? defaultStateDb)();
-      if (shouldRunOffsiteBackup(now, getJobLastCompletedAt(stateDb, JOB_BACKUP))) {
-        const s = await runOffsiteBackupNow({ ...opts.run, scheduled: true, stateDb });
+      const due = (opts.run?.verticals ?? OFFSITE_VERTICALS).filter(
+        (v) =>
+          shouldRunOffsiteBackup(now, getJobLastCompletedAt(stateDb, `${JOB_BACKUP}:${v}`)) &&
+          attemptsTonight(v, now) < OFFSITE_MAX_ATTEMPTS_PER_NIGHT,
+      );
+      if (due.length > 0) {
+        due.forEach((v) => noteAttempt(v, now));
+        const s = await runOffsiteBackupNow({ ...opts.run, verticals: due, scheduled: true, stateDb });
         s.results.forEach(logBackup);
       }
       if (shouldRunRestoreTest(now, getJobLastCompletedAt(stateDb, JOB_RESTORE))) {
@@ -907,4 +934,5 @@ export function __resetOffsiteBackupForTesting(): void {
   lastBackupResults = [];
   lastRestoreResults = [];
   statusCache = null;
+  nightAttempts.clear();
 }

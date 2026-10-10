@@ -468,7 +468,8 @@ router.get("/backup", (req: Request, res: Response) => {
 // GET  /offsite-backup[?list=1]                    status; ?list=1 also lists the bucket
 // POST /offsite-backup?vertical=<v|all>              start a backup now (202, runs in background)
 // POST /offsite-backup/restore-test?vertical=<v|all> start a restore test now (202)
-// Manual runs are refused 07–09 UTC (send window) and while a run is in progress.
+// Manual runs are refused at 03 UTC (prune + WAL checkpoint), 07–09 UTC (send window) and
+// while a run is in progress.
 
 function parseOffsiteVerticals(raw: unknown, res: Response): OffsiteVertical[] | null {
   if (raw === "all") return [...OFFSITE_VERTICALS];
@@ -507,7 +508,7 @@ function startOffsite(kind: "backup" | "restore", req: Request, res: Response): 
     return;
   }
   if (isOffsiteBlockedHour(new Date())) {
-    res.status(409).json({ error: "Manual offsite runs are not allowed 07–09 UTC" });
+    res.status(409).json({ error: "Manual offsite runs are not allowed at 03 UTC or 07–09 UTC" });
     return;
   }
   if (isOffsiteRunning()) {

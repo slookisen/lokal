@@ -1,8 +1,11 @@
 // Worker thread for src/services/offsite-backup.ts. Keeps the heavy SQLite work off the
 // main thread (the event loop serves all traffic):
 //   op "backup":    own connection to the live DB file, SQLite online backup to destPath.
-//                   After the first default step (100 pages) the rest is copied in one step,
-//                   so writes on the main connection cannot keep restarting the backup.
+//                   After better-sqlite3's first step every later step asks for the maximum
+//                   page count, i.e. "all remaining pages", so the copy finishes in one step
+//                   even if the file grows meanwhile (asking for the previous total could
+//                   leave a few pages over, and the next step would then restart after a
+//                   write on the main connection — an endless loop while the DB grows).
 //                   The final fsync of the copy also happens here.
 //   op "integrity": PRAGMA integrity_check on a restored temp copy. Not opened read-only:
 //                   the copy may be in WAL mode without -shm/-wal files, and it is a
@@ -17,7 +20,7 @@ async function main(): Promise<string[]> {
   try {
     if (op === "backup") {
       if (!destPath) throw new Error("destPath missing");
-      await db.backup(destPath, { progress: (info) => Math.max(100, info.totalPages) });
+      await db.backup(destPath, { progress: () => 0x7fffffff });
       return [];
     }
     const rows = db.pragma("integrity_check") as Array<{ integrity_check: string }>;
