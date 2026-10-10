@@ -207,6 +207,9 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       }), baseHeaders);
       const sessionId = initRes.headers["mcp-session-id"] as string | undefined;
       assertTrue(!!sessionId, "s1: MCP initialize returns a session id");
+      const instructions = parseJsonRpcBody(initRes.text, (initRes.headers["content-type"] as string | undefined) ?? null)?.result?.instructions ?? "";
+      assertTrue(/in Norway only/.test(instructions) && /never takes payment/.test(instructions) && /cannot confirm a booking/.test(instructions),
+        "s2: initialize returns server instructions stating Norway only, no payment, no confirmed bookings");
 
       let rpcId = 0;
       async function rpc(method: string, params: Record<string, unknown>): Promise<any> {
@@ -315,6 +318,26 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       assertEq(await gsNames({ query: "Kenya" }), [], "h3: discover_gardssalg query 'Kenya' returns no producers");
       const tromso = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { lat: 69.65, lng: 18.95, radius_km: 50 } })).result?.content?.[0]?.text ?? "{}");
       assertTrue(!/only covers/.test(tromso.summary ?? ""), "h4: an origin in Norway (Tromsø) is searched normally");
+      // ChatGPT pre-submission check 2026-10-10: "Find me a safari lodge in
+      // Kenya for next month" answered "Norway only" in text while the card
+      // showed Norwegian safaris — the model searched without the place. The
+      // user's request now travels in `query`, and the card gets a flag.
+      const kenyaQ = await rpc("tools/call", { name: "discover_experiences", arguments: { category: "safari", query: "safari lodge in Kenya for next month" } });
+      const kenyaQText = JSON.parse(kenyaQ.result?.content?.[0]?.text ?? "{}");
+      assertTrue(kenyaQText.count === 0 && kenyaQText.out_of_area === true && kenyaQText.place === "Kenya" && /Do not search again without the place/.test(kenyaQText.summary ?? ""),
+        "h5: a category-only call whose query names Kenya returns no experiences, out_of_area, and tells the model not to retry without the place");
+      assertTrue(kenyaQ.result?.structuredContent?.out_of_area === true && (kenyaQ.result?.structuredContent?.experiences ?? []).length === 0,
+        "h6: the card's structuredContent carries out_of_area and no experiences");
+      const viaLondon = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { kommune: "Tromsø", season: "winter", query: "flying in from London, what can we do in Tromsø?" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(viaLondon.count === 3 && !viaLondon.out_of_area, "h7: a Norwegian kommune wins over a foreign city named in the query text");
+      const longQuery = await rpc("tools/call", { name: "discover_experiences", arguments: { query: "We are a family of four planning a long trip next summer and we would love a safari lodge in Kenya, ideally somewhere with guided game drives, good food and a pool for the kids, and maybe a short beach stay afterwards." } });
+      assertTrue(!longQuery.result?.isError && !longQuery.error && JSON.parse(longQuery.result?.content?.[0]?.text ?? "{}").out_of_area === true,
+        "h7b: a query longer than a few words does not fail the call and is still recognised as outside Norway");
+      const inNorway = JSON.parse((await rpc("tools/call", { name: "discover_experiences", arguments: { category: "wildlife", query: "Find wildlife and animal experiences in Norway" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(!inNorway.out_of_area && !/only covers/.test(inNorway.summary ?? ""), "h8: a query that names only Norway is searched normally");
+      const listHtml = (await rpc("resources/read", { uri: "ui://opplevagent/experiences-list" })).result?.contents?.[0]?.text ?? "";
+      assertTrue(/out\.out_of_area/.test(listHtml) && /Opplevagent only covers experiences in Norway/.test(listHtml),
+        "h9: the list card renders a Norway-only notice, not experience cards, for an out_of_area result");
 
       // ── (i) re-review 2026-10-03: /personvern promised analytics "for up
       // to 180 days" and visit requests "as long as needed" — neither is

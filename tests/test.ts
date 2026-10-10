@@ -46263,6 +46263,22 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── ChatGPT plugin packages (portable plugin.json + mcp.json) pass the final-submission limits ──");
+  try {
+    const { runChatgptPluginPackageTests } = require("../src/services/chatgpt-plugin-package.test") as
+      typeof import("../src/services/chatgpt-plugin-package.test");
+    const cpp = runChatgptPluginPackageTests({ log: false });
+    passed += cpp.passed;
+    failed += cpp.failed;
+    for (const f of cpp.failures) failures.push("chatgpt-plugin-package: " + f);
+    console.log(`  chatgpt-plugin-package: ${cpp.passed} passed, ${cpp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("chatgpt-plugin-package: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
   console.log("\n── ChatGPT app review 2026-09-24: Opplevagent widgets, annotations, season filter ──");
   try {
     const { runOpplevagentChatgptReviewTests } = require("../src/routes/opplevagent-chatgpt-review.test") as

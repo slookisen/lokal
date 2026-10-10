@@ -236,6 +236,15 @@ ${WIDGET_HELPERS}
       fitHeight();
       return;
     }
+    if (out.out_of_area) {
+      var where = out.place ? String(out.place) : "";
+      root.innerHTML = '<p class="muted">' + esc(t(
+        "Opplevagent dekker bare opplevelser i Norge" + (where ? ", og «" + where + "» ligger utenfor" : "") + ". Ingen opplevelser vises.",
+        "Opplevagent only covers experiences in Norway" + (where ? "; \\u201c" + where + "\\u201d is outside Norway" : "") + ". No experiences are shown."
+      )) + "</p>";
+      fitHeight();
+      return;
+    }
     var list = Array.isArray(out.experiences) ? out.experiences : [];
     if (!list.length) {
       root.innerHTML = '<p class="muted">' + esc(t("Ingen opplevelser passet søket.", "No experiences matched this search.")) + "</p>";
