@@ -410,6 +410,7 @@ export async function runOffsiteBackupTests(opts: { log?: boolean } = {}): Promi
     failDb.close();
   } finally {
     try { live.close(); } catch { /* ignore */ }
+    fake.server.closeAllConnections(); // keep-alive sockets from the client agent
     await new Promise<void>((r) => fake.server.close(() => r()));
     ob.__resetOffsiteBackupForTesting();
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }

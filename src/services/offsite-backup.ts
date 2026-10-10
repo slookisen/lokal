@@ -548,19 +548,23 @@ function runInWorker(data: { op: "backup" | "integrity"; dbPath: string; destPat
     : new Worker(script, options);
   return new Promise<string[]>((resolve, reject) => {
     let settled = false;
-    const finish = (fn: () => void) => {
+    const finish = (fn: () => void, waitForExit: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      fn();
-      void w.terminate().catch(() => {});
+      const stopped = w.terminate().catch(() => 0);
+      // After a normal answer the thread is gone before the caller continues, so nothing of it
+      // lingers into the next step. A timeout does not wait: terminate() cannot interrupt a
+      // native SQLite call that is still running.
+      if (waitForExit) void stopped.then(fn);
+      else fn();
     };
-    const timer = setTimeout(() => finish(() => reject(new Error(`${data.op} worker timed out`))), timeoutMs);
+    const timer = setTimeout(() => finish(() => reject(new Error(`${data.op} worker timed out`)), false), timeoutMs);
     w.on("message", (m: { ok: boolean; result?: string[]; error?: string }) =>
-      finish(() => (m.ok ? resolve(m.result ?? []) : reject(new Error(m.error || `${data.op} failed`)))),
+      finish(() => (m.ok ? resolve(m.result ?? []) : reject(new Error(m.error || `${data.op} failed`))), true),
     );
-    w.on("error", (e: Error) => finish(() => reject(e)));
-    w.on("exit", (code) => finish(() => reject(new Error(`${data.op} worker exited (code ${code})`))));
+    w.on("error", (e: Error) => finish(() => reject(e), false));
+    w.on("exit", (code) => finish(() => reject(new Error(`${data.op} worker exited (code ${code})`)), false));
   });
 }
 
