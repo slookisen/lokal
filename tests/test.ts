@@ -38079,7 +38079,7 @@ console.log("\n── mcp-usage-guides: GET /guide-mat-ai (rettfrabonden.com) �
     // the geo-faq-cc/geo-afo blocks' `expSeoSrcAfo.includes(...)` checks).
     const fsGma = require("fs");
     const seoSrcGma = fsGma.readFileSync("src/routes/seo.ts", "utf8");
-    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/proveniens"]'),
+    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/kjopsvilkar", "/proveniens"]'),
       "gma-15: sitemap.xml's corePaths array includes /guide-mat-ai");
 
     console.log("  mcp-usage-guides (rfb): OK (16 tests: route-registered/200-no/canonical-no/faq-no/title-no/real-tools/teknologi-crosslink/200-en/canonical-en/faq-en/title-en/tools-en/faq-builder-valid/faq-count/faq-shape/sitemap-corepaths)");
@@ -46199,6 +46199,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-privacy-terms-truth: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Kjøpsvilkår og refusjonsregler for rettfrabonden.com (Daniel live
+// 2026-10-10): page content NO/EN, operator facts, truth pins against the
+// code (pickup only, no buyer cancel endpoint, no payment yet), footer /
+// sitemap / shopping-list links. Router.handle() directly on seo.ts and
+// discovery.ts, no DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── kjøpsvilkår og refusjonsregler (rettfrabonden.com /kjopsvilkar) ──");
+  try {
+    const { runRfbKjopsvilkarTests } = require("../src/routes/rfb-kjopsvilkar.test") as
+      typeof import("../src/routes/rfb-kjopsvilkar.test");
+    const kv = await runRfbKjopsvilkarTests({ log: false });
+    passed += kv.passed;
+    failed += kv.failed;
+    for (const f of kv.failures) failures.push("rfb-kjopsvilkar: " + f);
+    console.log(`  rfb-kjopsvilkar: ${kv.passed} passed, ${kv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kjopsvilkar: unexpected error: " + String(err?.message || err));
   }
 });
 
