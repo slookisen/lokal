@@ -32754,6 +32754,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsce.failures) failures.push("opplevelser-gardssalg-set-contact-email: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-email: ${gsce.passed} passed, ${gsce.failed} failed`);
 
+    // dev-request 2026-10-10-opplevagent-adressekontroll-leser-epost-kilde:
+    // computeGardssalgAddressBasis reads field_provenance.epost (value-bound),
+    // the writers add value/source_type, and POST /admin/gardssalg-epost-
+    // homepage-proof backfills the evidence (dry-run default).
+    console.log("\n── opplevelser-gardssalg-epost-homepage-proof: adressegrunnlag leser epost-kilde ──");
+    const { runGardssalgEpostHomepageProofTests } = require("../src/routes/opplevelser-gardssalg-epost-homepage-proof.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-epost-homepage-proof.test");
+    const gseh = await runGardssalgEpostHomepageProofTests({ log: false });
+    passed += gseh.passed;
+    failed += gseh.failed;
+    for (const f of gseh.failures) failures.push("opplevelser-gardssalg-epost-homepage-proof: " + f);
+    console.log(`  opplevelser-gardssalg-epost-homepage-proof: ${gseh.passed} passed, ${gseh.failed} failed`);
+
     // dev-request 2026-08-18-gardssalg-set-contact-phone: phone-field
     // counterpart to gardssalg-set-contact-email above — same "correct an
     // already-filled stale value" gap, this time for `telefon` (Monkey Brew
