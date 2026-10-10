@@ -32,7 +32,8 @@
  *  - The page is `noindex` (query/cart surface, same URL for all steps).
  */
 
-import type { Lang } from "../i18n/t";
+import { localizedPath, type Lang } from "../i18n/t";
+import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 
 export function isHandelisteEnabled(): boolean {
   const v = (process.env.HANDLELISTE_ENABLED || "").trim().toLowerCase();
@@ -101,7 +102,7 @@ const COPY: Record<"no" | "en", Copy> = {
     no_payment: "Ingen betaling skjer via Rett fra Bonden. Du avtaler henting og betaling direkte med produsenten.",
     terms_before: "Når du sender handlelisten, gjelder",
     terms_link: "kjøpsvilkårene",
-    terms_after: ", også reglene for avbestilling og refusjon.",
+    terms_after: ", inkludert reglene for avbestilling og refusjon.",
     submit: "Send handlelisten",
     sending: "Sender …",
     error_generic: "Noe gikk galt. Prøv igjen om litt.",
@@ -578,7 +579,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
         <label class="hl-check"><input type="checkbox" id="hl-consent"><span>${e(c.consent_label)}</span></label>
         <div class="hl-hp" aria-hidden="true"><label>Website<input type="text" id="hl-website" tabindex="-1" autocomplete="off"></label></div>
         <p class="hl-hint">${e(c.no_payment)}</p>
-        <p class="hl-hint" id="hl-terms">${e(c.terms_before)} <a href="${lang === "en" ? "/en/kjopsvilkar" : "/kjopsvilkar"}">${e(c.terms_link)}</a>${e(c.terms_after)}</p>
+        <p class="hl-hint" id="hl-terms">${e(c.terms_before)} <a href="${localizedPath(KJOPSVILKAR_PATH, lang)}">${e(c.terms_link)}</a>${e(c.terms_after)}</p>
         <div id="hl-msg3" class="hl-msg" hidden role="alert"></div>
         <div class="hl-actions">
           <button type="button" class="hl-btn" id="hl-back2">${e(c.back)}</button>

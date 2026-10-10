@@ -116,10 +116,21 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   assertTrue(en.body.includes('id="right-of-cancellation"') && en.body.includes('id="refund"'), "EN: stable anchors #right-of-cancellation, #refund");
   assertTrue(no.body.includes("Selger er produsenten") && en.body.includes("The seller is the producer"), "both: the producer is named as the seller");
   assertTrue(no.body.includes("§ 22") && en.body.includes("section 22"), "both: the angrerett exceptions cite angrerettloven § 22");
+  assertTrue(no.body.includes("varer som forringes eller raskt går ut på dato (bokstav b)") && no.body.includes("(bokstav g)"), "NO: § 22 exceptions use the statute's wording and letters b and g");
+  assertTrue(no.body.includes('id="angreskjema"') && no.body.includes("Jeg/vi underretter herved om at jeg/vi ønsker å gå fra min/vår avtale"), "NO: the standard angreskjema is on the page (§ 8 h)");
+  assertTrue(en.body.includes('id="cancellation-form"') && en.body.includes("I/we hereby give notice"), "EN: the standard cancellation form is on the page");
+  assertTrue(no.body.includes("forbrukerkjøpsloven § 41") && no.body.includes("kan da ikke kreve betaling for varene") && en.body.includes("Consumer Purchases Act section 41"), "both: cancellation before pickup follows forbrukerkjøpsloven § 41 (compensation, not the price)");
+  assertTrue(!/avgjør om en avbestilling kan godtas|decides whether a cancellation can be accepted/.test(no.body + en.body), "both: no wording that lets the producer refuse a cancellation before pickup");
+  assertTrue(no.body.includes("holde tilbake betalingen") && en.body.includes("withhold payment"), "both: § 26 remedies include withholding payment");
+  assertTrue(no.body.includes("med mindre du og produsenten uttrykkelig avtaler noe annet, og uten gebyr") && en.body.includes("unless you and the producer expressly agree otherwise, and without any fee"), "both: refund uses the same payment method and no fee (angrerettloven § 24)");
+  assertTrue(no.body.includes("Ingen produsent betaler for plassering") && en.body.includes("No producer pays for placement"), "both: ranking parameters disclosed (angrerettloven § 9 a a)");
+  assertTrue(no.body.includes("ikke innhentet en erklæring") && no.body.includes("kjøpsloven") && en.body.includes("Sale of Goods Act"), "both: trader status and its consequence disclosed (§ 9 a b and c)");
+  assertTrue(no.body.includes("Produsentens navn står i bestillingen") && en.body.includes("The producer's name is shown in your order"), "both: the order is only promised to show the producer's name (OrderSummary carries no contact details)");
+  assertTrue(no.body.includes("bestillinger du har bedt assistenten sende") && en.body.includes("orders you have asked the assistant to send"), "both: AI-assistant clause limited to orders the buyer asked for");
   assertTrue(/14 dagers angrerett/.test(no.body) && /14-day right of cancellation/.test(en.body), "both: 14-day right of cancellation");
   assertTrue(/to måneder/.test(no.body) && /two months/.test(en.body), "both: two-month complaint rule (forbrukerkjøpsloven § 27)");
   assertTrue(no.body.includes("Forbrukerrådet") && no.body.includes("Forbrukerklageutvalget"), "NO: dispute bodies named (Forbrukerrådet, Forbrukerklageutvalget)");
-  assertTrue(!/odr|ec\.europa\.eu\/consumers\/odr/i.test(no.body + en.body), "both: no reference to the closed EU ODR platform");
+  assertTrue(!/\bODR\b|ec\.europa\.eu\/consumers\/odr/.test(no.body + en.body), "both: no reference to the closed EU ODR platform");
 
   for (const [lang, body] of [["NO", no.body], ["EN", en.body]] as const) {
     assertTrue(body.includes(COMPANY_INFO.legalName) && body.includes(COMPANY_INFO.orgNrDisplay), `${lang}: operator legal name + org.nr. from company-info.ts`);
@@ -129,7 +140,9 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   assertTrue(no.body.includes('href="/personvern"') && no.body.includes('href="/kontakt"'), "NO: links /personvern and /kontakt");
   assertTrue(en.body.includes('href="/en/personvern"') && en.body.includes('href="/en/kontakt"'), "EN: links /en/personvern and /en/kontakt");
   assertTrue(no.body.includes("Sist oppdatert: 10. oktober 2026") && en.body.includes("Last updated: 10 October 2026"), "both: last-updated date");
-  assertTrue(no.body.includes('rel="canonical" href="https://rettfrabonden.com/kjopsvilkar"') || no.body.includes("/kjopsvilkar\""), "NO: canonical points at /kjopsvilkar");
+  assertTrue(/rel="canonical" href="[^"]*\/kjopsvilkar"/.test(no.body) && !/rel="canonical" href="[^"]*\/en\/kjopsvilkar"/.test(no.body), "NO: canonical points at /kjopsvilkar");
+  assertTrue(/rel="canonical" href="[^"]*\/en\/kjopsvilkar"/.test(en.body), "EN: canonical points at /en/kjopsvilkar");
+  assertTrue(no.body.includes(`drives av ${COMPANY_INFO.legalName}`) && en.body.includes(`is run by ${COMPANY_INFO.legalName}`), "both: operator sentence reads «drives av / is run by <legal name>» (no leftover «Operatør:» prefix)");
 
   // ── 3. Truth pins against the code ──────────────────────────────────────
   const cartSvc = read("services/cart-service.ts");
@@ -137,13 +150,13 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   assertTrue(no.body.includes("Vi tilbyr ikke levering") && en.body.includes("We do not offer delivery"), "truth: page says pickup only, no delivery");
 
   const cartRoutes = read("routes/marketplace-cart.ts");
-  const cartRouterPaths = (cartRoutes.match(/cartRouter\.(get|post|patch|delete)\("([^"]+)"/g) || []).join("\n");
+  const cartRouterPaths = (cartRoutes.match(/cartRouter\.(get|post|put|patch|delete)\("([^"]+)"/g) || []).join("\n");
   assertTrue(cartRouterPaths.length > 0 && !/cancel/i.test(cartRouterPaths), "truth: no buyer-side cancel endpoint on cartRouter");
   assertTrue(no.body.includes("kontakter du produsenten direkte") && en.body.includes("contact the producer directly"), "truth: page sends cancellation to the producer");
 
   const readers = walkTs(SRC).filter((f) => !f.endsWith("rfb-kjopsvilkar.ts") && /PAYMENTS_ENABLED/.test(fs.readFileSync(f, "utf8")));
   assertTrue(readers.length === 0,
-    `truth: no payment through the platform yet (nothing reads PAYMENTS_ENABLED). If this fails, prepayment has shipped: update §4 «Betaling» in rfb-kjopsvilkar.ts and this pin. Readers: ${readers.map((f) => path.relative(SRC, f)).join(", ")}`);
+    `truth: no payment through the platform yet (nothing reads PAYMENTS_ENABLED). If this fails, prepayment code has landed: check whether PAYMENTS_ENABLED is on in prod; once it is, update §4 «Betaling» (and the «når forhåndsbetaling er tilgjengelig» qualifiers) in rfb-kjopsvilkar.ts, then this pin. Readers: ${readers.map((f) => path.relative(SRC, f)).join(", ")}`);
   assertTrue(no.body.includes("I dag betaler du produsenten ved henting") && no.body.includes("under innføring"), "truth: NO payment section says pay-at-pickup today, prepayment being introduced");
   assertTrue(en.body.includes("Today you pay the producer at pickup") && en.body.includes("being introduced"), "truth: EN payment section says pay-at-pickup today, prepayment being introduced");
   assertTrue(!/30 dager|30 days/.test(no.body + en.body), "truth: retention is not restated here (single source of truth is /personvern)");

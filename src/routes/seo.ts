@@ -2903,6 +2903,8 @@ const PERSONVERN_CSS = `
   .pv-table th { text-align: left; padding: 10px 12px; background: var(--green-50); border-bottom: 2px solid var(--g200); font-weight: 700; color: var(--charcoal); }
   .pv-table td { padding: 10px 12px; border-bottom: 1px solid var(--g100); color: var(--g700); }
   .pv-updated { font-size: 0.85rem; color: var(--g400); margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--g100); }
+  .pv-form { border: 1px solid var(--g200); border-radius: 8px; padding: 12px 16px; margin: 12px 0 24px; background: var(--green-50); }
+  .pv-form p { margin: 6px 0; }
   @media (max-width: 768px) {
     .pv-hero h1 { font-size: 1.6rem; }
     .pv-table { font-size: 0.8rem; }

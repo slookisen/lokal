@@ -22,6 +22,14 @@
 //     producer".
 //   - Contact data reaches a producer only with consent; retention is NOT
 //     restated here (the single source of truth is /personvern).
+//   - The buyer only gets the producer's NAME with a real order (OrderSummary),
+//     so contact details are pointed to the producer page or via us.
+//   - Offers in the shopping list / offers search are sorted by distance only
+//     (catalog-offers.ts); nobody pays for placement (angrerettloven § 9 a a).
+//   - No producer has given us a declaration that they are a trader, so the
+//     page says so and explains the consequence (§ 9 a b and c).
+// Law checked on Lovdata 2026-10-10: angrerettloven §§ 9 a, 18, 22 b/g, 24;
+// forbrukerkjøpsloven §§ 26, 27, 41.
 // rfb-kjopsvilkar.test.ts pins these facts against the code.
 
 import { getConfig } from "../config/vertical-config";
@@ -34,6 +42,30 @@ export const KJOPSVILKAR_LAST_UPDATED = { no: "10. oktober 2026", en: "10 Octobe
 const FORBRUKERTILSYNET_URL = "https://www.forbrukertilsynet.no";
 const FORBRUKERRADET_URL = "https://www.forbrukerradet.no";
 const MATTILSYNET_URL = "https://www.mattilsynet.no";
+
+/** The standard withdrawal form (angrerettloven § 8 h), adapted to goods picked up from a producer. */
+function angreskjemaHtml(lang: Lang, mail: string): string {
+  if (lang === "en") {
+    return `
+    <div class="pv-form" id="cancellation-form">
+      <p><strong>Standard cancellation form</strong></p>
+      <p>Fill in and return this form if you wish to withdraw from the agreement.</p>
+      <p>Send the completed form to: the producer you bought from (name and contact details are on the producer page), or to ${mail} and we will forward it.</p>
+      <p>I/we hereby give notice that I/we withdraw from my/our agreement to purchase the following goods: ……………</p>
+      <p>Goods received (picked up) on (date): ……………</p>
+      <p>Consumer's name: ……………<br>Consumer's address: ……………<br>Date: ……………<br>Consumer's signature (only if the form is sent on paper): ……………</p>
+    </div>`;
+  }
+  return `
+    <div class="pv-form" id="angreskjema">
+      <p><strong>Angreskjema</strong></p>
+      <p>Fyll ut og returner dette skjemaet dersom du ønsker å gå fra avtalen.</p>
+      <p>Utfylt skjema sendes til: produsenten du kjøpte fra (navn og kontaktinformasjon står på produsentsiden), eller til ${mail}, så sender vi det videre.</p>
+      <p>Jeg/vi underretter herved om at jeg/vi ønsker å gå fra min/vår avtale om kjøp av følgende varer: ……………</p>
+      <p>Varen ble mottatt (hentet) den (dato): ……………</p>
+      <p>Forbrukerens navn: ……………<br>Forbrukerens adresse: ……………<br>Dato: ……………<br>Forbrukerens underskrift (bare hvis skjemaet sendes på papir): ……………</p>
+    </div>`;
+}
 
 export function renderKjopsvilkarContent(lang: Lang): string {
   const cfg = getConfig();
@@ -54,16 +86,18 @@ export function renderKjopsvilkarContent(lang: Lang): string {
     <p>These terms apply when you, as a consumer, order goods from a producer through ${brand}, on the website or through an AI assistant. They do not limit the rights you have under mandatory Norwegian consumer law.</p>
 
     <h2 id="seller">1. Who you buy from</h2>
-    <p>The seller is the producer you order from. The purchase agreement is between you and the producer. The producer's name and contact details are shown on the producer page and in your order.</p>
+    <p>The seller is the producer you order from. The purchase agreement is between you and the producer. The producer's name is shown in your order. The producer's contact details are on the producer page, and you can always reach the producer through us at ${mailLink}.</p>
     <p>${brand} is run by ${companyOperatorSentence("en").replace(/^Operator: /, "")} We forward your order to the producer. We are not the seller, and we do not own or handle the goods.</p>
     <p>The producer is responsible for the goods, prices, labelling and food safety, and for meeting your rights under the Norwegian Consumer Purchases Act and the Cancellation Act.</p>
+    <p><strong>About the producers.</strong> Most producers are farms and other businesses selling their own goods. We have not collected a declaration from each producer that they are a trader. If a producer is not a trader, the Consumer Purchases Act and the Cancellation Act do not apply to the purchase; the Sale of Goods Act does. Ask the producer if you are unsure.</p>
+    <p><strong>How offers are sorted.</strong> In the shopping list and the offers search, offers are sorted by distance from the place you enter. No producer pays for placement.</p>
 
     <h2 id="ordering">2. How ordering works</h2>
     <p>You choose goods in the cart or shopping list and send the order. Some producers do not take orders through us. For those you instead get the producer's contact details and a ready-made message, and any agreement is made directly with the producer, outside the platform. Consumer law still applies, but the sections below about ordering, payment and refunds through the platform do not.</p>
-    <p>Your order is a request to the producer until the producer confirms it. The producer confirms or declines. The agreement is binding once the producer has confirmed. If the producer declines, there is no agreement and you pay nothing.</p>
+    <p>Your order is a request to the producer until the producer confirms it. The producer confirms or declines. The agreement is binding once the producer's confirmation has reached you. If the producer declines, there is no agreement and you pay nothing.</p>
 
     <h2 id="prices">3. Prices</h2>
-    <p>Prices are set by the producer and shown in Norwegian kroner when you order. The price you saw then applies to your order. If the producer is registered for VAT, VAT is included.</p>
+    <p>Prices are set by the producer and shown in Norwegian kroner. The price stated in your order applies when the producer confirms it. If no price is stated, you agree the price with the producer before pickup. If the producer is registered for VAT, VAT is included.</p>
     <p>${brand} charges you no fee as a buyer.</p>
     <p>If a price contains an obvious error, the producer may decline the order.</p>
 
@@ -77,8 +111,8 @@ export function renderKjopsvilkarContent(lang: Lang): string {
 
     <h2 id="cancellation">6. Cancellation and changes</h2>
     <p>To cancel or change an order, contact the producer directly as early as possible.</p>
-    <p>Before the producer has confirmed the order, you can withdraw it at no cost by telling the producer. If you have prepaid, the reservation is cancelled.</p>
-    <p>Once confirmed, the order is binding. For goods that do not deteriorate quickly you still have a right of cancellation, see section 8. For fresh goods the producer decides whether a cancellation can be accepted.</p>
+    <p>Before the producer has confirmed the order, you can withdraw it at no cost by telling the producer. If you have prepaid, the reservation is cancelled when the producer declines, or when the deadline passes without confirmation.</p>
+    <p>Once confirmed, the order is binding, but you can cancel until you have picked up the goods (Consumer Purchases Act section 41). The producer can then not claim payment for the goods, but can claim compensation for the loss the cancellation causes, for example for fresh goods prepared for you that cannot be sold again. If you have prepaid, you get back what exceeds such a loss. For goods that do not deteriorate quickly you also have a right of cancellation, see section 8.</p>
     <p>If the producer cannot deliver after confirming, you get the full amount back.</p>
 
     <h2 id="no-show">7. If you do not pick up</h2>
@@ -88,27 +122,28 @@ export function renderKjopsvilkarContent(lang: Lang): string {
     <p>A purchase through ${brand} is a distance sale. Under the Norwegian Cancellation Act you have a 14-day right of cancellation, counted from the day you pick up the goods.</p>
     <p>The right of cancellation does not apply to (Cancellation Act section 22):</p>
     <ul>
-      <li>goods that deteriorate or expire quickly, for example fresh vegetables, fruit, berries, meat, fish, eggs, dairy products and baked goods;</li>
-      <li>sealed goods that are not suitable for return for health or hygiene reasons once the seal is broken, for example opened honey or jam.</li>
+      <li>goods which are liable to deteriorate or expire rapidly (letter b), for example fresh vegetables, fruit, berries, meat, fish, eggs, dairy products and baked goods;</li>
+      <li>sealed goods which are not suitable for return due to health protection or hygiene reasons and were unsealed after delivery (letter g), for example opened honey or jam.</li>
     </ul>
-    <p>To use your right of cancellation, give the producer a clear message within the deadline, for example by e-mail. You can use the standard cancellation form from the <a href="${FORBRUKERTILSYNET_URL}">Norwegian Consumer Authority</a>. Return the goods to the producer no later than 14 days after your message; you cover any cost of returning them. The producer refunds what you paid within 14 days of receiving your message, but may wait until the goods have been received.</p>
+    <p>To use your right of cancellation, give the producer a clear message within the deadline, for example by e-mail. You do not have to use the form below, but you may. Return the goods to the producer no later than 14 days after your message; you cover any cost of returning them. The producer refunds what you paid within 14 days of receiving your message, but may wait until the goods have been received. More about the rules from the <a href="${FORBRUKERTILSYNET_URL}">Norwegian Consumer Authority</a>.</p>
+${angreskjemaHtml("en", mail)}
 
     <h2 id="complaints">9. Defects (reklamasjon)</h2>
-    <p>If there is something wrong with the goods, tell the producer within a reasonable time after you discovered it. For food this should happen as soon as possible. Your complaint is always in time if you give notice within two months of discovering the defect, and at the latest two years after you picked up the goods (Consumer Purchases Act).</p>
-    <p>Under the Consumer Purchases Act you can require the defect to be remedied, a replacement, a price reduction, cancellation of the purchase or compensation. The producer is responsible.</p>
+    <p>If there is something wrong with the goods, tell the producer within a reasonable time after you discovered it. For food this should happen as soon as possible. Your complaint is always in time if you give notice within two months of discovering the defect, and at the latest two years after you picked up the goods (five years for goods meant to last considerably longer) (Consumer Purchases Act section 27).</p>
+    <p>Under the Consumer Purchases Act section 26 you can withhold payment, require the defect to be remedied or a replacement, a price reduction, cancellation of the purchase and/or compensation. The producer is responsible.</p>
     <p>If you suspect that a product is a health risk, you can also report it to the <a href="${MATTILSYNET_URL}">Norwegian Food Safety Authority</a>.</p>
 
     <h2 id="refund">10. Refunds</h2>
     <p>Refunds come from the producer, not from ${brand}. You are entitled to a refund if you use your right of cancellation, if the purchase is cancelled or the price reduced because of a defect, or if the producer cannot deliver after confirming.</p>
     <ul>
-      <li><strong>Paid at pickup:</strong> you agree the refund with the producer, normally using the same payment method.</li>
-      <li><strong>Prepaid through Stripe:</strong> the amount is refunded to the same card or payment method. It usually takes 5 to 10 business days before the money shows, depending on your bank.</li>
+      <li><strong>Paid at pickup:</strong> the refund is made with the same payment method you used, unless you and the producer expressly agree otherwise, and without any fee.</li>
+      <li><strong>Prepaid through Stripe, when prepayment is available:</strong> the amount is refunded to the same card or payment method, without any fee. It usually takes 5 to 10 business days before the money shows, depending on your bank.</li>
     </ul>
     <p>An order the producer declines, or does not confirm in time, is never charged, so there is nothing to refund: the reservation is simply cancelled.</p>
     <p>Refunds must be made without undue delay and no later than the deadlines the law sets.</p>
 
     <h2 id="ai-assistants">11. Ordering through an AI assistant</h2>
-    <p>You can order through an AI assistant that uses our open interfaces (MCP, A2A and the API). The assistant acts on your behalf, and orders it sends for you count as your orders. The assistant never receives card details: any prepayment must always be approved by you in the payment page. Your contact details are shared with a producer only when you have consented.</p>
+    <p>You can order through an AI assistant that uses our open interfaces (MCP, A2A and the API). The assistant acts on your behalf, and orders you have asked the assistant to send count as your orders. The assistant never receives card details: when prepayment is available, it must always be approved by you on the payment page. Your contact details are shared with a producer only when you have consented.</p>
 
     <h2 id="privacy">12. Personal data</h2>
     <p>Your name, e-mail and phone number are passed to the producers you order from only when you consent when you send the order. How we process personal data, and for how long, is described in the <a href="${privacy}">privacy policy</a>.</p>
@@ -136,16 +171,18 @@ export function renderKjopsvilkarContent(lang: Lang): string {
     <p>Disse vilkårene gjelder når du som forbruker bestiller varer fra en produsent gjennom ${brand}, på nettsiden eller via en AI-assistent. De begrenser ikke rettighetene du har etter ufravikelig forbrukerlovgivning.</p>
 
     <h2 id="selger">1. Hvem du handler med</h2>
-    <p>Selger er produsenten du bestiller fra. Avtalen om kjøpet inngås mellom deg og produsenten. Produsentens navn og kontaktinformasjon vises på produsentsiden og i bestillingen.</p>
+    <p>Selger er produsenten du bestiller fra. Avtalen om kjøpet inngås mellom deg og produsenten. Produsentens navn står i bestillingen. Kontaktinformasjonen finner du på produsentsiden, og du kan alltid nå produsenten via oss på ${mailLink}.</p>
     <p>${brand} drives av ${companyOperatorSentence("nb").replace(/^Operatør: /, "")} Vi formidler bestillingen til produsenten. Vi er ikke selger, og vi eier eller håndterer ikke varene.</p>
     <p>Produsenten er ansvarlig for varene, prisene, merking og mattrygghet, og for å oppfylle rettighetene dine etter forbrukerkjøpsloven og angrerettloven.</p>
+    <p><strong>Om produsentene.</strong> De fleste produsentene er gårder og andre virksomheter som selger egne varer. Vi har ikke innhentet en erklæring fra hver produsent om at de er næringsdrivende. Er en produsent ikke næringsdrivende, gjelder ikke forbrukerkjøpsloven og angrerettloven for kjøpet, men kjøpsloven. Spør produsenten hvis du er usikker.</p>
+    <p><strong>Slik sorteres tilbudene.</strong> I handlelisten og tilbudssøket sorteres tilbudene etter avstand fra stedet du oppgir. Ingen produsent betaler for plassering.</p>
 
     <h2 id="bestilling">2. Slik bestiller du</h2>
     <p>Du velger varer i handlekurven eller handlelisten og sender bestillingen. Noen produsenter tar ikke imot bestillinger gjennom oss. Da får du i stedet produsentens kontaktinformasjon og en ferdig melding, og eventuell avtale gjør du direkte med produsenten, utenfor plattformen. Forbrukerlovgivningen gjelder også da, men punktene under om bestilling, betaling og refusjon gjennom plattformen gjør det ikke.</p>
-    <p>Bestillingen er en forespørsel til produsenten til produsenten har bekreftet den. Produsenten bekrefter eller avslår. Avtalen er bindende når produsenten har bekreftet. Avslår produsenten, er det ingen avtale, og du betaler ingenting.</p>
+    <p>Bestillingen er en forespørsel til produsenten til produsenten har bekreftet den. Produsenten bekrefter eller avslår. Avtalen er bindende når produsentens bekreftelse har nådd deg. Avslår produsenten, er det ingen avtale, og du betaler ingenting.</p>
 
     <h2 id="priser">3. Priser</h2>
-    <p>Prisene settes av produsenten og vises i norske kroner når du bestiller. Prisen du så da, gjelder for bestillingen. Er produsenten registrert i Merverdiavgiftsregisteret, er MVA inkludert.</p>
+    <p>Prisene settes av produsenten og vises i norske kroner. Prisen som står i bestillingen, gjelder når produsenten bekrefter den. Står det ingen pris, avtaler du prisen med produsenten før henting. Er produsenten registrert i Merverdiavgiftsregisteret, er MVA inkludert.</p>
     <p>${brand} tar ikke gebyr fra deg som kjøper.</p>
     <p>Inneholder en pris en åpenbar feil, kan produsenten avslå bestillingen.</p>
 
@@ -159,8 +196,8 @@ export function renderKjopsvilkarContent(lang: Lang): string {
 
     <h2 id="avbestilling">6. Avbestilling og endring</h2>
     <p>Vil du avbestille eller endre en bestilling, kontakter du produsenten direkte så tidlig som mulig.</p>
-    <p>Før produsenten har bekreftet bestillingen, kan du trekke den tilbake uten kostnad ved å gi produsenten beskjed. Har du forhåndsbetalt, oppheves reservasjonen.</p>
-    <p>Etter bekreftelse er bestillingen bindende. For varer som ikke raskt forringes, har du likevel angrerett, se punkt 8. For ferskvarer avgjør produsenten om en avbestilling kan godtas.</p>
+    <p>Før produsenten har bekreftet bestillingen, kan du trekke den tilbake uten kostnad ved å gi produsenten beskjed. Har du forhåndsbetalt, oppheves reservasjonen når produsenten avslår, eller når fristen går ut uten bekreftelse.</p>
+    <p>Etter bekreftelse er bestillingen bindende, men du kan avbestille fram til du har hentet varene (forbrukerkjøpsloven § 41). Produsenten kan da ikke kreve betaling for varene, men kan kreve erstatning for tap avbestillingen påfører produsenten, for eksempel for ferskvarer som er klargjort til deg og ikke kan selges på nytt. Har du forhåndsbetalt, får du tilbake det som overstiger et slikt tap. For varer som ikke raskt forringes, har du i tillegg angrerett, se punkt 8.</p>
     <p>Kan produsenten ikke levere etter å ha bekreftet, får du hele beløpet tilbake.</p>
 
     <h2 id="ikke-hentet">7. Hvis du ikke henter</h2>
@@ -170,27 +207,28 @@ export function renderKjopsvilkarContent(lang: Lang): string {
     <p>Kjøp gjennom ${brand} er fjernsalg. Etter angrerettloven har du 14 dagers angrerett, regnet fra dagen du henter varene.</p>
     <p>Angreretten gjelder ikke for (angrerettloven § 22):</p>
     <ul>
-      <li>varer som raskt kan forringes eller bli for gamle, for eksempel ferske grønnsaker, frukt, bær, kjøtt, fisk, egg, meieriprodukter og bakevarer;</li>
-      <li>forseglede varer som av helse- eller hygienehensyn ikke egner seg for retur når forseglingen er brutt, for eksempel åpnet honning eller syltetøy.</li>
+      <li>varer som forringes eller raskt går ut på dato (bokstav b), for eksempel ferske grønnsaker, frukt, bær, kjøtt, fisk, egg, meieriprodukter og bakevarer;</li>
+      <li>forseglede varer som av hensyn til helsevern eller hygiene ikke er egnet for retur, og der forseglingen er blitt brutt etter levering (bokstav g), for eksempel åpnet honning eller syltetøy.</li>
     </ul>
-    <p>Vil du bruke angreretten, gir du produsenten en klar melding innen fristen, for eksempel på e-post. Du kan bruke standard angreskjema fra <a href="${FORBRUKERTILSYNET_URL}">Forbrukertilsynet</a>. Lever varene tilbake til produsenten senest 14 dager etter meldingen. Du dekker eventuelle kostnader ved å returnere dem. Produsenten betaler tilbake det du har betalt innen 14 dager etter å ha mottatt meldingen, men kan vente til varene er mottatt.</p>
+    <p>Vil du bruke angreretten, gir du produsenten en klar melding innen fristen, for eksempel på e-post. Du trenger ikke bruke skjemaet under, men du kan. Lever varene tilbake til produsenten senest 14 dager etter meldingen. Du dekker eventuelle kostnader ved å returnere dem. Produsenten betaler tilbake det du har betalt innen 14 dager etter å ha mottatt meldingen, men kan vente til varene er mottatt. Mer om reglene hos <a href="${FORBRUKERTILSYNET_URL}">Forbrukertilsynet</a>.</p>
+${angreskjemaHtml("no", mail)}
 
     <h2 id="reklamasjon">9. Reklamasjon ved feil</h2>
-    <p>Er det feil ved en vare, gir du produsenten beskjed innen rimelig tid etter at du oppdaget feilen. For matvarer bør det skje så raskt som mulig. Du har alltid reklamert i tide hvis du gir beskjed innen to måneder etter at du oppdaget feilen, og senest to år etter at du hentet varen (forbrukerkjøpsloven).</p>
-    <p>Etter forbrukerkjøpsloven kan du kreve retting, ny vare, prisavslag, heving eller erstatning. Produsenten er ansvarlig.</p>
+    <p>Er det feil ved en vare, gir du produsenten beskjed innen rimelig tid etter at du oppdaget feilen. For matvarer bør det skje så raskt som mulig. Du har alltid reklamert i tide hvis du gir beskjed innen to måneder etter at du oppdaget feilen, og senest to år etter at du hentet varen (fem år for varer som er ment å vare vesentlig lenger) (forbrukerkjøpsloven § 27).</p>
+    <p>Etter forbrukerkjøpsloven § 26 kan du holde tilbake betalingen, kreve retting eller ny vare, prisavslag, heving og/eller erstatning. Produsenten er ansvarlig.</p>
     <p>Mistenker du at en vare er helsefarlig, kan du også melde fra til <a href="${MATTILSYNET_URL}">Mattilsynet</a>.</p>
 
     <h2 id="refusjon">10. Refusjon</h2>
     <p>Refusjon kommer fra produsenten, ikke fra ${brand}. Du har krav på refusjon når du bruker angreretten, når kjøpet heves eller prisen settes ned på grunn av en feil, og når produsenten ikke kan levere etter å ha bekreftet.</p>
     <ul>
-      <li><strong>Betalt ved henting:</strong> du avtaler refusjonen med produsenten, normalt med samme betalingsmåte.</li>
-      <li><strong>Forhåndsbetalt via Stripe:</strong> beløpet betales tilbake til samme kort eller betalingsmåte. Det tar vanligvis 5 til 10 virkedager før pengene vises hos deg, avhengig av banken.</li>
+      <li><strong>Betalt ved henting:</strong> refusjonen skjer med samme betalingsmåte som du brukte, med mindre du og produsenten uttrykkelig avtaler noe annet, og uten gebyr.</li>
+      <li><strong>Forhåndsbetalt via Stripe, når forhåndsbetaling er tilgjengelig:</strong> beløpet betales tilbake til samme kort eller betalingsmåte, uten gebyr. Det tar vanligvis 5 til 10 virkedager før pengene vises hos deg, avhengig av banken.</li>
     </ul>
     <p>En bestilling som produsenten avslår eller ikke bekrefter i tide, blir aldri belastet. Da er det ingenting å refundere, reservasjonen oppheves bare.</p>
     <p>Refusjon skal skje uten unødig opphold og senest innen fristene loven setter.</p>
 
     <h2 id="ai-assistent">11. Bestilling via AI-assistent</h2>
-    <p>Du kan bestille via en AI-assistent som bruker de åpne grensesnittene våre (MCP, A2A og API). Assistenten handler på dine vegne, og bestillinger den sender for deg, regnes som dine. Assistenten får aldri kortopplysninger: en eventuell forhåndsbetaling må alltid godkjennes av deg på betalingssiden. Kontaktinformasjonen din deles med en produsent bare når du har samtykket.</p>
+    <p>Du kan bestille via en AI-assistent som bruker de åpne grensesnittene våre (MCP, A2A og API). Assistenten handler på dine vegne, og bestillinger du har bedt assistenten sende, regnes som dine. Assistenten får aldri kortopplysninger: når forhåndsbetaling er tilgjengelig, må den alltid godkjennes av deg på betalingssiden. Kontaktinformasjonen din deles med en produsent bare når du har samtykket.</p>
 
     <h2 id="personopplysninger">12. Personopplysninger</h2>
     <p>Navn, e-post og telefonnummer sendes videre til produsentene du bestiller fra, bare når du samtykker til det når du sender bestillingen. Hvordan vi behandler personopplysninger, og hvor lenge, står i <a href="${privacy}">personvernerklæringen</a>.</p>
