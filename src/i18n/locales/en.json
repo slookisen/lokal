@@ -19,6 +19,7 @@
     "how_it_works": "How it works",
     "about_link": "About Rett fra Bonden",
     "privacy": "Privacy",
+    "terms_of_purchase": "Terms of purchase",
     "for_producers": "For producers",
     "register": "Register",
     "login": "Log in",
@@ -105,6 +106,11 @@
     "title": "Privacy — Rett fra Bonden",
     "description": "Privacy policy for Rett fra Bonden. What we collect, how we use it, and your rights.",
     "page_title": "Privacy"
+  },
+  "terms_of_purchase": {
+    "title": "Terms of purchase — Rett fra Bonden",
+    "description": "Terms of purchase and refund rules for orders through Rett fra Bonden: who the seller is, payment, pickup, cancellation, right of cancellation, defects and refunds.",
+    "page_title": "Terms of purchase"
   },
   "provenance": {
     "title": "How we verify our data — Rett fra Bonden",

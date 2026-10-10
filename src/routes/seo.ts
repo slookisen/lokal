@@ -11,6 +11,7 @@
  *   GET /:city                → City page with all producers in that city
  *   GET /produsent/:slug      → Individual producer profile page
  *   GET /personvern            → Privacy policy (GDPR)
+ *   GET /kjopsvilkar           → Terms of purchase + refund rules (rfb-kjopsvilkar.ts)
  *   GET /sitemap.xml          → Dynamic sitemap for Google
  *   GET /robots.txt           → Crawl instructions
  */
@@ -20,6 +21,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
+import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
@@ -776,7 +778,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="${localizedPath("/kontakt", lang)}">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="${localizedPath(KJOPSVILKAR_PATH, lang)}">${escapeHtml(t(lang, "footer.terms_of_purchase"))}</a><a href="${localizedPath("/kontakt", lang)}">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -3191,6 +3193,20 @@ router.get("/personvern", (req: Request, res: Response) => {
   ));
 });
 
+// GET /kjopsvilkar (+ /en/kjopsvilkar via the language prefix middleware) —
+// terms of purchase and refund rules. Daniel live 2026-10-10. Content and the
+// facts it must stay true to live in rfb-kjopsvilkar.ts; same shell, CSS and
+// hreflang handling as /personvern above. Registered above router.get("/:city").
+router.get(KJOPSVILKAR_PATH, (req: Request, res: Response) => {
+  const lang = req.lang;
+  res.send(shell(
+    t(lang, "terms_of_purchase.title"),
+    t(lang, "terms_of_purchase.description"),
+    renderKjopsvilkarContent(lang),
+    { canonical: `${BASE_URL}${localizedPath(KJOPSVILKAR_PATH, lang)}`, extraCss: PERSONVERN_CSS, lang, pathForAlternate: KJOPSVILKAR_PATH }
+  ));
+});
+
 
 // ═══════════════════════════════════════════════════════════════
 // GET /proveniens — How we verify our data (transparency page)
@@ -3693,6 +3709,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
       || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
+      || citySlug === "kjopsvilkar"
       || citySlug === "proveniens"
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"
@@ -6195,8 +6212,8 @@ export function buildSitemapXml(): string {
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">`;
 
-    const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/proveniens"];
-    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5", "/proveniens": "0.6" };
+    const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/kjopsvilkar", "/proveniens"];
+    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5", "/kjopsvilkar": "0.5", "/proveniens": "0.6" };
     const coreFreq: Record<string, string> = { "/": "daily" };
 
     function addEntry(path: string, freq: string, priority: string, lastmod: string) {

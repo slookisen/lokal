@@ -19,6 +19,7 @@
     "how_it_works": "Hvordan det fungerer",
     "about_link": "Om Rett fra Bonden",
     "privacy": "Personvern",
+    "terms_of_purchase": "Kjøpsvilkår",
     "for_producers": "For produsenter",
     "register": "Registrer deg",
     "login": "Logg inn",
@@ -105,6 +106,11 @@
     "title": "Personvern — Rett fra Bonden",
     "description": "Personvernerklæring for Rett fra Bonden. Hva vi samler inn, hvordan vi bruker det, og dine rettigheter.",
     "page_title": "Personvern"
+  },
+  "terms_of_purchase": {
+    "title": "Kjøpsvilkår — Rett fra Bonden",
+    "description": "Kjøpsvilkår og refusjonsregler for bestillinger gjennom Rett fra Bonden: hvem som er selger, betaling, henting, avbestilling, angrerett, reklamasjon og refusjon.",
+    "page_title": "Kjøpsvilkår"
   },
   "provenance": {
     "title": "Slik verifiserer vi dataene våre — Rett fra Bonden",

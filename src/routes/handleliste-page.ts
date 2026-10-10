@@ -99,6 +99,9 @@ const COPY: Record<"no" | "en", Copy> = {
     consent_label: "Jeg samtykker til at navn, e-post og telefon deles med produsentene jeg bestiller direkte hos, slik at de kan svare meg. Opplysningene slettes automatisk 30 dager etter at bestillingen er avsluttet.",
     consent_needed: "Samtykke og e-post eller telefon må oppgis for å sende en bestilling.",
     no_payment: "Ingen betaling skjer via Rett fra Bonden. Du avtaler henting og betaling direkte med produsenten.",
+    terms_before: "Når du sender handlelisten, gjelder",
+    terms_link: "kjøpsvilkårene",
+    terms_after: ", også reglene for avbestilling og refusjon.",
     submit: "Send handlelisten",
     sending: "Sender …",
     error_generic: "Noe gikk galt. Prøv igjen om litt.",
@@ -162,6 +165,9 @@ const COPY: Record<"no" | "en", Copy> = {
     consent_label: "I consent to my name, e-mail and phone being shared with the producers I order directly from, so they can reply to me. The details are deleted automatically 30 days after the order is closed.",
     consent_needed: "Consent and an e-mail or phone number are required to send an order.",
     no_payment: "No payment goes through Rett fra Bonden. You agree pickup and payment directly with the producer.",
+    terms_before: "When you send the list, our",
+    terms_link: "terms of purchase",
+    terms_after: " apply, including the rules for cancellation and refunds.",
     submit: "Send shopping list",
     sending: "Sending …",
     error_generic: "Something went wrong. Please try again shortly.",
@@ -572,6 +578,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
         <label class="hl-check"><input type="checkbox" id="hl-consent"><span>${e(c.consent_label)}</span></label>
         <div class="hl-hp" aria-hidden="true"><label>Website<input type="text" id="hl-website" tabindex="-1" autocomplete="off"></label></div>
         <p class="hl-hint">${e(c.no_payment)}</p>
+        <p class="hl-hint" id="hl-terms">${e(c.terms_before)} <a href="${lang === "en" ? "/en/kjopsvilkar" : "/kjopsvilkar"}">${e(c.terms_link)}</a>${e(c.terms_after)}</p>
         <div id="hl-msg3" class="hl-msg" hidden role="alert"></div>
         <div class="hl-actions">
           <button type="button" class="hl-btn" id="hl-back2">${e(c.back)}</button>

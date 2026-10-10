@@ -46202,6 +46202,27 @@ runSerial(async () => {
   }
 });
 
+// Kjøpsvilkår og refusjonsregler for rettfrabonden.com (Daniel live
+// 2026-10-10): page content NO/EN, operator facts, truth pins against the
+// code (pickup only, no buyer cancel endpoint, no payment yet), footer /
+// sitemap / shopping-list links. Router.handle() directly on seo.ts and
+// discovery.ts, no DB — tail position, not load-bearing.
+runSerial(async () => {
+  console.log("\n── kjøpsvilkår og refusjonsregler (rettfrabonden.com /kjopsvilkar) ──");
+  try {
+    const { runRfbKjopsvilkarTests } = require("../src/routes/rfb-kjopsvilkar.test") as
+      typeof import("../src/routes/rfb-kjopsvilkar.test");
+    const kv = await runRfbKjopsvilkarTests({ log: false });
+    passed += kv.passed;
+    failed += kv.failed;
+    for (const f of kv.failures) failures.push("rfb-kjopsvilkar: " + f);
+    console.log(`  rfb-kjopsvilkar: ${kv.passed} passed, ${kv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kjopsvilkar: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
 // checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
 // is now literally true). Own in-memory DB — tail position, not load-bearing.
