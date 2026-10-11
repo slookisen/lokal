@@ -2971,7 +2971,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Which source each field came from, and when it was last checked</li>
     </ul>
     <p>If the producer is a sole proprietorship, some of this can also be personal data about the owner, for example when the business carries the owner's name or address. The profile is public and can be fetched by AI assistants and other services (see “Who receives the data”).</p>
-    <p>We may email the public email address on the profile to say that the profile exists and how it can be confirmed or corrected. If you reply “fjern” (remove) to that email, we delete the profile. The emails we have sent you and your replies (email address, name and content) are kept in our customer-service system and in a send log. They are not deleted automatically when the profile is removed, but you can ask us to delete them too. When a profile is removed on request, we keep some identifiers on a do-not-re-add list — for example website domain, email address and name — so the profile is not created again.</p>
+    <p>We may email the public email address on the profile to say that the profile exists and how it can be confirmed or corrected. If you reply “fjern” (remove) to that email, we delete the profile. The emails we have sent you and your replies (email address, name and content) are kept in our customer-service system and in a send log. They are not deleted automatically when the profile is removed, but you can ask us to delete them too. Translated versions of the profile text (English and Swedish) are unpublished but stay in the database until we delete them; tell us if you want them deleted. When a profile is removed on request, we keep some identifiers on a do-not-re-add list — for example website domain, email address and name — so the profile is not created again, and a log entry that the profile was deleted.</p>
 
     <h3>Sellers who register (claim)</h3>
     <p>When you register as a ${getConfig().domain_dictionary.entity} to manage your profile, we collect:</p>
@@ -2988,7 +2988,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Images</h3>
     <p>Sellers can upload profile pictures and product photos. These are stored on the server. If image scanning is enabled, the image may be sent to an external AI service (Anthropic Claude or OpenAI) for automatic product recognition.</p>
 
-    <h3>Checks and translation with AI</h3>
+    <h3>AI at Anthropic</h3>
     <p>We use AI services from <span translate="no">Anthropic</span> (Claude) to find and check public information about producers — for example whether a website or a register match belongs to the right business — to write short producer descriptions from the producer's own web pages, and to translate profile text into English and Swedish. Claude also helps us read and answer emails sent to us. Profile data, text from public web pages and the content of emails can then be processed by <span translate="no">Anthropic</span> in the USA. An AI assessment on its own never counts as confirmation of a field.</p>
 
     <h3>Conversations between agents</h3>
@@ -3024,7 +3024,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Producer profiles from public sources</td><td>Legitimate interest</td><td>To give consumers and AI assistants an up-to-date overview of local food producers. The profile is built from information that is already public, and you can object at any time (see “Your rights”).</td></tr>
         <tr><td>Emails to producers about their profile</td><td>Legitimate interest</td><td>To say that the profile exists, and to make it possible to confirm, correct or remove it.</td></tr>
         <tr><td>Emails you send us</td><td>Legitimate interest</td><td>To read, answer and follow up your enquiry.</td></tr>
-        <tr><td>Checks and translation with AI</td><td>Legitimate interest</td><td>Correct information about the right business, and profiles in more than one language.</td></tr>
+        <tr><td>AI at Anthropic</td><td>Legitimate interest</td><td>Correct information about the right business, short descriptions from the producer's own web pages, profiles in more than one language, and answers to enquiries.</td></tr>
         <tr><td>Backups</td><td>Legitimate interest</td><td>To be able to restore the service after an error or data loss.</td></tr>
         <tr><td>Do-not-re-add list after removal</td><td>Legitimate interest</td><td>To respect your wish not to be added again.</td></tr>
         <tr><td>Seller registration</td><td>Consent</td><td>You actively provide data when you register. You can withdraw consent.</td></tr>
@@ -3053,7 +3053,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Verification codes</td><td>Unverified claims expire after 7 days.</td></tr>
         <tr><td>Magic links</td><td>Expire after 15 minutes. Used links older than 1 hour are auto-deleted.</td></tr>
         <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
-        <tr><td>Producer profile</td><td>For as long as the profile is relevant to the catalogue. Profiles of businesses that have closed down or were registered by mistake are hidden, but stay in the database. If you ask us to remove the profile, we delete it.</td></tr>
+        <tr><td>Producer profile</td><td>For as long as the profile is relevant to the catalogue. Profiles of businesses that have closed down or were registered by mistake are hidden, but stay in the database. If you ask us to remove the profile, we delete it; translated versions of the profile text stay until we delete them on request.</td></tr>
         <tr><td>Uploaded images</td><td>Stored until manually deleted.</td></tr>
         <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
@@ -3140,7 +3140,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Hvilken kilde hvert felt kom fra, og når det sist ble kontrollert</li>
     </ul>
     <p>Er produsenten et enkeltpersonforetak, kan noen av opplysningene også være personopplysninger om innehaveren, for eksempel når virksomheten har innehaverens navn eller adresse. Profilen er offentlig og kan hentes av KI-assistenter og andre tjenester (se «Hvem som får opplysningene»).</p>
-    <p>Vi kan sende e-post til den offentlige e-postadressen på profilen for å fortelle at profilen finnes, og hvordan den kan bekreftes eller rettes. Svarer du «fjern» på e-posten, sletter vi profilen. E-postene vi har sendt deg og svarene dine (e-postadresse, navn og innhold) lagres i kundeservicesystemet vårt og i en utsendingslogg. De slettes ikke automatisk når profilen fjernes, men du kan be om at også de slettes. Når en profil fjernes etter ønske, beholder vi noen kjennetegn i en sperreliste \u2014 for eksempel nettstedsdomene, e-postadresse og navn \u2014 slik at profilen ikke opprettes på nytt.</p>
+    <p>Vi kan sende e-post til den offentlige e-postadressen på profilen for å fortelle at profilen finnes, og hvordan den kan bekreftes eller rettes. Svarer du «fjern» på e-posten, sletter vi profilen. E-postene vi har sendt deg og svarene dine (e-postadresse, navn og innhold) lagres i kundeservicesystemet vårt og i en utsendingslogg. De slettes ikke automatisk når profilen fjernes, men du kan be om at også de slettes. Oversatte utgaver av profilteksten (engelsk og svensk) avpubliseres, men blir liggende i databasen til vi sletter dem; si fra hvis du vil ha dem slettet. Når en profil fjernes etter ønske, beholder vi noen kjennetegn i en sperreliste \u2014 for eksempel nettstedsdomene, e-postadresse og navn \u2014 slik at profilen ikke opprettes på nytt, og en logg over at profilen ble slettet.</p>
 
     <h3>Selgere som registrerer seg (claim)</h3>
     <p>Når du som ${getConfig().domain_dictionary.entity} registrerer deg for å administrere din profil, samler vi inn:</p>
@@ -3157,7 +3157,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Bilder</h3>
     <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
 
-    <h3>Kontroll og oversettelse med KI</h3>
+    <h3>KI hos Anthropic</h3>
     <p>Vi bruker KI-tjenester fra Anthropic (Claude) til å finne og kontrollere offentlige opplysninger om produsenter \u2014 for eksempel om et nettsted eller et registertreff hører til riktig virksomhet \u2014 til å skrive korte beskrivelser av produsenter ut fra deres egne nettsider, og til å oversette profiltekst til engelsk og svensk. Claude hjelper oss også med å lese og besvare e-post som sendes til oss. Da kan profilopplysninger, tekst fra offentlige nettsider og innholdet i e-poster behandles hos Anthropic i USA. En vurdering fra KI regnes aldri alene som bekreftelse av et felt.</p>
 
     <h3>Samtaler mellom agenter</h3>
@@ -3193,7 +3193,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Produsentprofiler fra offentlige kilder</td><td>Berettiget interesse</td><td>Å gi forbrukere og KI-assistenter en oppdatert oversikt over lokale matprodusenter. Profilen bygger på opplysninger som allerede er offentlige, og du kan når som helst protestere (se «Dine rettigheter»).</td></tr>
         <tr><td>E-post til produsenter om profilen</td><td>Berettiget interesse</td><td>Å fortelle at profilen finnes, og gi mulighet til å bekrefte, rette eller fjerne den.</td></tr>
         <tr><td>E-post du sender oss</td><td>Berettiget interesse</td><td>Å lese, svare på og følge opp henvendelsen.</td></tr>
-        <tr><td>Kontroll og oversettelse med KI</td><td>Berettiget interesse</td><td>Riktige opplysninger om riktig virksomhet, og profiler på flere språk.</td></tr>
+        <tr><td>KI hos Anthropic</td><td>Berettiget interesse</td><td>Riktige opplysninger om riktig virksomhet, korte beskrivelser ut fra produsentens egne nettsider, profiler på flere språk og svar på henvendelser.</td></tr>
         <tr><td>Sikkerhetskopier</td><td>Berettiget interesse</td><td>Å kunne gjenopprette tjenesten etter feil eller tap av data.</td></tr>
         <tr><td>Sperreliste etter fjerning</td><td>Berettiget interesse</td><td>Å respektere ønsket ditt om ikke å bli lagt inn igjen.</td></tr>
         <tr><td>Selgerregistrering</td><td>Samtykke</td><td>Du gir aktivt data når du registrerer deg. Du kan trekke tilbake samtykket.</td></tr>
@@ -3222,7 +3222,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
         <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
-        <tr><td>Produsentprofil</td><td>Så lenge profilen er relevant for katalogen. Profiler for nedlagte eller feilregistrerte virksomheter skjules, men blir liggende i databasen. Ber du oss fjerne profilen, sletter vi den.</td></tr>
+        <tr><td>Produsentprofil</td><td>Så lenge profilen er relevant for katalogen. Profiler for nedlagte eller feilregistrerte virksomheter skjules, men blir liggende i databasen. Ber du oss fjerne profilen, sletter vi den; oversatte utgaver av profilteksten blir liggende til vi sletter dem på forespørsel.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
         <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Ingen daglige tall beholdes fra denne loggen.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>

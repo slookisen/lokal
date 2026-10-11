@@ -169,8 +169,14 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     "ground truth: manual on-volume backups keep the 10 newest, with no age limit"
   );
   assertTrue(
-    /deactivates \(never deletes\)/.test(deactivateSrc),
-    "ground truth: closed or wrongly registered businesses are deactivated, never deleted"
+    /SET is_active = 0/.test(deactivateSrc) && !/DELETE FROM agents/.test(deactivateSrc),
+    "ground truth: closed or wrongly registered businesses are deactivated (is_active = 0), never deleted"
+  );
+  const translationsSrc = fs.readFileSync(path.join(__dirname, "..", "services", "profile-translations.ts"), "utf8");
+  const marketplaceSrc = fs.readFileSync(path.join(__dirname, "marketplace.ts"), "utf8");
+  assertTrue(
+    !/DELETE FROM profile_translations/.test(translationsSrc) && !/DELETE FROM profile_translations/.test(marketplaceSrc),
+    "ground truth: deleting a profile leaves its translations in profile_translations (no DELETE anywhere)"
   );
   assertTrue(
     /CREATE TABLE IF NOT EXISTS crm_contacts[\s\S]{0,300}agent_id TEXT REFERENCES agents\(id\) ON DELETE SET NULL/.test(dbInitSrc) &&
@@ -280,7 +286,7 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
       `/personvern (${lang}): discloses recipients, including AI assistants fetching public profiles`
     );
     assertTrue(
-      lang === "no" ? /Kontroll og oversettelse med KI/.test(body) : /Checks and translation with AI/.test(body),
+      lang === "no" ? /<h3>KI hos Anthropic<\/h3>/.test(body) : /<h3>AI at Anthropic<\/h3>/.test(body),
       `/personvern (${lang}): discloses profile checks and translation at Anthropic`
     );
     assertTrue(
@@ -315,6 +321,12 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     assertTrue(
       /Resend/.test(body) && /Gmail/.test(body),
       `/personvern (${lang}): names Resend and Gmail for sending and receiving e-mail`
+    );
+    assertTrue(
+      lang === "no"
+        ? /Oversatte utgaver av profilteksten \(engelsk og svensk\) avpubliseres, men blir liggende/.test(body)
+        : /Translated versions of the profile text \(English and Swedish\) are unpublished but stay in the database/.test(body),
+      `/personvern (${lang}): says translated profile text stays after the profile is deleted`
     );
     assertTrue(
       lang === "no"
