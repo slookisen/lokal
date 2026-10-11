@@ -37,6 +37,8 @@ import {
   // Grep 4c: navnegjetting v3 — first-word-only, ø→oe-alone, and
   // punycode/IDN candidate sources added to the tier-1 domain-guess heuristic.
   gardssalgWebsiteCandidateHosts,
+  providerNamesTokenMatch,
+  pickProviderByNameTokens,
 } from "./experience-store";
 
 export interface TestSummary {
@@ -1488,6 +1490,23 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
       } catch { /* best-effort */ }
       for (const p of cachePaths) delete require.cache[p];
     }
+  }
+
+  // ── dev-request 2026-10-11 harvest apply name-variant dedup ──
+  assertTrue(providerNamesTokenMatch("Røkenes Gård Restaurant og Gjestehus", "Røkenes Gård og Gjestehus"), "nt-1: Røkenes inserted-word pair matches");
+  assertTrue(providerNamesTokenMatch("Gjestehus og Gård Røkenes", "Røkenes Gård og Gjestehus"), "nt-2: reordering matches");
+  assertTrue(!providerNamesTokenMatch("Haugen Gård", "Låvbrua"), "nt-3: distinct names do not match");
+  assertTrue(!providerNamesTokenMatch("Nordre Gård", "Søndre Gård"), "nt-4: only generic Gård shared does not match");
+  assertTrue(!providerNamesTokenMatch("Gård", "Røkenes Gård"), "nt-5: single-token side never matches");
+  assertTrue(!providerNamesTokenMatch("Gård og Gjestehus", "Gård Restaurant og Gjestehus"), "nt-6: only generic tokens never match");
+  assertTrue(!providerNamesTokenMatch("Haugen Gård", "Haugen Gård Camping Hytter Restaurant Kafe"), "nt-7: too many extra tokens does not match");
+  {
+    const rows = [{ id: "a", org_nr: "811956732", navn: "Røkenes Gård og Gjestehus", kommune: "Vestre Toten" }];
+    assertEq(pickProviderByNameTokens({ navn: "Røkenes Gård Restaurant og Gjestehus", kommune: "Vestre Toten" }, rows)?.id, "a", "nt-8: picks Røkenes row");
+    assertEq(pickProviderByNameTokens({ navn: "Røkenes Gård Restaurant og Gjestehus", org_nr: "999999999" }, rows), null, "nt-9: known-different org_nr blocks match");
+    assertEq(pickProviderByNameTokens({ navn: "Røkenes Gård Restaurant og Gjestehus", kommune: "Bergen" }, rows), null, "nt-10: known-different kommune blocks match");
+    assertEq(pickProviderByNameTokens({ navn: "Røkenes Gård Restaurant og Gjestehus", org_nr: "811956732" }, rows)?.id, "a", "nt-11: same org_nr still matches");
+    assertEq(pickProviderByNameTokens({ navn: "Røkenes Gård Restaurant og Gjestehus" }, [...rows, { id: "b", org_nr: null, navn: "Røkenes Gård Gjestehus", kommune: null }]), null, "nt-12: ambiguous (2 hits) returns null");
   }
 
   return { passed, failed, failures };

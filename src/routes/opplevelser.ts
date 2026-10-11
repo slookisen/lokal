@@ -51,6 +51,7 @@ import {
   // miss) in the bulk-load handler below — see the `existing` lookup and
   // getProviderByDomain's own doc comment (experience-store.ts).
   getProviderByDomain,
+  getProviderByNameTokens,
   setBrregVerification,
   ExperienceSchema,
   DiscoverFilterSchema,
@@ -1932,6 +1933,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // reports the blocklist gate's own matches below.
   let providersMatchedByDomain = 0;
   const providersMatchedByDomainNames: string[] = [];
+  let providersMatchedByNameTokens = 0;
+  const providersMatchedByNameTokensNames: string[] = [];
   // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
   // utfoerelse): a producer whose org_nr, hjemmeside, or name matches a
   // removed producer (agent_blocklist) must not be (re-)created here — and,
@@ -2033,7 +2036,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       const byOrgnrOrName =
         (verdict.org_nr ? getProviderByOrgnr(verdict.org_nr) : null) ?? getProviderByName(name);
       const byDomain = byOrgnrOrName ? null : getProviderByDomain(candidateWebsite, verdict.org_nr);
-      const existing = byOrgnrOrName ?? byDomain;
+      // dev-request 2026-10-11-...-dedup-apply-navnevariant: FOURTH, additive
+      // fallback — word-token name match (inserted/reordered word), only when
+      // org_nr/name/domain all missed. Guarded against differing org_nr/kommune.
+      const byNameTokens =
+        byOrgnrOrName || byDomain ? null : getProviderByNameTokens(name, verdict.org_nr, kommune);
+      const existing = byOrgnrOrName ?? byDomain ?? byNameTokens;
       // Scope gate (dev-request 2026-09-18-opplevagent-skop-katalogen): an
       // EXISTING provider's cohort membership (producer_type set OR seeded
       // via RFB) is known now; a BRAND-NEW provider (created below) is never
@@ -2042,6 +2050,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       // its rows in scope via their own mat_drikke category, below.
       const providerInCohort = isProviderInGardssalgCohort(existing);
       if (existing) {
+        if (byNameTokens) {
+          providersMatchedByNameTokens++;
+          providersMatchedByNameTokensNames.push(name);
+        }
         if (byDomain) {
           providersMatchedByDomain++;
           providersMatchedByDomainNames.push(name);
@@ -2241,6 +2253,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     // the fallback never fired this call (today's behavior, unchanged).
     providers_matched_by_domain: providersMatchedByDomain,
     providers_matched_by_domain_names: providersMatchedByDomainNames,
+    providers_matched_by_name_tokens: providersMatchedByNameTokens,
+    providers_matched_by_name_tokens_names: providersMatchedByNameTokensNames,
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,

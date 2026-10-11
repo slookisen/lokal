@@ -2184,6 +2184,84 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
   );
 }
 
+// ── Word-token provider-name matching (dev-request 2026-10-11-opplevagent-
+// harvest-leverandor-dedup-apply-navnevariant) ──────────────────────────
+// Apply-time dedup used to miss «Røkenes Gård Restaurant og Gjestehus» vs the
+// existing «Røkenes Gård og Gjestehus» (an inserted word) and created a
+// duplicate row. Conservative, insertion/order-independent rule:
+//   1. normaliseName() + split, drop tokens < 3 chars and stop words.
+//   2. The SMALLER token set must be fully contained in the larger one
+//      (equal sets = pure reordering also match).
+//   3. The smaller set needs >= 2 tokens, at least one of them DISTINCTIVE
+//      (not a generic farm/venue word like «gård»), so two unrelated farms
+//      sharing only «Gård» never match.
+//   4. The larger side may add at most 2 extra tokens.
+// Guards in pickProviderByNameTokens: known-different org_nr or known-different
+// kommune => distinct entities, never matched; more than one matching row =>
+// ambiguous, return null (never guess).
+const PROVIDER_NAME_STOPWORDS = new Set(["og", "the", "and", "pa", "paa", "ved", "med", "for", "som", "den", "det", "ans", "asa", "enk"]);
+const PROVIDER_NAME_GENERIC_TOKENS = new Set([
+  "gard", "gaard", "gards", "gaarden", "garden", "farm", "gjestehus", "restaurant", "kafe", "cafe",
+  "camping", "hotell", "hotel", "overnatting", "turistsenter", "senter", "stue", "stuer",
+  "hytter", "hytte", "hyttene", "losji", "pensjonat", "bondegard", "bondegarden", "opplevelser",
+  "mat", "drikke", "lokalmat", "gardsmat", "gardsbutikk", "butikk", "bryggeri", "sider", "siderprodusent",
+]);
+const PROVIDER_NAME_MAX_EXTRA_TOKENS = 2;
+
+export function providerNameTokens(navn: string | null | undefined): Set<string> {
+  return new Set(
+    normaliseName(navn || "")
+      .split(/\s+/)
+      .filter((t) => t.length >= 3 && !PROVIDER_NAME_STOPWORDS.has(t))
+  );
+}
+
+/** PURE. True when two provider names are the same entity under the word-token rule above. */
+export function providerNamesTokenMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+  const ta = providerNameTokens(a);
+  const tb = providerNameTokens(b);
+  const [small, large] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+  if (small.size < 2) return false;
+  let distinctive = false;
+  for (const t of small) {
+    if (!large.has(t)) return false;
+    if (!PROVIDER_NAME_GENERIC_TOKENS.has(t)) distinctive = true;
+  }
+  if (!distinctive) return false;
+  return large.size - small.size <= PROVIDER_NAME_MAX_EXTRA_TOKENS;
+}
+
+/** PURE. Pick the single provider row whose name token-matches the candidate; null if none or ambiguous. */
+export function pickProviderByNameTokens(
+  candidate: { navn: string; org_nr?: string | null; kommune?: string | null },
+  rows: Array<Record<string, unknown>>,
+): Record<string, unknown> | null {
+  const candKommune = normaliseName(candidate.kommune || "");
+  const hits: Array<Record<string, unknown>> = [];
+  for (const row of rows) {
+    const rowOrgNr = row.org_nr as string | null | undefined;
+    if (candidate.org_nr && rowOrgNr && rowOrgNr !== candidate.org_nr) continue;
+    const rowKommune = normaliseName((row.kommune as string | null | undefined) || "");
+    if (candKommune && rowKommune && candKommune !== rowKommune) continue;
+    if (providerNamesTokenMatch(candidate.navn, row.navn as string)) hits.push(row);
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/** DB wrapper: ADDITIVE fallback after org_nr / exact name / domain miss. */
+export function getProviderByNameTokens(
+  navn: string,
+  orgNr?: string | null,
+  kommune?: string | null,
+): Record<string, unknown> | null {
+  if (providerNameTokens(navn).size < 2) return null;
+  const db = getDb(VERTICAL);
+  const rows = db.prepare("SELECT id, org_nr, navn, kommune FROM experience_providers").all() as Array<Record<string, unknown>>;
+  const hit = pickProviderByNameTokens({ navn, org_nr: orgNr, kommune }, rows);
+  if (!hit) return null;
+  return (db.prepare("SELECT * FROM experience_providers WHERE id = ?").get(hit.id) as Record<string, unknown>) ?? null;
+}
+
 /**
  * Find a provider by domain (registrable eTLD+1, hyphen-insensitive). Used
  * by bulk-load (dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-
