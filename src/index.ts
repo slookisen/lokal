@@ -70,6 +70,13 @@ import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
+import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
+import {
+  isRfbEnrichmentNightlyEnabled,
+  tickRfbEnrichmentNightly,
+  RFB_ENRICHMENT_TICK_MS,
+  RFB_ENRICHMENT_FIRST_TICK_MS,
+} from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
@@ -881,6 +888,11 @@ app.use("/admin/outreach-max-touch-vern", adminLimiter, adminOutreachMaxTouchVer
 // services/rfb-marketing-daily.ts; the 08:10Z tick is further down.
 app.use("/admin/rfb-marketing-lane", adminLimiter, rfbMarketingLaneRouter);
 app.use("/admin/rfb-marketing-daily-run", adminLimiter, rfbMarketingDailyRunRouter);
+// dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
+// enrichment job's admin surfaces — GET /preview (read-only, what each step
+// would take tonight), POST /run ({apply?}, dry run by default), GET /last.
+// services/rfb-enrichment-nightly.ts; the night tick is further down.
+app.use("/admin/rfb-enrichment-nightly", adminLimiter, rfbEnrichmentNightlyRouter);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
@@ -2024,6 +2036,48 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   });
   setTimeout(() => { void rfbMarketingDailyTick(); }, 120_000);
   setInterval(() => { void rfbMarketingDailyTick(); }, 10 * 60_000);
+}
+
+// ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,
+// amended live 2026-10-11): the nightly RFB enrichment job ─────────────────
+//
+// Runs the EXISTING enrichment tools (URL probe, e-mail-domain website
+// candidate → review queue, Brreg contact fields, Bondens Marked harvest over
+// a rotating slug window, contact extraction, homepage content refresh) on a
+// small capped batch of uncontacted RFB producers, then re-verifies the rows
+// it changed with the verifier's own batch path. Never sends anything, never
+// lowers a gate. Registered ONLY when RFB_ENRICHMENT_NIGHTLY_ENABLED is
+// "1"/"true" (default OFF — no tick exists otherwise; the job re-checks it).
+// Checks every 5 minutes; runs once per ~day inside RFB_ENRICHMENT_NIGHTLY_
+// HOURS_UTC (default 00–01Z), never in 08:00–08:59Z, and only while it holds
+// the verifier's own DB tick lock (so never concurrently with a verifier
+// tick). Statically imported: one module instance, one DB singleton. The
+// "ran today" stamp is persisted (boot_job_state). Manual/dry runs:
+// POST /admin/rfb-enrichment-nightly/run, GET /admin/rfb-enrichment-nightly/preview.
+if (isRfbEnrichmentNightlyEnabled()) {
+  let lastRfbEnrichmentRunAt: Date | null = null;
+  let rfbEnrichmentTickRunning = false;
+  const rfbEnrichmentNightlyTick = trackJob("rfb-enrichment-nightly", async () => {
+    if (rfbEnrichmentTickRunning) return;
+    rfbEnrichmentTickRunning = true;
+    try {
+      const t = await tickRfbEnrichmentNightly({ now: new Date(), lastRunAt: lastRfbEnrichmentRunAt });
+      lastRfbEnrichmentRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[rfb-enrichment-nightly] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `stopped=${r.stopped_reason ?? "-"} written=${r.totals.written} re_verified=${r.totals.re_verified} ` +
+          `new_in_pool=${r.totals.new_in_pool} llm=${r.llm.calls}/${r.llm.cap} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[rfb-enrichment-nightly] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      rfbEnrichmentTickRunning = false;
+    }
+  });
+  setTimeout(() => { void rfbEnrichmentNightlyTick(); }, RFB_ENRICHMENT_FIRST_TICK_MS);
+  setInterval(() => { void rfbEnrichmentNightlyTick(); }, RFB_ENRICHMENT_TICK_MS);
 }
 
 // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok

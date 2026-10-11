@@ -56,6 +56,10 @@
  * `judgeContactCandidate({ fieldType: "website", ... })` directly.
  */
 
+// dev-request 2026-10-10-rfb-berikelse-nattjobb: counts each model request on
+// the active LLM call meter (no-op outside one) — observability only.
+import { noteLlmCall } from "./llm-call-meter";
+
 export type ContactFieldType = "phone" | "email" | "address" | "website";
 
 export interface ContactCandidateDefectVerdict {
@@ -366,6 +370,7 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
   // One signal covers the fetch AND both body reads below.
   const signal = AbortSignal.timeout(judgeTimeoutMs);
   let response: Awaited<ReturnType<typeof fetch>>;
+  noteLlmCall("contact-candidate-judge");
   try {
     response = await raceAbort(fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",

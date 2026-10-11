@@ -47006,3 +47006,45 @@ runSerial(async () => {
     failures.push("seo-sitemap-rollesperre: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel live 2026-10-11):
+// GET /admin/bm-producer-harvest gained an optional `offset` (both branches,
+// default unchanged, echoed in the response). Pins its own in-memory DB and a
+// stub global fetch (both restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-10-rfb-berikelse-nattjobb: bm-producer-harvest offset ──");
+  try {
+    const { runAdminBmProducerHarvestOffsetTests } = require("../src/routes/admin-bm-producer-harvest-offset.test") as
+      typeof import("../src/routes/admin-bm-producer-harvest-offset.test");
+    const bo = await runAdminBmProducerHarvestOffsetTests({ log: false });
+    passed += bo.passed;
+    failed += bo.failed;
+    for (const f of bo.failures) failures.push("bm-producer-harvest-offset: " + f);
+    console.log(`  bm-producer-harvest-offset: ${bo.passed} passed, ${bo.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bm-producer-harvest-offset: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
+// enrichment job (services/rfb-enrichment-nightly.ts) — AC1 (cohort
+// exclusions pinned against pool-blocker-explain, per-step caps, LLM cap,
+// flag off = nothing, never 08:00–08:59Z), the verifier tick lock, envelope
+// shape, read-only preview, BM cursor rotation/wrap, admin routes. Pins a
+// fresh in-memory DB per block (restored in finally) — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-10-rfb-berikelse-nattjobb: rfb-enrichment-nightly ──");
+  try {
+    const { runRfbEnrichmentNightlyTests } = require("../src/services/rfb-enrichment-nightly.test") as
+      typeof import("../src/services/rfb-enrichment-nightly.test");
+    const ren = await runRfbEnrichmentNightlyTests({ log: false });
+    passed += ren.passed;
+    failed += ren.failed;
+    for (const f of ren.failures) failures.push("rfb-enrichment-nightly: " + f);
+    console.log(`  rfb-enrichment-nightly: ${ren.passed} passed, ${ren.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-nightly: unexpected error: " + String(err?.message || err));
+  }
+});

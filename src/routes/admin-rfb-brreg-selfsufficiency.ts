@@ -206,7 +206,10 @@ interface RfbBssTargetRow {
 // below for the org_nr-only diagnostic count), extended with the website-OR
 // branch this route's own combined batch needs. Never diverges from that
 // predicate's scope filters by hand-editing them separately.
-function rfbBssCandidateWhereSql(): string {
+// Exported (dev-request 2026-10-10-rfb-berikelse-nattjobb) so the nightly
+// enrichment job selects its Brreg-step rows with THIS predicate instead of a
+// copy of it (services/rfb-enrichment-nightly.ts). Export-only change.
+export function rfbBssCandidateWhereSql(): string {
   return `
     a.role = 'producer'
     AND a.is_active = 1

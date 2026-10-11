@@ -38,6 +38,10 @@
  * here — see this module's own callers for that wiring.
  */
 
+// dev-request 2026-10-10-rfb-berikelse-nattjobb: counts each model request on
+// the active LLM call meter (no-op outside one) — observability only.
+import { noteLlmCall } from "./llm-call-meter";
+
 export interface SecondLineProfileJudgeVerdict {
   approved: boolean;
   reason?: string;
@@ -196,6 +200,7 @@ ${SECOND_LINE_JUDGE_REJECT_TOKEN}
 Ved minste tvil, svar ${SECOND_LINE_JUDGE_REJECT_TOKEN}.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
+  noteLlmCall("second-line-profile-judge");
   try {
     response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",

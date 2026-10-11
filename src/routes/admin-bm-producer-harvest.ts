@@ -12,6 +12,14 @@
 //                hard-capped at 400 regardless of what's requested.
 //     dry_run  — optional, default "true". The literal string "false" is
 //                the ONLY way to reach the apply-mode stub below.
+//     offset   — optional non-negative integer, default 0 (dev-request
+//                2026-10-10-rfb-berikelse-nattjobb, Daniel live 2026-10-11):
+//                skips that many slugs of the sitemap's slug list BEFORE
+//                `limit` is applied, in BOTH branches, and is echoed back as
+//                `offset` in the response. Without it every call started at
+//                the first slug, so the apply branch's 60 s time budget could
+//                never reach the tail of the ~354-slug catalog. Absent,
+//                negative or unparseable = 0 = the exact pre-offset window.
 //
 // GET /admin/bm-producer-harvest?dry_run=false
 //
@@ -122,6 +130,17 @@ function requireAdmin(req: Request, res: Response): boolean {
 }
 
 const HARD_CAP_SLUGS = 400;
+
+/**
+ * `?offset=` → a non-negative integer, default 0. Anything that is not a
+ * plain non-negative integer (absent, negative, "abc", "1.5") is 0, so a
+ * caller that does not send it gets the window it always got.
+ */
+export function parseBmHarvestOffset(raw: unknown): number {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw.trim())) return 0;
+  const n = parseInt(raw.trim(), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
 
 // ─── Apply-mode (slice 3) ───────────────────────────────────────────────────
 
@@ -399,9 +418,10 @@ router.get("/", async (req: Request, res: Response) => {
         }
       }
 
+      const offset = parseBmHarvestOffset(req.query.offset);
       const allSlugs = await fetchBmProducerSlugs();
       const total_slugs = allSlugs.length;
-      const slugsToProcess = allSlugs.slice(0, limit);
+      const slugsToProcess = allSlugs.slice(offset, offset + limit);
 
       const db = getDb();
       const batchTag = `bm-producer-harvest-${new Date()
@@ -675,6 +695,7 @@ router.get("/", async (req: Request, res: Response) => {
         dry_run: false,
         batch_tag: batchTag,
         total_slugs,
+        offset,
         // `scanned` reflects how many slugs were actually attempted before
         // the time budget (if any) cut in — NOT the full requested/capped
         // `limit`. Equals slugsToProcess.length in the (overwhelmingly
@@ -707,9 +728,10 @@ router.get("/", async (req: Request, res: Response) => {
       }
     }
 
+    const offset = parseBmHarvestOffset(req.query.offset);
     const allSlugs = await fetchBmProducerSlugs();
     const total_slugs = allSlugs.length;
-    const slugsToProcess = allSlugs.slice(0, limit);
+    const slugsToProcess = allSlugs.slice(offset, offset + limit);
 
     const db = getDb();
 
@@ -780,6 +802,7 @@ router.get("/", async (req: Request, res: Response) => {
 
     res.json({
       total_slugs,
+      offset,
       fetched: slugsToProcess.length,
       parse_failed,
       matched,
