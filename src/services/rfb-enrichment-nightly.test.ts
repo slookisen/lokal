@@ -42,6 +42,10 @@
  *       route in process with the stored offset and advances the cursor
  *   (o) admin routes: auth, dry-run default, apply with the flag off
  *   (p) enrichment write-pause: writing steps skipped, verify still runs
+ *   (q) the BM step ALWAYS asks the route for fill_only=1 and scopes it to
+ *       the cohort: through the real in-process route a stored e-mail/phone
+ *       is never replaced, a blank one is filled, and a matched producer
+ *       outside the cohort (already contacted) is left alone
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-enrichment-nightly.test.ts
@@ -187,6 +191,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       is_active?: number;
       is_vetted?: number | null;
       claimed_at?: string | null;
+      city?: string;
       vertical_id?: string;
       catalog_hidden?: number;
       k?:
@@ -203,6 +208,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
             homepage_unreachable_since?: string | null;
             curated_fields?: string | null;
             enrichment_status?: string;
+            phone?: string | null;
           };
     } = {},
   ): void {
@@ -225,6 +231,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
     if (o.claimed_at !== undefined) cols.claimed_at = o.claimed_at;
     if (o.vertical_id !== undefined) cols.vertical_id = o.vertical_id;
     if (o.catalog_hidden !== undefined) cols.catalog_hidden = o.catalog_hidden;
+    if (o.city !== undefined) cols.city = o.city;
     const names = Object.keys(cols);
     db.prepare(`INSERT INTO agents (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`).run(
       ...names.map((n) => cols[n]),
@@ -243,6 +250,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       "homepage_unreachable_since",
       "curated_fields",
       "enrichment_status",
+      "phone",
     ] as const) {
       if ((k as any)[key] !== undefined) kc[key] = (k as any)[key];
     }
@@ -354,6 +362,11 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       setEnv({ RFB_SECOND_LINE_VERIFICATION_ENABLED: "true" });
       assertEq(job.rfbEnrichmentLlmCallsPerRowMax("reverify"), 1, "a7: verify 1 when the second line is on");
       setEnv({});
+      assertEq(
+        job.buildRfbEnrichmentBmHarvestRequest({ offset: 120, limit: 60, scopeAgentIds: ["x", "y"] }),
+        { method: "GET", path: "/", query: { dry_run: "false", fill_only: "1", limit: "60", offset: "120" }, body: { scope_agent_ids: ["x", "y"] } },
+        "a8 (d): the BM step's in-process request is apply + fill_only=1 + offset/limit + the cohort as scope",
+      );
     }
 
     // ── (b) AC1 cohort ───────────────────────────────────────────────────
@@ -695,8 +708,10 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const total = { n: 354 };
       let scannedOverride: number | null = null;
       const offsets: number[] = [];
-      const bm = async ({ offset, limit }: { offset: number; limit: number }) => {
+      const scopes: string[][] = [];
+      const bm = async ({ offset, limit, scopeAgentIds }: { offset: number; limit: number; scopeAgentIds: string[] }) => {
         offsets.push(offset);
+        scopes.push(scopeAgentIds);
         const scanned = scannedOverride ?? Math.max(0, Math.min(limit, total.n - offset));
         return { status: 200, total_slugs: total.n, offset, scanned, time_budget_exceeded: false, counts: {}, changed_agent_ids: [], written: 0 };
       };
@@ -705,6 +720,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
         await job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: new Date(NIGHT.getTime() + night * 86_400_000), deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
       }
       assertEq(offsets, [0, 60, 120, 180, 240, 300, 0], "j1: six nights of 60 cover 354 slugs, the seventh wraps to 0");
+      assertTrue(scopes.length === 7 && scopes.every((x) => Array.isArray(x)), "j1: every BM call carries the cohort scope");
       assertEq(job.getRfbEnrichmentBmCursor(db).next_offset, 60, "j1: cursor persisted (after the wrap night it points at 60)");
       scannedOverride = 25;
       await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
@@ -835,6 +851,44 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
         "p1: every writing step reports enrichment_write_paused",
       );
       assertEq(calls.filter((c) => c.step === "reverify").map((c) => c.id), ["p-dead"], "p2: verification (exempt by design) still runs");
+    });
+    // ── (q) BM step: fill_only + cohort scope through the real route ─────
+    await withDb("q", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_BM_SLUGS: "10" });
+      seedAgent("q-diff", { name: "Qdiff Gård", city: "Bostad", contact_email: "old@qdiff.no", k: { phone: "+4791111111", curated_fields: "{}" } });
+      seedAgent("q-blank", { name: "Qblank Gård", city: "Bostad", contact_email: "", k: { curated_fields: "{}" } });
+      seedAgent("q-contacted", { name: "Qcontacted Gård", city: "Bostad", contact_email: "", k: { email: "post@qcontacted.no" } });
+      db.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email, channel, message_id, notes, vertical_id) VALUES ('q-contacted', 'post@qcontacted.no', 'email', 'm-q', 'test', 'rfb')`).run();
+      const ldq = (name: string) =>
+        JSON.stringify({ "@context": "https://schema.org", "@type": "LocalBusiness", name, address: { "@type": "PostalAddress", addressLocality: "Bostad", addressCountry: "NO" } });
+      const pages: Record<string, string> = {
+        "qdiff-gard": `<script type="application/ld+json">${ldq("Qdiff Gård")}</script><a href="mailto:new@qdiff.no">x</a><a href="tel:+4792222222">x</a>`,
+        "qblank-gard": `<script type="application/ld+json">${ldq("Qblank Gård")}</script><a href="mailto:post@qblank.no">x</a>`,
+        "qcontacted-gard": `<script type="application/ld+json">${ldq("Qcontacted Gård")}</script><a href="mailto:annen@qcontacted.no">x</a>`,
+      };
+      const sitemap = `<urlset>${Object.keys(pages).map((sl) => `<url><loc>https://bondensmarked.no/produsenter/${sl}</loc></url>`).join("")}</urlset>`;
+      (globalThis as any).fetch = async (url: any) => {
+        const u = String(url);
+        if (u === "https://bondensmarked.no/sitemap.xml") return new Response(sitemap, { status: 200 });
+        const m = /\/produsenter\/([a-z0-9-]+)$/.exec(u);
+        if (m && pages[m[1]]) return new Response(pages[m[1]], { status: 200, headers: { "content-type": "text/html" } });
+        return new Response("not found", { status: 404 });
+      };
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT });
+      const bmStep = r.steps.find((s) => s.step === "bm_harvest")!;
+      assertEq(
+        [bmStep.outcomes.skipped_not_empty, bmStep.outcomes.phone_skipped_not_empty, bmStep.outcomes.skipped_out_of_scope, bmStep.outcomes.written],
+        [1, 1, 1, 1],
+        "q1 (d): the route ran with fill_only (skipped_not_empty) and the cohort scope (skipped_out_of_scope)",
+      );
+      const em = (id: string) => (db.prepare(`SELECT contact_email AS e FROM agents WHERE id = ?`).get(id) as { e: string }).e;
+      const ph = (id: string) => (db.prepare(`SELECT phone AS p FROM agent_knowledge WHERE agent_id = ?`).get(id) as { p: string | null }).p;
+      assertEq([em("q-diff"), ph("q-diff")], ["old@qdiff.no", "+4791111111"], "q2: a stored e-mail and phone are never replaced by the nightly job");
+      assertEq(em("q-blank"), "post@qblank.no", "q3: a blank e-mail is filled");
+      assertEq(em("q-contacted"), "", "q4: a matched producer outside the cohort (already contacted) is left alone");
+      assertEq(bmStep.changed_agent_ids, ["q-blank"], "q5: only the filled row goes on to re-verification");
+      const audit = (db.prepare(`SELECT COUNT(*) AS c FROM agent_knowledge_audit WHERE agent_id IN ('q-diff', 'q-contacted')`).get() as { c: number }).c;
+      assertEq(audit, 0, "q6: no audit row for the untouched rows");
     });
   } catch (err) {
     failed++;

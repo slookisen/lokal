@@ -31,7 +31,11 @@
 //                           gate for e-mail — unchanged).
 //   2c bm_harvest           GET /admin/bm-producer-harvest?dry_run=false, in
 //                           process, over a rotating slug window (`offset`,
-//                           cursor persisted in rfb_enrichment_sweep_state).
+//                           cursor persisted in rfb_enrichment_sweep_state),
+//                           ALWAYS with fill_only=1 (never replaces a stored
+//                           e-mail/phone) and scope_agent_ids = tonight's
+//                           cohort (a matched producer outside it is left
+//                           alone) — see buildRfbEnrichmentBmHarvestRequest.
 //   3  contact_extraction   POST /admin/rfb-contact-extraction, in process,
 //                           one row per call, for rows whose site answers and
 //                           that have no e-mail.
@@ -1020,11 +1024,38 @@ export interface RfbEnrichmentReverifyOutcome {
   detail?: string;
 }
 
+export interface RfbEnrichmentBmArgs {
+  offset: number;
+  limit: number;
+  /** Tonight's cohort: matched producers outside it get no write. */
+  scopeAgentIds: string[];
+}
+
+/**
+ * The exact in-process request the BM step sends. fill_only is not optional
+ * here: the route's default still REPLACES a different stored e-mail/phone
+ * (2026-10-11: 7 e-mails + 2 phones overwritten by a manual apply run), and
+ * this job only ever fills blanks.
+ */
+export function buildRfbEnrichmentBmHarvestRequest(args: RfbEnrichmentBmArgs): {
+  method: "GET";
+  path: string;
+  query: Record<string, string>;
+  body: { scope_agent_ids: string[] };
+} {
+  return {
+    method: "GET",
+    path: "/",
+    query: { dry_run: "false", fill_only: "1", limit: String(args.limit), offset: String(args.offset) },
+    body: { scope_agent_ids: args.scopeAgentIds },
+  };
+}
+
 export interface RfbEnrichmentExecutors {
   urlCheck(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   emailDomainWebsite(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   brregContact(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
-  bmHarvest(args: { offset: number; limit: number }): Promise<RfbEnrichmentBmOutcome>;
+  bmHarvest(args: RfbEnrichmentBmArgs): Promise<RfbEnrichmentBmOutcome>;
   contactExtraction(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   contentRefresh(row: RfbEnrichmentCohortRow, deadlineAtMs: number): Promise<RfbEnrichmentRowOutcome>;
   reverify(agentId: string): Promise<RfbEnrichmentReverifyOutcome>;
@@ -1113,12 +1144,9 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
       };
     },
 
-    async bmHarvest({ offset, limit }) {
-      const r = await callAdminRouterInProcess(bmProducerHarvestRouter, {
-        method: "GET",
-        path: "/",
-        query: { dry_run: "false", limit: String(limit), offset: String(offset) },
-      });
+    async bmHarvest(args) {
+      const { offset } = args;
+      const r = await callAdminRouterInProcess(bmProducerHarvestRouter, buildRfbEnrichmentBmHarvestRequest(args));
       const body = r.body ?? {};
       const results: any[] = Array.isArray(body.results) ? body.results : [];
       const changed = new Set<string>();
@@ -1352,7 +1380,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
         eligible: 0,
         selected: 0,
         selected_ids: [],
-        note: "slugs are read from bondensmarked.no at run time; the window starts at the stored cursor",
+        note: "slugs are read from bondensmarked.no at run time; the window starts at the stored cursor; always fill_only=1, scoped to the cohort",
         bm: { offset: cur.next_offset, limit: caps[step], last_total: cur.total, cursor_updated_at: cur.updated_at },
       });
       continue;
@@ -1715,11 +1743,12 @@ async function runSteps(rc: RunContext): Promise<void> {
       let offset = cursor.next_offset;
       let out: RfbEnrichmentBmOutcome;
       try {
-        out = await exec.bmHarvest({ offset, limit: sr.cap });
+        const scopeAgentIds = cohort.rows.map((r) => r.id);
+        out = await exec.bmHarvest({ offset, limit: sr.cap, scopeAgentIds });
         // The catalog shrank below the stored cursor: start over at 0 now.
         if (out.status === 200 && out.total_slugs > 0 && out.scanned === 0 && offset >= out.total_slugs) {
           offset = 0;
-          out = await exec.bmHarvest({ offset, limit: sr.cap });
+          out = await exec.bmHarvest({ offset, limit: sr.cap, scopeAgentIds });
         }
       } catch (err) {
         out = {

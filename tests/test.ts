@@ -47048,3 +47048,24 @@ runSerial(async () => {
     failures.push("rfb-enrichment-nightly: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-10-rfb-berikelse-nattjobb (prod incident 2026-10-11: a
+// manual apply run replaced 7 stored contact_email values and 2 phones):
+// GET /admin/bm-producer-harvest `fill_only` + `scope_agent_ids`; the default
+// (still overwriting) is pinned. Own in-memory DB + stub fetch per scenario
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-10-rfb-berikelse-nattjobb: bm-producer-harvest fill_only + scope ──");
+  try {
+    const { runAdminBmProducerHarvestFillOnlyTests } = require("../src/routes/admin-bm-producer-harvest-fill-only.test") as
+      typeof import("../src/routes/admin-bm-producer-harvest-fill-only.test");
+    const bf = await runAdminBmProducerHarvestFillOnlyTests({ log: false });
+    passed += bf.passed;
+    failed += bf.failed;
+    for (const f of bf.failures) failures.push("bm-producer-harvest-fill-only: " + f);
+    console.log(`  bm-producer-harvest-fill-only: ${bf.passed} passed, ${bf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bm-producer-harvest-fill-only: unexpected error: " + String(err?.message || err));
+  }
+});
