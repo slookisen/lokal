@@ -28,6 +28,13 @@
  *      create real orders and send order emails).
  *   7. Both pages' "Sist oppdatert"/"Last updated" date reflects this
  *      change (no longer the stale April 2026 dates).
+ *   8. (Daniel live 2026-10-11 «fiks personvernsiden») /personvern no longer
+ *      claims producer profiles rest on consent: profiles built from public
+ *      sources are on legitimate interest, with the sources, the recipients
+ *      (AI assistants), Anthropic checks/translation, Tigris backups and
+ *      their real 7-day + 4-week retention, the «fjern» removal reply, the
+ *      do-not-re-add list and the right to object all disclosed, each
+ *      cross-checked against the code that does it.
  *
  * Standalone: npx tsx src/routes/rfb-privacy-terms-truth.test.ts
  */
@@ -128,6 +135,27 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     /cutoffDays: number = 30/.test(cartSweepSrc),
     "ground truth: sweepExpiredCartContactData() really does default to a 30-day cutoff"
   );
+  const offsiteBackupSrc = fs.readFileSync(path.join(__dirname, "..", "services", "offsite-backup.ts"), "utf8");
+  const outreachTemplateSrc = fs.readFileSync(path.join(__dirname, "..", "services", "rfb-outreach-template.ts"), "utf8");
+  const blocklistSrc = fs.readFileSync(path.join(__dirname, "..", "services", "blocklist-service.ts"), "utf8");
+  const secondLineJudgeSrc = fs.readFileSync(path.join(__dirname, "..", "services", "second-line-profile-judge.ts"), "utf8");
+  assertTrue(
+    /export function selectBackupsToDelete\(objects: S3Object\[\], keepDays = 7, keepWeeks = 4\)/.test(offsiteBackupSrc),
+    "ground truth: offsite backups keep 7 daily + 4 weekly copies (selectBackupsToDelete defaults)"
+  );
+  assertTrue(
+    /Svar «fjern» så slettes profilen/.test(outreachTemplateSrc),
+    "ground truth: the outreach e-mail tells producers to reply «fjern» to have the profile deleted"
+  );
+  assertTrue(
+    /CREATE TABLE IF NOT EXISTS agent_blocklist/.test(dbInitSrc) &&
+      /"website_domain" \| "email" \| "email_domain" \| "name_normalized" \| "agent_id" \| "org_nr"/.test(blocklistSrc),
+    "ground truth: removed producers go on agent_blocklist by website domain, e-mail, name and org.nr"
+  );
+  assertTrue(
+    /https:\/\/api\.anthropic\.com\/v1\/messages/.test(secondLineJudgeSrc),
+    "ground truth: profile checks really call Anthropic's API (second-line-profile-judge.ts)"
+  );
 
   // ── 1. /privacy, /privacy-policy: redirect, no more duplicate content ──
   for (const p of ["/privacy", "/privacy-policy"]) {
@@ -199,8 +227,55 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     );
     assertTrue(
       // 2026-10-09: controller changed to AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
-      lang === "no" ? /Sist oppdatert: 9\. oktober 2026/.test(body) : /Last updated: 9 October 2026/.test(body),
+      // 2026-10-11: legal basis, sources, recipients, AI, backups and the right to object (Daniel live «fiks personvernsiden»).
+      lang === "no" ? /Sist oppdatert: 11\. oktober 2026/.test(body) : /Last updated: 11 October 2026/.test(body),
       `/personvern (${lang}): "last updated" date reflects this change`
+    );
+
+    // ── 8. Producer profiles: real legal basis, sources, recipients, AI, backups, objection ──
+    assertTrue(
+      !/Selgerprofil \(offentlig info\)/.test(body) && !/Seller profile \(public info\)/.test(body),
+      `/personvern (${lang}): no longer claims producer profiles rest on consent ("Selgerprofil (offentlig info)" row gone)`
+    );
+    assertTrue(
+      lang === "no"
+        ? /<td>Produsentprofiler fra offentlige kilder<\/td><td>Berettiget interesse<\/td>/.test(body)
+        : /<td>Producer profiles from public sources<\/td><td>Legitimate interest<\/td>/.test(body),
+      `/personvern (${lang}): profiles built from public sources are on legitimate interest`
+    );
+    assertTrue(
+      (lang === "no" ? /Brønnøysundregistrene/.test(body) : /Brønnøysund Register Centre/.test(body)) &&
+        /Debio/.test(body) && /Google Places/.test(body),
+      `/personvern (${lang}): names the public sources profiles are built from (same as /proveniens)`
+    );
+    assertTrue(
+      lang === "no"
+        ? /Hvem som får opplysningene/.test(body) && /KI-assistenter/.test(body)
+        : /Who receives the data/.test(body) && /AI assistants/.test(body),
+      `/personvern (${lang}): discloses recipients, including AI assistants fetching public profiles`
+    );
+    assertTrue(
+      lang === "no" ? /Kontroll og oversettelse med KI/.test(body) : /Checks and translation with AI/.test(body),
+      `/personvern (${lang}): discloses profile checks and translation at Anthropic`
+    );
+    assertTrue(
+      /Tigris/.test(body) &&
+        (lang === "no" ? /beholdes i 7 dager, og én kopi per uke i 4 uker til/.test(body) : /kept for 7 days, and one copy per week for 4 more weeks/.test(body)),
+      `/personvern (${lang}): discloses Tigris backups with the real 7-day + 4-week retention`
+    );
+    assertTrue(
+      lang === "no" ? /«fjern»/.test(body) && /sperreliste/.test(body) : /\u201cfjern\u201d/.test(body) && /do-not-re-add list/.test(body),
+      `/personvern (${lang}): discloses the «fjern» removal reply and the do-not-re-add list`
+    );
+    assertTrue(
+      lang === "no" ? /<strong>Protestere<\/strong>/.test(body) : /<strong>Object<\/strong>/.test(body),
+      `/personvern (${lang}): states the right to object`
+    );
+    assertTrue(
+      lang === "no"
+        ? /<td>Hentebestillinger<\/td><td>Avtale<\/td>/.test(body)
+        : /<td>Pickup orders<\/td><td>Contract<\/td>/.test(body),
+      `/personvern (${lang}): pickup orders listed on contract (both languages)`
     );
     // ChatGPT app re-review 2026-10-03: lokal_cart_submit takes optional
     // buyer contact fields that reach a producer only with contact_consent.
