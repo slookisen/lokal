@@ -156,6 +156,37 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     /https:\/\/api\.anthropic\.com\/v1\/messages/.test(secondLineJudgeSrc),
     "ground truth: profile checks really call Anthropic's API (second-line-profile-judge.ts)"
   );
+  // Review of lokal#1039: the page must not promise more deletion than the code does.
+  const dbBackupRouteSrc = fs.readFileSync(path.join(__dirname, "admin-db-backup.ts"), "utf8");
+  const deactivateSrc = fs.readFileSync(path.join(__dirname, "admin-agents-deactivate.ts"), "utf8");
+  const inboundEmailSrc = fs.readFileSync(path.join(__dirname, "..", "services", "inbound-email-webhook.ts"), "utf8");
+  assertTrue(
+    /for \(const k of selectBackupsToDelete\(objs\)\)/.test(offsiteBackupSrc),
+    "ground truth: the nightly Tigris job prunes with selectBackupsToDelete's defaults (7 days + 4 weeks)"
+  );
+  assertTrue(
+    /pruneBackups\(dir, 10, config\.filenameRe\)/.test(dbBackupRouteSrc),
+    "ground truth: manual on-volume backups keep the 10 newest, with no age limit"
+  );
+  assertTrue(
+    /SET is_active = 0/.test(deactivateSrc) && !/DELETE FROM agents/.test(deactivateSrc),
+    "ground truth: closed or wrongly registered businesses are deactivated (is_active = 0), never deleted"
+  );
+  const translationsSrc = fs.readFileSync(path.join(__dirname, "..", "services", "profile-translations.ts"), "utf8");
+  const marketplaceSrc = fs.readFileSync(path.join(__dirname, "marketplace.ts"), "utf8");
+  assertTrue(
+    !/DELETE FROM profile_translations/.test(translationsSrc) && !/DELETE FROM profile_translations/.test(marketplaceSrc),
+    "ground truth: deleting a profile leaves its translations in profile_translations (no DELETE anywhere)"
+  );
+  assertTrue(
+    /CREATE TABLE IF NOT EXISTS crm_contacts[\s\S]{0,300}agent_id TEXT REFERENCES agents\(id\) ON DELETE SET NULL/.test(dbInitSrc) &&
+      /CREATE TABLE IF NOT EXISTS rfb_marketing_send_ledger/.test(dbInitSrc),
+    "ground truth: CRM contacts survive profile deletion (ON DELETE SET NULL) and the send log exists"
+  );
+  assertTrue(
+    /api\.resend\.com\/emails\/receiving/.test(inboundEmailSrc) && /process\.env\.ADMIN_EMAIL/.test(inboundEmailSrc),
+    "ground truth: inbound email is received via Resend and forwarded to the admin mailbox"
+  );
 
   // ── 1. /privacy, /privacy-policy: redirect, no more duplicate content ──
   for (const p of ["/privacy", "/privacy-policy"]) {
@@ -255,7 +286,7 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
       `/personvern (${lang}): discloses recipients, including AI assistants fetching public profiles`
     );
     assertTrue(
-      lang === "no" ? /Kontroll og oversettelse med KI/.test(body) : /Checks and translation with AI/.test(body),
+      lang === "no" ? /<h3>KI hos Anthropic<\/h3>/.test(body) : /<h3>AI at Anthropic<\/h3>/.test(body),
       `/personvern (${lang}): discloses profile checks and translation at Anthropic`
     );
     assertTrue(
@@ -270,6 +301,32 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     assertTrue(
       lang === "no" ? /<strong>Protestere<\/strong>/.test(body) : /<strong>Object<\/strong>/.test(body),
       `/personvern (${lang}): states the right to object`
+    );
+    // Review of lokal#1039: deletion and retention claims match the code.
+    assertTrue(
+      !/inntil ca\. 5 uker/.test(body) && !/up to about 5 weeks/.test(body) &&
+        (lang === "no" ? /de ti nyeste beholdes, uten fast tidsgrense/.test(body) : /the ten newest are kept, with no fixed time limit/.test(body)),
+      `/personvern (${lang}): backups disclose the manual on-volume copies with no fixed time limit`
+    );
+    assertTrue(
+      !/profilen og tilknyttet data/.test(body) && !/your profile and associated data removed/.test(body) &&
+        (lang === "no" ? /<td>E-postkorrespondanse og utsendingslogg<\/td><td>Ingen automatisk sletting i dag/.test(body)
+          : /<td>Email correspondence and send log<\/td><td>No automatic deletion today/.test(body)),
+      `/personvern (${lang}): says e-mail correspondence and the send log are not deleted with the profile`
+    );
+    assertTrue(
+      lang === "no" ? /skjules, men blir liggende i databasen/.test(body) : /are hidden, but stay in the database/.test(body),
+      `/personvern (${lang}): closed or wrongly registered businesses are hidden, not deleted`
+    );
+    assertTrue(
+      /Resend/.test(body) && /Gmail/.test(body),
+      `/personvern (${lang}): names Resend and Gmail for sending and receiving e-mail`
+    );
+    assertTrue(
+      lang === "no"
+        ? /Oversatte utgaver av profilteksten \(engelsk og svensk\) avpubliseres, men blir liggende/.test(body)
+        : /Translated versions of the profile text \(English and Swedish\) are unpublished but stay in the database/.test(body),
+      `/personvern (${lang}): says translated profile text stays after the profile is deleted`
     );
     assertTrue(
       lang === "no"
@@ -296,8 +353,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     );
     assertTrue(
       lang === "no"
-        ? /Enkeltbesøk \(med anonymisert IP-hash\) slettes automatisk etter 60 dager/.test(body)
-        : /Individual page visits \(with the anonymised IP hash\) are deleted automatically after 60 days/.test(body),
+        ? /Enkeltbesøk \(med pseudonymisert IP-hash\) slettes automatisk etter 60 dager/.test(body)
+        : /Individual page visits \(with the pseudonymised IP hash\) are deleted automatically after 60 days/.test(body),
       `/personvern (${lang}): states the 60-day automatic deletion of raw page visits`
     );
   }
