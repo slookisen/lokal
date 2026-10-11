@@ -99,7 +99,18 @@ import { normaliseName } from "./brreg-client";
 // listenavn-varianter — getProviderByDomain() (below) needs the SAME
 // hyphen-insensitive eTLD+1 comparison PR-126 already established for
 // cross-source domain equivalence, not a second reimplementation.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, collapseDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, collapseDomain, domainsEquivalent, FREE_MAIL_DOMAINS } from "./cross-source-validator";
+
+// dev-request 2026-10-10-opplevagent-adressekontroll-leser-epost-kilde:
+// true when `sourceUrl` is on the same (or an equivalent) registrable domain
+// as the provider's own website. Fail closed on missing/unparseable input.
+export function isSourceOnWebsiteDomain(sourceUrl: string | null | undefined, hjemmeside: string | null | undefined): boolean {
+  if (!sourceUrl || !sourceUrl.trim() || !hjemmeside || !hjemmeside.trim()) return false;
+  const srcHost = hostFromUrlLike(sourceUrl);
+  const siteHost = hostFromUrlLike(hjemmeside);
+  if (!srcHost || !siteHost) return false;
+  return domainsEquivalent(registrableDomain(srcHost), registrableDomain(siteHost));
+}
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 1: the shared provider_work_queue hand-off table between the
 // sweep/berikelse/discovery gårdssalg pipelines — used here only to
@@ -5850,12 +5861,12 @@ export async function applyGardssalgProviderContact(
   sets.push("updated_at = datetime('now')");
 
   // ── field_provenance merge (read-modify-write, preserves other fields) ──
-  let provenance: Record<string, { source_url: string; fetched_at: string; source_type?: string }> = {};
+  let provenance: Record<string, { source_url: string; fetched_at: string; source_type?: string; value?: string }> = {};
   if (row.field_provenance) {
     try {
       const parsed = JSON.parse(row.field_provenance);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        provenance = parsed as Record<string, { source_url: string; fetched_at: string; source_type?: string }>;
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string; source_type?: string; value?: string }>;
       }
     } catch {
       /* malformed existing JSON -> treat as empty rather than clobber the write */
@@ -5863,9 +5874,15 @@ export async function applyGardssalgProviderContact(
   }
   const fetchedAt = new Date().toISOString();
   for (const f of written) {
-    provenance[f] = sourceType
+    const rec: { source_url: string; fetched_at: string; source_type?: string; value?: string } = sourceType
       ? { source_url: evidenceUrl, fetched_at: fetchedAt, source_type: sourceType }
       : { source_url: evidenceUrl, fetched_at: fetchedAt };
+    if (f === "epost" && typeof params.epost === "string") {
+      // Bind the source to the address written (read by computeGardssalgAddressBasis).
+      rec.value = params.epost;
+      if (isSourceOnWebsiteDomain(evidenceUrl, row.hjemmeside)) rec.source_type = "homepage";
+    }
+    provenance[f] = rec;
   }
   sets.push("field_provenance = @field_provenance");
   params.field_provenance = JSON.stringify(provenance);
@@ -6025,7 +6042,12 @@ export function applyGardssalgSetContactEmail(
       /* malformed existing JSON -> treat as empty rather than clobber the write */
     }
   }
-  provenance.epost = { source_url: source, fetched_at: new Date().toISOString() };
+  provenance.epost = {
+    source_url: source,
+    fetched_at: new Date().toISOString(),
+    value: email,
+    ...(isSourceOnWebsiteDomain(source, row.hjemmeside) ? { source_type: "homepage" } : {}),
+  };
   // Skive C fix-up (independent review, finding B1): a confirmed epost write
   // through THIS endpoint is a human resolving the address, so it always ends
   // any pending review on this row. Without it, an address flagged by the
@@ -6067,6 +6089,81 @@ export function applyGardssalgSetContactEmail(
   applyWithAudit();
 
   return { ok: true, old_value: oldValue, new_value: email };
+}
+
+/**
+ * dev-request 2026-10-10-opplevagent-adressekontroll-leser-epost-kilde, §3:
+ * does the EXACT address `email` appear on the page `html`? Pure. Case-
+ * insensitive; tolerates the common entity/percent encodings of "@" inside
+ * mailto links. The address must stand alone (not as a substring of a longer
+ * local part or domain), so "info@x.no" never matches "xinfo@x.no" or
+ * "info@x.nor".
+ */
+export function pageContainsExactEmail(html: string, email: string): boolean {
+  const target = (email || "").trim().toLowerCase();
+  if (!target || !target.includes("@")) return false;
+  const decoded = (html || "")
+    .toLowerCase()
+    .replace(/&#0*64;|&#x0*40;|&commat;|%40|\\u0040/g, "@");
+  const esc = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![a-z0-9._%+-])${esc}(?![a-z0-9_-]|\\.[a-z0-9])`).test(decoded);
+}
+
+export type GardssalgEpostProofResult =
+  | { ok: true; provider_id: string; epost: string; source_url: string }
+  | { ok: false; reason: "provider_not_found" | "no_epost" | "epost_changed" | "source_not_on_website_domain" };
+
+/**
+ * Writes field_provenance.epost = {source_url, fetched_at, source_type:
+ * "homepage", value} for a row whose CURRENT address was found on the
+ * producer's own pages. NEVER changes the address (only field_provenance is
+ * updated) and re-validates under the write: the stored epost must still equal
+ * `expectedEpost` and `sourceUrl` must be on the website's domain. One audit
+ * row (field epost_provenance, old = new = the address).
+ */
+export function applyGardssalgEpostHomepageProof(
+  providerId: string,
+  expectedEpost: string,
+  sourceUrl: string,
+  batchId: string | null,
+): GardssalgEpostProofResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, epost, hjemmeside, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; epost: string | null; hjemmeside: string | null; field_provenance: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+  const current = (row.epost || "").trim();
+  if (!current) return { ok: false, reason: "no_epost" };
+  if (current.toLowerCase() !== expectedEpost.trim().toLowerCase()) return { ok: false, reason: "epost_changed" };
+  if (!isSourceOnWebsiteDomain(sourceUrl, row.hjemmeside)) return { ok: false, reason: "source_not_on_website_domain" };
+
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) provenance = parsed as Record<string, unknown>;
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.epost = {
+    source_url: sourceUrl,
+    fetched_at: new Date().toISOString(),
+    source_type: "homepage",
+    value: current,
+  };
+  db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET field_provenance = @fp WHERE id = @id`).run({
+      id: providerId,
+      fp: JSON.stringify(provenance),
+    });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'epost_provenance', @v, @v, @source_url, @batch_id, 'admin', datetime('now'))`
+    ).run({ id: uuid(), provider_id: providerId, v: current, source_url: sourceUrl, batch_id: batchId });
+  })();
+  return { ok: true, provider_id: providerId, epost: current, source_url: sourceUrl };
 }
 
 export type GardssalgSetContactPhoneResult =
