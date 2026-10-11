@@ -15,17 +15,16 @@
  */
 
 import { Request, Response, NextFunction } from "express";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { safeHonestCatalogCount } from "../services/honest-count";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
-// Read the producer count from the live registry at request time so
-// the markdown negotiation responses don't drift away from the DB.
-// Fallback is deliberately conservative — we'd rather under-promise
-// than resurrect the old "1,400+" number if the registry briefly fails.
+// The honest catalog count (same as llms.txt and the front page), read at
+// request time so the markdown responses don't drift away from the DB. The
+// templates append "+", so the conservative fallback carries none of its own.
 function producerCount(): string {
-  const stats = marketplaceRegistry.getStats();
-  return stats.totalAgents ? String(stats.totalAgents) : "1,290+";
+  const n = safeHonestCatalogCount("rfb");
+  return n ? String(n) : "1,290";
 }
 
 // ═══════════════════════════════════════════════════════════════
