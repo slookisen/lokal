@@ -31,6 +31,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import { __resetDbFactoryForTesting } from "../database/db-factory";
 import {
   __setGeocodingFetchForTesting,
   __clearGeocodeCacheForTesting,
@@ -136,6 +137,12 @@ export async function runReisePageTests(opts: { log?: boolean } = {}): Promise<T
   const prevProvider = process.env.ROUTING_PROVIDER;
   const prevFallback = process.env.ROUTING_FALLBACK;
   const prevToken = process.env.MAPBOX_ACCESS_TOKEN;
+  const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+
+  // The OpplevAgent /reise page reads experiences.db through db-factory. Give it
+  // its own :memory: handle; unset, the factory falls back to /app/data.
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  __resetDbFactoryForTesting();
 
   const db = new Database(":memory:");
   db.pragma("journal_mode = DELETE");
@@ -364,6 +371,8 @@ export async function runReisePageTests(opts: { log?: boolean } = {}): Promise<T
     if (prevProvider === undefined) delete process.env.ROUTING_PROVIDER; else process.env.ROUTING_PROVIDER = prevProvider;
     if (prevFallback === undefined) delete process.env.ROUTING_FALLBACK; else process.env.ROUTING_FALLBACK = prevFallback;
     if (prevToken === undefined) delete process.env.MAPBOX_ACCESS_TOKEN; else process.env.MAPBOX_ACCESS_TOKEN = prevToken;
+    if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+    __resetDbFactoryForTesting();
     if (prevDb) (initMod as any).__setDbForTesting(prevDb as any);
   }
 
