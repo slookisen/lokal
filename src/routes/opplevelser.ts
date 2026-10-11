@@ -278,6 +278,9 @@ import {
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
   listGardssalgWebsiteReviewQueue,
+  // 2026-10-11 website-review-queue unblock — open-candidate predicate read
+  // by veien-til-pool step 1, the staleness route and the cleanup route.
+  isOpenGardssalgWebsiteCandidate,
   // Grep 8 slice 1 — third human-review queue reported by
   // GET /admin/gardssalg-review-queues-staleness (pending rows only).
   listExperienceHomepageReviewQueuePending,
@@ -7509,6 +7512,173 @@ router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Re
   });
 });
 
+// ─── gardssalg_website_review_queue triage read (2026-10-11) ─────────────────
+//
+// 2026-10-11 website-review-queue unblock. Prod read the same day: the queue
+// held 228–230 rows, all reported "stale" by GET /admin/gardssalg-review-
+// queues-staleness, yet only ~25 were genuinely blocked drink producers:
+// ~157 belonged to providers that are not gårdssalg producers at all (golf
+// clubs, museums, hotels … swept in by broad website-verification batches
+// such as `orch-m0-full-sweep-2026-09-03`) and ~46 to gårdssalg providers
+// whose hjemmeside was ALREADY verified (leftovers nothing ever cleared —
+// applyGardssalgWebsiteVerification now removes them on verify, but the
+// historical ones are still there).
+//
+// ONE SELECT joining the queue with experience_providers, classifying every
+// row along the three axes the staleness report and the cleanup route below
+// both need — deliberately NOT computeGardssalgReadinessRows (a full
+// readiness pass per call, far more than a queue-hygiene read needs):
+//
+//   - is_gardssalg_provider: the SAME gårdssalg-row predicate this file uses
+//     everywhere (`producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'`,
+//     see GFC_GARDSSALG_PRODUCER_TYPE_SQL), plus `merged_into IS NULL` — a
+//     merged-away duplicate's work belongs to its survivor (see the
+//     merged_into migration's own doc comment in init-experiences.ts, which
+//     leaves exactly this filter to each consumer). An orphan row (provider
+//     gone) is not a gårdssalg provider either.
+//   - website_verified: the shared fail-closed isHjemmesideVerified() gate on
+//     the provider's field_provenance (JS-side, which is why this is not a
+//     pure-SQL count).
+//   - parked / open candidate: isOpenGardssalgWebsiteCandidate()
+//     (experience-store.ts) — the same predicate veien-til-pool step 1 reads.
+//
+// Ordered `updated_at DESC`, identical to listGardssalgWebsiteReviewQueue(),
+// so an age report built from these rows ties exactly as it did before.
+interface GardssalgWebsiteQueueTriageRow {
+  provider_id: string;
+  provider_name: string | null;
+  reason: string;
+  created_at: string;
+  parked_since: string | null;
+  is_gardssalg_provider: boolean;
+  website_verified: boolean;
+}
+
+function readGardssalgWebsiteQueueTriage(db: Database.Database): GardssalgWebsiteQueueTriageRow[] {
+  const raw = db
+    .prepare(
+      `SELECT q.provider_id, q.provider_name, q.reason, q.created_at, q.parked_since,
+              CASE WHEN p.id IS NOT NULL
+                        AND (p.producer_type IS NOT NULL OR p.rfb_seed_source = 'rfb-seed')
+                        AND p.merged_into IS NULL
+                   THEN 1 ELSE 0 END AS is_gardssalg_provider,
+              p.field_provenance
+         FROM gardssalg_website_review_queue q
+         LEFT JOIN experience_providers p ON p.id = q.provider_id
+        ORDER BY q.updated_at DESC`,
+    )
+    .all() as Array<{
+    provider_id: string;
+    provider_name: string | null;
+    reason: string;
+    created_at: string;
+    parked_since: string | null;
+    is_gardssalg_provider: number;
+    field_provenance: string | null;
+  }>;
+  return raw.map((r) => ({
+    provider_id: r.provider_id,
+    provider_name: r.provider_name,
+    reason: r.reason,
+    created_at: r.created_at,
+    parked_since: r.parked_since ?? null,
+    is_gardssalg_provider: r.is_gardssalg_provider === 1,
+    website_verified: isHjemmesideVerified(r.field_provenance ?? null),
+  }));
+}
+
+// ─── POST /admin/gardssalg-website-review-queue-cleanup ─────────────────────
+//
+// 2026-10-11 website-review-queue unblock — the one-shot hygiene lever for the
+// historical backlog described above readGardssalgWebsiteQueueTriage. Same
+// discipline as the park route directly above: requireAdmin, dry-run by
+// default (`{"apply": true}` applies), guarded writes, never throws on an
+// empty selection. Two buckets, nothing else is ever touched:
+//
+//   - `resolved`: the provider's hjemmeside is already verified
+//     (isHjemmesideVerified) -> the queue row is DELETED. The entry is moot —
+//     exactly what applyGardssalgWebsiteVerification now does itself on every
+//     new verify, and what the approve lever already does on adoption
+//     (clearGardssalgWebsiteReviewQueueEntry); this only catches up the rows
+//     that pre-date that. Parked or not, any reason.
+//   - `not_gardssalg`: the provider is not a gårdssalg provider (predicate
+//     above) -> `parked_since` is stamped, NEVER deleted (fully reversible:
+//     clear the column to un-park), and only where `parked_since IS NULL`
+//     (the UPDATE re-checks it, same guard as the park route's stampPark), so
+//     a second apply is a no-op. A row that is BOTH verified and non-gårdssalg
+//     lands in `resolved` only.
+//
+// Everything else — open candidates and terminal notes for unverified
+// gårdssalg providers (the ~25 genuinely blocked drink producers) — is left
+// exactly as it is: veien-til-pool step 1 now re-evaluates those providers
+// itself instead of treating a terminal note as "queued".
+//
+// apply is gated on the experiences write-pause exactly like the judge route
+// (only when there is something to write, so an empty apply stays a 200
+// no-op); dry-run is never blocked. The handler is fully synchronous (no
+// await between the triage read and the writes) and both writes run in one
+// transaction. Response: { dry_run, resolved: {count, provider_ids},
+// not_gardssalg: {count, provider_ids}, remaining_total } — on apply the
+// counts/ids are what actually landed (a row already gone, or already parked,
+// by write time reports changes === 0 and is excluded), on dry-run what
+// would; `remaining_total` is the queue's total row count
+// after the cleanup (projected on dry-run — parked rows still count, they
+// stay in the table).
+router.post("/admin/gardssalg-website-review-queue-cleanup", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true;
+
+  const db = getExpDb("experiences");
+  const triage = readGardssalgWebsiteQueueTriage(db);
+  const resolvedIds = triage.filter((r) => r.website_verified).map((r) => r.provider_id);
+  const notGardssalgIds = triage
+    .filter((r) => !r.website_verified && !r.is_gardssalg_provider && r.parked_since === null)
+    .map((r) => r.provider_id);
+
+  if (!apply) {
+    res.json({
+      dry_run: true,
+      resolved: { count: resolvedIds.length, provider_ids: resolvedIds },
+      not_gardssalg: { count: notGardssalgIds.length, provider_ids: notGardssalgIds },
+      remaining_total: triage.length - resolvedIds.length,
+    });
+    return;
+  }
+
+  if (resolvedIds.length + notGardssalgIds.length > 0) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  const deleteResolved = db.prepare(`DELETE FROM gardssalg_website_review_queue WHERE provider_id = ?`);
+  const stampPark = db.prepare(
+    `UPDATE gardssalg_website_review_queue
+        SET parked_since = datetime('now'), updated_at = datetime('now')
+      WHERE provider_id = ? AND parked_since IS NULL`,
+  );
+  const deleted: string[] = [];
+  const parked: string[] = [];
+  db.transaction(() => {
+    for (const id of resolvedIds) {
+      if (deleteResolved.run(id).changes > 0) deleted.push(id);
+    }
+    for (const id of notGardssalgIds) {
+      if (stampPark.run(id).changes > 0) parked.push(id);
+    }
+  })();
+
+  const remaining = db.prepare(`SELECT COUNT(*) AS c FROM gardssalg_website_review_queue`).get() as { c: number };
+  res.json({
+    dry_run: false,
+    resolved: { count: deleted.length, provider_ids: deleted },
+    not_gardssalg: { count: parked.length, provider_ids: parked },
+    remaining_total: remaining.c,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/listing-homepage-discovery (admin) ────────
 //
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
@@ -13783,15 +13953,50 @@ router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, 
 // the two pre-existing response keys are untouched (the daily-brief SKILL
 // already consumes them).
 //
+// 2026-10-11 website-review-queue unblock: the website queue's alarm said 230
+// stale rows when ~25 mattered (see readGardssalgWebsiteQueueTriage's doc
+// comment for the prod breakdown). The three existing keys keep their exact
+// shape, but `website_review_queue` is now computed over rows with
+// `parked_since IS NULL` only — parking (POST .../gardssalg-website-review-
+// queue-park / -cleanup) exists precisely to take a row out of attention, and
+// counting parked rows here defeated it. Two ADDITIVE keys:
+//   - website_review_queue_actionable: the same age-report shape over rows
+//     that are OPEN candidates (isOpenGardssalgWebsiteCandidate) for a
+//     gårdssalg provider whose hjemmeside is not yet verified — the number a
+//     human actually has to look at.
+//   - website_review_queue_breakdown: plain counts { total, parked,
+//     open_candidates, terminal, for_non_gardssalg_providers,
+//     for_website_verified_providers }. parked + open_candidates + terminal
+//     === total (terminal = unparked rows that are not open candidates); the
+//     last two are cross-cutting counts over ALL rows (the hygiene backlog
+//     POST .../gardssalg-website-review-queue-cleanup removes/parks).
+// Still cheap: one SELECT joining the queue with experience_providers
+// (readGardssalgWebsiteQueueTriage), no readiness computation.
+//
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 router.get("/admin/gardssalg-review-queues-staleness", requireAdmin, (_req: Request, res: Response) => {
   const orgnrQueueReport = computeGardssalgQueueAgeReport(listGardssalgOrgnrReviewQueue());
-  const websiteQueueReport = computeGardssalgQueueAgeReport(listGardssalgWebsiteReviewQueue());
+  const websiteTriage = readGardssalgWebsiteQueueTriage(getExpDb("experiences"));
+  const websiteUnparked = websiteTriage.filter((r) => r.parked_since === null);
+  const websiteOpen = websiteTriage.filter((r) => isOpenGardssalgWebsiteCandidate(r));
+  const websiteQueueReport = computeGardssalgQueueAgeReport(websiteUnparked);
+  const websiteActionableReport = computeGardssalgQueueAgeReport(
+    websiteOpen.filter((r) => r.is_gardssalg_provider && !r.website_verified)
+  );
   const homepageQueueReport = computeGardssalgQueueAgeReport(listExperienceHomepageReviewQueuePending());
   res.json({
     orgnr_review_queue: orgnrQueueReport,
     website_review_queue: websiteQueueReport,
     experience_homepage_review_queue: homepageQueueReport,
+    website_review_queue_actionable: websiteActionableReport,
+    website_review_queue_breakdown: {
+      total: websiteTriage.length,
+      parked: websiteTriage.length - websiteUnparked.length,
+      open_candidates: websiteOpen.length,
+      terminal: websiteUnparked.length - websiteOpen.length,
+      for_non_gardssalg_providers: websiteTriage.filter((r) => !r.is_gardssalg_provider).length,
+      for_website_verified_providers: websiteTriage.filter((r) => r.website_verified).length,
+    },
   });
 });
 
@@ -21102,7 +21307,19 @@ async function gsVtpProcessProvider(
   if (isHjemmesideVerified(row0.field_provenance)) {
     steps.website = { status: "ok" };
   } else {
-    const queueEntry = websiteQueueByProvider.get(providerId);
+    // 2026-10-11 website-review-queue unblock: only an OPEN candidate
+    // (isOpenGardssalgWebsiteCandidate — reason website_discovery_candidate /
+    // brreg_registered_hjemmeside, not parked) counts as "queued" here.
+    // Previously ANY row for the provider took this branch, so a single
+    // terminal note (`verification_failed`, `candidate_evidence_failed`,
+    // `LLM judge AVVIS: …`, `judge GODKJENN but write blocked: …`) or a
+    // parked row pinned the provider at queued_needs_domain_affiliation
+    // forever: its own hjemmeside was never re-verified and a blank one was
+    // never reported as no_website_no_candidate. Such a row is now ignored
+    // and the provider falls through to the unchanged branches below (same
+    // dry-run/apply behaviour as a provider with no queue row at all).
+    const queueRow = websiteQueueByProvider.get(providerId);
+    const queueEntry = isOpenGardssalgWebsiteCandidate(queueRow) ? queueRow : undefined;
     if (queueEntry) {
       const affiliated = gardssalgWebsiteDomainAffiliated(queueEntry.candidate_url, {
         navn: row0.navn,
@@ -25124,6 +25341,9 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       scope,
       cohort: cohortParam,
       enqueued: applied.filter((a) => a.enqueued).length,
+      // 2026-10-11 website-review-queue unblock — additive: verified rows
+      // whose now-moot review-queue entry was removed by this apply.
+      dequeued: applied.filter((a) => a.dequeued).length,
       provenance_written: applied.length,
       summary,
       diagnostics,

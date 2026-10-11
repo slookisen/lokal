@@ -384,11 +384,22 @@ export function runAdminGardssalgReviewQueuesStalenessTests(opts: { log?: boolea
         assertEq((r.body.website_review_queue?.oldest_first as any[])?.length, 1, "s10i: website oldest_first still holds its row");
         assertEq(r.body.experience_homepage_review_queue?.count, 1, "s10j: homepage queue reported independently (count 1)");
         assertEq(r.body.experience_homepage_review_queue?.stale_count, 1, "s10k: homepage stale_count computed independently");
-        // Exactly three keys — no accidental extra/renamed key in the payload.
+        // Exactly the three queue keys plus the two ADDITIVE website-queue
+        // keys from the 2026-10-11 website-review-queue unblock
+        // (website_review_queue_actionable / _breakdown — covered in
+        // opplevelser-gardssalg-website-queue-unblock.test.ts u5) — no
+        // accidental extra/renamed key in the payload, and the three
+        // pre-existing keys are all still there.
         assertEq(
           JSON.stringify(Object.keys(r.body).sort()),
-          JSON.stringify(["experience_homepage_review_queue", "orgnr_review_queue", "website_review_queue"]),
-          "s10l: response carries exactly the three queue keys"
+          JSON.stringify([
+            "experience_homepage_review_queue",
+            "orgnr_review_queue",
+            "website_review_queue",
+            "website_review_queue_actionable",
+            "website_review_queue_breakdown",
+          ]),
+          "s10l: response carries exactly the three queue keys plus the two additive website-queue keys"
         );
       }
     } catch (err: any) {

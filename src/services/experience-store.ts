@@ -9811,6 +9811,42 @@ export type GardssalgWebsiteReviewQueueEntry = {
   batch_id?: string | null;
 };
 
+// 2026-10-11 website-review-queue unblock (prod read the same day: 230 rows
+// reported as stale, ~157 for non-gårdssalg providers swept in by the broad
+// website-verification batches, ~46 for providers whose hjemmeside was
+// ALREADY verified, only ~25 genuinely blocked drink producers). This table
+// mixes two very different kinds of row under one UNIQUE(provider_id):
+//
+//   - OPEN candidates: a concrete URL still awaiting a decision —
+//     `website_discovery_candidate` (domain-pattern / search discovery, the
+//     judge/approve drain routes' own reason) and `brreg_registered_hjemmeside`
+//     (the URL Brreg itself has on file, queued by POST /admin/gardssalg-
+//     contact-backfill). Only these are something a reviewer, the judge or
+//     veien-til-pool's approve step can act on.
+//   - TERMINAL notes: every other reason (`verification_failed`,
+//     `candidate_evidence_failed`, `LLM judge AVVIS: …`, `judge backstop
+//     AVVIS: …`, `judge GODKJENN but write blocked: …`, …) — a record that an
+//     attempt already failed, NOT a pending decision.
+//
+// A parked row (`parked_since` stamped by POST /admin/gardssalg-website-
+// review-queue-park or …-cleanup) is out of attention by definition, so it
+// is never an open candidate either, whatever its reason. Callers that used
+// to treat "any row for this provider" as "queued" (veien-til-pool step 1,
+// the verification sweep's upsert, the staleness alarm) read THIS predicate
+// instead, so a single failed attempt no longer blocks a provider forever.
+export const GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS = ["website_discovery_candidate", "brreg_registered_hjemmeside"] as const;
+
+/** True iff `row` is an OPEN website candidate: its reason is one of
+ *  GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS and it is not parked
+ *  (`parked_since` null/undefined). A missing row is never open. */
+export function isOpenGardssalgWebsiteCandidate(
+  row: { reason?: string | null; parked_since?: string | null } | null | undefined
+): boolean {
+  if (!row) return false;
+  if (row.parked_since !== null && row.parked_since !== undefined) return false;
+  return typeof row.reason === "string" && (GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS as readonly string[]).includes(row.reason);
+}
+
 /** Upsert one website-review-queue row — same UNIQUE(provider_id)
  * refresh-on-rerun idiom as the org_nr queue. */
 export function upsertGardssalgWebsiteReviewQueue(entry: GardssalgWebsiteReviewQueueEntry): void {
@@ -9847,16 +9883,24 @@ export function clearGardssalgWebsiteReviewQueueEntry(providerId: string): void 
   db.prepare(`DELETE FROM gardssalg_website_review_queue WHERE provider_id = ?`).run(providerId);
 }
 
-/** Lists all current website-queue entries, newest-updated first. */
+/** Lists all current website-queue entries, newest-updated first — parked
+ *  rows included (`parked_since` is carried on each row; filter with
+ *  isOpenGardssalgWebsiteCandidate above where only open candidates count). */
 export function listGardssalgWebsiteReviewQueue(): (GardssalgWebsiteReviewQueueEntry & {
   id: string;
   created_at: string;
   updated_at: string;
+  parked_since?: string | null;
 })[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(`SELECT * FROM gardssalg_website_review_queue ORDER BY updated_at DESC`)
-    .all() as (GardssalgWebsiteReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+    .all() as (GardssalgWebsiteReviewQueueEntry & {
+    id: string;
+    created_at: string;
+    updated_at: string;
+    parked_since?: string | null;
+  })[];
 }
 
 /**

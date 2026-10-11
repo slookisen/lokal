@@ -62,6 +62,7 @@ import {
   gardssalgWebsiteEvidenceMatch,
   upsertGardssalgWebsiteReviewQueue,
   listGardssalgWebsiteReviewQueue,
+  isOpenGardssalgWebsiteCandidate,
 } from "./experience-store";
 import { enqueueProviderWorkQueueItem } from "./provider-work-queue";
 
@@ -711,6 +712,14 @@ export interface GsWvApplyResult {
    * the one place to see whether the hjemmeside column itself changed.
    */
   promoted?: boolean;
+  /**
+   * 2026-10-11 website-review-queue unblock: present on "verified" rows only —
+   * true when this apply deleted the provider's gardssalg_website_review_queue
+   * row (any reason), false when there was none to delete. Absent on every
+   * other classification, so existing consumers (which only read `enqueued`
+   * and `promoted`) are unaffected.
+   */
+  dequeued?: boolean;
 }
 
 /**
@@ -729,12 +738,26 @@ export interface GsWvApplyResult {
  * if the provider already has a pending queue row with the SAME
  * reason+candidate_url (idempotent re-run: a re-scan that reaches the same
  * conclusion must not just keep bumping updated_at/duplicating queue churn).
- * gardssalg_website_review_queue has UNIQUE(provider_id), so a DIFFERENT
- * pending reason/url for the same provider (e.g. a stale
- * website_discovery_candidate row) is legitimately overwritten by the
- * upsert — that is the existing table's own established refresh-on-rerun
- * contract (see upsertGardssalgWebsiteReviewQueue's doc comment), unchanged
- * by this slice.
+ * gardssalg_website_review_queue has UNIQUE(provider_id), so the upsert
+ * replaces whatever row the provider already has — EXCEPT (2026-10-11
+ * website-review-queue unblock) an OPEN candidate for a DIFFERENT url
+ * (isOpenGardssalgWebsiteCandidate: an unparked website_discovery_candidate
+ * / brreg_registered_hjemmeside row). That row is a concrete, still-
+ * actionable replacement URL waiting for the judge/approve levers; the
+ * old "legitimately overwritten" contract destroyed it and left only a
+ * terminal verification_failed note about the URL that had just failed.
+ * It is now kept untouched (`enqueued` stays false). Every other existing
+ * row (a terminal note, a parked row, or an open candidate for the SAME url
+ * as the failing hjemmeside) is still refreshed by the upsert exactly as
+ * before (see upsertGardssalgWebsiteReviewQueue's doc comment).
+ *
+ * And for "verified" rows (2026-10-11 website-review-queue unblock): the
+ * provider's gardssalg_website_review_queue row, whatever its reason or
+ * parked state, is DELETED inside the same per-row transaction — once the
+ * hjemmeside is ownership-verified the queue entry is moot, and leaving it
+ * behind is exactly how ~46 already-verified/outreach_ready providers came
+ * to sit in the queue as permanent "stale" rows (prod read 2026-10-11).
+ * Reported per row as `dequeued`.
  *
  * Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render):
  * a row carrying `promoted_from_evidence_url` is the ONE case in this whole
@@ -866,12 +889,26 @@ export function applyGardssalgWebsiteVerification(
       }
     }
 
+    // 2026-10-11 website-review-queue unblock: a verified hjemmeside makes
+    // the provider's queue entry moot — remove it (any reason, parked or
+    // not) in this same transaction, so a verified provider can never be
+    // left behind as a "stale" queue row. See this function's doc comment.
+    let dequeued = false;
+    if (verified) {
+      dequeued =
+        db.prepare(`DELETE FROM gardssalg_website_review_queue WHERE provider_id = ?`).run(row.provider_id).changes > 0;
+    }
+
     let enqueued = false;
     if (row.classification === "unverified" && row.hjemmeside) {
       const existing = existingQueueByProvider.get(row.provider_id);
       const alreadyQueuedSame =
         !!existing && existing.reason === "verification_failed" && existing.candidate_url === row.hjemmeside;
-      if (!alreadyQueuedSame) {
+      // Never overwrite an OPEN candidate for a different URL with a
+      // terminal note about the URL that just failed (see doc comment).
+      const keepsOpenCandidate =
+        !!existing && isOpenGardssalgWebsiteCandidate(existing) && existing.candidate_url !== row.hjemmeside;
+      if (!alreadyQueuedSame && !keepsOpenCandidate) {
         upsertGardssalgWebsiteReviewQueue({
           provider_id: row.provider_id,
           provider_name: row.name,
@@ -889,6 +926,7 @@ export function applyGardssalgWebsiteVerification(
       classification: row.classification,
       enqueued,
       ...(isPromotion ? { promoted: stillBlank } : {}),
+      ...(verified ? { dequeued } : {}),
     });
   });
 
