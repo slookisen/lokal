@@ -17,7 +17,12 @@
  *   - drops modules that were first loaded while the swap was active and are
  *     still bound to a copy that has left require.cache (found through
  *     Module#children), so the next require() loads them against the
- *     restored copies instead of a closed or stale handle cache.
+ *     restored copies instead of a closed or stale handle cache;
+ *   - when it closes the last open swap, does that again for everything
+ *     loaded since the first of the overlapping swaps opened. With async
+ *     blocks overlapping, block B can take a module that block A's copy had
+ *     just bound as its own "previous" entry and put it back after A has
+ *     already restored; only this pass catches that.
  * Resetting the block's own db-factory copy stays the block's job: call
  * __resetDbFactoryForTesting() on the copy it required, not on a re-require.
  */
@@ -31,11 +36,23 @@ interface Slot {
   previous: CachedModule | undefined;
 }
 
+interface Overlap {
+  /** Swaps opened and not yet restored, over all ids. */
+  open: number;
+  /** require.cache as it was when the first of the open swaps began. */
+  before: Map<string, CachedModule | undefined> | null;
+}
+
 // On globalThis, like db-factory's resolved-path record: if this module is
 // ever loaded twice, both copies must share one table.
 function slots(): Map<string, Slot> {
   const g = globalThis as { [key: symbol]: Map<string, Slot> | undefined };
   return (g[Symbol.for("lokal.tests.moduleCacheSlots")] ??= new Map());
+}
+
+function overlap(): Overlap {
+  const g = globalThis as { [key: symbol]: Overlap | undefined };
+  return (g[Symbol.for("lokal.tests.moduleCacheOverlap")] ??= { open: 0, before: null });
 }
 
 /** Ids (from require.resolve) that a block still has swapped out. */
@@ -45,8 +62,11 @@ export function swappedOutModuleIds(): string[] {
 
 export function swapOutModules(ids: readonly string[]): () => void {
   const table = slots();
+  const open = overlap();
   const own = [...new Set(ids)];
   const before = new Map(Object.entries(require.cache));
+  if (open.open === 0) open.before = before;
+  open.open++;
   for (const id of own) {
     let slot = table.get(id);
     if (!slot || slot.depth === 0) {
@@ -69,6 +89,12 @@ export function swapOutModules(ids: readonly string[]): () => void {
       else delete require.cache[id];
     }
     dropModulesBoundToStaleCopies(before, table);
+    open.open--;
+    if (open.open === 0 && open.before) {
+      const epochBefore = open.before;
+      open.before = null;
+      dropModulesBoundToStaleCopies(epochBefore, table);
+    }
   };
 }
 

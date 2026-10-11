@@ -17360,6 +17360,21 @@ console.log("\n── module-cache: swapped-out modules come back ──");
   delete require.cache[storeId];
   withFreshModules(["./fixtures/module-cache/store"], () => { require("./fixtures/module-cache/store"); });
   assertTrue(!require.cache[storeId], "mc-11: an id that had no entry before the block has none after it");
+
+  // Overlap taint: the store first loads inside A's swap (bound to A's
+  // factory copy), B then swaps the store out and so keeps that bound store
+  // as its "previous" entry, A restores first, B last. B must not leave a
+  // store bound to A's discarded factory in the cache.
+  const restoreTaintA = swapOutFreshModules(["./fixtures/module-cache/factory"]);
+  const taintToken = (require("./fixtures/module-cache/factory") as typeof factory0).token;
+  require("./fixtures/module-cache/store");
+  const restoreTaintB = swapOutFreshModules(["./fixtures/module-cache/store"]);
+  require("./fixtures/module-cache/store");
+  restoreTaintA();
+  restoreTaintB();
+  const storeAfterOverlap = require("./fixtures/module-cache/store") as typeof import("./fixtures/module-cache/store");
+  assertTrue(storeAfterOverlap.factoryToken === factory0.token && storeAfterOverlap.factoryToken !== taintToken,
+    "mc-12: after overlapping swaps, no module bound to a discarded copy is left in require.cache");
 })();
 
 console.log("\n── PR-100: dental schema extension ──");
