@@ -658,6 +658,12 @@ export async function runAdminEnrichmentWritePauseTests(
         // same convention as Trinn A immediately above. Both trinn landed
         // independently; the merge keeps both entries.
         "routes/opplevelser-experience-orgnr-from-name-kommune.test.ts",
+        // 2026-10-11 website-review-queue unblock: POST /admin/gardssalg-
+        // website-review-queue-cleanup is gated by the SAME shared
+        // opplevelser.ts helper on apply; its test file sets/clears the
+        // pause via the service to prove the wiring (same convention as the
+        // test files above).
+        "routes/opplevelser-gardssalg-website-queue-unblock.test.ts",
         // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben
         // (owner decision 2026-09-29, pre-send homepage refresh): the daily
         // RFB send calls admin-knowledge.ts's extracted refreshHomepageContent()

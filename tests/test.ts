@@ -32690,6 +32690,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gwrqp.failures) failures.push("opplevelser-gardssalg-website-review-queue-park: " + f);
     console.log(`  opplevelser-gardssalg-website-review-queue-park: ${gwrqp.passed} passed, ${gwrqp.failed} failed`);
 
+    // 2026-10-11 website-review-queue unblock: only an OPEN candidate
+    // (website_discovery_candidate / brreg_registered_hjemmeside, unparked)
+    // counts as "queued" in veien-til-pool step 1; a verified hjemmeside
+    // removes the queue row and an unverified one no longer overwrites an
+    // open candidate (applyGardssalgWebsiteVerification); the staleness
+    // report excludes parked rows and adds actionable/breakdown keys; POST
+    // /admin/gardssalg-website-review-queue-cleanup clears the historical
+    // backlog. Same in-memory-DB pattern, runs sequentially inside this same
+    // gated block.
+    console.log("\n── opplevelser-gardssalg-website-queue-unblock: open-candidate queue semantics + cleanup ──");
+    const { runOpplevelserGardssalgWebsiteQueueUnblockTests } = require("../src/routes/opplevelser-gardssalg-website-queue-unblock.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-queue-unblock.test");
+    const gwqu = await runOpplevelserGardssalgWebsiteQueueUnblockTests({ log: false });
+    passed += gwqu.passed;
+    failed += gwqu.failed;
+    for (const f of gwqu.failures) failures.push("opplevelser-gardssalg-website-queue-unblock: " + f);
+    console.log(`  opplevelser-gardssalg-website-queue-unblock: ${gwqu.passed} passed, ${gwqu.failed} failed`);
+
     // dev-request 2026-09-14-opplevagent-needs-review-drenering ("grep 3 +
     // grep 4"): POST /admin/listing-homepage-review-judge — LLM-judge tier
     // for experience_homepage_review_queue's two no-resolution-path reasons
