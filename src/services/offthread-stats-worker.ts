@@ -24,6 +24,8 @@ import { computeTrafficStats } from "./traffic-stats-compute";
 import { computePageViewCounts } from "./health-counts-compute";
 import { runAdminStatsQuery, type AdminStatsQuery } from "./admin-stats-compute";
 import { computeAgentToolCalls } from "./agent-usage-compute";
+import { computeAgentStats } from "./agent-stats-compute";
+import { lowerCurrentThreadPriority } from "./thread-priority";
 
 export type StatsTask =
   | { kind: "trafficStats"; vertical?: VerticalId; windowDays: number }
@@ -31,7 +33,10 @@ export type StatsTask =
   // Admin-dashboard statistics (admin-stats.ts); runs in the "admin" lane's worker.
   | { kind: "adminStats"; query: AdminStatsQuery; nowMs: number }
   // Public tool-call count for agentplatform.no (agent-usage.ts).
-  | { kind: "agentToolCalls"; nowMs: number; windowDays: number };
+  | { kind: "agentToolCalls"; nowMs: number; windowDays: number }
+  // Public per-producer stats behind GET /api/agents/:id/stats (agent-stats.ts);
+  // runs in the "public" lane's worker (serverheng skive 6).
+  | { kind: "agentStats"; agentId: string; path: string; nowMs: number };
 
 export interface StatsWorkerRequest {
   id: number;
@@ -52,6 +57,8 @@ export function runStatsTask(db: Database.Database, task: StatsTask): unknown {
       return runAdminStatsQuery(db, task.query, task.nowMs);
     case "agentToolCalls":
       return computeAgentToolCalls(db, task.nowMs, task.windowDays);
+    case "agentStats":
+      return computeAgentStats(db, task.agentId, task.path, task.nowMs);
     default:
       throw new Error(`unknown stats task: ${JSON.stringify(task)}`);
   }
@@ -59,6 +66,10 @@ export function runStatsTask(db: Database.Database, task: StatsTask): unknown {
 
 if (parentPort && workerData && typeof workerData.dbPath === "string") {
   const port = parentPort;
+  // Serverheng skive 6: on a 1-vCPU machine this thread competes with the
+  // main thread for the same core; a lower priority keeps request handling
+  // ahead of background aggregation (Linux nice is per thread).
+  lowerCurrentThreadPriority();
   const db = new Database(workerData.dbPath, { readonly: true, fileMustExist: true });
   port.on("message", (req: StatsWorkerRequest) => {
     let res: StatsWorkerResponse;

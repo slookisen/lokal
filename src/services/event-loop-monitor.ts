@@ -36,7 +36,7 @@
 // Kill switch: EVENT_LOOP_MONITOR_DISABLED=1 stops the heartbeat + histogram.
 // Request/job tracking is two Map operations per request/job and stays on.
 
-import { monitorEventLoopDelay, type IntervalHistogram } from "perf_hooks";
+import { monitorEventLoopDelay, performance, type IntervalHistogram, type EventLoopUtilization } from "perf_hooks";
 
 export interface EventLoopMonitorConfig {
   /** How often the heartbeat timer is scheduled. */
@@ -273,11 +273,42 @@ function noteFinish(f: RecentFinish): void {
   if (recentFinishes.length > RECENT_FINISH_CAP) recentFinishes.splice(0, recentFinishes.length - RECENT_FINISH_CAP);
 }
 
+// Serverheng skive 6: a stall is wall-clock lateness of the heartbeat, which
+// a main thread that is BLOCKED (running JS/SQLite) and one that is STARVED
+// (waiting for the one vCPU while workers, gzip or CPU throttling hold it)
+// both produce. Each stall therefore also records, for the interval since
+// the previous beat, how long the event loop was active vs idle (ELU) and how
+// much CPU the whole process got. Blocked: active ≈ lag. Starved: mostly idle
+// and little process CPU. Best effort: never throws out of the heartbeat.
+let lastElu: EventLoopUtilization | null = null;
+let lastCpu: NodeJS.CpuUsage | null = null;
+
+function intervalUsage(): { eluActiveMs: number; eluIdleMs: number; processCpuMs: number } | null {
+  try {
+    const elu = performance.eventLoopUtilization();
+    const cpu = process.cpuUsage();
+    const prevElu = lastElu;
+    const prevCpu = lastCpu;
+    lastElu = elu;
+    lastCpu = cpu;
+    if (!prevElu || !prevCpu) return null;
+    const d = performance.eventLoopUtilization(elu, prevElu);
+    return {
+      eluActiveMs: Math.round(d.active),
+      eluIdleMs: Math.round(d.idle),
+      processCpuMs: Math.round((cpu.user - prevCpu.user + cpu.system - prevCpu.system) / 1000),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function beat(): void {
   const at = deps.now();
   const dueAt = lastBeatAt + cfg.heartbeatMs;
   const lagMs = at - dueAt;
   lastBeatAt = at;
+  const usage = intervalUsage();
   // Anything that finished before this heartbeat was due can no longer
   // explain a later stall — drop it (keeps the buffer tiny in steady state).
   const inWindow = recentFinishes.filter((f) => f.finishedAt >= dueAt);
@@ -301,7 +332,15 @@ function beat(): void {
     kind: "stall",
     durationMs: lagMs,
     label: "event-loop-stall",
-    extra: { inflight: record.inflight, inflightTotal: record.inflightTotal, activeJobs: record.activeJobs, finishedDuringBlock: record.finishedDuringBlock },
+    // `usage` first: event-loop-persist.ts cuts an oversized `extra` to a
+    // head slice, and the heaviest stalls are the ones whose usage matters.
+    extra: {
+      ...(usage ? { usage } : {}),
+      inflight: record.inflight,
+      inflightTotal: record.inflightTotal,
+      activeJobs: record.activeJobs,
+      finishedDuringBlock: record.finishedDuringBlock,
+    },
   });
   const reqs = record.inflight.map((r) => `${r.method} ${r.host}${r.path} (${r.ageMs}ms)`).join(", ") || "none";
   const jobs = record.activeJobs.map((j) => `${j.name} (${j.ageMs}ms)`).join(", ") || "none";
@@ -324,6 +363,9 @@ export function startEventLoopMonitor(
   histogram = monitorEventLoopDelay({ resolution: 20 });
   histogram.enable();
   lastBeatAt = deps.now();
+  lastElu = null;
+  lastCpu = null;
+  intervalUsage(); // baseline for the first beat
   heartbeat = setInterval(beat, cfg.heartbeatMs);
   // Never keep the process (or a test run) alive just for this timer.
   if (typeof (heartbeat as any).unref === "function") (heartbeat as any).unref();

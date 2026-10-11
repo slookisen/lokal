@@ -1394,9 +1394,15 @@ export function sweepStaleTranslations(
   platform: TranslationPlatform,
   opts: { dryRun: boolean; batchId: string; actor: string; limit?: number } = { dryRun: true, batchId: "sweep", actor: "stale-sweep" },
 ): StaleSweepResult {
+  // Serverheng skive 6: the source items are collected ONCE (they used to be
+  // collected twice, once per map — ~7k regex-heavy items per platform). Same
+  // items, same keys, same sourceHash() per item, so both maps are identical.
   const live = new Map<string, string>();
+  const liveText = new Map<string, string>();
   for (const item of collectSourceItems(db, platform)) {
-    live.set([item.entity_type, item.entity_id, item.field].join(" | "), sourceHash(item.text));
+    const key = [item.entity_type, item.entity_id, item.field].join(" | ");
+    live.set(key, sourceHash(item.text));
+    liveText.set(key, item.text);
   }
   const rows = (db
     .prepare("SELECT * FROM profile_translations WHERE platform = ? AND status IN ('published','verified','reviewed')")
@@ -1405,10 +1411,6 @@ export function sweepStaleTranslations(
     // the Norwegian - a Norwegian edit must not delete it. The portal shows
     // them that the Norwegian has changed (owner_text_source_hash).
     .filter((r) => !(r.owner_text && r.owner_text.trim()));
-  const liveText = new Map<string, string>();
-  for (const item of collectSourceItems(db, platform)) {
-    liveText.set([item.entity_type, item.entity_id, item.field].join(" | "), item.text);
-  }
   const stale: Array<{ row: TranslationRow; text: string | null; hash: string | null }> = [];
   let missingSource = 0;
   for (const r of rows) {

@@ -25,6 +25,11 @@ on:
     branches:
       - main                 # build-check runs on PRs to main; deploy is gated below
   workflow_dispatch:       # lets you trigger manually from Actions tab
+    inputs:
+      force:
+        description: "Deploy even if prod already runs a newer commit (deliberate rollback to an older ref)"
+        type: boolean
+        default: false
 
 jobs:
   build-check:
@@ -121,11 +126,51 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the freshness check below needs the history to compare commits
+
+      # Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-
+      # oppstart-statistikk-samtaler). The concurrency group above runs one
+      # deploy at a time, but in the order the BUILDS finish, not the order of
+      # the commits: on 2026-10-11 three merges within a minute made the
+      # #1015 deploy (older) run right after the #1014 deploy (newer), and
+      # prod lost #1014 until main was redeployed by hand.
+      # Rule: skip only when what is LIVE already contains this commit (this
+      # commit is an ancestor of the live one, and they differ). Then the
+      # deploy could only move prod backwards. Everything else deploys
+      # (fail-open): live unknown, live older, live unrelated, same commit
+      # (manual redeploy). Applies to push and workflow_dispatch alike.
+      # Rollback routes: a revert commit (normal push deploy), `fly releases
+      # rollback` / `fly deploy --image` outside this workflow, or this
+      # workflow dispatched on the older ref with force=true.
+      - name: Skip if prod already runs a newer commit that contains this one
+        id: freshness
+        run: |
+          set -u
+          THIS="${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::force=true: deploying $THIS regardless of what is live."
+            exit 0
+          fi
+          LIVE=$(curl -sf --max-time 10 https://rettfrabonden.com/health | jq -r '.git_sha // empty' 2>/dev/null || true)
+          if [ -n "$LIVE" ] && [ "$LIVE" != "$THIS" ] \
+             && git cat-file -e "${LIVE}^{commit}" 2>/dev/null \
+             && git merge-base --is-ancestor "$THIS" "$LIVE"; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipped: prod already runs $LIVE, which contains $THIS. Deploying this commit would move prod backwards."
+            echo "Deploy skipped: prod already runs \`$LIVE\`, which contains \`$THIS\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "Deploying $THIS (live: ${LIVE:-unknown})."
+          fi
 
       - name: Setup flyctl
+        if: steps.freshness.outputs.stale != 'true'
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy
+        if: steps.freshness.outputs.stale != 'true'
         # Pass --build-arg BUILD_REV so the Dockerfile's ARG/LABEL/RUN cache-bust
         # block actually invalidates the COPY src/ layer per commit. Without
         # this, Fly's remote builder reuses the cached layer indefinitely
@@ -135,6 +180,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Smoke test
+        if: steps.freshness.outputs.stale != 'true'
         run: |
           sleep 10
           curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz || \
@@ -149,7 +195,7 @@ jobs:
         # (still recorded — dev mode).
         # Failure of this step does NOT fail the deploy — the deploy already
         # succeeded; this is just observability glue.
-        if: success()
+        if: success() && steps.freshness.outputs.stale != 'true'
         continue-on-error: true
         env:
           TRIGGER_HMAC_SECRET: ${{ secrets.TRIGGER_HMAC_SECRET }}

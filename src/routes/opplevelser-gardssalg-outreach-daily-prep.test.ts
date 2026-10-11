@@ -454,6 +454,27 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
           "address-domain check, prov-e-overflow backfills into its slot (genuine batch-assembly-time backfill)",
       );
 
+      // Serverheng skive 6: daily-prep hands its full readiness rows to
+      // preflight instead of letting it recompute them (the corpus-wide
+      // conflict scan ran twice). Same eligibility either way.
+      {
+        const allRows = opplevelserModule.computeGardssalgReadinessRows(expDb);
+        const readyIds = allRows.filter((r) => r.readiness_tier === "outreach_ready").map((r) => r.id).sort();
+        const reused = opplevelserModule.computeGardssalgOutreachSendEligibility(expDb, readyIds, {
+          skipRecipientDedupe: true,
+          readinessRows: allRows,
+        });
+        const recomputed = opplevelserModule.computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true });
+        assertTrue(readyIds.length >= 4, "s6-0: the fixture has several outreach_ready providers to compare");
+        assertEq(reused, recomputed, "s6-1: eligibility with the reused readiness rows equals the recomputed one");
+        const someIds = [readyIds[1], "unknown-provider-id", readyIds[0], readyIds[1]];
+        assertEq(
+          opplevelserModule.computeGardssalgOutreachPreflight(expDb, someIds, { readinessRows: allRows }),
+          opplevelserModule.computeGardssalgOutreachPreflight(expDb, someIds),
+          "s6-2: preflight with reused rows equals preflight's own (order, duplicates, unknown id)",
+        );
+      }
+
       const REQUIRED_FIELDS = [
         "provider_id", "name", "profile_url", "recipient_email", "address_basis",
         "producer_type", "antall_ansatte", "kommune", "checks",

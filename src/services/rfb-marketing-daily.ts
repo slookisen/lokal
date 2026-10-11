@@ -2127,6 +2127,11 @@ async function runRfbMarketingDailyGuarded(opts: {
   };
 
   await processList(firstGate.candidates, "first");
+  // Serverheng skive 6: give the event loop a turn between the two gates.
+  // With an empty first list processList only queues a microtask, so both
+  // synchronous gates used to run in one macrotask (4.7–5.2 s stalls in prod
+  // on days with 0 candidates).
+  await new Promise<void>((resolve) => setImmediate(resolve));
   if (committed < budget && !stoppedReason) {
     let secondGate: OutreachCandidatesResult | null = null;
     try {

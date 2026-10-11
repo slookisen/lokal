@@ -32441,6 +32441,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     console.log(`  offthread-stats: ${ots.passed} passed, ${ots.failed} failed`);
 
     // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-
+    // samtaler, skive 6: per-producer stats in the worker's "public" lane,
+    // batched max-touch lookup, lower worker-thread priority. Starts the real
+    // worker against its own temp DB, so it runs in this sequential block.
+    console.log("\n── serverheng-skive6: public stats lane, batched max-touch, worker priority ──");
+    const { runServerhengSkive6Tests } = require("../src/services/serverheng-skive6.test") as
+      typeof import("../src/services/serverheng-skive6.test");
+    const sk6 = await runServerhengSkive6Tests({ log: false });
+    passed += sk6.passed;
+    failed += sk6.failed;
+    for (const f of sk6.failures) failures.push("serverheng-skive6: " + f);
+    console.log(`  serverheng-skive6: ${sk6.passed} passed, ${sk6.failed} failed`);
+
+    // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-
     // samtaler, skive 3: admin-dashboard statistics in the stats worker's own
     // lane with SWR; grouped /cities + /producers queries; INDEXED BY the
     // time-window index; 503 on worker failure. Runs after offthread-stats

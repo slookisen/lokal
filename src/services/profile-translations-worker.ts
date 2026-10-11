@@ -440,8 +440,11 @@ export function startProfileTranslationsStaleSweep(): NodeJS.Timeout | null {
       console.error("[profile-translations-stale-sweep] tick failed:", err);
     }
   });
+  // Serverheng skive 6: there used to be an extra first sweep 30 s after boot,
+  // inside the boot window, where it stalled the event loop for 1.6–2.9 s on
+  // top of the first requests. The first sweep is now the interval's first
+  // tick, 15 minutes after boot.
   const timer = setInterval(run, STALE_SWEEP_INTERVAL_MS);
-  setTimeout(run, 30_000);
   return timer;
 }
 

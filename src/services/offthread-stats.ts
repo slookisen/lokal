@@ -36,11 +36,19 @@
 // read-only connection, so an admin request never queues behind an 8–23 s
 // traffic-stats refresh. Admin tasks are never marked broken: their callers
 // have no synchronous fallback to switch to (a failure is a 503 there).
+//
+// Skive 6 (same dev-request) adds a third lane, "public", for the per-producer
+// stats behind GET /api/agents/:id/stats (kind "agentStats"): a cold cache
+// miss there waits for its result, so it must not queue behind an 8–23 s
+// traffic-stats refresh in the background lane. Its tasks are breakable like
+// the background lane's (three failures in a row → synchronous fallback).
+// Every worker lowers its own thread priority (thread-priority.ts).
 
 import { Worker } from "worker_threads";
 import * as path from "path";
 import type Database from "better-sqlite3";
 import type { StatsTask, StatsWorkerRequest, StatsWorkerResponse } from "./offthread-stats-worker";
+import { ensureThreadPoolStartedOnMainThread, lowerPriorityBootstrapSource } from "./thread-priority";
 
 export const OFFTHREAD_MAX_CONSECUTIVE_FAILURES = 3;
 /**
@@ -52,8 +60,8 @@ export const OFFTHREAD_TASK_TIMEOUT_MS = 300_000;
 /** V8 old-space cap for the worker, so a runaway query cannot eat the 1 GB machine. */
 const WORKER_MAX_OLD_GEN_MB = 256;
 
-export type StatsLane = "background" | "admin";
-const LANES: StatsLane[] = ["background", "admin"];
+export type StatsLane = "background" | "admin" | "public";
+const LANES: StatsLane[] = ["background", "admin", "public"];
 
 type Pending = {
   key: string;
@@ -74,12 +82,13 @@ type LaneState = {
 const lanes: Record<StatsLane, LaneState> = {
   background: { worker: null, workerDbPath: null, pending: new Map() },
   admin: { worker: null, workerDbPath: null, pending: new Map() },
+  public: { worker: null, workerDbPath: null, pending: new Map() },
 };
 let nextId = 1;
 const failuresByTask = new Map<string, number>();
 const lastRuns = new Map<string, { at: string; durationMs: number; ok: boolean; error?: string }>();
 const brokenKeys = new Map<string, string>(); // task key -> reason
-const workerScriptOverride: Record<StatsLane, string | null> = { background: null, admin: null };
+const workerScriptOverride: Record<StatsLane, string | null> = { background: null, admin: null, public: null };
 const walModeByDb = new WeakMap<object, boolean>();
 let lastWalMode: boolean | null = null;
 let walErrorLogged = false;
@@ -93,7 +102,9 @@ export function statsTaskKey(task: StatsTask): string {
 
 /** Which worker a task runs in. Unknown kinds stay on the background lane. */
 export function statsTaskLane(task: StatsTask): StatsLane {
-  return task.kind === "adminStats" ? "admin" : "background";
+  if (task.kind === "adminStats") return "admin";
+  if (task.kind === "agentStats") return "public";
+  return "background";
 }
 
 function workerScriptPath(lane: StatsLane): string {
@@ -221,8 +232,9 @@ function ensureWorker(lane: StatsLane, dbPath: string): Worker {
   // extensionless relative imports. So a .ts entry is started through a tiny
   // CommonJS bootstrap that registers tsx's require hook inside the worker
   // first. A compiled .js entry (node dist/index.js) is started directly.
+  ensureThreadPoolStartedOnMainThread();
   const w = script.endsWith(".ts")
-    ? new Worker(`require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
+    ? new Worker(`${lowerPriorityBootstrapSource()}require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
         ...options,
         eval: true,
       })
@@ -311,7 +323,7 @@ export interface OffThreadStatsState {
   workerRunning: boolean;
   /** Tasks pending across all lanes. */
   pendingTasks: number;
-  /** Per-lane worker state (background = periodic refreshes, admin = admin dashboard). */
+  /** Per-lane worker state (background = periodic refreshes, admin = admin dashboard, public = per-producer stats). */
   lanes: Record<StatsLane, { workerRunning: boolean; pendingTasks: number }>;
   /** Highest current run of consecutive failures across tasks. */
   consecutiveFailures: number;

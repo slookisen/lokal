@@ -213,3 +213,58 @@ export function getMaxTouchStatusForEmail(
     enabled: config.enabled,
   };
 }
+
+/**
+ * Batch form of getMaxTouchStatusForEmail for callers that check many
+ * addresses in one pass (computeOutreachCandidates' second mode). Serverheng
+ * skive 6: the per-address form runs two queries whose `LOWER(col) = ?`
+ * cannot use an index, i.e. two full scans per pool row, which stalled the
+ * main thread for seconds in prod. This reads both tables once, grouped by
+ * the same SQLite LOWER() expression, and answers each lookup from memory.
+ * Results are identical: a lookup key is normalized exactly as
+ * getMaxTouchStatusForEmail normalizes its parameter, and the map keys are
+ * the very LOWER(col) values the per-address queries compare it against.
+ */
+export function createMaxTouchStatusLookup(
+  db: Database.Database,
+  config: OutreachMaxTouchVernConfig,
+): (email: string) => MaxTouchStatus {
+  const sent = new Map<string, { cnt: number; last_sent_at: string | null }>();
+  for (const r of db
+    .prepare(
+      `SELECT LOWER(recipient_email) AS e, COUNT(*) AS cnt, MAX(sent_at) AS last_sent_at
+         FROM outreach_sent_log
+        WHERE recipient_email IS NOT NULL
+        GROUP BY LOWER(recipient_email)`,
+    )
+    .all() as Array<{ e: string | null; cnt: number; last_sent_at: string | null }>) {
+    if (r.e !== null) sent.set(r.e, { cnt: r.cnt, last_sent_at: r.last_sent_at });
+  }
+  const inbound = new Set<string>();
+  for (const r of db
+    .prepare(
+      `SELECT DISTINCT LOWER(c.email) AS e
+         FROM crm_messages m
+         JOIN crm_threads t ON t.id = m.thread_id
+         JOIN crm_contacts c ON c.id = t.contact_id
+        WHERE m.direction = 'in'
+          AND c.email IS NOT NULL`,
+    )
+    .all() as Array<{ e: string | null }>) {
+    if (r.e !== null) inbound.add(r.e);
+  }
+  return (email: string): MaxTouchStatus => {
+    const normalized = email.trim().toLowerCase();
+    const sentRow = sent.get(normalized);
+    const sendCount = sentRow?.cnt ?? 0;
+    const hasInboundEver = inbound.has(normalized);
+    return {
+      send_count: sendCount,
+      last_sent_at: sentRow?.last_sent_at ?? null,
+      has_inbound_ever: hasInboundEver,
+      suppressed: computeMaxTouchSuppressed(sendCount, hasInboundEver, config),
+      threshold: config.threshold,
+      enabled: config.enabled,
+    };
+  };
+}
