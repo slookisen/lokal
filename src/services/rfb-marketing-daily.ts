@@ -574,7 +574,13 @@ export function resolveRfbCanonicalProfileUrl(
  * hijacked_homepage: the pre-send refresh found the website taken over by
  * gambling/theme spam (owner decision 2026-09-29, «2 Ja»).
  */
-export type RfbHeldReason = "for_kort" | "boilerplate" | "not_norwegian" | "hijacked_homepage";
+export type RfbHeldReason =
+  | "for_kort"
+  | "boilerplate"
+  | "not_norwegian"
+  | "hijacked_homepage"
+  | "generic_products_only"
+  | "categories_not_corroborated";
 
 /**
  * The SKILL's post-refresh content-quality gate, deterministically: the
@@ -1238,6 +1244,41 @@ function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
   };
 }
 
+/**
+ * dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+ * the gate's named producers held back only by generic_products_only /
+ * categories_not_corroborated, as held-for-reenrichment entries (agent_id +
+ * reason), so lokal-agent-enrichment can pick them. Reporting only — the gate
+ * itself is unchanged. Skips agents already listed in `held`.
+ */
+function addDataQualityHeld(
+  db: Db,
+  held: RfbMarketingHeldEntry[],
+  gateResult: OutreachCandidatesResult,
+): void {
+  const dq = gateResult.data_quality_held as { producers?: unknown } | undefined;
+  const producers = Array.isArray(dq?.producers) ? (dq!.producers as Array<Record<string, unknown>>) : [];
+  for (const p of producers) {
+    const agentId = typeof p.agent_id === "string" ? p.agent_id : "";
+    if (!agentId || held.some((h) => h.agent_id === agentId)) continue;
+    const reasons = Array.isArray(p.reasons) ? (p.reasons as unknown[]).filter((r): r is string => typeof r === "string") : [];
+    const reason: RfbHeldReason = reasons.includes("generic_products_only") ? "generic_products_only" : "categories_not_corroborated";
+    let length = 0;
+    try {
+      length = rfbProfileProseLength(db, agentId);
+    } catch {
+      /* reporting only */
+    }
+    held.push({
+      agent_id: agentId,
+      name: typeof p.name === "string" ? p.name : "",
+      reason,
+      description_length: length,
+      detail: reasons.join(","),
+    });
+  }
+}
+
 function summarizeResults(results: RfbMarketingResultRow[]): RfbMarketingDailyRunReport["summary"] {
   const s = {
     sent: 0,
@@ -1729,6 +1770,11 @@ async function runRfbMarketingDailyGuarded(opts: {
   if (firstGate.paused) {
     return done("outreach_paused");
   }
+  try {
+    addDataQualityHeld(db, held, firstGate);
+  } catch (err) {
+    errors.push(`data-quality held (mode=first) failed: ${errMessage(err)}`);
+  }
 
   type Precheck =
     | { kind: "skip"; row: RfbMarketingResultRow }
@@ -2081,6 +2127,13 @@ async function runRfbMarketingDailyGuarded(opts: {
     }
     if (secondGate) {
       gate.second = summarizeGate(secondGate);
+      if (!secondGate.paused) {
+        try {
+          addDataQualityHeld(db, held, secondGate);
+        } catch (err) {
+          errors.push(`data-quality held (mode=second) failed: ${errMessage(err)}`);
+        }
+      }
       if (!secondGate.paused) await processList(secondGate.candidates, "second");
     }
   }

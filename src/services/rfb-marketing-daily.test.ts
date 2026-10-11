@@ -1072,6 +1072,34 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(env.status, "completed", "n9: refusals and held rows alone keep the envelope 'completed'");
     }
 
+    // ── (n10) dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-
+    // produkter AC4: rows the gate stops on generic_products_only /
+    // categories_not_corroborated are listed in held_for_reenrichment (agent_id
+    // + reason); the suppression itself is unchanged.
+    freshDb();
+    seedProducer("dq-1", "Kategorinavn Gård", "post@dq1.gard-test.no", {
+      products: JSON.stringify([{ name: "Frukt" }, { name: "Bær" }]),
+    });
+    seedProducer("dq-2", "Ukildet Kategori Gård", "post@dq2.gard-test.no");
+    db.prepare(`UPDATE agents SET categories = ? WHERE id = 'dq-2'`).run(JSON.stringify(["fish"]));
+    seedProducer("dq-3", "Ren Gård", "post@dq3.gard-test.no");
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+    {
+      const r = await run(false);
+      assertEq(
+        r.held_for_reenrichment.map((h) => [h.agent_id, h.reason]).sort(),
+        [["dq-1", "generic_products_only"], ["dq-2", "categories_not_corroborated"]],
+        "n10: dry run lists the gate-stopped rows in held_for_reenrichment with their reason",
+      );
+      assertEq(r.results.map((x) => x.agent_id), ["dq-3"], "n10b: the suppression stands — only the clean row is a result");
+      assertEq(
+        [r.gate?.first?.count, (r.gate?.first?.suppressed_counts as any)?.generic_products_only, (r.gate?.first?.suppressed_counts as any)?.categories_not_corroborated],
+        [1, 1, 1],
+        "n10c: gate counts unchanged",
+      );
+      assertEq(r.summary.held, 0, "n10d: summary.held (result rows) is not changed by the listing");
+    }
+
     // ── (u) the compose-attempt cap ────────────────────────────────────────
     // Pre-transport refusals (4xx) do not use the budget, so a streak of them
     // is bounded at budget + RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS compose calls.

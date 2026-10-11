@@ -97,7 +97,7 @@ import {
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
   enrichmentWritePauseBlockForAgents,
 } from "../services/enrichment-write-pause";
-import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
+import { isDirectoryOrAggregatorHost, categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
 // see the truncation-sweep router at the bottom of this file.
@@ -470,6 +470,19 @@ function incomingAddressRecordBeatsRoadDesignation(
 }
 
 /**
+ * productsAreGenericCategoryNames (admin-outreach-candidates.ts, the outreach
+ * gate's own test), loaded lazily: that module pulls in routes/seo, which keeps
+ * the process alive (open handles) and imports this module for
+ * CATEGORY_LABEL_NO. A top-level import would make every importer of
+ * admin-knowledge (e.g. the verifier agent's child-process tests) load it.
+ */
+function productsAreGenericCategoryNames(productsJson: string | null | undefined): boolean {
+  return (require("./admin-outreach-candidates") as typeof import("./admin-outreach-candidates")).productsAreGenericCategoryNames(
+    productsJson,
+  );
+}
+
+/**
  * Decide whether a factual field's populated legacy value may be SAFELY
  * overwritten by an incoming value. Pure function — exported for unit-testing.
  *
@@ -533,6 +546,34 @@ export function canCorrectFactualField(opts: {
 
   const existing = summariseProvenance(existingFieldProvenance);
   const incoming = summariseProvenance(incomingFieldProvenance);
+
+  // ── dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter ──
+  // products that are ONLY platform category names ("Frukt", "Bær", …) are not
+  // real products: a new products value that is itself only category names may
+  // never replace anything (owner correction excepted — an explicit owner
+  // statement is not an automatic write), and an existing category-names-only
+  // value counts as KNOWN BAD, so a real product list from a homepage / owner /
+  // two-Tier-A source may replace it even when the old value carries a
+  // homepage source. Needs the caller to pass existingValue/incomingValue; a
+  // call site that does not keeps the provenance-only behaviour. The curated
+  // lock above has already been applied.
+  if (field === "products") {
+    const incomingGeneric =
+      typeof opts.incomingValue === "string" && productsAreGenericCategoryNames(opts.incomingValue);
+    if (incomingGeneric && !incoming.hasTierS) {
+      return { allowed: false, reason: "new_generic_category_names" };
+    }
+    const existingGeneric =
+      typeof opts.existingValue === "string" && productsAreGenericCategoryNames(opts.existingValue);
+    if (
+      existingGeneric &&
+      typeof opts.incomingValue === "string" &&
+      !incomingGeneric &&
+      (incoming.hasPreferredContent || incoming.hasTierS || incoming.tierADistinct >= 2)
+    ) {
+      return { allowed: true, reason: "ok_existing_generic_category_names" };
+    }
+  }
 
   // ── Street address beats a road designation (W40 write guards) ─────────────
   // Kvestad Sideri: Google Places gave `Fv109, 5776 Nå` (a road number, no
@@ -1887,6 +1928,94 @@ export const HCR_THEME_SPAM_CANDIDATE_REASON =
   "about/description candidate looks like gambling/theme spam (hijacked or lapsed domain)";
 
 /**
+ * Auto-select for POST /admin/homepage-content-refresh (extracted unchanged
+ * from the route handler; see the long comment there for the parking
+ * rationale). Producers (non-umbrella) WITH a website AND existing
+ * about/products, whose content provenance does not yet carry a
+ * website_homepage source.
+ *
+ * dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+ * ALSO selects rows that DO carry a homepage source somewhere (typically
+ * `about`) but whose `categories` has no homepage/owner corroboration
+ * (categoriesLackWebsiteCorroboration — the outreach gate's own test) or whose
+ * `products` are only category names (productsAreGenericCategoryNames). Those
+ * were never picked before, so categories_not_corroborated /
+ * generic_products_only stood forever. At least half of `limit` is reserved
+ * for this group when it has that many rows, so a long first group cannot
+ * starve it. Parking (homepage_unreachable_since) and the limit apply to both.
+ */
+export function selectHomepageContentRefreshAutoTargets(
+  db: ReturnType<typeof getDb>,
+  limit: number,
+): HcrTargetRow[] {
+  const parkingDisabled = process.env.HOMEPAGE_PARKING_DISABLED === "true";
+  const parkingExclusion = parkingDisabled
+    ? ""
+    : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
+  const baseFrom = `FROM agents a
+             JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.umbrella_type IS NULL
+              AND (
+                    (k.website IS NOT NULL AND TRIM(k.website) != '')
+                 OR (a.url IS NOT NULL AND TRIM(a.url) != '')
+                  )
+              AND (
+                    (k.about IS NOT NULL AND TRIM(k.about) != '')
+                 OR (k.products IS NOT NULL AND TRIM(k.products) != '' AND TRIM(k.products) != '[]')
+                  )`;
+  const hasUrl = (r: HcrTargetRow) => !!r.homepage_url && r.homepage_url.trim().length > 0;
+  const urlCol = `COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url`;
+
+  const fresh = (
+    db
+      .prepare(
+        `SELECT a.id AS agent_id, a.name AS name, ${urlCol}
+             ${baseFrom}
+              AND (
+                    k.field_provenance IS NULL
+                 OR k.field_provenance = '{}'
+                 OR k.field_provenance NOT LIKE '%"website_homepage"%'
+                  )
+              ${parkingExclusion}
+            ORDER BY k.updated_at ASC
+            LIMIT ?`,
+      )
+      .all(limit) as HcrTargetRow[]
+  ).filter(hasUrl);
+
+  // Extension group: homepage-sourced somewhere, but categories uncorroborated
+  // or products only category names. The exact tests are JS (shared with the
+  // gate), so scan in updated_at order and stop once `limit` rows qualify.
+  const ext: HcrTargetRow[] = [];
+  const extRows = db
+    .prepare(
+      `SELECT a.id AS agent_id, a.name AS name, ${urlCol},
+              a.categories AS categories, k.products AS products, k.field_provenance AS field_provenance
+             ${baseFrom}
+              AND k.field_provenance LIKE '%"website_homepage"%'
+              ${parkingExclusion}
+            ORDER BY k.updated_at ASC
+            LIMIT ?`,
+    )
+    .all(HCR_AUTO_EXT_SCAN_LIMIT) as Array<
+    HcrTargetRow & { categories: string | null; products: string | null; field_provenance: string | null }
+  >;
+  for (const r of extRows) {
+    if (ext.length >= limit) break;
+    if (!hasUrl(r)) continue;
+    if (categoriesLackWebsiteCorroboration(r.categories, r.field_provenance) || productsAreGenericCategoryNames(r.products)) {
+      ext.push({ agent_id: r.agent_id, name: r.name, homepage_url: r.homepage_url });
+    }
+  }
+
+  const takeExt = Math.min(ext.length, Math.max(limit - fresh.length, Math.floor(limit / 2)));
+  return [...fresh.slice(0, limit - takeExt), ...ext.slice(0, takeExt)];
+}
+
+/** Max homepage-sourced rows scanned per auto-select for the extension group. */
+const HCR_AUTO_EXT_SCAN_LIMIT = 2000;
+
+/**
  * The per-agent body of POST /admin/homepage-content-refresh, extracted
  * verbatim (same dev-request/owner decision as
  * selectHomepageContentRefreshTargetsByIds above) so the platform-side daily
@@ -2124,20 +2253,14 @@ export async function refreshHomepageContent(
       }
     }
 
-    // products from the detected platform categories → ProductInfo[] shape.
+    // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+    // the detected platform categories are written as `categories` ONLY. They
+    // used to be turned into products [{name:"Frukt"}, …] as well — a list of
+    // category names, not products, which the outreach gate then stops on
+    // (generic_products_only) and which locked the field against later fixes.
+    // extractProductMentions yields category keys, not product names, so there
+    // is no real product list to write from this page.
     if (platformCategories.length > 0) {
-      const productObjs = platformCategories.map((cat) => ({
-        name: CATEGORY_LABEL_NO[cat] ?? cat,
-        category: cat,
-        seasonal: false,
-      }));
-      candidates.push({
-        field: "products",
-        // Stable provenance value: canonical category list (order-independent).
-        value: platformCategories.join(","),
-        columnVal: JSON.stringify(productObjs),
-        onAgents: false,
-      });
       // categories (agents table) — JSON array of platform category keys.
       candidates.push({
         field: "categories",
@@ -2375,36 +2498,7 @@ homepageContentRefreshRouter.post(
       // SAME exclusion clause used by homepage-provenance-batch closes this —
       // env HOMEPAGE_PARKING_DISABLED="true" is the shared rollback flag (read
       // at request time, same idiom as marketplace.ts).
-      const parkingDisabled = process.env.HOMEPAGE_PARKING_DISABLED === "true";
-      const parkingExclusion = parkingDisabled
-        ? ""
-        : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
-      const rows = db
-        .prepare(
-          `SELECT a.id AS agent_id, a.name AS name,
-                  COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url
-             FROM agents a
-             JOIN agent_knowledge k ON k.agent_id = a.id
-            WHERE a.umbrella_type IS NULL
-              AND (
-                    (k.website IS NOT NULL AND TRIM(k.website) != '')
-                 OR (a.url IS NOT NULL AND TRIM(a.url) != '')
-                  )
-              AND (
-                    (k.about IS NOT NULL AND TRIM(k.about) != '')
-                 OR (k.products IS NOT NULL AND TRIM(k.products) != '' AND TRIM(k.products) != '[]')
-                  )
-              AND (
-                    k.field_provenance IS NULL
-                 OR k.field_provenance = '{}'
-                 OR k.field_provenance NOT LIKE '%"website_homepage"%'
-                  )
-              ${parkingExclusion}
-            ORDER BY k.updated_at ASC
-            LIMIT ?`,
-        )
-        .all(limit) as HcrTargetRow[];
-      targets = rows.filter((r) => r.homepage_url && r.homepage_url.trim().length > 0);
+      targets = selectHomepageContentRefreshAutoTargets(db, limit);
     }
 
     // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-

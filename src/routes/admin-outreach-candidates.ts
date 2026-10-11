@@ -636,6 +636,12 @@ export function computeOutreachCandidates(
       suppressed_by_vertical: string;
       last_sent_at: string;
     }> = [];
+    // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+    // rows stopped by a data-quality reason (generic_products_only /
+    // categories_not_corroborated) and by nothing else — i.e. they would be
+    // candidates if their content were re-enriched. Reporting only; the
+    // suppression itself is unchanged.
+    const dataQualityHeld: Array<{ agent_id: string; name: string; reasons: string[] }> = [];
 
     // Most-recent send for a candidate across BOTH keys — agent_id and the
     // immutable recipient_email (populated for every recorded send). Keying on
@@ -853,6 +859,28 @@ export function computeOutreachCandidates(
       if (suppressedForMaxTouch) maxTouchSuppressedCount++;
       if (suppressedForPersonalAddress) personalAddressCount++;
       if (suppressedForGenericProducts) genericProductsOnlyCount++;
+
+      if (suppressedForGenericProducts || suppressedForCategoriesNotCorroborated) {
+        const otherReason =
+          suppressedForContacted ||
+          suppressedForReplied ||
+          suppressedForOptOut ||
+          suppressedForCustomer ||
+          suppressedForBounce ||
+          suppressedForBlocklist ||
+          suppressedForWebsiteUnverified ||
+          suppressedForInferenceOnly ||
+          suppressedForRecentCrmSend ||
+          suppressedForCrossPlatform ||
+          suppressedForMaxTouch ||
+          suppressedForPersonalAddress;
+        if (!otherReason) {
+          const reasons: string[] = [];
+          if (suppressedForGenericProducts) reasons.push("generic_products_only");
+          if (suppressedForCategoriesNotCorroborated) reasons.push("categories_not_corroborated");
+          dataQualityHeld.push({ agent_id: row.agent_id, name: row.name, reasons });
+        }
+      }
 
       if (
         !suppressedForContacted &&
@@ -1073,6 +1101,15 @@ export function computeOutreachCandidates(
       // address each selected candidate has (reporting only, not a filter).
       // Last key, so the existing body key order is unchanged.
       recipient_address_types: countRecipientAddressTypes(finalCandidates.map((c) => c.email)),
+      // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+      // named producers held back ONLY by generic_products_only /
+      // categories_not_corroborated, so the RFB job can list them for
+      // re-enrichment. Appended last — existing key order unchanged.
+      data_quality_held: {
+        count: dataQualityHeld.length,
+        truncated: dataQualityHeld.length > 100,
+        producers: dataQualityHeld.slice(0, 100),
+      },
     };
 }
 
