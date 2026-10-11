@@ -20,7 +20,6 @@
 import {
   assertPaymentsKeyAllowed,
   createRealPaymentsStripeClient,
-  isStripeAccountAccessError,
   isLivePaymentsKey,
   paymentsLivemode,
   PRODUCER_ACCOUNT_CONTROLLER,
@@ -95,13 +94,6 @@ export async function runPaymentProviderTests(opts: { log?: boolean } = {}): Pro
   ok(PRODUCER_ACCOUNT_CONTROLLER.requirement_collection === "stripe", "4c: Stripe collects KYC requirements");
   ok(PRODUCER_ACCOUNT_CONTROLLER.stripe_dashboard.type === "full", "4d: producer gets the full Stripe Dashboard");
   ok(Object.isFrozen(PRODUCER_ACCOUNT_CONTROLLER), "4e: controller constant is frozen");
-
-  // 4b. access errors (disconnected / other Stripe account)
-  ok(isStripeAccountAccessError({ type: "StripePermissionError" }), "4f: StripePermissionError is an access error");
-  ok(isStripeAccountAccessError({ code: "account_invalid" }), "4g: account_invalid is an access error");
-  ok(isStripeAccountAccessError({ statusCode: 403 }), "4h: HTTP 403 is an access error");
-  ok(!isStripeAccountAccessError({ type: "StripeConnectionError" }), "4i: network error is NOT an access error (Stripe should retry)");
-  ok(!isStripeAccountAccessError(null), "4j: null is not an access error");
 
   // 5. offline webhook verification through the real adapter
   const client = createRealPaymentsStripeClient(FAKE_TEST_KEY);

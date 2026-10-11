@@ -21,13 +21,12 @@
 // A producer can take prepayment when, on top of that, its Stripe account
 // for the current mode reports charges_enabled (account.updated webhook).
 
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { isEligibleForRealOrder } from "./cart-service";
 import { slugify } from "../utils/slug";
 import {
   PRODUCER_ACCOUNT_CONTROLLER,
   assertPaymentsKeyAllowed,
-  isStripeAccountAccessError,
   paymentsLivemode,
   type ConnectAccountLike,
   type PaymentsStripeClient,
@@ -99,6 +98,7 @@ export type ProducerPaymentState =
   | "deauthorized"  // the last account was disconnected — a new one can be connected
   | "onboarding"    // account exists, Stripe onboarding not finished
   | "restricted"    // Stripe needs more information from the producer
+  | "rejected"      // Stripe rejected or paused the account — nothing the button can fix
   | "pending"       // submitted, Stripe is reviewing — nothing to do
   | "active";       // charges_enabled — can take prepayment
 
@@ -125,6 +125,8 @@ export function getProducerPaymentStatus(
     return gone ? { state: "deauthorized", livemode, account: gone } : { state: "not_started", livemode, account: null };
   }
   if (account.charges_enabled === 1) return { state: "active", livemode, account };
+  const reason = account.disabled_reason || "";
+  if (reason.startsWith("rejected.") || reason === "platform_paused") return { state: "rejected", livemode, account };
   if (account.details_submitted !== 1) return { state: "onboarding", livemode, account };
   if (account.requirements_due > 0) return { state: "restricted", livemode, account };
   return { state: "pending", livemode, account };
@@ -212,25 +214,30 @@ async function createProducerAccount(db: any, stripe: PaymentsStripeClient, agen
     | undefined;
   if (!agent) return null;
 
-  // Generation = how many accounts this producer had in this mode before,
-  // so a NEW account after a disconnection gets a new idempotency key.
+  // Idempotency key: generation (accounts this producer had in this mode
+  // before, so a NEW account after a disconnection gets a new key) + a hash
+  // of the parameters + a 10-minute window. Stripe replays the first
+  // response for a key — errors included — so a failed or changed request
+  // must not stay locked for Stripe's 24 hours.
   const generation = (db.prepare(`SELECT COUNT(*) AS n FROM payment_accounts WHERE agent_id = ? AND livemode = ?`)
     .get(agentId, livemode ? 1 : 0) as { n: number }).n;
   const email = (agent.contact_email || "").trim();
-  const stripeAccount = await stripe.accounts.create(
-    {
-      country: "NO",
-      ...(email ? { email } : {}),
-      business_profile: {
-        name: agent.name,
-        url: `${baseUrl}/produsent/${slugify(agent.name)}`,
-        product_description: "Lokal mat solgt direkte fra produsenten, bestilt via Rett fra Bonden og hentet hos produsenten.",
-      },
-      controller: PRODUCER_ACCOUNT_CONTROLLER,
-      metadata: { agent_id: agentId, platform: "rettfrabonden" },
+  const createParams = {
+    country: "NO" as const,
+    ...(email ? { email } : {}),
+    business_profile: {
+      name: agent.name,
+      url: `${baseUrl}/produsent/${slugify(agent.name)}`,
+      product_description: "Lokal mat solgt direkte fra produsenten, bestilt via Rett fra Bonden og hentet hos produsenten.",
     },
-    { idempotencyKey: `rfb-acct:${agentId}:${livemode ? "live" : "test"}:${generation}` },
-  );
+    controller: PRODUCER_ACCOUNT_CONTROLLER,
+    metadata: { agent_id: agentId, platform: "rettfrabonden" },
+  };
+  const paramsHash = createHash("sha256").update(JSON.stringify(createParams)).digest("hex").slice(0, 12);
+  const window10m = Math.floor(Date.parse(now) / 600_000);
+  const stripeAccount = await stripe.accounts.create(createParams, {
+    idempotencyKey: `rfb-acct:${agentId}:${livemode ? "live" : "test"}:${generation}:${paramsHash}:${window10m}`,
+  });
 
   try {
     db.transaction(() => {
@@ -294,35 +301,38 @@ async function startProducerOnboardingUnlocked(params: {
   const livemode = status.livemode;
   const agentPath = `/eier/${encodeURIComponent(agentId)}/betaling`;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let account = getPaymentAccount(db, agentId, livemode);
-    let created = false;
-    if (!account) {
-      account = await createProducerAccount(db, stripe, agentId, livemode, baseUrl, now);
-      if (!account) return { ok: false, status: 404, error: "agent_not_found" };
-      created = true;
-    }
-    try {
-      const link = await stripe.accountLinks.create({
-        account: account.stripe_account_id,
-        refresh_url: `${baseUrl}${agentPath}/fornye`,
-        return_url: `${baseUrl}${agentPath}/retur`,
-        type: "account_onboarding",
-      });
-      if (!created) logPaymentEvent(db, { agentId, source: "owner", type: "onboarding_link_created", detail: account.stripe_account_id, now });
-      return { ok: true, url: link.url, stripeAccountId: account.stripe_account_id, created };
-    } catch (err) {
-      // The stored account is not reachable with this key (disconnected, or
-      // another Stripe account/sandbox): retire it and start a new one once.
-      if (attempt === 0 && !created && isStripeAccountAccessError(err)) {
-        const retired = account;
-        db.transaction(() => markDeauthorized(db, retired, { source: "owner", reason: "not_reachable", now }))();
-        continue;
-      }
-      throw err;
-    }
+  let account = getPaymentAccount(db, agentId, livemode);
+  let created = false;
+  if (!account) {
+    account = await createProducerAccount(db, stripe, agentId, livemode, baseUrl, now);
+    if (!account) return { ok: false, status: 404, error: "agent_not_found" };
+    created = true;
   }
-  return { ok: false, status: 500, error: "onboarding_failed" };
+  // Any Stripe error propagates (the owner sees «prøv igjen»). A stored
+  // account is NEVER retired here on a guess: a 403 can just as well be a
+  // restricted key missing a permission. Retiring is Stripe's own
+  // account.application.deauthorized event, or an explicit admin action.
+  const link = await stripe.accountLinks.create({
+    account: account.stripe_account_id,
+    refresh_url: `${baseUrl}${agentPath}/fornye`,
+    return_url: `${baseUrl}${agentPath}/retur`,
+    type: "account_onboarding",
+  });
+  if (!created) logPaymentEvent(db, { agentId, source: "owner", type: "onboarding_link_created", detail: account.stripe_account_id, now });
+  return { ok: true, url: link.url, stripeAccountId: account.stripe_account_id, created };
+}
+
+/**
+ * Admin: retire a producer's current account for this mode (e.g. the test
+ * key moved to another sandbox, so the stored account id no longer exists
+ * there). The owner can then connect a new account.
+ */
+export function retireProducerAccount(db: any, agentId: string, env: NodeJS.ProcessEnv = process.env, now: string = nowIso()): boolean {
+  const row = getPaymentAccount(db, agentId, paymentsLivemode(env));
+  if (!row) return false;
+  let done = false;
+  db.transaction(() => { done = markDeauthorized(db, row, { source: "admin", reason: "retired_by_admin", now }); })();
+  return done;
 }
 
 /**
@@ -392,8 +402,7 @@ function findAccountRow(db: any, stripeAccountId: string, livemode: boolean): Pa
 
 /**
  * Re-reads the account from Stripe (the webhook is only the trigger) and
- * applies it. An access error means we can no longer act on the account:
- * it is retired (deauthorized). Other errors propagate so Stripe retries.
+ * applies it.
  */
 async function fetchAndApplyAccount(
   db: any,
@@ -401,18 +410,17 @@ async function fetchAndApplyAccount(
   row: PaymentAccountRow,
   opts: { livemode: boolean; source: "webhook" | "admin" | "system"; stripeEventId?: string | null; eventCreated?: number | null; now: string },
 ): Promise<{ apply: () => boolean }> {
-  try {
-    const fresh = await stripe.accounts.retrieve(row.stripe_account_id);
-    return { apply: () => applyAccountSnapshot(db, fresh, opts).matched };
-  } catch (err) {
-    if (!isStripeAccountAccessError(err)) throw err;
-    return { apply: () => { markDeauthorized(db, row, { source: opts.source, reason: "not_reachable", stripeEventId: opts.stripeEventId, now: opts.now }); return true; } };
-  }
+  // Every error propagates: the webhook answers 500 and Stripe retries, the
+  // admin sync answers 502. Nothing is written on a guess.
+  const fresh = await stripe.accounts.retrieve(row.stripe_account_id);
+  return { apply: () => applyAccountSnapshot(db, fresh, opts).matched };
 }
 
 /** Admin resync (e.g. after webhooks were off): re-read every account of an agent from Stripe. */
-export async function syncProducerAccounts(db: any, stripe: PaymentsStripeClient, agentId: string, now: string = nowIso()): Promise<number> {
-  const rows = db.prepare(`SELECT * FROM payment_accounts WHERE agent_id = ? AND deauthorized_at IS NULL`).all(agentId) as PaymentAccountRow[];
+export async function syncProducerAccounts(db: any, stripe: PaymentsStripeClient, agentId: string, now: string = nowIso(), env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  // Only the configured key's mode: a test key cannot read live accounts.
+  const rows = db.prepare(`SELECT * FROM payment_accounts WHERE agent_id = ? AND livemode = ? AND deauthorized_at IS NULL`)
+    .all(agentId, paymentsLivemode(env) ? 1 : 0) as PaymentAccountRow[];
   let n = 0;
   for (const row of rows) {
     const { apply } = await fetchAndApplyAccount(db, stripe, row, { livemode: row.livemode === 1, source: "admin", now });
@@ -432,6 +440,7 @@ export async function handlePaymentsWebhook(params: {
   signature: string;
   secret: string;
   now?: string;
+  env?: NodeJS.ProcessEnv;
 }): Promise<PaymentsWebhookResult> {
   const { db, stripe, payload, signature, secret } = params;
   const now = params.now ?? nowIso();
@@ -451,11 +460,16 @@ export async function handlePaymentsWebhook(params: {
     return { ok: true, duplicate: true, eventId: event.id, type: event.type, handled: false };
   }
 
+  // An event from the other Stripe mode than the configured key (e.g. a
+  // live event while the server runs a test key) cannot be acted on with
+  // this key: record it and acknowledge it, never retry it forever.
+  const modeMatches = livemode === paymentsLivemode(params.env ?? process.env);
+
   // account.updated: the payload is only a trigger. Stripe does not order
   // events and retries for days, so the CURRENT account is re-read from
   // Stripe before anything is written (outside the transaction — network).
   let accountApply: (() => boolean) | null = null;
-  if (event.type === "account.updated") {
+  if (modeMatches && event.type === "account.updated") {
     const accountId = (event.data?.object as ConnectAccountLike | undefined)?.id || stripeAccountId || "";
     const row = accountId ? findAccountRow(db, accountId, livemode) : null;
     if (row && !row.deauthorized_at) {
@@ -471,7 +485,9 @@ export async function handlePaymentsWebhook(params: {
       duplicate = true;
       return;
     }
-    if (event.type === "account.updated") {
+    if (!modeMatches) {
+      handled = false;
+    } else if (event.type === "account.updated") {
       if (accountApply) handled = accountApply();
     } else if (event.type === "account.application.deauthorized" && stripeAccountId) {
       const row = findAccountRow(db, stripeAccountId, livemode);

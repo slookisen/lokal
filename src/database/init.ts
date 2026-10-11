@@ -4817,6 +4817,17 @@ function initSchema(db: Database.Database): void {
       updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+  // A database that got the very first draft of this table (local test DBs
+  // from before the review fixes — prod never had it) lacks these columns;
+  // add them before the index below refers to deauthorized_at.
+  for (const stmt of [
+    `ALTER TABLE payment_accounts ADD COLUMN requirements_due INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE payment_accounts ADD COLUMN pending_verification INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE payment_accounts ADD COLUMN deauthorized_at TEXT`,
+    `ALTER TABLE payment_accounts ADD COLUMN last_event_created INTEGER`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_accounts_one_active
       ON payment_accounts(agent_id, livemode) WHERE deauthorized_at IS NULL

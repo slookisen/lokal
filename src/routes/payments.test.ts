@@ -20,10 +20,12 @@
  *      change); account.updated is only a trigger — the account is re-read
  *      from Stripe (payload ignored); older events never overwrite newer
  *      state; a disconnection is sticky (late retries cannot re-enable);
- *      an access error on re-read retires the account; a Stripe outage → 500
- *      with nothing recorded, so the retry applies it; redelivery no-op.
- *   6. After a disconnection the owner can connect a NEW account; a stored
- *      account unreachable with the current key is retired on the next click.
+ *      ANY Stripe error on re-read (outage, 403 from a key missing a
+ *      permission) → 500 with nothing recorded or changed; events from the
+ *      other Stripe mode are acknowledged without a Stripe call.
+ *   6. After a disconnection the owner can connect a NEW account; a 403 on
+ *      the onboarding link never retires the stored account (only an admin
+ *      can, explicitly).
  *   7. Live-key guard on the request path; admin status/accounts/sync.
  *
  * Standalone: npx tsx src/routes/payments.test.ts
@@ -63,6 +65,7 @@ function makeFakeStripe() {
   /** What accounts.retrieve returns — Stripe's "current" state per account. */
   const state = new Map<string, ConnectAccountLike>();
   const noAccess = new Set<string>();
+  const retrieved: string[] = [];
   let outage = false;
   let createDelayMs = 0;
   const real = new Stripe(FAKE_TEST_KEY);
@@ -78,6 +81,7 @@ function makeFakeStripe() {
         return { id };
       },
       async retrieve(id) {
+        retrieved.push(id);
         if (outage) { const e: any = new Error("connection reset"); e.type = "StripeConnectionError"; throw e; }
         if (noAccess.has(id)) throw accessError();
         return state.get(id) ?? { id };
@@ -95,7 +99,7 @@ function makeFakeStripe() {
     },
   } as PaymentsStripeClient;
   return {
-    client, created, links, state, noAccess,
+    client, created, links, state, noAccess, retrieved,
     setOutage: (v: boolean) => { outage = v; },
     setCreateDelay: (ms: number) => { createDelayMs = ms; },
   };
@@ -287,7 +291,7 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     eq(p.metadata?.agent_id, "pay-a", "onb-12: metadata.agent_id");
     eq(p.email, "alfa@example.no", "onb-13: producer's own contact e-mail prefilled");
     eq(p.business_profile?.url, "https://rfb.test/produsent/gard-alfa", "onb-14: business URL is the producer page");
-    eq(fake.created[0]!.idempotencyKey, "rfb-acct:pay-a:test:0", "onb-15: Stripe idempotency key per agent, mode and generation");
+    ok(/^rfb-acct:pay-a:test:0:[0-9a-f]{12}:\d+$/.test(fake.created[0]!.idempotencyKey || ""), "onb-15: Stripe idempotency key per agent, mode, generation, params hash and 10-min window");
     const l = fake.links[0]!;
     eq([l.type, l.return_url, l.refresh_url], ["account_onboarding", "https://rfb.test/eier/pay-a/betaling/retur", "https://rfb.test/eier/pay-a/betaling/fornye"],
       "onb-16: account link return/refresh URLs");
@@ -359,8 +363,10 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     ok(r.status === 200 && activeRow("pay-a").charges_enabled === 1, "wh-14: event older than the last applied one → ignored");
     fake.state.set("acct_fake_1", { id: "acct_fake_1", charges_enabled: true, payouts_enabled: true, details_submitted: true });
 
+    const retrievesBefore = fake.retrieved.length;
     w = await send("account.updated", "acct_fake_1", { id: "acct_fake_1" }, { livemode: true });
-    ok(w.status === 200 && w.body?.handled === false, "wh-15: live event for a test-mode row → ignored");
+    ok(w.status === 200 && w.body?.handled === false, "wh-15: live event while running a test key → acknowledged, ignored");
+    eq(fake.retrieved.length, retrievesBefore, "wh-15b: … and never read from Stripe with the wrong-mode key");
     w = await send("account.updated", "acct_unknown", { id: "acct_unknown" });
     ok(w.status === 200 && w.body?.handled === false, "wh-16: unknown account → 200, ignored (never fetched)");
     w = await send("payment_intent.created", "acct_fake_1", { id: "pi_x" });
@@ -388,21 +394,37 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     // ── 6. reconnect + unreachable account ─────────────────────────────────
     r = await req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: {} });
     eq(r.location, "https://connect.stripe.test/setup/acct_fake_2", "rec-01: reconnect → a NEW Stripe account");
-    eq(fake.created[1]?.idempotencyKey, "rfb-acct:pay-a:test:1", "rec-02: new generation → new idempotency key");
+    ok(/^rfb-acct:pay-a:test:1:/.test(fake.created[1]?.idempotencyKey || ""), "rec-02: new generation → new idempotency key");
     ok(activeRow("pay-a")?.stripe_account_id === "acct_fake_2" && !!rowByAcct("acct_fake_1").deauthorized_at, "rec-03: new row active, old row kept as history");
 
     r = await req("POST", "/eier/pay-d/betaling/start", { headers: cookie("ptok-d"), form: {} });
     eq(r.location, "https://connect.stripe.test/setup/acct_fake_3", "rec-04: pay-d onboarding starts");
+    // A 403 (e.g. a restricted key missing a permission) is NOT a disconnection.
     fake.noAccess.add("acct_fake_3");
+    const createdBefore = fake.created.length;
     r = await req("POST", "/eier/pay-d/betaling/start", { headers: cookie("ptok-d"), form: {} });
-    eq(r.location, "https://connect.stripe.test/setup/acct_fake_4", "rec-05: stored account unreachable with this key → retired, new one created");
-    ok(!!rowByAcct("acct_fake_3").deauthorized_at && rowByAcct("acct_fake_3").disabled_reason === "not_reachable", "rec-06: … unreachable account marked");
+    ok(r.status === 303 && (r.location || "").includes("payments_error"), "rec-05: 403 on the onboarding link → «prøv igjen», nothing else");
+    eq(fake.created.length, createdBefore, "rec-06: … no new Stripe account");
+    ok(!rowByAcct("acct_fake_3").deauthorized_at && activeRow("pay-d")?.stripe_account_id === "acct_fake_3", "rec-07: … stored account kept, not retired");
 
-    fake.state.set("acct_fake_4", { id: "acct_fake_4", charges_enabled: true, details_submitted: true });
-    fake.noAccess.add("acct_fake_4");
-    w = await send("account.updated", "acct_fake_4", { id: "acct_fake_4", charges_enabled: true });
-    ok(w.body?.handled === true && !!rowByAcct("acct_fake_4").deauthorized_at, "rec-07: access error on re-read → account retired, never enabled");
-    fake.noAccess.delete("acct_fake_4");
+    fake.state.set("acct_fake_3", { id: "acct_fake_3", charges_enabled: true, details_submitted: true });
+    const ledgerBefore403 = ledgerCount();
+    w = await send("account.updated", "acct_fake_3", { id: "acct_fake_3", charges_enabled: true });
+    eq(w.status, 500, "rec-08: 403 on re-read → 500 (Stripe retries; config error stays loud)");
+    ok(ledgerCount() === ledgerBefore403 && rowByAcct("acct_fake_3").charges_enabled === 0 && !rowByAcct("acct_fake_3").deauthorized_at, "rec-09: … nothing recorded, nothing changed");
+
+    r = await req("POST", "/admin/payments/accounts/pay-d/retire");
+    eq(r.status, 403, "rec-10: admin retire without key → 403");
+    r = await req("POST", "/admin/payments/accounts/pay-d/retire", { headers: { "X-Admin-Key": "pay-admin-key" } });
+    ok(r.status === 200 && rowByAcct("acct_fake_3").disabled_reason === "retired_by_admin" && !!rowByAcct("acct_fake_3").deauthorized_at, "rec-11: explicit admin retire (e.g. key moved to another sandbox)");
+    fake.noAccess.delete("acct_fake_3");
+    r = await req("POST", "/eier/pay-d/betaling/start", { headers: cookie("ptok-d"), form: {} });
+    eq(r.location, "https://connect.stripe.test/setup/acct_fake_4", "rec-12: after retire the owner connects a new account");
+
+    fake.state.set("acct_fake_4", { id: "acct_fake_4", charges_enabled: false, details_submitted: true, requirements: { disabled_reason: "rejected.fraud", currently_due: [] } });
+    w = await send("account.updated", "acct_fake_4", { id: "acct_fake_4" });
+    r = await req("GET", "/eier/pay-d/portal", { headers: cookie("ptok-d") });
+    ok(r.text.includes("Stripe har avvist eller stoppet kontoen") && !r.text.includes("/eier/pay-d/betaling/start"), "card-13: rejected account → own text, no button");
 
     app.set("paymentsWebhookSecret", undefined);
     r = await req("POST", WH, { raw: w.raw, headers: { "Stripe-Signature": w.sig } });

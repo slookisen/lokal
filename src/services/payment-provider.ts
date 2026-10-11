@@ -154,18 +154,6 @@ export function createRealPaymentsStripeClient(
   };
 }
 
-/**
- * True when Stripe says our platform can no longer act on this connected
- * account: the producer disconnected it, or it belongs to another Stripe
- * account/sandbox than the configured key (e.g. after a key change).
- */
-export function isStripeAccountAccessError(err: unknown): boolean {
-  const e = err as { type?: string; code?: string; statusCode?: number; raw?: { code?: string } } | null;
-  if (!e) return false;
-  const code = e.code || e.raw?.code || "";
-  return e.type === "StripePermissionError" || code === "account_invalid" || e.statusCode === 403;
-}
-
 // ── Mode + live-key guard ────────────────────────────────────────────
 
 /**

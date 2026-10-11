@@ -74,6 +74,9 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
         <p style="margin-bottom:12px;">Stripe trenger flere opplysninger før du kan ta imot betaling.</p>
         ${button("Fortsett hos Stripe")}`;
       break;
+    case "rejected":
+      body = `<p>Stripe har avvist eller stoppet kontoen din, så du kan ikke ta imot forhåndsbetaling nå. Ta kontakt med Stripe, eller med oss på kontakt@rettfrabonden.com.</p>`;
+      break;
     case "pending":
       body = `<p>Stripe går gjennom opplysningene dine. Du trenger ikke gjøre noe nå. Statusen her endres når Stripe er ferdig.</p>`;
       break;

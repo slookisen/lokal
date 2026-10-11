@@ -13,7 +13,8 @@
 //                                        mounted early (mountPaymentWebhook)
 //   GET  /admin/payments/status          X-Admin-Key: mode, flags, guard
 //   GET  /admin/payments/accounts        X-Admin-Key: producer accounts
-//   POST /admin/payments/accounts/:agentId/sync  X-Admin-Key: re-read from Stripe
+//   POST /admin/payments/accounts/:agentId/sync    X-Admin-Key: re-read from Stripe
+//   POST /admin/payments/accounts/:agentId/retire  X-Admin-Key: retire the current account
 //
 // The return page never trusts the redirect: it only sends the owner back
 // to the portal, which shows the state the webhook wrote.
@@ -40,6 +41,7 @@ import {
   startProducerOnboarding,
   getPaymentAccount,
   syncProducerAccounts,
+  retireProducerAccount,
 } from "../services/payment-service";
 
 const router = Router();
@@ -214,6 +216,12 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
 router.get("/admin/payments/accounts", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   res.json({ success: true, accounts: listPaymentAccounts(getDb()) });
+});
+
+router.post("/admin/payments/accounts/:agentId/retire", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const retired = retireProducerAccount(getDb(), String(req.params.agentId || ""));
+  res.status(retired ? 200 : 404).json({ success: retired });
 });
 
 router.post("/admin/payments/accounts/:agentId/sync", async (req: Request, res: Response) => {
