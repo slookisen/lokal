@@ -496,7 +496,7 @@ const CLIENT_SCRIPT = `
         var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(p.seller || o.producer_name || '') })]);
         var href = safeHref(p.checkout_url);
         var amount = String(p.amount_nok).replace('.', ',');
-        if (href && /^https:\/\//i.test(href)) card.appendChild(mk('a', { href: href, cls: 'hl-btn primary', text: C.pay_btn + ' ' + amount + ' kr' }));
+        if (href && href.toLowerCase().indexOf('https://') === 0) card.appendChild(mk('a', { href: href, cls: 'hl-btn primary', text: C.pay_btn + ' ' + amount + ' kr' }));
         var until = p.expires_at ? new Date(p.expires_at) : null;
         if (until && !isNaN(until.getTime())) {
           var hh = ('0' + until.getHours()).slice(-2), mm = ('0' + until.getMinutes()).slice(-2);
