@@ -273,7 +273,7 @@ export function runOpplevelserGardssalgProducerTypeClassifyTests(
       const savedKey = process.env.ANTHROPIC_API_KEY;
       delete process.env.ANTHROPIC_API_KEY;
       const nokey = await callRoute(opplevelserRouter, { headers: auth, body: { providerIds: ["rt-nokey"], apply: true } });
-      process.env.ANTHROPIC_API_KEY = savedKey;
+      if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = savedKey;
       assertEq(nokey.body.results[0]?.judged_type, null, "d1: missing ANTHROPIC_API_KEY -> judged_type null");
       assertEq(nokey.body.results[0]?.applied, false, "d2: missing ANTHROPIC_API_KEY -> applied false");
       assertEq(getProviderRow("rt-nokey").producer_type, null, "d3: missing ANTHROPIC_API_KEY -> zero writes");
