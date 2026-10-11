@@ -396,7 +396,7 @@ export const OPPLEVAGENT_MCP_INSTRUCTIONS =
   "When the user asks about a place outside Norway, say that Opplevagent only covers Norway; do not present " +
   "Norwegian experiences as an answer unless the user asks for Norway. Pass the user's request, with any place " +
   "they named, in discover_experiences' `query`. " +
-  "Food-product shopping, such as buying stockfish, belongs to Rett fra Bonden, not experience discovery. " +
+  "Food-product shopping, such as buying stockfish, is outside the scope of experience discovery. " +
   "If discovery returns out_of_scope, explain that limit and do not retry without the purchase request. " +
   "Food tours, tastings, museums and experience tickets remain supported. " +
   "Opplevagent never takes payment: experiences are booked and paid with the provider, and a gårdssalg visit is " +
@@ -449,9 +449,9 @@ function stockfishPurchaseResult(filter: object) {
   const result = {
     summary:
       "Opplevagent finner opplevelser og gårdssalg med drikke, ikke utsalg for kjøp av tørrfisk. " +
-      "Bruk Rett fra Bonden for matprodusenter. Ingen opplevelser foreslås. Ikke søk på nytt uten kjøpsønsket. / " +
+      "Kjøp av matvarer faller utenfor søket. Ingen opplevelser foreslås. Ikke søk på nytt uten kjøpsønsket. / " +
       "Opplevagent covers experiences and farm-sale drink producers, not buying stockfish. " +
-      "Use Rett fra Bonden for food producers. No experiences are suggested. Do not retry without the purchase request.",
+      "Food-product purchases are outside this search. No experiences are suggested. Do not retry without the purchase request.",
     count: 0,
     out_of_scope: true,
     scope_reason: "food_product_purchase",
@@ -681,7 +681,7 @@ export function registerExperienceTools(
         "Only verified experiences from active providers (Brreg-checked) are returned. " +
         "Covers Norway only: pass the user's request in `query`; for a place outside Norway (e.g. Kenya) the tool " +
         "returns no experiences, and the answer is that Opplevagent only covers Norway. " +
-        "Not for food-product shopping such as buying stockfish: use Rett fra Bonden. " +
+        "Food-product shopping such as buying stockfish is outside this tool's scope. " +
         "Pass that intent in query; an out_of_scope response must not be retried as a general discovery search. " +
         "Examples: 'hva kan vi finne på i Troms om vinteren?' (fylke='Troms', season='winter'), " +
         "'wildlife experiences' (category='dyreliv_safari'), 'outdoor activities in Oslo for 4 people', " +
