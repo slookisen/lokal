@@ -116,8 +116,11 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   assertTrue(no.body.includes("holde tilbake betalingen") && en.body.includes("withhold payment"), "both: § 26 remedies include withholding payment");
   assertTrue(no.body.includes("med mindre du og produsenten uttrykkelig avtaler noe annet, og uten gebyr") && en.body.includes("unless you and the producer expressly agree otherwise, and without any fee"), "both: refund uses the same payment method and no fee (angrerettloven § 24)");
   assertTrue(no.body.includes("Ingen produsent betaler for plassering") && en.body.includes("No producer pays for placement"), "both: ranking parameters disclosed (angrerettloven § 9 a a)");
-  assertTrue(no.body.includes("ikke innhentet en erklæring") && no.body.includes("kjøpsloven") && en.body.includes("Sale of Goods Act"), "both: trader status and its consequence disclosed (§ 9 a b and c)");
-  assertTrue(no.body.includes("Produsentens navn står i bestillingen") && en.body.includes("The producer's name is shown in your order"), "both: the order is only promised to show the producer's name (OrderSummary carries no contact details)");
+  assertTrue(no.body.includes("oppgir om de selger som næringsdrivende") && no.body.includes("ikke innhentet en slik erklæring") && no.body.includes("kjøpsloven") && en.body.includes("Sale of Goods Act"), "both: trader status (declared for prepayment, not for others) and its consequence disclosed (§ 9 a b and c)");
+  // The web shopping list still shows only the producer's name after submit
+  // (the API/agent response carries producer_contact), so §1 promises only
+  // the name in the order and the contact details on the producer page.
+  assertTrue(no.body.includes("Produsentens navn står i bestillingen") && en.body.includes("The producer's name is shown in your order"), "both: the order is only promised to show the producer's name; contact details on the producer page");
   assertTrue(no.body.includes("bestillinger du har bedt assistenten sende") && en.body.includes("orders you have asked the assistant to send"), "both: AI-assistant clause limited to orders the buyer asked for");
   assertTrue(/14 dagers angrerett/.test(no.body) && /14-day right of cancellation/.test(en.body), "both: 14-day right of cancellation");
   assertTrue(/to måneder/.test(no.body) && /two months/.test(en.body), "both: two-month complaint rule (forbrukerkjøpsloven § 27)");
@@ -131,7 +134,7 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   }
   assertTrue(no.body.includes('href="/personvern"') && no.body.includes('href="/kontakt"'), "NO: links /personvern and /kontakt");
   assertTrue(en.body.includes('href="/en/personvern"') && en.body.includes('href="/en/kontakt"'), "EN: links /en/personvern and /en/kontakt");
-  assertTrue(no.body.includes("Sist oppdatert: 10. oktober 2026") && en.body.includes("Last updated: 10 October 2026"), "both: last-updated date");
+  assertTrue(no.body.includes("Sist oppdatert: 12. oktober 2026") && en.body.includes("Last updated: 12 October 2026"), "both: last-updated date");
   assertTrue(/rel="canonical" href="[^"]*\/kjopsvilkar"/.test(no.body) && !/rel="canonical" href="[^"]*\/en\/kjopsvilkar"/.test(no.body), "NO: canonical points at /kjopsvilkar");
   assertTrue(/rel="canonical" href="[^"]*\/en\/kjopsvilkar"/.test(en.body), "EN: canonical points at /en/kjopsvilkar");
   assertTrue(no.body.includes(`drives av ${COMPANY_INFO.legalName}`) && en.body.includes(`is run by ${COMPANY_INFO.legalName}`), "both: operator sentence reads «drives av / is run by <legal name>» (no leftover «Operatør:» prefix)");

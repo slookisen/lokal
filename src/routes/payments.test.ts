@@ -34,6 +34,7 @@ import Database from "better-sqlite3";
 import * as http from "http";
 import express from "express";
 import Stripe from "stripe";
+import { PRODUSENTVILKAR_VERSION } from "../config/producer-terms";
 import type {
   ConnectAccountLike,
   CreateAccountLinkParams,
@@ -46,6 +47,7 @@ export interface TestSummary { passed: number; failed: number; failures: string[
 const FAKE_TEST_KEY = "sk_" + "test_" + "FAKE".repeat(6);
 const FAKE_LIVE_KEY = "sk_" + "live_" + "FAKE".repeat(6);
 const FAKE_SECRET = "whsec_" + "fakeconnectsecret" + "4".repeat(10);
+const TERMS = { terms_accepted: "1", trader_status: "trader" };
 
 const ENV_KEYS = [
   "PAYMENTS_ENABLED", "PAYMENTS_ALLOWED_AGENT_IDS", "STRIPE_SECRET_KEY", "STRIPE_CONNECT_WEBHOOK_SECRET",
@@ -274,11 +276,26 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     ok(r.status === 303 && (r.location || "").includes("payments_orders_off"), "onb-05: orders off → refused with reason");
     eq(fake.created.length, 0, "onb-06: no Stripe account for refused producers");
 
+    // Prerequisites 4 + 5: producer terms + trader declaration before Stripe.
+    r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
+    ok(r.text.includes('name="terms_accepted"') && r.text.includes('href="/produsentvilkar"') && r.text.includes('name="trader_status" value="trader"') && r.text.includes('name="trader_status" value="non_trader"'),
+      "terms-01: first start form carries the terms checkbox, the /produsentvilkar link and the trader declaration");
+    r = await req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: {} });
+    ok(r.status === 303 && (r.location || "").includes("status=payments_terms_required"), "terms-02: start without accepting the terms → refused");
+    r = await req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: { terms_accepted: "1", trader_status: "constructor" } });
+    ok(r.status === 303 && (r.location || "").includes("status=payments_terms_required"), "terms-03: terms ticked but no valid trader status → refused");
+    r = await req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: { trader_status: "trader" } });
+    ok(r.status === 303 && (r.location || "").includes("status=payments_terms_required"), "terms-04: trader status without the terms checkbox → refused");
+    eq(fake.created.length, 0, "terms-05: no Stripe account before the terms are accepted");
+    eq(svc.getProducerTermsAcceptance(db, "pay-a"), null, "terms-06: … and no acceptance recorded");
+    r = await req("GET", "/eier/pay-a/portal?status=payments_terms_required", { headers: cookie("ptok-a") });
+    eq(r.status, 200, "terms-07: terms-required alert renders");
+
     // Two concurrent clicks → one account.
     fake.setCreateDelay(30);
     const [c1, c2] = await Promise.all([
-      req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: {} }),
-      req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: {} }),
+      req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: TERMS }),
+      req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: TERMS }),
     ]);
     fake.setCreateDelay(0);
     eq([c1.status, c2.status], [303, 303], "onb-07: both concurrent clicks → 303");
@@ -298,6 +315,28 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     let acc = activeRow("pay-a");
     ok(acc && acc.stripe_account_id === "acct_fake_1" && acc.livemode === 0 && acc.charges_enabled === 0, "onb-17: account row saved, test mode, charges off");
     eq(eventCount("account_created"), 1, "onb-18: payment_events account_created once");
+    const acc0 = svc.getProducerTermsAcceptance(db, "pay-a");
+    ok(acc0?.terms_version === PRODUSENTVILKAR_VERSION && acc0?.trader_status === "trader" && svc.hasAcceptedCurrentProducerTerms(db, "pay-a"),
+      "terms-08: acceptance recorded with the current terms version and the declaration");
+    eq(svc.sellerTraderStatus(db, "pay-a"), "trader", "terms-09: buyers are told the declared status");
+    r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
+    ok(!r.text.includes('name="terms_accepted"') && r.text.includes("Du selger som næringsdrivende"), "terms-10: after acceptance no checkbox; the declaration is shown with «Endre»");
+
+    // Change the declaration later.
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { form: { trader_status: "non_trader" } });
+    ok(r.status === 302 && r.location === "/eier/pay-a", "decl-01: no session → login redirect");
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-b"), form: { trader_status: "non_trader" } });
+    eq(r.status, 403, "decl-02: another agent's session → 403");
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "toString" } });
+    ok(r.status === 303 && (r.location || "").includes("payments_terms_required") && svc.sellerTraderStatus(db, "pay-a") === "trader", "decl-03: invalid value → refused, unchanged");
+    r = await req("POST", "/eier/pay-c/betaling/erklaering", { headers: cookie("ptok-c"), form: { trader_status: "trader" } });
+    ok(r.status === 303 && (r.location || "").includes("payments_terms_required") && svc.getProducerTermsAcceptance(db, "pay-c") === null, "decl-04: producer who never accepted the terms → refused");
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "non_trader" } });
+    ok(r.status === 303 && (r.location || "").includes("payments_declared") && svc.sellerTraderStatus(db, "pay-a") === "non_trader", "decl-05: declaration changed");
+    r = await req("GET", "/eier/pay-a/portal?status=payments_declared", { headers: cookie("ptok-a") });
+    ok(r.status === 200 && r.text.includes("Du selger som privatperson"), "decl-06: portal shows the new declaration");
+    eq(eventCount("producer_terms_accepted") >= 2, true, "decl-07: each acceptance/declaration is logged in payment_events");
+    await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "trader" } });
 
     r = await req("POST", "/eier/pay-a/betaling/start", { headers: cookie("ptok-a"), form: {} });
     eq(r.location, "https://connect.stripe.test/setup/acct_fake_1", "onb-19: later click → same account");
@@ -403,7 +442,7 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     ok(/^rfb-acct:pay-a:test:1:/.test(fake.created[1]?.idempotencyKey || ""), "rec-02: new generation → new idempotency key");
     ok(activeRow("pay-a")?.stripe_account_id === "acct_fake_2" && !!rowByAcct("acct_fake_1").deauthorized_at, "rec-03: new row active, old row kept as history");
 
-    r = await req("POST", "/eier/pay-d/betaling/start", { headers: cookie("ptok-d"), form: {} });
+    r = await req("POST", "/eier/pay-d/betaling/start", { headers: cookie("ptok-d"), form: TERMS });
     eq(r.location, "https://connect.stripe.test/setup/acct_fake_3", "rec-04: pay-d onboarding starts");
     // A 403 (e.g. a restricted key missing a permission) is NOT a disconnection.
     fake.noAccess.add("acct_fake_3");

@@ -28,6 +28,11 @@ const PAYMENT_PORTAL_ALERTS: Record<string, { ok: boolean; text: string }> = {
     ok: false,
     text: "Slå på «Motta bestillinger på e-post» først. Forhåndsbetaling bygger på bestillinger.",
   },
+  payments_terms_required: {
+    ok: false,
+    text: "Du må godta vilkårene for produsenter og oppgi om du selger som næringsdrivende før du kobler til Stripe.",
+  },
+  payments_declared: { ok: true, text: "Erklæringen er lagret." },
 };
 
 /**
@@ -42,15 +47,47 @@ export function shouldRenderPaymentCard(status: ProducerPaymentStatus): boolean 
   return status.state !== "disabled" && status.state !== "not_allowed";
 }
 
+const TRADER_LABEL: Record<string, string> = {
+  trader: "som næringsdrivende",
+  non_trader: "som privatperson",
+};
+
+function traderRadios(current: string | null | undefined): string {
+  const opt = (value: string, label: string) =>
+    `<label style="display:block;margin:4px 0;"><input type="radio" name="trader_status" value="${value}"${current === value ? " checked" : ""} required> ${esc(label)}</label>`;
+  return opt("trader", "Jeg selger som næringsdrivende (for eksempel enkeltpersonforetak, AS eller samvirke)") +
+    opt("non_trader", "Jeg selger som privatperson");
+}
+
 export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus): string {
   const action = `/eier/${encodeURIComponent(agentId)}/betaling/start`;
+  const declareAction = `/eier/${encodeURIComponent(agentId)}/betaling/erklaering`;
   const testBadge = status.livemode
     ? ""
     : `<p class="ep-alert ep-alert-ok" role="note" style="margin-bottom:12px;">Testmodus: ingen ekte penger trekkes.</p>`;
-  const button = (label: string) => `
+  // Before the first Stripe step (and after a terms version bump) the button
+  // comes with the producer terms and the trader declaration (prerequisites
+  // 4 + 5); afterwards it is a plain button.
+  const button = (label: string) => status.termsAccepted
+    ? `
         <form method="post" action="${esc(action)}" style="margin:0;">
           <button type="submit" class="ep-btn ep-btn-primary">${esc(label)}</button>
+        </form>`
+    : `
+        <form method="post" action="${esc(action)}" style="margin:0;">
+          <fieldset style="border:0;padding:0;margin:0 0 10px;"><legend style="font-weight:600;margin-bottom:4px;">Hvordan selger du?</legend>${traderRadios(status.traderStatus)}</fieldset>
+          <label style="display:block;margin:0 0 12px;"><input type="checkbox" name="terms_accepted" value="1" required> Jeg har lest og godtar <a href="/produsentvilkar" target="_blank" rel="noopener">vilkårene for produsenter</a>.</label>
+          <button type="submit" class="ep-btn ep-btn-primary">${esc(label)}</button>
         </form>`;
+  // Shown once a declaration exists: what buyers are told, and how to change it.
+  const declaration = status.termsAccepted && status.traderStatus
+    ? `
+        <details style="margin-top:12px;font-size:0.88rem;"><summary>Du selger ${esc(TRADER_LABEL[status.traderStatus] || "")} – kundene ser dette når de betaler. Endre</summary>
+          <form method="post" action="${esc(declareAction)}" style="margin:8px 0 0;">${traderRadios(status.traderStatus)}
+            <button type="submit" class="ep-btn ep-btn-secondary">Lagre</button>
+          </form>
+        </details>`
+    : "";
 
   let body: string;
   switch (status.state) {
@@ -98,6 +135,6 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
       <div class="ep-card" id="forhandsbetaling">
         <h2>Forhåndsbetaling</h2>
         ${testBadge}
-        ${body}
+        ${body}${status.state === "not_eligible" ? "" : declaration}
       </div>`;
 }

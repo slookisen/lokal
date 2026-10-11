@@ -55,6 +55,7 @@ import {
   type OrderPaymentEffect,
 } from "../services/payment-service";
 import { getDb } from "../database/init";
+import { sendBuyerOrderReceipt, type ReceiptEvent } from "../services/order-receipt-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
@@ -422,6 +423,15 @@ cartRouter.get("/orders/:id", (req: Request, res: Response) => {
   res.json(result);
 });
 
+// Prerequisite 1 (buyer receipt, angrerettloven § 18): after the payment
+// step, so the mail states what happened to the money. Fire-and-forget;
+// a no-op unless ORDER_BUYER_RECEIPTS_ENABLED=1.
+function receiptAfterTransition(orderId: string, toStatus: string): void {
+  if (toStatus === "confirmed" || toStatus === "declined" || toStatus === "cancelled") {
+    void sendBuyerOrderReceipt(orderId, toStatus as ReceiptEvent);
+  }
+}
+
 // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
 // connect, skive 3): the Stripe client for the payment step after an order
 // transition — null when payments are off (the step is then a no-op).
@@ -439,21 +449,31 @@ function paymentsClientFor(req: Request): PaymentsStripeClient | null {
 // no-show on an order that is not 'ready' is rejected with 409 by the central
 // guard in cart-service.transitionOrder (review fix, finding 3).
 
-const LIFECYCLE_ACTIONS = ["confirm", "decline", "ready", "complete", "no-show"] as const;
+const LIFECYCLE_ACTIONS = ["confirm", "decline", "ready", "complete", "no-show", "cancel"] as const;
 const ACTION_TO_STATUS: Record<string, string> = {
   confirm:   "confirmed",
   decline:   "declined",
   ready:     "ready",
   complete:  "completed",
   "no-show": "cancelled",
+  cancel:    "cancelled",
 };
+// POST /admin/marketplace/orders/:id/cancel { reason } — prerequisite 2.
+const ADMIN_CANCEL_REASONS = new Set(["producer_cancelled", "buyer_cancelled"]);
 
 for (const action of LIFECYCLE_ACTIONS) {
   adminOrderRouter.post(`/orders/:id/${action}`, async (req: Request, res: Response) => {
     if (!requireAdmin(req, res)) return;
 
     const toStatus = ACTION_TO_STATUS[action]!;
-    const cancelReason = action === "no-show" ? "no_show" : null;
+    let cancelReason: string | null = action === "no-show" ? "no_show" : null;
+    if (action === "cancel") {
+      cancelReason = String(req.body?.reason || "");
+      if (!ADMIN_CANCEL_REASONS.has(cancelReason)) {
+        res.status(400).json({ success: false, error: "reason must be producer_cancelled or buyer_cancelled" });
+        return;
+      }
+    }
     const result = transitionOrder(cartId(req), toStatus, {
       actor: "admin",
       cancelReason,
@@ -468,10 +488,12 @@ for (const action of LIFECYCLE_ACTIONS) {
     // never undoes it. Absent from the response when payments are off.
     const stripe = paymentsClientFor(req);
     if (!stripe) {
+      receiptAfterTransition(result.order_id, toStatus);
       res.json(result);
       return;
     }
     const payment_effect = await onOrderTransitioned({ db: getDb(), stripe, orderId: result.order_id, toStatus, cancelReason });
+    receiptAfterTransition(result.order_id, toStatus);
     res.json({ ...result, payment_effect });
   });
 }
@@ -490,6 +512,13 @@ function escapePageHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+const CANCEL_REASON_LABEL: Record<string, string> = Object.assign(Object.create(null), {
+  no_show: "ikke hentet",
+  producer_cancelled: "kansellert av produsenten",
+  buyer_cancelled: "avbestilt av kunden",
+  payment_expired: "ikke bekreftet innen fristen – reservasjonen er frigjort",
+});
+
 const ORDER_STATUS_LABEL: Record<string, string> = {
   pending:   "Venter på din bekreftelse",
   confirmed: "Bekreftet — ikke klar for henting ennå",
@@ -505,13 +534,18 @@ const ORDER_STATUS_LABEL: Record<string, string> = {
 // transitionOrder (shared with the admin no-show route above), which
 // returns 409 → this page redirects with ?error=ugyldig. The button is also
 // only rendered for 'ready' (ACTIONS_FOR_STATUS).
-const PRODUCER_ACTIONS: Record<string, { toStatus: string; cancelReason: string | null }> = {
+const PRODUCER_ACTIONS: Record<string, { toStatus: string; cancelReason: string | null }> = Object.assign(Object.create(null), {
   confirm:  { toStatus: "confirmed", cancelReason: null },
   decline:  { toStatus: "declined",  cancelReason: null },
   ready:    { toStatus: "ready",     cancelReason: null },
   complete: { toStatus: "completed", cancelReason: null },
   no_show:  { toStatus: "cancelled", cancelReason: "no_show" },
-};
+  // Prerequisite 2 of the prepayment dev-request: cancellation after
+  // confirmation, with the reason recorded — the producer cannot deliver,
+  // or the buyer withdrew (also before confirmation, § 41).
+  cancel_producer: { toStatus: "cancelled", cancelReason: "producer_cancelled" },
+  cancel_buyer:    { toStatus: "cancelled", cancelReason: "buyer_cancelled" },
+});
 
 // Which action buttons are offered per current status (must stay a subset of
 // cart-service VALID_TRANSITIONS — the service re-validates on POST anyway).
@@ -531,6 +565,40 @@ const ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: string; 
   completed: [],
   cancelled: [],
 };
+
+// Cancellation, behind a «Kanseller ordren …» disclosure so it is never one
+// stray click (prerequisite 2). Offered while the order is still open.
+const CANCEL_ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: string }>> = {
+  pending: [
+    { action: "cancel_buyer", label: "Kunden har avbestilt" },
+  ],
+  confirmed: [
+    { action: "cancel_producer", label: "Jeg kan ikke levere – kanseller" },
+    { action: "cancel_buyer", label: "Kunden har avbestilt" },
+  ],
+  ready: [
+    { action: "cancel_producer", label: "Jeg kan ikke levere – kanseller" },
+    { action: "cancel_buyer", label: "Kunden har avbestilt" },
+  ],
+};
+
+// The cancellation box ships with prepayment: shown (and accepted on POST)
+// only while the payment lifecycle is on (PAYMENTS_ENABLED=1 or "drain"),
+// so the producer page is unchanged until then.
+function cancelActionsEnabled(): boolean {
+  return isPaymentsLifecycleActive();
+}
+
+function cancelHint(p: ReturnType<typeof getPaymentForOrder>): string {
+  if (p?.status === "captured") {
+    return "Betalingen er trukket. Velger du «Jeg kan ikke levere», refunderes kunden automatisk. " +
+      "Har kunden avbestilt, refunderer du selv i Stripe – helt, eller med fradrag for dokumentert tap (forbrukerkjøpsloven § 41).";
+  }
+  if (p?.status === "authorized" || p?.status === "requires_payment") {
+    return "Betalingen er bare reservert. Kansellerer du, frigjøres reservasjonen og kunden belastes ikke.";
+  }
+  return "Avtal eventuelt oppgjør direkte med kunden.";
+}
 
 function kr(ore: number): string {
   const v = ore / 100;
@@ -616,13 +684,23 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
           ? `<div class="ordre-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`
           : "";
 
+  // Prepayment (skive 3): what happened to the buyer's payment. Only for
+  // orders that have a payment row — every other order renders as before.
+  let paymentRow: ReturnType<typeof getPaymentForOrder> = null;
+  try { paymentRow = getPaymentForOrder(getDb(), order.order_id); } catch { paymentRow = null; }
+
   const postTo = `/produsent/ordre/${encodeURIComponent(token)}`;
+  const cancelActions = cancelActionsEnabled() ? (CANCEL_ACTIONS_FOR_STATUS[order.status] || []) : [];
   const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
     .map(
       (a) =>
         `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}"><button type="submit" class="act-btn ${a.cls}">${a.label}</button></form>`
     )
-    .join("\n    ");
+    .join("\n    ") + (cancelActions.length
+      ? `\n    <details class="cancel-box"><summary>Kanseller ordren …</summary>\n      <p class="hint">${escapePageHtml(cancelHint(paymentRow))}</p>\n      ${cancelActions
+          .map((a) => `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}"><button type="submit" class="act-btn act-secondary">${a.label}</button></form>`)
+          .join("\n      ")}\n    </details>`
+      : "");
 
   const itemsHtml = order.items
     .map(
@@ -648,10 +726,6 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
     ? `<div class="recap"><strong>Kunde:</strong>\n      ${buyerRowsHtml}\n    </div>`
     : "";
 
-  // Prepayment (skive 3): what happened to the buyer's payment. Only for
-  // orders that have a payment row — every other order renders as before.
-  let paymentRow: ReturnType<typeof getPaymentForOrder> = null;
-  try { paymentRow = getPaymentForOrder(getDb(), order.order_id); } catch { paymentRow = null; }
   const paymentHtml = paymentRow ? `<div class="recap"><strong>Betaling:</strong>\n      <div>${escapePageHtml(producerPaymentText(paymentRow))}</div>\n    </div>` : "";
   const paymentBanner = PAYMENT_BANNERS[String(req.query["betaling"] || "")] || "";
 
@@ -683,6 +757,8 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
 .act-btn{margin-top:12px;width:100%;padding:12px 18px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
 .act-primary{background:#2c5b3f;color:#fff}
 .act-secondary{background:#eef0ea;color:#1e2b23;border:1px solid #d8dbd2}
+.cancel-box{margin-top:16px;font-size:.92rem}
+.cancel-box summary{cursor:pointer;color:#7a5218;font-weight:600}
 </style>
 </head>
 <body>
@@ -691,7 +767,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
     <h1>Henteordre hos ${escapePageHtml(order.producer_name)}</h1>
     <div class="ref">${escapePageHtml(orderRef)}</div>
     ${banner}
-    <div class="status-line">Status: <strong>${escapePageHtml(statusLabel)}</strong>${order.cancel_reason === "no_show" ? " (ikke hentet)" : ""}</div>
+    <div class="status-line">Status: <strong>${escapePageHtml(statusLabel)}</strong>${CANCEL_REASON_LABEL[order.cancel_reason || ""] ? ` (${CANCEL_REASON_LABEL[order.cancel_reason || ""]})` : ""}</div>
     <div class="recap">
       <div><strong>Opprettet:</strong> ${escapePageHtml(order.created_at)}</div>
       ${order.pickup_time ? `<div><strong>Hentetid:</strong> ${escapePageHtml(order.pickup_time)}</div>` : ""}
@@ -727,7 +803,7 @@ producerOrderRouter.post(
     const backTo = `/produsent/ordre/${encodeURIComponent(token)}`;
     const action = String((req.body || {})["action"] || "");
     const mapped = PRODUCER_ACTIONS[action];
-    if (!mapped) {
+    if (!mapped || (action.startsWith("cancel_") && !cancelActionsEnabled())) {
       res.redirect(303, `${backTo}?error=ugyldig`);
       return;
     }
@@ -746,6 +822,7 @@ producerOrderRouter.post(
     const effect = stripe
       ? await onOrderTransitioned({ db: getDb(), stripe, orderId: order.order_id, toStatus: mapped.toStatus, cancelReason: mapped.cancelReason })
       : "none";
+    receiptAfterTransition(order.order_id, mapped.toStatus);
     const banner = EFFECT_TO_BANNER[effect];
     res.redirect(303, `${backTo}?done=${mapped.toStatus}${banner ? `&betaling=${banner}` : ""}`);
   }

@@ -1053,7 +1053,9 @@ export function registerTools(
     "lokal_cart_create",
     {
       title: "Create a shopping cart",
-      description: "Create a new anonymous shopping cart ('handleliste'). Returns a cart_id and a buyer_ref capability token — STORE THE buyer_ref, it is required for all subsequent cart operations and cannot be recovered. Each cart is valid for 7 days. Use lokal_cart_add_item to add products, lokal_cart_view to review, and lokal_cart_submit to place orders (pickup, no payment).",
+      description: paymentsOn
+        ? "Create a new anonymous shopping cart ('handleliste'). Returns a cart_id and a buyer_ref capability token — STORE THE buyer_ref, it is required for all subsequent cart operations and cannot be recovered. Each cart is valid for 7 days. Use lokal_cart_add_item to add products, lokal_cart_view to review, and lokal_cart_submit to place orders (pickup; producers that take prepayment get a Stripe payment link the buyer approves themselves, the others are paid at pickup)."
+        : "Create a new anonymous shopping cart ('handleliste'). Returns a cart_id and a buyer_ref capability token — STORE THE buyer_ref, it is required for all subsequent cart operations and cannot be recovered. Each cart is valid for 7 days. Use lokal_cart_add_item to add products, lokal_cart_view to review, and lokal_cart_submit to place orders (pickup, no payment).",
       inputSchema: {},
       annotations: {
         title: "Create shopping cart",
@@ -1165,7 +1167,7 @@ export function registerTools(
       // schema are exactly what they were; with it on they say how payment
       // links work and accept pay_at_pickup.
       description: paymentsOn
-        ? "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. This tool never charges anyone. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers). For producers that take prepayment, the order also gets an entry in payments[] with a Stripe checkout_url: the buyer must open it and approve the payment themselves (you never see card data). The producer is the seller; the amount is reserved and only captured when the producer confirms the order, and released if the producer declines. If the buyer does not pay before expires_at, the order goes to the producer as pay-at-pickup. Set pay_at_pickup=true to skip prepayment. Orders without a payments[] entry are paid at pickup. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] (with payment_mode), payments[] and contact_handoffs[]. Use lokal_order_status to check an order."
+        ? "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. This tool never charges anyone. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers). For producers that take prepayment, the order also gets an entry in payments[] with a Stripe checkout_url: the buyer must open it and approve the payment themselves (you never see card data). Each entry carries seller_trader_status, the producer's own declaration ('trader', 'non_trader' or null): when it is 'non_trader', tell the buyer before they pay that the Consumer Purchases Act and the Cancellation Act then do not apply. The producer is the seller; the amount is reserved and only captured when the producer confirms the order, and released if the producer declines. If the buyer does not pay before expires_at, the order goes to the producer as pay-at-pickup. Set pay_at_pickup=true to skip prepayment. Orders without a payments[] entry are paid at pickup. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Submitting places binding orders under Rett fra Bonden's terms of purchase (terms_url in the response): get the buyer's explicit go-ahead before calling, and show them terms_url. Returns orders[] (with payment_mode and producer_contact — the seller's phone/e-mail/profile for cancellation and complaints), payments[], contact_handoffs[] and terms_url. Use lokal_order_status to check an order."
         : "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers); they get the order by e-mail and can confirm/decline it. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] and contact_handoffs[]. Use lokal_order_status to check an order.",
       inputSchema: {
         cart_id:   z.string().describe("Cart ID to submit"),
@@ -1229,7 +1231,9 @@ export function registerTools(
     "lokal_order_status",
     {
       title: "Get order status",
-      description: "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.",
+      description: paymentsOn
+        ? "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up, 'producer_cancelled' that the producer could not deliver (a captured payment is refunded), 'buyer_cancelled' that the buyer withdrew, 'payment_expired' that the producer did not confirm a prepaid order in time and the reservation was released). The timeline array lists every status transition with timestamps. producer_contact is the seller's phone/e-mail/profile for cancellation, the right of withdrawal and complaints. Prepaid orders also carry payment: status (requires_payment → authorized → captured, or canceled/expired/refunded), amount_nok, refunded_nok, fees, the checkout_url while it can still be paid, and events. The producer is the seller."
+        : "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.",
       inputSchema: {
         order_id:  z.string().describe("Order ID from lokal_cart_submit"),
         buyer_ref: z.string().describe("Buyer capability token (same as used for the cart)"),
@@ -1405,6 +1409,28 @@ export const RFB_MCP_INSTRUCTIONS =
   "to ask the producer whether they sell the requested product; a producer description is not proof that the " +
   "product is currently listed or available.";
 
+/**
+ * Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+ * connect, skive 4): the instructions with PAYMENTS_ENABLED=1. The platform
+ * still never handles card details — where a producer offers prepayment the
+ * buyer pays on Stripe's own page, directly to the producer.
+ */
+export const RFB_MCP_INSTRUCTIONS_PREPAY =
+  "Rett fra Bonden covers small-scale food producers in Norway only. When the user asks about a place outside " +
+  "Norway, say that it only covers Norway; do not present Norwegian producers as an answer about another country. " +
+  "It never asks for or handles card details. Some producers take prepayment: lokal_cart_submit then returns a " +
+  "Stripe payment link that the user opens and approves themselves; the producer is the seller and the amount is " +
+  "only charged when the producer confirms. Every other pickup order is paid to the producer at pickup. " +
+  "It cannot send marketing, newsletters or bulk messages to producers. The only message it sends is the user's " +
+  "own pickup order (lokal_cart_submit), and only to producers who have opted in to orders through the platform; " +
+  "other producers are returned as contact details. When asked to do something outside these limits, say plainly " +
+  "that Rett fra Bonden cannot do it.";
+
+/** The instructions for a new MCP server: unchanged unless PAYMENTS_ENABLED=1. */
+export function rfbMcpInstructions(): string {
+  return isPaymentsEnabled() ? RFB_MCP_INSTRUCTIONS_PREPAY : RFB_MCP_INSTRUCTIONS;
+}
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -1449,7 +1475,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: RFB_MCP_INSTRUCTIONS });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions() });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

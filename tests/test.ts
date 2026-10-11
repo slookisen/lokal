@@ -43048,6 +43048,26 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect, skive 4 /
+// AC6 + prerequisites 4, 7, 8: /betaling, /produsentvilkar and the Stripe
+// section of /personvern — served only while payments are on, true to the
+// code, no fixed Stripe price (src/routes/rfb-betaling.test.ts).
+runSerial(async () => {
+  console.log("\n── 2026-10-09-rfb-forhandsbetaling-stripe-connect: /betaling, /produsentvilkar, /personvern (Stripe) ──");
+  try {
+    const { runRfbBetalingTests } = require("../src/routes/rfb-betaling.test") as
+      typeof import("../src/routes/rfb-betaling.test");
+    const rb = await runRfbBetalingTests({ log: false });
+    passed += rb.passed;
+    failed += rb.failed;
+    for (const f of rb.failures) failures.push("rfb-betaling: " + f);
+    console.log(`  rfb-betaling: ${rb.passed} passed, ${rb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-betaling: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // owner decision 2026-09-29 «Blacklist bounces»: POST /webhooks/resend —
 // Svix-verified Resend hard bounces / complaints → email_bounces only (no
 // agent_blocklist row, owner decision «1B»), the outreach gate + compose

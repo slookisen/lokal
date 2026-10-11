@@ -47,6 +47,10 @@ import {
   getPaymentAccount,
   syncProducerAccounts,
   retireProducerAccount,
+  recordProducerTermsAcceptance,
+  hasAcceptedCurrentProducerTerms,
+  isTraderStatus,
+  getProducerPaymentStatus,
   resolvePaymentsStripeClient,
   checkoutMinutes,
   runPaymentMaintenance,
@@ -122,11 +126,23 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
   if (!requireOwner(req, res, agentId)) return;
   const stripe = resolveStripeClient(req);
   if (!stripe) return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
+  // Prerequisites 4 + 5: the form carries the terms checkbox and the trader
+  // declaration the first time (and after a terms version bump).
+  const db0 = getDb();
+  const st = getProducerPaymentStatus(db0, agentId);
+  if (st.state !== "disabled" && st.state !== "not_allowed" && st.state !== "not_eligible" && !hasAcceptedCurrentProducerTerms(db0, agentId)) {
+    const trader = req.body?.trader_status;
+    if (req.body?.terms_accepted !== "1" || !isTraderStatus(trader)) {
+      return res.redirect(303, portalUrl(agentId, "payments_terms_required"));
+    }
+    recordProducerTermsAcceptance(db0, agentId, trader);
+  }
   try {
     const out = await startProducerOnboarding({ db: getDb(), stripe, agentId, baseUrl: baseUrl() });
     if (!out.ok) {
       if (out.error === "already_active") return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal#forhandsbetaling`);
-      const status = out.error === "orders_not_enabled" ? "payments_orders_off" : "payments_unavailable";
+      const status = out.error === "orders_not_enabled" ? "payments_orders_off"
+        : out.error === "terms_required" ? "payments_terms_required" : "payments_unavailable";
       return res.redirect(303, portalUrl(agentId, status));
     }
     return res.redirect(303, out.url);
@@ -134,6 +150,22 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
     console.error(`[payments] onboarding start failed agent=${agentId}: ${String(err?.message || err)}`);
     return res.redirect(303, portalUrl(agentId, "payments_error"));
   }
+});
+
+// Change the trader declaration later (prerequisite 5). Only for producers
+// who already accepted the current terms; records a new acceptance row.
+router.post("/eier/:agentId/betaling/erklaering", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  if (!requireOwner(req, res, agentId)) return;
+  const db = getDb();
+  const st = getProducerPaymentStatus(db, agentId);
+  if (st.state === "disabled" || st.state === "not_allowed") return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
+  const trader = req.body?.trader_status;
+  if (!hasAcceptedCurrentProducerTerms(db, agentId) || !isTraderStatus(trader)) {
+    return res.redirect(303, portalUrl(agentId, "payments_terms_required"));
+  }
+  recordProducerTermsAcceptance(db, agentId, trader);
+  return res.redirect(303, portalUrl(agentId, "payments_declared"));
 });
 
 router.get("/eier/:agentId/betaling/retur", (req: Request, res: Response) => {

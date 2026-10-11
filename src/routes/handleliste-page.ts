@@ -34,6 +34,7 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
+import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 
 export function isHandelisteEnabled(): boolean {
@@ -491,9 +492,12 @@ const CLIENT_SCRIPT = `
     if (prepaid.length) {
       box.appendChild(mk('h3', { text: C.pay_h }));
       box.appendChild(mk('p', { cls: 'hl-hint', text: C.pay_p }));
+      if (C.__pay_how_href) box.appendChild(mk('p', { cls: 'hl-hint' }, [mk('a', { href: C.__pay_how_href, text: C.pay_how })]));
       prepaid.forEach(function(o){
         var p = pays[o.order_id];
         var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(p.seller || o.producer_name || '') })]);
+        if (p.seller_trader_status === 'trader') card.appendChild(mk('div', { cls: 'hl-meta', text: C.pay_trader }));
+        else if (p.seller_trader_status === 'non_trader') card.appendChild(mk('div', { cls: 'hl-meta', text: C.pay_nontrader }));
         var href = safeHref(p.checkout_url);
         var n = Number(p.amount_nok);
         var amount = (Math.round(n) === n ? String(n) : n.toFixed(2)).replace('.', ',');
@@ -563,25 +567,34 @@ export interface HandelistePage {
 // with payments off the page copy is exactly what it was.
 const PREPAY_COPY: Record<"no" | "en", Record<string, string>> = {
   no: {
+    lede: "Skriv inn varene du vil ha og hvor du er. Du får opptil fem produsenter per vare, sortert på avstand, og velger selv hvem du vil kjøpe fra. Noen produsenter tar imot forhåndsbetaling med Stripe; ellers betaler du ved henting.",
     no_payment: "Hos produsenter som tar imot forhåndsbetaling, betaler du med Stripe direkte til produsenten. Hos de andre avtaler du henting og betaling direkte med produsenten.",
     pay_h: "Betal på forhånd",
-    pay_p: "Disse produsentene tar imot forhåndsbetaling. Beløpet reserveres og trekkes først når produsenten bekrefter. Betaler du ikke innen fristen, sendes bestillingen med betaling ved henting.",
+    pay_p: "Disse produsentene tar imot forhåndsbetaling. Beløpet reserveres og trekkes først når produsenten bekrefter. Betaler du ikke innen fristen, sendes bestillingen med betaling ved henting. E-postadressen du oppgir hos Stripe, ser produsenten.",
     pay_btn: "Betal",
     pay_until: "Lenken gjelder til",
+    pay_trader: "Selger som næringsdrivende.",
+    pay_how: "Slik fungerer betaling",
+    pay_nontrader: "Produsenten har oppgitt at den ikke selger som næringsdrivende. Da gjelder ikke forbrukerkjøpsloven og angrerettloven for kjøpet, men kjøpsloven.",
   },
   en: {
+    lede: "Enter the items you want and where you are. You get up to five producers per item, sorted by distance, and choose who to buy from. Some producers take prepayment with Stripe; otherwise you pay at pickup.",
     no_payment: "Producers that take prepayment are paid with Stripe, directly to the producer. With the others you agree on pickup and payment directly with the producer.",
     pay_h: "Pay in advance",
-    pay_p: "These producers take prepayment. The amount is reserved and only charged when the producer confirms. If you do not pay before the deadline, the order is sent as pay at pickup.",
+    pay_p: "These producers take prepayment. The amount is reserved and only charged when the producer confirms. If you do not pay before the deadline, the order is sent as pay at pickup. The producer sees the email address you enter at Stripe.",
     pay_btn: "Pay",
     pay_until: "The link is valid until",
+    pay_trader: "Sells as a trader.",
+    pay_how: "How payment works",
+    pay_nontrader: "The producer has stated that it does not sell as a trader. The Consumer Purchases Act and the Cancellation Act then do not apply to the purchase; the Sale of Goods Act does.",
   },
 };
 
 export function buildHandelistePage(lang: Lang): HandelistePage {
   const base = COPY[lang === "en" ? "en" : "no"];
   const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
-  const copyJson = JSON.stringify({ ...c, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL })
+  const payHow = isPaymentsEnabled() ? { __pay_how_href: localizedPath(BETALING_PATH, lang) } : {};
+  const copyJson = JSON.stringify({ ...c, ...payHow, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL })
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");

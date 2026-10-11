@@ -23,6 +23,8 @@ import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
+import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
+import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
@@ -40,6 +42,8 @@ import { normalizeBmEventTime } from "../utils/bm-event-time";
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
+import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
+import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -2495,7 +2499,9 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "Can I order food directly through my AI assistant?",
-      a: "Yes — the cart tools let you build a shopping list and submit a pickup order per producer. There is no payment inside the AI flow; you pay the producer directly on pickup.",
+      a: isPaymentsEnabled()
+        ? "Yes — the cart tools let you build a shopping list and submit a pickup order per producer. Producers that take prepayment send a Stripe payment link that you open and approve yourself; the money goes straight to the producer and is only charged when they confirm. Everyone else is paid directly on pickup."
+        : "Yes — the cart tools let you build a shopping list and submit a pickup order per producer. There is no payment inside the AI flow; you pay the producer directly on pickup.",
     },
     {
       q: "How do I set up MCP in Claude Desktop or ChatGPT?",
@@ -2516,7 +2522,9 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "Kan jeg bestille mat direkte gjennom AI-assistenten?",
-      a: "Ja — handlekurv-verktøyene lar deg bygge en handleliste og sende en henteordre per produsent. Det er ingen betaling i AI-flyten — du betaler produsenten direkte ved henting.",
+      a: isPaymentsEnabled()
+        ? "Ja — handlekurv-verktøyene lar deg bygge en handleliste og sende en henteordre per produsent. Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du åpner og godkjenner selv. Pengene går rett til produsenten og trekkes først når produsenten bekrefter. Alle andre betaler du direkte ved henting."
+        : "Ja — handlekurv-verktøyene lar deg bygge en handleliste og sende en henteordre per produsent. Det er ingen betaling i AI-flyten — du betaler produsenten direkte ved henting.",
     },
     {
       q: "Hvordan setter jeg opp MCP i Claude Desktop eller ChatGPT?",
@@ -2784,9 +2792,9 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
       <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Which umbrellas a specific producer belongs to (which markets they sell at, which certifications they hold).</p></div>
       <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Upcoming Bondens marked market days for a region or venue, refreshed daily.</p></div>
     </div>
-    <p class="gma-group-label">Shopping cart (pickup, no online payment)</p>
+    <p class="gma-group-label">Shopping cart (pickup${isPaymentsEnabled() ? "" : ", no online payment"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from priced products, submit it as a pickup order per producer, and check order status. No payment happens in the AI flow — you pay the producer directly on pickup.</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from priced products, submit it as a pickup order per producer, and check order status. ${isPaymentsEnabled() ? "Producers that take prepayment send a Stripe payment link you approve yourself; everyone else is paid directly on pickup." : "No payment happens in the AI flow — you pay the producer directly on pickup."}</p></div>
     </div>
 
     <h2>Try asking your assistant</h2>
@@ -2842,9 +2850,9 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
       <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Hvilke paraplyer en spesifikk produsent tilhører (hvilke markeder de selger på, hvilke sertifiseringer de har).</p></div>
       <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Kommende Bondens marked-dager for en region eller et salgssted, oppdatert daglig.</p></div>
     </div>
-    <p class="gma-group-label">Handlekurv (henting, ingen nettbetaling)</p>
+    <p class="gma-group-label">Handlekurv (henting${isPaymentsEnabled() ? "" : ", ingen nettbetaling"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra prisede produkter, send den som en henteordre per produsent, og sjekk ordrestatus. Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting.</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra prisede produkter, send den som en henteordre per produsent, og sjekk ordrestatus. ${isPaymentsEnabled() ? "Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du godkjenner selv. Alle andre betaler du direkte ved henting." : "Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting."}</p></div>
     </div>
 
     <h2>Prøv å spørre assistenten din</h2>
@@ -2922,6 +2930,9 @@ router.get("/personvern", (req: Request, res: Response) => {
   const lang = req.lang;
   const brand = `<span translate="no">${getConfig().display_name}</span>`;
   const en = lang === "en";
+  // Prepayment (prerequisite 7): Stripe as a recipient, only while the
+  // payment lifecycle is on — otherwise the page is exactly as before.
+  const pp = isPaymentsLifecycleActive() ? renderPrepaymentPrivacy(lang) : null;
   const content = en ? `
   <section class="pv-hero">
     <h1>Privacy</h1>
@@ -2996,6 +3007,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
     <h3>Shopping cart, orders and buyer token</h3>
     <p>When you create a shopping cart (via the website or the MCP tools <code>lokal_cart_create</code> etc.) we store the cart's contents (chosen products and producers) and a capability token (buyer_ref) needed to manage it further — a cart is valid for 7 days. If you provide contact details when ordering (name, email, phone, delivery note), that is kept until the order is finally resolved (completed/declined/cancelled), then deleted automatically 30 days after that (or 30 days after submission if no real order was created). Your contact details are passed to a producer only if you agree to share them when you submit the order; otherwise no producer sees them. Orders carry no payment — we never charge a card. An order is sent by email only to producers who have verified their listing and opted in to receiving orders through the platform; for any other producer in the cart you get their public contact details and get in touch yourself.</p>
+${pp ? pp.section : ""}
 
     <h2>What we do not collect</h2>
     <ul>
@@ -3003,7 +3015,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>We have no third-party tracking (no Google Analytics, Facebook Pixel, etc.)</li>
       <li>We do not store full IP addresses \u2014 only a truncated hash</li>
       <li>We do not store passwords (passwordless sign-in)</li>
-      <li>We do not collect payment information</li>
+      <li>${pp ? pp.notCollected : "We do not collect payment information"}</li>
       <li>We never sell data to third parties</li>
     </ul>
 
@@ -3031,7 +3043,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Information you add to your profile yourself</td><td>Consent</td><td>You choose what to add, and you can remove it. Everything is visible on your profile page.</td></tr>
         <tr><td>Image upload</td><td>Consent</td><td>You upload images yourself. Image scanning is optional.</td></tr>
         <tr><td>Pickup orders</td><td>Contract</td><td>To pass your order on to the producer you order from.</td></tr>
-      </tbody>
+${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
     </table>
 
     <h2>Where data is stored</h2>
@@ -3040,7 +3052,8 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Database backups are stored with the storage service <span translate="no">Tigris</span>, provided via <span translate="no">Fly.io</span>. <span translate="no">Tigris</span> is a US company</li>
       <li>AI checks, descriptions, translation and email handling take place at <span translate="no">Anthropic</span> (USA)</li>
       <li>Email is sent and received via <span translate="no">Resend</span> (USA) — verification codes, magic links, orders and emails to producers — and emails to us are read in <span translate="no">Gmail</span> (<span translate="no">Google</span>, USA)</li>
-      <li>If image scanning is enabled, images may be sent to <span translate="no">Anthropic</span> (USA) or <span translate="no">OpenAI</span> (USA) for analysis</li>
+      <li>If image scanning is enabled, images may be sent to <span translate="no">Anthropic</span> (USA) or <span translate="no">OpenAI</span> (USA) for analysis</li>${pp ? `
+      ${pp.transfer}` : ""}
     </ul>
     <p>The source code is open and available on <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
 
@@ -3165,6 +3178,7 @@ router.get("/personvern", (req: Request, res: Response) => {
 
     <h3>Handlekurv, bestilling og kjøpertoken</h3>
     <p>Når du oppretter en handlekurv (via nettsiden eller MCP-verktøyene <code>lokal_cart_create</code> m.fl.) lagrer vi kurvens innhold (valgte produkter og produsenter) og et kapabilitetstoken (buyer_ref) som kreves for å styre kurven videre — en kurv er gyldig i 7 dager. Hvis du oppgir kontaktinfo ved bestilling (navn, e-post, telefon, leveringsmerknad), beholdes dette til bestillingen er endelig avgjort (levert/avvist/kansellert), og slettes deretter automatisk 30 dager senere (eller 30 dager etter innsending, hvis ingen faktisk bestilling ble opprettet). Kontaktinfoen din sendes videre til en produsent bare hvis du samtykker til det når du sender bestillingen; ellers ser ingen produsent den. Bestillinger innebærer ingen betaling — vi belaster aldri kort. En bestilling sendes på e-post bare til produsenter som har verifisert profilen sin og takket ja til å motta bestillinger via plattformen; for øvrige produsenter i kurven får du deres offentlige kontaktinfo og tar kontakt selv.</p>
+${pp ? pp.section : ""}
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
@@ -3172,7 +3186,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Vi har ingen tredjepartssporing (ingen Google Analytics, Facebook Pixel, etc.)</li>
       <li>Vi lagrer ikke fullstendige IP-adresser \u2014 kun en forkortet hash</li>
       <li>Vi lagrer ikke passord (passwordless innlogging)</li>
-      <li>Vi samler ikke inn betalingsinformasjon</li>
+      <li>${pp ? pp.notCollected : "Vi samler ikke inn betalingsinformasjon"}</li>
       <li>Vi selger aldri data til tredjeparter</li>
     </ul>
 
@@ -3200,7 +3214,7 @@ router.get("/personvern", (req: Request, res: Response) => {
         <tr><td>Opplysninger du selv legger inn på profilen</td><td>Samtykke</td><td>Du velger selv hva du legger inn, og kan fjerne det. Alt er synlig på profilsiden.</td></tr>
         <tr><td>Bildeoppasting</td><td>Samtykke</td><td>Du laster selv opp bilder. Bildeskanning er valgfritt.</td></tr>
         <tr><td>Hentebestillinger</td><td>Avtale</td><td>For å formidle bestillingen til produsenten du bestiller fra.</td></tr>
-      </tbody>
+${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
     </table>
 
     <h2>Hvor data lagres</h2>
@@ -3209,7 +3223,8 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Sikkerhetskopier av databasen lagres hos lagringstjenesten Tigris, levert via Fly.io. Tigris er et amerikansk selskap</li>
       <li>KI-kontroll, beskrivelser, oversettelse og e-posthåndtering skjer hos Anthropic (USA)</li>
       <li>E-post sendes og mottas via Resend (USA) \u2014 verifiseringskoder, magiske lenker, bestillinger og e-post til produsenter \u2014 og e-post til oss leses i Gmail (Google, USA)</li>
-      <li>Hvis bildeskanning er aktivert, kan bilder sendes til Anthropic (USA) eller OpenAI (USA) for analyse</li>
+      <li>Hvis bildeskanning er aktivert, kan bilder sendes til Anthropic (USA) eller OpenAI (USA) for analyse</li>${pp ? `
+      ${pp.transfer}` : ""}
     </ul>
     <p>Kildekoden er åpen og tilgjengelig på <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
 
@@ -3274,6 +3289,36 @@ router.get("/personvern", (req: Request, res: Response) => {
 // terms of purchase and refund rules. Daniel live 2026-10-10. Content and the
 // facts it must stay true to live in rfb-kjopsvilkar.ts; same shell, CSS and
 // hreflang handling as /personvern above. Registered above router.get("/:city").
+// Producer terms for prepayment (A2A dev-request 2026-10-09-rfb-
+// forhandsbetaling-stripe-connect, prerequisite 4). Norwegian only.
+// Like /betaling below, only served while the payment lifecycle is on.
+router.get(PRODUSENTVILKAR_PATH, (_req: Request, res: Response, next: any) => {
+  if (!isPaymentsLifecycleActive()) return next();
+  res.send(shell(
+    "Vilkår for produsenter | Rett fra Bonden",
+    "Vilkår for produsenter som tar imot bestillinger og forhåndsbetaling via Rett fra Bonden.",
+    renderProdusentvilkarContent(),
+    { canonical: `${BASE_URL}${PRODUSENTVILKAR_PATH}`, extraCss: PERSONVERN_CSS, lang: "no", pathForAlternate: PRODUSENTVILKAR_PATH }
+  ));
+});
+
+// GET /betaling (+ /en/betaling) — «Slik fungerer betaling» (prepayment
+// dev-request, skive 4 / AC6). Content and the facts it must stay true to
+// live in rfb-betaling.ts. Only while the payment lifecycle is on; otherwise
+// next() → the city catch-all's 404 ("betaling" is a reserved slug).
+router.get(BETALING_PATH, (req: Request, res: Response, next: any) => {
+  if (!isPaymentsLifecycleActive()) return next();
+  const lang = req.lang;
+  res.send(shell(
+    lang === "en" ? "How payment works | Rett fra Bonden" : "Slik fungerer betaling | Rett fra Bonden",
+    lang === "en"
+      ? "Prepayment on Rett fra Bonden: the producer is the seller, the amount is reserved and only charged when the producer confirms, and you pay no fee."
+      : "Forhåndsbetaling på Rett fra Bonden: produsenten er selger, beløpet reserveres og trekkes først når produsenten bekrefter, og du betaler ingen gebyrer.",
+    renderBetalingContent(lang),
+    { canonical: `${BASE_URL}${localizedPath(BETALING_PATH, lang)}`, extraCss: PERSONVERN_CSS, lang, pathForAlternate: BETALING_PATH }
+  ));
+});
+
 router.get(KJOPSVILKAR_PATH, (req: Request, res: Response) => {
   const lang = req.lang;
   res.send(shell(
@@ -3787,6 +3832,8 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
       || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
       || citySlug === "kjopsvilkar"
+      || citySlug === "produsentvilkar"
+      || citySlug === "betaling"
       || citySlug === "proveniens"
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"

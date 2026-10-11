@@ -32,8 +32,10 @@ import {
   type OrderSummary,
 } from "./cart-service";
 import { sendOrderNotificationForOrder } from "./order-notify-service";
+import { sendBuyerOrderReceipt } from "./order-receipt-service";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
+import { PRODUSENTVILKAR_VERSION } from "../config/producer-terms";
 import {
   PRODUCER_ACCOUNT_CONTROLLER,
   assertPaymentsKeyAllowed,
@@ -82,6 +84,51 @@ export function isAgentAllowedForPayments(agentId: string, env: NodeJS.ProcessEn
   const list = paymentsAllowedAgentIds(env);
   if (list.includes(agentId)) return true;
   return list.includes("*") && paymentsLivemode(env);
+}
+
+// ── Producer terms + trader declaration (prerequisites 4 + 5) ─────────
+
+export type TraderStatus = "trader" | "non_trader";
+
+export interface ProducerTermsAcceptance {
+  terms_version: string;
+  trader_status: TraderStatus;
+  accepted_at: string;
+}
+
+export function getProducerTermsAcceptance(db: any, agentId: string): ProducerTermsAcceptance | null {
+  try {
+    return (db.prepare(`
+      SELECT terms_version, trader_status, accepted_at FROM producer_terms_acceptances
+      WHERE agent_id = ? ORDER BY accepted_at DESC, rowid DESC LIMIT 1
+    `).get(agentId) as ProducerTermsAcceptance | undefined) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function hasAcceptedCurrentProducerTerms(db: any, agentId: string): boolean {
+  return getProducerTermsAcceptance(db, agentId)?.terms_version === PRODUSENTVILKAR_VERSION;
+}
+
+export function isTraderStatus(v: unknown): v is TraderStatus {
+  return v === "trader" || v === "non_trader";
+}
+
+/** Owner accepted the current terms and/or (re)declared trader status. */
+export function recordProducerTermsAcceptance(db: any, agentId: string, traderStatus: TraderStatus, now: string = nowIso()): void {
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO producer_terms_acceptances (id, agent_id, terms_version, trader_status, accepted_at, source)
+      VALUES (?, ?, ?, ?, ?, 'owner')
+    `).run(randomUUID(), agentId, PRODUSENTVILKAR_VERSION, traderStatus, now);
+    logPaymentEvent(db, { agentId, source: "owner", type: "producer_terms_accepted", detail: `${PRODUSENTVILKAR_VERSION} ${traderStatus}`, now });
+  })();
+}
+
+/** What buyers are told about the seller (angrerettloven § 9 a). */
+export function sellerTraderStatus(db: any, agentId: string): TraderStatus | null {
+  return getProducerTermsAcceptance(db, agentId)?.trader_status ?? null;
 }
 
 // ── Accounts ─────────────────────────────────────────────────────────
@@ -137,12 +184,25 @@ export interface ProducerPaymentStatus {
   state: ProducerPaymentState;
   livemode: boolean;
   account: PaymentAccountRow | null;
+  /** Prerequisites 4 + 5 — filled in by getProducerPaymentStatus(). */
+  termsAccepted?: boolean;
+  traderStatus?: TraderStatus | null;
 }
 
 export function getProducerPaymentStatus(
   db: any,
   agentId: string,
   env: NodeJS.ProcessEnv = process.env,
+): ProducerPaymentStatus {
+  const base = getProducerPaymentStatusBase(db, agentId, env);
+  if (base.state === "disabled" || base.state === "not_allowed") return base;
+  return { ...base, termsAccepted: hasAcceptedCurrentProducerTerms(db, agentId), traderStatus: sellerTraderStatus(db, agentId) };
+}
+
+function getProducerPaymentStatusBase(
+  db: any,
+  agentId: string,
+  env: NodeJS.ProcessEnv,
 ): ProducerPaymentStatus {
   const livemode = paymentsLivemode(env);
   if (!isPaymentsEnabled(env) || !assertPaymentsKeyAllowed(env).allowed) {
@@ -328,6 +388,7 @@ async function startProducerOnboardingUnlocked(params: {
   if (status.state === "not_allowed") return { ok: false, status: 403, error: "not_in_pilot" };
   if (status.state === "not_eligible") return { ok: false, status: 409, error: "orders_not_enabled" };
   if (status.state === "active") return { ok: false, status: 409, error: "already_active" };
+  if (!hasAcceptedCurrentProducerTerms(db, agentId)) return { ok: false, status: 409, error: "terms_required" };
 
   const livemode = status.livemode;
   const agentPath = `/eier/${encodeURIComponent(agentId)}/betaling`;
@@ -656,6 +717,8 @@ export interface OrderPaymentLink {
   order_id: string;
   payment_id: string;
   seller: string;
+  /** The producer's own declaration (angrerettloven § 9 a); null if none. */
+  seller_trader_status: TraderStatus | null;
   amount_nok: number;
   currency: "NOK";
   fees: { stripe_fee_payer: "producer"; platform_fee_nok: number };
@@ -792,6 +855,7 @@ export async function createCheckoutForOrder(params: {
     order_id: order.id,
     payment_id: paymentId,
     seller: order.producer_name,
+    seller_trader_status: sellerTraderStatus(db, order.agent_id),
     amount_nok: priced.totalOre / 100,
     currency: "NOK",
     fees: { stripe_fee_payer: "producer", platform_fee_nok: feeOre / 100 },
@@ -1271,10 +1335,15 @@ export type OrderPaymentEffect = "none" | "captured" | "capture_failed" | "captu
  * successful order transition. The order transition never waits for, and
  * is never undone by, the payment step; a failed Stripe call is retried by
  * runPaymentMaintenance().
- *   confirmed            → capture the reservation
- *   declined             → release (link or reservation)
- *   cancelled no_show    → kept: the producer keeps a captured payment (terms §7)
- *   cancelled other      → release a reservation, refund a captured payment
+ *   confirmed                 → capture the reservation
+ *   declined                  → release (link or reservation)
+ *   cancelled no_show         → kept: the producer keeps a captured payment (terms §7)
+ *   cancelled buyer_cancelled → release a reservation; a captured payment is
+ *                               NOT refunded automatically — the producer
+ *                               refunds in full or in part in Stripe
+ *                               (forbrukerkjøpsloven § 41: the seller may
+ *                               claim documented loss)
+ *   cancelled other           → release a reservation, refund a captured payment
  */
 export async function onOrderTransitioned(params: {
   db: any;
@@ -1307,6 +1376,14 @@ export async function onOrderTransitioned(params: {
           return out === "captured" ? "kept" : out === "authorization_gone" ? "capture_failed" : "capture_pending";
         }
         return "none";
+      }
+      if (params.cancelReason === "buyer_cancelled") {
+        // Terms §6 / forbrukerkjøpsloven § 41: after confirmation the buyer's
+        // cancellation is settled by the producer in Stripe (refund minus
+        // documented loss) — we keep a captured payment; a reservation that
+        // was never captured is simply released.
+        if (p.status === "captured") return "kept";
+        return (await releasePayment(db, stripe, p.id, "buyer_cancelled", now)) ? "released" : "none";
       }
       if (p.status === "captured") {
         const r = await refundPayment(db, stripe, p.id, { reason: params.cancelReason || "order_cancelled", source: "system", now });
@@ -1370,6 +1447,7 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
       out.expired_orders++;
       const fresh = db.prepare(`SELECT status FROM payments WHERE id = ?`).get(r.id) as { status: string } | undefined;
       if (fresh?.status === "authorized" && (await releasePayment(db, params.stripe, r.id, "payment_expired", now))) out.released++;
+      void sendBuyerOrderReceipt(r.order_id, "cancelled");
       if (onOrderExpired) onOrderExpired(r.order_id);
     });
   }
