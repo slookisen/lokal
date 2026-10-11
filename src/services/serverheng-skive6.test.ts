@@ -24,6 +24,7 @@ import {
   __resetOffThreadStatsForTesting,
 } from "./offthread-stats";
 import { computeAgentStats, type AgentStatsPayload } from "./agent-stats-compute";
+import { createAgentStatsReader, type AgentStatsReaderDeps } from "./agent-stats-reader";
 import {
   createMaxTouchStatusLookup,
   getMaxTouchStatusForEmail,
@@ -129,6 +130,15 @@ export async function runServerhengSkive6Tests(opts: { log?: boolean } = {}): Pr
       "S2: the fixture exercises views, the rollup blend and conversations (non-trivial payload)",
       expected,
     );
+    // Golden values for this fixture (old route = new function was verified by
+    // a differential run in review; these pin it from here on).
+    ok(
+      expected.humanViews === 4 && expected.aiViews === 6 &&
+        eq(expected.aiBreakdown, { chatgpt: 5, claude: 1, other: 0 }) && expected.conversationCount === 2 &&
+        eq(expected.lastConversations.map((c) => [c.source, c.question]), [["mcp", "Har dere epler?"], ["a2a", "Selger dere honning?"]]),
+      "S2b: golden payload for the fixture",
+      expected,
+    );
     ok(statsTaskLane({ kind: "agentStats", agentId: "a", path: "/p", nowMs: 0 }) === "public", "S3a: agentStats runs in the public lane");
     ok(statsTaskLane({ kind: "trafficStats", windowDays: 60 }) === "background", "S3b: trafficStats stays in the background lane");
     const st = getOffThreadStatsState();
@@ -196,17 +206,107 @@ export async function runServerhengSkive6Tests(opts: { log?: boolean } = {}): Pr
     mem.close();
   }
 
+  // ── R: the route's cache reader (agent-stats-reader.ts) with fakes ────
+  {
+    const P = (n: number): AgentStatsPayload => ({ agentId: "a", humanViews: n, aiViews: 0, aiBreakdown: { chatgpt: 0, claude: 0, other: 0 }, conversationCount: 0, lastConversations: [] });
+    const FILE_DB = { name: "/data/rfb.db" } as unknown as Database.Database;
+    const OTHER_DB = { name: "/data/other.db" } as unknown as Database.Database;
+    function mk(over: Partial<AgentStatsReaderDeps> & { clock: { t: number } }) {
+      const calls = { off: 0, sync: 0 };
+      const reader = createAgentStatsReader({
+        getDb: () => FILE_DB,
+        offThreadUsable: () => true,
+        runOffThread: async () => { calls.off++; return P(calls.off); },
+        computeSync: () => { calls.sync++; return P(100 + calls.sync); },
+        now: () => over.clock.t,
+        offThreadTtlMs: 1000,
+        waitMs: 50,
+        syncTtlMs: 500,
+        maxEntries: 10,
+        retryAfterMs: 5000,
+        log: () => {},
+        ...over,
+      });
+      return { reader, calls };
+    }
+    try {
+      // R1: cold miss resolves within the wait -> 200 with the worker's payload.
+      {
+        const clock = { t: 0 };
+        const { reader, calls } = mk({ clock });
+        const r = await reader.read("a", "/produsent/a");
+        ok(r.status === 200 && (r as any).payload.humanViews === 1 && calls.off === 1 && calls.sync === 0, "R1: cold miss waits for the worker and answers 200", { r, calls });
+        // R2: fresh hit is served without a new task.
+        clock.t = 500;
+        const r2 = await reader.read("a", "/produsent/a");
+        ok(r2.status === 200 && calls.off === 1, "R2: a fresh value is served without recomputing", calls);
+        // R3: a stale hit is served at once and refreshed in the background.
+        clock.t = 2000;
+        const r3 = await reader.read("a", "/produsent/a");
+        ok(r3.status === 200 && (r3 as any).payload.humanViews === 1 && calls.off === 2, "R3: a stale value is served immediately while a refresh runs", { r3, calls });
+        await new Promise((res) => setImmediate(res));
+        const r3b = await reader.read("a", "/produsent/a");
+        ok((r3b as any).payload.humanViews === 2, "R3b: the refreshed value replaces the stale one", r3b);
+        // R4: another DB path clears the cache.
+        const { reader: r4reader, calls: c4 } = mk({ clock, getDb: () => OTHER_DB });
+        await r4reader.read("a", "/produsent/a");
+        ok(c4.off === 1, "R4: a different DB path starts from an empty cache", c4);
+      }
+      // R5: cold miss that does not finish in time -> 503.
+      {
+        const clock = { t: 0 };
+        const { reader } = mk({ clock, runOffThread: () => new Promise<AgentStatsPayload>(() => {}) });
+        const r = await reader.read("a", "/produsent/a");
+        ok(r.status === 503, "R5: a cold miss that outlasts the wait answers 503", r);
+      }
+      // R6: a failed refresh -> 503, and no new task inside the retry back-off.
+      {
+        const clock = { t: 0 };
+        let n = 0;
+        const { reader } = mk({ clock, runOffThread: async () => { n++; throw new Error("boom"); } });
+        const r = await reader.read("a", "/produsent/a");
+        const r2 = await reader.read("a", "/produsent/a");
+        ok(r.status === 503 && r2.status === 503 && n === 1, "R6: a failed refresh answers 503 and is not retried inside the back-off", { r, r2, n });
+      }
+      // R7: synchronous path (worker not usable) keeps the old TTL cache.
+      {
+        const clock = { t: 0 };
+        const { reader, calls } = mk({ clock, offThreadUsable: () => false });
+        const a = await reader.read("a", "/produsent/a");
+        clock.t = 400;
+        const b = await reader.read("a", "/produsent/a");
+        clock.t = 600;
+        const c = await reader.read("a", "/produsent/a");
+        ok(a.status === 200 && (a as any).payload.humanViews === 101 && (b as any).payload.humanViews === 101 && (c as any).payload.humanViews === 102 && calls.off === 0,
+          "R7: synchronous path: computed, cached for its TTL, recomputed after", { a, b, c, calls });
+      }
+      // R8: prewarm starts one worker task only when the worker is usable.
+      {
+        const clock = { t: 0 };
+        const { reader, calls } = mk({ clock });
+        reader.prewarm();
+        await new Promise((res) => setImmediate(res));
+        const { reader: syncReader, calls: c2 } = mk({ clock, offThreadUsable: () => false });
+        syncReader.prewarm();
+        ok(calls.off === 1 && c2.off === 0 && c2.sync === 0, "R8: prewarm runs one worker task, and nothing on the synchronous path", { calls, c2 });
+      }
+    } catch (err) {
+      ok(false, "R: unexpected error", String((err as Error)?.stack || err));
+    }
+  }
+
   // ── S5: lowerCurrentThreadPriority ───────────────────────────────────
   {
     const calls: Array<[number, number]> = [];
     const setP = (pid: number, prio: number) => { calls.push([pid, prio]); };
-    ok(lowerCurrentThreadPriority(10, { platform: "darwin", setPriority: setP, getPriority: () => 0 }) === null && calls.length === 0, "S5a: no-op outside Linux");
-    ok(lowerCurrentThreadPriority(10, { platform: "linux", env: { WORKER_THREAD_NICE_DISABLED: "1" }, setPriority: setP, getPriority: () => 0 }) === null && calls.length === 0, "S5b: kill switch");
-    ok(lowerCurrentThreadPriority(10, { platform: "linux", env: {}, setPriority: setP, getPriority: () => 10 }) === 10 && eq(calls, [[0, 10]]), "S5c: sets the calling thread (pid 0) to the given nice", calls);
+    ok(lowerCurrentThreadPriority(10, { platform: "darwin", isMainThread: false, setPriority: setP, getPriority: () => 0 }) === null && calls.length === 0, "S5a: no-op outside Linux");
+    ok(lowerCurrentThreadPriority(10, { platform: "linux", env: {}, setPriority: setP, getPriority: () => 0 }) === null && calls.length === 0, "S5h: never on the main thread (the test runs on it)");
+    ok(lowerCurrentThreadPriority(10, { platform: "linux", isMainThread: false, env: { WORKER_THREAD_NICE_DISABLED: "1" }, setPriority: setP, getPriority: () => 0 }) === null && calls.length === 0, "S5b: kill switch");
+    ok(lowerCurrentThreadPriority(10, { platform: "linux", isMainThread: false, env: {}, setPriority: setP, getPriority: () => 10 }) === 10 && eq(calls, [[0, 10]]), "S5c: sets the calling thread (pid 0) to the given nice", calls);
     calls.length = 0;
-    lowerCurrentThreadPriority(25, { platform: "linux", env: {}, setPriority: setP, getPriority: () => 19 });
+    lowerCurrentThreadPriority(25, { platform: "linux", isMainThread: false, env: {}, setPriority: setP, getPriority: () => 19 });
     ok(eq(calls, [[0, 19]]), "S5d: clamped to 19", calls);
-    ok(lowerCurrentThreadPriority(10, { platform: "linux", env: {}, setPriority: () => { throw new Error("EACCES"); }, getPriority: () => 0 }) === null, "S5e: a failing setpriority is swallowed");
+    ok(lowerCurrentThreadPriority(10, { platform: "linux", isMainThread: false, env: {}, setPriority: () => { throw new Error("EACCES"); }, getPriority: () => 0 }) === null, "S5e: a failing setpriority is swallowed");
     const src = lowerPriorityBootstrapSource();
     ok(src.includes('require("os").setPriority(0, 10)') && src.includes('process.platform === "linux"') && src.includes("WORKER_THREAD_NICE_DISABLED") && src.endsWith("\n"), "S5f: the eval bootstrap lowers the priority first (Linux, kill switch)", src);
     ok(lowerPriorityBootstrapSource(42).includes("setPriority(0, 19)"), "S5g: bootstrap nice is clamped to 19");

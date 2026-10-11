@@ -35,7 +35,7 @@ import * as https from "https";
 import * as zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { Worker } from "worker_threads";
-import { lowerPriorityBootstrapSource } from "./thread-priority";
+import { ensureThreadPoolStartedOnMainThread, lowerPriorityBootstrapSource } from "./thread-priority";
 import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
 
 // ── Config ────────────────────────────────────────────────────────────
@@ -547,6 +547,7 @@ function runInWorker(data: { op: "backup" | "integrity"; dbPath: string; destPat
   const options = { workerData: data, resourceLimits: { maxOldGenerationSizeMb: 128 } };
   // Same bootstrap as offthread-stats.ts: tsx's hooks do not reach worker threads, so a .ts
   // entry registers tsx's require hook inside the worker first.
+  ensureThreadPoolStartedOnMainThread();
   const w = script.endsWith(".ts")
     ? new Worker(`${lowerPriorityBootstrapSource()}require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
         ...options,

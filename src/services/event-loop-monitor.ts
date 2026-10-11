@@ -332,12 +332,14 @@ function beat(): void {
     kind: "stall",
     durationMs: lagMs,
     label: "event-loop-stall",
+    // `usage` first: event-loop-persist.ts cuts an oversized `extra` to a
+    // head slice, and the heaviest stalls are the ones whose usage matters.
     extra: {
+      ...(usage ? { usage } : {}),
       inflight: record.inflight,
       inflightTotal: record.inflightTotal,
       activeJobs: record.activeJobs,
       finishedDuringBlock: record.finishedDuringBlock,
-      ...(usage ? { usage } : {}),
     },
   });
   const reqs = record.inflight.map((r) => `${r.method} ${r.host}${r.path} (${r.ageMs}ms)`).join(", ") || "none";

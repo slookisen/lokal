@@ -48,7 +48,7 @@ import { Worker } from "worker_threads";
 import * as path from "path";
 import type Database from "better-sqlite3";
 import type { StatsTask, StatsWorkerRequest, StatsWorkerResponse } from "./offthread-stats-worker";
-import { lowerPriorityBootstrapSource } from "./thread-priority";
+import { ensureThreadPoolStartedOnMainThread, lowerPriorityBootstrapSource } from "./thread-priority";
 
 export const OFFTHREAD_MAX_CONSECUTIVE_FAILURES = 3;
 /**
@@ -232,6 +232,7 @@ function ensureWorker(lane: StatsLane, dbPath: string): Worker {
   // extensionless relative imports. So a .ts entry is started through a tiny
   // CommonJS bootstrap that registers tsx's require hook inside the worker
   // first. A compiled .js entry (node dist/index.js) is started directly.
+  ensureThreadPoolStartedOnMainThread();
   const w = script.endsWith(".ts")
     ? new Worker(`${lowerPriorityBootstrapSource()}require(${JSON.stringify(require.resolve("tsx/cjs"))});\nrequire(${JSON.stringify(script)});`, {
         ...options,

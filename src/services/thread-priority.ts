@@ -11,7 +11,9 @@
 // Raising the nice value needs no privileges. Pure module: safe to import in
 // worker threads.
 
+import * as fs from "fs";
 import * as os from "os";
+import { isMainThread } from "worker_threads";
 
 /** Nice value for background worker threads (0 = normal, 19 = lowest). */
 export const WORKER_THREAD_NICE = 10;
@@ -23,10 +25,18 @@ export const WORKER_THREAD_NICE = 10;
  */
 export function lowerCurrentThreadPriority(
   nice: number = WORKER_THREAD_NICE,
-  opts: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; setPriority?: (pid: number, prio: number) => void; getPriority?: (pid: number) => number } = {}
+  opts: {
+    platform?: NodeJS.Platform;
+    env?: NodeJS.ProcessEnv;
+    isMainThread?: boolean;
+    setPriority?: (pid: number, prio: number) => void;
+    getPriority?: (pid: number) => number;
+  } = {}
 ): number | null {
   const platform = opts.platform ?? process.platform;
   const env = opts.env ?? process.env;
+  // Never on the main thread: that is the thread this whole exercise protects.
+  if (opts.isMainThread ?? isMainThread) return null;
   if (platform !== "linux") return null;
   if (env.WORKER_THREAD_NICE_DISABLED === "1") return null;
   const setPriority = opts.setPriority ?? ((pid: number, prio: number) => os.setPriority(pid, prio));
@@ -49,4 +59,25 @@ export function lowerCurrentThreadPriority(
 export function lowerPriorityBootstrapSource(nice: number = WORKER_THREAD_NICE): string {
   const n = Math.max(0, Math.min(19, Math.trunc(nice)));
   return `if (process.platform === "linux" && process.env.WORKER_THREAD_NICE_DISABLED !== "1") { try { require("os").setPriority(0, ${n}); } catch (e) {} }\n`;
+}
+
+let threadPoolStartedHere = false;
+
+/**
+ * Call on the MAIN thread right before starting a worker that lowers its own
+ * priority. New threads inherit the nice value of the thread that creates
+ * them, and libuv creates its thread pool (fs, dns.lookup, zlib, crypto) on
+ * the first piece of pool work in the process. If a niced worker were first,
+ * the pool would run at its nice value for the rest of the process, including
+ * the main thread's I/O. In prod the main thread uses the pool long before
+ * (express.static, /health), so this is a cheap guarantee, not a fix.
+ */
+export function ensureThreadPoolStartedOnMainThread(): void {
+  if (threadPoolStartedHere || !isMainThread) return;
+  threadPoolStartedHere = true;
+  try {
+    fs.stat(__filename, () => {});
+  } catch {
+    // best effort
+  }
 }

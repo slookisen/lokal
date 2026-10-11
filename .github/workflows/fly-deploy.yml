@@ -121,31 +121,35 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the freshness check below needs the history to compare commits
 
       # Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-
       # oppstart-statistikk-samtaler). The concurrency group above runs one
-      # deploy at a time but keeps them in arrival order of the BUILD, not of
-      # the commit: on 2026-10-11 three merges within a minute made the
-      # #1015 deploy (older) run right after the #1014 deploy (newer), so prod
-      # went back to a commit without #1014 until main was redeployed by hand.
-      # A push-triggered deploy whose commit is no longer main's head now
-      # skips itself; the deploy of the newer commit is already queued (a
-      # newer pending job replaces an older pending one, never the reverse)
-      # and ships everything. workflow_dispatch always deploys.
-      - name: Skip if a newer commit is already on main
+      # deploy at a time, but in the order the BUILDS finish, not the order of
+      # the commits: on 2026-10-11 three merges within a minute made the
+      # #1015 deploy (older) run right after the #1014 deploy (newer), and
+      # prod lost #1014 until main was redeployed by hand.
+      # Rule: skip only when what is LIVE already contains this commit (this
+      # commit is an ancestor of the live one, and they differ). Then the
+      # deploy could only move prod backwards. Everything else deploys
+      # (fail-open): live unknown, live older, live unrelated, same commit
+      # (manual redeploy). Applies to push and workflow_dispatch alike.
+      - name: Skip if prod already runs a newer commit that contains this one
         id: freshness
         run: |
-          set -e
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "stale=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          HEAD_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-          if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
-            echo "main is at $HEAD_SHA; this run is ${{ github.sha }}. Skipping, so an older build never replaces a newer one."
+          set -u
+          THIS="${{ github.sha }}"
+          LIVE=$(curl -sf --max-time 10 https://rettfrabonden.com/health | jq -r '.git_sha // empty' 2>/dev/null || true)
+          if [ -n "$LIVE" ] && [ "$LIVE" != "$THIS" ] \
+             && git cat-file -e "${LIVE}^{commit}" 2>/dev/null \
+             && git merge-base --is-ancestor "$THIS" "$LIVE"; then
             echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipped: prod already runs $LIVE, which contains $THIS. Deploying this commit would move prod backwards."
+            echo "Deploy skipped: prod already runs \`$LIVE\`, which contains \`$THIS\`." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "Deploying $THIS (live: ${LIVE:-unknown})."
           fi
 
       - name: Setup flyctl

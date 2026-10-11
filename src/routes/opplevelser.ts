@@ -16845,7 +16845,8 @@ function getGardssalgMergedIntoId(expDb: Database.Database, providerId: string):
 // Rows with merged_into set (folded away by POST .../gardssalg-provider-
 // dedup-merge) are excluded from the base query below (GARDSSALG_NOT_MERGED_
 // WHERE) — never surfaced by ANY caller of this function.
-function computeGardssalgReadinessRows(
+// Exported for the serverheng skive 6 equivalence test (daily-prep reuses these rows in preflight).
+export function computeGardssalgReadinessRows(
   expDb: Database.Database,
   providerIds?: string[],
 ): Array<{
