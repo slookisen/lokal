@@ -278,7 +278,7 @@ export function registerTools(
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
       // answered from a place NAME or not at all.
-      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Drink venues are a first-class category (Fase 5): queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf.",
+      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Drink venues are a first-class category (Fase 5): queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf. Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -416,11 +416,19 @@ export function registerTools(
           // 2026-10-03: a producer kept only for its broad category (`meat`
           // for "lamb") says so, instead of reading like a documented match.
           const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
-          const documented = (r.matchReasons as string[] | undefined)?.some((m) => m.startsWith("Produkter:"));
-          const categoryOnlyNote = productTerms.length > 0 && !documented
+          const reasons = (r.matchReasons as string[] | undefined) ?? [];
+          const documented = reasons.some((m) => m.startsWith("Produkter:"));
+          // Name matches bypass product scoring; absent product evidence in
+          // that branch must not turn a named lookup into a category match.
+          const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
+          const categoryOnly = productTerms.length > 0 && !documented && !nameMatch;
+          const categoryOnlyNote = categoryOnly
             ? `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${productTerms.join("/")}» — spør produsenten. / Category match only: the listed products don't mention «${productTerms.join("/")}»; ask the producer.`
             : "";
-          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist + categoryOnlyNote;
+          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.(), categoryOnly ? {
+            headingSuffix: ` — Kategoritreff / category-only: «${productTerms.join("/")}» ikke oppført / not listed`,
+            hideDescription: true,
+          } : undefined) + dist + categoryOnlyNote;
         }
       });
 
@@ -433,7 +441,9 @@ export function registerTools(
     "lokal_discover",
     {
       title: "Discover producers by filter",
-      description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.",
+      description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. " +
+        "Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden " +
+        "cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
       inputSchema: {
         // Fase 5b (dev-request 2026-07-25-reisesok…): "beverages" was already
         // a real, filterable category — 133 producers carry it — but was
@@ -1258,9 +1268,10 @@ export function registerTools(
 
 // ─── Compact agent formatter ────────────────────────────────
 
-function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string): string {
-  const lines = [`**${idx}. ${agent.name}**`];
-  if (agent.description) {
+function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string,
+  display?: { headingSuffix?: string; hideDescription?: boolean }): string {
+  const lines = [`**${idx}. ${agent.name}${display?.headingSuffix ?? ""}**`];
+  if (agent.description && !display?.hideDescription) {
     if (isJunkDescription(agent.description)) {
       console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
     } else {
