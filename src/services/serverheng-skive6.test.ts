@@ -29,7 +29,7 @@ import {
   getMaxTouchStatusForEmail,
   type OutreachMaxTouchVernConfig,
 } from "./outreach-max-touch-vern";
-import { lowerCurrentThreadPriority, WORKER_THREAD_NICE } from "./thread-priority";
+import { lowerCurrentThreadPriority, lowerPriorityBootstrapSource, WORKER_THREAD_NICE } from "./thread-priority";
 
 export interface TestSummary {
   passed: number;
@@ -207,6 +207,9 @@ export async function runServerhengSkive6Tests(opts: { log?: boolean } = {}): Pr
     lowerCurrentThreadPriority(25, { platform: "linux", env: {}, setPriority: setP, getPriority: () => 19 });
     ok(eq(calls, [[0, 19]]), "S5d: clamped to 19", calls);
     ok(lowerCurrentThreadPriority(10, { platform: "linux", env: {}, setPriority: () => { throw new Error("EACCES"); }, getPriority: () => 0 }) === null, "S5e: a failing setpriority is swallowed");
+    const src = lowerPriorityBootstrapSource();
+    ok(src.includes('require("os").setPriority(0, 10)') && src.includes('process.platform === "linux"') && src.includes("WORKER_THREAD_NICE_DISABLED") && src.endsWith("\n"), "S5f: the eval bootstrap lowers the priority first (Linux, kill switch)", src);
+    ok(lowerPriorityBootstrapSource(42).includes("setPriority(0, 19)"), "S5g: bootstrap nice is clamped to 19");
   }
 
   return { passed, failed, failures };

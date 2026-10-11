@@ -38,3 +38,15 @@ export function lowerCurrentThreadPriority(
     return null;
   }
 }
+
+/**
+ * JS source to put FIRST in an eval'd worker bootstrap (the tsx path in
+ * offthread-stats.ts and offsite-backup.ts): lowers the thread's priority
+ * before tsx compiles the worker's TypeScript imports — that compile is the
+ * worker's heaviest CPU moment and lands in the boot window. Same rules as
+ * lowerCurrentThreadPriority (Linux only, kill switch, fail-soft).
+ */
+export function lowerPriorityBootstrapSource(nice: number = WORKER_THREAD_NICE): string {
+  const n = Math.max(0, Math.min(19, Math.trunc(nice)));
+  return `if (process.platform === "linux" && process.env.WORKER_THREAD_NICE_DISABLED !== "1") { try { require("os").setPriority(0, ${n}); } catch (e) {} }\n`;
+}
