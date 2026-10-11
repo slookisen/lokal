@@ -14,7 +14,7 @@ import {
 } from "../services/profile-translations";
 import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
-import { PAYMENT_PORTAL_ALERTS, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
+import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
 const router = Router();
 
@@ -971,8 +971,8 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar nå bestillinger på e-post.</div>`;
     } else if (status === "orders_off") {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar ikke lenger bestillinger på e-post.</div>`;
-    } else if (PAYMENT_PORTAL_ALERTS[status]) {
-      const pa = PAYMENT_PORTAL_ALERTS[status]!;
+    } else if (paymentPortalAlert(status)) {
+      const pa = paymentPortalAlert(status)!;
       alert = pa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(pa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(pa.text)}</div>`;

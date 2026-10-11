@@ -139,7 +139,7 @@ import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
-import { mountPaymentRoutes } from "./routes/payments";
+import { mountPaymentRoutes, mountPaymentWebhook } from "./routes/payments";
 import contactRouter from "./routes/contact";
 import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -301,6 +301,15 @@ app.use(langMiddleware);
 // straight through. Auth = Svix signature (RESEND_WEBHOOK_SECRET; unset → 503).
 // See routes/resend-webhook.ts + services/resend-webhook.ts.
 app.use("/", resendWebhookRoutes);
+
+// ─── POST /webhooks/stripe-connect (prepayment, A2A dev-request
+// 2026-10-09-rfb-forhandsbetaling-stripe-connect) ───────────────────────
+// Stripe Connect events (accounts, payments on producers' own accounts).
+// Same placement and reasoning as /webhooks/resend: after express.json
+// (needs req.rawBody), before host gates and every /api limiter. Auth =
+// Stripe signature (STRIPE_CONNECT_WEBHOOK_SECRET; unset → 503). Mounts
+// nothing unless PAYMENTS_ENABLED=1 (routes/payments.ts).
+mountPaymentWebhook(app);
 
 // ─── PR-109: finn-tannlege.com host routing ───────────────────────────
 // Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and

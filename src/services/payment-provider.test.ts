@@ -20,6 +20,7 @@
 import {
   assertPaymentsKeyAllowed,
   createRealPaymentsStripeClient,
+  isStripeAccountAccessError,
   isLivePaymentsKey,
   paymentsLivemode,
   PRODUCER_ACCOUNT_CONTROLLER,
@@ -80,6 +81,13 @@ export async function runPaymentProviderTests(opts: { log?: boolean } = {}): Pro
   ok(!allGates.allowed, "3h: every env gate set, terms not live → still refused");
   ok(/kjopsvilkar/.test(allGates.reason || ""), "3i: refusal names the terms of purchase");
   ok(!/FAKE/.test(allGates.reason || ""), "3j: refusal never echoes the key");
+  const liveEnv = { STRIPE_SECRET_KEY: FAKE_LIVE_KEY, PAYMENTS_LIVE: "1", PAYMENTS_ORG_NR: "938 635 676" };
+  ok(assertPaymentsKeyAllowed(liveEnv, true).allowed, "3k: every gate set AND terms live → allowed (org.nr compared digits-only)");
+  ok(assertPaymentsKeyAllowed({ ...liveEnv, STRIPE_SECRET_KEY: FAKE_RESTRICTED_LIVE_KEY }, true).allowed, "3l: restricted live key with every gate → allowed");
+  ok(!assertPaymentsKeyAllowed({ ...liveEnv, PAYMENTS_LIVE: "true" }, true).allowed, "3m: PAYMENTS_LIVE must be exactly \"1\"");
+  ok(!assertPaymentsKeyAllowed({ ...liveEnv, PAYMENTS_ORG_NR: "" }, true).allowed, "3n: missing org.nr alone → refused");
+  ok(!assertPaymentsKeyAllowed({ ...liveEnv, PAYMENTS_ORG_NR: "938635677" }, true).allowed, "3o: wrong org.nr alone → refused");
+  ok(!assertPaymentsKeyAllowed(liveEnv, false).allowed, "3p: terms not live alone → refused");
 
   // 4. controller properties
   ok(PRODUCER_ACCOUNT_CONTROLLER.fees.payer === "account", "4a: Stripe bills the producer (fees.payer=account)");
@@ -87,6 +95,13 @@ export async function runPaymentProviderTests(opts: { log?: boolean } = {}): Pro
   ok(PRODUCER_ACCOUNT_CONTROLLER.requirement_collection === "stripe", "4c: Stripe collects KYC requirements");
   ok(PRODUCER_ACCOUNT_CONTROLLER.stripe_dashboard.type === "full", "4d: producer gets the full Stripe Dashboard");
   ok(Object.isFrozen(PRODUCER_ACCOUNT_CONTROLLER), "4e: controller constant is frozen");
+
+  // 4b. access errors (disconnected / other Stripe account)
+  ok(isStripeAccountAccessError({ type: "StripePermissionError" }), "4f: StripePermissionError is an access error");
+  ok(isStripeAccountAccessError({ code: "account_invalid" }), "4g: account_invalid is an access error");
+  ok(isStripeAccountAccessError({ statusCode: 403 }), "4h: HTTP 403 is an access error");
+  ok(!isStripeAccountAccessError({ type: "StripeConnectionError" }), "4i: network error is NOT an access error (Stripe should retry)");
+  ok(!isStripeAccountAccessError(null), "4j: null is not an access error");
 
   // 5. offline webhook verification through the real adapter
   const client = createRealPaymentsStripeClient(FAKE_TEST_KEY);

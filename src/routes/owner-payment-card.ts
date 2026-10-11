@@ -17,7 +17,7 @@ function esc(s: string): string {
 }
 
 /** Portal ?status= values set by routes/payments.ts → alert text. */
-export const PAYMENT_PORTAL_ALERTS: Record<string, { ok: boolean; text: string }> = {
+const PAYMENT_PORTAL_ALERTS: Record<string, { ok: boolean; text: string }> = {
   payments_return: {
     ok: true,
     text: "Takk! Vi venter på bekreftelse fra Stripe. Det kan ta et minutt. Last siden på nytt for å se status.",
@@ -29,6 +29,14 @@ export const PAYMENT_PORTAL_ALERTS: Record<string, { ok: boolean; text: string }
     text: "Slå på «Motta bestillinger på e-post» først. Forhåndsbetaling bygger på bestillinger.",
   },
 };
+
+/**
+ * Own keys only: ?status=constructor / __proto__ / toString must never hit
+ * Object.prototype (the portal would 500 — with payments off too).
+ */
+export function paymentPortalAlert(status: string): { ok: boolean; text: string } | null {
+  return Object.prototype.hasOwnProperty.call(PAYMENT_PORTAL_ALERTS, status) ? PAYMENT_PORTAL_ALERTS[status]! : null;
+}
 
 export function shouldRenderPaymentCard(status: ProducerPaymentStatus): boolean {
   return status.state !== "disabled" && status.state !== "not_allowed";
@@ -65,6 +73,14 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
       body = `
         <p style="margin-bottom:12px;">Stripe trenger flere opplysninger før du kan ta imot betaling.</p>
         ${button("Fortsett hos Stripe")}`;
+      break;
+    case "pending":
+      body = `<p>Stripe går gjennom opplysningene dine. Du trenger ikke gjøre noe nå. Statusen her endres når Stripe er ferdig.</p>`;
+      break;
+    case "deauthorized":
+      body = `
+        <p style="margin-bottom:12px;">Stripe-kontoen din er ikke lenger koblet til Rett fra Bonden, så du kan ikke ta imot forhåndsbetaling nå. Du kan koble til en konto på nytt.</p>
+        ${button("Koble til Stripe på nytt")}`;
       break;
     case "active":
       body = `

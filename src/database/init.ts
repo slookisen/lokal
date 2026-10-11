@@ -4781,30 +4781,45 @@ function initSchema(db: Database.Database): void {
   // and nothing reads them unless PAYMENTS_ENABLED=1. Kept separate from the
   // billing_* subscription tables above on purpose.
   //
-  // payment_accounts: one producer Stripe account per mode. A test-mode
-  //   account id does not exist in live mode, so the row is keyed by
-  //   (agent_id, livemode) instead of two columns on `agents`: going live
-  //   means a fresh live onboarding, never a stale test id.
+  // payment_accounts: a producer's Stripe account per mode. A test-mode
+  //   account id does not exist in live mode, so rows are per (agent_id,
+  //   livemode) instead of two columns on `agents`: going live means a fresh
+  //   live onboarding, never a stale test id.
   //   charges_enabled / payouts_enabled / details_submitted / business_type /
-  //   disabled_reason are copied ONLY from Stripe's own Account object
-  //   (account.updated webhook) — never from a client claim or the return
-  //   URL. charges_enabled=1 is what lets a producer take prepayment.
+  //   disabled_reason / requirements_due / pending_verification are copied
+  //   ONLY from Stripe's own Account object, re-fetched from Stripe when an
+  //   account.updated webhook arrives — never from a client claim or the
+  //   return URL. charges_enabled=1 is what lets a producer take prepayment.
+  //   deauthorized_at: the producer disconnected us (or the account is not
+  //   reachable with the configured key). Sticky — no later snapshot clears
+  //   it; the producer onboards a NEW account instead, which is why the
+  //   one-account-per-mode rule is a partial unique index over the rows that
+  //   are not deauthorized, not a table constraint.
+  //   last_event_created: Stripe event.created of the last snapshot applied —
+  //   an older, late or retried event never overwrites a newer state.
   db.exec(`
     CREATE TABLE IF NOT EXISTS payment_accounts (
-      id                 TEXT PRIMARY KEY,
-      agent_id           TEXT NOT NULL,
-      livemode           INTEGER NOT NULL DEFAULT 0 CHECK(livemode IN (0,1)),
-      stripe_account_id  TEXT NOT NULL UNIQUE,
-      charges_enabled    INTEGER NOT NULL DEFAULT 0,
-      payouts_enabled    INTEGER NOT NULL DEFAULT 0,
-      details_submitted  INTEGER NOT NULL DEFAULT 0,
-      business_type      TEXT,
-      disabled_reason    TEXT,
-      charges_enabled_at TEXT,
-      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(agent_id, livemode)
+      id                    TEXT PRIMARY KEY,
+      agent_id              TEXT NOT NULL,
+      livemode              INTEGER NOT NULL DEFAULT 0 CHECK(livemode IN (0,1)),
+      stripe_account_id     TEXT NOT NULL UNIQUE,
+      charges_enabled       INTEGER NOT NULL DEFAULT 0,
+      payouts_enabled       INTEGER NOT NULL DEFAULT 0,
+      details_submitted     INTEGER NOT NULL DEFAULT 0,
+      business_type         TEXT,
+      disabled_reason       TEXT,
+      requirements_due      INTEGER NOT NULL DEFAULT 0,
+      pending_verification  INTEGER NOT NULL DEFAULT 0,
+      charges_enabled_at    TEXT,
+      deauthorized_at       TEXT,
+      last_event_created    INTEGER,
+      created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
     )
+  `);
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_accounts_one_active
+      ON payment_accounts(agent_id, livemode) WHERE deauthorized_at IS NULL
   `);
 
   // payments: one row per prepaid order (written from skive 2). Amounts are

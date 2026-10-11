@@ -155,9 +155,14 @@ export interface LiveGuardResult {
   reason?: string;
 }
 
-/** `sk_live_` is Stripe's own live-secret-key prefix convention. */
+/**
+ * `sk_live_` is Stripe's live secret-key prefix; `rk_live_` is a live
+ * RESTRICTED key. STRIPE_SECRET_KEY is shared with the payments module
+ * (payment-provider.ts), where Daniel's go-live key is a restricted one —
+ * it must count as live here too, or billing would treat it as test mode.
+ */
 export function isLiveStripeKey(key: string | undefined | null): boolean {
-  return typeof key === "string" && key.startsWith("sk_live_");
+  return typeof key === "string" && (key.startsWith("sk_live_") || key.startsWith("rk_live_"));
 }
 
 export function assertBillingKeyAllowed(env: NodeJS.ProcessEnv = process.env): LiveGuardResult {

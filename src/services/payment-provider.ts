@@ -40,7 +40,7 @@
 
 import Stripe from "stripe";
 import { COMPANY_INFO } from "../config/company-info";
-import { KJOPSVILKAR_PREPAYMENT_LIVE } from "../routes/rfb-kjopsvilkar";
+import { KJOPSVILKAR_PREPAYMENT_LIVE } from "../config/payments-terms";
 
 // ── The seam ─────────────────────────────────────────────────────────
 
@@ -51,7 +51,12 @@ export interface ConnectAccountLike {
   payouts_enabled?: boolean;
   details_submitted?: boolean;
   business_type?: string | null;
-  requirements?: { disabled_reason?: string | null } | null;
+  requirements?: {
+    disabled_reason?: string | null;
+    currently_due?: string[] | null;
+    past_due?: string[] | null;
+    pending_verification?: string[] | null;
+  } | null;
 }
 
 export interface ConnectAccountLinkLike {
@@ -62,6 +67,8 @@ export interface ConnectAccountLinkLike {
 export interface PaymentsWebhookEvent {
   id: string;
   type: string;
+  /** Unix seconds — used to ignore an account snapshot older than the last one applied. */
+  created?: number;
   livemode?: boolean;
   /** Set on events that happened on a connected account (Connect endpoint). */
   account?: string | null;
@@ -94,7 +101,7 @@ export interface CreateAccountLinkParams {
  */
 export interface PaymentsStripeClient {
   accounts: {
-    create(params: CreateConnectAccountParams): Promise<ConnectAccountLike>;
+    create(params: CreateConnectAccountParams, opts?: { idempotencyKey?: string }): Promise<ConnectAccountLike>;
     retrieve(id: string): Promise<ConnectAccountLike>;
   };
   accountLinks: {
@@ -124,8 +131,8 @@ export function createRealPaymentsStripeClient(
   const stripe = new StripeCtor(secretKey);
   return {
     accounts: {
-      async create(params) {
-        const a = await stripe.accounts.create(params as any);
+      async create(params, opts) {
+        const a = await stripe.accounts.create(params, opts);
         return a as unknown as ConnectAccountLike;
       },
       async retrieve(id) {
@@ -135,7 +142,7 @@ export function createRealPaymentsStripeClient(
     },
     accountLinks: {
       async create(params) {
-        const l = await stripe.accountLinks.create(params as any);
+        const l = await stripe.accountLinks.create(params);
         return { url: l.url, expires_at: l.expires_at };
       },
     },
@@ -145,6 +152,18 @@ export function createRealPaymentsStripeClient(
       },
     },
   };
+}
+
+/**
+ * True when Stripe says our platform can no longer act on this connected
+ * account: the producer disconnected it, or it belongs to another Stripe
+ * account/sandbox than the configured key (e.g. after a key change).
+ */
+export function isStripeAccountAccessError(err: unknown): boolean {
+  const e = err as { type?: string; code?: string; statusCode?: number; raw?: { code?: string } } | null;
+  if (!e) return false;
+  const code = e.code || e.raw?.code || "";
+  return e.type === "StripePermissionError" || code === "account_invalid" || e.statusCode === 403;
 }
 
 // ── Mode + live-key guard ────────────────────────────────────────────
@@ -182,21 +201,24 @@ function digitsOnly(s: string): string {
  *     under terms that still say prepayment is not available.
  * A test key, a placeholder or no key is always allowed (test mode).
  */
-export function assertPaymentsKeyAllowed(env: NodeJS.ProcessEnv = process.env): PaymentsGuardResult {
+export function assertPaymentsKeyAllowed(
+  env: NodeJS.ProcessEnv = process.env,
+  termsLive: boolean = KJOPSVILKAR_PREPAYMENT_LIVE,
+): PaymentsGuardResult {
   const key = env.STRIPE_SECRET_KEY || "";
   if (!isLivePaymentsKey(key)) return { allowed: true };
 
   const liveGateSet = env.PAYMENTS_LIVE === "1";
   const orgNr = digitsOnly(env.PAYMENTS_ORG_NR || "");
   const orgOk = orgNr !== "" && orgNr === COMPANY_INFO.orgNr;
-  if (!liveGateSet || !orgOk || !KJOPSVILKAR_PREPAYMENT_LIVE) {
+  if (!liveGateSet || !orgOk || !termsLive) {
     return {
       allowed: false,
       reason:
         "refusing a live-mode Stripe key for payments: requires PAYMENTS_LIVE=1 " +
         `(currently ${liveGateSet ? "set" : "unset"}), PAYMENTS_ORG_NR equal to the company org.nr ` +
         `(currently ${orgNr ? (orgOk ? "matching" : "not matching") : "unset"}) and live wording in ` +
-        `/kjopsvilkar §4 (KJOPSVILKAR_PREPAYMENT_LIVE is ${KJOPSVILKAR_PREPAYMENT_LIVE}). ` +
+        `/kjopsvilkar §4 (KJOPSVILKAR_PREPAYMENT_LIVE is ${termsLive}). ` +
         "See A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect.",
     };
   }

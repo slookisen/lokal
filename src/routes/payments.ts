@@ -9,9 +9,11 @@
 //   POST /eier/:agentId/betaling/start   owner session → Stripe-hosted onboarding
 //   GET  /eier/:agentId/betaling/retur   Stripe sends the owner back here
 //   GET  /eier/:agentId/betaling/fornye  expired onboarding link → a fresh one
-//   POST /api/payments/stripe/webhook    Connect webhook (signature = auth)
+//   POST /webhooks/stripe-connect        Connect webhook (signature = auth),
+//                                        mounted early (mountPaymentWebhook)
 //   GET  /admin/payments/status          X-Admin-Key: mode, flags, guard
 //   GET  /admin/payments/accounts        X-Admin-Key: producer accounts
+//   POST /admin/payments/accounts/:agentId/sync  X-Admin-Key: re-read from Stripe
 //
 // The return page never trusts the redirect: it only sends the owner back
 // to the portal, which shows the state the webhook wrote.
@@ -37,9 +39,14 @@ import {
   paymentsAllowedAgentIds,
   startProducerOnboarding,
   getPaymentAccount,
+  syncProducerAccounts,
 } from "../services/payment-service";
 
 const router = Router();
+const webhookRouter = Router();
+
+/** Connect webhook path — what Daniel registers in Stripe (events on connected accounts). */
+export const PAYMENTS_WEBHOOK_PATH = "/webhooks/stripe-connect";
 
 function baseUrl(): string {
   return process.env.BASE_URL || "https://rettfrabonden.com";
@@ -111,6 +118,7 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
   try {
     const out = await startProducerOnboarding({ db: getDb(), stripe, agentId, baseUrl: baseUrl() });
     if (!out.ok) {
+      if (out.error === "already_active") return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal#forhandsbetaling`);
       const status = out.error === "orders_not_enabled" ? "payments_orders_off" : "payments_unavailable";
       return res.redirect(303, portalUrl(agentId, status));
     }
@@ -148,9 +156,11 @@ router.get("/eier/:agentId/betaling/fornye", async (req: Request, res: Response)
 
 // ── Connect webhook ──────────────────────────────────────────────────
 // Raw body: src/index.ts's global express.json() keeps the exact request
-// bytes on req.rawBody — Stripe's HMAC is over those bytes.
+// bytes on req.rawBody — Stripe's HMAC is over those bytes. Mounted early
+// (next to /webhooks/resend), outside /api, so the general /api rate limit
+// can never 429 Stripe's deliveries.
 
-router.post("/api/payments/stripe/webhook", async (req: Request, res: Response) => {
+webhookRouter.post(PAYMENTS_WEBHOOK_PATH, async (req: Request, res: Response) => {
   const secret = resolveWebhookSecret(req);
   if (!secret) {
     res.status(503).json({ error: "Webhook not configured (STRIPE_CONNECT_WEBHOOK_SECRET unset)" });
@@ -206,21 +216,50 @@ router.get("/admin/payments/accounts", (req: Request, res: Response) => {
   res.json({ success: true, accounts: listPaymentAccounts(getDb()) });
 });
 
+router.post("/admin/payments/accounts/:agentId/sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const stripe = resolveStripeClient(req);
+  if (!stripe) {
+    res.status(503).json({ error: "Payments not configured" });
+    return;
+  }
+  try {
+    const synced = await syncProducerAccounts(getDb(), stripe, String(req.params.agentId || ""));
+    res.json({ success: true, synced });
+  } catch (err: any) {
+    res.status(502).json({ error: "sync failed", detail: String(err?.message || err) });
+  }
+});
+
 // ── Mounting ─────────────────────────────────────────────────────────
 
-/**
- * Called unconditionally from src/index.ts. Mounts nothing unless
- * PAYMENTS_ENABLED=1, and nothing with a live key the guard refuses.
- */
-export function mountPaymentRoutes(app: Application, env: NodeJS.ProcessEnv = process.env): boolean {
+function paymentsMountable(env: NodeJS.ProcessEnv): boolean {
   if (!isPaymentsEnabled(env)) return false;
   const guard = assertPaymentsKeyAllowed(env);
   if (!guard.allowed) {
     console.error(`payments: ${guard.reason}`);
     return false;
   }
+  return true;
+}
+
+/**
+ * Called unconditionally from src/index.ts (late, after the owner portal).
+ * Mounts nothing unless PAYMENTS_ENABLED=1, and nothing with a live key the
+ * guard refuses.
+ */
+export function mountPaymentRoutes(app: Application, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!paymentsMountable(env)) return false;
   app.use(router);
   return true;
 }
 
+/** Called unconditionally from src/index.ts right after /webhooks/resend. Same gates. */
+export function mountPaymentWebhook(app: Application, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!paymentsMountable(env)) return false;
+  app.use(webhookRouter);
+  return true;
+}
+
 export default router;
+export { webhookRouter as paymentsWebhookRouter };
