@@ -2940,7 +2940,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Which page you visit (URL path)</li>
       <li>Referrer URL (where you came from)</li>
-      <li>An anonymised, salted hash of your IP address (SHA-256, truncated \u2014 we do not store your full IP address) and a separate hash of your browser type</li>
+      <li>A pseudonymised, salted hash of your IP address (SHA-256, truncated \u2014 we do not store your full IP address) and a separate hash of your browser type</li>
       <li>For human visitors, a coarse device category (mobile / tablet / desktop) \u2014 never your full, raw browser string. Automated tools and crawlers (e.g. GPTBot, Googlebot) are instead identified by their own self-declared, non-personal client name, so we can see which bots and AI crawlers visit the site</li>
       <li>Timestamp of the visit</li>
     </ul>
@@ -2953,7 +2953,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Selected category and city</li>
       <li>Number of results returned</li>
       <li>Which protocol was used (API, MCP, A2A)</li>
-      <li>Anonymised IP hash (same method as for page visits)</li>
+      <li>Pseudonymised IP hash (same method as for page visits)</li>
     </ul>
     <p>We store this to understand which searches give good results and to improve the service.</p>
 
@@ -2963,7 +2963,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>The <code>lokal_geocode</code> tool (place name → coordinates) forwards your search text to the Norwegian Mapping Authority's public geocoding API (Kartverket, ws.geonorge.no) to look it up.</p>
 
     <h3>Producer profiles we create</h3>
-    <p>Most profiles in the catalogue were created by us, without the producer signing up. They are built from information that is already public, including from the Brønnøysund Register Centre, Debio, Google Places and the producer's own website or official Facebook page (see <a href="${localizedPath("/proveniens", lang)}" style="color:var(--green-700);">how we verify our data</a>). For each profile we store, among other things:</p>
+    <p>Most profiles in the catalogue were created by us, without the producer signing up. They are built from information that is already public, including from the Brønnøysund Register Centre, Debio, Google Places, directories of local food and farm shops, web searches and the producer's own website or official Facebook page (see <a href="${localizedPath("/proveniens", lang)}" style="color:var(--green-700);">how we verify our data</a>). For each profile we store, among other things:</p>
     <ul>
       <li>The name of the farm or business, organisation number and address</li>
       <li>Phone, email and website published for the business</li>
@@ -2971,7 +2971,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Which source each field came from, and when it was last checked</li>
     </ul>
     <p>If the producer is a sole proprietorship, some of this can also be personal data about the owner, for example when the business carries the owner's name or address. The profile is public and can be fetched by AI assistants and other services (see “Who receives the data”).</p>
-    <p>We may email the public email address on the profile to say that the profile exists and how it can be confirmed or corrected. If you reply “fjern” (remove) to that email, we delete the profile. When a profile is removed on request, we keep a few identifiers (website domain, email address, name and organisation number) on a do-not-re-add list, so the profile is not created again.</p>
+    <p>We may email the public email address on the profile to say that the profile exists and how it can be confirmed or corrected. If you reply “fjern” (remove) to that email, we delete the profile. The emails we have sent you and your replies (email address, name and content) are kept in our customer-service system and in a send log. They are not deleted automatically when the profile is removed, but you can ask us to delete them too. When a profile is removed on request, we keep some identifiers on a do-not-re-add list — for example website domain, email address and name — so the profile is not created again.</p>
 
     <h3>Sellers who register (claim)</h3>
     <p>When you register as a ${getConfig().domain_dictionary.entity} to manage your profile, we collect:</p>
@@ -2989,7 +2989,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Sellers can upload profile pictures and product photos. These are stored on the server. If image scanning is enabled, the image may be sent to an external AI service (Anthropic Claude or OpenAI) for automatic product recognition.</p>
 
     <h3>Checks and translation with AI</h3>
-    <p>We use AI services from <span translate="no">Anthropic</span> (Claude) to find and check public information about producers — for example whether a website or a register match belongs to the right business — and to translate profile text into English and Swedish. Profile data and text from public web pages can then be processed by <span translate="no">Anthropic</span> in the USA. An AI assessment on its own never counts as confirmation of a field.</p>
+    <p>We use AI services from <span translate="no">Anthropic</span> (Claude) to find and check public information about producers — for example whether a website or a register match belongs to the right business — to write short producer descriptions from the producer's own web pages, and to translate profile text into English and Swedish. Claude also helps us read and answer emails sent to us. Profile data, text from public web pages and the content of emails can then be processed by <span translate="no">Anthropic</span> in the USA. An AI assessment on its own never counts as confirmation of a field.</p>
 
     <h3>Conversations between agents</h3>
     <p>${brand} supports the A2A protocol (agent-to-agent). When an AI agent contacts a producer agent, the conversation text, status and any transaction info are stored in the database.</p>
@@ -3011,7 +3011,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li><strong>Everyone who uses the service.</strong> Producer profiles are public. They are shown on the website and can be fetched by AI assistants and other services via MCP, A2A and the API, for example ChatGPT and Claude. What those services do with the data afterwards is governed by their own terms.</li>
       <li><strong>Producers you order from.</strong> Your contact details in an order go only to producers you have agreed to share them with (see “Shopping cart, orders and buyer token”).</li>
-      <li><strong>Providers that process data on our behalf:</strong> <span translate="no">Fly.io</span> (server hosting), <span translate="no">Tigris</span> (database backups, provided via <span translate="no">Fly.io</span>), <span translate="no">Anthropic</span> (checks and translation with AI, and image scanning), <span translate="no">OpenAI</span> (image scanning) and an email service (SMTP).</li>
+      <li><strong>Providers we use:</strong> <span translate="no">Fly.io</span> (server hosting), <span translate="no">Tigris</span> (database backups, provided via <span translate="no">Fly.io</span>), <span translate="no">Anthropic</span> (AI checks, descriptions, translation, email handling and image scanning), <span translate="no">OpenAI</span> (image scanning), <span translate="no">Resend</span> (sending and receiving email) and <span translate="no">Google</span> (Gmail, where emails to us are read).</li>
       <li><strong><span translate="no">Kartverket</span></strong> receives the search text when the <code>lokal_geocode</code> tool is used.</li>
     </ul>
 
@@ -3021,8 +3021,9 @@ router.get("/personvern", (req: Request, res: Response) => {
       <thead><tr><th>Data type</th><th>Basis</th><th>Explanation</th></tr></thead>
       <tbody>
         <tr><td>Analytics (page visits, searches)</td><td>Legitimate interest</td><td>To improve the service. IP addresses are stored only as a salted hash (pseudonymised).</td></tr>
-        <tr><td>Producer profiles from public sources</td><td>Legitimate interest</td><td>To give consumers and AI assistants an up-to-date overview of local food producers. We use only information that is already public, and you can object at any time (see “Your rights”).</td></tr>
+        <tr><td>Producer profiles from public sources</td><td>Legitimate interest</td><td>To give consumers and AI assistants an up-to-date overview of local food producers. The profile is built from information that is already public, and you can object at any time (see “Your rights”).</td></tr>
         <tr><td>Emails to producers about their profile</td><td>Legitimate interest</td><td>To say that the profile exists, and to make it possible to confirm, correct or remove it.</td></tr>
+        <tr><td>Emails you send us</td><td>Legitimate interest</td><td>To read, answer and follow up your enquiry.</td></tr>
         <tr><td>Checks and translation with AI</td><td>Legitimate interest</td><td>Correct information about the right business, and profiles in more than one language.</td></tr>
         <tr><td>Backups</td><td>Legitimate interest</td><td>To be able to restore the service after an error or data loss.</td></tr>
         <tr><td>Do-not-re-add list after removal</td><td>Legitimate interest</td><td>To respect your wish not to be added again.</td></tr>
@@ -3037,8 +3038,8 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>The database is on a server hosted by <span translate="no">Fly.io</span> in the <span translate="no">Stockholm</span> region (ARN). <span translate="no">Fly.io</span> is a US company. Data can also be processed outside the EU/EEA in these cases:</p>
     <ul>
       <li>Database backups are stored with the storage service <span translate="no">Tigris</span>, provided via <span translate="no">Fly.io</span>. <span translate="no">Tigris</span> is a US company</li>
-      <li>Checks and translation with AI take place at <span translate="no">Anthropic</span> (USA)</li>
-      <li>Email is sent via an SMTP service to deliver verification codes, magic links, orders and emails to producers</li>
+      <li>AI checks, descriptions, translation and email handling take place at <span translate="no">Anthropic</span> (USA)</li>
+      <li>Email is sent and received via <span translate="no">Resend</span> (USA) — verification codes, magic links, orders and emails to producers — and emails to us are read in <span translate="no">Gmail</span> (<span translate="no">Google</span>, USA)</li>
       <li>If image scanning is enabled, images may be sent to <span translate="no">Anthropic</span> (USA) or <span translate="no">OpenAI</span> (USA) for analysis</li>
     </ul>
     <p>The source code is open and available on <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
@@ -3047,17 +3048,18 @@ router.get("/personvern", (req: Request, res: Response) => {
     <table class="pv-table">
       <thead><tr><th>Data type</th><th>Retention</th></tr></thead>
       <tbody>
-        <tr><td>Page-visit analytics</td><td>Individual page visits (with the anonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per page, which contain no IP hash or other link to a visitor and are kept.</td></tr>
-        <tr><td>Search logs</td><td>Individual searches (with the anonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per search text, without any link to who searched, and those counts are kept.</td></tr>
+        <tr><td>Page-visit analytics</td><td>Individual page visits (with the pseudonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per page, which contain no IP hash or other link to a visitor and are kept.</td></tr>
+        <tr><td>Search logs</td><td>Individual searches (with the pseudonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per search text, without any link to who searched, and those counts are kept.</td></tr>
         <tr><td>Verification codes</td><td>Unverified claims expire after 7 days.</td></tr>
         <tr><td>Magic links</td><td>Expire after 15 minutes. Used links older than 1 hour are auto-deleted.</td></tr>
         <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
-        <tr><td>Producer profile</td><td>For as long as the business is active and the profile is relevant to the catalogue, or until you ask us to remove it.</td></tr>
+        <tr><td>Producer profile</td><td>For as long as the profile is relevant to the catalogue. Profiles of businesses that have closed down or were registered by mistake are hidden, but stay in the database. If you ask us to remove the profile, we delete it.</td></tr>
         <tr><td>Uploaded images</td><td>Stored until manually deleted.</td></tr>
         <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
         <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
-        <tr><td>Database backups</td><td>Daily copies are kept for 7 days, and one copy per week for 4 more weeks. Deleted information can therefore remain in a backup for up to about 5 weeks.</td></tr>
+        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, with no fixed time limit. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
+        <tr><td>Email correspondence and send log</td><td>No automatic deletion today. We delete it on request.</td></tr>
         <tr><td>Do-not-re-add list</td><td>For as long as the service exists, so a removed profile is not created again.</td></tr>
       </tbody>
     </table>
@@ -3067,8 +3069,8 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li><strong>Request access</strong> \u2014 we can tell you what we have stored about you</li>
       <li><strong>Correct errors</strong> \u2014 sellers can update their profile directly via the dashboard, and anyone else can contact us</li>
-      <li><strong>Delete data</strong> \u2014 contact us, or reply \u201cfjern\u201d to an email from us, to have your profile and associated data removed</li>
-      <li><strong>Object</strong> \u2014 you can object at any time to us showing a profile about you or your business. We then remove it</li>
+      <li><strong>Delete data</strong> \u2014 contact us, or reply \u201cfjern\u201d to an email from us, to have your profile removed. Tell us if you also want the email correspondence with us deleted</li>
+      <li><strong>Object</strong> \u2014 you can object at any time to us showing a profile about you or your business, or to us emailing you about it. We then remove the profile or stop emailing you</li>
       <li><strong>Withdraw consent</strong> \u2014 for information you added yourself or agreed to, you can withdraw your consent at any time</li>
       <li><strong>File a complaint</strong> \u2014 you can complain to <span translate="no">Datatilsynet</span> (the Norwegian Data Protection Authority, datatilsynet.no) if you believe we are breaking the rules</li>
     </ul>
@@ -3107,7 +3109,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li>Hvilken side du besøker (URL-sti)</li>
       <li>Referanse-URL (hvor du kom fra)</li>
-      <li>En anonymisert, saltet hash av IP-adressen din (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse) og en separat hash av nettlesertypen din</li>
+      <li>En pseudonymisert, saltet hash av IP-adressen din (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse) og en separat hash av nettlesertypen din</li>
       <li>For besøkende mennesker en grov enhetskategori (mobil / nettbrett / PC) \u2014 aldri din fullstendige, rå nettleser-streng. Automatiserte verktøy og roboter (f.eks. GPTBot, Googlebot) identifiseres i stedet med sitt eget selvangitte, ikke-personlige klientnavn, slik at vi kan se hvilke roboter og AI-crawlere som besøker siden</li>
       <li>Tidspunkt for besøket</li>
     </ul>
@@ -3120,7 +3122,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Valgt kategori og by</li>
       <li>Antall resultater returnert</li>
       <li>Hvilken protokoll som ble brukt (API, MCP, A2A)</li>
-      <li>Anonymisert IP-hash (samme metode som for sidebesøk)</li>
+      <li>Pseudonymisert IP-hash (samme metode som for sidebesøk)</li>
     </ul>
     <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
 
@@ -3130,7 +3132,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Verktøyet <code>lokal_geocode</code> (stedsnavn → koordinater) sender søketeksten din videre til Kartverkets offentlige geokodings-API (ws.geonorge.no) for oppslag.</p>
 
     <h3>Produsentprofiler vi oppretter</h3>
-    <p>De fleste profilene i katalogen har vi laget uten at produsenten har meldt seg på. De bygger på opplysninger som allerede er offentlige, blant annet fra Brønnøysundregistrene, Debio, Google Places og produsentens eget nettsted eller offisielle Facebook-side (se <a href="${localizedPath("/proveniens", lang)}" style="color:var(--green-700);">slik verifiserer vi dataene våre</a>). For hver profil lagrer vi blant annet:</p>
+    <p>De fleste profilene i katalogen har vi laget uten at produsenten har meldt seg på. De bygger på opplysninger som allerede er offentlige, blant annet fra Brønnøysundregistrene, Debio, Google Places, kataloger over lokalmat og gårdsutsalg, nettsøk og produsentens eget nettsted eller offisielle Facebook-side (se <a href="${localizedPath("/proveniens", lang)}" style="color:var(--green-700);">slik verifiserer vi dataene våre</a>). For hver profil lagrer vi blant annet:</p>
     <ul>
       <li>Navnet på gården eller virksomheten, organisasjonsnummer og adresse</li>
       <li>Telefon, e-post og nettsted som er publisert for virksomheten</li>
@@ -3138,7 +3140,7 @@ router.get("/personvern", (req: Request, res: Response) => {
       <li>Hvilken kilde hvert felt kom fra, og når det sist ble kontrollert</li>
     </ul>
     <p>Er produsenten et enkeltpersonforetak, kan noen av opplysningene også være personopplysninger om innehaveren, for eksempel når virksomheten har innehaverens navn eller adresse. Profilen er offentlig og kan hentes av KI-assistenter og andre tjenester (se «Hvem som får opplysningene»).</p>
-    <p>Vi kan sende e-post til den offentlige e-postadressen på profilen for å fortelle at profilen finnes, og hvordan den kan bekreftes eller rettes. Svarer du «fjern» på e-posten, sletter vi profilen. Når en profil fjernes etter ønske, beholder vi noen få kjennetegn (nettstedsdomene, e-postadresse, navn og organisasjonsnummer) i en sperreliste, slik at profilen ikke opprettes på nytt.</p>
+    <p>Vi kan sende e-post til den offentlige e-postadressen på profilen for å fortelle at profilen finnes, og hvordan den kan bekreftes eller rettes. Svarer du «fjern» på e-posten, sletter vi profilen. E-postene vi har sendt deg og svarene dine (e-postadresse, navn og innhold) lagres i kundeservicesystemet vårt og i en utsendingslogg. De slettes ikke automatisk når profilen fjernes, men du kan be om at også de slettes. Når en profil fjernes etter ønske, beholder vi noen kjennetegn i en sperreliste \u2014 for eksempel nettstedsdomene, e-postadresse og navn \u2014 slik at profilen ikke opprettes på nytt.</p>
 
     <h3>Selgere som registrerer seg (claim)</h3>
     <p>Når du som ${getConfig().domain_dictionary.entity} registrerer deg for å administrere din profil, samler vi inn:</p>
@@ -3156,7 +3158,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
 
     <h3>Kontroll og oversettelse med KI</h3>
-    <p>Vi bruker KI-tjenester fra Anthropic (Claude) til å finne og kontrollere offentlige opplysninger om produsenter \u2014 for eksempel om et nettsted eller et registertreff hører til riktig virksomhet \u2014 og til å oversette profiltekst til engelsk og svensk. Da kan profilopplysninger og tekst fra offentlige nettsider behandles hos Anthropic i USA. En vurdering fra KI regnes aldri alene som bekreftelse av et felt.</p>
+    <p>Vi bruker KI-tjenester fra Anthropic (Claude) til å finne og kontrollere offentlige opplysninger om produsenter \u2014 for eksempel om et nettsted eller et registertreff hører til riktig virksomhet \u2014 til å skrive korte beskrivelser av produsenter ut fra deres egne nettsider, og til å oversette profiltekst til engelsk og svensk. Claude hjelper oss også med å lese og besvare e-post som sendes til oss. Da kan profilopplysninger, tekst fra offentlige nettsider og innholdet i e-poster behandles hos Anthropic i USA. En vurdering fra KI regnes aldri alene som bekreftelse av et felt.</p>
 
     <h3>Samtaler mellom agenter</h3>
     <p>${brand} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
@@ -3178,7 +3180,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li><strong>Alle som bruker tjenesten.</strong> Produsentprofilene er offentlige. De vises på nettsiden og kan hentes av KI-assistenter og andre tjenester via MCP, A2A og API-et, for eksempel ChatGPT og Claude. Hva disse tjenestene gjør videre med opplysningene, styres av deres egne vilkår.</li>
       <li><strong>Produsenter du bestiller fra.</strong> Kontaktinfoen din i en bestilling går bare til produsenter du har samtykket til (se «Handlekurv, bestilling og kjøpertoken»).</li>
-      <li><strong>Leverandører som behandler data på våre vegne:</strong> Fly.io (drift av serveren), Tigris (sikkerhetskopier av databasen, levert via Fly.io), Anthropic (kontroll og oversettelse med KI, og bildeskanning), OpenAI (bildeskanning) og en e-posttjeneste (SMTP).</li>
+      <li><strong>Leverandører vi bruker:</strong> Fly.io (drift av serveren), Tigris (sikkerhetskopier av databasen, levert via Fly.io), Anthropic (KI-kontroll, beskrivelser, oversettelse, e-posthåndtering og bildeskanning), OpenAI (bildeskanning), Resend (sending og mottak av e-post) og Google (Gmail, der e-post til oss leses).</li>
       <li><strong>Kartverket</strong> får søketeksten når verktøyet <code>lokal_geocode</code> brukes.</li>
     </ul>
 
@@ -3188,8 +3190,9 @@ router.get("/personvern", (req: Request, res: Response) => {
       <thead><tr><th>Datatype</th><th>Grunnlag</th><th>Forklaring</th></tr></thead>
       <tbody>
         <tr><td>Analytikk (sidebesøk, søk)</td><td>Berettiget interesse</td><td>For å forbedre tjenesten. IP-adresser lagres bare som saltet hash (pseudonymisert).</td></tr>
-        <tr><td>Produsentprofiler fra offentlige kilder</td><td>Berettiget interesse</td><td>Å gi forbrukere og KI-assistenter en oppdatert oversikt over lokale matprodusenter. Vi bruker bare opplysninger som allerede er offentlige, og du kan når som helst protestere (se «Dine rettigheter»).</td></tr>
+        <tr><td>Produsentprofiler fra offentlige kilder</td><td>Berettiget interesse</td><td>Å gi forbrukere og KI-assistenter en oppdatert oversikt over lokale matprodusenter. Profilen bygger på opplysninger som allerede er offentlige, og du kan når som helst protestere (se «Dine rettigheter»).</td></tr>
         <tr><td>E-post til produsenter om profilen</td><td>Berettiget interesse</td><td>Å fortelle at profilen finnes, og gi mulighet til å bekrefte, rette eller fjerne den.</td></tr>
+        <tr><td>E-post du sender oss</td><td>Berettiget interesse</td><td>Å lese, svare på og følge opp henvendelsen.</td></tr>
         <tr><td>Kontroll og oversettelse med KI</td><td>Berettiget interesse</td><td>Riktige opplysninger om riktig virksomhet, og profiler på flere språk.</td></tr>
         <tr><td>Sikkerhetskopier</td><td>Berettiget interesse</td><td>Å kunne gjenopprette tjenesten etter feil eller tap av data.</td></tr>
         <tr><td>Sperreliste etter fjerning</td><td>Berettiget interesse</td><td>Å respektere ønsket ditt om ikke å bli lagt inn igjen.</td></tr>
@@ -3204,8 +3207,8 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Databasen ligger på en server hos Fly.io i Stockholm-regionen (ARN). Fly.io er et amerikansk selskap. Opplysninger kan også behandles utenfor EU/EØS i disse tilfellene:</p>
     <ul>
       <li>Sikkerhetskopier av databasen lagres hos lagringstjenesten Tigris, levert via Fly.io. Tigris er et amerikansk selskap</li>
-      <li>Kontroll og oversettelse med KI skjer hos Anthropic (USA)</li>
-      <li>E-post sendes via en SMTP-tjeneste for å levere verifiseringskoder, magiske lenker, bestillinger og e-post til produsenter</li>
+      <li>KI-kontroll, beskrivelser, oversettelse og e-posthåndtering skjer hos Anthropic (USA)</li>
+      <li>E-post sendes og mottas via Resend (USA) \u2014 verifiseringskoder, magiske lenker, bestillinger og e-post til produsenter \u2014 og e-post til oss leses i Gmail (Google, USA)</li>
       <li>Hvis bildeskanning er aktivert, kan bilder sendes til Anthropic (USA) eller OpenAI (USA) for analyse</li>
     </ul>
     <p>Kildekoden er åpen og tilgjengelig på <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
@@ -3214,17 +3217,18 @@ router.get("/personvern", (req: Request, res: Response) => {
     <table class="pv-table">
       <thead><tr><th>Datatype</th><th>Oppbevaring</th></tr></thead>
       <tbody>
-        <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med anonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per side, uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
-        <tr><td>Søkelogger</td><td>Enkeltsøk (med anonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per søketekst, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
+        <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per side, uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
+        <tr><td>Søkelogger</td><td>Enkeltsøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per søketekst, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
         <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
         <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
-        <tr><td>Produsentprofil</td><td>Så lenge virksomheten er aktiv og profilen er relevant for katalogen, eller til du ber oss fjerne den.</td></tr>
+        <tr><td>Produsentprofil</td><td>Så lenge profilen er relevant for katalogen. Profiler for nedlagte eller feilregistrerte virksomheter skjules, men blir liggende i databasen. Ber du oss fjerne profilen, sletter vi den.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
         <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Ingen daglige tall beholdes fra denne loggen.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
-        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier beholdes i 7 dager, og én kopi per uke i 4 uker til. En slettet opplysning kan derfor ligge i en sikkerhetskopi i inntil ca. 5 uker.</td></tr>
+        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+        <tr><td>E-postkorrespondanse og utsendingslogg</td><td>Ingen automatisk sletting i dag. Vi sletter på forespørsel.</td></tr>
         <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt.</td></tr>
       </tbody>
     </table>
@@ -3234,8 +3238,8 @@ router.get("/personvern", (req: Request, res: Response) => {
     <ul>
       <li><strong>Be om innsyn</strong> \u2014 vi kan fortelle deg hva vi har lagret om deg</li>
       <li><strong>Rette feil</strong> \u2014 selgere kan oppdatere profilen sin direkte via dashboardet, og alle andre kan kontakte oss</li>
-      <li><strong>Slette data</strong> \u2014 kontakt oss, eller svar «fjern» på en e-post fra oss, for å få fjernet profilen og tilknyttet data</li>
-      <li><strong>Protestere</strong> \u2014 du kan når som helst protestere mot at vi viser en profil om deg eller virksomheten din. Da fjerner vi den</li>
+      <li><strong>Slette data</strong> \u2014 kontakt oss, eller svar «fjern» på en e-post fra oss, for å få fjernet profilen. Si fra hvis du også vil ha slettet e-postkorrespondansen med oss</li>
+      <li><strong>Protestere</strong> \u2014 du kan når som helst protestere mot at vi viser en profil om deg eller virksomheten din, eller mot at vi sender deg e-post om den. Da fjerner vi profilen eller slutter å sende e-post</li>
       <li><strong>Trekke tilbake samtykke</strong> \u2014 for opplysninger du selv har lagt inn eller samtykket til, kan du når som helst trekke samtykket tilbake</li>
       <li><strong>Klage</strong> \u2014 du kan klage til Datatilsynet (datatilsynet.no) hvis du mener vi bryter reglene</li>
     </ul>
