@@ -408,7 +408,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
 
       expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfisksmaking med omvisning", category: "mat_drikke", season: ["all_year"] });
       expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfiskmuseum", category: "kultur_historie", season: ["all_year"] });
-      for (const query of ["Buy tickets for a stockfish tasting tour", "Buy a stockfish tasting tour", "Kjøpe billett til tørrfisksmaking", "Cooking classes with stockfish"]) {
+      for (const query of ["Buy tickets for a stockfish tasting tour", "Buy a stockfish tasting tour", "Kjøpe billett til tørrfisksmaking", "Cooking classes with stockfish", "Buy a cooking class with stockfish", "Buy a stockfish cooking class"]) {
         const allowed = (await rpc("tools/call", { name: "discover_experiences", arguments: { query, category: "mat_drikke", fylke: "Nordland" } })).result?.structuredContent;
         assertTrue(!allowed?.out_of_scope && allowed?.experiences?.some((e: any) => e.title === "Tørrfisksmaking med omvisning"),
           `j5: legitimate food experience is still discoverable: ${query}`);
