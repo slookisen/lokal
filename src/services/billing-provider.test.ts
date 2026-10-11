@@ -71,6 +71,8 @@ export function runBillingProviderTests(opts: { log?: boolean } = {}): TestSumma
   // ── isLiveStripeKey ────────────────────────────────────────────────
   assertEq(isLiveStripeKey(FAKE_LIVE_KEY), true, "isLiveStripeKey: sk_live_ prefix -> true");
   assertEq(isLiveStripeKey(FAKE_TEST_KEY), false, "isLiveStripeKey: sk_test_ prefix -> false");
+  assertEq(isLiveStripeKey("rk_" + "live_" + "FAKE".repeat(6)), true, "isLiveStripeKey: restricted rk_live_ prefix -> true (shared STRIPE_SECRET_KEY with payments)");
+  assertEq(isLiveStripeKey("rk_" + "test_" + "FAKE".repeat(6)), false, "isLiveStripeKey: rk_test_ prefix -> false");
   assertEq(isLiveStripeKey(""), false, "isLiveStripeKey: empty string -> false");
   assertEq(isLiveStripeKey(undefined), false, "isLiveStripeKey: undefined -> false");
   assertEq(isLiveStripeKey(null), false, "isLiveStripeKey: null -> false");

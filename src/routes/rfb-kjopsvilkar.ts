@@ -39,6 +39,9 @@ import { companyOperatorSentence } from "../services/company-legal";
 export const KJOPSVILKAR_PATH = "/kjopsvilkar";
 export const KJOPSVILKAR_LAST_UPDATED = { no: "10. oktober 2026", en: "10 October 2026" } as const;
 
+/** See config/payments-terms.ts — flip it together with §4 below. */
+export { KJOPSVILKAR_PREPAYMENT_LIVE } from "../config/payments-terms";
+
 const FORBRUKERTILSYNET_URL = "https://www.forbrukertilsynet.no";
 const FORBRUKERRADET_URL = "https://www.forbrukerradet.no";
 const MATTILSYNET_URL = "https://www.mattilsynet.no";
