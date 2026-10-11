@@ -27039,9 +27039,24 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 const WCR_DEFAULT_SAMPLE_SIZE = 30;
 const WCR_MAX_SAMPLE_SIZE = 100;
 const WCR_THRESHOLD = 0.02;
+// dev-request 2026-10-06-kvalitetsmaling-stikkprove-og-wcr: the sequential
+// fetch+judge loop has no natural upper bound (≤100 rows × fetch timeout +
+// one LLM call), and the W41 holdout got a 502 from the proxy in front of it.
+// The loop now checks a wall-clock deadline BEFORE each row and, once hit,
+// returns the aggregates over the rows already judged with `partial: true`.
+// A single in-flight row can still overrun by one fetch+judge. No job_id/async
+// variant (that would be L4).
+const WCR_DEFAULT_DEADLINE_MS = 25_000;
+const WCR_MIN_DEADLINE_MS = 1_000;
 
 router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { sample_size?: unknown };
+  const body = (req.body ?? {}) as { sample_size?: unknown; deadline_ms?: unknown };
+  const startedAtMs = Date.now();
+  // Optional shorter deadline (tests / callers behind tighter proxies); never longer than the default.
+  const deadlineMs =
+    typeof body.deadline_ms === "number" && Number.isFinite(body.deadline_ms)
+      ? Math.min(WCR_DEFAULT_DEADLINE_MS, Math.max(WCR_MIN_DEADLINE_MS, Math.floor(body.deadline_ms)))
+      : WCR_DEFAULT_DEADLINE_MS;
 
   let requestedSampleSize =
     typeof body.sample_size === "number" && Number.isFinite(body.sample_size)
@@ -27118,7 +27133,14 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
       reason?: string;
     }> = [];
 
+    let processed = 0;
+    let partial = false;
     for (const row of rows) {
+      if (Date.now() - startedAtMs >= deadlineMs) {
+        partial = true;
+        break;
+      }
+      processed++;
       const isPublished = publishedCheckStmt.get(row.id) !== undefined;
       const stratum = strata[isPublished ? 1 : 0]!;
       stratum.sample_size++;
@@ -27213,7 +27235,13 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
     };
 
     res.json({
-      sample_size: rows.length,
+      // Rows actually judged. Equals rows.length (the drawn sample) unless the
+      // deadline cut the run short — then `partial` is true.
+      sample_size: processed,
+      partial,
+      requested_sample_size: rows.length,
+      deadline_ms: deadlineMs,
+      elapsed_ms: Date.now() - startedAtMs,
       matched,
       mismatched,
       unresolved,
