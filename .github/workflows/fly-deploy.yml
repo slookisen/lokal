@@ -122,10 +122,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-
+      # oppstart-statistikk-samtaler). The concurrency group above runs one
+      # deploy at a time but keeps them in arrival order of the BUILD, not of
+      # the commit: on 2026-10-11 three merges within a minute made the
+      # #1015 deploy (older) run right after the #1014 deploy (newer), so prod
+      # went back to a commit without #1014 until main was redeployed by hand.
+      # A push-triggered deploy whose commit is no longer main's head now
+      # skips itself; the deploy of the newer commit is already queued (a
+      # newer pending job replaces an older pending one, never the reverse)
+      # and ships everything. workflow_dispatch always deploys.
+      - name: Skip if a newer commit is already on main
+        id: freshness
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HEAD_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
+            echo "main is at $HEAD_SHA; this run is ${{ github.sha }}. Skipping, so an older build never replaces a newer one."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup flyctl
+        if: steps.freshness.outputs.stale != 'true'
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy
+        if: steps.freshness.outputs.stale != 'true'
         # Pass --build-arg BUILD_REV so the Dockerfile's ARG/LABEL/RUN cache-bust
         # block actually invalidates the COPY src/ layer per commit. Without
         # this, Fly's remote builder reuses the cached layer indefinitely
@@ -135,6 +163,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Smoke test
+        if: steps.freshness.outputs.stale != 'true'
         run: |
           sleep 10
           curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz || \
@@ -149,7 +178,7 @@ jobs:
         # (still recorded — dev mode).
         # Failure of this step does NOT fail the deploy — the deploy already
         # succeeded; this is just observability glue.
-        if: success()
+        if: success() && steps.freshness.outputs.stale != 'true'
         continue-on-error: true
         env:
           TRIGGER_HMAC_SECRET: ${{ secrets.TRIGGER_HMAC_SECRET }}

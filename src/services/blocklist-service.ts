@@ -9,6 +9,7 @@
 // place means a future "block by phone number" or "block by org-no"
 // is a one-line addition.
 
+import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import { FREE_MAIL_DOMAINS } from "./cross-source-validator";
 
@@ -141,6 +142,21 @@ export function normalizeName(input: string | null | undefined): string {
 // True if any of name/website/email matches a row in agent_blocklist.
 // Cheap: SELECT 1 LIMIT 1 against an indexed (type, value) lookup.
 
+// Serverheng skive 6: isBlocked runs once per row in the outreach gates
+// (up to four lookups each). Compiling the statement on every call showed up
+// in the main-thread stalls, so it is prepared once per connection.
+const isBlockedStmtByDb = new WeakMap<object, Database.Statement<[string, string]>>();
+function isBlockedStmt(db: Database.Database): Database.Statement<[string, string]> {
+  let stmt = isBlockedStmtByDb.get(db);
+  if (!stmt) {
+    stmt = db.prepare<[string, string]>(
+      "SELECT identifier_type, identifier_value, linked_org_nr FROM agent_blocklist WHERE identifier_type = ? AND identifier_value = ? LIMIT 1"
+    );
+    isBlockedStmtByDb.set(db, stmt);
+  }
+  return stmt;
+}
+
 export function isBlocked(opts: {
   agentId?: string;
   name?: string;
@@ -170,9 +186,7 @@ export function isBlocked(opts: {
       if (norm) checks.push(["name_normalized", norm]);
     }
     for (const [type, value] of checks) {
-      const hit = db.prepare(
-        "SELECT identifier_type, identifier_value, linked_org_nr FROM agent_blocklist WHERE identifier_type = ? AND identifier_value = ? LIMIT 1"
-      ).get(type, value) as { identifier_type: BlocklistEntry["identifier_type"]; identifier_value: string; linked_org_nr: string | null } | undefined;
+      const hit = isBlockedStmt(db).get(type, value) as { identifier_type: BlocklistEntry["identifier_type"]; identifier_value: string; linked_org_nr: string | null } | undefined;
       if (hit) {
         // Mål 3 disambiguation: a 'name_normalized' row that was recorded
         // against a KNOWN org.nr does not block a candidate we can

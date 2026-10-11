@@ -441,7 +441,11 @@ export function startProfileTranslationsStaleSweep(): NodeJS.Timeout | null {
     }
   });
   const timer = setInterval(run, STALE_SWEEP_INTERVAL_MS);
-  setTimeout(run, 30_000);
+  // Serverheng skive 6: the first sweep used to run 30 s after boot, inside
+  // the boot window where it stalled the event loop for 1.6–2.9 s on top of
+  // the first requests. The 15-minute interval covers it anyway; 12 minutes
+  // keeps the first run clear of the boot window.
+  setTimeout(run, 12 * 60_000).unref();
   return timer;
 }
 

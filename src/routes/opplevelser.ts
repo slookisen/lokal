@@ -17803,7 +17803,16 @@ const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
 export function computeGardssalgOutreachPreflight(
   expDb: Database.Database,
   providerIds: string[],
-  opts?: { skipRecipientDedupe?: boolean },
+  opts?: {
+    skipRecipientDedupe?: boolean;
+    // Serverheng skive 6: a caller that has just computed the FULL readiness
+    // corpus in the same synchronous pass (computeGardssalgOutreachDailyPrep)
+    // passes it here, so the corpus-wide conflict scan inside
+    // computeGardssalgReadinessRows does not run a second time. Rows are
+    // computed per row against the same unfiltered conflict scan whether or
+    // not ids are passed, so the subset is identical to a filtered call.
+    readinessRows?: ReturnType<typeof computeGardssalgReadinessRows>;
+  },
 ): {
   results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }>;
   summary: { go: number; no_go: number; total: number };
@@ -17819,7 +17828,9 @@ export function computeGardssalgOutreachPreflight(
     }
   }
 
-  const rows = computeGardssalgReadinessRows(expDb, orderedIds);
+  const rows = opts?.readinessRows
+    ? opts.readinessRows.filter((r) => seen.has(r.id))
+    : computeGardssalgReadinessRows(expDb, orderedIds);
   const byId = new Map(rows.map((r) => [r.id, r]));
 
   const results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }> =
@@ -18058,7 +18069,7 @@ export const GARDSSALG_OUTREACH_MAX_TOUCHES = 2;
 export function computeGardssalgOutreachSendEligibility(
   expDb: Database.Database,
   providerIds: string[],
-  opts?: { skipRecipientDedupe?: boolean },
+  opts?: { skipRecipientDedupe?: boolean; readinessRows?: ReturnType<typeof computeGardssalgReadinessRows> },
 ): GardssalgOutreachEligibility[] {
   // Single preflight pass, reused per-provider below — same tiering
   // logic/outcome as POST /admin/gardssalg-outreach-preflight, folding in
@@ -19578,7 +19589,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     // cross-candidate batch dedup is deferred. The same-recipient dedup
     // itself now runs further below, AFTER Skive 3, over `afterSkive3` only
     // (see that block's own comment).
-    eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true });
+    eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true, readinessRows: rows });
   } catch (err) {
     throw new GardssalgOutreachDailyPrepError("eligibility", err);
   }

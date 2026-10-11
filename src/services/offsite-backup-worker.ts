@@ -12,6 +12,13 @@
 //                   throwaway file the caller deletes afterwards.
 import { parentPort, workerData } from "worker_threads";
 import Database from "better-sqlite3";
+import { lowerCurrentThreadPriority } from "./thread-priority";
+
+// Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-
+// samtaler): on one vCPU this thread competes with the main thread; the stall log showed request
+// handlers slowing to 4–5 s during the 04:04Z backup and the 04:11Z restore test. A lower
+// thread priority keeps request handling ahead (Linux nice is per thread).
+lowerCurrentThreadPriority();
 
 const { op, dbPath, destPath } = workerData as { op: "backup" | "integrity"; dbPath: string; destPath?: string };
 

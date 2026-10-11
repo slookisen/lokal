@@ -10,6 +10,7 @@ import {
   SessionCategory,
   SessionVelocity,
 } from "./traffic-classifier";
+import { readSessionVelocity } from "./agent-stats-compute";
 import {
   computeAdminSummary,
   computePageViewCount,
@@ -329,20 +330,10 @@ export function getSessionVelocity(
   anchorMs: number,
   mode: "trailing" | "centered"
 ): SessionVelocity | null {
+  // The query lives in agent-stats-compute.ts (readSessionVelocity) so the
+  // off-thread stats worker can run it on its own connection.
   try {
-    const span = (ms: number): [string, string] => mode === "trailing"
-      ? [sqliteDatetime(new Date(anchorMs - ms)), sqliteDatetime(new Date(anchorMs))]
-      : [sqliteDatetime(new Date(anchorMs - ms / 2)), sqliteDatetime(new Date(anchorMs + ms / 2))];
-    const [from10, to10] = span(10 * 60 * 1000);
-    const [fromHour, toHour] = span(60 * 60 * 1000);
-    const row = getDb().prepare(`
-      SELECT
-        COUNT(DISTINCT CASE WHEN created_at >= ? AND created_at <= ? THEN path END) AS u10,
-        COUNT(DISTINCT CASE WHEN path LIKE '%/produsent/%' THEN path END) AS p60
-      FROM analytics_page_views
-      WHERE created_at >= ? AND created_at <= ? AND session_id = ?
-    `).get(from10, to10, fromHour, toHour, sessionId) as { u10: number; p60: number } | undefined;
-    return { uniquePagesIn10Min: row?.u10 ?? 0, produsentPagesInHour: row?.p60 ?? 0 };
+    return readSessionVelocity(getDb(), sessionId, anchorMs, mode);
   } catch (err) {
     console.error("[analytics] Failed to read session velocity:", err);
     return null;

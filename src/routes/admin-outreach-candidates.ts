@@ -52,7 +52,7 @@ import { countRecipientAddressTypes, isColdRecipientAllowed } from "../services/
 import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
 import {
   getOutreachMaxTouchVernConfig,
-  getMaxTouchStatusForEmail,
+  createMaxTouchStatusLookup,
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_ENABLED,
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
 } from "../services/outreach-max-touch-vern";
@@ -760,6 +760,7 @@ export function computeOutreachCandidates(
             note: null,
             is_default: true,
           };
+    let maxTouchLookup: ReturnType<typeof createMaxTouchStatusLookup> | null = null;
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -821,8 +822,10 @@ export function computeOutreachCandidates(
       // dev-request 2026-08-29-outreach-max-touch-vern — address-based, so
       // only computed where it can ever fire (mode=second; mode=first is
       // guaranteed 0 prior sends, see the comment on maxTouchConfig above).
-      const maxTouchStatus =
-        mode === "second" ? getMaxTouchStatusForEmail(db, row.email, maxTouchConfig) : null;
+      // Serverheng skive 6: one batched read per call instead of two full
+      // scans per row (createMaxTouchStatusLookup, identical results).
+      if (mode === "second" && !maxTouchLookup) maxTouchLookup = createMaxTouchStatusLookup(db, maxTouchConfig);
+      const maxTouchStatus = mode === "second" && maxTouchLookup ? maxTouchLookup(row.email) : null;
       const suppressedForMaxTouch = maxTouchStatus?.suppressed ?? false;
       if (suppressedForMaxTouch && maxTouchStatus) {
         maxTouchSuppressedList.push({
