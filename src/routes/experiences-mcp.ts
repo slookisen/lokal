@@ -259,7 +259,8 @@ export const DiscoverExperiencesInputSchema = {
   query: z.string().optional().describe(
     "The user's request in a few words, including any place they named — e.g. 'safari lodge in Kenya', " +
     "'northern lights in Tromsø'. Opplevagent only covers Norway: when this names a place outside Norway and " +
-    "no Norwegian fylke/kommune or coordinates are given, the tool returns no experiences and says so."
+    "no Norwegian fylke/kommune or coordinates are given, the tool returns no experiences and says so. " +
+    "Include the purchase intent too: buying stockfish is food retail, not an experience search."
   ),
   fylke: z.string().optional().describe(
     "Norwegian county (fylke). Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
@@ -395,6 +396,9 @@ export const OPPLEVAGENT_MCP_INSTRUCTIONS =
   "When the user asks about a place outside Norway, say that Opplevagent only covers Norway; do not present " +
   "Norwegian experiences as an answer unless the user asks for Norway. Pass the user's request, with any place " +
   "they named, in discover_experiences' `query`. " +
+  "Food-product shopping, such as buying stockfish, belongs to Rett fra Bonden, not experience discovery. " +
+  "If discovery returns out_of_scope, explain that limit and do not retry without the purchase request. " +
+  "Food tours, tastings, museums and experience tickets remain supported. " +
   "Opplevagent never takes payment: experiences are booked and paid with the provider, and a gårdssalg visit is " +
   "paid on arrival. It cannot confirm a booking: book_gardssalg sends a visit request that stays pending until " +
   "the producer answers by e-mail.";
@@ -427,6 +431,34 @@ function outsideNorwayResult(rawPlace: string, listKey: "experiences" | "gardssa
     ...(listKey === "experiences" ? { structuredContent: result } : {}),
     content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
   };
+}
+
+/** Refuse the observed retail request without excluding food experiences. */
+function isStockfishPurchase(query: string | undefined): boolean {
+  if (!query) return false;
+  const request = query.normalize("NFKC").toLowerCase().replace(/ø/g, "o");
+  if (!/\b(?:stock[ -]?fish|torrfisk)\b/.test(request)) return false;
+  // Buying the food itself takes precedence over incidental museum/tour words.
+  if (/\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:some|fresh|dried|local|the|litt|fersk|lokal)\s+)*(?:stock[ -]?fish|torrfisk)\b(?!\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?))/i.test(request)) return true;
+  // Only an actual experience object qualifies, not a museum/tour mentioned elsewhere.
+  if (/\b(?:stock[ -]?fish|torrfisk)\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?)\b|\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:a|an|the|some|en|et)\s+)?(?:tickets?|tours?|tastings?|workshops?|experiences?|cooking\s+class(?:es)?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b/.test(request)) return false;
+  return /\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille|shops?|stores?|sellers?|butikker?|utsalg)\b/.test(request);
+}
+
+function stockfishPurchaseResult(filter: object) {
+  const result = {
+    summary:
+      "Opplevagent finner opplevelser og gårdssalg med drikke, ikke utsalg for kjøp av tørrfisk. " +
+      "Bruk Rett fra Bonden for matprodusenter. Ingen opplevelser foreslås. Ikke søk på nytt uten kjøpsønsket. / " +
+      "Opplevagent covers experiences and farm-sale drink producers, not buying stockfish. " +
+      "Use Rett fra Bonden for food producers. No experiences are suggested. Do not retry without the purchase request.",
+    count: 0,
+    out_of_scope: true,
+    scope_reason: "food_product_purchase",
+    filter_applied: filter,
+    experiences: [],
+  };
+  return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
 }
 
 // Words a model adds to a discover_gardssalg query that describe the whole
@@ -649,6 +681,8 @@ export function registerExperienceTools(
         "Only verified experiences from active providers (Brreg-checked) are returned. " +
         "Covers Norway only: pass the user's request in `query`; for a place outside Norway (e.g. Kenya) the tool " +
         "returns no experiences, and the answer is that Opplevagent only covers Norway. " +
+        "Not for food-product shopping such as buying stockfish: use Rett fra Bonden. " +
+        "Pass that intent in query; an out_of_scope response must not be retried as a general discovery search. " +
         "Examples: 'hva kan vi finne på i Troms om vinteren?' (fylke='Troms', season='winter'), " +
         "'wildlife experiences' (category='dyreliv_safari'), 'outdoor activities in Oslo for 4 people', " +
         "'experiences within 50km of lat 69.65 / lng 18.95'.",
@@ -701,6 +735,7 @@ export function registerExperienceTools(
         const queryText = typeof query === "string" ? query.slice(0, 300) : undefined;
         const foreign = outsideNorwayPlace({ fylke, kommune, lat, lng, query: placeGiven ? undefined : queryText });
         if (foreign) return outsideNorwayResult(foreign, "experiences", filter);
+        if (isStockfishPurchase(queryText)) return stockfishPurchaseResult(filter);
 
         // A category that is not a real slug even after normalisation used to
         // be relaxed away like an over-narrow filter, so the caller silently
