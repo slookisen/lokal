@@ -15,9 +15,11 @@
  */
 
 import { Request, Response, NextFunction } from "express";
-import { safeHonestCatalogCount } from "../services/honest-count";
+import { catalogVerticalForHost, safeHonestCatalogCount, type CatalogVertical } from "../services/honest-count";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+const OPPLEVAGENT_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
+const DENTAL_BASE_URL = (process.env.DENTAL_BASE_URL || "https://finn-tannlege.com").replace(/\/$/, "");
 
 // The honest catalog count (same as llms.txt and the front page), read at
 // request time so the markdown responses don't drift away from the DB. The
@@ -42,8 +44,26 @@ const DISCOVERY_LINKS = [
   `<${BASE_URL}/teknologi>; rel="service-doc"; type="text/html"`,
 ].join(", ");
 
-export function linkHeaders(_req: Request, res: Response, next: NextFunction) {
-  res.setHeader("Link", DISCOVERY_LINKS);
+// Both middlewares are mounted app-wide, ahead of the Opplevagent and
+// Finn-tannlege routers. Those hosts serve their own agent card, MCP server
+// card and sitemap (not the skills index, api-catalog or openapi.yaml), so they
+// point at those instead of at Rett fra Bonden's.
+function ownDiscoveryLinks(origin: string): string {
+  return [
+    `<${origin}/.well-known/agent-card.json>; rel="https://a2a.ai/spec/agent-card"; type="application/json"`,
+    `<${origin}/.well-known/mcp/server-card.json>; rel="https://modelcontextprotocol.io/spec/server-card"; type="application/json"`,
+    `<${origin}/sitemap.xml>; rel="sitemap"; type="application/xml"`,
+  ].join(", ");
+}
+
+const LINKS_BY_VERTICAL: Record<CatalogVertical, string> = {
+  rfb: DISCOVERY_LINKS,
+  experiences: ownDiscoveryLinks(OPPLEVAGENT_BASE_URL),
+  dental: ownDiscoveryLinks(DENTAL_BASE_URL),
+};
+
+export function linkHeaders(req: Request, res: Response, next: NextFunction) {
+  res.setHeader("Link", LINKS_BY_VERTICAL[catalogVerticalForHost(req.hostname)]);
   next();
 }
 
@@ -68,6 +88,8 @@ export function markdownNegotiation(req: Request, res: Response, next: NextFunct
   // Only act on GET, only on paths we have markdown for, and only when
   // the client explicitly asked for markdown. Never hijack a browser.
   if (req.method !== "GET") return next();
+  // The markdown below describes Rett fra Bonden; other hosts get their own HTML.
+  if (catalogVerticalForHost(req.hostname) !== "rfb") return next();
 
   const wantsMarkdown =
     queryFormat === "md" ||
