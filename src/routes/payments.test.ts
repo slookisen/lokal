@@ -382,10 +382,16 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     r = await req("POST", WH, { raw: w.raw, headers: { "Stripe-Signature": w.sig } });
     ok(r.status === 200 && r.body?.duplicate === false, "wh-20: retry of the same event → applied");
 
+    // A disconnection is recorded even when the configured key is in the
+    // other mode (signed, no Stripe call needed) — here: a live row, test key.
+    db.prepare(`INSERT INTO payment_accounts (id, agent_id, livemode, stripe_account_id, charges_enabled) VALUES ('pa-live-b', 'pay-b', 1, 'acct_live_b', 1)`).run();
+    w = await send("account.application.deauthorized", "acct_live_b", { id: "ca_live", object: "application" }, { livemode: true });
+    ok(w.body?.handled === true && !!rowByAcct("acct_live_b").deauthorized_at && rowByAcct("acct_live_b").charges_enabled === 0, "wh-20b: live disconnection recorded while running a test key");
+
     // Disconnection is sticky.
     w = await send("account.application.deauthorized", "acct_fake_1", { id: "ca_x", object: "application" });
     ok(w.body?.handled === true && rowByAcct("acct_fake_1").charges_enabled === 0 && !!rowByAcct("acct_fake_1").deauthorized_at, "wh-21: producer disconnects → prepayment off");
-    eq(eventCount("account_deauthorized"), 1, "wh-22: disconnection logged");
+    eq(eventCount("account_deauthorized"), 2, "wh-22: disconnection logged (live row above + this one)");
     w = await send("account.updated", "acct_fake_1", { id: "acct_fake_1", charges_enabled: true });
     ok(rowByAcct("acct_fake_1").charges_enabled === 0 && !svc.canProducerTakePrepayment(db, "pay-a"), "wh-23: late account.updated after disconnection → still off");
     r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
@@ -452,7 +458,7 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     ok(!r.text.includes(FAKE_SECRET) && !r.text.includes(FAKE_TEST_KEY), "adm-04: no secret or key in the output");
     r = await req("GET", "/admin/payments/accounts", { headers: { "X-Admin-Key": "pay-admin-key" } });
     const rows = r.body?.accounts || [];
-    ok(r.status === 200 && rows.length === 4 && rows.some((x: any) => x.agent_id === "pay-a" && x.agent_name === "Gard Alfa"), "adm-05: accounts list (history included)");
+    ok(r.status === 200 && rows.length === 5 && rows.some((x: any) => x.agent_id === "pay-a" && x.agent_name === "Gard Alfa"), "adm-05: accounts list (history included)");
     ok(!r.text.includes("alfa@example.no"), "adm-06: no producer e-mail in the admin list");
     r = await req("GET", "/admin/payments/accounts");
     eq(r.status, 403, "adm-07: accounts without key → 403");

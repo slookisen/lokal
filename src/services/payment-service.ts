@@ -485,16 +485,19 @@ export async function handlePaymentsWebhook(params: {
       duplicate = true;
       return;
     }
-    if (!modeMatches) {
-      handled = false;
-    } else if (event.type === "account.updated") {
-      if (accountApply) handled = accountApply();
-    } else if (event.type === "account.application.deauthorized" && stripeAccountId) {
+    if (event.type === "account.application.deauthorized" && stripeAccountId) {
+      // Signed and authoritative, no Stripe call needed: recorded whatever
+      // mode the configured key is in (findAccountRow matches the row's mode
+      // against the event's).
       const row = findAccountRow(db, stripeAccountId, livemode);
       if (row) {
         markDeauthorized(db, row, { source: "webhook", reason: "deauthorized", stripeEventId: event.id, now });
         handled = true;
       }
+    } else if (!modeMatches) {
+      handled = false;
+    } else if (event.type === "account.updated") {
+      if (accountApply) handled = accountApply();
     }
     db.prepare(`
       INSERT INTO payment_webhook_events (stripe_event_id, type, stripe_account_id, livemode, received_at)
