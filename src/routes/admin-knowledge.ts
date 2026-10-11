@@ -567,6 +567,7 @@ export function canCorrectFactualField(opts: {
       typeof opts.existingValue === "string" && productsAreGenericCategoryNames(opts.existingValue);
     if (
       existingGeneric &&
+      !existing.hasTierS && // an owner-attested value is never "known bad"
       typeof opts.incomingValue === "string" &&
       !incomingGeneric &&
       (incoming.hasPreferredContent || incoming.hasTierS || incoming.tierADistinct >= 2)
@@ -1938,9 +1939,11 @@ export const HCR_THEME_SPAM_CANDIDATE_REASON =
  * ALSO selects rows that DO carry a homepage source somewhere (typically
  * `about`) but whose `categories` has no homepage/owner corroboration
  * (categoriesLackWebsiteCorroboration — the outreach gate's own test) or whose
- * `products` are only category names (productsAreGenericCategoryNames). Those
- * were never picked before, so categories_not_corroborated /
- * generic_products_only stood forever. At least half of `limit` is reserved
+ * (categories only: the refresh writes categories, never products, so a
+ * category-name-only products list with corroborated categories is not
+ * selectable). Those rows were never picked before, so categories_not_corroborated
+ * stood forever. A row refreshed without any write is stamped (updated_at) and
+ * moves to the back of the queue. At least half of `limit` is reserved
  * for this group when it has that many rows, so a long first group cannot
  * starve it. Parking (homepage_unreachable_since) and the limit apply to both.
  */
@@ -2003,7 +2006,12 @@ export function selectHomepageContentRefreshAutoTargets(
   for (const r of extRows) {
     if (ext.length >= limit) break;
     if (!hasUrl(r)) continue;
-    if (categoriesLackWebsiteCorroboration(r.categories, r.field_provenance) || productsAreGenericCategoryNames(r.products)) {
+    // Only what the refresh can actually fix: it writes `categories`, never
+    // products. Category-name-only products with corroborated categories are
+    // not selectable (the refresh could not change them, so they would sit at
+    // the front forever); they are fixed via canCorrectFactualField when a
+    // real product list arrives from another writer.
+    if (categoriesLackWebsiteCorroboration(r.categories, r.field_provenance)) {
       ext.push({ agent_id: r.agent_id, name: r.name, homepage_url: r.homepage_url });
     }
   }
@@ -2042,6 +2050,21 @@ export async function refreshHomepageContent(
     opts.deadlineAt !== undefined || opts.fetchImpl ? { deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl } : undefined;
   // ── Per-agent processing (moved verbatim from the route handler) ────────
   const nowIso = new Date().toISOString();
+  // A row that already carries a homepage source but where this refresh wrote
+  // nothing (the page gave nothing new, or every field was refused) is stamped
+  // via the existing updated_at column, so the auto-select (ORDER BY updated_at
+  // ASC) moves it to the back instead of re-selecting it first every cycle.
+  // Only rows with a homepage source; apply runs only; never throws.
+  const markCheckedWithoutWrite = (agentId: string): void => {
+    if (dryRun) return;
+    try {
+      db.prepare(
+        `UPDATE agent_knowledge SET updated_at = ? WHERE agent_id = ? AND field_provenance LIKE '%"website_homepage"%'`,
+      ).run(nowIso, agentId);
+    } catch {
+      /* bookkeeping only */
+    }
+  };
   let scanned = 0;
   const byField: Record<string, number> = { about: 0, products: 0, categories: 0, description: 0 };
   const changed: Array<{ agent_id: string; fields: string[] }> = [];
@@ -2271,7 +2294,10 @@ export async function refreshHomepageContent(
     }
 
     scanned++;
-    if (candidates.length === 0) return; // nothing extractable — leave as-is.
+    if (candidates.length === 0) {
+      markCheckedWithoutWrite(agentId);
+      return; // nothing extractable — leave as-is.
+    }
 
     // Load existing provenance + curated locks + current column values.
     const kRow = db
@@ -2345,7 +2371,10 @@ export async function refreshHomepageContent(
     if (curatedSkipped.length > 0) {
       skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
     }
-    if (fieldsToWrite.length === 0) return;
+    if (fieldsToWrite.length === 0) {
+      markCheckedWithoutWrite(agentId);
+      return;
+    }
 
     const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
     for (const f of writtenFields) {

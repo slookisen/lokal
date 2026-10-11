@@ -121,6 +121,17 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       "AC2: the curated lock stays absolute",
     );
     assertEq(
+      can({
+        ...base,
+        existingFieldProvenance: [{ source_type: "owner", value: "Frukt,Bær", fetched_at: "2026-01-01T00:00:00.000Z" }],
+        incomingFieldProvenance: [HP("Eplemost")],
+        existingValue: GENERIC,
+        incomingValue: REAL,
+      }).allowed,
+      false,
+      "AC2: owner-attested category-name products are NOT known bad (owner lock)",
+    );
+    assertEq(
       can({ ...base, existingFieldProvenance: [HP("Frukt,Bær")], incomingFieldProvenance: [HP("Eplemost")] }).allowed,
       false,
       "AC2: without values (old call sites) the provenance-only behaviour is unchanged",
@@ -194,13 +205,43 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     const picked = mod.selectHomepageContentRefreshAutoTargets(db as any, 25).map((t) => t.agent_id).sort();
     assertEq(
       picked,
-      ["sel-fresh", "sel-generic", "sel-nocats"],
-      "AC3: picks the no-homepage row, the row with homepage about but no categories source, and the generic-products row; NOT the fully corroborated row, NOT the parked row",
+      ["sel-fresh", "sel-nocats"],
+      "AC3: picks the no-homepage row and the row with homepage about but no categories source; NOT the generic-products row with corroborated categories (the refresh cannot fix it), NOT the fully corroborated row, NOT the parked row",
     );
     assertEq(
       mod.selectHomepageContentRefreshAutoTargets(db as any, 2).length,
       2,
       "AC3: the limit still applies",
+    );
+    db.prepare(`DELETE FROM agent_knowledge`).run();
+    db.prepare(`DELETE FROM agents`).run();
+
+    // AC3b — rows the refresh cannot fix do not stick at the front: after a
+    // refresh with no write they move to the back and fixable rows are reached.
+    const stuckHtml = `<html><head><title>Tom</title></head><body><p>Velkommen.</p></body></html>`;
+    const pages: Record<string, string> = {};
+    for (const id of ["rot-a", "rot-b", "rot-c"]) {
+      seed(id, { cats: ["fish"], products: REAL, prov: aboutHp, updated: `2020-02-0${id.charCodeAt(4) - 96}T00:00:00.000Z` });
+      pages[`${id}.kat-test.no`] = stuckHtml;
+    }
+    seed("rot-d", { cats: ["fish"], products: REAL, prov: aboutHp, updated: "2020-02-09T00:00:00.000Z" });
+    pages["rot-d.kat-test.no"] = HOME_HTML;
+    const rotFetch = async (url: string) =>
+      new Response(pages[new URL(url).host] ?? "", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    const seen: string[][] = [];
+    for (let round = 0; round < 3; round++) {
+      const targets = mod.selectHomepageContentRefreshAutoTargets(db as any, 2);
+      seen.push(targets.map((t) => t.agent_id));
+      if (targets.length === 0) break;
+      await mod.refreshHomepageContent(db as any, targets, { dryRun: false, fetchImpl: rotFetch as any });
+    }
+    assertEq(seen[0], ["rot-a", "rot-b"], "AC3b: round 1 takes the front of the queue");
+    assertEq(seen[1].includes("rot-d"), true, "AC3b: round 2 reaches the fixable row after the stuck rows were stamped");
+    assertEq(seen[1].includes("rot-a") || seen[1].includes("rot-b"), false, "AC3b: stamped stuck rows are not re-selected in the next round (they rotate to the back)");
+    assertEq(
+      JSON.parse((db.prepare(`SELECT categories FROM agents WHERE id = 'rot-d'`).get() as any).categories).includes("honey"),
+      true,
+      "AC3b: the fixable row got corroborated categories written",
     );
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();

@@ -302,6 +302,12 @@ export interface OutreachCandidatesParams {
   cooldownDays: number;
   /** Parsed exactly as the route parses ?limit — see parseOutreachCandidatesLimit. */
   limit: number;
+  /**
+   * Cap on data_quality_held.producers (default 100, the HTTP route's compact
+   * answer). The RFB job passes a higher value so its re-enrichment list is
+   * complete.
+   */
+  dataQualityHeldLimit?: number;
 }
 
 export interface OutreachCandidate {
@@ -356,6 +362,7 @@ export function computeOutreachCandidates(
     throw new Error("computeOutreachCandidates: db must be the getDb() singleton (isBlocked() reads getDb())");
   }
   const { mode, cooldownDays, limit } = params;
+  const dataQualityHeldCap = params.dataQualityHeldLimit ?? 100;
 
     // ── Global kill-switch (P0-2026-07-11) ──────────────────────────────────
     // OUTREACH_PAUSED=true makes the gate return zero candidates so no batch can
@@ -1107,8 +1114,8 @@ export function computeOutreachCandidates(
       // re-enrichment. Appended last — existing key order unchanged.
       data_quality_held: {
         count: dataQualityHeld.length,
-        truncated: dataQualityHeld.length > 100,
-        producers: dataQualityHeld.slice(0, 100),
+        truncated: dataQualityHeld.length > dataQualityHeldCap,
+        producers: dataQualityHeld.slice(0, dataQualityHeldCap),
       },
     };
 }

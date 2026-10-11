@@ -1100,6 +1100,34 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(r.summary.held, 0, "n10d: summary.held (result rows) is not changed by the listing");
     }
 
+    // n11: gate-stopped rows come AFTER content-held rows in the list, and a
+    // mode=second row is listed even when the first-touch budget is used up.
+    freshDb();
+    seedProducer("dh-1", "Kort Gård", "post@dh1.gard-test.no", {
+      about: "Liten gård.",
+      products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Ull" }]),
+    });
+    seedProducer("dh-2", "Kategorinavn Gård", "post@dh2.gard-test.no", {
+      products: JSON.stringify([{ name: "Frukt" }]),
+    });
+    seedProducer("dh-3", "God Gård", "post@dh3.gard-test.no");
+    // A second-touch producer (contacted > cooldown ago) stopped on category names.
+    seedProducer("dh-4", "Andre Kategorinavn Gård", "post@dh4.gard-test.no", {
+      products: JSON.stringify([{ name: "Egg" }]),
+      secondTouchDaysAgo: 100,
+    });
+    setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+    {
+      const t = makeTransport();
+      const r = await run(true, { transport: t });
+      assertEq(r.summary.sent, 1, "n11: the budget (1) is used by first touch");
+      assertEq(
+        r.held_for_reenrichment.map((h) => [h.agent_id, h.reason]),
+        [["dh-1", "for_kort"], ["dh-2", "generic_products_only"], ["dh-4", "generic_products_only"]],
+        "n11b: content-held first, gate-stopped last; the mode=second row is listed although the budget is spent",
+      );
+    }
+
     // ── (u) the compose-attempt cap ────────────────────────────────────────
     // Pre-transport refusals (4xx) do not use the budget, so a streak of them
     // is bounded at budget + RFB_MARKETING_EXTRA_COMPOSE_ATTEMPTS compose calls.

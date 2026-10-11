@@ -1220,6 +1220,9 @@ export interface RfbMarketingDailyDeps {
   refreshLimits?: { perCandidateMs?: number; totalBudgetMs?: number };
 }
 
+/** Cap for the gate-stopped list the job asks the gate for (the HTTP route keeps 100). */
+const RFB_DATA_QUALITY_HELD_LIMIT = 10000;
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -1256,6 +1259,8 @@ function addDataQualityHeld(
   held: RfbMarketingHeldEntry[],
   gateResult: OutreachCandidatesResult,
 ): void {
+  // `held` is the data-quality list; dedupe is by agent_id within it. Overlap
+  // with content-held candidates is removed when the lists are merged.
   const dq = gateResult.data_quality_held as { producers?: unknown } | undefined;
   const producers = Array.isArray(dq?.producers) ? (dq!.producers as Array<Record<string, unknown>>) : [];
   for (const p of producers) {
@@ -1687,6 +1692,10 @@ async function runRfbMarketingDailyGuarded(opts: {
   // row and/or a stopped_reason, and finish() still writes the envelope.
   const results: RfbMarketingResultRow[] = [];
   const held: RfbMarketingHeldEntry[] = [];
+  // Gate-stopped rows (generic_products_only / categories_not_corroborated),
+  // kept apart and appended AFTER the content-held rows in the report, so the
+  // envelope's 100-row cut never drops a content-held candidate for them.
+  const dqHeld: RfbMarketingHeldEntry[] = [];
   const seenEmails = new Set<string>();
   let composeAttempts = 0;
   let committed = 0; // would_send (dry) or sent (apply) this run
@@ -1751,7 +1760,7 @@ async function runRfbMarketingDailyGuarded(opts: {
       social_proof: socialProof,
       gate,
       results,
-      held,
+      held: [...held, ...dqHeld.filter((d) => !held.some((h) => h.agent_id === d.agent_id))],
       compose_attempts: composeAttempts,
       stopped_reason: stoppedReason,
       skipped_reason: skipped,
@@ -1760,7 +1769,12 @@ async function runRfbMarketingDailyGuarded(opts: {
 
   let firstGate: OutreachCandidatesResult;
   try {
-    firstGate = computeOutreachCandidates(db, { mode: "first", cooldownDays, limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT });
+    firstGate = computeOutreachCandidates(db, {
+      mode: "first",
+      cooldownDays,
+      limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT,
+      dataQualityHeldLimit: RFB_DATA_QUALITY_HELD_LIMIT,
+    });
   } catch (err) {
     errors.push(`gate (mode=first) failed: ${errMessage(err)}`);
     stoppedReason = "db_error";
@@ -1771,7 +1785,7 @@ async function runRfbMarketingDailyGuarded(opts: {
     return done("outreach_paused");
   }
   try {
-    addDataQualityHeld(db, held, firstGate);
+    addDataQualityHeld(db, dqHeld, firstGate);
   } catch (err) {
     errors.push(`data-quality held (mode=first) failed: ${errMessage(err)}`);
   }
@@ -2120,6 +2134,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         mode: "second",
         cooldownDays,
         limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT,
+        dataQualityHeldLimit: RFB_DATA_QUALITY_HELD_LIMIT,
       });
     } catch (err) {
       errors.push(`gate (mode=second) failed: ${errMessage(err)}`);
@@ -2129,12 +2144,27 @@ async function runRfbMarketingDailyGuarded(opts: {
       gate.second = summarizeGate(secondGate);
       if (!secondGate.paused) {
         try {
-          addDataQualityHeld(db, held, secondGate);
+          addDataQualityHeld(db, dqHeld, secondGate);
         } catch (err) {
           errors.push(`data-quality held (mode=second) failed: ${errMessage(err)}`);
         }
       }
       if (!secondGate.paused) await processList(secondGate.candidates, "second");
+    }
+  } else if (!stoppedReason) {
+    // Budget already used by first touch: the second gate is not needed for
+    // sending, but its gate-stopped rows still belong in the re-enrichment
+    // list. Report-only; a failure here never changes the run's outcome.
+    try {
+      const secondForHeld = computeOutreachCandidates(db, {
+        mode: "second",
+        cooldownDays,
+        limit: RFB_MARKETING_CANDIDATE_FETCH_LIMIT,
+        dataQualityHeldLimit: RFB_DATA_QUALITY_HELD_LIMIT,
+      });
+      if (!secondForHeld.paused) addDataQualityHeld(db, dqHeld, secondForHeld);
+    } catch (err) {
+      console.error("[rfb-marketing-daily] data-quality held (mode=second, budget used) failed (non-fatal):", errMessage(err));
     }
   }
 
