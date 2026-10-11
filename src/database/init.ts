@@ -452,6 +452,11 @@ function initSchema(db: Database.Database): void {
       -- Future: seller preferences (v2 — NL responses, target groups)
       preferences TEXT DEFAULT '{}',       -- JSON: reserved for seller customization
 
+      -- homepage-content-refresh: when the refresh last ATTEMPTED this row (any
+      -- outcome, apply runs only). Rotation key for the auto-select; NOT a
+      -- "got new data" signal (updated_at stays untouched by it).
+      homepage_content_checked_at TEXT,
+
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -2069,6 +2074,9 @@ function initSchema(db: Database.Database): void {
   for (const stmt of [
     `ALTER TABLE agent_knowledge ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE agent_knowledge ADD COLUMN homepage_unreachable_since TEXT`,
+    // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
+    // see the CREATE TABLE comment — rotation key for the content-refresh auto-select.
+    `ALTER TABLE agent_knowledge ADD COLUMN homepage_content_checked_at TEXT`,
   ]) {
     try {
       db.exec(stmt);

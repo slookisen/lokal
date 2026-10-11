@@ -46433,6 +46433,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter: the
+// refresh writes categories only, category-name products are known-bad, the
+// auto-select takes uncorroborated rows, the gate names the stopped rows.
+// Own in-memory DB + admin key, restored in finally — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter ──");
+  try {
+    const { runHomepageRefreshKategorinavnTests } =
+      require("../src/routes/homepage-refresh-kategorinavn.test") as
+        typeof import("../src/routes/homepage-refresh-kategorinavn.test");
+    const r = await runHomepageRefreshKategorinavnTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("homepage-refresh-kategorinavn: " + f);
+    console.log(`  homepage-refresh-kategorinavn: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-refresh-kategorinavn: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
 // RFB outreach e-mail as code (services/rfb-outreach-template.ts) — pure, no
 // DB; pinned byte-for-byte against the effective A2A template.
