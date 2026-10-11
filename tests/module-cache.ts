@@ -74,6 +74,7 @@ export function swapOutModules(ids: readonly string[]): () => void {
       table.set(id, slot);
     }
     slot.depth++;
+    __diagLog(`swap-out depth=${slot.depth} prev=${__diagTag(slot.previous)} cur=`, id, require.cache[id]); // TEMP-DIAG
     delete require.cache[id];
   }
 
@@ -84,6 +85,7 @@ export function swapOutModules(ids: readonly string[]): () => void {
     for (const id of own) {
       const slot = table.get(id)!;
       slot.depth--;
+      __diagLog(`restore depth=${slot.depth} block-copy=${__diagTag(require.cache[id])} put-back=`, id, slot.depth > 0 ? null : (slot.previous ?? null)); // TEMP-DIAG
       if (slot.depth > 0) continue;
       if (slot.previous) require.cache[id] = slot.previous;
       else delete require.cache[id];
@@ -115,6 +117,37 @@ export function withModulesSwappedOut<T>(ids: readonly string[], fn: () => T): T
   return result;
 }
 
+// TEMP-DIAG (PR #1042 CI investigation) — remove before merge.
+const __diagTags = new WeakMap<object, number>();
+let __diagSeq = 0;
+const __diagTag = (m: unknown): string => {
+  if (!m || typeof m !== "object") return "none";
+  if (!__diagTags.has(m)) __diagTags.set(m, ++__diagSeq);
+  return `#${__diagTags.get(m)}`;
+};
+const __diagRe = /email-service|booking-store/;
+const __diagRel = (p: string) => String(p).replace(/.*[\\/](src|tests)[\\/]/, "$1/");
+export function __diagStaleBindings(where: string): void {
+  const cache = require.cache;
+  const lines: string[] = [];
+  for (const [id, m] of Object.entries(cache)) {
+    if (!m || /[\\/]tests[\\/]|\.test\.ts$/.test(id)) continue;
+    for (const c of m.children ?? []) {
+      if (!c || !/email-service|booking-store|db-factory/.test(c.filename)) continue;
+      if (cache[c.filename] !== c) lines.push(`${__diagRel(id)}${__diagTag(m)} -> ${__diagRel(c.filename)}${__diagTag(c)} (current ${__diagTag(cache[c.filename])})`);
+    }
+  }
+  const bs = Object.keys(cache).find((k) => /[\\/]services[\\/]booking-store\.ts$/.test(k));
+  const es = Object.keys(cache).find((k) => /[\\/]services[\\/]email-service\.ts$/.test(k));
+  const bsEmail = bs ? (cache[bs]!.children ?? []).filter((c) => /email-service/.test(c.filename)).map(__diagTag).join(",") : "-";
+  console.log(`MCDIAG [${where}] booking-store=${bs ? __diagTag(cache[bs]) : "absent"} its email=${bsEmail} | email-service=${es ? __diagTag(cache[es]) : "absent"} | open=${overlap().open} | stale bindings=${lines.length}`);
+  for (const l of lines.slice(0, 30)) console.log(`MCDIAG   ${l}`);
+}
+function __diagLog(what: string, id: string, m?: unknown): void {
+  if (__diagRe.test(id)) console.log(`MCDIAG ${what} ${__diagRel(id)} ${m === undefined ? "" : __diagTag(m)} open=${overlap().open}`);
+}
+// END TEMP-DIAG
+
 function dropModulesBoundToStaleCopies(
   before: Map<string, CachedModule | undefined>,
   table: Map<string, Slot>,
@@ -143,6 +176,7 @@ function dropModulesBoundToStaleCopies(
   for (const id of stale) {
     // The entry from before the swap is not bound to the block's copies.
     const previous = before.get(id);
+    __diagLog(`drop stale=${__diagTag(cache[id])} replace-with=`, id, previous ?? null); // TEMP-DIAG
     if (previous) cache[id] = previous;
     else delete cache[id];
   }

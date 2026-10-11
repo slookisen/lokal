@@ -42254,6 +42254,7 @@ runSerial(async () => {
 // unreachable-by-reason breakdown (asserted to be a true partition), and
 // dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
 // network seams injected; runs via runSerial() like its siblings.
+runSerial(() => (require("./module-cache") as any).__diagStaleBindings("before crm-platform-identity")); // TEMP-DIAG
 runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 3 (plattformidentitet ut + outreach-trigger-vakt) ──");
   try {
@@ -46741,6 +46742,7 @@ runSerial(async () => {
 // dry-run/apply/retire/refusal; the direct-id order flow; the three trust gates
 // byte-identical. Swaps the getDb() singleton, the order-notify send stub and
 // the geocoder fetch seam (all restored in finally) — runSerial, tail position.
+runSerial(() => (require("./module-cache") as any).__diagStaleBindings("before rfb-hidden-test-producer")); // TEMP-DIAG
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: hidden test producer + listing honesty ──");
   try {
