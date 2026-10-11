@@ -263,7 +263,14 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       }
       // The lang-toggle stays a landing-page-only affordance (browse pages
       // are NO-canonical) — the exclusion in navLinkHrefs must be real.
-      assertTrue(home.body.includes('class="lang-toggle"'), "c4: landing page keeps its NO/EN lang-toggle");
+      // dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: the toggle
+      // is hidden while OPPLEVAGENT_LANG_SWITCHER_ENABLED is off and back with it on.
+      assertTrue(!home.body.includes('class="lang-toggle"'), "c4: landing page hides the lang-toggle while the switcher flag is off");
+      const prevSwC4 = process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+      process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
+      const homeSwOn = await callHtmlRoute(seoRouter, "/");
+      if (prevSwC4 === undefined) delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED; else process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = prevSwC4;
+      assertTrue(homeSwOn.body.includes('class="lang-toggle"'), "c4b: landing page keeps its NO/EN lang-toggle when the switcher flag is on");
       assertTrue(!gard.body.includes('class="lang-toggle"'), "c5: gardssalg page has no lang-toggle");
 
       // ── (d) CSS: :checked reveal present, old always-hide rule gone ───
@@ -332,7 +339,10 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       }
 
       // ── (h) EN render: lang-toggle + lang-aware anchors ───────────────
+      const prevSwH = process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+      process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
       const homeEn = await callHtmlRoute(seoRouter, "/", "en");
+      if (prevSwH === undefined) delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED; else process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = prevSwH;
       assertTrue(homeEn.handled && homeEn.status === 200, `h1: GET / with req.lang="en" renders 200 (got ${homeEn.status})`);
       assertTrue(
         homeEn.body.includes('class="lang-toggle"') && />NO<\/a>/.test(homeEn.body) && homeEn.body.includes('hreflang="nb"'),
