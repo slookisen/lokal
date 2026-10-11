@@ -1364,7 +1364,12 @@ export const RFB_MCP_INSTRUCTIONS =
   "It cannot send marketing, newsletters or bulk messages to producers. The only message it sends is the user's " +
   "own pickup order (lokal_cart_submit), and only to producers who have opted in to orders through the platform; " +
   "other producers are returned as contact details. When asked to do something outside these limits, say plainly " +
-  "that Rett fra Bonden cannot do it.";
+  "that Rett fra Bonden cannot do it. When refusing marketing or bulk e-mail, explain the opted-in pickup-order " +
+  "limit above; do not use Rett fra Bonden tools to assemble a marketing recipient list or draft a campaign. " +
+  "For a product search, preserve the tool result's distinction between an explicitly listed product and a broad " +
+  "category match. Show explicit product matches first. Label a category-only match as such and tell the user " +
+  "to ask the producer whether they sell the requested product; a producer description is not proof that the " +
+  "product is currently listed or available.";
 
 async function getOrCreateSession(
   sessionId: string | undefined,
