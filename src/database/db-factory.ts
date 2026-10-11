@@ -61,6 +61,7 @@ export function getDb(vertical: string): DbHandle {
   // (or :memory: for unit tests).
   const envKey = `${vertical.toUpperCase()}_DB_PATH`;
   const dbPath = process.env[envKey] || `/app/data/${vertical}.db`;
+  resolvedDbPaths().push(dbPath);
 
   // Ensure parent dir exists (mirrors init.ts behaviour).
   // Skip for :memory: which has no filesystem path.
@@ -136,6 +137,24 @@ export function __resetDbFactoryForTesting(): void {
     }
   }
   handles.clear();
+}
+
+/**
+ * Test-only: every path getDb() has resolved for a non-rfb vertical in
+ * this process, in order. Recorded before the mkdir/open, so an attempt
+ * that fails (EACCES for /app/ on a non-root CI runner) still counts.
+ * Kept on globalThis rather than in module scope because tests drop this
+ * module from require.cache and re-require it, and every copy must append
+ * to the same list. Not cleared by __resetDbFactoryForTesting(). Read by
+ * the /app/ hermeticity check in tests/test.ts.
+ */
+export function __getResolvedDbPathsForTesting(): string[] {
+  return resolvedDbPaths();
+}
+
+function resolvedDbPaths(): string[] {
+  const g = globalThis as { [key: symbol]: string[] | undefined };
+  return (g[Symbol.for("lokal.dbFactory.resolvedPaths")] ??= []);
 }
 
 // Re-export the schema-init so src/index.ts can call it explicitly

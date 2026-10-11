@@ -24,6 +24,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import { __resetDbFactoryForTesting } from "../database/db-factory";
 
 export interface TestSummary {
   passed: number;
@@ -54,6 +55,12 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
 
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
+    // Contact resolution reads experiences.db through db-factory
+    // (CrmService.classifyEmailAgainstProviders). Give it its own :memory:
+    // handle; unset, the factory falls back to /app/data.
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+    __resetDbFactoryForTesting();
     const db = new Database(":memory:");
     const ident = require("./crm-platform-identity") as typeof import("./crm-platform-identity");
 
@@ -784,6 +791,9 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
     } finally {
       try { db.close(); } catch { /* already closed */ }
       initMod.__setDbForTesting(prevDb as any);
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      __resetDbFactoryForTesting();
     }
 
     if (log) console.log(`\n${passed} passed, ${failed} failed`);

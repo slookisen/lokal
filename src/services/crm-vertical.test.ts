@@ -39,6 +39,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import { __resetDbFactoryForTesting } from "../database/db-factory";
 
 export interface TestSummary {
   passed: number;
@@ -85,6 +86,12 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
 
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
+    // Contact resolution reads experiences.db through db-factory
+    // (CrmService.classifyEmailAgainstProviders). Give it its own :memory:
+    // handle; unset, the factory falls back to /app/data.
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+    __resetDbFactoryForTesting();
     const db = new Database(":memory:");
     const crm = require("./crm-service") as typeof import("./crm-service");
 
@@ -664,6 +671,9 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
     } finally {
       try { db.close(); } catch { /* already closed */ }
       initMod.__setDbForTesting(prevDb as any);
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      __resetDbFactoryForTesting();
     }
 
     if (log) console.log(`\n${passed} passed, ${failed} failed`);

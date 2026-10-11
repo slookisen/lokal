@@ -99,6 +99,12 @@ import conversationUiRouter, {
 //     the pattern used throughout this file (e.g. ~line 1013, ~line 4556),
 //     rather than sharing or closing the ambient singleton — save the prior
 //     handle and restore it (or null) in `finally`.
+//   - dental/experiences DBs (src/database/db-factory.ts getDb(vertical)):
+//     a block that reaches them, directly or through a route/service, sets
+//     its own DENTAL_DB_PATH / EXPERIENCES_DB_PATH = ":memory:" — use
+//     withMemoryVerticalDb() (below) for a sync block. Unset, the factory
+//     opens the production path /app/data/<vertical>.db; the db-hermetic
+//     check before the summary fails the suite if that happens.
 //
 // Fixed:
 //   - ADMIN_KEY / ANALYTICS_ADMIN_KEY, WITHIN THIS FILE'S OWN ~17 test
@@ -293,6 +299,25 @@ function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
   _serialChain = next.then(() => {}, () => {});
   return next;
+}
+
+// Runs a synchronous block with its own :memory: db-factory DB for one
+// vertical. Unset, `<VERTICAL>_DB_PATH` makes db-factory fall back to the
+// production volume path /app/data/<vertical>.db. Same steps as
+// src/routes/reise-page.test.ts: save, set :memory:, reset, and in `finally`
+// restore (delete when it was unset) and reset again.
+function withMemoryVerticalDb(envKey: "DENTAL_DB_PATH" | "EXPERIENCES_DB_PATH", fn: () => void): void {
+  const prev = process.env[envKey];
+  process.env[envKey] = ":memory:";
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
+  try {
+    fn();
+  } finally {
+    if (prev === undefined) delete process.env[envKey];
+    else process.env[envKey] = prev;
+    dbFactory.__resetDbFactoryForTesting();
+  }
 }
 
 function assertEq(actual: unknown, expected: unknown, label: string): void {
@@ -17828,7 +17853,12 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
       delete require.cache[dbFactoryPath2];
       const dbFactory2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
       dbFactory2.__resetDbFactoryForTesting();
+      const resolvedBeforePr100b = dbFactory2.__getResolvedDbPathsForTesting().length;
       dbFactory2.getDb("dental");
+      // This probe resolves the production path on purpose (the Database
+      // above is fake), so take it back out of db-factory's resolved-path
+      // record: the /app/ check before the summary is for real fall-throughs.
+      dbFactory2.__getResolvedDbPathsForTesting().splice(resolvedBeforePr100b);
       assertEq(capturedPath, "/app/data/dental.db",
         "pr100b-02: default dental DB path is /app/data/dental.db (persistent Fly volume)");
       dbFactory2.__resetDbFactoryForTesting();
@@ -20110,7 +20140,8 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
 // orch19-06: experiences-seo router — landing is NOT the rfb homepage;
 // llms.txt / robots.txt / agent-card.json / openapi.json route to experiences.
 // We invoke the router's internal GET layers directly (sync, mock req/res).
-{
+// The landing and llms.txt handlers count experiences via db-factory.
+withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
   const expSeo = require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo");
   const seoRouter = expSeo.default as any;
 
@@ -20224,7 +20255,7 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
     llmsExpMcp.body.includes("https://opplevagent.no/.well-known/mcp/server-card.json"),
     "mcpcard-exp-llmstxt: llms.txt links the MCP Server Card"
   );
-}
+});
 
 
 // ── site-quality (opplevagent-site-quality loop, work-order 2026-06-20) ──────
@@ -26774,6 +26805,26 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     try { createdThisRun = fs2.statSync(f).mtimeMs >= _suiteStartedAtMs; } catch { /* absent */ }
     assertTrue(!createdThisRun, `env-hygiene: the suite did not write ./${f}`);
   }
+  // DB hermeticity: no db-factory open may fall through to the production
+  // volume. With DENTAL_DB_PATH / EXPERIENCES_DB_PATH unset, getDb() resolves
+  // /app/data/<vertical>.db, which on Windows writes C:\app\data and on a
+  // non-root CI runner fails with EACCES (and a test that tolerates the error
+  // stays green). db-factory records every path it resolves, before the
+  // mkdir/open, so this reads in-process state, not files on disk. Fix a hit
+  // with withMemoryVerticalDb() or the save/:memory:/reset/restore steps in it.
+  {
+    const pathH = require("path");
+    const appRoot = pathH.resolve("/app");
+    const resolvedDbPaths = (require("../src/database/db-factory") as typeof import("../src/database/db-factory"))
+      .__getResolvedDbPathsForTesting();
+    assertTrue(resolvedDbPaths.length > 0, "db-hermetic: db-factory recorded the paths it resolved (the check below is live)");
+    const underApp = resolvedDbPaths.filter((p) => {
+      if (p === ":memory:" || p === "") return false;
+      const abs = pathH.resolve(p);
+      return abs === appRoot || abs.startsWith(appRoot + pathH.sep);
+    });
+    assertEq(underApp.join(", "), "", "db-hermetic: no db-factory DB resolved under /app/ during the suite");
+  }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
@@ -26898,7 +26949,7 @@ console.log("\n── PR-113: dental agent-card, A2A JSON-RPC, openapi ──");
 
 // pr113-03: dental-a2a message/send happy-path — parseIntent + handleDentalMessageSend
 // Router-testing uten HTTP: vi tester den eksporterte handler-funksjonen direkte.
-{
+withMemoryVerticalDb("DENTAL_DB_PATH", () => {
   const dentalA2a = require("../src/routes/dental-a2a") as typeof import("../src/routes/dental-a2a");
   const { parseIntent, handleDentalMessageSend } = dentalA2a;
 
@@ -26923,25 +26974,22 @@ console.log("\n── PR-113: dental agent-card, A2A JSON-RPC, openapi ──");
   assertEq(noMsg.error?.code, -32602, "pr113-03e: manglende message → feilkode -32602");
   assertEq(noMsg.id, "test-id", "pr113-03f: id reflekteres i feilsvar");
 
-  // handleDentalMessageSend: ukjent metode er ikke handlert her, men message/send med fylke
-  // kjøres mot :memory:-isolert DB via listPublicDentalAgents. Siden testene
-  // ikke kan opprette en dedikert dental.db her, verifiserer vi at kallet
-  // enten returnerer result (tom liste er OK) eller kaster -32603.
-  // Dette er nok til å bekrefte kodestien.
+  // handleDentalMessageSend: message/send med fylke kjøres via
+  // listPublicDentalAgents mot blokkens egen tomme :memory:-DB
+  // (withMemoryVerticalDb over). Tom DB gir tom liste, så svaret er "result".
+  // Før lå dental.db på /app/data og testen godtok også -32603 (DB utilgjengelig).
   try {
     const resp = handleDentalMessageSend(
       { message: { text: "finn tannlege i Oslo" } },
       "pr113-03g"
     ) as any;
-    // Enten "result" (tom liste fra tomt DB) eller "error" med -32603
     const isOk = resp.result !== undefined && resp.id === "pr113-03g";
-    const isDbErr = resp.error?.code === -32603;
-    assertTrue(isOk || isDbErr, "pr113-03g: message/send returnerer result eller -32603 (DB ikke tilgjengelig i test)");
+    assertTrue(isOk, `pr113-03g: message/send mot tom :memory:-DB returnerer result (fikk ${JSON.stringify(resp.error ?? null)})`);
   } catch {
     // Uventet kast — fail
     assertTrue(false, "pr113-03g: handleDentalMessageSend kastet uventet feil");
   }
-}
+});
 
 // pr113-04: ukjent JSON-RPC-metode gir -32601
 // Vi bruker handleDentalMessageSend indirekte — men for ukjent-metode-testen
@@ -38182,9 +38230,10 @@ console.log("\n── mcp-usage-guides: GET /guide-mat-ai (rettfrabonden.com) �
 // registered in src/routes/experiences-mcp.ts (discover_experiences,
 // list_experience_categories, get_experience) — explicitly NOT the
 // previously-assumed-but-nonexistent opplev_discover/opplev_info/
-// opplev_categories names. Fully static (no DB dependency).
+// opplev_categories names. The page itself is static; the sitemap.xml check
+// (gom-17/18) reads experiences.db via db-factory.
 console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.no) ──");
-(() => {
+withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
   try {
     const expSeoModGom = require("../src/routes/experiences-seo");
     const expSeoRouterGom = expSeoModGom.default as any;
@@ -38274,7 +38323,7 @@ console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.
     failed++;
     failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
-})();
+});
 
 // ── proveniens-transparens (dev-request 2026-07-25-proveniens-transparens):
 // public "how we verify our data" page on all three domains + additive
@@ -38373,7 +38422,8 @@ function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
 })();
 
 // ── finn-tannlege.com: GET /proveniens (dental-seo.ts) ──
-(() => {
+// llms.txt (prov-dental-10..12) counts clinics via db-factory.
+withMemoryVerticalDb("DENTAL_DB_PATH", () => {
   try {
     const dentalSeoModProv = require("../src/routes/dental-seo");
     const dentalSeoRouterProv = dentalSeoModProv.default as any;
@@ -38445,10 +38495,11 @@ function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
     failed++;
     failures.push(`proveniens-transparens (dental): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
-})();
+});
 
 // ── opplevagent.no: GET /proveniens (experiences-seo.ts) ──
-(() => {
+// llms.txt counts experiences via db-factory.
+withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
   try {
     const expSeoModProv = require("../src/routes/experiences-seo");
     const expSeoRouterProv = expSeoModProv.default as any;
@@ -38518,7 +38569,7 @@ function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
     failed++;
     failures.push(`proveniens-transparens (experiences): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
-})();
+});
 
 // ── rettfrabonden.com: /a2a card + getRegistryCard() + discovery.ts llms.txt
 // (these read the RFB `agents`/`listings` tables via getDb() — same DB-swap

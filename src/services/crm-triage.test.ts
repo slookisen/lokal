@@ -42,6 +42,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import { __resetDbFactoryForTesting } from "../database/db-factory";
 
 export interface TestSummary {
   passed: number;
@@ -65,6 +66,12 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
 
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
+    // Contact resolution reads experiences.db through db-factory
+    // (CrmService.classifyEmailAgainstProviders). Give it its own :memory:
+    // handle; unset, the factory falls back to /app/data.
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+    __resetDbFactoryForTesting();
     const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
     // admin-outreach-candidates reads ADMIN_KEY first and falls back to
     // ANALYTICS_ADMIN_KEY. Sending only the latter left every candidates call
@@ -833,6 +840,9 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
     } finally {
       try { db.close(); } catch { /* already closed */ }
       initMod.__setDbForTesting(prevDb as any);
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      __resetDbFactoryForTesting();
       if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
       else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
       if (prevTurnstile === undefined) delete process.env.SKIP_TURNSTILE;
