@@ -140,6 +140,8 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
     resolveMod("./experiences-seo"),
     resolveMod("./discovery"),
     resolveMod("./agent-readiness"),
+    resolveMod("./seo"),
+    resolveMod("../middleware/agent-discovery"),
   ];
   for (const p of cachePaths) delete require.cache[p];
 
@@ -282,6 +284,27 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const st = await callRouter(a2aRouter, "/api/stats", "rettfrabonden.com");
       assertEq(st?.body?.data?.honestCount, EXPECT_RFB, "rfb-count-api-stats: data.honestCount");
       assertEq(st?.body?.data?.honestCountVertical, "rfb", "rfb-count-api-stats: data.honestCountVertical");
+
+      // Human-facing pages: the front page and /teknologi said getStats().totalAgents
+      // (inactive + unvetted + umbrella rows too) while every machine surface said the
+      // honest count (live 11.10: 1813 vs 1563).
+      const seoRouter = require("./seo").default;
+      const callSeo = (url: string, lang: string): Promise<Captured | null> =>
+        new Promise((resolve) => {
+          const req: any = { ...fakeReq(url, "rettfrabonden.com"), lang };
+          seoRouter.handle(req, fakeRes((c) => resolve(c)), () => resolve(null));
+        });
+      const home = await callSeo("/", "no");
+      assertEq(digitsToNumber((String(home?.text).match(/(\d[\d\s]*) produsenter i hele Norge/) || [])[1]), EXPECT_RFB, "rfb-count-home-pill: front page «N produsenter i hele Norge»");
+      assertEq(digitsToNumber((String(home?.text).match(/<div class="stat-n">(\d[\d\s]*)<\/div><div class="stat-l">Produsenter/) || [])[1]), EXPECT_RFB, "rfb-count-home-stat: front page «Produsenter» figure");
+      const tech = await callSeo("/teknologi", "no");
+      assertEq(digitsToNumber((String(tech?.text).match(/database med (\d+)\+/) || [])[1]), EXPECT_RFB, "rfb-count-teknologi: MCP setup page «database med N+»");
+      const { markdownNegotiation } = require("../middleware/agent-discovery") as typeof import("../middleware/agent-discovery");
+      const md = await new Promise<Captured | null>((resolve) => {
+        const req: any = { ...fakeReq("/", "rettfrabonden.com"), query: { format: "md" } };
+        markdownNegotiation(req, fakeRes((c) => resolve(c)), () => resolve(null));
+      });
+      assertEq(digitsToNumber((String(md?.text).match(/connecting AI agents with (\d+)\+/) || [])[1]), EXPECT_RFB, "rfb-count-markdown: front page as markdown for agents");
     }
 
     // dental surfaces

@@ -15,17 +15,16 @@
  */
 
 import { Request, Response, NextFunction } from "express";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { safeHonestCatalogCount } from "../services/honest-count";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
-// Read the producer count from the live registry at request time so
-// the markdown negotiation responses don't drift away from the DB.
-// Fallback is deliberately conservative — we'd rather under-promise
-// than resurrect the old "1,400+" number if the registry briefly fails.
+// The honest catalog count (same as llms.txt and the front page), read at
+// request time so the markdown responses don't drift away from the DB. The
+// templates append "+", so the conservative fallback carries none of its own.
 function producerCount(): string {
-  const stats = marketplaceRegistry.getStats();
-  return stats.totalAgents ? String(stats.totalAgents) : "1,290+";
+  const n = safeHonestCatalogCount("rfb");
+  return n ? String(n) : "1,290";
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -101,11 +100,12 @@ export function markdownNegotiation(req: Request, res: Response, next: NextFunct
 // ─── Markdown templates ──────────────────────────────────────
 
 function homepageMarkdown(): string {
+  const count = producerCount();
   return `# Rett fra Bonden — A2A Marketplace for Local Food in Norway
 
 **${BASE_URL}**
 
-Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${producerCount()}+
+Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${count}+
 verified local food producers across Norway. Search fresh produce, organic
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
@@ -122,7 +122,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 | Skill | Description |
 |---|---|
-| \`discover-local-food-agents\` | Search ${producerCount()}+ verified producers by category, region, certification |
+| \`discover-local-food-agents\` | Search ${count}+ verified producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
 | \`search-compare-food\` | Natural-language search; compare prices, delivery, certifications |
 | \`agent-conversation\` | Open a buyer–seller negotiation channel |

@@ -18,6 +18,7 @@
 
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
+import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
@@ -1266,9 +1267,12 @@ const LANDING_CSS = `
 router.get("/", (req: Request, res: Response) => {
   const lang = req.lang;
   try {
-    const stats = marketplaceRegistry.getStats();
     const agents = marketplaceRegistry.getActiveAgents();
-    const totalAgents = stats.totalAgents || agents.length;
+    // The producer count people see is the honest catalog count (active, vetted,
+    // non-umbrella, listable), the same number as llms.txt, the agent card and
+    // agentplatform.no. getStats().totalAgents also counts inactive rows, unvetted
+    // rows and umbrella entries (markets, networks), which are not producers.
+    const totalAgents = safeHonestCatalogCount("rfb") ?? agents.length;
     const traffic = getTrafficStats("rfb");
 
     const cityCounts: Record<string, number> = {};
@@ -2178,8 +2182,8 @@ const TECH_CSS = `
 
 router.get("/teknologi", (req: Request, res: Response) => {
   const lang = req.lang;
-  const stats = marketplaceRegistry.getStats();
-  const totalAgents = stats.totalAgents || marketplaceRegistry.getActiveAgents().length;
+  // Honest catalog count, same as the front page (see router.get("/") above).
+  const totalAgents = safeHonestCatalogCount("rfb") ?? marketplaceRegistry.getActiveAgents().length;
   const brand = `<span translate="no">${getConfig().display_name}</span>`;
   const en = lang === "en";
   const content = en ? `
