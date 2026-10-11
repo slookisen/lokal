@@ -213,6 +213,8 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     const stale = reader.snapshot("rfb");
     ok(stale.ready && stale.stats.pageViews === 42 && offCalls.length === 2 && syncCalls.length === 0,
       "T3: stale stats are returned immediately while one background refresh runs — never the synchronous computation", { stale, offCalls, syncCalls });
+    ok(second.computedAt === 10_000 && stale.computedAt === 10_000,
+      "T3b: computedAt is when the cached value landed, also while it is served stale", { second: second.computedAt, stale: stale.computedAt });
     off.reject(new Error("worker down"));
     await reader.settled("rfb");
     const afterFail = reader.snapshot("rfb");
@@ -232,10 +234,13 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
     await reader.settled("rfb");
 
     usable = false;
+    const tSync = t;
     const syncFirst = reader.snapshot("dental");
     const syncCached = reader.snapshot("dental");
     ok(syncFirst.ready && syncFirst.stats.pageViews === 500 && syncCached.stats.pageViews === 500 && eq(syncCalls, ["dental"]),
       "T7: the fallback path computes synchronously and caches for the sync TTL", { syncCalls });
+    ok(syncFirst.computedAt === tSync && syncCached.computedAt === tSync,
+      "T7b: the fallback path reports its compute time, unchanged on a cached read", { syncFirst: syncFirst.computedAt, syncCached: syncCached.computedAt });
     t += 120_000;
     reader.snapshot("dental");
     ok(eq(syncCalls, ["dental", "dental"]), "T8: the fallback path recomputes after its TTL", syncCalls);

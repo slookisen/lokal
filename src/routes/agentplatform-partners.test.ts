@@ -28,12 +28,13 @@ import {
   createAgentplatformHostGate,
   createAgentplatformRouter,
   floorForTile,
+  formatOsloStamp,
   renderPartners,
   type AgentCallReading,
   type TrafficReading,
 } from "./agentplatform-site";
 import { computeAgentToolCalls } from "../services/agent-usage-compute";
-import { createAgentUsageReader } from "../services/agent-usage";
+import { AGENT_USAGE_OFFTHREAD_TTL_MS, createAgentUsageReader } from "../services/agent-usage";
 import { runStatsTask } from "../services/offthread-stats-worker";
 
 export interface TestSummary {
@@ -260,7 +261,74 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
   off.snapshot();
   await off.settled();
   check("e8: a stale value triggers one background refresh", offCalls === 2 && syncCalls === 0);
+
+  // computedAt: when the value was computed, not when it was read.
+  const syncComputedAt = clock;
+  const c1 = reader.snapshot();
+  clock += 1_000;
+  const c2 = reader.snapshot();
+  check("e9: sync snapshot carries its compute time, unchanged on a cached read", c1.computedAt === syncComputedAt && c2.computedAt === syncComputedAt);
+  const landedAt = offClock;
+  offClock += 5_000;
+  const o3 = off.snapshot();
+  check("e10: off-thread snapshot carries the time the value landed, not the read time", o3.ready && o3.computedAt === landedAt);
+  check("e11: the tool-call figure refreshes hourly", AGENT_USAGE_OFFTHREAD_TTL_MS === 60 * 60_000);
   db.close();
+
+  // ── (f) «Oppdatert …» under the figures ──────────────────────────────
+  const T0 = Date.UTC(2026, 9, 11, 12, 50); // 14.50 in Oslo (CEST)
+  check("f1: Oslo stamp, summer time (nb/en)", formatOsloStamp(T0, "nb") === "11. oktober kl. 14.50" && formatOsloStamp(T0, "en") === "11 October, 14:50");
+  check("f2: Oslo stamp, winter time and zero-padded minutes", formatOsloStamp(Date.UTC(2026, 11, 1, 13, 5), "nb") === "1. desember kl. 14.05");
+  const stampedTraffic = (at: number) => (v: string) => ({ ...traffic[v], computedAt: at + (v === "dental" ? 60_000 : 0) });
+  const stamped = collectPlatformMetrics(
+    { readTraffic: stampedTraffic(T0 + 120_000), readAgentCalls: () => ({ ...agent, computedAt: T0 }) },
+    counts as any,
+    T0 + 300_000,
+  );
+  check("f3: updatedAt is the oldest compute time among the shown figures", stamped.updatedAt === T0, String(stamped.updatedAt));
+  const hiddenOld = collectPlatformMetrics(
+    { readTraffic: stampedTraffic(T0 + 120_000), readAgentCalls: () => ({ toolCalls: 0, windowDays: 30, computedAt: T0 - 86_400_000 }) },
+    counts as any,
+    T0 + 300_000,
+  );
+  check("f4: a hidden figure's timestamp does not count", hiddenOld.agentToolCalls === null && hiddenOld.updatedAt === T0 + 120_000, String(hiddenOld.updatedAt));
+  const unstamped = collectPlatformMetrics({ readTraffic: (v) => traffic[v], readAgentCalls: () => ({ ...agent, computedAt: T0 }) }, counts as any, T0);
+  const nothing = collectPlatformMetrics({ readTraffic: () => null, readAgentCalls: () => null }, { rfb: null, experiences: null, dental: null }, T0);
+  check("f5: no stamp when a shown figure has no timestamp, or nothing is shown", unstamped.updatedAt === null && nothing.updatedAt === null);
+  const stampHtmlNb = renderPartners("nb", stamped);
+  const stampHtmlEn = renderPartners("en", stamped);
+  check("f6: the stamp renders under the tiles with a machine-readable time (nb/en)",
+    stampHtmlNb.includes('<p class="m-updated"><time datetime="2026-10-11T12:50:00.000Z">Oppdatert 11. oktober kl. 14.50</time></p>') &&
+      stampHtmlEn.includes('<time datetime="2026-10-11T12:50:00.000Z">Updated 11 October, 14:50 (Norwegian time)</time>'));
+  check("f7: no stamp line without a timestamp", !renderPartners("nb", unstamped).includes('class="m-updated"'));
+
+  // Through the router: the count cache's own read time takes part.
+  const stampRouter = createAgentplatformRouter({
+    readCount: (v) => counts[v] ?? null,
+    readTraffic: stampedTraffic(T0 + 120_000),
+    readAgentCalls: () => ({ ...agent, computedAt: T0 + 60_000 }),
+    now: () => T0 + 600_000,
+  });
+  const stampApp = express();
+  stampApp.set("trust proxy", true);
+  stampApp.use(createAgentplatformHostGate(stampRouter));
+  const stampServer = http.createServer(stampApp);
+  await new Promise<void>((r) => stampServer.listen(0, "127.0.0.1", () => r()));
+  try {
+    const stampPort = (stampServer.address() as any).port;
+    const page = await new Promise<string>((resolve, reject) => {
+      http
+        .get({ host: "127.0.0.1", port: stampPort, path: "/partnere", headers: { host: "agentplatform.no" } }, (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        })
+        .on("error", reject);
+    });
+    check("f8: /partnere shows the oldest figure's time (tool calls, 14.51)", page.includes("Oppdatert 11. oktober kl. 14.51</time>"));
+  } finally {
+    await new Promise<void>((r) => stampServer.close(() => r()));
+  }
 
   return summary;
 }

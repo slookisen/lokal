@@ -16,8 +16,8 @@ import {
 } from "./agent-usage-compute";
 import { createSwrCache, offThreadStatsUsable, runStatsTaskOffThread } from "./offthread-stats";
 
-/** A 30-day total: a few hours of staleness is fine and keeps the worker idle. */
-export const AGENT_USAGE_OFFTHREAD_TTL_MS = 6 * 60 * 60_000;
+/** Hourly, like the traffic figures it sits next to on /partnere. */
+export const AGENT_USAGE_OFFTHREAD_TTL_MS = 60 * 60_000;
 export const AGENT_USAGE_SYNC_TTL_MS = 10 * 60_000;
 const AGENT_USAGE_RETRY_MS = 5 * 60_000;
 const KEY = "agentToolCalls";
@@ -26,6 +26,8 @@ export interface AgentToolCallSnapshot {
   stats: AgentToolCallStats;
   /** False until a real value exists (first off-thread refresh still running, or the query failed). */
   ready: boolean;
+  /** When `stats` was computed (epoch ms); set whenever `ready` is true. */
+  computedAt?: number;
 }
 
 export interface AgentUsageReaderDeps {
@@ -81,16 +83,16 @@ export function createAgentUsageReader(deps: AgentUsageReaderDeps): AgentUsageRe
           offThreadDbPath = db.name;
         }
         const hit = offThread.get(KEY);
-        return hit ? { stats: hit.value, ready: true } : { stats: EMPTY, ready: false };
+        return hit ? { stats: hit.value, ready: true, computedAt: deps.now() - hit.ageMs } : { stats: EMPTY, ready: false };
       }
       const now = deps.now();
       if (syncCache && now >= syncCache.time && now - syncCache.time < deps.syncTtlMs) {
-        return { stats: syncCache.data, ready: true };
+        return { stats: syncCache.data, ready: true, computedAt: syncCache.time };
       }
       try {
         const data = deps.computeSync(db, now);
         syncCache = { data, time: now };
-        return { stats: data, ready: true };
+        return { stats: data, ready: true, computedAt: now };
       } catch {
         return { stats: EMPTY, ready: false };
       }
