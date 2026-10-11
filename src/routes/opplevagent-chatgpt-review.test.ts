@@ -380,6 +380,39 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       assertTrue(/No experiences matched/.test(emptyRun.after), "a9: an empty result says so explicitly");
       const detailRun = runWidget(EXPERIENCE_DETAIL_HTML, detail.result?.structuredContent);
       assertTrue(detailRun.after.includes(detail.result?.structuredContent?.title), "a10: detail widget renders the experience title once toolOutput arrives");
+
+      // A food-shopping request must not become nationwide experience cards.
+      for (const args of [
+        { query: "Where can I buy stockfish in Lofoten?" },
+        { query: "Hvor kan jeg kjøpe tørrfisk i Lofoten?", kommune: "Svolvær", category: "food" },
+        { query: "Where can I order stockfish for cooking at home?" },
+        { query: "Tørrfisk butikker i Lofoten" },
+      ]) {
+        const retail = (await rpc("tools/call", { name: "discover_experiences", arguments: args })).result;
+        const text = JSON.parse(retail?.content?.[0]?.text ?? "{}");
+        assertTrue(text.count === 0 && text.out_of_scope === true && text.scope_reason === "food_product_purchase" && !text.out_of_area && !text.relaxed_filters,
+          `j1: ${args.query} is outside experience scope, not outside Norway or relaxed`);
+        assertTrue(JSON.stringify(text) === JSON.stringify(retail?.structuredContent) && text.experiences.length === 0,
+          "j2: text and widget receive the same empty scope result");
+        const rendered = runWidget(EXPERIENCES_LIST_HTML, retail?.structuredContent).after;
+        assertTrue(rendered.includes("Rett fra Bonden") && !rendered.includes('class="card"') && !rendered.includes("data-more") && !rendered.includes("data-ask"),
+          "j3: widget explains the scope without cards, Details or Show all");
+      }
+      const malformedScope = runWidget(EXPERIENCES_LIST_HTML, { out_of_scope: true, experiences: discText.experiences }).after;
+      assertTrue(!malformedScope.includes("Nordlyscruise") && malformedScope.includes("Rett fra Bonden"),
+        "j4: scope notice takes precedence even if a stale result contains experiences");
+
+      expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfisksmaking med omvisning", category: "mat_drikke", season: ["all_year"] });
+      expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfiskmuseum", category: "kultur_historie", season: ["all_year"] });
+      for (const query of ["Buy tickets for a stockfish tasting tour", "Kjøpe billett til tørrfisksmaking", "Cooking classes with stockfish"]) {
+        const allowed = (await rpc("tools/call", { name: "discover_experiences", arguments: { query, category: "mat_drikke", fylke: "Nordland" } })).result?.structuredContent;
+        assertTrue(!allowed?.out_of_scope && allowed?.experiences?.some((e: any) => e.title === "Tørrfisksmaking med omvisning"),
+          `j5: legitimate food experience is still discoverable: ${query}`);
+      }
+      const museum = (await rpc("tools/call", { name: "discover_experiences", arguments: { query: "Buy tickets to the stockfish museum", category: "kultur_historie", fylke: "Nordland" } })).result?.structuredContent;
+      assertTrue(!museum?.out_of_scope && museum?.experiences?.some((e: any) => e.title === "Tørrfiskmuseum"), "j6: stockfish museum tickets remain supported");
+      const ordinary = (await rpc("tools/call", { name: "discover_experiences", arguments: { fylke: "Troms", season: "winter" } })).result?.structuredContent;
+      assertTrue(!ordinary?.out_of_scope && ordinary?.count === 3, "j7: existing clients without query still discover ordinary experiences");
     } catch (err: any) {
       failed++;
       failures.push("opplevagent-chatgpt-review: unexpected error: " + String(err?.stack || err?.message || err));

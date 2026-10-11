@@ -236,6 +236,14 @@ ${WIDGET_HELPERS}
       fitHeight();
       return;
     }
+    if (out.out_of_scope) {
+      root.innerHTML = '<p class="muted">' + esc(t(
+        "Opplevagent viser opplevelser, ikke utsalg for kjøp av tørrfisk. Bruk Rett fra Bonden for matprodusenter. Ingen opplevelser vises.",
+        "Opplevagent shows experiences, not stockfish retailers. Use Rett fra Bonden for food producers. No experiences are shown."
+      )) + "</p>";
+      fitHeight();
+      return;
+    }
     if (out.out_of_area) {
       var where = out.place ? String(out.place) : "";
       root.innerHTML = '<p class="muted">' + esc(t(
