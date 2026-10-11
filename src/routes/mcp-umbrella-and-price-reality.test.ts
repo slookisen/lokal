@@ -28,6 +28,7 @@
 
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
+import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
 
 export interface TestSummary {
   passed: number;
@@ -67,6 +68,20 @@ function seedUmbrellaAndMembers(db: Database.Database): { umbrellaId: string; pr
     "Lyngdal", null, null
   );
 
+  // The descriptions deliberately assert reindeer products that the broad
+  // catalogue rows do not list: the search must not turn prose into evidence.
+  for (let i = 0; i < 5; i++) {
+    const id = `product-match-fixture-${i}`;
+    agentStmt.run(id, i === 0 ? "Dokumentert Reinsdyrutsalg" : `Nordlys Gård ${i}`,
+      i === 0 ? "Dokumentert produsentbeskrivelse" : `Beskrivelsesbasert reinkjøtt ${i}`,
+      `${id}@example.no`, `https://${id}.example.no`, "producer", `key-${id}`,
+      "Karasjok", null, null);
+    db.prepare("UPDATE agents SET categories = '[\"meat\"]' WHERE id = ?").run(id);
+    db.prepare(`INSERT INTO agent_knowledge (agent_id, address, phone, email, website, products)
+      VALUES (?, 'Karasjokveien 1', '91234567', ?, ?, ?)`).run(id, `${id}@example.no`,
+      `https://${id}.example.no`, JSON.stringify([{ name: i === 0 ? "Reinsdyrkjøtt" : "Kjøtt" }]));
+  }
+
   db.prepare(`
     INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, labels, created_at)
     VALUES (?, ?, 'active', 'admin', '[]', datetime('now'))
@@ -93,6 +108,9 @@ export async function runMcpUmbrellaAndPriceRealityTests(opts: { log?: boolean }
   __setDbForTesting(db as any);
   __initSchemaForTesting(db as any);
   const { umbrellaId, producerId } = seedUmbrellaAndMembers(db);
+  __setGeocodingFetchForTesting((async () => ({ ok: false, status: 404,
+    json: async () => ({}) } as Response)) as typeof fetch);
+  __clearGeocodeCacheForTesting();
 
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence registry chatter */ };
@@ -181,7 +199,37 @@ export async function runMcpUmbrellaAndPriceRealityTests(opts: { log?: boolean }
       assertTrue(/most producers do not list exact prices/i.test(desc) || /price included when the producer/i.test(desc),
         `Funn B: lokal_info description is honest about partial price coverage (got: ${desc})`);
     }
+
+    if (search) {
+      const specificProduct = textOf(await search.handler({ query: "reindeer meat", limit: 20 }));
+      assertTrue(/Dokumentert Reinsdyrutsalg/.test(specificProduct) && /Reinsdyrkjøtt/.test(specificProduct),
+        "Product search preserves the explicitly listed product");
+      assertTrue(specificProduct.indexOf("Dokumentert Reinsdyrutsalg") < specificProduct.indexOf("Nordlys Gård 1"),
+        "Explicit product evidence ranks before category-only fixtures");
+      assertTrue(/\*\*\d+\. Nordlys Gård 1 — Kategoritreff \/ category-only:/.test(specificProduct),
+        "A category-only match is identified in its heading");
+      assertTrue(!/Beskrivelsesbasert reinkjøtt/.test(specificProduct),
+        "A category-only product search omits persuasive background product claims");
+      assertTrue(/91234567/.test(specificProduct) && /product-match-fixture-1@example.no/.test(specificProduct),
+        "Category-only results preserve known contact details");
+      assertTrue(/\/produsent\/nordlys-gard-1\?/.test(specificProduct),
+        "Heading labels do not change the producer profile slug");
+      assertTrue(/Category match only: the listed products don't mention/.test(specificProduct),
+        "Category-only results still explain the missing product listing");
+
+      const named = textOf(await search.handler({ query: 'Nordlys Gård reinsdyr', limit: 20 }));
+      assertTrue([1, 2, 3, 4].every((i) => named.includes(`Nordlys Gård ${i}`)),
+        "A named query exercises the compact branch with more than three results");
+      assertTrue(/Beskrivelsesbasert reinkjøtt/.test(named) && !/category-only/.test(named),
+        "Named matches preserve descriptions and are not misclassified by absent product scoring");
+
+      const general = textOf(await search.handler({ query: "meat", limit: 20 }));
+      assertTrue(/Beskrivelsesbasert reinkjøtt/.test(general) && !/category-only/.test(general),
+        "Broad category discovery preserves its original descriptions");
+    }
   } finally {
+    __setGeocodingFetchForTesting();
+    __clearGeocodeCacheForTesting();
     console.log = prevLog;
     if (prevDb) __setDbForTesting(prevDb as any);
   }
