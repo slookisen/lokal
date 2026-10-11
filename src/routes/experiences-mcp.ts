@@ -438,7 +438,10 @@ function isStockfishPurchase(query: string | undefined): boolean {
   if (!query) return false;
   const request = query.normalize("NFKC").toLowerCase().replace(/ø/g, "o");
   if (!/\b(?:stock[ -]?fish|torrfisk)\b/.test(request)) return false;
-  if (/\b(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b|\bcooking\s+class(?:es)?\b|\btorrfiskmuse(?:um|et)\b/.test(request)) return false;
+  // Buying the food itself takes precedence over incidental museum/tour words.
+  if (/\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:some|fresh|dried|local|the|litt|fersk|lokal)\s+)*(?:stock[ -]?fish|torrfisk)\b(?!\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?))/i.test(request)) return true;
+  // Only an actual experience object qualifies, not a museum/tour mentioned elsewhere.
+  if (/\b(?:stock[ -]?fish|torrfisk)\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?)\b|\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:a|an|the|some|en|et)\s+)?(?:tickets?|tours?|tastings?|workshops?|experiences?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b/.test(request)) return false;
   return /\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille|shops?|stores?|sellers?|butikker?|utsalg)\b/.test(request);
 }
 

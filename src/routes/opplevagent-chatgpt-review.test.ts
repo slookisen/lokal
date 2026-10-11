@@ -387,6 +387,10 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         { query: "Hvor kan jeg kjøpe tørrfisk i Lofoten?", kommune: "Svolvær", category: "food" },
         { query: "Where can I order stockfish for cooking at home?" },
         { query: "Tørrfisk butikker i Lofoten" },
+        { query: "Where can I buy stockfish to take home after a museum visit?" },
+        { query: "Where can I buy stockfish for home cooking, not a tour?" },
+        { query: "Stockfish shops near the museum" },
+        { query: "Hvor kan jeg kjøpe tørrfisk etter en omvisning?" },
       ]) {
         const retail = (await rpc("tools/call", { name: "discover_experiences", arguments: args })).result;
         const text = JSON.parse(retail?.content?.[0]?.text ?? "{}");
@@ -404,7 +408,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
 
       expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfisksmaking med omvisning", category: "mat_drikke", season: ["all_year"] });
       expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfiskmuseum", category: "kultur_historie", season: ["all_year"] });
-      for (const query of ["Buy tickets for a stockfish tasting tour", "Kjøpe billett til tørrfisksmaking", "Cooking classes with stockfish"]) {
+      for (const query of ["Buy tickets for a stockfish tasting tour", "Buy a stockfish tasting tour", "Kjøpe billett til tørrfisksmaking", "Cooking classes with stockfish"]) {
         const allowed = (await rpc("tools/call", { name: "discover_experiences", arguments: { query, category: "mat_drikke", fylke: "Nordland" } })).result?.structuredContent;
         assertTrue(!allowed?.out_of_scope && allowed?.experiences?.some((e: any) => e.title === "Tørrfisksmaking med omvisning"),
           `j5: legitimate food experience is still discoverable: ${query}`);
