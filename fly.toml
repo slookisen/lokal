@@ -12,7 +12,7 @@ primary_region = 'arn'
 [env]
   NODE_ENV = 'production'
   PORT = '3000'
-  MEMORY_LIMIT_MB = '1024'
+  MEMORY_LIMIT_MB = '2048'
   # Daily outreach candidate cap (Grep 6, lokal#665 — resolveDailyPrepMaxCandidates()).
   # Non-secret feature flag, same convention as GARDSSALG_BOOKING_DISPATCH_ENABLED below.
   # Daniel raised 4 -> 6 (live sesjon 2026-08-21) now that Grep 7 releases ~23 candidates;
@@ -184,8 +184,17 @@ primary_region = 'arn'
     method = "GET"
     path = "/.well-known/agent-card.json"
 
+# 2026-10-11 (Daniel): dedicated core. On shared-cpu-1x every restart started
+# with 5 s of CPU burst balance, and the boot (tsx compiling src/ at startup)
+# used it up, so the machine was throttled to its 6.25 % baseline for the first
+# 10–30 s after each deploy (event-loop stalls 1.3–6.2 s at 6–8 % CPU share;
+# A2A dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler).
+# performance-1x has no burst balance and no baseline quota. 2 GB is the
+# smallest memory size for performance-1x. Set here, because fly deploy applies
+# this section: a size changed only in the dashboard or with `fly scale vm`
+# does not survive the next deploy.
 [[vm]]
-  size = 'shared-cpu-1x'
-  memory = '1024mb'
+  size = 'performance-1x'
+  memory = '2048mb'
   cpus = 1
-  memory_mb = 1024
+  memory_mb = 2048
