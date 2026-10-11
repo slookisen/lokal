@@ -167,11 +167,15 @@ export interface TrafficReading {
   realVisitors: number;
   aiCrawlerViews: number;
   windowDays: number;
+  /** When the figures were computed (epoch ms). */
+  computedAt?: number;
 }
 
 export interface AgentCallReading {
   toolCalls: number;
   windowDays: number;
+  /** When the figure was computed (epoch ms). */
+  computedAt?: number;
 }
 
 export interface AgentplatformDeps {
@@ -187,7 +191,12 @@ function defaultReadTraffic(v: CatalogVertical): TrafficReading | null {
   try {
     const snap = getTrafficStatsSnapshot(v);
     if (!snap.ready) return null;
-    return { realVisitors: snap.stats.realVisitors, aiCrawlerViews: snap.stats.aiCrawlerViews, windowDays: snap.stats.windowDays };
+    return {
+      realVisitors: snap.stats.realVisitors,
+      aiCrawlerViews: snap.stats.aiCrawlerViews,
+      windowDays: snap.stats.windowDays,
+      computedAt: snap.computedAt,
+    };
   } catch {
     return null;
   }
@@ -196,7 +205,7 @@ function defaultReadTraffic(v: CatalogVertical): TrafficReading | null {
 function defaultReadAgentCalls(): AgentCallReading | null {
   try {
     const snap = getAgentToolCallsSnapshot();
-    return snap.ready ? { toolCalls: snap.stats.toolCalls, windowDays: snap.stats.windowDays } : null;
+    return snap.ready ? { toolCalls: snap.stats.toolCalls, windowDays: snap.stats.windowDays, computedAt: snap.computedAt } : null;
   } catch {
     return null;
   }
@@ -213,9 +222,19 @@ export interface PlatformMetrics {
   trafficWindowDays: number | null;
   agentToolCalls: number | null;
   agentWindowDays: number | null;
+  /**
+   * The oldest computation time (epoch ms) among the figures shown, so
+   * «Oppdatert …» never claims more freshness than the stalest tile has.
+   * Null when nothing is shown or a shown figure has no timestamp.
+   */
+  updatedAt?: number | null;
 }
 
-export function collectPlatformMetrics(deps: Pick<AgentplatformDeps, "readTraffic" | "readAgentCalls">, counts: ServiceCounts): PlatformMetrics {
+export function collectPlatformMetrics(
+  deps: Pick<AgentplatformDeps, "readTraffic" | "readAgentCalls">,
+  counts: ServiceCounts,
+  countsComputedAt?: number | null,
+): PlatformMetrics {
   const verticals: CatalogVertical[] = ["rfb", "experiences", "dental"];
   const catalog = verticals.map((v) => counts[v]);
   const catalogTotal = catalog.every((n) => n != null) ? catalog.reduce((a: number, n) => a + (n as number), 0) : null;
@@ -227,7 +246,7 @@ export function collectPlatformMetrics(deps: Pick<AgentplatformDeps, "readTraffi
   const trafficWindowDays = windows && windows.size === 1 ? [...windows][0] : null;
   const agent = deps.readAgentCalls();
   const positive = (n: number | null) => (n != null && Number.isFinite(n) && n > 0 ? n : null);
-  return {
+  const metrics: PlatformMetrics = {
     catalogTotal: positive(catalogTotal),
     humanVisits: trafficWindowDays ? positive(humanVisits) : null,
     aiCrawlerViews: trafficWindowDays ? positive(aiCrawlerViews) : null,
@@ -235,6 +254,38 @@ export function collectPlatformMetrics(deps: Pick<AgentplatformDeps, "readTraffi
     agentToolCalls: agent ? positive(agent.toolCalls) : null,
     agentWindowDays: agent ? agent.windowDays : null,
   };
+  const stamps: Array<number | null | undefined> = [];
+  if (metrics.catalogTotal != null) stamps.push(countsComputedAt);
+  if (metrics.humanVisits != null || metrics.aiCrawlerViews != null) stamps.push(...(allTraffic ?? []).map((t) => t.computedAt));
+  if (metrics.agentToolCalls != null) stamps.push(agent?.computedAt);
+  const known = stamps.every((t) => typeof t === "number" && Number.isFinite(t));
+  metrics.updatedAt = stamps.length && known ? Math.min(...(stamps as number[])) : null;
+  return metrics;
+}
+
+const MONTHS: Record<Lang, string[]> = {
+  nb: ["januar", "februar", "mars", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "desember"],
+  en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+};
+
+const OSLO_PARTS = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Oslo",
+  day: "numeric",
+  month: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+/** «11. oktober kl. 14.50» / «11 October, 14:50» in Norwegian time (Europe/Oslo). */
+export function formatOsloStamp(ms: number, lang: Lang): string {
+  const parts = OSLO_PARTS.formatToParts(new Date(ms));
+  const part = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const day = Number(part("day"));
+  const month = MONTHS[lang][Number(part("month")) - 1];
+  return lang === "en"
+    ? `${day} ${month}, ${part("hour")}:${part("minute")}`
+    : `${day}. ${month} kl. ${part("hour")}.${part("minute")}`;
 }
 
 /** "At least" display: 123 456 → 123 000, 5 527 → 5 500, 812 → 812 (always rounded down). */
@@ -246,19 +297,22 @@ export function floorForTile(n: number): number {
 
 function makeCountCache(deps: AgentplatformDeps) {
   let cache: { at: number; ttl: number; counts: ServiceCounts } | null = null;
-  return (): ServiceCounts => {
+  const counts = (): ServiceCounts => {
     const now = deps.now();
     if (!cache || now - cache.at >= cache.ttl) {
       const read = (v: CatalogVertical) => {
         const n = deps.readCount(v);
         return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : null;
       };
-      const counts = { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") };
-      const anyMissing = Object.values(counts).some((n) => n == null);
-      cache = { at: now, ttl: anyMissing ? COUNT_RETRY_MS : COUNT_TTL_MS, counts };
+      const fresh = { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") };
+      const anyMissing = Object.values(fresh).some((n) => n == null);
+      cache = { at: now, ttl: anyMissing ? COUNT_RETRY_MS : COUNT_TTL_MS, counts: fresh };
     }
     return cache.counts;
   };
+  /** When the cached counts were read (epoch ms); call after counts(). */
+  const computedAt = (): number | null => (cache ? cache.at : null);
+  return { counts, computedAt };
 }
 
 // ─── Copy ───────────────────────────────────────────────────────────────────
@@ -309,6 +363,7 @@ const T = {
         body: "Strukturerte data om tilbudene gjennom grensesnittene våre, til bruk i egne tjenester etter avtale.",
       },
     ],
+    mUpdated: (stamp: string) => `Oppdatert ${stamp}`,
     pMetricsKicker: "Plattformen i tall",
     pMetricsTitle: "Bruk vi kan dokumentere",
     pMetricsLead:
@@ -466,6 +521,7 @@ const T = {
         body: "Structured data about the offerings through our interfaces, for use in your own services by agreement.",
       },
     ],
+    mUpdated: (stamp: string) => `Updated ${stamp} (Norwegian time)`,
     pMetricsKicker: "The platform in figures",
     pMetricsTitle: "Usage we can document",
     pMetricsLead:
@@ -827,6 +883,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 .metric strong{font-size:34px;letter-spacing:-.03em;font-weight:650;color:#fff;font-variant-numeric:tabular-nums}
 .metric .m-label{color:var(--band-ink);font-weight:550}
 .metric .m-def{color:var(--band-muted);font-size:14px;line-height:1.5}
+.m-updated{margin-top:20px;color:var(--band-muted);font-size:14px}
 .steps{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);gap:20px;counter-reset:none}
 @media (max-width:980px){.steps{grid-template-columns:1fr}}
 .steps li{display:flex;gap:16px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
@@ -1158,6 +1215,7 @@ export function renderPartners(lang: Lang, metrics: PlatformMetrics): string {
 ${tiles.length ? `<section class="band" id="tall" aria-labelledby="tall-h"><div class="wrap">
 <p class="kicker">${t.pMetricsKicker}</p><h2 id="tall-h">${t.pMetricsTitle}</h2><p class="sec-lead">${esc(t.pMetricsLead)}</p>
 <div class="metrics">${tiles.join("")}</div>
+${metrics.updatedAt != null ? `<p class="m-updated"><time datetime="${new Date(metrics.updatedAt).toISOString()}">${esc(t.mUpdated(formatOsloStamp(metrics.updatedAt, lang)))}</time></p>` : ""}
 </div></section>` : ""}
 
 <section aria-labelledby="steg-h"><div class="wrap">
@@ -1403,13 +1461,15 @@ export function createAgentplatformRouter(overrides: Partial<AgentplatformDeps> 
     readAgentCalls: overrides.readAgentCalls ?? defaultReadAgentCalls,
     now: overrides.now ?? Date.now,
   };
-  const getCounts = makeCountCache(deps);
+  const countCache = makeCountCache(deps);
+  const getCounts = countCache.counts;
+  const partnerMetrics = () => collectPlatformMetrics(deps, getCounts(), countCache.computedAt());
   const router = Router();
 
   router.get("/", (_req, res) => sendHtml(res, 200, renderHome("nb", getCounts()), "nb"));
   router.get("/en", (_req, res) => sendHtml(res, 200, renderHome("en", getCounts()), "en"));
-  router.get("/partnere", (_req, res) => sendHtml(res, 200, renderPartners("nb", collectPlatformMetrics(deps, getCounts())), "nb"));
-  router.get("/en/partners", (_req, res) => sendHtml(res, 200, renderPartners("en", collectPlatformMetrics(deps, getCounts())), "en"));
+  router.get("/partnere", (_req, res) => sendHtml(res, 200, renderPartners("nb", partnerMetrics()), "nb"));
+  router.get("/en/partners", (_req, res) => sendHtml(res, 200, renderPartners("en", partnerMetrics()), "en"));
   router.get(["/partners", "/en/partnere", "/investorer", "/investors", "/en/investors"], (req, res) =>
     res.redirect(301, req.path === "/investorer" ? "/partnere#investorer" : req.path.includes("invest") ? "/en/partners#investorer" : "/en/partners"),
   );

@@ -72,6 +72,8 @@ export interface TrafficStatsSnapshot {
   stats: TrafficStats;
   /** False only while the first off-thread computation after boot is running. */
   ready: boolean;
+  /** When `stats` was computed (epoch ms); set whenever `ready` is true. */
+  computedAt?: number;
 }
 
 export interface TrafficStatsReaderDeps {
@@ -141,19 +143,22 @@ export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficS
       if (deps.offThreadUsable(db, `trafficStats:${cacheKey}`)) {
         bindOffThreadDb(db);
         const hit = offThread.get(cacheKey);
-        return hit ? { stats: hit.value, ready: true } : { stats: emptyTrafficStats(), ready: false };
+        return hit
+          ? { stats: hit.value, ready: true, computedAt: deps.now() - hit.ageMs }
+          : { stats: emptyTrafficStats(), ready: false };
       }
 
       // Synchronous path (in-memory DB, kill switch, or worker broken).
       const now = deps.now();
       const cached = syncCache.get(cacheKey);
       if (cached && now >= cached.time && now - cached.time < deps.syncTtlMs) {
-        return { stats: cached.data, ready: true };
+        return { stats: cached.data, ready: true, computedAt: cached.time };
       }
       try {
+        const time = deps.now();
         const data = deps.computeSync(db, vertical);
-        syncCache.set(cacheKey, { data, time: deps.now() });
-        return { stats: data, ready: true };
+        syncCache.set(cacheKey, { data, time });
+        return { stats: data, ready: true, computedAt: time };
       } catch {
         return { stats: emptyTrafficStats(), ready: false };
       }
