@@ -28,8 +28,8 @@ try {
   const row = publicResult.experience;
   if (row?.id !== id) throw new Error('The public response did not identify the requested record.');
   report.public_record = { id: row.id, title: row.title, price_from: row.price_from,
-    price_unit: row.price_unit, duration_minutes_min: row.duration_minutes_min,
-    duration_minutes_max: row.duration_minutes_max, description: row.description };
+    price_unit: row.price_unit, duration_min: row.duration_min,
+    duration_max: row.duration_max, description: row.description };
 
   report.corrections_dry_run = await request('/api/opplevelser/admin/experiences-data-corrections', {
     admin: true,
