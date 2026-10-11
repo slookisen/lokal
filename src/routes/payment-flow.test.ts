@@ -832,7 +832,9 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     const toolsOn2: Record<string, { def: any }> = {};
     process.env.PAYMENTS_ENABLED = "1";
     mcp.registerTools(new Proxy({}, { get: (_t, prop) => prop === "registerTool" ? (name: string, def: any) => { toolsOn2[name] = { def }; } : () => undefined }) as any);
-    ok(mcp.rfbMcpInstructions() === mcp.RFB_MCP_INSTRUCTIONS_PREPAY && !mcp.rfbMcpInstructions().includes("never takes payment"), "F17-26: MCP server instructions describe prepayment when on");
+    ok(mcp.rfbMcpInstructions() === mcp.RFB_MCP_INSTRUCTIONS_PREPAY && !mcp.rfbMcpInstructions().includes("never takes payment") && mcp.rfbMcpInstructions().includes("Some producers take prepayment")
+      && mcp.RFB_MCP_INSTRUCTIONS_PREPAY.endsWith(mcp.RFB_MCP_INSTRUCTIONS.slice(mcp.RFB_MCP_INSTRUCTIONS.indexOf("It cannot send marketing"))),
+      "F17-26: MCP server instructions describe prepayment when on, and keep the rest of the shared guidance");
     ok(toolsOn2["lokal_cart_submit"]!.def.description.includes("seller_trader_status") && toolsOn2["lokal_cart_submit"]!.def.description.includes("terms_url")
       && toolsOn2["lokal_cart_create"]!.def.description.includes("Stripe payment link") && toolsOn2["lokal_order_status"]!.def.description.includes("producer_cancelled"),
       "F17-27: tool descriptions mention the trader status, terms_url, payment links and the new cancel reasons");
