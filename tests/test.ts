@@ -24,6 +24,7 @@ process.env.EMAIL_FORCE_DRY_RUN = 'true';
 // file DB getDb() happens to open. The worker path is tested directly (with
 // its own temp DB) in src/services/offthread-stats.test.ts.
 process.env.OFFTHREAD_STATS_DISABLED = '1';
+(require("./module-cache") as any).__diagWatch(); // TEMP-DIAG
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";

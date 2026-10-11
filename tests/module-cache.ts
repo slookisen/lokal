@@ -143,6 +143,25 @@ export function __diagStaleBindings(where: string): void {
   console.log(`MCDIAG [${where}] booking-store=${bs ? __diagTag(cache[bs]) : "absent"} its email=${bsEmail} | email-service=${es ? __diagTag(cache[es]) : "absent"} | open=${overlap().open} | stale bindings=${lines.length}`);
   for (const l of lines.slice(0, 30)) console.log(`MCDIAG   ${l}`);
 }
+export function __diagWatch(): void {
+  const origLog = console.log;
+  let last = "";
+  const snap = (): string => {
+    const cache = require.cache;
+    const bs = Object.keys(cache).find((k) => /[\\/]services[\\/]booking-store\.ts$/.test(k));
+    const es = Object.keys(cache).find((k) => /[\\/]services[\\/]email-service\.ts$/.test(k));
+    const op = Object.keys(cache).find((k) => /[\\/]routes[\\/]owner-portal\.ts$/.test(k));
+    const kid = (k: string | undefined) => (k ? (cache[k]!.children ?? []).filter((c) => /email-service/.test(c.filename)).map(__diagTag).join(",") : "-");
+    return `email=${es ? __diagTag(cache[es]) : "absent"} booking-store=${bs ? __diagTag(cache[bs]) : "absent"}(email ${kid(bs)}) owner-portal=${op ? __diagTag(cache[op]) : "absent"}(email ${kid(op)}) open=${overlap().open}`;
+  };
+  console.log = function (...a: unknown[]) {
+    if (typeof a[0] === "string" && /^\n?── /.test(a[0])) {
+      const s = snap();
+      if (s !== last) { origLog.call(console, `MCDIAG watch before ${a[0].trim().slice(0, 90)} :: ${s}`); last = s; }
+    }
+    return origLog.apply(console, a as []);
+  } as typeof console.log;
+}
 function __diagLog(what: string, id: string, m?: unknown): void {
   if (__diagRe.test(id)) console.log(`MCDIAG ${what} ${__diagRel(id)} ${m === undefined ? "" : __diagTag(m)} open=${overlap().open}`);
 }
