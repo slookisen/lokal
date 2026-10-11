@@ -26,7 +26,10 @@
 //     in such a word). Any other word is left to the JS filter (strict
 //     path) or forces the full scan (any-word path).
 //
-// Kill switch: RFB_NAME_FTS=0 → full scan as before; table and triggers stay.
+// Kill switch: RFB_NAME_FTS=0 → full scan as before at once, and at the next
+// boot ensureAgentsNameFts drops the triggers and then the table, so agents
+// writes no longer touch the index (the fix if the index itself breaks).
+// Removing the variable rebuilds both at the next boot.
 // Rollback: drop the TRIGGERS before the table — a trigger whose body names a
 // missing table makes every write to agents fail:
 //   DROP TRIGGER IF EXISTS agents_name_fts_ai; DROP TRIGGER IF EXISTS agents_name_fts_ad;
@@ -44,7 +47,19 @@ export function isNameFtsEnabled(): boolean {
   return process.env.RFB_NAME_FTS !== "0";
 }
 
+// DBs whose last sync failed: their index may be empty or behind (a failed
+// first fill leaves a fresh table empty), so the search must not trust it
+// until a later sync (boot or nightly) succeeds.
+const unsynced = new WeakSet<object>();
+
+/** The search may use this DB's index: switch on and its last sync did not fail. */
+export function isNameFtsUsable(db: Database.Database): boolean {
+  return isNameFtsEnabled() && !unsynced.has(db);
+}
+
 const FTS_DDL = `CREATE VIRTUAL TABLE IF NOT EXISTS ${NAME_FTS_TABLE} USING fts5(agent_id UNINDEXED, name, tokenize = 'trigram')`;
+
+const TRIGGER_NAMES = ["agents_name_fts_ai", "agents_name_fts_ad", "agents_name_fts_au"];
 
 // The UPDATE trigger only fires when id or name really changed, so a write
 // that re-sets the same name costs nothing. A REPLACE that deletes an old row
@@ -93,15 +108,42 @@ export function syncAgentsNameFts(db: Database.Database): NameFtsSyncResult {
   try {
     const agents = (db.prepare("SELECT COUNT(*) AS c FROM agents").get() as { c: number }).c;
     const indexed = (db.prepare(`SELECT COUNT(*) AS c FROM ${NAME_FTS_TABLE}`).get() as { c: number }).c;
-    if (agents === indexed) return { agents, indexed, rebuilt: false, ms: performance.now() - t0 };
-    db.transaction(() => {
-      db.exec(`DELETE FROM ${NAME_FTS_TABLE}`);
-      db.exec(`INSERT INTO ${NAME_FTS_TABLE}(agent_id, name) SELECT id, name FROM agents`);
-    })();
-    return { agents, indexed, rebuilt: true, ms: performance.now() - t0 };
+    if (agents !== indexed) {
+      db.transaction(() => {
+        db.exec(`DELETE FROM ${NAME_FTS_TABLE}`);
+        db.exec(`INSERT INTO ${NAME_FTS_TABLE}(agent_id, name) SELECT id, name FROM agents`);
+      })();
+    }
+    unsynced.delete(db);
+    return { agents, indexed, rebuilt: agents !== indexed, ms: performance.now() - t0 };
   } catch (err) {
+    try { unsynced.add(db); } catch { /* not an object */ }
     return { agents: -1, indexed: -1, rebuilt: false, ms: performance.now() - t0, error: (err as Error)?.message ?? String(err) };
   }
+}
+
+/**
+ * The kill switch at boot: drops the triggers first (each on its own, so a
+ * broken index cannot keep one alive), then the table. Never throws; returns
+ * false if a trigger is still there, i.e. agents writes may still fail.
+ */
+export function dropAgentsNameFts(db: Database.Database): boolean {
+  let triggersGone = true;
+  for (const name of TRIGGER_NAMES) {
+    try {
+      db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    } catch (err) {
+      triggersGone = false;
+      console.error(`[name-fts] could not drop trigger ${name}: ${(err as Error)?.message ?? err}`);
+    }
+  }
+  try {
+    db.exec(`DROP TABLE IF EXISTS ${NAME_FTS_TABLE}`);
+  } catch (err) {
+    // Harmless once the triggers are gone: nothing writes or reads it.
+    console.error(`[name-fts] could not drop ${NAME_FTS_TABLE} (non-fatal): ${(err as Error)?.message ?? err}`);
+  }
+  return triggersGone;
 }
 
 /**
@@ -109,8 +151,14 @@ export function syncAgentsNameFts(db: Database.Database): NameFtsSyncResult {
  * empty or out of step. Table and triggers are created in one transaction, so
  * there is never a table without its triggers. When FTS5/trigram is missing
  * it logs once and creates nothing — the search keeps using the full scan.
+ * With RFB_NAME_FTS=0 it drops triggers and table instead (see header).
  */
 export function ensureAgentsNameFts(db: Database.Database): NameFtsSyncResult | null {
+  if (!isNameFtsEnabled()) {
+    const gone = dropAgentsNameFts(db);
+    console.log(`[name-fts] RFB_NAME_FTS=0: ${gone ? "index and triggers dropped" : "TRIGGERS NOT DROPPED"}, name search uses the full scan`);
+    return null;
+  }
   try {
     db.transaction(() => {
       db.exec(FTS_DDL);

@@ -3,7 +3,7 @@ import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
-import { syncAgentsNameFts } from "./services/name-search-fts";
+import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
@@ -1565,11 +1565,14 @@ app.listen(Number(PORT), HOST, async () => {
       // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: rebuild the
       // name-search FTS index if its row count has drifted from agents
       // (services/name-search-fts.ts). Before the WAL checkpoint below, so a
-      // rebuild's WAL is truncated the same night. Never throws.
+      // rebuild's WAL is truncated the same night. Skipped with RFB_NAME_FTS=0
+      // (boot dropped the index). Never throws.
       try {
-        const fts = syncAgentsNameFts(getDb());
-        if (fts.error) console.error(`[name-fts] consistency check failed (non-fatal): ${fts.error}`);
-        else if (fts.rebuilt) console.log(`[name-fts] rebuilt: agents=${fts.agents} indexed=${fts.indexed} in ${fts.ms.toFixed(1)}ms`);
+        if (isNameFtsEnabled()) {
+          const fts = syncAgentsNameFts(getDb());
+          if (fts.error) console.error(`[name-fts] consistency check failed (non-fatal): ${fts.error}`);
+          else if (fts.rebuilt) console.log(`[name-fts] rebuilt: agents=${fts.agents} indexed=${fts.indexed} in ${fts.ms.toFixed(1)}ms`);
+        }
       } catch (err) {
         console.error("[name-fts] consistency check failed (non-fatal):", err);
       }

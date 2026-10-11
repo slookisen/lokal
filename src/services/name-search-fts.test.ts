@@ -11,6 +11,9 @@
  * Standalone: npx tsx src/services/name-search-fts.test.ts
  */
 import Database from "better-sqlite3";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { publicListableSql } from "./agent-visibility";
 
@@ -70,7 +73,7 @@ const QUERIES = [
   "ÖLANDS", "müller", "MÜLLER KÄSE", "café", "CAFÉ ÉLAN", "élan", "ÉLAN", "ærø", "ÆRØ ÆBLEMOST", "æblegården",
   "li gård", "ny lia", "li ny", "lia", "bakeri", "BAKERİ", "bakeri istanbul", "konditori", "tori", "kåre's",
   "ost & sånt", "søndre øyen", "straße", "ꭰbc", "Ꭰbc Farm", "gård", "nordre gård", "Nordre", "nordre 1",
-  "xyzzy finnes ikke", "Ås Fiskemat Honning", "Testprodusent", "Tannlege", "Paraply",
+  "xyzzy finnes ikke", "Ås Fiskemat Honning", "Testprodusent", "Tannlege", "Paraply", "ꭰbc xyzzy",
 ];
 
 function seed(db: Database.Database, rows: Fixture[]): void {
@@ -221,6 +224,8 @@ export function runNameSearchFtsTests(opts: { log?: boolean } = {}): TestSummary
     ok(!r8.viaFts && ids(r8).includes("ny-lia"), "only 2-char words → full scan, still finds 'Ny Lia Gård'");
     const r9 = search("Ꭰbc Farm");
     ok(r9.viaFts && ids(r9).includes("cherokee"), "word FTS can't fold is left to JS, the other word still prefilters");
+    const r11 = search("ꭰbc xyzzy");
+    ok(ids(r11).includes("cherokee") && r11.results[0]?.matchReasons?.[0]?.startsWith("Mulig navnematch") === true, "any-word path with a word FTS can't fold → full scan, still finds 'Ꭰbc Farm'");
     const r10 = search("nordre gård");
     ok(r10.results.length === 20, "broad match is cut at the page size (order-sensitive case covered by parity)");
     for (const np of ["Testprodusent", "Tannlege", "Paraply"]) {
@@ -305,6 +310,63 @@ export function runNameSearchFtsTests(opts: { log?: boolean } = {}): TestSummary
     threw = false;
     try { r = search("bjørndal gård"); } catch { threw = true; }
     ok(!threw && !!r && !r.viaFts && JSON.stringify(r.results) === JSON.stringify(ref.results), "broken index (MATCH throws) → full scan, same results");
+
+    // ── (10) kill switch at boot: drops triggers + table, so a broken index stops blocking writes ──
+    db.exec("DROP TABLE agents_name_fts");
+    quiet();
+    try { m1 = fts.ensureAgentsNameFts(db); } finally { loud(); }
+    ok(!!m1 && m1.rebuilt && search("bjørndal").viaFts, "index restored before the kill-switch test");
+    db.exec("DROP TABLE agents_name_fts; CREATE TABLE agents_name_fts (x TEXT)"); // triggers stay, their INSERT now fails
+    const writeAgent = (): boolean => {
+      try {
+        seed(db, [{ id: "ks-write", name: "Kill Switch Gård" }]);
+        db.prepare("UPDATE agents SET name = 'Kill Switch Gård 2' WHERE id = 'ks-write'").run();
+        db.prepare("DELETE FROM agents WHERE id = 'ks-write'").run();
+        return true;
+      } catch { return false; }
+    };
+    ok(!writeAgent(), "broken index with live triggers blocks agents writes (what the kill switch must fix)");
+    setFts(false);
+    quiet();
+    try { m1 = fts.ensureAgentsNameFts(db); } finally { loud(); }
+    const left = db.prepare("SELECT name FROM sqlite_master WHERE name LIKE 'agents_name_fts%'").all();
+    ok(m1 === null && left.length === 0 && captured.some((l) => l.includes("index and triggers dropped")), `RFB_NAME_FTS=0 at boot drops triggers and table (left: ${JSON.stringify(left)})`);
+    ok(writeAgent(), "agents writes work again after the kill switch");
+    setFts(false); const ksOff = search("bjørndal gård");
+    ok(!ksOff.viaFts && JSON.stringify(ksOff.results) === JSON.stringify(ref.results), "kill switch on → full scan, same results");
+    setFts(true);
+    quiet();
+    try { m1 = fts.ensureAgentsNameFts(db); } finally { loud(); }
+    ok(!!m1 && m1.rebuilt && ftsCount() === agentCount() && search("bjørndal").viaFts, "switch removed → next boot rebuilds the index");
+
+    // ── (11) a failed sync (e.g. SQLITE_BUSY on the first fill) → that DB's index is not used ──
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "name-fts-"));
+    const file = path.join(tmp, "agents.db");
+    const fdb = new Database(file);
+    const locker = new Database(file);
+    try {
+      fdb.pragma("foreign_keys = OFF");
+      quiet();
+      try { __initSchemaForTesting(fdb); } finally { loud(); }
+      seed(fdb, FIXTURES.slice(0, 5));
+      fdb.exec(`DELETE FROM ${fts.NAME_FTS_TABLE}`); // a fresh, still empty index
+      fdb.pragma("busy_timeout = 0");
+      locker.exec("BEGIN IMMEDIATE"); // another writer: the fill's DELETE gets SQLITE_BUSY
+      const failedSync = fts.syncAgentsNameFts(fdb);
+      ok(!!failedSync.error && !fts.isNameFtsUsable(fdb) && fts.isNameFtsUsable(db), `failed sync → that DB's index is not trusted, other DBs unaffected (${failedSync.error})`);
+      __setDbForTesting(fdb);
+      const viaScan = search("bjørndal");
+      ok(!viaScan.viaFts && ids(viaScan).includes("bjorndal"), "empty index after a failed fill → full scan, the agent is still found");
+      locker.exec("ROLLBACK");
+      const okSync = fts.syncAgentsNameFts(fdb);
+      const viaFtsAgain = search("bjørndal");
+      ok(okSync.rebuilt && fts.isNameFtsUsable(fdb) && viaFtsAgain.viaFts && ids(viaFtsAgain).includes("bjorndal"), "next successful sync → the index is used again");
+    } finally {
+      __setDbForTesting(db);
+      try { locker.close(); } catch { /* ignore */ }
+      try { fdb.close(); } catch { /* ignore */ }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   } catch (err) {
     loud();
     failed++;

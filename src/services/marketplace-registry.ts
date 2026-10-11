@@ -41,7 +41,7 @@ import { publicListableSql, isPubliclyListable } from "./agent-visibility";
 // name search. PURE (type-only import), same isolation rule as above.
 import {
   NAME_FTS_TABLE,
-  isNameFtsEnabled,
+  isNameFtsUsable,
   nameFtsAllWordsMatch,
   nameFtsAnyWordMatch,
   noteNameFtsQueryFailure,
@@ -246,7 +246,7 @@ class MarketplaceRegistry {
       // Only rows whose name the FTS index (services/name-search-fts.ts) says
       // can match — a superset of what the JS filters below keep. Null → full scan.
       const ftsRows = (match: string | null): any[] | null => {
-        if (!match || !isNameFtsEnabled()) return null;
+        if (!match || !isNameFtsUsable(db)) return null;
         try {
           return db.prepare(
             `SELECT * FROM agents WHERE id IN (SELECT agent_id FROM ${NAME_FTS_TABLE} WHERE ${NAME_FTS_TABLE} MATCH ?) ` +
