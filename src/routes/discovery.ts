@@ -1057,6 +1057,7 @@ ${companyOperatorSentence("en")}</p>
 <footer>
   ${getConfig().display_name} · <a href="/">rettfrabonden.com</a> ·
   <a href="/privacy">Privacy</a> ·
+  <a href="/kjopsvilkar">Kjøpsvilkår</a> ·
   <a href="/.well-known/agent-card.json">Agent Card</a> ·
   <a href="https://github.com/slookisen/lokal">Source</a>
   <div class="company-line">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>

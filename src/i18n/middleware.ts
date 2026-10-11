@@ -91,7 +91,7 @@ export const LANG_SESSION_COOKIE = "rfb_lang_session";
 /** RFB pages whose handler reads req.lang and renders in that language. */
 const RFB_LOCALIZED_EXACT: ReadonlySet<string> = new Set([
   "/", "/sok", "/om", "/teknologi", "/reise", "/guide-mat-ai", "/personvern",
-  "/proveniens", "/kategori", "/verifisert-av-eier", "/kontakt",
+  "/kjopsvilkar", "/proveniens", "/kategori", "/verifisert-av-eier", "/kontakt",
 ]);
 const RFB_LOCALIZED_PREFIXES: readonly string[] = ["/produsent/", "/kategori/"];
 

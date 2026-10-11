@@ -19,6 +19,7 @@
     "how_it_works": "Så fungerar det",
     "about_link": "Om Rett fra Bonden",
     "privacy": "Integritet",
+    "terms_of_purchase": "Köpvillkor",
     "for_producers": "För producenter",
     "register": "Registrera dig",
     "login": "Logga in",
@@ -105,6 +106,11 @@
     "title": "Integritet — Rett fra Bonden",
     "description": "Integritetspolicy för Rett fra Bonden. Vad vi samlar in, hur vi använder det och dina rättigheter.",
     "page_title": "Integritet"
+  },
+  "terms_of_purchase": {
+    "title": "Köpvillkor — Rett fra Bonden",
+    "description": "Köpvillkor och återbetalningsregler för beställningar via Rett fra Bonden.",
+    "page_title": "Köpvillkor"
   },
   "provenance": {
     "title": "Så verifierar vi våra data — Rett fra Bonden",
