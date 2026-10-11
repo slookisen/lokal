@@ -274,7 +274,7 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
           "e4: aboutBody falls back to the existing honest fallback copy",
         );
         assertTrue(
-          r.body.includes("Detaljer om hva besøket hos") || r.body.includes("inkluderer typisk"),
+          r.body.includes("direkte om det går an å komme på besøk") && !r.body.includes("inkluderer typisk") && !r.body.includes("Book et besøk"),
           "e5: visitBody falls back to the existing honest fallback copy",
         );
       }

@@ -68,6 +68,7 @@ import {
   searchGardssalgProviders,
   countGardssalgProviders,
   getProviderById,
+  unfilterableDiscoverFields,
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
@@ -145,6 +146,59 @@ const router = Router();
 // "https://opplevagent.no") — used to build the discover_gardssalg
 // profile_url below.
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
+
+// dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: additive
+// provider/profile/source fields for discover_experiences + get_experience.
+// Every field without a value is null (never "" and never omitted), so an agent
+// can tell "unknown" from "empty". Nothing here changes stored data.
+function cleanStr(v: unknown): string | null {
+  const t = typeof v === "string" ? v.trim() : "";
+  return t ? t : null;
+}
+function cleanHttpUrl(v: unknown): string | null {
+  const t = cleanStr(v);
+  if (!t) return null;
+  try {
+    const u = new URL(t);
+    return u.protocol === "http:" || u.protocol === "https:" ? t : null;
+  } catch {
+    return null;
+  }
+}
+export function buildExperienceVisibilityFields(e: {
+  provider_id?: string | null;
+  slug?: string | null;
+  evidence_url?: string | null;
+  booking_url?: string | null;
+}): {
+  provider: { name: string | null; org_nr: string | null; website: string | null; phone: string | null } | null;
+  profile_url: string | null;
+  source_url: string | null;
+  booking_info_only: boolean;
+} {
+  let provider: { name: string | null; org_nr: string | null; website: string | null; phone: string | null } | null = null;
+  if (e.provider_id) {
+    try {
+      const p = getProviderById(e.provider_id);
+      if (p) {
+        provider = {
+          name: cleanStr(p.navn),
+          org_nr: cleanStr(p.org_nr),
+          website: cleanHttpUrl(p.hjemmeside),
+          phone: cleanStr(p.telefon),
+        };
+      }
+    } catch { /* provider lookup is best-effort; the experience is still returned */ }
+  }
+  return {
+    provider,
+    profile_url: cleanStr(e.slug) ? `${APP_URL}/opplevelse/${encodeURIComponent(String(e.slug).trim())}` : null,
+    source_url: cleanHttpUrl(e.evidence_url),
+    // true when there is no usable http(s) booking link: the entry is
+    // information only and the agent should not promise a booking.
+    booking_info_only: cleanHttpUrl(e.booking_url) === null,
+  };
+}
 
 // Apply rate limiting to all routes on this router (same pattern as dental-mcp.ts)
 router.use(jsonRpcLimiter);
@@ -701,6 +755,7 @@ export function registerExperienceTools(
             : null,
           booking_url: e.booking_url ?? null,
           booking_type: e.booking_type ?? null,
+          ...buildExperienceVisibilityFields(e),
           tags: e.tags ?? [],
           // Only present when an origin (lat/lng) was given. geo_precision
           // tells the caller whether distance_km is an exact address-based
@@ -709,10 +764,16 @@ export function registerExperienceTools(
           ...(hasGeo ? { distance_km: e.distance_km ?? null, geo_precision: e.geo_precision ?? null } : {}),
         }));
 
+        // Filters that cannot narrow anything because no published experience
+        // carries the field (group_size / age / language): say so.
+        let unfilterable: string[] = [];
+        try { unfilterable = unfilterableDiscoverFields(filter); } catch { unfilterable = []; }
+
         const result = {
           summary,
           count: results.length,
           filter_applied: filter,
+          unfilterable_fields: unfilterable.length > 0 ? unfilterable : undefined,
           relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
           suggestions: suggestions.length > 0 ? suggestions : undefined,
           experiences: formatted,
@@ -905,6 +966,7 @@ export function registerExperienceTools(
           accessibility: experience.accessibility ?? [],
           booking_url: experience.booking_url ?? null,
           booking_type: experience.booking_type ?? null,
+          ...buildExperienceVisibilityFields(experience),
           meeting_point: experience.meeting_point ?? null,
           kommune: experience.kommune ?? null,
           fylke: experience.fylke ?? null,

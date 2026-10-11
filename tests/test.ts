@@ -30749,8 +30749,10 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   assertEq(localBizGP?.geo?.latitude, 61.115, "gp-08e: LocalBusiness geo.latitude matches the seeded lat");
   assertEq(localBizGP?.telephone, "61234567", "gp-08f: LocalBusiness telephone matches");
   assertEq(localBizGP?.email, "post@fjellrosideri.no", "gp-08g: LocalBusiness email matches");
-  assertEq(localBizGP?.offers?.url, `https://opplevagent.no/kategori/gardssalg/book/${slugGP}`,
-    "gp-08h: LocalBusiness offers.url points at the booking route (absolute URL)");
+  // 2026-10-06 (opplevagent-visning): this provider has booking paused, so the
+  // page must not publish an InStock Offer pointing at the booking route.
+  assertEq(localBizGP?.offers, undefined,
+    "gp-08h: LocalBusiness has no offers node while booking is paused");
   const breadcrumbGP = ldObjsGP.find((o: any) => o["@type"] === "BreadcrumbList");
   assertTrue(!!breadcrumbGP, "gp-08i: a BreadcrumbList JSON-LD block is present");
   assertEq(breadcrumbGP?.itemListElement?.length, 3, "gp-08j: breadcrumb has 3 items (Forsiden / Gårdssalg og smaking / provider)");
@@ -33377,6 +33379,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esgbna.failed;
     for (const f of esgbna.failures) failures.push("experiences-seo-gardssalg-booking-ikke-aktivert: " + f);
     console.log(`  experiences-seo-gardssalg-booking-ikke-aktivert: ${esgbna.passed} passed, ${esgbna.failed} failed`);
+
+    // dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: honest
+    // machine signals (no InStock while paused), MCP provider/profile fields,
+    // unfilterable_fields, /tilbyder/ Organization JSON-LD, no EN signals
+    // while the language switcher flag is off.
+    console.log("\n── experiences-seo-visning-mcp-tilbyder: honest visning + MCP fields ──");
+    const { runExperiencesSeoVisningMcpTilbyderTests } = require("../src/routes/experiences-seo-visning-mcp-tilbyder.test") as
+      typeof import("../src/routes/experiences-seo-visning-mcp-tilbyder.test");
+    const esvmt = await runExperiencesSeoVisningMcpTilbyderTests({ log: false });
+    passed += esvmt.passed;
+    failed += esvmt.failed;
+    for (const f of esvmt.failures) failures.push("experiences-seo-visning-mcp-tilbyder: " + f);
+    console.log(`  experiences-seo-visning-mcp-tilbyder: ${esvmt.passed} passed, ${esvmt.failed} failed`);
 
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
     // arbeidspunkt 5: gårdssalg produsent-profil template render-guards —

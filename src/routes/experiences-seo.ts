@@ -2044,9 +2044,9 @@ router.get("/", (req: Request, res: Response) => {
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
-<link rel="alternate" hreflang="nb" href="${url}">
+${isOpplevagentLangSwitcherEnabled() ? `<link rel="alternate" hreflang="nb" href="${url}">
 <link rel="alternate" hreflang="en" href="${url}/en">
-<link rel="alternate" hreflang="x-default" href="${url}">
+<link rel="alternate" hreflang="x-default" href="${url}">` : ""}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 ${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:title" content="${escapeHtml(S.ogTitle)}">
@@ -2259,7 +2259,7 @@ ${ldScripts}
 <body>
 <a class="skip-link" href="#hovedinnhold">${S.skip}</a>
 
-${oaSiteNav({ active: "hjem", lang })}
+${oaSiteNav({ active: "hjem", lang, switcher: isOpplevagentLangSwitcherEnabled() })}
 
 <main id="hovedinnhold">
   <section class="hero" aria-labelledby="hero-title">
@@ -3644,7 +3644,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">${L.skip}</a>
-${oaSiteNav({ lang, path: noPath, switcher: switcherOn || undefined })}
+${oaSiteNav({ lang, path: noPath, switcher: switcherOn })}
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="${L.crumbs}">
     <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(switcherOn ? displayTitle : exp.title)}
@@ -5592,19 +5592,6 @@ function drivingSted(p: GardssalgProviderRow): string {
   return gardssalgPlaceLabel(p);
 }
 
-// Generic, type-general "what a visit typically includes" copy — intentionally
-// NOT phrased as a verified fact about the specific producer (no per-producer
-// source yet), just an honest orientation until real content lands.
-const VISIT_TYPE_COPY: Record<string, string> = {
-  bryggeri: "en omvisning i bryggeriet og en smaking av deres øl",
-  cideri: "en smaking av sider, gjerne med et innblikk i fruktdyrkingen bak",
-  sideri: "en smaking av sider, gjerne med et innblikk i fruktdyrkingen bak",
-  mjøderi: "en smaking av mjød og et innblikk i mjødhåndverket",
-  vingård: "en smaking av fruktvin og en tur i vingården/frukthagen",
-  destilleri: "en omvisning og en smaking av destillater",
-  seltzeri: "en smaking av kombucha og et innblikk i produksjonen",
-};
-
 // dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: pure
 // decision function for the client-side owner-CTA swap below. This page is
 // public/shared-cacheable (`Cache-Control: public, max-age=300` a few lines
@@ -5704,8 +5691,6 @@ router.get(
     // 'no_match'/null which draw no point at all.
     const presentation = gardssalgMapPresentation(provider.geocode_confidence);
 
-    const metaDesc = L.gsMeta(provider.navn, sted || "");
-
     // Hero — themed by drink-type color-coding (2026-06-29 UI spec, shared
     // DRINK_TYPE_META also used by drinkBadge()); falls back to the plain
     // gårdssalg teal gradient used on the category page for untyped rows.
@@ -5728,6 +5713,14 @@ router.get(
     const hasRealAbout = !!(provider.about_text && provider.about_text.trim())
       && !isJunkDescription(provider.about_text)
       && !looksTruncatedMidWord(provider.about_text);
+    // dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: a page
+    // with no real description gets a fact-based, per-producer meta description
+    // (name + type + place) instead of the generic "book a tasting" sentence,
+    // which promised a booking/tasting we cannot vouch for. NO locale only;
+    // EN/SV keep their existing copy.
+    const metaDesc = !hasRealAbout && uiLang === "no"
+      ? `${provider.navn}${meta ? " – " + meta.label.toLowerCase() : ""}${sted ? " i " + sted : ""}. Profil på Opplevagent med kontaktinformasjon der den finnes.`
+      : L.gsMeta(provider.navn, sted || "");
     const aboutBody = hasRealAbout
       ? `<p>${escapeHtml(tr.about_text || (provider.about_text as string))}</p>`
       : site
@@ -5737,17 +5730,12 @@ router.get(
     // "Besøket" — real enriched copy (visit_text) when present; otherwise the
     // existing type-general orientation, explicitly not a per-producer claim.
     // Same dual render-guard as about_text above.
-    const visitCopy = provider.producer_type
-      ? VISIT_TYPE_COPY[provider.producer_type.toLowerCase()]
-      : null;
     const hasRealVisit = !!(provider.visit_text && provider.visit_text.trim())
       && !isJunkDescription(provider.visit_text)
       && !looksTruncatedMidWord(provider.visit_text);
     const visitBody = hasRealVisit
       ? `<p>${escapeHtml(tr.visit_text || (provider.visit_text as string))}</p>`
-      : visitCopy
-      ? `<p>Et besøk hos ${escapeHtml(provider.navn)} inkluderer typisk ${visitCopy}. Nøyaktig program avtales ved reservasjon.</p>`
-      : `<p>Detaljer om hva besøket hos ${escapeHtml(provider.navn)} inneholder, publiseres fortløpende. Book et besøk for å avtale program direkte med produsenten.</p>`;
+      : `<p>Spør ${escapeHtml(provider.navn)} direkte om det går an å komme på besøk.</p>`;
 
     // Practical info — only rows we actually have data for. Sesong/varighet/
     // pris/kapasitet are NOT yet columns on experience_providers (see comment
@@ -5887,12 +5875,18 @@ router.get(
     // Same review gate as the visible "E-post" fact row above — see
     // epostUnderReview's comment there (AC4).
     if (provider.epost && !epostUnderReview) ld.email = provider.epost;
-    ld.offers = {
-      "@type": "Offer",
-      name: `Gårdsbesøk og smaking hos ${provider.navn}`,
-      url: `${url}${bookHref}`,
-      availability: "https://schema.org/InStock",
-    };
+    // Machine signal must match reality: an InStock Offer pointing at /book
+    // while booking is paused told agents a visit could be reserved. The
+    // provider row carries no price, so a live-booking Offer stays price-less
+    // as before; a paused page gets no Offer at all.
+    if (!bookingPaused) {
+      ld.offers = {
+        "@type": "Offer",
+        name: `Gårdsbesøk og smaking hos ${provider.navn}`,
+        url: `${url}${bookHref}`,
+        availability: "https://schema.org/InStock",
+      };
+    }
     const breadcrumb = {
       "@context": "https://schema.org",
       "@type": "BreadcrumbList",
@@ -7960,6 +7954,61 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
 });
 
 // providerId is the provider's UUID -- one provider's experiences.
+// dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: /tilbyder/
+// contact block + Organization JSON-LD. Only fields that actually hold a value
+// are rendered (no empty strings, no placeholders). E-mail is deliberately not
+// shown here (the review gate for it lives on the gårdssalg profile only).
+// Returns null for the JSON-LD when there is no usable name/url.
+export function buildProviderContact(
+  provider: Record<string, unknown>,
+  canonicalUrl: string
+): { contactHtml: string; organizationLd: Record<string, unknown> | null } {
+  const clean = (v: unknown): string | null => {
+    const t = typeof v === "string" ? v.trim() : "";
+    return t ? t : null;
+  };
+  const name = clean(provider.navn);
+  const site = safeHttpUrl(provider.hjemmeside);
+  const phoneRaw = clean(provider.telefon);
+  const phone = phoneRaw && isDisplayablePhone(phoneRaw) ? phoneRaw : null;
+  const street = clean(provider.adresse);
+  const locality = clean(provider.poststed) || clean(provider.kommune);
+  const region = clean(provider.fylke);
+  const postal = clean(provider.postnummer);
+  const orgNr = clean(provider.org_nr);
+
+  const rows: string[] = [];
+  // A bare kommune/fylke is not a contact address: the row needs a street or postnummer.
+  const addr = street || postal
+    ? [street, [postal, locality].filter(Boolean).join(" ")].filter((x) => x && x.trim()).join(", ")
+    : "";
+  if (addr) rows.push(`<li><strong>Adresse:</strong> ${escapeHtml(addr)}</li>`);
+  if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></li>`);
+  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
+  if (orgNr) rows.push(`<li><strong>Org.nr.:</strong> ${escapeHtml(orgNr)}</li>`);
+  const contactHtml = rows.length
+    ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>`
+    : "";
+
+  let organizationLd: Record<string, unknown> | null = null;
+  if (name && canonicalUrl) {
+    const ld: Record<string, unknown> = { "@context": "https://schema.org", "@type": "Organization", name, url: canonicalUrl };
+    if (site) ld.sameAs = [site];
+    if (phone) ld.telephone = phone;
+    if (orgNr) ld.identifier = orgNr;
+    if (street || locality || region) {
+      const a: Record<string, unknown> = { "@type": "PostalAddress", addressCountry: "NO" };
+      if (street) a.streetAddress = street;
+      if (locality) a.addressLocality = locality;
+      if (region) a.addressRegion = region;
+      if (postal) a.postalCode = postal;
+      ld.address = a;
+    }
+    organizationLd = ld;
+  }
+  return { contactHtml, organizationLd };
+}
+
 router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: NextFunction) => {
   const param = String(req.params.providerSlugOrId || "");
   if (!param) return next();
@@ -8000,6 +8049,9 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
     : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
 
+  const providerCanonicalPath = `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`;
+  const contact = buildProviderContact(provider, `${baseUrl()}${providerCanonicalPath}`);
+
   const html = renderBrowsePage({
     lang: req.lang,
     title: `${navn} | Opplevagent`,
@@ -8012,7 +8064,8 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
-    extraTopHtml: verifiedNote,
+    extraTopHtml: verifiedNote + contact.contactHtml,
+    extraJsonLd: contact.organizationLd ? [contact.organizationLd] : undefined,
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
     // (delt header/footer): /tilbyder/:providerSlugOrId adopts the shared S1
     // chrome (hamburger nav + full footer incl. "For tilbydere"). navActive is
@@ -9758,9 +9811,9 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
 <meta name="description" content="${escapeHtml(description)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <link rel="canonical" href="${canonical}">
-<link rel="alternate" hreflang="nb" href="${url}/guide-opplevelser-mcp">
+${isOpplevagentLangSwitcherEnabled() ? `<link rel="alternate" hreflang="nb" href="${url}/guide-opplevelser-mcp">
 <link rel="alternate" hreflang="en" href="${url}/en/guide-opplevelser-mcp">
-<link rel="alternate" hreflang="x-default" href="${url}/guide-opplevelser-mcp">
+<link rel="alternate" hreflang="x-default" href="${url}/guide-opplevelser-mcp">` : ""}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 ${pwaHeadTags()}
 <meta property="og:title" content="${escapeHtml(title)}">

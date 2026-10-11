@@ -1750,6 +1750,41 @@ export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
 }
 
 /**
+ * dev-request 2026-10-06-opplevagent-visning-mcp-og-tilbydersider: which of the
+ * group_size / age / language filters the caller used cannot narrow anything
+ * because NO published experience carries the underlying field (the filter SQL
+ * lets NULL rows through, so such a filter silently matches everything).
+ * Returned as the filter's own names so an agent can say so honestly. Read-only.
+ */
+export function unfilterableDiscoverFields(
+  filter: { group_size?: number; age?: number; language?: string }
+): Array<"group_size" | "age" | "language"> {
+  const wants = {
+    group_size: typeof filter.group_size === "number",
+    age: typeof filter.age === "number",
+    language: !!filter.language,
+  };
+  if (!wants.group_size && !wants.age && !wants.language) return [];
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN e.group_min IS NOT NULL OR e.group_max IS NOT NULL THEN 1 ELSE 0 END) AS g,
+         SUM(CASE WHEN e.min_age IS NOT NULL THEN 1 ELSE 0 END) AS a,
+         SUM(CASE WHEN e.languages IS NOT NULL AND TRIM(e.languages) NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END) AS l
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${PUBLISH_GATE_SQL}`
+    )
+    .get() as { g: number | null; a: number | null; l: number | null } | undefined;
+  const out: Array<"group_size" | "age" | "language"> = [];
+  if (wants.group_size && !(row?.g)) out.push("group_size");
+  if (wants.age && !(row?.a)) out.push("age");
+  if (wants.language && !(row?.l)) out.push("language");
+  return out;
+}
+
+/**
  * Intent-discovery query — the heart of "Hva kan vi finne på i [sted]".
  *
  * Only surfaces rows that are publishable: verified experience whose provider
