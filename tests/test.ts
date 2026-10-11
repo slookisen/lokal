@@ -42999,6 +42999,27 @@ runSerial(async () => {
   }
 });
 
+// Skive 2 + 3 of the same dev-request: payment link at submit (direct
+// charge, manual capture), authorization via webhook, producer notified
+// only when reserved, capture on confirm, release on decline / deadline,
+// pay-at-pickup fallbacks, refunds, maintenance job, rollback
+// (src/routes/payment-flow.test.ts; loopback only, fake Stripe client).
+runSerial(async () => {
+  console.log("\n── 2026-10-09-rfb-forhandsbetaling-stripe-connect: payment flow (checkout at submit, authorize, capture/release/refund, maintenance) ──");
+  try {
+    const { runPaymentFlowTests } = require("../src/routes/payment-flow.test") as
+      typeof import("../src/routes/payment-flow.test");
+    const pf = await runPaymentFlowTests({ log: false });
+    passed += pf.passed;
+    failed += pf.failed;
+    for (const f of pf.failures) failures.push("payment-flow: " + f);
+    console.log(`  payment-flow: ${pf.passed} passed, ${pf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("payment-flow: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // owner decision 2026-09-29 «Blacklist bounces»: POST /webhooks/resend —
 // Svix-verified Resend hard bounces / complaints → email_bounces only (no
 // agent_blocklist row, owner decision «1B»), the outreach gate + compose

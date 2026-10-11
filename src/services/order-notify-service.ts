@@ -120,6 +120,16 @@ export interface OrderNotificationInput {
   buyer_email?: string | null;
   buyer_phone?: string | null;
   delivery_note?: string | null;
+  // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+  // connect, skive 2). Absent on every order without a prepayment attempt —
+  // then both templates are byte-for-byte what they were. Present only on
+  // the notification payment-service.ts sends when the payment is
+  // authorized ("authorized") or when a prepay order fell back to paying at
+  // pickup ("not_prepaid"); it replaces the «Ingen betaling skjer via
+  // plattformen» line, which would be false for a prepaid order (also in v1).
+  payment?:
+    | { status: "authorized"; amount_nok: number; confirm_by: string | null }
+    | { status: "not_prepaid" };
 }
 
 export type OrderNotifyEmailVersion = "v1" | "v2";
@@ -182,6 +192,35 @@ function renderItemLinesText(items: OrderNotificationInput["items"]): string {
   return items.map((i) => `- ${i.name}: ${i.qty}${i.unit ? " " + i.unit : ""}`).join("\n");
 }
 
+const NO_PAYMENT_HTML = "<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>";
+const NO_PAYMENT_TEXT = "Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.";
+
+function formatNok(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(".", ",");
+}
+
+/** The payment line + subject for a notification (unchanged when `payment` is absent). */
+function paymentCopy(order: OrderNotificationInput, orderRef: string): { html: string; text: string; subject: string } {
+  const p = order.payment;
+  if (p?.status === "authorized") {
+    const deadline = p.confirm_by ? ` Bekreft innen ${p.confirm_by}, ellers frigjøres reservasjonen automatisk.` : "";
+    const sentence = `Beløpet er reservert på kundens betalingskort og trekkes først når du bekrefter ordren. Avslår du, frigjøres reservasjonen.${deadline} Pengene går til din egen Stripe-konto.`;
+    return {
+      html: `<p><strong>Kunden har betalt ${formatNok(p.amount_nok)} kr på forhånd.</strong> ${escHtml(sentence)}</p>`,
+      text: `Kunden har betalt ${formatNok(p.amount_nok)} kr på forhånd. ${sentence}`,
+      subject: `Ny forhåndsbetalt henteordre — ${orderRef}`,
+    };
+  }
+  if (p?.status === "not_prepaid") {
+    return {
+      html: "<p>Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.</p>",
+      text: "Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.",
+      subject: `Ny henteordre — ${orderRef}`,
+    };
+  }
+  return { html: NO_PAYMENT_HTML, text: NO_PAYMENT_TEXT, subject: `Ny henteordre — ${orderRef}` };
+}
+
 /**
  * v1 — the ORIGINAL pilot-ordre-loop template, byte-for-byte unchanged.
  * Never includes buyer contact fields, whatever the order carries — that is
@@ -192,6 +231,7 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
   const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}`;
   const itemRows = renderItemRowsHtml(order.items);
   const itemLines = renderItemLinesText(order.items);
+  const pay = paymentCopy(order, orderRef);
 
   const htmlContent = `
 <p>Hei,</p>
@@ -208,13 +248,13 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
 </table>
 <p><a href="${confirmUrl}">Bekreft eller avslå ordren her</a> — samme side brukes for «klar for henting» og «hentet».<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
-<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>
+${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nIngen betaling skjer via plattformen; oppgjør ved henting som vanlig.\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
-  return { subject: `Ny henteordre — ${orderRef}`, htmlContent, textContent, replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO };
+  return { subject: pay.subject, htmlContent, textContent, replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO };
 }
 
 /**
@@ -229,6 +269,7 @@ export function renderOrderNotificationEmailV2(order: OrderNotificationInput): R
   const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}`;
   const itemRows = renderItemRowsHtml(order.items);
   const itemLines = renderItemLinesText(order.items);
+  const pay = paymentCopy(order, orderRef);
 
   const buyerName = (order.buyer_name || "").trim() || null;
   const buyerEmail = (order.buyer_email || "").trim() || null;
@@ -270,14 +311,14 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 </table>
 <p><a href="${confirmUrl}">Bekreft eller avslå ordren her</a> — samme side brukes for «klar for henting» og «hentet».<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
-<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>
+${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nIngen betaling skjer via plattformen; oppgjør ved henting som vanlig.\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
-    subject: `Ny henteordre — ${orderRef}`,
+    subject: pay.subject,
     htmlContent,
     textContent,
     replyTo: resolveReplyTo(buyerEmail),

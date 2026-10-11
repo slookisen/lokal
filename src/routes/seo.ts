@@ -628,7 +628,7 @@ const CSS = `
 
 // ─── Page shell ─────────────────────────────────────────────
 
-function shell(
+export function shell(
   title: string,
   description: string,
   content: string,

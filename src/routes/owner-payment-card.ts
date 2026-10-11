@@ -5,7 +5,7 @@
 // be imported back. owner-portal.ts only renders it when the producer's
 // state is something other than "disabled" / "not_allowed".
 
-import type { ProducerPaymentStatus } from "../services/payment-service";
+import { isPlatformFeeConfigured, type ProducerPaymentStatus } from "../services/payment-service";
 
 function esc(s: string): string {
   return s
@@ -60,7 +60,7 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
     case "not_started":
       body = `
         <p>Med forhåndsbetaling kan kunder betale når de sender bestillingen. Beløpet reserveres på kortet og trekkes først når du bekrefter bestillingen. Avslår du, frigjøres reservasjonen.</p>
-        <p>Pengene går direkte til din egen Stripe-konto, og du står som selger. Stripe tar et gebyr per betaling, som trekkes fra beløpet. Rett fra Bonden tar ingen avgift.</p>
+        <p>Pengene går direkte til din egen Stripe-konto, og du står som selger. Stripe tar et gebyr per betaling, som trekkes fra beløpet.${isPlatformFeeConfigured() ? "" : " Rett fra Bonden tar ingen avgift."}</p>
         <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Du oppretter kontoen hos Stripe og oppgir bedriftsopplysninger og bankkonto for utbetaling der.</p>
         ${button("Kom i gang hos Stripe")}`;
       break;
@@ -87,7 +87,7 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
       break;
     case "active":
       body = `
-        <p>Stripe-kontoen din er klar til å ta imot betaling.</p>
+        <p>Forhåndsbetaling er på. Kunder kan betale på forhånd for bestillinger til deg. Beløpet trekkes når du bekrefter bestillingen.</p>
         <p style="color:#737373;font-size:0.88rem;">Utbetalinger, gebyrer og refusjoner finner du i <a href="https://dashboard.stripe.com" target="_blank" rel="noopener noreferrer">Stripe-dashbordet</a>.</p>`;
       break;
     default:

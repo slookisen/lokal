@@ -50,6 +50,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
+import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
 
 const router = Router();
 
@@ -268,6 +269,10 @@ export function registerTools(
   getClientIdentity?: () => string | undefined,
   getRequestMeta?: () => import("../services/conversation-service").RequestMeta | undefined,
 ) {
+  // Read once per server build (one per MCP session): decides the
+  // lokal_cart_submit description/schema below (prepayment, skive 2).
+  const paymentsOn = isPaymentsEnabled();
+
   // Tool 1: Natural language search
   server.registerTool(
     "lokal_search",
@@ -1155,7 +1160,13 @@ export function registerTools(
     "lokal_cart_submit",
     {
       title: "Submit cart and place pickup orders",
-      description: "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers); they get the order by e-mail and can confirm/decline it. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] and contact_handoffs[]. Use lokal_order_status to check an order.",
+      // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+      // connect, skive 2): with PAYMENTS_ENABLED off the description and
+      // schema are exactly what they were; with it on they say how payment
+      // links work and accept pay_at_pickup.
+      description: paymentsOn
+        ? "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. This tool never charges anyone. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers). For producers that take prepayment, the order also gets an entry in payments[] with a Stripe checkout_url: the buyer must open it and approve the payment themselves (you never see card data). The producer is the seller; the amount is reserved and only captured when the producer confirms the order, and released if the producer declines. If the buyer does not pay before expires_at, the order goes to the producer as pay-at-pickup. Set pay_at_pickup=true to skip prepayment. Orders without a payments[] entry are paid at pickup. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] (with payment_mode), payments[] and contact_handoffs[]. Use lokal_order_status to check an order."
+        : "Submit the cart. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. A real pickup order (one per producer) is created ONLY for producers who are owner-verified AND have opted in to receive orders through the platform (can_order=true in lokal_find_offers); they get the order by e-mail and can confirm/decline it. Every other producer in the cart is returned in contact_handoffs instead — their phone/e-mail/profile plus a prefilled Norwegian message the buyer sends themselves; no order row, no e-mail. Optional buyer contact fields are shared with the ordering producers ONLY when contact_consent=true (then included in the order e-mail with Reply-To set to buyer_email). Returns orders[] and contact_handoffs[]. Use lokal_order_status to check an order.",
       inputSchema: {
         cart_id:   z.string().describe("Cart ID to submit"),
         buyer_ref: z.string().describe("Buyer capability token"),
@@ -1164,6 +1175,9 @@ export function registerTools(
         buyer_phone:     z.string().max(40).optional().describe("Buyer's phone — shared only when contact_consent=true"),
         delivery_note:   z.string().max(500).optional().describe("Free-text delivery/pickup wish for the producer (orders are pickup; this is informational)"),
         contact_consent: z.boolean().optional().describe("true = the buyer agrees that the contact fields above are passed to the producers who receive a real order. Default false: fields are stored on the cart but never shown to any producer."),
+        ...(paymentsOn
+          ? { pay_at_pickup: z.boolean().optional().describe("true = no prepayment; every order is paid at pickup. Default false: producers that take prepayment get a payment link in payments[].") }
+          : {}),
       },
       annotations: {
         title: "Submit cart",
@@ -1183,20 +1197,29 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent }) => {
+    async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent, ...rest }: any) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
       }
       // Same trim-or-null normalisation as the REST route (marketplace-cart.ts).
       const t = (v: unknown) => (typeof v === "string" ? v.trim() || null : null);
-      const result = svcSubmitCart(cart_id, {
+      const contact = {
         buyer_name: t(buyer_name),
         buyer_email: t(buyer_email),
         buyer_phone: t(buyer_phone),
         delivery_note: t(delivery_note),
         contact_consent: contact_consent === true,
-      });
+        pay_at_pickup: rest?.pay_at_pickup === true,
+      };
+      const result = paymentsOn
+        ? await submitCartWithPayments({
+            cartId: cart_id,
+            contact,
+            stripe: resolvePaymentsStripeClient(),
+            baseUrl: process.env.BASE_URL || "https://rettfrabonden.com",
+          })
+        : svcSubmitCart(cart_id, contact);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     }
   );

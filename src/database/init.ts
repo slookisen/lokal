@@ -4867,6 +4867,14 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_payments_agent_id ON payments(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
 
+  // orders.payment_mode (skive 2): 'prepay' when submit created a Stripe
+  //   payment link for this order (the producer is notified only once the
+  //   payment is authorized), 'at_pickup' when the order fell back to paying
+  //   at pickup (no link, the link failed, or it expired unpaid). NULL on
+  //   every order created before skive 2 and whenever payments are off —
+  //   which also means pay at pickup.
+  try { db.exec(`ALTER TABLE orders ADD COLUMN payment_mode TEXT`); } catch { /* already exists — expected */ }
+
   // payment_events: append-only log of every payment/account state change
   //   (source: webhook | owner | admin | system). No buyer personal data in
   //   `detail`, ever.

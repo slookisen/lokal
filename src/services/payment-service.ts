@@ -22,13 +22,27 @@
 // for the current mode reports charges_enabled (account.updated webhook).
 
 import { createHash, randomUUID } from "crypto";
-import { isEligibleForRealOrder } from "./cart-service";
+import {
+  isEligibleForRealOrder,
+  submitCart,
+  transitionOrder,
+  buildOrderNotificationInput,
+  type SubmitContactInput,
+  type SubmitResult,
+  type OrderSummary,
+} from "./cart-service";
+import { sendOrderNotificationForOrder } from "./order-notify-service";
+import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
 import {
   PRODUCER_ACCOUNT_CONTROLLER,
   assertPaymentsKeyAllowed,
+  createRealPaymentsStripeClient,
   paymentsLivemode,
+  type CheckoutSessionLike,
   type ConnectAccountLike,
+  type CreateCheckoutSessionParams,
+  type PaymentIntentLike,
   type PaymentsStripeClient,
   type PaymentsWebhookEvent,
 } from "./payment-provider";
@@ -479,6 +493,7 @@ export async function handlePaymentsWebhook(params: {
 
   let duplicate = false;
   let handled = false;
+  const after: AfterCommit[] = [];
   const tx = db.transaction(() => {
     const seen = db.prepare(`SELECT 1 FROM payment_webhook_events WHERE stripe_event_id = ?`).get(event.id);
     if (seen) {
@@ -498,6 +513,9 @@ export async function handlePaymentsWebhook(params: {
       handled = false;
     } else if (event.type === "account.updated") {
       if (accountApply) handled = accountApply();
+    } else if (stripeAccountId && PAYMENT_EVENT_TYPES.has(event.type)) {
+      const ctx = { db, stripeAccountId, livemode, stripeEventId: event.id, now, env: params.env ?? process.env, after };
+      handled = applyPaymentEvent(event.type, event.data?.object || {}, ctx);
     }
     db.prepare(`
       INSERT INTO payment_webhook_events (stripe_event_id, type, stripe_account_id, livemode, received_at)
@@ -514,6 +532,9 @@ export async function handlePaymentsWebhook(params: {
     if (seen) return { ok: true, duplicate: true, eventId: event.id, type: event.type, handled: false };
     throw err;
   }
+  // Side effects only AFTER the state change committed (e-mails, Stripe
+  // calls). Each one is self-contained and never throws.
+  await runAfterCommit(after, { db, stripe, now });
   return { ok: true, duplicate, eventId: event.id, type: event.type, handled };
 }
 
@@ -525,4 +546,783 @@ export function listPaymentAccounts(db: any): Array<PaymentAccountRow & { agent_
     LEFT JOIN agents a ON a.id = pa.agent_id
     ORDER BY pa.created_at DESC
   `).all() as Array<PaymentAccountRow & { agent_name: string | null }>;
+}
+
+// ══ Skive 2 — payment link at submit, authorization, expiry ═══════════════
+
+/** Stripe's minimum charge in NOK is 3.00 kr. */
+export const PAYMENT_MIN_ORE = 300;
+
+function intEnv(env: NodeJS.ProcessEnv, name: string, dflt: number, min: number, max: number): number {
+  const n = Number.parseInt(String(env[name] ?? ""), 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+/** How long the buyer's payment link lives. Stripe allows 30 min – 24 h. */
+export function checkoutMinutes(env: NodeJS.ProcessEnv = process.env): number {
+  return intEnv(env, "PAYMENT_CHECKOUT_MINUTES", 60, 30, 1440);
+}
+
+/**
+ * How long the producer has to confirm an authorized payment before the
+ * reservation is released (skive 3 job). Card authorizations last about
+ * 7 days online, so the cap stays well inside that.
+ */
+export function confirmHours(env: NodeJS.ProcessEnv = process.env): number {
+  return intEnv(env, "PAYMENT_CONFIRM_HOURS", 48, 1, 120);
+}
+
+/**
+ * Platform fee (application_fee_amount). Supported, but 0 in the pilot:
+ * PLATFORM_FEE_BPS (basis points) and PLATFORM_FEE_FIXED_ORE both default to
+ * 0. Pricing is Daniel's decision (L4).
+ */
+export function platformFeeOre(amountOre: number, env: NodeJS.ProcessEnv = process.env): number {
+  const bps = intEnv(env, "PLATFORM_FEE_BPS", 0, 0, 10000);
+  const fixed = intEnv(env, "PLATFORM_FEE_FIXED_ORE", 0, 0, 1_000_000);
+  const fee = Math.round((amountOre * bps) / 10000) + fixed;
+  return Math.max(0, Math.min(fee, amountOre - 1));
+}
+
+export function isPlatformFeeConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return platformFeeOre(1_000_000, env) > 0;
+}
+
+/** Integer øre per line, or null when any line has no usable price. */
+export function priceLinesOre(
+  lines: Array<{ unit_price_snapshot: number | null; qty: number }>,
+): { totalOre: number; units: number[] } | null {
+  const units: number[] = [];
+  let total = 0;
+  for (const l of lines) {
+    if (l.unit_price_snapshot == null || !Number.isFinite(l.unit_price_snapshot) || l.unit_price_snapshot <= 0) return null;
+    if (!Number.isInteger(l.qty) || l.qty <= 0) return null;
+    const unit = Math.round(l.unit_price_snapshot * 100);
+    if (unit <= 0) return null;
+    units.push(unit);
+    total += unit * l.qty;
+  }
+  return lines.length ? { totalOre: total, units } : null;
+}
+
+/**
+ * submitCart()'s prepay hook: prepay when the buyer did not ask to pay at
+ * pickup, the producer can take prepayment, every line has a price and the
+ * total is at least Stripe's minimum.
+ */
+export function makePrepayPredicate(
+  db: any,
+  env: NodeJS.ProcessEnv,
+  contact?: SubmitContactInput,
+): (agentId: string, lines: Array<{ unit_price_snapshot: number | null; qty: number }>) => boolean {
+  return (agentId, lines) => {
+    if (contact?.pay_at_pickup === true) return false;
+    if (!canProducerTakePrepayment(db, agentId, env)) return false;
+    const priced = priceLinesOre(lines);
+    return !!priced && priced.totalOre >= PAYMENT_MIN_ORE;
+  };
+}
+
+/** One entry of `payments[]` in the submit response (REST + lokal_cart_submit). */
+export interface OrderPaymentLink {
+  order_id: string;
+  payment_id: string;
+  seller: string;
+  amount_nok: number;
+  currency: "NOK";
+  fees: { stripe_fee_payer: "producer"; platform_fee_nok: number };
+  checkout_url: string;
+  expires_at: string;
+  status: "requires_payment";
+  capture: "on_producer_confirmation";
+}
+
+export type SubmitWithPaymentsResult =
+  | (Extract<SubmitResult, { success: true }> & {
+      orders: Array<OrderSummary & { payment_mode?: "prepay" | "at_pickup" }>;
+      payments?: OrderPaymentLink[];
+      payment_note?: string;
+    })
+  | Extract<SubmitResult, { success: false }>;
+
+let _testStripeClient: PaymentsStripeClient | null = null;
+/** Test pin for callers that have no Express app to inject through (MCP). */
+export function __setPaymentsStripeClientForTesting(c: PaymentsStripeClient | null): void {
+  _testStripeClient = c;
+}
+
+/**
+ * The Stripe client for payment calls: an injected/test client, else a real
+ * one — but only with a key the live guard accepts (re-checked per call).
+ */
+export function resolvePaymentsStripeClient(
+  injected?: PaymentsStripeClient | null,
+  env: NodeJS.ProcessEnv = process.env,
+): PaymentsStripeClient | null {
+  if (injected) return injected;
+  if (_testStripeClient) return _testStripeClient;
+  const key = env.STRIPE_SECRET_KEY || "";
+  if (!key || !assertPaymentsKeyAllowed(env).allowed) return null;
+  return createRealPaymentsStripeClient(key);
+}
+
+function addMinutesIso(nowIsoStr: string, minutes: number): string {
+  return new Date(Date.parse(nowIsoStr) + minutes * 60_000).toISOString();
+}
+
+/** «13. oktober kl. 14:30» in Oslo time, for e-mails. */
+export function formatOsloDateTime(iso: string): string {
+  const d = new Date(iso);
+  const date = new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", day: "numeric", month: "long" }).format(d);
+  const time = new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
+  return `${date} kl. ${time.replace(".", ":")}`;
+}
+
+/**
+ * Creates the Stripe Checkout Session for one prepay order — a DIRECT
+ * charge on the producer's account (Stripe-Account), manual capture — and
+ * records the payments row. Throws on any Stripe/DB failure; the caller
+ * falls back to pay-at-pickup.
+ */
+export async function createCheckoutForOrder(params: {
+  db: any;
+  stripe: PaymentsStripeClient;
+  orderId: string;
+  baseUrl: string;
+  env?: NodeJS.ProcessEnv;
+  now?: string;
+}): Promise<OrderPaymentLink> {
+  const { db, stripe, orderId } = params;
+  const env = params.env ?? process.env;
+  const now = params.now ?? nowIso();
+  const baseUrl = params.baseUrl.replace(/\/+$/, "");
+
+  const order = db.prepare(`
+    SELECT o.id, o.cart_id, o.agent_id, o.status, o.payment_mode, a.name AS producer_name
+    FROM orders o INNER JOIN agents a ON a.id = o.agent_id WHERE o.id = ?
+  `).get(orderId) as
+    | { id: string; cart_id: string | null; agent_id: string; status: string; payment_mode: string | null; producer_name: string }
+    | undefined;
+  if (!order || order.payment_mode !== "prepay" || order.status !== "pending") throw new Error("order not payable");
+
+  const items = db.prepare(`
+    SELECT name_snapshot, qty, unit_price_snapshot FROM order_items WHERE order_id = ? ORDER BY rowid
+  `).all(orderId) as Array<{ name_snapshot: string | null; qty: number; unit_price_snapshot: number | null }>;
+  const priced = priceLinesOre(items);
+  if (!priced || priced.totalOre < PAYMENT_MIN_ORE) throw new Error("order not priced");
+
+  const livemode = paymentsLivemode(env);
+  const account = getPaymentAccount(db, order.agent_id, livemode);
+  if (!account || account.charges_enabled !== 1) throw new Error("producer cannot take prepayment");
+
+  const paymentId = randomUUID();
+  const feeOre = platformFeeOre(priced.totalOre, env);
+  const minutes = checkoutMinutes(env);
+  const expiresAtIso = addMinutesIso(now, minutes);
+  const metadata = { order_id: order.id, cart_id: order.cart_id ?? "", agent_id: order.agent_id, payment_id: paymentId, platform: "rettfrabonden" };
+
+  // Stripe allows 100 line items; beyond that one summary line with the total.
+  const lineItems: CreateCheckoutSessionParams["line_items"] =
+    items.length <= 100
+      ? items.map((it, idx) => ({
+          quantity: it.qty,
+          price_data: { currency: "nok", unit_amount: priced.units[idx]!, product_data: { name: (it.name_snapshot || "Vare").slice(0, 250) } },
+        }))
+      : [{ quantity: 1, price_data: { currency: "nok", unit_amount: priced.totalOre, product_data: { name: `Bestilling hos ${order.producer_name}`.slice(0, 250) } } }];
+
+  const session: CheckoutSessionLike = await stripe.checkout.sessions.create(
+    {
+      mode: "payment",
+      line_items: lineItems,
+      payment_intent_data: {
+        capture_method: "manual",
+        ...(feeOre > 0 ? { application_fee_amount: feeOre } : {}),
+        description: `Henteordre ${order.id.slice(0, 8)} via Rett fra Bonden`,
+        metadata,
+      },
+      metadata,
+      client_reference_id: order.id,
+      success_url: `${baseUrl}/betaling/takk?ordre=${encodeURIComponent(order.id)}`,
+      cancel_url: `${baseUrl}/betaling/avbrutt?ordre=${encodeURIComponent(order.id)}`,
+      expires_at: Math.floor(Date.parse(expiresAtIso) / 1000),
+      locale: "nb",
+    },
+    { stripeAccount: account.stripe_account_id, idempotencyKey: `rfb-checkout-${paymentId}` },
+  );
+  if (!session.url) throw new Error("checkout session has no url");
+
+  db.prepare(`
+    INSERT INTO payments
+      (id, order_id, agent_id, stripe_account_id, livemode, amount_ore, currency, application_fee_ore,
+       status, checkout_session_id, checkout_url, checkout_expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'nok', ?, 'requires_payment', ?, ?, ?, ?, ?)
+  `).run(paymentId, order.id, order.agent_id, account.stripe_account_id, livemode ? 1 : 0, priced.totalOre, feeOre,
+    session.id, session.url, expiresAtIso, now, now);
+  logPaymentEvent(db, { paymentId, orderId: order.id, agentId: order.agent_id, source: "system", type: "checkout_created", toStatus: "requires_payment", now });
+
+  return {
+    order_id: order.id,
+    payment_id: paymentId,
+    seller: order.producer_name,
+    amount_nok: priced.totalOre / 100,
+    currency: "NOK",
+    fees: { stripe_fee_payer: "producer", platform_fee_nok: feeOre / 100 },
+    checkout_url: session.url,
+    expires_at: expiresAtIso,
+    status: "requires_payment",
+    capture: "on_producer_confirmation",
+  };
+}
+
+/**
+ * A prepay order that will not be prepaid (link creation failed, or the
+ * link expired unpaid) continues as an ordinary pay-at-pickup order: the
+ * producer is notified now, so it never becomes a «dead» order nobody saw.
+ * Returns whether the order was switched (only from 'prepay' while pending).
+ */
+function switchToPayAtPickup(db: any, orderId: string): boolean {
+  const upd = db.prepare(`
+    UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now')
+    WHERE id = ? AND payment_mode = 'prepay' AND status = 'pending'
+  `).run(orderId);
+  return upd.changes === 1;
+}
+
+function notifyProducer(orderId: string, payment?: Parameters<typeof sendOrderNotificationForOrder>[0]["payment"]): void {
+  const input = buildOrderNotificationInput(orderId);
+  if (!input) return;
+  void sendOrderNotificationForOrder(payment ? { ...input, payment } : input).catch((err) => {
+    console.error(`[payments] notify rejection order=${orderId}:`, err);
+  });
+}
+
+export function buyerPaymentNote(env: NodeJS.ProcessEnv = process.env): string {
+  return (
+    `Betal innen ${checkoutMinutes(env)} minutter. Beløpet reserveres og trekkes først når produsenten bekrefter bestillingen; ` +
+    "avslår produsenten, frigjøres reservasjonen. Betaler du ikke innen fristen, sendes bestillingen til produsenten med betaling ved henting. " +
+    "Produsenten er selger og mottar betalingen direkte via Stripe."
+  );
+}
+
+/**
+ * submit + prepayment. With PAYMENTS_ENABLED off (or no usable Stripe
+ * client) this IS submitCart(), response unchanged. Otherwise orders for
+ * producers that take prepayment get a Stripe payment link in `payments[]`
+ * and every order carries `payment_mode`.
+ */
+export async function submitCartWithPayments(params: {
+  cartId: string;
+  contact?: SubmitContactInput;
+  stripe: PaymentsStripeClient | null;
+  baseUrl: string;
+  db?: any;
+  env?: NodeJS.ProcessEnv;
+  now?: string;
+}): Promise<SubmitWithPaymentsResult> {
+  const env = params.env ?? process.env;
+  if (!isPaymentsEnabled(env) || !params.stripe || !assertPaymentsKeyAllowed(env).allowed) {
+    return submitCart(params.cartId, params.contact);
+  }
+  const db = params.db ?? getDb();
+  const result = submitCart(params.cartId, params.contact, { prepay: makePrepayPredicate(db, env, params.contact) });
+  if (!result.success) return result;
+
+  const payments: OrderPaymentLink[] = [];
+  const modeOf = (orderId: string) =>
+    ((db.prepare(`SELECT payment_mode FROM orders WHERE id = ?`).get(orderId) as any)?.payment_mode ?? null) as string | null;
+
+  for (const o of result.orders) {
+    if (modeOf(o.order_id) !== "prepay") continue;
+    try {
+      payments.push(await createCheckoutForOrder({ db, stripe: params.stripe, orderId: o.order_id, baseUrl: params.baseUrl, env, now: params.now }));
+    } catch (err: any) {
+      const now = params.now ?? nowIso();
+      if (switchToPayAtPickup(db, o.order_id)) {
+        logPaymentEvent(db, { orderId: o.order_id, agentId: o.agent_id, source: "system", type: "checkout_create_failed", toStatus: "at_pickup", detail: String(err?.message || err).slice(0, 200), now });
+        notifyProducer(o.order_id);
+      }
+      console.error(`[payments] checkout creation failed order=${o.order_id}: ${String(err?.message || err)}`);
+    }
+  }
+
+  const orders = result.orders.map((o) => ({ ...o, payment_mode: (modeOf(o.order_id) === "prepay" ? "prepay" : "at_pickup") as "prepay" | "at_pickup" }));
+  return {
+    ...result,
+    orders,
+    payments,
+    ...(payments.length ? { payment_note: buyerPaymentNote(env) } : {}),
+  };
+}
+
+// ── Webhook: payment events (on the producer's connected account) ────────
+
+const PAYMENT_EVENT_TYPES = new Set([
+  "checkout.session.completed",
+  "checkout.session.expired",
+  "payment_intent.amount_capturable_updated",
+  "payment_intent.succeeded",
+  "payment_intent.canceled",
+  "charge.refunded",
+  "charge.dispute.created",
+]);
+
+type AfterCommit =
+  | { kind: "notify_authorized"; orderId: string; amountOre: number; confirmByIso: string }
+  | { kind: "notify_not_prepaid"; orderId: string }
+  | { kind: "sync_intent"; paymentId: string }
+  | { kind: "cancel_intent"; paymentId: string; reason: string };
+
+interface PaymentEventCtx {
+  db: any;
+  stripeAccountId: string;
+  livemode: boolean;
+  stripeEventId: string;
+  now: string;
+  env: NodeJS.ProcessEnv;
+  after: AfterCommit[];
+}
+
+export interface PaymentRow {
+  id: string;
+  order_id: string;
+  agent_id: string;
+  stripe_account_id: string;
+  livemode: number;
+  amount_ore: number;
+  application_fee_ore: number;
+  stripe_fee_ore: number | null;
+  refunded_ore: number;
+  status: string;
+  checkout_session_id: string | null;
+  checkout_url: string | null;
+  checkout_expires_at: string | null;
+  payment_intent_id: string | null;
+  capture_deadline_at: string | null;
+  authorized_at: string | null;
+  captured_at: string | null;
+  canceled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Only rows that live on THIS connected account and mode — never cross accounts. */
+function findPayment(db: any, where: { id?: string; sessionId?: string; intentId?: string }, ctx: { stripeAccountId: string; livemode: boolean }): PaymentRow | null {
+  let row: PaymentRow | undefined;
+  if (where.id) row = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(where.id);
+  if (!row && where.intentId) row = db.prepare(`SELECT * FROM payments WHERE payment_intent_id = ?`).get(where.intentId);
+  if (!row && where.sessionId) row = db.prepare(`SELECT * FROM payments WHERE checkout_session_id = ?`).get(where.sessionId);
+  if (!row) return null;
+  if (row.stripe_account_id !== ctx.stripeAccountId || (row.livemode === 1) !== ctx.livemode) return null;
+  return row;
+}
+
+function setPaymentStatus(db: any, p: PaymentRow, to: string, extra: Record<string, string | number | null>, e: { source: "webhook" | "system" | "admin" | "owner"; type: string; stripeEventId?: string | null; detail?: string | null; now: string }): boolean {
+  const cols = Object.keys(extra);
+  const sets = ["status = ?", "updated_at = ?", ...cols.map((c) => `${c} = ?`)].join(", ");
+  const upd = db.prepare(`UPDATE payments SET ${sets} WHERE id = ? AND status = ?`).run(to, e.now, ...cols.map((c) => extra[c]), p.id, p.status);
+  if (upd.changes !== 1) return false;
+  logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: e.stripeEventId ?? null, source: e.source, type: e.type, fromStatus: p.status, toStatus: to, detail: e.detail ?? null, now: e.now });
+  return true;
+}
+
+function intentIdOf(v: unknown): string | null {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object" && typeof (v as any).id === "string") return (v as any).id;
+  return null;
+}
+
+/** requires_payment → authorized, from Stripe's PaymentIntent. Idempotent. */
+function applyAuthorization(db: any, p: PaymentRow, pi: PaymentIntentLike, ctx: { now: string; env: NodeJS.ProcessEnv; stripeEventId?: string | null; source: "webhook" | "system"; after: AfterCommit[] }): boolean {
+  if (p.status !== "requires_payment") return false;
+  if (pi.status !== "requires_capture") return false;
+  if (typeof pi.amount === "number" && pi.amount !== p.amount_ore) {
+    // Never authorize an amount we did not ask for.
+    logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: ctx.stripeEventId ?? null, source: ctx.source, type: "amount_mismatch", detail: `${pi.amount} != ${p.amount_ore}`, now: ctx.now });
+    db.prepare(`UPDATE payments SET payment_intent_id = COALESCE(payment_intent_id, ?), updated_at = ? WHERE id = ?`).run(pi.id, ctx.now, p.id);
+    ctx.after.push({ kind: "cancel_intent", paymentId: p.id, reason: "amount_mismatch" });
+    return true;
+  }
+  const deadline = addMinutesIso(ctx.now, confirmHours(ctx.env) * 60);
+  const ok = setPaymentStatus(db, p, "authorized", { payment_intent_id: pi.id, authorized_at: ctx.now, capture_deadline_at: deadline }, { source: ctx.source, type: "payment_authorized", stripeEventId: ctx.stripeEventId, now: ctx.now });
+  if (!ok) return false;
+  const order = db.prepare(`SELECT status FROM orders WHERE id = ?`).get(p.order_id) as { status: string } | undefined;
+  if (order?.status === "pending") {
+    ctx.after.push({ kind: "notify_authorized", orderId: p.order_id, amountOre: p.amount_ore, confirmByIso: deadline });
+  } else {
+    // The order was closed while the buyer paid — release the money at once.
+    ctx.after.push({ kind: "cancel_intent", paymentId: p.id, reason: `order_${order?.status ?? "missing"}` });
+  }
+  return true;
+}
+
+function applyPaymentEvent(type: string, obj: any, ctx: PaymentEventCtx): boolean {
+  const { db, now } = ctx;
+  if (type === "checkout.session.completed") {
+    const p = findPayment(db, { id: obj?.metadata?.payment_id, sessionId: obj?.id }, ctx);
+    if (!p) return false;
+    const intentId = intentIdOf(obj?.payment_intent);
+    if (intentId && !p.payment_intent_id) {
+      db.prepare(`UPDATE payments SET payment_intent_id = ?, updated_at = ? WHERE id = ?`).run(intentId, now, p.id);
+    }
+    logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: ctx.stripeEventId, source: "webhook", type: "checkout_completed", now });
+    // Belt and braces: confirm the authorization from the PaymentIntent too,
+    // in case payment_intent.amount_capturable_updated is delayed or lost.
+    if (p.status === "requires_payment" && intentId) ctx.after.push({ kind: "sync_intent", paymentId: p.id });
+    return true;
+  }
+  if (type === "payment_intent.amount_capturable_updated") {
+    const pi = obj as PaymentIntentLike;
+    const p = findPayment(db, { id: pi?.metadata?.payment_id, intentId: pi?.id }, ctx);
+    if (!p) return false;
+    applyAuthorization(db, p, pi, { now, env: ctx.env, stripeEventId: ctx.stripeEventId, source: "webhook", after: ctx.after });
+    return true;
+  }
+  if (type === "checkout.session.expired") {
+    const p = findPayment(db, { id: obj?.metadata?.payment_id, sessionId: obj?.id }, ctx);
+    if (!p) return false;
+    applySessionExpired(db, p, { source: "webhook", stripeEventId: ctx.stripeEventId, now, after: ctx.after });
+    return true;
+  }
+  if (type === "payment_intent.succeeded") {
+    // Captured outside our own capture call (e.g. from the producer's Stripe Dashboard).
+    const pi = obj as PaymentIntentLike;
+    const p = findPayment(db, { id: pi?.metadata?.payment_id, intentId: pi?.id }, ctx);
+    if (!p) return false;
+    if (p.status === "authorized") {
+      setPaymentStatus(db, p, "captured", { captured_at: now, payment_intent_id: pi.id }, { source: "webhook", type: "payment_captured", stripeEventId: ctx.stripeEventId, now });
+    }
+    return true;
+  }
+  if (type === "payment_intent.canceled") {
+    const pi = obj as PaymentIntentLike & { cancellation_reason?: string | null };
+    const p = findPayment(db, { id: pi?.metadata?.payment_id, intentId: pi?.id }, ctx);
+    if (!p) return false;
+    if (p.status === "authorized" || p.status === "requires_payment") {
+      const reason = pi.cancellation_reason || "canceled_at_stripe";
+      if (setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "webhook", type: "payment_canceled", stripeEventId: ctx.stripeEventId, detail: reason, now })) {
+        // The reservation is gone: whatever happens next is paid at pickup.
+        db.prepare(`UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now') WHERE id = ? AND payment_mode = 'prepay'`).run(p.order_id);
+      }
+    }
+    return true;
+  }
+  if (type === "charge.refunded") {
+    const intentId = intentIdOf(obj?.payment_intent);
+    const p = findPayment(db, { intentId: intentId ?? undefined }, ctx);
+    if (!p) return false;
+    const refunded = Math.max(p.refunded_ore, Number(obj?.amount_refunded) || 0);
+    if (refunded !== p.refunded_ore) applyRefundTotal(db, p, refunded, { source: "webhook", stripeEventId: ctx.stripeEventId, now });
+    return true;
+  }
+  if (type === "charge.dispute.created") {
+    const intentId = intentIdOf(obj?.payment_intent);
+    const p = findPayment(db, { intentId: intentId ?? undefined }, ctx);
+    if (!p) return false;
+    logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: ctx.stripeEventId, source: "webhook", type: "dispute_opened", detail: String(obj?.reason || "").slice(0, 80), now });
+    return true;
+  }
+  return false;
+}
+
+/** requires_payment → expired; the order falls back to pay at pickup. */
+function applySessionExpired(db: any, p: PaymentRow, e: { source: "webhook" | "system"; stripeEventId?: string | null; now: string; after: AfterCommit[] }): void {
+  if (setPaymentStatus(db, p, "expired", {}, { source: e.source, type: "checkout_expired", stripeEventId: e.stripeEventId ?? null, now: e.now })) {
+    if (switchToPayAtPickup(db, p.order_id)) e.after.push({ kind: "notify_not_prepaid", orderId: p.order_id });
+  }
+}
+
+function applyRefundTotal(db: any, p: PaymentRow, refundedOre: number, e: { source: "webhook" | "system" | "admin" | "owner"; stripeEventId?: string | null; now: string }): void {
+  const full = refundedOre >= p.amount_ore;
+  if (full && p.status !== "refunded") {
+    setPaymentStatus(db, p, "refunded", { refunded_ore: refundedOre }, { source: e.source, type: "payment_refunded", stripeEventId: e.stripeEventId ?? null, detail: String(refundedOre), now: e.now });
+  } else {
+    db.prepare(`UPDATE payments SET refunded_ore = ?, updated_at = ? WHERE id = ?`).run(refundedOre, e.now, p.id);
+    logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: e.stripeEventId ?? null, source: e.source, type: "payment_partially_refunded", detail: String(refundedOre), now: e.now });
+  }
+}
+
+async function runAfterCommit(actions: AfterCommit[], deps: { db: any; stripe: PaymentsStripeClient; now: string }): Promise<void> {
+  for (const a of actions) {
+    try {
+      if (a.kind === "notify_authorized") {
+        notifyProducer(a.orderId, { status: "authorized", amount_nok: a.amountOre / 100, confirm_by: formatOsloDateTime(a.confirmByIso) });
+      } else if (a.kind === "notify_not_prepaid") {
+        notifyProducer(a.orderId, { status: "not_prepaid" });
+      } else if (a.kind === "sync_intent") {
+        await syncPaymentIntent(deps.db, deps.stripe, a.paymentId, deps.now);
+      } else if (a.kind === "cancel_intent") {
+        await cancelPaymentIntent(deps.db, deps.stripe, a.paymentId, a.reason, deps.now);
+      }
+    } catch (err: any) {
+      console.error(`[payments] after-commit ${a.kind} failed: ${String(err?.message || err)}`);
+    }
+  }
+}
+
+/** Reads the PaymentIntent from the producer's account and applies an authorization. */
+export async function syncPaymentIntent(db: any, stripe: PaymentsStripeClient, paymentId: string, now: string = nowIso(), env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
+  if (!p || !p.payment_intent_id || p.status !== "requires_payment") return false;
+  const pi = await stripe.paymentIntents.retrieve(p.payment_intent_id, { stripeAccount: p.stripe_account_id });
+  const after: AfterCommit[] = [];
+  let applied = false;
+  db.transaction(() => {
+    const fresh = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow;
+    applied = applyAuthorization(db, fresh, pi, { now, env, source: "system", after });
+  })();
+  await runAfterCommit(after, { db, stripe, now });
+  return applied;
+}
+
+/** Releases a reservation on the producer's account (authorized → canceled). */
+export async function cancelPaymentIntent(db: any, stripe: PaymentsStripeClient, paymentId: string, reason: string, now: string = nowIso()): Promise<boolean> {
+  const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
+  if (!p || !p.payment_intent_id) return false;
+  if (p.status !== "authorized" && p.status !== "requires_payment") return false;
+  await stripe.paymentIntents.cancel(p.payment_intent_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-cancel-${p.id}` });
+  return setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+}
+
+// ══ Skive 3 — lifecycle: capture on confirm, release, refund, maintenance ══
+
+export function getPaymentForOrder(db: any, orderId: string): PaymentRow | null {
+  return (db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId) as PaymentRow | undefined) ?? null;
+}
+
+/** Stripe's processing fee incl. VAT on it (not the platform fee) from the charge's balance transaction. */
+export function stripeFeeOreFrom(pi: PaymentIntentLike): number | null {
+  const ch = pi.latest_charge;
+  const bt = ch && typeof ch === "object" ? ch.balance_transaction : null;
+  if (!bt || typeof bt !== "object") return null;
+  if (Array.isArray(bt.fee_details) && bt.fee_details.length) {
+    return bt.fee_details.filter((f) => f.type === "stripe_fee" || f.type === "tax").reduce((sum, f) => sum + (f.amount || 0), 0);
+  }
+  return typeof bt.fee === "number" ? bt.fee : null;
+}
+
+export type CaptureOutcome = "captured" | "not_authorized" | "authorization_gone" | "retry_later";
+
+/**
+ * authorized → captured, on the producer's account. On a definitive
+ * failure (the authorization is gone) the payment becomes 'expired' and
+ * the order is paid at pickup; on anything else it stays 'authorized' and
+ * runPaymentMaintenance() retries.
+ */
+export async function capturePayment(db: any, stripe: PaymentsStripeClient, paymentId: string, now: string = nowIso()): Promise<CaptureOutcome> {
+  const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
+  if (!p || p.status !== "authorized" || !p.payment_intent_id) return "not_authorized";
+  const opts = { stripeAccount: p.stripe_account_id };
+  let pi: PaymentIntentLike;
+  try {
+    pi = await stripe.paymentIntents.capture(p.payment_intent_id, { ...opts, idempotencyKey: `rfb-capture-${p.id}` });
+  } catch (err: any) {
+    let current: PaymentIntentLike | null = null;
+    try { current = await stripe.paymentIntents.retrieve(p.payment_intent_id, opts); } catch { current = null; }
+    if (current?.status === "succeeded") {
+      pi = current;
+    } else if (current?.status === "canceled") {
+      db.transaction(() => {
+        if (setPaymentStatus(db, p, "expired", { failure_reason: "authorization_expired" }, { source: "system", type: "capture_failed", detail: "authorization_expired", now })) {
+          db.prepare(`UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now') WHERE id = ? AND payment_mode = 'prepay'`).run(p.order_id);
+        }
+      })();
+      return "authorization_gone";
+    } else {
+      logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, source: "system", type: "capture_retry_pending", detail: String(err?.code || err?.type || "error").slice(0, 80), now });
+      return "retry_later";
+    }
+  }
+  if (pi.status !== "succeeded") return "retry_later";
+  const fee = stripeFeeOreFrom(pi);
+  setPaymentStatus(db, p, "captured", { captured_at: now, stripe_fee_ore: fee }, { source: "system", type: "payment_captured", now });
+  return "captured";
+}
+
+/** Releases an unpaid link or a reservation (requires_payment/authorized → canceled). */
+export async function releasePayment(db: any, stripe: PaymentsStripeClient, paymentId: string, reason: string, now: string = nowIso()): Promise<boolean> {
+  const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
+  if (!p) return false;
+  if (p.status === "authorized") return cancelPaymentIntent(db, stripe, p.id, reason, now);
+  if (p.status === "requires_payment" && p.checkout_session_id) {
+    try {
+      await stripe.checkout.sessions.expire(p.checkout_session_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-expire-${p.id}` });
+    } catch (err) {
+      // Already completed in the meantime: re-read the intent so the
+      // reservation is found and released on the next maintenance run.
+      const cs = await stripe.checkout.sessions.retrieve(p.checkout_session_id, { stripeAccount: p.stripe_account_id }).catch(() => null);
+      const intentId = intentIdOf(cs?.payment_intent);
+      if (intentId) db.prepare(`UPDATE payments SET payment_intent_id = COALESCE(payment_intent_id, ?), updated_at = ? WHERE id = ?`).run(intentId, now, p.id);
+      return false;
+    }
+    return setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+  }
+  return false;
+}
+
+/** Full or partial refund of a captured payment, on the producer's account. */
+export async function refundPayment(
+  db: any,
+  stripe: PaymentsStripeClient,
+  paymentId: string,
+  opts: { amountOre?: number; reason: string; source: "admin" | "owner" | "system"; now?: string },
+): Promise<{ ok: true; refundedOre: number } | { ok: false; error: string }> {
+  const now = opts.now ?? nowIso();
+  const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
+  if (!p || !p.payment_intent_id) return { ok: false, error: "payment_not_found" };
+  if (p.status !== "captured") return { ok: false, error: `not_refundable_in_status_${p.status}` };
+  const remaining = p.amount_ore - p.refunded_ore;
+  const amount = opts.amountOre ?? remaining;
+  if (!Number.isInteger(amount) || amount <= 0 || amount > remaining) return { ok: false, error: "invalid_amount" };
+  const refund = await stripe.refunds.create(
+    { payment_intent: p.payment_intent_id, ...(amount < p.amount_ore || p.refunded_ore > 0 ? { amount } : {}), metadata: { payment_id: p.id, order_id: p.order_id, reason: opts.reason } },
+    { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-refund-${p.id}-${p.refunded_ore}-${amount}` },
+  );
+  const total = p.refunded_ore + (refund.amount || amount);
+  db.transaction(() => {
+    const fresh = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(p.id) as PaymentRow;
+    applyRefundTotal(db, fresh, Math.max(fresh.refunded_ore, total), { source: opts.source, now });
+  })();
+  return { ok: true, refundedOre: total };
+}
+
+export type OrderPaymentEffect = "none" | "captured" | "capture_failed" | "capture_pending" | "released" | "refunded" | "kept";
+
+/**
+ * Called by the producer page and the admin lifecycle routes AFTER a
+ * successful order transition. The order transition never waits for, and
+ * is never undone by, the payment step; a failed Stripe call is retried by
+ * runPaymentMaintenance().
+ *   confirmed            → capture the reservation
+ *   declined             → release (link or reservation)
+ *   cancelled no_show    → kept: the producer keeps a captured payment (terms §7)
+ *   cancelled other      → release a reservation, refund a captured payment
+ */
+export async function onOrderTransitioned(params: {
+  db: any;
+  stripe: PaymentsStripeClient | null;
+  orderId: string;
+  toStatus: string;
+  cancelReason?: string | null;
+  now?: string;
+}): Promise<OrderPaymentEffect> {
+  const { db, stripe, orderId, toStatus } = params;
+  const now = params.now ?? nowIso();
+  const p = getPaymentForOrder(db, orderId);
+  if (!p || !stripe) return "none";
+  try {
+    if (toStatus === "confirmed") {
+      if (p.status !== "authorized") return "none";
+      const out = await capturePayment(db, stripe, p.id, now);
+      return out === "captured" ? "captured" : out === "authorization_gone" ? "capture_failed" : "capture_pending";
+    }
+    if (toStatus === "declined") {
+      return (await releasePayment(db, stripe, p.id, "order_declined", now)) ? "released" : "none";
+    }
+    if (toStatus === "cancelled") {
+      if (params.cancelReason === "no_show") return p.status === "captured" ? "kept" : (await releasePayment(db, stripe, p.id, "no_show", now)) ? "released" : "none";
+      if (p.status === "captured") {
+        const r = await refundPayment(db, stripe, p.id, { reason: params.cancelReason || "order_cancelled", source: "system", now });
+        return r.ok ? "refunded" : "none";
+      }
+      return (await releasePayment(db, stripe, p.id, params.cancelReason || "order_cancelled", now)) ? "released" : "none";
+    }
+  } catch (err: any) {
+    console.error(`[payments] order ${orderId} → ${toStatus}: payment step failed: ${String(err?.message || err)}`);
+    logPaymentEvent(db, { paymentId: p.id, orderId, agentId: p.agent_id, source: "system", type: "lifecycle_step_failed", detail: `${toStatus}: ${String(err?.code || err?.type || "error")}`.slice(0, 120), now });
+    return toStatus === "confirmed" ? "capture_pending" : "none";
+  }
+  return "none";
+}
+
+export interface MaintenanceResult {
+  expired_orders: number;
+  captured: number;
+  released: number;
+  sessions_expired: number;
+  intents_synced: number;
+}
+
+/**
+ * Every few minutes (src/index.ts, PAYMENTS_ENABLED only) and on demand
+ * (admin). Covers lost webhooks and failed Stripe calls:
+ *   1. a reservation the producer did not confirm before capture_deadline_at
+ *      → order cancelled (payment_expired) + reservation released;
+ *   2. confirmed/ready/completed orders whose payment is still only
+ *      authorized → capture again;
+ *   3. declined/cancelled orders whose payment is still reserved → release;
+ *   4. payment links past their expiry with no webhook → re-read the
+ *      Checkout Session: expired → pay at pickup; completed → authorize.
+ */
+export async function runPaymentMaintenance(params: { db?: any; stripe: PaymentsStripeClient; now?: string; env?: NodeJS.ProcessEnv }): Promise<MaintenanceResult> {
+  const db = params.db ?? getDb();
+  const now = params.now ?? nowIso();
+  const env = params.env ?? process.env;
+  const out: MaintenanceResult = { expired_orders: 0, captured: 0, released: 0, sessions_expired: 0, intents_synced: 0 };
+  const step = async (label: string, fn: () => Promise<void>) => {
+    try { await fn(); } catch (err: any) { console.error(`[payments] maintenance ${label} failed: ${String(err?.message || err)}`); }
+  };
+
+  const overdue = db.prepare(`
+    SELECT p.id, p.order_id FROM payments p JOIN orders o ON o.id = p.order_id
+    WHERE p.status = 'authorized' AND p.capture_deadline_at IS NOT NULL AND p.capture_deadline_at <= ? AND o.status = 'pending'
+  `).all(now) as Array<{ id: string; order_id: string }>;
+  for (const r of overdue) {
+    await step(`deadline ${r.order_id}`, async () => {
+      const t = transitionOrder(r.order_id, "cancelled", { actor: "system", cancelReason: "payment_expired" });
+      if (t.success) out.expired_orders++;
+      if (await releasePayment(db, params.stripe, r.id, "payment_expired", now)) out.released++;
+    });
+  }
+
+  const toCapture = db.prepare(`
+    SELECT p.id FROM payments p JOIN orders o ON o.id = p.order_id
+    WHERE p.status = 'authorized' AND o.status IN ('confirmed','ready','completed')
+  `).all() as Array<{ id: string }>;
+  for (const r of toCapture) {
+    await step(`capture ${r.id}`, async () => { if ((await capturePayment(db, params.stripe, r.id, now)) === "captured") out.captured++; });
+  }
+
+  const toRelease = db.prepare(`
+    SELECT p.id FROM payments p JOIN orders o ON o.id = p.order_id
+    WHERE p.status = 'authorized' AND o.status IN ('declined','cancelled')
+  `).all() as Array<{ id: string }>;
+  for (const r of toRelease) {
+    await step(`release ${r.id}`, async () => { if (await releasePayment(db, params.stripe, r.id, "order_closed", now)) out.released++; });
+  }
+
+  const staleLinks = db.prepare(`
+    SELECT * FROM payments WHERE status = 'requires_payment' AND checkout_expires_at IS NOT NULL AND checkout_expires_at <= ?
+  `).all(addMinutesIso(now, -10)) as PaymentRow[];
+  for (const p of staleLinks) {
+    await step(`session ${p.id}`, async () => {
+      if (!p.checkout_session_id) return;
+      const cs = await params.stripe.checkout.sessions.retrieve(p.checkout_session_id, { stripeAccount: p.stripe_account_id });
+      if (cs.status === "expired") {
+        const after: AfterCommit[] = [];
+        db.transaction(() => applySessionExpired(db, p, { source: "system", now, after }))();
+        await runAfterCommit(after, { db, stripe: params.stripe, now });
+        out.sessions_expired++;
+      } else if (cs.status === "complete") {
+        const intentId = intentIdOf(cs.payment_intent);
+        if (intentId) {
+          db.prepare(`UPDATE payments SET payment_intent_id = COALESCE(payment_intent_id, ?), updated_at = ? WHERE id = ?`).run(intentId, now, p.id);
+          if (await syncPaymentIntent(db, params.stripe, p.id, now, env)) out.intents_synced++;
+        }
+      }
+    });
+  }
+  return out;
+}
+
+/** Rollback helper (PAYMENTS_ENABLED going off): release every open link and reservation. */
+export async function releaseAllOpenPayments(db: any, stripe: PaymentsStripeClient, now: string = nowIso()): Promise<number> {
+  const rows = db.prepare(`SELECT id FROM payments WHERE status IN ('requires_payment','authorized')`).all() as Array<{ id: string }>;
+  let n = 0;
+  for (const r of rows) {
+    try { if (await releasePayment(db, stripe, r.id, "rollback", now)) n++; } catch (err: any) {
+      console.error(`[payments] rollback release ${r.id} failed: ${String(err?.message || err)}`);
+    }
+  }
+  return n;
 }
