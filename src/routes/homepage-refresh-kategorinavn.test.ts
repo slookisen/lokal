@@ -216,18 +216,32 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();
 
-    // AC3b — rows the refresh cannot fix do not stick at the front: after a
-    // refresh with no write they move to the back and fixable rows are reached.
+    // AC3b — rows the refresh cannot fix do not stick at the front. Stuck rows
+    // (no-write, transient fetch failure, theme-spam page) are stamped in
+    // homepage_content_checked_at and rotate to the back; the fixable row is
+    // reached; updated_at is never touched without a data change.
     const stuckHtml = `<html><head><title>Tom</title></head><body><p>Velkommen.</p></body></html>`;
+    const spamHtml =
+      `<html><head><title>Beste norske casino 2026</title><meta property="og:description" content="Casino bonus og free spins"></head>` +
+      `<body><h1>Beste norske casino 2026</h1><p>Spill casino med velkomstbonus.</p></body></html>`;
     const pages: Record<string, string> = {};
-    for (const id of ["rot-a", "rot-b", "rot-c"]) {
-      seed(id, { cats: ["fish"], products: REAL, prov: aboutHp, updated: `2020-02-0${id.charCodeAt(4) - 96}T00:00:00.000Z` });
-      pages[`${id}.kat-test.no`] = stuckHtml;
-    }
-    seed("rot-d", { cats: ["fish"], products: REAL, prov: aboutHp, updated: "2020-02-09T00:00:00.000Z" });
-    pages["rot-d.kat-test.no"] = HOME_HTML;
-    const rotFetch = async (url: string) =>
-      new Response(pages[new URL(url).host] ?? "", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    const order = ["rot-a", "rot-b", "rot-c", "rot-e", "rot-d"];
+    order.forEach((id, i) => {
+      seed(id, { cats: ["fish"], products: REAL, prov: aboutHp, updated: `2020-02-0${i + 1}T00:00:00.000Z` });
+      pages[`${id}.kat-test.no`] = id === "rot-d" ? HOME_HTML : id === "rot-e" ? spamHtml : stuckHtml;
+    });
+    const rotFetch = async (url: string) => {
+      const host = new URL(url).host;
+      if (host.startsWith("rot-c")) {
+        const e = new Error("The operation was aborted due to timeout");
+        e.name = "TimeoutError";
+        throw e;
+      }
+      return new Response(pages[host] ?? "", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    };
+    const updatedBefore = Object.fromEntries(
+      order.map((id) => [id, (db.prepare(`SELECT updated_at FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).updated_at]),
+    );
     const seen: string[][] = [];
     for (let round = 0; round < 3; round++) {
       const targets = mod.selectHomepageContentRefreshAutoTargets(db as any, 2);
@@ -235,13 +249,39 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       if (targets.length === 0) break;
       await mod.refreshHomepageContent(db as any, targets, { dryRun: false, fetchImpl: rotFetch as any });
     }
-    assertEq(seen[0], ["rot-a", "rot-b"], "AC3b: round 1 takes the front of the queue");
-    assertEq(seen[1].includes("rot-d"), true, "AC3b: round 2 reaches the fixable row after the stuck rows were stamped");
-    assertEq(seen[1].includes("rot-a") || seen[1].includes("rot-b"), false, "AC3b: stamped stuck rows are not re-selected in the next round (they rotate to the back)");
+    assertEq(seen[0], ["rot-a", "rot-b"], "AC3b: round 1 takes the front of the queue (no-write rows)");
+    assertEq(seen[1], ["rot-c", "rot-e"], "AC3b: round 2 takes the transient-failure row and the theme-spam row (stamped rows moved back)");
+    assertEq(seen[2].includes("rot-d"), true, "AC3b: round 3 reaches the fixable row, after all stuck kinds were attempted once");
     assertEq(
       JSON.parse((db.prepare(`SELECT categories FROM agents WHERE id = 'rot-d'`).get() as any).categories).includes("honey"),
       true,
       "AC3b: the fixable row got corroborated categories written",
+    );
+    const stuckAfter = Object.fromEntries(
+      ["rot-a", "rot-b", "rot-c", "rot-e"].map((id) => [id, (db.prepare(`SELECT updated_at, homepage_content_checked_at AS c FROM agent_knowledge WHERE agent_id = ?`).get(id) as any)]),
+    );
+    assertEq(
+      ["rot-a", "rot-b", "rot-c", "rot-e"].map((id) => stuckAfter[id].updated_at === updatedBefore[id]),
+      [true, true, true, true],
+      "AC3b: updated_at is unchanged on every no-write / failed / spam attempt",
+    );
+    assertEq(
+      ["rot-a", "rot-b", "rot-c", "rot-e"].map((id) => !!stuckAfter[id].c),
+      [true, true, true, true],
+      "AC3b: homepage_content_checked_at is stamped for no-write, transient failure and theme-spam",
+    );
+    // dry run stamps nothing
+    seed("rot-dry", { cats: ["fish"], products: REAL, prov: aboutHp });
+    pages["rot-dry.kat-test.no"] = stuckHtml;
+    await mod.refreshHomepageContent(
+      db as any,
+      [{ agent_id: "rot-dry", name: "x", homepage_url: "https://rot-dry.kat-test.no" }] as any,
+      { dryRun: true, fetchImpl: rotFetch as any },
+    );
+    assertEq(
+      (db.prepare(`SELECT homepage_content_checked_at AS c FROM agent_knowledge WHERE agent_id = 'rot-dry'`).get() as any).c,
+      null,
+      "AC3b: a dry run stamps nothing",
     );
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();

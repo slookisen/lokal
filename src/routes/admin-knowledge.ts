@@ -1942,8 +1942,9 @@ export const HCR_THEME_SPAM_CANDIDATE_REASON =
  * (categories only: the refresh writes categories, never products, so a
  * category-name-only products list with corroborated categories is not
  * selectable). Those rows were never picked before, so categories_not_corroborated
- * stood forever. A row refreshed without any write is stamped (updated_at) and
- * moves to the back of the queue. At least half of `limit` is reserved
+ * stood forever. The extension group is ordered by
+ * homepage_content_checked_at (NULL first, stamped on every apply attempt),
+ * then updated_at, so a row the refresh cannot fix moves to the back. At least half of `limit` is reserved
  * for this group when it has that many rows, so a long first group cannot
  * starve it. Parking (homepage_unreachable_since) and the limit apply to both.
  */
@@ -1997,7 +1998,7 @@ export function selectHomepageContentRefreshAutoTargets(
              ${baseFrom}
               AND k.field_provenance LIKE '%"website_homepage"%'
               ${parkingExclusion}
-            ORDER BY k.updated_at ASC
+            ORDER BY (k.homepage_content_checked_at IS NOT NULL), k.homepage_content_checked_at ASC, k.updated_at ASC
             LIMIT ?`,
     )
     .all(HCR_AUTO_EXT_SCAN_LIMIT) as Array<
@@ -2050,21 +2051,6 @@ export async function refreshHomepageContent(
     opts.deadlineAt !== undefined || opts.fetchImpl ? { deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl } : undefined;
   // ── Per-agent processing (moved verbatim from the route handler) ────────
   const nowIso = new Date().toISOString();
-  // A row that already carries a homepage source but where this refresh wrote
-  // nothing (the page gave nothing new, or every field was refused) is stamped
-  // via the existing updated_at column, so the auto-select (ORDER BY updated_at
-  // ASC) moves it to the back instead of re-selecting it first every cycle.
-  // Only rows with a homepage source; apply runs only; never throws.
-  const markCheckedWithoutWrite = (agentId: string): void => {
-    if (dryRun) return;
-    try {
-      db.prepare(
-        `UPDATE agent_knowledge SET updated_at = ? WHERE agent_id = ? AND field_provenance LIKE '%"website_homepage"%'`,
-      ).run(nowIso, agentId);
-    } catch {
-      /* bookkeeping only */
-    }
-  };
   let scanned = 0;
   const byField: Record<string, number> = { about: 0, products: 0, categories: 0, description: 0 };
   const changed: Array<{ agent_id: string; fields: string[] }> = [];
@@ -2137,7 +2123,33 @@ export async function refreshHomepageContent(
     ).run(agentId);
   }
 
+  // Every ATTEMPT in an apply run stamps homepage_content_checked_at (the
+  // auto-select's rotation key) — whatever the outcome: nothing written,
+  // fetch failure, theme-spam page, exception. Never updated_at. Not stamped
+  // after a caller deadline (that path must write nothing at all).
   async function processOne(t: HcrTargetRow): Promise<void> {
+    try {
+      await processOneInner(t);
+    } finally {
+      if (!dryRun) {
+        const deadlineHit = errors.some(
+          (e) => e.agent_id === t.agent_id && e.error.startsWith(HCR_DEADLINE_EXCEEDED),
+        );
+        if (!deadlineHit) {
+          try {
+            db.prepare("UPDATE agent_knowledge SET homepage_content_checked_at = ? WHERE agent_id = ?").run(
+              new Date().toISOString(),
+              t.agent_id,
+            );
+          } catch {
+            /* rotation bookkeeping only */
+          }
+        }
+      }
+    }
+  }
+
+  async function processOneInner(t: HcrTargetRow): Promise<void> {
     const agentId = t.agent_id;
     if (!t.homepage_url) {
       errors.push({ agent_id: agentId, error: "no_homepage_url" });
@@ -2294,10 +2306,7 @@ export async function refreshHomepageContent(
     }
 
     scanned++;
-    if (candidates.length === 0) {
-      markCheckedWithoutWrite(agentId);
-      return; // nothing extractable — leave as-is.
-    }
+    if (candidates.length === 0) return; // nothing extractable — leave as-is.
 
     // Load existing provenance + curated locks + current column values.
     const kRow = db
@@ -2371,10 +2380,7 @@ export async function refreshHomepageContent(
     if (curatedSkipped.length > 0) {
       skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
     }
-    if (fieldsToWrite.length === 0) {
-      markCheckedWithoutWrite(agentId);
-      return;
-    }
+    if (fieldsToWrite.length === 0) return;
 
     const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
     for (const f of writtenFields) {
