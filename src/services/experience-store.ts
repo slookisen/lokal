@@ -9847,8 +9847,48 @@ export function isOpenGardssalgWebsiteCandidate(
   return typeof row.reason === "string" && (GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS as readonly string[]).includes(row.reason);
 }
 
+/**
+ * SQL predicate for "this experience_providers row is a LIVE gårdssalg
+ * provider" as far as the website-review queue is concerned: the gårdssalg-
+ * row predicate used throughout routes/opplevelser.ts (`producer_type IS NOT
+ * NULL OR rfb_seed_source = 'rfb-seed'`, see GFC_GARDSSALG_PRODUCER_TYPE_SQL
+ * there) plus `merged_into IS NULL` (a merged-away duplicate's work belongs
+ * to its survivor — the merged_into migration in init-experiences.ts leaves
+ * exactly this filter to each consumer). `alias` is a code-supplied table
+ * alias (e.g. "p" for a JOIN), never user input. One definition shared by
+ * applyGardssalgWebsiteVerification's enqueue gate and the queue triage read
+ * behind the staleness/cleanup routes (2026-10-11 website-review-queue
+ * unblock), so the two can never disagree on who counts.
+ */
+export function gardssalgWebsiteQueueProviderSql(alias?: string): string {
+  const a = alias ? `${alias}.` : "";
+  return `((${a}producer_type IS NOT NULL OR ${a}rfb_seed_source = 'rfb-seed') AND ${a}merged_into IS NULL)`;
+}
+
+// Named parameters for the open-reason IN-list below, derived from
+// GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS (never hand-copied literals), so the
+// SQL and isOpenGardssalgWebsiteCandidate() can never drift apart.
+const GS_WQ_OPEN_REASON_PARAMS: Record<string, string> = Object.fromEntries(
+  GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS.map((r, i) => [`open_reason_${i}`, r])
+);
+const GS_WQ_OPEN_REASON_PLACEHOLDERS = Object.keys(GS_WQ_OPEN_REASON_PARAMS)
+  .map((k) => `@${k}`)
+  .join(", ");
+
 /** Upsert one website-review-queue row — same UNIQUE(provider_id)
- * refresh-on-rerun idiom as the org_nr queue. */
+ * refresh-on-rerun idiom as the org_nr queue.
+ *
+ * `parked_since` (2026-10-11 website-review-queue unblock, review fix B1): a
+ * conflicting upsert that brings a NEW OPEN candidate (reason in
+ * GARDSSALG_WEBSITE_QUEUE_OPEN_REASONS — e.g. contact-backfill's
+ * brreg_registered_hjemmeside or discovery's website_discovery_candidate
+ * landing on a parked candidate_evidence_failed row) clears `parked_since`:
+ * the parking was about the OLD failed attempt, and leaving it set would
+ * hide the fresh actionable candidate from veien-til-pool, the judge/
+ * approve levers and the staleness alarm — the same "one stale row blocks
+ * the provider" bug this whole slice removes. Any other reason (a terminal
+ * note such as verification_failed) keeps whatever `parked_since` the row
+ * already had, exactly as before. */
 export function upsertGardssalgWebsiteReviewQueue(entry: GardssalgWebsiteReviewQueueEntry): void {
   const db = getDb(VERTICAL);
   db.prepare(
@@ -9863,6 +9903,8 @@ export function upsertGardssalgWebsiteReviewQueue(entry: GardssalgWebsiteReviewQ
        confidence = excluded.confidence,
        reason = excluded.reason,
        batch_id = excluded.batch_id,
+       parked_since = CASE WHEN excluded.reason IN (${GS_WQ_OPEN_REASON_PLACEHOLDERS})
+                           THEN NULL ELSE gardssalg_website_review_queue.parked_since END,
        updated_at = datetime('now')`
   ).run({
     id: uuid(),
@@ -9874,6 +9916,7 @@ export function upsertGardssalgWebsiteReviewQueue(entry: GardssalgWebsiteReviewQ
     confidence: entry.confidence ?? null,
     reason: entry.reason ?? "website_discovery_candidate",
     batch_id: entry.batch_id ?? null,
+    ...GS_WQ_OPEN_REASON_PARAMS,
   });
 }
 

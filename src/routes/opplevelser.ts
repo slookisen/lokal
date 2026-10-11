@@ -281,6 +281,7 @@ import {
   // 2026-10-11 website-review-queue unblock — open-candidate predicate read
   // by veien-til-pool step 1, the staleness route and the cleanup route.
   isOpenGardssalgWebsiteCandidate,
+  gardssalgWebsiteQueueProviderSql,
   // Grep 8 slice 1 — third human-review queue reported by
   // GET /admin/gardssalg-review-queues-staleness (pending rows only).
   listExperienceHomepageReviewQueuePending,
@@ -7054,11 +7055,30 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
   // Server-side selection for auto mode — NEVER a client-supplied list in
   // this mode, which is exactly what makes it safe to auto-run from the
   // charter without curl+jq JSON-evidence parsing in a routine text file.
+  //
+  // 2026-10-11 website-review-queue unblock (review follow-up): selection is
+  // ALSO restricted to `reason = 'website_discovery_candidate' AND
+  // parked_since IS NULL`. It used to filter on confidence alone, but the
+  // judge route below records its verdict by rewriting `reason` while
+  // keeping `confidence` (and its band now reaches 1.0), so a row the LLM
+  // judge had already REJECTED (`LLM judge AVVIS: …`, confidence 1.0), a
+  // `judge GODKJENN but write blocked: …` row, or a parked row was
+  // auto-approved on the very next auto run. The judge route's own doc
+  // comment always described this mechanism as draining "reason =
+  // 'website_discovery_candidate' AND confidence >= 1.0" — the code now
+  // matches. Client-supplied `approvals` mode is unchanged.
   let candidatesConsidered = 0;
   let approvalsInput: unknown[];
   if (auto) {
     const qualifying = queue
-      .filter((q) => q.confidence !== null && q.confidence !== undefined && q.confidence >= minConfidence)
+      .filter(
+        (q) =>
+          q.reason === "website_discovery_candidate" &&
+          (q.parked_since === null || q.parked_since === undefined) &&
+          q.confidence !== null &&
+          q.confidence !== undefined &&
+          q.confidence >= minConfidence
+      )
       .sort((a, b) => (a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0));
     candidatesConsidered = qualifying.length;
     approvalsInput = qualifying
@@ -7309,11 +7329,16 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
   }
 
   const db = getExpDb("experiences");
+  // `parked_since IS NULL` (2026-10-11 website-review-queue unblock, review
+  // follow-up): a parked row is out of attention by definition and is never
+  // judged — same exclusion as the auto-approve selection above and
+  // isOpenGardssalgWebsiteCandidate(). Mirrored in still_pending below.
   const pending = db
     .prepare(
       `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason
          FROM gardssalg_website_review_queue
         WHERE reason = 'website_discovery_candidate'
+          AND parked_since IS NULL
           AND confidence >= ? AND confidence < ?
         ORDER BY updated_at ASC
         LIMIT ?`,
@@ -7418,7 +7443,8 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
   const stillPendingRow = db
     .prepare(
       `SELECT COUNT(*) AS c FROM gardssalg_website_review_queue
-        WHERE reason = 'website_discovery_candidate' AND confidence >= ? AND confidence < ?`,
+        WHERE reason = 'website_discovery_candidate' AND parked_since IS NULL
+          AND confidence >= ? AND confidence < ?`,
     )
     .get(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE) as { c: number };
 
@@ -7529,16 +7555,21 @@ router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Re
 // both need — deliberately NOT computeGardssalgReadinessRows (a full
 // readiness pass per call, far more than a queue-hygiene read needs):
 //
-//   - is_gardssalg_provider: the SAME gårdssalg-row predicate this file uses
-//     everywhere (`producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'`,
-//     see GFC_GARDSSALG_PRODUCER_TYPE_SQL), plus `merged_into IS NULL` — a
+//   - is_gardssalg_provider: gardssalgWebsiteQueueProviderSql (experience-
+//     store.ts) — the SAME gårdssalg-row predicate this file uses everywhere
+//     (`producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'`, see
+//     GFC_GARDSSALG_PRODUCER_TYPE_SQL), plus `merged_into IS NULL` — a
 //     merged-away duplicate's work belongs to its survivor (see the
 //     merged_into migration's own doc comment in init-experiences.ts, which
-//     leaves exactly this filter to each consumer). An orphan row (provider
-//     gone) is not a gårdssalg provider either.
+//     leaves exactly this filter to each consumer). Shared with
+//     applyGardssalgWebsiteVerification's enqueue gate. An orphan row
+//     (provider gone) is not a gårdssalg provider either.
 //   - website_verified: the shared fail-closed isHjemmesideVerified() gate on
 //     the provider's field_provenance (JS-side, which is why this is not a
-//     pure-SQL count).
+//     pure-SQL count) AND a non-blank hjemmeside (review fix N3): a
+//     hjemmeside that was blanked after verification can still carry a stale
+//     `verified: true` stamp, and a provider with no website at all must
+//     never be treated as "website resolved".
 //   - parked / open candidate: isOpenGardssalgWebsiteCandidate()
 //     (experience-store.ts) — the same predicate veien-til-pool step 1 reads.
 //
@@ -7548,6 +7579,7 @@ interface GardssalgWebsiteQueueTriageRow {
   provider_id: string;
   provider_name: string | null;
   reason: string;
+  candidate_url: string;
   created_at: string;
   parked_since: string | null;
   is_gardssalg_provider: boolean;
@@ -7557,12 +7589,10 @@ interface GardssalgWebsiteQueueTriageRow {
 function readGardssalgWebsiteQueueTriage(db: Database.Database): GardssalgWebsiteQueueTriageRow[] {
   const raw = db
     .prepare(
-      `SELECT q.provider_id, q.provider_name, q.reason, q.created_at, q.parked_since,
-              CASE WHEN p.id IS NOT NULL
-                        AND (p.producer_type IS NOT NULL OR p.rfb_seed_source = 'rfb-seed')
-                        AND p.merged_into IS NULL
+      `SELECT q.provider_id, q.provider_name, q.reason, q.candidate_url, q.created_at, q.parked_since,
+              CASE WHEN p.id IS NOT NULL AND ${gardssalgWebsiteQueueProviderSql("p")}
                    THEN 1 ELSE 0 END AS is_gardssalg_provider,
-              p.field_provenance
+              p.field_provenance, p.hjemmeside
          FROM gardssalg_website_review_queue q
          LEFT JOIN experience_providers p ON p.id = q.provider_id
         ORDER BY q.updated_at DESC`,
@@ -7571,19 +7601,23 @@ function readGardssalgWebsiteQueueTriage(db: Database.Database): GardssalgWebsit
     provider_id: string;
     provider_name: string | null;
     reason: string;
+    candidate_url: string;
     created_at: string;
     parked_since: string | null;
     is_gardssalg_provider: number;
     field_provenance: string | null;
+    hjemmeside: string | null;
   }>;
   return raw.map((r) => ({
     provider_id: r.provider_id,
     provider_name: r.provider_name,
     reason: r.reason,
+    candidate_url: r.candidate_url,
     created_at: r.created_at,
     parked_since: r.parked_since ?? null,
     is_gardssalg_provider: r.is_gardssalg_provider === 1,
-    website_verified: isHjemmesideVerified(r.field_provenance ?? null),
+    website_verified:
+      typeof r.hjemmeside === "string" && r.hjemmeside.trim() !== "" && isHjemmesideVerified(r.field_provenance ?? null),
   }));
 }
 
@@ -7595,8 +7629,8 @@ function readGardssalgWebsiteQueueTriage(db: Database.Database): GardssalgWebsit
 // default (`{"apply": true}` applies), guarded writes, never throws on an
 // empty selection. Two buckets, nothing else is ever touched:
 //
-//   - `resolved`: the provider's hjemmeside is already verified
-//     (isHjemmesideVerified) -> the queue row is DELETED. The entry is moot —
+//   - `resolved`: the provider has a non-blank hjemmeside that is already
+//     verified (isHjemmesideVerified) -> the queue row is DELETED. The entry is moot —
 //     exactly what applyGardssalgWebsiteVerification now does itself on every
 //     new verify, and what the approve lever already does on adoption
 //     (clearGardssalgWebsiteReviewQueueEntry); this only catches up the rows
@@ -7617,9 +7651,11 @@ function readGardssalgWebsiteQueueTriage(db: Database.Database): GardssalgWebsit
 // (only when there is something to write, so an empty apply stays a 200
 // no-op); dry-run is never blocked. The handler is fully synchronous (no
 // await between the triage read and the writes) and both writes run in one
-// transaction. Response: { dry_run, resolved: {count, provider_ids},
-// not_gardssalg: {count, provider_ids}, remaining_total } — on apply the
-// counts/ids are what actually landed (a row already gone, or already parked,
+// transaction. Response: { dry_run, resolved: {count, provider_ids, rows},
+// not_gardssalg: {count, provider_ids}, remaining_total } — `resolved.rows`
+// carries {provider_id, reason, candidate_url} for every deleted (dry-run:
+// would-delete) row, so what a DELETE removed stays on record in the
+// response (review fix N3). On apply the counts/ids are what actually landed (a row already gone, or already parked,
 // by write time reports changes === 0 and is excluded), on dry-run what
 // would; `remaining_total` is the queue's total row count
 // after the cleanup (projected on dry-run — parked rows still count, they
@@ -7630,7 +7666,9 @@ router.post("/admin/gardssalg-website-review-queue-cleanup", requireAdmin, (req:
 
   const db = getExpDb("experiences");
   const triage = readGardssalgWebsiteQueueTriage(db);
-  const resolvedIds = triage.filter((r) => r.website_verified).map((r) => r.provider_id);
+  const resolvedRows = triage
+    .filter((r) => r.website_verified)
+    .map((r) => ({ provider_id: r.provider_id, reason: r.reason, candidate_url: r.candidate_url }));
   const notGardssalgIds = triage
     .filter((r) => !r.website_verified && !r.is_gardssalg_provider && r.parked_since === null)
     .map((r) => r.provider_id);
@@ -7638,14 +7676,14 @@ router.post("/admin/gardssalg-website-review-queue-cleanup", requireAdmin, (req:
   if (!apply) {
     res.json({
       dry_run: true,
-      resolved: { count: resolvedIds.length, provider_ids: resolvedIds },
+      resolved: { count: resolvedRows.length, provider_ids: resolvedRows.map((r) => r.provider_id), rows: resolvedRows },
       not_gardssalg: { count: notGardssalgIds.length, provider_ids: notGardssalgIds },
-      remaining_total: triage.length - resolvedIds.length,
+      remaining_total: triage.length - resolvedRows.length,
     });
     return;
   }
 
-  if (resolvedIds.length + notGardssalgIds.length > 0) {
+  if (resolvedRows.length + notGardssalgIds.length > 0) {
     const pauseBlock = experiencesWritePauseBlock();
     if (pauseBlock) {
       res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
@@ -7659,11 +7697,11 @@ router.post("/admin/gardssalg-website-review-queue-cleanup", requireAdmin, (req:
         SET parked_since = datetime('now'), updated_at = datetime('now')
       WHERE provider_id = ? AND parked_since IS NULL`,
   );
-  const deleted: string[] = [];
+  const deleted: Array<{ provider_id: string; reason: string; candidate_url: string }> = [];
   const parked: string[] = [];
   db.transaction(() => {
-    for (const id of resolvedIds) {
-      if (deleteResolved.run(id).changes > 0) deleted.push(id);
+    for (const r of resolvedRows) {
+      if (deleteResolved.run(r.provider_id).changes > 0) deleted.push(r);
     }
     for (const id of notGardssalgIds) {
       if (stampPark.run(id).changes > 0) parked.push(id);
@@ -7673,7 +7711,7 @@ router.post("/admin/gardssalg-website-review-queue-cleanup", requireAdmin, (req:
   const remaining = db.prepare(`SELECT COUNT(*) AS c FROM gardssalg_website_review_queue`).get() as { c: number };
   res.json({
     dry_run: false,
-    resolved: { count: deleted.length, provider_ids: deleted },
+    resolved: { count: deleted.length, provider_ids: deleted.map((r) => r.provider_id), rows: deleted },
     not_gardssalg: { count: parked.length, provider_ids: parked },
     remaining_total: remaining.c,
   });
@@ -13962,8 +14000,10 @@ router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, 
 // counting parked rows here defeated it. Two ADDITIVE keys:
 //   - website_review_queue_actionable: the same age-report shape over rows
 //     that are OPEN candidates (isOpenGardssalgWebsiteCandidate) for a
-//     gårdssalg provider whose hjemmeside is not yet verified — the number a
-//     human actually has to look at.
+//     gårdssalg provider whose hjemmeside is not yet verified (a verified
+//     stamp only counts together with a non-blank hjemmeside — see
+//     readGardssalgWebsiteQueueTriage) — the number a human actually has to
+//     look at.
 //   - website_review_queue_breakdown: plain counts { total, parked,
 //     open_candidates, terminal, for_non_gardssalg_providers,
 //     for_website_verified_providers }. parked + open_candidates + terminal
@@ -21309,17 +21349,28 @@ async function gsVtpProcessProvider(
   } else {
     // 2026-10-11 website-review-queue unblock: only an OPEN candidate
     // (isOpenGardssalgWebsiteCandidate — reason website_discovery_candidate /
-    // brreg_registered_hjemmeside, not parked) counts as "queued" here.
-    // Previously ANY row for the provider took this branch, so a single
-    // terminal note (`verification_failed`, `candidate_evidence_failed`,
-    // `LLM judge AVVIS: …`, `judge GODKJENN but write blocked: …`) or a
-    // parked row pinned the provider at queued_needs_domain_affiliation
-    // forever: its own hjemmeside was never re-verified and a blank one was
-    // never reported as no_website_no_candidate. Such a row is now ignored
-    // and the provider falls through to the unchanged branches below (same
-    // dry-run/apply behaviour as a provider with no queue row at all).
+    // brreg_registered_hjemmeside, not parked) counts as "queued" here, and
+    // only while the provider's hjemmeside is BLANK. Previously ANY row for
+    // the provider took this branch, so a single terminal note
+    // (`verification_failed`, `candidate_evidence_failed`, `LLM judge AVVIS:
+    // …`, `judge GODKJENN but write blocked: …`) or a parked row pinned the
+    // provider at queued_needs_domain_affiliation forever: its own hjemmeside
+    // was never re-verified and a blank one was never reported as
+    // no_website_no_candidate. Such a row is now ignored and the provider
+    // falls through to the unchanged branches below (same dry-run/apply
+    // behaviour as a provider with no queue row at all).
+    //
+    // Review fix N1 — the blank-hjemmeside condition: the approve lever is
+    // fill-only, so an open candidate for a provider that already HAS a
+    // hjemmeside (e.g. the alternative URL applyGardssalgWebsiteVerification
+    // now deliberately keeps when the own site fails) can never be adopted
+    // from here; taking this branch would loop on write_rejected /
+    // write_skipped_by_guards every run. With a hjemmeside present the
+    // provider falls through to the re-verification of its OWN site instead
+    // (the candidate row stays in the queue for a human).
     const queueRow = websiteQueueByProvider.get(providerId);
-    const queueEntry = isOpenGardssalgWebsiteCandidate(queueRow) ? queueRow : undefined;
+    const queueEntry =
+      isOpenGardssalgWebsiteCandidate(queueRow) && !gsVtpPresent(row0.hjemmeside) ? queueRow : undefined;
     if (queueEntry) {
       const affiliated = gardssalgWebsiteDomainAffiliated(queueEntry.candidate_url, {
         navn: row0.navn,

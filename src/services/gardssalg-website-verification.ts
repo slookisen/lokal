@@ -63,6 +63,7 @@ import {
   upsertGardssalgWebsiteReviewQueue,
   listGardssalgWebsiteReviewQueue,
   isOpenGardssalgWebsiteCandidate,
+  gardssalgWebsiteQueueProviderSql,
 } from "./experience-store";
 import { enqueueProviderWorkQueueItem } from "./provider-work-queue";
 
@@ -738,6 +739,14 @@ export interface GsWvApplyResult {
  * if the provider already has a pending queue row with the SAME
  * reason+candidate_url (idempotent re-run: a re-scan that reaches the same
  * conclusion must not just keep bumping updated_at/duplicating queue churn).
+ * Also SKIPPED (2026-10-11 website-review-queue unblock, review fix N4) when
+ * the provider is not a live gårdssalg provider
+ * (gardssalgWebsiteQueueProviderSql: producer_type IS NOT NULL OR
+ * rfb_seed_source = 'rfb-seed', and merged_into IS NULL): this is a GÅRDSSALG
+ * review queue, and broad verification sweeps that also scanned golf clubs,
+ * museums and hotels are how ~157 of the 230 rows measured on 2026-10-11 got
+ * there. Their field_provenance stamp and audit row are written exactly as
+ * before — only the queue row is not.
  * gardssalg_website_review_queue has UNIQUE(provider_id), so the upsert
  * replaces whatever row the provider already has — EXCEPT (2026-10-11
  * website-review-queue unblock) an OPEN candidate for a DIFFERENT url
@@ -746,10 +755,16 @@ export interface GsWvApplyResult {
  * actionable replacement URL waiting for the judge/approve levers; the
  * old "legitimately overwritten" contract destroyed it and left only a
  * terminal verification_failed note about the URL that had just failed.
- * It is now kept untouched (`enqueued` stays false). Every other existing
- * row (a terminal note, a parked row, or an open candidate for the SAME url
- * as the failing hjemmeside) is still refreshed by the upsert exactly as
- * before (see upsertGardssalgWebsiteReviewQueue's doc comment).
+ * It is now kept untouched (`enqueued` stays false). Note that the
+ * provider still HAS a (failing) hjemmeside at this point, so the fill-only
+ * approve lever cannot adopt the kept candidate as-is — it stays visible as
+ * the alternative URL for whoever decides to replace the hjemmeside, and
+ * veien-til-pool step 1 deliberately treats an open candidate as "queued"
+ * only while the hjemmeside is blank, re-verifying the provider's own site
+ * otherwise instead of looping on write_skipped_by_guards. Every other
+ * existing row (a terminal note, a parked row, or an open candidate for the
+ * SAME url as the failing hjemmeside) is still refreshed by the upsert
+ * exactly as before (see upsertGardssalgWebsiteReviewQueue's doc comment).
  *
  * And for "verified" rows (2026-10-11 website-review-queue unblock): the
  * provider's gardssalg_website_review_queue row, whatever its reason or
@@ -781,8 +796,14 @@ export function applyGardssalgWebsiteVerification(
 
   const runOne = db.transaction((row: GsWvScanRow) => {
     const providerRow = db
-      .prepare(`SELECT field_provenance, hjemmeside FROM experience_providers WHERE id = ?`)
-      .get(row.provider_id) as { field_provenance: string | null; hjemmeside: string | null } | undefined;
+      .prepare(
+        `SELECT field_provenance, hjemmeside,
+                CASE WHEN ${gardssalgWebsiteQueueProviderSql()} THEN 1 ELSE 0 END AS is_gardssalg_queue_provider
+           FROM experience_providers WHERE id = ?`
+      )
+      .get(row.provider_id) as
+      | { field_provenance: string | null; hjemmeside: string | null; is_gardssalg_queue_provider: number }
+      | undefined;
     if (!providerRow) return; // provider vanished mid-run (deleted) -> nothing to stamp
 
     // A transient unreachability is not a finding about the producer, so it
@@ -900,7 +921,10 @@ export function applyGardssalgWebsiteVerification(
     }
 
     let enqueued = false;
-    if (row.classification === "unverified" && row.hjemmeside) {
+    // Review fix N4: the review queue is gårdssalg-only — a non-gårdssalg
+    // provider's unverified verdict is stamped/audited above as before but
+    // never queued (see doc comment).
+    if (row.classification === "unverified" && row.hjemmeside && providerRow.is_gardssalg_queue_provider === 1) {
       const existing = existingQueueByProvider.get(row.provider_id);
       const alreadyQueuedSame =
         !!existing && existing.reason === "verification_failed" && existing.candidate_url === row.hjemmeside;

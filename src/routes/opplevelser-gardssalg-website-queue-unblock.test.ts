@@ -31,8 +31,27 @@
  *       website_review_queue_breakdown adds up.
  *   u6  POST /admin/gardssalg-website-review-queue-cleanup: 403 without key;
  *       empty queue is a no-op; dry-run writes nothing; write-pause -> 423
- *       on apply only; apply deletes resolved rows, parks not_gardssalg
- *       rows, leaves the rest byte-identical; second apply is a no-op.
+ *       on apply only; apply deletes resolved rows (reported with reason +
+ *       candidate_url), parks not_gardssalg rows, leaves the rest
+ *       byte-identical (incl. a provider whose hjemmeside was blanked but
+ *       still carries a verified stamp); second apply is a no-op.
+ *
+ * Review fix-up round (CHANGES-REQUESTED on 033620b9):
+ *   u8  N1 — an open candidate for a provider that already HAS a hjemmeside
+ *       is not "queued" (the approve lever is fill-only): veien-til-pool
+ *       re-verifies the own site instead and the candidate row is kept.
+ *   u9  B1 — a new OPEN-candidate upsert onto a PARKED row clears
+ *       parked_since (veien-til-pool takes the queued branch, the staleness
+ *       report counts it actionable); a terminal upsert keeps the parking.
+ *   u4q-u4v N4 — applyGardssalgWebsiteVerification only queues
+ *       verification_failed for live gårdssalg providers (not for a
+ *       non-gårdssalg or merged-away provider; rfb-seed rows still queue);
+ *       provenance is stamped for all of them as before.
+ *   u10 follow-up — approve `auto: true` and the judge only select unparked
+ *       `website_discovery_candidate` rows: a judge-rejected (LLM judge
+ *       AVVIS, confidence 1.0) row and a parked candidate are never
+ *       auto-approved or judged; a normal open candidate still is, and once
+ *       the judge rejects it the next auto run no longer picks it up.
  *
  * Harness: mirrors opplevelser-gardssalg-website-review-queue-park.test.ts /
  * opplevelser-veien-til-pool-skive2.test.ts (EXPERIENCES_DB_PATH=":memory:",
@@ -134,10 +153,14 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
     // helpers at ITS load time, so it must be refreshed together with it.
     const wvServicePath = require.resolve("../services/gardssalg-website-verification");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, storePath, wvServicePath, opplevelserPath];
+    // Fresh judge module too, same as opplevelser-gardssalg-website-review-
+    // judge.test.ts (u10 runs the judge route against a mocked Anthropic).
+    const judgePath = require.resolve("../services/contact-candidate-judge");
+    const cachePaths = [dbFactoryPath, storePath, wvServicePath, judgePath, opplevelserPath];
     for (const p of cachePaths) delete require.cache[p];
 
     const prevFetch = globalThis.fetch;
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
     let restoreMainDb: (() => void) | null = null;
 
     try {
@@ -234,6 +257,15 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         fetchCalls.set(host, (fetchCalls.get(host) ?? 0) + 1);
         if (host === "klippesideri-u1.example") {
           return htmlResponse(u, `<html><body>Klippe Sideri, org.nr 912345671, velkommen til garden</body></html>`);
+        }
+        // u8: the provider's own site, reachable but naming no owner.
+        if (host === "n1-own-unblock.example") {
+          return htmlResponse(u, `<html><body>Helt urelatert forsidetekst uten noen treff</body></html>`);
+        }
+        // u10: the LLM judge — always AVVIS.
+        if (host === "api.anthropic.com") {
+          return ({ ok: true, status: 200,
+                    json: async () => ({ content: [{ type: "text", text: "AVVIS\nIkke nok bevis, avvist for testens skyld." }] }) }) as unknown as Response;
         }
         return ({ ok: false, status: 404, statusText: "Not Found", url: u, headers: mockHeaders,
                   arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) }) as unknown as Response;
@@ -349,6 +381,10 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         queue({ provider_id: "u4-parked-cand", candidate_url: "https://u4-parked-candidate.example", reason: "website_discovery_candidate", parked_since: "2026-09-03 10:00:00" });
         seed({ id: "u4-same-url", navn: "U4 Samme Url", hj: "https://u4-same-url.example" });
         queue({ provider_id: "u4-same-url", candidate_url: "https://u4-same-url.example", reason: "website_discovery_candidate", confidence: 0.9 });
+        // N4 — who gets a verification_failed row at all.
+        seed({ id: "u4-nongs", navn: "U4 Golfklubb", pt: null, seed: null, hj: "https://u4-nongs.example" });
+        seed({ id: "u4-merged", navn: "U4 Sammenslått", merged_into: "u4-new", hj: "https://u4-merged.example" });
+        seed({ id: "u4-rfbseed", navn: "U4 Rfb Seed", pt: null, seed: "rfb-seed", hj: "https://u4-rfbseed.example" });
 
         const keepBefore = getQueueRow("u4-keep");
         const keepBrregBefore = getQueueRow("u4-keep-brreg");
@@ -365,6 +401,9 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
             row({ provider_id: "u4-terminal", hjemmeside: "https://u4-terminal-own.example", classification: "unverified" }),
             row({ provider_id: "u4-parked-cand", hjemmeside: "https://u4-parked-own.example", classification: "unverified" }),
             row({ provider_id: "u4-same-url", hjemmeside: "https://u4-same-url.example", classification: "unverified" }),
+            row({ provider_id: "u4-nongs", hjemmeside: "https://u4-nongs.example", classification: "unverified" }),
+            row({ provider_id: "u4-merged", hjemmeside: "https://u4-merged.example", classification: "unverified" }),
+            row({ provider_id: "u4-rfbseed", hjemmeside: "https://u4-rfbseed.example", classification: "unverified" }),
           ],
           "u4-batch",
         );
@@ -400,6 +439,16 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
           "u4o: a parked candidate is not open -> refreshed as before (parked_since preserved by the upsert)");
         const sameRow = getQueueRow("u4-same-url");
         assertEq(sameRow?.reason, "verification_failed", "u4p: open candidate for the SAME url as the failing hjemmeside -> refreshed as before");
+
+        // N4: the review queue is gårdssalg-only; provenance is not.
+        assertEq(getQueueRow("u4-nongs"), undefined, "u4q: non-gårdssalg provider (no producer_type / rfb-seed) -> no verification_failed row");
+        assertEq(byId.get("u4-nongs")?.enqueued, false, "u4r: …enqueued false");
+        assertEq(JSON.parse(getProvider("u4-nongs").field_provenance || "{}").hjemmeside_verification?.classification, "unverified",
+          "u4s: …but its provenance is stamped exactly as before");
+        assertEq(getQueueRow("u4-merged"), undefined, "u4t: merged-away gårdssalg duplicate -> no queue row (its survivor owns the work)");
+        assertEq(JSON.parse(getProvider("u4-merged").field_provenance || "{}").hjemmeside_verification?.classification, "unverified",
+          "u4u: …provenance still stamped");
+        assertEq(getQueueRow("u4-rfbseed")?.reason, "verification_failed", "u4v: rfb-seed provider (producer_type NULL) is gårdssalg -> row inserted as before");
       }
 
       // ═══ u5: staleness route ════════════════════════════════════════════
@@ -433,24 +482,28 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         queue({ provider_id: "s-gs-verified", candidate_url: "https://s-gs-verified-other.example", reason: "website_discovery_candidate", created_at: sqliteUtcDaysAgo(25) });
         seed({ id: "s-merged", navn: "S Sammenslått Gard", merged_into: "s-gs-open" });
         queue({ provider_id: "s-merged", candidate_url: "https://s-merged.example", reason: "website_discovery_candidate", created_at: sqliteUtcDaysAgo(25) });
+        // N3: hjemmeside blanked after verification, stale verified stamp left.
+        seed({ id: "s-blanked", navn: "S Tømt Nettsted Gard", hj: "", field_provenance: verifiedProvenance });
+        queue({ provider_id: "s-blanked", candidate_url: "https://s-blanked-new.example", reason: "website_discovery_candidate", created_at: sqliteUtcDaysAgo(5) });
 
         const r = await callStaleness();
         assertEq(r.status, 200, "u5d: populated queue -> 200");
         const wq = r.body.website_review_queue;
         const wqIds = ((wq?.oldest_first as any[]) ?? []).map((x) => x.provider_id).sort();
-        assertEq(wq?.count, 6, "u5e: website_review_queue counts unparked rows only (8 total - 2 parked)");
+        assertEq(wq?.count, 7, "u5e: website_review_queue counts unparked rows only (9 total - 2 parked)");
         assertTrue(!wqIds.includes("s-gs-parked") && !wqIds.includes("s-gs-parked-open"), "u5f: neither parked row appears in website_review_queue");
 
         const act = r.body.website_review_queue_actionable;
         const actIds = ((act?.oldest_first as any[]) ?? []).map((x) => x.provider_id);
-        assertEq(act?.count, 2, "u5g: actionable = open candidates of non-verified gårdssalg providers only");
-        assertEq(actIds, ["s-gs-open", "s-gs-brreg"], "u5h: …s-gs-open (producer_type) + s-gs-brreg (rfb-seed), oldest first");
+        assertEq(act?.count, 3, "u5g: actionable = open candidates of non-verified gårdssalg providers only");
+        assertEq(actIds, ["s-gs-open", "s-blanked", "s-gs-brreg"],
+          "u5h: …s-gs-open (producer_type), s-blanked (verified stamp but blank hjemmeside = not verified), s-gs-brreg (rfb-seed), oldest first");
         assertEq(act?.stale_count, 1, "u5i: actionable stale_count counts only the >threshold row");
         assertEq(act?.stale_threshold_days, opplevelserModule.GS_VTP_QUEUE_STALE_DAYS, "u5j: same stale threshold as the other reports");
 
         const bd = r.body.website_review_queue_breakdown;
-        assertEq(bd, { total: 8, parked: 2, open_candidates: 5, terminal: 1, for_non_gardssalg_providers: 2, for_website_verified_providers: 1 },
-          "u5k: breakdown counts (non-gårdssalg = no producer_type/rfb-seed OR merged_into set)");
+        assertEq(bd, { total: 9, parked: 2, open_candidates: 6, terminal: 1, for_non_gardssalg_providers: 2, for_website_verified_providers: 1 },
+          "u5k: breakdown counts (non-gårdssalg = no producer_type/rfb-seed OR merged_into set; a blank hjemmeside is never 'verified')");
         assertEq(bd.parked + bd.open_candidates + bd.terminal, bd.total, "u5l: parked + open_candidates + terminal === total");
         assertEq(
           Object.keys(r.body).sort(),
@@ -471,10 +524,10 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         assertEq((await cleanup({}, {})).status, 403, "u6a: POST without X-Admin-Key -> 403");
 
         const emptyDry = await cleanup({});
-        assertEq(emptyDry.body, { dry_run: true, resolved: { count: 0, provider_ids: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 0 },
+        assertEq(emptyDry.body, { dry_run: true, resolved: { count: 0, provider_ids: [], rows: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 0 },
           "u6b: empty queue dry-run -> zero no-op");
         const emptyApply = await cleanup({ apply: true });
-        assertEq([emptyApply.status, emptyApply.body], [200, { dry_run: false, resolved: { count: 0, provider_ids: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 0 }],
+        assertEq([emptyApply.status, emptyApply.body], [200, { dry_run: false, resolved: { count: 0, provider_ids: [], rows: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 0 }],
           "u6c: empty queue apply -> 200 zero no-op (never throws)");
 
         seed({ id: "c-resolved", navn: "C Løst Gard", hj: "https://c-resolved.example", field_provenance: verifiedProvenance });
@@ -491,12 +544,22 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         queue({ provider_id: "c-keep-open", candidate_url: "https://c-keep-open.example", reason: "website_discovery_candidate", confidence: 0.9 });
         seed({ id: "c-keep-terminal", navn: "C Terminal Gard", hj: "https://c-keep-terminal.example" });
         queue({ provider_id: "c-keep-terminal", candidate_url: "https://c-keep-terminal.example", reason: "verification_failed" });
+        // N3: verified stamp but the hjemmeside was blanked since -> NOT resolved.
+        seed({ id: "c-blanked", navn: "C Tømt Gard", hj: null, field_provenance: verifiedProvenance });
+        queue({ provider_id: "c-blanked", candidate_url: "https://c-blanked-new.example", reason: "website_discovery_candidate", confidence: 0.9 });
 
         const snapshot = dumpQueue();
         const keepOpenBefore = getQueueRow("c-keep-open");
         const keepTerminalBefore = getQueueRow("c-keep-terminal");
         const nongsParkedBefore = getQueueRow("c-nongs-parked");
         const nongsBefore = getQueueRow("c-nongs");
+        const blankedBefore = getQueueRow("c-blanked");
+        const expectedResolvedRows = [
+          { provider_id: "c-nongs-verified", reason: "verification_failed", candidate_url: "https://c-museum.example" },
+          { provider_id: "c-resolved", reason: "verification_failed", candidate_url: "https://c-resolved.example" },
+          { provider_id: "c-resolved-parked", reason: "candidate_evidence_failed", candidate_url: "https://c-resolved-parked-old.example" },
+        ];
+        const sortRows = (rows: any[]) => [...rows].sort((a, b) => (a.provider_id < b.provider_id ? -1 : 1));
 
         const dry = await cleanup({});
         assertEq(dry.status, 200, "u6d: dry-run -> 200");
@@ -504,9 +567,11 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         assertEq([...dry.body.resolved.provider_ids].sort(), ["c-nongs-verified", "c-resolved", "c-resolved-parked"],
           "u6f: resolved = every row whose provider's hjemmeside is verified (parked or not, gårdssalg or not)");
         assertEq(dry.body.resolved.count, 3, "u6g: resolved.count");
+        assertEq(sortRows(dry.body.resolved.rows), expectedResolvedRows, "u6g2: resolved.rows carry provider_id + reason + candidate_url");
+        assertTrue(!dry.body.resolved.provider_ids.includes("c-blanked"), "u6g3: a blank hjemmeside with a stale verified stamp is NOT resolved");
         assertEq(dry.body.not_gardssalg, { count: 1, provider_ids: ["c-nongs"] },
           "u6h: not_gardssalg = unparked rows of non-gårdssalg providers (already-parked and verified ones excluded)");
-        assertEq(dry.body.remaining_total, 4, "u6i: remaining_total projects 7 - 3 deleted");
+        assertEq(dry.body.remaining_total, 5, "u6i: remaining_total projects 8 - 3 deleted");
         assertEq(dumpQueue(), snapshot, "u6j: dry-run writes nothing");
         assertEq((await cleanup({ apply: false })).body.dry_run, true, "u6k: apply:false is a dry-run");
 
@@ -524,7 +589,9 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
         assertEq(app.body.dry_run, false, "u6p: dry_run false on apply");
         assertEq([...app.body.resolved.provider_ids].sort(), ["c-nongs-verified", "c-resolved", "c-resolved-parked"], "u6q: apply resolved ids match the dry-run");
         assertEq(app.body.not_gardssalg, { count: 1, provider_ids: ["c-nongs"] }, "u6r: apply not_gardssalg matches the dry-run");
-        assertEq(app.body.remaining_total, 4, "u6s: remaining_total after apply");
+        assertEq(sortRows(app.body.resolved.rows), expectedResolvedRows, "u6r2: apply resolved.rows carry what was deleted");
+        assertEq(app.body.remaining_total, 5, "u6s: remaining_total after apply");
+        assertEq(getQueueRow("c-blanked"), blankedBefore, "u6s2: the blanked-hjemmeside provider's open candidate is untouched");
         for (const id of ["c-resolved", "c-resolved-parked", "c-nongs-verified"]) {
           assertEq(getQueueRow(id), undefined, `u6t.${id}: resolved row deleted`);
         }
@@ -538,14 +605,114 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
 
         const afterFirst = dumpQueue();
         const again = await cleanup({ apply: true });
-        assertEq(again.body, { dry_run: false, resolved: { count: 0, provider_ids: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 4 },
+        assertEq(again.body, { dry_run: false, resolved: { count: 0, provider_ids: [], rows: [] }, not_gardssalg: { count: 0, provider_ids: [] }, remaining_total: 5 },
           "u6z: second apply is a no-op");
         assertEq(dumpQueue(), afterFirst, "u6z2: second apply wrote nothing");
 
         // The two cleaned buckets are gone from the staleness alarm too.
         const st = await callRoute(router, { method: "GET", path: "/admin/gardssalg-review-queues-staleness", headers: auth });
-        assertEq(st.body.website_review_queue?.count, 2, "u6z3: website_review_queue now counts only the 2 rows that matter (open + terminal)");
-        assertEq(st.body.website_review_queue_actionable?.count, 1, "u6z4: actionable = the one open candidate");
+        assertEq(st.body.website_review_queue?.count, 3, "u6z3: website_review_queue now counts only the 3 rows that matter (2 open + 1 terminal)");
+        assertEq(st.body.website_review_queue_actionable?.count, 2, "u6z4: actionable = the two open candidates (c-keep-open, c-blanked)");
+      }
+
+      // ═══ u8: N1 — open candidate + NON-blank hjemmeside is not "queued" ══
+      expDb.prepare(`DELETE FROM gardssalg_website_review_queue`).run();
+      {
+        // The candidate's domain IS affiliated with the name, so the old
+        // branch would have taken it: dry-run would_write, apply
+        // write_rejected (approve is fill-only) — every run, forever.
+        seed({ id: "u8-n1", navn: "Elvebakken Sideri", hj: "https://n1-own-unblock.example" });
+        queue({ provider_id: "u8-n1", candidate_url: "https://elvebakkensideri-n1.example", reason: "website_discovery_candidate", confidence: 0.95 });
+        const candBefore = getQueueRow("u8-n1");
+        const fetchesBefore = fetchCalls.get("n1-own-unblock.example") ?? 0;
+
+        const dry = await callVtp({ providerIds: ["u8-n1"] });
+        assertEq(websiteStep(dry, "u8-n1")?.status, "queued_verification_failed",
+          "u8a: hjemmeside present -> falls through to re-verifying the OWN site (not would_write on the candidate)");
+        assertTrue((fetchCalls.get("n1-own-unblock.example") ?? 0) > fetchesBefore, "u8b: the own hjemmeside was fetched");
+        assertEq(getQueueRow("u8-n1"), candBefore, "u8c: dry-run leaves the candidate row byte-identical");
+
+        const app = await callVtp({ providerIds: ["u8-n1"], apply: true });
+        assertEq(websiteStep(app, "u8-n1")?.status, "queued_verification_failed", "u8d: apply -> queued_verification_failed, never write_rejected");
+        assertEq(getQueueRow("u8-n1"), candBefore, "u8e: the open candidate for another url is kept, not overwritten (C)");
+        assertEq(getProvider("u8-n1").hjemmeside, "https://n1-own-unblock.example", "u8f: hjemmeside untouched");
+        assertEq(JSON.parse(getProvider("u8-n1").field_provenance || "{}").hjemmeside_verification?.classification, "unverified",
+          "u8g: the own site's verdict is stamped as usual");
+      }
+
+      // ═══ u9: B1 — a new OPEN candidate un-parks a parked row ════════════
+      {
+        seed({ id: "u9-b1", navn: "Bekkestua Sideri" });
+        queue({ provider_id: "u9-b1", candidate_url: "https://old-failed-u9.example", reason: "candidate_evidence_failed", parked_since: "2026-09-03 10:00:00" });
+        const r0 = await callVtp({ providerIds: ["u9-b1"] });
+        assertEq(websiteStep(r0, "u9-b1")?.status, "no_website_no_candidate", "u9a: sanity — while parked, the row is not queued");
+
+        // Exactly what POST /admin/gardssalg-contact-backfill does.
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "u9-b1", provider_name: "Bekkestua Sideri",
+          candidate_url: "https://bekkestuasideri-u9.example", evidence: "brreg_hjemmeside:913999999",
+          reason: "brreg_registered_hjemmeside", batch_id: "u9-batch",
+        });
+        const after = getQueueRow("u9-b1");
+        assertEq([after?.reason, after?.parked_since], ["brreg_registered_hjemmeside", null], "u9b: open-candidate upsert clears parked_since");
+
+        const r1 = await callVtp({ providerIds: ["u9-b1"] });
+        assertEq(websiteStep(r1, "u9-b1"), { status: "would_write", candidate_url: "https://bekkestuasideri-u9.example" },
+          "u9c: veien-til-pool now takes the queued branch for the fresh candidate");
+        const st = await callRoute(router, { method: "GET", path: "/admin/gardssalg-review-queues-staleness", headers: auth });
+        assertTrue(((st.body.website_review_queue_actionable?.oldest_first as any[]) ?? []).some((x) => x.provider_id === "u9-b1"),
+          "u9d: …and the staleness report counts it as actionable");
+
+        // Default reason (website_discovery_candidate, discovery's upsert) un-parks too.
+        seed({ id: "u9-wdc", navn: "U9 Discovery Gard" });
+        queue({ provider_id: "u9-wdc", candidate_url: "https://old-u9-wdc.example", reason: "verification_failed", parked_since: "2026-09-03 10:00:00" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "u9-wdc", candidate_url: "https://u9-wdc-new.example", confidence: 0.92 });
+        assertEq([getQueueRow("u9-wdc")?.reason, getQueueRow("u9-wdc")?.parked_since], ["website_discovery_candidate", null],
+          "u9e: default-reason (website_discovery_candidate) upsert un-parks as well");
+
+        // A terminal upsert keeps the parking (u4o's behaviour, direct).
+        seed({ id: "u9-term", navn: "U9 Terminal Gard" });
+        queue({ provider_id: "u9-term", candidate_url: "https://old-u9-term.example", reason: "candidate_evidence_failed", parked_since: "2026-09-03 10:00:00" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "u9-term", candidate_url: "https://u9-term-own.example", reason: "verification_failed" });
+        assertEq([getQueueRow("u9-term")?.reason, getQueueRow("u9-term")?.parked_since], ["verification_failed", "2026-09-03 10:00:00"],
+          "u9f: a terminal (verification_failed) upsert keeps parked_since");
+      }
+
+      // ═══ u10: auto-approve / judge select only unparked open candidates ═
+      expDb.prepare(`DELETE FROM gardssalg_website_review_queue`).run();
+      {
+        seed({ id: "u10-avvis", navn: "U10 Avvist Gard" });
+        queue({ provider_id: "u10-avvis", candidate_url: "https://u10-avvis.example", reason: "LLM judge AVVIS: designbyrå", confidence: 1.0 });
+        seed({ id: "u10-blocked", navn: "U10 Blokkert Gard" });
+        queue({ provider_id: "u10-blocked", candidate_url: "https://u10-blocked.example", reason: "judge GODKJENN but write blocked: write_skipped_by_guards", confidence: 1.0 });
+        seed({ id: "u10-parked", navn: "U10 Parkert Gard" });
+        queue({ provider_id: "u10-parked", candidate_url: "https://u10-parked.example", reason: "website_discovery_candidate", confidence: 1.0, parked_since: "2026-09-03 10:00:00" });
+        seed({ id: "u10-open", navn: "U10 Åpen Gard" });
+        queue({ provider_id: "u10-open", candidate_url: "https://u10-open.example", reason: "website_discovery_candidate", confidence: 1.0 });
+        const approve = (body: any) => callRoute(router, { path: "/admin/gardssalg-website-review-approve", headers: auth, body });
+
+        const auto1 = await approve({ auto: true });
+        assertEq(auto1.body.candidates_considered, 1, "u10a: auto mode considers only the unparked website_discovery_candidate row");
+        assertEq(((auto1.body.approved as any[]) ?? []).map((a) => a.provider_id), ["u10-open"],
+          "u10b: a judge-rejected (AVVIS, confidence 1.0), a write-blocked and a parked row are never auto-approved; the normal open candidate is");
+
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key-u10";
+        const anthropicBefore = fetchCalls.get("api.anthropic.com") ?? 0;
+        const judged = await callRoute(router, { path: "/admin/gardssalg-website-review-judge", headers: auth, body: { limit: 30 } });
+        assertEq(judged.status, 200, "u10c: judge -> 200");
+        assertEq(((judged.body.results as any[]) ?? []).map((r) => r.provider_id), ["u10-open"],
+          "u10d: the judge only judges the unparked open candidate (the parked one is skipped)");
+        assertEq((fetchCalls.get("api.anthropic.com") ?? 0) - anthropicBefore, 1, "u10e: exactly one LLM call");
+        assertEq(getQueueRow("u10-parked")?.reason, "website_discovery_candidate", "u10f: the parked row's reason is untouched by the judge");
+        assertEq(judged.body.still_pending, 0, "u10g: still_pending excludes the parked row");
+
+        const auto2 = await approve({ auto: true });
+        assertEq([auto2.body.candidates_considered, auto2.body.approved_count], [0, 0],
+          "u10h: once the judge has rejected the candidate, the next auto run no longer picks it up");
+        const nothingWritten = expDb.prepare(
+          `SELECT COUNT(*) AS n FROM experience_providers WHERE id IN ('u10-avvis','u10-blocked','u10-parked','u10-open') AND hjemmeside IS NOT NULL`,
+        ).get() as { n: number };
+        assertEq(nothingWritten.n, 0, "u10i: no hjemmeside written for any of them");
       }
 
       // Sanity: the shared predicate itself.
@@ -563,6 +730,8 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
       failures.push("opplevelser-gardssalg-website-queue-unblock: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
       globalThis.fetch = prevFetch;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       if (restoreMainDb) restoreMainDb();
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
