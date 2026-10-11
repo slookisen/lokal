@@ -287,6 +287,8 @@ const failures: string[] = [];
 // Do not reintroduce `await import(...)` for this module.
 //
 let _serialChain: Promise<void> = Promise.resolve();
+// Read by the env-hygiene check before the summary.
+const _suiteStartedAtMs = Date.now();
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
   _serialChain = next.then(() => {}, () => {});
@@ -26756,6 +26758,18 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _deleteBlocklistNameSurvivorPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
+  // Env hygiene: `process.env.X = prev` with prev undefined stores the STRING
+  // "undefined", and the next db-factory open then creates ./undefined
+  // (+ -shm/-wal) in the repo root. Restore with
+  // `if (prev === undefined) delete process.env.X; else process.env.X = prev;`.
+  for (const k of ["DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH"]) {
+    assertTrue(process.env[k] !== "undefined", `env-hygiene: process.env.${k} is not the string "undefined" after the suite`);
+  }
+  for (const f of ["undefined", "undefined-wal", "undefined-shm"]) {
+    let createdThisRun = false;
+    try { createdThisRun = fs2.statSync(f).mtimeMs >= _suiteStartedAtMs; } catch { /* absent */ }
+    assertTrue(!createdThisRun, `env-hygiene: the suite did not write ./${f}`);
+  }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
@@ -28658,7 +28672,8 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
   assertTrue(!/Rett fra Bonden/i.test(okSL.body), "sq-slug-06: no 'Rett fra Bonden' on tilbyder page");
   assertTrue(!/Finn-tannlege|\/api\/tannlege/i.test(okSL.body), "sq-slug-07: no dental identity on tilbyder page");
 
-  process.env.EXPERIENCES_DB_PATH = prevPathSlug;
+  if (prevPathSlug === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathSlug;
   delete require.cache[dbFacPathSL];
   delete require.cache[expStPathSL];
   delete require.cache[expSeoPathSL];
@@ -28762,7 +28777,8 @@ console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap
     "sq-sitemap-cold-01e: sitemap does NOT emit UUID-based tilbyder URL"
   );
 
-  process.env.EXPERIENCES_DB_PATH = prevPathCS;
+  if (prevPathCS === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathCS;
   delete require.cache[dbFacPathCS];
   delete require.cache[expStPathCS];
   delete require.cache[expSeoPathCS];
