@@ -201,7 +201,14 @@ function formatNok(n: number): string {
 }
 
 /** The payment line + subject for a notification (unchanged when `payment` is absent). */
-function paymentCopy(order: OrderNotificationInput, orderRef: string): { html: string; text: string; subject: string } {
+interface PaymentCopy { html: string; text: string; subject: string; intro?: string; link?: string }
+const DEFAULT_INTRO = "Du har fått en ny henteordre via Rett fra Bonden";
+const DEFAULT_LINK = "Bekreft eller avslå ordren her";
+function paymentCopy(order: OrderNotificationInput, orderRef: string): Required<PaymentCopy> {
+  const c = paymentCopyInner(order, orderRef);
+  return { intro: DEFAULT_INTRO, link: DEFAULT_LINK, ...c };
+}
+function paymentCopyInner(order: OrderNotificationInput, orderRef: string): PaymentCopy {
   const p = order.payment;
   if (p?.status === "authorized") {
     const deadline = p.confirm_by ? ` Bekreft innen ${p.confirm_by}, ellers frigjøres reservasjonen automatisk og ordren kanselleres.` : "";
@@ -217,6 +224,9 @@ function paymentCopy(order: OrderNotificationInput, orderRef: string): { html: s
       html: "<p><strong>Rettelse:</strong> Forhåndsbetalingen for denne ordren er frigjort og blir ikke trukket. Oppgjør ved henting som vanlig.</p>",
       text: "Rettelse: Forhåndsbetalingen for denne ordren er frigjort og blir ikke trukket. Oppgjør ved henting som vanlig.",
       subject: `Endring i henteordre — ${orderRef}`,
+      // Not a new order: the producer already got this one (review finding).
+      intro: "Det er en endring i en henteordre du allerede har fått via Rett fra Bonden",
+      link: "Se ordren her",
     };
   }
   if (p?.status === "not_prepaid") {
@@ -243,7 +253,7 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
 
   const htmlContent = `
 <p>Hei,</p>
-<p>Du har fått en ny henteordre via Rett fra Bonden:</p>
+<p>${escHtml(pay.intro)}:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
@@ -254,13 +264,13 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">Bekreft eller avslå ordren her</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return { subject: pay.subject, htmlContent, textContent, replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO };
 }
@@ -306,7 +316,7 @@ export function renderOrderNotificationEmailV2(order: OrderNotificationInput): R
 
   const htmlContent = `
 <p>Hei,</p>
-<p>Du har fått en ny henteordre via Rett fra Bonden:</p>
+<p>${escHtml(pay.intro)}:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
@@ -317,13 +327,13 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">Bekreft eller avslå ordren her</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny henteordre via Rett fra Bonden.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\nBekreft eller avslå ordren her (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
     subject: pay.subject,

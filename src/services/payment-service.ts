@@ -1051,7 +1051,14 @@ function applyPaymentEvent(type: string, obj: any, ctx: PaymentEventCtx): boolea
         }
         // The reservation is gone: whatever happens next is paid at pickup.
         db.prepare(`UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now') WHERE id = ? AND payment_mode = 'prepay'`).run(p.order_id);
-        if (o?.status === "pending" || o?.status === "confirmed" || o?.status === "ready") ctx.after.push({ kind: "notify_released", orderId: p.order_id });
+        // An unpaid link (the producer has not heard about the order yet) →
+        // the held-back order mail as pay at pickup; a reservation the
+        // producer was told about → the correction.
+        if (o?.status === "pending" || o?.status === "confirmed" || o?.status === "ready") {
+          ctx.after.push(p.status === "requires_payment"
+            ? { kind: "notify_not_prepaid", orderId: p.order_id }
+            : { kind: "notify_released", orderId: p.order_id });
+        }
       }
     }
     return true;
@@ -1239,7 +1246,15 @@ export async function refundPayment(
   if (!Number.isInteger(amount) || amount <= 0 || amount > remaining) return { ok: false, error: "invalid_amount" };
   const refund = await stripe.refunds.create(
     { payment_intent: p.payment_intent_id, ...(amount < p.amount_ore || p.refunded_ore > 0 ? { amount } : {}), metadata: { payment_id: p.id, order_id: p.order_id, reason: opts.reason } },
-    { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-refund-${p.id}-${p.refunded_ore}-${amount}-${idemWindow(now)}` },
+    // A manual (admin/owner) refund keeps one key per (refunded so far,
+    // amount), so a retry after a timeout in which Stripe DID refund is
+    // deduplicated instead of refunding a partial amount twice. The system's
+    // full refunds use 10-minute buckets so the maintenance retry is not stuck
+    // on a cached Stripe error for 24 h; a duplicate full refund is refused by
+    // Stripe anyway (nothing left to refund).
+    { stripeAccount: p.stripe_account_id, idempotencyKey: opts.source === "system"
+      ? `rfb-refund-${p.id}-${p.refunded_ore}-${amount}-${idemWindow(now)}`
+      : `rfb-refund-${p.id}-${p.refunded_ore}-${amount}` },
   );
   const total = p.refunded_ore + (refund.amount || amount);
   db.transaction(() => {
@@ -1287,7 +1302,10 @@ export async function onOrderTransitioned(params: {
         // Terms §7: the producer keeps the payment on a no-show — a payment
         // still only reserved (capture queued) is captured, not released.
         if (p.status === "captured") return "kept";
-        if (p.status === "authorized") return (await capturePayment(db, stripe, p.id, now)) === "captured" ? "kept" : "capture_pending";
+        if (p.status === "authorized") {
+          const out = await capturePayment(db, stripe, p.id, now);
+          return out === "captured" ? "kept" : out === "authorization_gone" ? "capture_failed" : "capture_pending";
+        }
         return "none";
       }
       if (p.status === "captured") {
@@ -1443,22 +1461,37 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
   return out;
 }
 
-/** Rollback helper (PAYMENTS_ENABLED going off): release every open link and reservation. */
-export async function releaseAllOpenPayments(db: any, stripe: PaymentsStripeClient, now: string = nowIso()): Promise<number> {
-  const rows = db.prepare(`SELECT id, order_id, status FROM payments WHERE status IN ('requires_payment','authorized')`).all() as
-    Array<{ id: string; order_id: string; status: string }>;
-  let n = 0;
+/**
+ * Rollback helper (PAYMENTS_ENABLED=drain, then off): release every unpaid
+ * link and every reservation the producer has NOT confirmed. A reservation on
+ * an order the producer confirmed (or that ended as a no-show) is left for
+ * the capture step — releasing it would take money the producer is owed for
+ * goods already promised or handed over. In "drain" the maintenance job
+ * captures those; /admin/payments/status shows when nothing is open.
+ */
+export async function releaseAllOpenPayments(db: any, stripe: PaymentsStripeClient, now: string = nowIso()): Promise<{ released: number; left_for_capture: number }> {
+  const rows = db.prepare(`
+    SELECT p.id, p.order_id, p.status, o.status AS order_status, o.cancel_reason
+    FROM payments p LEFT JOIN orders o ON o.id = p.order_id
+    WHERE p.status IN ('requires_payment','authorized')
+  `).all() as Array<{ id: string; order_id: string; status: string; order_status: string | null; cancel_reason: string | null }>;
+  let released = 0;
+  let leftForCapture = 0;
   for (const r of rows) {
+    const owed = r.status === "authorized" && (
+      r.order_status === "confirmed" || r.order_status === "ready" || r.order_status === "completed" ||
+      (r.order_status === "cancelled" && r.cancel_reason === "no_show"));
+    if (owed) { leftForCapture++; continue; }
     try {
       if (!(await releasePayment(db, stripe, r.id, "rollback", now))) continue;
-      n++;
+      released++;
       // An unpaid link: releasePayment already switched the order to pay at
-      // pickup and announced it. A reservation the producer was already told
-      // about: tell them it will NOT be captured.
+      // pickup and announced it. A reservation on a still-pending order the
+      // producer was told about: tell them it will NOT be captured.
       if (r.status === "authorized") {
         const upd = db.prepare(`
           UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now')
-          WHERE id = ? AND payment_mode = 'prepay' AND status IN ('pending','confirmed','ready')
+          WHERE id = ? AND payment_mode = 'prepay' AND status = 'pending'
         `).run(r.order_id);
         if (upd.changes === 1) notifyProducer(r.order_id, { status: "payment_released" });
       }
@@ -1466,5 +1499,5 @@ export async function releaseAllOpenPayments(db: any, stripe: PaymentsStripeClie
       console.error(`[payments] rollback release ${r.id} failed: ${String(err?.message || err)}`);
     }
   }
-  return n;
+  return { released, left_for_capture: leftForCapture };
 }

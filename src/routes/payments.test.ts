@@ -483,5 +483,6 @@ if (require.main === module) {
   runPaymentsRouteTests({ log: true }).then((s) => {
     console.log(`\npayments routes: ${s.passed} passed, ${s.failed} failed`);
     if (s.failed) { for (const f of s.failures) console.log(f); process.exit(1); }
+    process.exit(0);
   });
 }

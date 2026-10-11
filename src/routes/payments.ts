@@ -242,6 +242,13 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
     payments_enabled: isPaymentsEnabled(),
     payments_mode: process.env.PAYMENTS_ENABLED === "1" ? "on" : process.env.PAYMENTS_ENABLED === "drain" ? "drain" : "off",
     open_payments: (getDb().prepare(`SELECT COUNT(*) AS n FROM payments WHERE status IN ('requires_payment','authorized')`).get() as { n: number }).n,
+    // Money the producer may lose (lost reservation after confirmation,
+    // capture that keeps failing) — the verifier/daily brief reads this.
+    alerts_7d: getDb().prepare(`
+      SELECT type, order_id, created_at AS at FROM payment_events
+      WHERE type IN ('authorization_lost_after_confirm','capture_stuck') AND created_at >= ?
+      ORDER BY created_at DESC LIMIT 20
+    `).all(new Date(Date.now() - 7 * 86400000).toISOString()),
     livemode: paymentsLivemode(),
     stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
     connect_webhook_secret_configured: !!process.env.STRIPE_CONNECT_WEBHOOK_SECRET,
@@ -293,7 +300,7 @@ router.post("/admin/payments/release-all", async (req: Request, res: Response) =
     res.status(503).json({ error: "Payments not configured" });
     return;
   }
-  res.json({ success: true, released: await releaseAllOpenPayments(getDb(), stripe) });
+  res.json({ success: true, ...(await releaseAllOpenPayments(getDb(), stripe)) });
 });
 
 router.post("/admin/payments/accounts/:agentId/retire", (req: Request, res: Response) => {
