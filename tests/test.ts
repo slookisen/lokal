@@ -46810,3 +46810,22 @@ runSerial(async () => {
     failures.push("company-legal-sites: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical (skive A):
+// sitemap role-gate (one batch query), two 404 umbrella slugs excluded, and the
+// shared BM event time-offset helper. Own in-memory DB; runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── sitemap role-gate + BM event time offset ──");
+  try {
+    const { runSeoSitemapRollesperreTests } = require("../src/routes/seo-sitemap-rollesperre.test") as
+      typeof import("../src/routes/seo-sitemap-rollesperre.test");
+    const sr = await runSeoSitemapRollesperreTests({ log: false });
+    passed += sr.passed;
+    failed += sr.failed;
+    for (const f of sr.failures) failures.push("seo-sitemap-rollesperre: " + f);
+    console.log(`  seo-sitemap-rollesperre: ${sr.passed} passed, ${sr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("seo-sitemap-rollesperre: unexpected error: " + String(err?.message || err));
+  }
+});

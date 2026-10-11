@@ -34,6 +34,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
+import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
@@ -462,7 +463,8 @@ export function parseNokPrice(raw: unknown): number | null {
 /**
  * dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (B): schema.org Event for a
  * Bondens marked market day. Only known fields; no offers; no undefined keys.
- * start/end are passed through verbatim (ISO offset preserved, no UTC conversion).
+ * start/end keep their wall-clock; a "+00:00"/"Z" label (BM writes Oslo local time
+ * with it) is corrected to the real Europe/Oslo offset via normalizeBmEventTime.
  */
 export function buildBmEventJsonLd(
   r: { event_name: string; location_text?: string | null; start_at: string; end_at?: string | null; source_url?: string | null; venue_name: string; lat?: number | null; lng?: number | null; city?: string | null },
@@ -487,14 +489,14 @@ export function buildBmEventJsonLd(
     "@type": "Event",
     "name": r.event_name,
     "description": description,
-    "startDate": r.start_at,
+    "startDate": normalizeBmEventTime(r.start_at),
     "eventStatus": "https://schema.org/EventScheduled",
     "eventAttendanceMode": "https://schema.org/OfflineEventAttendanceMode",
     "location": place,
     "image": image,
     "organizer": { "@type": "Organization", "name": "Bondens marked Norge", "url": "https://bondensmarked.no" },
   };
-  if (r.end_at) ev.endDate = r.end_at;
+  if (r.end_at) ev.endDate = normalizeBmEventTime(r.end_at);
   if (r.source_url) ev.url = r.source_url;
   return ev;
 }
@@ -6180,6 +6182,10 @@ export function getSitemapXml(now: number = Date.now(), build: () => string = bu
   return sitemapCache.xml;
 }
 
+// Umbrella-style slugs that answer 404 on /produsent/:slug but come out of the agents
+// table (no hardcoded list exists); kept out of the sitemap (NO + EN) until their pages exist.
+const SITEMAP_EXCLUDED_PRODUCER_SLUGS = new Set(["hanen-bygdeturisme-gardsmat", "debio-sertifisering"]);
+
 export function buildSitemapXml(): string {
   {
     const agents = marketplaceRegistry.getActiveAgents();
@@ -6262,10 +6268,25 @@ export function buildSitemapXml(): string {
     // (short/empty slugs, skeleton imports with no knowledge row and no claim).
     // Symptom of the 2026-05-14 Search Console "sitemap-listed URLs returning
     // 404" report.
+    // Role gate as ONE batch query (not passesRoleGate per agent = N SELECTs): mirrors
+    // passesRoleGate's `failsRoleGate` — an agent is refused unless it carries an
+    // umbrella_type, or has no role, or role='producer'. (is_vetted / listability are
+    // already enforced by getActiveAgents().) Fail-open on a failed read, like the route.
+    let roleGateOk: Set<string> | null = null;
+    try {
+      const rows = getDb()
+        .prepare("SELECT id FROM agents WHERE is_active = ? AND (COALESCE(umbrella_type, '') <> '' OR COALESCE(role, '') = '' OR role = ?)")
+        .all(1, "producer") as Array<{ id: string }>;
+      roleGateOk = new Set(rows.map(r => r.id));
+    } catch (e) {
+      console.error("[sitemap] role-gate query failed:", e);
+    }
     let skippedCount = 0;
     for (const a of agents) {
       const slug = slugify(a.name);
       if (!slug || slug.length < 2) { skippedCount++; continue; }
+      if (roleGateOk && !roleGateOk.has(a.id)) { skippedCount++; continue; }
+      if (SITEMAP_EXCLUDED_PRODUCER_SLUGS.has(slug)) { skippedCount++; continue; }
       const k = knowledgeByAgent.get(a.id);
       // RegisteredAgent type doesn't surface claimed_by_user_id, but the
       // underlying agents row does — narrow-cast to read it without polluting
