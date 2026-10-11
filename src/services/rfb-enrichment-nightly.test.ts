@@ -42,6 +42,22 @@
  *       route in process with the stored offset and advances the cursor
  *   (o) admin routes: auth, dry-run default, apply with the flag off
  *   (p) enrichment write-pause: writing steps skipped, verify still runs
+ *   (r) step 1 never probes a homepage on a social / directory host (incl.
+ *       an agents.url fallback) — counted as skipped_directory_or_social_host;
+ *       the preview shows the agents.url-only rows
+ *   (s) the LLM cap is per NIGHT (earlier runs' calls are subtracted; an
+ *       unreadable ledger = no LLM budget); a second apply run in a night is
+ *       refused (already_ran_tonight) unless forced; force never lifts the
+ *       LLM cap
+ *   (t) one no-run envelope per night: `partial` when the window ended
+ *       without a run (lock held all window, with the reason), `failed` on an
+ *       error before the lock; none when a run happened or the process
+ *       started after the window
+ *   (u) transient outcomes (http_5xx / missing admin key, error, timeout,
+ *       the tool's run-lock, write-pause) are not stamped as attempts
+ *   (v) Brreg selection: rows without a contact e-mail first (the route's
+ *       LLM gate can only add an e-mail there); a row with org_nr + website +
+ *       contact e-mail is never selected (the route's own predicate)
  *   (q) the BM step ALWAYS asks the route for fill_only=1 and scopes it to
  *       the cohort: through the real in-process route a stored e-mail/phone
  *       is never replaced, a blank one is filled, and a matched producer
@@ -633,7 +649,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       calls.length = 0;
       db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
       setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "0", RFB_ENRICHMENT_CAP_BM_SLUGS: "0" });
-      const r2 = await job.runRfbEnrichmentNightly({
+      const r2 = await job.runRfbEnrichmentNightly({ force: true,
         apply: true,
         trigger: "manual",
         now: NIGHT,
@@ -723,12 +739,12 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       assertTrue(scopes.length === 7 && scopes.every((x) => Array.isArray(x)), "j1: every BM call carries the cohort scope");
       assertEq(job.getRfbEnrichmentBmCursor(db).next_offset, 60, "j1: cursor persisted (after the wrap night it points at 60)");
       scannedOverride = 25;
-      await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
+      await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: NIGHT, deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
       assertEq(job.getRfbEnrichmentBmCursor(db).next_offset, 85, "j2: a partial scan (route time budget) advances by what was scanned");
       scannedOverride = null;
       job.setRfbEnrichmentBmCursor(db, 400, 420, new Date());
       offsets.length = 0;
-      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: NIGHT, deps: { executors: stubExecutors(calls, realClock, { bmHarvest: bm }) } });
       assertEq([offsets, job.getRfbEnrichmentBmCursor(db).next_offset], [[400, 0], 60], "j3: a cursor past a shrunken catalog restarts at 0 the same night");
       const bmStep = r.steps.find((s) => s.step === "bm_harvest")!;
       assertEq([bmStep.extra?.offset, bmStep.extra?.next_offset, bmStep.extra?.total_slugs], [0, 60, 354], "j4: the step reports offset / next offset / total");
@@ -820,7 +836,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       assertEq([bmStep.attempted, bmStep.extra?.offset, bmStep.extra?.next_offset, bmStep.extra?.total_slugs], [2, 0, 2, 5], "n2: the real BM route ran in process over slugs 0..1");
       assertTrue(fetched.includes("GET https://bondensmarked.no/produsenter/bm-a") && fetched.includes("GET https://bondensmarked.no/produsenter/bm-b") && !fetched.some((f) => f.endsWith("/bm-c")), "n2: exactly the window's pages were fetched");
       fetched.length = 0;
-      await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT });
+      await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: NIGHT });
       assertTrue(fetched.some((f) => f.endsWith("/bm-c")) && fetched.some((f) => f.endsWith("/bm-d")) && !fetched.some((f) => f.endsWith("/bm-a")), "n3: the next run continues at the stored offset (slugs 2..3)");
       assertEq(job.getRfbEnrichmentBmCursor(db).next_offset, 4, "n3: cursor advanced to 4");
     });
@@ -889,6 +905,165 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       assertEq(bmStep.changed_agent_ids, ["q-blank"], "q5: only the filled row goes on to re-verification");
       const audit = (db.prepare(`SELECT COUNT(*) AS c FROM agent_knowledge_audit WHERE agent_id IN ('q-diff', 'q-contacted')`).get() as { c: number }).c;
       assertEq(audit, 0, "q6: no audit row for the untouched rows");
+    });
+
+    // ── (r) N1: no probe of social / directory homepages ─────────────────
+    await withDb("r", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_URL_CHECK: "10" });
+      seedAgent("r-aurl-fb", { url: "https://www.facebook.com/r-gard", k: { website: null } });
+      seedAgent("r-kweb-dir", { k: { website: "https://www.1881.no/r-gard" } });
+      seedAgent("r-aurl-own", { url: "https://r-own.no", k: { website: null } });
+      seedAgent("r-kweb-own", { k: { website: "https://r-kweb.no" } });
+      const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
+      const pu = p.steps.find((x) => x.step === "url_check")!;
+      assertEq(pu.selected_ids, ["r-kweb-own", "r-aurl-own"], "r1: social / directory homepages are not selected for the URL probe (own-site rows, closest tier first)");
+      assertEq([pu.skipped, pu.a_url_only], [{ skipped_directory_or_social_host: 2 }, { eligible: 1, selected: 1 }], "r1: preview counts skipped_directory_or_social_host and the agents.url-only rows");
+      const calls: Call[] = [];
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { executors: stubExecutors(calls, realClock) } });
+      assertEq(calls.filter((c) => c.step === "url_check").map((c) => c.id), ["r-kweb-own", "r-aurl-own"], "r2: the run probes only the producers' own hosts");
+      assertEq(r.steps.find((x) => x.step === "url_check")?.extra, { skipped_before_selection: { skipped_directory_or_social_host: 2 }, a_url_only: { eligible: 1, selected: 1 } }, "r2: the step (and its envelope claim) reports both counts");
+      let fetches = 0;
+      (globalThis as any).fetch = async () => {
+        fetches++;
+        return new Response("", { status: 200 });
+      };
+      const exec = job.createDefaultRfbEnrichmentExecutors(db, "test");
+      const fbRow = (await job.loadRfbEnrichmentCohort(db)).rows.find((x) => x.id === "r-aurl-fb")!;
+      const out = await exec.urlCheck(fbRow);
+      const k = db.prepare(`SELECT url_last_status FROM agent_knowledge WHERE agent_id = 'r-aurl-fb'`).get() as { url_last_status: number | null };
+      assertEq([out.outcome, out.written, fetches, k.url_last_status], ["skipped_directory_or_social_host", false, 0, null], "r3: the real executor refuses it too — no fetch, no url_last_status written");
+    });
+
+    // ── (s) N3: LLM cap per night; one apply run per night unless forced ─
+    await withDb("s", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "2" });
+      for (let i = 0; i < 5; i++) seedGeneric(`s${i}`);
+      const calls: Call[] = [];
+      const judging = async (row: { id: string }) => {
+        calls.push({ step: "brreg_contact", id: row.id, at: "" });
+        meterMod.noteLlmCall("contact-candidate-judge");
+        return { outcome: "email_rejected_by_gate", written: false, changed: false };
+      };
+      const deps = { executors: stubExecutors(calls, realClock, { brregContact: judging }) };
+      const r1 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: NIGHT, deps });
+      assertEq([r1.llm.calls, r1.llm.used_before_this_run, r1.llm.run_budget], [2, 0, 3], "s1: first run of the night: budget = the night cap");
+      const later = new Date(NIGHT.getTime() + 3 * 3600_000); // 03:10Z, same night
+      const r2 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: later, deps });
+      assertEq([r2.skipped_reason, r2.lock.acquired, r2.envelope_recorded, calls.length], ["already_ran_tonight", false, false, 2], "s2: a second apply in the same night is refused without force — no lock, no work, no envelope");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "5" });
+      const r3 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: later, deps });
+      assertEq([r3.skipped_reason, r3.llm.used_before_this_run, r3.llm.run_budget, r3.llm.calls], [null, 2, 1, 1], "s3: force allows the run, but only the night's remaining LLM budget (3 − 2 = 1)");
+      assertEq(r3.steps.find((x) => x.step === "brreg_contact")?.stopped_reason, "llm_cap_reached", "s3: and the LLM step stops there");
+      assertEq(job.readRfbEnrichmentLlmCallsTonight(db, later), 3, "s4: calls tonight sum to exactly the cap");
+      const nextNight = new Date(NIGHT.getTime() + 86_400_000);
+      const r4 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: nextNight, deps });
+      assertEq([r4.skipped_reason, r4.llm.used_before_this_run, r4.llm.run_budget], [null, 0, 3], "s5: the next night starts with the full cap and no stamp");
+      assertEq(
+        [job.rfbEnrichmentNightKey(new Date("2026-10-12T07:59:00Z")), job.rfbEnrichmentNightKey(new Date("2026-10-12T08:00:00Z")), job.rfbEnrichmentNightKey(new Date("2026-10-11T22:00:00Z"))],
+        ["2026-10-11", "2026-10-12", "2026-10-11"],
+        "s6: a night runs 08:00Z → 08:00Z (22Z and the next 07Z are the same night)",
+      );
+      db.exec(`ALTER TABLE runs RENAME TO runs_hidden`);
+      const r5 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: new Date(nextNight.getTime() + 3600_000), deps });
+      db.exec(`ALTER TABLE runs_hidden RENAME TO runs`);
+      assertEq([r5.llm.run_budget, r5.llm.calls, r5.errors.some((e) => e.startsWith("LLM calls tonight unreadable"))], [0, 0, true], "s7: an unreadable ledger means no LLM budget (fail closed)");
+      if (![7, 8].includes(new Date().getUTCHours())) {
+        setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1" });
+        initMod.getDb(); // same pinned handle
+        const { markJobCompleted } = require("./boot-job-gate") as typeof import("./boot-job-gate");
+        markJobCompleted(db, job.RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY, new Date(Date.now() - 60_000));
+        const noForce = await callRoute(routes.rfbEnrichmentNightlyRouter, { method: "POST", url: "/run", headers: auth, body: { apply: true } });
+        const withForce = await callRoute(routes.rfbEnrichmentNightlyRouter, { method: "POST", url: "/run", headers: auth, body: { apply: true, force: true } });
+        assertEq([noForce.body?.skipped_reason, withForce.status === 200 ? withForce.body?.skipped_reason ?? null : "202"], ["already_ran_tonight", null], "s8: POST /run forwards force (refused without, runs with)");
+      } else {
+        passed++; // the route check depends on the wall clock; skipped near 08Z
+      }
+    });
+
+    // ── (t) N4: one no-run envelope per night ────────────────────────────
+    await withDb("t", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1" });
+      job.__resetRfbEnrichmentNoRunTrackerForTesting();
+      const calls: Call[] = [];
+      const deps = { executors: stubExecutors(calls, realClock) };
+      const started = new Date("2026-10-11T23:00:00Z");
+      const at = (hhmm: string, dayOffset = 0) => new Date(new Date(`2026-10-12T${hhmm}:00Z`).getTime() + dayOffset * 86_400_000);
+      ledger.acquireLock({ agent: job.VERIFIER_TICK_LOCK_AGENT, run_id: "run-held-lokal-agent-verifier-tick", started_at: new Date().toISOString(), staleMinutes: 50 });
+      const t1 = await job.tickRfbEnrichmentNightly({ now: at("00:10"), lastRunAt: null, deps, processStartedAt: started });
+      const t2 = await job.tickRfbEnrichmentNightly({ now: at("01:10"), lastRunAt: t1.lastRunAt, deps, processStartedAt: started });
+      assertEq([t1.report?.skipped_reason, t2.report?.skipped_reason, count("runs")], ["verifier_tick_lock_held", "verifier_tick_lock_held", 0], "t1: the lock is held at every try inside the window — no envelope yet");
+      const t3 = await job.tickRfbEnrichmentNightly({ now: at("02:05"), lastRunAt: t2.lastRunAt, deps, processStartedAt: started });
+      const env = db.prepare(`SELECT run_id, status, claims, notes FROM runs WHERE agent = ?`).all(job.RFB_ENRICHMENT_NIGHTLY_AGENT) as any[];
+      const meta = JSON.parse(env[0]?.claims ?? "[]")[0]?.meta ?? {};
+      assertEq([t3.noRunEnvelopeRecorded, env.length, env[0]?.run_id, env[0]?.status], [true, 1, "run-2026-10-11-rfb-enrichment-nightly-no-run", "partial"], "t2: when the window has ended without a run: one partial envelope");
+      assertEq([meta.kind, meta.reason, meta.lock_held_skips, meta.last_lock_holder?.run_id], ["rfb_enrichment_no_run", "verifier_tick_lock_held", 2, "run-held-lokal-agent-verifier-tick"], "t2: with the reason and the lock holder");
+      const t4 = await job.tickRfbEnrichmentNightly({ now: at("03:30"), lastRunAt: t3.lastRunAt, deps, processStartedAt: started });
+      assertEq([t4.noRunEnvelopeRecorded ?? false, count("runs")], [false, 1], "t3: at most once per night");
+      db.prepare(`DELETE FROM orchestrator_locks`).run();
+      // Next night: it ran → no no-run envelope.
+      const n1 = await job.tickRfbEnrichmentNightly({ now: at("00:10", 1), lastRunAt: null, deps, processStartedAt: started });
+      const n2 = await job.tickRfbEnrichmentNightly({ now: at("02:05", 1), lastRunAt: n1.lastRunAt, deps, processStartedAt: started });
+      assertEq([n1.report?.envelope_recorded, n2.noRunEnvelopeRecorded ?? false, count("runs")], [true, false, 2], "t4: a night with a run gets its run envelope only");
+      // A process that started after the window ended knows nothing about it.
+      const late = await job.tickRfbEnrichmentNightly({ now: at("02:10", 2), lastRunAt: null, deps, processStartedAt: at("02:01", 2) });
+      assertEq([late.noRunEnvelopeRecorded ?? false, count("runs")], [false, 2], "t5: no no-run envelope from a process that started after the window");
+      // Error before the lock → one failed envelope for that night.
+      db.exec(`DROP TABLE orchestrator_locks`);
+      const e1 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: at("00:20", 3), deps });
+      const e2 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: at("00:40", 3), deps });
+      const failedEnv = db.prepare(`SELECT status, claims FROM runs WHERE run_id = 'run-2026-10-14-rfb-enrichment-nightly-no-run'`).all() as any[];
+      assertEq([e1.skipped_reason, e1.envelope_recorded, e2.envelope_recorded, failedEnv.length, failedEnv[0]?.status], ["error", true, false, 1, "failed"], "t6: an error before the lock → one failed envelope per night");
+      assertEq(JSON.parse(failedEnv[0]?.claims ?? "[]")[0]?.meta?.reason, "error_before_lock", "t6: reason error_before_lock");
+    });
+
+    // ── (u) N5: transient outcomes are not stamped ───────────────────────
+    await withDb("u", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_URL_CHECK: "4", RFB_ENRICHMENT_CAP_CONTACT_EXTRACTION: "2", RFB_ENRICHMENT_CAP_BRREG: "2" });
+      for (let i = 0; i < 4; i++) seedGeneric(`u${i}`);
+      const urlOutcomes = [
+        { outcome: "http_503", written: false, changed: false, error: true },
+        { outcome: "error", written: false, changed: false, error: true },
+        { outcome: "timeout", written: false, changed: false },
+        { outcome: "probe_failed_404", written: true, changed: false },
+      ];
+      let i = 0;
+      const calls: Call[] = [];
+      const r = await job.runRfbEnrichmentNightly({
+        apply: true,
+        trigger: "manual",
+        now: NIGHT,
+        deps: {
+          executors: stubExecutors(calls, realClock, {
+            urlCheck: async () => urlOutcomes[i++],
+            brregContact: async () => ({ outcome: "enrichment_write_paused", written: false, changed: false, stop: "enrichment_write_paused" }),
+            contactExtraction: async () => ({ outcome: "run_in_progress", written: false, changed: false, stop: "contact_extraction_run_in_progress" }),
+          }),
+        },
+      });
+      const stamped = db.prepare(`SELECT agent_id, step, last_outcome FROM rfb_enrichment_nightly_attempts ORDER BY step, agent_id`).all();
+      assertEq(stamped, [{ agent_id: "u3", step: "url_check", last_outcome: "probe_failed_404" }], "u1: only the real outcome is stamped (no 503 / error / timeout / write-pause / run-lock)");
+      assertEq([r.steps.find((x) => x.step === "url_check")?.attempted, r.steps.find((x) => x.step === "brreg_contact")?.stopped_reason], [4, "enrichment_write_paused"], "u1: the transient rows were still attempted and reported");
+      assertEq(
+        [
+          job.isTransientRfbEnrichmentOutcome({ outcome: "http_500" }),
+          job.isTransientRfbEnrichmentOutcome({ outcome: "route_timeout", error: true, stop: "route_timeout" }),
+          job.isTransientRfbEnrichmentOutcome({ outcome: "no_contact_found" }),
+          job.isTransientRfbEnrichmentOutcome({ outcome: "rejected_evidence_mismatch" }),
+        ],
+        [true, true, false, false],
+        "u2: classifier — 5xx / timeouts transient, real verdicts not",
+      );
+    });
+
+    // ── (v) N8: Brreg selection order ────────────────────────────────────
+    await withDb("v", async () => {
+      setEnv({ RFB_ENRICHMENT_CAP_BRREG: "10" });
+      seedAgent("v-has-email", { contact_email: "post@vhas.no", org_nr: null, k: {} });
+      seedAgent("v-no-email", { contact_email: "", org_nr: null, k: {} });
+      seedAgent("v-complete", { contact_email: "post@vcomplete.no", org_nr: "999888777", k: { website: "https://v-complete.no", url_last_status: 404 } });
+      const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
+      assertEq(p.steps.find((x) => x.step === "brreg_contact")?.selected_ids, ["v-no-email", "v-has-email"], "v1: rows without a contact e-mail first; a row with org_nr + website + e-mail is never selected");
+      assertEq(p.llm_calls_per_row_max.brreg_contact, 1, "v2: the worst case stays 1 per row (the route still calls its gate for rows with an e-mail)");
     });
   } catch (err) {
     failed++;

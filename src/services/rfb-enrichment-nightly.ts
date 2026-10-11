@@ -88,18 +88,34 @@
 //   • One row at a time, a setImmediate yield before every row, bounded wall
 //     clock (RFB_ENRICHMENT_MAX_RUNTIME_MINUTES, default 20). Writing steps
 //     stop early enough to leave step 5 a reserve.
-//   • LLM: at most RFB_ENRICHMENT_LLM_CAP (default 150) model calls per run.
-//     A row is only started if its worst case (LLM_CALLS_PER_ROW_MAX) still
-//     fits; once it does not, every LLM-needing step stops for the night (no
-//     queue builds up). Real calls are counted by the judges themselves
+//   • LLM: at most RFB_ENRICHMENT_LLM_CAP (default 150) model calls per NIGHT
+//     (08:00Z→08:00Z; calls already spent by earlier runs tonight, read from
+//     their envelopes, are subtracted; unreadable → no LLM budget). A row is
+//     only started if its worst case (LLM_CALLS_PER_ROW_MAX) still fits; once
+//     it does not, every LLM-needing step stops for the night (no queue
+//     builds up). Real calls are counted by the judges themselves
 //     (llm-call-meter.ts) and reported with an estimated cost.
+//   • One apply run per night (cron or manual); a manual second run needs an
+//     explicit force (which never lifts the LLM cap, the 08Z ban or the lock).
+//   • Only real per-row outcomes enter the rotation memory; transient ones
+//     (timeouts, 5xx, errors, write-pause, a missing admin key, a tool's own
+//     run-lock) are retried the next night.
+//   • Step 1 never probes a homepage on a social/directory/aggregator host
+//     (rfbWebsiteHostExclusionReason + isDirectoryOrAggregatorHost): the pool
+//     view reads url_last_status alone, so such a probe could let a row pass
+//     the pool's URL leg on someone else's site. Counted as
+//     skipped_directory_or_social_host; the preview shows the agents.url-only
+//     rows.
 //   • Honours the enrichment write-pause (services/enrichment-write-pause.ts)
 //     before every writing row; the verifier is exempt by that module's own
 //     documented design.
 //
 // One run-ledger envelope per run (vertical rfb, agent rfb-enrichment-
 // nightly) with a claim per step: attempted, written, rejected (+ reasons),
-// LLM calls, estimated cost, re-verified, new verified, new in pool.
+// LLM calls, estimated cost, re-verified, new verified, new in pool. A night
+// with no run still gets ONE envelope (run-<night>-rfb-enrichment-nightly-
+// no-run): `failed` when an error stopped a run before the lock, `partial`
+// when the window ended without one (reason, e.g. the lock was held).
 // Manual surfaces: GET /admin/rfb-enrichment-nightly/preview and POST
 // /admin/rfb-enrichment-nightly/run (routes/admin-rfb-enrichment-nightly.ts).
 
@@ -110,7 +126,7 @@ import { publicListableSql } from "./agent-visibility";
 import { customerRuleSql } from "./customer-rule";
 import { isBlocked } from "./blocklist-service";
 import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
-import { FREE_MAIL_DOMAINS } from "./cross-source-validator";
+import { FREE_MAIL_DOMAINS, hostFromUrlLike, isDirectoryOrAggregatorHost } from "./cross-source-validator";
 import { outreachSentLogHasVerticalColumn } from "./outreach-suppression-signals";
 import { createLlmCallMeter, runWithLlmCallMeter, type LlmCallMeter } from "./llm-call-meter";
 import { refreshRfbCandidateHomepage } from "./rfb-marketing-daily";
@@ -365,8 +381,156 @@ export function rfbEnrichmentRunConsumesWindow(r: { skipped_reason: string | nul
     r.skipped_reason !== "verifier_tick_lock_held" &&
     r.skipped_reason !== "run_in_progress" &&
     r.skipped_reason !== "forbidden_hour" &&
-    r.skipped_reason !== "disabled_by_env"
+    r.skipped_reason !== "disabled_by_env" &&
+    r.skipped_reason !== "already_ran_tonight"
   );
+}
+
+// ─── Nights ────────────────────────────────────────────────────────────────
+//
+// A "night" runs from 08:00Z to the next 08:00Z: the forbidden send hour
+// opens the next one, so every possible run slot (22–05Z) of one night falls
+// inside the same window. The per-night LLM cap, the "one apply run per
+// night" rule and the at-most-once no-run envelope all key on it.
+
+/** Start (08:00Z) of the night `d` belongs to. */
+export function rfbEnrichmentNightStart(d: Date): Date {
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), RFB_ENRICHMENT_FORBIDDEN_HOUR_UTC));
+  if (d.getTime() < start.getTime()) start.setUTCDate(start.getUTCDate() - 1);
+  return start;
+}
+
+/** The night's key: the UTC date its 08:00Z start falls on. */
+export function rfbEnrichmentNightKey(d: Date): string {
+  return rfbEnrichmentNightStart(d).toISOString().slice(0, 10);
+}
+
+/** End of the last configured start hour inside the night `d` belongs to. */
+export function rfbEnrichmentWindowEnd(d: Date, hours: readonly number[]): Date {
+  const nightStartMs = rfbEnrichmentNightStart(d).getTime();
+  let end = nightStartMs;
+  for (const h of hours) {
+    const offsetHours = (((h - RFB_ENRICHMENT_FORBIDDEN_HOUR_UTC) % 24) + 24) % 24;
+    end = Math.max(end, nightStartMs + (offsetHours + 1) * 3600_000);
+  }
+  return new Date(end);
+}
+
+/**
+ * LLM calls already spent by this job's runs that STARTED in the night `now`
+ * belongs to (sum of the envelopes' rfb_enrichment_llm_calls claims). Throws
+ * when the ledger cannot be read — the caller fails closed.
+ */
+export function readRfbEnrichmentLlmCallsTonight(db: Db, now: Date): number {
+  const start = rfbEnrichmentNightStart(now);
+  const end = new Date(start.getTime() + 86_400_000);
+  const rows = db
+    .prepare(`SELECT claims FROM runs WHERE agent = ? AND started_at >= ? AND started_at < ?`)
+    .all(RFB_ENRICHMENT_NIGHTLY_AGENT, start.toISOString(), end.toISOString()) as Array<{ claims: string }>;
+  let total = 0;
+  for (const r of rows) {
+    try {
+      const claims = JSON.parse(r.claims) as Array<{ value?: unknown; meta?: { kind?: string } }>;
+      const llm = Array.isArray(claims) ? claims.find((c) => c?.meta?.kind === "rfb_enrichment_llm_calls") : undefined;
+      const n = Number(llm?.value);
+      if (Number.isFinite(n) && n > 0) total += n;
+    } catch {
+      // an unparseable envelope carries no LLM count
+    }
+  }
+  return total;
+}
+
+/**
+ * The one "nothing ran tonight" envelope (N4): `failed` when an error stopped
+ * a run before it could take the lock, `partial` when the night's window
+ * ended without a run (e.g. the verifier tick lock was held at every try).
+ * Deterministic run_id per night → at most one per night. Returns whether it
+ * was written now.
+ */
+export function recordRfbEnrichmentNoRunEnvelope(
+  db: Db,
+  now: Date,
+  status: "partial" | "failed",
+  trigger: "cron" | "manual",
+  meta: { reason: string } & Record<string, unknown>,
+): boolean {
+  const night = rfbEnrichmentNightKey(now);
+  const runId = `run-${night}-${RFB_ENRICHMENT_NIGHTLY_AGENT}-no-run`;
+  try {
+    if (db.prepare(`SELECT 1 FROM runs WHERE run_id = ?`).get(runId)) return false;
+    recordRun({
+      run_id: runId,
+      vertical: "rfb",
+      agent: RFB_ENRICHMENT_NIGHTLY_AGENT,
+      trigger_source: trigger,
+      started_at: now.toISOString(),
+      finished_at: now.toISOString(),
+      status,
+      claims: [{ type: "custom", value: 0, meta: { kind: "rfb_enrichment_no_run", night, status, ...meta } }],
+      evidence: [],
+      notes: `no enrichment run tonight (${night}): ${meta.reason}`.slice(0, 490),
+    });
+    return true;
+  } catch (err) {
+    console.error("[rfb-enrichment-nightly] no-run envelope not recorded (non-fatal):", err);
+    return false;
+  }
+}
+
+/** Why tonight's tick-driven runs were skipped (this process only). */
+interface NoRunTracker {
+  night: string;
+  lockHeldSkips: number;
+  lastHolder: { run_id: string; started_at: string } | null;
+  otherSkips: Record<string, number>;
+}
+let noRunTracker: NoRunTracker = { night: "", lockHeldSkips: 0, lastHolder: null, otherSkips: {} };
+const MODULE_LOADED_AT = new Date();
+
+/** Test-only: forget this process's skip memory. */
+export function __resetRfbEnrichmentNoRunTrackerForTesting(): void {
+  noRunTracker = { night: "", lockHeldSkips: 0, lastHolder: null, otherSkips: {} };
+}
+
+function trackSkip(now: Date, r: RfbEnrichmentNightlyReport): void {
+  const night = rfbEnrichmentNightKey(now);
+  if (noRunTracker.night !== night) noRunTracker = { night, lockHeldSkips: 0, lastHolder: null, otherSkips: {} };
+  if (!r.skipped_reason) return;
+  if (r.skipped_reason === "verifier_tick_lock_held") {
+    noRunTracker.lockHeldSkips++;
+    noRunTracker.lastHolder = r.lock.holder ?? null;
+  } else {
+    noRunTracker.otherSkips[r.skipped_reason] = (noRunTracker.otherSkips[r.skipped_reason] ?? 0) + 1;
+  }
+}
+
+/**
+ * After tonight's window has ended without a run, write the no-run envelope
+ * once. Only when this process was up before the window ended (a deploy at
+ * 03:00Z knows nothing about the 00–01Z window).
+ */
+function maybeRecordNoRunEnvelope(db: Db, now: Date, lastRunAt: Date | null, processStartedAt: Date): boolean {
+  const windowEnd = rfbEnrichmentWindowEnd(now, resolveRfbEnrichmentWindowHours());
+  if (now.getTime() < windowEnd.getTime()) return false;
+  if (processStartedAt.getTime() >= windowEnd.getTime()) return false;
+  const nightStartMs = rfbEnrichmentNightStart(now).getTime();
+  const ranTonight = (d: Date | null) => !!d && d.getTime() >= nightStartMs && d.getTime() <= now.getTime();
+  if (ranTonight(lastRunAt) || ranTonight(getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY))) return false;
+  const night = rfbEnrichmentNightKey(now);
+  const t = noRunTracker.night === night ? noRunTracker : { lockHeldSkips: 0, lastHolder: null, otherSkips: {} as Record<string, number> };
+  const reason =
+    t.lockHeldSkips > 0
+      ? "verifier_tick_lock_held"
+      : Object.keys(t.otherSkips)[0] ?? "no_run_in_window";
+  return recordRfbEnrichmentNoRunEnvelope(db, now, "partial", "cron", {
+    reason,
+    window_hours_utc: resolveRfbEnrichmentWindowHours(),
+    window_end: windowEnd.toISOString(),
+    lock_held_skips: t.lockHeldSkips,
+    last_lock_holder: t.lastHolder,
+    other_skips: t.otherSkips,
+  });
 }
 
 /**
@@ -377,12 +541,18 @@ export async function tickRfbEnrichmentNightly(opts: {
   now: Date;
   lastRunAt: Date | null;
   deps?: RfbEnrichmentNightlyDeps;
-}): Promise<{ lastRunAt: Date | null; report: RfbEnrichmentNightlyReport | null }> {
+  /** When this process started (tests); default: module load time. */
+  processStartedAt?: Date;
+}): Promise<{ lastRunAt: Date | null; report: RfbEnrichmentNightlyReport | null; noRunEnvelopeRecorded?: boolean }> {
   if (!isRfbEnrichmentNightlyEnabled()) return { lastRunAt: opts.lastRunAt, report: null };
   const db = getDb();
   const lastRunAt = resolveDailyJobLastRunAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY, opts.lastRunAt, opts.now);
-  if (!shouldRunRfbEnrichmentNightly({ now: opts.now, lastRunAt })) return { lastRunAt, report: null };
+  if (!shouldRunRfbEnrichmentNightly({ now: opts.now, lastRunAt })) {
+    const noRunEnvelopeRecorded = maybeRecordNoRunEnvelope(db, opts.now, lastRunAt, opts.processStartedAt ?? MODULE_LOADED_AT);
+    return { lastRunAt, report: null, ...(noRunEnvelopeRecorded ? { noRunEnvelopeRecorded } : {}) };
+  }
   const report = await runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: opts.now, deps: opts.deps });
+  trackSkip(opts.now, report);
   if (!rfbEnrichmentRunConsumesWindow(report)) return { lastRunAt, report };
   // runRfbEnrichmentNightly already stamped boot_job_state for a real run.
   return { lastRunAt: opts.now, report };
@@ -804,6 +974,10 @@ interface SelectionContext {
 export interface RfbEnrichmentSelection {
   eligible: number;
   rows: RfbEnrichmentCohortRow[];
+  /** Rows the step would otherwise have taken but must not, by reason. */
+  skipped: Record<string, number>;
+  /** url_check only: rows whose URL is agents.url because k.website is blank. */
+  a_url_only?: { eligible: number; selected: number };
 }
 
 function parseMs(v: string | null | undefined): number | null {
@@ -814,6 +988,20 @@ function parseMs(v: string | null | undefined): number | null {
 
 function homepageOf(r: RfbEnrichmentCohortRow): string {
   return trimmed(r.k_website) || trimmed(r.a_url);
+}
+
+/**
+ * A homepage on a social / directory / known-hijacked host (the website-
+ * discovery exclusion) or a directory/aggregator host (the cross-source
+ * list) is never the producer's own site. Step 1 must not probe it: the pool
+ * view reads url_last_status alone, so a probe of, say, a Facebook page
+ * stored in agents.url would let a row pass the pool's URL leg on someone
+ * else's site. Both lists are reused, not copied.
+ */
+export function rfbEnrichmentHomepageHostExcluded(url: string): boolean {
+  const host = hostFromUrlLike(url);
+  if (!host) return false;
+  return !!rfbWebsiteHostExclusionReason(host) || isDirectoryOrAggregatorHost(host);
 }
 
 /** The e-mail domain step 2 would try as a website, or null when it may not. */
@@ -830,14 +1018,18 @@ export function emailDomainWebsiteCandidate(db: Db, r: RfbEnrichmentCohortRow): 
   return dom;
 }
 
-function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: SelectionContext): boolean {
+/** true = take it; false = not eligible; a string = would be eligible but is skipped for that reason (counted). */
+function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: SelectionContext): boolean | string {
   switch (step) {
     case "url_check": {
-      if (!homepageOf(r)) return false;
+      const url = homepageOf(r);
+      if (!url) return false;
       // Our own domain as "homepage" is a data bug, never the producer's site.
       if (isOwnPlatformHomepage({ website: r.k_website, url: r.a_url })) return false;
       const probed = parseMs(r.url_last_probed);
-      return probed === null || probed < ctx.nowMs - RFB_ENRICHMENT_URL_STALE_DAYS * 86_400_000;
+      if (!(probed === null || probed < ctx.nowMs - RFB_ENRICHMENT_URL_STALE_DAYS * 86_400_000)) return false;
+      if (rfbEnrichmentHomepageHostExcluded(url)) return "skipped_directory_or_social_host";
+      return true;
     }
     case "email_domain_website":
       if (ctx.pendingQueueAgentIds?.has(r.id)) return false;
@@ -907,18 +1099,36 @@ export async function selectRfbEnrichmentStepRows(
   cap: number,
 ): Promise<RfbEnrichmentSelection> {
   const last = ctx.attempts.get(step) ?? new Map<string, number>();
-  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number }> = [];
+  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number; second: number }> = [];
+  const skipped: Record<string, number> = {};
   for (let i = 0; i < cohort.rows.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
     const r = cohort.rows[i];
     const attemptMs = last.get(r.id) ?? null;
     if (attemptMs !== null && attemptMs > ctx.nowMs - ctx.retryMs) continue;
-    if (!stepEligible(step, r, ctx)) continue;
-    picked.push({ row: r, attemptMs: attemptMs ?? 0 });
+    const ok = stepEligible(step, r, ctx);
+    if (typeof ok === "string") {
+      skipped[ok] = (skipped[ok] ?? 0) + 1;
+      continue;
+    }
+    if (!ok) continue;
+    // Brreg: within a tier, rows WITHOUT a contact e-mail first. The route
+    // calls the LLM e-mail gate for every row with a Brreg e-mail, but an
+    // existing contact_email is never replaced ("own site wins"), so for
+    // those rows the call cannot add an e-mail — they come after the rows
+    // where it can (their org_nr/website gain is unchanged).
+    const second = step === "brreg_contact" && trimmed(r.contact_email) !== "" ? 1 : 0;
+    picked.push({ row: r, attemptMs: attemptMs ?? 0, second });
   }
   // Stable sort: cohort order (created_at, id) breaks the remaining ties.
-  picked.sort((a, b) => a.row.tier - b.row.tier || a.attemptMs - b.attemptMs);
-  return { eligible: picked.length, rows: picked.slice(0, Math.max(0, cap)).map((p) => p.row) };
+  picked.sort((a, b) => a.row.tier - b.row.tier || a.second - b.second || a.attemptMs - b.attemptMs);
+  const rows = picked.slice(0, Math.max(0, cap)).map((p) => p.row);
+  const out: RfbEnrichmentSelection = { eligible: picked.length, rows, skipped };
+  if (step === "url_check") {
+    const aOnly = (r: RfbEnrichmentCohortRow) => trimmed(r.k_website) === "";
+    out.a_url_only = { eligible: picked.filter((p) => aOnly(p.row)).length, selected: rows.filter(aOnly).length };
+  }
+  return out;
 }
 
 // ─── In-process admin route calls ──────────────────────────────────────────
@@ -990,6 +1200,24 @@ export function callAdminRouterInProcess(
 }
 
 // ─── Step executors (the seams tests replace) ──────────────────────────────
+
+/** Outcomes that say nothing about the row itself — never stamped as an attempt. */
+const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
+  "route_timeout",
+  "run_in_progress",
+  "enrichment_write_paused",
+  "write_paused",
+  "timeout",
+  "error",
+  "no_result",
+  "skipped_refresh_budget",
+]);
+
+export function isTransientRfbEnrichmentOutcome(out: { outcome: string; error?: boolean; stop?: string }): boolean {
+  if (out.error || out.stop) return true;
+  if (TRANSIENT_ROW_OUTCOMES.has(out.outcome)) return true;
+  return /^http_\d+$/.test(out.outcome); // incl. http_503 = no admin key configured
+}
 
 export interface RfbEnrichmentRowOutcome {
   /** Short outcome code; tallied in `outcomes`. */
@@ -1068,6 +1296,9 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
     async urlCheck(row) {
       if (!row.has_knowledge) return { outcome: "no_knowledge_row", written: false, changed: false };
       const url = homepageOf(row);
+      if (rfbEnrichmentHomepageHostExcluded(url)) {
+        return { outcome: "skipped_directory_or_social_host", written: false, changed: false };
+      }
       let probe: { status: number; ok: boolean };
       try {
         probe = await probeAgentUrl(url);
@@ -1244,6 +1475,7 @@ export type RfbEnrichmentSkipReason =
   | "disabled_by_env"
   | "run_in_progress"
   | "forbidden_hour"
+  | "already_ran_tonight"
   | "verifier_tick_lock_held"
   | "error";
 
@@ -1268,6 +1500,10 @@ export interface RfbEnrichmentPreview {
     eligible: number;
     selected: number;
     selected_ids: string[];
+    /** Would be eligible but skipped, by reason (e.g. skipped_directory_or_social_host). */
+    skipped?: Record<string, number>;
+    /** url_check: rows whose URL is agents.url because k.website is blank. */
+    a_url_only?: { eligible: number; selected: number };
     note?: string;
     bm?: { offset: number; limit: number; last_total: number | null; cursor_updated_at: string | null };
   }>;
@@ -1288,7 +1524,19 @@ export interface RfbEnrichmentNightlyReport {
   write_deadline_at: string | null;
   lock: { acquired: boolean; holder?: { run_id: string; started_at: string }; released: boolean };
   caps: Record<RfbEnrichmentStep, number>;
-  llm: { cap: number; calls: number; est_cost_usd: number; usd_per_call: number; by_source: Record<string, number>; cap_reached: boolean };
+  llm: {
+    /** The per-NIGHT cap (RFB_ENRICHMENT_LLM_CAP). */
+    cap: number;
+    /** Calls already spent tonight by earlier runs (their envelopes). */
+    used_before_this_run: number;
+    /** What this run may spend: cap − used_before_this_run (0 if unreadable). */
+    run_budget: number;
+    calls: number;
+    est_cost_usd: number;
+    usd_per_call: number;
+    by_source: Record<string, number>;
+    cap_reached: boolean;
+  };
   cohort: { considered: number; eligible: number; excluded: Record<RfbEnrichmentExclusion, number>; by_tier: Record<string, number> } | null;
   steps: RfbEnrichmentStepReport[];
   totals: { attempted: number; written: number; changed_agents: number; re_verified: number; new_verified: number; new_in_pool: number };
@@ -1392,6 +1640,8 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
       eligible: sel.eligible,
       selected: sel.rows.length,
       selected_ids: sel.rows.map((r) => r.id),
+      ...(Object.keys(sel.skipped).length > 0 ? { skipped: sel.skipped } : {}),
+      ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
       ...(step === "reverify" ? { note: "plus every row steps 1–4 change tonight (taken first, same cap)" } : {}),
     });
   }
@@ -1422,14 +1672,20 @@ let runInFlight = false;
 /**
  * One run. `apply: false` = dry run: the preview, nothing else. `apply:
  * true` = the real thing, behind every guard in the header. Records one
- * run-ledger envelope for a run that got the lock (whatever happened after),
- * never for a skip. Never throws.
+ * run-ledger envelope for a run that got the lock (whatever happened after);
+ * a skip records nothing, except an error before the lock (the night's one
+ * `failed` no-run envelope). Never throws.
  */
 export async function runRfbEnrichmentNightly(opts: {
   apply: boolean;
   trigger: "cron" | "manual";
   now?: Date;
   deps?: RfbEnrichmentNightlyDeps;
+  /**
+   * Manual only: allow a second apply run in a night that already had one.
+   * Never lifts the per-night LLM cap, the 08Z ban or the lock.
+   */
+  force?: boolean;
 }): Promise<RfbEnrichmentNightlyReport> {
   if (opts.apply && runInFlight) return runGuarded({ ...opts, alreadyRunning: true });
   if (!opts.apply) return runGuarded({ ...opts, alreadyRunning: false });
@@ -1446,6 +1702,7 @@ async function runGuarded(opts: {
   trigger: "cron" | "manual";
   now?: Date;
   deps?: RfbEnrichmentNightlyDeps;
+  force?: boolean;
   alreadyRunning: boolean;
 }): Promise<RfbEnrichmentNightlyReport> {
   const now = opts.now ?? new Date();
@@ -1477,7 +1734,7 @@ async function runGuarded(opts: {
     write_deadline_at: null,
     lock: { acquired: false, released: false },
     caps,
-    llm: { cap: llmCap, calls: 0, est_cost_usd: 0, usd_per_call: usdPerCall, by_source: {}, cap_reached: false },
+    llm: { cap: llmCap, used_before_this_run: 0, run_budget: llmCap, calls: 0, est_cost_usd: 0, usd_per_call: usdPerCall, by_source: {}, cap_reached: false },
     cohort: null,
     steps: [],
     totals: { attempted: 0, written: 0, changed_agents: 0, re_verified: 0, new_verified: 0, new_in_pool: 0 },
@@ -1533,6 +1790,15 @@ async function runGuarded(opts: {
     report.skipped_reason = "forbidden_hour";
     return done();
   }
+  // One apply run per night (cron or manual) unless explicitly forced.
+  {
+    const last = getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY);
+    const nightStartMs = rfbEnrichmentNightStart(now).getTime();
+    if (!opts.force && last && last.getTime() >= nightStartMs && last.getTime() <= now.getTime()) {
+      report.skipped_reason = "already_ran_tonight";
+      return done();
+    }
+  }
   const runMs = deadline.getTime() - now.getTime();
   const verifyReserveMs = Math.min(5 * 60_000, Math.floor(runMs * 0.25));
   const writeDeadline = new Date(deadline.getTime() - verifyReserveMs);
@@ -1552,6 +1818,10 @@ async function runGuarded(opts: {
   } catch (err) {
     errors.push(`verifier tick lock unreadable: ${errMessage(err)}`);
     report.skipped_reason = "error";
+    report.envelope_recorded = recordRfbEnrichmentNoRunEnvelope(db, now, "failed", opts.trigger, {
+      reason: "error_before_lock",
+      error: errMessage(err),
+    });
     return done();
   }
   if (!lock.acquired) {
@@ -1561,10 +1831,22 @@ async function runGuarded(opts: {
   }
   report.lock = { acquired: true, released: false };
 
+  // The LLM cap is per NIGHT: subtract what earlier runs tonight already spent.
+  // Unreadable ledger → no LLM budget (fail closed); the rest of the run goes on.
+  let runBudget = 0;
+  try {
+    const used = readRfbEnrichmentLlmCallsTonight(db, now);
+    report.llm.used_before_this_run = used;
+    runBudget = Math.max(0, llmCap - used);
+  } catch (err) {
+    errors.push(`LLM calls tonight unreadable — LLM steps skipped (fail closed): ${errMessage(err)}`);
+  }
+  report.llm.run_budget = runBudget;
+
   try {
     ensureRfbEnrichmentNightlyTables(db);
     await runWithLlmCallMeter(meter, () =>
-      runSteps({ db, report, now, clock, deadline, writeDeadline, meter, llmCap, usdPerCall, deps: opts.deps }),
+      runSteps({ db, report, now, clock, deadline, writeDeadline, meter, llmCap: runBudget, usdPerCall, deps: opts.deps }),
     );
   } catch (err) {
     errors.push(`run aborted: ${errMessage(err)}`);
@@ -1595,6 +1877,7 @@ interface RunContext {
   deadline: Date;
   writeDeadline: Date;
   meter: LlmCallMeter;
+  /** This run's LLM budget (the per-night cap minus what tonight already used). */
   llmCap: number;
   usdPerCall: number;
   deps?: RfbEnrichmentNightlyDeps;
@@ -1694,6 +1977,12 @@ async function runSteps(rc: RunContext): Promise<void> {
     const sel = await selectRfbEnrichmentStepRows(step, cohort, buildSelectionContext(db, now.getTime(), attempts), sr.cap);
     sr.eligible = sel.eligible;
     sr.selected = sel.rows.length;
+    if (Object.keys(sel.skipped).length > 0 || sel.a_url_only) {
+      sr.extra = {
+        ...(Object.keys(sel.skipped).length > 0 ? { skipped_before_selection: sel.skipped } : {}),
+        ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
+      };
+    }
     const perRowLlm = rfbEnrichmentLlmCallsPerRowMax(step);
     for (const row of sel.rows) {
       await yieldToEventLoop();
@@ -1709,7 +1998,10 @@ async function runSteps(rc: RunContext): Promise<void> {
         out = { outcome: "error", written: false, changed: false, error: true, detail: errMessage(err) };
       }
       tally(sr, row.id, out);
-      stampAttempt(db, row.id, step, clock(), out.outcome, report.run_id);
+      // Only a real per-row outcome enters the rotation memory; a transient
+      // one (timeout, 5xx, error, write-pause, missing admin key, the tool's
+      // own run-lock) is retried tomorrow, not parked for the retry window.
+      if (!isTransientRfbEnrichmentOutcome(out)) stampAttempt(db, row.id, step, clock(), out.outcome, report.run_id);
       if (out.stop) {
         sr.stopped_reason = out.stop;
         if (out.stop === "enrichment_write_paused") writesPaused = true;
@@ -1853,7 +2145,7 @@ async function runSteps(rc: RunContext): Promise<void> {
           if (origin && !out.error) origin.re_verified++;
           if (origin && newlyVerified) origin.new_verified++;
           if (origin && newlyInPool) origin.new_in_pool++;
-        } else {
+        } else if (!out.error) {
           stampAttempt(db, w.id, step, clock(), out.outcome, report.run_id);
         }
         sr.changed_agent_ids.push(w.id);
@@ -1968,6 +2260,9 @@ function recordEnvelope(
           meta: {
             kind: "rfb_enrichment_llm_calls",
             cap: report.llm.cap,
+            cap_scope: "night",
+            used_before_this_run: report.llm.used_before_this_run,
+            run_budget: report.llm.run_budget,
             cap_reached: report.llm.cap_reached,
             est_cost_usd: roundUsd(llmCalls * usdPerCall),
             usd_per_call: usdPerCall,

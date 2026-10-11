@@ -9,7 +9,7 @@
 //                   the verifier tick lock is held right now. Read-only: no
 //                   fetch, no write, no lock, no envelope. Works with the
 //                   flag off (the spec's AC2 dry run).
-//   POST /run     — {apply?: boolean}. Absent/false = the same dry run.
+//   POST /run     — {apply?: boolean, force?: boolean}. Absent/false = the same dry run.
 //                   apply:true runs the job once, now, behind the same guards
 //                   as the night tick (flag, never 08:00–08:59Z, the verifier
 //                   tick lock, caps, LLM cap, max runtime) — only the night
@@ -18,8 +18,12 @@
 //                   off, lock held, forbidden hour, already running) answers
 //                   200 with the report; a run that is under way answers 202
 //                   and its report lands in the run-ledger and in GET /last.
-//                   A manual apply counts as that day's run (the next night
-//                   tick waits 20 h), so the per-night caps hold.
+//                   A manual apply counts as that night's run (the next night
+//                   tick waits 20 h), and a second apply in a night that
+//                   already had one (night = 08:00Z→08:00Z) is refused as
+//                   already_ran_tonight unless `force: true`. force never lifts
+//                   the per-NIGHT LLM cap (calls already spent tonight are
+//                   subtracted), the 08Z ban or the lock.
 //   GET  /last    — the last apply report this process produced (in memory).
 //
 // Same X-Admin-Key check (403) as admin-rfb-marketing.ts.
@@ -72,14 +76,15 @@ rfbEnrichmentNightlyRouter.get("/last", requireAdmin, (_req: Request, res: Respo
 });
 
 rfbEnrichmentNightlyRouter.post("/run", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown };
+  const body = (req.body ?? {}) as { apply?: unknown; force?: unknown };
   const apply = body.apply === true;
+  const force = body.force === true;
   try {
     if (!apply) {
       res.json(await runRfbEnrichmentNightly({ apply: false, trigger: "manual" }));
       return;
     }
-    const run = runRfbEnrichmentNightly({ apply: true, trigger: "manual" }).then((r) => {
+    const run = runRfbEnrichmentNightly({ apply: true, trigger: "manual", force }).then((r) => {
       lastApplyReport = r;
       return r;
     });

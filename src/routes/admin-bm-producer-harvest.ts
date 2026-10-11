@@ -32,6 +32,9 @@
 //                default should change is Daniel's decision. Echoed back as
 //                `fill_only` in both branches.
 //
+//   `dry_run`, `limit`, `offset` and `fill_only` may each appear at most once:
+//   a repeated (array-valued) or nested one is a 400, never a silent default.
+//
 //   Optional JSON body (in-process callers): `scope_agent_ids: string[]` — a
 //   matched agent outside this list is reported `skipped_out_of_scope` and
 //   nothing is written or queued for it (email, phone and url alike). The
@@ -456,8 +459,22 @@ function applyBmPhone(
   }
 }
 
+/** Query params that must appear at most once (a repeat would arrive as an array). */
+const BM_HARVEST_SINGLE_PARAMS = ["dry_run", "limit", "offset", "fill_only"] as const;
+
 router.get("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // A repeated param (`fill_only=1&fill_only=1`) arrives as an array, which the
+  // string checks below would silently read as "absent" — i.e. fall back to
+  // overwrite / the default window. Refuse it instead, before any work.
+  for (const name of BM_HARVEST_SINGLE_PARAMS) {
+    const v = (req.query as Record<string, unknown> | undefined)?.[name];
+    if (v !== undefined && typeof v !== "string") {
+      res.status(400).json({ error: `query param '${name}' must be given once, as a plain value`, param: name });
+      return;
+    }
+  }
 
   // The ONLY way into apply-mode is the literal string "false" — missing,
   // "1", "yes", anything else stays on the safe dry-run path below.

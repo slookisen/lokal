@@ -16,6 +16,9 @@
  *      param its counts are today's
  *   f6 scope_agent_ids: a matched agent outside the scope → skipped_out_of_
  *      scope, nothing written or queued; dry-run counts it
+ *   f7 a repeated (array-valued) or nested dry_run / limit / offset /
+ *      fill_only → 400 before any fetch or write (it used to fall back to
+ *      the overwriting default silently)
  *
  * Fresh in-memory DB per scenario (pinned + restored), stubbed global fetch.
  * Standalone: npx tsx src/routes/admin-bm-producer-harvest-fill-only.test.ts
@@ -120,7 +123,9 @@ export async function runAdminBmProducerHarvestFillOnlyTests(opts: { log?: boole
   const auth = { "x-admin-key": key };
   const prevFetch = globalThis.fetch;
   const sitemap = `<urlset>${SLUGS.map((s) => `<url><loc>https://bondensmarked.no/produsenter/${s}</loc></url>`).join("")}</urlset>`;
+  let fetchCount = 0;
   (globalThis as any).fetch = async (url: any) => {
+    fetchCount++;
     const u = String(url);
     if (u === "https://bondensmarked.no/sitemap.xml") return new Response(sitemap, { status: 200 });
     const m = /\/produsenter\/([a-z0-9-]+)$/.exec(u);
@@ -213,6 +218,27 @@ export async function runAdminBmProducerHarvestFillOnlyTests(opts: { log?: boole
       assertEq([o?.outcome, o?.agent_id, o?.phone_outcome, o?.url_outcome], ["skipped_out_of_scope", "a-out", undefined, undefined], "f6: a matched agent outside the scope → skipped_out_of_scope, no other attempt");
       assertEq([email("a-out"), phone("a-out"), audits("a-out", "contact_email")], ["", null, 0], "f6: nothing written for it");
       assertEq([r.body?.scope_size, result(r.body, "foblank-gard")?.outcome], [3, "written"], "f6: in-scope rows are processed as usual");
+    });
+
+    // f7: repeated / nested params are refused, never silently defaulted
+    await scenario("repeated params", async () => {
+      const before = fetchCount;
+      const cases: Array<[string, Record<string, any>]> = [
+        ["fill_only", { dry_run: "false", fill_only: ["1", "1"] }],
+        ["offset", { dry_run: "false", fill_only: "1", offset: ["0", "60"] }],
+        ["limit", { dry_run: "false", fill_only: "1", limit: ["5", "6"] }],
+        ["dry_run", { dry_run: ["false", "false"], fill_only: "1" }],
+        ["fill_only", { dry_run: "false", fill_only: { a: "1" } }],
+      ];
+      const got: Array<[number, string | undefined]> = [];
+      for (const [, q] of cases) {
+        const r = await get(q as Record<string, string>);
+        got.push([r.status, r.body?.param]);
+      }
+      assertEq(got, cases.map(([name]) => [400, name]), "f7: an array-valued / nested dry_run, limit, offset or fill_only → 400 naming the param");
+      assertEq([fetchCount - before, email("a-diff"), phone("a-diff")], [0, "old@fodiff.no", "+4791111111"], "f7: refused before any fetch or write");
+      const ok = await get({ dry_run: "false", fill_only: "1", limit: "1", offset: "0" });
+      assertEq(ok.status, 200, "f7: single values still work");
     });
   } finally {
     (globalThis as any).fetch = prevFetch;
