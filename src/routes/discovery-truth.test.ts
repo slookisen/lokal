@@ -305,6 +305,38 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
         markdownNegotiation(req, fakeRes((c) => resolve(c)), () => resolve(null));
       });
       assertEq(digitsToNumber((String(md?.text).match(/connecting AI agents with (\d+)\+/) || [])[1]), EXPECT_RFB, "rfb-count-markdown: front page as markdown for agents");
+
+      // Host isolation: linkHeaders and markdownNegotiation are mounted app-wide, ahead of
+      // the Opplevagent and Finn-tannlege routers. Live 11.10 both hosts answered
+      // `?format=md` with Rett fra Bonden's front page and advertised RFB's agent card.
+      const { linkHeaders } = require("../middleware/agent-discovery") as typeof import("../middleware/agent-discovery");
+      const linkFor = (host: string): string => {
+        const headers: Record<string, string> = {};
+        const res: any = { setHeader(k: string, v: string) { headers[k.toLowerCase()] = String(v); } };
+        linkHeaders(fakeReq("/", host) as any, res, () => {});
+        return headers.link || "";
+      };
+      const otherHosts: Array<[string, string]> = [
+        ["opplevagent.no", (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "")],
+        ["finn-tannlege.com", (process.env.DENTAL_BASE_URL || "https://finn-tannlege.com").replace(/\/$/, "")],
+      ];
+      for (const [host, origin] of otherHosts) {
+        const fellThrough = await new Promise<boolean>((resolve) => {
+          const req: any = { ...fakeReq("/", host), query: { format: "md" } };
+          markdownNegotiation(req, fakeRes(() => resolve(false)), () => resolve(true));
+        });
+        assertTrue(fellThrough, `md-host-${host}: ?format=md falls through to the host's own page (no RFB markdown)`);
+        const link = linkFor(host);
+        assertTrue(
+          link.includes(`<${origin}/.well-known/agent-card.json>`) && link.includes(`<${origin}/.well-known/mcp/server-card.json>`) && !link.includes("rettfrabonden.com"),
+          `link-host-${host}: Link header points at its own agent card and MCP server card, never at rettfrabonden.com`,
+        );
+      }
+      const rfbLink = linkFor("rettfrabonden.com");
+      assertTrue(
+        rfbLink.includes("/.well-known/agent-card.json>") && rfbLink.includes("/.well-known/agent-skills/index.json>") && rfbLink.includes("/.well-known/api-catalog>"),
+        "link-host-rettfrabonden.com: RFB keeps its full Link set (agent card, skills index, api-catalog)",
+      );
     }
 
     // dental surfaces
