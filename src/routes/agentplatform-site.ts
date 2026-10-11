@@ -268,16 +268,18 @@ const MONTHS: Record<Lang, string[]> = {
   en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
 };
 
+const OSLO_PARTS = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Oslo",
+  day: "numeric",
+  month: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
 /** «11. oktober kl. 14.50» / «11 October, 14:50» in Norwegian time (Europe/Oslo). */
 export function formatOsloStamp(ms: number, lang: Lang): string {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Europe/Oslo",
-    day: "numeric",
-    month: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(ms));
+  const parts = OSLO_PARTS.formatToParts(new Date(ms));
   const part = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
   const day = Number(part("day"));
   const month = MONTHS[lang][Number(part("month")) - 1];
@@ -302,9 +304,9 @@ function makeCountCache(deps: AgentplatformDeps) {
         const n = deps.readCount(v);
         return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : null;
       };
-      const counts = { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") };
-      const anyMissing = Object.values(counts).some((n) => n == null);
-      cache = { at: now, ttl: anyMissing ? COUNT_RETRY_MS : COUNT_TTL_MS, counts };
+      const fresh = { rfb: read("rfb"), experiences: read("experiences"), dental: read("dental") };
+      const anyMissing = Object.values(fresh).some((n) => n == null);
+      cache = { at: now, ttl: anyMissing ? COUNT_RETRY_MS : COUNT_TTL_MS, counts: fresh };
     }
     return cache.counts;
   };

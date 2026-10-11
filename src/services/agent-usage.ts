@@ -18,6 +18,12 @@ import { createSwrCache, offThreadStatsUsable, runStatsTaskOffThread } from "./o
 
 /** Hourly, like the traffic figures it sits next to on /partnere. */
 export const AGENT_USAGE_OFFTHREAD_TTL_MS = 60 * 60_000;
+/**
+ * Only /partnere reads this figure, so src/index.ts calls prewarm() on this
+ * interval; a refresh starts once the value is older than the TTL, keeping it
+ * at most ~1 h 15 min old even when nobody visits the page.
+ */
+export const AGENT_USAGE_PREWARM_INTERVAL_MS = 15 * 60_000;
 export const AGENT_USAGE_SYNC_TTL_MS = 10 * 60_000;
 const AGENT_USAGE_RETRY_MS = 5 * 60_000;
 const KEY = "agentToolCalls";

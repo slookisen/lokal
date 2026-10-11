@@ -34,7 +34,7 @@ import {
   type TrafficReading,
 } from "./agentplatform-site";
 import { computeAgentToolCalls } from "../services/agent-usage-compute";
-import { AGENT_USAGE_OFFTHREAD_TTL_MS, createAgentUsageReader } from "../services/agent-usage";
+import { AGENT_USAGE_OFFTHREAD_TTL_MS, AGENT_USAGE_PREWARM_INTERVAL_MS, createAgentUsageReader } from "../services/agent-usage";
 import { runStatsTask } from "../services/offthread-stats-worker";
 
 export interface TestSummary {
@@ -273,6 +273,15 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
   const o3 = off.snapshot();
   check("e10: off-thread snapshot carries the time the value landed, not the read time", o3.ready && o3.computedAt === landedAt);
   check("e11: the tool-call figure refreshes hourly", AGENT_USAGE_OFFTHREAD_TTL_MS === 60 * 60_000);
+  // The boot-time interval calls prewarm(): a fresh value is left alone, a stale one refreshes once.
+  const beforeTick = offCalls;
+  off.prewarm();
+  const freshTick = offCalls;
+  offClock += AGENT_USAGE_OFFTHREAD_TTL_MS;
+  off.prewarm();
+  await off.settled();
+  check("e12: prewarm() refreshes only a stale value, so the interval keeps the figure hourly without visitors",
+    freshTick === beforeTick && offCalls === beforeTick + 1 && AGENT_USAGE_PREWARM_INTERVAL_MS < AGENT_USAGE_OFFTHREAD_TTL_MS);
   db.close();
 
   // ── (f) «Oppdatert …» under the figures ──────────────────────────────

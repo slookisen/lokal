@@ -53,7 +53,7 @@ import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
 import { getHealthCatalog, getHealthQueryCount } from "./services/health-cheap-counts";
 import { prewarmTrafficStats } from "./services/traffic-stats";
-import { prewarmAgentToolCalls } from "./services/agent-usage";
+import { AGENT_USAGE_PREWARM_INTERVAL_MS, prewarmAgentToolCalls } from "./services/agent-usage";
 import { prewarmAgentStats } from "./services/agent-stats-reader";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
@@ -1391,6 +1391,8 @@ app.listen(Number(PORT), HOST, async () => {
   // agentplatform.no/partnere: the 30-day MCP tool-call count (agent-usage.ts),
   // same worker, same delay — one indexed COUNT, far lighter than the scans above.
   setTimeout(() => prewarmAgentToolCalls(), TRAFFIC_PREWARM_BOOT_DELAY_MS);
+  // Only /partnere reads it, so keep it hourly-fresh without visitors too.
+  setInterval(() => prewarmAgentToolCalls(), AGENT_USAGE_PREWARM_INTERVAL_MS);
   // Serverheng skive 6: start the "public" stats worker (GET /api/agents/:id/stats)
   // before the first producer page asks for it.
   setTimeout(() => prewarmAgentStats(), TRAFFIC_PREWARM_BOOT_DELAY_MS);

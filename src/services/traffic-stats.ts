@@ -155,8 +155,8 @@ export function createTrafficStatsReader(deps: TrafficStatsReaderDeps): TrafficS
         return { stats: cached.data, ready: true, computedAt: cached.time };
       }
       try {
-        const data = deps.computeSync(db, vertical);
         const time = deps.now();
+        const data = deps.computeSync(db, vertical);
         syncCache.set(cacheKey, { data, time });
         return { stats: data, ready: true, computedAt: time };
       } catch {
