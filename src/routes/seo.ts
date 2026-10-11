@@ -1267,7 +1267,6 @@ const LANDING_CSS = `
 router.get("/", (req: Request, res: Response) => {
   const lang = req.lang;
   try {
-    const stats = marketplaceRegistry.getStats();
     const agents = marketplaceRegistry.getActiveAgents();
     // The producer count people see is the honest catalog count (active, vetted,
     // non-umbrella, listable), the same number as llms.txt, the agent card and

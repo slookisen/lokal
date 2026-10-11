@@ -100,11 +100,12 @@ export function markdownNegotiation(req: Request, res: Response, next: NextFunct
 // ─── Markdown templates ──────────────────────────────────────
 
 function homepageMarkdown(): string {
+  const count = producerCount();
   return `# Rett fra Bonden — A2A Marketplace for Local Food in Norway
 
 **${BASE_URL}**
 
-Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${producerCount()}+
+Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${count}+
 verified local food producers across Norway. Search fresh produce, organic
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
@@ -121,7 +122,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 | Skill | Description |
 |---|---|
-| \`discover-local-food-agents\` | Search ${producerCount()}+ verified producers by category, region, certification |
+| \`discover-local-food-agents\` | Search ${count}+ verified producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
 | \`search-compare-food\` | Natural-language search; compare prices, delivery, certifications |
 | \`agent-conversation\` | Open a buyer–seller negotiation channel |
