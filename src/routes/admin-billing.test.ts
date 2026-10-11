@@ -255,7 +255,7 @@ export async function runAdminBillingTests(opts: { log?: boolean } = {}): Promis
       delete process.env.ANALYTICS_ADMIN_KEY;
       const unconfigured = await call("/plans", "get", { headers: { "x-admin-key": "anything" } });
       assertEq(unconfigured.status, 503, "2e: auth: no ADMIN_KEY configured at all -> 503");
-      process.env.ADMIN_KEY = prevAdmin;
+      if (prevAdmin === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdmin;
       if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
     }
 

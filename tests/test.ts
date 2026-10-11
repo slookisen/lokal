@@ -289,6 +289,7 @@ const failures: string[] = [];
 let _serialChain: Promise<void> = Promise.resolve();
 // Read by the env-hygiene check before the summary.
 const _suiteStartedAtMs = Date.now();
+const _envUndefinedAtStart = new Set(Object.keys(process.env).filter(k => process.env[k] === "undefined"));
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
   _serialChain = next.then(() => {}, () => {});
@@ -26760,11 +26761,14 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Env hygiene: `process.env.X = prev` with prev undefined stores the STRING
   // "undefined", and the next db-factory open then creates ./undefined
-  // (+ -shm/-wal) in the repo root. Restore with
+  // (+ -shm/-wal) in the repo root. For keys, the truthy string makes
+  // `if (process.env.ANTHROPIC_API_KEY)` believe a key is configured. Restore with
   // `if (prev === undefined) delete process.env.X; else process.env.X = prev;`.
-  for (const k of ["DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH"]) {
+  for (const k of ["DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "ANTHROPIC_API_KEY", "ADMIN_KEY"]) {
     assertTrue(process.env[k] !== "undefined", `env-hygiene: process.env.${k} is not the string "undefined" after the suite`);
   }
+  const _envLeakedUndefined = Object.keys(process.env).filter(k => process.env[k] === "undefined" && !_envUndefinedAtStart.has(k));
+  assertTrue(_envLeakedUndefined.length === 0, `env-hygiene: no env var became the string "undefined" during the suite (got: ${_envLeakedUndefined.join(", ")})`);
   for (const f of ["undefined", "undefined-wal", "undefined-shm"]) {
     let createdThisRun = false;
     try { createdThisRun = fs2.statSync(f).mtimeMs >= _suiteStartedAtMs; } catch { /* absent */ }

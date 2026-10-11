@@ -633,7 +633,8 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
         assertEq(item?.outcome, "no_contact_found", "q1: missing ANTHROPIC_API_KEY -> fails closed, reported as no_contact_found");
         assertEq(contactEmailOf("cx-gate-nokey"), "", "q2: nothing written with no ANTHROPIC_API_KEY, even though the page has a perfectly valid mailto");
       } finally {
-        process.env.ANTHROPIC_API_KEY = savedKey;
+        if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = savedKey;
       }
     }
 
