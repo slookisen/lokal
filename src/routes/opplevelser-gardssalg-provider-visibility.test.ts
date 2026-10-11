@@ -82,7 +82,7 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
     const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, blocklistPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: any = null;
 
@@ -340,7 +340,7 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

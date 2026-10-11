@@ -148,7 +148,7 @@ export function runCrmIngestAliasGateAutorouteTests(
     const crmServicePath = require.resolve("../services/crm-service");
     const crmRoutePath = require.resolve("./crm");
     const cachePaths = [dbFactoryPath, crmServicePath, crmRoutePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
@@ -443,7 +443,7 @@ export function runCrmIngestAliasGateAutorouteTests(
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
       if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExpPath;
       if (prevDb) initMod.__setDbForTesting(prevDb);
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
       try { db.close(); } catch { /* best-effort */ }
     }
 

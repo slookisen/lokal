@@ -143,7 +143,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
     resolveMod("./seo"),
     resolveMod("../middleware/agent-discovery"),
   ];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     // ── vertical config (discovery.ts / registry card read getConfig()) ──
@@ -518,7 +518,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       (regMod.marketplaceRegistry as any)._statsCache = null;
       (regMod.marketplaceRegistry as any)._agentsCache = null;
     } catch { /* best-effort */ }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

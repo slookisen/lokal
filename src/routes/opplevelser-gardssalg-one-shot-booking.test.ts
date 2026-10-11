@@ -166,7 +166,7 @@ export function runOpplevelserGardssalgOneShotBookingTests(opts: { log?: boolean
       require.resolve("./experiences-mcp"),
       require.resolve("./opplevelser"),
     ];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let server: http.Server | undefined;
     let emailMod: typeof import("../services/email-service") | undefined;
@@ -515,7 +515,7 @@ export function runOpplevelserGardssalgOneShotBookingTests(opts: { log?: boolean
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevBookingDispatchEnabled === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
       else process.env.BOOKING_DISPATCH_ENABLED = prevBookingDispatchEnabled;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

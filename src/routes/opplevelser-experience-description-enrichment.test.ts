@@ -968,7 +968,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
-    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, experienceStorePath, opplevelserPath]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1576,7 +1576,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       else process.env.ADMIN_KEY = prevAdminKey;
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
-      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+      restoreModuleCache();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1731,7 +1731,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
       const dbFactoryPathF = require.resolve("../database/db-factory");
       const experienceStorePathF = require.resolve("../services/experience-store");
       const opplevelserPathF = require.resolve("./opplevelser");
-      for (const p of [dbFactoryPathF, experienceStorePathF, opplevelserPathF]) delete require.cache[p];
+      const restoreModuleCacheF = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPathF, experienceStorePathF, opplevelserPathF]);
       let restoreMainDbF: (() => void) | null = null;
 
       try {
@@ -2094,7 +2094,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         else process.env.ADMIN_KEY = prevAdminKeyF;
         if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
-        for (const p of [dbFactoryPathF, experienceStorePathF, opplevelserPathF]) delete require.cache[p];
+        restoreModuleCacheF();
       }
     }
 

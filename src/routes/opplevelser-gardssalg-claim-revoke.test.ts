@@ -140,7 +140,7 @@ export function runOpplevelserGardssalgClaimRevokeTests(
     const emailPath = require.resolve("../services/email-service");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, claimSvcPath, emailPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let emailSvc: any = null;
     let origConfigured: unknown;
@@ -377,7 +377,7 @@ export function runOpplevelserGardssalgClaimRevokeTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

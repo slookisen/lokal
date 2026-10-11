@@ -170,7 +170,7 @@ export async function runAdminDentalOffentligKlinikkKorrigeringTests(
   const cleanupRoutePath = require.resolve("./admin-dental-hjemmeside-cleanup");
   const routePath = require.resolve("./admin-dental-offentlig-klinikk-hjemmeside-korrigering");
   const cachePaths = [dbFactoryPath, discoveryRoutePath, cleanupRoutePath, routePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   const brregFixtures: Map<string, Record<string, unknown>> = new Map();
   const pageFixtures: Map<string, Response> = new Map();
@@ -507,7 +507,7 @@ export async function runAdminDentalOffentligKlinikkKorrigeringTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

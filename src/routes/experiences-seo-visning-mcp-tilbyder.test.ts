@@ -96,7 +96,7 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       require.resolve("./experiences-mcp"),
       require.resolve("./experiences-seo"),
     ];
-    for (const p of paths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(paths);
 
     try {
       try {
@@ -260,7 +260,7 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       try {
         (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of paths) delete require.cache[p];
+      restoreModuleCache();
     }
   })();
 }

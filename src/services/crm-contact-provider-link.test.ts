@@ -87,11 +87,12 @@ export function runCrmContactProviderLinkTests(opts: { log?: boolean } = {}): Pr
     // creates a NEW module instance — while a crm-service loaded 100 suites
     // ago keeps its closure over the OLD instance and its stale 'experiences'
     // handle. Seeds then land in a database crm-service never reads, and
-    // every assertion tests nothing. Deleting both and re-requiring both
-    // makes them share one fresh db-factory. cl0c below verifies this took.
+    // every assertion tests nothing. Fresh copies of both make them share one
+    // fresh db-factory (swapped out here, put back in finally). cl0c below
+    // verifies this took.
     const dbFactoryPath = require.resolve("../database/db-factory");
     const crmServicePath = require.resolve("./crm-service");
-    for (const pth of [dbFactoryPath, crmServicePath]) delete require.cache[pth];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, crmServicePath]);
 
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
@@ -377,10 +378,10 @@ export function runCrmContactProviderLinkTests(opts: { log?: boolean } = {}): Pr
       if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExpPath;
       dbFactory.__resetDbFactoryForTesting();
-      // Evict our fresh copies too, so the NEXT suite that requires either
-      // module rebinds both from scratch instead of inheriting our pairing —
-      // leaving them cached is exactly how an earlier suite set this trap.
-      for (const pth of [dbFactoryPath, crmServicePath]) delete require.cache[pth];
+      // Put the previous entries back, so the NEXT suite that requires either
+      // module gets the pair the rest of the app holds instead of ours —
+      // leaving ours cached is exactly how an earlier suite set this trap.
+      restoreModuleCache();
       if (prevDb) initMod.__setDbForTesting(prevDb as any);
       try { db.close(); } catch { /* already closed */ }
     }

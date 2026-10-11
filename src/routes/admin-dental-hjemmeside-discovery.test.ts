@@ -230,7 +230,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
   const dbFactoryPath = require.resolve("../database/db-factory");
   const routePath = require.resolve("./admin-dental-hjemmeside-discovery");
   const cachePaths = [dbFactoryPath, routePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   // Brreg /enheter/{orgNr} detail fixtures, keyed by the bare 9-digit org
   // number. Absent -> a real 404 (fetchBrregWebsite's own documented "no
@@ -855,7 +855,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

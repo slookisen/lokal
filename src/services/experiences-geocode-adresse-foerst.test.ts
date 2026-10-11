@@ -90,6 +90,7 @@ export function runExperiencesGeocodeAdresseFoerstTests(opts: { log?: boolean } 
     const seoPath = require.resolve("../routes/experiences-seo");
     const cachePaths = [dbFactoryPath, storePath, workerPath, seoPath];
 
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
     try {
       for (const p of cachePaths) delete require.cache[p];
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -252,7 +253,7 @@ export function runExperiencesGeocodeAdresseFoerstTests(opts: { log?: boolean } 
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -166,7 +166,7 @@ export function runDentalTests(
     // require time, which would otherwise stay bound to a stale :memory:
     // connection from an earlier test block in the shared `npm test` run.
     const cachePaths = [dbFactoryPath, dentalPath, dentalStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -559,7 +559,7 @@ export function runDentalTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

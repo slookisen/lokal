@@ -72,7 +72,7 @@ export function runDentalStorePublicCatalogClassFilterTests(
   const dentalStorePath = require.resolve("./dental-store");
   const catalogClassPath = require.resolve("./dental-catalog-class");
   const cachePaths = [dbFactoryPath, dentalStorePath, catalogClassPath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -181,7 +181,7 @@ export function runDentalStorePublicCatalogClassFilterTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };
@@ -238,7 +238,7 @@ export function runDentalListPoststederFylkeModeTests(
   const dbFactoryPath = require.resolve("../database/db-factory");
   const dentalStorePath = require.resolve("./dental-store");
   const cachePaths = [dbFactoryPath, dentalStorePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -309,7 +309,7 @@ export function runDentalListPoststederFylkeModeTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };
@@ -365,7 +365,7 @@ export function runDentalStoreUpdatedAtHydrationTests(
   const dbFactoryPath = require.resolve("../database/db-factory");
   const dentalStorePath = require.resolve("./dental-store");
   const cachePaths = [dbFactoryPath, dentalStorePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -423,7 +423,7 @@ export function runDentalStoreUpdatedAtHydrationTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };
@@ -476,7 +476,7 @@ export function runDentalProfilkvalitetTests(
   const dbFactoryPath = require.resolve("../database/db-factory");
   const dentalStorePath = require.resolve("./dental-store");
   const cachePaths = [dbFactoryPath, dentalStorePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -638,7 +638,7 @@ export function runDentalProfilkvalitetTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

@@ -110,7 +110,7 @@ export async function runA2aStatsVerticalTests(opts: { log?: boolean } = {}): Pr
   const experienceStorePath = require.resolve("../services/experience-store");
   const a2aRoutePath = require.resolve("./a2a");
   const cachePaths = [dbFactoryPath, dentalStorePath, experienceStorePath, a2aRoutePath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     // ── RFB fixtures (in-memory, via __setDbForTesting) ────────────────
@@ -306,7 +306,7 @@ export async function runA2aStatsVerticalTests(opts: { log?: boolean } = {}): Pr
       regMod.marketplaceRegistry._statsCache = null;
       regMod.marketplaceRegistry._agentsCache = null;
     } catch { /* best-effort */ }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

@@ -157,9 +157,7 @@ export function runExperienceOgImageTests(opts: { log?: boolean } = {}): Promise
     const dbFactoryPath = require.resolve("../database/db-factory");
     const ogImagePath = require.resolve("./experience-og-image");
     const expSeoPath = require.resolve("../routes/experiences-seo");
-    for (const p of [dbFactoryPath, ogImagePath, expSeoPath]) {
-      delete require.cache[p];
-    }
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, ogImagePath, expSeoPath]);
 
     try {
       initMod.__setDbForTesting(rfbDb as any);
@@ -273,9 +271,7 @@ export function runExperienceOgImageTests(opts: { log?: boolean } = {}): Promise
       } catch {
         // best-effort cleanup
       }
-      for (const p of [dbFactoryPath, ogImagePath, expSeoPath]) {
-        delete require.cache[p];
-      }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

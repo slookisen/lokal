@@ -123,7 +123,7 @@ export function runExperiencesLlmsExamplesTests(opts: { log?: boolean } = {}): P
     const a2aPath = require.resolve("./experiences-a2a");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, expStorePath, seoPath, mcpPath, a2aPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let server: http.Server | undefined;
 
@@ -310,7 +310,7 @@ export function runExperiencesLlmsExamplesTests(opts: { log?: boolean } = {}): P
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -181,7 +181,7 @@ export function runGardssalgMedlemslisteBekreftTests(opts: { log?: boolean } = {
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const prevFetch = globalThis.fetch;
     try {
@@ -564,7 +564,7 @@ export function runGardssalgMedlemslisteBekreftTests(opts: { log?: boolean } = {
       else process.env.EXPERIENCES_DB_PATH = prevExpPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

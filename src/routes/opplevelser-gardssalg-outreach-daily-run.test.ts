@@ -180,7 +180,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, emailPath, blocklistPath, experienceStorePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let emailSvc: any = null;
     let origConfigured: unknown;
@@ -698,7 +698,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       else process.env.GARDSSALG_OUTREACH_DAILY_DISABLED = prevDisabled;
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
     return { passed, failed, failures };
   })();

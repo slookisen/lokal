@@ -228,7 +228,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const experiencesMcpPath = require.resolve("./experiences-mcp");
-    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, experiencesMcpPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, experienceStorePath, opplevelserPath, experiencesMcpPath]);
     let restoreMainDb: (() => void) | null = null;
     let networkCalls = 0;
     globalThis.fetch = (async (url: any) => {
@@ -1219,7 +1219,7 @@ export function runOpplevelserExperienceDataCorrectionsTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, experiencesMcpPath]) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

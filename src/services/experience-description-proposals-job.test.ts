@@ -118,7 +118,7 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
     const experienceStorePath = require.resolve("./experience-store");
     const opplevelserPath = require.resolve("../routes/opplevelser");
     const jobPath = require.resolve("./experience-description-proposals-job");
-    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, jobPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, experienceStorePath, opplevelserPath, jobPath]);
     let restoreMainDb: (() => void) | null = null;
 
     // ── No-LLM guard on every fetch seam. ──────────────────────────────
@@ -598,7 +598,7 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
       }
-      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath, jobPath]) delete require.cache[p];
+      restoreModuleCache();
     }
     return { passed, failed, failures };
   })();

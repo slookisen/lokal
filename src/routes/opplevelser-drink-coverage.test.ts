@@ -86,7 +86,7 @@ export function runOpplevelserDrinkCoverageTests(
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const opplevelserPath = require.resolve("./opplevelser");
-    for (const p of [dbFactoryPath, opplevelserPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, opplevelserPath]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -209,7 +209,7 @@ export function runOpplevelserDrinkCoverageTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of [dbFactoryPath, opplevelserPath]) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

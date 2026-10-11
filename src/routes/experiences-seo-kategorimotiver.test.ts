@@ -173,7 +173,7 @@ export function runExperiencesSeoKategorimotiverTests(opts: { log?: boolean } = 
     const expStorePath = require.resolve("../services/experience-store");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, expStorePath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const prevLog = console.log;
     if (!log) console.log = () => { /* silence route/store chatter */ };
@@ -345,7 +345,7 @@ export function runExperiencesSeoKategorimotiverTests(opts: { log?: boolean } = 
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

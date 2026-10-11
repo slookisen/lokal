@@ -119,7 +119,7 @@ export function runExperiencesSeoEierCtaSwapTests(opts: { log?: boolean } = {}):
     const claimSvcPath = require.resolve("../services/gardssalg-claim");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, expStorePath, claimSvcPath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const seoMod = require("./experiences-seo") as typeof import("./experiences-seo");
@@ -254,7 +254,7 @@ export function runExperiencesSeoEierCtaSwapTests(opts: { log?: boolean } = {}):
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

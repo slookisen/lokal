@@ -96,8 +96,8 @@ export async function runServerhengSlice5Tests(opts: { log?: boolean } = {}): Pr
     const prevPath = process.env.EXPERIENCES_DB_PATH;
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     const paths = ["../database/db-factory", "./experience-store", "./experiences-geocode-worker"].map((p) => require.resolve(p));
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(paths);
     try {
-      for (const p of paths) delete require.cache[p];
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const db: any = dbFactory.getDb("experiences");
@@ -120,7 +120,7 @@ export async function runServerhengSlice5Tests(opts: { log?: boolean } = {}): Pr
       ok(false, "slice5 geocode: unexpected error " + String((err as any)?.message || err));
     } finally {
       if (prevPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevPath;
-      for (const p of paths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 

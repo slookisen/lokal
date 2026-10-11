@@ -125,7 +125,7 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
     const bookingStorePath = require.resolve("../services/booking-store");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, expStorePath, bookingStorePath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       try {
@@ -472,7 +472,7 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   })();
 }

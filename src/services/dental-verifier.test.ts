@@ -256,7 +256,7 @@ export async function runDentalVerifierTests(opts: { log?: boolean } = {}): Prom
   const dentalStorePath = require.resolve("./dental-store");
   const dentalVerifierPath = require.resolve("./dental-verifier");
   const cachePaths = [dbFacPath, dentalStorePath, dentalVerifierPath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
   dbFactory.__resetDbFactoryForTesting();
@@ -599,7 +599,7 @@ export async function runDentalVerifierTests(opts: { log?: boolean } = {}): Prom
   } finally {
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFactory.__resetDbFactoryForTesting();
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

@@ -68,6 +68,7 @@ export async function runCxRunLockStalenessTests(opts: { log?: boolean } = {}): 
   // AbortSignal.timeout timers are unref'd; keep the loop alive standalone.
   const keepAlive = setInterval(() => {}, 1000);
 
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
   try {
     process.env.ADMIN_KEY = ADMIN_KEY;
     delete process.env.ANALYTICS_ADMIN_KEY;
@@ -262,7 +263,7 @@ export async function runCxRunLockStalenessTests(opts: { log?: boolean } = {}): 
     if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExpPath;
     try { if (prevDb) __setDbForTesting(prevDb); } catch { /* best-effort */ }
     try { (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting(); } catch { /* best-effort */ }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

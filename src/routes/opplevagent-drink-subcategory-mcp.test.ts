@@ -105,7 +105,7 @@ export function runOpplevagentDrinkSubcategoryMcpTests(
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const storePath = require.resolve("../services/experience-store");
-    for (const p of [dbFactoryPath, storePath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, storePath]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -176,7 +176,7 @@ export function runOpplevagentDrinkSubcategoryMcpTests(
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
-      for (const p of [dbFactoryPath, storePath]) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

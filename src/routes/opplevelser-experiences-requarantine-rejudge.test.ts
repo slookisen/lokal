@@ -190,7 +190,7 @@ export function runOpplevelserExperiencesRequarantineRejudgeTests(
     const contentJudgePath = require.resolve("../services/experience-content-judge");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, contentJudgePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -526,6 +526,7 @@ export function runOpplevelserExperiencesRequarantineRejudgeTests(
       else process.env.ADMIN_KEY = prevAdminKey;
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -125,7 +125,7 @@ export function runExperiencesSeoMapTilesTests(opts: { log?: boolean } = {}): Pr
     const dbFactoryPath = require.resolve("../database/db-factory");
     const expStorePath = require.resolve("../services/experience-store");
     const seoPath = require.resolve("./experiences-seo");
-    for (const p of [dbFactoryPath, expStorePath, seoPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, seoPath]);
 
     let dbFactory: typeof import("../database/db-factory") | null = null;
     try {
@@ -217,6 +217,7 @@ export function runExperiencesSeoMapTilesTests(opts: { log?: boolean } = {}): Pr
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (dbFactory) dbFactory.__resetDbFactoryForTesting();
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

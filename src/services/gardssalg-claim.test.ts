@@ -702,7 +702,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
     const dbFactoryPath = require.resolve("../database/db-factory");
     const claimSvcPath = require.resolve("./gardssalg-claim");
     const enrichPath = require.resolve("./gardssalg-rfb-enrich");
-    for (const p of [dbFactoryPath, claimSvcPath, enrichPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, claimSvcPath, enrichPath]);
 
     // stored_epost_verified's (b-epost) sub-case reads outreach_sent_log /
     // email_bounces from the RFB MAIN db (lokal.db), not experiences.db —
@@ -1926,6 +1926,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         claimSvc.__resetClaimHarvestCacheForTesting();
       } catch { /* ignore */ }
       try { rfbDb.close(); } catch { /* already closed */ }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

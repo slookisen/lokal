@@ -123,8 +123,11 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    // experience-store too: w1-w6 write through applyExperienceContent, which
+    // must reach the same fresh db-factory as this suite's expDb.
+    const experienceStorePath = require.resolve("../services/experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath, opplevelserPath];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1442,7 +1445,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

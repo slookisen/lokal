@@ -155,7 +155,7 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
     const dbFactoryPath = require.resolve("../database/db-factory");
     const expStorePath = require.resolve("../services/experience-store");
     const expSeoPath = require.resolve("./experiences-seo");
-    for (const p of [dbFactoryPath, expStorePath, expSeoPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, expSeoPath]);
 
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
@@ -256,6 +256,7 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
       if (prevPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevPath;
       dbFactory.__resetDbFactoryForTesting();
+      restoreModuleCache();
     }
   }
 

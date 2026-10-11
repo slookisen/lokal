@@ -120,7 +120,7 @@ export function runAdminDentalWrongEntityRetroSanitizeTests(
     const servicePath = require.resolve("../services/dental-wrong-entity-retro");
     const routePath = require.resolve("./admin-dental-wrong-entity-retro-sanitize");
     const cachePaths = [dbFactoryPath, storePath, servicePath, routePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -343,7 +343,7 @@ export function runAdminDentalWrongEntityRetroSanitizeTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

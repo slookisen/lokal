@@ -153,7 +153,7 @@ export function runOpplevelserGardssalgEpostSynthesisAuditTests(
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const opplevelserPath = require.resolve("./opplevelser");
-    for (const p of [dbFactoryPath, opplevelserPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, opplevelserPath]);
 
     // Standalone RFB db — never installed as the shared singleton (see the
     // file-header comment for why). Handed to the route's own testing seam.
@@ -447,6 +447,7 @@ export function runOpplevelserGardssalgEpostSynthesisAuditTests(
       } catch {
         /* module already uncached — nothing to clear */
       }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

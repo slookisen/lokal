@@ -147,7 +147,7 @@ export function runOpplevelserBulkLoadProviderDomainDedupTests(
     const experienceBrregPath = require.resolve("../services/experience-brreg");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, experienceBrregPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: unknown = null;
     let expBrreg: typeof import("../services/experience-brreg") | null = null;
@@ -404,7 +404,7 @@ export function runOpplevelserBulkLoadProviderDomainDedupTests(
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -381,9 +381,7 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     const dbFacPathHp = require.resolve("../database/db-factory");
     const dentalStorePathHp = require.resolve("./dental-store");
     const dentalClaimPathHp = require.resolve("./dental-claim-service");
-    delete require.cache[dbFacPathHp];
-    delete require.cache[dentalStorePathHp];
-    delete require.cache[dentalClaimPathHp];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFacPathHp, dentalStorePathHp, dentalClaimPathHp]);
 
     const dbFacHp = require("../database/db-factory") as typeof import("../database/db-factory");
     dbFacHp.__resetDbFactoryForTesting();
@@ -437,9 +435,7 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
       if (prevPath === undefined) delete process.env.DENTAL_DB_PATH;
       else process.env.DENTAL_DB_PATH = prevPath;
       dbFacHp.__resetDbFactoryForTesting();
-      delete require.cache[dbFacPathHp];
-      delete require.cache[dentalStorePathHp];
-      delete require.cache[dentalClaimPathHp];
+      restoreModuleCache();
     }
   }
 

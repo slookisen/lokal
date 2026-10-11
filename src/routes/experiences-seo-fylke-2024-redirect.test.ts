@@ -122,7 +122,7 @@ export function runExperiencesSeoFylke2024RedirectTests(
     const seoPath = require.resolve("./experiences-seo");
     const norwayFylkePath = require.resolve("../services/norway-fylke");
     const cachePaths = [dbFactoryPath, expStorePath, seoPath, norwayFylkePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -216,7 +216,7 @@ export function runExperiencesSeoFylke2024RedirectTests(
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

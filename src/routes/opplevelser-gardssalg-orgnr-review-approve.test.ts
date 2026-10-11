@@ -136,7 +136,7 @@ export function runOpplevelserGardssalgOrgnrReviewApproveTests(opts: { log?: boo
     const storePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, storePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -496,7 +496,7 @@ export function runOpplevelserGardssalgOrgnrReviewApproveTests(opts: { log?: boo
       } catch {
         /* best-effort */
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   })();
 }
