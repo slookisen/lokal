@@ -495,7 +495,8 @@ const CLIENT_SCRIPT = `
         var p = pays[o.order_id];
         var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(p.seller || o.producer_name || '') })]);
         var href = safeHref(p.checkout_url);
-        var amount = String(p.amount_nok).replace('.', ',');
+        var n = Number(p.amount_nok);
+        var amount = (Math.round(n) === n ? String(n) : n.toFixed(2)).replace('.', ',');
         if (href && href.toLowerCase().indexOf('https://') === 0) card.appendChild(mk('a', { href: href, cls: 'hl-btn primary', text: C.pay_btn + ' ' + amount + ' kr' }));
         var until = p.expires_at ? new Date(p.expires_at) : null;
         if (until && !isNaN(until.getTime())) {
@@ -563,14 +564,14 @@ export interface HandelistePage {
 const PREPAY_COPY: Record<"no" | "en", Record<string, string>> = {
   no: {
     no_payment: "Hos produsenter som tar imot forhåndsbetaling, betaler du med Stripe direkte til produsenten. Hos de andre avtaler du henting og betaling direkte med produsenten.",
-    pay_h: "Betal for å sende bestillingen",
+    pay_h: "Betal på forhånd",
     pay_p: "Disse produsentene tar imot forhåndsbetaling. Beløpet reserveres og trekkes først når produsenten bekrefter. Betaler du ikke innen fristen, sendes bestillingen med betaling ved henting.",
     pay_btn: "Betal",
     pay_until: "Lenken gjelder til",
   },
   en: {
     no_payment: "Producers that take prepayment are paid with Stripe, directly to the producer. With the others you agree on pickup and payment directly with the producer.",
-    pay_h: "Pay to send your order",
+    pay_h: "Pay in advance",
     pay_p: "These producers take prepayment. The amount is reserved and only charged when the producer confirms. If you do not pay before the deadline, the order is sent as pay at pickup.",
     pay_btn: "Pay",
     pay_until: "The link is valid until",

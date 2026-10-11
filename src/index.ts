@@ -2090,9 +2090,10 @@ if (process.env.RFB_DISABLE_POSTAL_BACKFILL !== "1") {
 // Prepayment lifecycle job (A2A dev-request 2026-10-09-rfb-forhandsbetaling-
 // stripe-connect, skive 3): releases reservations the producer did not
 // confirm in time, retries captures/releases that failed, and catches
-// payment links whose webhook never arrived. Only with PAYMENTS_ENABLED=1;
+// payment links whose webhook never arrived. With PAYMENTS_ENABLED=1 or
+// "drain" (rollback: finishes open payments, creates no new ones);
 // RFB_DISABLE_PAYMENT_MAINTENANCE=1 turns it off (dev / CI).
-if (process.env.PAYMENTS_ENABLED === "1" && process.env.RFB_DISABLE_PAYMENT_MAINTENANCE !== "1") {
+if ((process.env.PAYMENTS_ENABLED === "1" || process.env.PAYMENTS_ENABLED === "drain") && process.env.RFB_DISABLE_PAYMENT_MAINTENANCE !== "1") {
   setInterval(trackJob("payment-maintenance", async () => {
     try {
       const { resolvePaymentsStripeClient, runPaymentMaintenance } = await import("./services/payment-service");

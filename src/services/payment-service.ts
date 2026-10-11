@@ -49,8 +49,25 @@ import {
 
 // ── Flags ────────────────────────────────────────────────────────────
 
+/**
+ * PAYMENTS_ENABLED:
+ *   "1"     — on: onboarding, new payment links, and the lifecycle below.
+ *   "drain" — rollback mode: NO new payment links and no onboarding, but
+ *             the lifecycle keeps running (webhook, capture on confirm,
+ *             release, refund, maintenance job, admin routes) so every open
+ *             link and reservation is finished properly. Roll back with
+ *             "drain" → (optionally POST /admin/payments/release-all) →
+ *             wait until GET /admin/payments/status shows no open payments
+ *             → unset.
+ *   unset   — off: nothing payment-related runs.
+ */
 export function isPaymentsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PAYMENTS_ENABLED === "1";
+}
+
+/** Webhook, capture/release/refund, maintenance and admin routes: "1" or "drain". */
+export function isPaymentsLifecycleActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PAYMENTS_ENABLED === "1" || env.PAYMENTS_ENABLED === "drain";
 }
 
 export function paymentsAllowedAgentIds(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -533,8 +550,10 @@ export async function handlePaymentsWebhook(params: {
     throw err;
   }
   // Side effects only AFTER the state change committed (e-mails, Stripe
-  // calls). Each one is self-contained and never throws.
-  await runAfterCommit(after, { db, stripe, now });
+  // calls), and without holding Stripe's request open: the 200 goes back
+  // at once. Each action is self-contained and never throws; whatever
+  // fails is picked up by runPaymentMaintenance().
+  if (after.length) void runAfterCommit(after, { db, stripe, now }).catch(() => undefined);
   return { ok: true, duplicate, eventId: event.id, type: event.type, handled };
 }
 
@@ -561,7 +580,8 @@ function intEnv(env: NodeJS.ProcessEnv, name: string, dflt: number, min: number,
 
 /** How long the buyer's payment link lives. Stripe allows 30 min – 24 h. */
 export function checkoutMinutes(env: NodeJS.ProcessEnv = process.env): number {
-  return intEnv(env, "PAYMENT_CHECKOUT_MINUTES", 60, 30, 1440);
+  // Stripe's minimum is 30 minutes from creation; 31 leaves room for clock skew.
+  return intEnv(env, "PAYMENT_CHECKOUT_MINUTES", 60, 31, 1440);
 }
 
 /**
@@ -570,7 +590,14 @@ export function checkoutMinutes(env: NodeJS.ProcessEnv = process.env): number {
  * 7 days online, so the cap stays well inside that.
  */
 export function confirmHours(env: NodeJS.ProcessEnv = process.env): number {
-  return intEnv(env, "PAYMENT_CONFIRM_HOURS", 48, 1, 120);
+  // Capped at 72 h so the deadline stays well inside the ~7-day card
+  // authorization window even if the authorization webhook arrives late.
+  return intEnv(env, "PAYMENT_CONFIRM_HOURS", 48, 1, 72);
+}
+
+/** A 10-minute window in idempotency keys: a retry right away replays, a later retry is a new attempt. */
+function idemWindow(nowIsoStr: string): number {
+  return Math.floor(Date.parse(nowIsoStr) / 600_000);
 }
 
 /**
@@ -789,6 +816,18 @@ function switchToPayAtPickup(db: any, orderId: string): boolean {
   return upd.changes === 1;
 }
 
+/**
+ * A prepay order whose payment will not happen (link failed/expired,
+ * amount mismatch, rollback) continues as pay at pickup — and the producer,
+ * who has not been told about it yet, gets the order now. No-op unless the
+ * order is still pending with payment_mode='prepay' (so never twice).
+ */
+function fallbackToPayAtPickup(db: any, orderId: string, notice: "not_prepaid" | "none"): boolean {
+  if (!switchToPayAtPickup(db, orderId)) return false;
+  notifyProducer(orderId, notice === "not_prepaid" ? { status: "not_prepaid" } : undefined);
+  return true;
+}
+
 function notifyProducer(orderId: string, payment?: Parameters<typeof sendOrderNotificationForOrder>[0]["payment"]): void {
   const input = buildOrderNotificationInput(orderId);
   if (!input) return;
@@ -800,7 +839,8 @@ function notifyProducer(orderId: string, payment?: Parameters<typeof sendOrderNo
 export function buyerPaymentNote(env: NodeJS.ProcessEnv = process.env): string {
   return (
     `Betal innen ${checkoutMinutes(env)} minutter. Beløpet reserveres og trekkes først når produsenten bekrefter bestillingen; ` +
-    "avslår produsenten, frigjøres reservasjonen. Betaler du ikke innen fristen, sendes bestillingen til produsenten med betaling ved henting. " +
+    `avslår produsenten, eller bekrefter ikke innen ${confirmHours(env)} timer, frigjøres reservasjonen og bestillingen kanselleres. ` +
+    "Betaler du ikke innen fristen, sendes bestillingen til produsenten med betaling ved henting. " +
     "Produsenten er selger og mottar betalingen direkte via Stripe."
   );
 }
@@ -870,6 +910,7 @@ const PAYMENT_EVENT_TYPES = new Set([
 type AfterCommit =
   | { kind: "notify_authorized"; orderId: string; amountOre: number; confirmByIso: string }
   | { kind: "notify_not_prepaid"; orderId: string }
+  | { kind: "notify_released"; orderId: string }
   | { kind: "sync_intent"; paymentId: string }
   | { kind: "cancel_intent"; paymentId: string; reason: string };
 
@@ -899,6 +940,7 @@ export interface PaymentRow {
   checkout_expires_at: string | null;
   payment_intent_id: string | null;
   capture_deadline_at: string | null;
+  failure_reason: string | null;
   authorized_at: string | null;
   captured_at: string | null;
   canceled_at: string | null;
@@ -1001,8 +1043,15 @@ function applyPaymentEvent(type: string, obj: any, ctx: PaymentEventCtx): boolea
     if (p.status === "authorized" || p.status === "requires_payment") {
       const reason = pi.cancellation_reason || "canceled_at_stripe";
       if (setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "webhook", type: "payment_canceled", stripeEventId: ctx.stripeEventId, detail: reason, now })) {
+        const o = db.prepare(`SELECT status FROM orders WHERE id = ?`).get(p.order_id) as { status: string } | undefined;
+        if (o && (o.status === "confirmed" || o.status === "ready" || o.status === "completed")) {
+          // The producer confirmed and was told the money would be captured.
+          console.error(`[payments] ALERT authorization lost after confirmation order=${p.order_id} payment=${p.id} reason=${reason}`);
+          logPaymentEvent(db, { paymentId: p.id, orderId: p.order_id, agentId: p.agent_id, stripeEventId: ctx.stripeEventId, source: "webhook", type: "authorization_lost_after_confirm", detail: reason, now });
+        }
         // The reservation is gone: whatever happens next is paid at pickup.
         db.prepare(`UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now') WHERE id = ? AND payment_mode = 'prepay'`).run(p.order_id);
+        if (o?.status === "pending" || o?.status === "confirmed" || o?.status === "ready") ctx.after.push({ kind: "notify_released", orderId: p.order_id });
       }
     }
     return true;
@@ -1027,6 +1076,9 @@ function applyPaymentEvent(type: string, obj: any, ctx: PaymentEventCtx): boolea
 
 /** requires_payment → expired; the order falls back to pay at pickup. */
 function applySessionExpired(db: any, p: PaymentRow, e: { source: "webhook" | "system"; stripeEventId?: string | null; now: string; after: AfterCommit[] }): void {
+  // Only an unpaid link expires: a link we expired ourselves (decline,
+  // rollback) is already 'canceled' and keeps that history.
+  if (p.status !== "requires_payment") return;
   if (setPaymentStatus(db, p, "expired", {}, { source: e.source, type: "checkout_expired", stripeEventId: e.stripeEventId ?? null, now: e.now })) {
     if (switchToPayAtPickup(db, p.order_id)) e.after.push({ kind: "notify_not_prepaid", orderId: p.order_id });
   }
@@ -1049,6 +1101,8 @@ async function runAfterCommit(actions: AfterCommit[], deps: { db: any; stripe: P
         notifyProducer(a.orderId, { status: "authorized", amount_nok: a.amountOre / 100, confirm_by: formatOsloDateTime(a.confirmByIso) });
       } else if (a.kind === "notify_not_prepaid") {
         notifyProducer(a.orderId, { status: "not_prepaid" });
+      } else if (a.kind === "notify_released") {
+        notifyProducer(a.orderId, { status: "payment_released" });
       } else if (a.kind === "sync_intent") {
         await syncPaymentIntent(deps.db, deps.stripe, a.paymentId, deps.now);
       } else if (a.kind === "cancel_intent") {
@@ -1080,8 +1134,12 @@ export async function cancelPaymentIntent(db: any, stripe: PaymentsStripeClient,
   const p = db.prepare(`SELECT * FROM payments WHERE id = ?`).get(paymentId) as PaymentRow | undefined;
   if (!p || !p.payment_intent_id) return false;
   if (p.status !== "authorized" && p.status !== "requires_payment") return false;
-  await stripe.paymentIntents.cancel(p.payment_intent_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-cancel-${p.id}` });
-  return setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+  await stripe.paymentIntents.cancel(p.payment_intent_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-cancel-${p.id}-${idemWindow(now)}` });
+  const done = setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+  // Released while the order is still pending and never announced (amount
+  // mismatch, rollback of an unpaid link): it becomes pay at pickup now.
+  if (done && p.status === "requires_payment") fallbackToPayAtPickup(db, p.order_id, "not_prepaid");
+  return done;
 }
 
 // ══ Skive 3 — lifecycle: capture on confirm, release, refund, maintenance ══
@@ -1115,7 +1173,7 @@ export async function capturePayment(db: any, stripe: PaymentsStripeClient, paym
   const opts = { stripeAccount: p.stripe_account_id };
   let pi: PaymentIntentLike;
   try {
-    pi = await stripe.paymentIntents.capture(p.payment_intent_id, { ...opts, idempotencyKey: `rfb-capture-${p.id}` });
+    pi = await stripe.paymentIntents.capture(p.payment_intent_id, { ...opts, idempotencyKey: `rfb-capture-${p.id}-${idemWindow(now)}` });
   } catch (err: any) {
     let current: PaymentIntentLike | null = null;
     try { current = await stripe.paymentIntents.retrieve(p.payment_intent_id, opts); } catch { current = null; }
@@ -1135,7 +1193,10 @@ export async function capturePayment(db: any, stripe: PaymentsStripeClient, paym
   }
   if (pi.status !== "succeeded") return "retry_later";
   const fee = stripeFeeOreFrom(pi);
-  setPaymentStatus(db, p, "captured", { captured_at: now, stripe_fee_ore: fee }, { source: "system", type: "payment_captured", now });
+  if (!setPaymentStatus(db, p, "captured", { captured_at: now, stripe_fee_ore: fee }, { source: "system", type: "payment_captured", now })) {
+    // payment_intent.succeeded got there first: keep the fee anyway.
+    if (fee != null) db.prepare(`UPDATE payments SET stripe_fee_ore = ?, updated_at = ? WHERE id = ? AND stripe_fee_ore IS NULL`).run(fee, now, p.id);
+  }
   return "captured";
 }
 
@@ -1146,7 +1207,7 @@ export async function releasePayment(db: any, stripe: PaymentsStripeClient, paym
   if (p.status === "authorized") return cancelPaymentIntent(db, stripe, p.id, reason, now);
   if (p.status === "requires_payment" && p.checkout_session_id) {
     try {
-      await stripe.checkout.sessions.expire(p.checkout_session_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-expire-${p.id}` });
+      await stripe.checkout.sessions.expire(p.checkout_session_id, { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-expire-${p.id}-${idemWindow(now)}` });
     } catch (err) {
       // Already completed in the meantime: re-read the intent so the
       // reservation is found and released on the next maintenance run.
@@ -1155,7 +1216,9 @@ export async function releasePayment(db: any, stripe: PaymentsStripeClient, paym
       if (intentId) db.prepare(`UPDATE payments SET payment_intent_id = COALESCE(payment_intent_id, ?), updated_at = ? WHERE id = ?`).run(intentId, now, p.id);
       return false;
     }
-    return setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+    const done = setPaymentStatus(db, p, "canceled", { canceled_at: now, failure_reason: reason }, { source: "system", type: "payment_canceled", detail: reason, now });
+    if (done) fallbackToPayAtPickup(db, p.order_id, "not_prepaid");
+    return done;
   }
   return false;
 }
@@ -1176,7 +1239,7 @@ export async function refundPayment(
   if (!Number.isInteger(amount) || amount <= 0 || amount > remaining) return { ok: false, error: "invalid_amount" };
   const refund = await stripe.refunds.create(
     { payment_intent: p.payment_intent_id, ...(amount < p.amount_ore || p.refunded_ore > 0 ? { amount } : {}), metadata: { payment_id: p.id, order_id: p.order_id, reason: opts.reason } },
-    { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-refund-${p.id}-${p.refunded_ore}-${amount}` },
+    { stripeAccount: p.stripe_account_id, idempotencyKey: `rfb-refund-${p.id}-${p.refunded_ore}-${amount}-${idemWindow(now)}` },
   );
   const total = p.refunded_ore + (refund.amount || amount);
   db.transaction(() => {
@@ -1220,7 +1283,13 @@ export async function onOrderTransitioned(params: {
       return (await releasePayment(db, stripe, p.id, "order_declined", now)) ? "released" : "none";
     }
     if (toStatus === "cancelled") {
-      if (params.cancelReason === "no_show") return p.status === "captured" ? "kept" : (await releasePayment(db, stripe, p.id, "no_show", now)) ? "released" : "none";
+      if (params.cancelReason === "no_show") {
+        // Terms §7: the producer keeps the payment on a no-show — a payment
+        // still only reserved (capture queued) is captured, not released.
+        if (p.status === "captured") return "kept";
+        if (p.status === "authorized") return (await capturePayment(db, stripe, p.id, now)) === "captured" ? "kept" : "capture_pending";
+        return "none";
+      }
       if (p.status === "captured") {
         const r = await refundPayment(db, stripe, p.id, { reason: params.cancelReason || "order_cancelled", source: "system", now });
         return r.ok ? "refunded" : "none";
@@ -1239,9 +1308,15 @@ export interface MaintenanceResult {
   expired_orders: number;
   captured: number;
   released: number;
+  refunded: number;
   sessions_expired: number;
   intents_synced: number;
+  orphans_notified: number;
 }
+
+/** Hook for the buyer receipt (skive 4) without an import cycle. */
+let onOrderExpired: ((orderId: string) => void) | null = null;
+export function setOnOrderExpiredHook(fn: ((orderId: string) => void) | null): void { onOrderExpired = fn; }
 
 /**
  * Every few minutes (src/index.ts, PAYMENTS_ENABLED only) and on demand
@@ -1258,7 +1333,7 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
   const db = params.db ?? getDb();
   const now = params.now ?? nowIso();
   const env = params.env ?? process.env;
-  const out: MaintenanceResult = { expired_orders: 0, captured: 0, released: 0, sessions_expired: 0, intents_synced: 0 };
+  const out: MaintenanceResult = { expired_orders: 0, captured: 0, released: 0, refunded: 0, sessions_expired: 0, intents_synced: 0, orphans_notified: 0 };
   const step = async (label: string, fn: () => Promise<void>) => {
     try { await fn(); } catch (err: any) { console.error(`[payments] maintenance ${label} failed: ${String(err?.message || err)}`); }
   };
@@ -1269,15 +1344,24 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
   `).all(now) as Array<{ id: string; order_id: string }>;
   for (const r of overdue) {
     await step(`deadline ${r.order_id}`, async () => {
+      // transitionOrder refuses payment_expired unless the order is STILL
+      // pending — a producer who confirmed meanwhile wins, and only then is
+      // the (re-read, still authorized) reservation released.
       const t = transitionOrder(r.order_id, "cancelled", { actor: "system", cancelReason: "payment_expired" });
-      if (t.success) out.expired_orders++;
-      if (await releasePayment(db, params.stripe, r.id, "payment_expired", now)) out.released++;
+      if (!t.success) return;
+      out.expired_orders++;
+      const fresh = db.prepare(`SELECT status FROM payments WHERE id = ?`).get(r.id) as { status: string } | undefined;
+      if (fresh?.status === "authorized" && (await releasePayment(db, params.stripe, r.id, "payment_expired", now))) out.released++;
+      if (onOrderExpired) onOrderExpired(r.order_id);
     });
   }
 
+  // Orders the producer confirmed (or that ended as a no-show — terms §7,
+  // the producer keeps the payment) whose payment is still only reserved.
   const toCapture = db.prepare(`
     SELECT p.id FROM payments p JOIN orders o ON o.id = p.order_id
-    WHERE p.status = 'authorized' AND o.status IN ('confirmed','ready','completed')
+    WHERE p.status = 'authorized'
+      AND (o.status IN ('confirmed','ready','completed') OR (o.status = 'cancelled' AND o.cancel_reason = 'no_show'))
   `).all() as Array<{ id: string }>;
   for (const r of toCapture) {
     await step(`capture ${r.id}`, async () => { if ((await capturePayment(db, params.stripe, r.id, now)) === "captured") out.captured++; });
@@ -1285,10 +1369,54 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
 
   const toRelease = db.prepare(`
     SELECT p.id FROM payments p JOIN orders o ON o.id = p.order_id
-    WHERE p.status = 'authorized' AND o.status IN ('declined','cancelled')
+    WHERE p.status = 'authorized'
+      AND (o.status = 'declined' OR (o.status = 'cancelled' AND COALESCE(o.cancel_reason, '') <> 'no_show'))
   `).all() as Array<{ id: string }>;
   for (const r of toRelease) {
     await step(`release ${r.id}`, async () => { if (await releasePayment(db, params.stripe, r.id, "order_closed", now)) out.released++; });
+  }
+
+  // A captured payment on an order the producer could not deliver (or that
+  // was declined/expired) that was never refunded — e.g. the refund call
+  // failed after the cancellation. Buyer-cancelled and no-show orders are
+  // left to the producer (terms §5/§7).
+  const toRefund = db.prepare(`
+    SELECT p.id FROM payments p JOIN orders o ON o.id = p.order_id
+    WHERE p.status = 'captured' AND p.refunded_ore = 0
+      AND (o.status = 'declined' OR (o.status = 'cancelled' AND o.cancel_reason IN ('producer_cancelled','payment_expired')))
+  `).all() as Array<{ id: string }>;
+  for (const r of toRefund) {
+    await step(`refund ${r.id}`, async () => {
+      const res = await refundPayment(db, params.stripe, r.id, { reason: "order_not_delivered", source: "system", now });
+      if (res.ok) out.refunded++;
+    });
+  }
+
+  // Prepay orders nobody was told about: the process died between the
+  // submit commit and the payment link (no payments row after 10 minutes),
+  // or the payment ended without the order switching to pay at pickup.
+  const orphans = db.prepare(`
+    SELECT o.id, p.status AS pay_status FROM orders o LEFT JOIN payments p ON p.order_id = o.id
+    WHERE o.status = 'pending' AND o.payment_mode = 'prepay'
+      AND ((p.id IS NULL AND o.created_at <= datetime(?)) OR p.status IN ('canceled','expired','failed'))
+  `).all(addMinutesIso(now, -10)) as Array<{ id: string; pay_status: string | null }>;
+  for (const o of orphans) {
+    await step(`orphan ${o.id}`, async () => {
+      if (fallbackToPayAtPickup(db, o.id, o.pay_status ? "not_prepaid" : "none")) out.orphans_notified++;
+    });
+  }
+
+  // A capture that keeps failing would leave a producer who confirmed
+  // without the money — say so loudly (once per payment).
+  const stuck = db.prepare(`
+    SELECT p.id, p.order_id, p.agent_id FROM payments p JOIN orders o ON o.id = p.order_id
+    WHERE p.status = 'authorized' AND o.status IN ('confirmed','ready','completed')
+      AND (SELECT COUNT(*) FROM payment_events e WHERE e.payment_id = p.id AND e.type = 'capture_retry_pending') >= 3
+      AND NOT EXISTS (SELECT 1 FROM payment_events e WHERE e.payment_id = p.id AND e.type = 'capture_stuck')
+  `).all() as Array<{ id: string; order_id: string; agent_id: string }>;
+  for (const r of stuck) {
+    console.error(`[payments] ALERT capture keeps failing order=${r.order_id} payment=${r.id}`);
+    logPaymentEvent(db, { paymentId: r.id, orderId: r.order_id, agentId: r.agent_id, source: "system", type: "capture_stuck", now });
   }
 
   const staleLinks = db.prepare(`
@@ -1317,10 +1445,24 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
 
 /** Rollback helper (PAYMENTS_ENABLED going off): release every open link and reservation. */
 export async function releaseAllOpenPayments(db: any, stripe: PaymentsStripeClient, now: string = nowIso()): Promise<number> {
-  const rows = db.prepare(`SELECT id FROM payments WHERE status IN ('requires_payment','authorized')`).all() as Array<{ id: string }>;
+  const rows = db.prepare(`SELECT id, order_id, status FROM payments WHERE status IN ('requires_payment','authorized')`).all() as
+    Array<{ id: string; order_id: string; status: string }>;
   let n = 0;
   for (const r of rows) {
-    try { if (await releasePayment(db, stripe, r.id, "rollback", now)) n++; } catch (err: any) {
+    try {
+      if (!(await releasePayment(db, stripe, r.id, "rollback", now))) continue;
+      n++;
+      // An unpaid link: releasePayment already switched the order to pay at
+      // pickup and announced it. A reservation the producer was already told
+      // about: tell them it will NOT be captured.
+      if (r.status === "authorized") {
+        const upd = db.prepare(`
+          UPDATE orders SET payment_mode = 'at_pickup', updated_at = datetime('now')
+          WHERE id = ? AND payment_mode = 'prepay' AND status IN ('pending','confirmed','ready')
+        `).run(r.order_id);
+        if (upd.changes === 1) notifyProducer(r.order_id, { status: "payment_released" });
+      }
+    } catch (err: any) {
       console.error(`[payments] rollback release ${r.id} failed: ${String(err?.message || err)}`);
     }
   }

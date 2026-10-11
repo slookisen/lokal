@@ -129,7 +129,8 @@ export interface OrderNotificationInput {
   // plattformen» line, which would be false for a prepaid order (also in v1).
   payment?:
     | { status: "authorized"; amount_nok: number; confirm_by: string | null }
-    | { status: "not_prepaid" };
+    | { status: "not_prepaid" }
+    | { status: "payment_released" };
 }
 
 export type OrderNotifyEmailVersion = "v1" | "v2";
@@ -203,12 +204,19 @@ function formatNok(n: number): string {
 function paymentCopy(order: OrderNotificationInput, orderRef: string): { html: string; text: string; subject: string } {
   const p = order.payment;
   if (p?.status === "authorized") {
-    const deadline = p.confirm_by ? ` Bekreft innen ${p.confirm_by}, ellers frigjøres reservasjonen automatisk.` : "";
+    const deadline = p.confirm_by ? ` Bekreft innen ${p.confirm_by}, ellers frigjøres reservasjonen automatisk og ordren kanselleres.` : "";
     const sentence = `Beløpet er reservert på kundens betalingskort og trekkes først når du bekrefter ordren. Avslår du, frigjøres reservasjonen.${deadline} Pengene går til din egen Stripe-konto.`;
     return {
       html: `<p><strong>Kunden har betalt ${formatNok(p.amount_nok)} kr på forhånd.</strong> ${escHtml(sentence)}</p>`,
       text: `Kunden har betalt ${formatNok(p.amount_nok)} kr på forhånd. ${sentence}`,
       subject: `Ny forhåndsbetalt henteordre — ${orderRef}`,
+    };
+  }
+  if (p?.status === "payment_released") {
+    return {
+      html: "<p><strong>Rettelse:</strong> Forhåndsbetalingen for denne ordren er frigjort og blir ikke trukket. Oppgjør ved henting som vanlig.</p>",
+      text: "Rettelse: Forhåndsbetalingen for denne ordren er frigjort og blir ikke trukket. Oppgjør ved henting som vanlig.",
+      subject: `Endring i henteordre — ${orderRef}`,
     };
   }
   if (p?.status === "not_prepaid") {

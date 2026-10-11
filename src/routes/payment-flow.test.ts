@@ -54,6 +54,8 @@ function makeFakeStripe() {
   const calls: Array<{ op: string; id?: string; params?: any; opts?: any }> = [];
   let n = 0;
   let failCreate = false;
+  let failRefund = false;
+  let captureHook: ((piId: string) => void) | null = null;
   let captureMode: "ok" | "gone" | "transient" = "ok";
   const real = new Stripe(FAKE_TEST_KEY);
   const client = {
@@ -105,12 +107,14 @@ function makeFakeStripe() {
         if (captureMode === "gone") { pi.status = "canceled"; const e: any = new Error("intent canceled"); e.code = "payment_intent_unexpected_state"; throw e; }
         if (captureMode === "transient") { const e: any = new Error("timeout"); e.type = "StripeConnectionError"; throw e; }
         pi.status = "succeeded";
+        if (captureHook) captureHook(id);
         return { ...pi, latest_charge: { id: "ch_" + id, balance_transaction: { fee: 759, fee_details: [{ amount: 607, type: "stripe_fee" }, { amount: 152, type: "tax" }] } } };
       },
     },
     refunds: {
       async create(params: any, opts: any) {
         calls.push({ op: "refund", params, opts });
+        if (failRefund) throw new Error("refund timeout");
         return { id: "re_" + calls.length, amount: params.amount ?? intents.get(params.payment_intent)!.amount!, status: "succeeded" };
       },
     },
@@ -129,6 +133,8 @@ function makeFakeStripe() {
   return {
     client, sessions, intents, calls, pay,
     setFailCreate: (v: boolean) => { failCreate = v; },
+    setFailRefund: (v: boolean) => { failRefund = v; },
+    setCaptureHook: (fn: ((piId: string) => void) | null) => { captureHook = fn; },
     setCaptureMode: (m: "ok" | "gone" | "transient") => { captureMode = m; },
   };
 }
@@ -398,7 +404,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop(), { amount: 100 });
     await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
     ok(payRow(oid).status === "canceled" && fake.intents.get(pi)!.status === "canceled", "F10-01: amount we did not ask for → released, never authorized");
-    eq(sentTo("betal@example.no").length, 0, "F10-02: producer not told about a payment that does not match");
+    mails = sentTo("betal@example.no");
+    ok(orderRow(oid).payment_mode === "at_pickup" && mails.length === 1 && mails[0]!.textContent.includes("Kunden betalte ikke på forhånd"), "F10-02: the order is not left dead — pay at pickup, producer notified");
 
     // ── F11. capture failures ──────────────────────────────────────────────
     cart = await newCart([["p-egg", 1]]);
@@ -472,9 +479,125 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     await settle();
     eq(sentTo("betal@example.no").length, 2, "F13-03: both producers' orders notified (authorized + not prepaid)");
 
+    // ── F15. review fixes (skive 2+3 review) ───────────────────────────────
+    // payment_expired never applies to a confirmed order.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    const tExp = cartSvc.transitionOrder(oid, "cancelled", { actor: "system", cancelReason: "payment_expired" });
+    ok(!tExp.success && orderRow(oid).status === "confirmed" && payRow(oid).status === "captured", "F15-01: payment_expired refused for a confirmed (captured) order");
+    db.prepare(`UPDATE payments SET capture_deadline_at = ? WHERE order_id = ?`).run(new Date(Date.now() - 3600000).toISOString(), oid);
+    m = await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    ok(orderRow(oid).status === "confirmed" && payRow(oid).status === "captured", "F15-02: deadline job leaves the confirmed, captured order alone");
+
+    // Producer cancels after capture while Stripe refunds fail → maintenance refunds later.
+    fake.setFailRefund(true);
+    const tCancel = cartSvc.transitionOrder(oid, "cancelled", { actor: "producer", cancelReason: "producer_cancelled" });
+    const effCancel = await svc.onOrderTransitioned({ db, stripe: fake.client, orderId: oid, toStatus: "cancelled", cancelReason: "producer_cancelled" });
+    ok(tCancel.success && effCancel !== "refunded" && orderRow(oid).status === "cancelled" && orderRow(oid).cancel_reason === "producer_cancelled" && payRow(oid).refunded_ore === 0, "F15-03: cancel after capture with a failing refund → order cancelled, not refunded yet");
+    fake.setFailRefund(false);
+    m = await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    ok(m.refunded === 1 && payRow(oid).status === "refunded", "F15-04: maintenance refunds a captured payment on an undeliverable order");
+
+    // Orphan: a prepay order with no payment row (process died after the commit).
+    sent.length = 0;
+    db.prepare(`INSERT INTO orders (id, cart_id, agent_id, buyer_ref, status, fulfilment, total_nok, confirm_token, created_at, updated_at, payment_mode)
+      VALUES ('orphan-1', NULL, 'ag-pay', 'bref_orphan', 'pending', 'pickup', 60, 'ctok_orphan1', datetime('now','-1 hour'), datetime('now','-1 hour'), 'prepay')`).run();
+    db.prepare(`INSERT INTO order_items (id, order_id, product_id, name_snapshot, qty, unit_price_snapshot, line_total) VALUES ('oi-orphan', 'orphan-1', 'p-egg', 'Egg', 1, 60, 60)`).run();
+    m = await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    await settle();
+    ok(m.orphans_notified === 1 && orderRow("orphan-1").payment_mode === "at_pickup" && sentTo("betal@example.no").length === 1, "F15-05: orphaned prepay order → pay at pickup, producer notified");
+
+    // Expired-session webhook after we expired the link ourselves keeps 'canceled'.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    cs = r.body.payments[0].checkout_url.split("/").pop();
+    await req("POST", `/admin/marketplace/orders/${oid}/decline`, { headers: { "X-Admin-Key": "flow-admin-key" } });
+    await webhook("checkout.session.expired", { id: cs, object: "checkout.session", metadata: fake.sessions.get(cs)!.metadata });
+    eq(payRow(oid).status, "canceled", "F15-06: our own expiry stays 'canceled' (history kept)");
+
+    // Fee is kept when payment_intent.succeeded wins the race against the capture response.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    const racedOid = oid;
+    fake.setCaptureHook(() => { db.prepare(`UPDATE payments SET status = 'captured', captured_at = datetime('now') WHERE order_id = ?`).run(racedOid); });
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    fake.setCaptureHook(null);
+    eq([payRow(oid).status, payRow(oid).stripe_fee_ore], ["captured", 759], "F15-07: fee recorded even when the webhook captured first");
+
+    // No-show while the payment is still only reserved → captured (terms §7), not released.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    fake.setCaptureMode("transient");
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "ready" } });
+    fake.setCaptureMode("ok");
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "no_show" } });
+    ok(payRow(oid).status === "captured" && fake.intents.get(pi)!.status === "succeeded", "F15-08: no-show with a reserved payment → captured, producer keeps it");
+
+    // Authorization lost after confirmation → alert event + correction mail.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    fake.setCaptureMode("transient");
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    fake.setCaptureMode("ok");
+    sent.length = 0;
+    fake.intents.get(pi)!.status = "canceled";
+    await webhook("payment_intent.canceled", { ...fake.intents.get(pi), cancellation_reason: "automatic" });
+    const lost = (db.prepare(`SELECT COUNT(*) AS n FROM payment_events WHERE type = 'authorization_lost_after_confirm'`).get() as any).n;
+    ok(lost === 1 && orderRow(oid).payment_mode === "at_pickup" && sentTo("betal@example.no").some((m2) => m2.subject.startsWith("Endring i henteordre")), "F15-09: lost authorization after confirm → alert + correction to the producer");
+
+    // Drain (rollback mode): no new links, the lifecycle keeps running.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    const drainOid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    process.env.PAYMENTS_ENABLED = "drain";
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    ok(r.status === 201 && !("payments" in r.body), "F15-10: drain → submit creates no new payment link (response as with payments off)");
+    r = await req("POST", `/produsent/ordre/${tokenOf(drainOid)}`, { form: { action: "confirm" } });
+    ok((r.location || "").includes("betaling=trukket") && payRow(drainOid).status === "captured", "F15-11: drain → confirm still captures the open reservation");
+    r = await webhook("payment_intent.created", { id: "pi_drain_probe" });
+    eq(r.status, 200, "F15-12: drain → webhook still mounted");
+    process.env.PAYMENTS_ENABLED = "1";
+
+    // Fully off with an open reservation → the producer page never promises a capture.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    delete process.env.PAYMENTS_ENABLED;
+    r = await req("GET", `/produsent/ordre/${tokenOf(oid)}`);
+    ok(r.text.includes("midlertidig slått av") && !r.text.includes("trekkes når du bekrefter"), "F15-13: payments fully off → no capture promise on the producer page");
+    process.env.PAYMENTS_ENABLED = "1";
+
     // ── F14. rollback, MCP, handleliste, return pages ──────────────────────
+    cart = await newCart([["p-honning", 1]]);
+    r = await submit(cart);
+    const unpaidAtRollback = r.body.orders[0].order_id;
+    sent.length = 0;
     r = await req("POST", "/admin/payments/release-all", { headers: { "X-Admin-Key": "flow-admin-key" } });
-    ok(r.status === 200 && r.body.released >= 1 && payRow(lostPaid).status === "canceled", "F14-01: release-all releases every open reservation");
+    await settle();
+    ok(r.status === 200 && r.body.released >= 2 && payRow(lostPaid).status === "canceled" && payRow(unpaidAtRollback).status === "canceled", "F14-01: release-all releases every open link and reservation");
+    ok(orderRow(unpaidAtRollback).payment_mode === "at_pickup" && orderRow(lostPaid).payment_mode === "at_pickup", "F14-01b: … both orders continue as pay at pickup");
+    ok(sentTo("betal@example.no").some((m2) => m2.subject.startsWith("Endring i henteordre") && m2.textContent.includes("blir ikke trukket"))
+      && sentTo("betal@example.no").some((m2) => m2.textContent.includes("Kunden betalte ikke på forhånd")), "F14-01c: producer gets a correction (reserved) and the order (unpaid link)");
     r = await req("POST", "/admin/payments/maintenance", { headers: { "X-Admin-Key": "flow-admin-key" } });
     ok(r.status === 200 && r.body.success === true, "F14-02: maintenance on demand");
 
@@ -493,8 +616,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     const off = hl.buildHandelistePage("no" as any).content;
     process.env.PAYMENTS_ENABLED = "1";
     const on = hl.buildHandelistePage("no" as any).content;
-    ok(off.includes("Ingen betaling skjer via Rett fra Bonden") && !off.includes("Betal for å sende bestillingen"), "F14-05: shopping list copy unchanged with payments off");
-    ok(on.includes("betaler du med Stripe direkte til produsenten") && on.includes("Betal for å sende bestillingen"), "F14-06: shopping list explains prepayment with payments on");
+    ok(off.includes("Ingen betaling skjer via Rett fra Bonden") && !off.includes("Betal på forhånd"), "F14-05: shopping list copy unchanged with payments off");
+    ok(on.includes("betaler du med Stripe direkte til produsenten") && on.includes("Betal på forhånd"), "F14-06: shopping list explains prepayment with payments on");
     const vc = require("../config/vertical-config") as typeof import("../config/vertical-config");
     try { vc.getConfig("rfb"); } catch { vc.loadConfigsAtBoot(); }
     r = await req("GET", "/betaling/takk?ordre=x");

@@ -1316,6 +1316,16 @@ export function transitionOrder(
   // requires from-status 'ready'. Enforced centrally here so BOTH callers
   // (producer PRG page and the admin no-show route) share the same guard.
   // A plain confirmed → cancelled (no reason) remains legal.
+  // payment_expired is only for a still-PENDING order (the deadline job):
+  // never for an order the producer confirmed in the meantime — that one
+  // may already be captured (review finding on skive 2+3).
+  if (cancelReason === "payment_expired" && order.status !== "pending") {
+    return {
+      success: false,
+      status: 409,
+      error: `Cannot expire the payment of an order in '${order.status}' — only pending orders expire`,
+    };
+  }
   if (cancelReason === "no_show" && order.status !== "ready") {
     return {
       success: false,

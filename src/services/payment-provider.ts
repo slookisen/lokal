@@ -205,7 +205,10 @@ export function createRealPaymentsStripeClient(
   secretKey: string,
   StripeCtor: typeof Stripe = Stripe,
 ): PaymentsStripeClient {
-  const stripe = new StripeCtor(secretKey);
+  // Short timeouts: a submit, a producer click or a webhook must never hang
+  // on Stripe for minutes (stripe-node's default is 80 s with retries). The
+  // maintenance job retries whatever times out.
+  const stripe = new StripeCtor(secretKey, { timeout: 15_000, maxNetworkRetries: 1 });
   return {
     accounts: {
       async create(params, opts) {

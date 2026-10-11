@@ -40,6 +40,7 @@ import {
 import {
   handlePaymentsWebhook,
   isPaymentsEnabled,
+  isPaymentsLifecycleActive,
   listPaymentAccounts,
   paymentsAllowedAgentIds,
   startProducerOnboarding,
@@ -239,6 +240,8 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
   res.json({
     success: true,
     payments_enabled: isPaymentsEnabled(),
+    payments_mode: process.env.PAYMENTS_ENABLED === "1" ? "on" : process.env.PAYMENTS_ENABLED === "drain" ? "drain" : "off",
+    open_payments: (getDb().prepare(`SELECT COUNT(*) AS n FROM payments WHERE status IN ('requires_payment','authorized')`).get() as { n: number }).n,
     livemode: paymentsLivemode(),
     stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
     connect_webhook_secret_configured: !!process.env.STRIPE_CONNECT_WEBHOOK_SECRET,
@@ -317,7 +320,10 @@ router.post("/admin/payments/accounts/:agentId/sync", async (req: Request, res: 
 // ── Mounting ─────────────────────────────────────────────────────────
 
 function paymentsMountable(env: NodeJS.ProcessEnv): boolean {
-  if (!isPaymentsEnabled(env)) return false;
+  // "drain" keeps the routes (webhook, admin, return pages) so open links and
+  // reservations can be finished; owner onboarding refuses on its own (the
+  // producer state is "disabled" unless PAYMENTS_ENABLED=1).
+  if (!isPaymentsLifecycleActive(env)) return false;
   const guard = assertPaymentsKeyAllowed(env);
   if (!guard.allowed) {
     console.error(`payments: ${guard.reason}`);

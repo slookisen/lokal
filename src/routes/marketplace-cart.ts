@@ -48,6 +48,7 @@ import {
   submitCartWithPayments,
   resolvePaymentsStripeClient,
   isPaymentsEnabled,
+  isPaymentsLifecycleActive,
   onOrderTransitioned,
   getPaymentForOrder,
   formatOsloDateTime,
@@ -425,7 +426,8 @@ cartRouter.get("/orders/:id", (req: Request, res: Response) => {
 // connect, skive 3): the Stripe client for the payment step after an order
 // transition — null when payments are off (the step is then a no-op).
 function paymentsClientFor(req: Request): PaymentsStripeClient | null {
-  return isPaymentsEnabled()
+  // "drain" (rollback) still captures/releases open payments.
+  return isPaymentsLifecycleActive()
     ? resolvePaymentsStripeClient(req.app.get("paymentsStripeClient") as PaymentsStripeClient | undefined)
     : null;
 }
@@ -537,6 +539,11 @@ function kr(ore: number): string {
 
 /** One line on the producer page per payment state (prepayment, skive 3). */
 function producerPaymentText(p: NonNullable<ReturnType<typeof getPaymentForOrder>>): string {
+  if (p.status === "authorized" && !isPaymentsLifecycleActive()) {
+    // Payments switched fully off with a reservation still open: nothing
+    // will capture it — never promise that it will.
+    return `Kunden har reservert ${kr(p.amount_ore)}, men forhåndsbetaling er midlertidig slått av, så beløpet blir ikke trukket automatisk. Oppgjør ved henting som vanlig.`;
+  }
   switch (p.status) {
     case "authorized":
       return `Kunden har betalt ${kr(p.amount_ore)}. Beløpet er reservert og trekkes når du bekrefter ordren.` +
@@ -554,8 +561,19 @@ function producerPaymentText(p: NonNullable<ReturnType<typeof getPaymentForOrder
       return `${kr(p.refunded_ore || p.amount_ore)} er refundert til kunden.`;
     case "requires_payment":
       return "Kunden har ikke betalt ennå.";
+    case "expired":
+      return p.authorized_at
+        ? "Reservasjonen gikk ut før betalingen ble trukket. Oppgjør ved henting som vanlig."
+        : "Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.";
+    case "canceled": {
+      const reason = (p as { failure_reason?: string | null }).failure_reason || "";
+      if (!p.authorized_at) return "Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.";
+      if (reason === "payment_expired") return "Ordren ble ikke bekreftet innen fristen. Reservasjonen er frigjort, og kunden er ikke belastet.";
+      if (reason === "order_declined") return "Reservasjonen er frigjort, og kunden er ikke belastet.";
+      return "Reservasjonen er frigjort, og kunden er ikke belastet. Oppgjør ved henting som vanlig hvis bestillingen gjennomføres.";
+    }
     default:
-      return "Reservasjonen er frigjort. Oppgjør ved henting som vanlig.";
+      return "Oppgjør ved henting som vanlig.";
   }
 }
 
