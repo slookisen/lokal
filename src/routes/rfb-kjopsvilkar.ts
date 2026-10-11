@@ -39,6 +39,16 @@ import { companyOperatorSentence } from "../services/company-legal";
 export const KJOPSVILKAR_PATH = "/kjopsvilkar";
 export const KJOPSVILKAR_LAST_UPDATED = { no: "10. oktober 2026", en: "10 October 2026" } as const;
 
+/**
+ * false while §4 «Betaling» says prepayment is «under innføring». The
+ * payments live-key guard (services/payment-provider.ts) refuses a live
+ * Stripe key while this is false, so real prepayments cannot start under
+ * terms that say they are not available. Flip it in the same change that
+ * rewrites §4 (and the «når forhåndsbetaling er tilgjengelig» qualifiers)
+ * to the live wording.
+ */
+export const KJOPSVILKAR_PREPAYMENT_LIVE = false;
+
 const FORBRUKERTILSYNET_URL = "https://www.forbrukertilsynet.no";
 const FORBRUKERRADET_URL = "https://www.forbrukerradet.no";
 const MATTILSYNET_URL = "https://www.mattilsynet.no";

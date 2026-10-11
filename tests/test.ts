@@ -42885,6 +42885,51 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect (L4,
+// Daniel-authorized 2026-10-09), skive 1: prepayment via Stripe Connect,
+// entirely behind PAYMENTS_ENABLED (default OFF). Run serially (shared
+// in-memory DB + process.env mutations):
+//   - payment-provider.test.ts : live-key guard (sk_live_ AND rk_live_,
+//                                PAYMENTS_LIVE + org.nr + terms live),
+//                                binding controller properties, offline
+//                                webhook HMAC.
+//   - payments.test.ts         : owner onboarding (pilot list, gates,
+//                                session), portal card states, Connect
+//                                webhook (signature, idempotency, the only
+//                                writer of charges_enabled), request-path
+//                                guard, admin status.
+runSerial(async () => {
+  console.log("\n── 2026-10-09-rfb-forhandsbetaling-stripe-connect: payment-provider (live-key guard, controller properties, offline webhook HMAC) ──");
+  try {
+    const { runPaymentProviderTests } = require("../src/services/payment-provider.test") as
+      typeof import("../src/services/payment-provider.test");
+    const pp = await runPaymentProviderTests({ log: false });
+    passed += pp.passed;
+    failed += pp.failed;
+    for (const f of pp.failures) failures.push("payment-provider: " + f);
+    console.log(`  payment-provider: ${pp.passed} passed, ${pp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("payment-provider: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── 2026-10-09-rfb-forhandsbetaling-stripe-connect: payments routes (onboarding, portal card, Connect webhook, guard, admin) ──");
+  try {
+    const { runPaymentsRouteTests } = require("../src/routes/payments.test") as
+      typeof import("../src/routes/payments.test");
+    const pr = await runPaymentsRouteTests({ log: false });
+    passed += pr.passed;
+    failed += pr.failed;
+    for (const f of pr.failures) failures.push("payments-routes: " + f);
+    console.log(`  payments-routes: ${pr.passed} passed, ${pr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("payments-routes: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // owner decision 2026-09-29 «Blacklist bounces»: POST /webhooks/resend —
 // Svix-verified Resend hard bounces / complaints → email_bounces only (no
 // agent_blocklist row, owner decision «1B»), the outreach gate + compose

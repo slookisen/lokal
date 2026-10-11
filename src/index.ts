@@ -139,6 +139,7 @@ import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
+import { mountPaymentRoutes } from "./routes/payments";
 import contactRouter from "./routes/contact";
 import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -1147,6 +1148,13 @@ app.use("/admin", adminLimiter, adminCrossVerticalContactLookupRoutes);
 // (routes/admin-billing.ts) so it stays unit-testable without booting the
 // whole app — this call is unconditional on purpose.
 mountBillingRoutes(app);
+
+// Prepayment via Stripe Connect (producer is the seller, direct charges on
+// the producer's own Stripe account) — A2A dev-request 2026-10-09-rfb-
+// forhandsbetaling-stripe-connect. Default OFF: mountPaymentRoutes() checks
+// PAYMENTS_ENABLED and the live-key guard itself (routes/payments.ts), so
+// this call is unconditional on purpose, same as mountBillingRoutes().
+mountPaymentRoutes(app);
 
 // ─── GET /admin/blocklist (Phase 4.11 — work-order #3 step 4) ─────────
 // Thin alias for /api/marketplace/admin/blocklist so verifier probes don't

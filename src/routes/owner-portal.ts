@@ -13,6 +13,8 @@ import {
   type TranslationTargetLang,
 } from "../services/profile-translations";
 import crypto from "crypto";
+import { getProducerPaymentStatus } from "../services/payment-service";
+import { PAYMENT_PORTAL_ALERTS, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
 const router = Router();
 
@@ -299,7 +301,7 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed.rfb_owner_session;
 }
 
-function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
+export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
   // Try cookie first
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
@@ -969,7 +971,22 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar nå bestillinger på e-post.</div>`;
     } else if (status === "orders_off") {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar ikke lenger bestillinger på e-post.</div>`;
+    } else if (PAYMENT_PORTAL_ALERTS[status]) {
+      const pa = PAYMENT_PORTAL_ALERTS[status]!;
+      alert = pa.ok
+        ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(pa.text)}</div>`
+        : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(pa.text)}</div>`;
     }
+
+    // Prepayment card (A2A dev-request 2026-10-09-rfb-forhandsbetaling-
+    // stripe-connect): only rendered when PAYMENTS_ENABLED=1 and this
+    // producer is in the pilot — otherwise the portal is byte-identical to
+    // before. A read failure (e.g. a DB without the payment tables) hides it.
+    let paymentCardHtml = "";
+    try {
+      const paymentStatus = getProducerPaymentStatus(db, agentId);
+      if (shouldRenderPaymentCard(paymentStatus)) paymentCardHtml = renderPaymentCard(agentId, paymentStatus);
+    } catch { paymentCardHtml = ""; }
 
     // Editable fields with display labels (Norwegian Bokmål)
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
@@ -1051,7 +1068,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
           <input type="hidden" name="opt_in" value="${agent.order_notifications_opt_in ? "0" : "1"}">
           <button type="submit" class="ep-btn ep-btn-primary">${agent.order_notifications_opt_in ? "Slå av bestillinger på e-post" : "Slå på bestillinger på e-post"}</button>
         </form>
-      </div>
+      </div>${paymentCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>

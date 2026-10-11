@@ -4774,6 +4774,107 @@ function initSchema(db: Database.Database): void {
     )
   `);
 
+  // ─── A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect ─────
+  // (L4, Daniel-authorized 2026-10-09), skive 1: prepayment for orders via
+  // Stripe Connect direct charges on the PRODUCER's own Stripe account. All
+  // four tables are new (plain CREATE TABLE IF NOT EXISTS is the migration)
+  // and nothing reads them unless PAYMENTS_ENABLED=1. Kept separate from the
+  // billing_* subscription tables above on purpose.
+  //
+  // payment_accounts: one producer Stripe account per mode. A test-mode
+  //   account id does not exist in live mode, so the row is keyed by
+  //   (agent_id, livemode) instead of two columns on `agents`: going live
+  //   means a fresh live onboarding, never a stale test id.
+  //   charges_enabled / payouts_enabled / details_submitted / business_type /
+  //   disabled_reason are copied ONLY from Stripe's own Account object
+  //   (account.updated webhook) — never from a client claim or the return
+  //   URL. charges_enabled=1 is what lets a producer take prepayment.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payment_accounts (
+      id                 TEXT PRIMARY KEY,
+      agent_id           TEXT NOT NULL,
+      livemode           INTEGER NOT NULL DEFAULT 0 CHECK(livemode IN (0,1)),
+      stripe_account_id  TEXT NOT NULL UNIQUE,
+      charges_enabled    INTEGER NOT NULL DEFAULT 0,
+      payouts_enabled    INTEGER NOT NULL DEFAULT 0,
+      details_submitted  INTEGER NOT NULL DEFAULT 0,
+      business_type      TEXT,
+      disabled_reason    TEXT,
+      charges_enabled_at TEXT,
+      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent_id, livemode)
+    )
+  `);
+
+  // payments: one row per prepaid order (written from skive 2). Amounts are
+  //   integer øre. Stripe is the source of truth for `status` (webhooks),
+  //   never the buyer's or agent's claim. refunded_ore tracks partial
+  //   refunds; status 'refunded' means fully refunded.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id                   TEXT PRIMARY KEY,
+      order_id             TEXT NOT NULL UNIQUE,
+      agent_id             TEXT NOT NULL,
+      stripe_account_id    TEXT NOT NULL,
+      livemode             INTEGER NOT NULL DEFAULT 0 CHECK(livemode IN (0,1)),
+      amount_ore           INTEGER NOT NULL CHECK(amount_ore > 0),
+      currency             TEXT NOT NULL DEFAULT 'nok',
+      application_fee_ore  INTEGER NOT NULL DEFAULT 0,
+      stripe_fee_ore       INTEGER,
+      refunded_ore         INTEGER NOT NULL DEFAULT 0,
+      status               TEXT NOT NULL DEFAULT 'requires_payment'
+                           CHECK(status IN ('requires_payment','authorized','captured','canceled','refunded','failed','expired')),
+      checkout_session_id  TEXT UNIQUE,
+      checkout_url         TEXT,
+      checkout_expires_at  TEXT,
+      payment_intent_id    TEXT UNIQUE,
+      capture_deadline_at  TEXT,
+      authorized_at        TEXT,
+      captured_at          TEXT,
+      canceled_at          TEXT,
+      failure_reason       TEXT,
+      created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_payments_agent_id ON payments(agent_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
+
+  // payment_events: append-only log of every payment/account state change
+  //   (source: webhook | owner | admin | system). No buyer personal data in
+  //   `detail`, ever.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payment_events (
+      id               TEXT PRIMARY KEY,
+      payment_id       TEXT,
+      order_id         TEXT,
+      agent_id         TEXT,
+      stripe_event_id  TEXT,
+      source           TEXT NOT NULL CHECK(source IN ('webhook','owner','admin','system')),
+      type             TEXT NOT NULL,
+      from_status      TEXT,
+      to_status        TEXT,
+      detail           TEXT,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_payment_events_payment_id ON payment_events(payment_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_payment_events_agent_id ON payment_events(agent_id)`);
+
+  // payment_webhook_events: idempotency ledger for the Connect webhook.
+  //   stripe_event_id PRIMARY KEY, written in the SAME transaction as the
+  //   state change it caused, so a redelivered event is a no-op.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payment_webhook_events (
+      stripe_event_id    TEXT PRIMARY KEY,
+      type               TEXT NOT NULL,
+      stripe_account_id  TEXT,
+      livemode           INTEGER NOT NULL DEFAULT 0,
+      received_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
   // ─── dev-request 2026-08-03-mikhailo-quarantine-gates ───────────────────
   // Incident: 2026-07-30, a spam profile ("Mikhailo T", Kyiv) was (1) created
   // via the PUBLIC POST /api/marketplace/register endpoint, (2) same-day

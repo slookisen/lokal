@@ -15,11 +15,13 @@
  *      rfb-privacy-terms-truth.test.ts):
  *        - pickup only: submitCart() inserts fulfilment 'pickup';
  *        - no buyer-side cancel endpoint on cartRouter → "contact the producer";
- *        - no payment through the platform yet: nothing in src reads
- *          PAYMENTS_ENABLED. When prepayment ships (A2A dev-request
- *          2026-10-09-rfb-forhandsbetaling-stripe-connect) this pin FAILS on
- *          purpose: update §4 «Betaling» from "under innføring" to live
- *          wording, then update the pin;
+ *        - no real prepayment yet: KJOPSVILKAR_PREPAYMENT_LIVE is false,
+ *          §4 says "under innføring", and the payments live-key guard
+ *          (services/payment-provider.ts) refuses a live Stripe key even
+ *          with every env gate set. Going live (A2A dev-request
+ *          2026-10-09-rfb-forhandsbetaling-stripe-connect) means rewriting
+ *          §4 to the live wording and flipping the constant in the same
+ *          change — then update these pins;
  *        - retention is NOT restated (single source of truth is /personvern).
  *   4. Discoverability: the shell() footer links /kjopsvilkar (NO) and
  *      /en/kjopsvilkar (EN); the /vilkar footer links it; the sitemap core
@@ -62,16 +64,6 @@ function invokeGet(router: any, routePath: string, lang: "no" | "en" = "no"): { 
 
 function footersOf(html: string): string {
   return (html.match(/<footer[\s\S]*?<\/footer>/g) || []).join("\n");
-}
-
-function walkTs(dir: string, out: string[] = []): string[] {
-  for (const name of fs.readdirSync(dir)) {
-    const full = path.join(dir, name);
-    const st = fs.statSync(full);
-    if (st.isDirectory()) walkTs(full, out);
-    else if (name.endsWith(".ts") && !name.endsWith(".test.ts")) out.push(full);
-  }
-  return out;
 }
 
 export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -154,9 +146,13 @@ export async function runRfbKjopsvilkarTests(opts: { log?: boolean } = {}): Prom
   assertTrue(cartRouterPaths.length > 0 && !/cancel/i.test(cartRouterPaths), "truth: no buyer-side cancel endpoint on cartRouter");
   assertTrue(no.body.includes("kontakter du produsenten direkte") && en.body.includes("contact the producer directly"), "truth: page sends cancellation to the producer");
 
-  const readers = walkTs(SRC).filter((f) => !f.endsWith("rfb-kjopsvilkar.ts") && /PAYMENTS_ENABLED/.test(fs.readFileSync(f, "utf8")));
-  assertTrue(readers.length === 0,
-    `truth: no payment through the platform yet (nothing reads PAYMENTS_ENABLED). If this fails, prepayment code has landed: check whether PAYMENTS_ENABLED is on in prod; once it is, update §4 «Betaling» (and the «når forhåndsbetaling er tilgjengelig» qualifiers) in rfb-kjopsvilkar.ts, then this pin. Readers: ${readers.map((f) => path.relative(SRC, f)).join(", ")}`);
+  const { KJOPSVILKAR_PREPAYMENT_LIVE } = require("./rfb-kjopsvilkar") as typeof import("./rfb-kjopsvilkar");
+  const { assertPaymentsKeyAllowed } = require("../services/payment-provider") as typeof import("../services/payment-provider");
+  assertTrue(KJOPSVILKAR_PREPAYMENT_LIVE === false,
+    "truth: KJOPSVILKAR_PREPAYMENT_LIVE is false while §4 says prepayment is «under innføring». Flip it only in the change that rewrites §4 (and the «når forhåndsbetaling er tilgjengelig» qualifiers) to live wording, then update these pins.");
+  const liveKey = "sk_" + "live_" + "FAKE".repeat(6);
+  assertTrue(!assertPaymentsKeyAllowed({ STRIPE_SECRET_KEY: liveKey, PAYMENTS_LIVE: "1", PAYMENTS_ORG_NR: "938635676" }).allowed,
+    "truth: no real prepayment under these terms — the payments live-key guard refuses a live key while KJOPSVILKAR_PREPAYMENT_LIVE is false, even with every env gate set");
   assertTrue(no.body.includes("I dag betaler du produsenten ved henting") && no.body.includes("under innføring"), "truth: NO payment section says pay-at-pickup today, prepayment being introduced");
   assertTrue(en.body.includes("Today you pay the producer at pickup") && en.body.includes("being introduced"), "truth: EN payment section says pay-at-pickup today, prepayment being introduced");
   assertTrue(!/30 dager|30 days/.test(no.body + en.body), "truth: retention is not restated here (single source of truth is /personvern)");
