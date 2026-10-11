@@ -25,6 +25,11 @@ on:
     branches:
       - main                 # build-check runs on PRs to main; deploy is gated below
   workflow_dispatch:       # lets you trigger manually from Actions tab
+    inputs:
+      force:
+        description: "Deploy even if prod already runs a newer commit (deliberate rollback to an older ref)"
+        type: boolean
+        default: false
 
 jobs:
   build-check:
@@ -135,11 +140,19 @@ jobs:
       # deploy could only move prod backwards. Everything else deploys
       # (fail-open): live unknown, live older, live unrelated, same commit
       # (manual redeploy). Applies to push and workflow_dispatch alike.
+      # Rollback routes: a revert commit (normal push deploy), `fly releases
+      # rollback` / `fly deploy --image` outside this workflow, or this
+      # workflow dispatched on the older ref with force=true.
       - name: Skip if prod already runs a newer commit that contains this one
         id: freshness
         run: |
           set -u
           THIS="${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::force=true: deploying $THIS regardless of what is live."
+            exit 0
+          fi
           LIVE=$(curl -sf --max-time 10 https://rettfrabonden.com/health | jq -r '.git_sha // empty' 2>/dev/null || true)
           if [ -n "$LIVE" ] && [ "$LIVE" != "$THIS" ] \
              && git cat-file -e "${LIVE}^{commit}" 2>/dev/null \
