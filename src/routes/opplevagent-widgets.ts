@@ -238,8 +238,8 @@ ${WIDGET_HELPERS}
     }
     if (out.out_of_scope) {
       root.innerHTML = '<p class="muted">' + esc(t(
-        "Opplevagent viser opplevelser, ikke utsalg for kjøp av tørrfisk. Bruk Rett fra Bonden for matprodusenter. Ingen opplevelser vises.",
-        "Opplevagent shows experiences, not stockfish retailers. Use Rett fra Bonden for food producers. No experiences are shown."
+        "Opplevagent viser opplevelser, ikke utsalg for kjøp av tørrfisk. Kjøp av matvarer faller utenfor søket. Ingen opplevelser vises.",
+        "Opplevagent shows experiences, not stockfish retailers. Food-product purchases are outside this search. No experiences are shown."
       )) + "</p>";
       fitHeight();
       return;

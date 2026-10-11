@@ -224,6 +224,8 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       // ── (e) annotation table ──────────────────────────────────────────
       const list = await rpc("tools/list", {});
       const tools: any[] = list.result?.tools ?? [];
+      assertTrue(!instructions.includes("Rett fra Bonden") && !tools.find((t) => t.name === "discover_experiences")?.description?.includes("Rett fra Bonden") && instructions.includes("out_of_scope"),
+        "s3: scope guidance stays within this app without directing selection of another plugin");
       for (const [name, expected] of Object.entries(OPPLEVAGENT_EXPECTED_ANNOTATIONS)) {
         const tool = tools.find((t) => t.name === name);
         assertTrue(!!tool, `e1: tools/list exposes ${name}`);
@@ -396,14 +398,14 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         const text = JSON.parse(retail?.content?.[0]?.text ?? "{}");
         assertTrue(text.count === 0 && text.out_of_scope === true && text.scope_reason === "food_product_purchase" && !text.out_of_area && !text.relaxed_filters,
           `j1: ${args.query} is outside experience scope, not outside Norway or relaxed`);
-        assertTrue(JSON.stringify(text) === JSON.stringify(retail?.structuredContent) && text.experiences.length === 0,
+        assertTrue(JSON.stringify(text) === JSON.stringify(retail?.structuredContent) && text.experiences.length === 0 && !text.summary.includes("Rett fra Bonden"),
           "j2: text and widget receive the same empty scope result");
         const rendered = runWidget(EXPERIENCES_LIST_HTML, retail?.structuredContent).after;
-        assertTrue(rendered.includes("Rett fra Bonden") && !rendered.includes('class="card"') && !rendered.includes("data-more") && !rendered.includes("data-ask"),
+        assertTrue(/tørrfisk|stockfish/.test(rendered) && !rendered.includes("Rett fra Bonden") && !rendered.includes('class="card"') && !rendered.includes("data-more") && !rendered.includes("data-ask"),
           "j3: widget explains the scope without cards, Details or Show all");
       }
       const malformedScope = runWidget(EXPERIENCES_LIST_HTML, { out_of_scope: true, experiences: discText.experiences }).after;
-      assertTrue(!malformedScope.includes("Nordlyscruise") && malformedScope.includes("Rett fra Bonden"),
+      assertTrue(!malformedScope.includes("Nordlyscruise") && /tørrfisk|stockfish/.test(malformedScope),
         "j4: scope notice takes precedence even if a stale result contains experiences");
 
       expStore.createExperience({ ...base, fylke: "Nordland", kommune: "Vestvågøy", title: "Tørrfisksmaking med omvisning", category: "mat_drikke", season: ["all_year"] });
