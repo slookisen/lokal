@@ -45833,6 +45833,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-mismatch:
+// snapshot-semantic claim kinds report DB-wide counts (matching mode=snapshot probe).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-mismatch: snapshot claims ──");
+  try {
+    const { runLokalAgentVerifierSnapshotClaimsTests } =
+      require("../src/agents/lokal-agent-verifier-snapshot-claims.test") as
+        typeof import("../src/agents/lokal-agent-verifier-snapshot-claims.test");
+    const sc = await runLokalAgentVerifierSnapshotClaimsTests({ log: false });
+    passed += sc.passed;
+    failed += sc.failed;
+    for (const f of sc.failures) failures.push("lokal-agent-verifier-snapshot-claims: " + f);
+    console.log(`  lokal-agent-verifier-snapshot-claims: ${sc.passed} passed, ${sc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-snapshot-claims: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
 // Slice 0: daily automatic catalog sync (runProductCatalogSync, extracted
 // from POST /admin/products/backfill) — proves the availability-preservation

@@ -207,6 +207,39 @@ function buildQuery(
   };
 }
 
+// dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-
+// mismatch: current-state (mode=snapshot) counts for the snapshot-semantic
+// claim kinds, computed with the SAME condition + is_active filter the
+// endpoint uses, so a run-envelope claim built from these is comparable to
+// platform-verifier's `claim-counts?mode=snapshot` probe by construction.
+// `agents_verified` is deliberately absent: it is a per-run delta claim.
+export const SNAPSHOT_CLAIM_KINDS = [
+  "agents_review_required",
+  "agents_pending_verify",
+  "agents_data_insufficient",
+  "http_unreachable",
+  "brreg_inactive_flagged",
+  "agents_domain_incoherent",
+] as const;
+export type SnapshotClaimKind = (typeof SNAPSHOT_CLAIM_KINDS)[number];
+
+export function getSnapshotClaimCounts(db: any): Partial<Record<SnapshotClaimKind, number>> {
+  const out: Partial<Record<SnapshotClaimKind, number>> = {};
+  for (const kind of SNAPSHOT_CLAIM_KINDS) {
+    const { where, params } = buildQuery(kind, "snapshot", null, null);
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+           FROM agent_knowledge k
+           INNER JOIN agents a ON a.id = k.agent_id
+          WHERE a.is_active = 1 AND ${where}`
+      )
+      .get(...params) as { c: number } | undefined;
+    out[kind] = row?.c ?? 0;
+  }
+  return out;
+}
+
 // GET /admin/verifier/claim-counts?kind=<kind>&since=<ISO-8601>&until=<ISO-8601>[&mode=delta|snapshot]
 //
 // mode=delta (default/omitted): returns the count of agents matching `kind`

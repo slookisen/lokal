@@ -15,6 +15,7 @@
 import { Router, Request, Response } from "express";
 import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased, resolveBrregLookup } from "../agents/lokal-agent-verifier";
 import { recordRun, acquireLock } from "../services/run-ledger";
+import { getSnapshotClaimCounts } from "./admin-verifier-claim-counts";
 
 const router = Router();
 
@@ -296,11 +297,21 @@ export async function runVerifierTick(opts: {
   ).length;
 
   // Build envelope and record directly via service (no HTTP roundtrip)
+  // dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-
+  // mismatch: claim DB-wide current-state counts for the snapshot-semantic
+  // kinds. Fail-open to the legacy batch tally if the count query throws.
+  let snapshotCounts: ReturnType<typeof getSnapshotClaimCounts> | undefined;
+  try {
+    snapshotCounts = getSnapshotClaimCounts(getDb());
+  } catch (e: any) {
+    console.error(`[admin/run-verifier] snapshot claim counts failed:`, e?.message || e);
+  }
   const envelope: any = buildRunEnvelope({
     run_id: batchResult.run_id,
     started_at: batchResult.started_at,
     finished_at: batchResult.finished_at,
     results,
+    snapshotCounts,
   });
   if (!envelope.evidence) envelope.evidence = [];
 

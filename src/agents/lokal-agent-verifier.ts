@@ -2843,8 +2843,21 @@ export function buildRunEnvelope(input: {
   finished_at: string;
   results: VerifierResult[];
   reportPath?: string;
+  // dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-
+  // mismatch: DB-wide current-state counts (getSnapshotClaimCounts). When
+  // given, the six snapshot-semantic claim kinds report these instead of the
+  // per-batch tally, so platform-verifier's mode=snapshot probe compares
+  // like with like. The batch tally is kept in meta.batch_count. Omitted =
+  // legacy batch-scoped values (tests, the standalone runner script).
+  snapshotCounts?: Partial<Record<string, number>>;
 }): Record<string, unknown> {
   const r = input.results;
+  const snap = (kind: string, batchValue: number) => {
+    const v = input.snapshotCounts?.[kind];
+    return typeof v === "number"
+      ? { value: v, meta: { kind, scope: "snapshot", batch_count: batchValue } }
+      : { value: batchValue, meta: { kind } };
+  };
   const verified = r.filter((x) => x.new_verification_status === "verified").length;
   const review = r.filter((x) => x.new_verification_status === "review_required").length;
   const pending = r.filter((x) => x.new_verification_status === "pending_verify").length;
@@ -2900,12 +2913,12 @@ export function buildRunEnvelope(input: {
     status: "completed",
     claims: [
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified" } },
-      { type: "db_state_change", value: review, meta: { kind: "agents_review_required" } },
-      { type: "db_state_change", value: pending, meta: { kind: "agents_pending_verify" } },
-      { type: "db_state_change", value: dataInsufficient, meta: { kind: "agents_data_insufficient" } },
-      { type: "db_state_change", value: httpUnreachable, meta: { kind: "http_unreachable" } },
-      { type: "db_state_change", value: brregFlagged, meta: { kind: "brreg_inactive_flagged" } },
-      { type: "db_state_change", value: domainIncoherent, meta: { kind: "agents_domain_incoherent" } },
+      { type: "db_state_change", ...snap("agents_review_required", review) },
+      { type: "db_state_change", ...snap("agents_pending_verify", pending) },
+      { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
+      { type: "db_state_change", ...snap("http_unreachable", httpUnreachable) },
+      { type: "db_state_change", ...snap("brreg_inactive_flagged", brregFlagged) },
+      { type: "db_state_change", ...snap("agents_domain_incoherent", domainIncoherent) },
       {
         type: "db_state_change",
         value: emailOwnershipUnprovenEnforced,
