@@ -41,6 +41,7 @@ export function renderBetalingContent(lang: Lang, env: NodeJS.ProcessEnv = proce
   const hours = confirmHours(env);
   const feeOn = isPlatformFeeConfigured(env);
   const live = paymentsLivemode(env);
+  const drain = env.PAYMENTS_ENABLED === "drain";
   const terms = localizedPath(KJOPSVILKAR_PATH, lang);
 
   if (lang === "en") {
@@ -51,6 +52,7 @@ export function renderBetalingContent(lang: Lang, env: NodeJS.ProcessEnv = proce
   </section>
 
   <section class="pv-sec">
+    ${drain ? `<p class="pv-form"><strong>Paused.</strong> Prepayment is paused for now: new orders are paid at pickup. Payments already made are handled as described here.</p>` : ""}
     ${live ? "" : `<p class="pv-form"><strong>Being tested.</strong> Prepayment is currently only running in Stripe's test mode. No real payments are taken.</p>`}
     <h2 id="seller">The producer is the seller</h2>
     <p>You buy directly from the producer. The payment is processed by Stripe and goes straight to the producer's own Stripe account. ${brand} never receives or holds the money and never sees your card details.</p>
@@ -75,7 +77,7 @@ export function renderBetalingContent(lang: Lang, env: NodeJS.ProcessEnv = proce
     <p>Refunds go back to the same card, without a fee. It usually takes 5 to 10 business days before the money shows up, depending on your bank.</p>
 
     <h2 id="right-of-cancellation">Right of cancellation</h2>
-    <p>As a rule you have 14 days' right of cancellation from the day you pick up the goods. It does not apply to goods that deteriorate or expire quickly, such as fresh vegetables, meat, fish, eggs, dairy and baked goods, or to sealed goods whose seal has been broken after pickup. Details and the cancellation form are in the <a href="${terms}#right-of-cancellation">terms of purchase</a>. Producers that take prepayment state whether they sell as a trader, and we show it before you pay.</p>
+    <p>As a rule you have 14 days' right of cancellation from the day you pick up the goods. It does not apply to goods that deteriorate or expire quickly, such as fresh vegetables, meat, fish, eggs, dairy and baked goods, or to sealed goods that are not suitable for return for health or hygiene reasons once the seal has been broken after pickup. Details and the cancellation form are in the <a href="${terms}#right-of-cancellation">terms of purchase</a>. Producers that take prepayment state whether they sell as a trader, and we show it before you pay.</p>
 
     <h2 id="fees">Fees</h2>
     <p><strong>You pay no fee.</strong> The price you see is the price you pay.</p>
@@ -96,6 +98,7 @@ export function renderBetalingContent(lang: Lang, env: NodeJS.ProcessEnv = proce
   </section>
 
   <section class="pv-sec">
+    ${drain ? `<p class="pv-form"><strong>Satt på pause.</strong> Forhåndsbetaling er satt på pause: nye bestillinger betales ved henting. Betalinger som allerede er gjort, behandles som beskrevet her.</p>` : ""}
     ${live ? "" : `<p class="pv-form"><strong>Under utprøving.</strong> Forhåndsbetaling kjører foreløpig bare i Stripes testmodus. Det tas ikke imot ekte betalinger.</p>`}
     <h2 id="selger">Produsenten er selger</h2>
     <p>Du kjøper direkte fra produsenten. Betalingen behandles av Stripe og går rett til produsentens egen Stripe-konto. ${brand} mottar eller oppbevarer aldri pengene og ser aldri kortopplysningene dine.</p>
@@ -120,7 +123,7 @@ export function renderBetalingContent(lang: Lang, env: NodeJS.ProcessEnv = proce
     <p>Refusjon går tilbake til samme kort, uten gebyr. Det tar vanligvis 5 til 10 virkedager før pengene vises hos deg, avhengig av banken.</p>
 
     <h2 id="angrerett">Angrerett</h2>
-    <p>Som hovedregel har du 14 dagers angrerett fra dagen du henter varene. Den gjelder ikke for varer som forringes eller raskt går ut på dato, som ferske grønnsaker, kjøtt, fisk, egg, meieriprodukter og bakevarer, og heller ikke for forseglede varer der forseglingen er brutt etter henting. Detaljer og angreskjema står i <a href="${terms}#angrerett">kjøpsvilkårene</a>. Produsenter som tar imot forhåndsbetaling, oppgir om de selger som næringsdrivende, og vi viser det før du betaler.</p>
+    <p>Som hovedregel har du 14 dagers angrerett fra dagen du henter varene. Den gjelder ikke for varer som forringes eller raskt går ut på dato, som ferske grønnsaker, kjøtt, fisk, egg, meieriprodukter og bakevarer, og heller ikke for forseglede varer som av hensyn til helsevern eller hygiene ikke er egnet for retur, når forseglingen er brutt etter henting. Detaljer og angreskjema står i <a href="${terms}#angrerett">kjøpsvilkårene</a>. Produsenter som tar imot forhåndsbetaling, oppgir om de selger som næringsdrivende, og vi viser det før du betaler.</p>
 
     <h2 id="gebyrer">Gebyrer</h2>
     <p><strong>Du betaler ingen gebyrer.</strong> Prisen du ser, er prisen du betaler.</p>

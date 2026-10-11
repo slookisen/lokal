@@ -13,6 +13,7 @@
  *  - Availability is checked on add AND re-checked on submit.
  */
 
+import { formatAddressLine } from "../utils/address-format";
 import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
@@ -91,6 +92,8 @@ export interface OrderSummary {
 export interface ProducerContact {
   phone: string | null;
   email: string | null;
+  /** Geographic address from the public profile (angrerettloven § 8), or null. */
+  address: string | null;
   profile_url: string;
 }
 
@@ -762,11 +765,14 @@ function buildHandoffMessage(lines: Array<{ name: string; qty: number; unit?: st
 
 /** The producer's public contact details (agent_knowledge), as on the profile page. Never throws. */
 export function producerContact(agentId: string, agentName: string): ProducerContact {
-  let k: any = null;
-  try { k = knowledgeService.getAgentInfo(agentId)?.knowledge ?? null; } catch { k = null; }
+  let info: any = null;
+  try { info = knowledgeService.getAgentInfo(agentId) ?? null; } catch { info = null; }
+  const k = info?.knowledge ?? null;
+  const address = k?.address ? formatAddressLine(k.address, k.postalCode, info?.agent?.city) : "";
   return {
     phone: k?.phone ?? null,
     email: k?.email ?? null,
+    address: address || null,
     profile_url: `${HANDOFF_BASE_URL}/produsent/${slugify(agentName)}`,
   };
 }
@@ -1200,21 +1206,43 @@ export interface BuyerPaymentView {
   seller: "producer";
   capture: "on_producer_confirmation";
   fees: { stripe_fee_payer: "producer"; platform_fee_nok: number };
-  /** Payment timeline (no personal data): event type + timestamp. */
+  /** The producer's own declaration (angrerettloven § 9 a); null if none. */
+  seller_trader_status: "trader" | "non_trader" | null;
+  /** Payment timeline (no personal data): buyer-relevant event types + timestamp. */
   events: Array<{ type: string; at: string }>;
+}
+
+// Only these payment_events types are shown to buyers/agents; internal
+// retries, alerts and step failures stay in the admin view.
+const BUYER_PAYMENT_EVENT_TYPES = [
+  "checkout_created", "checkout_completed", "checkout_expired", "payment_authorized", "payment_captured",
+  "payment_canceled", "payment_refunded", "payment_partially_refunded",
+];
+
+/** The newest trader declaration of a producer (producer_terms_acceptances); null if none. */
+export function producerTraderStatus(db: any, agentId: string): "trader" | "non_trader" | null {
+  try {
+    const r = db.prepare(`SELECT trader_status FROM producer_terms_acceptances WHERE agent_id = ? ORDER BY accepted_at DESC, rowid DESC LIMIT 1`)
+      .get(agentId) as { trader_status: string } | undefined;
+    return r?.trader_status === "trader" || r?.trader_status === "non_trader" ? r.trader_status : null;
+  } catch {
+    return null;
+  }
 }
 
 function buyerPaymentView(db: any, orderId: string): BuyerPaymentView | undefined {
   try {
     const p = db.prepare(`
-      SELECT id, status, amount_ore, refunded_ore, application_fee_ore, checkout_url, checkout_expires_at FROM payments WHERE order_id = ?
+      SELECT id, agent_id, status, amount_ore, refunded_ore, application_fee_ore, checkout_url, checkout_expires_at FROM payments WHERE order_id = ?
     `).get(orderId) as
-      | { id: string; status: string; amount_ore: number; refunded_ore: number; application_fee_ore: number; checkout_url: string | null; checkout_expires_at: string | null }
+      | { id: string; agent_id: string; status: string; amount_ore: number; refunded_ore: number; application_fee_ore: number; checkout_url: string | null; checkout_expires_at: string | null }
       | undefined;
     if (!p) return undefined;
     const events = db.prepare(`
-      SELECT type, created_at AS at FROM payment_events WHERE payment_id = ? ORDER BY created_at, rowid
-    `).all(p.id) as Array<{ type: string; at: string }>;
+      SELECT type, created_at AS at FROM payment_events
+      WHERE payment_id = ? AND type IN (${BUYER_PAYMENT_EVENT_TYPES.map(() => "?").join(",")})
+      ORDER BY created_at, rowid
+    `).all(p.id, ...BUYER_PAYMENT_EVENT_TYPES) as Array<{ type: string; at: string }>;
     const payable = p.status === "requires_payment" && !!p.checkout_url && !!p.checkout_expires_at && Date.parse(p.checkout_expires_at) > Date.now();
     return {
       status: p.status,
@@ -1224,6 +1252,7 @@ function buyerPaymentView(db: any, orderId: string): BuyerPaymentView | undefine
       seller: "producer",
       capture: "on_producer_confirmation",
       fees: { stripe_fee_payer: "producer", platform_fee_nok: p.application_fee_ore / 100 },
+      seller_trader_status: producerTraderStatus(db, p.agent_id),
       events,
     };
   } catch {

@@ -26,8 +26,7 @@
 //     so contact details are pointed to the producer page or via us.
 //   - Offers in the shopping list / offers search are sorted by distance only
 //     (catalog-offers.ts); nobody pays for placement (angrerettloven § 9 a a).
-//   - Only producers that take prepayment declare their trader status
-//     (producer terms, owner portal); for the rest we still have none, so the
+//   - No producer has given us a declaration that they are a trader, so the
 //     page says so and explains the consequence (§ 9 a b and c).
 // Law checked on Lovdata 2026-10-10: angrerettloven §§ 9 a, 18, 22 b/g, 24;
 // forbrukerkjøpsloven §§ 26, 27, 41.
@@ -38,7 +37,7 @@ import { localizedPath, Lang } from "../i18n/t";
 import { companyOperatorSentence } from "../services/company-legal";
 
 export const KJOPSVILKAR_PATH = "/kjopsvilkar";
-export const KJOPSVILKAR_LAST_UPDATED = { no: "12. oktober 2026", en: "12 October 2026" } as const;
+export const KJOPSVILKAR_LAST_UPDATED = { no: "10. oktober 2026", en: "10 October 2026" } as const;
 
 /** See config/payments-terms.ts — flip it together with §4 below. */
 export { KJOPSVILKAR_PREPAYMENT_LIVE } from "../config/payments-terms";
@@ -93,7 +92,7 @@ export function renderKjopsvilkarContent(lang: Lang): string {
     <p>The seller is the producer you order from. The purchase agreement is between you and the producer. The producer's name is shown in your order. The producer's contact details are on the producer page, and you can always reach the producer through us at ${mailLink}.</p>
     <p>${brand} is run by ${companyOperatorSentence("en").replace(/^Operator: /, "")} We forward your order to the producer. We are not the seller, and we do not own or handle the goods.</p>
     <p>The producer is responsible for the goods, prices, labelling and food safety, and for meeting your rights under the Norwegian Consumer Purchases Act and the Cancellation Act.</p>
-    <p><strong>About the producers.</strong> Most producers are farms and other businesses selling their own goods. Producers that take prepayment state whether they sell as a trader, and we show it when you pay. For other producers we have not collected such a declaration. If a producer is not a trader, the Consumer Purchases Act and the Cancellation Act do not apply to the purchase; the Sale of Goods Act does. Ask the producer if you are unsure.</p>
+    <p><strong>About the producers.</strong> Most producers are farms and other businesses selling their own goods. We have not collected a declaration from each producer that they are a trader. If a producer is not a trader, the Consumer Purchases Act and the Cancellation Act do not apply to the purchase; the Sale of Goods Act does. Ask the producer if you are unsure.</p>
     <p><strong>How offers are sorted.</strong> In the shopping list and the offers search, offers are sorted by distance from the place you enter. No producer pays for placement.</p>
 
     <h2 id="ordering">2. How ordering works</h2>
@@ -178,7 +177,7 @@ ${angreskjemaHtml("en", mail)}
     <p>Selger er produsenten du bestiller fra. Avtalen om kjøpet inngås mellom deg og produsenten. Produsentens navn står i bestillingen. Kontaktinformasjonen finner du på produsentsiden, og du kan alltid nå produsenten via oss på ${mailLink}.</p>
     <p>${brand} drives av ${companyOperatorSentence("nb").replace(/^Operatør: /, "")} Vi formidler bestillingen til produsenten. Vi er ikke selger, og vi eier eller håndterer ikke varene.</p>
     <p>Produsenten er ansvarlig for varene, prisene, merking og mattrygghet, og for å oppfylle rettighetene dine etter forbrukerkjøpsloven og angrerettloven.</p>
-    <p><strong>Om produsentene.</strong> De fleste produsentene er gårder og andre virksomheter som selger egne varer. Produsenter som tar imot forhåndsbetaling, oppgir om de selger som næringsdrivende, og vi viser opplysningen når du betaler. For andre produsenter har vi ikke innhentet en slik erklæring. Er en produsent ikke næringsdrivende, gjelder ikke forbrukerkjøpsloven og angrerettloven for kjøpet, men kjøpsloven. Spør produsenten hvis du er usikker.</p>
+    <p><strong>Om produsentene.</strong> De fleste produsentene er gårder og andre virksomheter som selger egne varer. Vi har ikke innhentet en erklæring fra hver produsent om at de er næringsdrivende. Er en produsent ikke næringsdrivende, gjelder ikke forbrukerkjøpsloven og angrerettloven for kjøpet, men kjøpsloven. Spør produsenten hvis du er usikker.</p>
     <p><strong>Slik sorteres tilbudene.</strong> I handlelisten og tilbudssøket sorteres tilbudene etter avstand fra stedet du oppgir. Ingen produsent betaler for plassering.</p>
 
     <h2 id="bestilling">2. Slik bestiller du</h2>

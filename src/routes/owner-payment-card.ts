@@ -123,6 +123,18 @@ export function renderPaymentCard(agentId: string, status: ProducerPaymentStatus
         ${button("Koble til Stripe på nytt")}`;
       break;
     case "active":
+      if (!status.termsAccepted) {
+        // A terms version bump (or an account connected before the terms
+        // existed): no payment links until the owner accepts again.
+        body = `
+        <p style="margin-bottom:12px;">Vilkårene for produsenter er oppdatert. Inntil du godtar dem, får kundene ikke betalingslenke til deg, og bestillinger betales ved henting.</p>
+        <form method="post" action="${esc(declareAction)}" style="margin:0;">
+          <fieldset style="border:0;padding:0;margin:0 0 10px;"><legend style="font-weight:600;margin-bottom:4px;">Hvordan selger du?</legend>${traderRadios(status.traderStatus)}</fieldset>
+          <label style="display:block;margin:0 0 12px;"><input type="checkbox" name="terms_accepted" value="1" required> Jeg har lest og godtar <a href="/produsentvilkar" target="_blank" rel="noopener">vilkårene for produsenter</a>.</label>
+          <button type="submit" class="ep-btn ep-btn-primary">Godta og fortsett</button>
+        </form>`;
+        break;
+      }
       body = `
         <p>Forhåndsbetaling er på. Kunder kan betale på forhånd for bestillinger til deg. Beløpet trekkes når du bekrefter bestillingen.</p>
         <p style="color:#737373;font-size:0.88rem;">Utbetalinger, gebyrer og refusjoner finner du i <a href="https://dashboard.stripe.com" target="_blank" rel="noopener noreferrer">Stripe-dashbordet</a>.</p>`;

@@ -315,13 +315,18 @@ export function assertPaymentsKeyAllowed(
   const liveGateSet = env.PAYMENTS_LIVE === "1";
   const orgNr = digitsOnly(env.PAYMENTS_ORG_NR || "");
   const orgOk = orgNr !== "" && orgNr === COMPANY_INFO.orgNr;
-  if (!liveGateSet || !orgOk || !termsLive) {
+  // Prerequisite 1 (angrerettloven § 18): no real prepayment without the
+  // buyer receipt on a durable medium — the buyer must hear what happened to
+  // the money, also when a producer records a cancellation.
+  const receiptsOn = env.ORDER_BUYER_RECEIPTS_ENABLED === "1";
+  if (!liveGateSet || !orgOk || !termsLive || !receiptsOn) {
     return {
       allowed: false,
       reason:
         "refusing a live-mode Stripe key for payments: requires PAYMENTS_LIVE=1 " +
         `(currently ${liveGateSet ? "set" : "unset"}), PAYMENTS_ORG_NR equal to the company org.nr ` +
-        `(currently ${orgNr ? (orgOk ? "matching" : "not matching") : "unset"}) and live wording in ` +
+        `(currently ${orgNr ? (orgOk ? "matching" : "not matching") : "unset"}), ORDER_BUYER_RECEIPTS_ENABLED=1 ` +
+        `(currently ${receiptsOn ? "set" : "unset"}) and live wording in ` +
         `/kjopsvilkar §4 (KJOPSVILKAR_PREPAYMENT_LIVE is ${termsLive}). ` +
         "See A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect.",
     };

@@ -52,7 +52,7 @@ function invokeGet(router: any, routePath: string, lang: "no" | "en" = "no"): { 
   return { found: true, status, body, nextCalled };
 }
 
-const ENV_KEYS = ["PAYMENTS_ENABLED", "STRIPE_SECRET_KEY", "PAYMENT_CHECKOUT_MINUTES", "PAYMENT_CONFIRM_HOURS", "PLATFORM_FEE_BPS", "PLATFORM_FEE_FIXED_ORE"];
+const ENV_KEYS = ["PAYMENTS_ENABLED", "STRIPE_SECRET_KEY", "PAYMENT_CHECKOUT_MINUTES", "PAYMENT_CONFIRM_HOURS", "PLATFORM_FEE_BPS", "PLATFORM_FEE_FIXED_ORE", "ORDER_BUYER_RECEIPTS_ENABLED"];
 const FAKE_TEST_KEY = "sk_" + "test_" + "FAKE".repeat(6);
 const FAKE_LIVE_KEY = "rk_" + "live_" + "FAKE".repeat(6);
 
@@ -126,6 +126,9 @@ export async function runRfbBetalingTests(opts: { log?: boolean } = {}): Promise
     ok(nb.includes('href="/kjopsvilkar#angrerett"') && enc.includes('href="/en/kjopsvilkar#right-of-cancellation"'), "content-12: links the right of cancellation in the terms, in the page language");
     ok(nb.includes("godkjenner betalingen selv") && nb.includes("kan ikke betale for deg"), "content-13: an AI assistant never pays for the buyer");
     ok(nb.includes("AGENTPLATFORM.NO AS") && !/938\s?635\s?676\s*MVA/.test(nb), "content-14: operator named, no «MVA» after the org.nr.");
+    ok(nb.includes("som av hensyn til helsevern eller hygiene ikke er egnet for retur") && enc.includes("not suitable for return for health or hygiene reasons"), "content-15: § 22 g exception in full (not wider than the law or /kjopsvilkar § 8)");
+    const drainNb = renderBetalingContent("no", { STRIPE_SECRET_KEY: FAKE_TEST_KEY, PAYMENTS_ENABLED: "drain" });
+    ok(drainNb.includes("Satt på pause") && !nb.includes("Satt på pause"), "content-16: drain → the page says prepayment is paused (no new links)");
 
     // ── 3. /personvern with payments on ────────────────────────────────────
     const pvNo = invokeGet(seoRouter, "/personvern", "no").body;
@@ -136,6 +139,12 @@ export async function runRfbBetalingTests(opts: { log?: boolean } = {}): Promise
     ok(pvNo.includes("Vi samler aldri inn eller lagrer kortopplysninger") && !pvNo.includes("Vi samler ikke inn betalingsinformasjon"), "privacy-06: «no payment information» replaced by «never card details»");
     ok(pvNo.includes("<td>Forhåndsbetaling</td><td>Avtale</td>") && pvEn.includes("<td>Prepayment</td><td>Contract</td>"), "privacy-07: legal basis row");
     ok(pvNo.includes("Forhåndsbetaling behandles av") && pvNo.includes("utenfor EU/EØS"), "privacy-08: transfer outside the EU/EEA disclosed");
+    ok(!pvNo.includes("Bestillinger innebærer ingen betaling") && pvNo.includes("Vi belaster aldri kort selv") && !pvEn.includes("Orders carry no payment") && pvEn.includes("We never charge a card ourselves"),
+      "privacy-08b: payments on → the cart section no longer says orders carry no payment");
+    ok(!pvNo.includes("sender vi deg en kvittering"), "privacy-08c: receipts off → no receipt purpose stated");
+    process.env.ORDER_BUYER_RECEIPTS_ENABLED = "1";
+    ok(invokeGet(seoRouter, "/personvern", "no").body.includes("sender vi deg en kvittering på e-postadressen du oppga"), "privacy-08d: receipts on → the receipt e-mail is stated as a purpose");
+    delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     const pp = renderPrepaymentPrivacy("no");
     ok(pp.section.includes("e-postadresse, navn og adressen til produsentsiden"), "privacy-09: states what onboarding sends to Stripe");
     const svcSrc = read("services/payment-service.ts");
@@ -152,6 +161,11 @@ export async function runRfbBetalingTests(opts: { log?: boolean } = {}): Promise
     ok(pv.includes("refunderes kunden automatisk") && pv.includes("forbrukerkjøpsloven § 41"), "terms-04: refund rules match onOrderTransitioned");
     ok(pv.includes("For varer du kan selge på nytt, refunderer du kunden i Stripe") && !pv.includes("beholder du betalingen, med mindre"), "terms-05: no-show rule matches kjøpsvilkår §7 (resalable goods are refunded)");
     ok(pv.includes("«Kunden har avbestilt», ikke som et avslag"), "terms-06: a buyer withdrawal is recorded as such, not as the producer's decline");
+    ok(pv.includes("velger kunden å betale ved henting, får du bestillingen som vanlig") && pv.includes("e-postadressen og betalingsopplysningene kunden oppgir der"), "terms-07: pay-at-pickup fallback and Stripe Checkout data covered");
+    process.env.PLATFORM_FEE_BPS = "100";
+    const pvFee = invokeGet(seoRouter, "/produsentvilkar").body;
+    delete process.env.PLATFORM_FEE_BPS;
+    ok(pvFee.includes("tar en plattformavgift per forhåndsbetaling") && !pvFee.includes("tar i dag ingen avgift"), "terms-08: a configured platform fee is stated in the producer terms too");
   } catch (err: any) {
     failed++;
     failures.push("✗ unexpected error: " + String(err?.stack || err));

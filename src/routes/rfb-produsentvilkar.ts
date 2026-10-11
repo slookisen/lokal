@@ -11,7 +11,7 @@
 //     a no-show (the producer refunds resalable goods, terms §7), not
 //     refunded automatically when the buyer cancels after capture
 //     (services/payment-service.ts onOrderTransitioned);
-//   - no platform fee today (PLATFORM_FEE_* default 0);
+//   - no platform fee unless PLATFORM_FEE_* is set (isPlatformFeeConfigured);
 //   - the trader declaration is shown to buyers (payments[] and the order
 //     view: seller_trader_status).
 // rfb-betaling.test.ts pins these facts.
@@ -19,7 +19,7 @@
 import { getConfig } from "../config/vertical-config";
 import { companyOperatorSentence } from "../services/company-legal";
 import { PRODUSENTVILKAR_LAST_UPDATED, PRODUSENTVILKAR_VERSION } from "../config/producer-terms";
-import { confirmHours } from "../services/payment-service";
+import { confirmHours, isPlatformFeeConfigured } from "../services/payment-service";
 
 export function renderProdusentvilkarContent(): string {
   const cfg = getConfig();
@@ -27,6 +27,7 @@ export function renderProdusentvilkarContent(): string {
   const mail = `kontakt@${cfg.domain}`;
   const mailLink = `<a href="mailto:${mail}">${mail}</a>`;
   const hours = confirmHours();
+  const feeOn = isPlatformFeeConfigured();
   return `
   <section class="pv-hero">
     <h1>Vilkår for produsenter</h1>
@@ -49,7 +50,7 @@ export function renderProdusentvilkarContent(): string {
     <h2 id="forhandsbetaling">5. Forhåndsbetaling med Stripe</h2>
     <ul>
       <li>Du oppretter din egen Stripe-konto og godtar Stripes egne vilkår der. Kundens betaling går direkte til din Stripe-konto. ${brand} mottar eller holder aldri pengene.</li>
-      <li>Beløpet reserveres når kunden betaler, og trekkes når du bekrefter bestillingen. Først når beløpet er reservert, får du bestillingen på e-post.</li>
+      <li>Beløpet reserveres når kunden betaler, og trekkes når du bekrefter bestillingen. En bestilling med forhåndsbetaling får du på e-post når beløpet er reservert. Betaler ikke kunden innen fristen, eller velger kunden å betale ved henting, får du bestillingen som vanlig med betaling ved henting.</li>
       <li>Avslår du, eller bekrefter du ikke innen ${hours} timer, frigjøres reservasjonen. Bestillingen kanselleres da hvis du ikke har bekreftet.</li>
       <li>Kansellerer du etter at beløpet er trukket fordi du ikke kan levere, refunderes kunden automatisk.</li>
       <li>Avbestiller kunden etter at beløpet er trukket, refunderer du selv i Stripe, helt eller delvis. Du kan kreve dekket dokumentert tap (forbrukerkjøpsloven § 41).</li>
@@ -59,10 +60,10 @@ export function renderProdusentvilkarContent(): string {
     </ul>
 
     <h2 id="gebyr">6. Gebyr til ${brand}</h2>
-    <p>${brand} tar i dag ingen avgift for bestillinger eller forhåndsbetaling. Hvis vi vil innføre en avgift, varsler vi deg minst 30 dager før, og den gjelder bare hvis du godtar den.</p>
+    <p>${feeOn ? `${brand} tar en plattformavgift per forhåndsbetaling, som trekkes fra beløpet før utbetaling. Avgiften vises i Stripe for hver betaling.` : `${brand} tar i dag ingen avgift for bestillinger eller forhåndsbetaling.`} Hvis vi vil innføre eller endre en avgift, varsler vi deg minst 30 dager før, og den gjelder bare hvis du godtar den.</p>
 
     <h2 id="kundeopplysninger">7. Kundeopplysninger</h2>
-    <p>Når kunden har samtykket til det, får du kundens navn og kontaktopplysninger for å gjennomføre bestillingen. Du skal bare bruke dem til det, og ikke til markedsføring. Se <a href="/personvern">personvernerklæringen</a>.</p>
+    <p>Når kunden har samtykket til det, får du kundens navn og kontaktopplysninger for å gjennomføre bestillingen. Ved forhåndsbetaling ser du dessuten i Stripe e-postadressen og betalingsopplysningene kunden oppgir der. Du skal bare bruke opplysningene til å gjennomføre bestillingen, betalingen og eventuelle refusjoner og reklamasjoner, og ikke til markedsføring. Se <a href="/personvern">personvernerklæringen</a>.</p>
 
     <h2 id="avslutning">8. Avslutning</h2>
     <p>Du kan når som helst slå av bestillinger i eierportalen og koble Stripe-kontoen fra ${brand}. Bestillinger du allerede har bekreftet, må du levere eller kansellere. Vi kan stanse forhåndsbetaling for en produsent ved misbruk, gjentatte klager eller hvis Stripe stenger kontoen.</p>

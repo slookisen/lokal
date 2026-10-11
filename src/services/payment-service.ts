@@ -224,8 +224,14 @@ function getProducerPaymentStatusBase(
 }
 
 /** The one question skive 2 asks before creating a payment link. */
+/**
+ * Active Stripe account AND the current producer terms accepted (with a
+ * trader declaration) — after a PRODUSENTVILKAR_VERSION bump an active
+ * producer gets no payment links until they accept again in the portal.
+ */
 export function canProducerTakePrepayment(db: any, agentId: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return getProducerPaymentStatus(db, agentId, env).state === "active";
+  const st = getProducerPaymentStatus(db, agentId, env);
+  return st.state === "active" && st.termsAccepted === true;
 }
 
 function logPaymentEvent(
@@ -1382,7 +1388,12 @@ export async function onOrderTransitioned(params: {
         // cancellation is settled by the producer in Stripe (refund minus
         // documented loss) — we keep a captured payment; a reservation that
         // was never captured is simply released.
-        if (p.status === "captured") return "kept";
+        if (p.status === "captured") {
+          // Visible to admin (alerts_7d): the buyer is NOT refunded
+          // automatically here — the producer must settle it in Stripe.
+          logPaymentEvent(db, { paymentId: p.id, orderId, agentId: p.agent_id, source: "system", type: "buyer_cancel_kept", now });
+          return "kept";
+        }
         return (await releasePayment(db, stripe, p.id, "buyer_cancelled", now)) ? "released" : "none";
       }
       if (p.status === "captured") {
@@ -1409,9 +1420,6 @@ export interface MaintenanceResult {
   orphans_notified: number;
 }
 
-/** Hook for the buyer receipt (skive 4) without an import cycle. */
-let onOrderExpired: ((orderId: string) => void) | null = null;
-export function setOnOrderExpiredHook(fn: ((orderId: string) => void) | null): void { onOrderExpired = fn; }
 
 /**
  * Every few minutes (src/index.ts, PAYMENTS_ENABLED only) and on demand
@@ -1448,7 +1456,6 @@ export async function runPaymentMaintenance(params: { db?: any; stripe: Payments
       const fresh = db.prepare(`SELECT status FROM payments WHERE id = ?`).get(r.id) as { status: string } | undefined;
       if (fresh?.status === "authorized" && (await releasePayment(db, params.stripe, r.id, "payment_expired", now))) out.released++;
       void sendBuyerOrderReceipt(r.order_id, "cancelled");
-      if (onOrderExpired) onOrderExpired(r.order_id);
     });
   }
 

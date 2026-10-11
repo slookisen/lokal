@@ -152,16 +152,19 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
   }
 });
 
-// Change the trader declaration later (prerequisite 5). Only for producers
-// who already accepted the current terms; records a new acceptance row.
+// Change the trader declaration later (prerequisite 5), or accept a new
+// terms version without a new Stripe step (an active producer after a
+// PRODUSENTVILKAR_VERSION bump gets no payment links until then). Records a
+// new acceptance row; the terms checkbox is required unless the current
+// version is already accepted.
 router.post("/eier/:agentId/betaling/erklaering", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const agentId = String(req.params.agentId || "");
   if (!requireOwner(req, res, agentId)) return;
   const db = getDb();
   const st = getProducerPaymentStatus(db, agentId);
-  if (st.state === "disabled" || st.state === "not_allowed") return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
+  if (st.state === "disabled" || st.state === "not_allowed" || st.state === "not_eligible") return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
   const trader = req.body?.trader_status;
-  if (!hasAcceptedCurrentProducerTerms(db, agentId) || !isTraderStatus(trader)) {
+  if (!isTraderStatus(trader) || (!hasAcceptedCurrentProducerTerms(db, agentId) && req.body?.terms_accepted !== "1")) {
     return res.redirect(303, portalUrl(agentId, "payments_terms_required"));
   }
   recordProducerTermsAcceptance(db, agentId, trader);
@@ -278,7 +281,7 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
     // capture that keeps failing) — the verifier/daily brief reads this.
     alerts_7d: getDb().prepare(`
       SELECT type, order_id, created_at AS at FROM payment_events
-      WHERE type IN ('authorization_lost_after_confirm','capture_stuck') AND created_at >= ?
+      WHERE type IN ('authorization_lost_after_confirm','capture_stuck','buyer_cancel_kept') AND created_at >= ?
       ORDER BY created_at DESC LIMIT 20
     `).all(new Date(Date.now() - 7 * 86400000).toISOString()),
     livemode: paymentsLivemode(),

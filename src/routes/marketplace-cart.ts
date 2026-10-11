@@ -468,6 +468,12 @@ for (const action of LIFECYCLE_ACTIONS) {
     const toStatus = ACTION_TO_STATUS[action]!;
     let cancelReason: string | null = action === "no-show" ? "no_show" : null;
     if (action === "cancel") {
+      // Ships with prepayment, like the producer page's cancellation box:
+      // with the lifecycle off a captured payment could not be refunded.
+      if (!cancelActionsEnabled()) {
+        res.status(409).json({ success: false, error: "cancellation with a reason requires PAYMENTS_ENABLED=1 or drain" });
+        return;
+      }
       cancelReason = String(req.body?.reason || "");
       if (!ADMIN_CANCEL_REASONS.has(cancelReason)) {
         res.status(400).json({ success: false, error: "reason must be producer_cancelled or buyer_cancelled" });

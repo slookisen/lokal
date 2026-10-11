@@ -329,8 +329,12 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     eq(r.status, 403, "decl-02: another agent's session → 403");
     r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "toString" } });
     ok(r.status === 303 && (r.location || "").includes("payments_terms_required") && svc.sellerTraderStatus(db, "pay-a") === "trader", "decl-03: invalid value → refused, unchanged");
-    r = await req("POST", "/eier/pay-c/betaling/erklaering", { headers: cookie("ptok-c"), form: { trader_status: "trader" } });
-    ok(r.status === 303 && (r.location || "").includes("payments_terms_required") && svc.getProducerTermsAcceptance(db, "pay-c") === null, "decl-04: producer who never accepted the terms → refused");
+    r = await req("POST", "/eier/pay-c/betaling/erklaering", { headers: cookie("ptok-c"), form: { trader_status: "trader", terms_accepted: "1" } });
+    ok(r.status === 303 && (r.location || "").includes("payments_unavailable") && svc.getProducerTermsAcceptance(db, "pay-c") === null, "decl-04: producer with orders off → refused, nothing recorded");
+    r = await req("POST", "/eier/pay-d/betaling/erklaering", { headers: cookie("ptok-d"), form: { trader_status: "trader" } });
+    ok(r.status === 303 && (r.location || "").includes("payments_terms_required") && svc.getProducerTermsAcceptance(db, "pay-d") === null, "decl-04b: pilot producer who never accepted → the terms checkbox is required");
+    const direct = await svc.startProducerOnboarding({ db, stripe: fake.client, agentId: "pay-d", baseUrl: "https://rfb.test" });
+    ok(!direct.ok && (direct as any).error === "terms_required", "decl-04c: the service itself refuses onboarding without accepted terms (not only the route)");
     r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "non_trader" } });
     ok(r.status === 303 && (r.location || "").includes("payments_declared") && svc.sellerTraderStatus(db, "pay-a") === "non_trader", "decl-05: declaration changed");
     r = await req("GET", "/eier/pay-a/portal?status=payments_declared", { headers: cookie("ptok-a") });
@@ -389,6 +393,15 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     ok(svc.canProducerTakePrepayment(db, "pay-a"), "wh-11: producer can now take prepayment");
     r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
     ok(r.text.includes("Forhåndsbetaling er på") && !r.text.includes("/eier/pay-a/betaling/start"), "card-11: active card, no start button");
+    // A terms version bump: the active producer gets no payment links until they accept again, from the card.
+    db.prepare(`INSERT INTO producer_terms_acceptances (id, agent_id, terms_version, trader_status, accepted_at, source) VALUES ('pta-bump', 'pay-a', '2000-01-01', 'trader', ?, 'owner')`).run(new Date().toISOString());
+    ok(!svc.canProducerTakePrepayment(db, "pay-a"), "bump-01: old terms version newest → no prepayment");
+    r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
+    ok(r.text.includes("Vilkårene for produsenter er oppdatert") && r.text.includes('action="/eier/pay-a/betaling/erklaering"') && r.text.includes('name="terms_accepted"'), "bump-02: active card asks to accept the new terms");
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "trader" } });
+    ok((r.location || "").includes("payments_terms_required") && !svc.canProducerTakePrepayment(db, "pay-a"), "bump-03: declaration without the checkbox does not accept new terms");
+    r = await req("POST", "/eier/pay-a/betaling/erklaering", { headers: cookie("ptok-a"), form: { trader_status: "trader", terms_accepted: "1" } });
+    ok((r.location || "").includes("payments_declared") && svc.canProducerTakePrepayment(db, "pay-a") && svc.hasAcceptedCurrentProducerTerms(db, "pay-a"), "bump-04: accepted from the card → prepayment back");
 
     r = await req("POST", WH, { raw: w.raw, headers: { "Stripe-Signature": w.sig } });
     ok(r.status === 200 && r.body?.duplicate === true, "wh-12: redelivery → duplicate");
