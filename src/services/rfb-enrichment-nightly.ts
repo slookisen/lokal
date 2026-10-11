@@ -89,14 +89,18 @@
 //     clock (RFB_ENRICHMENT_MAX_RUNTIME_MINUTES, default 20). Writing steps
 //     stop early enough to leave step 5 a reserve.
 //   • LLM: at most RFB_ENRICHMENT_LLM_CAP (default 150) model calls per NIGHT
-//     (08:00Z→08:00Z; calls already spent by earlier runs tonight, read from
-//     their envelopes, are subtracted; unreadable → no LLM budget). A row is
+//     (08:00Z→08:00Z; calls already spent tonight are subtracted — the larger
+//     of earlier runs' envelopes and a durable per-night counter that every
+//     LLM-capable row reserves its worst case in BEFORE it starts, so a run
+//     that dies mid-way still counts; unreadable → no LLM budget). A row is
 //     only started if its worst case (LLM_CALLS_PER_ROW_MAX) still fits; once
 //     it does not, every LLM-needing step stops for the night (no queue
 //     builds up). Real calls are counted by the judges themselves
 //     (llm-call-meter.ts) and reported with an estimated cost.
-//   • One apply run per night (cron or manual); a manual second run needs an
-//     explicit force (which never lifts the LLM cap, the 08Z ban or the lock).
+//   • One apply run per night (cron or manual), stamped the moment a run
+//     takes the lock (so a run that dies still uses up the night); a manual
+//     second run needs an explicit force (which never lifts the LLM cap, the
+//     08Z ban or the lock).
 //   • Only real per-row outcomes enter the rotation memory; transient ones
 //     (timeouts, 5xx, errors, write-pause, a missing admin key, a tool's own
 //     run-lock) are retried the next night.
@@ -442,6 +446,61 @@ export function readRfbEnrichmentLlmCallsTonight(db: Db, now: Date): number {
 }
 
 /**
+ * Durable per-night LLM counter (survives a run that dies before its
+ * envelope): a row in rfb_enrichment_sweep_state keyed
+ * `llm_calls_night:<night>`, whose next_offset column holds the night's
+ * count. Before every LLM-capable row starts, the row's worst case is added
+ * (a reservation); when it finishes, the difference to the calls it really
+ * made is settled. So at any instant — including the moment a process dies —
+ * the counter is >= the calls actually spent tonight.
+ */
+export function rfbEnrichmentLlmCounterKey(now: Date): string {
+  return `llm_calls_night:${rfbEnrichmentNightKey(now)}`;
+}
+
+/** The night's durable LLM counter (0 when none). Throws when unreadable — callers fail closed. */
+export function readRfbEnrichmentNightLlmCounter(db: Db, now: Date): number {
+  const row = db
+    .prepare(`SELECT next_offset FROM rfb_enrichment_sweep_state WHERE cursor = ?`)
+    .get(rfbEnrichmentLlmCounterKey(now)) as { next_offset: number } | undefined;
+  const n = Number(row?.next_offset ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Add `delta` (may be negative when settling) to the night's counter, never below 0. Throws on a DB error. */
+export function bumpRfbEnrichmentNightLlmCounter(db: Db, now: Date, delta: number, at: Date): void {
+  db.prepare(
+    `INSERT INTO rfb_enrichment_sweep_state (cursor, next_offset, total, updated_at)
+     VALUES (@key, MAX(0, @delta), NULL, @at)
+     ON CONFLICT(cursor) DO UPDATE SET
+       next_offset = MAX(0, next_offset + @delta),
+       updated_at = @at`,
+  ).run({ key: rfbEnrichmentLlmCounterKey(now), delta: Math.trunc(delta), at: at.toISOString() });
+}
+
+/**
+ * LLM calls already spent tonight for budgeting: the larger of the envelopes'
+ * sum and the durable counter (the counter also covers a run that died before
+ * writing its envelope). Throws when either is unreadable — callers fail closed.
+ */
+export function readRfbEnrichmentLlmSpentTonight(db: Db, now: Date): number {
+  return Math.max(readRfbEnrichmentLlmCallsTonight(db, now), readRfbEnrichmentNightLlmCounter(db, now));
+}
+
+/** Whether any envelope of this job (a run's or the no-run one) started in the night `now` belongs to. */
+function hasEnvelopeTonight(db: Db, now: Date): boolean {
+  const start = rfbEnrichmentNightStart(now);
+  const end = new Date(start.getTime() + 86_400_000);
+  try {
+    return !!db
+      .prepare(`SELECT 1 AS x FROM runs WHERE agent = ? AND started_at >= ? AND started_at < ? LIMIT 1`)
+      .get(RFB_ENRICHMENT_NIGHTLY_AGENT, start.toISOString(), end.toISOString());
+  } catch {
+    return true; // ledger unreadable: do not try to write to it either
+  }
+}
+
+/**
  * The one "nothing ran tonight" envelope (N4): `failed` when an error stopped
  * a run before it could take the lock, `partial` when the night's window
  * ended without a run (e.g. the verifier tick lock was held at every try).
@@ -511,16 +570,24 @@ function trackSkip(now: Date, r: RfbEnrichmentNightlyReport): void {
  * 03:00Z knows nothing about the 00–01Z window).
  */
 function maybeRecordNoRunEnvelope(db: Db, now: Date, lastRunAt: Date | null, processStartedAt: Date): boolean {
+  // A run (e.g. a manual POST /run apply) is in flight in this process: its
+  // envelope is still to come. The index.ts tick guard only serialises ticks.
+  if (runInFlight) return false;
   const windowEnd = rfbEnrichmentWindowEnd(now, resolveRfbEnrichmentWindowHours());
   if (now.getTime() < windowEnd.getTime()) return false;
   if (processStartedAt.getTime() >= windowEnd.getTime()) return false;
+  // A run's envelope (or this night's no-run envelope) is already on record.
+  if (hasEnvelopeTonight(db, now)) return false;
   const nightStartMs = rfbEnrichmentNightStart(now).getTime();
-  const ranTonight = (d: Date | null) => !!d && d.getTime() >= nightStartMs && d.getTime() <= now.getTime();
-  if (ranTonight(lastRunAt) || ranTonight(getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY))) return false;
+  const stampedTonight = (d: Date | null) => !!d && d.getTime() >= nightStartMs && d.getTime() <= now.getTime();
+  // Stamped but no envelope: a run took the lock and then died (deploy, OOM,
+  // restart) before it could write one — still one envelope for the night.
+  const runDied = stampedTonight(lastRunAt) || stampedTonight(getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY));
   const night = rfbEnrichmentNightKey(now);
   const t = noRunTracker.night === night ? noRunTracker : { lockHeldSkips: 0, lastHolder: null, otherSkips: {} as Record<string, number> };
-  const reason =
-    t.lockHeldSkips > 0
+  const reason = runDied
+    ? "run_started_without_envelope"
+    : t.lockHeldSkips > 0
       ? "verifier_tick_lock_held"
       : Object.keys(t.otherSkips)[0] ?? "no_run_in_window";
   return recordRfbEnrichmentNoRunEnvelope(db, now, "partial", "cron", {
@@ -530,7 +597,16 @@ function maybeRecordNoRunEnvelope(db: Db, now: Date, lastRunAt: Date | null, pro
     lock_held_skips: t.lockHeldSkips,
     last_lock_holder: t.lastHolder,
     other_skips: t.otherSkips,
+    ...(runDied ? { llm_calls_counted_tonight: safeCounter(db, now) } : {}),
   });
+}
+
+function safeCounter(db: Db, now: Date): number | null {
+  try {
+    return readRfbEnrichmentNightLlmCounter(db, now);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1211,7 +1287,34 @@ const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
   "error",
   "no_result",
   "skipped_refresh_budget",
+  // Brreg outage / null contact fetch — says nothing about the producer (NB3).
+  "brreg_contact_fetch_failed",
+  // contact extraction: the host is in a temporary 429 cooldown (NB3).
+  // (`fetch_failed` stays a real outcome: the site may really be dead.)
+  "cooldown_skipped",
 ]);
+
+/**
+ * Row outcome for a non-200 answer from an in-process route call. A 4xx
+ * (bad request shape, auth) or a 503 (admin key not configured) is the same
+ * for every row, so it stops the step for the night instead of being retried
+ * row by row up to the cap (NB5); a 504 is the call's own timeout; any other
+ * 5xx is one row's failure. All are transient (never stamped).
+ */
+export function rfbEnrichmentHttpFailureOutcome(status: number, detail?: string): RfbEnrichmentRowOutcome {
+  if (status === 504) {
+    return { outcome: "route_timeout", written: false, changed: false, error: true, stop: "route_timeout" };
+  }
+  const stepWide = (status >= 400 && status < 500) || status === 503;
+  return {
+    outcome: `http_${status}`,
+    written: false,
+    changed: false,
+    error: true,
+    ...(stepWide ? { stop: `http_${status}` } : {}),
+    ...(detail ? { detail } : {}),
+  };
+}
 
 export function isTransientRfbEnrichmentOutcome(out: { outcome: string; error?: boolean; stop?: string }): boolean {
   if (out.error || out.stop) return true;
@@ -1345,10 +1448,7 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
         body: { agentIds: [row.id], apply: true, limit: 1 },
       });
       if (r.status === 423) return { outcome: "enrichment_write_paused", written: false, changed: false, stop: "enrichment_write_paused" };
-      if (r.status === 504) return { outcome: "route_timeout", written: false, changed: false, error: true, stop: "route_timeout" };
-      if (r.status !== 200) {
-        return { outcome: `http_${r.status}`, written: false, changed: false, error: true, detail: String(r.body?.error ?? r.body?.detail ?? "") };
-      }
+      if (r.status !== 200) return rfbEnrichmentHttpFailureOutcome(r.status, String(r.body?.error ?? r.body?.detail ?? ""));
       const d = Array.isArray(r.body?.details) ? r.body.details[0] : null;
       const errs = Array.isArray(r.body?.errors) ? r.body.errors : [];
       if (!d) {
@@ -1409,10 +1509,7 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
         body: { agentIds: [row.id], apply: true },
       });
       if (r.status === 409) return { outcome: "run_in_progress", written: false, changed: false, stop: "contact_extraction_run_in_progress" };
-      if (r.status === 504) return { outcome: "route_timeout", written: false, changed: false, error: true, stop: "route_timeout" };
-      if (r.status !== 200) {
-        return { outcome: `http_${r.status}`, written: false, changed: false, error: true, detail: String(r.body?.error ?? "") };
-      }
+      if (r.status !== 200) return rfbEnrichmentHttpFailureOutcome(r.status, String(r.body?.error ?? ""));
       const item = Array.isArray(r.body?.results) ? r.body.results[0] : null;
       const outcome = typeof item?.outcome === "string" ? item.outcome : "no_result";
       const written = outcome === "written";
@@ -1669,6 +1766,11 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
 
 let runInFlight = false;
 
+/** Test-only: forget the in-process "a run is in flight" flag (simulates a new process). */
+export function __resetRfbEnrichmentRunInFlightForTesting(): void {
+  runInFlight = false;
+}
+
 /**
  * One run. `apply: false` = dry run: the preview, nothing else. `apply:
  * true` = the real thing, behind every guard in the header. Records one
@@ -1831,11 +1933,23 @@ async function runGuarded(opts: {
   }
   report.lock = { acquired: true, released: false };
 
-  // The LLM cap is per NIGHT: subtract what earlier runs tonight already spent.
-  // Unreadable ledger → no LLM budget (fail closed); the rest of the run goes on.
+  // The night is used up the moment a run holds the lock — before it can
+  // spend a single LLM call. A run that then dies (deploy, OOM, restart)
+  // leaves this stamp, so the next tick is already_ran_tonight instead of a
+  // second full-budget run. Every skip path (flag off, in flight, forbidden
+  // hour, already ran, lock held, error before the lock) returns ABOVE this
+  // line, so a skip never consumes the night; nothing between the lock and
+  // runSteps can skip.
+  markJobCompleted(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY, now);
+
+  // The LLM cap is per NIGHT: subtract what tonight already spent — the larger
+  // of the envelopes' sum and the durable counter (which also covers a run
+  // that died before its envelope). Unreadable → no LLM budget (fail closed);
+  // the rest of the run goes on.
   let runBudget = 0;
   try {
-    const used = readRfbEnrichmentLlmCallsTonight(db, now);
+    ensureRfbEnrichmentNightlyTables(db);
+    const used = readRfbEnrichmentLlmSpentTonight(db, now);
     report.llm.used_before_this_run = used;
     runBudget = Math.max(0, llmCap - used);
   } catch (err) {
@@ -1844,7 +1958,6 @@ async function runGuarded(opts: {
   report.llm.run_budget = runBudget;
 
   try {
-    ensureRfbEnrichmentNightlyTables(db);
     await runWithLlmCallMeter(meter, () =>
       runSteps({ db, report, now, clock, deadline, writeDeadline, meter, llmCap: runBudget, usdPerCall, deps: opts.deps }),
     );
@@ -1858,9 +1971,7 @@ async function runGuarded(opts: {
     }
   }
 
-  // This run is the day's run (cron or manual): stamp before the envelope, so
-  // a restart cannot run a second night inside the 20 h gap.
-  markJobCompleted(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY, now);
+  // (The night was stamped when the lock was taken — see above.)
   recordEnvelope(db, report, meter, usdPerCall, clock);
   return done();
 }
@@ -1929,6 +2040,33 @@ async function runSteps(rc: RunContext): Promise<void> {
     return null;
   };
 
+  /**
+   * Durable LLM reservation (NB1): before an LLM-capable row starts, add its
+   * worst case to the night's counter; null when the counter cannot be
+   * written — then every LLM step stops for the night (fail closed).
+   */
+  const reserveLlm = (perRowLlm: number): number | null => {
+    if (perRowLlm <= 0) return 0;
+    try {
+      bumpRfbEnrichmentNightLlmCounter(db, now, perRowLlm, clock());
+      return perRowLlm;
+    } catch (err) {
+      llmCapReached = true;
+      report.errors.push(`LLM counter unwritable — LLM steps stopped (fail closed): ${errMessage(err)}`);
+      return null;
+    }
+  };
+  /** After the row: replace the reservation by the calls it really made. */
+  const settleLlm = (reserved: number, actual: number): void => {
+    if (reserved <= 0 && actual <= 0) return;
+    if (actual === reserved) return;
+    try {
+      bumpRfbEnrichmentNightLlmCounter(db, now, actual - reserved, clock());
+    } catch {
+      // the reservation stays: over-counting is the safe direction
+    }
+  };
+
   /** Why a whole step may not start (null = go). */
   const skipStep = (step: RfbEnrichmentStep, cap: number): string | null => {
     if (globalStop) return globalStop;
@@ -1991,12 +2129,19 @@ async function runSteps(rc: RunContext): Promise<void> {
         sr.stopped_reason = stop;
         break;
       }
+      const reserved = reserveLlm(perRowLlm);
+      if (reserved === null) {
+        sr.stopped_reason = "llm_counter_unwritable";
+        break;
+      }
+      const callsBefore = meter.calls;
       let out: RfbEnrichmentRowOutcome;
       try {
         out = await run(row);
       } catch (err) {
         out = { outcome: "error", written: false, changed: false, error: true, detail: errMessage(err) };
       }
+      settleLlm(reserved, meter.calls - callsBefore);
       tally(sr, row.id, out);
       // Only a real per-row outcome enters the rotation memory; a transient
       // one (timeout, 5xx, error, write-pause, missing admin key, the tool's
@@ -2120,6 +2265,12 @@ async function runSteps(rc: RunContext): Promise<void> {
           sr.stopped_reason = stop;
           break;
         }
+        const reserved = reserveLlm(perRowLlm);
+        if (reserved === null) {
+          sr.stopped_reason = "llm_counter_unwritable";
+          break;
+        }
+        const callsBefore = meter.calls;
         const before = isInPool(db, w.id);
         let out: RfbEnrichmentReverifyOutcome;
         try {
@@ -2127,6 +2278,7 @@ async function runSteps(rc: RunContext): Promise<void> {
         } catch (err) {
           out = { outcome: "error", prior: null, next: null, error: true, detail: errMessage(err) };
         }
+        settleLlm(reserved, meter.calls - callsBefore);
         const after = isInPool(db, w.id);
         sr.attempted++;
         sr.outcomes[out.outcome] = (sr.outcomes[out.outcome] ?? 0) + 1;

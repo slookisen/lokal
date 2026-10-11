@@ -58,6 +58,14 @@
  *   (v) Brreg selection: rows without a contact e-mail first (the route's
  *       LLM gate can only add an e-mail there); a row with org_nr + website +
  *       contact e-mail is never selected (the route's own predicate)
+ *   (w) a run that dies mid-way (after k LLM rows) has already used up the
+ *       night (stamped at lock time) and its calls stay counted (durable
+ *       per-night counter): a later cron run is already_ran_tonight, a forced
+ *       run gets cap − k (cap − k − 1 if it died inside an LLM row), and the
+ *       night still gets one envelope (run_started_without_envelope)
+ *   (x) no no-run envelope while a manual run is in flight
+ *   (y) Brreg-outage / host-cooldown outcomes are not stamped; a 4xx / 503
+ *       from an in-process route stops the step for the night
  *   (q) the BM step ALWAYS asks the route for fill_only=1 and scopes it to
  *       the cohort: through the real in-process route a stored e-mail/phone
  *       is never replaced, a blank one is filled, and a matched producer
@@ -1064,6 +1072,168 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
       assertEq(p.steps.find((x) => x.step === "brreg_contact")?.selected_ids, ["v-no-email", "v-has-email"], "v1: rows without a contact e-mail first; a row with org_nr + website + e-mail is never selected");
       assertEq(p.llm_calls_per_row_max.brreg_contact, 1, "v2: the worst case stays 1 per row (the route still calls its gate for rows with an e-mail)");
+    });
+
+    // ── (w) NB1: a run that dies mid-way still uses up the night ─────────
+    await withDb("w", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "2", RFB_ENRICHMENT_CAP_BM_SLUGS: "1" });
+      job.__resetRfbEnrichmentNoRunTrackerForTesting();
+      for (let i = 0; i < 6; i++) seedGeneric(`w${i}`);
+      const calls: Call[] = [];
+      const judging = async (row: { id: string }) => {
+        calls.push({ step: "brreg_contact", id: row.id, at: "" });
+        meterMod.noteLlmCall("contact-candidate-judge");
+        return { outcome: "email_rejected_by_gate", written: false, changed: false };
+      };
+      let reachedBm!: () => void;
+      const bmReached = new Promise<void>((resolve) => { reachedBm = resolve; });
+      const dies = async () => {
+        reachedBm();
+        return new Promise<never>(() => {}); // the process dies here: never settles
+      };
+      const at = (hhmm: string) => new Date(`2026-10-12T${hhmm}:00Z`);
+      void job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: at("00:05"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judging, bmHarvest: dies as any }) } });
+      await bmReached;
+      // "Restart": in-process memory gone, the dead run's lock goes stale.
+      job.__resetRfbEnrichmentRunInFlightForTesting();
+      db.prepare(`DELETE FROM orchestrator_locks`).run();
+      assertEq([calls.length, job.readRfbEnrichmentNightLlmCounter(db, at("00:05")), count("runs")], [2, 2, 0], "w1: the dead run spent 2 calls; the durable counter has them, no envelope was written");
+      const tick = await job.tickRfbEnrichmentNightly({ now: at("01:10"), lastRunAt: null, deps: { executors: stubExecutors(calls, realClock, { brregContact: judging }) }, processStartedAt: at("01:00") });
+      assertEq(tick.report, null, "w2: the next tick does not start a second run (the night was stamped at lock time)");
+      const cron = await job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: at("01:10"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judging }) } });
+      assertEq([cron.skipped_reason, calls.length], ["already_ran_tonight", 2], "w2: a cron run after the death is already_ran_tonight");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "5" });
+      const forced = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: at("01:20"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judging }) } });
+      assertEq([forced.llm.used_before_this_run, forced.llm.run_budget, forced.llm.calls], [2, 1, 1], "w3: a forced run gets cap − k (3 − 2 = 1), not the full cap");
+      assertEq(job.readRfbEnrichmentLlmSpentTonight(db, at("01:20")), 3, "w3: the night's total is exactly the cap");
+
+      // Died INSIDE an LLM row: that row's reservation stays counted.
+      db.prepare(`DELETE FROM runs`).run();
+      db.prepare(`DELETE FROM boot_job_state`).run();
+      db.prepare(`DELETE FROM rfb_enrichment_sweep_state`).run();
+      db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "5" });
+      let n = 0;
+      let reachedRow!: () => void;
+      const rowReached = new Promise<void>((resolve) => { reachedRow = resolve; });
+      const judgingThenDie = async (row: { id: string }) => {
+        n++;
+        if (n === 2) {
+          reachedRow();
+          return new Promise<never>(() => {});
+        }
+        return judging(row);
+      };
+      const night2 = (hhmm: string) => new Date(`2026-10-13T${hhmm}:00Z`);
+      void job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: night2("00:05"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judgingThenDie }) } });
+      await rowReached;
+      job.__resetRfbEnrichmentRunInFlightForTesting();
+      db.prepare(`DELETE FROM orchestrator_locks`).run();
+      assertEq(job.readRfbEnrichmentNightLlmCounter(db, night2("00:05")), 2, "w4: 1 settled call + 1 reservation for the row that was in flight");
+      const forced2 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: night2("00:30"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judging }) } });
+      assertEq([forced2.llm.used_before_this_run, forced2.llm.run_budget], [2, 1], "w4: a forced run then gets cap − k − 1 (the conservative side)");
+
+      // A run that died and nothing after it: the night still gets one envelope.
+      db.prepare(`DELETE FROM runs`).run();
+      const late = await job.tickRfbEnrichmentNightly({ now: night2("02:05"), lastRunAt: null, deps: {}, processStartedAt: night2("00:00") });
+      const env = db.prepare(`SELECT run_id, status, claims FROM runs`).all() as any[];
+      const meta = JSON.parse(env[0]?.claims ?? "[]")[0]?.meta ?? {};
+      assertEq([late.noRunEnvelopeRecorded, env.length, env[0]?.status, meta.reason, meta.llm_calls_counted_tonight], [true, 1, "partial", "run_started_without_envelope", 3], "w5: a stamped night without an envelope gets the no-run envelope (run_started_without_envelope, with the counted calls: 2 from the dead run + 1 from the forced one)");
+
+      // Settling: a row that reserved but made no call gives it back.
+      db.prepare(`DELETE FROM rfb_enrichment_sweep_state`).run();
+      db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
+      const night3 = new Date("2026-10-14T00:05:00Z");
+      const noCall = async (row: { id: string }) => ({ outcome: "no_brreg_epost", written: false, changed: false });
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: night3, deps: { executors: stubExecutors(calls, realClock, { brregContact: noCall }) } });
+      assertEq([r.steps.find((x) => x.step === "brreg_contact")?.attempted, job.readRfbEnrichmentNightLlmCounter(db, night3)], [5, 0], "w6: reservations are settled to the real count (5 rows, 0 calls → 0)");
+    });
+
+    // ── (x) NB2: no no-run envelope while a manual run is in flight ──────
+    await withDb("x", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_URL_CHECK: "1" });
+      job.__resetRfbEnrichmentNoRunTrackerForTesting();
+      seedGeneric("x0");
+      const calls: Call[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const inRow = new Promise<void>((resolve) => { entered = resolve; });
+      const slowProbe = async () => {
+        entered();
+        await gate;
+        return { outcome: "probe_ok", written: true, changed: false };
+      };
+      const at = (hhmm: string) => new Date(`2026-10-12T${hhmm}:00Z`);
+      const manual = job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: at("02:30"), deps: { executors: stubExecutors(calls, realClock, { urlCheck: slowProbe }) } });
+      await inRow;
+      const during = await job.tickRfbEnrichmentNightly({ now: at("02:40"), lastRunAt: null, deps: {}, processStartedAt: at("00:00") });
+      assertEq([during.noRunEnvelopeRecorded ?? false, count("runs")], [false, 0], "x1: while a manual run is in flight the tick writes no no-run envelope");
+      release();
+      const r = await manual;
+      const after = await job.tickRfbEnrichmentNightly({ now: at("02:50"), lastRunAt: null, deps: {}, processStartedAt: at("00:00") });
+      assertEq([r.envelope_recorded, after.noRunEnvelopeRecorded ?? false, count("runs")], [true, false, 1], "x2: afterwards the night has the run's envelope only");
+    });
+
+    // ── (y) NB3 + NB5 ────────────────────────────────────────────────────
+    await withDb("y", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_BRREG: "2", RFB_ENRICHMENT_CAP_CONTACT_EXTRACTION: "3" });
+      for (let i = 0; i < 3; i++) seedGeneric(`y${i}`);
+      const cxOutcomes = ["cooldown_skipped", "fetch_failed", "no_contact_found"];
+      let ci = 0;
+      const calls: Call[] = [];
+      await job.runRfbEnrichmentNightly({
+        apply: true,
+        trigger: "manual",
+        now: NIGHT,
+        deps: {
+          executors: stubExecutors(calls, realClock, {
+            brregContact: async () => ({ outcome: "brreg_contact_fetch_failed", written: false, changed: false }),
+            contactExtraction: async () => ({ outcome: cxOutcomes[ci++], written: false, changed: false }),
+          }),
+        },
+      });
+      const stamped = db.prepare(`SELECT agent_id, step, last_outcome FROM rfb_enrichment_nightly_attempts ORDER BY agent_id`).all();
+      assertEq(
+        stamped,
+        [
+          { agent_id: "y1", step: "contact_extraction", last_outcome: "fetch_failed" },
+          { agent_id: "y2", step: "contact_extraction", last_outcome: "no_contact_found" },
+        ],
+        "y1 (NB3): brreg_contact_fetch_failed and cooldown_skipped are not stamped; fetch_failed / no_contact_found are",
+      );
+      assertEq(
+        [400, 403, 404, 500, 503, 504].map((st) => {
+          const o = job.rfbEnrichmentHttpFailureOutcome(st);
+          return [o.outcome, o.stop ?? null, job.isTransientRfbEnrichmentOutcome(o)];
+        }),
+        [
+          ["http_400", "http_400", true],
+          ["http_403", "http_403", true],
+          ["http_404", "http_404", true],
+          ["http_500", null, true],
+          ["http_503", "http_503", true],
+          ["route_timeout", "route_timeout", true],
+        ],
+        "y2 (NB5): a 4xx or 503 stops the step; a 500 is one row's failure; all unstamped",
+      );
+      // Real Brreg executor with no admin key configured → 503 from the route
+      // → the step stops after one row, nothing stamped.
+      db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_BRREG: "3" });
+      const prevAnalytics = process.env.ANALYTICS_ADMIN_KEY;
+      delete process.env.ADMIN_KEY;
+      delete process.env.ANALYTICS_ADMIN_KEY;
+      let r: Awaited<ReturnType<typeof job.runRfbEnrichmentNightly>>;
+      try {
+        r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: NIGHT });
+      } finally {
+        process.env.ADMIN_KEY = testKey;
+        if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+        else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
+      }
+      const b = r.steps.find((x) => x.step === "brreg_contact")!;
+      assertEq([b.selected, b.attempted, b.stopped_reason, b.outcomes, count("rfb_enrichment_nightly_attempts")], [3, 1, "http_503", { http_503: 1 }, 0], "y3 (NB5): a step-wide 503 stops the Brreg step after one row, nothing stamped");
     });
   } catch (err) {
     failed++;
