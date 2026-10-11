@@ -277,6 +277,11 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
       let label = "Google-søk";
       const fileDb = { name: "/data/x.db", memory: false, pragma: () => "wal" } as unknown as Database.Database;
       let computeSyncCalls = 0;
+      // The reader's clock is the test's own: with maxStaleMs 0 a value is
+      // servable only at the instant it was stored, so on Date.now a refresh
+      // that lands one millisecond before the check made R4 a 503 (flaky on
+      // busy CI runners). The clock moves only where the test says so.
+      let clock = 1_000_000;
       const reader = createAdminStatsReader({
         getDb: () => fileDb,
         offThreadUsable: () => true,
@@ -286,7 +291,7 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
             ? Promise.resolve([{ sourceKey: "google", sourceLabel: label, visitCount: 4, producerViews: 0, topProducers: [], otherProducerCount: 0 }])
             : Promise.reject(new Error("worker down"));
         },
-        now: Date.now,
+        now: () => clock,
         ttlMs: 0, // every read refreshes, so the HTML cache is what decides what is served
         maxStaleMs: 0,
         retryAfterMs: 0,
@@ -333,6 +338,7 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
       ok(again.status === 200 && again.body === up.body && reads === readsBefore,
         "R3: a second request within the TTL is served from the HTML cache, byte-identical, without touching the strip reader");
 
+      clock += 1; // the strip cached for R2 is now too old to serve, so R4 waits for the refresh
       const mcp = await get("/samtaler?kilde=mcp");
       const mcp2 = await get("/samtaler?kilde=mcp");
       ok(mcp.status === 200 && mcp.body.includes("Endret") && mcp.body !== up.body && mcp2.body === mcp.body,
