@@ -26759,12 +26759,16 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Env hygiene: `process.env.X = prev` with prev undefined stores the STRING
-  // "undefined", and the next db-factory open then creates ./undefined
-  // (+ -shm/-wal) in the repo root. Restore with
+  // "undefined", which is truthy — the next db-factory open then creates
+  // ./undefined (+ -shm/-wal) in the repo root, and any `if (!process.env.X)`
+  // gate (e.g. ANTHROPIC_API_KEY) believes X is configured for the rest of this
+  // single-process suite. Restore with
   // `if (prev === undefined) delete process.env.X; else process.env.X = prev;`.
-  for (const k of ["DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH"]) {
-    assertTrue(process.env[k] !== "undefined", `env-hygiene: process.env.${k} is not the string "undefined" after the suite`);
-  }
+  const undefinedStringEnvKeys = Object.keys(process.env).filter((k) => process.env[k] === "undefined").sort();
+  assertTrue(
+    undefinedStringEnvKeys.length === 0,
+    `env-hygiene: no process.env value is the string "undefined" after the suite (offending: ${undefinedStringEnvKeys.join(", ") || "none"})`,
+  );
   for (const f of ["undefined", "undefined-wal", "undefined-shm"]) {
     let createdThisRun = false;
     try { createdThisRun = fs2.statSync(f).mtimeMs >= _suiteStartedAtMs; } catch { /* absent */ }
