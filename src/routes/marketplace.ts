@@ -11,6 +11,7 @@ import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { normalizeBmEventTime } from "../utils/bm-event-time";
 import { publicListableSql } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
@@ -6233,8 +6234,8 @@ router.get("/bm-events", (req: Request, res: Response) => {
         type: r.venue_type,
       },
       location_text: r.location_text,
-      start_at: r.start_at,
-      end_at: r.end_at,
+      start_at: normalizeBmEventTime(r.start_at),
+      end_at: normalizeBmEventTime(r.end_at),
       source_url: r.source_url,
     }));
 

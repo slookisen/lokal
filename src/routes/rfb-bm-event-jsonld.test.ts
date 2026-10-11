@@ -179,8 +179,8 @@ export async function runBmEventJsonLdTests(opts: { log?: boolean } = {}): Promi
       assertTrue(!!ev, "with-event: an Event entry is present");
 
       assertTrue(!!ev && ev.name === "Julemarked på Torget", "with-event: Event.name matches the seeded event_name");
-      assertTrue(!!ev && ev.startDate === FUTURE_START, "with-event: Event.startDate matches the seeded start_at");
-      assertTrue(!!ev && ev.endDate === FUTURE_END, "with-event: Event.endDate matches the seeded end_at");
+      assertTrue(!!ev && ev.startDate === "2026-12-01T10:00:00.000+01:00", "with-event: Event.startDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
+      assertTrue(!!ev && ev.endDate === "2026-12-01T14:00:00.000+01:00", "with-event: Event.endDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
       assertTrue(!!ev && ev.url === "https://bondensmarked.no/marked/torget-2026-12-01", "with-event: Event.url matches the seeded source_url");
       assertTrue(!!ev && typeof ev.location === "object" && ev.location !== null, "with-event: Event.location object is present");
       assertTrue(!!ev && ev.location["@type"] === "Place", "with-event: Event.location.@type is Place");
