@@ -64,8 +64,13 @@
  *       run gets cap − k (cap − k − 1 if it died inside an LLM row), and the
  *       night still gets one envelope (run_started_without_envelope)
  *   (x) no no-run envelope while a manual run is in flight
- *   (y) Brreg-outage / host-cooldown outcomes are not stamped; a 4xx / 503
- *       from an in-process route stops the step for the night
+ *   (y) a host-cooldown outcome is not stamped (a lone Brreg fetch failure
+ *       is, see z); a 4xx / 503 from an in-process route stops the step
+ *   (z) B1: a judge call that lands AFTER a 504 is still counted (the
+ *       reservation is never settled away), so a forced run cannot push the
+ *       night past the cap; R3-NB1: a single Brreg contact-fetch failure (a
+ *       404-type org_nr) is stamped, three in a row stop the step
+ *       (brreg_unavailable) and park nobody
  *   (q) the BM step ALWAYS asks the route for fill_only=1 and scopes it to
  *       the cohort: through the real in-process route a stored e-mail/phone
  *       is never replaced, a blank one is filled, and a matched producer
@@ -1193,14 +1198,16 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
           }),
         },
       });
-      const stamped = db.prepare(`SELECT agent_id, step, last_outcome FROM rfb_enrichment_nightly_attempts ORDER BY agent_id`).all();
+      const stamped = db.prepare(`SELECT agent_id, step, last_outcome FROM rfb_enrichment_nightly_attempts ORDER BY agent_id, step`).all();
       assertEq(
         stamped,
         [
+          { agent_id: "y0", step: "brreg_contact", last_outcome: "brreg_contact_fetch_failed" },
+          { agent_id: "y1", step: "brreg_contact", last_outcome: "brreg_contact_fetch_failed" },
           { agent_id: "y1", step: "contact_extraction", last_outcome: "fetch_failed" },
           { agent_id: "y2", step: "contact_extraction", last_outcome: "no_contact_found" },
         ],
-        "y1 (NB3): brreg_contact_fetch_failed and cooldown_skipped are not stamped; fetch_failed / no_contact_found are",
+        "y1: cooldown_skipped is not stamped; fetch_failed / no_contact_found are; two Brreg fetch failures (< 3 in a row) are real outcomes and stamped (R3-NB1)",
       );
       assertEq(
         [400, 403, 404, 500, 503, 504].map((st) => {
@@ -1234,6 +1241,102 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       }
       const b = r.steps.find((x) => x.step === "brreg_contact")!;
       assertEq([b.selected, b.attempted, b.stopped_reason, b.outcomes, count("rfb_enrichment_nightly_attempts")], [3, 1, "http_503", { http_503: 1 }, 0], "y3 (NB5): a step-wide 503 stops the Brreg step after one row, nothing stamped");
+    });
+
+    // ── (z) B1 + R3-NB1 ──────────────────────────────────────────────────
+    await withDb("z", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_LLM_CAP: "3", RFB_ENRICHMENT_CAP_BRREG: "5" });
+      for (let i = 0; i < 8; i++) seedGeneric(`z${i}`);
+      const calls: Call[] = [];
+      let realCalls = 0;
+      const realCall = () => {
+        realCalls++;
+        meterMod.noteLlmCall("contact-candidate-judge");
+      };
+      let rowNo = 0;
+      let lateLanded!: () => void;
+      const late = new Promise<void>((resolve) => { lateLanded = resolve; });
+      const timesOut = async (row: { id: string }) => {
+        calls.push({ step: "brreg_contact", id: row.id, at: "" });
+        rowNo++;
+        if (rowNo === 1) {
+          realCall();
+          return { outcome: "email_rejected_by_gate", written: false, changed: false };
+        }
+        // Row 2: the in-process call gives up (504) while the route goes on
+        // and makes its judge call 30 ms later — in the same meter scope.
+        setTimeout(() => {
+          realCall();
+          lateLanded();
+        }, 30);
+        return job.rfbEnrichmentHttpFailureOutcome(504);
+      };
+      const at = (hhmm: string) => new Date(`2026-10-12T${hhmm}:00Z`);
+      const r1 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: at("00:05"), deps: { executors: stubExecutors(calls, realClock, { brregContact: timesOut }) } });
+      await late;
+      assertEq([r1.steps.find((x) => x.step === "brreg_contact")?.stopped_reason, realCalls], ["route_timeout", 2], "z1 (B1): run 1 stopped on the 504; the abandoned call still spent one more (real spend 2)");
+      assertEq(job.readRfbEnrichmentLlmSpentTonight(db, at("00:05")) >= realCalls, true, "z1 (B1): the night's counted spend is never below the real spend");
+      const judging = async (row: { id: string }) => {
+        calls.push({ step: "brreg_contact", id: row.id, at: "" });
+        realCall();
+        return { outcome: "email_rejected_by_gate", written: false, changed: false };
+      };
+      const r2 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", force: true, now: at("00:40"), deps: { executors: stubExecutors(calls, realClock, { brregContact: judging }) } });
+      assertEq([r2.llm.used_before_this_run, r2.llm.run_budget], [2, 1], "z2 (B1): the forced run's budget is cap − 2, not cap − 1");
+      assertTrue(realCalls <= 3, `z2 (B1): the night's REAL calls stay within the cap (real=${realCalls}, cap=3)`);
+      assertEq(
+        [job.settledLlmCalls("route_timeout", "route_timeout", 1, 0), job.settledLlmCalls("http_500", undefined, 1, 0), job.settledLlmCalls("email_written", undefined, 1, 1)],
+        [1, 0, 1],
+        "z3 (B1): a timed-out row is never settled below its reservation; other rows settle to the real count",
+      );
+
+      // R3-NB1: one 404-type contact-fetch failure is a real outcome (stamped).
+      db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
+      const night2 = (hhmm: string) => new Date(`2026-10-13T${hhmm}:00Z`);
+      const seqA = ["brreg_contact_fetch_failed", "website_proposed", "brreg_contact_fetch_failed", "brreg_contact_fetch_failed"];
+      let ai = 0;
+      calls.length = 0;
+      const outA = async (row: { id: string }) => {
+        calls.push({ step: "brreg_contact", id: row.id, at: "" });
+        const o = seqA[ai++];
+        return { outcome: o, written: o === "website_proposed", changed: false };
+      };
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_BRREG: "4" });
+      const ra = await job.runRfbEnrichmentNightly({ apply: true, trigger: "cron", now: night2("00:05"), deps: { executors: stubExecutors(calls, realClock, { brregContact: outA }) } });
+      const stampedA = db.prepare(`SELECT agent_id, last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'brreg_contact' ORDER BY agent_id`).all();
+      assertEq(
+        stampedA,
+        [
+          { agent_id: "z0", last_outcome: "brreg_contact_fetch_failed" },
+          { agent_id: "z1", last_outcome: "website_proposed" },
+          { agent_id: "z2", last_outcome: "brreg_contact_fetch_failed" },
+          { agent_id: "z3", last_outcome: "brreg_contact_fetch_failed" },
+        ],
+        "z4 (R3-NB1): a single (or two-in-a-row) Brreg contact-fetch failure is stamped — normal 14-day backoff",
+      );
+      assertEq(ra.steps.find((x) => x.step === "brreg_contact")?.stopped_reason, null, "z4: and does not stop the step");
+
+      // Three in a row = outage: stop, nothing after them, none of the three parked.
+      db.prepare(`DELETE FROM rfb_enrichment_nightly_attempts`).run();
+      calls.length = 0;
+      const night3 = new Date("2026-10-14T00:05:00Z");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_BRREG: "6" });
+      const rb = await job.runRfbEnrichmentNightly({
+        apply: true,
+        trigger: "cron",
+        now: night3,
+        deps: {
+          executors: stubExecutors(calls, realClock, {
+            brregContact: async (row: { id: string }) => {
+              calls.push({ step: "brreg_contact", id: row.id, at: "" });
+              return { outcome: "brreg_contact_fetch_failed", written: false, changed: false };
+            },
+          }),
+        },
+      });
+      const bs = rb.steps.find((x) => x.step === "brreg_contact")!;
+      assertEq([bs.selected, calls.length, bs.attempted, bs.stopped_reason], [6, 3, 3, "brreg_unavailable"], "z5 (R3-NB1): three consecutive fetch failures stop the Brreg step; nothing after them runs");
+      assertEq(count("rfb_enrichment_nightly_attempts"), 0, "z5: and none of the three is parked");
     });
   } catch (err) {
     failed++;

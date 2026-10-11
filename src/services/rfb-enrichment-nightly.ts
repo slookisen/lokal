@@ -208,6 +208,10 @@ export const RFB_ENRICHMENT_ROUTE_CALL_TIMEOUT_MS = 5 * 60_000;
 export const RFB_ENRICHMENT_BM_MIN_REMAINING_MS = 3 * 60_000;
 /** Cursor key in rfb_enrichment_sweep_state. */
 export const RFB_ENRICHMENT_BM_CURSOR = "bm_producer_harvest";
+/** The Brreg step's "contact fetch returned nothing" outcome (a 404/410 or an outage). */
+export const RFB_ENRICHMENT_BRREG_FETCH_FAILED = "brreg_contact_fetch_failed";
+/** That many in a row = Brreg is down: stop the step for the night, park nobody. */
+export const RFB_ENRICHMENT_BRREG_OUTAGE_STREAK = 3;
 /** Queue `reason` for step 2's candidates (approval reads confidence, not reason). */
 export const RFB_ENRICHMENT_EMAIL_DOMAIN_QUEUE_REASON = "email_domain_candidate";
 
@@ -451,8 +455,11 @@ export function readRfbEnrichmentLlmCallsTonight(db: Db, now: Date): number {
  * `llm_calls_night:<night>`, whose next_offset column holds the night's
  * count. Before every LLM-capable row starts, the row's worst case is added
  * (a reservation); when it finishes, the difference to the calls it really
- * made is settled. So at any instant — including the moment a process dies —
- * the counter is >= the calls actually spent tonight.
+ * made is settled — never below the reservation for a row whose route call
+ * timed out (504), whose judge call may still land later. So at any instant —
+ * including the moment a process dies — the counter is >= the calls actually
+ * spent tonight. One caveat: a late call after a 504 that lands after 08:00Z
+ * is counted on the night the run started in.
  */
 export function rfbEnrichmentLlmCounterKey(now: Date): string {
   return `llm_calls_night:${rfbEnrichmentNightKey(now)}`;
@@ -1277,6 +1284,18 @@ export function callAdminRouterInProcess(
 
 // ─── Step executors (the seams tests replace) ──────────────────────────────
 
+/**
+ * What a finished row's LLM reservation is settled to (B1): the calls the
+ * meter saw — except after a 504 / route_timeout, where the abandoned route
+ * call may still make its judge call after we moved on. Then the row keeps at
+ * least its reservation, so the durable counter never drops below the real
+ * spend.
+ */
+export function settledLlmCalls(outcome: string, stop: string | undefined, reserved: number, actual: number): number {
+  const timedOut = outcome === "route_timeout" || stop === "route_timeout";
+  return timedOut ? Math.max(reserved, actual) : actual;
+}
+
 /** Outcomes that say nothing about the row itself — never stamped as an attempt. */
 const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
   "route_timeout",
@@ -1287,8 +1306,10 @@ const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
   "error",
   "no_result",
   "skipped_refresh_budget",
-  // Brreg outage / null contact fetch — says nothing about the producer (NB3).
-  "brreg_contact_fetch_failed",
+  // NB: brreg_contact_fetch_failed is NOT here — fetchBrregContact also
+  // returns null on a 404/410 (wrong, deleted or sub-unit org_nr), a real
+  // per-row outcome. An outage is caught by the step instead: three in a row
+  // stop the Brreg step for the night (brreg_unavailable), unstamped.
   // contact extraction: the host is in a temporary 429 cooldown (NB3).
   // (`fetch_failed` stays a real outcome: the site may really be dead.)
   "cooldown_skipped",
@@ -2056,7 +2077,11 @@ async function runSteps(rc: RunContext): Promise<void> {
       return null;
     }
   };
-  /** After the row: replace the reservation by the calls it really made. */
+  /**
+   * After the row: replace the reservation by the calls it really made — but
+   * a timed-out row keeps at least its reservation (settledLlmCalls), because
+   * the abandoned call may still spend it later.
+   */
   const settleLlm = (reserved: number, actual: number): void => {
     if (reserved <= 0 && actual <= 0) return;
     if (actual === reserved) return;
@@ -2122,6 +2147,15 @@ async function runSteps(rc: RunContext): Promise<void> {
       };
     }
     const perRowLlm = rfbEnrichmentLlmCallsPerRowMax(step);
+    // Brreg outage guard (R3-NB1): consecutive brreg_contact_fetch_failed rows
+    // are held back unstamped; a different outcome (or the end of the step)
+    // stamps them as the real per-row outcomes they were, while the third in
+    // a row stops the step for the night and leaves all three unstamped.
+    const pendingFetchFailed: Array<{ id: string; outcome: string }> = [];
+    const flushPending = () => {
+      for (const p of pendingFetchFailed) stampAttempt(db, p.id, step, clock(), p.outcome, report.run_id);
+      pendingFetchFailed.length = 0;
+    };
     for (const row of sel.rows) {
       await yieldToEventLoop();
       const stop = stopBefore(step, perRowLlm);
@@ -2141,8 +2175,20 @@ async function runSteps(rc: RunContext): Promise<void> {
       } catch (err) {
         out = { outcome: "error", written: false, changed: false, error: true, detail: errMessage(err) };
       }
-      settleLlm(reserved, meter.calls - callsBefore);
+      // A route call that timed out (504) may still be working, and its judge
+      // call can land AFTER this point (B1): keep at least the reservation.
+      settleLlm(reserved, settledLlmCalls(out.outcome, out.stop, reserved, meter.calls - callsBefore));
       tally(sr, row.id, out);
+      if (step === "brreg_contact" && out.outcome === RFB_ENRICHMENT_BRREG_FETCH_FAILED) {
+        pendingFetchFailed.push({ id: row.id, outcome: out.outcome });
+        if (pendingFetchFailed.length >= RFB_ENRICHMENT_BRREG_OUTAGE_STREAK) {
+          pendingFetchFailed.length = 0; // an outage parks nobody
+          sr.stopped_reason = "brreg_unavailable";
+          break;
+        }
+        continue;
+      }
+      flushPending();
       // Only a real per-row outcome enters the rotation memory; a transient
       // one (timeout, 5xx, error, write-pause, missing admin key, the tool's
       // own run-lock) is retried tomorrow, not parked for the retry window.
@@ -2156,6 +2202,7 @@ async function runSteps(rc: RunContext): Promise<void> {
         break;
       }
     }
+    flushPending(); // fewer than three in a row: real per-row outcomes
     finishStep(sr, t0, llmBefore);
   };
 
@@ -2278,7 +2325,7 @@ async function runSteps(rc: RunContext): Promise<void> {
         } catch (err) {
           out = { outcome: "error", prior: null, next: null, error: true, detail: errMessage(err) };
         }
-        settleLlm(reserved, meter.calls - callsBefore);
+        settleLlm(reserved, settledLlmCalls(out.outcome, undefined, reserved, meter.calls - callsBefore));
         const after = isInPool(db, w.id);
         sr.attempted++;
         sr.outcomes[out.outcome] = (sr.outcomes[out.outcome] ?? 0) + 1;
