@@ -32488,6 +32488,15 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of off1.failures) failures.push("offsite-backup: " + f);
     console.log(`  offsite-backup: ${off1.passed} passed, ${off1.failed} failed`);
 
+    console.log("\n── name-search-fts: FTS5 trigram prefilter, parity with full scan, triggers, fallback ──");
+    const { runNameSearchFtsTests } = require("../src/services/name-search-fts.test") as
+      typeof import("../src/services/name-search-fts.test");
+    const nfts = runNameSearchFtsTests({ log: false });
+    passed += nfts.passed;
+    failed += nfts.failed;
+    for (const f of nfts.failures) failures.push("name-search-fts: " + f);
+    console.log(`  name-search-fts: ${nfts.passed} passed, ${nfts.failed} failed`);
+
     console.log("\n── health-write-probe: cached write-path probe for /health ──");
     const { runHealthWriteProbeTests } = require("../src/services/health-write-probe.test") as
       typeof import("../src/services/health-write-probe.test");

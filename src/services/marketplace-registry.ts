@@ -37,6 +37,15 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
 import { publicListableSql, isPubliclyListable } from "./agent-visibility";
+// S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
+// name search. PURE (type-only import), same isolation rule as above.
+import {
+  NAME_FTS_TABLE,
+  isNameFtsUsable,
+  nameFtsAllWordsMatch,
+  nameFtsAnyWordMatch,
+  noteNameFtsQueryFailure,
+} from "./name-search-fts";
 import { safeHonestCatalogCount } from "./honest-count";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
@@ -217,17 +226,42 @@ class MarketplaceRegistry {
     // matching in JavaScript instead of SQL to handle Norwegian characters (ø,å,æ).
     const nameQuery = (query as any)._nameQuery as string | undefined;
     if (nameQuery && nameQuery.length >= 3) {
-      // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
+      // Fetch the active agents and filter by name in JS (case-insensitive for Unicode)
       // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
       // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
       // self-registered, not-yet-vetted row (is_vetted = 0) must not surface
       // on any public discovery surface, including this name-match path.
       // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: nor may
       // a catalog_hidden fixture or a non-RFB-vertical row (agent-visibility.ts).
-      const allRows = db.prepare(`SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[];
+      const publicNameSql = `is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
+      // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: the full scan used
+      // to have no ORDER BY; its plan (SCAN … USING INDEX idx_agents_geo) returned
+      // rows in (lat, lng, rowid) order, and the stable sorts below keep that order
+      // for ties. It is written out so the FTS path returns the same order (the
+      // plan is unchanged: the index still supplies it, no extra sort).
+      const nameOrderSql = "ORDER BY lat, lng, rowid";
+      let scanRows: any[] | null = null;
+      const fullScan = (): any[] =>
+        (scanRows ??= db.prepare(`SELECT * FROM agents WHERE ${publicNameSql} ${nameOrderSql}`).all() as any[]);
+      // Only rows whose name the FTS index (services/name-search-fts.ts) says
+      // can match — a superset of what the JS filters below keep. Null → full scan.
+      const ftsRows = (match: string | null): any[] | null => {
+        if (!match || !isNameFtsUsable(db)) return null;
+        try {
+          return db.prepare(
+            `SELECT * FROM agents WHERE id IN (SELECT agent_id FROM ${NAME_FTS_TABLE} WHERE ${NAME_FTS_TABLE} MATCH ?) ` +
+            `AND ${publicNameSql} ${nameOrderSql}`,
+          ).all(match) as any[];
+        } catch (err) {
+          noteNameFtsQueryFailure(err);
+          return null;
+        }
+      };
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
-      console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
+      const strictFts = ftsRows(nameFtsAllWordsMatch(nameWords));
+      const allRows = strictFts ?? fullScan();
+      console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, ${strictFts ? "ftsCandidates" : "totalAgents"}=${allRows.length}`);
 
       const nameRows = allRows.filter(row => {
         const agentName = (row.name || "").toLowerCase();
@@ -276,7 +310,10 @@ class MarketplaceRegistry {
       const distinctiveWords = nameWords.filter(w =>
         !GENERIC_NAME_TOKENS.has(w) && !KNOWN_PLACE_WORDS.has(w) && w.length >= 3);
       if (distinctiveWords.length > 0) {
-        const fuzzyRows = allRows
+        // Same pool as before: every public row (a full scan already loaded is
+        // reused), or the FTS rows whose name has at least one distinctive word.
+        const fuzzyPool = scanRows ?? ftsRows(nameFtsAnyWordMatch(distinctiveWords)) ?? fullScan();
+        const fuzzyRows = fuzzyPool
           .map(row => {
             const agentName = (row.name || "").toLowerCase();
             const matchedCount = distinctiveWords.filter(w => agentName.includes(w)).length;

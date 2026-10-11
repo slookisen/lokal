@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 import { publicListableSql } from "../services/agent-visibility";
+import { ensureAgentsNameFts } from "../services/name-search-fts";
 
 // ─── Database Initialization ─────────────────────────────────
 // SQLite is the right call for phase 1-3:
@@ -5328,6 +5329,19 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_day_status ON rfb_marketing_send_ledger(day, status)`);
   } catch (err) {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
+  }
+
+  // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
+  // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
+  // populated here only when empty or out of step with agents (one INSERT …
+  // SELECT; measured ~12 ms for 2,000 rows, ~130 ms for 20,000, file DB with
+  // a cold page cache; otherwise two COUNT(*)s, < 1 ms at 2,000 rows).
+  // Last in initSchema so every agents column migration above has run first.
+  // Never throws; without FTS5 the name search keeps using the full scan.
+  try {
+    ensureAgentsNameFts(db);
+  } catch (err) {
+    console.error("Migration agents_name_fts failed:", err);
   }
 }
 
