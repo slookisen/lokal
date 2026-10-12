@@ -33063,10 +33063,11 @@ export function buildExperienceDescriptionFacts(
   const band = (row.price_band ?? "").trim();
   const bandIsFact = band !== "" && band !== "ukjent";
   if (row.price_from || bandIsFact) {
-    const unit = row.price_unit === "per_person" ? " per person"
+    const unit = row.price_unit === "per_adult" ? " per voksen"
+      : row.price_unit === "per_person" ? " per person"
       : row.price_unit === "per_group" ? " per gruppe" : "";
     const pr = row.price_from
-      ? `fra ${row.price_from} kroner${unit}`
+      ? `${row.price_unit === "per_adult" ? "" : "fra "}${row.price_from} kroner${unit}`
       : (EXP_DESC_PRICE_BAND_LABELS[band] || band);
     facts.push(["Pris", pr]);
   }
@@ -34522,8 +34523,17 @@ router.get("/admin/experiences-description-candidates", requireAdmin, (req: Requ
   // The SAME queue as the 4c route (no `ids` -> cooldown applies). Pure
   // read: no fetch, no LLM, no write.
   const { eligibleRows, queueCounts } = selectExperienceDescriptionQueue(db, null);
-
-  const items = eligibleRows.slice(0, limit).map((row) => {
+  // Target one already eligible row without changing candidate, owner,
+  // publication or cooldown gates. Filtering before the page limit lets an
+  // administrator inspect a specific correction anywhere in the queue.
+  const rawId = (req.query as Record<string, unknown> | undefined)?.id;
+  if (rawId !== undefined && (typeof rawId !== "string" || !rawId.trim())) {
+    res.status(400).json({ error: "id must be a non-empty string" });
+    return;
+  }
+  const selectedRows = typeof rawId === "string"
+    ? eligibleRows.filter((row) => row.id === rawId.trim()) : eligibleRows;
+  const items = selectedRows.slice(0, limit).map((row) => {
     // eligibleRows never contains a `skip`-tier row (thin-data precheck).
     const level = selectExperienceDescriptionTier(row).level as "kildetro" | "faktalinje";
     const factsBlock = renderExperienceDescriptionFactsBlock(row, buildExperienceDescriptionFacts(row));
@@ -34965,6 +34975,7 @@ export const EXP_DATA_CORRECTION_FIELDS = [
   "season",
   "duration",
   "price_from",
+  "price_unit",
   "homepage_url",
   "provider",
   "source_page_url",
@@ -34985,7 +34996,7 @@ const EXP_DC_REVERT_MAX_IDS = 500;
 /** Fields an item may `clear` (set to NULL). The rest are either NOT NULL
  *  (title), structural (provider) or location fields a page should never
  *  lose outright. */
-const EXP_DC_CLEARABLE_FIELDS: ReadonlySet<string> = new Set(["season", "duration", "price_from", "homepage_url", "source_page_url"]);
+const EXP_DC_CLEARABLE_FIELDS: ReadonlySet<string> = new Set(["season", "duration", "price_from", "price_unit", "homepage_url", "source_page_url"]);
 /** Fields whose OLD value is looked for in the row's description text
  *  (warning `description_mentions_old_value`). */
 const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "kommune", "price_from", "provider"]);
@@ -34993,7 +35004,7 @@ const EXP_DC_DESCRIPTION_CHECK_FIELDS: ReadonlySet<string> = new Set(["title", "
  *  below is checked against these lists first. */
 const EXP_DC_EXPERIENCE_COLUMNS: ReadonlySet<string> = new Set([
   "kommune", "fylke", "title", "title_no", "season", "duration_min", "duration_max",
-  "price_from", "provider_id", "provider_match_status", "content_field_evidence", "source_page_url",
+  "price_from", "price_unit", "provider_id", "provider_match_status", "content_field_evidence", "source_page_url",
   "catalog_hidden", "hidden_reason", "hidden_at",
 ]);
 const EXP_DC_PROVIDER_COLUMNS: ReadonlySet<string> = new Set(["hjemmeside", "field_provenance"]);
@@ -35309,6 +35320,8 @@ function expDcCurrentForms(field: ExpDataCorrectionField, row: ExpDcRow): string
       if (row.price_from) forms.push(`fra ${row.price_from} kroner`);
       return forms;
     }
+    case "price_unit":
+      return [row.price_unit ?? ""];
     case "homepage_url":
       return [row.provider_hjemmeside ?? ""];
     case "source_page_url":
@@ -35462,6 +35475,7 @@ const EXP_DC_EVIDENCE_KEYS: Record<string, string[]> = {
   season: ["season"],
   duration: ["duration_min", "duration_max"],
   price_from: ["price_from"],
+  price_unit: ["price_unit"],
   provider: ["provider_id"],
   source_page_url: ["source_page_url"],
   visibility: ["catalog_hidden"],
@@ -35781,6 +35795,16 @@ export async function applyExperienceDataCorrections(
           }
           if (row.price_from === p) { rejected = { reason: "no_op" }; break; }
           expWrites.push(["price_from", p]);
+          break;
+        }
+        case "price_unit": {
+          const unit = it.action === "clear" ? null : nv;
+          if (it.action !== "clear" && (typeof unit !== "string" || !["per_person", "per_group", "per_adult"].includes(unit))) {
+            rejected = { reason: "invalid_value", detail: "price_unit must be per_person, per_group or per_adult" };
+            break;
+          }
+          if ((row.price_unit ?? null) === unit) { rejected = { reason: "no_op" }; break; }
+          expWrites.push(["price_unit", unit]);
           break;
         }
         case "homepage_url": {

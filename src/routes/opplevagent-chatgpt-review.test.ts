@@ -82,12 +82,12 @@ export const OPPLEVAGENT_EXPECTED_ANNOTATIONS: Record<string, { readOnlyHint: bo
  * the way ChatGPT does: `window.openai` exists but `toolOutput` is not set
  * yet; it arrives later together with an `openai:set_globals` event.
  */
-function runWidget(html: string, lateToolOutput: unknown): { before: string; after: string } {
+function runWidget(html: string, lateToolOutput: unknown, locale = "en-US"): { before: string; after: string } {
   const script = html.slice(html.indexOf("<script>") + "<script>".length, html.lastIndexOf("</script>"));
   const listeners: Record<string, Array<() => void>> = {};
   const root = { innerHTML: "", addEventListener: () => {} };
   const fakeWindow: any = {
-    openai: { theme: "light", locale: "en-US", toolOutput: null },
+    openai: { theme: "light", locale, toolOutput: null },
     addEventListener: (type: string, fn: () => void) => { (listeners[type] ||= []).push(fn); },
     open: () => {},
   };
@@ -302,6 +302,11 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         return (JSON.parse(r.result?.content?.[0]?.text ?? "{}").gardssalg_producers ?? []).map((p: any) => p.navn).sort();
       };
       assertEq(await gsNames({ fylke: "Vestland" }), ["Fjellbryggeriet"], "g1: fylke 'Vestland' returns the Vestland producer only");
+      const gsPresentation = JSON.parse((await rpc("tools/call", { name: "discover_gardssalg", arguments: { fylke: "Vestland" } })).result?.content?.[0]?.text ?? "{}");
+      assertTrue(gsPresentation.presentation_note.includes("profile_url") && gsPresentation.presentation_note.includes("no reservation has been sent"),
+        "farm-profile: response explains clickable links and paused booking");
+      assertTrue(gsPresentation.gardssalg_producers.every((p: any) => p.profile_url === null || p.profile_url.startsWith("https://opplevagent.no/kategori/gardssalg/produsent/")),
+        "farm-profile: guidance uses actual available profile URLs");
       assertEq(await gsNames({ fylke: "vestland" }), ["Fjellbryggeriet"], "g2: fylke 'vestland' (lower case) matches too");
       assertEq(await gsNames({ fylke: "Hordaland" }), ["Fjellbryggeriet"], "g3: the pre-2020 county 'Hordaland' maps to Vestland");
       assertEq(await gsNames({ kommune: "bergen" }), ["Fjellbryggeriet"], "g4: kommune 'bergen' (lower case) matches 'Bergen'");
@@ -382,6 +387,13 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       assertTrue(/No experiences matched/.test(emptyRun.after), "a9: an empty result says so explicitly");
       const detailRun = runWidget(EXPERIENCE_DETAIL_HTML, detail.result?.structuredContent);
       assertTrue(detailRun.after.includes(detail.result?.structuredContent?.title), "a10: detail widget renders the experience title once toolOutput arrives");
+      for (const [locale, label] of [["en-US", "Adult price NOK 990"], ["nb-NO", "Voksenpris 990 kr"]]) {
+        const adult = { title: "Nordlyscruise", price_from: 990, price_unit: "per_adult", duration_min: 240, slug: "nordlys" };
+        assertTrue(runWidget(EXPERIENCES_LIST_HTML, { experiences: [adult] }, locale).after.includes(label), "adult-widget: list price labels adult basis");
+        assertTrue(runWidget(EXPERIENCE_DETAIL_HTML, adult, locale).after.includes(label), "adult-widget: detail price labels adult basis");
+      }
+      const unknownUnit = runWidget(EXPERIENCE_DETAIL_HTML, { title: "Tur", price_from: 990, price_unit: "unknown" }).after;
+      assertTrue(unknownUnit.includes("from NOK 990") && !unknownUnit.includes("Adult price"), "adult-widget: unknown unit retains existing fallback");
 
       // A food-shopping request must not become nationwide experience cards.
       for (const args of [

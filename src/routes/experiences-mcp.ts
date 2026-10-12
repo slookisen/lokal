@@ -399,6 +399,7 @@ export const OPPLEVAGENT_MCP_INSTRUCTIONS =
   "Food-product shopping, such as buying stockfish, is outside the scope of experience discovery. " +
   "If discovery returns out_of_scope, explain that limit and do not retry without the purchase request. " +
   "Food tours, tastings, museums and experience tickets remain supported. " +
+  "When price_unit is per_adult, describe price_from as the adult price, not the lowest price for all ages. " +
   "Opplevagent never takes payment: experiences are booked and paid with the provider, and a gårdssalg visit is " +
   "paid on arrival. It cannot confirm a booking: book_gardssalg sends a visit request that stays pending until " +
   "the producer answers by e-mail.";
@@ -1055,8 +1056,9 @@ export function registerExperienceTools(
         "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
         "rounded distance_km and are sorted nearest-first, and rows with no geocoded location are excluded " +
         "(never a fabricated distance). Returns id (the provider_id for book_gardssalg), name, location, producer " +
-        "type, and an honest booking status " +
+        "type, profile_url, and an honest booking status " +
         "(live direct booking vs. a dark-launch 'coming soon' note — never overclaims booking availability). " +
+        "Include each returned producer's profile_url as a clickable link when available; when booking is paused, tell the user to contact the producer via that profile page. " +
         "To look up ONE specific producer by name (e.g. when the guest says 'book hos Fjordgard Bryggeri'), " +
         "pass `query`. " +
         "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking', " +
@@ -1146,6 +1148,7 @@ export function registerExperienceTools(
           count: results.length,
           filter_applied: filter,
           gardssalg_producers: formatted,
+          presentation_note: "Include each available profile_url as a clickable producer link. When booking.mode is paused, direct contact is via the profile page; no reservation has been sent.",
         };
 
         try {

@@ -3336,9 +3336,10 @@ function renderOpplevelseDetail(
     facts.push([L.fGroup, escapeHtml(g)]);
   }
   if (exp.price_from || exp.price_band) {
-    const unit = exp.price_unit === "per_person" ? L.perPerson : exp.price_unit === "per_group" ? L.perGroup : "";
+    const unit = exp.price_unit === "per_adult" ? (lang === "en" ? " per adult" : lang === "sv" ? " per vuxen" : " per voksen")
+      : exp.price_unit === "per_person" ? L.perPerson : exp.price_unit === "per_group" ? L.perGroup : "";
     const pr = exp.price_from
-      ? `${L.from} ${exp.price_from} ${L.kr}${unit}`
+      ? `${exp.price_unit === "per_adult" ? "" : L.from + " "}${exp.price_from} ${L.kr}${unit}`
       : (PRICE_BAND_LABELS[String(exp.price_band)] || String(exp.price_band));
     facts.push([L.fPrice, escapeHtml(pr)]);
   }
@@ -3480,6 +3481,7 @@ function renderOpplevelseDetail(
       priceCurrency: "NOK",
       availability: "https://schema.org/InStock",
     };
+    if (exp.price_unit === "per_adult") offer.name = "Adult price";
     if (bookingUrl || provSite) offer.url = bookingUrl || provSite;
     ld.offers = offer;
   }
@@ -4233,7 +4235,7 @@ function renderCard(
   const tags: string[] = [];
   if (row.category) tags.push(`<span class="tag tag-cat" style="background:${cardColor};border-color:${cardColor}">${escapeHtml(catLabel(row.category))}</span>`);
   if (row.indoor_outdoor) tags.push(`<span class="tag">${escapeHtml(ioLabel(row.indoor_outdoor))}</span>`);
-  if (row.price_from) tags.push(`<span class="tag">fra ${row.price_from} kr</span>`);
+  if (row.price_from) tags.push(`<span class="tag">${row.price_unit === "per_adult" ? "Voksenpris " : "fra "}${row.price_from} kr</span>`);
   else if (row.price_band && PRICE_BAND_LABELS[row.price_band]) tags.push(`<span class="tag">${escapeHtml(PRICE_BAND_LABELS[row.price_band] as string)}</span>`);
   // dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4: badges on
   // cards for the derived cross-cutting filter tags. "gratis"/"under-300"

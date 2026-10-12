@@ -148,6 +148,18 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       }
 
       const seoRouter = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
+      {
+        db.prepare("UPDATE experiences SET price_from = 990, price_unit = 'per_adult' WHERE id = ?").run(expIds[0]);
+        const adult = await callHtmlRoute(seoRouter, "/opplevelse/vm-exp-0");
+        assertTrue(adult.status === 200 && adult.body.includes("990 kr per voksen"), "adult-seo: detail shows adult basis");
+        assertTrue(!adult.body.includes("fra 990 kr"), "adult-seo: adult price is not claimed as cheapest age price");
+        assertTrue(ldBlocks(adult.body).some((b) => b.offers?.price === 990 && b.offers?.name === "Adult price"), "adult-seo: structured offer labels adult basis");
+        const listing = await callHtmlRoute(seoRouter, "/kategori/mat_drikke");
+        assertTrue(listing.status === 200 && listing.body.includes("Voksenpris 990 kr"), "adult-seo: list card labels adult price");
+        db.prepare("UPDATE experiences SET price_unit = 'unknown' WHERE id = ?").run(expIds[0]);
+        const unknown = await callHtmlRoute(seoRouter, "/opplevelse/vm-exp-0");
+        assertTrue(unknown.body.includes("fra 990 kr") && !unknown.body.includes("per voksen"), "adult-seo: unknown basis keeps fallback");
+      }
 
       // ── AC1 + AC6: gårdssalg pages ──
       {
