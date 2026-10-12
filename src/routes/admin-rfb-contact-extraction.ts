@@ -238,7 +238,11 @@ interface RfbCxTargetRow {
 // (unlike the sibling's blank-website cohort), so an INNER JOIN and a LEFT
 // JOIN + `k.website IS NOT NULL` filter are behaviourally identical; INNER
 // JOIN is used to mirror the sibling file's literal join style exactly.
-function rfbCxSelectSql(extraWhere: string): string {
+// Exported (dev-request 2026-10-10-rfb-berikelse-nattjobb), together with
+// RFB_CX_ELIGIBLE_WHERE below, so the nightly enrichment job selects its
+// contact-extraction rows with this route's own cohort SQL instead of a copy
+// of it (services/rfb-enrichment-nightly.ts). Export-only change.
+export function rfbCxSelectSql(extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.contact_email AS contact_email, a.org_nr AS org_nr,
            a.claimed_at AS claimed_at,
@@ -255,7 +259,7 @@ function rfbCxSelectSql(extraWhere: string): string {
 // Fill-or-replace-if-flagged-dead: contact_email is blank, OR the DNS check
 // (admin-agents-contact-email-dns-check.ts) has stamped it dead. Read as a
 // cohort filter only — this route never writes contact_email_dns_check.
-const RFB_CX_ELIGIBLE_WHERE = `
+export const RFB_CX_ELIGIBLE_WHERE = `
   AND (
     TRIM(COALESCE(a.contact_email,'')) = ''
     OR json_extract(k.field_provenance,'$.contact_email_dns_check.live') = 0

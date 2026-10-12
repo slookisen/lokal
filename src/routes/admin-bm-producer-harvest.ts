@@ -12,6 +12,34 @@
 //                hard-capped at 400 regardless of what's requested.
 //     dry_run  — optional, default "true". The literal string "false" is
 //                the ONLY way to reach the apply-mode stub below.
+//     offset   — optional non-negative integer, default 0 (dev-request
+//                2026-10-10-rfb-berikelse-nattjobb, Daniel live 2026-10-11):
+//                skips that many slugs of the sitemap's slug list BEFORE
+//                `limit` is applied, in BOTH branches, and is echoed back as
+//                `offset` in the response. Without it every call started at
+//                the first slug, so the apply branch's 60 s time budget could
+//                never reach the tail of the ~354-slug catalog. Absent,
+//                negative or unparseable = 0 = the exact pre-offset window.
+//     fill_only — optional, "1"/"true" (same dev-request; after a manual apply
+//                run on 2026-10-11 overwrote 7 existing contact_email values
+//                and 2 phones in prod). Apply branch: agents.contact_email is
+//                written only when it is blank (else `skipped_not_empty`) and
+//                agent_knowledge.phone only when blank (else
+//                `phone_skipped_not_empty`) — re-checked inside the write
+//                transaction. The dry-run branch applies the same decision to
+//                its would-write counts. ABSENT = TODAY'S BEHAVIOUR, which
+//                still REPLACES a different non-blank value; whether the
+//                default should change is Daniel's decision. Echoed back as
+//                `fill_only` in both branches.
+//
+//   `dry_run`, `limit`, `offset` and `fill_only` may each appear at most once:
+//   a repeated (array-valued) or nested one is a 400, never a silent default.
+//
+//   Optional JSON body (in-process callers): `scope_agent_ids: string[]` — a
+//   matched agent outside this list is reported `skipped_out_of_scope` and
+//   nothing is written or queued for it (email, phone and url alike). The
+//   nightly enrichment job (services/rfb-enrichment-nightly.ts) passes its
+//   uncontacted cohort here. Absent = no restriction (today's behaviour).
 //
 // GET /admin/bm-producer-harvest?dry_run=false
 //
@@ -123,6 +151,39 @@ function requireAdmin(req: Request, res: Response): boolean {
 
 const HARD_CAP_SLUGS = 400;
 
+/**
+ * `?offset=` → a non-negative integer, default 0. Anything that is not a
+ * plain non-negative integer (absent, negative, "abc", "1.5") is 0, so a
+ * caller that does not send it gets the window it always got.
+ */
+export function parseBmHarvestOffset(raw: unknown): number {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw.trim())) return 0;
+  const n = parseInt(raw.trim(), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
+/** `?fill_only=` → true only for "1"/"true"; anything else (incl. absent) = today's overwrite behaviour. */
+export function parseBmHarvestFillOnly(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
+/**
+ * Body `scope_agent_ids` → a Set, or null (no restriction) when absent or not
+ * an array. An empty array is a real (empty) scope: nothing may be written.
+ */
+export function parseBmHarvestScope(body: unknown): Set<string> | null {
+  const raw = body && typeof body === "object" ? (body as Record<string, unknown>).scope_agent_ids : undefined;
+  if (!Array.isArray(raw)) return null;
+  return new Set(raw.filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim()));
+}
+
+/** Fill-only decision shared by both branches: a non-blank current value blocks the write. */
+function bmFillOnlyBlocks(fillOnly: boolean, current: string | null | undefined): boolean {
+  return fillOnly && (current ?? "").trim() !== "";
+}
+
 // ─── Apply-mode (slice 3) ───────────────────────────────────────────────────
 
 /** Default (20) stays deliberately far below HARD_CAP_SLUGS (400) — apply mode WRITES, dry-run only reads. */
@@ -186,6 +247,10 @@ type ApplyOutcome =
   | "rejected_platform_domain"
   | "unmatched"
   | "parse_failed"
+  // fill_only=1 and agents.contact_email already holds a different, non-blank value.
+  | "skipped_not_empty"
+  // scope_agent_ids given and the matched agent is not in it — nothing written.
+  | "skipped_out_of_scope"
   | "error";
 
 // ─── Phone outcomes (slice 4) ───────────────────────────────────────────────
@@ -200,7 +265,9 @@ type PhoneOutcome =
   | "phone_skipped_claimed"
   | "phone_skipped_curated"
   | "phone_skipped_unchanged"
-  | "phone_rejected_invalid";
+  | "phone_rejected_invalid"
+  // fill_only=1 and agent_knowledge.phone already holds a different, non-blank value.
+  | "phone_skipped_not_empty";
 
 // ─── URL outcomes (slice 5, QUEUE ONLY — see file header) ──────────────────
 // Additive, own vocabulary, same independent-per-field-outcome convention
@@ -273,6 +340,7 @@ function applyBmEmail(
   newValue: string,
   batchTag: string,
   slug: string,
+  fillOnly = false,
 ): { outcome: ApplyOutcome; oldValue?: string | null; detail?: string } {
   try {
     const tx = db.transaction((): { outcome: ApplyOutcome; oldValue?: string | null; detail?: string } => {
@@ -296,6 +364,10 @@ function applyBmEmail(
       const currentValue = cur.contact_email ?? "";
       if (currentValue.trim().toLowerCase() === newValue.trim().toLowerCase()) {
         return { outcome: "skipped_unchanged", oldValue: cur.contact_email };
+      }
+      // fill_only: re-checked on the fresh in-transaction snapshot.
+      if (bmFillOnlyBlocks(fillOnly, cur.contact_email)) {
+        return { outcome: "skipped_not_empty", oldValue: cur.contact_email };
       }
 
       db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newValue, agentId);
@@ -341,6 +413,7 @@ function applyBmPhone(
   newValue: string,
   batchTag: string,
   slug: string,
+  fillOnly = false,
 ): { outcome: PhoneOutcome | "error"; oldValue?: string | null; detail?: string } {
   try {
     const tx = db.transaction((): { outcome: PhoneOutcome | "error"; oldValue?: string | null; detail?: string } => {
@@ -366,6 +439,10 @@ function applyBmPhone(
       if (cur.phone && normalizePhone(cur.phone) === normalizePhone(newValue)) {
         return { outcome: "phone_skipped_unchanged", oldValue: cur.phone };
       }
+      // fill_only: re-checked on the fresh in-transaction snapshot.
+      if (bmFillOnlyBlocks(fillOnly, cur.phone)) {
+        return { outcome: "phone_skipped_not_empty", oldValue: cur.phone };
+      }
 
       db.prepare(`UPDATE agent_knowledge SET phone = ? WHERE agent_id = ?`).run(newValue, agentId);
       db.prepare(
@@ -382,8 +459,22 @@ function applyBmPhone(
   }
 }
 
+/** Query params that must appear at most once (a repeat would arrive as an array). */
+const BM_HARVEST_SINGLE_PARAMS = ["dry_run", "limit", "offset", "fill_only"] as const;
+
 router.get("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // A repeated param (`fill_only=1&fill_only=1`) arrives as an array, which the
+  // string checks below would silently read as "absent" — i.e. fall back to
+  // overwrite / the default window. Refuse it instead, before any work.
+  for (const name of BM_HARVEST_SINGLE_PARAMS) {
+    const v = (req.query as Record<string, unknown> | undefined)?.[name];
+    if (v !== undefined && typeof v !== "string") {
+      res.status(400).json({ error: `query param '${name}' must be given once, as a plain value`, param: name });
+      return;
+    }
+  }
 
   // The ONLY way into apply-mode is the literal string "false" — missing,
   // "1", "yes", anything else stays on the safe dry-run path below.
@@ -399,9 +490,12 @@ router.get("/", async (req: Request, res: Response) => {
         }
       }
 
+      const offset = parseBmHarvestOffset(req.query.offset);
+      const fillOnly = parseBmHarvestFillOnly(req.query.fill_only);
+      const scope = parseBmHarvestScope(req.body);
       const allSlugs = await fetchBmProducerSlugs();
       const total_slugs = allSlugs.length;
-      const slugsToProcess = allSlugs.slice(0, limit);
+      const slugsToProcess = allSlugs.slice(offset, offset + limit);
 
       const db = getDb();
       const batchTag = `bm-producer-harvest-${new Date()
@@ -453,6 +547,13 @@ router.get("/", async (req: Request, res: Response) => {
           continue;
         }
         const agentId = match.agentId;
+
+        // scope_agent_ids: a matched agent outside the caller's scope gets no
+        // write and no queue proposal of any kind.
+        if (scope && !scope.has(agentId)) {
+          results.push({ slug, agent_id: agentId, outcome: "skipped_out_of_scope" });
+          continue;
+        }
 
         // ── EMAIL (slice 3) ────────────────────────────────────────────────
         // Computed into local variables rather than an early `continue` on
@@ -516,8 +617,12 @@ router.get("/", async (req: Request, res: Response) => {
             } else if ((cur.contact_email ?? "").trim().toLowerCase() === candidate.toLowerCase()) {
               emailOutcome = "skipped_unchanged";
               emailOldValue = cur.contact_email;
+            } else if (bmFillOnlyBlocks(fillOnly, cur.contact_email)) {
+              emailOutcome = "skipped_not_empty";
+              emailOldValue = cur.contact_email;
+              emailNewValue = candidate;
             } else {
-              const w = applyBmEmail(db, agentId, candidate, batchTag, slug);
+              const w = applyBmEmail(db, agentId, candidate, batchTag, slug, fillOnly);
               emailOutcome = w.outcome;
               emailOldValue = w.oldValue ?? cur.contact_email;
               emailNewValue = candidate;
@@ -569,8 +674,12 @@ router.get("/", async (req: Request, res: Response) => {
             } else if (curP.phone && normalizePhone(curP.phone) === normalizePhone(validated)) {
               phoneOutcome = "phone_skipped_unchanged";
               phoneOldValue = curP.phone;
+            } else if (bmFillOnlyBlocks(fillOnly, curP.phone)) {
+              phoneOutcome = "phone_skipped_not_empty";
+              phoneOldValue = curP.phone;
+              phoneNewValue = validated;
             } else {
-              const wp = applyBmPhone(db, agentId, validated, batchTag, slug);
+              const wp = applyBmPhone(db, agentId, validated, batchTag, slug, fillOnly);
               phoneOutcome = wp.outcome;
               phoneOldValue = wp.oldValue ?? curP.phone;
               phoneNewValue = validated;
@@ -675,6 +784,9 @@ router.get("/", async (req: Request, res: Response) => {
         dry_run: false,
         batch_tag: batchTag,
         total_slugs,
+        offset,
+        fill_only: fillOnly,
+        ...(scope ? { scope_size: scope.size } : {}),
         // `scanned` reflects how many slugs were actually attempted before
         // the time budget (if any) cut in — NOT the full requested/capped
         // `limit`. Equals slugsToProcess.length in the (overwhelmingly
@@ -707,13 +819,20 @@ router.get("/", async (req: Request, res: Response) => {
       }
     }
 
+    const offset = parseBmHarvestOffset(req.query.offset);
+    const fillOnly = parseBmHarvestFillOnly(req.query.fill_only);
+    const scope = parseBmHarvestScope(req.body);
     const allSlugs = await fetchBmProducerSlugs();
     const total_slugs = allSlugs.length;
-    const slugsToProcess = allSlugs.slice(0, limit);
+    const slugsToProcess = allSlugs.slice(offset, offset + limit);
 
     const db = getDb();
 
     let parse_failed = 0;
+    // fill_only / scope_agent_ids decisions, mirrored from the apply branch
+    // (counted only when the param/body is given — absent = today's response).
+    const would_skip_not_empty = { email: 0, phone: 0 };
+    let out_of_scope = 0;
     let matched = 0;
     let unmatched = 0;
     let bm_domain_email_excluded_count = 0;
@@ -744,6 +863,10 @@ router.get("/", async (req: Request, res: Response) => {
         continue;
       }
       matched++;
+      if (scope && !scope.has(match.agentId)) {
+        out_of_scope++;
+        continue;
+      }
 
       if (sample.length < 20) {
         sample.push({
@@ -765,21 +888,43 @@ router.get("/", async (req: Request, res: Response) => {
       if (record.email) {
         const current = (agentRow?.contact_email ?? "").trim();
         if (!current || current.toLowerCase() !== record.email.trim().toLowerCase()) {
-          would_write_estimate.email++;
+          if (bmFillOnlyBlocks(fillOnly, current)) would_skip_not_empty.email++;
+          else would_write_estimate.email++;
         }
       }
       // `agents` carries no phone column of its own (phone lives on
       // agent_knowledge, a second table deliberately left untouched by this
       // single-table read) — so from what we selected here "current" is
       // always absent, and any BM-sourced phone counts as a would-be fill.
+      // With fill_only the apply branch's own decision needs the stored
+      // phone, so (and only then) it is read from agent_knowledge — read-only.
       if (record.phone) {
-        would_write_estimate.phone++;
+        if (fillOnly) {
+          const kRow = db.prepare("SELECT phone FROM agent_knowledge WHERE agent_id = ?").get(match.agentId) as
+            | { phone: string | null }
+            | undefined;
+          const curPhone = kRow?.phone ?? null;
+          const unchanged = !!curPhone && normalizePhone(curPhone) === normalizePhone(record.phone);
+          if (unchanged) {
+            // the apply branch reports phone_skipped_unchanged — not a write
+          } else if (bmFillOnlyBlocks(true, curPhone)) {
+            would_skip_not_empty.phone++;
+          } else {
+            would_write_estimate.phone++;
+          }
+        } else {
+          would_write_estimate.phone++;
+        }
       }
       would_write_estimate.address_2nd_source++;
     }
 
     res.json({
       total_slugs,
+      offset,
+      fill_only: fillOnly,
+      ...(fillOnly ? { would_skip_not_empty } : {}),
+      ...(scope ? { scope_size: scope.size, out_of_scope } : {}),
       fetched: slugsToProcess.length,
       parse_failed,
       matched,

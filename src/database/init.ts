@@ -5206,6 +5206,38 @@ function initSchema(db: Database.Database): void {
     console.error("Migration boot_job_state failed:", err);
   }
 
+  // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): two small state
+  // tables for the nightly RFB enrichment job (services/rfb-enrichment-
+  // nightly.ts). Created in-module too (ensureRfbEnrichmentNightlyTables), so
+  // either path is enough on its own.
+  //   rfb_enrichment_nightly_attempts — the job's rotation memory: one row per
+  //     (agent, step) with the last attempt time + outcome, so a row a step
+  //     could not help is not re-selected every night (same ALWAYS-STAMP
+  //     discipline as agents-city-backfill's *_attempted_at columns).
+  //   rfb_enrichment_sweep_state — persisted offset cursor(s), same shape as
+  //     gardssalg_website_verification_sweep_state (database/init-
+  //     experiences.ts): the Bondens Marked step's rotating slug window.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS rfb_enrichment_nightly_attempts (
+        agent_id TEXT NOT NULL,
+        step TEXT NOT NULL,
+        last_attempted_at TEXT NOT NULL,
+        last_outcome TEXT,
+        last_run_id TEXT,
+        PRIMARY KEY (agent_id, step)
+      );
+      CREATE TABLE IF NOT EXISTS rfb_enrichment_sweep_state (
+        cursor TEXT PRIMARY KEY,
+        next_offset INTEGER NOT NULL DEFAULT 0,
+        total INTEGER,
+        updated_at TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration rfb_enrichment_nightly tables failed:", err);
+  }
+
   // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler
   // (slice 1): persisted event-loop stalls / slow requests / slow jobs, so the
   // monitor's evidence survives a restart (services/event-loop-persist.ts).

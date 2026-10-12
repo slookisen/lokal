@@ -678,6 +678,12 @@ export async function runAdminEnrichmentWritePauseTests(
         "services/experience-description-proposals-job.ts",
         "services/rfb-marketing-daily.test.ts",
         "services/rfb-marketing-daily.ts",
+        // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
+        // enrichment job checks the rfb pause before every writing row (its
+        // in-process tool calls keep their own gates too); its test file sets
+        // the pause via the service to prove the writing steps stop.
+        "services/rfb-enrichment-nightly.test.ts",
+        "services/rfb-enrichment-nightly.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );
