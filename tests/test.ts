@@ -45,6 +45,7 @@ import conversationUiRouter, {
   splitSellerReply,
   renderTranscriptBody,
 } from "../src/routes/conversation-ui";
+import { swapOutModules, swappedOutModuleIds, withModulesSwappedOut } from "./module-cache";
 
 // ─────────────────────────────────────────────────────────────────────────
 // SHARED GLOBAL STATE — read this before adding a new test block.
@@ -105,6 +106,20 @@ import conversationUiRouter, {
 //     withMemoryVerticalDb() (below) for a sync block. Unset, the factory
 //     opens the production path /app/data/<vertical>.db; the db-hermetic
 //     check before the summary fails the suite if that happens.
+//   - Fresh module copies (require.cache): a block that wants its own
+//     db-factory, or its own copy of a store/route bound to it, must not
+//     just `delete require.cache[...]` and re-require. Code loaded earlier
+//     keeps the copy it holds, so the cache and production code drift
+//     apart and a later __resetDbFactoryForTesting() resets the wrong copy.
+//     Use withFreshModules([...paths], () => { ... }) (below) for the
+//     block, or swapOutFreshModules([...paths]) with restore() in your own
+//     `finally` — they put the previous entries back and drop modules still
+//     bound to the block's copies. List every module between the code under
+//     test and db-factory (stores, services) that the block needs on its
+//     own DB, not just db-factory and the route. Reset the factory copy your
+//     block required (dbFactoryX.__resetDbFactoryForTesting()), not a
+//     re-require. The colocated src/**/*.test.ts suites follow the same rule
+//     via swapOutModules() from tests/module-cache.ts.
 //
 // Fixed:
 //   - ADMIN_KEY / ANALYTICS_ADMIN_KEY, WITHIN THIS FILE'S OWN ~17 test
@@ -318,6 +333,20 @@ function withMemoryVerticalDb(envKey: "DENTAL_DB_PATH" | "EXPERIENCES_DB_PATH", 
     else process.env[envKey] = prev;
     dbFactory.__resetDbFactoryForTesting();
   }
+}
+
+// Runs a block (sync or async) with fresh copies of the given modules
+// (paths relative to this file, as for require). Inside it, require() of one
+// of them loads a new copy; when it returns, throws or settles, the previous
+// require.cache entries are put back. See tests/module-cache.ts.
+function withFreshModules<T>(paths: readonly string[], fn: () => T): T {
+  return withModulesSwappedOut(paths.map((p) => require.resolve(p)), fn);
+}
+
+// The same for a block that already has its own try/finally: call the
+// returned restore() in that finally.
+function swapOutFreshModules(paths: readonly string[]): () => void {
+  return swapOutModules(paths.map((p) => require.resolve(p)));
 }
 
 function assertEq(actual: unknown, expected: unknown, label: string): void {
@@ -6285,8 +6314,12 @@ const _m2Promise = (async function runOwnerPortalTests() {
       }
 
       // Mock sendEmail so the real POST route can run end-to-end without
-      // hitting SMTP (same technique as m2-E1.4 above).
-      const emailSvcMod2 = await import("../src/services/email-service");
+      // hitting SMTP (same technique as m2-E1.4 above). require(), not
+      // `await import()`: on Node 20 the dynamic import put a SECOND
+      // email-service instance in require.cache, so later suites stubbed a
+      // different emailService than booking-store/owner-portal send through
+      // (same hazard as the database/init note at the top of this file).
+      const emailSvcMod2 = require("../src/services/email-service") as typeof import("../src/services/email-service");
       const origSendEmail2 = emailSvcMod2.emailService.sendEmail.bind(emailSvcMod2.emailService);
       (emailSvcMod2.emailService as any).sendEmail = async () => ({ success: true, messageId: "mock-rl" });
       try {
@@ -6336,7 +6369,8 @@ const _m2Promise = (async function runOwnerPortalTests() {
     // E1.4 — Magic-link email body template contains agent name + 7-day expiry.
     // Tested directly against the email-service helper (avoids HTTP rate-limit + SMTP).
     {
-      const emailSvcMod = await import("../src/services/email-service");
+      // require(), not `await import()` — see the m2-rl note above.
+      const emailSvcMod = require("../src/services/email-service") as typeof import("../src/services/email-service");
       let captured: any = null;
       const origSend = emailSvcMod.emailService.sendEmail.bind(emailSvcMod.emailService);
       (emailSvcMod.emailService as any).sendEmail = async (opts: any) => {
@@ -17281,13 +17315,78 @@ console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations �
 // locally on every run, but CI's deterministic ordering makes it
 // reliable). Using require() + sync makes pr100 a strictly serial
 // extension to the existing top-level synchronous test block.
-console.log("\n── PR-100: dental schema extension ──");
+// ── module-cache: withFreshModules / swapOutModules (tests/module-cache.ts) ──
+// The helper every db-factory-swapping block relies on: fresh copies inside,
+// previous require.cache entries back afterwards, modules first loaded
+// against a block's copy dropped. Fixture modules stand in for db-factory
+// (factory) and a store bound to it (store).
+console.log("\n── module-cache: swapped-out modules come back ──");
 (() => {
+  const factoryId = require.resolve("./fixtures/module-cache/factory");
+  const storeId = require.resolve("./fixtures/module-cache/store");
+  const factory0 = require("./fixtures/module-cache/factory") as typeof import("./fixtures/module-cache/factory");
+  const factoryEntry0 = require.cache[factoryId];
+  delete require.cache[storeId];
+
+  const inside: { token?: object } = {};
+  withFreshModules(["./fixtures/module-cache/factory"], () => {
+    inside.token = (require("./fixtures/module-cache/factory") as typeof factory0).token;
+    const store = require("./fixtures/module-cache/store") as typeof import("./fixtures/module-cache/store");
+    assertTrue(store.factoryToken === inside.token, "mc-01: a module first loaded inside the block binds to the block's copy");
+  });
+  assertTrue(!!inside.token && inside.token !== factory0.token, "mc-02: inside the block, require() loads a fresh copy");
+  assertTrue(require.cache[factoryId] === factoryEntry0, "mc-03: afterwards the previous require.cache entry is back");
+  assertTrue(!require.cache[storeId], "mc-04: the module bound to the block's copy was dropped from require.cache");
+  const storeAfter = require("./fixtures/module-cache/store") as typeof import("./fixtures/module-cache/store");
+  assertTrue(storeAfter.factoryToken === factory0.token, "mc-05: requiring it again binds to the restored copy");
+
+  // Overlapping swaps of the same id (async blocks): the entry goes back
+  // only when the last one restores.
+  const restoreA = swapOutFreshModules(["./fixtures/module-cache/factory"]);
+  require("./fixtures/module-cache/factory");
+  const restoreB = swapOutFreshModules(["./fixtures/module-cache/factory"]);
+  const tokenB = (require("./fixtures/module-cache/factory") as typeof factory0).token;
+  restoreA();
+  assertTrue((require.cache[factoryId]?.exports as typeof factory0 | undefined)?.token === tokenB,
+    "mc-06: the first of two overlapping swaps to restore leaves the other's copy in place");
+  assertTrue(swappedOutModuleIds().includes(factoryId), "mc-07: …and the id is still reported as swapped out");
+  restoreB();
+  assertTrue(require.cache[factoryId] === factoryEntry0, "mc-08: the last restore puts the original entry back");
+  assertTrue(!swappedOutModuleIds().includes(factoryId), "mc-09: nothing is left swapped out");
+
+  // A throwing block still restores; an id with no previous entry is deleted.
+  try {
+    withFreshModules(["./fixtures/module-cache/factory"], () => {
+      require("./fixtures/module-cache/factory");
+      throw new Error("mc-throw");
+    });
+  } catch { /* expected */ }
+  assertTrue(require.cache[factoryId] === factoryEntry0, "mc-10: a block that throws still gets its entries put back");
+  delete require.cache[storeId];
+  withFreshModules(["./fixtures/module-cache/store"], () => { require("./fixtures/module-cache/store"); });
+  assertTrue(!require.cache[storeId], "mc-11: an id that had no entry before the block has none after it");
+
+  // Overlap taint: the store first loads inside A's swap (bound to A's
+  // factory copy), B then swaps the store out and so keeps that bound store
+  // as its "previous" entry, A restores first, B last. B must not leave a
+  // store bound to A's discarded factory in the cache.
+  const restoreTaintA = swapOutFreshModules(["./fixtures/module-cache/factory"]);
+  const taintToken = (require("./fixtures/module-cache/factory") as typeof factory0).token;
+  require("./fixtures/module-cache/store");
+  const restoreTaintB = swapOutFreshModules(["./fixtures/module-cache/store"]);
+  require("./fixtures/module-cache/store");
+  restoreTaintA();
+  restoreTaintB();
+  const storeAfterOverlap = require("./fixtures/module-cache/store") as typeof import("./fixtures/module-cache/store");
+  assertTrue(storeAfterOverlap.factoryToken === factory0.token && storeAfterOverlap.factoryToken !== taintToken,
+    "mc-12: after overlapping swaps, no module bound to a discarded copy is left in require.cache");
+})();
+
+console.log("\n── PR-100: dental schema extension ──");
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPathPr100 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFactoryPathPr100 = require.resolve("../src/database/db-factory");
-  delete require.cache[dbFactoryPathPr100];
   const dbFactoryPr100 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr100.__resetDbFactoryForTesting();
 
@@ -17571,7 +17670,7 @@ console.log("\n── PR-100: dental schema extension ──");
     process.env.DENTAL_DB_PATH = prevPathPr100;
   }
   dbFactoryPr100.__resetDbFactoryForTesting();
-})();
+});
 
 // ── FIX finn-tannlege search: filters + sparse-specialty handling ────
 // Root cause: the /sok specialty filter only matched the sparse
@@ -17581,12 +17680,10 @@ console.log("\n── PR-100: dental schema extension ──");
 // dental store directly (same :memory: pattern as PR-100) and asserts
 // the search behaviour the public /sok page depends on.
 console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFactoryPathFT = require.resolve("../src/database/db-factory");
-  delete require.cache[dbFactoryPathFT];
   const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactory.__resetDbFactoryForTesting();
 
@@ -17707,7 +17804,7 @@ console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ─�
   if (prevPath === undefined) delete process.env.DENTAL_DB_PATH;
   else process.env.DENTAL_DB_PATH = prevPath;
   dbFactory.__resetDbFactoryForTesting();
-})();
+});
 
 // ── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe ──────────
 // Root cause: `q LIKE @q` relied on SQLite's built-in LIKE/LOWER()/UPPER()
@@ -17728,17 +17825,13 @@ console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ─�
 // stored value (poststed="TROMSØ", the real-world convention) — it must
 // fail on pre-fix code (LIKE with no nb_lower) and pass after the fix.
 console.log("\n── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe: Ø/Æ/Å case-folding ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPathOe = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFactoryPathOe = require.resolve("../src/database/db-factory");
-  delete require.cache[dbFactoryPathOe];
   const dbFactoryOe = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryOe.__resetDbFactoryForTesting();
 
-  const dentalStorePathOe = require.resolve("../src/services/dental-store");
-  delete require.cache[dentalStorePathOe];
   const storeOe = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
   const { createDentalAgent: createOe, countPublicDentalAgents: countOe } = storeOe;
 
@@ -17786,7 +17879,7 @@ console.log("\n── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe: �
   if (prevPathOe === undefined) delete process.env.DENTAL_DB_PATH;
   else process.env.DENTAL_DB_PATH = prevPathOe;
   dbFactoryOe.__resetDbFactoryForTesting();
-})();
+});
 
 
 
@@ -17803,14 +17896,14 @@ console.log("\n── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe: �
 //   2. The default fallback (env-var unset) resolves to /app/data/.
 //   3. getDb('rfb') still delegates to init.ts (no path change for rfb).
 console.log("\n── PR-100b: Fly volume path hotfix ──");
-(() => {
+// Each probe below loads its own db-factory copy; withFreshModules puts the
+// previous require.cache entry back when the block ends.
+withFreshModules(["../src/database/db-factory"], () => {
   const prevPathPr100b = process.env.DENTAL_DB_PATH;
 
   // ── 1. Env-var override still works: DENTAL_DB_PATH=:memory:
   {
     process.env.DENTAL_DB_PATH = ":memory:";
-    const dbFactoryPathPr100bMem = require.resolve("../src/database/db-factory");
-    delete require.cache[dbFactoryPathPr100bMem];
     const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
     const db = dbFactory.getDb("dental");
@@ -17899,7 +17992,7 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
   } else {
     process.env.DENTAL_DB_PATH = prevPathPr100b;
   }
-})();
+});
 
 
 // ── PR-104: dental claim-batch service ──────────────────────────────
@@ -17910,22 +18003,16 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
 // Synchronous IIFE so we stay in the strictly-serial block before the
 // REPORT async coda (mirrors PR-100 / PR-100b).
 console.log("\n── PR-104: dental claim-batch service ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPathPr104 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  // PR-100b block 2 mutates require.cache for db-factory (deletes
-  // it on exit), which means the previously-cached dental-store
-  // module still holds a stale `getDb` reference into a different
-  // db-factory module instance with its own handle cache. Re-load
-  // both db-factory AND its dependents so they share one cache.
-  const dbFactoryPath = require.resolve("../src/database/db-factory");
-  const dentalStorePath = require.resolve("../src/services/dental-store");
-  const dentalClaimPath = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFactoryPath];
-  delete require.cache[dentalStorePath];
-  delete require.cache[dentalClaimPath];
-
+  // Load db-factory AND its dependents fresh so they share one handle
+  // cache (and one :memory: dental.db) for this block.
   const dbFactoryPr104 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr104.__resetDbFactoryForTesting();
 
@@ -18076,7 +18163,7 @@ console.log("\n── PR-104: dental claim-batch service ──");
     process.env.DENTAL_DB_PATH = prevPathPr104;
   }
   dbFactoryPr104.__resetDbFactoryForTesting();
-})();
+});
 
 // ── Experiences scaffold (orchestrator-pr-15): experience-store ──────
 // Drives the experiences store directly against an in-memory
@@ -18087,17 +18174,11 @@ console.log("\n── PR-104: dental claim-batch service ──");
 // surfaces inserted rows, and the provider vertical-isolation CHECK
 // (vertical='experiences').
 console.log("\n── experiences scaffold: experience-store ──");
-(() => {
+// Fresh db-factory AND experience-store together so they share one handle
+// cache and a single :memory: DB.
+withFreshModules(["../src/database/db-factory", "../src/services/experience-store"], () => {
   const prevPathExp = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  // Prior IIFEs (PR-100b / PR-104) mutate require.cache for db-factory;
-  // re-load db-factory AND experience-store together so they share one
-  // handle cache and a single :memory: DB.
-  const dbFactoryPathExp = require.resolve("../src/database/db-factory");
-  const expStorePathExp = require.resolve("../src/services/experience-store");
-  delete require.cache[dbFactoryPathExp];
-  delete require.cache[expStorePathExp];
 
   const dbFactoryExp = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryExp.__resetDbFactoryForTesting();
@@ -18303,7 +18384,7 @@ console.log("\n── experiences scaffold: experience-store ──");
     process.env.EXPERIENCES_DB_PATH = prevPathExp;
   }
   dbFactoryExp.__resetDbFactoryForTesting();
-})();
+});
 
 
 // ── orch-pr-18: POST /api/opplevelser/admin/bulk-load ────────────────
@@ -18357,20 +18438,19 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   let prevFetch18: typeof globalThis.fetch | null = null;
   let prevAnthropicKey18: string | undefined;
   let fetchStub18Installed = false;
+  let restoreModules18: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
-    // Bust require cache for db-factory + experience-store + experience-brreg
-    // + the opplevelser route TOGETHER so the route binds to the fresh,
+    // Fresh db-factory + experience-store + experience-brreg + the
+    // opplevelser route TOGETHER so the route binds to the fresh,
     // :memory:-backed store/brreg instances (mirrors the exp-store scaffold).
-    const dbFactoryPath18 = require.resolve("../src/database/db-factory");
-    const expStorePath18 = require.resolve("../src/services/experience-store");
-    const expBrregPath18 = require.resolve("../src/services/experience-brreg");
-    const opplevelserPath18 = require.resolve("../src/routes/opplevelser");
-    delete require.cache[dbFactoryPath18];
-    delete require.cache[expStorePath18];
-    delete require.cache[expBrregPath18];
-    delete require.cache[opplevelserPath18];
+    restoreModules18 = swapOutFreshModules([
+      "../src/database/db-factory",
+      "../src/services/experience-store",
+      "../src/services/experience-brreg",
+      "../src/routes/opplevelser",
+    ]);
 
     const dbFactory18 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactory18.__resetDbFactoryForTesting();
@@ -19063,6 +19143,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     }
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
+    restoreModules18?.();
     try {
       const initFin18 = require("../src/database/init") as typeof import("../src/database/init");
       // Re-entrancy-safe: only restore if the singleton is still OUR handle
@@ -19110,19 +19191,19 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
   // db singleton (fail-closed) — pin a fresh schema-initialised in-memory
   // main db for this block, restored in finally.
   let restoreMainDbDedup: (() => void) | null = null;
+  let restoreModulesDedup: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     restoreMainDbDedup = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
-    // Bust require cache for db-factory + experience-store + the opplevelser
-    // route TOGETHER so the route binds to the fresh, :memory:-backed store
-    // (mirrors orch-pr-18's scaffold).
-    const dbFactoryPathDedup = require.resolve("../src/database/db-factory");
-    const expStorePathDedup = require.resolve("../src/services/experience-store");
-    const opplevelserPathDedup = require.resolve("../src/routes/opplevelser");
-    delete require.cache[dbFactoryPathDedup];
-    delete require.cache[expStorePathDedup];
-    delete require.cache[opplevelserPathDedup];
+    // Fresh db-factory + experience-store + the opplevelser route TOGETHER
+    // so the route binds to the fresh, :memory:-backed store (mirrors
+    // orch-pr-18's scaffold).
+    restoreModulesDedup = swapOutFreshModules([
+      "../src/database/db-factory",
+      "../src/services/experience-store",
+      "../src/routes/opplevelser",
+    ]);
 
     const dbFactoryDedup = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactoryDedup.__resetDbFactoryForTesting();
@@ -19317,6 +19398,7 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     }
     if (prevPathDedup === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathDedup;
+    restoreModulesDedup?.();
     _orchPrDedupBackfillEndpointResolve();
   }
 })();
@@ -19377,16 +19459,16 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
   // title-no-backfill (dry_run:false) is gated on the MAIN db's
   // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
   let restoreMainDbTNB: (() => void) | null = null;
+  let restoreModulesTNB: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     restoreMainDbTNB = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
-    const dbFactoryPathTNB = require.resolve("../src/database/db-factory");
-    const expStorePathTNB = require.resolve("../src/services/experience-store");
-    const opplevelserPathTNB = require.resolve("../src/routes/opplevelser");
-    delete require.cache[dbFactoryPathTNB];
-    delete require.cache[expStorePathTNB];
-    delete require.cache[opplevelserPathTNB];
+    restoreModulesTNB = swapOutFreshModules([
+      "../src/database/db-factory",
+      "../src/services/experience-store",
+      "../src/routes/opplevelser",
+    ]);
 
     const dbFactoryTNB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactoryTNB.__resetDbFactoryForTesting();
@@ -19662,6 +19744,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     else process.env.EXPERIENCES_DB_PATH = prevPathTNB;
     if (prevAnthropicKeyTNB === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyTNB;
+    restoreModulesTNB?.();
     _titleNoBackfillResolve();
   }
 })();
@@ -19778,19 +19861,16 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
 
 // orch19-05: experiences-a2a parseExperiencesIntent + handleExperiencesMessageSend
 // Runs the real discover path against an isolated :memory: experiences.db.
-(() => {
+// Fresh db-factory + experience-store + experiences-a2a together so they
+// share a single :memory: handle (same discipline as the experiences
+// scaffold block above).
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-a2a",
+], () => {
   const prevPath19 = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  // Re-load db-factory + experience-store + experiences-a2a together so they
-  // share a single :memory: handle (same require-cache discipline as the
-  // experiences scaffold IIFE above).
-  const dbFactoryPath19 = require.resolve("../src/database/db-factory");
-  const expStorePath19 = require.resolve("../src/services/experience-store");
-  const expA2aPath19 = require.resolve("../src/routes/experiences-a2a");
-  delete require.cache[dbFactoryPath19];
-  delete require.cache[expStorePath19];
-  delete require.cache[expA2aPath19];
 
   const dbFactory19 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactory19.__resetDbFactoryForTesting();
@@ -19963,7 +20043,7 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   if (prevPath19 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPath19;
   dbFactory19.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent-conversation-logging (dev-request 2026-07-10) ────────────────
 // Slice 1: experiences-a2a/mcp log real agent interactions into the SHARED
@@ -19973,7 +20053,12 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
 // 'rfb' — every existing RFB call site (no param) must be byte-for-byte
 // unchanged, and 'experiences' rows must be fully invisible to it.
 console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-a2a",
+  "../src/routes/experiences-mcp",
+], () => {
   // Isolated MAIN db (conversations/messages live here — see conversation-service.ts)
   // AND isolated EXPERIENCES db (discover/get results — see experience-store.ts),
   // set up the same way as rfb-samtaler-slice4 and orch19-05 respectively.
@@ -19988,14 +20073,6 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
 
   const prevPathOcl = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-  const dbFactoryPathOcl = require.resolve("../src/database/db-factory");
-  const expStorePathOcl = require.resolve("../src/services/experience-store");
-  const expA2aPathOcl = require.resolve("../src/routes/experiences-a2a");
-  const expMcpPathOcl = require.resolve("../src/routes/experiences-mcp");
-  delete require.cache[dbFactoryPathOcl];
-  delete require.cache[expStorePathOcl];
-  delete require.cache[expA2aPathOcl];
-  delete require.cache[expMcpPathOcl];
 
   const dbFactoryOcl = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryOcl.__resetDbFactoryForTesting();
@@ -20135,7 +20212,7 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
     else process.env.EXPERIENCES_DB_PATH = prevPathOcl;
     dbFactoryOcl.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // orch19-06: experiences-seo router — landing is NOT the rfb homepage;
 // llms.txt / robots.txt / agent-card.json / openapi.json route to experiences.
@@ -20266,16 +20343,13 @@ withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
 // sitemap layer directly (sync mock req/res, like orch19-06). Host-isolated:
 // asserts NO rfb/dental identity leaks onto the opplevagent detail page.
 console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathSQ = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathSQ = require.resolve("../src/database/db-factory");
-  const expStorePathSQ = require.resolve("../src/services/experience-store");
-  const expSeoPathSQ = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathSQ];
-  delete require.cache[expStorePathSQ];
-  delete require.cache[expSeoPathSQ];
 
   const dbFactorySQ = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactorySQ.__resetDbFactoryForTesting();
@@ -20401,7 +20475,7 @@ console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences)
   if (prevPathSQ === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathSQ;
   dbFactorySQ.__resetDbFactoryForTesting();
-})();
+});
 
 // ── Phase 2 (feat/opplevagent-p2-browse-pages): human-browse subpages ────────
 // /opplevelser, /kategori/:c, /fylke/:f, /tilbyder/:id, /sok + DB-driven sitemap
@@ -20410,16 +20484,13 @@ console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences)
 // Opplevagent brand and must not leak rfb/dental identity. Unknown
 // category/fylke/provider must 404 (router calls next()).
 console.log("\n── opplevagent P2: human-browse subpages (experiences) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathP2 = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathP2 = require.resolve("../src/database/db-factory");
-  const expStorePathP2 = require.resolve("../src/services/experience-store");
-  const expSeoPathP2 = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathP2];
-  delete require.cache[expStorePathP2];
-  delete require.cache[expSeoPathP2];
 
   const dbFactoryP2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryP2.__resetDbFactoryForTesting();
@@ -20854,7 +20925,7 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathP2;
   dbFactoryP2.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-request
 // 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: self-hosted Leaflet +
@@ -20874,16 +20945,13 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
 // (honest omission); (9) /opplevelser, /kategori/*, /kommune/:kommune get
 // NO map markup at all (opts.map is ONLY ever passed by /fylke/:fylke).
 console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-request 2026-07-19) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathKart = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathKart = require.resolve("../src/database/db-factory");
-  const expStorePathKart = require.resolve("../src/services/experience-store");
-  const expSeoPathKart = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathKart];
-  delete require.cache[expStorePathKart];
-  delete require.cache[expSeoPathKart];
 
   const dbFactoryKart = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryKart.__resetDbFactoryForTesting();
@@ -21124,7 +21192,7 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   if (prevPathKart === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKart;
   dbFactoryKart.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request
 // 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6: "Klynging ved
@@ -21144,18 +21212,14 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
 // itself carries the clustering wiring while the single-point mini-map page
 // carries NONE of it.
 console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+  "../src/services/map-clustering",
+], () => {
   const prevPathKC = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathKC = require.resolve("../src/database/db-factory");
-  const expStorePathKC = require.resolve("../src/services/experience-store");
-  const expSeoPathKC = require.resolve("../src/routes/experiences-seo");
-  const mapClusterPathKC = require.resolve("../src/services/map-clustering");
-  delete require.cache[dbFactoryPathKC];
-  delete require.cache[expStorePathKC];
-  delete require.cache[expSeoPathKC];
-  delete require.cache[mapClusterPathKC];
 
   const dbFactoryKC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryKC.__resetDbFactoryForTesting();
@@ -21314,7 +21378,7 @@ console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering 
   if (prevPathKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKC;
   dbFactoryKC.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request
 // 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4: the SAME kind
@@ -21335,16 +21399,13 @@ console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering 
 // tag, IntersectionObserver used); (6) zero geocoded providers → no map
 // section at all (honest omission).
 console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request 2026-07-19, arbeidspunkt 4) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathKG = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathKG = require.resolve("../src/database/db-factory");
-  const expStorePathKG = require.resolve("../src/services/experience-store");
-  const expSeoPathKG = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathKG];
-  delete require.cache[expStorePathKG];
-  delete require.cache[expSeoPathKG];
 
   const dbFactoryKG = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryKG.__resetDbFactoryForTesting();
@@ -21566,7 +21627,7 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   if (prevPathKG === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKG;
   dbFactoryKG.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker
 // clustering (dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg,
@@ -21577,18 +21638,14 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
 // individual, and an approximate-confidence producer co-located with the
 // dense exact cluster never merges into it.
 console.log("\n── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+  "../src/services/map-clustering",
+], () => {
   const prevPathKGC = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathKGC = require.resolve("../src/database/db-factory");
-  const expStorePathKGC = require.resolve("../src/services/experience-store");
-  const expSeoPathKGC = require.resolve("../src/routes/experiences-seo");
-  const mapClusterPathKGC = require.resolve("../src/services/map-clustering");
-  delete require.cache[dbFactoryPathKGC];
-  delete require.cache[expStorePathKGC];
-  delete require.cache[expSeoPathKGC];
-  delete require.cache[mapClusterPathKGC];
 
   const dbFactoryKGC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryKGC.__resetDbFactoryForTesting();
@@ -21714,23 +21771,20 @@ console.log("\n── opplevagent kart-gardssalg-cluster: /kategori/gardssalg ma
   if (prevPathKGC === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKGC;
   dbFactoryKGC.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent kart-gardssalg (no geocoded providers): honest omission ──────
 // A separate isolated DB with ZERO geocoded gårdssalg producers must render
 // NO map section at all (never an empty/broken map), while the card grid
 // still renders normally — same discipline as kart-10 above for /fylke/:fylke.
 console.log("\n── opplevagent kart-gardssalg: no map section when zero geocoded producers ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathKGZ = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathKGZ = require.resolve("../src/database/db-factory");
-  const expStorePathKGZ = require.resolve("../src/services/experience-store");
-  const expSeoPathKGZ = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathKGZ];
-  delete require.cache[expStorePathKGZ];
-  delete require.cache[expSeoPathKGZ];
 
   const dbFactoryKGZ = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryKGZ.__resetDbFactoryForTesting();
@@ -21767,7 +21821,7 @@ console.log("\n── opplevagent kart-gardssalg: no map section when zero geoco
   if (prevPathKGZ === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKGZ;
   dbFactoryKGZ.__resetDbFactoryForTesting();
-})();
+});
 
 // ── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ───────────────
 // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
@@ -21780,16 +21834,13 @@ console.log("\n── opplevagent kart-gardssalg: no map section when zero geoco
 // still 404s via next(), same as a genuinely-unknown place. Isolated
 // :memory: experiences.db + sync IIFE, same pattern as the P2 block above.
 console.log("\n── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathAmb = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathAmb = require.resolve("../src/database/db-factory");
-  const expStorePathAmb = require.resolve("../src/services/experience-store");
-  const expSeoPathAmb = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathAmb];
-  delete require.cache[expStorePathAmb];
-  delete require.cache[expSeoPathAmb];
 
   const dbFactoryAmb = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryAmb.__resetDbFactoryForTesting();
@@ -21867,21 +21918,16 @@ console.log("\n── opplevagent: /fylke + /kommune fold-redirect ambiguity gua
   if (prevPathAmb === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathAmb;
   dbFactoryAmb.__resetDbFactoryForTesting();
-})();
+});
 
 // ── Norwegian search synonym expansion (feat/experiences-search-norwegian) ─────
 // Verifies that searchPublishedExperiences() expands Norwegian query terms into
 // English equivalents so Norwegian users find English-titled experiences.
 // Isolated :memory: experiences.db + sync IIFE (no async CI race).
 console.log("\n── opplevagent: Norwegian search synonyms ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/experience-store"], () => {
   const prevPathNO = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathNO = require.resolve("../src/database/db-factory");
-  const expStorePathNO   = require.resolve("../src/services/experience-store");
-  delete require.cache[dbFactoryPathNO];
-  delete require.cache[expStorePathNO];
 
   const dbFactoryNO = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryNO.__resetDbFactoryForTesting();
@@ -21990,7 +22036,7 @@ console.log("\n── opplevagent: Norwegian search synonyms ──");
   if (prevPathNO === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathNO;
   dbFactoryNO.__resetDbFactoryForTesting();
-})();
+});
 
 // ── PR-80 (2026-06-22): SEO title truncation + /sok OG tags ──────────
 // Tests for seoPageTitle cascade logic and /sok OG meta presence.
@@ -22053,18 +22099,16 @@ console.log("\n── opplevagent: Norwegian search synonyms ──");
 // synchronous IIFE pattern proven by PR-100 / PR-100b / PR-104.
 // NOT async (async IIFEs caused CI races that got PR-96/PR-98 reverted).
 console.log("\n── PR-107: zombie-claim sweep fix ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPathPr107 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
   // Bust require cache so we get a fresh db-factory + fresh dental-claim-service
   // bound to the :memory: instance (mirrors PR-104 pattern exactly).
-  const dbFactoryPath107 = require.resolve("../src/database/db-factory");
-  const dentalStorePath107 = require.resolve("../src/services/dental-store");
-  const dentalClaimPath107 = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFactoryPath107];
-  delete require.cache[dentalStorePath107];
-  delete require.cache[dentalClaimPath107];
 
   const dbFactoryPr107 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr107.__resetDbFactoryForTesting();
@@ -22202,7 +22246,7 @@ console.log("\n── PR-107: zombie-claim sweep fix ──");
     process.env.DENTAL_DB_PATH = prevPathPr107;
   }
   dbFactoryPr107.__resetDbFactoryForTesting();
-})();
+});
 
 // ── PR-108 (2026-06-04): claim-pool junk-exclusion ───────────────────
 // buildWhereClause must exclude verification_status IN ('needs_review',
@@ -22210,16 +22254,13 @@ console.log("\n── PR-107: zombie-claim sweep fix ──");
 // claim pool. Explicit verification_status filters still reach them.
 // Same sync-IIFE + :memory: pattern as PR-107 above.
 console.log("\n── PR-108: claim-pool junk-exclusion ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPathPr108 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
-
-  const dbFactoryPath108 = require.resolve("../src/database/db-factory");
-  const dentalStorePath108 = require.resolve("../src/services/dental-store");
-  const dentalClaimPath108 = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFactoryPath108];
-  delete require.cache[dentalStorePath108];
-  delete require.cache[dentalClaimPath108];
 
   const dbFactoryPr108 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr108.__resetDbFactoryForTesting();
@@ -22306,7 +22347,7 @@ console.log("\n── PR-108: claim-pool junk-exclusion ──");
     process.env.DENTAL_DB_PATH = prevPathPr108;
   }
   dbFactoryPr108.__resetDbFactoryForTesting();
-})();
+});
 
 // ── PR-120 (2026-06-05): list-endpoint enrichment_state filter + thin_site ──
 // Three tests:
@@ -22317,16 +22358,13 @@ console.log("\n── PR-108: claim-pool junk-exclusion ──");
 // Uses :memory: + __resetDbFactoryForTesting() — the sync-IIFE pattern
 // proven by PR-104 / PR-107 / PR-108. No async, no HTTP server.
 console.log("\n── PR-120: list enrichment_state filter + thin_site parking ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPathPr120 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
-
-  const dbFactoryPath120 = require.resolve("../src/database/db-factory");
-  const dentalStorePath120 = require.resolve("../src/services/dental-store");
-  const dentalClaimPath120 = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFactoryPath120];
-  delete require.cache[dentalStorePath120];
-  delete require.cache[dentalClaimPath120];
 
   const dbFactoryPr120 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr120.__resetDbFactoryForTesting();
@@ -22426,22 +22464,19 @@ console.log("\n── PR-120: list enrichment_state filter + thin_site parking �
     process.env.DENTAL_DB_PATH = prevPathPr120;
   }
   dbFactoryPr120.__resetDbFactoryForTesting();
-})();
+});
 
 // ── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
 // flagging): is_inactive excluded from claimBatch unconditionally (no
 // filter flag passed) — same :memory: + claimBatch pattern as PR-120 above.
 console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: claimBatch is_inactive exclusion ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPathNedlagt = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
-
-  const dbFactoryPathNedlagt = require.resolve("../src/database/db-factory");
-  const dentalStorePathNedlagt = require.resolve("../src/services/dental-store");
-  const dentalClaimPathNedlagt = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFactoryPathNedlagt];
-  delete require.cache[dentalStorePathNedlagt];
-  delete require.cache[dentalClaimPathNedlagt];
 
   const dbFactoryNedlagt = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryNedlagt.__resetDbFactoryForTesting();
@@ -22500,7 +22535,7 @@ console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2:
     process.env.DENTAL_DB_PATH = prevPathNedlagt;
   }
   dbFactoryNedlagt.__resetDbFactoryForTesting();
-})();
+});
 
 // ── PR-110 (2026-06-04): MCP lokal_search geocode-enrichment ────────
 // Regression: MCP searches were nationwide text-match because the MCP
@@ -22592,6 +22627,8 @@ console.log("\n── PR-103: backend dental geocoding worker ──");
 // ── (b) Async tests with mocked fetch + in-memory DB ────────────────
 let _pr103Resolve: () => void = () => {};
 const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = r; });
+// Called at the end and in .catch below (the block has no finally).
+let _pr103RestoreModules: (() => void) | null = null;
 (async () => {
   // Wait for earlier dental-DB-touching IIFEs to settle. The two
   // sibling PR-100 / PR-100b blocks above are synchronous, but the
@@ -22603,20 +22640,17 @@ const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = 
   const prevPathPr103 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  // PR-100b's IIFE busts the db-factory entry in require.cache when
-  // it restores the real better-sqlite3 export. That means an
-  // already-loaded dental-store still holds a reference to the OLD
-  // db-factory module. We have to bust dental-store + the worker too,
-  // so when we re-require below they all wire up to the SAME fresh
-  // db-factory instance (and therefore the same in-memory dental.db
-  // handle). Skipping this step leaks the PR-100b state into PR-103
-  // and createDentalAgent quietly writes to a different DB than
-  // geocodeTick reads from (caught in CI by pr103-14a). Order matters:
-  // we delete leaves before the factory so the re-require pulls a
-  // fresh dental-store that imports the fresh factory.
-  delete require.cache[require.resolve("../src/services/dental-store")];
-  delete require.cache[require.resolve("../src/services/dental-geocode-worker")];
-  delete require.cache[require.resolve("../src/database/db-factory")];
+  // Fresh dental-store + the worker + db-factory together, so they all
+  // wire up to the SAME fresh db-factory instance (and therefore the same
+  // in-memory dental.db handle). With only db-factory fresh, an
+  // already-loaded dental-store keeps its own factory copy and
+  // createDentalAgent quietly writes to a different DB than geocodeTick
+  // reads from (caught in CI by pr103-14a).
+  _pr103RestoreModules = swapOutFreshModules([
+    "../src/services/dental-store",
+    "../src/services/dental-geocode-worker",
+    "../src/database/db-factory",
+  ]);
 
   const dbFactoryPr103 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr103.__resetDbFactoryForTesting();
@@ -22921,10 +22955,12 @@ const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = 
     process.env.DENTAL_DB_PATH = prevPathPr103;
   }
   dbFactoryPr103.__resetDbFactoryForTesting();
+  _pr103RestoreModules?.();
   _pr103Resolve();
 })().catch((err) => {
   failed++;
   failures.push(`pr103 IIFE crashed: ${err instanceof Error ? err.message : String(err)}`);
+  _pr103RestoreModules?.();
   _pr103Resolve();
 });
 
@@ -23141,18 +23177,18 @@ const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = 
 // dental-seo exports (slugifyClinic, parseClinicSlug) are imported
 // directly — no HTTP server needed.
 console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/routes/dental-seo",
+], () => {
   const prevPathPr109 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
   // Re-require db-factory + dental-store fresh (same pattern as PR-104)
-  const dbFactoryPath109 = require.resolve("../src/database/db-factory");
-  delete require.cache[dbFactoryPath109];
   const dbFactory109 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactory109.__resetDbFactoryForTesting();
 
-  const storePath109 = require.resolve("../src/services/dental-store");
-  delete require.cache[storePath109];
   const store109 = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
   const {
     createDentalAgent,
@@ -23300,9 +23336,7 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
 
   // ── pr109-10: slugifyClinic / parseClinicSlug roundtrip incl. æøå
   {
-    const seoPath = require.resolve("../src/routes/dental-seo");
     // dental-seo is a fresh require here (no HTTP setup needed — we only use its exports)
-    delete require.cache[seoPath];
     const seo109 = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
     const { slugifyClinic, parseClinicSlug } = seo109;
 
@@ -23370,7 +23404,7 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     process.env.DENTAL_DB_PATH = prevPathPr109;
   }
   dbFactory109.__resetDbFactoryForTesting();
-})();
+});
 
 
 // ── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
@@ -23382,14 +23416,9 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
 // createDentalAgent/updateDentalAgent — there is no public write path for
 // this column outside that route.
 console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: is_inactive exclusion (dental-store) ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPathInactive = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
-
-  const dbFactoryPathInactive = require.resolve("../src/database/db-factory");
-  const dentalStorePathInactive = require.resolve("../src/services/dental-store");
-  delete require.cache[dbFactoryPathInactive];
-  delete require.cache[dentalStorePathInactive];
 
   const dbFactoryInactive = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryInactive.__resetDbFactoryForTesting();
@@ -23479,7 +23508,7 @@ console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2:
     process.env.DENTAL_DB_PATH = prevPathInactive;
   }
   dbFactoryInactive.__resetDbFactoryForTesting();
-})();
+});
 
 
 // ── pr111: canonical fylke filter (PR-111)
@@ -23579,6 +23608,8 @@ console.log("── orch-PR Phase 2: platform-verifier (run-platform-verifier) �
 // ── orch-pr: finn-tannlege SEO — per-clinic SSR, Dentist JSON-LD, sitemap, robots ──
 // Boots the dental-seo router against an in-memory dental DB and asserts the
 // crawlable per-clinic page, sitemap, and robots.txt expose the right SEO surface.
+// Restored in .finally below, whether the block passes or throws.
+let _seoDentalRestoreModules: (() => void) | null = null;
 const _seoDentalPromise = (async () => {
   // Serialize after the owner-portal (M2) + integration tests so our fresh
   // module re-requires + db-factory reset cannot race their shared init DB
@@ -23591,13 +23622,14 @@ const _seoDentalPromise = (async () => {
   process.env.DENTAL_BASE_URL = "https://finn-tannlege.com";
 
   // Fresh db-factory + store + router (mirror PR-109 reset pattern).
-  const dbFactoryPathSeo = require.resolve("../src/database/db-factory");
-  delete require.cache[dbFactoryPathSeo];
+  _seoDentalRestoreModules = swapOutFreshModules([
+    "../src/database/db-factory",
+    "../src/services/dental-store",
+    "../src/routes/dental-seo",
+  ]);
   const dbFactorySeo = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactorySeo.__resetDbFactoryForTesting();
 
-  const storePathSeo = require.resolve("../src/services/dental-store");
-  delete require.cache[storePathSeo];
   const storeSeo = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
   const { createDentalAgent, slugifyClinic } = {
     ...storeSeo,
@@ -23639,8 +23671,6 @@ const _seoDentalPromise = (async () => {
   const seoSlug = slugifyClinic(NAVN, ORG);
 
   // Fresh dental-seo router bound to this in-memory DB.
-  const seoRouterPath = require.resolve("../src/routes/dental-seo");
-  delete require.cache[seoRouterPath];
   const dentalSeoRouter = (require("../src/routes/dental-seo") as any).default;
 
   const expressMod = (await import("express")).default;
@@ -23893,7 +23923,7 @@ const _seoDentalPromise = (async () => {
   if (prevBase === undefined) delete process.env.DENTAL_BASE_URL;
   else process.env.DENTAL_BASE_URL = prevBase;
   dbFactorySeo.__resetDbFactoryForTesting();
-})();
+})().finally(() => _seoDentalRestoreModules?.());
 
 const _platformVerifierPromise = runSerial(async () => {
   const Database = require("better-sqlite3");
@@ -26825,6 +26855,14 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     });
     assertEq(underApp.join(", "), "", "db-hermetic: no db-factory DB resolved under /app/ during the suite");
   }
+  // Module-cache hygiene: every withFreshModules / swapOutModules swap has
+  // been restored, so require.cache holds the db-factory copy (and the
+  // stores/routes) the app's modules were loaded with, not a block's copy.
+  {
+    const pathM = require("path");
+    const stillSwapped = swappedOutModuleIds().map((id) => pathM.relative(pathM.join(__dirname, ".."), id));
+    assertEq(stillSwapped.join(", "), "", "module-cache: no block left a module swapped out of require.cache");
+  }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
@@ -28622,16 +28660,13 @@ Promise.allSettled(_adminAgentsRegisterDeps).then(async () => {
 // Mirrors the sq-detail IIFE discipline: isolated :memory: experiences.db,
 // fresh require-cache, sync mock req/res. Host-isolated (zero rfb/dental).
 console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathSlug = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathSL = require.resolve("../src/database/db-factory");
-  const expStPathSL = require.resolve("../src/services/experience-store");
-  const expSeoPathSL = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathSL];
-  delete require.cache[expStPathSL];
-  delete require.cache[expSeoPathSL];
 
   const dbFacSL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacSL.__resetDbFactoryForTesting();
@@ -28726,11 +28761,9 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
 
   if (prevPathSlug === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathSlug;
-  delete require.cache[dbFacPathSL];
-  delete require.cache[expStPathSL];
-  delete require.cache[expSeoPathSL];
+  dbFacSL.__resetDbFactoryForTesting();
   console.log("  sq-slug: OK (7 tests: slug-200/301-uuid/404/sitemap-no-uuid/detail-link/host-isolation)");
-})();
+});
 
 // ── site-quality: sitemap cold-start provider slug backfill (sq-sitemap-cold) ──
 // Regression guard: new provider inserted with slug=NULL; sitemap.xml is hit
@@ -28738,16 +28771,13 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
 // Old code: sitemap emits UUID URL. Fixed code: sitemap calls backfillProviderSlugs()
 // directly (bypassing the one-shot flag) so newly-slugless providers get slugs first.
 console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap-cold) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathCS = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathCS = require.resolve("../src/database/db-factory");
-  const expStPathCS = require.resolve("../src/services/experience-store");
-  const expSeoPathCS = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathCS];
-  delete require.cache[expStPathCS];
-  delete require.cache[expSeoPathCS];
 
   const dbFacCS = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacCS.__resetDbFactoryForTesting();
@@ -28831,11 +28861,9 @@ console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap
 
   if (prevPathCS === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathCS;
-  delete require.cache[dbFacPathCS];
-  delete require.cache[expStPathCS];
-  delete require.cache[expSeoPathCS];
+  dbFacCS.__resetDbFactoryForTesting();
   console.log("  sq-sitemap-cold: OK (5 tests: cold-no-slug/backfill-ran/slug-derived/sitemap-slug/sitemap-no-uuid)");
-})();
+});
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-23) ──────────────────
 // Homepage category card labels: cat-name must render human-readable label
@@ -28846,16 +28874,13 @@ console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap
 // Fix: CATEGORY_LABELS hoisted to module top (before safeCategories).
 // Uses :memory: DB + experiences-seo router; host-isolated (zero rfb/dental).
 console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlabel) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathHL = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathHL = require.resolve("../src/database/db-factory");
-  const expStPathHL = require.resolve("../src/services/experience-store");
-  const expSeoPathHL = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathHL];
-  delete require.cache[expStPathHL];
-  delete require.cache[expSeoPathHL];
 
   const dbFacHL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacHL.__resetDbFactoryForTesting();
@@ -28932,7 +28957,7 @@ console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlab
   else process.env.EXPERIENCES_DB_PATH = prevPathHL;
   dbFacHL.__resetDbFactoryForTesting();
   console.log("  sq-homepage-catlabel: OK (7 tests: 200/readable-label-kultur/readable-label-vinter/no-raw-slug-kultur/no-raw-slug-vinter/no-rfb/no-dental)");
-})();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Category icon regression guard — sq-caticon
@@ -28942,16 +28967,13 @@ console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlab
 // Regression guard for PR #88 (feat/experiences-category-icons, 2026-06-23).
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── site-quality: category card icons (sq-caticon) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPath = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPath = require.resolve("../src/database/db-factory");
-  const expStPath = require.resolve("../src/services/experience-store");
-  const expSeoPath = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPath];
-  delete require.cache[expStPath];
-  delete require.cache[expSeoPath];
 
   const dbFac = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFac.__resetDbFactoryForTesting();
@@ -29057,7 +29079,7 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
   else process.env.EXPERIENCES_DB_PATH = prevPath;
   dbFac.__resetDbFactoryForTesting();
   console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
-})();
+});
 
 // ─── gardssalg-homepage-count: no gårdssalg card on the .cat-grid ───────────
 // Originally a regression guard for `dev-requests/2026-07-04-opplevagent-
@@ -29074,16 +29096,13 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
 // experiences-seo-forside-seksjonering.test.ts. Same isolated :memory:
 // experiences DB + sync mock req/res pattern as sq-caticon above.
 console.log("\n── gardssalg-homepage-count: no gårdssalg card on the .cat-grid ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathGHC = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathGHC = require.resolve("../src/database/db-factory");
-  const expStPathGHC = require.resolve("../src/services/experience-store");
-  const expSeoPathGHC = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathGHC];
-  delete require.cache[expStPathGHC];
-  delete require.cache[expSeoPathGHC];
 
   const dbFacGHC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGHC.__resetDbFactoryForTesting();
@@ -29153,7 +29172,7 @@ console.log("\n── gardssalg-homepage-count: no gårdssalg card on the .cat-g
   else process.env.EXPERIENCES_DB_PATH = prevPathGHC;
   dbFacGHC.__resetDbFactoryForTesting();
   console.log("  gardssalg-homepage-count: OK (3 tests: 200/no-cat-grid-card/drikkested-still-renders)");
-})();
+});
 
 // ─── content-refresh-attempt-tracking: failed attempts don't block forever ──
 // Regression guard for `controller-handoff/2026-07-05-experiences-enrichment-
@@ -29166,14 +29185,9 @@ console.log("\n── gardssalg-homepage-count: no gårdssalg card on the .cat-g
 // stamped via markProviderContentAttempted() on every attempt regardless of
 // outcome, now drives the ordering instead.
 console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to the back ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/experience-store"], () => {
   const prevPathCRA = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathCRA = require.resolve("../src/database/db-factory");
-  const expStPathCRA = require.resolve("../src/services/experience-store");
-  delete require.cache[dbFacPathCRA];
-  delete require.cache[expStPathCRA];
 
   const dbFacCRA = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacCRA.__resetDbFactoryForTesting();
@@ -29235,7 +29249,7 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
   else process.env.EXPERIENCES_DB_PATH = prevPathCRA;
   dbFacCRA.__resetDbFactoryForTesting();
   console.log("  content-refresh-attempt-tracking: OK (6 tests: initial-order/stamp-returns-true/timestamp-set/reorder-after-attempt)");
-})();
+});
 
 // ─── gardssalg-book: reservation → confirmation journey (2026-07-02) ────────
 // Regression coverage for the live "Book besøk" 404: gårdssalg producers
@@ -29250,7 +29264,12 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
 // experiences DB + sync mock req/res pattern as the p2/sq-caticon blocks
 // above — fully synchronous, so it cannot race the async report tail.
 console.log("\n── gardssalg-book: reservation → confirmation journey ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/services/booking-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathGB = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0: booking
@@ -29272,15 +29291,6 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   // BOOKING_DISPATCH_ENABLED permanently overridden for later blocks in this
   // same process.
   try {
-
-  const dbFacPathGB = require.resolve("../src/database/db-factory");
-  const expStPathGB = require.resolve("../src/services/experience-store");
-  const bookStPathGB = require.resolve("../src/services/booking-store");
-  const expSeoPathGB = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathGB];
-  delete require.cache[expStPathGB];
-  delete require.cache[bookStPathGB];
-  delete require.cache[expSeoPathGB];
 
   const dbFacGB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGB.__resetDbFactoryForTesting();
@@ -29472,7 +29482,7 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGB;
     (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ─── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / booking_live gate
 //     (dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0) ──────────
@@ -29496,7 +29506,13 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
 // email sends), so calling handlers without awaiting is safe and this stays
 // fully synchronous, unable to race the async report tail.
 console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / booking_live gate ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/services/booking-store",
+  "../src/routes/experiences-seo",
+  "../src/routes/opplevelser",
+], () => {
   const prevPathGDL = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevDispatchGDL = process.env.BOOKING_DISPATCH_ENABLED;
@@ -29515,17 +29531,6 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   const emailSvcRestoreGDL = require("../src/services/email-service") as typeof import("../src/services/email-service");
   const origSendRestoreGDL = emailSvcRestoreGDL.emailService.sendEmail.bind(emailSvcRestoreGDL.emailService);
   try {
-
-  const dbFacPathGDL = require.resolve("../src/database/db-factory");
-  const expStPathGDL = require.resolve("../src/services/experience-store");
-  const bookStPathGDL = require.resolve("../src/services/booking-store");
-  const expSeoPathGDL = require.resolve("../src/routes/experiences-seo");
-  const opplevelserPathGDL = require.resolve("../src/routes/opplevelser");
-  delete require.cache[dbFacPathGDL];
-  delete require.cache[expStPathGDL];
-  delete require.cache[bookStPathGDL];
-  delete require.cache[expSeoPathGDL];
-  delete require.cache[opplevelserPathGDL];
 
   const dbFacGDL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGDL.__resetDbFactoryForTesting();
@@ -29824,7 +29829,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGDL;
     (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ─── gardssalg-test-provider-slice0: hidden-but-bookable test provider
 //     (dev-request 2026-07-14-booking-flyt-v1, slice 0) ──────────────────────
@@ -29843,7 +29848,12 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
 // req/res pattern as the gardssalg-dark-launch-stop block above — every path
 // resolves before its first internal await, so it stays fully synchronous.
 console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test provider + producer dispatch to Daniel ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/services/booking-store",
+  "../src/routes/opplevelser",
+], () => {
   const prevPathTP = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevDispatchTP = process.env.BOOKING_DISPATCH_ENABLED;
@@ -29862,15 +29872,6 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   const emailSvcRestoreTP = require("../src/services/email-service") as typeof import("../src/services/email-service");
   const origSendRestoreTP = emailSvcRestoreTP.emailService.sendEmail.bind(emailSvcRestoreTP.emailService);
   try {
-
-  const dbFacPathTP = require.resolve("../src/database/db-factory");
-  const expStPathTP = require.resolve("../src/services/experience-store");
-  const bookStPathTP = require.resolve("../src/services/booking-store");
-  const opplevelserPathTP = require.resolve("../src/routes/opplevelser");
-  delete require.cache[dbFacPathTP];
-  delete require.cache[expStPathTP];
-  delete require.cache[bookStPathTP];
-  delete require.cache[opplevelserPathTP];
 
   const dbFacTP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacTP.__resetDbFactoryForTesting();
@@ -30119,7 +30120,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
     (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ─── gardssalg booking: kundekommentar + produsentens bekreft-løkke
 //     (dev-request 2026-07-14-booking-flyt-v1, oppfølging etter Daniels
@@ -30162,20 +30163,19 @@ const _bekreftLoekkePromise = runSerial(async () => {
   // happens.
   const emailSvcRestoreBKC = require("../src/services/email-service") as typeof import("../src/services/email-service");
   const origSendRestoreBKC = emailSvcRestoreBKC.emailService.sendEmail.bind(emailSvcRestoreBKC.emailService);
+  const restoreModulesBKC = swapOutFreshModules([
+    "../src/database/db-factory",
+    "../src/services/experience-store",
+    "../src/services/booking-store",
+    "../src/routes/experiences-seo",
+    "../src/routes/opplevelser",
+  ]);
+  // This block's own factory copy, for the finally.
+  let dbFacOwnBKC: typeof import("../src/database/db-factory") | undefined;
   try {
 
-  const dbFacPathBKC = require.resolve("../src/database/db-factory");
-  const expStPathBKC = require.resolve("../src/services/experience-store");
-  const bookStPathBKC = require.resolve("../src/services/booking-store");
-  const expSeoPathBKC = require.resolve("../src/routes/experiences-seo");
-  const opplevelserPathBKC = require.resolve("../src/routes/opplevelser");
-  delete require.cache[dbFacPathBKC];
-  delete require.cache[expStPathBKC];
-  delete require.cache[bookStPathBKC];
-  delete require.cache[expSeoPathBKC];
-  delete require.cache[opplevelserPathBKC];
-
   const dbFacBKC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacOwnBKC = dbFacBKC;
   dbFacBKC.__resetDbFactoryForTesting();
   const expStBKC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
   const bookStBKC = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
@@ -30457,7 +30457,8 @@ const _bekreftLoekkePromise = runSerial(async () => {
     else process.env.EXPERIENCES_DB_PATH = prevPathBKC;
     if (prevDispatchBKC === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
     else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchBKC;
-    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+    dbFacOwnBKC?.__resetDbFactoryForTesting();
+    restoreModulesBKC();
   }
 });
 
@@ -30477,18 +30478,14 @@ const _bekreftLoekkePromise = runSerial(async () => {
 // block can render an honest "ca. posisjon" label instead of claiming
 // address-level precision it doesn't have.
 console.log("\n── gardssalg-go-live-gate slice 3: geocode Step D + honest map label ──");
-const _geoStepDPromise = runSerial(async () => {
+const _geoStepDPromise = runSerial(() => withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/services/experiences-geocode-worker",
+  "../src/routes/experiences-seo",
+], async () => {
   const prevPathGEO = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathGEO = require.resolve("../src/database/db-factory");
-  const expStPathGEO = require.resolve("../src/services/experience-store");
-  const geoWorkerPathGEO = require.resolve("../src/services/experiences-geocode-worker");
-  const expSeoPathGEO = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathGEO];
-  delete require.cache[expStPathGEO];
-  delete require.cache[geoWorkerPathGEO];
-  delete require.cache[expSeoPathGEO];
 
   const dbFacGEO = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGEO.__resetDbFactoryForTesting();
@@ -30641,7 +30638,7 @@ const _geoStepDPromise = runSerial(async () => {
   else process.env.EXPERIENCES_DB_PATH = prevPathGEO;
   dbFacGEO.__resetDbFactoryForTesting();
   console.log("  gardssalg-go-live-gate slice 3 geocode Step D: OK (kommune fallback, fylke fallback, same-tick Step A->D chaining, no-overwrite of real geocodes, unresolved-without-throw, honest map-label rendering incl. no-regression on exact/none cases)");
-});
+}));
 
 // gb-qr: qrcode SVG generation smoke test. Isolated — touches no DB/Express
 // state at all — so it's safe to run through the async serial chain without
@@ -30674,16 +30671,13 @@ const _gardssalgQrPromise = runSerial(async () => {
 // as the gardssalg-book/sq-caticon blocks — fully synchronous, so it cannot
 // race the async report tail.
 console.log("\n── gardssalg-profile: produsent profile page ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathGP = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathGP = require.resolve("../src/database/db-factory");
-  const expStPathGP = require.resolve("../src/services/experience-store");
-  const expSeoPathGP = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathGP];
-  delete require.cache[expStPathGP];
-  delete require.cache[expSeoPathGP];
 
   const dbFacGP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGP.__resetDbFactoryForTesting();
@@ -30913,7 +30907,7 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   else process.env.EXPERIENCES_DB_PATH = prevPathGP;
   dbFacGP.__resetDbFactoryForTesting();
   console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression, opplevagent-lenkeplan backlink badge)");
-})();
+});
 
 // ─── gardssalg-content-enrichment: pure extractors (2026-07-10, Fase 1 item 3
 //     of the rike-profiler dev-request) ────────────────────────────────────
@@ -31031,16 +31025,16 @@ console.log("\n── gardssalg-content-refresh: POST /api/opplevelser/admin/gar
   // gardssalg-content-refresh (apply:true) is gated on the MAIN db's
   // enrichment_write_pause (fail-closed) — pin an in-memory main db here.
   let restoreMainDbGCR: (() => void) | null = null;
+  let restoreModulesGCR: (() => void) | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     restoreMainDbGCR = (require("../src/database/init") as typeof import("../src/database/init")).__pinInMemoryDbForTesting();
 
-    const dbFactoryPathGCR = require.resolve("../src/database/db-factory");
-    const expStorePathGCR = require.resolve("../src/services/experience-store");
-    const opplevelserPathGCR = require.resolve("../src/routes/opplevelser");
-    delete require.cache[dbFactoryPathGCR];
-    delete require.cache[expStorePathGCR];
-    delete require.cache[opplevelserPathGCR];
+    restoreModulesGCR = swapOutFreshModules([
+      "../src/database/db-factory",
+      "../src/services/experience-store",
+      "../src/routes/opplevelser",
+    ]);
 
     dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactoryGCR.__resetDbFactoryForTesting();
@@ -31236,6 +31230,7 @@ console.log("\n── gardssalg-content-refresh: POST /api/opplevelser/admin/gar
     }
     if (prevPathGCR === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathGCR;
+    restoreModulesGCR?.();
     console.log("  gardssalg-content-refresh: OK (auth-gate, lock-check-before-fetch, apply-vs-dry-run attempt stamping, providerIds override, auto-select exclusion)");
     _gardssalgContentRefreshResolve();
   }
@@ -38017,19 +38012,18 @@ console.log("\n── geo-produkt-by-query-landing: buildProduktByFaqJsonLd / bu
 // This is the regression guard the PR-149 incident note calls for: prove the
 // route+DB path end-to-end, not only the isolated pure function.
 console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + sitemap (real :memory: DB) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathPBH = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
 
-  const dbFacPathPBH = require.resolve("../src/database/db-factory");
-  const expStPathPBH = require.resolve("../src/services/experience-store");
-  const expSeoPathPBH = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathPBH];
-  delete require.cache[expStPathPBH];
-  delete require.cache[expSeoPathPBH];
-
+  // Hoisted so the finally resets this block's own factory copy.
+  let dbFacPBH: typeof import("../src/database/db-factory") | undefined;
   try {
-    const dbFacPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFacPBH.__resetDbFactoryForTesting();
     const expStPBH = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
     const seoRouterPBH = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
@@ -38135,12 +38129,9 @@ console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + 
   } finally {
     if (prevPathPBH === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathPBH;
-    const dbFactoryPathPBHReset = require.resolve("../src/database/db-factory");
-    delete require.cache[dbFactoryPathPBHReset];
-    const dbFacResetPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
-    dbFacResetPBH.__resetDbFactoryForTesting();
+    dbFacPBH?.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ── mcp-usage-guides: /guide-mat-ai (rettfrabonden.com) — dev-request
 // 2026-06-30-mcp-distribution-traffic-growth, Track C (usage-content).
@@ -38832,16 +38823,13 @@ console.log("\n── outreach-suppression-P0: compose-leak + email-keyed gate �
 // title_no backfilled, one WITHOUT (still NULL) — proves the fallback never
 // renders a broken/empty title on either locale.
 console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no wiring ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathTNR = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathTNR = require.resolve("../src/database/db-factory");
-  const expStorePathTNR = require.resolve("../src/services/experience-store");
-  const expSeoPathTNR = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathTNR];
-  delete require.cache[expStorePathTNR];
-  delete require.cache[expSeoPathTNR];
 
   const dbFactoryTNR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryTNR.__resetDbFactoryForTesting();
@@ -38952,7 +38940,7 @@ console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no 
   else process.env.EXPERIENCES_DB_PATH = prevPathTNR;
   dbFactoryTNR.__resetDbFactoryForTesting();
   console.log("  orch-pr-titleno-render: OK (card + detail <h1> title_no fallback, both locales)");
-})();
+});
 
 
 // ── orch-pr-provider-phone-weave: provider phone surfaced like booking_url ──
@@ -38965,16 +38953,13 @@ console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no 
 // as orch-pr-titleno-render above for the render half; direct experience-
 // store calls for the API-row half.
 console.log("\n── orch-pr-provider-phone-weave: provider phone on detail page + API row ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathPhone = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFactoryPathPhone = require.resolve("../src/database/db-factory");
-  const expStorePathPhone = require.resolve("../src/services/experience-store");
-  const expSeoPathPhone = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFactoryPathPhone];
-  delete require.cache[expStorePathPhone];
-  delete require.cache[expSeoPathPhone];
 
   const dbFactoryPhone = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPhone.__resetDbFactoryForTesting();
@@ -39092,7 +39077,7 @@ console.log("\n── orch-pr-provider-phone-weave: provider phone on detail pag
   else process.env.EXPERIENCES_DB_PATH = prevPathPhone;
   dbFactoryPhone.__resetDbFactoryForTesting();
   console.log("  orch-pr-provider-phone-weave: OK (API row `phone` present/absent/blank + detail-page tel: rendering)");
-})();
+});
 
 
 // ── gardssalg-produsent-products: "Produkter" section render (2026-07-12, Daniel) ──
@@ -39103,16 +39088,13 @@ console.log("\n── orch-pr-provider-phone-weave: provider phone on detail pag
 // a provider with NO products renders no "Produkter" section (never a
 // placeholder); (d) case-insensitive de-dup.
 console.log("\n── gardssalg-produsent-products: 'Produkter' section render ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/experience-store",
+  "../src/routes/experiences-seo",
+], () => {
   const prevPathGPP = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
-
-  const dbFacPathGPP = require.resolve("../src/database/db-factory");
-  const expStPathGPP = require.resolve("../src/services/experience-store");
-  const expSeoPathGPP = require.resolve("../src/routes/experiences-seo");
-  delete require.cache[dbFacPathGPP];
-  delete require.cache[expStPathGPP];
-  delete require.cache[expSeoPathGPP];
 
   const dbFacGPP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGPP.__resetDbFactoryForTesting();
@@ -39188,7 +39170,7 @@ console.log("\n── gardssalg-produsent-products: 'Produkter' section render �
     else process.env.EXPERIENCES_DB_PATH = prevPathGPP;
     dbFacGPP.__resetDbFactoryForTesting();
   }
-})();
+});
 
 
 // ── gardssalg-rfb-enrich: field-selection rules (2026-07-12, Daniel 2A) ──────
@@ -39423,17 +39405,13 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
 // RE-STAMP after expired backoff (the #248 review blocker), selector/list
 // exclusion honors the park + the rollback env flag.
 console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + experiences) ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   // ── Dental ──────────────────────────────────────────────────────────
   const prevDentalPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
   const prevDentalFlag = process.env.DENTAL_HOMEPAGE_PARKING_DISABLED;
   delete process.env.DENTAL_HOMEPAGE_PARKING_DISABLED;
 
-  const dbFacPathEms = require.resolve("../src/database/db-factory");
-  const dentalStorePathEms = require.resolve("../src/services/dental-store");
-  delete require.cache[dbFacPathEms];
-  delete require.cache[dentalStorePathEms];
   const dbFacEms = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacEms.__resetDbFactoryForTesting();
   const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
@@ -39626,19 +39604,15 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     delete process.env.DENTAL_REPEAT_PARK_TO_REVIEW;
     dbFacEms.__resetDbFactoryForTesting();
   }
-})();
+});
 
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/experience-store"], () => {
   // ── Experiences ─────────────────────────────────────────────────────
   const prevExpPath = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
   const prevExpFlag = process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED;
   delete process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED;
 
-  const dbFacPathEms2 = require.resolve("../src/database/db-factory");
-  const expStorePathEms2 = require.resolve("../src/services/experience-store");
-  delete require.cache[dbFacPathEms2];
-  delete require.cache[expStorePathEms2];
   const dbFacEms2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacEms2.__resetDbFactoryForTesting();
   const estore = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
@@ -39683,7 +39657,7 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     if (prevExpFlag === undefined) delete process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED; else process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED = prevExpFlag;
     dbFacEms2.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ── item 2a: dead-extraction parking (dev-request 2026-07-12-dental-
 // enrichment-universe-growth-and-queue-hygiene, 2026-07-17) ──────────────────
@@ -39698,16 +39672,14 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
 // unlike the homepage twin, extraction parking excludes from the CLAIM pool,
 // not the public read-side listing).
 console.log("\n── item2a: dead-extraction parking (dental) ──");
-(() => {
+withFreshModules([
+  "../src/database/db-factory",
+  "../src/services/dental-store",
+  "../src/services/dental-claim-service",
+], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFacPathI2a = require.resolve("../src/database/db-factory");
-  const dentalStorePathI2a = require.resolve("../src/services/dental-store");
-  const dentalClaimPathI2a = require.resolve("../src/services/dental-claim-service");
-  delete require.cache[dbFacPathI2a];
-  delete require.cache[dentalStorePathI2a];
-  delete require.cache[dentalClaimPathI2a];
   const dbFacI2a = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacI2a.__resetDbFactoryForTesting();
   const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
@@ -39899,7 +39871,7 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFacI2a.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ── dev-request 2026-08-23-dental-wrong-entity-streak-parking (2026-08-24) ──
 // Independent wrong_entity_streak / wrong_entity_unreachable_since backoff,
@@ -39939,14 +39911,10 @@ console.log("\n── dental-any-failure-streak (mixed-reason failure backoff) �
 // dental-stage-v-drift-result.test.ts, wired in below like the field-
 // provenance PUT route test.
 console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-store) ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFacS4a = require.resolve("../src/database/db-factory");
-  const dentalStorePathS4a = require.resolve("../src/services/dental-store");
-  delete require.cache[dbFacS4a];
-  delete require.cache[dentalStorePathS4a];
   const dbFactoryS4a = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryS4a.__resetDbFactoryForTesting();
   const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
@@ -40039,7 +40007,7 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFactoryS4a.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ── slice 4b: Stage V treatments/opening_hours auto-correction (dev-request
 // 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene, item 4,
@@ -40051,14 +40019,10 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
 // (400/404/403 + order-insensitive HTTP-layer) coverage lives in
 // dental-stage-v-drift-result.test.ts (sections i-n).
 console.log("\n── slice4b: Stage V treatments/opening_hours auto-correction (dental-store) ──");
-(() => {
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFacS4b = require.resolve("../src/database/db-factory");
-  const dentalStorePathS4b = require.resolve("../src/services/dental-store");
-  delete require.cache[dbFacS4b];
-  delete require.cache[dentalStorePathS4b];
   const dbFactoryS4b = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryS4b.__resetDbFactoryForTesting();
   const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
@@ -40202,7 +40166,7 @@ console.log("\n── slice4b: Stage V treatments/opening_hours auto-correction 
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFactoryS4b.__resetDbFactoryForTesting();
   }
-})();
+});
 
 // ── a2a-card-v1-signing slice 1: A2A v1.0 fields dual-published on all three
 // agent cards, additive-only (legacy authentication/interfaces untouched) ──
@@ -40502,20 +40466,19 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   // longer be able to take any OTHER suite down with it.
   const emailSvcRestorePV = require("../src/services/email-service") as typeof import("../src/services/email-service");
   const origSendRestorePV = emailSvcRestorePV.emailService.sendEmail.bind(emailSvcRestorePV.emailService);
+  const restoreModulesPV = swapOutFreshModules([
+    "../src/database/db-factory",
+    "../src/services/experience-store",
+    "../src/services/booking-store",
+    "../src/routes/experiences-seo",
+    "../src/routes/opplevelser",
+  ]);
+  // This block's own factory copy, for the finally.
+  let dbFacOwnPV: typeof import("../src/database/db-factory") | undefined;
   try {
 
-  const dbFacPathPV = require.resolve("../src/database/db-factory");
-  const expStPathPV = require.resolve("../src/services/experience-store");
-  const bookStPathPV = require.resolve("../src/services/booking-store");
-  const expSeoPathPV = require.resolve("../src/routes/experiences-seo");
-  const opplevelserPathPV = require.resolve("../src/routes/opplevelser");
-  delete require.cache[dbFacPathPV];
-  delete require.cache[expStPathPV];
-  delete require.cache[bookStPathPV];
-  delete require.cache[expSeoPathPV];
-  delete require.cache[opplevelserPathPV];
-
   const dbFacPV = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacOwnPV = dbFacPV;
   dbFacPV.__resetDbFactoryForTesting();
   const expStPV = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
   const bookStPV = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
@@ -41300,7 +41263,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
     if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
     else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
-    (require("../src/database/db-factory") as typeof import("../src/database/db-factory")).__resetDbFactoryForTesting();
+    dbFacOwnPV?.__resetDbFactoryForTesting();
+    restoreModulesPV();
   }
 });
 

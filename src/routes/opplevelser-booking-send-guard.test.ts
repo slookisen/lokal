@@ -167,7 +167,7 @@ export function runOpplevelserBookingSendGuardTests(
       dbFactoryPath, experienceStorePath, bookingStorePath,
       claimPath, emailPath, sendGuardPath, resolvePath, opplevelserPath,
     ];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let emailSvc: any = null;
     let origConfigured: unknown;
@@ -707,7 +707,7 @@ export function runOpplevelserBookingSendGuardTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

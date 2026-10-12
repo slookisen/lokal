@@ -69,7 +69,7 @@ export function runInitDentalBackfillTests(
   const dbFactoryPath = require.resolve("./db-factory");
   const initDentalPath = require.resolve("./init-dental");
   const cachePaths = [dbFactoryPath, initDentalPath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   try {
     const dbFactory = require("./db-factory") as typeof import("./db-factory");
@@ -158,7 +158,7 @@ export function runInitDentalBackfillTests(
     } catch {
       // best-effort cleanup
     }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

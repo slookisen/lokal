@@ -192,7 +192,7 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
     const expStorePath = require.resolve("../services/experience-store");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, expStorePath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -506,7 +506,7 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

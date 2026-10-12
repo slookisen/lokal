@@ -186,7 +186,7 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
     const contentJudgePath = require.resolve("../services/experience-content-judge");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, contentJudgePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -722,7 +722,7 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

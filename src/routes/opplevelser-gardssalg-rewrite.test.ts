@@ -489,7 +489,7 @@ export function runOpplevelserGardssalgRewriteTests(
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1088,7 +1088,7 @@ export function runOpplevelserGardssalgRewriteTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

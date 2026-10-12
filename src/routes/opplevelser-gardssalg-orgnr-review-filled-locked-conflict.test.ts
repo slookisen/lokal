@@ -170,7 +170,7 @@ export function runOpplevelserGardssalgOrgnrReviewFilledLockedConflictTests(
     const judgePath = require.resolve("../services/orgnr-identity-judge");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, storePath, judgePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -562,7 +562,7 @@ export function runOpplevelserGardssalgOrgnrReviewFilledLockedConflictTests(
       } catch {
         /* best-effort */
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   })();
 }

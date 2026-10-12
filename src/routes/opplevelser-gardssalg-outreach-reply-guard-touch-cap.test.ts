@@ -62,7 +62,7 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, emailPath, blocklistPath, experienceStorePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: any = null;
     try {
@@ -220,7 +220,7 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       restore("EXPERIENCES_DB_PATH", prevExperiencesDbPath);
       restore("OUTREACH_COOLDOWN_DAYS", prevCooldownDays);
       restore("DAILY_PREP_MAX_CANDIDATES", prevMaxCandidates);
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
     return { passed, failed, failures };
   })();

@@ -187,6 +187,7 @@ export function runExperiencesSeoForsideSeksjoneringTests(opts: { log?: boolean 
       insertExperience(db, { id: "fs-exp-gardssalg-2", title: "Gårdsbutikk-opplevelse 2", category: "gårdssalg" });
     }
 
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
     try {
       // ════════════════════════════════════════════════════════════════
       // Phase A — dark-launch: 5 gårdssalg providers, NONE booking_live=1,
@@ -299,7 +300,7 @@ export function runExperiencesSeoForsideSeksjoneringTests(opts: { log?: boolean 
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

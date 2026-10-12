@@ -78,9 +78,7 @@ export function runProviderWorkQueueTests(opts: { log?: boolean } = {}): Promise
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const pwqPath = require.resolve("./provider-work-queue");
-    for (const p of [dbFactoryPath, pwqPath]) {
-      delete require.cache[p];
-    }
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, pwqPath]);
 
     try {
       initMod.__setDbForTesting(rfbDb as any);
@@ -221,9 +219,7 @@ export function runProviderWorkQueueTests(opts: { log?: boolean } = {}): Promise
       } catch {
         // best-effort cleanup
       }
-      for (const p of [dbFactoryPath, pwqPath]) {
-        delete require.cache[p];
-      }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

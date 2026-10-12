@@ -438,7 +438,7 @@ export function runOpplevelserGardssalgSecondLineTests(
     const opplevelserPath = require.resolve("./opplevelser");
     const providerWorkQueuePath = require.resolve("../services/provider-work-queue");
     const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, blocklistPath, opplevelserPath, providerWorkQueuePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: any = null;
 
@@ -975,7 +975,7 @@ export function runOpplevelserGardssalgSecondLineTests(
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       if (prevFlag === undefined) delete process.env.GS_SECOND_LINE_VERIFICATION_ENABLED;
       else process.env.GS_SECOND_LINE_VERIFICATION_ENABLED = prevFlag;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

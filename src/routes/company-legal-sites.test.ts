@@ -147,7 +147,7 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     "./experiences-mcp",
     "./dental-mcp",
   ].map((rel) => require.resolve(rel));
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   let server: http.Server | undefined;
   try {
@@ -427,7 +427,7 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       (regMod.marketplaceRegistry as any)._statsCache = null;
       (regMod.marketplaceRegistry as any)._agentsCache = null;
     } catch { /* best-effort */ }
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
     try { rfbTestDb.close(); } catch { /* best-effort */ }
   }
 

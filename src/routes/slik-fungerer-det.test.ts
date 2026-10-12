@@ -141,7 +141,7 @@ export function runSlikFungererDetTests(opts: { log?: boolean } = {}): Promise<T
     const expStorePath = require.resolve("../services/experience-store");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, expStorePath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -294,7 +294,7 @@ export function runSlikFungererDetTests(opts: { log?: boolean } = {}): Promise<T
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -74,7 +74,7 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
     const dbFactoryPath = require.resolve("../database/db-factory");
     const claimSvcPath = require.resolve("../services/gardssalg-claim");
     const routerPath = require.resolve("./gardssalg-claim");
-    for (const p of [dbFactoryPath, claimSvcPath, routerPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, claimSvcPath, routerPath]);
 
     let server: any = null;
     const initMod = require("../database/init") as typeof import("../database/init");
@@ -778,6 +778,7 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* ignore */ }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

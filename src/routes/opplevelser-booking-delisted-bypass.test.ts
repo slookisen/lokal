@@ -81,7 +81,7 @@ export function runOpplevelserBookingDelistedBypassTests(opts: { log?: boolean }
       require.resolve("./opplevelser"),
       require.resolve("./experiences-mcp"),
     ];
-    for (const p of paths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(paths);
 
     let server: http.Server | undefined;
     let emailMod: typeof import("../services/email-service") | undefined;
@@ -286,7 +286,7 @@ export function runOpplevelserBookingDelistedBypassTests(opts: { log?: boolean }
       try {
         (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of paths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

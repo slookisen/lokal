@@ -168,7 +168,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       dbFactoryPath, expStorePath, bookingStorePath, claimSvcPath, emailPath,
       opplevelserPath, seoPath, mcpPath,
     ];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let servers: http.Server[] = [];
     let emailSvc: any = null;
@@ -810,7 +810,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

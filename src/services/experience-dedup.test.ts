@@ -631,9 +631,7 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
     const dbFactoryPath = require.resolve("../database/db-factory");
     const expStorePath = require.resolve("./experience-store");
     const expDedupPath = require.resolve("./experience-dedup");
-    for (const p of [dbFactoryPath, expStorePath, expDedupPath]) {
-      delete require.cache[p];
-    }
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, expDedupPath]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1114,9 +1112,7 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       } else {
         process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       }
-      for (const p of [dbFactoryPath, expStorePath, expDedupPath]) {
-        delete require.cache[p];
-      }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

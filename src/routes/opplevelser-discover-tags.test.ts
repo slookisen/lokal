@@ -98,9 +98,7 @@ export function runOpplevelserDiscoverTagsTests(opts: { log?: boolean } = {}): P
     const expStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
     const openapiPath = require.resolve("../services/experiences-openapi");
-    for (const p of [dbFactoryPath, expStorePath, opplevelserPath, openapiPath]) {
-      delete require.cache[p];
-    }
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, opplevelserPath, openapiPath]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -163,9 +161,7 @@ export function runOpplevelserDiscoverTagsTests(opts: { log?: boolean } = {}): P
       } catch {
         // best-effort cleanup
       }
-      for (const p of [dbFactoryPath, expStorePath, opplevelserPath, openapiPath]) {
-        delete require.cache[p];
-      }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

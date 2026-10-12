@@ -153,7 +153,7 @@ export function runAdminDentalCatalogClassSonnetSampleTests(
     const dentalStorePath = require.resolve("../services/dental-store");
     const routePath = require.resolve("./admin-dental-catalog-class-sonnet-sample");
     const cachePaths = [dbFactoryPath, judgePath, dentalStorePath, routePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     // ── judgeDentalCatalogClass mock ────────────────────────────────────────
     // Keyed by `navn` -> a preset verdict. Every call is recorded (in order)
@@ -477,7 +477,7 @@ export function runAdminDentalCatalogClassSonnetSampleTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

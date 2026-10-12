@@ -117,7 +117,7 @@ export function runOpplevelserAdminFylke2024MigrationTests(
     const fylkeMigrationPath = require.resolve("../services/fylke-2024-migration");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, fylkeMigrationPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -355,7 +355,7 @@ export function runOpplevelserAdminFylke2024MigrationTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

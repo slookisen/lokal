@@ -139,7 +139,7 @@ export function runOpplevelserAdminProvidersAllTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -402,7 +402,7 @@ export function runOpplevelserAdminProvidersAllTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

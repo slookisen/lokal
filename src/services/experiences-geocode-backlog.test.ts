@@ -224,7 +224,7 @@ export function runExperiencesGeocodeBacklogTests(opts: { log?: boolean } = {}):
     const expStorePath = require.resolve("./experience-store");
     const workerPath = require.resolve("./experiences-geocode-worker");
     const opplevelserPath = require.resolve("../routes/opplevelser");
-    for (const p of [dbFactoryPath, expStorePath, workerPath, opplevelserPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, workerPath, opplevelserPath]);
 
     const geo = require("./geocoding-service") as typeof import("./geocoding-service");
     geo.__setGeocodingFetchForTesting(backlogGeocodingFetchStub as unknown as typeof fetch);
@@ -631,6 +631,7 @@ export function runExperiencesGeocodeBacklogTests(opts: { log?: boolean } = {}):
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

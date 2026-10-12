@@ -142,8 +142,7 @@ export async function runAdminAgentAuditFieldProvenanceLegacyShapeTests(
 
   const dbFactoryPath = require.resolve("../database/db-factory");
   const routePath = require.resolve("../routes/admin-agent-audit");
-  delete require.cache[dbFactoryPath];
-  delete require.cache[routePath];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, routePath]);
 
   try {
     __setDbForTesting(rfbTestDb as any);
@@ -293,16 +292,7 @@ export async function runAdminAgentAuditFieldProvenanceLegacyShapeTests(
     } catch {
       /* ignore */
     }
-    try {
-      delete require.cache[require.resolve("../routes/admin-agent-audit")];
-    } catch {
-      /* ignore */
-    }
-    try {
-      delete require.cache[require.resolve("../database/db-factory")];
-    } catch {
-      /* ignore */
-    }
+    restoreModuleCache();
     rfbTestDb.close();
   }
 

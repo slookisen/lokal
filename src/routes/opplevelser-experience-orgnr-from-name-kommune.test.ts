@@ -225,7 +225,7 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
     const svcPath = require.resolve("../services/experience-orgnr-from-name-kommune");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, svcPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const initMod = require("../database/init") as typeof import("../database/init");
     const brregClient = require("../services/brreg-client") as typeof import("../services/brreg-client");
@@ -842,6 +842,7 @@ export function runOpplevelserExperienceOrgnrFromNameKommuneTests(
       fylkeMod.__setKommuneFylke2024RowsForTesting(null);
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

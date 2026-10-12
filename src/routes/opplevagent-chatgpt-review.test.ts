@@ -140,7 +140,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
     const expStorePath = require.resolve("../services/experience-store");
     const experiencesMcpPath = require.resolve("./experiences-mcp");
     const cachePaths = [dbFactoryPath, expStorePath, experiencesMcpPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let server: http.Server | undefined;
 
@@ -434,7 +434,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

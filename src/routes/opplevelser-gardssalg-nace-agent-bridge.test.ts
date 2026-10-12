@@ -116,8 +116,11 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, blocklistPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    // experience-store too: the route inserts through createProvider, which
+    // must reach the same fresh db-factory as the route's own getDb.
+    const experienceStorePath = require.resolve("../services/experience-store");
+    const cachePaths = [dbFactoryPath, blocklistPath, experienceStorePath, opplevelserPath];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: any = null;
 
@@ -529,7 +532,7 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

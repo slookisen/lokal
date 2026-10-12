@@ -104,7 +104,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
     const bookingStorePath = require.resolve("../services/booking-store");
     const experiencesMcpPath = require.resolve("./experiences-mcp");
     const cachePaths = [dbFactoryPath, expStorePath, bookingStorePath, experiencesMcpPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let server: http.Server | undefined;
     let emailModMcp: typeof import("../services/email-service") | undefined;
@@ -485,7 +485,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

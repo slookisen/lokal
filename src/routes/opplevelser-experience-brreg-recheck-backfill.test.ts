@@ -202,7 +202,7 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
     const backfillSvcPath = require.resolve("../services/experience-brreg-recheck-backfill");
     const opplevelserPath = require.resolve("./opplevelser");
     const cachePaths = [dbFactoryPath, experienceStorePath, experienceBrregPath, backfillSvcPath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const initMod = require("../database/init") as typeof import("../database/init");
     let expBrreg: typeof import("../services/experience-brreg") | null = null;
@@ -680,6 +680,7 @@ export function runOpplevelserExperienceBrregRecheckBackfillTests(
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

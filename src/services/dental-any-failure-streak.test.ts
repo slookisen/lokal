@@ -93,7 +93,7 @@ export function runDentalAnyFailureStreakTests(opts: { log?: boolean } = {}): Te
   const dentalStorePath = require.resolve("./dental-store");
   const dentalClaimPath = require.resolve("./dental-claim-service");
   const cachePaths = [dbFacPath, dentalStorePath, dentalClaimPath];
-  for (const p of cachePaths) delete require.cache[p];
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
   const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
   dbFactory.__resetDbFactoryForTesting();
@@ -240,7 +240,7 @@ export function runDentalAnyFailureStreakTests(opts: { log?: boolean } = {}): Te
   } finally {
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFactory.__resetDbFactoryForTesting();
-    for (const p of cachePaths) delete require.cache[p];
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };

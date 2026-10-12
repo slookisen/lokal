@@ -116,7 +116,7 @@ export function runOpplevelserGardssalgKildeklasseContactTests(
     const opplevelserPath = require.resolve("./opplevelser");
     const providerWorkQueuePath = require.resolve("../services/provider-work-queue");
     const cachePaths = [dbFactoryPath, experienceStorePath, blocklistPath, opplevelserPath, providerWorkQueuePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let prevRfbDb: any = null;
 
@@ -534,7 +534,7 @@ export function runOpplevelserGardssalgKildeklasseContactTests(
         const initMod = require("../database/init") as typeof import("../database/init");
         if (prevRfbDb) initMod.__setDbForTesting(prevRfbDb);
       } catch { /* best-effort restore */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

@@ -158,7 +158,7 @@ export function runDentalAgentPutFieldProvenanceTests(
     // cachePaths pattern) forces it to re-bind to the fresh db-factory
     // instance created below.
     const cachePaths = [dbFactoryPath, dentalPath, dentalStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -440,7 +440,7 @@ export function runDentalAgentPutFieldProvenanceTests(
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

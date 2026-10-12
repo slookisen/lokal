@@ -157,7 +157,7 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
     // judge.test.ts (u10 runs the judge route against a mocked Anthropic).
     const judgePath = require.resolve("../services/contact-candidate-judge");
     const cachePaths = [dbFactoryPath, storePath, wvServicePath, judgePath, opplevelserPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     const prevFetch = globalThis.fetch;
     const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
@@ -743,7 +743,7 @@ export function runOpplevelserGardssalgWebsiteQueueUnblockTests(opts: { log?: bo
       } catch {
         /* best-effort */
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

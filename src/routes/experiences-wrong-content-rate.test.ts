@@ -532,7 +532,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
       const contentJudgePath = require.resolve("../services/experience-content-judge");
       const opplevelserPath = require.resolve("./opplevelser");
       const cachePaths = [dbFactoryPath, experienceStorePath, contentJudgePath, opplevelserPath];
-      for (const p of cachePaths) delete require.cache[p];
+      const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -789,7 +789,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           assertTrue(r2.body.sample_size <= 30, "wcr-5d: negative sample_size falls back to the default cap (30)");
         }
       } finally {
-        for (const p of cachePaths) delete require.cache[p];
+        restoreModuleCache();
         if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
         if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
@@ -850,7 +850,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         require.resolve("../services/experience-content-judge"),
         require.resolve("./opplevelser"),
       ];
-      for (const p of cachePathsD) delete require.cache[p];
+      const restoreModuleCacheD = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePathsD);
 
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -992,7 +992,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           "wcr-d9e: strata partition the sample exactly (no row double-counted or dropped)",
         );
       } finally {
-        for (const p of cachePathsD) delete require.cache[p];
+        restoreModuleCacheD();
         if (prevDbPathD === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevDbPathD;
         if (prevAdminKeyD === undefined) delete process.env.ADMIN_KEY;
@@ -1021,7 +1021,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         require.resolve("../services/experience-content-judge"),
         require.resolve("./opplevelser"),
       ];
-      for (const p of cachePathsE) delete require.cache[p];
+      const restoreModuleCacheE = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePathsE);
 
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1100,7 +1100,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         const noCitationResult = (r.body.results as any[]).find((x) => x.experience_id === "e-served-no-citation");
         assertEq(noCitationResult, undefined, "wcr-e9: the no-citation published row is honestly excluded from rows/results, never fabricated a comparison");
       } finally {
-        for (const p of cachePathsE) delete require.cache[p];
+        restoreModuleCacheE();
         if (prevDbPathE === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevDbPathE;
         if (prevAdminKeyE === undefined) delete process.env.ADMIN_KEY;
@@ -1136,7 +1136,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         require.resolve("../services/experience-content-judge"),
         require.resolve("./opplevelser"),
       ];
-      for (const p of cachePathsF) delete require.cache[p];
+      const restoreModuleCacheF = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePathsF);
 
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1200,7 +1200,7 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         const distinctIds = new Set((r.body.results as any[]).map((x) => x.experience_id));
         assertEq(distinctIds.size, 10, "wcr-f3: all 10 results are for distinct experience ids, no double-counted row");
       } finally {
-        for (const p of cachePathsF) delete require.cache[p];
+        restoreModuleCacheF();
         if (prevDbPathF === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevDbPathF;
         if (prevAdminKeyF === undefined) delete process.env.ADMIN_KEY;

@@ -645,7 +645,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -756,7 +756,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -773,7 +773,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -819,7 +819,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -834,7 +834,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -958,7 +958,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -977,7 +977,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1141,7 +1141,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -1160,7 +1160,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1237,7 +1237,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -1256,7 +1256,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1347,7 +1347,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 
@@ -1369,7 +1369,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("./experience-store");
     const cachePaths = [dbFactoryPath, experienceStorePath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -1488,7 +1488,7 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* best-effort */ }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
   }
 

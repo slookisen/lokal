@@ -66,11 +66,11 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
-    for (const p of [
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
       require.resolve("../database/db-factory"),
       require.resolve("./experience-store"),
       require.resolve("./experiences-geocode-worker"),
-    ]) delete require.cache[p];
+    ]);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -386,6 +386,7 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
       } catch { /* nothing to reset */ }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

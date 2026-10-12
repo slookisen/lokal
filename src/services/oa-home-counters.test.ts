@@ -141,9 +141,7 @@ export function runOaHomeCountersTests(opts: { log?: boolean } = {}): Promise<Te
     const trafficStatsPath = require.resolve("./traffic-stats");
     const oaHomeCountersPath = require.resolve("./oa-home-counters");
     const expSeoPath = require.resolve("../routes/experiences-seo");
-    for (const p of [dbFactoryPath, expStorePath, trafficStatsPath, oaHomeCountersPath, expSeoPath]) {
-      delete require.cache[p];
-    }
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, trafficStatsPath, oaHomeCountersPath, expSeoPath]);
 
     try {
       initMod.__setDbForTesting(rfbDb as any);
@@ -360,9 +358,7 @@ export function runOaHomeCountersTests(opts: { log?: boolean } = {}): Promise<Te
       } catch {
         // best-effort cleanup
       }
-      for (const p of [dbFactoryPath, expStorePath, trafficStatsPath, oaHomeCountersPath, expSeoPath]) {
-        delete require.cache[p];
-      }
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

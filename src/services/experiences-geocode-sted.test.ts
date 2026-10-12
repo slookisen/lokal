@@ -96,7 +96,7 @@ export function runExperiencesGeocodeStedTests(opts: { log?: boolean } = {}): Pr
     const dbFactoryPath = require.resolve("../database/db-factory");
     const expStorePath = require.resolve("./experience-store");
     const workerPath = require.resolve("./experiences-geocode-worker");
-    for (const p of [dbFactoryPath, expStorePath, workerPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, expStorePath, workerPath]);
 
     const geo = require("./geocoding-service") as typeof import("./geocoding-service");
 
@@ -209,6 +209,7 @@ export function runExperiencesGeocodeStedTests(opts: { log?: boolean } = {}): Pr
       } catch { /* nothing to reset */ }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

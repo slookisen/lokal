@@ -399,8 +399,7 @@ export async function runGardssalgOpeningHoursTests(opts: { log?: boolean } = {}
     // resolves to the SAME fresh db-factory instance `dbf` below uses.
     const dbFactoryPath = require.resolve("../database/db-factory");
     const openingHoursPath = require.resolve("./gardssalg-opening-hours");
-    delete require.cache[dbFactoryPath];
-    delete require.cache[openingHoursPath];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, openingHoursPath]);
     const dbf = require("../database/db-factory") as any;
     const freshMod = require("./gardssalg-opening-hours") as typeof import("./gardssalg-opening-hours");
     dbf.__resetDbFactoryForTesting?.();
@@ -438,8 +437,7 @@ export async function runGardssalgOpeningHoursTests(opts: { log?: boolean } = {}
       if (prevExpDb === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExpDb;
       dbf.__resetDbFactoryForTesting?.();
-      delete require.cache[dbFactoryPath];
-      delete require.cache[openingHoursPath];
+      restoreModuleCache();
       try { fsm.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }

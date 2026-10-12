@@ -263,7 +263,7 @@ export function runOpplevelserExperienceDescriptionWriteTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
     const opplevelserPath = require.resolve("./opplevelser");
-    for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, experienceStorePath, opplevelserPath]);
     let restoreMainDb: (() => void) | null = null;
 
     // ── The no-LLM guard: any request to api.anthropic.com, through either
@@ -722,7 +722,7 @@ export function runOpplevelserExperienceDescriptionWriteTests(
       else process.env.ADMIN_KEY = prevAdminKey;
       if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
-      for (const p of [dbFactoryPath, experienceStorePath, opplevelserPath]) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };

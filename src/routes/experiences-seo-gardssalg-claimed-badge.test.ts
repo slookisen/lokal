@@ -118,7 +118,7 @@ export function runExperiencesSeoGardssalgClaimedBadgeTests(opts: { log?: boolea
     const claimSvcPath = require.resolve("../services/gardssalg-claim");
     const seoPath = require.resolve("./experiences-seo");
     const cachePaths = [dbFactoryPath, initExpPath, expStorePath, claimSvcPath, seoPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -311,7 +311,7 @@ export function runExperiencesSeoGardssalgClaimedBadgeTests(opts: { log?: boolea
       } catch {
         // best-effort cleanup
       }
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
     }
 
     return { passed, failed, failures };
