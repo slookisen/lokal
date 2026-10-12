@@ -1,0 +1,29 @@
+name: ChatGPT review - Arctic Explorer catalogue check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check one catalogue record without applying changes
+        env:
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+        run: node scripts/chatgpt-arctic-catalogue-check.mjs
+      - name: Preserve the catalogue check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arctic-explorer-catalogue-check
+          path: catalogue-check-report.json
+          if-no-files-found: warn
+          retention-days: 14
