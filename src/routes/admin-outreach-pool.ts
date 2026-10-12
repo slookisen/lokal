@@ -121,7 +121,27 @@ router.get("/stats", (req: Request, res: Response) => {
   try {
     const db = getDb();
     const total = db.prepare(`SELECT COUNT(*) AS c FROM outreach_ready_pool`).get() as { c: number };
+    // dev-request 2026-10-11-controller-to-admin-endepunkter-uenige-om-verified-
+    // beholdningen: `by_verification_status` now uses the SAME population and
+    // classification as GET /admin/dod-bulk (src/routes/admin-dod-bulk.ts) —
+    // producers without an umbrella_type, LEFT JOINed to agent_knowledge, a
+    // producer with no knowledge row counted as 'unverified' — so
+    // `data_verified` reads identically from either endpoint. It used to
+    // GROUP BY over every agent_knowledge row (umbrella and non-producer rows
+    // included, producers without a row missing), which put umbrella rows into
+    // `paraply_epost_mangler` (57 vs 2) and hid the 'unverified' class.
+    // The unscoped breakdown stays available, additively, as
+    // `by_verification_status_all_knowledge_rows`.
     const byStatus = db
+      .prepare(
+        `SELECT COALESCE(k.verification_status, 'unverified') AS k, COUNT(*) AS c
+           FROM agents a
+           LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.role = 'producer' AND a.umbrella_type IS NULL
+          GROUP BY COALESCE(k.verification_status, 'unverified')`,
+      )
+      .all() as Array<{ k: string; c: number }>;
+    const byStatusAllKnowledgeRows = db
       .prepare(`SELECT verification_status AS k, COUNT(*) AS c FROM agent_knowledge GROUP BY verification_status`)
       .all() as Array<{ k: string; c: number }>;
     const byEnrichment = db
@@ -488,6 +508,7 @@ router.get("/stats", (req: Request, res: Response) => {
       success: true,
       pool_size: total?.c ?? 0,
       by_verification_status: byStatus,
+      by_verification_status_all_knowledge_rows: byStatusAllKnowledgeRows,
       by_enrichment_status: byEnrichment,
       pool_funnel: {
         verified_and_rich_or_partial: verifiedRichOrPartial?.c ?? 0,
