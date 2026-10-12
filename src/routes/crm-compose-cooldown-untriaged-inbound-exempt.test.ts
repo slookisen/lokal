@@ -176,7 +176,7 @@ export function runCrmComposeCooldownUntriagedInboundExemptTests(
     const emailPath = require.resolve("../services/email-service");
     const crmPath = require.resolve("./crm");
     const cachePaths = [emailPath, crmPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let sendCalls: Array<Record<string, any>> = [];
 
@@ -413,7 +413,7 @@ export function runCrmComposeCooldownUntriagedInboundExemptTests(
       if (prevOutreachMaxPerDay === undefined) delete process.env.OUTREACH_MAX_PER_DAY; else process.env.OUTREACH_MAX_PER_DAY = prevOutreachMaxPerDay;
       if (prevOutreachPaused === undefined) delete process.env.OUTREACH_PAUSED; else process.env.OUTREACH_PAUSED = prevOutreachPaused;
       if (prevDb) initMod.__setDbForTesting(prevDb);
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
       try { db.close(); } catch { /* best-effort */ }
     }
 

@@ -152,7 +152,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
     const crmPath = require.resolve("./crm");
     const runVerifierPath = require.resolve("./admin-run-verifier");
     const cachePaths = [emailPath, crmPath, runVerifierPath];
-    for (const p of cachePaths) delete require.cache[p];
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
 
     let emailSvc: any = null;
     let sendCalls: Array<Record<string, any>> = [];
@@ -503,7 +503,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       if (prevOutreachCooldownDays === undefined) delete process.env.OUTREACH_COOLDOWN_DAYS; else process.env.OUTREACH_COOLDOWN_DAYS = prevOutreachCooldownDays;
       if (prevOutreachPaused === undefined) delete process.env.OUTREACH_PAUSED; else process.env.OUTREACH_PAUSED = prevOutreachPaused;
       if (prevDb) initMod.__setDbForTesting(prevDb);
-      for (const p of cachePaths) delete require.cache[p];
+      restoreModuleCache();
       try { db.close(); } catch { /* best-effort */ }
     }
 

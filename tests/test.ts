@@ -24,7 +24,6 @@ process.env.EMAIL_FORCE_DRY_RUN = 'true';
 // file DB getDb() happens to open. The worker path is tested directly (with
 // its own temp DB) in src/services/offthread-stats.test.ts.
 process.env.OFFTHREAD_STATS_DISABLED = '1';
-(require("./module-cache") as any).__diagWatch(); // TEMP-DIAG
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
@@ -6315,8 +6314,12 @@ const _m2Promise = (async function runOwnerPortalTests() {
       }
 
       // Mock sendEmail so the real POST route can run end-to-end without
-      // hitting SMTP (same technique as m2-E1.4 above).
-      const emailSvcMod2 = await import("../src/services/email-service");
+      // hitting SMTP (same technique as m2-E1.4 above). require(), not
+      // `await import()`: on Node 20 the dynamic import put a SECOND
+      // email-service instance in require.cache, so later suites stubbed a
+      // different emailService than booking-store/owner-portal send through
+      // (same hazard as the database/init note at the top of this file).
+      const emailSvcMod2 = require("../src/services/email-service") as typeof import("../src/services/email-service");
       const origSendEmail2 = emailSvcMod2.emailService.sendEmail.bind(emailSvcMod2.emailService);
       (emailSvcMod2.emailService as any).sendEmail = async () => ({ success: true, messageId: "mock-rl" });
       try {
@@ -6366,7 +6369,8 @@ const _m2Promise = (async function runOwnerPortalTests() {
     // E1.4 — Magic-link email body template contains agent name + 7-day expiry.
     // Tested directly against the email-service helper (avoids HTTP rate-limit + SMTP).
     {
-      const emailSvcMod = await import("../src/services/email-service");
+      // require(), not `await import()` — see the m2-rl note above.
+      const emailSvcMod = require("../src/services/email-service") as typeof import("../src/services/email-service");
       let captured: any = null;
       const origSend = emailSvcMod.emailService.sendEmail.bind(emailSvcMod.emailService);
       (emailSvcMod.emailService as any).sendEmail = async (opts: any) => {
@@ -42255,7 +42259,6 @@ runSerial(async () => {
 // unreachable-by-reason breakdown (asserted to be a true partition), and
 // dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
 // network seams injected; runs via runSerial() like its siblings.
-runSerial(() => (require("./module-cache") as any).__diagStaleBindings("before crm-platform-identity")); // TEMP-DIAG
 runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 3 (plattformidentitet ut + outreach-trigger-vakt) ──");
   try {
@@ -46743,7 +46746,6 @@ runSerial(async () => {
 // dry-run/apply/retire/refusal; the direct-id order flow; the three trust gates
 // byte-identical. Swaps the getDb() singleton, the order-notify send stub and
 // the geocoder fetch seam (all restored in finally) — runSerial, tail position.
-runSerial(() => (require("./module-cache") as any).__diagStaleBindings("before rfb-hidden-test-producer")); // TEMP-DIAG
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: hidden test producer + listing honesty ──");
   try {
