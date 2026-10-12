@@ -173,7 +173,13 @@ export function renderRfbOutreachEmail(input: RfbOutreachRenderInput): RfbOutrea
     "kontakt@rettfrabonden.com",
     "rettfrabonden.com",
     "",
-    "(Svar «fjern» så slettes profilen automatisk.)",
+    // dev-request 2026-10-12-utsendingsmal-personvernlenke (Daniel live
+    // 2026-10-12, «Én linje + lenke»): GDPR art. 14(3)(b) and 21(4) — the
+    // privacy notice and the right to object, at the latest in the first
+    // contact. Replaces the old «(Svar «fjern» så slettes profilen
+    // automatisk.)» line, whose opt-out it keeps.
+    "Slik behandler vi opplysningene: https://rettfrabonden.com/personvern",
+    "Du kan når som helst protestere – svar «fjern», så slettes profilen.",
   ];
 
   return {
