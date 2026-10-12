@@ -174,6 +174,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
     seedRfb("rfb-hidden", { hidden: 1 });        // never listed anywhere
     seedRfb("rfb-dental", { vertical: "dental" }); // not an RFB producer
     const EXPECT_RFB = 3;
+    let rfbHomeHtml = ""; // the front page, for the lokal_stats parity check in section B
 
     const regMod = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
     const reg: any = regMod.marketplaceRegistry;
@@ -295,6 +296,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
           seoRouter.handle(req, fakeRes((c) => resolve(c)), () => resolve(null));
         });
       const home = await callSeo("/", "no");
+      rfbHomeHtml = String(home?.text);
       assertEq(digitsToNumber((String(home?.text).match(/(\d[\d\s]*) produsenter i hele Norge/) || [])[1]), EXPECT_RFB, "rfb-count-home-pill: front page «N produsenter i hele Norge»");
       assertEq(digitsToNumber((String(home?.text).match(/<div class="stat-n">(\d[\d\s]*)<\/div><div class="stat-l">Produsenter/) || [])[1]), EXPECT_RFB, "rfb-count-home-stat: front page «Produsenter» figure");
       const tech = await callSeo("/teknologi", "no");
@@ -405,6 +407,31 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
     assertEq(manifest.registeredMcpToolNames("rfb").slice().sort(), live.rfb, "tools-1a: manifest(rfb) == live tools/list");
     assertEq(manifest.registeredMcpToolNames("dental").slice().sort(), live.dental, "tools-1b: manifest(dental) == live tools/list");
     assertEq(manifest.registeredMcpToolNames("experiences").slice().sort(), live.experiences, "tools-1c: manifest(experiences) == live tools/list");
+
+    // lokal_stats said getStats().totalAgents (live 11.10: 1813, inactive + unvetted +
+    // umbrella rows too) and printed the whole city list after «Byer:». It now shows the
+    // front page's three figures.
+    {
+      const server = new McpServer({ name: "live-rfb-stats", version: "0.0.0" });
+      (require("./mcp") as typeof import("./mcp")).registerTools(server);
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "discovery-truth-test", version: "0.0.0" });
+      await Promise.all([server.connect(st), client.connect(ct)]);
+      const res: any = await client.callTool({ name: "lokal_stats", arguments: {} });
+      await client.close();
+      await server.close();
+      const text = String(res?.content?.[0]?.text);
+      const toolFigure = (label: string) => digitsToNumber((text.match(new RegExp(`${label}: (\\d+)\\s*$`, "m")) || [])[1]);
+      const homeFigure = (label: string) =>
+        digitsToNumber((rfbHomeHtml.match(new RegExp(`<div class="stat-n">(\\d[\\d\\s]*)</div><div class="stat-l">${label}<`)) || [])[1]);
+      assertEq(toolFigure("Produsenter"), EXPECT_RFB, "rfb-count-mcp-stats: lokal_stats producer count");
+      for (const label of ["Produsenter", "Byer", "Kategorier"]) {
+        const fromHome = homeFigure(label);
+        assertTrue(Number.isFinite(fromHome), `stats-mcp-home-${label}: front page shows a «${label}» figure`);
+        assertEq(toolFigure(label), fromHome, `stats-mcp-home-${label}: lokal_stats == front page`);
+      }
+      assertTrue(!text.includes("Oslo"), "stats-mcp-no-city-list: lokal_stats gives a count, not the city names");
+    }
 
     // RFB: mcp.json, server-card.json (+aliases), discovery.ts card, agent card, llms.txt, skills
     for (const p of ["/.well-known/mcp.json", "/.well-known/mcp/server-card.json", "/.well-known/mcp-server.json"]) {
