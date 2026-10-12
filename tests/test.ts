@@ -46737,6 +46737,26 @@ runSerial(async () => {
   }
 });
 
+// Prod 2026-10-12: the memory limit and /health's memory thresholds
+// (services/memory-thresholds.ts) scale with the machine — the RFB marketing
+// job's G3b gate skipped every attempt at 455 MB RSS on the 2048 MB machine
+// against the old hardcoded 420 MB. Pure, no DB — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── prod 2026-10-12: memory thresholds scale with MEMORY_LIMIT_MB (/health + RFB G3b gate) ──");
+  try {
+    const { runMemoryThresholdsTests } = require("../src/services/memory-thresholds.test") as
+      typeof import("../src/services/memory-thresholds.test");
+    const mt = runMemoryThresholdsTests({ log: false });
+    passed += mt.passed;
+    failed += mt.failed;
+    for (const f of mt.failures) failures.push("memory-thresholds: " + f);
+    console.log(`  memory-thresholds: ${mt.passed} passed, ${mt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("memory-thresholds: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
 // platform-side daily RFB outreach send (services/rfb-marketing-daily.ts) —
 // guards G1–G4, dry run, reserve-before-send fail-closed, restart/second-tick

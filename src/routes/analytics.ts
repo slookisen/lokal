@@ -20,6 +20,7 @@ import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
 import { getOffThreadStatsState } from "../services/offthread-stats";
+import { MEMORY_LIMIT_MB } from "../services/memory-thresholds";
 import {
   isRollupTableName,
   getRollupTableColumns,
@@ -1582,7 +1583,8 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
         rssMb: Math.round(mem.rss / 1024 / 1024),
         heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
         heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
-        pct: Math.round(mem.rss / 1024 / 1024 / 512 * 100),
+        // Same limit as GET /health's memory.pct (was a hardcoded 512 MB).
+        pct: Math.round(mem.rss / 1024 / 1024 / MEMORY_LIMIT_MB * 100),
       },
       database: {
         sizeMb: dbSizeMb,

@@ -178,6 +178,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   }
   const initMod = require("../database/init") as typeof import("../database/init");
   const daily = require("./rfb-marketing-daily") as typeof import("./rfb-marketing-daily");
+  const memThresholds = require("./memory-thresholds") as typeof import("./memory-thresholds");
   const tmpl = require("./rfb-outreach-template") as typeof import("./rfb-outreach-template");
   const identity = require("./crm-platform-identity") as typeof import("./crm-platform-identity");
   const aoc = require("../routes/admin-outreach-candidates") as typeof import("../routes/admin-outreach-candidates");
@@ -928,11 +929,19 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([r.skipped_reason, t.calls.length, daily.getRfbMarketingLaneState(db).paused], ["health_red", 0, false], "k1: red → skip, nothing sent, lane NOT paused (transient)");
       assertEq(r.health?.reasons, ["data volume 96% full"], "k2: the reason is reported");
       const c = daily.classifyRfbMarketingHealth;
-      assertEq([c({ rssMb: 421, diskUsedPct: 10 }).red, c({ rssMb: 420, diskUsedPct: 10 }).red], [true, false], "k3: memory threshold mirrors /health (> 420MB)");
+      // Updated 2026-10-12: the memory threshold now scales with the resolved
+      // memory limit (services/memory-thresholds.ts), so it is pinned to the
+      // 512 MB value here instead of read from this process's environment.
+      const crit512 = memThresholds.memoryThresholdsFor(512).criticalMb;
+      assertEq([c({ rssMb: 421, diskUsedPct: 10 }, crit512).red, c({ rssMb: 420, diskUsedPct: 10 }, crit512).red], [true, false], "k3: memory threshold mirrors /health (> 420MB at a 512 MB limit)");
       assertEq([c({ rssMb: 100, diskUsedPct: 95 }).red, c({ rssMb: 100, diskUsedPct: 94.9 }).red], [true, false], "k4: disk threshold mirrors /health (>= 95%)");
       assertEq(c({ rssMb: null, diskUsedPct: null }).red, false, "k5: an unreadable signal is not red");
       const indexSrc = fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8");
-      assertTrue(indexSrc.includes(`memUsedMb > ${daily.HEALTH_CRITICAL_RSS_MB}) { status = "critical"`), "k6: drift guard — /health's memory-critical threshold equals the mirror");
+      assertTrue(
+        indexSrc.includes(`memUsedMb > MEMORY_THRESHOLDS.criticalMb) { status = "critical"`) &&
+          daily.HEALTH_CRITICAL_RSS_MB === memThresholds.MEMORY_THRESHOLDS.criticalMb,
+        "k6: drift guard — /health's memory-critical threshold and the mirror read the same shared value",
+      );
       assertTrue(indexSrc.includes(`disk.used_pct >= ${daily.HEALTH_CRITICAL_DISK_USED_PCT}) { status = "critical"`), "k7: drift guard — /health's disk-critical threshold equals the mirror");
       const consumes = daily.rfbMarketingRunConsumesWindow;
       assertEq(

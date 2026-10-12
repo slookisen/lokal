@@ -53,6 +53,7 @@ import { computePageViewPruneLag, PRUNE_LAG_GRACE_DAYS } from "./services/health
 import { getRetentionWindowDays } from "./services/traffic-stats-compute";
 import { getWritePathHealth } from "./services/health-write-probe";
 import { getHealthCatalog, getHealthQueryCount } from "./services/health-cheap-counts";
+import { MEMORY_LIMIT_MB, MEMORY_THRESHOLDS } from "./services/memory-thresholds";
 import { prewarmTrafficStats } from "./services/traffic-stats";
 import { AGENT_USAGE_PREWARM_INTERVAL_MS, prewarmAgentToolCalls } from "./services/agent-usage";
 import { prewarmAgentStats } from "./services/agent-stats-reader";
@@ -618,17 +619,9 @@ app.get("/openapi.yaml", (_req, res) => {
 // ─── Health check ────────────────────────────────────────────
 const BOOT_TIME = new Date().toISOString();
 
-// Dynamic memory limit: reads MEMORY_LIMIT_MB env var first,
-// then falls back to cgroup memory.max (Fly.io/container), then 512 MB.
-const MEMORY_LIMIT_MB = (() => {
-  const env = Number(process.env.MEMORY_LIMIT_MB);
-  if (env > 0) return env;
-  try {
-    const raw = require("fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
-    if (raw !== "max") { const mb = Math.round(Number(raw) / 1024 / 1024); if (mb > 0) return mb; }
-  } catch {}
-  return 512;
-})();
+// Dynamic memory limit (MEMORY_LIMIT_MB env var, then cgroup memory.max, then
+// 512 MB) and the memory warning/critical thresholds, which scale with it:
+// services/memory-thresholds.ts, shared with the RFB marketing job's health gate.
 
 app.get("/health", (_req, res) => {
   const startMs = Date.now();
@@ -676,8 +669,8 @@ app.get("/health", (_req, res) => {
     let status: "healthy" | "warning" | "critical" = "healthy";
     const warnings: string[] = [];
 
-    if (memUsedMb > 420) { status = "critical"; warnings.push(`Memory critical: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
-    else if (memUsedMb > 350) { status = "warning"; warnings.push(`Memory high: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
+    if (memUsedMb > MEMORY_THRESHOLDS.criticalMb) { status = "critical"; warnings.push(`Memory critical: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
+    else if (memUsedMb > MEMORY_THRESHOLDS.warningMb) { status = "warning"; warnings.push(`Memory high: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
 
     if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
     else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }

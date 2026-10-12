@@ -146,6 +146,7 @@ import {
 } from "../routes/admin-outreach-candidates";
 import { executeCompose, resolveDailyOutreachCap, type ComposeDeps, type ComposeOutcome } from "../routes/crm";
 import { diskUsage } from "../routes/admin-db-backup";
+import { MEMORY_THRESHOLDS } from "./memory-thresholds";
 import { markJobCompleted, resolveDailyJobLastRunAt } from "./boot-job-gate";
 import { emailService } from "./email-service";
 import { recordRun } from "./run-ledger";
@@ -214,10 +215,13 @@ export const RFB_MARKETING_EXTRA_REFRESHES = 10;
 const CONTACTED_LEDGER_STATUSES_SQL = "('reserved', 'sent', 'unknown')";
 /**
  * The /health "critical" thresholds (src/index.ts, GET /health: memUsedMb >
- * 420 → critical; disk.used_pct >= 95 → critical). Mirrored here because
- * /health computes them inline; a test pins that the two stay equal.
+ * MEMORY_THRESHOLDS.criticalMb → critical; disk.used_pct >= 95 → critical).
+ * The memory one is read from services/memory-thresholds.ts, the same
+ * resolved value /health uses (it scales with the machine's memory limit:
+ * 420 MB at 512 MB, 1680 MB at 2048 MB). The disk one is mirrored here
+ * because /health computes it inline. A test pins that both stay equal.
  */
-export const HEALTH_CRITICAL_RSS_MB = 420;
+export const HEALTH_CRITICAL_RSS_MB = MEMORY_THRESHOLDS.criticalMb;
 export const HEALTH_CRITICAL_DISK_USED_PCT = 95;
 
 export function isRfbMarketingPlatformEnabled(): boolean {
@@ -436,14 +440,17 @@ export interface RfbMarketingHealthSignal {
   disk_used_pct: number | null;
 }
 
-/** Pure: would GET /health report "critical" for these readings? */
+/**
+ * Pure: would GET /health report "critical" for these readings?
+ * `criticalRssMb` defaults to /health's own resolved threshold; tests pin it.
+ */
 export function classifyRfbMarketingHealth(readings: {
   rssMb: number | null;
   diskUsedPct: number | null;
-}): RfbMarketingHealthSignal {
+}, criticalRssMb: number = HEALTH_CRITICAL_RSS_MB): RfbMarketingHealthSignal {
   const reasons: string[] = [];
-  if (readings.rssMb !== null && readings.rssMb > HEALTH_CRITICAL_RSS_MB) {
-    reasons.push(`memory critical: ${readings.rssMb}MB rss (> ${HEALTH_CRITICAL_RSS_MB}MB)`);
+  if (readings.rssMb !== null && readings.rssMb > criticalRssMb) {
+    reasons.push(`memory critical: ${readings.rssMb}MB rss (> ${criticalRssMb}MB)`);
   }
   if (readings.diskUsedPct !== null && readings.diskUsedPct >= HEALTH_CRITICAL_DISK_USED_PCT) {
     reasons.push(`data volume ${readings.diskUsedPct}% full (>= ${HEALTH_CRITICAL_DISK_USED_PCT}%) — SQLite writes will fail`);
