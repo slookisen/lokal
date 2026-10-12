@@ -20,6 +20,11 @@ export interface EmailAttachment {
   contentType: string;
 }
 
+/** Masks e-mail addresses in a log/error string (redactRecipientInLogs). */
+export function maskEmails(s: string): string {
+  return s.replace(/[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g, "[email]");
+}
+
 export interface EmailOptions {
   to: string;
   subject: string;
@@ -45,6 +50,13 @@ export interface EmailOptions {
    * behaviour bit-for-bit unchanged.
    */
   isTestSend?: boolean;
+  /**
+   * Prepayment dev-request (skive 4, buyer receipts): the recipient is a
+   * consumer, so no log line may carry the address — `to` is logged as
+   * "[redacted]" and e-mail addresses inside error messages are masked.
+   * Omitted/false leaves the logging unchanged.
+   */
+  redactRecipientInLogs?: boolean;
   /**
    * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
    *
@@ -293,6 +305,9 @@ export class EmailService {
   }
 
   async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const redact = options.redactRecipientInLogs === true;
+    const logTo = (to: string) => (redact ? "[redacted]" : to);
+    const logErr = (msg: string) => (redact ? maskEmails(msg) : msg);
     // ── Test-send guard (dev-request 2026-07-26-booking-test-send-guard) ──
     // Applied FIRST, ahead of the dry-run short-circuit and every other
     // branch below, so there is no code path on which a test-flagged email
@@ -308,8 +323,8 @@ export class EmailService {
           textContent: options.textContent,
         });
         logger.warn('Test-send redirect applied', {
-          intendedRecipient: options.to,
-          redirectedTo: redirected.to,
+          intendedRecipient: logTo(options.to),
+          redirectedTo: logTo(redirected.to),
           subject: redirected.subject,
         });
         options = { ...options, ...redirected };
@@ -321,7 +336,7 @@ export class EmailService {
               ? err.message
               : 'test_send_redirect_failed';
         logger.error('Test-send BLOCKED — nothing sent', {
-          intendedRecipient: options.to,
+          intendedRecipient: logTo(options.to),
           subject: options.subject,
           error,
         });
@@ -334,7 +349,7 @@ export class EmailService {
     // substituted for its own inspection.
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send email', {
-        to: options.to,
+        to: logTo(options.to),
         subject: options.subject,
       });
       return { success: true, messageId: 'DRY_RUN' };
@@ -375,7 +390,7 @@ export class EmailService {
       const info = await this.transporter.sendMail(mailOptions);
 
       logger.info('Email sent successfully', {
-        to: options.to,
+        to: logTo(options.to),
         subject: options.subject,
         messageId: info.messageId as string,
       });
@@ -383,12 +398,12 @@ export class EmailService {
       return { success: true, messageId: info.messageId as string };
     } catch (error) {
       logger.error('Failed to send email', {
-        to: options.to,
-        error: error instanceof Error ? error.message : String(error),
+        to: logTo(options.to),
+        error: logErr(error instanceof Error ? error.message : String(error)),
       });
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: logErr(error instanceof Error ? error.message : 'Unknown error'),
       };
     }
   }

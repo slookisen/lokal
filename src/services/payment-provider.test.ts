@@ -80,7 +80,9 @@ export async function runPaymentProviderTests(opts: { log?: boolean } = {}): Pro
   ok(!allGates.allowed, "3h: every env gate set, terms not live → still refused");
   ok(/kjopsvilkar/.test(allGates.reason || ""), "3i: refusal names the terms of purchase");
   ok(!/FAKE/.test(allGates.reason || ""), "3j: refusal never echoes the key");
-  const liveEnv = { STRIPE_SECRET_KEY: FAKE_LIVE_KEY, PAYMENTS_LIVE: "1", PAYMENTS_ORG_NR: "938 635 676" };
+  const liveEnv = { STRIPE_SECRET_KEY: FAKE_LIVE_KEY, PAYMENTS_LIVE: "1", PAYMENTS_ORG_NR: "938 635 676", ORDER_BUYER_RECEIPTS_ENABLED: "1" };
+  const noReceipts = assertPaymentsKeyAllowed({ ...liveEnv, ORDER_BUYER_RECEIPTS_ENABLED: undefined }, true);
+  ok(!noReceipts.allowed && /ORDER_BUYER_RECEIPTS_ENABLED/.test(noReceipts.reason || ""), "3k0: live key without buyer receipts (prerequisite 1, § 18) → refused, and the reason says why");
   ok(assertPaymentsKeyAllowed(liveEnv, true).allowed, "3k: every gate set AND terms live → allowed (org.nr compared digits-only)");
   ok(assertPaymentsKeyAllowed({ ...liveEnv, STRIPE_SECRET_KEY: FAKE_RESTRICTED_LIVE_KEY }, true).allowed, "3l: restricted live key with every gate → allowed");
   ok(!assertPaymentsKeyAllowed({ ...liveEnv, PAYMENTS_LIVE: "true" }, true).allowed, "3m: PAYMENTS_LIVE must be exactly \"1\"");

@@ -22,6 +22,7 @@ import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { agentCardProvider } from "../services/company-legal";
+import { isPaymentsEnabled } from "../services/payment-service";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -144,7 +145,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       skills: [
         { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
-        { id: "build-shopping-cart", name: "Build a shopping cart", description: "Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (pickup order, no payment). Not available through message/send on /a2a.", tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
+        { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };

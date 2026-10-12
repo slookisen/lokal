@@ -4876,6 +4876,23 @@ function initSchema(db: Database.Database): void {
   //   which also means pay at pickup.
   try { db.exec(`ALTER TABLE orders ADD COLUMN payment_mode TEXT`); } catch { /* already exists — expected */ }
 
+  // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
+  //   /produsentvilkar (terms_version) and declared whether they sell as a
+  //   trader (angrerettloven § 9 a) — required before connecting Stripe.
+  //   Append-only; the newest row per agent counts. trader_status is shown
+  //   to buyers with every payment link.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS producer_terms_acceptances (
+      id             TEXT PRIMARY KEY,
+      agent_id       TEXT NOT NULL,
+      terms_version  TEXT NOT NULL,
+      trader_status  TEXT NOT NULL CHECK(trader_status IN ('trader','non_trader')),
+      accepted_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      source         TEXT NOT NULL DEFAULT 'owner'
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_producer_terms_acceptances_agent ON producer_terms_acceptances(agent_id, accepted_at)`);
+
   // payment_events: append-only log of every payment/account state change
   //   (source: webhook | owner | admin | system). No buyer personal data in
   //   `detail`, ever.

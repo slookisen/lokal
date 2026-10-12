@@ -46,6 +46,7 @@ const ENV_KEYS = [
   "PAYMENTS_ENABLED", "PAYMENTS_ALLOWED_AGENT_IDS", "STRIPE_SECRET_KEY", "STRIPE_CONNECT_WEBHOOK_SECRET",
   "PAYMENTS_LIVE", "PAYMENTS_ORG_NR", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "BASE_URL", "ORDER_NOTIFY_EMAIL_VERSION",
   "PAYMENT_CHECKOUT_MINUTES", "PAYMENT_CONFIRM_HOURS", "PLATFORM_FEE_BPS", "PLATFORM_FEE_FIXED_ORE",
+  "ORDER_BUYER_RECEIPTS_ENABLED",
 ];
 
 function makeFakeStripe() {
@@ -189,6 +190,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     const cartRoutes = require("./marketplace-cart") as typeof import("./marketplace-cart");
     const paymentsMod = require("./payments") as typeof import("./payments");
     const svc = require("../services/payment-service") as typeof import("../services/payment-service");
+    svc.recordProducerTermsAcceptance(db, "ag-pay", "trader");
     const app = express();
     app.use(express.json({ verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
     app.set("paymentsStripeClient", fake.client);
@@ -693,6 +695,253 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     ok(r.status === 200 && r.text.includes("trekkes først når produsenten bekrefter") && r.text.includes("noindex"), "F14-07: thank-you page, noindex, no status claim");
     r = await req("GET", "/betaling/avbrutt?ordre=x");
     ok(r.status === 200 && r.text.includes("betaling ved henting"), "F14-08: cancel page explains the fallback");
+
+    // ── F17. skive 4: receipts, cancellation, contact, trader status, copy ─
+    const receiptSvc = require("../services/order-receipt-service") as typeof import("../services/order-receipt-service");
+    const receipts: Array<{ to: string; subject: string; textContent?: string; replyTo?: string }> = [];
+    receiptSvc.__setBuyerReceiptTestDb(db as any);
+    receiptSvc.__setBuyerReceiptSendForTesting(async (o) => { receipts.push({ to: o.to, subject: o.subject, textContent: o.textContent, replyTo: o.replyTo }); return { success: true, messageId: "stub" }; });
+    db.prepare(`UPDATE agent_knowledge SET email = 'gard@example.no', phone = '+47 400 00 000', address = 'Gårdsveien 1', postal_code = '3100' WHERE agent_id = 'ag-pay'`).run();
+    svc.recordProducerTermsAcceptance(db, "ag-pay", "non_trader");
+    process.env.PAYMENTS_ENABLED = "1";
+    process.env.ORDER_BUYER_RECEIPTS_ENABLED = "1";
+    const buyer = { contact_consent: true, buyer_name: "Kari", buyer_email: "kari@example.no" };
+    const receiptsTo = (oid2: string) => receipts.filter((m2) => m2.subject.includes(oid2.slice(0, 8)));
+
+    cart = await newCart([["p-egg", 2], ["p-poteter", 1]]);
+    r = await submit(cart, buyer);
+    const kOid = r.body.orders.find((o: any) => o.agent_id === "ag-pay").order_id;
+    const plainOid = r.body.orders.find((o: any) => o.agent_id === "ag-plain").order_id;
+    ok(typeof r.body.terms_url === "string" && r.body.terms_url.endsWith("/kjopsvilkar"), "F17-01: submit response carries terms_url (prerequisite 6)");
+    const kOrder = r.body.orders.find((o: any) => o.order_id === kOid);
+    ok(kOrder.producer_contact?.email === "gard@example.no" && kOrder.producer_contact?.phone === "+47 400 00 000" && /\/produsent\/betal-gard$/.test(kOrder.producer_contact?.profile_url || "")
+      && (kOrder.producer_contact?.address || "").includes("Gårdsveien 1"),
+      "F17-02: orders carry the producer's public contact details (prerequisite 3)");
+    ok(r.body.orders.find((o: any) => o.order_id === plainOid).producer_contact?.profile_url?.includes("/produsent/"), "F17-03: … also for pay-at-pickup orders");
+    eq(r.body.payments[0].seller_trader_status, "non_trader", "F17-04: payments[] carries the producer's trader declaration (§ 9 a)");
+    const kCs = r.body.payments[0].checkout_url.split("/").pop();
+    r = await req("GET", `/api/marketplace/orders/${kOid}?buyer_ref=${encodeURIComponent(cart.buyer_ref)}`);
+    ok(r.status === 200 && r.body.producer_contact?.email === "gard@example.no" && r.body.payment?.fees?.stripe_fee_payer === "producer" && Array.isArray(r.body.payment?.events)
+      && r.body.payment?.seller_trader_status === "non_trader" && r.body.payment.events.every((e: any) => !/retry|failed|stuck|lost|kept|mismatch/.test(e.type)),
+      "F17-05: order status shows producer_contact, fees and the payment timeline");
+
+    // Confirm → binding → receipt with the § 18 information.
+    pi = fake.pay(kCs);
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    receipts.length = 0;
+    r = await req("POST", `/produsent/ordre/${tokenOf(kOid)}`, { form: { action: "confirm" } });
+    await settle();
+    const conf = receiptsTo(kOid)[0];
+    ok(!!conf && conf.to === "kari@example.no" && conf.replyTo === "gard@example.no" && conf.subject.startsWith("Ordrebekreftelse fra Betal Gård"),
+      "F17-06: confirmation receipt to the buyer, Reply-To the producer");
+    ok(!!conf && conf.textContent!.includes("Kjøpet er dermed bindende") && conf.textContent!.includes("Du har betalt 120 kr på forhånd") && conf.textContent!.includes("/kjopsvilkar")
+      && conf.textContent!.includes("Telefon: +47 400 00 000") && conf.textContent!.includes("Adresse: Gårdsveien 1") && conf.textContent!.includes("AGENTPLATFORM.NO AS"),
+      "F17-07: receipt has the binding confirmation, payment, terms link, seller contact and address, operator");
+    ok(!!conf && conf.textContent!.includes("kjøpsloven") && !conf.textContent!.includes("Angrerett:") && !conf.textContent!.includes("Angreskjema"),
+      "F17-07b: producer declared non-trader → the receipt says the Sale of Goods Act applies, no consumer-law promises");
+
+    // Producer page: cancellation box (payments on), with a payment-aware hint.
+    r = await req("GET", `/produsent/ordre/${tokenOf(kOid)}`);
+    ok(r.text.includes("Kanseller ordren …") && r.text.includes('value="cancel_producer"') && r.text.includes('value="cancel_buyer"') && r.text.includes("Betalingen er trukket."),
+      "F17-08: confirmed order → cancellation box with both reasons and the captured-payment hint");
+
+    // Buyer withdraws after confirmation → payment kept (producer refunds in Stripe, § 41).
+    receipts.length = 0;
+    const refundsBeforeK = count("refund");
+    r = await req("POST", `/produsent/ordre/${tokenOf(kOid)}`, { form: { action: "cancel_buyer" } });
+    await settle();
+    ok(orderRow(kOid).status === "cancelled" && orderRow(kOid).cancel_reason === "buyer_cancelled" && payRow(kOid).status === "captured" && count("refund") === refundsBeforeK,
+      "F17-09: buyer cancellation after capture → payment kept, no automatic refund");
+    ok(receiptsTo(kOid)[0]?.textContent?.includes("Avbestillingen din er registrert") && receiptsTo(kOid)[0]!.textContent!.includes("Avtal tilbakebetaling med Betal Gård"), "F17-10: cancellation receipt (non-trader) says to agree the refund with the producer");
+    r = await req("GET", `/produsent/ordre/${tokenOf(kOid)}`);
+    ok(r.text.includes("(avbestilt av kunden)") && !r.text.includes("Kanseller ordren …"), "F17-11: status shows the reason; no more cancellation box");
+    m = await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    r = await req("GET", "/admin/payments/status", { headers: { "X-Admin-Key": "flow-admin-key" } });
+    ok(payRow(kOid).status === "captured" && count("refund") === refundsBeforeK && r.body.alerts_7d.some((a: any) => a.type === "buyer_cancel_kept" && a.order_id === kOid),
+      "F17-11b: maintenance leaves a buyer-cancelled captured payment alone; admin sees it in alerts_7d");
+
+    // From here the producer sells as a trader.
+    svc.recordProducerTermsAcceptance(db, "ag-pay", "trader");
+
+    // Buyer withdraws BEFORE confirmation → recorded as buyer_cancelled, reservation released, no decline against the producer.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    r = await req("GET", `/produsent/ordre/${tokenOf(oid)}`);
+    ok(r.text.includes('value="cancel_buyer"') && !r.text.includes('value="cancel_producer"') && r.text.includes("Betalingen er bare reservert"), "F17-12: pending order → only «Kunden har avbestilt», reservation hint");
+    receipts.length = 0;
+    r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_buyer" } });
+    await settle();
+    const declinedEvents = (db.prepare(`SELECT COUNT(*) AS n FROM trust_events WHERE ref = ? AND event_type = 'order_declined'`).get(oid) as any)?.n ?? 0;
+    ok(orderRow(oid).status === "cancelled" && orderRow(oid).cancel_reason === "buyer_cancelled" && payRow(oid).status === "canceled" && declinedEvents === 0,
+      "F17-13: buyer cancellation before confirmation → reservation released, not logged as a producer decline");
+    ok(receiptsTo(oid)[0]?.textContent?.includes("frigjort"), "F17-14: … receipt says the reservation is released");
+
+    // Producer cannot deliver after capture → automatic refund + receipt.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    await settle();
+    const tConf = receiptsTo(oid)[0]?.textContent || "";
+    ok(tConf.includes("Angrerett:") && tConf.includes("helsevern eller hygiene ikke er egnet for retur") && tConf.includes("§ 22 b") && tConf.includes("Angreskjema (angrerettloven § 8 h)")
+      && tConf.includes("forbrukerkjøpsloven § 41") && tConf.includes("Gårdsveien 1"),
+      "F17-14b: trader → receipt carries the withdrawal rules with the full § 22 g wording and the withdrawal form itself (durable medium)");
+    receipts.length = 0;
+    r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_producer" } });
+    await settle();
+    ok((r.location || "").includes("betaling=refundert") && payRow(oid).status === "refunded" && orderRow(oid).cancel_reason === "producer_cancelled", "F17-15: producer cancels after capture → refunded");
+    ok(receiptsTo(oid)[0]?.textContent?.includes("Du får pengene tilbake"), "F17-16: … receipt promises the refund");
+
+    // Decline → receipt; admin cancel validates the reason.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "decline" } });
+    await settle();
+    ok(receiptsTo(oid)[0]?.subject.startsWith("Bestillingen ble ikke bekreftet") && receiptsTo(oid)[0]!.textContent!.includes("Du er ikke belastet") && !receiptsTo(oid)[0]!.textContent!.includes("frigjort"),
+      "F17-17: decline of an unpaid order → receipt says «ikke belastet», not «frigjort»");
+
+    // Producer cancels after capture while Stripe refunds fail → the receipt already promises the refund (the job retries).
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    fake.setFailRefund(true);
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_producer" } });
+    await settle();
+    fake.setFailRefund(false);
+    ok(payRow(oid).status === "captured" && receiptsTo(oid)[0]?.textContent?.includes("Du får pengene tilbake"), "F17-17b: refund failed at cancel → receipt still promises the refund");
+    m = await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    ok(payRow(oid).status === "refunded", "F17-17c: … and the maintenance job refunds it");
+
+    // Deadline passes → the maintenance job cancels and sends the receipt.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    db.prepare(`UPDATE payments SET capture_deadline_at = ? WHERE order_id = ?`).run(new Date(Date.now() - 60000).toISOString(), oid);
+    receipts.length = 0;
+    await svc.runPaymentMaintenance({ db, stripe: fake.client });
+    await settle();
+    ok(orderRow(oid).cancel_reason === "payment_expired" && (receiptsTo(oid)[0]?.textContent || "").includes("innen fristen") && (receiptsTo(oid)[0]?.textContent || "").includes("blir frigjort"),
+      "F17-17d: payment_expired from the maintenance job → receipt (reservation released)");
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, buyer);
+    oid = r.body.orders[0].order_id;
+    r = await req("POST", `/admin/marketplace/orders/${oid}/cancel`, { headers: { "X-Admin-Key": "flow-admin-key" }, body: { reason: "no_show" } });
+    eq(r.status, 400, "F17-18: admin cancel with a reason outside producer_cancelled/buyer_cancelled → 400");
+    r = await req("POST", `/admin/marketplace/orders/${oid}/cancel`, { headers: { "X-Admin-Key": "flow-admin-key" }, body: { reason: "buyer_cancelled" } });
+    ok(r.status === 200 && orderRow(oid).cancel_reason === "buyer_cancelled" && r.body.payment_effect === "released", "F17-19: admin cancel with a reason → transition + payment step");
+
+    // No e-mail → no receipt; receipts off → nothing sent.
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, { pay_at_pickup: true });
+    oid = r.body.orders[0].order_id;
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    await settle();
+    eq(receiptsTo(oid).length, 0, "F17-20: no buyer e-mail → no receipt (skipped, never logged)");
+    delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, { ...buyer, pay_at_pickup: true });
+    oid = r.body.orders[0].order_id;
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    await settle();
+    eq(receiptsTo(oid).length, 0, "F17-21: ORDER_BUYER_RECEIPTS_ENABLED unset → no receipt");
+    process.env.ORDER_BUYER_RECEIPTS_ENABLED = "1";
+
+    // Suppressed address → no receipt.
+    db.prepare(`INSERT INTO agent_blocklist (identifier_type, identifier_value, reason) VALUES ('email', 'blokk@example.no', 'test')`).run();
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart, { contact_consent: true, buyer_email: "blokk@example.no", pay_at_pickup: true });
+    oid = r.body.orders[0].order_id;
+    receipts.length = 0;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    await settle();
+    eq(receiptsTo(oid).length, 0, "F17-21b: blocklisted buyer address → no receipt");
+
+    // The real send path never logs the buyer's address (e-mail service in dry-run here).
+    receiptSvc.__setBuyerReceiptSendForTesting(null);
+    const logged: string[] = [];
+    const origLog = console.log, origErr = console.error, origWarn = console.warn;
+    console.log = (...a: any[]) => { logged.push(a.map(String).join(" ")); };
+    console.error = (...a: any[]) => { logged.push(a.map(String).join(" ")); };
+    console.warn = (...a: any[]) => { logged.push(a.map(String).join(" ")); };
+    try {
+      cart = await newCart([["p-egg", 1]]);
+      r = await submit(cart, { contact_consent: true, buyer_email: "kari.logg@example.no", pay_at_pickup: true });
+      oid = r.body.orders[0].order_id;
+      await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+      await settle();
+      receiptSvc.__setBuyerReceiptTestDb({ prepare() { throw new Error("db down for kari.logg@example.no"); } });
+      let threw = false;
+      try { await receiptSvc.sendBuyerOrderReceipt(oid, "confirmed"); } catch { threw = true; }
+      receiptSvc.__setBuyerReceiptTestDb(db as any);
+      ok(!threw, "F17-21c: a DB error never throws out of the receipt send");
+    } finally {
+      console.log = origLog; console.error = origErr; console.warn = origWarn;
+    }
+    ok(logged.some((l) => l.includes("[buyer-receipt] sent order=")) && logged.some((l) => l.includes('"to":"[redacted]"')) && !logged.some((l) => l.includes("kari.logg@example.no")),
+      "F17-21d: receipt sent through the e-mail service; no log line carries the buyer's address (recipient redacted, errors masked)");
+    receiptSvc.__setBuyerReceiptSendForTesting(async (o) => { receipts.push({ to: o.to, subject: o.subject, textContent: o.textContent, replyTo: o.replyTo }); return { success: true, messageId: "stub" }; });
+
+    // A terms version bump → no payment links until the producer accepts again.
+    db.prepare(`INSERT INTO producer_terms_acceptances (id, agent_id, terms_version, trader_status, accepted_at, source) VALUES ('pta-old', 'ag-pay', '2000-01-01', 'trader', '2999-01-01T00:00:00.000Z', 'owner')`).run();
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    ok(r.status === 201 && !(r.body.payments || []).length && !svc.canProducerTakePrepayment(db, "ag-pay"), "F17-21e: newest acceptance is an old terms version → no payment link (pay at pickup)");
+    db.prepare(`DELETE FROM producer_terms_acceptances WHERE id = 'pta-old'`).run();
+    ok(svc.canProducerTakePrepayment(db, "ag-pay"), "F17-21f: current terms accepted again → prepayment back");
+    const payAtPickupReceipt = receiptSvc.renderBuyerReceipt("confirmed", { orderRef: "abcd1234", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "https://rfb.test/produsent/gard" }, traderStatus: null, items: [{ name: "Egg", qty: 1, line_total: 60 }], totalNok: 60, cancelReason: null, payment: null });
+    ok(!!payAtPickupReceipt && payAtPickupReceipt.text.includes("Du betaler Gård ved henting"), "F17-22: pay-at-pickup receipt says so");
+    eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null }), null, "F17-23: no receipt for a no-show");
+
+    // Payments off: no cancellation box, and the POST is refused.
+    process.env.PAYMENTS_ENABLED = "1";
+    cart = await newCart([["p-poteter", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    delete process.env.PAYMENTS_ENABLED;
+    r = await req("GET", `/produsent/ordre/${tokenOf(oid)}`);
+    ok(!r.text.includes("Kanseller ordren …"), "F17-24: payments off → producer page without the cancellation box");
+    r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_producer" } });
+    ok((r.location || "").includes("error=ugyldig") && orderRow(oid).status === "confirmed", "F17-25: payments off → cancel POST refused, order unchanged");
+    r = await req("POST", `/admin/marketplace/orders/${oid}/cancel`, { headers: { "X-Admin-Key": "flow-admin-key" }, body: { reason: "producer_cancelled" } });
+    ok(r.status === 409 && orderRow(oid).status === "confirmed", "F17-25b: payments off → admin cancel with a reason refused too");
+
+    // MCP and A2A copy follow the flag.
+    const toolsOn2: Record<string, { def: any }> = {};
+    process.env.PAYMENTS_ENABLED = "1";
+    mcp.registerTools(new Proxy({}, { get: (_t, prop) => prop === "registerTool" ? (name: string, def: any) => { toolsOn2[name] = { def }; } : () => undefined }) as any);
+    ok(mcp.rfbMcpInstructions() === mcp.RFB_MCP_INSTRUCTIONS_PREPAY && !mcp.rfbMcpInstructions().includes("never takes payment") && mcp.rfbMcpInstructions().includes("Some producers take prepayment")
+      && mcp.RFB_MCP_INSTRUCTIONS_PREPAY.endsWith(mcp.RFB_MCP_INSTRUCTIONS.slice(mcp.RFB_MCP_INSTRUCTIONS.indexOf("It cannot send marketing"))),
+      "F17-26: MCP server instructions describe prepayment when on, and keep the rest of the shared guidance");
+    ok(toolsOn2["lokal_cart_submit"]!.def.description.includes("seller_trader_status") && toolsOn2["lokal_cart_submit"]!.def.description.includes("terms_url")
+      && toolsOn2["lokal_cart_create"]!.def.description.includes("Stripe payment link") && toolsOn2["lokal_order_status"]!.def.description.includes("producer_cancelled"),
+      "F17-27: tool descriptions mention the trader status, terms_url, payment links and the new cancel reasons");
+    delete process.env.PAYMENTS_ENABLED;
+    ok(mcp.rfbMcpInstructions() === mcp.RFB_MCP_INSTRUCTIONS && toolsOff["lokal_cart_create"]!.def.description.endsWith("(pickup, no payment)."), "F17-28: payments off → instructions and lokal_cart_create unchanged");
+    const hlOff = hl.buildHandelistePage("no" as any).content;
+    process.env.PAYMENTS_ENABLED = "1";
+    const hlOn = hl.buildHandelistePage("no" as any).content;
+    ok(hlOff.includes("Ingen betaling skjer her.") && !hlOff.includes('"__pay_how_href":'), "F17-29: shopping list lede and copy unchanged with payments off");
+    ok(hlOn.includes("Noen produsenter tar imot forhåndsbetaling") && hlOn.includes('"__pay_how_href":"/betaling"') && hlOn.includes("ikke selger som næringsdrivende") && hlOn.includes("E-postadressen du oppgir hos Stripe, ser produsenten"),
+      "F17-30: shopping list with payments on: lede, «Slik fungerer betaling» link, trader copy, Stripe e-mail disclosure");
+    receiptSvc.__setBuyerReceiptSendForTesting(null);
+    receiptSvc.__setBuyerReceiptTestDb(null);
   } catch (err: any) {
     failed++;
     failures.push("✗ unexpected error: " + String(err?.stack || err));

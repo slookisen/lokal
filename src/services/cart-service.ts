@@ -13,6 +13,7 @@
  *  - Availability is checked on add AND re-checked on submit.
  */
 
+import { formatAddressLine } from "../utils/address-format";
 import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
@@ -82,6 +83,18 @@ export interface OrderSummary {
   producer_name: string;
   total_nok: number;
   status: string;
+  // Prerequisite 3 of the prepayment dev-request: the buyer reaches the
+  // seller directly for cancellation, withdrawal and complaints — the
+  // producer's PUBLIC contact details (same source as contact_handoffs).
+  producer_contact?: ProducerContact;
+}
+
+export interface ProducerContact {
+  phone: string | null;
+  email: string | null;
+  /** Geographic address from the public profile (angrerettloven § 8), or null. */
+  address: string | null;
+  profile_url: string;
 }
 
 // ─── Token generation ───────────────────────────────────────────────────────
@@ -737,7 +750,7 @@ export interface ContactHandoff {
 }
 
 export type SubmitResult =
-  | { success: true; orders: OrderSummary[]; contact_handoffs: ContactHandoff[] }
+  | { success: true; orders: OrderSummary[]; contact_handoffs: ContactHandoff[]; terms_url: string }
   | { success: false; status: number; error: string; unavailable?: Array<{ product_id: string; product_name: string; availability: string }> };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -749,6 +762,23 @@ function buildHandoffMessage(lines: Array<{ name: string; qty: number; unit?: st
     .join(", ");
   return `Hei! Jeg fant deg på Rett fra Bonden og ønsker å bestille: ${itemText}. Har du dette tilgjengelig, og hvordan kan jeg få hentet det?`;
 }
+
+/** The producer's public contact details (agent_knowledge), as on the profile page. Never throws. */
+export function producerContact(agentId: string, agentName: string): ProducerContact {
+  let info: any = null;
+  try { info = knowledgeService.getAgentInfo(agentId) ?? null; } catch { info = null; }
+  const k = info?.knowledge ?? null;
+  const address = k?.address ? formatAddressLine(k.address, k.postalCode, info?.agent?.city) : "";
+  return {
+    phone: k?.phone ?? null,
+    email: k?.email ?? null,
+    address: address || null,
+    profile_url: `${HANDOFF_BASE_URL}/produsent/${slugify(agentName)}`,
+  };
+}
+
+/** Prerequisite 6: every submit response points at the terms the buyer accepted. */
+export const TERMS_OF_PURCHASE_URL = `${HANDOFF_BASE_URL}/kjopsvilkar`;
 
 /** Builds a ContactHandoff for one producer from a merged item/wish list. Never throws. */
 function buildContactHandoff(
@@ -1089,7 +1119,8 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
     buildContactHandoff(agent_id, v.name, v.lines)
   );
 
-  return { success: true, orders: orderSummaries, contact_handoffs };
+  const orders = orderSummaries.map((o) => ({ ...o, producer_contact: producerContact(o.agent_id, o.producer_name) }));
+  return { success: true, orders, contact_handoffs, terms_url: TERMS_OF_PURCHASE_URL };
 }
 
 // ─── Notification input rebuilt from the order (prepayment, skive 2) ────────
@@ -1142,6 +1173,7 @@ export type OrderView =
       cart_id: string | null;
       agent_id: string;
       producer_name: string;
+      producer_contact: ProducerContact;
       status: string;
       cancel_reason: string | null;
       fulfilment: string;
@@ -1173,16 +1205,44 @@ export interface BuyerPaymentView {
   expires_at?: string;
   seller: "producer";
   capture: "on_producer_confirmation";
+  fees: { stripe_fee_payer: "producer"; platform_fee_nok: number };
+  /** The producer's own declaration (angrerettloven § 9 a); null if none. */
+  seller_trader_status: "trader" | "non_trader" | null;
+  /** Payment timeline (no personal data): buyer-relevant event types + timestamp. */
+  events: Array<{ type: string; at: string }>;
+}
+
+// Only these payment_events types are shown to buyers/agents; internal
+// retries, alerts and step failures stay in the admin view.
+const BUYER_PAYMENT_EVENT_TYPES = [
+  "checkout_created", "checkout_completed", "checkout_expired", "payment_authorized", "payment_captured",
+  "payment_canceled", "payment_refunded", "payment_partially_refunded",
+];
+
+/** The newest trader declaration of a producer (producer_terms_acceptances); null if none. */
+export function producerTraderStatus(db: any, agentId: string): "trader" | "non_trader" | null {
+  try {
+    const r = db.prepare(`SELECT trader_status FROM producer_terms_acceptances WHERE agent_id = ? ORDER BY accepted_at DESC, rowid DESC LIMIT 1`)
+      .get(agentId) as { trader_status: string } | undefined;
+    return r?.trader_status === "trader" || r?.trader_status === "non_trader" ? r.trader_status : null;
+  } catch {
+    return null;
+  }
 }
 
 function buyerPaymentView(db: any, orderId: string): BuyerPaymentView | undefined {
   try {
     const p = db.prepare(`
-      SELECT status, amount_ore, refunded_ore, checkout_url, checkout_expires_at FROM payments WHERE order_id = ?
+      SELECT id, agent_id, status, amount_ore, refunded_ore, application_fee_ore, checkout_url, checkout_expires_at FROM payments WHERE order_id = ?
     `).get(orderId) as
-      | { status: string; amount_ore: number; refunded_ore: number; checkout_url: string | null; checkout_expires_at: string | null }
+      | { id: string; agent_id: string; status: string; amount_ore: number; refunded_ore: number; application_fee_ore: number; checkout_url: string | null; checkout_expires_at: string | null }
       | undefined;
     if (!p) return undefined;
+    const events = db.prepare(`
+      SELECT type, created_at AS at FROM payment_events
+      WHERE payment_id = ? AND type IN (${BUYER_PAYMENT_EVENT_TYPES.map(() => "?").join(",")})
+      ORDER BY created_at, rowid
+    `).all(p.id, ...BUYER_PAYMENT_EVENT_TYPES) as Array<{ type: string; at: string }>;
     const payable = p.status === "requires_payment" && !!p.checkout_url && !!p.checkout_expires_at && Date.parse(p.checkout_expires_at) > Date.now();
     return {
       status: p.status,
@@ -1191,6 +1251,9 @@ function buyerPaymentView(db: any, orderId: string): BuyerPaymentView | undefine
       ...(payable ? { checkout_url: p.checkout_url!, expires_at: p.checkout_expires_at! } : {}),
       seller: "producer",
       capture: "on_producer_confirmation",
+      fees: { stripe_fee_payer: "producer", platform_fee_nok: p.application_fee_ore / 100 },
+      seller_trader_status: producerTraderStatus(db, p.agent_id),
+      events,
     };
   } catch {
     // A DB without the payments table (minimal test schema) → no payment view.
@@ -1247,6 +1310,7 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
     cart_id: order.cart_id,
     agent_id: order.agent_id,
     producer_name: order.producer_name,
+    producer_contact: producerContact(order.agent_id, order.producer_name),
     status: order.status,
     cancel_reason: order.cancel_reason,
     fulfilment: order.fulfilment,
@@ -1273,7 +1337,7 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
   cancelled: [],
 };
 
-const SYSTEM_PENDING_CANCEL_REASONS = new Set(["payment_expired"]);
+const SYSTEM_PENDING_CANCEL_REASONS = new Set(["payment_expired", "buyer_cancelled"]);
 
 export type TransitionResult =
   | { success: true; order_id: string; status: string }
@@ -1294,10 +1358,13 @@ export function transitionOrder(
 
   const allowed = VALID_TRANSITIONS[order.status] ?? [];
   // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
-  // connect, skive 3): a pending order whose reserved payment was never
-  // confirmed by the producer in time is cancelled by the system with
-  // cancel_reason='payment_expired'. That reason is the ONLY way into
-  // pending → cancelled; every other caller still gets the matrix above.
+  // connect, skive 3 + prerequisite 2): pending → cancelled is reachable
+  // ONLY with an explicit reason in SYSTEM_PENDING_CANCEL_REASONS —
+  // 'payment_expired' (the producer did not confirm a reserved payment in
+  // time, set by the system) and 'buyer_cancelled' (the buyer withdrew
+  // before confirmation, recorded by the producer — forbrukerkjøpsloven
+  // § 41 — instead of a «decline» that would count against the producer).
+  // Every other caller still gets the matrix above.
   const systemCancel = order.status === "pending" && toStatus === "cancelled" &&
     SYSTEM_PENDING_CANCEL_REASONS.has(opts?.cancelReason ?? "");
   if (!allowed.includes(toStatus) && !systemCancel) {

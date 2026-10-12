@@ -47,6 +47,10 @@ import {
   getPaymentAccount,
   syncProducerAccounts,
   retireProducerAccount,
+  recordProducerTermsAcceptance,
+  hasAcceptedCurrentProducerTerms,
+  isTraderStatus,
+  getProducerPaymentStatus,
   resolvePaymentsStripeClient,
   checkoutMinutes,
   runPaymentMaintenance,
@@ -122,11 +126,23 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
   if (!requireOwner(req, res, agentId)) return;
   const stripe = resolveStripeClient(req);
   if (!stripe) return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
+  // Prerequisites 4 + 5: the form carries the terms checkbox and the trader
+  // declaration the first time (and after a terms version bump).
+  const db0 = getDb();
+  const st = getProducerPaymentStatus(db0, agentId);
+  if (st.state !== "disabled" && st.state !== "not_allowed" && st.state !== "not_eligible" && !hasAcceptedCurrentProducerTerms(db0, agentId)) {
+    const trader = req.body?.trader_status;
+    if (req.body?.terms_accepted !== "1" || !isTraderStatus(trader)) {
+      return res.redirect(303, portalUrl(agentId, "payments_terms_required"));
+    }
+    recordProducerTermsAcceptance(db0, agentId, trader);
+  }
   try {
     const out = await startProducerOnboarding({ db: getDb(), stripe, agentId, baseUrl: baseUrl() });
     if (!out.ok) {
       if (out.error === "already_active") return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal#forhandsbetaling`);
-      const status = out.error === "orders_not_enabled" ? "payments_orders_off" : "payments_unavailable";
+      const status = out.error === "orders_not_enabled" ? "payments_orders_off"
+        : out.error === "terms_required" ? "payments_terms_required" : "payments_unavailable";
       return res.redirect(303, portalUrl(agentId, status));
     }
     return res.redirect(303, out.url);
@@ -134,6 +150,25 @@ router.post("/eier/:agentId/betaling/start", express.urlencoded({ extended: fals
     console.error(`[payments] onboarding start failed agent=${agentId}: ${String(err?.message || err)}`);
     return res.redirect(303, portalUrl(agentId, "payments_error"));
   }
+});
+
+// Change the trader declaration later (prerequisite 5), or accept a new
+// terms version without a new Stripe step (an active producer after a
+// PRODUSENTVILKAR_VERSION bump gets no payment links until then). Records a
+// new acceptance row; the terms checkbox is required unless the current
+// version is already accepted.
+router.post("/eier/:agentId/betaling/erklaering", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  if (!requireOwner(req, res, agentId)) return;
+  const db = getDb();
+  const st = getProducerPaymentStatus(db, agentId);
+  if (st.state === "disabled" || st.state === "not_allowed" || st.state === "not_eligible") return res.redirect(303, portalUrl(agentId, "payments_unavailable"));
+  const trader = req.body?.trader_status;
+  if (!isTraderStatus(trader) || (!hasAcceptedCurrentProducerTerms(db, agentId) && req.body?.terms_accepted !== "1")) {
+    return res.redirect(303, portalUrl(agentId, "payments_terms_required"));
+  }
+  recordProducerTermsAcceptance(db, agentId, trader);
+  return res.redirect(303, portalUrl(agentId, "payments_declared"));
 });
 
 router.get("/eier/:agentId/betaling/retur", (req: Request, res: Response) => {
@@ -246,7 +281,7 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
     // capture that keeps failing) — the verifier/daily brief reads this.
     alerts_7d: getDb().prepare(`
       SELECT type, order_id, created_at AS at FROM payment_events
-      WHERE type IN ('authorization_lost_after_confirm','capture_stuck') AND created_at >= ?
+      WHERE type IN ('authorization_lost_after_confirm','capture_stuck','buyer_cancel_kept') AND created_at >= ?
       ORDER BY created_at DESC LIMIT 20
     `).all(new Date(Date.now() - 7 * 86400000).toISOString()),
     livemode: paymentsLivemode(),
