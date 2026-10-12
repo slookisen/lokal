@@ -748,6 +748,35 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           assertEq(r.body.wrong_content_rate, null, "wcr-4f: wrong_content_rate is null (0 denominator) at this larger n too");
         }
 
+        // ── wcr-4g..: deadline + partial result (dev-request 2026-10-06-
+        //    kvalitetsmaling-stikkprove-og-wcr). A fake clock that advances
+        //    400 ms per Date.now() call makes the 1000 ms deadline hit after
+        //    exactly 2 rows (start=0; checks at 400, 800 pass; 1200 breaks). ──
+        {
+          const realNow = Date.now;
+          let fakeT = 0;
+          Date.now = () => (fakeT += 400);
+          let r: RouteResult;
+          try {
+            r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample_size: 50, deadline_ms: 1000 } });
+          } finally {
+            Date.now = realNow;
+          }
+          assertEq(r.status, 200, "wcr-4g: deadline hit -> still 200 with a partial result, not a 5xx");
+          assertEq(r.body.partial, true, "wcr-4h: partial is true when the deadline cut the run short");
+          assertEq(r.body.sample_size, 2, "wcr-4i: sample_size counts only the rows actually judged");
+          assertEq(r.body.requested_sample_size, 50, "wcr-4j: requested_sample_size reports the drawn sample");
+          assertEq(r.body.unresolved, 2, "wcr-4k: aggregates cover only the processed rows");
+          assertEq(r.body.results.length, 2, "wcr-4l: results hold only the processed rows");
+          assertEq(r.body.deadline_ms, 1000, "wcr-4m: the effective deadline is echoed");
+
+          // A deadline_ms above the default is clamped to 25 000, and a normal run is not partial.
+          const r2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample_size: 10, deadline_ms: 999999 } });
+          assertEq(r2.body.deadline_ms, 25000, "wcr-4n: deadline_ms is clamped to the 25 s default ceiling");
+          assertEq(r2.body.partial, false, "wcr-4o: a run inside the deadline is not partial");
+          assertEq(r2.body.sample_size, 10, "wcr-4p: a full run judges the whole drawn sample");
+        }
+
         // ── wcr-5: a non-numeric / zero / negative sample_size falls back to
         //    the default (30), not a crash or an unbounded query. ───────────
         {
