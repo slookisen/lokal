@@ -1312,6 +1312,8 @@ function buildGardssalgOutreachHtml(providerName: string, profileUrl: string): s
 
     <p style="${P}">Dette er et prosjekt under utvikling, så ting vil endre seg underveis &mdash; jeg setter stor pris på tilbakemeldinger. Vil dere ikke stå oppført, si fra, så fjerner jeg profilen med en gang.</p>
 
+    <p style="${P}">Slik behandler vi opplysningene: <a href="https://opplevagent.no/personvern" style="color:#0f5a50">opplevagent.no/personvern</a>. Du kan når som helst protestere &ndash; svar &laquo;fjern&raquo;, så fjerner jeg profilen.</p>
+
     <div style="margin-top:36px;padding-top:18px;border-top:1px solid #eee">
       <p style="margin:0;font-size:13px;line-height:1.6;color:#666">Med vennlig hilsen</p>
       <p style="margin:0;font-size:13px;line-height:1.6;color:#666">Daniel Fredriksen</p>
@@ -1357,6 +1359,9 @@ https://opplevagent.no/slik-fungerer-det
 Dette er et prosjekt under utvikling, så ting vil endre seg underveis — jeg setter
 stor pris på tilbakemeldinger. Vil dere ikke stå oppført, si fra, så fjerner jeg
 profilen med en gang.
+
+Slik behandler vi opplysningene: https://opplevagent.no/personvern
+Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen.
 
 Med vennlig hilsen
 Daniel Fredriksen
@@ -1411,7 +1416,7 @@ Daniel Fredriksen
 Opplevagent
 kontakt@opplevagent.no
 
-(Svar «fjern», så fjerner jeg profilen med en gang.)
+Slik behandler vi opplysningene: https://opplevagent.no/personvern. Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
 `,
   };
 }

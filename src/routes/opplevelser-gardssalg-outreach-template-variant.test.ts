@@ -71,6 +71,13 @@ export async function runOpplevelserGardssalgOutreachTemplateVariantTests(
     personal.text.split(URL).length === 2,
   );
   check("p3: personal is TEXT-ONLY (html undefined, never an empty string)", personal.html === undefined);
+  // dev-request 2026-10-12-utsendingsmal-personvernlenke: both arms carry the
+  // privacy notice link and the right to object (GDPR art. 14(3)(b), 21(4)).
+  check(
+    "pv1: standard text and html link https://opplevagent.no/personvern and state the right to object",
+    standard.text.includes("https://opplevagent.no/personvern") && /protestere – svar «fjern»/.test(standard.text) &&
+      standard.html.includes('href="https://opplevagent.no/personvern"') && standard.html.includes("protestere &ndash; svar &laquo;fjern&raquo;"),
+  );
   check(
     "p4: personal signature is the platform address kontakt@opplevagent.no",
     personal.text.includes("kontakt@opplevagent.no"),
@@ -84,8 +91,8 @@ export async function runOpplevelserGardssalgOutreachTemplateVariantTests(
     !personal.text.includes("da.fredriksen@gmail.com"),
   );
   check(
-    "p7: personal keeps the RFB draft's opt-out line («Svar «fjern» …»)",
-    /Svar «fjern»/.test(personal.text),
+    "p7: personal keeps the opt-out («svar «fjern» …») and links the privacy page (dev-request 2026-10-12-utsendingsmal-personvernlenke)",
+    /svar «fjern»/i.test(personal.text) && personal.text.includes("https://opplevagent.no/personvern"),
   );
   check(
     "p8: Norwegian characters survive verbatim (no mojibake)",
@@ -120,7 +127,7 @@ Daniel Fredriksen
 Opplevagent
 kontakt@opplevagent.no
 
-(Svar «fjern», så fjerner jeg profilen med en gang.)
+Slik behandler vi opplysningene: https://opplevagent.no/personvern. Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
 `;
   check(
     "p11: personal text matches the corrected 2026-09-03 template verbatim (AC1+AC3 golden check)",

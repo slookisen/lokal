@@ -60,7 +60,8 @@ const EXPECTED_TEXT = [
   "kontakt@rettfrabonden.com",
   "rettfrabonden.com",
   "",
-  "(Svar «fjern» så slettes profilen automatisk.)",
+  "Slik behandler vi opplysningene: https://rettfrabonden.com/personvern",
+  "Du kan når som helst protestere – svar «fjern», så slettes profilen.",
 ].join("\n");
 
 export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestSummary {
@@ -106,6 +107,11 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
     assertEq(r.text, EXPECTED_TEXT, "t1: rendered body equals the effective A2A template, byte for byte");
     assertEq(r.subject, "Profil-utkast for Inderøy Mosteri — Inderøy", "t1: subject B for an odd last hex digit (…e57), as sent 2026-09-12");
     assertEq(r.variant, "B", "t1: variant B");
+    // dev-request 2026-10-12-utsendingsmal-personvernlenke (GDPR art. 14(3)(b), 21(4)).
+    assertTrue(
+      r.text.includes("https://rettfrabonden.com/personvern") && /protestere – svar «fjern»/.test(r.text),
+      "t1: the first contact links /personvern and states the right to object",
+    );
     assertEq(r.template, RFB_OUTREACH_TEMPLATE_ID, "t1: template id carried");
 
     // ── t2: A/B split — «producer_id mod 2 == 0 → A» on the last hex digit ─
@@ -161,7 +167,10 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
     assertEq(/\{\{|\}\}/.test(r.text), false, "t7: no unfilled placeholder");
     assertEq(r.text.includes("\n\n\n"), false, "t7: dropped personal_observation leaves no double blank line");
     assertTrue(r.text.includes("\nRett fra Bonden\nkontakt@rettfrabonden.com\nrettfrabonden.com\n"), "t7: signature block with the platform address");
-    assertEq((r.text.match(/https?:\/\//g) || []).length, 1, "t7: exactly one link — the canonical profile URL");
+    // Two links since dev-request 2026-10-12-utsendingsmal-personvernlenke (Daniel: «Én linje + lenke»): the profile
+    // and /personvern, both on rettfrabonden.com — the spam checklist's own-domain-only rule still holds.
+    const links = r.text.match(/https?:\/\/\S+/g) || [];
+    assertEq(links, [fixture.profileUrl, "https://rettfrabonden.com/personvern"], "t7: exactly two links — the canonical profile URL and /personvern, both on rettfrabonden.com");
 
     // ── t8: refusals instead of improvisation ──────────────────────────────
     assertThrows(() => renderRfbOutreachEmail({ ...fixture, producerName: "  " }), /producer name is empty/, "t8: empty producer name refused");
