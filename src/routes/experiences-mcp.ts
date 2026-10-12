@@ -399,6 +399,7 @@ export const OPPLEVAGENT_MCP_INSTRUCTIONS =
   "Food-product shopping, such as buying stockfish, is outside the scope of experience discovery. " +
   "If discovery returns out_of_scope, explain that limit and do not retry without the purchase request. " +
   "Food tours, tastings, museums and experience tickets remain supported. " +
+  "When price_unit is per_adult, describe price_from as the adult price, not the lowest price for all ages. " +
   "Opplevagent never takes payment: experiences are booked and paid with the provider, and a gårdssalg visit is " +
   "paid on arrival. It cannot confirm a booking: book_gardssalg sends a visit request that stays pending until " +
   "the producer answers by e-mail.";
@@ -626,6 +627,10 @@ function jsonToolResult(payload: Record<string, unknown>, isError = false) {
 // empty; opplevagent.no is listed as the one trusted openExternal target.
 export const WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
 export const WIDGET_DOMAIN = "https://opplevagent.no";
+// A new reference makes the adult-price template available immediately.
+// Keep the previous references readable for already-open conversations.
+export const WIDGET_LIST_URI = "ui://opplevagent/experiences-list-2026-10-12";
+export const WIDGET_DETAIL_URI = "ui://opplevagent/experience-detail-2026-10-12";
 
 function registerWidgetResource(
   server: McpServer,
@@ -700,8 +705,8 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
       _meta: {
-        ui: { resourceUri: "ui://opplevagent/experiences-list" },
-        "openai/outputTemplate": "ui://opplevagent/experiences-list",
+        ui: { resourceUri: WIDGET_LIST_URI },
+        "openai/outputTemplate": WIDGET_LIST_URI,
         "openai/toolInvocation/invoking": "Searching experiences…",
         "openai/toolInvocation/invoked": "Found experiences",
       },
@@ -915,17 +920,21 @@ export function registerExperienceTools(
   registerWidgetResource(
     server,
     "experiences-list",
-    "ui://opplevagent/experiences-list",
+    WIDGET_LIST_URI,
     EXPERIENCES_LIST_HTML,
     "Cards for the experiences the assistant just found, each with a Details button and a link to opplevagent.no. The assistant should summarise the results briefly rather than repeat every card.",
   );
   registerWidgetResource(
     server,
     "experience-detail",
-    "ui://opplevagent/experience-detail",
+    WIDGET_DETAIL_URI,
     EXPERIENCE_DETAIL_HTML,
     "A detail card for one experience: category, place, price, duration, season, description and links to the provider and opplevagent.no.",
   );
+  registerWidgetResource(server, "experiences-list-legacy", "ui://opplevagent/experiences-list", EXPERIENCES_LIST_HTML,
+    "Experience cards for existing conversations.");
+  registerWidgetResource(server, "experience-detail-legacy", "ui://opplevagent/experience-detail", EXPERIENCE_DETAIL_HTML,
+    "An experience detail card for existing conversations.");
 
   // Tool 3: get_experience
   server.registerTool(
@@ -954,8 +963,8 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
       _meta: {
-        ui: { resourceUri: "ui://opplevagent/experience-detail" },
-        "openai/outputTemplate": "ui://opplevagent/experience-detail",
+        ui: { resourceUri: WIDGET_DETAIL_URI },
+        "openai/outputTemplate": WIDGET_DETAIL_URI,
         "openai/toolInvocation/invoking": "Loading experience…",
         "openai/toolInvocation/invoked": "Loaded experience",
       },
@@ -1055,8 +1064,9 @@ export function registerExperienceTools(
         "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
         "rounded distance_km and are sorted nearest-first, and rows with no geocoded location are excluded " +
         "(never a fabricated distance). Returns id (the provider_id for book_gardssalg), name, location, producer " +
-        "type, and an honest booking status " +
+        "type, profile_url, and an honest booking status " +
         "(live direct booking vs. a dark-launch 'coming soon' note — never overclaims booking availability). " +
+        "Include each returned producer's profile_url as a clickable link when available; when booking is paused, tell the user to contact the producer via that profile page. " +
         "To look up ONE specific producer by name (e.g. when the guest says 'book hos Fjordgard Bryggeri'), " +
         "pass `query`. " +
         "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking', " +
@@ -1146,6 +1156,7 @@ export function registerExperienceTools(
           count: results.length,
           filter_applied: filter,
           gardssalg_producers: formatted,
+          presentation_note: "Include each available profile_url as a clickable producer link. When booking.mode is paused, direct contact is via the profile page; no reservation has been sent.",
         };
 
         try {

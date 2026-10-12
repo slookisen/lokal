@@ -1206,6 +1206,43 @@ export function runOpplevelserExperienceDataCorrectionsTests(
         }
       }
 
+      // Adult pricing uses the same audit, stale/owner guards and revert as
+      // numeric corrections. A unit does not imply a cheapest child price.
+      {
+        const id = seed("dc-adult-unit", { price_from: 990, price_unit: null });
+        const correction = item(id, "price_unit", "", "per_adult");
+        const before = dumpAll();
+        const fpBefore = fpOf(id);
+        const dry = await post("/admin/experiences-data-corrections", { items: [correction], dry_run: true });
+        assertEq([dry.status, dry.body.results[0].result], [200, "would_apply"], "adult-unit: route dry-run accepted");
+        assertEq(dumpAll(), before, "adult-unit: dry-run changes neither data nor audit");
+        for (const nv of ["adult", "<script>", 1, null, { unit: "per_adult" }]) {
+          const invalid = await preview([item(id, "price_unit", "", nv)]);
+          assertEq(invalid.results[0].reason, "invalid_value", "adult-unit: rejects unknown/non-string value");
+        }
+        assertEq((await preview([item(id, "price_unit", "per_person", "per_adult")])).results[0].reason,
+          "stale_expected_current", "adult-unit: stale unit rejected");
+        assertEq((await preview([item("dc-manual", "price_unit", "per_person", "per_adult")])).results[0].reason,
+          "owner_managed", "adult-unit: owner-managed experience protected");
+        const written = await apply([correction]);
+        assertEq([written.results[0].result, rowOf(id).price_unit], ["applied", "per_adult"], "adult-unit: applied");
+        assertEq(JSON.parse(rowOf(id).content_field_evidence).price_unit, SRC, "adult-unit: source evidence recorded");
+        assertTrue(fpOf(id) !== fpBefore, "adult-unit: facts fingerprint changes");
+        assertTrue(written.results[0].column_changes.some((c: any) => c.column === "price_unit" && c.old === null && c.new === "per_adult"),
+          "adult-unit: audit captures old/new unit");
+        assertEq(revert({ correction_ids: [written.results[0].correction_id] }, true).results[0].result,
+          "would_revert", "adult-unit: revert dry-run accepted");
+        assertEq(rowOf(id).price_unit, "per_adult", "adult-unit: revert preview writes nothing");
+        assertEq(revert({ correction_ids: [written.results[0].correction_id] }).results[0].result,
+          "reverted", "adult-unit: correction reverted");
+        assertEq(rowOf(id).price_unit, null, "adult-unit: null restored");
+        for (const unit of ["per_person", "per_group", "per_adult"]) {
+          const w = await apply([item(id, "price_unit", "", unit)]);
+          assertEq(w.results[0].result, "applied", "adult-unit: supported unit applied");
+          const clear = await apply([clearItem(id, "price_unit", unit)]);
+          assertEq([clear.results[0].result, rowOf(id).price_unit], ["applied", null], "adult-unit: supported unit clearable");
+        }
+      }
       assertEq(anthropicRequests, 0, "dc-r14b: ZERO requests to api.anthropic.com");
       assertEq(networkCalls, 0, "dc-r14: ZERO network requests across every path above");
       dbFactory.__resetDbFactoryForTesting();

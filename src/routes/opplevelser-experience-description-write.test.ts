@@ -439,6 +439,21 @@ export function runOpplevelserExperienceDescriptionWriteTests(
       }
 
       // ── cw-r3: selection parity with the 4c route. ───────────────────
+      {
+        const target = await getCandidates({ id: idUp, limit: "1" });
+        assertEq(target.body.items.map((i: any) => i.id), [idUp], "target-candidate: filters before page limit");
+        for (const id of [idGood, idManual, idUnpub, idThin, "missing-id"]) {
+          assertEq((await getCandidates({ id })).body.items, [], "target-candidate: existing eligibility gates preserved");
+        }
+        assertEq((await getCandidates({ id: " " })).status, 400, "target-candidate: empty id rejected");
+        const oldFp = fpOf(idF1);
+        expDb.prepare("UPDATE experiences SET price_unit = 'per_adult' WHERE id = ?").run(idF1);
+        const adult = (await getCandidates({ id: idF1 })).body.items[0];
+        assertTrue(adult.facts_block.includes("Pris: 890 kroner per voksen") && !adult.facts_block.includes("Pris: fra 890"),
+          "adult-facts: adult basis explicit without cheapest-price claim");
+        assertTrue(adult.facts_fingerprint !== oldFp, "adult-facts: unit included in fingerprint");
+        expDb.prepare("UPDATE experiences SET price_unit = 'per_person' WHERE id = ?").run(idF1);
+      }
       async function assertParity(label: string): Promise<void> {
         const g = await getCandidates({ limit: "50" });
         const p = await enrichPreview();
@@ -574,6 +589,7 @@ export function runOpplevelserExperienceDescriptionWriteTests(
         const g = await getCandidates({ limit: "50" });
         const ids = (g.body.items as any[]).map((i) => i.id);
         assertTrue(!ids.includes(idF2) && !ids.includes(idK2), "cw-r8e: GET excludes the recently attempted rows");
+        assertEq((await getCandidates({ id: idF2 })).body.items, [], "target-candidate: id filter never bypasses cooldown");
         assertEq(g.body.skipped_recently_attempted, 2, "cw-r8f: counted in skipped_recently_attempted");
         await assertParity("cw-r8g");
         // kildetro fetch_failed has the 7-day window: 8 days old -> back.

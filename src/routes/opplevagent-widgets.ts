@@ -133,6 +133,9 @@ const WIDGET_HELPERS = `
     return parts.join(", ");
   }
   function price(e) {
+    if (e.price_unit === "per_adult") {
+      return typeof e.price_from === "number" ? t("Voksenpris " + e.price_from + " kr", "Adult price NOK " + e.price_from) : "";
+    }
     return typeof e.price_from === "number" ? t("fra " + e.price_from + " kr", "from NOK " + e.price_from) : "";
   }
   function duration(e) {

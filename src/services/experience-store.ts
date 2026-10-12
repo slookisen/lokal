@@ -867,6 +867,7 @@ export type ExperienceCardRow = {
   indoor_outdoor: string | null;
   duration_min: number | null;
   price_from: number | null;
+  price_unit?: string | null;
   price_band: string | null;
   confidence: string | null;
   // dev-request 2026-07-04-opplevagent-taksonomi-filtre: derived cross-cutting
@@ -881,7 +882,7 @@ const CARD_COLS =
   "e.content_field_evidence AS content_field_evidence, " +
   "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
   "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
-  "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence, " +
+  "e.price_from AS price_from, e.price_unit AS price_unit, e.price_band AS price_band, e.confidence AS confidence, " +
   // Extra raw columns needed ONLY to derive `tags` (deriveExperienceTags's
   // TaggableExperience shape) — not part of the public ExperienceCardRow
   // surface; stripped by hydrateCardRow() below.
@@ -905,6 +906,7 @@ function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
     indoor_outdoor: (row.indoor_outdoor as string | null) ?? null,
     duration_min: (row.duration_min as number | null) ?? null,
     price_from: (row.price_from as number | null) ?? null,
+    price_unit: (row.price_unit as string | null) ?? null,
     price_band: (row.price_band as string | null) ?? null,
     confidence: (row.confidence as string | null) ?? null,
     tags: deriveExperienceTags({
