@@ -94,6 +94,14 @@ export async function runOpplevelserGardssalgOutreachTemplateVariantTests(
     "p7: personal keeps the opt-out («svar «fjern» …») and links the privacy page (dev-request 2026-10-12-utsendingsmal-personvernlenke)",
     /svar «fjern»/i.test(personal.text) && personal.text.includes("https://opplevagent.no/personvern"),
   );
+  // Same lock as rfb-outreach-template t7. Matching whole \S+ runs also catches
+  // punctuation glued to a URL, which a strict client folds into the link
+  // (`/personvern.` → 404).
+  check(
+    "p7b: personal carries exactly two links — the profile and the privacy page — with nothing glued on",
+    JSON.stringify(personal.text.match(/https?:\/\/\S+/g) || []) ===
+      JSON.stringify([URL, "https://opplevagent.no/personvern"]),
+  );
   check(
     "p8: Norwegian characters survive verbatim (no mojibake)",
     personal.text.includes("økende") && personal.text.includes("gårdsopplevelser") && !personal.text.includes("Ã"),
@@ -127,7 +135,9 @@ Daniel Fredriksen
 Opplevagent
 kontakt@opplevagent.no
 
-Slik behandler vi opplysningene: https://opplevagent.no/personvern. Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
+Slik behandler vi opplysningene: https://opplevagent.no/personvern
+
+Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
 `;
   check(
     "p11: personal text matches the corrected 2026-09-03 template verbatim (AC1+AC3 golden check)",

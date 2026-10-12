@@ -1416,7 +1416,9 @@ Daniel Fredriksen
 Opplevagent
 kontakt@opplevagent.no
 
-Slik behandler vi opplysningene: https://opplevagent.no/personvern. Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
+Slik behandler vi opplysningene: https://opplevagent.no/personvern
+
+Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen med en gang.
 `,
   };
 }
