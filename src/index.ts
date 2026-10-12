@@ -2157,6 +2157,28 @@ if (process.env.RFB_DISABLE_POSTAL_BACKFILL !== "1") {
 // runs the same function on demand. Producer emails inside go through the
 // same dispatch gates as every other producer send (suppressed → logged).
 //
+// Prepayment lifecycle job (A2A dev-request 2026-10-09-rfb-forhandsbetaling-
+// stripe-connect, skive 3): releases reservations the producer did not
+// confirm in time, retries captures/releases that failed, and catches
+// payment links whose webhook never arrived. With PAYMENTS_ENABLED=1 or
+// "drain" (rollback: finishes open payments, creates no new ones);
+// RFB_DISABLE_PAYMENT_MAINTENANCE=1 turns it off (dev / CI).
+if ((process.env.PAYMENTS_ENABLED === "1" || process.env.PAYMENTS_ENABLED === "drain") && process.env.RFB_DISABLE_PAYMENT_MAINTENANCE !== "1") {
+  setInterval(trackJob("payment-maintenance", async () => {
+    try {
+      const { resolvePaymentsStripeClient, runPaymentMaintenance } = await import("./services/payment-service");
+      const stripe = resolvePaymentsStripeClient();
+      if (!stripe) return;
+      const r = await runPaymentMaintenance({ stripe });
+      if (r.expired_orders || r.captured || r.released || r.sessions_expired || r.intents_synced) {
+        console.log(`[payments] maintenance: ${JSON.stringify(r)}`);
+      }
+    } catch (err) {
+      console.error("[payments] maintenance tick failed (non-fatal):", err);
+    }
+  }), 10 * 60_000);
+}
+
 // Mirrors the experiences-geocode scheduler above: gated on the experiences
 // vertical being enabled (otherwise experiences.db isn't open), disable on
 // dev / CI with RFB_DISABLE_BOOKING_FOLLOWUPS=1.

@@ -15,6 +15,10 @@
 //   GET  /admin/payments/accounts        X-Admin-Key: producer accounts
 //   POST /admin/payments/accounts/:agentId/sync    X-Admin-Key: re-read from Stripe
 //   POST /admin/payments/accounts/:agentId/retire  X-Admin-Key: retire the current account
+//   POST /admin/payments/maintenance       X-Admin-Key: run the lifecycle job now
+//   POST /admin/payments/:paymentId/refund X-Admin-Key: full/partial refund (support)
+//   POST /admin/payments/release-all       X-Admin-Key: rollback — release every open link/reservation
+//   GET  /betaling/takk, /betaling/avbrutt  buyer return pages after Stripe Checkout
 //
 // The return page never trusts the redirect: it only sends the owner back
 // to the portal, which shows the state the webhook wrote.
@@ -27,21 +31,27 @@ import express, { Router, Request, Response } from "express";
 import type { Application } from "express";
 import { getDb } from "../database/init";
 import { verifyOwnerSession } from "./owner-portal";
+import { shell } from "./seo";
 import {
   assertPaymentsKeyAllowed,
-  createRealPaymentsStripeClient,
   paymentsLivemode,
   type PaymentsStripeClient,
 } from "../services/payment-provider";
 import {
   handlePaymentsWebhook,
   isPaymentsEnabled,
+  isPaymentsLifecycleActive,
   listPaymentAccounts,
   paymentsAllowedAgentIds,
   startProducerOnboarding,
   getPaymentAccount,
   syncProducerAccounts,
   retireProducerAccount,
+  resolvePaymentsStripeClient,
+  checkoutMinutes,
+  runPaymentMaintenance,
+  refundPayment,
+  releaseAllOpenPayments,
 } from "../services/payment-service";
 
 const router = Router();
@@ -78,12 +88,7 @@ function requireAdmin(req: Request, res: Response): boolean {
  * change under a running process), then a real client is built.
  */
 function resolveStripeClient(req: Request): PaymentsStripeClient | null {
-  const injected = req.app.get("paymentsStripeClient") as PaymentsStripeClient | undefined;
-  if (injected) return injected;
-  const key = process.env.STRIPE_SECRET_KEY || "";
-  if (!key) return null;
-  if (!assertPaymentsKeyAllowed().allowed) return null;
-  return createRealPaymentsStripeClient(key);
+  return resolvePaymentsStripeClient(req.app.get("paymentsStripeClient") as PaymentsStripeClient | undefined);
 }
 
 function resolveWebhookSecret(req: Request): string {
@@ -156,6 +161,36 @@ router.get("/eier/:agentId/betaling/fornye", async (req: Request, res: Response)
   }
 });
 
+// ── Buyer return pages after Stripe Checkout (skive 2) ───────────────
+// Stripe sends the buyer here after paying or cancelling. The redirect is
+// NOT proof of payment (the webhook is), so the copy never claims a status
+// and never shows order details — the order id in the URL is not a buyer
+// capability.
+
+const RETURN_CSS = `.pay-wrap{max-width:640px;margin:48px auto;padding:0 16px;} .pay-wrap h1{font-size:1.6rem;margin-bottom:12px;} .pay-wrap p{margin:10px 0;line-height:1.55;}`;
+
+router.get("/betaling/takk", (_req: Request, res: Response) => {
+  const body = `<main class="pay-wrap">
+    <h1>Takk for betalingen</h1>
+    <p>Når Stripe har bekreftet betalingen, får produsenten bestillingen din.</p>
+    <p>Beløpet er reservert og trekkes først når produsenten bekrefter bestillingen. Avslår produsenten, frigjøres reservasjonen.</p>
+    <p>Produsenten er selger og mottar betalingen direkte. Les mer i <a href="/kjopsvilkar">kjøpsvilkårene</a>.</p>
+  </main>`;
+  res.set("Cache-Control", "no-store");
+  res.send(shell("Takk for betalingen", "Betalingen er registrert hos Stripe.", body, { robots: "noindex, nofollow", extraCss: RETURN_CSS }));
+});
+
+router.get("/betaling/avbrutt", (_req: Request, res: Response) => {
+  const body = `<main class="pay-wrap">
+    <h1>Betalingen ble ikke fullført</h1>
+    <p>Du kan betale med lenken du fikk så lenge den gjelder (${checkoutMinutes()} minutter fra du sendte bestillingen).</p>
+    <p>Betaler du ikke innen fristen, sendes bestillingen til produsenten med betaling ved henting.</p>
+    <p>Vil du ikke ha varene likevel, kontakter du produsenten. Les mer i <a href="/kjopsvilkar">kjøpsvilkårene</a>.</p>
+  </main>`;
+  res.set("Cache-Control", "no-store");
+  res.send(shell("Betalingen ble ikke fullført", "Betalingen ble ikke fullført.", body, { robots: "noindex, nofollow", extraCss: RETURN_CSS }));
+});
+
 // ── Connect webhook ──────────────────────────────────────────────────
 // Raw body: src/index.ts's global express.json() keeps the exact request
 // bytes on req.rawBody — Stripe's HMAC is over those bytes. Mounted early
@@ -205,6 +240,15 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
   res.json({
     success: true,
     payments_enabled: isPaymentsEnabled(),
+    payments_mode: process.env.PAYMENTS_ENABLED === "1" ? "on" : process.env.PAYMENTS_ENABLED === "drain" ? "drain" : "off",
+    open_payments: (getDb().prepare(`SELECT COUNT(*) AS n FROM payments WHERE status IN ('requires_payment','authorized')`).get() as { n: number }).n,
+    // Money the producer may lose (lost reservation after confirmation,
+    // capture that keeps failing) — the verifier/daily brief reads this.
+    alerts_7d: getDb().prepare(`
+      SELECT type, order_id, created_at AS at FROM payment_events
+      WHERE type IN ('authorization_lost_after_confirm','capture_stuck') AND created_at >= ?
+      ORDER BY created_at DESC LIMIT 20
+    `).all(new Date(Date.now() - 7 * 86400000).toISOString()),
     livemode: paymentsLivemode(),
     stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
     connect_webhook_secret_configured: !!process.env.STRIPE_CONNECT_WEBHOOK_SECRET,
@@ -216,6 +260,47 @@ router.get("/admin/payments/status", (req: Request, res: Response) => {
 router.get("/admin/payments/accounts", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   res.json({ success: true, accounts: listPaymentAccounts(getDb()) });
+});
+
+// Lifecycle support (skive 3). Producers refund in their own Stripe
+// Dashboard; these exist for support and rollback.
+router.post("/admin/payments/maintenance", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const stripe = resolveStripeClient(req);
+  if (!stripe) {
+    res.status(503).json({ error: "Payments not configured" });
+    return;
+  }
+  res.json({ success: true, result: await runPaymentMaintenance({ db: getDb(), stripe }) });
+});
+
+router.post("/admin/payments/:paymentId/refund", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const stripe = resolveStripeClient(req);
+  if (!stripe) {
+    res.status(503).json({ error: "Payments not configured" });
+    return;
+  }
+  const raw = req.body?.amount_ore;
+  const amountOre = raw === undefined || raw === null ? undefined : Number(raw);
+  try {
+    const out = await refundPayment(getDb(), stripe, String(req.params.paymentId || ""), {
+      amountOre, reason: String(req.body?.reason || "admin_refund").slice(0, 60), source: "admin",
+    });
+    res.status(out.ok ? 200 : 409).json(out.ok ? { success: true, refunded_ore: out.refundedOre } : { success: false, error: out.error });
+  } catch (err: any) {
+    res.status(502).json({ error: "refund failed", detail: String(err?.message || err) });
+  }
+});
+
+router.post("/admin/payments/release-all", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const stripe = resolveStripeClient(req);
+  if (!stripe) {
+    res.status(503).json({ error: "Payments not configured" });
+    return;
+  }
+  res.json({ success: true, ...(await releaseAllOpenPayments(getDb(), stripe)) });
 });
 
 router.post("/admin/payments/accounts/:agentId/retire", (req: Request, res: Response) => {
@@ -242,7 +327,10 @@ router.post("/admin/payments/accounts/:agentId/sync", async (req: Request, res: 
 // ── Mounting ─────────────────────────────────────────────────────────
 
 function paymentsMountable(env: NodeJS.ProcessEnv): boolean {
-  if (!isPaymentsEnabled(env)) return false;
+  // "drain" keeps the routes (webhook, admin, return pages) so open links and
+  // reservations can be finished; owner onboarding refuses on its own (the
+  // producer state is "disabled" unless PAYMENTS_ENABLED=1).
+  if (!isPaymentsLifecycleActive(env)) return false;
   const guard = assertPaymentsKeyAllowed(env);
   if (!guard.allowed) {
     console.error(`payments: ${guard.reason}`);

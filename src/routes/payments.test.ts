@@ -349,7 +349,7 @@ export async function runPaymentsRouteTests(opts: { log?: boolean } = {}): Promi
     eq(eventCount("account_charges_enabled_changed"), 1, "wh-10: one state-change event");
     ok(svc.canProducerTakePrepayment(db, "pay-a"), "wh-11: producer can now take prepayment");
     r = await req("GET", "/eier/pay-a/portal", { headers: cookie("ptok-a") });
-    ok(r.text.includes("klar til å ta imot betaling") && !r.text.includes("/eier/pay-a/betaling/start"), "card-11: active card, no start button");
+    ok(r.text.includes("Forhåndsbetaling er på") && !r.text.includes("/eier/pay-a/betaling/start"), "card-11: active card, no start button");
 
     r = await req("POST", WH, { raw: w.raw, headers: { "Stripe-Signature": w.sig } });
     ok(r.status === 200 && r.body?.duplicate === true, "wh-12: redelivery → duplicate");
@@ -483,5 +483,6 @@ if (require.main === module) {
   runPaymentsRouteTests({ log: true }).then((s) => {
     console.log(`\npayments routes: ${s.passed} passed, ${s.failed} failed`);
     if (s.failed) { for (const f of s.failures) console.log(f); process.exit(1); }
+    process.exit(0);
   });
 }

@@ -36,7 +36,6 @@ import {
   updateCartItem,
   deleteCartItem,
   viewCart,
-  submitCart,
   getOrder,
   transitionOrder,
   getOrderByConfirmToken,
@@ -45,6 +44,18 @@ import {
   deleteCartWish,
 } from "../services/cart-service";
 import { cartWishesLimiter } from "../middleware/security";
+import {
+  submitCartWithPayments,
+  resolvePaymentsStripeClient,
+  isPaymentsEnabled,
+  isPaymentsLifecycleActive,
+  onOrderTransitioned,
+  getPaymentForOrder,
+  formatOsloDateTime,
+  type OrderPaymentEffect,
+} from "../services/payment-service";
+import { getDb } from "../database/init";
+import type { PaymentsStripeClient } from "../services/payment-provider";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
 export const cartRouter = Router();
@@ -344,7 +355,7 @@ cartRouter.get("/cart/:id", (req: Request, res: Response) => {
 // cart-service.submitCart). Swept 30 days after terminal order status by
 // services/cart-contact-sweep.ts.
 // ─────────────────────────────────────────────────────────────────────────────
-cartRouter.post("/cart/:id/submit", cartWishesLimiter, (req: Request, res: Response) => {
+cartRouter.post("/cart/:id/submit", cartWishesLimiter, async (req: Request, res: Response) => {
   const body = req.body ?? {};
 
   // Honeypot — silently accepted as a field, rejected only if filled in.
@@ -366,9 +377,22 @@ cartRouter.post("/cart/:id/submit", cartWishesLimiter, (req: Request, res: Respo
     buyer_phone: typeof body.buyer_phone === "string" ? body.buyer_phone.trim() || null : null,
     delivery_note: typeof body.delivery_note === "string" ? body.delivery_note.trim() || null : null,
     contact_consent: body.contact_consent === true,
+    pay_at_pickup: body.pay_at_pickup === true,
   };
 
-  const result = submitCart(cartId(req), contact);
+  // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+  // connect, skive 2): with PAYMENTS_ENABLED off this is exactly
+  // submitCart() and the response is unchanged; with it on, orders for
+  // producers that take prepayment come back with Stripe payment links in
+  // `payments[]`.
+  const result = await submitCartWithPayments({
+    cartId: cartId(req),
+    contact,
+    stripe: isPaymentsEnabled()
+      ? resolvePaymentsStripeClient(req.app.get("paymentsStripeClient") as PaymentsStripeClient | undefined)
+      : null,
+    baseUrl: process.env.BASE_URL || "https://rettfrabonden.com",
+  });
   if (!result.success) {
     res.status(result.status).json(result);
     return;
@@ -398,6 +422,16 @@ cartRouter.get("/orders/:id", (req: Request, res: Response) => {
   res.json(result);
 });
 
+// Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+// connect, skive 3): the Stripe client for the payment step after an order
+// transition — null when payments are off (the step is then a no-op).
+function paymentsClientFor(req: Request): PaymentsStripeClient | null {
+  // "drain" (rollback) still captures/releases open payments.
+  return isPaymentsLifecycleActive()
+    ? resolvePaymentsStripeClient(req.app.get("paymentsStripeClient") as PaymentsStripeClient | undefined)
+    : null;
+}
+
 // ─── Admin order lifecycle ────────────────────────────────────────────────────
 // POST /admin/marketplace/orders/:id/confirm|decline|ready|complete|no-show
 // Admin-gated (X-Admin-Key). Transitions the order status. "no-show" is the
@@ -415,13 +449,14 @@ const ACTION_TO_STATUS: Record<string, string> = {
 };
 
 for (const action of LIFECYCLE_ACTIONS) {
-  adminOrderRouter.post(`/orders/:id/${action}`, (req: Request, res: Response) => {
+  adminOrderRouter.post(`/orders/:id/${action}`, async (req: Request, res: Response) => {
     if (!requireAdmin(req, res)) return;
 
     const toStatus = ACTION_TO_STATUS[action]!;
+    const cancelReason = action === "no-show" ? "no_show" : null;
     const result = transitionOrder(cartId(req), toStatus, {
       actor: "admin",
-      cancelReason: action === "no-show" ? "no_show" : null,
+      cancelReason,
     });
 
     if (!result.success) {
@@ -429,7 +464,15 @@ for (const action of LIFECYCLE_ACTIONS) {
       return;
     }
 
-    res.json(result);
+    // Prepayment step (capture / release / refund) after the transition —
+    // never undoes it. Absent from the response when payments are off.
+    const stripe = paymentsClientFor(req);
+    if (!stripe) {
+      res.json(result);
+      return;
+    }
+    const payment_effect = await onOrderTransitioned({ db: getDb(), stripe, orderId: result.order_id, toStatus, cancelReason });
+    res.json({ ...result, payment_effect });
   });
 }
 
@@ -489,6 +532,67 @@ const ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: string; 
   cancelled: [],
 };
 
+function kr(ore: number): string {
+  const v = ore / 100;
+  return Number.isInteger(v) ? `${v} kr` : `${v.toFixed(2).replace(".", ",")} kr`;
+}
+
+/** One line on the producer page per payment state (prepayment, skive 3). */
+function producerPaymentText(p: NonNullable<ReturnType<typeof getPaymentForOrder>>): string {
+  if (p.status === "authorized" && !isPaymentsLifecycleActive()) {
+    // Payments switched fully off with a reservation still open: nothing
+    // will capture it — never promise that it will.
+    return `Kunden har reservert ${kr(p.amount_ore)}, men forhåndsbetaling er midlertidig slått av, så beløpet blir ikke trukket automatisk. Oppgjør ved henting som vanlig.`;
+  }
+  switch (p.status) {
+    case "authorized":
+      return `Kunden har betalt ${kr(p.amount_ore)}. Beløpet er reservert og trekkes når du bekrefter ordren.` +
+        (p.capture_deadline_at ? ` Bekreft innen ${formatOsloDateTime(p.capture_deadline_at)}, ellers frigjøres reservasjonen og ordren kanselleres.` : "") +
+        " Avslår du, frigjøres reservasjonen.";
+    case "captured": {
+      const fee = p.stripe_fee_ore;
+      const net = fee != null ? p.amount_ore - fee - p.application_fee_ore - p.refunded_ore : null;
+      return `${kr(p.amount_ore)} er trukket og går til din Stripe-konto.` +
+        (fee != null ? ` Stripe-gebyr: ${kr(fee)}.` : "") +
+        (p.refunded_ore > 0 ? ` Refundert til kunden: ${kr(p.refunded_ore)}.` : "") +
+        (net != null ? ` Netto til deg: ${kr(net)}.` : "");
+    }
+    case "refunded":
+      return `${kr(p.refunded_ore || p.amount_ore)} er refundert til kunden.`;
+    case "requires_payment":
+      return "Kunden har ikke betalt ennå.";
+    case "expired":
+      return p.authorized_at
+        ? "Reservasjonen gikk ut før betalingen ble trukket. Oppgjør ved henting som vanlig."
+        : "Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.";
+    case "canceled": {
+      const reason = (p as { failure_reason?: string | null }).failure_reason || "";
+      if (!p.authorized_at) return "Kunden betalte ikke på forhånd. Oppgjør ved henting som vanlig.";
+      if (reason === "payment_expired") return "Ordren ble ikke bekreftet innen fristen. Reservasjonen er frigjort, og kunden er ikke belastet.";
+      if (reason === "order_declined") return "Reservasjonen er frigjort, og kunden er ikke belastet.";
+      return "Reservasjonen er frigjort, og kunden er ikke belastet. Oppgjør ved henting som vanlig hvis bestillingen gjennomføres.";
+    }
+    default:
+      return "Oppgjør ved henting som vanlig.";
+  }
+}
+
+const PAYMENT_BANNERS: Record<string, string> = Object.assign(Object.create(null), {
+  trukket: `<div class="ordre-banner ok" role="status">Betalingen er trukket.</div>`,
+  frigjort: `<div class="ordre-banner ok" role="status">Reservasjonen er frigjort.</div>`,
+  refundert: `<div class="ordre-banner ok" role="status">Betalingen er refundert til kunden.</div>`,
+  venter: `<div class="ordre-banner warn" role="status">Betalingen trekkes om litt. Du trenger ikke gjøre noe.</div>`,
+  feilet: `<div class="ordre-banner warn" role="alert">Betalingen kunne ikke trekkes fordi reservasjonen er utløpt. Avtal betaling ved henting.</div>`,
+});
+
+const EFFECT_TO_BANNER: Partial<Record<OrderPaymentEffect, string>> = {
+  captured: "trukket",
+  released: "frigjort",
+  refunded: "refundert",
+  capture_pending: "venter",
+  capture_failed: "feilet",
+};
+
 producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   const raw = req.params["token"];
   const token = Array.isArray(raw) ? (raw[0] as string) : (raw as string);
@@ -544,6 +648,13 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
     ? `<div class="recap"><strong>Kunde:</strong>\n      ${buyerRowsHtml}\n    </div>`
     : "";
 
+  // Prepayment (skive 3): what happened to the buyer's payment. Only for
+  // orders that have a payment row — every other order renders as before.
+  let paymentRow: ReturnType<typeof getPaymentForOrder> = null;
+  try { paymentRow = getPaymentForOrder(getDb(), order.order_id); } catch { paymentRow = null; }
+  const paymentHtml = paymentRow ? `<div class="recap"><strong>Betaling:</strong>\n      <div>${escapePageHtml(producerPaymentText(paymentRow))}</div>\n    </div>` : "";
+  const paymentBanner = PAYMENT_BANNERS[String(req.query["betaling"] || "")] || "";
+
   const timelineHtml = order.timeline.length
     ? `<div class="recap"><strong>Tidslinje:</strong>\n      ${order.timeline
         .map((e) => `<div>${escapePageHtml(e.created_at)}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
@@ -587,10 +698,10 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
       ${order.total_nok != null ? `<div><strong>Sum:</strong> ${order.total_nok} kr</div>` : ""}
       ${itemsHtml}
     </div>
-    ${buyerBlockHtml}
+    ${buyerBlockHtml}${paymentRow ? `\n    ${paymentBanner}${paymentHtml}` : ""}
     ${timelineHtml}
     ${actionsHtml}
-    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. Ingen betaling skjer via plattformen.</p>
+    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. ${paymentRow ? "Betalingen går via Stripe direkte til din egen Stripe-konto." : "Ingen betaling skjer via plattformen."}</p>
   </div>
 </main>
 </body>
@@ -604,7 +715,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
 producerOrderRouter.post(
   "/:token",
   express.urlencoded({ extended: false }),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const raw = req.params["token"];
     const token = Array.isArray(raw) ? (raw[0] as string) : (raw as string);
     const order = token ? getOrderByConfirmToken(token) : null;
@@ -625,6 +736,17 @@ producerOrderRouter.post(
       actor: "producer",
       cancelReason: mapped.cancelReason,
     });
-    res.redirect(303, result.success ? `${backTo}?done=${mapped.toStatus}` : `${backTo}?error=ugyldig`);
+    if (!result.success) {
+      res.redirect(303, `${backTo}?error=ugyldig`);
+      return;
+    }
+    // Prepayment step after the transition (skive 3): confirm → capture,
+    // decline → release. The banner says what happened to the payment.
+    const stripe = paymentsClientFor(req);
+    const effect = stripe
+      ? await onOrderTransitioned({ db: getDb(), stripe, orderId: order.order_id, toStatus: mapped.toStatus, cancelReason: mapped.cancelReason })
+      : "none";
+    const banner = EFFECT_TO_BANNER[effect];
+    res.redirect(303, `${backTo}?done=${mapped.toStatus}${banner ? `&betaling=${banner}` : ""}`);
   }
 );

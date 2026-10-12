@@ -693,6 +693,24 @@ export interface SubmitContactInput {
   buyer_phone?: string | null;
   delivery_note?: string | null;
   contact_consent?: boolean;
+  // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+  // connect, skive 2): the buyer asks to pay at pickup even where the
+  // producer takes prepayment. Only read through SubmitOptions.prepay.
+  pay_at_pickup?: boolean;
+}
+
+/**
+ * Prepayment hook (skive 2). submitCart() itself never talks to Stripe and
+ * never changes WHO gets a real order (isEligibleForRealOrder() decides
+ * that, unchanged). For each producer that already gets a real order,
+ * `prepay` says whether the order should wait for a prepayment: such an
+ * order is written with payment_mode='prepay' and its producer
+ * notification is NOT sent here — payment-service.ts sends it once Stripe
+ * reports the payment authorized, or falls back to pay-at-pickup.
+ * Without `prepay` (payments off) submitCart behaves exactly as before.
+ */
+export interface SubmitOptions {
+  prepay?: (agentId: string, lines: Array<{ unit_price_snapshot: number | null; qty: number }>) => boolean;
 }
 
 // skive 2: hard length caps on the buyer contact fields, enforced centrally
@@ -750,7 +768,7 @@ function buildContactHandoff(
   };
 }
 
-export function submitCart(cartId: string, contact?: SubmitContactInput): SubmitResult {
+export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: SubmitOptions): SubmitResult {
   const db = _cartTestDb ?? getDb();
 
   const cart = db.prepare("SELECT id, status FROM carts WHERE id = ?").get(cartId) as
@@ -907,6 +925,16 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
 
   const buyer_ref = (db.prepare("SELECT buyer_ref FROM carts WHERE id = ?").get(cartId) as any).buyer_ref;
 
+  // Prepayment decision per real-order producer (skive 2). Evaluated BEFORE
+  // the transaction so a throwing hook can never half-write a submit.
+  const prepayAgentIds = new Set<string>();
+  if (opts?.prepay) {
+    for (const agent_id of eligibleAgentIds) {
+      const lines = byAgent.get(agent_id)!.map((i) => ({ unit_price_snapshot: i.unit_price_snapshot, qty: i.qty }));
+      if (opts.prepay(agent_id, lines)) prepayAgentIds.add(agent_id);
+    }
+  }
+
   const orderSummaries: OrderSummary[] = [];
   const pendingNotifications: OrderNotificationInput[] = [];
   const consentNow = contact?.contact_consent === true;
@@ -985,6 +1013,9 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
         sharedContact.delivery_note,
         consentNow ? 1 : 0
       );
+      if (prepayAgentIds.has(agent_id)) {
+        db.prepare(`UPDATE orders SET payment_mode = 'prepay' WHERE id = ?`).run(order_id);
+      }
 
       for (const item of agentItems) {
         const line_total =
@@ -1012,6 +1043,10 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
         total_nok,
         status: "pending",
       });
+
+      // A prepay order's producer is told only once the payment is
+      // authorized (payment-service.ts) — never here.
+      if (prepayAgentIds.has(agent_id)) continue;
 
       pendingNotifications.push({
         order_id,
@@ -1057,6 +1092,47 @@ export function submitCart(cartId: string, contact?: SubmitContactInput): Submit
   return { success: true, orders: orderSummaries, contact_handoffs };
 }
 
+// ─── Notification input rebuilt from the order (prepayment, skive 2) ────────
+// A prepay order's producer notification is sent later than submit (when
+// Stripe reports the payment authorized, or when the order falls back to
+// pay-at-pickup), so the input is rebuilt from what submitCart() wrote to
+// the ORDER — the same consent-gated contact fields, never the cart's.
+export function buildOrderNotificationInput(orderId: string): OrderNotificationInput | null {
+  const db = _cartTestDb ?? getDb();
+  const o = db.prepare(`
+    SELECT o.id, o.agent_id, o.buyer_ref, o.confirm_token, o.pickup_time, o.total_nok,
+           o.buyer_name, o.buyer_email, o.buyer_phone, o.delivery_note, a.name AS producer_name
+    FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+    WHERE o.id = ?
+  `).get(orderId) as
+    | {
+        id: string; agent_id: string; buyer_ref: string; confirm_token: string | null; pickup_time: string | null;
+        total_nok: number | null; buyer_name: string | null; buyer_email: string | null; buyer_phone: string | null;
+        delivery_note: string | null; producer_name: string;
+      }
+    | undefined;
+  if (!o || !o.confirm_token) return null;
+  const items = db.prepare(`
+    SELECT oi.name_snapshot AS name, oi.qty AS qty, p.unit AS unit
+    FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+    WHERE oi.order_id = ? ORDER BY oi.rowid
+  `).all(orderId) as Array<{ name: string | null; qty: number | null; unit: string | null }>;
+  return {
+    order_id: o.id,
+    agent_id: o.agent_id,
+    producer_name: o.producer_name,
+    buyer_ref: o.buyer_ref,
+    confirm_token: o.confirm_token,
+    pickup_time: o.pickup_time,
+    total_nok: o.total_nok,
+    items: items.map((i) => ({ name: i.name ?? "", qty: i.qty ?? 0, unit: i.unit ?? null })),
+    buyer_name: o.buyer_name,
+    buyer_email: o.buyer_email,
+    buyer_phone: o.buyer_phone,
+    delivery_note: o.delivery_note,
+  };
+}
+
 // ─── Get order ───────────────────────────────────────────────────────────────
 
 export type OrderView =
@@ -1082,8 +1158,45 @@ export type OrderView =
       // Status timeline (order_events) — pilot-ordre-loop. Empty until the
       // first transition happens.
       timeline: OrderEvent[];
+      // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+      // connect): present only for orders that had a payment link.
+      payment?: BuyerPaymentView;
     }
   | { success: false; status: number; error: string };
+
+export interface BuyerPaymentView {
+  status: string;
+  amount_nok: number;
+  refunded_nok: number;
+  /** Only while the link is still payable. */
+  checkout_url?: string;
+  expires_at?: string;
+  seller: "producer";
+  capture: "on_producer_confirmation";
+}
+
+function buyerPaymentView(db: any, orderId: string): BuyerPaymentView | undefined {
+  try {
+    const p = db.prepare(`
+      SELECT status, amount_ore, refunded_ore, checkout_url, checkout_expires_at FROM payments WHERE order_id = ?
+    `).get(orderId) as
+      | { status: string; amount_ore: number; refunded_ore: number; checkout_url: string | null; checkout_expires_at: string | null }
+      | undefined;
+    if (!p) return undefined;
+    const payable = p.status === "requires_payment" && !!p.checkout_url && !!p.checkout_expires_at && Date.parse(p.checkout_expires_at) > Date.now();
+    return {
+      status: p.status,
+      amount_nok: p.amount_ore / 100,
+      refunded_nok: p.refunded_ore / 100,
+      ...(payable ? { checkout_url: p.checkout_url!, expires_at: p.checkout_expires_at! } : {}),
+      seller: "producer",
+      capture: "on_producer_confirmation",
+    };
+  } catch {
+    // A DB without the payments table (minimal test schema) → no payment view.
+    return undefined;
+  }
+}
 
 export function getOrder(orderId: string, buyerRef: string): OrderView {
   const db = _cartTestDb ?? getDb();
@@ -1141,6 +1254,7 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
     total_nok: order.total_nok,
     items: orderItems,
     timeline: getOrderTimeline(order.id),
+    ...(() => { const payment = buyerPaymentView(db, order.id); return payment ? { payment } : {}; })(),
   };
 }
 
@@ -1158,6 +1272,8 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
   completed: [],
   cancelled: [],
 };
+
+const SYSTEM_PENDING_CANCEL_REASONS = new Set(["payment_expired"]);
 
 export type TransitionResult =
   | { success: true; order_id: string; status: string }
@@ -1177,7 +1293,14 @@ export function transitionOrder(
   if (!order) return { success: false, status: 404, error: "Order not found" };
 
   const allowed = VALID_TRANSITIONS[order.status] ?? [];
-  if (!allowed.includes(toStatus)) {
+  // Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+  // connect, skive 3): a pending order whose reserved payment was never
+  // confirmed by the producer in time is cancelled by the system with
+  // cancel_reason='payment_expired'. That reason is the ONLY way into
+  // pending → cancelled; every other caller still gets the matrix above.
+  const systemCancel = order.status === "pending" && toStatus === "cancelled" &&
+    SYSTEM_PENDING_CANCEL_REASONS.has(opts?.cancelReason ?? "");
+  if (!allowed.includes(toStatus) && !systemCancel) {
     return {
       success: false,
       status: 409,
@@ -1193,6 +1316,16 @@ export function transitionOrder(
   // requires from-status 'ready'. Enforced centrally here so BOTH callers
   // (producer PRG page and the admin no-show route) share the same guard.
   // A plain confirmed → cancelled (no reason) remains legal.
+  // payment_expired is only for a still-PENDING order (the deadline job):
+  // never for an order the producer confirmed in the meantime — that one
+  // may already be captured (review finding on skive 2+3).
+  if (cancelReason === "payment_expired" && order.status !== "pending") {
+    return {
+      success: false,
+      status: 409,
+      error: `Cannot expire the payment of an order in '${order.status}' — only pending orders expire`,
+    };
+  }
   if (cancelReason === "no_show" && order.status !== "ready") {
     return {
       success: false,

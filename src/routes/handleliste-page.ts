@@ -34,6 +34,7 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
+import { isPaymentsEnabled } from "../services/payment-service";
 
 export function isHandelisteEnabled(): boolean {
   const v = (process.env.HANDLELISTE_ENABLED || "").trim().toLowerCase();
@@ -468,7 +469,7 @@ const CLIENT_SCRIPT = `
       if (r.status !== 201 || !r.body || r.body.success !== true) throw r;
       var vcards = {};
       ch.forEach(function(c){ var p = c.offer.producer || {}; if (p.agent_id) vcards[p.agent_id] = p.vcard_url || null; });
-      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards };
+      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards, payments: r.body.payments || [] };
       lsDel(LS_CART); lsSet(LS_RESULT, result);
       el('hl-name').value = ''; el('hl-email').value = ''; el('hl-phone').value = ''; el('hl-note').value = '';
       btn.disabled = false; btn.textContent = C.submit;
@@ -479,9 +480,31 @@ const CLIENT_SCRIPT = `
   // ── step 4: result ──
   function renderResult(res){
     var box = el('hl-result'); clear(box);
-    if (res.orders && res.orders.length) {
+    var pays = {};
+    (res.payments || []).forEach(function(p){ if (p && p.order_id) pays[p.order_id] = p; });
+    var plain = (res.orders || []).filter(function(o){ return !pays[o.order_id]; });
+    var prepaid = (res.orders || []).filter(function(o){ return !!pays[o.order_id]; });
+    if (plain.length) {
       box.appendChild(mk('div', { cls: 'hl-msg hl-ok' }, [mk('strong', { text: C.sent_h }), mk('div', { text: C.sent_p })]));
-      res.orders.forEach(function(o){ box.appendChild(mk('div', { cls: 'hl-meta', text: String(o.producer_name || '') + (o.total_nok != null ? ' — ' + o.total_nok + ' kr' : '') })); });
+      plain.forEach(function(o){ box.appendChild(mk('div', { cls: 'hl-meta', text: String(o.producer_name || '') + (o.total_nok != null ? ' — ' + o.total_nok + ' kr' : '') })); });
+    }
+    if (prepaid.length) {
+      box.appendChild(mk('h3', { text: C.pay_h }));
+      box.appendChild(mk('p', { cls: 'hl-hint', text: C.pay_p }));
+      prepaid.forEach(function(o){
+        var p = pays[o.order_id];
+        var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(p.seller || o.producer_name || '') })]);
+        var href = safeHref(p.checkout_url);
+        var n = Number(p.amount_nok);
+        var amount = (Math.round(n) === n ? String(n) : n.toFixed(2)).replace('.', ',');
+        if (href && href.toLowerCase().indexOf('https://') === 0) card.appendChild(mk('a', { href: href, cls: 'hl-btn primary', text: C.pay_btn + ' ' + amount + ' kr' }));
+        var until = p.expires_at ? new Date(p.expires_at) : null;
+        if (until && !isNaN(until.getTime())) {
+          var hh = ('0' + until.getHours()).slice(-2), mm = ('0' + until.getMinutes()).slice(-2);
+          card.appendChild(mk('div', { cls: 'hl-meta', text: C.pay_until + ' ' + hh + ':' + mm }));
+        }
+        box.appendChild(card);
+      });
     }
     if (res.handoffs && res.handoffs.length) {
       box.appendChild(mk('h3', { text: C.contact_h2 }));
@@ -535,8 +558,29 @@ export interface HandelistePage {
 }
 
 /** Pure: builds the (static, escaped) page content for the given language. */
+// Prepayment (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-
+// connect, skive 2): only merged into the copy when PAYMENTS_ENABLED=1, so
+// with payments off the page copy is exactly what it was.
+const PREPAY_COPY: Record<"no" | "en", Record<string, string>> = {
+  no: {
+    no_payment: "Hos produsenter som tar imot forhåndsbetaling, betaler du med Stripe direkte til produsenten. Hos de andre avtaler du henting og betaling direkte med produsenten.",
+    pay_h: "Betal på forhånd",
+    pay_p: "Disse produsentene tar imot forhåndsbetaling. Beløpet reserveres og trekkes først når produsenten bekrefter. Betaler du ikke innen fristen, sendes bestillingen med betaling ved henting.",
+    pay_btn: "Betal",
+    pay_until: "Lenken gjelder til",
+  },
+  en: {
+    no_payment: "Producers that take prepayment are paid with Stripe, directly to the producer. With the others you agree on pickup and payment directly with the producer.",
+    pay_h: "Pay in advance",
+    pay_p: "These producers take prepayment. The amount is reserved and only charged when the producer confirms. If you do not pay before the deadline, the order is sent as pay at pickup.",
+    pay_btn: "Pay",
+    pay_until: "The link is valid until",
+  },
+};
+
 export function buildHandelistePage(lang: Lang): HandelistePage {
-  const c = COPY[lang === "en" ? "en" : "no"];
+  const base = COPY[lang === "en" ? "en" : "no"];
+  const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
   const copyJson = JSON.stringify({ ...c, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL })
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
