@@ -154,23 +154,26 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
     // ── RFB fixtures: honest = active + non-umbrella + vetted + listable = 3 ──
     __setDbForTesting(rfbTestDb as any);
     __initSchemaForTesting(rfbTestDb as any);
-    function seedRfb(id: string, o: { active?: number; umbrella?: string | null; vetted?: number; hidden?: number; vertical?: string } = {}): void {
+    function seedRfb(id: string, o: { active?: number; umbrella?: string | null; vetted?: number; hidden?: number; vertical?: string; city?: string; categories?: string[] } = {}): void {
       rfbTestDb.prepare(
         `INSERT INTO agents (
           id, name, description, provider, contact_email, url, role, api_key,
-          city, is_active, umbrella_type, is_vetted, catalog_hidden, vertical_id, created_at, last_seen_at
-        ) VALUES (?, ?, 'En beskrivelse', ?, ?, ?, 'producer', ?, 'Oslo', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+          city, lat, lng, categories, is_active, umbrella_type, is_vetted, catalog_hidden, vertical_id, created_at, last_seen_at
+        ) VALUES (?, ?, 'En beskrivelse', ?, ?, ?, 'producer', ?, ?, 59.91, 10.75, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
       ).run(
         id, `Testgård ${id}`, `Testgård ${id}`, `${id}@example.no`, `https://${id}.example.no`, `key-${id}`,
+        o.city ?? "Oslo", JSON.stringify(o.categories ?? []),
         o.active ?? 1, o.umbrella ?? null, o.vetted ?? 1, o.hidden ?? 0, o.vertical ?? "rfb",
       );
     }
-    seedRfb("rfb-1");
-    seedRfb("rfb-2");
-    seedRfb("rfb-3");
-    seedRfb("rfb-inactive", { active: 0 });      // in legacy totalAgents, not honest
-    seedRfb("rfb-umbrella", { umbrella: "venue" }); // in legacy totalAgents, not honest
-    seedRfb("rfb-unvetted", { vetted: 0 });      // in legacy totalAgents, not honest
+    // Listed producers cover 2 cities and 3 categories; the rows that are not listed
+    // add other cities and categories, so a count over the wrong rows shows up.
+    seedRfb("rfb-1", { city: "Oslo", categories: ["vegetables", "eggs"] });
+    seedRfb("rfb-2", { city: "Bergen", categories: ["fish"] });
+    seedRfb("rfb-3", { city: "Oslo", categories: ["vegetables"] });
+    seedRfb("rfb-inactive", { active: 0, city: "Tromsø", categories: ["honey"] });           // in legacy totalAgents, not honest
+    seedRfb("rfb-umbrella", { umbrella: "venue", city: "Trondheim", categories: ["dairy"] }); // in legacy totalAgents, not honest
+    seedRfb("rfb-unvetted", { vetted: 0, city: "Bodø", categories: ["meat"] });              // in legacy totalAgents, not honest
     seedRfb("rfb-hidden", { hidden: 1 });        // never listed anywhere
     seedRfb("rfb-dental", { vertical: "dental" }); // not an RFB producer
     const EXPECT_RFB = 3;
@@ -425,6 +428,8 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const homeFigure = (label: string) =>
         digitsToNumber((rfbHomeHtml.match(new RegExp(`<div class="stat-n">(\\d[\\d\\s]*)</div><div class="stat-l">${label}<`)) || [])[1]);
       assertEq(toolFigure("Produsenter"), EXPECT_RFB, "rfb-count-mcp-stats: lokal_stats producer count");
+      assertEq(toolFigure("Byer"), 2, "stats-mcp-cities: lokal_stats counts the listed producers' cities (Oslo, Bergen)");
+      assertEq(toolFigure("Kategorier"), 3, "stats-mcp-categories: lokal_stats counts the listed producers' categories");
       for (const label of ["Produsenter", "Byer", "Kategorier"]) {
         const fromHome = homeFigure(label);
         assertTrue(Number.isFinite(fromHome), `stats-mcp-home-${label}: front page shows a «${label}» figure`);
