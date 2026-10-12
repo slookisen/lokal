@@ -627,6 +627,10 @@ function jsonToolResult(payload: Record<string, unknown>, isError = false) {
 // empty; opplevagent.no is listed as the one trusted openExternal target.
 export const WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
 export const WIDGET_DOMAIN = "https://opplevagent.no";
+// A new reference makes the adult-price template available immediately.
+// Keep the previous references readable for already-open conversations.
+export const WIDGET_LIST_URI = "ui://opplevagent/experiences-list-2026-10-12";
+export const WIDGET_DETAIL_URI = "ui://opplevagent/experience-detail-2026-10-12";
 
 function registerWidgetResource(
   server: McpServer,
@@ -701,8 +705,8 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
       _meta: {
-        ui: { resourceUri: "ui://opplevagent/experiences-list" },
-        "openai/outputTemplate": "ui://opplevagent/experiences-list",
+        ui: { resourceUri: WIDGET_LIST_URI },
+        "openai/outputTemplate": WIDGET_LIST_URI,
         "openai/toolInvocation/invoking": "Searching experiences…",
         "openai/toolInvocation/invoked": "Found experiences",
       },
@@ -916,17 +920,21 @@ export function registerExperienceTools(
   registerWidgetResource(
     server,
     "experiences-list",
-    "ui://opplevagent/experiences-list",
+    WIDGET_LIST_URI,
     EXPERIENCES_LIST_HTML,
     "Cards for the experiences the assistant just found, each with a Details button and a link to opplevagent.no. The assistant should summarise the results briefly rather than repeat every card.",
   );
   registerWidgetResource(
     server,
     "experience-detail",
-    "ui://opplevagent/experience-detail",
+    WIDGET_DETAIL_URI,
     EXPERIENCE_DETAIL_HTML,
     "A detail card for one experience: category, place, price, duration, season, description and links to the provider and opplevagent.no.",
   );
+  registerWidgetResource(server, "experiences-list-legacy", "ui://opplevagent/experiences-list", EXPERIENCES_LIST_HTML,
+    "Experience cards for existing conversations.");
+  registerWidgetResource(server, "experience-detail-legacy", "ui://opplevagent/experience-detail", EXPERIENCE_DETAIL_HTML,
+    "An experience detail card for existing conversations.");
 
   // Tool 3: get_experience
   server.registerTool(
@@ -955,8 +963,8 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
       _meta: {
-        ui: { resourceUri: "ui://opplevagent/experience-detail" },
-        "openai/outputTemplate": "ui://opplevagent/experience-detail",
+        ui: { resourceUri: WIDGET_DETAIL_URI },
+        "openai/outputTemplate": WIDGET_DETAIL_URI,
         "openai/toolInvocation/invoking": "Loading experience…",
         "openai/toolInvocation/invoked": "Loaded experience",
       },

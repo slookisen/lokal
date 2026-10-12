@@ -255,11 +255,11 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         );
       }
       const discoverTool = tools.find((t) => t.name === "discover_experiences");
-      assertEq(discoverTool?._meta?.ui?.resourceUri, "ui://opplevagent/experiences-list", "e5: discover_experiences points at the list template (ui.resourceUri)");
-      assertEq(discoverTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experiences-list", "e5b: … and the ChatGPT alias openai/outputTemplate");
+      assertEq(discoverTool?._meta?.ui?.resourceUri, "ui://opplevagent/experiences-list-2026-10-12", "e5: discovery points at the adult-price list template (ui.resourceUri)");
+      assertEq(discoverTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experiences-list-2026-10-12", "e5b: … and the ChatGPT alias openai/outputTemplate");
       const getTool = tools.find((t) => t.name === "get_experience");
-      assertEq(getTool?._meta?.ui?.resourceUri, "ui://opplevagent/experience-detail", "e6: get_experience points at the detail template (ui.resourceUri)");
-      assertEq(getTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experience-detail", "e6b: … and the ChatGPT alias openai/outputTemplate");
+      assertEq(getTool?._meta?.ui?.resourceUri, "ui://opplevagent/experience-detail-2026-10-12", "e6: details point at the adult-price template (ui.resourceUri)");
+      assertEq(getTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experience-detail-2026-10-12", "e6b: … and the ChatGPT alias openai/outputTemplate");
 
       // ── (a) structuredContent on the two widget-backed tools ──────────
       const disc = await rpc("tools/call", { name: "discover_experiences", arguments: { fylke: "Troms", season: "winter" } });
@@ -362,7 +362,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         "i3: /vilkar describes visit requests (NO + EN): forwarded by email, never a confirmed booking");
 
       // ── (b) templates: MIME type, CSP, and the host API they use ──────
-      for (const uri of ["ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
+      for (const uri of ["ui://opplevagent/experiences-list-2026-10-12", "ui://opplevagent/experience-detail-2026-10-12", "ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
         const read = await rpc("resources/read", { uri });
         const c = read.result?.contents?.[0] ?? {};
         assertEq(c.mimeType, "text/html;profile=mcp-app", `b1: ${uri} is served as an MCP Apps resource (text/html;profile=mcp-app)`);
@@ -376,6 +376,11 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         assertTrue(!/target="_blank"/.test(c.text), `b5: ${uri} opens links via openExternal, not target=_blank`);
       }
 
+      for (const uri of ["ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
+        const legacy = (await rpc("resources/read", { uri })).result?.contents?.[0]?.text;
+        const current = (await rpc("resources/read", { uri: uri + "-2026-10-12" })).result?.contents?.[0]?.text;
+        assertTrue(typeof current === "string" && current === legacy, "adult-resource: legacy alias keeps current compatible template");
+      }
       // ── (a) the widget scripts render late-arriving data ──────────────
       const { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } = require("./opplevagent-widgets") as typeof import("./opplevagent-widgets");
       const listRun = runWidget(EXPERIENCES_LIST_HTML, discText);
