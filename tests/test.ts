@@ -42773,6 +42773,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-11-controller-to-admin-endepunkter-uenige-om-verified-beholdningen:
+// GET /admin/outreach-ready-pool/stats by_verification_status uses the same
+// population/classification as GET /admin/dod-bulk (parity test).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-11-controller-to-admin-endepunkter-uenige-om-verified-beholdningen: pool-stats vs dod-bulk population parity ──");
+  try {
+    const { runAdminOutreachPoolStatsPopulationTests } = require("../src/routes/admin-outreach-pool-stats-population.test") as
+      typeof import("../src/routes/admin-outreach-pool-stats-population.test");
+    const sp = await runAdminOutreachPoolStatsPopulationTests({ log: false });
+    passed += sp.passed;
+    failed += sp.failed;
+    for (const f of sp.failures) failures.push("outreach-pool-stats-population: " + f);
+    console.log(`  outreach-pool-stats-population: ${sp.passed} passed, ${sp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-pool-stats-population: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann (criterion 4):
 // GET /admin/agents/category-sanity-report (src/routes/admin-agents.ts) —
 // read-only, report-only detector for RFB producer rows whose `categories`

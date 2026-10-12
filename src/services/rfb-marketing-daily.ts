@@ -539,8 +539,10 @@ function readOutreachReservedToday(db: Db, day: string): number {
 
 /**
  * The social-proof number, from the same source the routine used: the sum of
- * `by_verification_status[].c` in GET /admin/outreach-ready-pool/stats
- * (routes/admin-outreach-pool.ts) — i.e. this exact GROUP BY, summed.
+ * `by_verification_status_all_knowledge_rows[].c` in GET
+ * /admin/outreach-ready-pool/stats (routes/admin-outreach-pool.ts) — i.e. this
+ * exact GROUP BY over every agent_knowledge row, summed. (`by_verification_status`
+ * itself is producer-scoped since 2026-10-12 and no longer the same number.)
  */
 export function countRfbProducersForSocialProof(db: Db): number {
   const rows = db
