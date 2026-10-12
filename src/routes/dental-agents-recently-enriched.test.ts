@@ -241,6 +241,23 @@ export function runDentalAgentsRecentlyEnrichedTests(
       const malformedRow = (shapeResp.body.agents as any[]).find((a) => a.id === "clinic-malformed");
       assertTrue(!!malformedRow, "g1: clinic-malformed row present");
       assertEq(malformedRow.field_provenance, {}, "g2: malformed field_provenance JSON -> {}");
+
+      // ── (h) with_fields=1: only clinics with a checkable telefon/adresse/om_oss ──
+      {
+        const q = { since: daysAgoIso(30), limit: "50" };
+        const none = await callRoute(dentalRouter, { headers: { "x-admin-key": testKey }, query: { ...q, with_fields: "1" } });
+        assertEq(none.body.agents.length, 0, "h1: with_fields=1 excludes clinics whose telefon/adresse/om_oss are all empty");
+        const off = await callRoute(dentalRouter, { headers: { "x-admin-key": testKey }, query: q });
+        assertTrue((off.body.agents as any[]).map((a) => a.id).includes("clinic-recent"), "h2: without with_fields the empty clinic is still served (default unchanged)");
+
+        dentalDb.prepare(`UPDATE dental_agents SET telefon = '  ' WHERE id = 'clinic-malformed'`).run();
+        const blank = await callRoute(dentalRouter, { headers: { "x-admin-key": testKey }, query: { ...q, with_fields: "1" } });
+        assertEq(blank.body.agents.length, 0, "h3: whitespace-only telefon does not count");
+
+        dentalDb.prepare(`UPDATE dental_agents SET om_oss = 'Moderne klinikk i sentrum' WHERE id = 'clinic-recent'`).run();
+        const some = await callRoute(dentalRouter, { headers: { "x-admin-key": testKey }, query: { ...q, with_fields: "1" } });
+        assertEq((some.body.agents as any[]).map((a) => a.id), ["clinic-recent"], "h4: with_fields=1 serves only the clinic with a value");
+      }
     } catch (err: any) {
       failed++;
       failures.push("dental-agents-recently-enriched: unexpected error: " + String(err?.stack || err?.message || err));

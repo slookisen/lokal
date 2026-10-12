@@ -314,6 +314,26 @@ export async function runAdminAgentsRecentlyEnrichedTests(opts: { log?: boolean 
       const ids = (r.body.agents as any[]).map((a) => a.id);
       assertTrue(!ids.includes("agent-does-not-exist"), "j1: orphaned agent_knowledge row excluded by the inner JOIN");
     }
+
+    // ── (k) with_fields=1: only rows with a checkable phone/address/about ──
+    {
+      const q = { since: daysAgoIso(30), limit: "50" };
+      const none = await callEndpoint({ headers: { "x-admin-key": ADMIN_KEY }, query: { ...q, with_fields: "1" } });
+      assertEq((none.body.agents as any[]).length, 0, "k1: with_fields=1 excludes rows whose phone/address/about are all empty");
+      const off = await callEndpoint({ headers: { "x-admin-key": ADMIN_KEY }, query: q });
+      assertTrue((off.body.agents as any[]).map((a) => a.id).includes("agent-recent"), "k2: without with_fields the empty row is still served (default unchanged)");
+
+      testDb.prepare(`UPDATE agent_knowledge SET phone = '   ' WHERE agent_id = 'agent-malformed'`).run();
+      const blank = await callEndpoint({ headers: { "x-admin-key": ADMIN_KEY }, query: { ...q, with_fields: "1" } });
+      assertEq((blank.body.agents as any[]).length, 0, "k3: whitespace-only phone does not count as a checkable field");
+
+      testDb.prepare(`UPDATE agent_knowledge SET about = 'Gard med geiter og ost' WHERE agent_id = 'agent-recent'`).run();
+      testDb.prepare(`UPDATE agent_knowledge SET phone = '12345678' WHERE agent_id = 'agent-inactive'`).run();
+      const some = await callEndpoint({ headers: { "x-admin-key": ADMIN_KEY }, query: { ...q, with_fields: "1" } });
+      assertEq((some.body.agents as any[]).map((a) => a.id), ["agent-recent"], "k4: with_fields=1 serves only the row with a value (inactive agent still excluded)");
+      const other = await callEndpoint({ headers: { "x-admin-key": ADMIN_KEY }, query: { ...q, with_fields: "true" } });
+      assertTrue((other.body.agents as any[]).map((a) => a.id).includes("agent-malformed"), "k5: only the literal value 1 enables the filter (\"true\" is ignored)");
+    }
   } catch (err) {
     failed++;
     failures.push(`admin-agents-recently-enriched: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);

@@ -838,6 +838,10 @@ router.get(
 //   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
 //                        for an unparseable value)
 //   ?limit=<int>       — default 10, clamped to [1, 50]
+//   ?with_fields=1     — only clinics with at least one checkable value
+//                        (telefon, adresse or om_oss non-empty). Off by default.
+//                        Dev-request 2026-10-06-kvalitetsmaling-stikkprove-og-wcr
+//                        slice 2 (W42 sampled rows with nothing to check).
 //
 // dental_agents has no is_active column (unlike rfb's agents table), so
 // there is no activity filter here — just the last_enriched_at window.
@@ -863,11 +867,16 @@ router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: 
     if (!Number.isFinite(limit)) limit = 10;
     limit = Math.min(50, Math.max(1, limit));
 
+    const withFields = req.query.with_fields === "1";
+    const fieldsClause = withFields
+      ? `AND (COALESCE(TRIM(telefon), '') <> '' OR COALESCE(TRIM(adresse), '') <> '' OR COALESCE(TRIM(om_oss), '') <> '')`
+      : "";
+
     const rows = db
       .prepare(
         `SELECT id, navn, hjemmeside, last_enriched_at, field_provenance
            FROM dental_agents
-          WHERE last_enriched_at >= ?
+          WHERE last_enriched_at >= ? ${fieldsClause}
           ORDER BY RANDOM()
           LIMIT ?`
       )

@@ -4909,6 +4909,12 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 //                        for an unparseable value, so a bad query never
 //                        500s or silently returns everything)
 //   ?limit=<int>       — default 10, clamped to [1, 50]
+//   ?with_fields=1     — only agents whose agent_knowledge row carries at
+//                        least one checkable value (phone, address or about
+//                        non-empty). Off by default (unchanged contract).
+//                        Dev-request 2026-10-06-kvalitetsmaling-stikkprove-og-wcr
+//                        slice 2: W41/W42 spot-checks sampled enriched-but-empty
+//                        rows and got checked=0.
 //
 // Random-sampled (ORDER BY RANDOM()) rather than deterministic — the
 // point is a spot-check, not the same agents every run.
@@ -4941,13 +4947,18 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
     if (!Number.isFinite(limit)) limit = 10;
     limit = Math.min(50, Math.max(1, limit));
 
+    const withFields = req.query.with_fields === "1";
+    const fieldsClause = withFields
+      ? `AND (COALESCE(TRIM(k.phone), '') <> '' OR COALESCE(TRIM(k.address), '') <> '' OR COALESCE(TRIM(k.about), '') <> '')`
+      : "";
+
     const rows = db.prepare(`
       SELECT a.id as id, a.name as name, a.url as website,
              a.city as location_city,
              k.last_enriched_at as last_enriched_at, k.field_provenance as field_provenance
       FROM agents a
       JOIN agent_knowledge k ON k.agent_id = a.id
-      WHERE k.last_enriched_at >= ? AND a.is_active = 1
+      WHERE k.last_enriched_at >= ? AND a.is_active = 1 ${fieldsClause}
       ORDER BY RANDOM()
       LIMIT ?
     `).all(since, limit) as any[];
