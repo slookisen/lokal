@@ -258,9 +258,10 @@
                 <div id="statPageViews" class="stat-value">—</div>
                 <div id="statPageViewsSub" class="stat-sub"></div>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">Søk totalt</div>
+            <div class="stat-card" title="Søk på /sok på de tre nettstedene, via API-et og via AI-assistentenes søkeverktøy (MCP og A2A). Roboters søk og egen trafikk er holdt utenfor.">
+                <div class="stat-label">Søk</div>
                 <div id="statQueries" class="stat-value purple">—</div>
+                <div id="statQueriesSub" class="stat-sub"></div>
             </div>
             <div class="stat-card" title="Et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid (*-User-agenter).">
                 <div class="stat-label">AI-søk (visninger)</div>
@@ -291,6 +292,7 @@
                 <li><strong>Besøkende:</strong> én IP-adresse + nettleser i perioden. Én person på to enheter, eller på en mobil som bytter IP, telles mer enn én gang.</li>
                 <li><strong>Besøk:</strong> sidevisninger fra én besøkende uten mer enn 30 minutters pause (samme regel som Google Analytics).</li>
                 <li><strong>Mennesker:</strong> alt som ikke er AI, roboter, skript, skannere (prøver wp-admin, .env o.l.) eller skrapere (flere enn 60 sider på 10 minutter eller 200 produsentsider i timen).</li>
+                <li><strong>Søk:</strong> søk på /sok (første resultatside), kall til søke-API-et, AI-assistentenes søkeverktøy (MCP), A2A-forespørsler og AI-assistenter som henter søkesiden for noen (f.eks. ChatGPT-User). Søk fra søkemotorer, AI-crawlere og andre roboter, og kall som ble avvist (f.eks. for mange forespørsler), telles ikke med.</li>
                 <li><strong>Egen trafikk</strong> (eier-cookie og egne skript) er holdt utenfor alle tall.</li>
             </ul>
         </details>
@@ -344,7 +346,7 @@
                 <div id="trafficSourceChart"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">🔍 Topp søkeord</div>
+                <div class="panel-title">🔍 Topp søkeord (nettsider og API)</div>
                 <div id="searchTerms"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel" data-rfb-only>
@@ -692,6 +694,11 @@
         document.getElementById("statPageViews").textContent = fmtNum(total);
         document.getElementById("statPageViewsSub").textContent = "mennesker, AI, roboter og skript";
         document.getElementById("statQueries").textContent = fmtNum(s.totalQueries);
+        var ch = s.searchesByChannel || {};
+        document.getElementById("statQueriesSub").textContent = s.searchesByChannel
+            ? "nettsider " + fmtNum(ch.web) + " · AI-assistenter " + fmtNum((ch.mcp || 0) + (ch.a2a || 0) + (ch.ai || 0)) + " · API " + fmtNum(ch.api)
+              + (s.botSearches ? " · " + fmtNum(s.botSearches) + " fra roboter holdt utenfor" : "")
+            : "";
         document.getElementById("statAiSearch").textContent = fmtNum(s.aiSearchViews);
         document.getElementById("statAiSearchPct").textContent = pct(s.aiSearchViews, total) + " av visningene";
         document.getElementById("statAiCrawlers").textContent = fmtNum(s.aiCrawlerViews);

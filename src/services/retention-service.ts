@@ -1,5 +1,6 @@
 import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn, type RollupRawTable } from "./analytics-rollup-boundary";
+import { BOT_SEARCH_CLASSES } from "./search-tracking";
 import fs from "fs";
 
 export interface RetentionResult {
@@ -326,9 +327,21 @@ const PAGE_VIEWS_SPEC: PruneSpec = {
   },
 };
 
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: since every
+// channel logs searches with the client's class, robots' searches (crawlers,
+// AI crawlers, scanners, scripts on the search page) are deleted without
+// rollup, like owner rows, so query_daily / query_text_daily keep people's and
+// programs' searches only. Rows without a class (written before) roll up as before.
+function notBotSearchSql(db: Db): string {
+  const has = (db.prepare("PRAGMA table_info(analytics_queries)").all() as Array<{ name: string }>).some((c) => c.name === "client_class");
+  if (!has) return "";
+  const cls = "COALESCE(client_class, '')";
+  return ` AND ${cls} NOT IN (${BOT_SEARCH_CLASSES.map((c) => `'${c}'`).join(", ")}) AND NOT (protocol = 'web' AND ${cls} = 'dev')`;
+}
+
 const QUERIES_SPEC: PruneSpec = {
   table: "analytics_queries",
-  rollupSql: () => [
+  rollupSql: (db) => [
     // 1a. Rollup: query_daily (protocol/agent/vertical/city dimensions)
     `INSERT INTO query_daily (
        day, protocol, agent_id, vertical_id, city,
@@ -346,7 +359,7 @@ const QUERIES_SPEC: PruneSpec = {
        COUNT(response_time_ms) as response_time_ms_n
      FROM analytics_queries
      WHERE created_at >= ? AND created_at < ?
-       AND (is_owner IS NULL OR is_owner = 0)
+       AND (is_owner IS NULL OR is_owner = 0)${notBotSearchSql(db)}
      GROUP BY day, protocol, agent_id, vertical_id, city
      ON CONFLICT(day, protocol, agent_id, vertical_id, city) DO UPDATE SET
        query_count = query_count + excluded.query_count,
@@ -362,7 +375,7 @@ const QUERIES_SPEC: PruneSpec = {
        COUNT(*) as query_count
      FROM analytics_queries
      WHERE created_at >= ? AND created_at < ?
-       AND (is_owner IS NULL OR is_owner = 0)
+       AND (is_owner IS NULL OR is_owner = 0)${notBotSearchSql(db)}
      GROUP BY day, query, vertical_id
      ON CONFLICT(day, query, vertical_id) DO UPDATE SET
        query_count = query_count + excluded.query_count`,

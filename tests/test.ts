@@ -42448,6 +42448,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
+  // logged from /sok on all three sites, the public search API, and counted
+  // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and
+  // DENTAL_DB_PATH, so it runs in this serial chain.
+  console.log("\n── statistikk S2: searches per channel ──");
+  try {
+    const { runSearchTrackingTests } = require("../src/services/search-tracking.test") as
+      typeof import("../src/services/search-tracking.test");
+    const str = await runSearchTrackingTests({ log: false });
+    passed += str.passed;
+    failed += str.failed;
+    for (const f of str.failures) failures.push("search-tracking: " + f);
+    console.log(`  search-tracking: ${str.passed} passed, ${str.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("search-tracking: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ search-tracking: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
   try {
     const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as

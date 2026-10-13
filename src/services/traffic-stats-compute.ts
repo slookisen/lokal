@@ -23,6 +23,7 @@
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { computeTrafficReport } from "./traffic-report";
+import { computeQueryStats } from "./admin-stats-compute";
 
 export interface TrafficStats {
   pageViews: number;
@@ -100,10 +101,6 @@ export function computeTrafficStats(
   nowMs: number = Date.now()
 ): TrafficStats {
   const report = computeTrafficReport(db, windowDays * 24, vertical, nowMs, { detail: false });
-  const notOwner = "(is_owner IS NULL OR is_owner = 0)";
-  const vertSql = vertical ? " AND vertical_id = ?" : "";
-  const vertParams: string[] = vertical ? [vertical] : [];
-  const cutoff = new Date(nowMs - windowDays * 86_400_000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 
   const humanViews = report.groups.human.views;
   const aiSearchViews = report.groups.ai_search.views;
@@ -111,9 +108,11 @@ export function computeTrafficStats(
   // Everything that is neither a person nor human-initiated AI retrieval.
   const botViews = report.totals.views - humanViews - aiSearchViews;
 
-  const aiQueries = (db.prepare(
-    `SELECT COUNT(*) as n FROM analytics_queries WHERE created_at > ? AND ${notOwner}${vertSql}`
-  ).get(cutoff, ...vertParams) as any)?.n ?? 0;
+  // Searches by AI assistants (their search tools over MCP/A2A, and assistants
+  // fetching the search page or API for someone). Since S2 analytics_queries
+  // also holds people's searches on the sites, so it is no longer all AI.
+  const q = computeQueryStats(db, windowDays * 24, vertical, nowMs);
+  const aiQueries = (q.byChannel?.mcp ?? 0) + (q.byChannel?.a2a ?? 0) + (q.byChannel?.ai ?? 0);
 
   return {
     pageViews: report.totals.views,

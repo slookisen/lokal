@@ -207,8 +207,19 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     "both parts do not promise automatic deletion (and say there is none today)");
 
   // Hardening: no automatic-deletion promise anywhere; ownership claim pinned; legal-basis table pinned.
-  assertTrue(!/slettes automatisk/i.test(html) && !/automatically deleted/i.test(html) && !/slettes etter \d/i.test(html) && !/deleted after \d/i.test(html),
-    "the page contains no 'slettes automatisk' / 'automatically deleted' promise");
+  // The one exception is the visit/search statistics and the technical MCP/A2A
+  // log (dev-request 2026-10-13-statistikk-riktig-for-investorer, S2): the
+  // nightly prune does delete those rows after RFB_AUTO_PRUNE_DAYS (default 60).
+  const indexSrc = src("..", "index.ts");
+  const analyticsSvc = src("..", "services", "analytics-service.ts");
+  assertTrue(/RFB_AUTO_PRUNE_DAYS \|\| "60"/.test(indexSrc) &&
+    /rollupAndPrunePageViews/.test(analyticsSvc) && /rollupAndPruneQueries/.test(analyticsSvc) && /pruneAnalyticsMcpCalls/.test(analyticsSvc),
+    "ground truth: the nightly prune deletes page views, searches and the MCP/A2A log after 60 days by default");
+  const statsRow = /<tr><td>(Besøks- og søkestatistikk og teknisk MCP\/A2A-logg|Visit and search statistics and the technical MCP\/A2A log)<\/td><td>[^<]*<\/td><\/tr>/g;
+  assertTrue((html.match(statsRow) ?? []).length === 4, "both parts have the statistics rows (legal basis and retention)");
+  const rest = html.replace(statsRow, "");
+  assertTrue(!/slettes automatisk/i.test(rest) && !/automatically deleted/i.test(rest) && !/slettes etter \d/i.test(rest) && !/deleted after \d/i.test(rest),
+    "the page contains no 'slettes automatisk' / 'automatically deleted' promise outside the statistics rows");
   assertTrue(!/eierskap[^.]{0,80}(lagres|lagret)/i.test(html) && !/(lagres|lagret)[^.]{0,80}eierskap/i.test(html) &&
     !/(stored|kept)[^.]{0,80}ownership/i.test(html) && !/ownership[^.]{0,80}(stored|kept)/i.test(html),
     "no sentence ties storage of the provider e-mail to ownership (eierskap/ownership near lagres/stored)");

@@ -32,6 +32,8 @@ import * as QRCode from "qrcode";
 // every non-API path into this router before express.static is ever reached).
 import * as fs from "fs";
 import * as path from "path";
+import { analyticsService } from "../services/analytics-service";
+import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
@@ -8341,6 +8343,7 @@ function renderNearMeBox(q: string, activeTags: ExperienceTag[], radiusKm: numbe
 // discoverExperiences() is never called, rows/ordering are byte-identical to
 // before this feature existed.
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
+  const searchStarted = Date.now();
   const q = String(req.query.q ?? "").trim();
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
 
@@ -8546,6 +8549,16 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   }
 
   const hasQuery = Boolean(q) || activeTags.length > 0 || hasGeo;
+
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: log the
+  // search (free text, else the tag and place filters, else "[nær meg]" for
+  // a position-only search; the position itself is never stored).
+  if (hasQuery) {
+    analyticsService.logWebSearch(req, Date.now() - searchStarted, {
+      query: q || filterQueryText({ tags: activeTags.length > 0 ? activeTags : undefined, sted: typedPlace || undefined }) || "[nær meg]",
+      resultCount: rows.length,
+    });
+  }
 
   const h1 = q
     ? `Søk: «${q}»`
@@ -8959,6 +8972,8 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Tilbyderprofiler:</strong> for hver tilbyder lagrer vi navn, organisasjonsnummer, adresse, telefon, e-postadresse og nettsted slik de er publisert i Brønnøysundregistrene eller på tilbyderens egen nettside, samt hvilken kilde opplysningene kom fra. Er tilbyderen et enkeltpersonforetak, kan noe av dette være personopplysninger om innehaveren.</li>
 <li><strong>E-post vi sender til tilbydere, og svarene:</strong> vi kan sende en e-post til den offentlige e-postadressen på profilen. Vi lagrer en utsendingslogg (mottakers e-postadresse, tidspunkt og meldings-ID) og selve korrespondansen (e-postene vi har sendt og svarene dine, med e-postadresse, navn og innhold) i kundeservicesystemet vårt. Svarene lander også i en innboks hos oss.</li>
 <li><strong>Agent-forespørsler:</strong> for hvert søk logger vi hvilket verktøy som ble brukt, hvilke filtre/søkeord som ble sendt, og navnet på AI-klienten (f.eks. ChatGPT eller Claude, utledet av nettleser-/klientstrengen). Vi lagrer ikke IP-adresse, navn, konto eller andre personlige identifikatorer i denne loggen.</li>
+<li><strong>Teknisk logg over MCP/A2A-kall:</strong> separat fra loggen over logger vi for hvert kall verktøy, protokoll, svartid, AI-klientens nettleser-/klientstreng og en saltet, forkortet hash av IP-adressen, for å se hvilke AI-klienter som bruker tjenesten.</li>
+<li><strong>Besøks- og søkestatistikk:</strong> for hvert sidebesøk registrerer serveren, uten cookies, hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (aldri hele IP-adressen) og en grov klassifisering av nettleseren (f.eks. mobil, PC eller søkemotor). Søk på nettsiden og via API-et lagres med søketekst, valgte filtre (f.eks. sted eller tema), antall treff og den samme IP-hashen.</li>
 <li><strong>Besøksforespørsler til gårdssalg:</strong> når du ber om et besøk hos en gårdssalg-produsent — på nettsiden eller via en AI-assistent som ChatGPT eller Claude — lagrer vi navn, e-postadresse, eventuelt telefonnummer, ønsket dato/tid, antall personer og en eventuell kommentar. Opplysningene sendes på e-post til produsenten du ba om å besøke, slik at produsenten kan svare deg, og du får selv en kvittering med en statuslenke. Formålet er kun å formidle og følge opp forespørselen; opplysningene brukes ikke til markedsføring.</li></ul>
 <h2>Tilbyderprofiler og e-post vi sender uten at du har bedt om det</h2>
 <p>De fleste profilene i katalogen har vi laget uten at tilbyderen har meldt seg på. De bygger på opplysninger som allerede er offentlige: Brønnøysundregistrene, tilbyderens egen nettside, Visit Norway / CBIS, Rett fra Bondens produsentregister, nettsøk (Brave Search) og kataloger og oppføringssider. Vi kan sende tilbyderen en e-post om at profilen finnes, slik at den kan se over, rette eller overta profilen. Grunnlaget er berettiget interesse (personvernforordningen art. 6 nr. 1 bokstav f): å gi tilbydere synlighet i en gratis katalog som AI-assistenter kan hente fra.</p>
@@ -8971,6 +8986,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>E-post du sender oss, og svarene våre</td><td>Berettiget interesse</td></tr>
 <tr><td>Sperreliste etter «fjern»</td><td>Berettiget interesse</td></tr>
 <tr><td>Sikkerhetskopier</td><td>Berettiget interesse</td></tr>
+<tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Berettiget interesse: å forstå hvordan tjenesten brukes og forbedre den</td></tr>
 <tr><td>Besøksforespørsler til gårdssalg</td><td>Avtale</td></tr>
 </tbody></table>
 <h2>Hvem som får opplysningene</h2><ul>
@@ -8984,6 +9000,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Opplevelsesdata og tilbyderprofiler</td><td>Så lenge opplevelsen eller tilbyderen er aktiv i katalogen. Ingen automatisk sletting i dag. En profil som skjules etter «fjern», blir liggende i databasen til du ber om sletting.</td></tr>
 <tr><td>E-postkorrespondanse og utsendingslogg</td><td>Ingen automatisk sletting i dag. Vi sletter manuelt på forespørsel.</td></tr>
 <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt og vi ikke tar kontakt igjen. Lagrer nettstedsdomene, avsenderens e-postadresse og årsak.</td></tr>
+<tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
 <tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
 <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
@@ -9003,6 +9020,8 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Provider profiles:</strong> for each provider we store the name, organisation number, address, phone, email address and website as published in the Norwegian business registry or on the provider's own website, and which source the details came from. If the provider is a sole proprietorship, some of this can be personal data about the owner.</li>
 <li><strong>Emails we send to providers, and the replies:</strong> we may send an email to the public email address on the profile. We store a send log (the recipient's email address, time and message ID) and the correspondence itself (the emails we sent and your replies, with email address, name and content) in our customer-service system. Replies also land in an inbox on our side.</li>
 <li><strong>Agent requests:</strong> for each search we log which tool was used, which filters/search terms were sent, and the name of the AI client (e.g. ChatGPT or Claude, derived from the browser/client string). This log holds no IP address, name, account or other personal identifier.</li>
+<li><strong>Technical log of MCP/A2A calls:</strong> separately from the log above, for each call we log the tool, protocol, response time, the AI client's browser/client string and a salted, truncated hash of the IP address, to see which AI clients use the service.</li>
+<li><strong>Visit and search statistics:</strong> for each page visit the server records, without cookies, which page was shown, where you came from (referrer URL), the time, a salted and truncated hash of the IP address (never the full IP address) and a rough classification of the browser (e.g. mobile, desktop or search engine). Searches on the website and through the API are stored with the search text, the filters chosen (e.g. place or theme), the number of results and the same IP hash.</li>
 <li><strong>Farm-sale visit requests:</strong> when you request a visit to a farm-sale (gårdssalg) producer — on the website or through an AI assistant such as ChatGPT or Claude — we store your name, email address, optional phone number, requested date/time, party size and any note. These details are emailed to the producer you asked to visit so they can reply to you, and you receive a receipt with a status link. They are used only to pass on and follow up the request, never for marketing.</li></ul>
 <h2>Provider profiles and emails we send without being asked</h2>
 <p>Most profiles in the catalogue were created without the provider signing up. They are built on information that is already public: the Norwegian business registry, the provider's own website, Visit Norway / CBIS, the Rett fra Bonden producer register, web search (Brave Search) and directory and listing pages. We may email the provider to say the profile exists, so they can review, correct or take over the profile. The basis is legitimate interest (GDPR art. 6(1)(f)): giving providers visibility in a free catalogue that AI assistants can fetch from.</p>
@@ -9015,6 +9034,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Email you send us, and our replies</td><td>Legitimate interest</td></tr>
 <tr><td>Do-not-contact list after “fjern”</td><td>Legitimate interest</td></tr>
 <tr><td>Backups</td><td>Legitimate interest</td></tr>
+<tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Legitimate interest: understanding how the service is used and improving it</td></tr>
 <tr><td>Farm-sale visit requests</td><td>Contract</td></tr>
 </tbody></table>
 <h2>Who receives the data</h2><ul>
@@ -9028,6 +9048,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Experience data and provider profiles</td><td>While the experience or provider is active in the catalogue. No automatic deletion today. A profile hidden after “fjern” stays in the database until you ask for deletion.</td></tr>
 <tr><td>Email correspondence and send log</td><td>No automatic deletion today. We delete manually on request.</td></tr>
 <tr><td>Do-not-contact list</td><td>For as long as the service exists, so that a removed profile is not re-created and we do not contact you again. Stores the website domain, the sender's email address and the reason.</td></tr>
+<tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
 <tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
 <tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, with no fixed time limit. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>

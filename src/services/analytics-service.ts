@@ -12,6 +12,7 @@ import {
   SessionVelocity,
 } from "./traffic-classifier";
 import { shouldRecordPageView } from "./page-view-definition";
+import { apiSearchQueryText, clampQueryText, isApiSearchRequest, type SearchChannel } from "./search-tracking";
 import { readSessionVelocity } from "./agent-stats-compute";
 import {
   computeAdminSummary,
@@ -76,9 +77,9 @@ const OWNER_UA_MARKERS_LC = [
   "curl/",            // manual terminal checks
 ];
 export function isOwnerRequest(req: Request): boolean {
-  const cookieHeader = req.headers.cookie || "";
+  const cookieHeader = req.headers?.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  return isOwnerScriptUA(req.headers["user-agent"] || "");
+  return isOwnerScriptUA(req.headers?.["user-agent"] || "");
 }
 
 /** True for our own scripts' UAs (the UA half of isOwnerRequest). */
@@ -418,19 +419,24 @@ export class AnalyticsService {
         });
       }
 
-      // Intercept response to track timing
-      const originalSend = res.send;
-      res.send = function(data: any) {
-        const duration = Date.now() - startTime;
-
-        // Track API usage and queries
-        if (self.options.trackSearchQueries && req.path.includes("/search")) {
-          const isOwner = isOwnerRequest(req);
-          analyticsService.trackSearchQuery(req, duration, undefined, isOwner);
-        }
-
-        return originalSend.call(this, data);
-      };
+      // Intercept response to track timing.
+      // S2 (dev-request 2026-10-13-statistikk-riktig-for-investorer): the
+      // public search/discover API endpoints (search-tracking.ts), once per
+      // request (res.send(object) re-enters send through res.json), successful
+      // answers only. The search pages log themselves (protocol 'web').
+      if (self.options.trackSearchQueries && isApiSearchRequest(req.method, req.path, req.query as Record<string, unknown>)) {
+        const originalSend = res.send;
+        let logged = false;
+        res.send = function(data: any) {
+          if (!logged && res.statusCode < 400) {
+            logged = true;
+            analyticsService.trackSearchQuery(req, Date.now() - startTime, {
+              query: apiSearchQueryText(req.query as Record<string, unknown>, req.body),
+            }, isOwnerRequest(req), { protocol: "api" });
+          }
+          return originalSend.call(this, data);
+        };
+      }
 
       next();
     };
@@ -498,12 +504,13 @@ export class AnalyticsService {
     city?: string;
     resultCount?: number;
     agentId?: string;
-  }, isOwner: boolean = false): void {
+  }, isOwner: boolean = false, opts: { protocol?: SearchChannel } = {}): void {
     try {
       const db = getDb();
       const userAgent = req.get("user-agent") || "";
       const clientIp = req.ip || "unknown";
-      const query = result?.query || req.query.q || "";
+      // At most MAX_QUERY_TEXT characters: a JSON body may be up to 1 MB.
+      const query = clampQueryText(result?.query || req.query.q || "");
       const categories = result?.categories ? JSON.stringify(result.categories) : null;
       const city = result?.city || null;
       const resultCount = result?.resultCount || 0;
@@ -518,20 +525,20 @@ export class AnalyticsService {
         return;
       }
 
-      // Determine protocol from request
-      let protocol = "api";
-      if (req.path.startsWith("/a2a")) protocol = "a2a";
-      else if (req.path.startsWith("/mcp")) protocol = "mcp";
+      // Channel: given by the caller (the search pages pass 'web'), else from the path.
+      let protocol: string = opts.protocol ?? "api";
+      if (!opts.protocol && req.path.startsWith("/a2a")) protocol = "a2a";
+      else if (!opts.protocol && req.path.startsWith("/mcp")) protocol = "mcp";
 
       const uaParse = parseUserAgent(userAgent);
       const ipHash = hashIP(clientIp);
 
       db.prepare(`
-        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash, is_owner, vertical_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash, is_owner, vertical_id, client_class)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         protocol,
-        String(query),
+        query,
         categories,
         city,
         resultCount,
@@ -539,10 +546,28 @@ export class AnalyticsService {
         uaParse.clientName || null,
         ipHash,
         isOwner ? 1 : 0,
-        getVerticalFromHost(req.hostname)
+        getVerticalFromHost(req.hostname),
+        // Same write-time class as page views (S1): a crawler following a
+        // /sok?q= link is a bot search, not a person's.
+        isOwnerScriptUA(userAgent) ? "dev" : clientClassForUA(userAgent),
       );
     } catch (err) {
       console.error("[analytics] Failed to track search query:", err);
+    }
+  }
+
+  /**
+   * A search on one of the sites' search pages (protocol 'web'). Never throws:
+   * logging must not break the page that is answering the search.
+   */
+  logWebSearch(req: Request, responseTimeMs: number, result: { query: string; resultCount?: number }): void {
+    // GET only: a HEAD (link checkers, uptime probes) renders the page but is
+    // nobody's search, and page views count GET only too.
+    if (req.method !== "GET") return;
+    try {
+      this.trackSearchQuery(req, responseTimeMs, result, isOwnerRequest(req), { protocol: "web" });
+    } catch (err) {
+      console.error("[analytics] Failed to log web search:", err);
     }
   }
 
