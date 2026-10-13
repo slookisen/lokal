@@ -245,9 +245,11 @@ function sessionBotName(sessionId: string, cls: SessionCategory): string {
 
 function refHost(referrer: string): string {
   try {
-    return new URL(referrer).hostname.replace(/^www\./, "");
+    return new URL(referrer).hostname.replace(/^www\./, "") || "ukjent";
   } catch {
-    return referrer.slice(0, 80);
+    // Never the raw string: it can carry a path or query, and hosts are kept
+    // in the stored history (traffic-history-compute.ts).
+    return "ukjent";
   }
 }
 

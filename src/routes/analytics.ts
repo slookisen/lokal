@@ -822,7 +822,7 @@ router.get("/conversations", (req: Request, res: Response) => {
     // never counted (getSourceStats' public rule).
     const hours = req.query.hours !== undefined ? windowHours(req) : null;
     const vertical = parseVertical(req);
-    const filtered = hours !== null || req.query.vertical !== undefined || lockedVerticalForHost(req) !== null;
+    const filtered = hours !== null || req.query.vertical !== undefined || !!lockedVerticalForHost(req);
     const sourceStats = conversationService.getSourceStats(filtered
       ? {
           allVerticals: !vertical,
