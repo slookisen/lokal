@@ -728,6 +728,8 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
       { name: "visitors", hours: 720, limit: 50 },
       { name: "pages", hours: 720, limit: 20, vertical: "dental" },
       { name: "umbrellaTraffic", sinceHours: 720 },
+      { name: "trafficHistory", days: 90 },
+      { name: "trafficHistory", days: null, vertical: "rfb" },
     ];
     let bad: unknown = null;
     for (const q of queries) {

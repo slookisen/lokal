@@ -1,5 +1,6 @@
 import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn, type RollupRawTable } from "./analytics-rollup-boundary";
+import { ensureTrafficHistoryForDaySync } from "./traffic-history";
 import { BOT_SEARCH_CLASSES } from "./search-tracking";
 import fs from "fs";
 
@@ -96,6 +97,11 @@ interface PruneSpec {
   table: "analytics_page_views" | "analytics_queries" | "analytics_agent_views";
   /** Rollup INSERT..SELECT statements; each takes (lo, hi) as its two params. */
   rollupSql: (db: Db) => string[];
+  /**
+   * Runs before day [lo, hi) is rolled up and deleted; throwing stops the
+   * prune there, like a failed rollup (nothing of that day is deleted).
+   */
+  beforeDay?: (db: Db, lo: string, hi: string) => void;
 }
 
 const markerJob = (table: string) => `retention-rolled-delete-pending:${table}`;
@@ -210,6 +216,7 @@ function* pruneTableSteps(
       for (let i = 0; i + 1 < bounds.length; i++) {
         const lo = bounds[i];
         const hi = bounds[i + 1];
+        spec.beforeDay?.(db, lo, hi);
         const rows = (countCapped.get(lo, hi, chunk + 1) as { c: number }).c;
         if (rows <= chunk) {
           // Small day: rollup + delete atomically (the pre-chunking invariant).
@@ -263,6 +270,12 @@ async function runStepsAsync(gen: PruneSteps): Promise<PruneResult> {
 
 const PAGE_VIEWS_SPEC: PruneSpec = {
   table: "analytics_page_views",
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S3: the day's
+  // traffic-history summaries (traffic-history.ts) are the dashboard's only
+  // record of it once its raw rows are gone; compute any that are missing.
+  beforeDay: (db, lo) => {
+    ensureTrafficHistoryForDaySync(db, lo);
+  },
   rollupSql: (db) => {
     const sql = [
       // 1. Rollup: INSERT into page_view_daily (upsert to handle re-runs)

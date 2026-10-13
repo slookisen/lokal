@@ -359,6 +359,16 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       assertTrue(!!bergen, "rollup-only city (Bergen, only reachable via agent-b's pruned view) still appears in getCityStats");
       assertEq(bergen?.viewCount, 9, "rollup-only Bergen viewCount comes entirely from agent_view_daily");
 
+      // agent_view_daily has no vertical_id: with a site chosen the blend used
+      // to fail (no such column) and silently drop every pruned day.
+      const rfbProducers = analyticsService.getTopProducers(20, hoursBack, "rfb");
+      assertEq(rfbProducers.find((p: any) => p.agentId === "agent-b")?.viewCount, 9,
+        "vertical=rfb: the pruned days of agent_view_daily are included (no vertical_id filter on a table without the column)");
+      assertEq(analyticsService.getCityStats(hoursBack, "rfb").find((c: any) => c.city === "Bergen")?.viewCount, 9,
+        "vertical=rfb: getCityStats includes the pruned days too");
+      assertEq(analyticsService.getTopProducers(20, hoursBack, "dental").find((p: any) => p.agentId === "agent-b"), undefined,
+        "vertical=dental: no producer-profile rollup rows (they are all rettfrabonden's)");
+
       // flag=false: exact pre-Skive-3 raw-only reproduction.
       process.env.ANALYTICS_ROLLUP_READ = "false";
       const rawOnlyProducers = analyticsService.getTopProducers(20, hoursBack);

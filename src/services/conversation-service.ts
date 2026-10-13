@@ -643,10 +643,15 @@ class ConversationService {
   // classified spam/probe rows (COUNTABLE_CONV_SQL). Pass
   // { includeInternal: true } for the ADMIN view, which still shows full totals.
   // vertical-filter: same default-'rfb' contract as getConversation() above.
-  getSourceStats(opts: { includeInternal?: boolean; verticalId?: string } = {}): { source: string; count: number; lastActivity: string }[] {
+  // allVerticals / since (dev-request 2026-10-13-statistikk-riktig-for-
+  // investorer, S3): the admin dashboard counts the chosen window and site;
+  // `since` is any date string SQLite's datetime() reads (rows hold both ISO
+  // and 'YYYY-MM-DD HH:MM:SS' timestamps, so both sides are normalised).
+  getSourceStats(opts: { includeInternal?: boolean; verticalId?: string; allVerticals?: boolean; since?: string } = {}): { source: string; count: number; lastActivity: string }[] {
     const db = getDb();
-    let where = "WHERE vertical_id = ?";
-    const params: any[] = [opts.verticalId || "rfb"];
+    let where = opts.allVerticals ? "WHERE 1 = 1" : "WHERE vertical_id = ?";
+    const params: any[] = opts.allVerticals ? [] : [opts.verticalId || "rfb"];
+    if (opts.since) { where += " AND datetime(created_at) > datetime(?)"; params.push(opts.since); }
     if (!opts.includeInternal) { where += ` AND ${COUNTABLE_CONV_SQL}`; }
     const rows = db.prepare(`
       SELECT COALESCE(source, 'api') as source, COUNT(*) as count,

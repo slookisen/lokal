@@ -42466,6 +42466,21 @@ runSerial(async () => {
     failures.push("search-tracking: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ search-tracking: unexpected error: ${String(err?.message || err)}`);
   }
+
+  console.log("\n── statistikk S3: traffic history beyond the raw window ──");
+  try {
+    const { runTrafficHistoryTests } = require("../src/services/traffic-history.test") as
+      typeof import("../src/services/traffic-history.test");
+    const th = await runTrafficHistoryTests({ log: false });
+    passed += th.passed;
+    failed += th.failed;
+    for (const f of th.failures) failures.push("traffic-history: " + f);
+    console.log(`  traffic-history: ${th.passed} passed, ${th.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("traffic-history: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ traffic-history: unexpected error: ${String(err?.message || err)}`);
+  }
 });
 
 runSerial(async () => {

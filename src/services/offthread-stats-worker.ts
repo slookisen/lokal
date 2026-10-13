@@ -26,6 +26,7 @@ import { runAdminStatsQuery, type AdminStatsQuery } from "./admin-stats-compute"
 import { computeAgentToolCalls } from "./agent-usage-compute";
 import { computeAgentStats } from "./agent-stats-compute";
 import { lowerCurrentThreadPriority } from "./thread-priority";
+import { computeHistorySummary, type HistoryItem } from "./traffic-history-compute";
 
 export type StatsTask =
   | { kind: "trafficStats"; vertical?: VerticalId; windowDays: number }
@@ -36,7 +37,9 @@ export type StatsTask =
   | { kind: "agentToolCalls"; nowMs: number; windowDays: number }
   // Public per-producer stats behind GET /api/agents/:id/stats (agent-stats.ts);
   // runs in the "public" lane's worker (serverheng skive 6).
-  | { kind: "agentStats"; agentId: string; path: string; nowMs: number };
+  | { kind: "agentStats"; agentId: string; path: string; nowMs: number }
+  // One stored traffic-history summary (traffic-history.ts); background lane.
+  | { kind: "trafficHistory"; item: HistoryItem; nowMs: number };
 
 export interface StatsWorkerRequest {
   id: number;
@@ -59,6 +62,8 @@ export function runStatsTask(db: Database.Database, task: StatsTask): unknown {
       return computeAgentToolCalls(db, task.nowMs, task.windowDays);
     case "agentStats":
       return computeAgentStats(db, task.agentId, task.path, task.nowMs);
+    case "trafficHistory":
+      return computeHistorySummary(db, task.item, task.nowMs);
     default:
       throw new Error(`unknown stats task: ${JSON.stringify(task)}`);
   }

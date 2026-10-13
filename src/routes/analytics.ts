@@ -19,6 +19,8 @@ import {
   type UmbrellaTrafficBucket,
 } from "../services/admin-stats-compute";
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
+import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
+import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -697,6 +699,29 @@ router.get("/visitors", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /admin/analytics/history?days=90|all&vertical=
+ * The stored traffic history (S3 of dev-request
+ * 2026-10-13-statistikk-riktig-for-investorer): sums over the stored days of
+ * the last `days` days up to yesterday (UTC), the daily series, and every
+ * stored week and month plus the current one so far. Raw rows only live 60
+ * days; this is what the dashboard shows for longer windows and in its
+ * month-by-month table. Definitions: services/traffic-history-compute.ts.
+ */
+router.get("/history", async (req: Request, res: Response) => {
+  const raw = String(req.query.days ?? "all");
+  const days = raw === "all" ? null : Math.max(1, Math.min(3650, parseInt(raw, 10) || 90));
+  const vertical = parseVertical(req);
+  const r = await readStats<HistoryView>(req, { name: "trafficHistory", days, vertical }, () =>
+    computeHistoryView(getDb(), days, vertical ?? "all", Date.now()),
+  ).catch((err) => ({ ok: false as const, error: String(err) }));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, (r as { error: string }).error);
+    return;
+  }
+  res.json({ ...r.value, job: getTrafficHistoryJobState(), rawRetentionDays: rawRetentionDays() });
+});
+
+/**
  * GET /admin/analytics/hourly
  * Hourly traffic breakdown for chart
  */
@@ -786,12 +811,25 @@ router.get("/devices", async (req: Request, res: Response) => {
  * a2aGuard counts the POST /a2a calls the spam guard turned away since boot
  * (those no longer leave a conversation row at all).
  */
-router.get("/conversations", (_req: Request, res: Response) => {
+router.get("/conversations", (req: Request, res: Response) => {
   try {
     // Lazy import to avoid circular init at module load.
     const { conversationService } = require("../services/conversation-service");
     const { getA2aGuardStats } = require("../services/a2a-traffic-classifier");
-    const sourceStats = conversationService.getSourceStats() as Array<{ source: string; count: number; lastActivity: string }>;
+    // ?hours= and ?vertical= (S3 of 2026-10-13-statistikk-riktig-for-investorer):
+    // the dashboard's window and site. Without them: all time, rettfrabonden
+    // only, as before. Internal fleet traffic and classified spam/probes are
+    // never counted (getSourceStats' public rule).
+    const hours = req.query.hours !== undefined ? windowHours(req) : null;
+    const vertical = parseVertical(req);
+    const filtered = hours !== null || req.query.vertical !== undefined || lockedVerticalForHost(req) !== null;
+    const sourceStats = conversationService.getSourceStats(filtered
+      ? {
+          allVerticals: !vertical,
+          verticalId: vertical,
+          since: hours !== null ? new Date(Date.now() - hours * 3600_000).toISOString() : undefined,
+        }
+      : {}) as Array<{ source: string; count: number; lastActivity: string }>;
     const total = sourceStats.reduce((s, r) => s + r.count, 0);
     const bySource: Record<string, number> = { mcp: 0, a2a: 0, web: 0, api: 0 };
     for (const r of sourceStats) {
@@ -799,6 +837,7 @@ router.get("/conversations", (_req: Request, res: Response) => {
     }
     res.json({
       timestamp: new Date().toISOString(),
+      ...(filtered ? { hours, vertical: vertical || "all" } : {}),
       total,
       bySource,
       sourceStats,
@@ -1395,6 +1434,15 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
       const oldestDay = (db.prepare(`SELECT MIN(day) as d FROM ${t}`).get() as any)?.d ?? null;
       rollup[t] = { rows, oldestDay };
     }
+    // S3 of 2026-10-13-statistikk-riktig-for-investorer: the stored traffic history.
+    let trafficHistory: Record<string, unknown> = {};
+    try {
+      const th = db.prepare(`
+        SELECT period, COUNT(*) AS rows, MIN(period_start) AS first, MAX(period_start) AS last
+        FROM traffic_history WHERE vertical = 'all' GROUP BY period
+      `).all() as Array<{ period: string; rows: number; first: string; last: string }>;
+      trafficHistory = { ...Object.fromEntries(th.map((r) => [r.period, { rows: r.rows, first: r.first, last: r.last }])), job: getTrafficHistoryJobState() };
+    } catch { /* table missing on an old schema */ }
 
     // DB file size
     let dbSizeMb = 0;
@@ -1447,6 +1495,7 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
           query: oldestQ,
         },
         rollup,
+        trafficHistory,
       },
       lastHour: {
         totalViews: recentPv,

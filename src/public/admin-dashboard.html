@@ -74,6 +74,13 @@
         .stat-definitions ul { margin: 8px 0 0 18px; padding: 0; }
         .stat-definitions li { margin: 3px 0; }
         .panel-title { font-size: 14px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .panel-note { font-weight: 400; font-size: 12px; color: var(--text-dim); }
+        .history-banner { font-size: 12px; color: var(--text-dim); background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin: 0 0 20px; }
+        .period-tabs { display: inline-flex; gap: 4px; margin-left: auto; }
+        .period-tabs button { padding: 4px 10px; font-size: 12px; }
+        .period-tabs button.active { color: var(--text); border-color: var(--accent); }
+        .history-table td.num, .history-table th.num { text-align: right; }
+        .history-table .flag { color: var(--text-dim); font-size: 11px; }
         .panel-full { grid-column: 1 / -1; }
 
         /* ─── Bar chart ─── */
@@ -197,6 +204,7 @@
                 <option value="72">Siste 3 dager</option>
                 <option value="168">Siste uke</option>
                 <option value="720">Siste 30 dager</option>
+                <option value="1440">Siste 60 dager</option>
                 <option value="2160">Siste 90 dager</option>
                 <option value="8760">Siste år</option>
                 <option value="all">Hele perioden</option>
@@ -297,6 +305,24 @@
             </ul>
         </details>
 
+        <div id="historyBanner" class="history-banner" style="display:none"></div>
+
+        <!-- Month by month (stored history, S3): exact unique people per month,
+             kept after the raw rows are deleted. Independent of the window above. -->
+        <div class="panel-grid">
+            <div class="panel panel-full">
+                <div class="panel-title">📅 <span id="historyTitle">Måned for måned</span>
+                    <span class="period-tabs">
+                        <button class="btn-sm active" data-period="month">Måned</button>
+                        <button class="btn-sm" data-period="week">Uke</button>
+                        <button class="btn-sm" id="historyCsv" title="Last ned tabellen som CSV">CSV</button>
+                    </span>
+                </div>
+                <div id="historyTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+                <div id="historyNote" style="font-size:11px;color:var(--text-dim);margin-top:8px"></div>
+            </div>
+        </div>
+
         <!-- Hourly Traffic Chart -->
         <div class="panel-grid">
             <div class="panel panel-full">
@@ -314,7 +340,7 @@
                 <div id="trafficClassification"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">🤖 AI og roboter etter navn (visninger)</div>
+                <div class="panel-title">🤖 AI og roboter etter navn (visninger) <span class="panel-note" data-approx-note></span></div>
                 <div id="botBreakdown"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -322,7 +348,7 @@
         <!-- Samtaler (agent-til-agent) -->
         <div class="panel-grid">
             <div class="panel panel-full">
-                <div class="panel-title">💬 Samtaler (agent-til-agent)</div>
+                <div class="panel-title">💬 Samtaler <span class="panel-note">· startet i perioden</span></div>
                 <div id="conversationsPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -330,7 +356,7 @@
         <!-- Referrers + AI agents -->
         <div class="panel-grid">
             <div class="panel">
-                <div class="panel-title">🔗 Henvisende nettsider (mennesker)</div>
+                <div class="panel-title">🔗 Henvisende nettsider (mennesker) <span class="panel-note" data-approx-note></span></div>
                 <div id="referrerList"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
@@ -346,15 +372,15 @@
                 <div id="trafficSourceChart"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">🔍 Topp søkeord (nettsider og API)</div>
+                <div class="panel-title">🔍 Topp søkeord (nettsider og API) <span class="panel-note" data-approx-note></span></div>
                 <div id="searchTerms"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel" data-rfb-only>
-                <div class="panel-title">🏙 Byer</div>
+                <div class="panel-title">🏙 Byer <span class="panel-note" data-raw-note></span></div>
                 <div id="cityStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">📄 Topp sider</div>
+                <div class="panel-title">📄 Topp sider <span class="panel-note" data-approx-note></span></div>
                 <div id="topPages"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -366,7 +392,7 @@
                 <div id="deviceStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">👤 Mest aktive besøkende (mennesker)</div>
+                <div class="panel-title">👤 Mest aktive besøkende (mennesker) <span class="panel-note" data-raw-note></span></div>
                 <div id="humanVisitors"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -374,11 +400,11 @@
         <!-- Producers + Visitors Tables -->
         <div class="panel-grid">
             <div class="panel panel-full" data-rfb-only>
-                <div class="panel-title">⭐ Mest besøkte produsenter</div>
+                <div class="panel-title">⭐ Mest besøkte produsenter <span class="panel-note" data-raw-note></span></div>
                 <div id="producerTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel panel-full">
-                <div class="panel-title">👥 Siste aktivitet (alle klienter)</div>
+                <div class="panel-title">👥 Siste aktivitet (alle klienter) <span class="panel-note" data-raw-note></span></div>
                 <div id="visitorTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -386,7 +412,7 @@
         <!-- Markedsnettverk-trafikk (PR-74) -->
         <div class="panel-grid" data-rfb-only>
             <div class="panel panel-full">
-                <div class="panel-title">🌐 Markedsnettverk-trafikk</div>
+                <div class="panel-title">🌐 Markedsnettverk-trafikk <span class="panel-note" data-raw-note></span></div>
                 <div id="umbrellaTrafficTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
@@ -525,6 +551,10 @@
             if (e.key === "Enter") doLogin();
         });
         document.getElementById("timeSelect").addEventListener("change", loadDashboard);
+        document.querySelectorAll(".period-tabs [data-period]").forEach(function(b) {
+            b.addEventListener("click", function() { HISTORY_PERIOD = b.getAttribute("data-period"); renderHistoryTable(); });
+        });
+        document.getElementById("historyCsv").addEventListener("click", downloadHistoryCsv);
         document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
         document.getElementById("logoutBtn").addEventListener("click", doLogout);
 
@@ -580,12 +610,24 @@
     }
 
     // ─── Load Dashboard ──────────────────────────────
+    // Raw page views are kept RAW_HOURS (60 days); a longer window is read
+    // from the stored history (GET /admin/analytics/history, S3).
+    var RAW_HOURS = 1440;
+
     function loadDashboard() {
         var hours = document.getElementById("timeSelect").value;
+        var allTime = hours === "all";
         // "all" is presented in the dropdown but the API expects a number.
         // 87600h = 10 years — well past site launch, so it's effectively
         // "all data" without needing a special-case server param.
-        if (hours === "all") hours = "87600";
+        if (allTime) hours = "87600";
+        var longWindow = parseInt(hours, 10) > RAW_HOURS;
+        setWindowNotes(longWindow);
+        loadHistoryTable();
+        if (longWindow) {
+            loadHistoryWindow(allTime ? "all" : String(Math.round(parseInt(hours, 10) / 24)));
+            return;
+        }
 
         // rfb-only endpoints (producers, cities, umbrella) read from data that
         // only the rfb SEO routes populate (analytics_agent_views / umbrellas).
@@ -602,7 +644,7 @@
             api("/devices?hours=" + hours),
             api("/traffic-classification?hours=" + hours),
             api("/referrers?hours=" + hours),
-            api("/conversations"),
+            api("/conversations?hours=" + hours),
             rfbOnly ? api("/umbrella-traffic?since_hours=" + hours) : Promise.resolve({ umbrellas: [] }),
         ])
         .then(function(results) {
@@ -661,6 +703,231 @@
         }
     }
 
+    // ─── Long windows: the stored history ────────────
+    function setWindowNotes(longWindow) {
+        document.querySelectorAll("[data-raw-note]").forEach(function(el) {
+            el.textContent = longWindow ? "· siste " + Math.round(RAW_HOURS / 24) + " dager" : "";
+        });
+        document.querySelectorAll("[data-approx-note]").forEach(function(el) {
+            el.textContent = longWindow ? "· ≈ sum av daglige topplister" : "";
+        });
+        if (!longWindow) document.getElementById("historyBanner").style.display = "none";
+    }
+
+    function loadHistoryWindow(daysParam) {
+        var rawHours = String(RAW_HOURS);
+        var rfbOnly = (VERTICAL === "rfb" || VERTICAL === "all");
+        Promise.all([
+            api("/history?days=" + daysParam),
+            rfbOnly ? api("/producers?hours=" + rawHours + "&limit=15") : Promise.resolve({ producers: [] }),
+            rfbOnly ? api("/cities?hours=" + rawHours) : Promise.resolve({ cities: [] }),
+            api("/visitors?hours=" + rawHours + "&limit=30&sort=recent"),
+            api("/traffic-classification?hours=" + rawHours),
+            api("/conversations?hours=" + (daysParam === "all" ? "87600" : String(parseInt(daysParam, 10) * 24))),
+            rfbOnly ? api("/umbrella-traffic?since_hours=" + rawHours) : Promise.resolve({ umbrellas: [] }),
+        ])
+        .then(function(r) {
+            var h = r[0];
+            if (!h || !h.window) throw new Error((h && h.error) || "historikk utilgjengelig");
+            var s = summaryFromHistory(h);
+            var shownFrom = h.coverage.firstDay && h.coverage.firstDay > h.window.from ? h.coverage.firstDay : h.window.from;
+            document.getElementById("lastUpdated").textContent =
+                "Sist oppdatert: " + new Date().toLocaleString("no-NO") + " — lagret historikk " +
+                fmtDay(shownFrom) + " – " + fmtDay(addDayIso(h.window.to, -1));
+            renderStats(s, { human: { pagesPerVisit: h.human.pagesPerVisit } });
+            renderHourlyChart(h.series.points.map(function(p) { return { hour: p.t, views: p.views, humanViews: p.humanViews }; }), "day");
+            renderTrafficClassification(classificationFromHistory(h));
+            renderBotBreakdown({ bots: h.approximate.bots, otherUaSamples: [] });
+            renderConversations(r[5] || {});
+            renderReferrers(h.approximate.referrers);
+            renderAgentDonut(h.aiVendors);
+            var src = {};
+            h.human.entrySources.forEach(function(e) { src[e.key] = e.visits; });
+            renderTrafficSources(src);
+            renderSearchTerms(h.approximate.topTerms);
+            renderCities((r[2] && r[2].cities) || []);
+            renderDevices(["desktop", "mobile", "tablet", "unknown"].map(function(d) {
+                return { device: d, visitors: (h.human.devices[d] || {}).visits || 0 };
+            }).filter(function(d) { return d.visitors > 0; }), "visits");
+            renderTopPages(h.approximate.topPages);
+            renderProducers((r[1] && r[1].producers) || []);
+            renderVisitors((r[3] && r[3].visitors) || []);
+            renderHumanVisitors(r[4] || {});
+            renderUmbrellaTraffic((r[6] && r[6].umbrellas) || []);
+            var banner = document.getElementById("historyBanner");
+            banner.style.display = "block";
+            banner.textContent = "Perioden er lengre enn de " + (h.rawRetentionDays || 60) + " dagene enkeltbesøk lagres. Tallene er summer av lagrede dagstall"
+                + (h.coverage.firstDay ? " (historikken starter " + fmtDay(h.coverage.firstDay) + ")" : " (ingen lagrede dager ennå)")
+                + ". Unike besøkende kan ikke summeres over dager, så kortet viser snitt per hele måned; se månedstabellen."
+                + " Lister merket ≈ er summer av hver dags toppliste. Paneler merket «siste " + Math.round(RAW_HOURS / 24) + " dager» viser rådata.";
+        })
+        .catch(function(err) {
+            console.error("History load failed:", err);
+            var banner = document.getElementById("historyBanner");
+            banner.style.display = "block";
+            banner.textContent = "Kunne ikke hente lagret historikk: " + err.message;
+        });
+
+        if (VERTICAL === "all") {
+            Promise.all([
+                apiRaw("/history?days=" + daysParam + "&vertical=rfb"),
+                apiRaw("/history?days=" + daysParam + "&vertical=dental"),
+                apiRaw("/history?days=" + daysParam + "&vertical=experiences"),
+            ])
+            .then(function(res) {
+                renderCompareCard("compareRfb", summaryFromHistory(res[0]));
+                renderCompareCard("compareDental", summaryFromHistory(res[1]));
+                renderCompareCard("compareExperiences", summaryFromHistory(res[2]));
+            })
+            .catch(function(err) { console.error("Compare strip (history) load failed:", err); });
+        }
+    }
+
+    // The summary shape renderStats/renderCompareCard read, from a history view.
+    function summaryFromHistory(h) {
+        var g = h.groups, m = h.monthlyHumanVisitors;
+        return {
+            pageViews: h.totals.views,
+            humanViews: g.human.views,
+            botViews: g.bot.views,
+            devViews: g.dev.views,
+            humanVisitors: m ? m.average : null,
+            uniqueVisitors: null,
+            visitorsNote: m
+                ? "snitt per hele måned (" + m.months.map(monthLabel).join(", ") + ")"
+                : "ingen hel måned i perioden – se månedstabellen",
+            humanVisits: g.human.visits,
+            avgTimeOnSite: h.human.avgVisitSeconds,
+            totalQueries: h.searches.total,
+            searchesByChannel: h.searches.byChannel,
+            botSearches: h.searches.botQueries,
+            aiSearchViews: g.ai_search.views,
+            aiCrawlerViews: g.ai_crawler.views,
+            agentTraffic: h.aiVendors,
+            ownerStats: { pageViews: h.owner.views, queries: h.searches.ownerQueries, cookieViews: h.owner.cookieViews, scriptViews: h.owner.scriptViews, unknownViews: h.owner.unknownViews },
+            historyCoverage: h.coverage,
+        };
+    }
+
+    function classificationFromHistory(h) {
+        var c = h.classes;
+        function sum(keys, f) { return keys.reduce(function(a, k) { return a + ((c[k] || {})[f] || 0); }, 0); }
+        function bucket(keys) { return { views: sum(keys, "views"), sessions: sum(keys, "visits") }; }
+        return {
+            unitLabel: "besøk",
+            classification: {
+                human: bucket(["human"]),
+                ai_search: bucket(["ai_search"]),
+                ai_crawler: bucket(["ai_crawler"]),
+                bot: bucket(["search_engine", "seo_bot", "social", "other_bot"]),
+                dev: bucket(["dev"]),
+                scanner: bucket(["scanner", "scraper"]),
+            },
+        };
+    }
+
+    // ─── Month / week table (always the whole stored history) ──
+    var HISTORY_DATA = null;
+    var HISTORY_PERIOD = "month";
+
+    function loadHistoryTable() {
+        api("/history?days=all").then(function(h) {
+            if (!h || !h.window) throw new Error((h && h.error) || "historikk utilgjengelig");
+            HISTORY_DATA = h;
+            renderHistoryTable();
+        }).catch(function(err) {
+            document.getElementById("historyTable").innerHTML = '<div class="empty-state">Kunne ikke hente historikk: ' + escHtml(err.message) + '</div>';
+        });
+    }
+
+    function historyRows() {
+        if (!HISTORY_DATA) return [];
+        return (HISTORY_PERIOD === "week" ? HISTORY_DATA.weeks : HISTORY_DATA.months).slice().reverse();
+    }
+
+    function periodLabel(r) {
+        if (r.period === "month") {
+            var name = new Date(r.start + "T00:00:00Z").toLocaleDateString("no-NO", { month: "long", year: "numeric", timeZone: "UTC" });
+            return name.charAt(0).toUpperCase() + name.slice(1);
+        }
+        return "Uke " + isoWeek(r.start) + " (" + fmtDayShort(r.start) + "–" + fmtDayShort(addDayIso(r.end, -1)) + ")";
+    }
+
+    function renderHistoryTable() {
+        var el = document.getElementById("historyTable");
+        var rows = historyRows();
+        document.getElementById("historyTitle").textContent = HISTORY_PERIOD === "week" ? "Uke for uke" : "Måned for måned";
+        document.querySelectorAll(".period-tabs [data-period]").forEach(function(b) {
+            b.classList.toggle("active", b.getAttribute("data-period") === HISTORY_PERIOD);
+        });
+        if (rows.length === 0) {
+            el.innerHTML = '<div class="empty-state">Ingen lagret historikk ennå. Den fylles ut automatisk noen minutter etter oppstart.</div>';
+        } else {
+            el.innerHTML = '<table class="data-table history-table"><thead><tr><th>Periode</th>'
+                + '<th class="num" title="Unike IP-adresser + nettlesere klassifisert som mennesker, telt én gang per periode">Unike besøkende</th>'
+                + '<th class="num">Besøk</th><th class="num">Sidevisninger (mennesker)</th><th class="num">Sidevisninger (alle)</th>'
+                + '<th class="num">AI-visninger</th><th class="num">Søk</th></tr></thead><tbody>'
+                + rows.map(function(r) {
+                    var flag = r.inProgress ? "hittil" : (r.partialFrom ? "fra " + fmtDayShort(r.partialFrom) : "");
+                    return '<tr><td>' + escHtml(periodLabel(r)) + (flag ? ' <span class="flag">(' + escHtml(flag) + ')</span>' : '') + '</td>'
+                        + '<td class="num">' + fmtNum(r.humanVisitors) + '</td><td class="num">' + fmtNum(r.humanVisits) + '</td>'
+                        + '<td class="num">' + fmtNum(r.humanViews) + '</td><td class="num">' + fmtNum(r.views) + '</td>'
+                        + '<td class="num">' + fmtNum(r.aiViews) + '</td><td class="num">' + fmtNum(r.searches) + '</td></tr>';
+                }).join("") + '</tbody></table>';
+        }
+        var h = HISTORY_DATA || {};
+        var cov = h.coverage || {};
+        var note = "Unike besøkende telles én gang per " + (HISTORY_PERIOD === "week" ? "uke" : "måned") + " (én IP-adresse + nettleser), ikke summert over dager. "
+            + "«hittil» = inneværende periode så langt; «fra …» = perioden er bare lagret fra den datoen. ";
+        if (cov.firstDay) note += "Lagret historikk fra " + fmtDay(cov.firstDay) + ": enkeltbesøk slettes etter " + (h.rawRetentionDays || 60) + " dager, og bare samletall tas vare på.";
+        if (cov.missingDays && cov.missingDays.length) note += " Dager uten lagrede tall: " + cov.missingDays.map(fmtDayShort).join(", ") + ".";
+        if (h.job && h.job.running) note += " Historikken fylles ut nå.";
+        document.getElementById("historyNote").textContent = note;
+    }
+
+    function downloadHistoryCsv() {
+        var rows = historyRows();
+        if (!rows.length) return;
+        var head = ["periode", "start", "slutt_eksklusiv", "delvis_fra", "hittil", "unike_besokende_mennesker", "besok_mennesker",
+            "sidevisninger_mennesker", "sidevisninger_alle", "ai_visninger", "robot_og_skript_visninger", "sok"];
+        var lines = [head.join(";")].concat(rows.map(function(r) {
+            return [periodLabel(r), r.start, r.end, r.partialFrom || "", r.inProgress ? "ja" : "nei", r.humanVisitors, r.humanVisits,
+                r.humanViews, r.views, r.aiViews, r.botViews, r.searches].map(function(v) {
+                    var t = String(v);
+                    return /[;"\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+                }).join(";");
+        }));
+        var blob = new Blob(["﻿" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "trafikk-" + (HISTORY_PERIOD === "week" ? "uke" : "maned") + "-" + VERTICAL + ".csv";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    }
+
+    function addDayIso(day, n) {
+        var d = new Date(day + "T00:00:00Z");
+        d.setUTCDate(d.getUTCDate() + n);
+        return d.toISOString().slice(0, 10);
+    }
+    function isoWeek(day) {
+        var d = new Date(day + "T00:00:00Z");
+        d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));
+        var jan4 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+        return 1 + Math.round(((d - jan4) / 86400000 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
+    }
+    function fmtDay(day) {
+        return new Date(day + "T00:00:00Z").toLocaleDateString("no-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+    }
+    function fmtDayShort(day) {
+        return new Date(day + "T00:00:00Z").toLocaleDateString("no-NO", { day: "numeric", month: "short", timeZone: "UTC" });
+    }
+    function monthLabel(ym) {
+        return new Date(ym + "-01T00:00:00Z").toLocaleDateString("no-NO", { month: "short", year: "numeric", timeZone: "UTC" });
+    }
+
+
     // ─── «Begge»-sammenligningskort ──────────────────
     function renderCompareCard(elId, s) {
         var el = document.getElementById(elId);
@@ -673,7 +940,7 @@
             { label: "AI-visninger", value: agentTotal },
         ];
         el.innerHTML = stats.map(function(st) {
-            return '<div><div class="compare-stat-label">' + st.label + '</div><div class="compare-stat-value">' + fmtNum(st.value) + '</div></div>';
+            return '<div><div class="compare-stat-label">' + st.label + '</div><div class="compare-stat-value">' + (st.value == null ? "–" : fmtNum(st.value)) + '</div></div>';
         }).join("");
     }
 
@@ -682,8 +949,8 @@
         var total = s.pageViews || 0;
         var humanViews = s.humanViews || 0;
         var botViews = (s.botViews || 0) + (s.devViews || 0);
-        document.getElementById("statVisitors").textContent = fmtNum(s.humanVisitors);
-        document.getElementById("statVisitorsSub").textContent = fmtNum(s.uniqueVisitors) + " inkl. AI og roboter";
+        document.getElementById("statVisitors").textContent = s.humanVisitors == null ? "–" : fmtNum(s.humanVisitors);
+        document.getElementById("statVisitorsSub").textContent = s.visitorsNote || (fmtNum(s.uniqueVisitors) + " inkl. AI og roboter");
         document.getElementById("statHumans").textContent = fmtNum(s.humanVisits);
         var h = (classData && classData.human) || {};
         document.getElementById("statHumansPct").textContent = s.humanVisits
@@ -716,7 +983,12 @@
         document.getElementById("statOwnerSub").textContent = parts.join(" · ");
 
         var cov = document.getElementById("statCoverage");
-        if (s.coverage && !s.coverage.complete && s.coverage.oldestRow) {
+        var hc = s.historyCoverage;
+        if (hc) {
+            cov.style.display = "block";
+            cov.textContent = hc.daysWithData + " av " + hc.daysInWindow + " dager i perioden har lagrede tall"
+                + (hc.firstDay ? " (historikken starter " + fmtDay(hc.firstDay) + ")" : "") + ".";
+        } else if (s.coverage && !s.coverage.complete && s.coverage.oldestRow) {
             cov.style.display = "block";
             cov.textContent = "Perioden dekkes fra " + fmtDate(s.coverage.oldestRow) + ": eldre enkeltbesøk er slettet etter "
                 + (s.coverage.retentionDays || 60) + " dager.";
@@ -855,7 +1127,7 @@
     }
 
     // ─── Devices (people only) ───────────────────────
-    function renderDevices(devices) {
+    function renderDevices(devices, unit) {
         var el = document.getElementById("deviceStats");
         if (!devices || devices.length === 0) { el.innerHTML = '<div class="empty-state">Ingen data enda</div>'; return; }
         var total = devices.reduce(function(a, d) { return a + (d.visitors || 0); }, 0);
@@ -864,7 +1136,7 @@
         el.innerHTML = devices.map(function(d) {
             var share = total > 0 ? d.visitors / total * 100 : 0;
             return '<div class="bar-row"><span class="bar-label">' + (labels[d.device] || d.device) + ' (' + pct(d.visitors, total) + ')</span><div class="bar-track"><div class="bar-fill ' + (colors[d.device] || "purple") + '" style="width: ' + share.toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(d.visitors) + '</span></div>';
-        }).join("") + '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Antall besøkende</div>';
+        }).join("") + '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">' + (unit === "visits" ? "Antall besøk" : "Antall besøkende") + '</div>';
     }
 
     // ─── Top Pages ───────────────────────────────────
@@ -971,7 +1243,7 @@
 
         var legend = items.map(function(d) {
             var pctLabel = pct(d.value, total);
-            return '<div class="legend-item"><span class="legend-dot" style="background:' + d.color + '"></span><span>' + d.label + ': <strong>' + fmtNum(d.value) + '</strong> (' + pctLabel + ') — ' + fmtNum(d.sessions) + ' besøkende</span></div>';
+            return '<div class="legend-item"><span class="legend-dot" style="background:' + d.color + '"></span><span>' + d.label + ': <strong>' + fmtNum(d.value) + '</strong> (' + pctLabel + ') — ' + fmtNum(d.sessions) + ' ' + (data.unitLabel || "besøkende") + '</span></div>';
         }).join("");
 
         el.innerHTML = '<div class="donut-container"><svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '"><circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="var(--bg)" stroke-width="' + stroke + '" />' + arcs + '<text x="' + cx + '" y="' + (cy - 6) + '" text-anchor="middle" fill="var(--text)" font-size="16" font-weight="700">' + fmtNum(total) + '</text><text x="' + cx + '" y="' + (cy + 12) + '" text-anchor="middle" fill="var(--text-dim)" font-size="10">visninger</text></svg><div class="donut-legend">' + legend + '</div></div>';
@@ -1016,13 +1288,13 @@
         var total = data.total || 0;
         var by = data.bySource || {};
         if (total === 0) {
-            el.innerHTML = '<div class="empty-state">Ingen samtaler registrert enda</div>';
+            el.innerHTML = '<div class="empty-state">Ingen samtaler i perioden</div>';
             return;
         }
         var items = [
-            { key: "mcp",  label: "MCP",  icon: "🤖", color: "purple" },
-            { key: "a2a",  label: "A2A",  icon: "🚀", color: "cyan" },
-            { key: "web",  label: "Web",  icon: "🌐", color: "green" },
+            { key: "mcp",  label: "AI-assistenter (MCP)",  icon: "🤖", color: "purple" },
+            { key: "a2a",  label: "Agenter (A2A)",  icon: "🚀", color: "cyan" },
+            { key: "web",  label: "Nettsiden (mennesker)",  icon: "🌐", color: "green" },
             { key: "api",  label: "API",  icon: "🔌", color: "yellow" },
         ];
         var max = Math.max.apply(null, items.map(function(i) { return by[i.key] || 0; })) || 1;
@@ -1030,7 +1302,7 @@
             var v = by[i.key] || 0;
             return '<div class="bar-row"><span class="bar-label">' + i.icon + ' ' + i.label + '</span><div class="bar-track"><div class="bar-fill ' + i.color + '" style="width: ' + (v / max * 100).toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(v) + '</span></div>';
         }).join("");
-        el.innerHTML = '<div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:10px">Totalt <strong style="color:var(--text)">' + fmtNum(total) + '</strong> samtaler (agent-til-agent). Ikke samme som sidevisninger — se forklaring på <a href="/samtaler" style="color:var(--accent)" target="_blank">/samtaler</a>.</div>' + bars;
+        el.innerHTML = '<div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:10px"><strong style="color:var(--text)">' + fmtNum(total) + '</strong> samtaler startet i perioden: en AI-assistent, en agent eller en person på nettsiden ba om hjelp til å finne noe. Interne tester og søppel er holdt utenfor. Ikke det samme som sidevisninger — se <a href="/samtaler" style="color:var(--accent)" target="_blank">/samtaler</a>.</div>' + bars;
     }
 
     // ─── External sites that sent people ────────────
@@ -1038,7 +1310,7 @@
         var el = document.getElementById("referrerList");
         if (!referrers || referrers.length === 0) { el.innerHTML = '<div class="empty-state">Ingen henvisninger fra andre nettsider i perioden</div>'; return; }
         var rows = referrers.slice(0, 10).map(function(r) {
-            return '<tr><td>' + escHtml(r.host || r.referrer) + '</td><td><span class="badge badge-web">' + escHtml(r.label || entrySourceLabel(r.source)) + '</span></td><td>' + fmtNum(r.visits) + '</td><td>' + fmtNum(r.unique_visitors) + '</td></tr>';
+            return '<tr><td>' + escHtml(r.host || r.referrer) + '</td><td><span class="badge badge-web">' + escHtml(r.label || entrySourceLabel(r.source)) + '</span></td><td>' + fmtNum(r.visits) + '</td><td>' + (r.unique_visitors == null ? "–" : fmtNum(r.unique_visitors)) + '</td></tr>';
         }).join("");
         el.innerHTML = '<table class="data-table"><thead><tr><th>Nettside</th><th>Type</th><th>Besøk</th><th>Besøkende</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
