@@ -225,7 +225,7 @@ export function computeAdminSummary(db: Db, hoursBack: number, vertical: Vertica
  * every client class in the window (traffic-report.ts).
  */
 export function computePageViewCount(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): number {
-  return computeTrafficReport(db, hoursBack, vertical, nowMs).totals.views;
+  return computeTrafficReport(db, hoursBack, vertical, nowMs, { detail: false }).totals.views;
 }
 
 export interface UtmRow {
@@ -510,8 +510,9 @@ export function computeCityStats(db: Db, hoursBack: number, vertical: VerticalId
  * every class (traffic-report.ts recentSessions), newest first. Legacy field
  * names kept (ipHash is the first 8 hex chars of the salted IP hash).
  */
-export function visitorsFromReport(report: TrafficReport, limit: number): any[] {
-  return report.recentSessions.slice(0, limit).map((r: SessionRow) => ({
+export function visitorsFromReport(report: TrafficReport, limit: number, sort: "views" | "recent" = "views"): any[] {
+  const list = sort === "recent" ? report.recentSessions : report.busiestSessions;
+  return list.slice(0, limit).map((r: SessionRow) => ({
     ipHash: r.id,
     pageViews: r.views,
     uniquePages: r.uniquePages,
@@ -523,6 +524,7 @@ export function visitorsFromReport(report: TrafficReport, limit: number): any[] 
     cls: r.cls,
     group: r.group,
     name: r.name ?? null,
+    ua: r.ua ?? null,
   }));
 }
 
@@ -775,7 +777,7 @@ export interface Summary24Result {
 
 /** Human visits in the last 30 days (traffic-report.ts definitions). */
 export function computeMonthlyHumanVisits(db: Db, vertical: VerticalId | undefined, nowMs: number): number {
-  return computeTrafficReport(db, 24 * 30, vertical, nowMs).groups.human.visits;
+  return computeTrafficReport(db, 24 * 30, vertical, nowMs, { detail: false }).groups.human.visits;
 }
 
 export function runAdminStatsQuery(db: Db, query: AdminStatsQuery, nowMs: number): unknown {

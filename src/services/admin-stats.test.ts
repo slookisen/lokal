@@ -649,6 +649,47 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
         ok(seenKeys.includes(adminStatsKey({ name: "producers", limit: 20, hours: 720 })) && seenKeys.includes(adminStatsKey({ name: "umbrellaTraffic", sinceHours: 720 })) &&
            seenKeys.includes(adminStatsKey({ name: "trafficReport", hours: 720 })) && seenKeys.includes(adminStatsKey({ name: "queryStats", hours: 720 })),
           "H5: the routes pass their parsed parameters to the worker task", seen);
+
+        // H6: the main-thread fallback (OFFTHREAD_STATS_DISABLED=1, or no WAL)
+        // answers /summary with the worker's own query: monthly_visits is
+        // human visits on both paths, not every client's page views.
+        const initMod = require("../database/init") as typeof import("../database/init");
+        const prevDb = initMod.getDb();
+        const fbDb = new Database(":memory:");
+        let fbServer: http.Server | null = null;
+        try {
+          __initSchemaForTesting(fbDb as any);
+          initMod.__setDbForTesting(fbDb as any);
+          const fbIns = fbDb.prepare("INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at, status_code) VALUES (?, ?, 0, 'rfb', ?, 200)");
+          for (let i = 0; i < 5; i++) fbIns.run(`/p${i}`, gpt, sqliteTs(Date.now() - 2 * 3600_000 + i * 60_000));
+          fbIns.run("/", "ip9:desktop:9999", sqliteTs(Date.now() - 3600_000));
+          const fbReader = createAdminStatsReader({
+            getDb: () => fbDb as any,
+            offThreadUsable: () => false,
+            runOffThread: () => Promise.reject(new Error("must not run off-thread")),
+            now: Date.now, ttlMs: 300_000, maxStaleMs: 600_000, retryAfterMs: 0, maxEntries: 50, log: () => {},
+          });
+          const fbApp = express();
+          fbApp.set(ADMIN_STATS_READER_APP_KEY, fbReader);
+          fbApp.use("/admin/analytics", analyticsRouter);
+          fbServer = await new Promise<http.Server>((resolve) => { const s2 = fbApp.listen(0, "127.0.0.1", () => resolve(s2)); });
+          const fbPort = (fbServer.address() as AddressInfo).port;
+          const fb = await new Promise<any>((resolve) => {
+            const rq = http.request({ host: "127.0.0.1", port: fbPort, path: "/admin/analytics/summary", method: "GET", headers: { "X-Admin-Key": KEY } }, (res) => {
+              let buf = "";
+              res.on("data", (c) => (buf += c));
+              res.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve(buf); } });
+            });
+            rq.on("error", () => resolve(null));
+            rq.end();
+          });
+          ok(fb?.pageViews === 6 && fb?.monthly_visits === 1,
+            "H6: the main-thread fallback of /summary gives the same monthly_visits as the worker (human visits: 1, not the 6 page views of all clients)", fb);
+        } finally {
+          if (fbServer) await new Promise<void>((r) => fbServer!.close(() => r()));
+          initMod.__setDbForTesting(prevDb);
+          fbDb.close();
+        }
       }
     } catch (e) {
       ok(false, "H: route tests threw", (e as Error).stack);

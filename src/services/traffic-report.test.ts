@@ -78,13 +78,16 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
        shouldRecordPageView("/", 200, "text/markdown; charset=utf-8") &&
        shouldRecordPageView("/sok", 304, undefined) &&
        shouldRecordPageView("/produsent/x", 302, "text/html") &&
+       shouldRecordPageView("/produsent/x", 301, "text/plain; charset=utf-8") &&
+       shouldRecordPageView("/finnes-ikke", 404, "application/json") &&
+       shouldRecordPageView("/.ENV", 404, "text/plain") &&
        shouldRecordPageView("/wp-admin/x.php", 404, "text/html") &&
        shouldRecordPageView("/.env", 404, "application/json") &&
        !shouldRecordPageView("/", 200, "application/json") &&
        !shouldRecordPageView("/logo.png", 200, "image/png") &&
        !shouldRecordPageView("/offline.html", 200, "text/html") &&
        !shouldRecordPageView("/mcp", 200, "text/html"),
-      "a4: the middleware stores documents for pages (any status, 304 without a type) and every scanner probe, nothing else");
+      "a4: the middleware stores pages answered 3xx/4xx/5xx whatever the type, 2xx pages only as documents, and every scanner probe in any case");
 
     const db = new Database(":memory:");
     db.exec("CREATE TABLE analytics_page_views (path TEXT, status_code INTEGER)");
@@ -195,6 +198,74 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
     db.close();
   }
 
+  // ── (d) Edges: thresholds, boundaries, ranges, lists ──────────────
+  {
+    const db = new Database(":memory:");
+    initMod.__initSchemaForTesting(db as any);
+    const now = Date.UTC(2026, 9, 13, 12, 0, 0);
+    const H = 3600_000;
+    const M = 60_000;
+    const ins = db.prepare(`
+      INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, vertical_id, created_at, client_class)
+      VALUES (?, ?, 0, ?, 'rfb', ?, ?)
+    `);
+    const pv = (sid: string, atMs: number, path = "/", status = 200, cls: string | null = null) => ins.run(path, sid, status, ts(atMs), cls);
+
+    // 230 distinct producer pages in 57.5 minutes (one per 15 s): never 60 in
+    // 10 minutes, but over 200 in an hour → scraper.
+    for (let i = 0; i < 230; i++) pv("ipH:desktop:hhhh", now - 20 * H + i * 15_000, `/produsent/p${i}`);
+    // Exactly 30 minutes apart continues a visit; 31 minutes starts a new one.
+    pv("ipV:desktop:vvvv", now - 10 * H, "/");
+    pv("ipV:desktop:vvvv", now - 10 * H + 30 * M, "/sok");
+    pv("ipV:desktop:vvvv", now - 10 * H + 61 * M, "/om");
+    // A visit that began before the window: only its in-window views count, as one visit.
+    pv("ipW:desktop:wwww", now - 24 * H - 10 * M, "/");
+    pv("ipW:desktop:wwww", now - 24 * H + 5 * M, "/sok");
+    pv("ipW:desktop:wwww", now - 24 * H + 15 * M, "/om");
+    // A legacy row (no class, browser bucket) then a row stored as ai_search: the stored class wins for the whole session.
+    pv("ipX:desktop:xxxx", now - 5 * H, "/");
+    pv("ipX:desktop:xxxx", now - 5 * H + M, "/sok", 200, "ai_search");
+    // A probe in upper case is still a probe; a scanner behind a browser UA has no UA to show.
+    pv("ipU:desktop:uuuu", now - 4 * H, "/.ENV", 404);
+    pv("ipU:desktop:uuuu", now - 4 * H + M, "/");
+    // A named bot keeps its UA.
+    pv("ipB:Mozilla/5.0 (compatible; Googlebot/2.1)", now - 3 * H, "/");
+
+    const r = computeTrafficReport(db as any, 24, undefined, now);
+    ok(eq(r.classes.scraper, { views: 230, visitors: 1, visits: 1 }), "d1: over 200 producer pages in an hour is a scraper, even at 4 pages a minute", r.classes.scraper);
+    const v = r.busiestSessions.find((x) => x.id === "ipV");
+    ok(v?.visits === 2 && v?.views === 3, "d2: exactly 30 minutes continues the visit, 31 minutes starts a new one", v);
+    const w = r.busiestSessions.find((x) => x.id === "ipW");
+    ok(w?.views === 2 && w?.visits === 1, "d3: a visit begun before the window counts only its in-window views, as one visit", w);
+    ok(r.classes.ai_search.visitors === 1 && r.classes.ai_search.views === 2, "d4: a stored class overrides the legacy class for the whole session", r.classes.ai_search);
+    const scan = r.bots.find((b) => b.cls === "scanner");
+    ok(r.classes.scanner.visitors === 1 && scan?.name === "Skanner med nettleser-UA" && scan?.sampleUa === null,
+      "d5: an upper-case probe makes a scanner; a scanner behind a browser UA is named as such, with no fake UA", r.bots);
+    const g = r.busiestSessions.find((x) => x.name === "Googlebot");
+    ok(g?.ua === "Mozilla/5.0 (compatible; Googlebot/2.1)" && r.busiestSessions[0].views === 230 &&
+       r.busiestSessions.every((x, i, a) => i === 0 || a[i - 1].views >= x.views),
+      "d6: busiest sessions sorted by page views; a named bot carries its UA", r.busiestSessions.slice(0, 3));
+
+    // A fixed range is [from, to): a row at `from` is in, a row at `to` is out.
+    pv("ipR:desktop:rrrr", Date.UTC(2026, 9, 12), "/");
+    pv("ipR:desktop:rrrr", Date.UTC(2026, 9, 13), "/sok");
+    const day = computeTrafficReport(db as any, 24, undefined, now, { fromMs: Date.UTC(2026, 9, 12), toMs: Date.UTC(2026, 9, 13) });
+    const rr = day.busiestSessions.find((x) => x.id === "ipR");
+    ok(rr?.views === 1 && day.window.hours === 24 && day.window.from === "2026-10-12 00:00:00" && day.window.to === "2026-10-13 00:00:00" &&
+       day.series.unit === "hour" && day.series.points.length === 24,
+      "d7: a fixed range includes its start and excludes its end; 24 hourly buckets", { rr, window: day.window, n: day.series.points.length });
+    // Coverage of a range: complete when its first day is stored (rows are pruned in whole days).
+    const first = computeTrafficReport(db as any, 24, undefined, now, { fromMs: Date.UTC(2026, 9, 12), toMs: Date.UTC(2026, 9, 13) });
+    ok(first.coverage.oldestRow === "2026-10-12 00:00:00" && first.coverage.complete === true, "d8: a range starting on the oldest stored day is complete", first.coverage);
+    const before = computeTrafficReport(db as any, 24, undefined, now, { fromMs: Date.UTC(2026, 9, 11), toMs: Date.UTC(2026, 9, 12) });
+    ok(before.coverage.complete === false, "d9: a range before the oldest stored day is not", before.coverage);
+    // "All time" starts its series at the first stored row, not ten years back.
+    const all = computeTrafficReport(db as any, 87600, undefined, now);
+    ok(all.series.unit === "day" && all.series.points.length === 2 && all.series.points[0].t === "2026-10-12",
+      "d10: a window longer than the stored rows starts its series at the first row", all.series.points.map((p) => p.t));
+    db.close();
+  }
+
   // ── (c) The write path ─────────────────────────────────────────────
   {
     const prevDb = initMod.getDb();
@@ -211,10 +282,12 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
       app.get("/data", (_req, res) => { res.json({ a: 1 }); });
       app.get("/wp-admin/setup.php", (_req, res) => { res.status(404).json({ error: "nei" }); });
       app.get("/stale", (_req, res) => { res.status(304).end(); });
+      app.get("/produsent/gammel", (_req, res) => { res.redirect(301, "/produsent/ny"); });
+      app.get("/.ENV", (_req, res) => { res.status(404).send("nei"); });
       server = await new Promise<http.Server>((resolve) => { const s = app.listen(0, "127.0.0.1", () => resolve(s)); });
       const port = (server.address() as AddressInfo).port;
-      const get = (p: string, ua: string) => new Promise<void>((resolve) => {
-        const req = http.request({ host: "127.0.0.1", port, path: p, method: "GET", headers: { "User-Agent": ua } }, (res) => {
+      const get = (p: string, ua: string, extra: Record<string, string> = {}) => new Promise<void>((resolve) => {
+        const req = http.request({ host: "127.0.0.1", port, path: p, method: "GET", headers: { "User-Agent": ua, ...extra } }, (res) => {
           res.resume();
           res.on("end", () => resolve());
         });
@@ -228,14 +301,23 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
       await get("/stale", CHROME);
       await get("/", "RFB-ContactVerifier/1.0 (+https://rettfrabonden.com)");
       await get("/", OLD_CHROME);
+      // Redirects: Express answers text/plain unless the client asks for HTML.
+      await get("/produsent/gammel", "Mozilla/5.0 (compatible; Googlebot/2.1)");
+      await get("/produsent/gammel", "Mozilla/5.0 (compatible; Googlebot/2.1)", { Accept: "*/*" });
+      await get("/produsent/gammel", CHROME, { Accept: "text/html" });
+      await get("/.ENV", CHROME);
       await new Promise((r) => setTimeout(r, 50));
       const rows = memDb.prepare("SELECT path, status_code, is_owner, client_class FROM analytics_page_views ORDER BY id").all() as any[];
-      ok(eq(rows.map((x) => x.path), ["/", "/wp-admin/setup.php", "/stale", "/", "/"]),
-        "c1: stored: the page, the scanner probe and the 304; not the image or the JSON", rows);
+      ok(eq(rows.slice(0, 5).map((x) => x.path), ["/", "/wp-admin/setup.php", "/stale", "/", "/"]),
+        "c1: stored: the page, the scanner probe and the 304; not the image or the JSON", rows.slice(0, 5));
       ok(rows[0]?.client_class === "human" && rows[0]?.is_owner === 0, "c2: a browser is stored as 'human'", rows[0]);
       ok(rows[2]?.status_code === 304, "c3: a 304 page is stored with its status", rows[2]);
       ok(rows[3]?.is_owner === 1 && rows[3]?.client_class === "dev", "c4: our own script: owner, class 'dev' (its UA has no bot marker)", rows[3]);
       ok(rows[4]?.client_class === "scanner", "c5: a fake stale Chrome is stored as 'scanner'", rows[4]);
+      const redirects = rows.slice(5, 8);
+      ok(redirects.length === 3 && redirects.every((x) => x.path === "/produsent/gammel" && x.status_code === 301),
+        "c6: a 301 is stored whatever the client accepts (no Accept, */*, text/html), for producer-outcomes", redirects);
+      ok(rows[8]?.path === "/.ENV" && rows.length === 9, "c7: an upper-case probe path is stored", rows.slice(8));
     } catch (e) {
       ok(false, "c: write-path tests threw", (e as Error).stack);
     } finally {

@@ -46,7 +46,7 @@ import {
   type ClientClass,
   type SessionCategory,
 } from "./traffic-classifier";
-import { pagePathSql, pageViewSql } from "./page-view-definition";
+import { isPagePath, isPageViewStatus, isScannerProbePath } from "./page-view-definition";
 import { classifyReferralSource } from "./human-referrals";
 
 type Db = Database.Database;
@@ -84,8 +84,10 @@ export interface SessionRow {
   cls: SessionCategory;
   group: TrafficGroup;
   device: Device | "bot";
-  /** Named bot (bots only), e.g. "Googlebot". */
+  /** Named bot (non-human sessions only), e.g. "Googlebot". */
   name?: string;
+  /** The stored user agent (non-human sessions whose session_id keeps the raw UA). */
+  ua?: string;
   views: number;
   uniquePages: number;
   visits: number;
@@ -131,11 +133,13 @@ export interface TrafficReport {
   };
   topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number }>;
   /** Named non-human clients (AI and bots), by views. */
-  bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number; sampleUa: string }>;
+  bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number; sampleUa: string | null }>;
   /** Raw UA samples of bots with no recognisable name. */
   otherUaSamples: Array<{ ua: string; views: number }>;
-  /** Most recently active visitors of every class. */
+  /** Most recently active visitors of every class (up to 200). */
   recentSessions: SessionRow[];
+  /** Visitors of every class with the most page views (up to 200). */
+  busiestSessions: SessionRow[];
 }
 
 // ── Small helpers ──────────────────────────────────────────────────────
@@ -149,6 +153,22 @@ function parseTs(s: string): number {
   const iso = s.length <= 10 ? `${s}T00:00:00Z` : `${s.replace(" ", "T")}${s.endsWith("Z") ? "" : "Z"}`;
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? ms : NaN;
+}
+
+/** parseTs for the row scan: the minute is parsed once per minute, the seconds by hand. */
+function createTsParser(): (s: string) => number {
+  let lastMinute = "";
+  let lastBase = NaN;
+  return (s: string) => {
+    if (s.length !== 19 || s.charCodeAt(16) !== 58 /* ':' */) return parseTs(s);
+    const minute = s.slice(0, 16);
+    if (minute !== lastMinute) {
+      lastMinute = minute;
+      lastBase = parseTs(`${minute}:00`);
+    }
+    const sec = (s.charCodeAt(17) - 48) * 10 + (s.charCodeAt(18) - 48);
+    return sec >= 0 && sec < 60 ? lastBase + sec * 1000 : parseTs(s);
+  };
 }
 
 function emptyTotals(): Totals {
@@ -194,6 +214,32 @@ export function botNameForUA(ua: string): string {
   return ua.trim() ? "Ukjent" : "Tom user-agent";
 }
 
+/**
+ * The raw UA kept in a session_id, or "" when the session_id holds only a
+ * browser's device bucket and hash (sessionIdFor: every browser-looking UA).
+ */
+export function rawUaOfSession(sessionId: string): string {
+  const ua = uaFromSessionId(sessionId);
+  return isBucketedUa(ua) ? "" : ua;
+}
+
+function isBucketedUa(ua: string): boolean {
+  // sessionIdFor: `${ipHash}:${bucket}:${hash16}` for every browser-looking UA.
+  return /^(mobile|tablet|desktop):[0-9a-z]+$/i.test(ua);
+}
+
+/** Label for a non-human session whose UA is a browser's (scanners and scrapers behind a normal-looking UA). */
+const BROWSER_UA_NAME: Partial<Record<SessionCategory, string>> = {
+  scanner: "Skanner med nettleser-UA",
+  scraper: "Skraper med nettleser-UA",
+};
+
+function sessionBotName(sessionId: string, cls: SessionCategory): string {
+  const ua = uaFromSessionId(sessionId);
+  if (isBucketedUa(ua)) return BROWSER_UA_NAME[cls] ?? "Nettleser-UA";
+  return botNameForUA(ua);
+}
+
 function refHost(referrer: string): string {
   try {
     return new URL(referrer).hostname.replace(/^www\./, "");
@@ -219,7 +265,9 @@ class Interner {
 // ── The report ─────────────────────────────────────────────────────────
 
 const LIST_LIMIT = 30;
-const TOP_PAGES_LIMIT = 50;
+/** GET /admin/analytics/visitors takes limit ≤ 200, /pages limit ≤ 100. */
+const SESSION_LIST_LIMIT = 200;
+const TOP_PAGES_LIMIT = 100;
 
 export interface TrafficReportOptions {
   /**
@@ -229,6 +277,13 @@ export interface TrafficReportOptions {
    * empty. Used by the public 60-day counters, which need only the totals.
    */
   detail?: boolean;
+  /**
+   * A fixed range [fromMs, toMs) instead of the trailing `hours` before
+   * `nowMs` (one UTC day, ISO week or month for the stored history). Both or
+   * neither.
+   */
+  fromMs?: number;
+  toMs?: number;
 }
 
 export function computeTrafficReport(
@@ -239,28 +294,28 @@ export function computeTrafficReport(
   opts: TrafficReportOptions = {},
 ): TrafficReport {
   const keepRows = opts.detail !== false;
-  const fromMs = nowMs - hours * 3600_000;
+  const ranged = opts.fromMs !== undefined && opts.toMs !== undefined;
+  const fromMs = ranged ? opts.fromMs! : nowMs - hours * 3600_000;
+  const endMs = ranged ? opts.toMs! : nowMs;
   const cutoff = sqliteDatetime(fromMs);
+  // Live windows: (now - hours, now]. Fixed ranges: [from, to), so consecutive
+  // days, weeks and months neither overlap nor leave a gap.
+  const timeSql = ranged ? "created_at >= ? AND created_at < ?" : "created_at > ?";
+  const tp: string[] = ranged ? [cutoff, sqliteDatetime(endMs)] : [cutoff];
   // Older and minimal (test) schemas lack some columns: read what exists.
   const has = (col: string) => hasColumn(db, "analytics_page_views", col);
   const hasVertical = has("vertical_id");
   const V = vertical && hasVertical ? " AND vertical_id = ?" : "";
   const vp: string[] = vertical && hasVertical ? [vertical] : [];
   const col = (name: string) => (has(name) ? name : `NULL AS ${name}`);
-  const pageFilter = has("status_code") ? pageViewSql() : pagePathSql();
+  const statusCol = has("status_code") ? "status_code" : "NULL AS status_code";
 
   const oldestRow = ((db.prepare("SELECT MIN(created_at) AS m FROM analytics_page_views").get() as { m: string | null } | undefined)?.m) ?? null;
 
   // Sessions that probed scanner paths in the window (any status: the probes
   // themselves are not page views, but they tell a scanner from a person).
-  const probeSql = SCANNER_PATH_PATTERNS.map(() => "path LIKE ?").join(" OR ");
-  const probeSessions = new Set(
-    (db.prepare(`
-      SELECT DISTINCT session_id FROM analytics_page_views
-      WHERE created_at > ?${V} AND (${probeSql})
-    `).all(cutoff, ...vp, ...SCANNER_PATH_PATTERNS.map((p) => `%${p}%`)) as Array<{ session_id: string | null }>)
-      .map((r) => r.session_id ?? ""),
-  );
+  // Filled during the scan below, read when the sessions are classified.
+  const probeSessions = new Set<string>();
 
   // ── Pass 1: stream the window's page views in time order ──
   const sessions = new Interner();
@@ -303,31 +358,51 @@ export function computeTrafficReport(
     if (sVisitViews[s] === 1) sSingleViewVisits[s] += 1;
   };
 
+  // One scan of every row in the window. The page-view rule is applied here
+  // (isPagePath, memoised per path, + isPageViewStatus), not in SQL: the SQL
+  // form (pageViewSql) runs string functions on every row and, with the probe
+  // scan it replaces, made a 60-day report about 40 % slower.
   const rowStmt = db.prepare(`
-    SELECT session_id, ${col("client_class")}, path, created_at, ${col("referrer")}, ${col("is_owner")}
+    SELECT session_id, ${col("client_class")}, path, created_at, ${col("referrer")}, ${col("is_owner")}, ${statusCol}
     FROM analytics_page_views${indexHint(db, V ? vertical : undefined)}
-    WHERE created_at > ?${V} AND ${pageFilter}
+    WHERE ${timeSql}${V}
     ORDER BY created_at
   `);
+  // Per path: bit 1 = a page, bit 2 = a scanner probe, bit 4 = a /produsent/ page.
+  const pathInfo = new Map<string, number>();
+  const infoOf = (path: string): number => {
+    let i = pathInfo.get(path);
+    if (i === undefined) {
+      i = (isPagePath(path) ? 1 : 0) | (isScannerProbePath(path) ? 2 : 0) | (path.includes("/produsent/") ? 4 : 0);
+      pathInfo.set(path, i);
+    }
+    return i;
+  };
+  const produsentPath: boolean[] = [];
+  const rowTs = createTsParser();
 
-  // raw(): rows as arrays, not objects — ~750k rows for 60 days, so the
+  // raw(): rows as arrays, not objects — ~1.5M rows for 60 days, so the
   // per-row allocation matters. Column order is the SELECT above.
-  for (const r of rowStmt.raw(true).iterate(cutoff, ...vp) as Iterable<[
-    string | null, string | null, string, string, string | null, number | null,
+  for (const r of rowStmt.raw(true).iterate(...tp, ...vp) as Iterable<[
+    string | null, string | null, string, string, string | null, number | null, number | null,
   ]>) {
-    const row = { session_id: r[0], client_class: r[1], path: r[2], created_at: r[3], referrer: r[4], is_owner: r[5] };
-    const sid = row.session_id ?? "";
-    const ts = parseTs(row.created_at);
+    const sid = r[0] ?? "";
+    const clientClass = r[1];
+    const path = r[2] ?? "";
+    const info = infoOf(path);
+    if (info & 2) probeSessions.add(sid);
+    if (!(info & 1) || !isPageViewStatus(r[6])) continue;
+    const ts = rowTs(r[3]);
     if (!Number.isFinite(ts)) continue;
 
-    if (row.is_owner === 1) {
+    if (r[5] === 1) {
       // Owner = the _rfb_owner cookie (a person's browser) or a script UA
       // (isOwnerRequest). Since S1 the write path stores client_class 'dev' for
       // the script case; older rows can only be split when their session_id
       // still shows a non-browser UA.
       owner.views += 1;
-      if (row.client_class) {
-        if (row.client_class === "human") owner.cookieViews += 1;
+      if (clientClass) {
+        if (clientClass === "human") owner.cookieViews += 1;
         else owner.scriptViews += 1;
       } else if (storedClientClass(sid, null) !== "human") owner.scriptViews += 1;
       else owner.unknownViews += 1;
@@ -336,23 +411,25 @@ export function computeTrafficReport(
 
     const s = sessions.id(sid);
     if (s === sClass.length) {
-      sClass.push(storedClientClass(sid, row.client_class));
+      sClass.push(storedClientClass(sid, clientClass));
       sLast.push(ts); sFirst.push(ts); sViews.push(0); sVisits.push(0);
       sVisitStartTs.push(ts); sVisitDurSum.push(0); sVisitViews.push(0); sSingleViewVisits.push(0);
       sScraper.push(false);
-    } else if (row.client_class && row.client_class !== sClass[s]) {
+    } else if (clientClass && clientClass !== sClass[s]) {
       // A class stored at write time (full UA) beats one recovered from the
       // session_id of an older row of the same session.
-      sClass[s] = storedClientClass(sid, row.client_class);
+      sClass[s] = storedClientClass(sid, clientClass);
     }
 
-    const p = paths.id(row.path);
+    const p = paths.id(path);
+    if (p === produsentPath.length) produsentPath.push((info & 4) !== 0);
     if (keepRows) {
       if (n === cap) grow();
       sIdx[n] = s;
       tsArr[n] = ts;
       pIdx[n] = p;
-      rIdx[n] = row.referrer && row.referrer.trim() ? referrers.id(row.referrer) : -1;
+      const referrer = r[4];
+      rIdx[n] = referrer && referrer.trim() ? referrers.id(referrer) : -1;
     }
 
     const isNewVisit = sViews[s] === 0 || ts - sLast[s] > VISIT_GAP_MS;
@@ -381,7 +458,7 @@ export function computeTrafficReport(
       for (let i = q.length - 1; i >= 0; i--) {
         const e = q[i];
         if (e.ts >= ts - 600_000) recent.add(e.p);
-        if (paths.values[e.p].includes("/produsent/")) produsent.add(e.p);
+        if (produsentPath[e.p]) produsent.add(e.p);
       }
       if (isVelocityScraper({ uniquePagesIn10Min: recent.size, produsentPagesInHour: produsent.size })) {
         sScraper[s] = true;
@@ -430,10 +507,16 @@ export function computeTrafficReport(
   }
 
   // Series buckets.
-  const unit: "hour" | "day" = hours <= HOURLY_SERIES_MAX_HOURS ? "hour" : "day";
+  const spanHours = (endMs - fromMs) / 3600_000;
+  const unit: "hour" | "day" = spanHours <= HOURLY_SERIES_MAX_HOURS ? "hour" : "day";
   const bucketMs = unit === "hour" ? 3600_000 : 86_400_000;
-  const firstBucket = Math.floor(fromMs / bucketMs) * bucketMs;
-  const bucketCount = keepRows ? Math.max(1, Math.floor((nowMs - firstBucket) / bucketMs) + 1) : 0;
+  // The series starts at the first stored row when the window reaches further
+  // back ("all" = 10 years would otherwise be 3,650 empty days).
+  const oldestMs = oldestRow ? parseTs(oldestRow) : NaN;
+  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs ? oldestMs : fromMs;
+  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
+  const lastMs = ranged ? endMs - 1 : endMs;
+  const bucketCount = keepRows ? Math.max(1, Math.floor((lastMs - firstBucket) / bucketMs) + 1) : 0;
   const series = Array.from({ length: bucketCount }, (_, i) => {
     const iso = new Date(firstBucket + i * bucketMs).toISOString();
     return {
@@ -507,8 +590,11 @@ export function computeTrafficReport(
     .slice(0, LIST_LIMIT);
   const recent = [...Array(keepRows ? sessionCount : 0).keys()]
     .sort((a, b) => sLast[b] - sLast[a] || sViews[b] - sViews[a])
-    .slice(0, LIST_LIMIT);
-  const listed = new Set([...humanTop, ...recent]);
+    .slice(0, SESSION_LIST_LIMIT);
+  const busiest = [...Array(keepRows ? sessionCount : 0).keys()]
+    .sort((a, b) => sViews[b] - sViews[a] || sLast[b] - sLast[a])
+    .slice(0, SESSION_LIST_LIMIT);
+  const listed = new Set([...humanTop, ...recent, ...busiest]);
   const sessionPages = new Map<number, Set<number>>();
   const sessionEntry = new Map<number, string>();
   for (const s of listed) sessionPages.set(s, new Set());
@@ -540,7 +626,8 @@ export function computeTrafficReport(
       cls: c,
       group: groupOf(c),
       device: isBot ? "bot" : deviceForSession(sid),
-      ...(isBot ? { name: botNameForUA(ua[s]) } : {}),
+      ...(isBot ? { name: sessionBotName(sid, c) } : {}),
+      ...(isBot && rawUaOfSession(sid) ? { ua: rawUaOfSession(sid).slice(0, 300) } : {}),
       views: sViews[s],
       uniquePages: sessionPages.get(s)?.size ?? 0,
       visits: sVisits[s],
@@ -551,22 +638,23 @@ export function computeTrafficReport(
   };
 
   // Named bots.
-  const botMap = new Map<string, { name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number; sampleUa: string }>();
+  const botMap = new Map<string, TrafficReport["bots"][number]>();
   const otherSamples = new Map<string, { ua: string; views: number }>();
   for (let s = 0; keepRows && s < sessionCount; s++) {
     const g = groupOf(cls[s]);
     if (g === "human" || g === "dev") continue;
-    const name = botNameForUA(ua[s]);
+    const raw = rawUaOfSession(sessions.values[s]);
+    const name = sessionBotName(sessions.values[s], cls[s]);
     const key = `${name}|${cls[s]}`;
     let b = botMap.get(key);
-    if (!b) { b = { name, group: g, cls: cls[s], views: 0, visitors: 0, sampleUa: ua[s].slice(0, 160) }; botMap.set(key, b); }
+    if (!b) { b = { name, group: g, cls: cls[s], views: 0, visitors: 0, sampleUa: raw ? raw.slice(0, 160) : null }; botMap.set(key, b); }
     b.views += sViews[s];
     b.visitors += 1;
-    if (name === "Ukjent" || name === "Tom user-agent") {
-      const k = ua[s].slice(0, 40);
+    if (raw && (name === "Ukjent" || name === "Tom user-agent")) {
+      const k = raw.slice(0, 40);
       const o = otherSamples.get(k);
       if (o) o.views += sViews[s];
-      else otherSamples.set(k, { ua: ua[s].slice(0, 160), views: sViews[s] });
+      else otherSamples.set(k, { ua: raw.slice(0, 160), views: sViews[s] });
     }
   }
 
@@ -582,8 +670,13 @@ export function computeTrafficReport(
 
   return {
     version: 1,
-    window: { hours, from: cutoff, to: sqliteDatetime(nowMs), vertical: vertical ?? "all" },
-    coverage: { oldestRow, complete: oldestRow !== null && oldestRow <= cutoff },
+    window: { hours: spanHours, from: cutoff, to: sqliteDatetime(endMs), vertical: vertical ?? "all" },
+    // Raw rows are pruned in whole UTC days (retention-service.ts), so a fixed
+    // range starting at midnight is complete when its first day is stored.
+    coverage: {
+      oldestRow,
+      complete: oldestRow !== null && (ranged ? oldestRow.slice(0, 10) <= cutoff.slice(0, 10) : oldestRow <= cutoff),
+    },
     totals,
     groups,
     classes,
@@ -613,6 +706,7 @@ export function computeTrafficReport(
     bots: [...botMap.values()].sort((a, b) => b.views - a.views || a.name.localeCompare(b.name)),
     otherUaSamples: [...otherSamples.values()].sort((a, b) => b.views - a.views).slice(0, 20),
     recentSessions: recent.map(sessionRow),
+    busiestSessions: busiest.map(sessionRow),
   };
 }
 

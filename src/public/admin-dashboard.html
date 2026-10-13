@@ -584,8 +584,6 @@
         // 87600h = 10 years — well past site launch, so it's effectively
         // "all data" without needing a special-case server param.
         if (hours === "all") hours = "87600";
-        // /hourly bins blow up beyond a week, so cap that one separately.
-        var hourlyHours = (parseInt(hours, 10) > 168) ? "168" : hours;
 
         // rfb-only endpoints (producers, cities, umbrella) read from data that
         // only the rfb SEO routes populate (analytics_agent_views / umbrellas).
@@ -596,8 +594,8 @@
             api("/summary/" + hours),
             rfbOnly ? api("/producers?hours=" + hours + "&limit=15") : Promise.resolve({ producers: [] }),
             rfbOnly ? api("/cities?hours=" + hours) : Promise.resolve({ cities: [] }),
-            api("/visitors?hours=" + hours + "&limit=30"),
-            api("/hourly?hours=" + hourlyHours),
+            api("/visitors?hours=" + hours + "&limit=30&sort=recent"),
+            api("/hourly?hours=" + hours),
             api("/pages?hours=" + hours),
             api("/devices?hours=" + hours),
             api("/traffic-classification?hours=" + hours),
@@ -713,14 +711,15 @@
         var cov = document.getElementById("statCoverage");
         if (s.coverage && !s.coverage.complete && s.coverage.oldestRow) {
             cov.style.display = "block";
-            cov.textContent = "Perioden dekkes fra " + fmtDate(s.coverage.oldestRow) + ": eldre enkeltbesøk er slettet etter 60 dager.";
+            cov.textContent = "Perioden dekkes fra " + fmtDate(s.coverage.oldestRow) + ": eldre enkeltbesøk er slettet etter "
+                + (s.coverage.retentionDays || 60) + " dager.";
         } else {
             cov.style.display = "none";
         }
     }
 
     // ─── Traffic Chart (SVG) ─────────────────────────
-    // Buckets are UTC hours (or days); labels are shown in Norwegian time.
+    // Buckets are UTC hours (or UTC days); hour labels are shown in Norwegian time.
     // Area = page views of every client; green line = page views by people.
     function renderHourlyChart(data, unit) {
         var el = document.getElementById("hourlyChart");
@@ -760,7 +759,7 @@
 
         el.innerHTML = '<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">'
             + '<span style="color:var(--accent)">■</span> alle sidevisninger &nbsp; <span style="color:#4ade80">━</span> mennesker'
-            + ' &nbsp;·&nbsp; ' + (unit === "day" ? "per døgn" : "per time") + ', norsk tid</div>'
+            + ' &nbsp;·&nbsp; ' + (unit === "day" ? "per døgn (UTC)" : "per time, norsk tid") + '</div>'
             + '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
             yLabels + xLabels +
             '<path d="' + areaPath + '" fill="rgba(74,222,128,0.1)" />' +
@@ -1082,7 +1081,13 @@
             sosial: "Sosiale medier", annet: "Annen nettside", intern: "Direkte"
         }[k] || k || "Direkte";
     }
-    function escHtml(s) { var d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+    // Text and attribute values: quotes escaped too (a user agent or referrer
+    // is attacker-controlled and ends up inside title="…").
+    function escHtml(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function(c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    }
 
     function sourceLabel(s) {
         var labels = { direct: "Direkte", organic: "Organisk", search: "Søkemotor", social: "Sosiale medier", referral: "Referanse", unknown: "Ukjent", chatgpt: "ChatGPT", claude: "Claude", mcp: "MCP", web: "Web" };
