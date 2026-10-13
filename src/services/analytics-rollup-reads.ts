@@ -353,28 +353,39 @@ export function getPrunedAgentViewRows(
   vertical?: VerticalId,
   db?: Db
 ): Array<{ agent_id: string; city: string; view_source: string; view_count: number }> {
+  if (!agentViewsExistFor(vertical)) return [];
   return withPrunedWindow(cutoffIso, "analytics_agent_views", [], (w, db) => {
-    const V = vertical ? " AND vertical_id = ?" : "";
-    const vp: string[] = vertical ? [vertical] : [];
     return db.prepare(`
       SELECT agent_id, city, view_source, SUM(view_count) as view_count
       FROM agent_view_daily
-      WHERE day >= ? AND day < ? AND view_source != ?${V}
+      WHERE day >= ? AND day < ? AND view_source != ?
       GROUP BY agent_id, city, view_source
-    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE, ...vp) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
+    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
   }, db);
+}
+
+/**
+ * agent_view_daily has no vertical_id column. It used to be filtered with
+ * `AND vertical_id = ?` all the same, which failed whenever a site was chosen,
+ * and withPrunedWindow's catch then silently dropped every pruned day from the
+ * Produsenter and Byer panels (dev-request 2026-10-13-statistikk-riktig-for-
+ * investorer, S3). Every producer-profile view is rettfrabonden's (seo.ts is
+ * the only trackAgentView caller), so 'rfb' and "all" read every row and the
+ * other sites have none.
+ */
+function agentViewsExistFor(vertical?: VerticalId): boolean {
+  return !vertical || vertical === "rfb";
 }
 
 /** Pruned-day portion of agent_view_daily grouped by city (AnalyticsService.getCityStats.viewCount). Same legacy-bucket exclusion as above. */
 export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: VerticalId, db?: Db): Record<string, number> {
+  if (!agentViewsExistFor(vertical)) return {};
   return withPrunedWindow(cutoffIso, "analytics_agent_views", {} as Record<string, number>, (w, db) => {
-    const V = vertical ? " AND vertical_id = ?" : "";
-    const vp: string[] = vertical ? [vertical] : [];
     const rows = db.prepare(`
       SELECT city, SUM(view_count) as c FROM agent_view_daily
-      WHERE day >= ? AND day < ? AND city != '' AND view_source != ?${V}
+      WHERE day >= ? AND day < ? AND city != '' AND view_source != ?
       GROUP BY city
-    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE, ...vp) as Array<{ city: string; c: number }>;
+    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ city: string; c: number }>;
     const out: Record<string, number> = {};
     for (const r of rows) out[r.city] = r.c || 0;
     return out;

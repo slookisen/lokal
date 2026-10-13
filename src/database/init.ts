@@ -711,6 +711,25 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_daily_day ON sessions_daily(day DESC);
 
+    -- traffic_history: page views, visits, visitors and searches per UTC day,
+    -- ISO week and month per site ('all', 'rfb', 'dental', 'experiences'),
+    -- computed from analytics_page_views / analytics_queries / analytics_mcp_calls
+    -- while their raw rows exist (services/traffic-history.ts) and kept after the
+    -- raw rows are pruned. Aggregates only: no session ids, IP hashes or user
+    -- agents. summary = JSON HistorySummary (services/traffic-history-compute.ts).
+    -- dev-request 2026-10-13-statistikk-riktig-for-investorer, S3.
+    CREATE TABLE IF NOT EXISTS traffic_history (
+      period TEXT NOT NULL,          -- 'day' | 'week' | 'month'
+      period_start TEXT NOT NULL,    -- 'YYYY-MM-DD' (UTC), inclusive
+      period_end TEXT NOT NULL,      -- 'YYYY-MM-DD' (UTC), exclusive
+      vertical TEXT NOT NULL,        -- 'all' | 'rfb' | 'dental' | 'experiences'
+      version INTEGER NOT NULL,
+      partial_from TEXT,             -- first stored raw day when after period_start
+      summary TEXT NOT NULL,
+      computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (period, period_start, vertical)
+    );
+
     CREATE TABLE IF NOT EXISTS runs_daily_summary (
       day TEXT NOT NULL,
       vertical TEXT NOT NULL,

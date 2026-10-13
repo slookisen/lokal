@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
+import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -1451,6 +1452,14 @@ app.listen(Number(PORT), HOST, async () => {
     }, URL_BACKFILL_BOOT_DELAY_MS); // ≥5 min — well after boot-trust-recalc + health checks
   }
 
+  // ─── Traffic history (dev-request 2026-10-13-statistikk-riktig-for-investorer, S3)
+  // Day/week/month aggregates of page views, visits, visitors and searches,
+  // computed in the stats worker while the raw rows exist and kept after the
+  // 60-day prune (services/traffic-history.ts). Boot run after 6 min (after the
+  // boot prewarm and trust recalc), then hourly; the nightly prune below also
+  // awaits one run before deleting. Disable with TRAFFIC_HISTORY_DISABLED=1.
+  startTrafficHistoryScheduler({ getDb: () => getDb(), bootDelayMs: 6 * 60_000 });
+
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
   // ~7–8 MB/day). Fires once per day inside the 03:00–03:59 UTC window
@@ -1478,6 +1487,18 @@ app.listen(Number(PORT), HOST, async () => {
       if (!shouldRunAutoPrune({ now, lastRunAt: lastPruneAt })) return;
       autoPruneRunning = true;
       try {
+        // Store the traffic history of the days about to be deleted first (off
+        // the main thread); the prune's own per-day safety net covers a failure.
+        if (process.env.TRAFFIC_HISTORY_DISABLED !== "1") {
+          try {
+            const h = await runTrafficHistoryJob({ db: getDb(), requireWorker: true });
+            if (h.planned > 0 || h.failed > 0) {
+              console.log(`[traffic-history] before prune: planned=${h.planned} computed=${h.computed} failed=${h.failed} ms=${h.ms}`);
+            }
+          } catch (err) {
+            console.error("[traffic-history] before prune failed (non-fatal):", err);
+          }
+        }
         const result = await analyticsService.runAutoPruneAsync({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP });
         console.log(
           `[auto-prune] daysToKeep=${result.daysKept} cutoff=${result.cutoff} ` +

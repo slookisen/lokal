@@ -119,6 +119,9 @@ export interface TrafficReport {
     entrySources: Array<{ key: string; label: string; visits: number; visitors: number }>;
     /** External referrer hosts of human visits (own domains excluded). */
     referrers: Array<{ host: string; key: string; label: string; visits: number; visitors: number }>;
+    /** Sum of human visit lengths in seconds, and visits with one page view (additive across days). */
+    visitSeconds: number;
+    singleViewVisits: number;
     /** Mean visit length in seconds (single-page visits count as 0). */
     avgVisitSeconds: number;
     pagesPerVisit: number;
@@ -242,9 +245,11 @@ function sessionBotName(sessionId: string, cls: SessionCategory): string {
 
 function refHost(referrer: string): string {
   try {
-    return new URL(referrer).hostname.replace(/^www\./, "");
+    return new URL(referrer).hostname.replace(/^www\./, "") || "ukjent";
   } catch {
-    return referrer.slice(0, 80);
+    // Never the raw string: it can carry a path or query, and hosts are kept
+    // in the stored history (traffic-history-compute.ts).
+    return "ukjent";
   }
 }
 
@@ -284,6 +289,8 @@ export interface TrafficReportOptions {
    */
   fromMs?: number;
   toMs?: number;
+  /** Length of topPages (default 100). */
+  topPages?: number;
 }
 
 export function computeTrafficReport(
@@ -513,9 +520,10 @@ export function computeTrafficReport(
   // The series starts at the first stored row when the window reaches further
   // back ("all" = 10 years would otherwise be 3,650 empty days).
   const oldestMs = oldestRow ? parseTs(oldestRow) : NaN;
-  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs ? oldestMs : fromMs;
-  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const lastMs = ranged ? endMs - 1 : endMs;
+  // (A range that ends before the first stored row keeps its own buckets, all zero.)
+  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs && oldestMs <= lastMs ? oldestMs : fromMs;
+  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const bucketCount = keepRows ? Math.max(1, Math.floor((lastMs - firstBucket) / bucketMs) + 1) : 0;
   const series = Array.from({ length: bucketCount }, (_, i) => {
     const iso = new Date(firstBucket + i * bucketMs).toISOString();
@@ -576,7 +584,7 @@ export function computeTrafficReport(
   // Top pages, with distinct visitors computed for the chosen paths only.
   const topPageIds = [...pageViews.entries()]
     .sort((a, b) => b[1].views - a[1].views || paths.values[a[0]].localeCompare(paths.values[b[0]]))
-    .slice(0, TOP_PAGES_LIMIT)
+    .slice(0, opts.topPages ?? TOP_PAGES_LIMIT)
     .map(([p]) => p);
   const topSet = new Set(topPageIds);
   const pageVisitors = new Map<number, Set<number>>();
@@ -691,6 +699,8 @@ export function computeTrafficReport(
         .map(([host, r]) => ({ host, key: r.key, label: r.label, visits: r.visits, visitors: r.visitors.size }))
         .sort((a, b) => b.visits - a.visits || a.host.localeCompare(b.host))
         .slice(0, LIST_LIMIT),
+      visitSeconds: Math.round(humanDur / 1000),
+      singleViewVisits: humanSingle,
       avgVisitSeconds: humanVisits ? Math.round(humanDur / humanVisits / 1000) : 0,
       pagesPerVisit: humanVisits ? Math.round((humanViews / humanVisits) * 100) / 100 : 0,
       bounceRate: humanVisits ? Math.round((humanSingle / humanVisits) * 1000) / 1000 : 0,

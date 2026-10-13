@@ -3137,6 +3137,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
       <li>En pseudonymisert, saltet hash av IP-adressen din (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse) og en separat hash av nettlesertypen din</li>
       <li>For besøkende mennesker en grov enhetskategori (mobil / nettbrett / PC) \u2014 aldri din fullstendige, rå nettleser-streng. Automatiserte verktøy og roboter (f.eks. GPTBot, Googlebot) identifiseres i stedet med sitt eget selvangitte, ikke-personlige klientnavn, slik at vi kan se hvilke roboter og AI-crawlere som besøker siden</li>
       <li>Tidspunkt for besøket</li>
+      <li>En klassifisering av klienten (menneske, AI-assistent, søkemotor eller annen robot), avledet av nettleser-strengen da besøket ble registrert</li>
     </ul>
     <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
@@ -3146,8 +3147,8 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
       <li>Søketeksten du skrev</li>
       <li>Valgt kategori og by</li>
       <li>Antall resultater returnert</li>
-      <li>Hvilken protokoll som ble brukt (API, MCP, A2A)</li>
-      <li>Pseudonymisert IP-hash (samme metode som for sidebesøk)</li>
+      <li>Hvilken kanal som ble brukt (nettsiden, API, MCP, A2A)</li>
+      <li>Pseudonymisert IP-hash og samme klassifisering av klienten som for sidebesøk (slik at søk fra roboter kan holdes utenfor tallene)</li>
     </ul>
     <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
 
@@ -3244,14 +3245,14 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
     <table class="pv-table">
       <thead><tr><th>Datatype</th><th>Oppbevaring</th></tr></thead>
       <tbody>
-        <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per side, uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
-        <tr><td>Søkelogger</td><td>Enkeltsøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til daglige tall per søketekst, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
+        <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til tall per dag, uke og måned (antall sidevisninger, besøk og unike besøkende, per side, kilde og type klient), uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
+        <tr><td>Søkelogger</td><td>Enkeltsøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til tall per dag, uke og måned per søketekst og per kanal, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
         <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
         <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
         <tr><td>Produsentprofil</td><td>Så lenge profilen er relevant for katalogen. Profiler for nedlagte eller feilregistrerte virksomheter skjules, men blir liggende i databasen. Ber du oss fjerne profilen, sletter vi den; oversatte utgaver av profilteksten blir liggende til vi sletter dem på forespørsel.</td></tr>
         <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
-        <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Ingen daglige tall beholdes fra denne loggen.</td></tr>
+        <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Fra denne loggen beholdes bare antall søk per dag, uke og måned per kanal (MCP eller A2A), uten klient-streng, IP-hash eller annen kobling til den som kalte.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
         <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
