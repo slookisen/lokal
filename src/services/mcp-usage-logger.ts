@@ -34,6 +34,8 @@ interface UsageRow {
   ipHash: string;
   durationMs: number;
   isOwner: boolean;
+  /** HTTP status of the response (agent-card rows: undefined → NULL). */
+  statusCode?: number;
 }
 
 // tools/call carries the actual tool in params.name; every other JSON-RPC
@@ -67,8 +69,8 @@ function insertUsageRow(row: UsageRow): void {
     const db = getDb();
     db.prepare(`
       INSERT INTO analytics_mcp_calls
-        (protocol, vertical_id, tool_name, client_name, client_version, user_agent, ip_hash, duration_ms, is_owner)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (protocol, vertical_id, tool_name, client_name, client_version, user_agent, ip_hash, duration_ms, is_owner, status_code)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       row.protocol,
       row.vertical,
@@ -79,6 +81,7 @@ function insertUsageRow(row: UsageRow): void {
       row.ipHash,
       row.durationMs,
       row.isOwner ? 1 : 0,
+      row.statusCode ?? null,
     );
   } catch (err) {
     console.error("[mcp-usage-logger] Failed to log usage:", err);
@@ -127,6 +130,7 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
             ipHash,
             durationMs,
             isOwner,
+            statusCode: res.statusCode,
           });
         }
       } catch (err) {
@@ -160,6 +164,7 @@ export function agentCardUsageLogger(vertical: VerticalId) {
           ipHash: hashIP(req.ip || "unknown"),
           durationMs: Date.now() - startTime,
           isOwner: isOwnerRequest(req),
+          statusCode: res.statusCode,
         });
       } catch (err) {
         console.error("[mcp-usage-logger] agent-card finish handler failed:", err);

@@ -12,7 +12,7 @@ import {
   SessionVelocity,
 } from "./traffic-classifier";
 import { shouldRecordPageView } from "./page-view-definition";
-import { apiSearchQueryText, isApiSearchRequest, type SearchChannel } from "./search-tracking";
+import { apiSearchQueryText, clampQueryText, isApiSearchRequest, type SearchChannel } from "./search-tracking";
 import { readSessionVelocity } from "./agent-stats-compute";
 import {
   computeAdminSummary,
@@ -424,7 +424,7 @@ export class AnalyticsService {
       // public search/discover API endpoints (search-tracking.ts), once per
       // request (res.send(object) re-enters send through res.json), successful
       // answers only. The search pages log themselves (protocol 'web').
-      if (self.options.trackSearchQueries && isApiSearchRequest(req.method, req.path)) {
+      if (self.options.trackSearchQueries && isApiSearchRequest(req.method, req.path, req.query as Record<string, unknown>)) {
         const originalSend = res.send;
         let logged = false;
         res.send = function(data: any) {
@@ -509,7 +509,8 @@ export class AnalyticsService {
       const db = getDb();
       const userAgent = req.get("user-agent") || "";
       const clientIp = req.ip || "unknown";
-      const query = result?.query || req.query.q || "";
+      // At most MAX_QUERY_TEXT characters: a JSON body may be up to 1 MB.
+      const query = clampQueryText(result?.query || req.query.q || "");
       const categories = result?.categories ? JSON.stringify(result.categories) : null;
       const city = result?.city || null;
       const resultCount = result?.resultCount || 0;
@@ -537,7 +538,7 @@ export class AnalyticsService {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         protocol,
-        String(query),
+        query,
         categories,
         city,
         resultCount,
@@ -560,6 +561,9 @@ export class AnalyticsService {
    * logging must not break the page that is answering the search.
    */
   logWebSearch(req: Request, responseTimeMs: number, result: { query: string; resultCount?: number }): void {
+    // GET only: a HEAD (link checkers, uptime probes) renders the page but is
+    // nobody's search, and page views count GET only too.
+    if (req.method !== "GET") return;
     try {
       this.trackSearchQuery(req, responseTimeMs, result, isOwnerRequest(req), { protocol: "web" });
     } catch (err) {

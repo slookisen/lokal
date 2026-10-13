@@ -124,12 +124,17 @@ export function runTrafficStatsTests(opts: { log?: boolean } = {}): TestSummary 
     // a different vertical — must not leak into rfb numbers
     insertPv.run("/", `oa1:${CHROME}`, 0, "experiences");
 
-    // 2 AI queries in analytics_queries (rfb)
+    // Searches (rfb): two people on the API and the search page are not AI;
+    // AI = two MCP search-tool calls + ChatGPT-User fetching /sok (S2).
     const insertQ = memDb.prepare(
-      `INSERT INTO analytics_queries (protocol, query, is_owner, vertical_id) VALUES ('api', ?, 0, 'rfb')`
+      `INSERT INTO analytics_queries (protocol, query, is_owner, vertical_id, client_class) VALUES (?, ?, 0, 'rfb', ?)`
     );
-    insertQ.run("egg oslo");
-    insertQ.run("honning bergen");
+    insertQ.run("api", "egg oslo", null);
+    insertQ.run("web", "honning bergen", "human");
+    insertQ.run("web", "rabarbra", "ai_search");
+    const insertMcp = memDb.prepare(`INSERT INTO analytics_mcp_calls (protocol, vertical_id, tool_name, is_owner) VALUES ('mcp', 'rfb', ?, 0)`);
+    insertMcp.run("lokal_search");
+    insertMcp.run("lokal_discover");
 
     const s = trafficStats.getTrafficStats("rfb");
 
@@ -153,7 +158,7 @@ export function runTrafficStatsTests(opts: { log?: boolean } = {}): TestSummary 
 
     // ── (d) Back-compat aliases ─────────────────────────────────────────
     assertEq(s.realHumans, s.humanViews, "d1: realHumans aliases humanViews");
-    assertEq(s.aiQueries, 2, "d2: aiQueries = 2");
+    assertEq(s.aiQueries, 3, "d2: aiQueries = 3 AI-assistant searches (2 MCP search tools + 1 ChatGPT-User fetch), not the 2 people's searches");
     assertEq(s.botAndAi, s.aiSearchViews + s.botViews + s.aiQueries,
       "d3: botAndAi keeps the old aggregate meaning (all non-human views + AI queries)");
 

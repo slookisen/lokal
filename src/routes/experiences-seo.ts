@@ -8551,10 +8551,11 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const hasQuery = Boolean(q) || activeTags.length > 0 || hasGeo;
 
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: log the
-  // search (free text, else the tag filters or "[nær meg]").
+  // search (free text, else the tag and place filters, else "[nær meg]" for
+  // a position-only search; the position itself is never stored).
   if (hasQuery) {
     analyticsService.logWebSearch(req, Date.now() - searchStarted, {
-      query: q || (activeTags.length > 0 ? filterQueryText({ tags: activeTags }) : "[nær meg]"),
+      query: q || filterQueryText({ tags: activeTags.length > 0 ? activeTags : undefined, sted: typedPlace || undefined }) || "[nær meg]",
       resultCount: rows.length,
     });
   }
