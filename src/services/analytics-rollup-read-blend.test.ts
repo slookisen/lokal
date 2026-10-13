@@ -369,6 +369,16 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       assertEq(analyticsService.getTopProducers(20, hoursBack, "dental").find((p: any) => p.agentId === "agent-b"), undefined,
         "vertical=dental: no producer-profile rollup rows (they are all rettfrabonden's)");
 
+      // Days rolled up before the view-stats honesty fix (#976) kept bots: never read.
+      testDb.prepare(
+        `INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count) VALUES ('2026-08-01', 'agent-b', 'seo', 'Bergen', 500)`,
+      ).run();
+      const longWindow = Math.ceil((Date.now() - Date.parse("2026-07-25T00:00:00Z")) / 3600_000);
+      assertEq(analyticsService.getTopProducers(20, longWindow).find((p: any) => p.agentId === "agent-b")?.viewCount, 9,
+        "agent_view_daily days before 2026-08-05 (rolled up with bots) are not added, however long the window");
+      assertEq(analyticsService.getCityStats(longWindow).find((c: any) => c.city === "Bergen")?.viewCount, 9,
+        "getCityStats leaves those days out too");
+
       // flag=false: exact pre-Skive-3 raw-only reproduction.
       process.env.ANALYTICS_ROLLUP_READ = "false";
       const rawOnlyProducers = analyticsService.getTopProducers(20, hoursBack);

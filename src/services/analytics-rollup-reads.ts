@@ -216,38 +216,6 @@ export function getPrunedPageViewsByPath(
   }, db);
 }
 
-/**
- * Pruned-day portion of an exact-path (or IN-list) page-view count, optionally
- * filtered by `source` — used by GET /admin/analytics/umbrella-traffic's
- * pageViews_via_profile / pageViews_via_members / search_referrals, which all
- * query exact paths (page_view_daily's `path` column matches 1:1).
- *
- * ai_bot_pageviews on that same route is NOT blended here — it matches a
- * specific AI_TOKENS allow-list (Perplexity, Gemini, Googlebot, …) that,
- * like getPrunedChatgptClaudeCounts's doc comment explains, does not line up
- * 1:1 with rollup's bot_type buckets beyond chatgpt/claude. Left raw-only,
- * documented known gap.
- */
-export function getPrunedExactPathViewCount(
-  paths: string[],
-  cutoffIso: string,
-  opts: { source?: string } = {},
-  db?: Db
-): number {
-  if (paths.length === 0) return 0;
-  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w, db) => {
-    const placeholders = paths.map(() => "?").join(",");
-    const sourceClause = opts.source ? " AND source = ?" : "";
-    const params: string[] = [...paths, w.fromDay, w.boundary];
-    if (opts.source) params.push(opts.source);
-    const row = db.prepare(`
-      SELECT COALESCE(SUM(view_count), 0) as c FROM page_view_daily
-      WHERE path IN (${placeholders}) AND day >= ? AND day < ?${sourceClause}
-    `).get(...params) as { c: number };
-    return row.c || 0;
-  }, db);
-}
-
 // ═════════════════════════════════════════════════════════════════
 // sessions_daily blend
 // ═════════════════════════════════════════════════════════════════
@@ -360,7 +328,7 @@ export function getPrunedAgentViewRows(
       FROM agent_view_daily
       WHERE day >= ? AND day < ? AND view_source != ?
       GROUP BY agent_id, city, view_source
-    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
+    `).all(agentViewRollupFrom(w.fromDay), w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ agent_id: string; city: string; view_source: string; view_count: number }>;
   }, db);
 }
 
@@ -377,6 +345,23 @@ function agentViewsExistFor(vertical?: VerticalId): boolean {
   return !vertical || vertical === "rfb";
 }
 
+/**
+ * First agent_view_daily day that can hold people's views only. Days rolled
+ * up before the view-stats honesty fix (#976, deployed 2026-10-04) kept bots,
+ * scanners and scrapers under their view_source; that rollup prunes day D on
+ * D + 60, so every day before 2026-08-05 was rolled up the old way and cannot
+ * be told apart. Later days carry only classified human rows (and the
+ * excluded legacy bucket). Those old days used to inflate the Byer and
+ * Produsenter panels on 90-day+ windows (Oslo 5,323 under «Alle» against 445
+ * for the same data under rfb; dev-request 2026-10-13-statistikk-riktig-for-
+ * investorer, S4).
+ */
+export const AGENT_VIEW_HUMAN_ROLLUP_SINCE = "2026-08-05";
+
+function agentViewRollupFrom(fromDay: string): string {
+  return fromDay > AGENT_VIEW_HUMAN_ROLLUP_SINCE ? fromDay : AGENT_VIEW_HUMAN_ROLLUP_SINCE;
+}
+
 /** Pruned-day portion of agent_view_daily grouped by city (AnalyticsService.getCityStats.viewCount). Same legacy-bucket exclusion as above. */
 export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: VerticalId, db?: Db): Record<string, number> {
   if (!agentViewsExistFor(vertical)) return {};
@@ -385,7 +370,7 @@ export function getPrunedAgentViewCountsByCity(cutoffIso: string, vertical?: Ver
       SELECT city, SUM(view_count) as c FROM agent_view_daily
       WHERE day >= ? AND day < ? AND city != '' AND view_source != ?
       GROUP BY city
-    `).all(w.fromDay, w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ city: string; c: number }>;
+    `).all(agentViewRollupFrom(w.fromDay), w.boundary, LEGACY_AGENT_VIEW_SOURCE) as Array<{ city: string; c: number }>;
     const out: Record<string, number> = {};
     for (const r of rows) out[r.city] = r.c || 0;
     return out;
