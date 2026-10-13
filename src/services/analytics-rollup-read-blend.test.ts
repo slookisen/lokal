@@ -480,9 +480,14 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       const spanningOff = await callStats();
       delete process.env.ANALYTICS_ROLLUP_READ;
 
-      assertEq(spanningOff.aiBreakdown.chatgpt, 0, "flag=false, boundary-spanning period: chatgpt views are MISSING (0) — reproduces the exact pre-Skive-3 wrongness, not a new different wrongness");
-      assertEq(spanningOn.aiBreakdown.chatgpt, 4, "flag=true, same period: the 4 pruned chatgpt views are recovered from page_view_daily");
-      assertTrue(spanningOn.aiBreakdown.chatgpt > spanningOff.aiBreakdown.chatgpt, "flag on strictly improves on flag off for a boundary-spanning period (never regresses to something worse or different-shaped)");
+      // 2026-10-13 (statistikk-riktig-for-investorer, S5): the window is now
+      // the raw retention (60 days) and page_view_daily is no longer read: it
+      // counted files and every status, and topped up ChatGPT/Claude only, so
+      // one tile mixed three periods and definitions. In prod the raw rows
+      // always cover the window.
+      assertEq(spanningOn.windowDays, 60, "agent-stats: the window is the raw retention window (60 days)");
+      assertEq(spanningOn.aiBreakdown.chatgpt, 0, "agent-stats: page_view_daily rows are not added (raw page views only, flag on)");
+      assertEq(spanningOff.aiBreakdown.chatgpt, 0, "agent-stats: page_view_daily rows are not added (flag off)");
       // Everything else in the response is unaffected by the flag for this fixture.
       assertEq(spanningOn.humanViews, spanningOff.humanViews, "flag does not affect humanViews (documented raw-only known gap, unrelated to this assertion)");
       assertEq(spanningOn.conversationCount, spanningOff.conversationCount, "flag does not affect conversationCount (unrelated table)");
