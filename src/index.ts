@@ -1491,7 +1491,7 @@ app.listen(Number(PORT), HOST, async () => {
         // the main thread); the prune's own per-day safety net covers a failure.
         if (process.env.TRAFFIC_HISTORY_DISABLED !== "1") {
           try {
-            const h = await runTrafficHistoryJob({ db: getDb() });
+            const h = await runTrafficHistoryJob({ db: getDb(), requireWorker: true });
             if (h.planned > 0 || h.failed > 0) {
               console.log(`[traffic-history] before prune: planned=${h.planned} computed=${h.computed} failed=${h.failed} ms=${h.ms}`);
             }

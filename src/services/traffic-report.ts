@@ -245,9 +245,11 @@ function sessionBotName(sessionId: string, cls: SessionCategory): string {
 
 function refHost(referrer: string): string {
   try {
-    return new URL(referrer).hostname.replace(/^www\./, "");
+    return new URL(referrer).hostname.replace(/^www\./, "") || "ukjent";
   } catch {
-    return referrer.slice(0, 80);
+    // Never the raw string: it can carry a path or query, and hosts are kept
+    // in the stored history (traffic-history-compute.ts).
+    return "ukjent";
   }
 }
 
@@ -518,9 +520,10 @@ export function computeTrafficReport(
   // The series starts at the first stored row when the window reaches further
   // back ("all" = 10 years would otherwise be 3,650 empty days).
   const oldestMs = oldestRow ? parseTs(oldestRow) : NaN;
-  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs ? oldestMs : fromMs;
-  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const lastMs = ranged ? endMs - 1 : endMs;
+  // (A range that ends before the first stored row keeps its own buckets, all zero.)
+  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs && oldestMs <= lastMs ? oldestMs : fromMs;
+  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const bucketCount = keepRows ? Math.max(1, Math.floor((lastMs - firstBucket) / bucketMs) + 1) : 0;
   const series = Array.from({ length: bucketCount }, (_, i) => {
     const iso = new Date(firstBucket + i * bucketMs).toISOString();

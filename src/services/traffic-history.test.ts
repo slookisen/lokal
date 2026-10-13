@@ -239,16 +239,26 @@ export async function runTrafficHistoryTests(opts: { log?: boolean } = {}): Prom
       const s = seeder(db);
       const today = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
       // Raw rows 70 … 1 days ago; the prune keeps 60 days.
-      for (let k = 70; k >= 1; k--) s.view("ipA:desktop:aaaa", today - k * D + 9 * H, "/");
+      // Raw rows 70 … 1 days ago, with a day without traffic (65 days ago) inside the pruned range.
+      for (let k = 70; k >= 1; k--) if (k !== 65) s.view("ipA:desktop:aaaa", today - k * D + 9 * H, "/");
       const { rollupAndPrunePageViews } = require("./retention-service") as typeof import("./retention-service");
       const oldest = ts(today - 70 * D).slice(0, 10);
       const day = ensureTrafficHistoryForDaySync(db as any, oldest);
       ok(day === 4 && ensureTrafficHistoryForDaySync(db as any, oldest) === 0, "f1: the safety net writes a day's four site summaries once");
+      const emptyDay = ts(today - 90 * D).slice(0, 10);
+      const zero = ensureTrafficHistoryForDaySync(db as any, emptyDay);
+      const zeroRow = db.prepare("SELECT summary FROM traffic_history WHERE period = 'day' AND period_start = ? AND vertical = 'all'").get(emptyDay) as { summary: string } | undefined;
+      ok(zero === 4 && !!zeroRow && JSON.parse(zeroRow.summary).totals.views === 0 && JSON.parse(zeroRow.summary).partialFrom === null,
+        "f1b: a day the prune is about to delete with no rows is stored as a real zero day, not an error");
+      ok(ensureTrafficHistoryForDaySync(db as any, "") === 0 && ensureTrafficHistoryForDaySync(db as any, "2026-1x-01") === 0,
+        "f1c: a malformed day (from a broken timestamp) is skipped");
+      db.exec("DELETE FROM traffic_history");
+      ensureTrafficHistoryForDaySync(db as any, oldest);
       const r = quiet(() => rollupAndPrunePageViews(60, 7));
       const stored = (db.prepare("SELECT COUNT(DISTINCT period_start) AS n FROM traffic_history WHERE period = 'day' AND vertical = 'all'").get() as { n: number }).n;
       const rawOldest = (db.prepare("SELECT substr(MIN(created_at), 1, 10) AS d FROM analytics_page_views").get() as { d: string }).d;
-      ok(r.rowsDeleted >= 9 && stored === r.rowsDeleted && rawOldest > oldest,
-        "f2: every raw day the prune deleted has its day summary", { r, stored, rawOldest });
+      ok(r.rowsDeleted >= 8 && stored === r.rowsDeleted + 1 && rawOldest > oldest,
+        "f2: every raw day the prune deleted has its day summary, and the day without traffic is a stored zero day, not a stop", { r, stored, rawOldest });
       const sum = JSON.parse((db.prepare("SELECT summary FROM traffic_history WHERE period = 'day' AND period_start = ? AND vertical = 'rfb'").get(oldest) as { summary: string }).summary);
       ok(sum.groups.human.views === 1 && sum.groups.human.visitors === 1, "f3: the pruned day's numbers survive in the history", sum.groups.human);
 
@@ -266,6 +276,21 @@ export async function runTrafficHistoryTests(opts: { log?: boolean } = {}): Prom
       initMod.__setDbForTesting(prevDb);
       db.close();
     }
+  }
+
+  // ── (g) Scheduled runs need the stats worker ─────────────────────
+  {
+    const db = freshDb();
+    seeder(db).view("ipA:desktop:aaaa", Date.now() - 3 * D, "/");
+    const r = await runTrafficHistoryJob({ db: db as any, requireWorker: true });
+    ok(!!r.skipped && r.planned === 0 && readStoredHistoryRows(db as any).length === 0,
+      "g1: a scheduled run on a DB the worker cannot read (here in-memory) does nothing on the main thread", r);
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 0);
+    const slow = await runTrafficHistoryJob({ db: db as any, nowMs: Date.now(), compute: async (item, n) => computeHistorySummary(db as any, item, n) });
+    clearInterval(timer);
+    ok(slow.computed > 0 && ticks > 0, "g2: a synchronous compute yields to the event loop between summaries", { computed: slow.computed, ticks });
+    db.close();
   }
 
   return { passed, failed, failures };

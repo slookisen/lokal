@@ -246,8 +246,8 @@
              site (src/services/traffic-report.ts), so they add up; the
              definitions are spelled out under the cards. -->
         <div class="stat-grid">
-            <div class="stat-card" title="Unike IP-adresser + nettlesere klassifisert som mennesker i perioden.">
-                <div class="stat-label">Besøkende (mennesker)</div>
+            <div class="stat-card" id="statVisitorsCard" title="Unike IP-adresser + nettlesere klassifisert som mennesker i perioden.">
+                <div class="stat-label" id="statVisitorsLabel">Besøkende (mennesker)</div>
                 <div id="statVisitors" class="stat-value cyan">—</div>
                 <div id="statVisitorsSub" class="stat-sub"></div>
             </div>
@@ -793,6 +793,8 @@
             devViews: g.dev.views,
             humanVisitors: m ? m.average : null,
             uniqueVisitors: null,
+            visitorsLabel: "Besøkende/mnd (snitt, mennesker)",
+            visitorsTitle: "Snittet av unike besøkende (IP-adresse + nettleser, mennesker) per hele måned i perioden. Unike besøkende kan ikke summeres over dager; tallet for hver måned står i månedstabellen.",
             visitorsNote: m
                 ? "snitt per hele måned (" + m.months.map(monthLabel).join(", ") + ")"
                 : "ingen hel måned i perioden – se månedstabellen",
@@ -878,6 +880,7 @@
         var h = HISTORY_DATA || {};
         var cov = h.coverage || {};
         var note = "Unike besøkende telles én gang per " + (HISTORY_PERIOD === "week" ? "uke" : "måned") + " (én IP-adresse + nettleser), ikke summert over dager. "
+            + "Hver periode klassifiseres for seg: en klient som prøver wp-admin eller leser sider i robotfart regnes som robot i den perioden, så summen av dagene kan avvike litt fra måneden. "
             + "«hittil» = inneværende periode så langt; «fra …» = perioden er bare lagret fra den datoen. ";
         if (cov.firstDay) note += "Lagret historikk fra " + fmtDay(cov.firstDay) + ": enkeltbesøk slettes etter " + (h.rawRetentionDays || 60) + " dager, og bare samletall tas vare på.";
         if (cov.missingDays && cov.missingDays.length) note += " Dager uten lagrede tall: " + cov.missingDays.map(fmtDayShort).join(", ") + ".";
@@ -934,7 +937,7 @@
         if (!el) return;
         var agentTotal = ((s.agentTraffic || {}).chatgpt || 0) + ((s.agentTraffic || {}).claude || 0) + ((s.agentTraffic || {}).other || 0);
         var stats = [
-            { label: "Besøkende", value: s.humanVisitors },
+            { label: s.visitorsLabel ? "Besøkende/mnd (snitt)" : "Besøkende", value: s.humanVisitors },
             { label: "Besøk", value: s.humanVisits },
             { label: "Søk", value: s.totalQueries },
             { label: "AI-visninger", value: agentTotal },
@@ -949,6 +952,10 @@
         var total = s.pageViews || 0;
         var humanViews = s.humanViews || 0;
         var botViews = (s.botViews || 0) + (s.devViews || 0);
+        // Long windows (stored history): unique visitors do not add up over
+        // days, so the card is the mean of the exact monthly figure, and says so.
+        document.getElementById("statVisitorsLabel").textContent = s.visitorsLabel || "Besøkende (mennesker)";
+        document.getElementById("statVisitorsCard").title = s.visitorsTitle || "Unike IP-adresser + nettlesere klassifisert som mennesker i perioden.";
         document.getElementById("statVisitors").textContent = s.humanVisitors == null ? "–" : fmtNum(s.humanVisitors);
         document.getElementById("statVisitorsSub").textContent = s.visitorsNote || (fmtNum(s.uniqueVisitors) + " inkl. AI og roboter");
         document.getElementById("statHumans").textContent = fmtNum(s.humanVisits);

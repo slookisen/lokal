@@ -19,6 +19,7 @@ import type Database from "better-sqlite3";
 import {
   computeHistorySummary,
   HISTORY_VERTICALS,
+  isDay,
   periodEnd,
   planHistoryItems,
   TRAFFIC_HISTORY_VERSION,
@@ -61,6 +62,8 @@ export interface TrafficHistoryRunResult {
   failed: number;
   errors: string[];
   ms: number;
+  /** Set when the run did nothing because the stats worker cannot be used (requireWorker). */
+  skipped?: string;
 }
 
 export interface TrafficHistoryJobDeps {
@@ -70,6 +73,13 @@ export interface TrafficHistoryJobDeps {
   compute?: (item: HistoryItem, nowMs: number) => Promise<HistorySummary>;
   /** Stop after this many summaries (the rest is picked up by the next run). */
   maxItems?: number;
+  /**
+   * Scheduled runs: do nothing when the stats worker cannot be used
+   * (OFFTHREAD_STATS_DISABLED=1, a DB not in WAL mode), rather than compute
+   * ~300 summaries on the main thread. The prune's per-day safety net still
+   * keeps every day it deletes.
+   */
+  requireWorker?: boolean;
 }
 
 let running: Promise<TrafficHistoryRunResult> | null = null;
@@ -100,6 +110,13 @@ export function runTrafficHistoryJob(deps: TrafficHistoryJobDeps): Promise<Traff
     const result: TrafficHistoryRunResult = { planned: 0, computed: 0, failed: 0, errors: [], ms: 0 };
     try {
       if (!hasHistoryTable(deps.db)) return result;
+      if (deps.requireWorker && !deps.compute) {
+        const off = require("./offthread-stats") as typeof import("./offthread-stats");
+        if (!off.offThreadStatsEnvUsable(deps.db)) {
+          result.skipped = "stats worker not usable (OFFTHREAD_STATS_DISABLED=1 or no WAL); the prune's per-day safety net still keeps each day";
+          return result;
+        }
+      }
       const items = planHistoryItems(deps.db, readStoredHistoryRows(deps.db), nowMs);
       result.planned = items.length;
       for (const item of items.slice(0, deps.maxItems ?? items.length)) {
@@ -110,6 +127,9 @@ export function runTrafficHistoryJob(deps: TrafficHistoryJobDeps): Promise<Traff
           result.failed += 1;
           if (result.errors.length < 5) result.errors.push(`${item.period} ${item.start} ${item.vertical}: ${err instanceof Error ? err.message : String(err)}`);
         }
+        // Let the event loop serve requests between summaries (a synchronous
+        // compute resolves at once and would otherwise hold it for the whole run).
+        await new Promise<void>((r) => setImmediate(r));
       }
       return result;
     } finally {
@@ -133,6 +153,9 @@ export function getTrafficHistoryJobState(): { running: boolean; lastRun: typeof
  */
 export function ensureTrafficHistoryForDaySync(db: Db, day: string, nowMs: number = Date.now()): number {
   if (!hasHistoryTable(db) || process.env.TRAFFIC_HISTORY_DISABLED === "1") return 0;
+  // The prune's day bounds come from the stored timestamps; a malformed one
+  // ('' or garbage) is not a day to summarise.
+  if (!isDay(day)) return 0;
   const have = new Set(
     (db.prepare("SELECT vertical FROM traffic_history WHERE period = 'day' AND period_start = ? AND version >= ?")
       .all(day, TRAFFIC_HISTORY_VERSION) as Array<{ vertical: string }>).map((r) => r.vertical),
@@ -140,7 +163,9 @@ export function ensureTrafficHistoryForDaySync(db: Db, day: string, nowMs: numbe
   let written = 0;
   for (const vertical of HISTORY_VERTICALS) {
     if (have.has(vertical)) continue;
-    writeHistorySummary(db, computeHistorySummary(db, { period: "day", start: day, end: periodEnd("day", day), vertical }, nowMs));
+    // The day is about to be deleted and is still stored in full: compute it
+    // as it is (a day without rows is a real zero day; the prune walks gaps too).
+    writeHistorySummary(db, computeHistorySummary(db, { period: "day", start: day, end: periodEnd("day", day), vertical }, nowMs, { wholePeriod: true }));
     written += 1;
   }
   return written;
@@ -158,9 +183,14 @@ export function startTrafficHistoryScheduler(opts: {
     log("[traffic-history] disabled (TRAFFIC_HISTORY_DISABLED=1)");
     return { stop: () => {} };
   }
+  let skipLogged = false;
   const tick = async () => {
     try {
-      const r = await runTrafficHistoryJob({ db: opts.getDb() });
+      const r = await runTrafficHistoryJob({ db: opts.getDb(), requireWorker: true });
+      if (r.skipped) {
+        if (!skipLogged) { log(`[traffic-history] skipped: ${r.skipped}`); skipLogged = true; }
+        return;
+      }
       if (r.planned > 0 || r.failed > 0) {
         log(`[traffic-history] planned=${r.planned} computed=${r.computed} failed=${r.failed} ms=${r.ms}` +
           (r.errors.length ? ` errors=${JSON.stringify(r.errors)}` : ""));

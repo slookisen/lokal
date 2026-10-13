@@ -562,7 +562,11 @@ export function pruneAnalyticsMcpCalls(
   const db = getDb();
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - daysToKeep);
-  const cutoffStr = cutoff.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  // Whole UTC days, like the page-view and query prunes (pruneTableSteps): the
+  // stored traffic history counts MCP/A2A searches per day, and a cut at the
+  // time of the run would leave the oldest raw day short of its first hours
+  // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S3).
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
 
   const toDelete = (db.prepare(
     "SELECT COUNT(*) as c FROM analytics_mcp_calls WHERE created_at < ?"
