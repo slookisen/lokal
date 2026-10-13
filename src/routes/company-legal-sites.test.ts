@@ -322,7 +322,7 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       }
       // Unchanged privacy wording around the replaced sentence stays put.
       check(no.body.includes("er en åpen katalog over lokale") && en.body.includes("is an open catalogue of local"), "AC3 rfb /personvern: the surrounding «Hvem vi er» wording is untouched");
-      check(ft.body.includes("<h2>Behandlingsansvarlig</h2>") && ft.body.includes("Vi behandler <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>"), "AC3 finn-tannlege /personvern: headings and data wording untouched");
+      check(ft.body.includes("<h2>Behandlingsansvarlig</h2>") && ft.body.includes("<h2>Hvilke data behandler vi?</h2>"), "AC3 finn-tannlege /personvern: headings kept (data wording corrected in dental-privacy-truth.test.ts)");
       check(oa.body.includes("Ingen sporingscookies.") && oa.body.includes("No tracking cookies."), "AC3 opplevagent /personvern: cookie wording untouched");
     }
 
