@@ -141,6 +141,8 @@ export interface TrafficReport {
   otherUaSamples: Array<{ ua: string; views: number }>;
   /** Most recently active visitors of every class (up to 200). */
   recentSessions: SessionRow[];
+  /** Only with opts.reclassified: browser-looking sessions classed scanner or scraper in this window. */
+  reclassifiedSessions?: string[];
   /** Visitors of every class with the most page views (up to 200). */
   busiestSessions: SessionRow[];
 }
@@ -291,6 +293,12 @@ export interface TrafficReportOptions {
   toMs?: number;
   /** Length of topPages (default 100). */
   topPages?: number;
+  /**
+   * Also return `reclassifiedSessions`: the session_ids whose stored class is
+   * a person's but who are scanners or scrapers in this window, for readers
+   * that classify rows one by one (the umbrella table).
+   */
+  reclassified?: boolean;
 }
 
 export function computeTrafficReport(
@@ -716,6 +724,9 @@ export function computeTrafficReport(
     bots: [...botMap.values()].sort((a, b) => b.views - a.views || a.name.localeCompare(b.name)),
     otherUaSamples: [...otherSamples.values()].sort((a, b) => b.views - a.views).slice(0, 20),
     recentSessions: recent.map(sessionRow),
+    ...(opts.reclassified
+      ? { reclassifiedSessions: [...Array(sessionCount).keys()].filter((s) => sClass[s] === "human" && cls[s] !== "human").map((s) => sessions.values[s]) }
+      : {}),
     busiestSessions: busiest.map(sessionRow),
   };
 }
