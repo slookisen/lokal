@@ -6002,8 +6002,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
       if (hasAnyActivity) {
         const statsHtml = `<div class="act-grid">
-          <div class="act-stat"><strong>${views30.human.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? "Profile views · 30d" : "Profilvisninger · 30d"}</small></div>
-          <div class="act-stat"><strong>${views30.ai.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? "AI-agent lookups · 30d" : "AI-agent-oppslag · 30d"}</small></div>
+          <div class="act-stat"><strong>${views30.human.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `Profile views · ${views30.days}d` : `Profilvisninger · ${views30.days}d`}</small></div>
+          <div class="act-stat"><strong>${views30.ai.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `AI-agent lookups · ${views30.days}d` : `AI-agent-oppslag · ${views30.days}d`}</small></div>
         </div>`;
 
         const termsHtml = topQueryTerms.length

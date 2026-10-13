@@ -442,6 +442,10 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
         `INSERT INTO analytics_page_views (path, source, user_agent_hash, session_id, status_code, vertical_id, created_at)
          VALUES (?, 'direct', 'h1', 'sess-gpt:GPTBot/1.0', 200, 'rfb', ?)`,
       ).run(path, isoDaysAgo(3));
+      testDb.prepare(
+        `INSERT INTO analytics_page_views (path, source, user_agent_hash, session_id, status_code, vertical_id, created_at)
+         VALUES (?, 'direct', 'h1', 'sess-gpt-user:Mozilla/5.0 (compatible; ChatGPT-User/1.0)', 200, 'rfb', ?)`,
+      ).run(path, isoDaysAgo(3));
 
       delete process.env.ANALYTICS_ROLLUP_READ; // on (default true)
       const allRawOn = await callStats();
@@ -450,7 +454,7 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       delete process.env.ANALYTICS_ROLLUP_READ;
 
       assertEq(allRawOn, allRawOff, "AC1-lite: /api/agents/:id/stats is byte-identical, flag on vs off, for a period entirely within raw's current coverage");
-      assertEq(allRawOn.aiBreakdown, { chatgpt: 1, claude: 0, other: 0 }, "AC1-lite sanity: the seeded GPTBot view is counted");
+      assertEq(allRawOn.aiBreakdown, { chatgpt: 1, claude: 0, other: 0 }, "AC1-lite sanity: the seeded ChatGPT-User view is counted, the GPTBot crawl is not (AI search only)");
       assertEq(allRawOn.humanViews, 1, "AC1-lite sanity: the seeded human view is counted");
 
       // ── (4) flag=false reproduces the exact pre-Skive-3 raw-only

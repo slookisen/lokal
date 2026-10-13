@@ -19,7 +19,7 @@ import type Database from "better-sqlite3";
 import { getRetentionWindowDays } from "./retention-window";
 import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
-import { classifySession, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
+import { classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
 
 /**
  * A session is velocity-checked around its first view of this page. One
@@ -32,6 +32,7 @@ export const MAX_VELOCITY_CHECKS = 200;
 export interface AgentStatsPayload {
   agentId: string;
   humanViews: number;
+  /** AI search only: assistants fetching the page for a person. AI crawlers are not counted. */
   aiViews: number;
   aiBreakdown: { chatgpt: number; claude: number; other: number };
   conversationCount: number;
@@ -97,9 +98,11 @@ export function computeAgentStats(
   const windowDays = getRetentionWindowDays();
   const cutoffIso = sqliteDatetime(new Date(nowMs - windowDays * 24 * 60 * 60 * 1000));
   // Page views only (page-view-definition.ts): 2xx or 304; legacy rows have no status.
-  const hasStatus = (db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>)
-    .some((c) => c.name === "status_code");
-  const statusOk = hasStatus ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
+  const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
+  const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
+  // The class stored at write time from the full UA (S1); every row of a
+  // session has the same UA, so MAX() only skips legacy rows without one.
+  const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
 
   // ── Views: ONE grouped read, bucketed by the shared classifier ───
   // We anchor on path equality (not LIKE) because the slug uniquely
@@ -107,23 +110,26 @@ export function computeAgentStats(
   // traffic (RFB-ContactVerifier etc.) so the count reflects real
   // public visits.
   const sessions = db.prepare(`
-    SELECT session_id, COUNT(*) as views, MIN(created_at) as first_seen
+    SELECT session_id, ${clientClass} as client_class, COUNT(*) as views, MIN(created_at) as first_seen
     FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
       AND created_at > ?${statusOk}
     GROUP BY session_id
-  `).all(path, cutoffIso) as Array<{ session_id: string | null; views: number; first_seen: string }>;
+  `).all(path, cutoffIso) as Array<{ session_id: string | null; client_class: string | null; views: number; first_seen: string }>;
 
+  // The AI tile counts AI search only: an assistant fetching the page for a
+  // person (ChatGPT-User, Claude-User, Perplexity-User …), which is what its
+  // tooltip says. AI crawlers (GPTBot, ClaudeBot, OAI-SearchBot …) index
+  // pages and are not counted (Daniel 2026-10-13: «Tell bare AI-søk, behold
+  // teksten»).
   const aiRaw = { chatgpt: 0, claude: 0, other: 0 };
   const humanLooking: typeof sessions = [];
   for (const s of sessions) {
     const sessionId = s.session_id || "";
-    const category = classifySession(sessionId);
+    const category = storedClientClass(sessionId, s.client_class);
     if (category === "human") humanLooking.push(s);
-    else if (category === "ai_search" || category === "ai_crawler") {
-      aiRaw[aiVendorBucket(uaFromSessionId(sessionId))] += s.views;
-    }
+    else if (category === "ai_search") aiRaw[aiVendorBucket(uaFromSessionId(sessionId))] += s.views;
   }
 
   // Velocity: a browser UA proves nothing (see traffic-classifier.ts

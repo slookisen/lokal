@@ -10,8 +10,9 @@
  * honest, non-fabricated aggregates from tables that already exist:
  *
  *   - analytics_page_views  → profile views (humans) + AI-agent lookups
- *     (ChatGPT/Claude/other), last 30 days, excluding bots-that-aren't-AI
- *     and the owner's own views (is_owner).
+ *     (AI search: ChatGPT/Claude/other assistants fetching the page for a
+ *     person), last 30 days, page views only, excluding every other bot and
+ *     the owner's own views (is_owner).
  *   - conversations          → top search-query terms that led a buyer to
  *     this producer (query_text, seller_agent_id) + which channels
  *     (source: web/a2a/mcp) ever produced a conversation with this agent.
@@ -43,30 +44,16 @@
  */
 
 import type Database from "better-sqlite3";
-import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
 import { COUNTABLE_CONV_SQL, isPublicQueryTerm } from "./a2a-traffic-classifier";
-
-// ─── AI bot UA markers ────────────────────────────────────────────────
-// Same technique + marker lists as src/routes/agent-stats.ts's per-agent
-// AI/human view split (session_id = "<ipHash>:<userAgent>", LIKE-matched).
-// Duplicated rather than imported because agent-stats.ts doesn't currently
-// export these lists — see the SYNC-TODO comment there. If a new AI bot
-// marker is added in analytics-service.ts / agent-stats.ts, mirror it here.
-const AI_MARKERS = {
-  chatgpt: ["GPTBot", "ChatGPT", "OAI-SearchBot"],
-  claude: ["ClaudeBot", "Claude-User", "Anthropic"],
-  other: [
-    "Gemini", "Google-Extended", "PerplexityBot", "Perplexity-User",
-    "CCBot", "Bytespider", "Applebot-Extended", "YandexAdditional",
-    "NotHumanSearch", "DuckDuckBot", "Googlebot",
-  ],
-};
-const ALL_AI_MARKERS = [...AI_MARKERS.chatgpt, ...AI_MARKERS.claude, ...AI_MARKERS.other];
+import { aiVendorBucket, storedClientClass, uaFromSessionId } from "./traffic-classifier";
+import { getRetentionWindowDays } from "./retention-window";
 
 export interface ProfileActivityViews {
   human: number;
   ai: number;
   aiBreakdown: { chatgpt: number; claude: number; other: number };
+  /** The window in days: 30, or the raw retention if that is shorter. */
+  days: number;
 }
 
 export interface ProfileActivityQueryTerm {
@@ -82,66 +69,49 @@ export interface ProfileActivity {
   platforms: ProfilePlatformBadge[];
 }
 
-const VIEWS_WINDOW_SQL = "datetime('now', '-30 days')";
-
-function likeClause(markers: string[]): { clause: string; params: string[] } {
-  return {
-    clause: markers.map(() => "session_id LIKE ?").join(" OR "),
-    params: markers.map((m) => `%${m}%`),
-  };
-}
+const VIEWS_WINDOW_DAYS = 30;
 
 /**
- * Profile views (humans, last 30d) + AI-agent lookups (last 30d, split by
- * platform). Mirrors the exact exclusion rules already used by
- * src/routes/agent-stats.ts's 90-day owner-dashboard stats (is_owner
- * excluded, AI UA markers split out of the "human" bucket) but windowed to
- * 30 days for the public panel per the dev-request spec.
+ * Profile views from people and AI-agent lookups over the last 30 days, with
+ * the shared definitions (dev-request 2026-10-13-statistikk-riktig-for-
+ * investorer, S5): page views only (2xx/304), each session classed once by
+ * the class stored at write time (traffic-classifier storedClientClass, the
+ * session_id for legacy rows), so search engines, SEO bots, scanners and
+ * scripts are not «profile views». AI-agent lookups are AI search only, as on
+ * the AI tile above (Daniel 2026-10-13: «Tell bare AI-søk»); AI crawlers
+ * (GPTBot, ClaudeBot …) are not counted.
+ *
+ * Runs synchronously on every /produsent/:slug render, so it is one grouped
+ * read of the path's rows and no per-session velocity read: a scraper behind
+ * a browser UA can count as one profile view here (the tile above, computed
+ * off-thread, checks velocity). The window stays inside the raw rows; the
+ * old page_view_daily top-up counted crawlers and is no longer added.
  */
 function getViews30(db: Database.Database, path: string): ProfileActivityViews {
-  const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
-  const aiNotParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
-  const gpt = likeClause(AI_MARKERS.chatgpt);
-  const cl = likeClause(AI_MARKERS.claude);
-  const oth = likeClause(AI_MARKERS.other);
-
-  // ONE pass over this path's rows instead of four (dev-request 2026-09-26-
-  // rfb-produsentside-synkron-slug-skann): this runs synchronously on every
-  // /produsent/:slug render, and each pass re-reads every 30-day row of the
-  // path — ~290 ms of the main thread for the most-viewed producer on a
-  // prod-scale DB, ~half of it after this change. Each SUM(CASE …) is exactly
-  // the predicate one of the former COUNT(*) queries had in its WHERE (a NULL
-  // session_id is "not true" in both forms, so it is counted in neither);
-  // COALESCE keeps COUNT(*)'s 0 for a path with no rows.
-  const row = db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN ${aiNotClause} THEN 1 ELSE 0 END), 0) AS human,
-           COALESCE(SUM(CASE WHEN (${gpt.clause}) THEN 1 ELSE 0 END), 0) AS chatgpt,
-           COALESCE(SUM(CASE WHEN (${cl.clause}) THEN 1 ELSE 0 END), 0) AS claude,
-           COALESCE(SUM(CASE WHEN (${oth.clause}) THEN 1 ELSE 0 END), 0) AS other
+  const days = Math.min(VIEWS_WINDOW_DAYS, getRetentionWindowDays());
+  const cutoffIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
+  const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
+  const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
+  const sessions = db.prepare(`
+    SELECT session_id, ${clientClass} AS client_class, COUNT(*) AS views
     FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at >= ${VIEWS_WINDOW_SQL}
-  `).get(...aiNotParams, ...gpt.params, ...cl.params, ...oth.params, path) as
-    { human: number; chatgpt: number; claude: number; other: number } | undefined;
-  const human = row?.human ?? 0;
-  const raw = { chatgpt: row?.chatgpt ?? 0, claude: row?.claude ?? 0, other: row?.other ?? 0 };
+      AND created_at >= ?${statusOk}
+      AND session_id IS NOT NULL
+    GROUP BY session_id
+  `).all(path, cutoffIso) as Array<{ session_id: string; client_class: string | null; views: number }>;
 
-  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
-  // retention): 30-day window — safely inside the DEFAULT 60-day retention,
-  // but RFB_AUTO_PRUNE_DAYS can be configured down to a minimum of 7 days
-  // (src/index.ts), which would push part of this window past the raw-table
-  // boundary. Blend chatgpt/claude exactly, same reasoning (and same
-  // documented `other`/`human` gap) as agent-stats.ts and owner-stats-
-  // service.ts — see getPrunedChatgptClaudeCounts's doc comment.
-  const cutoffIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
-  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
-  const chatgpt = raw.chatgpt + prunedAi.chatgpt;
-  const claude = raw.claude + prunedAi.claude;
-  const other = raw.other;
-
-  return { human, ai: chatgpt + claude + other, aiBreakdown: { chatgpt, claude, other } };
+  let human = 0;
+  const aiBreakdown = { chatgpt: 0, claude: 0, other: 0 };
+  for (const s of sessions) {
+    const cls = storedClientClass(s.session_id, s.client_class);
+    if (cls === "human") human += s.views;
+    else if (cls === "ai_search") aiBreakdown[aiVendorBucket(uaFromSessionId(s.session_id))] += s.views;
+  }
+  return { human, ai: aiBreakdown.chatgpt + aiBreakdown.claude + aiBreakdown.other, aiBreakdown, days };
 }
 
 /**
