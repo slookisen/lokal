@@ -46438,6 +46438,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-13-opplevagent-personvern-utsending: Opplevagent's
+// /personvern covers the provider outreach e-mail and matches the code.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-13-opplevagent-personvern-utsending: Opplevagent privacy truth ──");
+  try {
+    const { runOpplevagentPrivacyTruthTests } = require("../src/routes/opplevagent-privacy-truth.test") as
+      typeof import("../src/routes/opplevagent-privacy-truth.test");
+    const opt = await runOpplevagentPrivacyTruthTests({ log: false });
+    passed += opt.passed;
+    failed += opt.failed;
+    for (const f of opt.failures) failures.push("opplevagent-privacy-truth: " + f);
+    console.log(`  opplevagent-privacy-truth: ${opt.passed} passed, ${opt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevagent-privacy-truth: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Kjøpsvilkår og refusjonsregler for rettfrabonden.com (Daniel live
 // 2026-10-10): page content NO/EN, operator facts, truth pins against the
 // code (pickup only, no buyer cancel endpoint, no payment yet), footer /
