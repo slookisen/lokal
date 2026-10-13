@@ -1,0 +1,25 @@
+{
+  "name": "rfb-intl-staging",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Fly.io staging service for SE/DK producer candidates. Outside prod, never public (dev-request A2A 2026-10-13-se-batch-profiler-staging).",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
