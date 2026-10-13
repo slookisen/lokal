@@ -85,6 +85,8 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   const vision = src("..", "services", "vision-provider.ts");
   const opplevelser = src("opplevelser.ts");
   const dbBackupRoute = src("admin-db-backup.ts");
+  const searchEnrich = src("..", "services", "search-enrich.ts");
+  const geocodeWorker = src("..", "services", "experiences-geocode-worker.ts");
   const flyToml = fs.readFileSync(path.join(__dirname, "..", "..", "fly.toml"), "utf8");
 
   assertTrue(
@@ -175,8 +177,8 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     "both parts have the outreach section");
   assertTrue(/berettiget interesse \(personvernforordningen art\. 6 nr\. 1 bokstav f\)/.test(noT) &&
     /legitimate interest \(GDPR art\. 6\(1\)\(f\)\)/.test(enT), "both parts name legitimate interest, art. 6(1)(f)");
-  assertTrue(/Brønnøysundregistrene og tilbyderens egen nettside/.test(noT) &&
-    /Norwegian business registry and the provider's own website/.test(enT), "both parts name the sources");
+  assertTrue(/Brønnøysundregistrene, tilbyderens egen nettside, Visit Norway \/ CBIS, Rett fra Bondens produsentregister, nettsøk \(Brave Search\) og kataloger og oppføringssider/.test(noT) &&
+    /Norwegian business registry, the provider's own website, Visit Norway \/ CBIS, the Rett fra Bonden producer register, web search \(Brave Search\) and directory and listing pages/.test(enT), "both parts name the sources");
   assertTrue(/Svar «fjern» på e-posten/.test(noT) && /Reply “fjern” to the email/.test(enT),
     "both parts tell the provider to reply «fjern»");
   assertTrue(/protestere \(art\. 21\)/.test(noT) && /object at any time \(art\. 21\)/.test(enT),
@@ -185,7 +187,7 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(/Datatilsynet/.test(noT) && /Datatilsynet/.test(enT), "both parts mention the Datatilsynet complaint right");
   assertTrue(/utsendingslogg/.test(noT) && /send log/.test(enT) && /korrespondansen/.test(noT) && /correspondence/.test(enT),
     "both parts say the send log and the correspondence are stored");
-  assertTrue(/kontakt@opplevagent\.no/.test(noT) || /kontakt@opplevagent\.no/.test(no), "deletion/objection contact address is on the page");
+  assertTrue(/kontakt@opplevagent\.no/.test(noT) && /kontakt@opplevagent\.no/.test(enT), "deletion/objection contact address is on the page in both parts");
   assertTrue(/13\. oktober 2026/.test(noT) && /13 October 2026/.test(enT), "both parts show today's updated date, 13 October 2026");
 
   // 2. «fjern» hides, does not delete.
@@ -203,6 +205,24 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(!/automatisk sletting av/.test(noT) && !/automatically deleted/.test(enT) &&
     /Ingen automatisk sletting i dag/.test(noT) && /No automatic deletion today/.test(enT),
     "both parts do not promise automatic deletion (and say there is none today)");
+
+  // Hardening: no automatic-deletion promise anywhere; ownership claim pinned; legal-basis table pinned.
+  assertTrue(!/slettes automatisk/i.test(html) && !/automatically deleted/i.test(html) && !/slettes etter \d/i.test(html) && !/deleted after \d/i.test(html),
+    "the page contains no 'slettes automatisk' / 'automatically deleted' promise");
+  assertTrue(!/eierskap[^.]{0,80}(lagres|lagret)/i.test(html) && !/(lagres|lagret)[^.]{0,80}eierskap/i.test(html) &&
+    !/(stored|kept)[^.]{0,80}ownership/i.test(html) && !/ownership[^.]{0,80}(stored|kept)/i.test(html),
+    "no sentence ties storage of the provider e-mail to ownership (eierskap/ownership near lagres/stored)");
+  assertTrue(/sletting gjør vi manuelt; det finnes ingen automatisk eller selvbetjent sletting/.test(noT) &&
+    /we do the deletion manually; there is no automatic or self-service deletion/.test(enT), "both parts say deletion on request is manual");
+  assertTrue(/som også lagrer e-postadressen du svarte fra og årsaken/.test(noT) && /also stores the email address you replied from and the reason/.test(enT),
+    "both parts say the do-not-contact list stores the sender e-mail and the reason");
+  for (const [label, part, rows] of [["no", no, ["E-post til tilbydere om profilen", "Tilbyderprofiler fra offentlige kilder", "Sperreliste etter «fjern»"]], ["en", en, ["Emails to providers about the profile", "Provider profiles from public sources", "Do-not-contact list after “fjern”"]]] as const) {
+    const basis = label === "no" ? "Berettiget interesse" : "Legitimate interest";
+    for (const row of rows) {
+      assertTrue(part.includes(`<tr><td>${row}</td><td>${basis}</td></tr>`), `(${label}) legal-basis table: "${row}" is on ${basis}`);
+    }
+    assertTrue(!/Samtykke/.test(part) && !/<td>Consent<\/td>/.test(part), `(${label}) legal-basis table has no consent row for outreach`);
+  }
 
   // 3. Old ownership-only claim gone.
   assertTrue(
@@ -223,7 +243,9 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     { name: "Fly.io", proof: /primary_region = 'arn'/.test(flyToml) },
     { name: "Tigris", proof: /Tigris/i.test(offsite) && /experiences/.test(offsite) },
     { name: "Resend", proof: /connectors\.resend_domain/.test(emailSvc) && /api\.resend\.com\/emails\/receiving/.test(inbound) },
-    { name: "Google", proof: /@gmail\.com/.test(inbound) },
+    { name: "Google", proof: /const forwardTo = process\.env\.ADMIN_EMAIL \|\| "[^"]*@gmail\.com"/.test(inbound) && /to: forwardTo/.test(inbound) },
+    { name: "Brave Search", proof: /https:\/\/api\.search\.brave\.com\/res\/v1\/web\/search/.test(searchEnrich) && /braveSearch\(query, braveKey/.test(opplevelser) && /<kommune\/poststed>/.test(opplevelser) },
+    { name: "Kartverket", proof: /KARTVERKET_ADRESSE_BASE = "https:\/\/ws\.geonorge\.no\/adresser\/v1\/sok"/.test(geocodeWorker) },
     { name: "Anthropic", proof: /api\.anthropic\.com/.test(contentJudge) && /api\.anthropic\.com/.test(translations) },
   ];
   for (const v of vendors) {
