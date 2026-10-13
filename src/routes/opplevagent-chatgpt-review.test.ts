@@ -354,8 +354,8 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       const legalSrc = require("fs").readFileSync(require.resolve("./experiences-seo"), "utf8") as string;
       assertTrue(!/opptil 180 dager/.test(legalSrc) && !/up to 180 days/.test(legalSrc),
         "i1: /personvern no longer promises a 180-day analytics window no job enforces");
-      assertTrue(/Besøksforespørsler<\/strong> \(navn, e-post, telefon, ønsket tid, antall personer og kommentar\) slettes ikke automatisk i dag/.test(legalSrc)
-        && /Visit requests<\/strong> \(name, email, phone, requested time, party size and note\) are not deleted automatically today/.test(legalSrc),
+      assertTrue(/<tr><td>Besøksforespørsler<\/td><td>Ingen automatisk sletting i dag\. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager/.test(legalSrc)
+        && /<tr><td>Visit requests<\/td><td>No automatic deletion today\. They are kept until you ask us to delete them, and we then delete them within 30 days/.test(legalSrc),
         "i2: /personvern states plainly (NO + EN) that visit requests are not auto-deleted and how deletion works");
       assertTrue(/1a\. Besøksforespørsler til gårdssalg/.test(legalSrc) && /1a\. Farm-sale visit requests/.test(legalSrc)
         && /ikke<\/strong> en bekreftet booking/.test(legalSrc) && /not<\/strong> a confirmed booking/.test(legalSrc),
