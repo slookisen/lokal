@@ -212,6 +212,7 @@ export function runMcpUsageLoggerTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(row.protocol, "mcp", "mcp-2: protocol='mcp'");
         assertEq(row.vertical_id, "rfb", "mcp-3: vertical_id='rfb'");
         assertEq(row.tool_name, "lokal_search", "mcp-4: tools/call logs params.name, not the literal method");
+        assertEq(row.status_code, 200, "mcp-4b: the response's HTTP status is stored (a 429 must not count as a search)");
       }
 
       // ── 2. initialize captures clientInfo ─────────────────────────────
