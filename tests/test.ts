@@ -9079,7 +9079,8 @@ console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
   // The tile itself must be untouched: same wrapper, same data-fill hook the
   // stats JS writes into, same meta line.
   assertTrue(
-    /<div class="pf-stat" data-stat="ai" title="\$\{lang === "en" \? "[^"]+" : "[^"]+"\}">/.test(seoSrcTip),
+    // (2026-10-13: the strings are template literals so ${statsDays} is filled in; still no raw " inside.)
+    /<div class="pf-stat" data-stat="ai" title="\$\{lang === "en" \? (["`])[^"`]+\1 : (["`])[^"`]+\2\}">/.test(seoSrcTip),
     "ai-tooltip: tile markup unchanged and the title attribute stays valid (no raw quote inside)"
   );
   assertTrue(
