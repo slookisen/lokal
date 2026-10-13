@@ -13,24 +13,26 @@
  * import from a worker thread. Do not import database/init or anything with
  * module-level side effects from here.
  *
- * Why it must not run on the main thread in production: every call is three
- * full scans of analytics_page_views (~1.2 M rows, no index on vertical_id or
- * session_id) plus a JS classification of every session. The event-loop
- * monitor (PR #922) measured it at 8–23 s per homepage render on the
- * shared-cpu-1x machine, freezing all three hosts each time the cache expired.
+ * Why it must not run on the main thread in production: it reads every page
+ * view of the window (about 60 days, hundreds of thousands of rows) and
+ * classifies every visitor. The event-loop monitor (PR #922) measured the
+ * previous version at 8–23 s per homepage render on the shared-cpu-1x machine,
+ * freezing all three hosts each time the cache expired.
  */
 
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
-import { classifySession, SCANNER_PATH_PATTERNS } from "./traffic-classifier";
+import { computeTrafficReport } from "./traffic-report";
 
 export interface TrafficStats {
   pageViews: number;
   uniqueVisitors: number;
-  /** Unique HUMAN sessions (NOT views) — the honest "ekte besøkende". */
+  /** Distinct human visitors (IP + browser) in the window — NOT views. */
   realVisitors: number;
   /** Page views from human sessions. */
   humanViews: number;
+  /** Human visits (30-minute inactivity rule, traffic-report.ts). */
+  humanVisits: number;
   /** Page views from human-initiated AI retrieval (`*-User` agents). */
   aiSearchViews: number;
   /** Page views from autonomous AI crawlers (GPTBot, ClaudeBot, …). */
@@ -67,6 +69,7 @@ export function emptyTrafficStats(windowDays: number = getRetentionWindowDays())
     uniqueVisitors: 0,
     realVisitors: 0,
     humanViews: 0,
+    humanVisits: 0,
     aiSearchViews: 0,
     aiCrawlerViews: 0,
     botViews: 0,
@@ -79,77 +82,49 @@ export function emptyTrafficStats(windowDays: number = getRetentionWindowDays())
 
 /**
  * Computes the stats for one vertical (or all traffic when `vertical` is
- * undefined). Throws on DB errors; callers decide the fallback.
+ * undefined) over the last `windowDays` days. Throws on DB errors; callers
+ * decide the fallback.
+ *
+ * dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: built on the
+ * dashboard's traffic report (traffic-report.ts), so the public counters and
+ * the admin dashboard use one definition of a page view, a visitor and a bot.
+ * Before, this counted every stored row with no date filter (the "siste 60
+ * dager" label held only because the nightly prune deletes older rows), static
+ * files and redirects included, and classified visitors without the scanner
+ * UA and scraper rules.
  */
 export function computeTrafficStats(
   db: Database.Database,
   vertical: VerticalId | undefined,
-  windowDays: number = getRetentionWindowDays()
+  windowDays: number = getRetentionWindowDays(),
+  nowMs: number = Date.now()
 ): TrafficStats {
+  const report = computeTrafficReport(db, windowDays * 24, vertical, nowMs, { detail: false });
   const notOwner = "(is_owner IS NULL OR is_owner = 0)";
   const vertSql = vertical ? " AND vertical_id = ?" : "";
   const vertParams: string[] = vertical ? [vertical] : [];
+  const cutoff = new Date(nowMs - windowDays * 86_400_000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 
-  // Total page views (excluding owner)
-  const pageViews = (db.prepare(
-    `SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}${vertSql}`
-  ).get(...vertParams) as any)?.n ?? 0;
+  const humanViews = report.groups.human.views;
+  const aiSearchViews = report.groups.ai_search.views;
+  const aiCrawlerViews = report.groups.ai_crawler.views;
+  // Everything that is neither a person nor human-initiated AI retrieval.
+  const botViews = report.totals.views - humanViews - aiSearchViews;
 
-  // Session-based classification via the shared classifier
-  const sessions = db.prepare(`
-    SELECT session_id, COUNT(*) as views
-    FROM analytics_page_views
-    WHERE ${notOwner}${vertSql}
-    GROUP BY session_id
-  `).all(...vertParams) as any[];
-
-  // Sessions that hit scanner probe paths (wp-admin/.env/…) — fold into
-  // 'scanner' even when the UA looks like a plausible browser. Same rule
-  // as /admin/analytics/traffic-classification.
-  const scannerHits = db.prepare(`
-    SELECT DISTINCT session_id FROM analytics_page_views
-    WHERE ${notOwner}${vertSql} AND (${SCANNER_PATH_PATTERNS.map(() => 'path LIKE ?').join(' OR ')})
-  `).all(...vertParams, ...SCANNER_PATH_PATTERNS.map(p => `%${p}%`)) as any[];
-  const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
-
-  let realVisitors = 0;
-  let humanViews = 0;
-  let aiSearchViews = 0;
-  let aiCrawlerViews = 0;
-  let botViews = 0;
-  for (const s of sessions) {
-    const category = classifySession(s.session_id, {
-      scannerPaths: scannerSessionIds.has(s.session_id),
-    });
-    if (category === 'human') {
-      realVisitors += 1;
-      humanViews += s.views;
-    } else if (category === 'ai_search') {
-      aiSearchViews += s.views;
-    } else {
-      // ai_crawler + search_engine + seo_bot + social + dev + other_bot + scanner
-      if (category === 'ai_crawler') aiCrawlerViews += s.views;
-      botViews += s.views;
-    }
-  }
-
-  // AI queries from analytics_queries
   const aiQueries = (db.prepare(
-    `SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}${vertSql}`
-  ).get(...vertParams) as any)?.n ?? 0;
+    `SELECT COUNT(*) as n FROM analytics_queries WHERE created_at > ? AND ${notOwner}${vertSql}`
+  ).get(cutoff, ...vertParams) as any)?.n ?? 0;
 
   return {
-    pageViews,
-    uniqueVisitors: sessions.length,
-    realVisitors,
+    pageViews: report.totals.views,
+    uniqueVisitors: report.totals.visitors,
+    realVisitors: report.groups.human.visitors,
     humanViews,
+    humanVisits: report.groups.human.visits,
     aiSearchViews,
     aiCrawlerViews,
     botViews,
     windowDays,
-    // Back-compat aliases: realHumans was "views from sessions we didn't
-    // flag as bot/dev"; humanViews is its honest successor. botAndAi was
-    // "all bot/dev views + AI queries" — preserve that aggregate meaning.
     realHumans: humanViews,
     botAndAi: aiSearchViews + botViews + aiQueries,
     aiQueries,

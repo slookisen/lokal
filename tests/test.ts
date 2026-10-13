@@ -42427,6 +42427,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: one definition
+  // of a page view, one traffic report for every dashboard number, and the
+  // write path that stores pages and scanner probes only. Swaps the shared
+  // getDb() for its write-path block, so it runs in this serial chain.
+  console.log("\n── statistikk S1: page-view definition, traffic report, write path ──");
+  try {
+    const { runTrafficReportTests } = require("../src/services/traffic-report.test") as
+      typeof import("../src/services/traffic-report.test");
+    const trr = await runTrafficReportTests({ log: false });
+    passed += trr.passed;
+    failed += trr.failed;
+    for (const f of trr.failures) failures.push("traffic-report: " + f);
+    console.log(`  traffic-report: ${trr.passed} passed, ${trr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("traffic-report: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ traffic-report: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
   try {
     const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as

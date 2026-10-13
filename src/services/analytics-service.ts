@@ -5,11 +5,13 @@ import { slugify } from "../utils/slug";
 import { extractUtmFromQuery } from "../utils/utm-capture";
 import {
   classifyUA,
+  clientClassForUA,
   isScannerUA,
   isVelocityScraper,
   SessionCategory,
   SessionVelocity,
 } from "./traffic-classifier";
+import { shouldRecordPageView } from "./page-view-definition";
 import { readSessionVelocity } from "./agent-stats-compute";
 import {
   computeAdminSummary,
@@ -76,7 +78,12 @@ const OWNER_UA_MARKERS_LC = [
 export function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  return isOwnerScriptUA(req.headers["user-agent"] || "");
+}
+
+/** True for our own scripts' UAs (the UA half of isOwnerRequest). */
+export function isOwnerScriptUA(userAgent: string): boolean {
+  const ua = (userAgent || "").toLowerCase();
   return OWNER_UA_MARKERS_LC.some(m => ua.includes(m));
 }
 
@@ -397,9 +404,16 @@ export class AnalyticsService {
       // Defer until response finish so we capture statusCode (200/301/404) — that
       // way we can measure how often /produsent/<slug> hits 404 from AI crawlers
       // and whether the fuzzy-redirect fix is actually catching dead traffic.
+      //
+      // dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: only pages
+      // answered with a document (and scanner probes) are stored. Static files,
+      // the offline fallback, robots/llms/sitemap and the /mcp and /a2a
+      // endpoints used to be stored as page views too — see
+      // page-view-definition.ts for the rule and why.
       if (self.options.trackPageViews && req.method === "GET" && !req.path.startsWith("/api/")) {
         const isOwner = isOwnerRequest(req);
         res.on("finish", () => {
+          if (!shouldRecordPageView(req.path, res.statusCode, res.getHeader("content-type"))) return;
           self.trackPageView(req, isOwner, res.statusCode);
         });
       }
@@ -440,9 +454,13 @@ export class AnalyticsService {
       const utm = extractUtmFromQuery(req.query); // B4: inbound utm_* (sanitised, nullable)
 
       db.prepare(`
-        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code, vertical_id, utm_source, utm_medium, utm_campaign)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null, getVerticalFromHost(req.hostname), utm.utm_source, utm.utm_medium, utm.utm_campaign);
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code, vertical_id, utm_source, utm_medium, utm_campaign, client_class)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null, getVerticalFromHost(req.hostname), utm.utm_source, utm.utm_medium, utm.utm_campaign,
+        // Our own scripts are scripts even when their UA looks like a browser
+        // (e.g. "RFB-ContactVerifier/1.0"), so the owner card can split them
+        // from the owner's own browsing.
+        isOwnerScriptUA(userAgent) ? "dev" : clientClassForUA(userAgent));
     } catch (err) {
       console.error("[analytics] Failed to track page view:", err);
     }

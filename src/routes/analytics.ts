@@ -2,20 +2,22 @@ import { Router, Request, Response } from "express";
 import path from "path";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { analyticsService, VerticalId, HUMAN_DEVICE_BUCKETS } from "../services/analytics-service";
-import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
+import { analyticsService, VerticalId } from "../services/analytics-service";
+import { classifySession } from "../services/traffic-classifier";
 import {
-  computeVisitors,
-  computeTopPages,
   computeUmbrellaTraffic,
+  computeQueryStats,
+  summaryFromReport,
+  topPagesFromReport,
+  visitorsFromReport,
   type AdminStatsQuery,
-  type AdminSummary,
+  type QueryStats,
   type Summary24Result,
   type TopProducerRow,
   type CityStatsRow,
-  type TopPageRow,
   type UmbrellaTrafficBucket,
 } from "../services/admin-stats-compute";
+import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -98,6 +100,27 @@ const router = Router();
 // fallback on the main thread.
 function readStats<T>(req: Request, query: AdminStatsQuery, computeSync: () => T) {
   return adminStatsReaderFor(req.app).read<T>(query, computeSync);
+}
+
+/**
+ * The traffic report for one window and vertical (traffic-report.ts). Every
+ * page-view panel reads it, so they share one cache entry and one computation
+ * in the stats worker. Errors (worker or synchronous path) come back as
+ * { ok: false }.
+ */
+async function readReport(req: Request, hours: number, vertical: VerticalId | undefined) {
+  try {
+    return await readStats<TrafficReport>(req, { name: "trafficReport", hours, vertical }, () =>
+      computeTrafficReport(getDb(), hours, vertical, Date.now()),
+    );
+  } catch (err) {
+    console.error("[analytics] traffic report error:", err);
+    return { ok: false as const, error: String(err) };
+  }
+}
+
+function windowHours(req: Request, max = 87600): number {
+  return Math.max(1, Math.min(max, parseInt(req.query.hours as string) || 24));
 }
 
 function sendAdminStatsUnavailable(res: Response, error: string): void {
@@ -276,18 +299,21 @@ router.get("/summary/:hours", async (req: Request, res: Response) => {
   const hoursParam = req.params.hours as string;
   const hours = Math.max(1, Math.min(87600, parseInt(hoursParam) || 24));
   const vertical = parseVertical(req);
-  const r = await readStats<AdminSummary>(req, { name: "summary", hours, vertical }, () =>
-    analyticsService.getSummary(hours, vertical)
-  );
-  if (!r.ok) {
-    sendAdminStatsUnavailable(res, r.error);
+  const [rep, q] = await Promise.all([
+    readReport(req, hours, vertical),
+    readStats<QueryStats>(req, { name: "queryStats", hours, vertical }, () =>
+      computeQueryStats(getDb(), hours, vertical, Date.now()),
+    ).catch((err) => ({ ok: false as const, error: String(err) })),
+  ]);
+  if (!rep.ok || !q.ok) {
+    sendAdminStatsUnavailable(res, !rep.ok ? rep.error : (q as { error: string }).error);
     return;
   }
   res.json({
     timeframe: `last ${hours} hours`,
     vertical: vertical || "all",
     timestamp: new Date().toISOString(),
-    ...r.value,
+    ...summaryFromReport(rep.value, q.value),
   });
 });
 
@@ -648,52 +674,43 @@ router.get("/health", (_req: Request, res: Response) => {
  * Detailed visitor list with session info
  */
 router.get("/visitors", async (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  const hours = windowHours(req);
   const limit = Math.min(200, parseInt(req.query.limit as string) || 50);
-  const vertical = parseVertical(req);
-
-  const r = await readStats<any[]>(req, { name: "visitors", hours, limit, vertical }, () => {
-    try {
-      return computeVisitors(getDb(), hours, limit, vertical, Date.now());
-    } catch (err) {
-      console.error("[analytics] visitors error:", err);
-      return [];
-    }
-  });
+  const r = await readReport(req, hours, parseVertical(req));
   if (!r.ok) {
     sendAdminStatsUnavailable(res, r.error);
     return;
   }
-  res.json({ visitors: r.value });
+  // Most recently active visitors of every class, newest first.
+  res.json({ visitors: visitorsFromReport(r.value, limit) });
 });
 
 /**
  * GET /admin/analytics/hourly
  * Hourly traffic breakdown for chart
  */
-router.get("/hourly", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
-
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    const hourly = db.prepare(`
-      SELECT
-        strftime('%Y-%m-%d %H:00', created_at) as hour,
-        COUNT(*) as views,
-        COUNT(DISTINCT session_id) as visitors
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
-      GROUP BY hour
-      ORDER BY hour ASC
-    `).all(cutoff, ...verticalFilter(req).params) as any[];
-
-    res.json({ hourly });
-  } catch (err) {
-    console.error("[analytics] hourly error:", err);
-    res.json({ hourly: [] });
+router.get("/hourly", async (req: Request, res: Response) => {
+  // Hourly buckets up to a week (the report switches to days beyond that).
+  const hours = windowHours(req, 168);
+  const r = await readReport(req, hours, parseVertical(req));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  // UTC hour buckets, zero-filled. `views` = page views of every class;
+  // human/AI/bot split and visitors per hour alongside.
+  res.json({
+    unit: r.value.series.unit,
+    hourly: r.value.series.points.map((p) => ({
+      hour: p.t,
+      views: p.views,
+      visitors: p.visitors,
+      humanViews: p.humanViews,
+      aiViews: p.aiViews,
+      botViews: p.botViews,
+      humanVisitors: p.humanVisitors,
+    })),
+  });
 });
 
 /**
@@ -701,25 +718,16 @@ router.get("/hourly", (req: Request, res: Response) => {
  * Top pages by view count
  */
 router.get("/pages", async (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  const hours = windowHours(req);
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
-  const vertical = parseVertical(req);
-
-  // Query (scanner-path exclusion, time-window index, rollup blend):
-  // computeTopPages in services/admin-stats-compute.ts.
-  const r = await readStats<TopPageRow[]>(req, { name: "pages", hours, limit, vertical }, () => {
-    try {
-      return computeTopPages(getDb(), hours, limit, vertical, Date.now());
-    } catch (err) {
-      console.error("[analytics] pages error:", err);
-      return [];
-    }
-  });
+  const r = await readReport(req, hours, parseVertical(req));
   if (!r.ok) {
     sendAdminStatsUnavailable(res, r.error);
     return;
   }
-  res.json({ pages: r.value });
+  // Page views only (page-view-definition.ts): no static files, redirects,
+  // errors or scanner probes. Human / AI / bot split per page.
+  res.json({ pages: topPagesFromReport(r.value, limit) });
 });
 
 // ─── Device classification for /devices (Enheter widget) ────────────────
@@ -735,82 +743,26 @@ router.get("/pages", async (req: Request, res: Response) => {
 // Exported for direct unit coverage (more testable than driving the whole
 // route + DB for every case).
 export function deriveDeviceFromSessionId(sessionId: string): 'desktop' | 'mobile' | 'tablet' | 'unknown' {
-  const rest = sessionId.includes(':') ? sessionId.split(':').slice(1).join(':') : '';
-  const firstSegment = rest.includes(':') ? rest.slice(0, rest.indexOf(':')) : rest;
-  if ((HUMAN_DEVICE_BUCKETS as readonly string[]).includes(firstSegment)) {
-    return firstSegment as 'desktop' | 'mobile' | 'tablet';
-  }
-  const lower = rest.toLowerCase();
-  // Order matters — tablet check first because iPads include "Mobile" too.
-  if (lower.includes('ipad') || lower.includes('tablet')) {
-    return 'tablet';
-  } else if (lower.includes('mobile') || lower.includes('iphone') || lower.includes('android')) {
-    return 'mobile';
-  } else if (lower.includes('mozilla') || lower.includes('chrome') || lower.includes('safari') || lower.includes('firefox') || lower.includes('edg/')) {
-    return 'desktop';
-  }
-  return 'unknown';
+  return deviceForSession(sessionId);
 }
 
 /**
  * GET /admin/analytics/devices
  * Device type breakdown
  */
-router.get("/devices", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
-
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    // Device breakdown derived from session_id — see deriveDeviceFromSessionId()
-    // above for the two formats it has to handle. Previously this endpoint
-    // grouped by the `source` column (direct/search/social/referral), which
-    // is *referrer*, not device — meaning Trafikkilder and Enheter showed
-    // identical data.
-    //
-    // Filter out bots/scanners so the Enheter widget reflects human visitors
-    // only. Bot traffic has its own widget (Bot-fordeling).
-    const rows = db.prepare(`
-      SELECT session_id, COUNT(*) as count
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}
-        AND session_id NOT LIKE '%Bot%'
-        AND session_id NOT LIKE '%bot%'
-        AND session_id NOT LIKE '%spider%'
-        AND session_id NOT LIKE '%crawl%'
-        AND session_id NOT LIKE '%curl/%'
-        AND session_id NOT LIKE '%Python/%'
-        AND session_id NOT LIKE '%aiohttp%'
-        AND session_id NOT LIKE '%Lokal/%'
-        AND session_id NOT LIKE '%node-fetch%'
-        AND session_id NOT LIKE '%axios/%'${verticalFilter(req).sql}
-      GROUP BY session_id
-    `).all(cutoff, ...verticalFilter(req).params) as any[];
-
-    const buckets: Record<string, { count: number; visitors: number }> = {
-      desktop: { count: 0, visitors: 0 },
-      mobile: { count: 0, visitors: 0 },
-      tablet: { count: 0, visitors: 0 },
-      unknown: { count: 0, visitors: 0 },
-    };
-
-    for (const r of rows) {
-      const device = deriveDeviceFromSessionId(r.session_id);
-      buckets[device].count += r.count;
-      buckets[device].visitors += 1;
-    }
-
-    const devices = Object.entries(buckets)
-      .map(([device, v]) => ({ device, count: v.count, visitors: v.visitors }))
-      .filter(d => d.count > 0)
-      .sort((a, b) => b.count - a.count);
-
-    res.json({ devices });
-  } catch (err) {
-    console.error("[analytics] devices error:", err);
-    res.json({ devices: [] });
+router.get("/devices", async (req: Request, res: Response) => {
+  const r = await readReport(req, windowHours(req), parseVertical(req));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  // Human visitors only (traffic-report.ts classes); bots have their own panel.
+  // count = page views, visitors = distinct visitors, visits = visits.
+  const devices = Object.entries(r.value.human.devices)
+    .map(([device, t]) => ({ device, count: t.views, visitors: t.visitors, visits: t.visits }))
+    .filter((d) => d.count > 0)
+    .sort((a, b) => b.count - a.count);
+  res.json({ devices });
 });
 
 /**
@@ -852,191 +804,75 @@ router.get("/conversations", (_req: Request, res: Response) => {
  * Classifies visitors into: human, bot, dev, scanner
  * This is the key endpoint for understanding real vs artificial traffic
  */
-router.get("/traffic-classification", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
-
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    const visitors = db.prepare(`
-      SELECT
-        session_id,
-        COUNT(*) as views,
-        COUNT(DISTINCT path) as unique_pages,
-        MIN(created_at) as first_seen,
-        MAX(created_at) as last_seen
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
-      GROUP BY session_id
-    `).all(cutoff, ...verticalFilter(req).params) as any[];
-
-    // Classification now goes through the SHARED classifier
-    // (src/services/traffic-classifier.ts) — the local botPatterns/devPatterns/
-    // scannerPatterns copies that used to live here (one of three drifting
-    // lists) are gone. Scanner probe paths still come from the shared module.
-    const scannerPaths = SCANNER_PATH_PATTERNS;
-
-    // Dynamic bot-name extractor. Tries (in order):
-    //   1. Exact token ending in Bot/Crawler/Spider/bot (case-insensitive) —
-    //      catches AhrefsBot, SemrushBot, PetalBot, etc. without us having
-    //      to hardcode every crawler in existence.
-    //   2. First identifier before a "/" (UA convention "Name/version ...") —
-    //      catches "facebookexternalhit/1.1" → "facebookexternalhit",
-    //      "meta-externalagent/1.1" → "meta-externalagent".
-    //   3. First alphanumeric token — last-resort bucket ("UA looks weird").
-    // Returns { name, otherSample } where otherSample is the raw UA (truncated)
-    // for UAs that fell through to #3, so Daniel can see what's hiding in "other".
-    function extractBotName(ua: string): string {
-      // 1. Known-good substring match first (preserves existing labels)
-      const known = ua.match(/(ClaudeBot|GPTBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|DuckDuckBot|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|Bytespider|Amazonbot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|CCBot|meta-externalagent|anthropic-ai|LinkedInBot|Slackbot|TelegramBot|ImagesiftBot|Diffbot)/i);
-      if (known) return known[1];
-      // 2. Generic "*Bot/*Crawler/*Spider" token (e.g. "HostBot", "MyCrawler")
-      const generic = ua.match(/([A-Za-z][A-Za-z0-9_-]*(?:Bot|Crawler|Spider|bot|crawler|spider))/);
-      if (generic) return generic[1];
-      // 3. First "Name/version" tuple (e.g. "Go-http-client/1.1")
-      const slash = ua.match(/^([A-Za-z][A-Za-z0-9_.-]+)\//);
-      if (slash) return slash[1];
-      // 4. Fallback: first word-like token
-      const word = ua.match(/([A-Za-z][A-Za-z0-9_-]{2,})/);
-      return word ? word[1] : 'other';
-    }
-
-    // Also get scanner paths
-    const scannerHits = db.prepare(`
-      SELECT session_id FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql} AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
-      GROUP BY session_id
-    `).all(cutoff, ...verticalFilter(req).params, ...scannerPaths.map(p => `%${p}%`)) as any[];
-    const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
-
-    // Buckets: human/bot/dev/scanner keys are kept for backward compat (`bot`
-    // stays the aggregate of NON-AI bots: search_engine + seo_bot + social +
-    // other_bot), and the two new honest AI buckets are ADDED — ai_search
-    // (human-initiated `*-User` retrieval) and ai_crawler (GPTBot & co).
-    const classification = {
-      human: { views: 0, sessions: 0 },
-      ai_search: { views: 0, sessions: 0 },
-      ai_crawler: { views: 0, sessions: 0 },
-      bot: { views: 0, sessions: 0 },
-      dev: { views: 0, sessions: 0 },
-      scanner: { views: 0, sessions: 0 },
-    };
-    const botDetails: Record<string, { name: string; views: number; sampleUa?: string }> = {};
-    const humanSessions: any[] = [];
-    // Sample raw UAs that fell into "other" so the dashboard can show them.
-    // We keep at most one sample per unique UA prefix to stay under ~30 samples.
-    const otherSamples: Array<{ ua: string; views: number }> = [];
-
-    for (const v of visitors) {
-      const ua = uaFromSessionId(v.session_id);
-      const category = classifySession(v.session_id, { scannerPaths: scannerSessionIds.has(v.session_id) });
-
-      let type: string;
-      if (category === 'human') {
-        type = 'human';
-        humanSessions.push({
-          ua: ua.substring(0, 80),
-          views: v.views,
-          uniquePages: v.unique_pages,
-          firstSeen: v.first_seen,
-          lastSeen: v.last_seen,
-        });
-      } else if (category === 'dev' || category === 'scanner' || category === 'ai_search' || category === 'ai_crawler') {
-        type = category;
-      } else {
-        // search_engine + seo_bot + social + other_bot → the legacy 'bot' key
-        type = 'bot';
-      }
-
-      // Named-bot breakdown covers every non-human, non-dev, non-scanner
-      // session (incl. the AI buckets) so the dashboard's bots list stays
-      // complete.
-      if (type === 'bot' || type === 'ai_search' || type === 'ai_crawler') {
-        const botName = extractBotName(ua);
-        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0, sampleUa: ua.slice(0, 120) };
-        botDetails[botName].views += v.views;
-        // If we fell back to the last-resort token, preserve the raw UA so we
-        // can surface it in the dashboard's "other" drill-down.
-        if (botName === 'other' || /^(Mozilla|compatible)$/i.test(botName)) {
-          otherSamples.push({ ua: ua.slice(0, 160), views: v.views });
-        }
-      }
-
-      (classification as any)[type].views += v.views;
-      (classification as any)[type].sessions += 1;
-    }
-
-    // Sort human sessions by views
-    humanSessions.sort((a, b) => b.views - a.views);
-
-    // Bot breakdown sorted by views
-    const bots = Object.values(botDetails).sort((a, b) => b.views - a.views);
-
-    // Dedupe "other" UA samples by first 40 chars, keep top 20 by views.
-    const sampleMap = new Map<string, { ua: string; views: number }>();
-    for (const s of otherSamples) {
-      const key = s.ua.slice(0, 40);
-      const existing = sampleMap.get(key);
-      if (existing) existing.views += s.views;
-      else sampleMap.set(key, { ua: s.ua, views: s.views });
-    }
-    const otherUaSamples = [...sampleMap.values()]
-      .sort((a, b) => b.views - a.views)
-      .slice(0, 20);
-
-    res.json({
-      timeframe: `last ${hours} hours`,
-      timestamp: new Date().toISOString(),
-      totalViews: visitors.reduce((s, v) => s + v.views, 0),
-      totalSessions: visitors.length,
-      classification,
-      bots,
-      // Raw UA samples for the "other"/long-tail bucket, so the dashboard can
-      // expose "who is hiding here" instead of an opaque number.
-      otherUaSamples,
-      humanSessions: humanSessions.slice(0, 30),
-    });
-  } catch (err) {
-    console.error("[analytics] traffic-classification error:", err);
-    res.status(500).json({ error: String(err) });
+router.get("/traffic-classification", async (req: Request, res: Response) => {
+  const hours = windowHours(req);
+  const r = await readReport(req, hours, parseVertical(req));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  const rep = r.value;
+  const c = rep.classes;
+  const sum = (...ts: Array<{ views: number; visitors: number; visits: number }>) => ({
+    views: ts.reduce((a, t) => a + t.views, 0),
+    sessions: ts.reduce((a, t) => a + t.visitors, 0),
+    visits: ts.reduce((a, t) => a + t.visits, 0),
+  });
+  // `sessions` keeps its old name but is distinct visitors (IP + browser);
+  // `visits` applies the 30-minute rule. The six buckets add up to the totals.
+  const classification = {
+    human: sum(c.human),
+    ai_search: sum(c.ai_search),
+    ai_crawler: sum(c.ai_crawler),
+    bot: sum(c.search_engine, c.seo_bot, c.social, c.other_bot),
+    dev: sum(c.dev),
+    scanner: sum(c.scanner, c.scraper),
+  };
+  res.json({
+    timeframe: `last ${hours} hours`,
+    timestamp: new Date().toISOString(),
+    totalViews: rep.totals.views,
+    totalSessions: rep.totals.visitors,
+    totalVisits: rep.totals.visits,
+    classification,
+    classes: rep.classes,
+    coverage: rep.coverage,
+    bots: rep.bots,
+    otherUaSamples: rep.otherUaSamples,
+    humanSessions: rep.human.topSessions,
+    human: {
+      avgVisitSeconds: rep.human.avgVisitSeconds,
+      pagesPerVisit: rep.human.pagesPerVisit,
+      bounceRate: rep.human.bounceRate,
+    },
+  });
 });
 
 /**
  * GET /admin/analytics/referrers
  * Shows actual referrer URLs for non-direct traffic
  */
-router.get("/referrers", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
-
-  try {
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
-
-    const referrers = db.prepare(`
-      SELECT
-        referrer,
-        source,
-        COUNT(*) as visits,
-        COUNT(DISTINCT session_id) as unique_visitors,
-        GROUP_CONCAT(DISTINCT path) as paths
-      FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql} AND referrer IS NOT NULL AND referrer != ''
-      GROUP BY referrer
-      ORDER BY visits DESC
-      LIMIT 30
-    `).all(cutoff, ...verticalFilter(req).params) as any[];
-
-    res.json({
-      timeframe: `last ${hours} hours`,
-      timestamp: new Date().toISOString(),
-      referrers,
-    });
-  } catch (err) {
-    console.error("[analytics] referrers error:", err);
-    res.json({ referrers: [] });
+router.get("/referrers", async (req: Request, res: Response) => {
+  const hours = windowHours(req);
+  const r = await readReport(req, hours, parseVertical(req));
+  if (!r.ok) {
+    sendAdminStatsUnavailable(res, r.error);
+    return;
   }
+  // External sites that sent human visits (the referrer of each visit's first
+  // page). Navigation inside our own sites is not a referral.
+  res.json({
+    timeframe: `last ${hours} hours`,
+    timestamp: new Date().toISOString(),
+    referrers: r.value.human.referrers.map((x) => ({
+      referrer: x.host,
+      host: x.host,
+      source: x.key,
+      label: x.label,
+      visits: x.visits,
+      unique_visitors: x.visitors,
+    })),
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════

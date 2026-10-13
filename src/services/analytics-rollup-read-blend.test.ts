@@ -222,8 +222,13 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       analyticsService._summaryCache.clear();
 
       const hoursBack = 24 * 25; // reaches back past both pruned days
+      // dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: page views
+      // and visitors come from the traffic report over the stored rows only;
+      // page_view_daily / sessions_daily used the old classifier and counted
+      // static files, so they are no longer blended in. History beyond the
+      // stored rows returns in S3 from daily tables built with the new rules.
       const count = analyticsService.getPageViewCount(hoursBack);
-      assertEq(count, 2 + 10 + 7, "no-double-count (page_view_daily): raw(2) + rollup(10+7) = 19, boundary day counted once as raw");
+      assertEq(count, 2, "S1: getPageViewCount = the 2 stored page views; the old page_view_daily rows are not blended in");
 
       // Flip the flag off: must reproduce the OLD raw-only number (2), not 19.
       process.env.ANALYTICS_ROLLUP_READ = "false";
@@ -235,9 +240,10 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       // uniqueVisitors (sessions_daily blend) via getSummary, same fixture.
       analyticsService._summaryCache.clear();
       const summary = analyticsService.getSummary(hoursBack);
-      // raw: 2 distinct sessions (sess-boundary, sess-recent); rollup: 4+3 = 7.
-      assertEq(summary.uniqueVisitors, 2 + 7, "no-double-count (sessions_daily): raw(2) + rollup(4+3) = 9 via getSummary.uniqueVisitors");
-      assertEq(summary.pageViews, 2 + 10 + 7, "getSummary.pageViews blends the same way as getPageViewCount");
+      // raw: 2 distinct sessions (sess-boundary, sess-recent).
+      assertEq(summary.uniqueVisitors, 2, "S1: getSummary.uniqueVisitors = the 2 stored visitors (sessions_daily not blended in)");
+      assertEq(summary.pageViews, 2, "S1: getSummary.pageViews matches getPageViewCount");
+      assertEq(summary.coverage?.complete, false, "S1: getSummary says the window reaches past the stored rows");
     }
 
     // ════════════════════════════════════════════════════════════════════

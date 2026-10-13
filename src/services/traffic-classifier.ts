@@ -269,6 +269,38 @@ export function isVelocityScraper(v: SessionVelocity | null | undefined): boolea
     || v.produsentPagesInHour > SCRAPER_PRODUSENT_PAGES_PER_HOUR;
 }
 
+// ── Client class stored at write time ───────────────────────────────────────
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S1. A human
+// session_id no longer carries the raw UA (it holds a device bucket and a
+// hash, see sessionIdFor in analytics-service.ts), so classifying a stored row
+// from its session_id alone cannot see a fake-stale-Chrome scanner UA any more.
+// trackPageView therefore stores the class of the FULL UA in
+// analytics_page_views.client_class; readers prefer it and fall back to the
+// session_id for rows written before the column existed.
+
+/** classifyUA's buckets plus 'scanner' (a fake-stale-Chrome UA). */
+export type ClientClass = TrafficCategory | "scanner";
+
+const CLIENT_CLASSES: readonly string[] = [
+  "human", "ai_search", "ai_crawler", "search_engine", "seo_bot", "social", "dev", "other_bot", "scanner",
+];
+
+/** Class of a full User-Agent string, as stored at write time. */
+export function clientClassForUA(userAgent: string): ClientClass {
+  const category = classifyUA(userAgent);
+  if (category === "human" && isScannerUA(userAgent)) return "scanner";
+  return category;
+}
+
+/**
+ * A stored row's client class: the write-time `client_class` when present and
+ * valid, else the class recovered from its session_id (legacy rows).
+ */
+export function storedClientClass(sessionId: string, clientClass: string | null | undefined): ClientClass {
+  if (clientClass && CLIENT_CLASSES.includes(clientClass)) return clientClass as ClientClass;
+  return clientClassForUA(uaFromSessionId(sessionId || ""));
+}
+
 /**
  * Classify a session by its session_id. Callers that know the session hit
  * scanner probe paths (SCANNER_PATH_PATTERNS) pass { scannerPaths: true } to

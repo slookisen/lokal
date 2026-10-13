@@ -347,7 +347,7 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
       );
       CREATE TABLE analytics_queries (
         id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT, is_owner INTEGER DEFAULT 0,
-        vertical_id TEXT NOT NULL DEFAULT 'rfb'
+        vertical_id TEXT NOT NULL DEFAULT 'rfb', created_at TEXT DEFAULT (datetime('now'))
       );
     `);
     const ins = writer.prepare("INSERT INTO analytics_page_views (path, session_id, created_at, is_owner, vertical_id) VALUES (?,?,?,?,?)");
@@ -367,7 +367,10 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
 
     const expectedRfb = computeTrafficStats(writer, "rfb", 60);
     const gotRfb = await runStatsTaskOffThread<TrafficStats>(dbPath, { kind: "trafficStats", vertical: "rfb", windowDays: 60 });
-    ok(eq(gotRfb, expectedRfb) && expectedRfb.pageViews === 5, "W1: the worker computes exactly what the synchronous function computes (rfb)", { gotRfb, expectedRfb });
+    // 2 = the two recent non-owner rfb page views: the 2026-01-01 rows are outside
+    // the 60-day window and /wp-admin/setup.php is a probe, not a page
+    // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S1).
+    ok(eq(gotRfb, expectedRfb) && expectedRfb.pageViews === 2, "W1: the worker computes exactly what the synchronous function computes (rfb)", { gotRfb, expectedRfb });
 
     const nowMs = Date.now();
     const expectedPv = computePageViewCounts(writer, nowMs);
@@ -376,7 +379,7 @@ export async function runOffThreadStatsTests(opts: { log?: boolean } = {}): Prom
 
     ins.run("/", "ip7:desktop:eeee", recent, 0, "rfb");
     const afterWrite = await runStatsTaskOffThread<TrafficStats>(dbPath, { kind: "trafficStats", vertical: "rfb", windowDays: 60 });
-    ok(afterWrite.pageViews === 6, "W3: the worker's read-only connection sees rows the main connection wrote after it opened", afterWrite);
+    ok(afterWrite.pageViews === 3, "W3: the worker's read-only connection sees rows the main connection wrote after it opened", afterWrite);
 
     let taskErr = "";
     try {
