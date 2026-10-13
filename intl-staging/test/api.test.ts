@@ -241,8 +241,8 @@ test("page excerpts expire after 30 days", async () => {
     await call(base, "POST", "/candidates/lease", { run_id: "build-run-10", n: 1 });
     assert.equal((await call(base, "POST", `/candidates/${encodeURIComponent(CID)}/draft`, goodDraft("build-run-10"))).status, 200);
     clock = new Date(clock.getTime() + 31 * 24 * 3600 * 1000);
-    const p = await call(base, "POST", "/purge");
-    assert.equal(p.json.excerpts_deleted, 1);
+    // The first request after the jump purges (traffic-driven housekeeping).
+    await call(base, "GET", "/health", undefined, null);
   });
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM excerpts").get() as any).n, 0);
 });

@@ -53,6 +53,23 @@ export function createApp(deps: AppDeps) {
 
   let importState: { import_id: string; state: "running" | "done" | "failed"; started_at: string; finished_at?: string; counts?: ImportCounts; error?: string } | null = null;
 
+  // Housekeeping on traffic as well as on the timer: the timer does not tick
+  // while Fly has the machine suspended (review 2026-10-13), so expired page
+  // excerpts are also dropped on the first requests after a wake-up.
+  let lastPurge = 0;
+  app.use((_req, _res, next) => {
+    const t = now().getTime();
+    if (t - lastPurge > 10 * 60 * 1000) {
+      lastPurge = t;
+      try {
+        purge(db, now());
+      } catch (e) {
+        console.error("[intl-staging] purge failed", (e as Error).message);
+      }
+    }
+    next();
+  });
+
   app.get("/health", (_req, res) => {
     res.json({
       status: "ok",
@@ -109,7 +126,7 @@ export function createApp(deps: AppDeps) {
     return { paused: pausedState(db) };
   }));
   app.post("/resume", wrap(() => {
-    resume(db);
+    resume(db, now());
     return { paused: null };
   }));
   app.post("/purge", wrap(() => purge(db, now())));
@@ -119,6 +136,9 @@ export function createApp(deps: AppDeps) {
   }));
 
   app.post("/import/se", guardWrites, (_req, res) => {
+    // Without the HMAC key the opt-out list cannot be read, and an import must
+    // never quietly bring back a unit that asked to be removed.
+    if (!deps.hmacKey) return res.status(503).json({ error: "hmac_key_not_configured" });
     if (importState?.state === "running") return res.status(409).json({ error: "import_running", import: importState });
     const importId = `imp-${now().toISOString()}`;
     importState = { import_id: importId, state: "running", started_at: now().toISOString() };
@@ -126,7 +146,7 @@ export function createApp(deps: AppDeps) {
     runSeImport(db, deps.importSources, {
       importId,
       now,
-      isOptedOut: key ? (orgNr) => isOptedOut(db, orgNr, key) : undefined,
+      isOptedOut: (orgNr) => isOptedOut(db, orgNr, key as string),
       onProgress: (c) => {
         if (importState) importState.counts = c;
       },
@@ -143,5 +163,12 @@ export function createApp(deps: AppDeps) {
   app.get("/import/status", wrap(() => ({ import: importState, last_import: lastImport(db) })));
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
+  // Error handler: never let Express log or echo a request body. A malformed or
+  // truncated JSON body can carry page text (review 2026-10-13).
+  app.use((err: { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    const status = typeof err?.status === "number" && err.status >= 400 && err.status < 600 ? err.status : 500;
+    if (status >= 500) console.error("[intl-staging] request error", err?.type || "internal");
+    res.status(status).json({ error: err?.type || (status >= 500 ? "internal" : "bad_request") });
+  });
   return app;
 }

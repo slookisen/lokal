@@ -78,6 +78,32 @@ const SOURCE_HOST_DENYLIST = [
   "mrkoll.se",
 ];
 
+// Hosts that can never be the producer's OWN website: link shorteners, map/
+// listing pages and directories (review 2026-10-13: a directory page passed as
+// "website" made the own-site rule meaningless).
+const NOT_AN_OWN_SITE = [
+  ...SOURCE_HOST_DENYLIST,
+  "youtube.com",
+  "business.site",
+  "g.page",
+  "goo.gl",
+  "maps.app.goo.gl",
+  "yelp.com",
+  "yelp.se",
+  "gulasidorna.se",
+  "118100.se",
+  "bizzdo.se",
+  "kompass.com",
+  "reko-ringar.se",
+  "rekoringar.se",
+  "linktr.ee",
+];
+
+// Sources other than the producer's own site that a field may use.
+const OPENSTREETMAP = ["openstreetmap.org"];
+
+export const MIN_QUOTE_CHARS = 8;
+
 const FREE_TEXT_FIELDS = ["display_name", "opening_hours", "season", "municipality", "postal_town"];
 
 export function hostOf(url: string): string | null {
@@ -112,8 +138,11 @@ export function normText(s: string): string {
     .trim();
 }
 
+function hostIn(host: string, list: string[]): boolean {
+  return list.some((d) => host === d || host.endsWith(`.${d}`));
+}
 function isDenylisted(host: string): boolean {
-  return SOURCE_HOST_DENYLIST.some((d) => host === d || host.endsWith(`.${d}`));
+  return hostIn(host, SOURCE_HOST_DENYLIST);
 }
 
 function phoneDigits(s: string): string {
@@ -123,15 +152,27 @@ function phoneDigits(s: string): string {
   return d;
 }
 
-/** Replaces personnummer-shaped numbers in raw page text before it is stored. */
-export function redactExcerpt(text: string): { text: string; redacted: number } {
+/**
+ * Replaces personnummer-shaped numbers in raw page text before it is stored.
+ * `keepDigits` exempts the declared business phone: about one Swedish phone
+ * number in a hundred has the date+Luhn shape, and redacting it would break the
+ * phone field's own quote. The judge still checks that the number is published
+ * for the business.
+ */
+export function redactExcerpt(text: string, keepDigits: string[] = []): { text: string; redacted: number } {
   let redacted = 0;
   let out = text;
   for (const hit of findPersonnummer(text)) {
+    if (keepDigits.includes(hit.replace(/\D/g, ""))) continue;
     out = out.split(hit).join("[borttaget]");
     redacted++;
   }
   return { text: out, redacted };
+}
+
+export function declaredPhoneDigits(fields: Record<string, FieldValue> | undefined): string[] {
+  const v = fields?.business_phone?.value;
+  return typeof v === "string" ? [phoneDigits(v)] : [];
 }
 
 export function checkDraft(fields: Record<string, FieldValue>, excerpts: ExcerptIn[], unit: UnitInfo): CheckResult {
@@ -147,9 +188,19 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   }
   if (!fields.display_name) errors.push("missing:display_name");
   if (!fields.product_categories && !fields.sales_channels) errors.push("missing:product_categories_or_sales_channels");
-  if (!fields.website && !fields.business_email && !fields.business_phone) errors.push("missing:website_or_contact");
+  // Every profile rests on the producer's own website (LIA SE §5/§6.7, DPIA T8):
+  // without one there is nothing that may be quoted.
+  if (!fields.website) errors.push("missing:website");
 
   const websiteHost = fields.website && typeof fields.website.value === "string" ? hostOf(fields.website.value) : null;
+  // Which non-register hosts a field may quote from: the own site, plus a few
+  // named exceptions. Anything else (directories, catalogues) is refused.
+  const allowedHosts = (key: string): string[] => {
+    const own = websiteHost ? [websiteHost] : [];
+    if (key === "certifications") return Object.values(SE_CERTIFICATIONS).flat();
+    if (key === "display_name" || key === "visit_address") return [...own, ...OPENSTREETMAP];
+    return own;
+  };
 
   for (const [key, fv] of Object.entries(fields)) {
     if (!(ALLOWED_FIELDS as readonly string[]).includes(key)) continue;
@@ -167,9 +218,9 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
         errors.push(`bad_source_url:${key}`);
         continue;
       }
-      if (isDenylisted(host)) errors.push(`source_host_not_allowed:${key}:${host}`);
+      if (isDenylisted(host) || !hostIn(host, allowedHosts(key))) errors.push(`source_host_not_allowed:${key}:${host}`);
       const quote = normText(src.quote || "");
-      if (quote.length < 3) {
+      if (quote.length < MIN_QUOTE_CHARS) {
         errors.push(`missing_quote:${key}`);
         continue;
       }
@@ -197,7 +248,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   if (fields.website) {
     const v = str("website");
     if (!v || !hostOf(v)) errors.push("bad_value:website");
-    else if (isDenylisted(hostOf(v) as string)) errors.push("website_is_not_own_site");
+    else if (hostIn(hostOf(v) as string, NOT_AN_OWN_SITE)) errors.push("website_is_not_own_site");
     else if (!fields.website.sources.some((s) => hostOf(s.url) === hostOf(v))) errors.push("website_not_sourced_from_itself");
   }
   for (const k of ["business_email", "business_phone"]) {
@@ -252,6 +303,16 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
     if (!fields[k]) continue;
     const v = str(k);
     if (!v || v.length > 300) errors.push(`bad_value:${k}`);
+    // Bind the value to its quote: every number in the value must be in a quote.
+    else {
+      const quoted = fields[k].sources.map((s) => normText(s.quote || "")).join(" ");
+      const nums = v.match(/\d+/g) || [];
+      if (nums.some((n) => !new RegExp(`(?<!\\d)${n}(?!\\d)`).test(quoted))) errors.push(`value_not_in_quote:${k}`);
+    }
+  }
+  if (fields.display_name) {
+    const v = str("display_name");
+    if (v && !fields.display_name.sources.some((s) => normText(s.quote || "").includes(normText(v)))) errors.push("value_not_in_quote:display_name");
   }
   const vocabCheck = (k: string, allowed: readonly string[]) => {
     if (!fields[k]) return;
@@ -279,11 +340,9 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   }
 
   // Personnummer block over every value and quote (the declared phone number is
-  // removed first — phone numbers share the shape, see pii.ts).
-  let scan = JSON.stringify(fields);
-  const phone = str("business_phone");
-  if (phone) scan = scan.split(phone).join("");
-  if (findPersonnummer(scan).length) errors.push("personnummer_in_fields");
+  // exempt in any formatting — phone numbers share the shape, see pii.ts).
+  const keep = declaredPhoneDigits(fields);
+  if (findPersonnummer(JSON.stringify(fields)).some((hit) => !keep.includes(hit.replace(/\D/g, "")))) errors.push("personnummer_in_fields");
 
   return { ok: errors.length === 0, errors };
 }

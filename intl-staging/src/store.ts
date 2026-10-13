@@ -7,7 +7,8 @@
 // side, so a misbehaving batch run cannot keep going past it.
 import crypto from "node:crypto";
 import { type DB, deleteMeta, getMeta, norm, setMeta } from "./db";
-import { checkDraft, type ExcerptIn, type FieldValue, hostOf, redactExcerpt } from "./checks";
+import { checkDraft, declaredPhoneDigits, type ExcerptIn, type FieldValue, hostOf, redactExcerpt } from "./checks";
+import { findPersonnummer } from "./pii";
 
 export const CANDIDATE_LEASE_MS = 3 * 60 * 60 * 1000;
 export const JUDGE_LEASE_MS = 2 * 60 * 60 * 1000;
@@ -40,8 +41,11 @@ export function pausedState(db: DB): { reason: string; at: string } | null {
 export function pause(db: DB, reason: string, now: Date): void {
   if (!pausedState(db)) setMeta(db, "paused", JSON.stringify({ reason, at: now.toISOString() }));
 }
-export function resume(db: DB): void {
+export function resume(db: DB, now: Date): void {
   deleteMeta(db, "paused");
+  // The quality brake counts only verdicts after a resume, so the verdicts that
+  // tripped it cannot re-trip it at the next good verdict (review 2026-10-13).
+  setMeta(db, "quality_since", now.toISOString());
 }
 function assertNotPaused(db: DB): void {
   const p = pausedState(db);
@@ -91,7 +95,7 @@ function unitView(u: UnitRow) {
 
 // ── housekeeping ──────────────────────────────────────────────────────────
 
-export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number } {
+export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number; exhausted: number } {
   const t = iso(now);
   const excerpts = db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes;
   const leases = db
@@ -100,7 +104,11 @@ export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_rel
   const judge = db
     .prepare("UPDATE drafts SET judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE status = 'awaiting_judge' AND judge_lease_expires_at < ?")
     .run(t).changes;
-  return { excerpts_deleted: excerpts, leases_released: leases, judge_leases_released: judge };
+  // Candidates that used up their attempts leave the queue for a human look.
+  const exhausted = db
+    .prepare("UPDATE candidates SET status = 'needs_review', status_reason = 'max_attempts', updated_at = ? WHERE status = 'new' AND attempts >= ?")
+    .run(t, MAX_ATTEMPTS).changes;
+  return { excerpts_deleted: excerpts, leases_released: leases, judge_leases_released: judge, exhausted };
 }
 
 // ── build side ────────────────────────────────────────────────────────────
@@ -162,12 +170,13 @@ export function addSearchCandidate(db: DB, body: { run_id?: unknown; org_nr?: un
   if (!unit) throw new HttpError(404, "not_in_scope");
   const t = iso(now);
   const expires = iso(new Date(now.getTime() + CANDIDATE_LEASE_MS));
-  const existing = db.prepare("SELECT status, lease_run_id, lease_expires_at FROM candidates WHERE candidate_id = ?").get(unitId) as
-    | { status: string; lease_run_id: string | null; lease_expires_at: string | null }
+  const existing = db.prepare("SELECT status, lease_run_id, lease_expires_at, attempts FROM candidates WHERE candidate_id = ?").get(unitId) as
+    | { status: string; lease_run_id: string | null; lease_expires_at: string | null; attempts: number }
     | undefined;
   if (existing) {
     const freeNew = existing.status === "new" || (existing.status === "leased" && (existing.lease_expires_at || "") < t);
     if (!freeNew) throw new HttpError(409, "already_candidate", { status: existing.status });
+    if (existing.attempts >= MAX_ATTEMPTS) throw new HttpError(409, "max_attempts");
     db.prepare("UPDATE candidates SET status = 'leased', lease_run_id = ?, lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE candidate_id = ?").run(
       runId,
       expires,
@@ -227,9 +236,11 @@ export function submitDraft(
     if (!host) throw new HttpError(400, "bad_excerpt_url");
     perHost.set(host, (perHost.get(host) || 0) + 1);
     if ((perHost.get(host) as number) > 4) throw new HttpError(400, "more_than_4_pages_from_one_site", { host });
-    const r = redactExcerpt(e.text.slice(0, 8000));
+    const r = redactExcerpt(e.text.slice(0, 8000), declaredPhoneDigits(fields));
     redacted += r.redacted;
-    excerpts.push({ url: e.url, text: r.text, fetched_at: e.fetched_at });
+    // fetched_at is set by the server: a client value is free text that could
+    // carry anything (review 2026-10-13).
+    excerpts.push({ url: e.url, text: r.text });
   }
   // Excerpts already stored for this candidate (an earlier attempt within TTL) count too.
   const stored = db.prepare("SELECT url, text FROM excerpts WHERE candidate_id = ? AND expires_at >= ?").all(candidateId, t) as ExcerptIn[];
@@ -244,7 +255,7 @@ export function submitDraft(
   const expires = iso(new Date(now.getTime() + EXCERPT_TTL_MS));
   const draftId = db.transaction(() => {
     const ins = db.prepare("INSERT INTO excerpts (candidate_id, url, text, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?)");
-    for (const e of excerpts) ins.run(candidateId, e.url, e.text, e.fetched_at || t, expires);
+    for (const e of excerpts) ins.run(candidateId, e.url, e.text, t, expires);
     db.prepare("UPDATE drafts SET status = 'superseded' WHERE candidate_id = ? AND status = 'awaiting_judge'").run(candidateId);
     const res = db
       .prepare("INSERT INTO drafts (candidate_id, builder_run_id, language, fields_json, check_json, status, created_at) VALUES (?, ?, 'sv', ?, ?, 'awaiting_judge', ?)")
@@ -270,8 +281,10 @@ export function leaseDrafts(db: DB, body: { run_id?: unknown; n?: unknown }, now
   const rows = db.transaction(() => {
     const drafts = db
       .prepare(
-        `SELECT d.draft_id, d.candidate_id, d.fields_json, d.language, u.* FROM drafts d JOIN register_units u ON u.unit_id = d.candidate_id
-         WHERE d.status = 'awaiting_judge' AND d.builder_run_id != ? AND (d.judge_lease_run_id IS NULL OR d.judge_lease_expires_at < ?)
+        `SELECT d.draft_id, d.candidate_id, d.fields_json, d.language, u.* FROM drafts d
+         JOIN register_units u ON u.unit_id = d.candidate_id JOIN candidates c ON c.candidate_id = d.candidate_id
+         WHERE d.status = 'awaiting_judge' AND c.status = 'drafted' AND u.active = 1
+           AND d.builder_run_id != ? AND (d.judge_lease_run_id IS NULL OR d.judge_lease_expires_at < ?)
          ORDER BY d.created_at LIMIT ?`,
       )
       .all(runId, t, n) as Array<UnitRow & { draft_id: number; candidate_id: string; fields_json: string; language: string }>;
@@ -304,6 +317,7 @@ export function submitVerdict(
     direct_sale_ok?: unknown;
     language_ok?: unknown;
     personal_data_found?: unknown;
+    excerpt_verified?: unknown;
     field_results?: unknown;
     reasons?: unknown;
   },
@@ -315,10 +329,17 @@ export function submitVerdict(
   for (const k of ["entity_match", "direct_sale_ok", "language_ok", "personal_data_found"] as const) {
     if (typeof body[k] !== "boolean") throw new HttpError(400, `missing_boolean:${k}`);
   }
-  const fieldResults = body.field_results as Record<string, string> | undefined;
-  if (!fieldResults || typeof fieldResults !== "object") throw new HttpError(400, "field_results_required");
-  const reasons = typeof body.reasons === "string" ? body.reasons.slice(0, 2000) : "";
-  if (!reasons) throw new HttpError(400, "reasons_required");
+  const fieldResults = body.field_results as Record<string, unknown> | undefined;
+  if (!fieldResults || typeof fieldResults !== "object" || Array.isArray(fieldResults)) throw new HttpError(400, "field_results_required");
+  for (const v of Object.values(fieldResults)) {
+    if (v !== "ok" && v !== "unsupported" && v !== "wrong") throw new HttpError(400, "bad_field_result", { allowed: ["ok", "unsupported", "wrong"] });
+  }
+  if (body.excerpt_verified !== undefined && typeof body.excerpt_verified !== "boolean") throw new HttpError(400, "bad_excerpt_verified");
+  if (typeof body.reasons !== "string" || !body.reasons.trim()) throw new HttpError(400, "reasons_required");
+  if (body.reasons.length > 2000) throw new HttpError(400, "reasons_too_long");
+  const reasons = body.reasons;
+  // The judge's own text is stored too, so it gets the same personnummer block.
+  if (findPersonnummer(reasons).length) throw new HttpError(422, "personnummer_in_reasons");
 
   const t = iso(now);
   const d = db.prepare("SELECT candidate_id, builder_run_id, fields_json, status, judge_lease_run_id, judge_lease_expires_at FROM drafts WHERE draft_id = ?").get(draftId) as
@@ -328,9 +349,13 @@ export function submitVerdict(
   if (d.builder_run_id === runId) throw new HttpError(403, "builder_cannot_judge_own_draft");
   if (d.status !== "awaiting_judge" || d.judge_lease_run_id !== runId || (d.judge_lease_expires_at || "") < t) throw new HttpError(409, "judge_lease_not_held");
 
+  const cand = db.prepare("SELECT status FROM candidates WHERE candidate_id = ?").get(d.candidate_id) as { status: string } | undefined;
+  if (!cand || cand.status !== "drafted") throw new HttpError(409, "candidate_not_drafted", { status: cand?.status });
   const fieldKeys = Object.keys(JSON.parse(d.fields_json));
   const missing = fieldKeys.filter((k) => !(k in fieldResults));
   if (missing.length) throw new HttpError(400, "field_results_incomplete", { missing });
+  const extra = Object.keys(fieldResults).filter((k) => !fieldKeys.includes(k));
+  if (extra.length) throw new HttpError(400, "field_results_unknown_fields", { extra });
   const allOk = fieldKeys.every((k) => fieldResults[k] === "ok");
   if (verdict === "approve" && !(body.entity_match && body.direct_sale_ok && body.language_ok && !body.personal_data_found && allOk)) {
     throw new HttpError(400, "approve_inconsistent_with_checks");
@@ -338,8 +363,8 @@ export function submitVerdict(
   const status = verdict === "approve" ? "approved" : verdict === "reject" ? "rejected" : "needs_review";
   db.transaction(() => {
     db.prepare(
-      `INSERT INTO verdicts (draft_id, judge_run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, field_results_json, reasons, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO verdicts (draft_id, judge_run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, excerpt_verified, field_results_json, reasons, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       draftId,
       runId,
@@ -348,6 +373,7 @@ export function submitVerdict(
       body.direct_sale_ok ? 1 : 0,
       body.language_ok ? 1 : 0,
       body.personal_data_found ? 1 : 0,
+      body.excerpt_verified === undefined ? null : body.excerpt_verified ? 1 : 0,
       JSON.stringify(fieldResults),
       reasons,
       t,
@@ -364,11 +390,15 @@ export function submitVerdict(
 }
 
 export function qualityWindow(db: DB) {
-  const rows = db.prepare("SELECT verdict, entity_match FROM verdicts ORDER BY verdict_id DESC LIMIT ?").all(QUALITY_WINDOW) as Array<{ verdict: string; entity_match: number }>;
+  const since = getMeta(db, "quality_since") || "";
+  const rows = db
+    .prepare("SELECT verdict, entity_match, excerpt_verified FROM verdicts WHERE created_at > ? ORDER BY verdict_id DESC LIMIT ?")
+    .all(since, QUALITY_WINDOW) as Array<{ verdict: string; entity_match: number; excerpt_verified: number | null }>;
   const n = rows.length;
   const mismatch = rows.filter((r) => !r.entity_match).length;
   const approved = rows.filter((r) => r.verdict === "approve").length;
-  return { n, entity_mismatch_rate: n ? mismatch / n : 0, approve_rate: n ? approved / n : 0 };
+  const verified = rows.filter((r) => r.excerpt_verified === 1).length;
+  return { n, since: since || null, entity_mismatch_rate: n ? mismatch / n : 0, approve_rate: n ? approved / n : 0, excerpt_verified_share: n ? verified / n : 0 };
 }
 
 // ── reporting ─────────────────────────────────────────────────────────────

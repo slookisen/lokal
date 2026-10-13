@@ -29,7 +29,10 @@ function dateOk(yymmdd: string): boolean {
   return (dd >= 1 && dd <= 31) || (dd >= 61 && dd <= 91);
 }
 
-const CANDIDATE_RE = /(?<!\d)(?:(19|20)?(\d{6})[-+]?(\d{4}))(?!\d)/g;
+// Separator between the date and the serial: none, hyphen/plus, any Unicode
+// dash, a space, a no-break space or a dot (review 2026-10-13: «800101–1231»
+// with an en dash and «800101 1231» slipped through).
+const CANDIDATE_RE = /(?<!\d)(?:(19|20)?(\d{6})[-+\u2010-\u2015\u2212 \u00a0\u202f.]?(\d{4}))(?!\d)/g;
 
 export function findPersonnummer(text: string): string[] {
   const hits: string[] = [];

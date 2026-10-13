@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS verdicts (
   direct_sale_ok INTEGER NOT NULL,
   language_ok INTEGER NOT NULL,
   personal_data_found INTEGER NOT NULL,
+  excerpt_verified INTEGER,
   field_results_json TEXT NOT NULL,
   reasons TEXT NOT NULL,
   created_at TEXT NOT NULL

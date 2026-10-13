@@ -188,6 +188,7 @@ interface UnitRow {
 export interface ImportCounts {
   scb_rows: number;
   in_scope_units: number;
+  stored_units: number;
   bolagsverket_records: number;
   bolagsverket_malformed: number;
   units_with_description: number;
@@ -223,6 +224,7 @@ export async function runSeImport(
   const counts: ImportCounts = {
     scb_rows: 0,
     in_scope_units: 0,
+    stored_units: 0,
     bolagsverket_records: 0,
     bolagsverket_malformed: 0,
     units_with_description: 0,
@@ -256,7 +258,8 @@ export async function runSeImport(
       if (looksLikeSwedishPersonId(orgNr)) continue;
       const sni = [f[idx.Ng1], f[idx.Ng2], f[idx.Ng3], f[idx.Ng4], f[idx.Ng5]].map((s) => (s || "").trim()).filter(Boolean);
       if (!sni.some((c) => SNI_PREFIXES.includes(c.slice(0, 2)))) continue;
-      if (sni[0] === REINDEER_HERDING) continue;
+      // LIA SE §4.3: reindeer herding is left out entirely, main or side activity.
+      if (sni.includes(REINDEER_HERDING)) continue;
       if (opts.isOptedOut && opts.isOptedOut(orgNr)) {
         counts.skipped_optout++;
         continue;
@@ -320,19 +323,29 @@ export async function runSeImport(
     UPDATE candidates SET status = 'new', status_reason = NULL, updated_at = ?
     WHERE candidate_id = ? AND status = 'excluded' AND status_reason = 'register_inactive'`);
 
-  const rows = [...units.values()];
+  // Decide what is stored. Candidates need the target industry as MAIN activity
+  // (Ng1), as in the phase-1 sample. AB and ekonomisk förening without a signal
+  // stay in the register index so search mode can match them. HB/KB names are
+  // often the partners' own names, so an HB/KB is stored only when it is a
+  // candidate (LIA SE §7 / DPIA T16b: filter in memory, store only what is used).
+  const rows: Array<UnitRow & { signal: Signal | null }> = [];
+  for (const u of units.values()) {
+    if (u.descriptions.length) counts.units_with_description++;
+    const mainInScope = SNI_PREFIXES.includes(u.sni[0].slice(0, 2));
+    const signal = mainInScope && u.descriptions.length ? directSaleSignal(u.descriptions.join(" ")) : null;
+    if (u.legalForm === "HB/KB" && !signal) continue;
+    rows.push({ ...u, signal });
+  }
+  units.clear();
+  counts.stored_units = rows.length;
+
   const BATCH = 1000;
   for (let i = 0; i < rows.length; i += BATCH) {
-    const tx = db.transaction((batch: UnitRow[]) => {
+    const tx = db.transaction((batch: Array<UnitRow & { signal: Signal | null }>) => {
       for (const u of batch) {
         const unitId = `se:${u.orgNr}`;
         const county = countyForPostalCode(u.postalCode);
-        // Candidates need the target industry as MAIN activity (Ng1), as in the
-        // phase-1 sample; units with it only as a side activity stay in the
-        // register index so search mode can still match them.
-        const mainInScope = SNI_PREFIXES.includes(u.sni[0].slice(0, 2));
-        const signal = mainInScope && u.descriptions.length ? directSaleSignal(u.descriptions.join(" ")) : null;
-        if (u.descriptions.length) counts.units_with_description++;
+        const signal = u.signal;
         upsertUnit.run({
           unit_id: unitId,
           org_nr: u.orgNr,
@@ -367,7 +380,7 @@ export async function runSeImport(
   // Deactivate units that left the register or the scope — unless this import
   // saw suspiciously few units (a truncated download must not mass-exclude).
   const previouslyActive = (db.prepare("SELECT COUNT(*) AS n FROM register_units WHERE country = 'se' AND active = 1 AND last_seen_import != ?").get(opts.importId) as { n: number }).n;
-  const seenNow = units.size;
+  const seenNow = rows.length;
   if (previouslyActive > 0 && seenNow < 0.5 * (previouslyActive + seenNow)) {
     counts.deactivation_skipped = `only ${seenNow} units seen against ${previouslyActive} not seen; deactivation skipped`;
   } else {
@@ -376,10 +389,12 @@ export async function runSeImport(
       const deact = db.prepare("UPDATE register_units SET active = 0, updated_at = ? WHERE unit_id = ?");
       const excl = db.prepare("UPDATE candidates SET status = 'excluded', status_reason = 'register_inactive', lease_run_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE candidate_id = ? AND status != 'approved'");
       const review = db.prepare("UPDATE candidates SET status = 'needs_review', status_reason = 'register_inactive', updated_at = ? WHERE candidate_id = ? AND status = 'approved'");
+      const supersede = db.prepare("UPDATE drafts SET status = 'superseded', judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE candidate_id = ? AND status = 'awaiting_judge'");
       for (const s of stale) {
         deact.run(nowIso, s.unit_id);
         excl.run(nowIso, s.unit_id);
         review.run(nowIso, s.unit_id);
+        supersede.run(s.unit_id);
       }
       counts.deactivated_units = stale.length;
     });
