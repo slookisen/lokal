@@ -29,6 +29,7 @@ const AB_IT = "5561000077";
 const AB_SVIN = "5561000088";
 const AB_DEREG = "5561000099";
 const AB_ADBLOCK = "5561000100";
+const AB_SIDE = "5561000111";
 
 function fixtures() {
   const scb = scbFile([
@@ -42,6 +43,8 @@ function fixtures() {
     { PeOrgNr: `16${AB_SVIN}`, JurForm: "49", FtgStat: "1", Namn: "Grisgården AB", Ng1: "01460", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "1" },
     { PeOrgNr: `16${AB_DEREG}`, JurForm: "49", FtgStat: "1", Namn: "Nystart AB", Ng1: "01110", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "1" },
     { PeOrgNr: `16${AB_ADBLOCK}`, JurForm: "41", FtgStat: "1", Namn: "Spärrad Gård AB", Ng1: "10110", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "2" },
+    // Target industry only as a side activity: register index yes, candidate no.
+    { PeOrgNr: `16${AB_SIDE}`, JurForm: "49", FtgStat: "1", Namn: "Konsult & Odling AB", Ng1: "70220", Ng2: "01130", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "1" },
     // Sole trader: the identifier is a personnummer. Must never reach the database.
     { PeOrgNr: PNR12, JurForm: "10", FtgStat: "1", Namn: "Anna Andersson", Ng1: "01110", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "1" },
   ]);
@@ -51,6 +54,7 @@ function fixtures() {
     { organisationsidentitet: `${AB_SVIN}$ORGNR-IDORG`, organisationsform: "AB-ORGFO", verksamhetsbeskrivning: "Svinproduktion och växtodling." },
     { organisationsidentitet: `${AB_DEREG}$ORGNR-IDORG`, organisationsform: "AB-ORGFO", avregistreringsdatum: "2019-01-01", verksamhetsbeskrivning: "Gårdsbutik och självplock." },
     { organisationsidentitet: `${AB_ADBLOCK}$ORGNR-IDORG`, organisationsform: "AB-ORGFO", verksamhetsbeskrivning: "Charkuteri och försäljning av egenproducerade varor." },
+    { organisationsidentitet: `${AB_SIDE}$ORGNR-IDORG`, verksamhetsbeskrivning: "Managementkonsult samt gårdsbutik." },
     { organisationsidentitet: `${PNR12}$PERSONNR-IDORG`, organisationsform: "EF-ORGFO", verksamhetsbeskrivning: "Gårdsbutik." },
   ]);
   return { scb, bv };
@@ -89,12 +93,13 @@ test("import keeps only active legal persons in scope and never stores a sole tr
 
   const units = db.prepare("SELECT org_nr, legal_form, county, ad_block, signal FROM register_units ORDER BY org_nr").all() as any[];
   const orgs = units.map((u) => u.org_nr);
-  assert.deepEqual(orgs.sort(), [AB_VG, AB_SVIN, AB_DEREG, AB_ADBLOCK, EK_STHLM, HB_SKANE].sort());
+  assert.deepEqual(orgs.sort(), [AB_VG, AB_SVIN, AB_DEREG, AB_ADBLOCK, EK_STHLM, HB_SKANE, AB_SIDE].sort());
   assert.ok(!orgs.includes(AB_REINDEER), "reindeer herding as main SNI is out");
   assert.ok(!orgs.includes(AB_INACTIVE), "FtgStat 0 is out");
   assert.ok(!orgs.includes(ENKLA_BOLAG), "enkla bolag is out");
   assert.ok(!orgs.includes(AB_IT), "SNI outside 01/03/10/11 is out");
-  assert.equal(counts.in_scope_units, 6);
+  assert.equal(counts.in_scope_units, 7);
+  assert.equal(units.find((u) => u.org_nr === AB_SIDE).signal, null, "side-activity units are indexed but not candidates");
 
   const cands = db.prepare("SELECT candidate_id, priority FROM candidates ORDER BY priority, candidate_id").all() as any[];
   assert.deepEqual(
@@ -129,7 +134,7 @@ test("re-import deactivates units that left the register; a truncated file does 
   const { db } = makeTestApp();
   await runSeImport(db, sourcesFrom(scb, bv), { importId: "imp-1", now: () => new Date("2026-10-13T10:00:00Z") });
 
-  // Second import without the Skåne HB (5 of 6 seen → deactivation runs).
+  // Second import without the Skåne HB and the side-activity AB (5 of 7 seen → deactivation runs).
   const scb2 = scbFile([
     { PeOrgNr: `16${AB_VG}`, JurForm: "49", FtgStat: "1", Namn: "Gårdens Mat AB", Ng1: "01110", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "1" },
     { PeOrgNr: `16${EK_STHLM}`, JurForm: "51", FtgStat: "1", Namn: "Odlarföreningen ek. för.", Ng1: "01130", PostNr: "11120", PostOrt: "STOCKHOLM", Reklamsparrtyp: "1" },
@@ -138,7 +143,7 @@ test("re-import deactivates units that left the register; a truncated file does 
     { PeOrgNr: `16${AB_ADBLOCK}`, JurForm: "41", FtgStat: "1", Namn: "Spärrad Gård AB", Ng1: "10110", PostNr: "41101", PostOrt: "GÖTEBORG", Reklamsparrtyp: "2" },
   ]);
   const c2 = await runSeImport(db, sourcesFrom(scb2, bv), { importId: "imp-2", now: () => new Date("2026-10-20T10:00:00Z") });
-  assert.equal(c2.deactivated_units, 1);
+  assert.equal(c2.deactivated_units, 2); // the Skåne HB and the side-activity AB
   const hb = db.prepare("SELECT status, status_reason FROM candidates WHERE candidate_id = ?").get(`se:${HB_SKANE}`) as any;
   assert.deepEqual(hb, { status: "excluded", status_reason: "register_inactive" });
 

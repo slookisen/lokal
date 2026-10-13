@@ -327,7 +327,11 @@ export async function runSeImport(
       for (const u of batch) {
         const unitId = `se:${u.orgNr}`;
         const county = countyForPostalCode(u.postalCode);
-        const signal = u.descriptions.length ? directSaleSignal(u.descriptions.join(" ")) : null;
+        // Candidates need the target industry as MAIN activity (Ng1), as in the
+        // phase-1 sample; units with it only as a side activity stay in the
+        // register index so search mode can still match them.
+        const mainInScope = SNI_PREFIXES.includes(u.sni[0].slice(0, 2));
+        const signal = mainInScope && u.descriptions.length ? directSaleSignal(u.descriptions.join(" ")) : null;
         if (u.descriptions.length) counts.units_with_description++;
         upsertUnit.run({
           unit_id: unitId,
