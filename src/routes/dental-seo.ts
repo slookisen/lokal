@@ -2203,7 +2203,9 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/personvern", (_req: Request, res: Response) => {
-  const updatedDate = "2026-10-09"; // operator → AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as)
+  // 2026-10-13: visit and search statistics described (dev-request
+  // 2026-10-13-statistikk-riktig-for-investorer, S2: searches are now logged).
+  const updatedDate = "2026-10-13";
   const html = `
 <main>
   <div class="content-page">
@@ -2214,19 +2216,23 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>${companyControllerSentenceHtml("nb", { siteName: "Finn-tannlege.com", siteEmail: "kontakt@finn-tannlege.com" })}</p>
 
     <h2>Hvilke data behandler vi?</h2>
-    <p>Vi behandler <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>:</p>
+    <p>Om klinikkene behandler vi <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>:</p>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, adresse, kontaktinformasjon og næringsgruppekode for registrerte tannlegeklinikker</li>
       <li><strong>Offentlige helseregistre (HPR)</strong> &mdash; autorisasjon og spesialisttittel for helsepersonell i yrkesutøvelse (offentlig informasjon etter helsepersonelloven)</li>
       <li><strong>Klinikkenes egne offentlige nettsider</strong> &mdash; åpningstider, behandlingstilbud og presentasjonstekst</li>
     </ul>
-    <p>Vi behandler <strong>ingen pasientdata</strong>, <strong>ingen helseopplysninger om enkeltpersoner</strong> og ingen sensitiv personinformasjon utover det som er offentlig tilgjengelig i kapasitet som yrkesutøver.</p>
+    <p>Vi behandler <strong>ingen pasientdata</strong>, <strong>ingen helseopplysninger om enkeltpersoner</strong> og ingen sensitiv personinformasjon utover det som er offentlig tilgjengelig i kapasitet som yrkesutøver. Om deg som besøker siden lagrer vi bare besøks- og søkestatistikken beskrevet under.</p>
+
+    <h2>Besøks- og søkestatistikk</h2>
+    <p>For å forstå hvordan tjenesten brukes, registrerer serveren &mdash; uten cookies &mdash; for hvert sidebesøk hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (vi lagrer aldri hele IP-adressen) og en grov klassifisering av nettleseren (for eksempel mobil, PC eller søkemotor). Når du søker på nettsiden eller via API-et, lagrer vi i tillegg søketeksten og filtrene du valgte (for eksempel fylke, spesialitet eller akutt), antall treff og den samme IP-hashen. Når en AI-assistent bruker våre MCP- eller A2A-verktøy, logger vi verktøyet, AI-klientens nettleser-/klientstreng og en saltet IP-hash.</p>
+    <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Opplysningene deles ikke med noen.</p>
 
     <h2>Navngitte personer</h2>
     <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>
 
     <h2>Behandlingsgrunnlag</h2>
-    <p>Behandlingen er basert på <strong>berettiget interesse</strong>, jf. GDPR artikkel 6 (1) bokstav f. Det er et legitimt behov for at befolkningen enkelt kan finne og sammenligne tannlegeklinikker og verifisere helsepersonells autorisasjon. Behandlingen er begrenset til offentlig tilgjengelige data og medfører lav personvernrisiko.</p>
+    <p>Behandlingen er basert på <strong>berettiget interesse</strong>, jf. GDPR artikkel 6 (1) bokstav f. Det er et legitimt behov for at befolkningen enkelt kan finne og sammenligne tannlegeklinikker og verifisere helsepersonells autorisasjon. Behandlingen er begrenset til offentlig tilgjengelige data og medfører lav personvernrisiko. Besøks- og søkestatistikken behandles også på grunnlag av berettiget interesse: å forstå hvordan tjenesten brukes og forbedre den.</p>
 
     <h2>Dine rettigheter</h2>
     <p>Du har rettigheter etter GDPR kapittel III, herunder:</p>
@@ -2239,7 +2245,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>Send forespørsel til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 30 dager.</p>
 
     <h2>Informasjonskapsler (cookies)</h2>
-    <p>Vi bruker <strong>ingen sporingscookies</strong> og ingen markedsføringscookies. Tjenesten benytter kun anonym, aggregert, server-side trafikkstatistikk som ikke kan kobles til enkeltpersoner. Det lagres ingen cookies på din enhet for analyseformål.</p>
+    <p>Vi bruker <strong>ingen sporingscookies</strong> og ingen markedsføringscookies. Det lagres ingen cookies på din enhet for analyseformål; statistikken over regnes ut på serveren.</p>
 
     <h2>Tredjeparter</h2>
     <p>Vi <strong>selger ikke</strong> og deler ikke personopplysninger med tredjeparter for kommersielle formål. Tjenesten driftes på Fly.io i EU-region (Frankfurt). Ingen persondata overføres til land utenfor EU/EØS-området.</p>

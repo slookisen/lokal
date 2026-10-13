@@ -322,7 +322,12 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       }
       // Unchanged privacy wording around the replaced sentence stays put.
       check(no.body.includes("er en åpen katalog over lokale") && en.body.includes("is an open catalogue of local"), "AC3 rfb /personvern: the surrounding «Hvem vi er» wording is untouched");
-      check(ft.body.includes("<h2>Behandlingsansvarlig</h2>") && ft.body.includes("Vi behandler <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>"), "AC3 finn-tannlege /personvern: headings and data wording untouched");
+      // 2026-10-13 (statistikk-riktig-for-investorer, S2): «utelukkende offentlig
+      // tilgjengelige virksomhetsdata» is now said about the clinics, and the
+      // visit and search statistics have their own section.
+      check(ft.body.includes("<h2>Behandlingsansvarlig</h2>") && ft.body.includes("Om klinikkene behandler vi <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>"), "AC3 finn-tannlege /personvern: headings and data wording kept");
+      check(ft.body.includes("<h2>Besøks- og søkestatistikk</h2>") && ft.body.includes("slettes automatisk etter 60 dager") && !ft.body.includes("kun anonym, aggregert"),
+        "AC3 finn-tannlege /personvern: visit and search statistics described (IP hash, 60 days), not called anonymous");
       check(oa.body.includes("Ingen sporingscookies.") && oa.body.includes("No tracking cookies."), "AC3 opplevagent /personvern: cookie wording untouched");
     }
 
