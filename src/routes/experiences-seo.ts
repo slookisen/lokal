@@ -24,6 +24,7 @@
  */
 
 import express, { Router, Request, Response, NextFunction } from "express";
+import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import * as QRCode from "qrcode";
 // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: reads the
 // vendored Leaflet assets (src/public/leaflet/) off disk for the
@@ -2533,10 +2534,9 @@ Sitemap: ${url}/sitemap.xml
 // GET /sitemap.xml
 // ═══════════════════════════════════════════════════════════
 
-router.get("/sitemap.xml", (_req: Request, res: Response) => {
+function buildExperiencesSitemapXml(): string {
   const url = baseUrl();
   const today = new Date().toISOString().slice(0, 10);
-  res.setHeader("Content-Type", "application/xml; charset=utf-8");
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
     { p: "/en", freq: "daily", pri: "0.9" },
@@ -2696,7 +2696,31 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
   } catch { /* experiences DB not open */ }
   xml += `\n</urlset>\n`;
-  res.send(xml);
+  return xml;
+}
+
+// Slice C (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx): short-TTL in-memory
+// cache (same SITEMAP_CACHE_TTL_MS as rfb). baseUrl() is a fixed constant -> one entry.
+const experiencesSitemapCache = createSitemapCache("experiences", buildExperiencesSitemapXml);
+export function getExperiencesSitemapXml(now?: number, build?: () => string): string {
+  return experiencesSitemapCache.get(now, build);
+}
+export function __resetExperiencesSitemapCacheForTesting(): void {
+  experiencesSitemapCache.reset();
+}
+
+router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  const startedAt = Date.now();
+  try {
+    const xml = getExperiencesSitemapXml();
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
+    res.send(xml);
+  } catch (err) {
+    console.error("[experiences-sitemap] error:", err);
+    res.status(500).send("Error generating sitemap");
+  }
+  logSlowSitemap("experiences", startedAt);
 });
 
 // ═══════════════════════════════════════════════════════════
