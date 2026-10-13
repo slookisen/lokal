@@ -131,8 +131,12 @@ test("deterministic checks refuse unsupported or forbidden fields", async () => 
     };
     assert.ok((await errs({ opening_hours: { value: "mån–fre 9–17", sources: [{ url: PAGE, quote: "mån–fre 9–17" }] } })).includes("quote_not_in_excerpt:opening_hours"));
     assert.ok((await errs({ owner_name: { value: "Anna", sources: [{ url: PAGE, quote: "Gårdens Mat" }] } })).includes("field_not_allowed:owner_name"));
+    // A social-media page can be neither a stored excerpt nor a field source.
+    const fb = await post({ ...goodDraft("build-run-2"), excerpts: [{ url: PAGE, text: PAGE_TEXT }, { url: "https://www.facebook.com/gardensmat", text: "lördagar 10–14" }] });
+    assert.equal(fb.status, 400);
+    assert.equal(fb.json.error, "excerpt_host_not_allowed");
     assert.ok(
-      (await errs({ opening_hours: { value: "lördagar 10–14", sources: [{ url: "https://www.facebook.com/gardensmat", quote: "lördagar 10–14" }] } }, { excerpts: [{ url: PAGE, text: PAGE_TEXT }, { url: "https://www.facebook.com/gardensmat", text: "lördagar 10–14" }] })).some((e) =>
+      (await errs({ opening_hours: { value: "lördagar 10–14", sources: [{ url: "https://www.facebook.com/gardensmat", quote: "lördagar 10–14" }] } })).some((e) =>
         e.startsWith("source_host_not_allowed:opening_hours"),
       ),
     );
@@ -140,10 +144,7 @@ test("deterministic checks refuse unsupported or forbidden fields", async () => 
     assert.ok((await errs({ visit_address: { value: { street: "Byvägen 1" }, sources: [{ url: PAGE, quote: "Besöksadress: Byvägen 1" }] } })).includes("visit_address_needs_two_sources"));
     assert.ok((await errs({ display_name: { value: "Gårdens Mat og søster", sources: [{ url: PAGE, quote: "Gårdens Mat AB" }] } })).includes("not_swedish:display_name"));
     assert.ok((await errs({ org_nr: { value: "5561000099", sources: [{ url: "register:se" }] } })).includes("org_nr_mismatch"));
-    const emailElsewhere = await errs(
-      { business_email: { value: "info@gardensmat.se", sources: [{ url: "https://katalog.example.se/gardensmat", quote: "info@gardensmat.se" }] } },
-      { excerpts: [{ url: PAGE, text: PAGE_TEXT }, { url: "https://katalog.example.se/gardensmat", text: "info@gardensmat.se" }] },
-    );
+    const emailElsewhere = await errs({ business_email: { value: "info@gardensmat.se", sources: [{ url: "https://katalog.example.se/gardensmat", quote: "info@gardensmat.se" }] } });
     assert.ok(emailElsewhere.includes("business_email_not_published_on_own_site"));
 
     // Visiting address confirmed by the own site AND the register is accepted.

@@ -79,7 +79,7 @@ filter). That is an ordinary restart of `lokal`.
 | POST | `/judge/lease` | `{run_id, n≤25}` → drafts from other runs, with excerpts |
 | POST | `/drafts/:id/verdict` | `{run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, excerpt_verified?, field_results, reasons}` |
 | GET | `/sample?n=10` | random approved profiles for a human spot check |
-| POST | `/pause` · `/resume` · `/purge` · `/optout` | operations |
+| POST | `/pause` · `/resume` · `/purge` · `/optout` | operations (`/resume` also restarts the quality window, whatever the pause reason) |
 
 ## Local development
 

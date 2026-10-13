@@ -7,7 +7,7 @@
 // side, so a misbehaving batch run cannot keep going past it.
 import crypto from "node:crypto";
 import { type DB, deleteMeta, getMeta, norm, setMeta } from "./db";
-import { checkDraft, declaredPhoneDigits, type ExcerptIn, type FieldValue, hostOf, redactExcerpt } from "./checks";
+import { checkDraft, declaredPhoneDigits, excerptHostAllowed, type ExcerptIn, type FieldValue, hostOf, ownSiteHost, redactExcerpt } from "./checks";
 import { findPersonnummer } from "./pii";
 
 export const CANDIDATE_LEASE_MS = 3 * 60 * 60 * 1000;
@@ -95,7 +95,7 @@ function unitView(u: UnitRow) {
 
 // ── housekeeping ──────────────────────────────────────────────────────────
 
-export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number; exhausted: number } {
+export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number; exhausted: number; stale_drafts: number } {
   const t = iso(now);
   const excerpts = db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes;
   const leases = db
@@ -104,11 +104,19 @@ export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_rel
   const judge = db
     .prepare("UPDATE drafts SET judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE status = 'awaiting_judge' AND judge_lease_expires_at < ?")
     .run(t).changes;
+  // A draft nobody judged before its excerpts expired cannot be judged against
+  // its sources any more: retire it and put the candidate back in the queue.
+  const staleBefore = iso(new Date(now.getTime() - EXCERPT_TTL_MS));
+  const stale = db.prepare("SELECT draft_id, candidate_id FROM drafts WHERE status = 'awaiting_judge' AND created_at < ?").all(staleBefore) as Array<{ draft_id: number; candidate_id: string }>;
+  for (const d of stale) {
+    db.prepare("UPDATE drafts SET status = 'superseded', judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE draft_id = ?").run(d.draft_id);
+    db.prepare("UPDATE candidates SET status = 'new', status_reason = 'draft_expired', updated_at = ? WHERE candidate_id = ? AND status = 'drafted'").run(t, d.candidate_id);
+  }
   // Candidates that used up their attempts leave the queue for a human look.
   const exhausted = db
     .prepare("UPDATE candidates SET status = 'needs_review', status_reason = 'max_attempts', updated_at = ? WHERE status = 'new' AND attempts >= ?")
     .run(t, MAX_ATTEMPTS).changes;
-  return { excerpts_deleted: excerpts, leases_released: leases, judge_leases_released: judge, exhausted };
+  return { excerpts_deleted: excerpts, leases_released: leases, judge_leases_released: judge, exhausted, stale_drafts: stale.length };
 }
 
 // ── build side ────────────────────────────────────────────────────────────
@@ -227,6 +235,11 @@ export function submitDraft(
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new HttpError(400, "fields_required");
   const rawExcerpts = Array.isArray(body.excerpts) ? (body.excerpts as ExcerptIn[]) : [];
   if (rawExcerpts.length > 8) throw new HttpError(400, "too_many_excerpts");
+  // Excerpts are stored for 30 days, so they may only come from the producer's
+  // own site (plus OpenStreetMap and krav.se): a people-search or social page
+  // pasted "as identity proof" would store exactly the personal data this base
+  // must not hold (review 2026-10-13, round 2; DPIA R4/R5, T8).
+  const websiteHost = ownSiteHost(fields);
   const perHost = new Map<string, number>();
   const excerpts: ExcerptIn[] = [];
   let redacted = 0;
@@ -234,6 +247,7 @@ export function submitDraft(
     if (!e || typeof e.url !== "string" || typeof e.text !== "string") throw new HttpError(400, "bad_excerpt");
     const host = hostOf(e.url);
     if (!host) throw new HttpError(400, "bad_excerpt_url");
+    if (!excerptHostAllowed(host, websiteHost)) throw new HttpError(400, "excerpt_host_not_allowed", { host });
     perHost.set(host, (perHost.get(host) || 0) + 1);
     if ((perHost.get(host) as number) > 4) throw new HttpError(400, "more_than_4_pages_from_one_site", { host });
     const r = redactExcerpt(e.text.slice(0, 8000), declaredPhoneDigits(fields));

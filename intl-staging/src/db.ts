@@ -117,7 +117,17 @@ export function openDb(file: string): DB {
   // Cap the WAL so a long import cannot balloon the volume (DPIA T17 note).
   db.pragma("journal_size_limit = 67108864");
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+// Schema migrations keyed on PRAGMA user_version. SCHEMA above is version 1;
+// a later column goes in as `if (v < 2) { ALTER TABLE …; }` so an existing
+// volume gets it too (CREATE TABLE IF NOT EXISTS never alters a table).
+const SCHEMA_VERSION = 1;
+function migrate(db: DB): void {
+  const v = db.pragma("user_version", { simple: true }) as number;
+  if (v < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 }
 
 /** Case-folds Swedish text for search (SQLite's NOCASE only folds ASCII). */

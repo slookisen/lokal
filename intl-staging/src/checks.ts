@@ -116,6 +116,19 @@ export function hostOf(url: string): string | null {
   }
 }
 
+/** The producer's own site host, or null when the website field is missing or not a real host. */
+export function ownSiteHost(fields: Record<string, FieldValue> | undefined): string | null {
+  const v = fields?.website?.value;
+  const h = typeof v === "string" ? hostOf(v) : null;
+  return h && h.includes(".") ? h : null;
+}
+
+/** Hosts a page excerpt may come from: the own site plus the named exceptions. */
+export function excerptHostAllowed(host: string, websiteHost: string | null): boolean {
+  const allowed = [...(websiteHost ? [websiteHost] : []), "openstreetmap.org", ...Object.values(SE_CERTIFICATIONS).flat()];
+  return allowed.some((d) => host === d || host.endsWith(`.${d}`));
+}
+
 export function normUrl(url: string): string {
   try {
     const u = new URL(url);
@@ -163,16 +176,34 @@ export function redactExcerpt(text: string, keepDigits: string[] = []): { text: 
   let redacted = 0;
   let out = text;
   for (const hit of findPersonnummer(text)) {
-    if (keepDigits.includes(hit.replace(/\D/g, ""))) continue;
+    if (isDeclaredPhoneHit(hit, keepDigits)) continue;
     out = out.split(hit).join("[borttaget]");
     redacted++;
   }
   return { text: out, redacted };
 }
 
+/** A Swedish phone number after +46 → 0: a leading 0 and 8–10 digits in all. */
+export const SWEDISH_PHONE_RE = /^0\d{7,9}$/;
+
 export function declaredPhoneDigits(fields: Record<string, FieldValue> | undefined): string[] {
   const v = fields?.business_phone?.value;
-  return typeof v === "string" ? [phoneDigits(v)] : [];
+  if (typeof v !== "string") return [];
+  const d = phoneDigits(v);
+  return SWEDISH_PHONE_RE.test(d) ? [d] : [];
+}
+
+/**
+ * Whether a personnummer-shaped hit may stay because it IS the declared
+ * business phone. Only 10-digit hits that start with 0 qualify, and never one
+ * written the personnummer way (6 digits, hyphen or plus, 4 digits) — phone
+ * numbers are not written like that (review 2026-10-13, round 2).
+ */
+export function isDeclaredPhoneHit(hit: string, keepDigits: string[]): boolean {
+  const d = hit.replace(/\D/g, "");
+  if (d.length !== 10 || !d.startsWith("0")) return false;
+  if (/^\d{6}[-+]\d{4}$/.test(hit)) return false;
+  return keepDigits.includes(d);
 }
 
 export function checkDraft(fields: Record<string, FieldValue>, excerpts: ExcerptIn[], unit: UnitInfo): CheckResult {
@@ -192,7 +223,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   // without one there is nothing that may be quoted.
   if (!fields.website) errors.push("missing:website");
 
-  const websiteHost = fields.website && typeof fields.website.value === "string" ? hostOf(fields.website.value) : null;
+  const websiteHost = ownSiteHost(fields);
   // Which non-register hosts a field may quote from: the own site, plus a few
   // named exceptions. Anything else (directories, catalogues) is refused.
   const allowedHosts = (key: string): string[] => {
@@ -247,7 +278,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   }
   if (fields.website) {
     const v = str("website");
-    if (!v || !hostOf(v)) errors.push("bad_value:website");
+    if (!v || !hostOf(v) || !(hostOf(v) as string).includes(".")) errors.push("bad_value:website");
     else if (hostIn(hostOf(v) as string, NOT_AN_OWN_SITE)) errors.push("website_is_not_own_site");
     else if (!fields.website.sources.some((s) => hostOf(s.url) === hostOf(v))) errors.push("website_not_sourced_from_itself");
   }
@@ -269,7 +300,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
       else if (!own.some((s) => normText(s.quote || "").includes(v.toLowerCase()))) errors.push("business_email_not_in_quote");
     } else {
       const d = phoneDigits(v);
-      if (d.length < 7 || d.length > 13) errors.push("bad_value:business_phone");
+      if (!SWEDISH_PHONE_RE.test(d)) errors.push("bad_value:business_phone");
       else if (!own.some((s) => phoneDigits(s.quote || "").includes(d))) errors.push("business_phone_not_in_quote");
     }
   }
@@ -342,7 +373,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
   // Personnummer block over every value and quote (the declared phone number is
   // exempt in any formatting — phone numbers share the shape, see pii.ts).
   const keep = declaredPhoneDigits(fields);
-  if (findPersonnummer(JSON.stringify(fields)).some((hit) => !keep.includes(hit.replace(/\D/g, "")))) errors.push("personnummer_in_fields");
+  if (findPersonnummer(JSON.stringify(fields)).some((hit) => !isDeclaredPhoneHit(hit, keep))) errors.push("personnummer_in_fields");
 
   return { ok: errors.length === 0, errors };
 }

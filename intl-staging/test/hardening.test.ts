@@ -192,12 +192,23 @@ test("own-site rule: a directory page is neither a website nor a field source", 
     await call(base, "POST", "/candidates/lease", { run_id: "build-c1", n: 1 });
     const cat = "https://www.gulasidorna.se/gardens-mat";
     const catText = "Gårdens Mat AB. Öppettider: lördagar 10–14.";
-    const r1 = await call(base, "POST", draftPath, draft("build-c1", { opening_hours: { value: "lördagar 10–14", sources: [{ url: cat, quote: "Öppettider: lördagar 10–14" }] } }, [{ url: PAGE, text: PAGE_TEXT }, { url: cat, text: catText }]));
+    const r0 = await call(base, "POST", draftPath, draft("build-c1", {}, [{ url: PAGE, text: PAGE_TEXT }, { url: cat, text: catText }]));
+    assert.equal(r0.status, 400, "a directory page is not stored as an excerpt");
+    assert.equal(r0.json.error, "excerpt_host_not_allowed");
+    const r1 = await call(base, "POST", draftPath, draft("build-c1", { opening_hours: { value: "lördagar 10–14", sources: [{ url: cat, quote: "Öppettider: lördagar 10–14" }] } }));
     assert.equal(r1.status, 422);
     assert.ok(r1.json.detail.errors.some((e: string) => e.startsWith("source_host_not_allowed:opening_hours")));
-    const r2 = await call(base, "POST", draftPath, draft("build-c1", { website: { value: cat, sources: [{ url: cat, quote: "Gårdens Mat AB. Öppettider" }] } }, [{ url: PAGE, text: PAGE_TEXT }, { url: cat, text: catText }]));
+    const r2 = await call(base, "POST", draftPath, draft("build-c1", { website: { value: cat, sources: [{ url: cat, quote: "Gårdens Mat AB. Öppettider" }] } }, [{ url: cat, text: catText }]));
+    assert.equal(r2.status, 422);
     assert.ok(r2.json.detail.errors.includes("website_is_not_own_site"));
-    const r3 = await call(base, "POST", draftPath, { ...draft("build-c1"), fields: { display_name: draft("x").fields.display_name, product_categories: draft("x").fields.product_categories } });
+    const r4 = await call(base, "POST", draftPath, draft("build-c1", { website: { value: "https://se/", sources: [{ url: "https://se/", quote: "välkommen till vår gårdsbutik" }] } }));
+    assert.ok(r4.status === 400 || r4.json.detail.errors.includes("bad_value:website"), "a one-label host is not a website");
+    const noSite = { display_name: draft("x").fields.display_name, product_categories: draft("x").fields.product_categories };
+    // Without a website no page can be stored at all …
+    const r3a = await call(base, "POST", draftPath, { ...draft("build-c1"), fields: noSite });
+    assert.equal(r3a.json.error, "excerpt_host_not_allowed");
+    // … and the draft itself is refused for lacking one.
+    const r3 = await call(base, "POST", draftPath, { ...draft("build-c1"), fields: noSite, excerpts: [] });
     assert.ok(r3.json.detail.errors.includes("missing:website"));
   });
 });
@@ -223,9 +234,12 @@ test("contact, register and certification rules (mutation gaps)", async () => {
     };
     // email must be in the quote
     assert.ok((await errs({ business_email: { value: "info@gardensmat.se", sources: [{ url: PAGE, quote: "Gårdens Mat AB – välkommen" }] } })).includes("business_email_not_in_quote"));
-    // website must be sourced from itself
+    // website must be sourced from itself (a subdomain page is an allowed excerpt but not the site itself)
+    const SHOP = "https://shop.gardensmat.se/om";
     assert.ok(
-      (await errs({ website: { value: "https://annan-gard.se", sources: [{ url: PAGE, quote: "välkommen till vår gårdsbutik" }] } })).includes("website_not_sourced_from_itself"),
+      (await errs({ website: { value: SITE, sources: [{ url: SHOP, quote: "välkommen till vår gårdsbutik" }] } }, [{ url: PAGE, text: PAGE_TEXT }, { url: SHOP, text: PAGE_TEXT }])).includes(
+        "website_not_sourced_from_itself",
+      ),
     );
     // register:se only for org_nr / postal_town / visit_address, and must match the register
     assert.ok((await errs({ season: { value: "maj–sep", sources: [{ url: "register:se" }] } })).includes("register_source_not_allowed:season"));
@@ -360,4 +374,99 @@ test("register search escapes LIKE wildcards and folds Swedish case", async () =
     assert.equal((await call(base, "GET", `/register/search?name=${encodeURIComponent("%%%")}`)).json.matches.length, 0);
     assert.equal((await call(base, "GET", `/register/search?name=${encodeURIComponent("GÅRDENS")}&town=${encodeURIComponent("Göteborg")}`)).json.matches.length, 1);
   });
+});
+
+// ── round 2 (2026-10-13) ──────────────────────────────────────────────────
+
+test("a personnummer can never pass as the business phone", async () => {
+  const { app, db } = await seeded();
+  const text = `${PAGE_TEXT} Innehavare: Anna Andersson, pnr ${PNR}.`;
+  await withServer(app, async (base) => {
+    await call(base, "POST", "/candidates/lease", { run_id: "build-k1", n: 1 });
+    for (const value of [PNR, PNR.replace("-", ""), `19${PNR.replace("-", "")}`]) {
+      const r = await call(base, "POST", draftPath, draft("build-k1", { business_phone: { value, sources: [{ url: PAGE, quote: `pnr ${PNR}` }] } }, [{ url: PAGE, text }]));
+      assert.equal(r.status, 422, value);
+      assert.ok(r.json.detail.errors.includes("bad_value:business_phone") || r.json.detail.errors.includes("personnummer_in_fields"), value);
+    }
+    // A people-search page is never stored, whatever it is offered as.
+    const rs = await call(base, "POST", draftPath, draft("build-k1", {}, [{ url: PAGE, text: PAGE_TEXT }, { url: "https://www.ratsit.se/x", text: "46 år, född 1 januari 1980" }]));
+    assert.equal(rs.json.error, "excerpt_host_not_allowed");
+  });
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM excerpts").get() as any).n, 0);
+});
+
+test("verdict enum is enforced on its own (a reject with a free-text field result is refused)", async () => {
+  const { app } = await seeded();
+  await withServer(app, async (base) => {
+    await call(base, "POST", "/candidates/lease", { run_id: "build-l1", n: 1 });
+    const d = await call(base, "POST", draftPath, draft("build-l1"));
+    await call(base, "POST", "/judge/lease", { run_id: "judge-l1" });
+    const r = await call(base, "POST", `/drafts/${d.json.draft_id}/verdict`, verdict("judge-l1", FIELDS, { verdict: "reject", entity_match: false, field_results: { display_name: "Anna Andersson", website: "ok", product_categories: "ok" } }));
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error, "bad_field_result");
+  });
+});
+
+test("malformed JSON body never reaches the logs, even with util.inspect", async () => {
+  const util = await import("node:util");
+  const { app } = await seeded();
+  const logged: string[] = [];
+  const orig = { error: console.error, log: console.log, warn: console.warn };
+  const capture = (...a: unknown[]) => logged.push(a.map((x) => util.inspect(x, { depth: 5 })).join(" "));
+  console.error = capture;
+  console.log = capture;
+  console.warn = capture;
+  try {
+    await withServer(app, async (base) => {
+      const res = await fetch(`${base}/candidates/lease`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-token-123456" },
+        body: `{"a": Anna ${PNR}}`,
+      });
+      assert.equal(res.status, 400);
+      assert.ok(!(await res.text()).includes("Anna"));
+    });
+  } finally {
+    Object.assign(console, orig);
+  }
+  assert.ok(logged.every((l) => !l.includes("Anna") && !l.includes("1231")), logged.join("\n"));
+});
+
+test("judge lease and verdict both require a drafted candidate", async () => {
+  const { db } = await seeded();
+  const { leaseCandidates, leaseDrafts, submitDraft, submitVerdict, HttpError } = await import("../src/store");
+  const now = new Date();
+  leaseCandidates(db, { run_id: "build-m1", n: 1 }, now);
+  const d = submitDraft(db, CID, draft("build-m1"), now);
+  db.prepare("UPDATE candidates SET status = 'rejected' WHERE candidate_id = ?").run(CID);
+  assert.equal(leaseDrafts(db, { run_id: "judge-m1" }, now).drafts.length, 0, "lease filter");
+  db.prepare("UPDATE candidates SET status = 'drafted' WHERE candidate_id = ?").run(CID);
+  assert.equal(leaseDrafts(db, { run_id: "judge-m1" }, now).drafts.length, 1);
+  db.prepare("UPDATE candidates SET status = 'excluded' WHERE candidate_id = ?").run(CID);
+  assert.throws(() => submitVerdict(db, d.draft_id as number, verdict("judge-m1", FIELDS), now), (e: unknown) => e instanceof HttpError && e.code === "candidate_not_drafted");
+});
+
+test("search mode refuses a candidate that used up its attempts (checked on its own)", async () => {
+  const { db } = await seeded();
+  const { addSearchCandidate, HttpError } = await import("../src/store");
+  db.prepare("UPDATE candidates SET status = 'new', attempts = 3 WHERE candidate_id = ?").run(CID);
+  assert.throws(() => addSearchCandidate(db, { run_id: "build-n1", org_nr: ORG }, new Date()), (e: unknown) => e instanceof HttpError && e.code === "max_attempts");
+});
+
+test("a draft left unjudged past the excerpt TTL is retired and the candidate requeued", async () => {
+  let clock = new Date("2026-10-13T10:00:00Z");
+  const { db } = await seeded({ now: () => clock });
+  const { leaseCandidates, submitDraft, purge } = await import("../src/store");
+  leaseCandidates(db, { run_id: "build-o1", n: 1 }, clock);
+  submitDraft(db, CID, draft("build-o1"), clock);
+  clock = new Date(clock.getTime() + 31 * 24 * 3600 * 1000);
+  const r = purge(db, clock);
+  assert.equal(r.stale_drafts, 1);
+  assert.equal((db.prepare("SELECT status FROM drafts").get() as any).status, "superseded");
+  assert.deepEqual(db.prepare("SELECT status, status_reason FROM candidates WHERE candidate_id = ?").get(CID), { status: "new", status_reason: "draft_expired" });
+});
+
+test("the schema carries a user_version for later migrations", async () => {
+  const { db } = await seeded();
+  assert.equal(db.pragma("user_version", { simple: true }), 1);
 });
