@@ -171,19 +171,21 @@ export function computeQueryStats(db: Db, hoursBack: number, vertical: VerticalI
   // COALESCE: rows written before S2 have no class; without it `NULL IN (…)`
   // is NULL and `NOT (…)` would drop those rows instead of keeping them.
   const cls = columnExists(db, "analytics_queries", "client_class") ? "COALESCE(client_class, '')" : "''";
+  // Minimal schemas (older test fixtures) lack protocol: every row is then an API search.
+  const proto = columnExists(db, "analytics_queries", "protocol") ? "protocol" : "'api'";
   const botClasses = BOT_SEARCH_CLASSES.map((c) => `'${c}'`).join(", ");
   // A bot search: a bot class (AI crawlers included) on any channel, or a
   // script on the web page.
-  const isBot = `(${cls} IN (${botClasses}) OR (protocol = 'web' AND ${cls} = 'dev'))`;
+  const isBot = `(${cls} IN (${botClasses}) OR (${proto} = 'web' AND ${cls} = 'dev'))`;
   const isAssistant = `(${cls} = '${ASSISTANT_SEARCH_CLASS}')`;
 
   const byChannel = { web: 0, api: 0, mcp: 0, a2a: 0, ai: 0 };
   let botQueries = 0;
   let ownerQueries = 0;
   const rows = db.prepare(`
-    SELECT protocol, is_owner, ${isBot} AS bot, ${isAssistant} AS assistant, COUNT(*) AS n FROM analytics_queries
+    SELECT ${proto} AS protocol, is_owner, ${isBot} AS bot, ${isAssistant} AS assistant, COUNT(*) AS n FROM analytics_queries
     WHERE created_at > ?${V}
-    GROUP BY protocol, is_owner, bot, assistant
+    GROUP BY 1, is_owner, bot, assistant
   `).all(cutoff, ...vp) as Array<{ protocol: string; is_owner: number | null; bot: number; assistant: number; n: number }>;
   for (const r of rows) {
     if (r.is_owner === 1) { ownerQueries += r.n; continue; }
