@@ -123,9 +123,11 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     insertPv.run(PATH, "iphash-ahrefs:Mozilla/5.0 (compatible; AhrefsBot/7.0)", 0, "-3 days");
     insertPv.run(PATH, "iphash-curl:curl/8.0", 0, "-3 days");
     insertPv.run(PATH, "iphash-scan:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36", 0, "-3 days");
-    // A browser-looking session whose class was stored at write time as a scanner (full UA)
+    // A browser-looking session whose class was stored at write time as a scanner (full UA),
+    // with an older row of the same session from before the column (no class): the whole session is out.
     db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, client_class, created_at) VALUES (?, ?, 0, 'scanner', datetime('now', '-3 days'))`)
       .run(PATH, "iphash-bucket:desktop:0123456789abcdef");
+    insertPv.run(PATH, "iphash-bucket:desktop:0123456789abcdef", 0, "-4 days");
     // A redirect and a 404 are not page views
     db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, created_at) VALUES (?, ?, 0, ?, datetime('now', '-3 days'))`)
       .run(PATH, "iphash-redirect:Mozilla/5.0 (Macintosh) Chrome/120", 301);
@@ -186,6 +188,16 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     assertEq(activity.views30.aiBreakdown.other, 1, "views30: 1 other AI search (Perplexity-User); Googlebot is not AI");
     assertEq(activity.views30.ai, 6, "views30: ai = chatgpt+claude+other = 6");
     assertEq(activity.views30.days, 30, "views30: a 30-day window (inside the 60-day raw retention)");
+
+    // A raw retention shorter than 30 days shortens the window (and the label reads it).
+    const prevPrune = process.env.RFB_AUTO_PRUNE_DAYS;
+    process.env.RFB_AUTO_PRUNE_DAYS = "7"; // the lowest retention getRetentionWindowDays allows
+    try {
+      const short = getProfileActivity(db, AGENT_ID, PATH).views30;
+      assertEq([short.days, short.human, short.ai], [7, 4, 6], "views30: retention 7 days → a 7-day window (every fixture view is ≤ 5 days old)");
+    } finally {
+      if (prevPrune === undefined) delete process.env.RFB_AUTO_PRUNE_DAYS; else process.env.RFB_AUTO_PRUNE_DAYS = prevPrune;
+    }
 
     // ── (b) topQueryTerms ───────────────────────────────────────────
     assertEq(activity.topQueryTerms.length, 3, "topQueryTerms: capped at 3");

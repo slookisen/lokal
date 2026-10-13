@@ -160,13 +160,16 @@ export function runProdusentHotPathTests(opts: { log?: boolean } = {}): TestSumm
     const p1 = getProfileActivity(db, "agent-x", P1).views30;
     check(p1.human === 6 && JSON.stringify(p1.aiBreakdown) === JSON.stringify({ chatgpt: 3, claude: 3, other: 3 }),
       `hp-D ${P1}: 6 human views, AI search only (3 per assistant over the 3 in-window ages): ${JSON.stringify(p1)}`);
-    // No page_view_daily top-up: it counted crawlers, and the window is inside the raw rows.
+    // No page_view_daily top-up: it counted crawlers. Raw rows now start 20
+    // days back, so the old code would have added the rollup days 24-25 on top.
+    db.prepare(`DELETE FROM analytics_page_views WHERE created_at < ?`).run(sqlTs(20 * DAY));
     const dayAgo = (d: number) => new Date(Date.now() - d * DAY).toISOString().slice(0, 10);
     const insDaily = db.prepare(`INSERT INTO page_view_daily (day, path, source, bot_type, vertical_id, view_count, session_count) VALUES (?, ?, 'direct', ?, 'rfb', ?, 1)`);
     insDaily.run(dayAgo(25), P1, "chatgpt", 7);
     insDaily.run(dayAgo(24), P1, "claude", 3);
     const after = getProfileActivity(db, "agent-x", P1).views30;
-    check(JSON.stringify(after) === JSON.stringify(p1), `hp-D page_view_daily rows are not added on top: ${JSON.stringify(after)}`);
+    check(JSON.stringify(after) === JSON.stringify(oracle(P1)) && after.aiBreakdown.chatgpt < 7,
+      `hp-D page_view_daily rows are not added on top of the raw rows: ${JSON.stringify(after)}`);
   } catch (err: any) {
     failed++;
     failures.push(`hp: unexpected error: ${String(err?.stack || err)}`);

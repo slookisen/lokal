@@ -102,6 +102,9 @@ export function computeAgentStats(
   const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
   // The class stored at write time from the full UA (S1); every row of a
   // session has the same UA, so MAX() only skips legacy rows without one.
+  // (Only a change to the classifier's pattern lists between two deploys can
+  // give one session two stored classes; MAX() then takes the alphabetically
+  // last one for up to the retention window.)
   const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
 
   // ── Views: ONE grouped read, bucketed by the shared classifier ───

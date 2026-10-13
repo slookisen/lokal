@@ -197,6 +197,16 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
         [{ agent_id: "low-trust", view_source: "discovery", is_owner: 0, traffic_category: "human" }],
         "a5: a profile visit books exactly one row: own-domain Referer → 'discovery', human, not owner",
       );
+      // The rendered tiles carry the real window, not template text (2026-10-13:
+      // S5 put ${statsDays} inside plain quotes, so the page showed it literally).
+      const days = require("../services/retention-window").getRetentionWindowDays();
+      assertTrue(
+        !profile.body.includes("${") &&
+          profile.body.includes(`Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${days} dager.`) &&
+          profile.body.includes(`Sidevisninger fra mennesker, siste ${days} dager`) &&
+          profile.body.includes(`mennesker &middot; ${days}d`) && profile.body.includes(`AI-agenter &middot; ${days}d`),
+        `a6: the rendered stat tiles and the approved AI tooltip show the window (${days} days), no raw \${…}`,
+      );
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -93,6 +93,7 @@ function getViews30(db: Database.Database, path: string): ProfileActivityViews {
     .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
   const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
   const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
+  // One class per session (same UA on every row); MAX() skips legacy NULLs.
   const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
   const sessions = db.prepare(`
     SELECT session_id, ${clientClass} AS client_class, COUNT(*) AS views
