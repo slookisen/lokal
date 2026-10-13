@@ -77,9 +77,9 @@ const OWNER_UA_MARKERS_LC = [
   "curl/",            // manual terminal checks
 ];
 export function isOwnerRequest(req: Request): boolean {
-  const cookieHeader = req.headers.cookie || "";
+  const cookieHeader = req.headers?.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  return isOwnerScriptUA(req.headers["user-agent"] || "");
+  return isOwnerScriptUA(req.headers?.["user-agent"] || "");
 }
 
 /** True for our own scripts' UAs (the UA half of isOwnerRequest). */
@@ -552,6 +552,18 @@ export class AnalyticsService {
       );
     } catch (err) {
       console.error("[analytics] Failed to track search query:", err);
+    }
+  }
+
+  /**
+   * A search on one of the sites' search pages (protocol 'web'). Never throws:
+   * logging must not break the page that is answering the search.
+   */
+  logWebSearch(req: Request, responseTimeMs: number, result: { query: string; resultCount?: number }): void {
+    try {
+      this.trackSearchQuery(req, responseTimeMs, result, isOwnerRequest(req), { protocol: "web" });
+    } catch (err) {
+      console.error("[analytics] Failed to log web search:", err);
     }
   }
 

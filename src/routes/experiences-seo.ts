@@ -32,7 +32,7 @@ import * as QRCode from "qrcode";
 // every non-API path into this router before express.static is ever reached).
 import * as fs from "fs";
 import * as path from "path";
-import { analyticsService, isOwnerRequest } from "../services/analytics-service";
+import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
@@ -8553,10 +8553,10 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: log the
   // search (free text, else the tag filters or "[nær meg]").
   if (hasQuery) {
-    analyticsService.trackSearchQuery(req, Date.now() - searchStarted, {
+    analyticsService.logWebSearch(req, Date.now() - searchStarted, {
       query: q || (activeTags.length > 0 ? filterQueryText({ tags: activeTags }) : "[nær meg]"),
       resultCount: rows.length,
-    }, isOwnerRequest(req), { protocol: "web" });
+    });
   }
 
   const h1 = q

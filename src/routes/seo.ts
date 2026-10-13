@@ -27,7 +27,7 @@ import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
 import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
-import { analyticsService, parseUserAgent, isOwnerRequest } from "../services/analytics-service";
+import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { getDb } from "../database/init";
@@ -1792,10 +1792,10 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // search on this page is a search (bots too, classed at write time so the
     // dashboard can tell them apart). A coordinates-only search is stored as
     // "[nær meg]": counted, but kept out of the top search terms.
-    analyticsService.trackSearchQuery(req, Date.now() - searchStarted, {
+    analyticsService.logWebSearch(req, Date.now() - searchStarted, {
       query: q.trim() || "[nær meg]",
       resultCount: results.length,
-    }, isOwnerRequest(req), { protocol: "web" });
+    });
 
     const searcherIsBot = parseUserAgent(req.get("user-agent") || "").isBot;
     if (results.length > 0 && !searcherIsBot) {
