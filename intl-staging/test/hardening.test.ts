@@ -470,3 +470,26 @@ test("the schema carries a user_version for later migrations", async () => {
   const { db } = await seeded();
   assert.equal(db.pragma("user_version", { simple: true }), 1);
 });
+
+test("a personnummer for someone born 2000–2009, written 6+4 with any separator, is never exempt as a phone", async () => {
+  // 050101-123x with a valid Luhn digit: personnummer-shaped AND phone-shaped digits.
+  const nine = "050101123";
+  let sum = 0;
+  for (let i = 0; i < 9; i++) {
+    let d = Number(nine[i]) * (i % 2 === 0 ? 2 : 1);
+    if (d > 9) d -= 9;
+    sum += d;
+  }
+  const ten = nine + ((10 - (sum % 10)) % 10);
+  assert.equal(looksLikeSwedishPersonId(ten), true);
+  const { app } = await seeded();
+  await withServer(app, async (base) => {
+    await call(base, "POST", "/candidates/lease", { run_id: "build-p1", n: 1 });
+    for (const sep of ["-", "\u2013", " ", "."]) {
+      const value = `${ten.slice(0, 6)}${sep}${ten.slice(6)}`;
+      const r = await call(base, "POST", draftPath, draft("build-p1", { business_phone: { value, sources: [{ url: PAGE, quote: `nr ${value}` }] } }, [{ url: PAGE, text: `${PAGE_TEXT} nr ${value}` }]));
+      assert.equal(r.status, 422, JSON.stringify(sep));
+      assert.ok(r.json.detail.errors.includes("personnummer_in_fields"), JSON.stringify(r.json.detail.errors));
+    }
+  });
+});

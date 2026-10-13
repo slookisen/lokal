@@ -196,13 +196,15 @@ export function declaredPhoneDigits(fields: Record<string, FieldValue> | undefin
 /**
  * Whether a personnummer-shaped hit may stay because it IS the declared
  * business phone. Only 10-digit hits that start with 0 qualify, and never one
- * written the personnummer way (6 digits, hyphen or plus, 4 digits) — phone
- * numbers are not written like that (review 2026-10-13, round 2).
+ * written the personnummer way (6 digits, any separator, 4 digits) — phone
+ * numbers are not grouped like that (review 2026-10-13, rounds 2 and 3). An
+ * unseparated 10-digit number starting with 0 stays ambiguous (born 2000–09);
+ * the judge's personal-data check covers that residual.
  */
 export function isDeclaredPhoneHit(hit: string, keepDigits: string[]): boolean {
   const d = hit.replace(/\D/g, "");
   if (d.length !== 10 || !d.startsWith("0")) return false;
-  if (/^\d{6}[-+]\d{4}$/.test(hit)) return false;
+  if (/^\d{6}[-+\u2010-\u2015\u2212 \u00a0\u202f.]\d{4}$/.test(hit)) return false;
   return keepDigits.includes(d);
 }
 
