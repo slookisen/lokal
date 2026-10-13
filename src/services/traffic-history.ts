@@ -77,7 +77,9 @@ export interface TrafficHistoryJobDeps {
    * Scheduled runs: do nothing when the stats worker cannot be used
    * (OFFTHREAD_STATS_DISABLED=1, a DB not in WAL mode), rather than compute
    * ~300 summaries on the main thread. The prune's per-day safety net still
-   * keeps every day it deletes.
+   * keeps every day it deletes, but no week or month: a week or month whose
+   * first day is pruned while the worker stays off is later stored as
+   * partial (partialFrom). Keep the kill switch on for days, not weeks.
    */
   requireWorker?: boolean;
 }

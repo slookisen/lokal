@@ -633,10 +633,11 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
   // One read of the window's rows on those paths (path index), classified
   // per row with the shared classifier (write-time client_class, else the
   // session_id): page views only (page-view-definition.ts), owner traffic out.
-  // A browser-looking session that the traffic report finds to be a scanner
-  // (probes) or a scraper (reading faster than a person) is not a person
-  // here either: producer pages are where scrapers go.
-  const reclassified = new Set(
+  // A row that looks like a person's takes the class the traffic report gives
+  // its whole session: a scanner (probes), a scraper (reading faster than a
+  // person; producer pages are where scrapers go), or a session whose rows
+  // from before the write-time class sit next to a non-human one.
+  const reclassified = new Map(
     computeTrafficReport(db, sinceHours, undefined, nowMs, { detail: false, reclassified: true }).reclassifiedSessions ?? [],
   );
   const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
@@ -654,7 +655,8 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
     for (const [path, sid, cls, referrer, status] of rows) {
       if (!isPageViewStatus(status)) continue;
       const stored = groupOf(storedClientClass(sid ?? "", cls));
-      const g = stored === "human" && reclassified.has(sid ?? "") ? "bot" : stored;
+      const final = stored === "human" ? reclassified.get(sid ?? "") : undefined;
+      const g = final ? groupOf(final) : stored;
       const human = g === "human";
       const ai = g === "ai_search" || g === "ai_crawler";
       const fromSearch = human && UMBRELLA_SEARCH_SOURCES.has(classifyReferralSource(referrer).key);

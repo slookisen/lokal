@@ -29,6 +29,7 @@ import {
   shouldRecordPageView,
 } from "./page-view-definition";
 import { computeTrafficReport, TRAFFIC_GROUPS, VISIT_GAP_MS } from "./traffic-report";
+import { computeUmbrellaTraffic } from "./admin-stats-compute";
 
 export interface TestSummary {
   passed: number;
@@ -270,6 +271,37 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
     const all = computeTrafficReport(db as any, 87600, undefined, now);
     ok(all.series.unit === "day" && all.series.points.length === 2 && all.series.points[0].t === "2026-10-12",
       "d10: a window longer than the stored rows starts its series at the first row", all.series.points.map((p) => p.t));
+    db.close();
+  }
+
+  // ── (d11) The umbrella table classifies its rows the way the report classifies their sessions ──
+  {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, umbrella_type TEXT, is_active INTEGER DEFAULT 1);
+      CREATE TABLE agent_affiliations (id INTEGER PRIMARY KEY AUTOINCREMENT, producer_id TEXT NOT NULL, umbrella_id TEXT NOT NULL, status TEXT NOT NULL);
+      CREATE TABLE analytics_page_views (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, referrer TEXT, session_id TEXT,
+        status_code INTEGER, created_at TEXT, is_owner INTEGER DEFAULT 0, vertical_id TEXT DEFAULT 'rfb', client_class TEXT);
+    `);
+    db.prepare("INSERT INTO agents VALUES ('U', 'Nett', 'market_network', 1)").run();
+    const now = Date.UTC(2026, 9, 13, 12, 0, 0);
+    const H = 3600_000;
+    const ins = db.prepare("INSERT INTO analytics_page_views (path, session_id, status_code, created_at, client_class) VALUES ('/produsent/nett', ?, 200, ?, ?)");
+    // Sessions spanning the write-time class: two older rows with no class, then one with a non-human class.
+    for (const [sid, cls] of [["ipA:desktop:aaaa", "ai_search"], ["ipD:desktop:dddd", "dev"], ["ipS:desktop:ssss", "scanner"]]) {
+      ins.run(sid, ts(now - 3 * H), null);
+      ins.run(sid, ts(now - 2 * H), null);
+      ins.run(sid, ts(now - H), cls);
+    }
+    // A person, before and after the write-time class.
+    ins.run("ipP:desktop:pppp", ts(now - 3 * H), null);
+    ins.run("ipP:desktop:pppp", ts(now - H), "human");
+    const u = computeUmbrellaTraffic(db as any, 24, now)[0];
+    const page = computeTrafficReport(db as any, 24, undefined, now).topPages.find((p) => p.path === "/produsent/nett");
+    ok(u?.human_pageviews_profile === 2 && u?.ai_bot_pageviews === 3 && u?.pageViews_via_profile === 11 &&
+       u?.human_pageviews_profile === page?.humanViews && u?.ai_bot_pageviews === page?.aiViews,
+      "d11: rows from before the write-time class take their session's class, as in the report",
+      { umbrella: u && { human: u.human_pageviews_profile, ai: u.ai_bot_pageviews, all: u.pageViews_via_profile }, page });
     db.close();
   }
 

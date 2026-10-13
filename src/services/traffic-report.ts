@@ -141,8 +141,12 @@ export interface TrafficReport {
   otherUaSamples: Array<{ ua: string; views: number }>;
   /** Most recently active visitors of every class (up to 200). */
   recentSessions: SessionRow[];
-  /** Only with opts.reclassified: browser-looking sessions classed scanner or scraper in this window. */
-  reclassifiedSessions?: string[];
+  /**
+   * Only with opts.reclassified: [session_id, class] for each session not
+   * classed human here whose rows a row-by-row reader could take for a
+   * person's (stored class human, or a browser-looking session_id).
+   */
+  reclassifiedSessions?: Array<[string, SessionCategory]>;
   /** Visitors of every class with the most page views (up to 200). */
   busiestSessions: SessionRow[];
 }
@@ -294,9 +298,11 @@ export interface TrafficReportOptions {
   /** Length of topPages (default 100). */
   topPages?: number;
   /**
-   * Also return `reclassifiedSessions`: the session_ids whose stored class is
-   * a person's but who are scanners or scrapers in this window, for readers
-   * that classify rows one by one (the umbrella table).
+   * Also return `reclassifiedSessions`: the final class of each session whose
+   * rows look like a person's one by one but which is not one in this window
+   * (a scanner, a scraper, or a session whose older rows predate the
+   * write-time class), for readers that classify rows one by one (the
+   * umbrella table).
    */
   reclassified?: boolean;
 }
@@ -725,7 +731,11 @@ export function computeTrafficReport(
     otherUaSamples: [...otherSamples.values()].sort((a, b) => b.views - a.views).slice(0, 20),
     recentSessions: recent.map(sessionRow),
     ...(opts.reclassified
-      ? { reclassifiedSessions: [...Array(sessionCount).keys()].filter((s) => sClass[s] === "human" && cls[s] !== "human").map((s) => sessions.values[s]) }
+      ? {
+          reclassifiedSessions: [...Array(sessionCount).keys()]
+            .filter((s) => cls[s] !== "human" && (sClass[s] === "human" || storedClientClass(sessions.values[s], null) === "human"))
+            .map((s): [string, SessionCategory] => [sessions.values[s], cls[s]]),
+        }
       : {}),
     busiestSessions: busiest.map(sessionRow),
   };
