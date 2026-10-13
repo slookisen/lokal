@@ -258,7 +258,8 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
     const first = computeTrafficReport(db as any, 24, undefined, now, { fromMs: Date.UTC(2026, 9, 12), toMs: Date.UTC(2026, 9, 13) });
     ok(first.coverage.oldestRow === "2026-10-12 00:00:00" && first.coverage.complete === true, "d8: a range starting on the oldest stored day is complete", first.coverage);
     const before = computeTrafficReport(db as any, 24, undefined, now, { fromMs: Date.UTC(2026, 9, 11), toMs: Date.UTC(2026, 9, 12) });
-    ok(before.coverage.complete === false, "d9: a range before the oldest stored day is not", before.coverage);
+    ok(before.coverage.complete === false && before.series.points.length === 24 && before.series.points[0].t === "2026-10-11 00:00",
+      "d9: a range before the oldest stored day is not complete, and keeps its own 24 empty hours", { coverage: before.coverage, first: before.series.points[0]?.t });
     // "All time" starts its series at the first stored row, not ten years back.
     const all = computeTrafficReport(db as any, 87600, undefined, now);
     ok(all.series.unit === "day" && all.series.points.length === 2 && all.series.points[0].t === "2026-10-12",
