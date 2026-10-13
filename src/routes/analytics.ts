@@ -21,6 +21,7 @@ import {
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
 import { getTrafficHistoryJobState } from "../services/traffic-history";
+import { getRetentionWindowDays } from "../services/traffic-stats-compute";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -324,8 +325,7 @@ router.get("/summary/:hours", async (req: Request, res: Response) => {
 });
 
 function rawRetentionDays(): number {
-  const d = parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10);
-  return Number.isFinite(d) && d > 0 ? d : 60;
+  return getRetentionWindowDays();
 }
 
 /**
@@ -822,7 +822,7 @@ router.get("/conversations", (req: Request, res: Response) => {
     // never counted (getSourceStats' public rule).
     const hours = req.query.hours !== undefined ? windowHours(req) : null;
     const vertical = parseVertical(req);
-    const filtered = hours !== null || req.query.vertical !== undefined || lockedVerticalForHost(req) !== null;
+    const filtered = hours !== null || req.query.vertical !== undefined || !!lockedVerticalForHost(req);
     const sourceStats = conversationService.getSourceStats(filtered
       ? {
           allVerticals: !vertical,

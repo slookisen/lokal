@@ -97,6 +97,10 @@ export interface HistorySummary extends HistoryItem {
 
 // ── Calendar helpers (UTC) ──────────────────────────────────────────────
 
+export function isDay(s: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(dayMs(s));
+}
+
 export function dayOf(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -146,8 +150,9 @@ function tableExists(db: Db, name: string): boolean {
  * are no raw rows.
  */
 export function firstCompleteRawDay(db: Db): string | null {
-  const oldest = (db.prepare("SELECT substr(MIN(created_at), 1, 10) AS d FROM analytics_page_views").get() as { d: string | null } | undefined)?.d ?? null;
-  if (!oldest) return null;
+  // created_at >= '1970': rows with an empty or broken timestamp are not a day.
+  const oldest = (db.prepare("SELECT substr(MIN(created_at), 1, 10) AS d FROM analytics_page_views WHERE created_at >= '1970'").get() as { d: string | null } | undefined)?.d ?? null;
+  if (!oldest || !isDay(oldest)) return null;
   if (tableExists(db, "boot_job_state")) {
     const marker = (db.prepare("SELECT last_completed_at AS v FROM boot_job_state WHERE job = ?").get(PRUNE_MARKER_JOB) as { v: string } | undefined)?.v;
     if (marker && marker.slice(0, 10) === oldest) return addDays(oldest, 1);
@@ -161,11 +166,25 @@ export function firstCompleteRawDay(db: Db): string | null {
  * Aggregates of one period for one site (or "all"), from the raw rows. When
  * the period's first days are no longer stored, covers [first stored day, end)
  * and says so in `partialFrom`. Throws when no raw day of the period is stored.
+ *
+ * `wholePeriod`: the caller knows every raw row of the period is still stored
+ * (the nightly prune, about to delete the day), so the period is computed as
+ * it is — a day with no rows is a real zero day.
+ *
+ * Reads in one read transaction, so the coverage check and the counts see
+ * the same rows even while the prune is deleting on another connection.
  */
-export function computeHistorySummary(db: Db, item: HistoryItem, nowMs: number): HistorySummary {
-  const first = firstCompleteRawDay(db);
-  if (!first || first >= item.end) throw new Error(`no raw rows for ${item.period} ${item.start} (${item.vertical})`);
-  const from = first > item.start ? first : item.start;
+export function computeHistorySummary(db: Db, item: HistoryItem, nowMs: number, opts: { wholePeriod?: boolean } = {}): HistorySummary {
+  return db.transaction(() => computeHistorySummaryInTx(db, item, nowMs, opts))();
+}
+
+function computeHistorySummaryInTx(db: Db, item: HistoryItem, nowMs: number, opts: { wholePeriod?: boolean }): HistorySummary {
+  let from = item.start;
+  if (!opts.wholePeriod) {
+    const first = firstCompleteRawDay(db);
+    if (!first || first >= item.end) throw new Error(`no raw rows for ${item.period} ${item.start} (${item.vertical})`);
+    if (first > item.start) from = first;
+  }
   const fromMs = dayMs(from);
   const toMs = dayMs(item.end);
   const vertical = item.vertical === "all" ? undefined : item.vertical;
@@ -294,6 +313,7 @@ export interface HistoryView {
     topTerms: Array<{ query: string; count: number }>;
   };
   series: { unit: "day"; points: Array<{ t: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number; humanVisits: number; searches: number }> };
+  /** Every stored month and week; the all-time view (days = null) adds the current one so far. */
   months: HistoryPeriodRow[];
   weeks: HistoryPeriodRow[];
 }
@@ -370,11 +390,14 @@ function topN<T>(m: Map<string, T>, by: (t: T) => number, n: number): T[] {
  */
 export function computeHistoryView(db: Db, days: number | null, vertical: HistoryVertical, nowMs: number): HistoryView {
   const today = dayOf(nowMs);
-  const dayRows = readSummaries(db, "day", vertical);
-  const firstDay = dayRows.length ? dayRows[0].start : null;
-  const lastDay = dayRows.length ? dayRows[dayRows.length - 1].start : null;
+  const bounds = tableExists(db, "traffic_history")
+    ? (db.prepare("SELECT MIN(period_start) AS a, MAX(period_start) AS b FROM traffic_history WHERE period = 'day' AND vertical = ?").get(vertical) as { a: string | null; b: string | null })
+    : { a: null, b: null };
+  const firstDay = bounds.a;
+  const lastDay = bounds.b;
   const from = days === null ? (firstDay ?? today) : addDays(today, -days);
-  const inWindow = dayRows.filter((d) => d.start >= from && d.start < today);
+  // Only the window's day rows are parsed (a year of rows is ~15 MB of JSON).
+  const inWindow = readSummaries(db, "day", vertical, from, today);
 
   const zero = () => ({ views: 0, visits: 0 });
   const groups = Object.fromEntries(TRAFFIC_GROUPS.map((g) => [g, zero()])) as Record<TrafficGroup, { views: number; visits: number }>;
@@ -456,10 +479,15 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
   const hv = groups.human.visits;
   const months = readSummaries(db, "month", vertical).map((s) => periodRow(s, false));
   const weeks = readSummaries(db, "week", vertical).map((s) => periodRow(s, false));
-  const liveMonth = liveSummary(db, "month", vertical, nowMs);
-  if (liveMonth && !months.some((m) => m.start === liveMonth.start)) months.push(periodRow(liveMonth, true));
-  const liveWeek = liveSummary(db, "week", vertical, nowMs);
-  if (liveWeek && !weeks.some((w) => w.start === liveWeek.start)) weeks.push(periodRow(liveWeek, true));
+  // The current month and week so far are computed from the raw rows (up to
+  // a month of rows) for the all-time view only, which carries the dashboard's
+  // month/week table; a window view uses whole stored months only.
+  if (days === null) {
+    const liveMonth = liveSummary(db, "month", vertical, nowMs);
+    if (liveMonth && !months.some((m) => m.start === liveMonth.start)) months.push(periodRow(liveMonth, true));
+    const liveWeek = liveSummary(db, "week", vertical, nowMs);
+    if (liveWeek && !weeks.some((w) => w.start === liveWeek.start)) weeks.push(periodRow(liveWeek, true));
+  }
 
   // Whole months inside the window: stored, not partial, not in progress.
   const fullMonths = months.filter((m) => !m.inProgress && !m.partialFrom && m.start >= from && m.end <= today);

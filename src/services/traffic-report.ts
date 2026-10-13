@@ -141,6 +141,8 @@ export interface TrafficReport {
   otherUaSamples: Array<{ ua: string; views: number }>;
   /** Most recently active visitors of every class (up to 200). */
   recentSessions: SessionRow[];
+  /** Only with opts.reclassified: browser-looking sessions classed scanner or scraper in this window. */
+  reclassifiedSessions?: string[];
   /** Visitors of every class with the most page views (up to 200). */
   busiestSessions: SessionRow[];
 }
@@ -245,9 +247,11 @@ function sessionBotName(sessionId: string, cls: SessionCategory): string {
 
 function refHost(referrer: string): string {
   try {
-    return new URL(referrer).hostname.replace(/^www\./, "");
+    return new URL(referrer).hostname.replace(/^www\./, "") || "ukjent";
   } catch {
-    return referrer.slice(0, 80);
+    // Never the raw string: it can carry a path or query, and hosts are kept
+    // in the stored history (traffic-history-compute.ts).
+    return "ukjent";
   }
 }
 
@@ -289,6 +293,12 @@ export interface TrafficReportOptions {
   toMs?: number;
   /** Length of topPages (default 100). */
   topPages?: number;
+  /**
+   * Also return `reclassifiedSessions`: the session_ids whose stored class is
+   * a person's but who are scanners or scrapers in this window, for readers
+   * that classify rows one by one (the umbrella table).
+   */
+  reclassified?: boolean;
 }
 
 export function computeTrafficReport(
@@ -518,9 +528,10 @@ export function computeTrafficReport(
   // The series starts at the first stored row when the window reaches further
   // back ("all" = 10 years would otherwise be 3,650 empty days).
   const oldestMs = oldestRow ? parseTs(oldestRow) : NaN;
-  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs ? oldestMs : fromMs;
-  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const lastMs = ranged ? endMs - 1 : endMs;
+  // (A range that ends before the first stored row keeps its own buckets, all zero.)
+  const seriesFromMs = Number.isFinite(oldestMs) && oldestMs > fromMs && oldestMs <= lastMs ? oldestMs : fromMs;
+  const firstBucket = Math.floor(seriesFromMs / bucketMs) * bucketMs;
   const bucketCount = keepRows ? Math.max(1, Math.floor((lastMs - firstBucket) / bucketMs) + 1) : 0;
   const series = Array.from({ length: bucketCount }, (_, i) => {
     const iso = new Date(firstBucket + i * bucketMs).toISOString();
@@ -713,6 +724,9 @@ export function computeTrafficReport(
     bots: [...botMap.values()].sort((a, b) => b.views - a.views || a.name.localeCompare(b.name)),
     otherUaSamples: [...otherSamples.values()].sort((a, b) => b.views - a.views).slice(0, 20),
     recentSessions: recent.map(sessionRow),
+    ...(opts.reclassified
+      ? { reclassifiedSessions: [...Array(sessionCount).keys()].filter((s) => sClass[s] === "human" && cls[s] !== "human").map((s) => sessions.values[s]) }
+      : {}),
     busiestSessions: busiest.map(sessionRow),
   };
 }

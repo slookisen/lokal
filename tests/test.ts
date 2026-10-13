@@ -15350,6 +15350,10 @@ const _pr74Promise = (async () => {
 
   // Hanen member prod-b: 2 human.
   for (let i = 0; i < 2; i++) insertPv.run("/produsent/hjortegarden", "ipB"+i+":Mozilla/5.0 Chrome", "direct", 0, null);
+  // A scanner behind a browser UA: probes wp-admin, then views a member page.
+  // Not a person (S4: the umbrella table uses the report's session classes).
+  insertPv.run("/wp-admin/setup.php", "ipW:Mozilla/5.0 Chrome", "direct", 0, null);
+  insertPv.run("/produsent/hjortegarden", "ipW:Mozilla/5.0 Chrome", "direct", 0, null);
 
   // Historical member traffic must NOT be counted toward Hanen.
   for (let i = 0; i < 4; i++) insertPv.run("/produsent/stale-member", "ipSt"+i+":Mozilla/5.0 Chrome", "direct", 0, null);
@@ -15382,8 +15386,8 @@ const _pr74Promise = (async () => {
     SELECT COUNT(*) as c FROM analytics_page_views
     WHERE path IN (${placeholders}) AND (is_owner IS NULL OR is_owner = 0)
   `).get(...memberPaths) as { c: number };
-  // prod-a: 9 (5 human + 2 ClaudeBot + 1 from Google + Googlebot) + prod-b: 2 = 11. prod-c excluded.
-  assertEq(memberViewsRow.c, 11, "pr-74: Hanen pageViews_via_members excludes historical members");
+  // prod-a: 9 (5 human + 2 ClaudeBot + 1 from Google + Googlebot) + prod-b: 3 (2 human + the scanner) = 12. prod-c excluded.
+  assertEq(memberViewsRow.c, 12, "pr-74: Hanen pageViews_via_members excludes historical members");
 
   // ── A2 + A3: combined check via real router ─────────────────────────
   // Inject in-memory DB and load the analytics router fresh, then mount
@@ -15498,9 +15502,9 @@ const _pr74Promise = (async () => {
   assertEq(first.name, "Hanen", "pr-74 endpoint: ordered by pageViews_total DESC (Hanen first)");
   assertEq(second.name, "Bondens Marked", "pr-74 endpoint: Bondens Marked second (0 views)");
   assertEq(first.pageViews_via_profile, 4, "pr-74 endpoint: Hanen profile views = 4");
-  assertEq(first.pageViews_via_members, 11, "pr-74 endpoint: Hanen member views = 11");
+  assertEq(first.pageViews_via_members, 12, "pr-74 endpoint: Hanen member views = 12");
   assertEq(first.human_pageviews_profile, 3, "pr-74 endpoint: Hanen profile views by people = 3");
-  assertEq(first.human_pageviews_members, 8, "pr-74 endpoint: Hanen member views by people = 8 (5 + 1 from Google + 2)");
+  assertEq(first.human_pageviews_members, 8, "pr-74 endpoint: Hanen member views by people = 8 (5 + 1 from Google + 2; not the browser-UA scanner)");
   assertEq(first.ai_bot_pageviews, 3, "pr-74 endpoint: Hanen ai_bot_pageviews = 3 (GPTBot + 2 ClaudeBot; Googlebot is a search engine, not AI)");
   assertEq(first.search_referrals, 1, "pr-74 endpoint: Hanen search_referrals = 1 (the person from Google, not Googlebot)");
   assertEq(first.active_members, 2, "pr-74 endpoint: Hanen active_members = 2");

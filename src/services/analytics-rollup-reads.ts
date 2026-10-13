@@ -216,38 +216,6 @@ export function getPrunedPageViewsByPath(
   }, db);
 }
 
-/**
- * Pruned-day portion of an exact-path (or IN-list) page-view count, optionally
- * filtered by `source` — used by GET /admin/analytics/umbrella-traffic's
- * pageViews_via_profile / pageViews_via_members / search_referrals, which all
- * query exact paths (page_view_daily's `path` column matches 1:1).
- *
- * ai_bot_pageviews on that same route is NOT blended here — it matches a
- * specific AI_TOKENS allow-list (Perplexity, Gemini, Googlebot, …) that,
- * like getPrunedChatgptClaudeCounts's doc comment explains, does not line up
- * 1:1 with rollup's bot_type buckets beyond chatgpt/claude. Left raw-only,
- * documented known gap.
- */
-export function getPrunedExactPathViewCount(
-  paths: string[],
-  cutoffIso: string,
-  opts: { source?: string } = {},
-  db?: Db
-): number {
-  if (paths.length === 0) return 0;
-  return withPrunedWindow(cutoffIso, "analytics_page_views", 0, (w, db) => {
-    const placeholders = paths.map(() => "?").join(",");
-    const sourceClause = opts.source ? " AND source = ?" : "";
-    const params: string[] = [...paths, w.fromDay, w.boundary];
-    if (opts.source) params.push(opts.source);
-    const row = db.prepare(`
-      SELECT COALESCE(SUM(view_count), 0) as c FROM page_view_daily
-      WHERE path IN (${placeholders}) AND day >= ? AND day < ?${sourceClause}
-    `).get(...params) as { c: number };
-    return row.c || 0;
-  }, db);
-}
-
 // ═════════════════════════════════════════════════════════════════
 // sessions_daily blend
 // ═════════════════════════════════════════════════════════════════
