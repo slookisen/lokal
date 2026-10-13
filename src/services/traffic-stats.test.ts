@@ -101,8 +101,24 @@ export function runTrafficStatsTests(opts: { log?: boolean } = {}): TestSummary 
     insertPv.run("/", "g1:Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", 0, "rfb");
     insertPv.run("/", "s1:Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)", 0, "rfb");
     insertPv.run("/", "d1:curl/8.4.0", 0, "rfb");
-    // 1 scanner session: browser-like UA probing wp-admin (path-based fold)
+    // 1 scanner session: browser-like UA probing wp-admin (path-based fold).
+    // The probe itself is not a page view (S1); its view of "/" is, and counts
+    // as scanner traffic, not human.
     insertPv.run("/wp-admin/setup.php", `sc1:${CHROME}`, 0, "rfb");
+    insertPv.run("/", `sc1:${CHROME}`, 0, "rfb");
+    // Not page views (page-view-definition.ts): static files and the service
+    // worker's offline page, /mcp, and a redirect and a 404 answer.
+    insertPv.run("/favicon.ico", `h1:${CHROME}`, 0, "rfb");
+    insertPv.run("/sw.js", `h1:${CHROME}`, 0, "rfb");
+    insertPv.run("/offline.html", `h2:${IPHONE}`, 0, "rfb");
+    insertPv.run("/mcp", "c1:Mozilla/5.0 (compatible; GPTBot/1.4)", 0, "rfb");
+    memDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, status_code) VALUES (?, ?, 0, 'rfb', ?)`)
+      .run("/produsent/gammel-gard", `h1:${CHROME}`, 302);
+    memDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, status_code) VALUES (?, ?, 0, 'rfb', ?)`)
+      .run("/finnes-ikke", `h2:${IPHONE}`, 404);
+    // Outside the 60-day window: not counted.
+    memDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at) VALUES (?, ?, 0, 'rfb', datetime('now', '-61 days'))`)
+      .run("/", "old1:Mozilla/5.0 (compatible; GPTBot/1.4)");
     // owner traffic — excluded from everything
     insertPv.run("/", "own1:Lokal-Enricher/1.0", 1, "rfb");
     // a different vertical — must not leak into rfb numbers
@@ -118,7 +134,7 @@ export function runTrafficStatsTests(opts: { log?: boolean } = {}): TestSummary 
     const s = trafficStats.getTrafficStats("rfb");
 
     // ── (a) Sum identity ────────────────────────────────────────────────
-    assertEq(s.pageViews, 11, "a1: pageViews = 11 non-owner rfb rows");
+    assertEq(s.pageViews, 11, "a1: pageViews = 11 non-owner rfb page views in the window (no files, probes, redirects, errors or old rows)");
     assertEq(s.humanViews + s.aiSearchViews + s.botViews, s.pageViews,
       "a2: humanViews + aiSearchViews + botViews === pageViews (public-strip invariant)");
     assertEq(s.humanViews, 3, "a3: humanViews = 3");

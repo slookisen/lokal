@@ -31,7 +31,8 @@ import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
-import { classifyUA, uaFromSessionId, aiVendorBucket } from "./traffic-classifier";
+import { computeTrafficReport, type TrafficReport, type SessionRow } from "./traffic-report";
+import { pagePathSql, pageViewSql } from "./page-view-definition";
 import { slugify } from "../utils/slug";
 import {
   aggregateHumanReferrals,
@@ -40,17 +41,11 @@ import {
   type HumanReferralRow,
 } from "./human-referrals";
 import {
-  getPrunedPageViewCount,
-  getPrunedPageViewsBySource,
-  getPrunedSessionsTotal,
   getPrunedQueryCount,
   getPrunedTopQueryTerms,
-  getPrunedChatgptClaudeCounts,
-  getPrunedQueryCountsByAgent,
   getPrunedAgentViewRows,
   getPrunedAgentViewCountsByCity,
   getPrunedQueryCountsByCity,
-  getPrunedPageViewsByPath,
   getPrunedExactPathViewCount,
 } from "./analytics-rollup-reads";
 
@@ -87,14 +82,32 @@ export function pageViewsWindowIndexHint(db: Db, vertical?: VerticalId): string 
 // ── /summary, /summary/:hours ─────────────────────────────────────────
 
 export interface AdminSummary {
+  /** Page views (page-view-definition.ts), owner excluded, every client class. */
   pageViews: number;
+  /** Distinct visitors (IP + browser) in the window, every client class. */
   uniqueVisitors: number;
+  /** Mean length of a human visit in seconds (traffic-report.ts). */
   avgTimeOnSite: number;
   totalQueries: number;
   topSearchTerms: Array<{ query: string; count: number }>;
+  /** Human visits by where they came from (classifyReferralSource key). */
   trafficBySource: Record<string, number>;
+  /** Page views by AI vendor over AI search + AI crawlers. */
   agentTraffic: { chatgpt: number; claude: number; other: number };
-  ownerStats: { pageViews: number; queries: number };
+  ownerStats: { pageViews: number; queries: number; cookieViews?: number; scriptViews?: number; unknownViews?: number };
+  // ── dev-request 2026-10-13-statistikk-riktig-for-investorer, S1 ──
+  /** Visits (30 min inactivity rule), every client class. */
+  visits?: number;
+  humanViews?: number;
+  humanVisitors?: number;
+  humanVisits?: number;
+  aiSearchViews?: number;
+  aiCrawlerViews?: number;
+  /** Search engines, SEO tools, link previews, other bots, scanners and scrapers. */
+  botViews?: number;
+  devViews?: number;
+  /** Oldest stored page view; a window reaching further back is not fully covered. */
+  coverage?: { oldestRow: string | null; complete: boolean };
 }
 
 export function emptyAdminSummary(): AdminSummary {
@@ -110,76 +123,30 @@ export function emptyAdminSummary(): AdminSummary {
   };
 }
 
-/**
- * Body of AnalyticsService.getSummary (which adds its 2-minute cache and
- * returns zeros on error).
- */
-export function computeAdminSummary(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): AdminSummary {
-  const cutoff = cutoffFor(nowMs, hoursBack);
+// ── Search queries (unchanged in S1; S2 widens what is logged) ──────────
 
-  // Vertical filter fragment — appended to every per-table WHERE clause.
+export interface QueryStats {
+  totalQueries: number;
+  ownerQueries: number;
+  topSearchTerms: Array<{ query: string; count: number }>;
+}
+
+export function computeQueryStats(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): QueryStats {
+  const cutoff = cutoffFor(nowMs, hoursBack);
   const V = vertical ? " AND vertical_id = ?" : "";
   const vp: string[] = vertical ? [vertical] : [];
 
-  // Page views (excluding owner)
-  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-
-  // foer-retention): every raw COUNT()/GROUP BY below only sees whatever
-  // auto-prune hasn't yet rolled up + deleted. Each is blended with its
-  // pruned-day rollup portion from analytics-rollup-reads.ts — a no-op
-  // (+0 / unchanged) when the window is entirely still in raw, or when
-  // ANALYTICS_ROLLUP_READ=false (instant-rollback path). ownerPageViews/
-  // ownerQueries and avgTimeOnSite below are NOT blended — owner (is_owner=1)
-  // rows are excluded from every rollup write by design (retention-
-  // service.ts), so their pruned-day history is genuinely gone forever;
-  // and avgTimeOnSite needs per-session first/last-seen timestamps rollup
-  // tables never captured. Both are documented known gaps, not oversights.
-  const pvResult = db.prepare(`
-    SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-  `).get(cutoff, ...vp) as any;
-  const pageViews = (pvResult.count as number) + getPrunedPageViewCount(cutoff, vertical, db);
-
-  // Owner page views
-  const ownerPvResult = db.prepare(`
-    SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND is_owner = 1${V}
-  `).get(cutoff, ...vp) as any;
-  const ownerPageViews = ownerPvResult.count;
-
-  // Unique visitors (excluding owner)
-  const uvResult = db.prepare(`
-    SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-  `).get(cutoff, ...vp) as any;
-  const uniqueVisitors = (uvResult.count as number) + getPrunedSessionsTotal(cutoff, vertical, db);
-
-  // Traffic by source (excluding owner). INDEXED BY (skive 3, serverheng):
-  // without it SQLite walks idx_analytics_page_views_source — the whole
-  // table — to skip the GROUP BY sort, whatever the window.
-  const sourceResult = db.prepare(`
-    SELECT source, COUNT(*) as count FROM analytics_page_views${pageViewsWindowIndexHint(db, vertical)}
-    WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-    GROUP BY source
-  `).all(cutoff, ...vp) as any[];
-  const trafficBySource: Record<string, number> = {};
-  sourceResult.forEach(row => {
-    trafficBySource[row.source] = row.count;
-  });
-  const prunedBySource = getPrunedPageViewsBySource(cutoff, vertical, db);
-  for (const [source, count] of Object.entries(prunedBySource)) {
-    trafficBySource[source] = (trafficBySource[source] || 0) + count;
-  }
-
-  // Total queries (excluding owner)
   const qResult = db.prepare(`
     SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
   `).get(cutoff, ...vp) as any;
   const totalQueries = (qResult.count as number) + getPrunedQueryCount(cutoff, vertical, db);
 
-  // Owner queries
   const ownerQResult = db.prepare(`
     SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND is_owner = 1${V}
   `).get(cutoff, ...vp) as any;
-  const ownerQueries = ownerQResult.count;
 
-  // Top search terms (excluding owner, excluding single-char autocomplete noise)
+  // Top search terms (excluding owner, excluding single-char autocomplete noise),
+  // blended with the pruned-day portion and re-sorted.
   const topQueriesResult = db.prepare(`
     SELECT query, COUNT(*) as count FROM analytics_queries
     WHERE created_at > ?
@@ -190,11 +157,6 @@ export function computeAdminSummary(db: Db, hoursBack: number, vertical: Vertica
     ORDER BY count DESC
     LIMIT 10
   `).all(cutoff, ...vp) as any[];
-  // Blend in the pruned-day portion (query_text_daily has no <2-char
-  // filter to replicate — trackSearchQuery() never wrote single-char
-  // rows in the first place, see the skip-autocomplete-noise comment at
-  // the insert site — so nothing here can reintroduce that noise), then
-  // re-sort/re-limit exactly like the raw-only query already does.
   const termTotals = new Map<string, number>();
   for (const r of topQueriesResult) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
   for (const r of getPrunedTopQueryTerms(cutoff, vertical, db)) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
@@ -203,124 +165,67 @@ export function computeAdminSummary(db: Db, hoursBack: number, vertical: Vertica
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
 
-  // AI agent traffic breakdown
-  // WHY: bots overwhelmingly produce page views, not search queries, so the
-  // old agent_id read from analytics_queries always came back ~0 even when
-  // GPTBot and ClaudeBot were hammering the site. session_id is stored as
-  // `${ipHash}:${userAgent}`, so we can scan it for crawler UA tokens and
-  // get a truthful read on AI visibility.
-  // Response shape (chatgpt/claude/other) is kept for compatibility, but
-  // membership is now decided by the SHARED classifier
-  // (src/services/traffic-classifier.ts): a session counts as AI traffic
-  // iff it classifies as ai_search (`*-User` retrieval) or ai_crawler.
-  // NOTE (slice A honesty fix): plain search-engine crawlers (Googlebot,
-  // DuckDuckBot, …) used to be folded into `other` here — they are now
-  // search_engine, not AI, so they no longer inflate this number.
-  const agentTraffic = { chatgpt: 0, claude: 0, other: 0 };
-  const aiSessions = db.prepare(`
-    SELECT session_id, COUNT(*) as count FROM analytics_page_views
-    WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}${V}
-    GROUP BY session_id
-  `).all(cutoff, ...vp) as any[];
-  for (const row of aiSessions) {
-    const ua = uaFromSessionId(row.session_id);
-    const category = classifyUA(ua);
-    if (category !== "ai_search" && category !== "ai_crawler") continue;
-    agentTraffic[aiVendorBucket(ua)] += row.count;
-  }
-  // Skive 3: blend in the pruned-day chatgpt/claude portion from
-  // page_view_daily's bot_type dimension — the token sets are identical
-  // to the regexes just above. `other` is NOT blended: rollup's
-  // 'other_bot' bucket uses a different, broader UA match than this
-  // classifier's ai_search/ai_crawler "other" residue (see
-  // getPrunedChatgptClaudeCounts's doc comment) — documented known gap.
-  const prunedAgentTraffic = getPrunedChatgptClaudeCounts(cutoff, { vertical, db });
-  agentTraffic.chatgpt += prunedAgentTraffic.chatgpt;
-  agentTraffic.claude += prunedAgentTraffic.claude;
+  return { totalQueries, ownerQueries: ownerQResult.count as number, topSearchTerms };
+}
 
-  // Back-compat: if the analytics_queries table has search-query hits from
-  // explicitly named agents (ChatGPT/Claude), fold those in too so we don't
-  // under-count real search-query traffic that also happens to be AI.
-  const agentQueryResult = db.prepare(`
-    SELECT agent_id, COUNT(*) as count FROM analytics_queries
-    WHERE created_at > ? AND agent_id IS NOT NULL${V}
-    GROUP BY agent_id
-  `).all(cutoff, ...vp) as any[];
-  agentQueryResult.forEach(row => {
-    if (row.agent_id === "ChatGPT") agentTraffic.chatgpt += row.count;
-    else if (row.agent_id === "Claude") agentTraffic.claude += row.count;
-    else agentTraffic.other += row.count;
-  });
-  // Skive 3: same back-compat fold, for the pruned-day portion of
-  // analytics_queries (query_daily.agent_id is an exact string match,
-  // same as the raw column, so this reproduces the loop above exactly).
-  getPrunedQueryCountsByAgent(cutoff, vertical, db).forEach(row => {
-    if (row.agent_id === "ChatGPT") agentTraffic.chatgpt += row.count;
-    else if (row.agent_id === "Claude") agentTraffic.claude += row.count;
-    else agentTraffic.other += row.count;
-  });
+// ── Summary = traffic report + search queries ──────────────────────────
+//
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: every page-view
+// number comes from the one traffic report (traffic-report.ts), so the cards
+// add up. Gone with it: static files, redirects and the /mcp and /a2a
+// endpoints counted as page views; AI search QUERIES added to the AI page-view
+// card; a bot list maintained separately from the shared classifier.
+//
+// Raw rows only: windows longer than the stored raw data (60 days) report what
+// is stored and say so in `coverage`. The history beyond that comes in S3.
 
-  // Average time on site (seconds) — approximation from session page-view spans.
-  // WHY: we don't have explicit beacons/pagehide tracking, but session_id is
-  // stable per visitor, so for any multi-pageview session we can take
-  // (last_view - first_view) as a lower-bound for time spent. We cap each
-  // session at 1800s (30 min) to filter "tab left open overnight" outliers,
-  // and we exclude single-pageview sessions from the numerator because they
-  // give us no duration signal at all — they show up as bounces in
-  // uniqueVisitors but shouldn't drag the average to zero. Bots (session_id
-  // containing a UA token like GPTBot/ClaudeBot) are excluded so we measure
-  // human dwell time only.
-  let avgTimeOnSite = 0;
-  try {
-    const durRow = db.prepare(`
-      SELECT AVG(dur) as avg_dur FROM (
-        SELECT MIN(
-          1800,
-          CAST((julianday(MAX(created_at)) - julianday(MIN(created_at))) * 86400 AS INTEGER)
-        ) as dur
-        FROM analytics_page_views
-        WHERE created_at > ?
-          AND (is_owner IS NULL OR is_owner = 0)
-          AND session_id IS NOT NULL
-          AND session_id NOT LIKE '%GPTBot%'
-          AND session_id NOT LIKE '%ClaudeBot%'
-          AND session_id NOT LIKE '%Claude-User%'
-          AND session_id NOT LIKE '%ChatGPT%'
-          AND session_id NOT LIKE '%bot%'
-          AND session_id NOT LIKE '%Bot%'
-          AND session_id NOT LIKE '%crawler%'
-          AND session_id NOT LIKE '%spider%'${V}
-        GROUP BY session_id
-        HAVING COUNT(*) >= 2
-      )
-    `).get(cutoff, ...vp) as any;
-    avgTimeOnSite = Math.round(durRow?.avg_dur || 0);
-  } catch (e) {
-    // Non-fatal: keep avgTimeOnSite at 0 rather than failing the whole summary.
-    console.warn("[analytics] avgTimeOnSite calculation skipped:", (e as Error).message);
-  }
-
+export function summaryFromReport(report: TrafficReport, q: QueryStats): AdminSummary {
+  const trafficBySource: Record<string, number> = {};
+  for (const e of report.human.entrySources) trafficBySource[e.key] = e.visits;
   return {
-    pageViews,
-    uniqueVisitors,
-    avgTimeOnSite,
-    totalQueries,
-    topSearchTerms,
+    pageViews: report.totals.views,
+    uniqueVisitors: report.totals.visitors,
+    avgTimeOnSite: report.human.avgVisitSeconds,
+    totalQueries: q.totalQueries,
+    topSearchTerms: q.topSearchTerms,
     trafficBySource,
-    agentTraffic,
-    ownerStats: { pageViews: ownerPageViews, queries: ownerQueries },
+    agentTraffic: { ...report.aiVendors },
+    ownerStats: {
+      pageViews: report.owner.views,
+      queries: q.ownerQueries,
+      cookieViews: report.owner.cookieViews,
+      scriptViews: report.owner.scriptViews,
+      unknownViews: report.owner.unknownViews,
+    },
+    visits: report.totals.visits,
+    humanViews: report.groups.human.views,
+    humanVisitors: report.groups.human.visitors,
+    humanVisits: report.groups.human.visits,
+    aiSearchViews: report.groups.ai_search.views,
+    aiCrawlerViews: report.groups.ai_crawler.views,
+    botViews: report.groups.bot.views,
+    devViews: report.groups.dev.views,
+    coverage: report.coverage,
   };
 }
 
-/** Body of AnalyticsService.getPageViewCount (without its cache). */
+/**
+ * Body of AnalyticsService.getSummary (which adds its 2-minute cache and
+ * returns zeros on error).
+ */
+export function computeAdminSummary(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): AdminSummary {
+  return summaryFromReport(
+    computeTrafficReport(db, hoursBack, vertical, nowMs),
+    computeQueryStats(db, hoursBack, vertical, nowMs),
+  );
+}
+
+/**
+ * Body of AnalyticsService.getPageViewCount (without its cache): page views of
+ * every client class in the window (traffic-report.ts).
+ */
 export function computePageViewCount(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): number {
-  const cutoff = cutoffFor(nowMs, hoursBack);
-  const V = vertical ? " AND vertical_id = ?" : "";
-  const vp: string[] = vertical ? [vertical] : [];
-  const result = db.prepare(`
-    SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-  `).get(cutoff, ...vp) as any;
-  return (result.count as number) + getPrunedPageViewCount(cutoff, vertical, db);
+  return computeTrafficReport(db, hoursBack, vertical, nowMs, { detail: false }).totals.views;
 }
 
 export interface UtmRow {
@@ -600,90 +505,56 @@ export function computeCityStats(db: Db, hoursBack: number, vertical: VerticalId
 
 // ── /visitors ─────────────────────────────────────────────────────────
 
-/** Body of GET /admin/analytics/visitors. */
+/**
+ * Body of GET /admin/analytics/visitors: the most recently active visitors of
+ * every class (traffic-report.ts recentSessions), newest first. Legacy field
+ * names kept (ipHash is the first 8 hex chars of the salted IP hash).
+ */
+export function visitorsFromReport(report: TrafficReport, limit: number, sort: "views" | "recent" = "views"): any[] {
+  const list = sort === "recent" ? report.recentSessions : report.busiestSessions;
+  return list.slice(0, limit).map((r: SessionRow) => ({
+    ipHash: r.id,
+    pageViews: r.views,
+    uniquePages: r.uniquePages,
+    visits: r.visits,
+    firstSeen: r.firstSeen,
+    lastSeen: r.lastSeen,
+    source: r.entrySource,
+    device: r.device,
+    cls: r.cls,
+    group: r.group,
+    name: r.name ?? null,
+    ua: r.ua ?? null,
+  }));
+}
+
 export function computeVisitors(db: Db, hours: number, limit: number, vertical: VerticalId | undefined, nowMs: number): any[] {
-  const cutoff = cutoffFor(nowMs, hours);
-  const V = vertical ? " AND vertical_id = ?" : "";
-  const vp: string[] = vertical ? [vertical] : [];
-  return db.prepare(`
-    SELECT
-      session_id as ipHash,
-      COUNT(*) as pageViews,
-      COUNT(DISTINCT path) as uniquePages,
-      MIN(created_at) as firstSeen,
-      MAX(created_at) as lastSeen,
-      source,
-      CASE
-        WHEN session_id LIKE '%mobile%' OR session_id LIKE '%iphone%' THEN 'mobile'
-        WHEN session_id LIKE '%tablet%' OR session_id LIKE '%ipad%' THEN 'tablet'
-        ELSE 'desktop'
-      END as device
-    FROM analytics_page_views
-    WHERE created_at > ? AND ${NOT_OWNER}${V}
-    GROUP BY session_id
-    ORDER BY pageViews DESC
-    LIMIT ?
-  `).all(cutoff, ...vp, limit) as any[];
+  return visitorsFromReport(computeTrafficReport(db, hours, vertical, nowMs), limit);
 }
 
 // ── /pages ────────────────────────────────────────────────────────────
-
-/**
- * Automated vulnerability-scanner paths, excluded from the top-pages list
- * (bots probing for WordPress/PHP installs are not signal).
- */
-export const TOP_PAGES_SCANNER_PATTERNS = [
-  "%wp-admin%", "%wp-login%", "%wp-includes%", "%wordpress%",
-  "%wlwmanifest%", "%xmlrpc%", "%/.env%", "%/.git%",
-  "%phpunit%", "%phpinfo%", "%setup-config%",
-];
 
 export interface TopPageRow {
   path: string;
   views: number;
   visitors: number;
+  humanViews?: number;
+  aiViews?: number;
+  botViews?: number;
+  humanVisitors?: number;
 }
 
-/** Body of GET /admin/analytics/pages (raw window + pruned-day rollup blend). */
+/**
+ * Body of GET /admin/analytics/pages: pages by views (traffic-report.ts), with
+ * the human / AI / bot split. Static files, redirects, errors and scanner
+ * probes are not page views (page-view-definition.ts), so they never appear.
+ */
+export function topPagesFromReport(report: TrafficReport, limit: number): TopPageRow[] {
+  return report.topPages.slice(0, limit).map((p) => ({ ...p }));
+}
+
 export function computeTopPages(db: Db, hours: number, limit: number, vertical: VerticalId | undefined, nowMs: number): TopPageRow[] {
-  const cutoff = cutoffFor(nowMs, hours);
-  const V = vertical ? " AND vertical_id = ?" : "";
-  const vp: string[] = vertical ? [vertical] : [];
-  const SCANNER_PATTERNS = TOP_PAGES_SCANNER_PATTERNS;
-  const scannerExclusion = SCANNER_PATTERNS.map(() => "path NOT LIKE ?").join(" AND ");
-
-  const prunedPages = getPrunedPageViewsByPath(cutoff, vertical, SCANNER_PATTERNS, db);
-
-  // INDEXED BY: without it SQLite walks idx_analytics_page_views_path (whole
-  // table) to skip the GROUP BY sort, whatever the window.
-  const rawQuery = `
-    SELECT
-      path,
-      COUNT(*) as views,
-      COUNT(DISTINCT session_id) as visitors
-    FROM analytics_page_views${pageViewsWindowIndexHint(db, vertical)}
-    WHERE created_at > ? AND ${NOT_OWNER}${V}
-      AND (${scannerExclusion})
-    GROUP BY path
-    ORDER BY views DESC, path ${vertical ? "DESC" : "ASC"}
-  `;
-
-  if (prunedPages.length === 0) {
-    return db.prepare(`${rawQuery} LIMIT ?`).all(cutoff, ...vp, ...SCANNER_PATTERNS, limit) as any[];
-  }
-  const rawPages = db.prepare(rawQuery).all(cutoff, ...vp, ...SCANNER_PATTERNS) as any[];
-  const byPath = new Map<string, TopPageRow>();
-  for (const p of rawPages) byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
-  for (const p of prunedPages) {
-    const existing = byPath.get(p.path);
-    if (existing) {
-      existing.views += p.views;
-      existing.visitors += p.visitors; // approximation — see getPrunedPageViewsByPath
-    } else {
-      byPath.set(p.path, { path: p.path, views: p.views, visitors: p.visitors });
-    }
-  }
-  return [...byPath.values()].sort((a, b) => b.views - a.views).slice(0, limit);
+  return topPagesFromReport(computeTrafficReport(db, hours, vertical, nowMs), limit);
 }
 
 // ── /umbrella-traffic ─────────────────────────────────────────────────
@@ -741,6 +612,11 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
 
   const cutoff = sqliteDatetime(new Date(nowMs - sinceHours * 3600 * 1000));
   const aiClause = UMBRELLA_AI_TOKENS.map(() => "session_id LIKE ?").join(" OR ");
+  // Page views only (page-view-definition.ts); a schema without status_code
+  // (older test fixtures) is filtered on the path alone.
+  const hasStatus = (db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>)
+    .some((c) => c.name === "status_code");
+  const pageFilter = hasStatus ? pageViewSql() : pagePathSql();
   const aiParams = UMBRELLA_AI_TOKENS.map(t => `%${t}%`);
 
   const memberCountStmt = db.prepare(`
@@ -768,6 +644,7 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
       WHERE path = ?
         AND created_at > ?
         AND (is_owner IS NULL OR is_owner = 0)
+        AND ${pageFilter}
     `).get(umbrellaPath, cutoff) as { c: number };
     const pageViews_via_profile = profileRow.c + getPrunedExactPathViewCount([umbrellaPath], cutoff, {}, db);
 
@@ -779,6 +656,7 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
         WHERE path IN (${placeholders})
           AND created_at > ?
           AND (is_owner IS NULL OR is_owner = 0)
+          AND ${pageFilter}
       `).get(...memberPaths, cutoff) as { c: number };
       pageViews_via_members = memberRow.c + getPrunedExactPathViewCount(memberPaths, cutoff, {}, db);
     }
@@ -791,6 +669,7 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
       WHERE path IN (${pathPlaceholders})
         AND created_at > ?
         AND (is_owner IS NULL OR is_owner = 0)
+        AND ${pageFilter}
         AND (${aiClause})
     `).get(...allPaths, cutoff, ...aiParams) as { c: number };
     const ai_bot_pageviews = aiRow.c;
@@ -800,6 +679,7 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
       WHERE path IN (${pathPlaceholders})
         AND created_at > ?
         AND (is_owner IS NULL OR is_owner = 0)
+        AND ${pageFilter}
         AND source = 'search'
     `).get(...allPaths, cutoff) as { c: number };
     const search_referrals = searchRow.c + getPrunedExactPathViewCount(allPaths, cutoff, { source: "search" }, db);
@@ -868,6 +748,12 @@ export function computeHumanReferralPatterns(
 
 /** One admin-dashboard read; JSON-serialisable (it crosses the worker boundary and is the cache key). */
 export type AdminStatsQuery =
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: one report
+  // per (window, vertical) feeds the summary cards, /traffic-classification,
+  // /hourly, /devices, /referrers, /pages and /visitors, so they share one
+  // cache entry and one computation.
+  | { name: "trafficReport"; hours: number; vertical?: VerticalId }
+  | { name: "queryStats"; hours: number; vertical?: VerticalId }
   | { name: "summary24"; vertical?: VerticalId }
   | { name: "summary"; hours: number; vertical?: VerticalId }
   | { name: "producers"; limit: number; hours: number; vertical?: VerticalId }
@@ -878,19 +764,32 @@ export type AdminStatsQuery =
   // /samtaler referral strip (skive 4); cached 30–60 min by samtaler-strip.ts.
   | { name: "humanReferrals"; hours: number; vertical?: VerticalId };
 
-/** GET /admin/analytics/summary's three numbers (24 h summary, 30-day visits, 24 h UTM). */
+/**
+ * GET /admin/analytics/summary's three numbers: the 24 h summary, the human
+ * visits of the last 30 days (`monthly_visits`; it used to be every stored row
+ * of 30 days, static files and crawlers included) and the 24 h UTM table.
+ */
 export interface Summary24Result {
   summary: AdminSummary;
   monthlyVisits: number;
   utm: UtmRow[];
 }
 
+/** Human visits in the last 30 days (traffic-report.ts definitions). */
+export function computeMonthlyHumanVisits(db: Db, vertical: VerticalId | undefined, nowMs: number): number {
+  return computeTrafficReport(db, 24 * 30, vertical, nowMs, { detail: false }).groups.human.visits;
+}
+
 export function runAdminStatsQuery(db: Db, query: AdminStatsQuery, nowMs: number): unknown {
   switch (query.name) {
+    case "trafficReport":
+      return computeTrafficReport(db, query.hours, query.vertical, nowMs);
+    case "queryStats":
+      return computeQueryStats(db, query.hours, query.vertical, nowMs);
     case "summary24":
       return {
         summary: computeAdminSummary(db, 24, query.vertical, nowMs),
-        monthlyVisits: computePageViewCount(db, 24 * 30, query.vertical, nowMs),
+        monthlyVisits: computeMonthlyHumanVisits(db, query.vertical, nowMs),
         utm: computeUtmBreakdown(db, 24, query.vertical, nowMs),
       } satisfies Summary24Result;
     case "summary":

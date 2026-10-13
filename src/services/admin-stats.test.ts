@@ -55,9 +55,12 @@ import {
   computeTopPages,
   runAdminStatsQuery,
   pageViewsWindowIndexHint,
-  TOP_PAGES_SCANNER_PATTERNS,
+  visitorsFromReport,
+  topPagesFromReport,
   type AdminStatsQuery,
 } from "./admin-stats-compute";
+import { pageViewSql } from "./page-view-definition";
+import { computeTrafficReport } from "./traffic-report";
 
 export interface TestSummary {
   passed: number;
@@ -183,19 +186,20 @@ function oldProducerRows(db: Database.Database, cutoff: string, limit: number, v
   `).all(cutoff, cutoff, ...vp, limit) as any[];
 }
 
-/** Old top-pages raw query (no INDEXED BY). */
-function oldPageRows(db: Database.Database, cutoff: string, limit: number, vertical?: string): any[] {
+/**
+ * Page views in a window straight from SQL (page-view-definition.ts), the
+ * independent check for the traffic report's totals and top pages.
+ */
+function sqlPageRows(db: Database.Database, cutoff: string, vertical?: string): any[] {
   const V = vertical ? " AND vertical_id = ?" : "";
   const vp: string[] = vertical ? [vertical] : [];
-  const excl = TOP_PAGES_SCANNER_PATTERNS.map(() => "path NOT LIKE ?").join(" AND ");
   return db.prepare(`
     SELECT path, COUNT(*) as views, COUNT(DISTINCT session_id) as visitors
     FROM analytics_page_views
-    WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V} AND (${excl})
+    WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V} AND ${pageViewSql()}
     GROUP BY path
-    ORDER BY views DESC
-    LIMIT ?
-  `).all(cutoff, ...vp, ...TOP_PAGES_SCANNER_PATTERNS, limit) as any[];
+    ORDER BY views DESC, path ASC
+  `).all(cutoff, ...vp) as any[];
 }
 
 /** Does the top-category / top-source / ranking have a tie the old SQL left to the engine? */
@@ -459,53 +463,60 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
       "Q2: /producers' grouped query returns the old SQL's rows, counts, ranking and top source, with and without LIMIT (48 cases)", prodBad);
     ok(tiedRanks > 0 && tiedPicks > 0, "Q3: the seeded data contains tied counts and tied top categories/sources, so Q1/Q2 cover the tie rules", { tiedRanks, tiedPicks });
 
-    // Q4: summary trafficBySource with INDEXED BY equals the un-hinted query.
+    // Q4 (dev-request 2026-10-13-statistikk-riktig-for-investorer, S1): the
+    // summary's page views and visitors equal a plain SQL count of page views
+    // (probes like /wp-admin/x.php are not pages), and the five groups add up.
     {
       let bad: unknown = null;
       for (const hours of [24, 720]) {
         for (const v of [undefined, "rfb"] as const) {
           const cutoff = sqliteTs(nowMs - hours * 3600_000);
           const V = v ? " AND vertical_id = ?" : "";
-          const rows = qdb.prepare(`SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V} GROUP BY source`)
-            .all(cutoff, ...(v ? [v] : [])) as Array<{ source: string; count: number }>;
-          const expected: Record<string, number> = {};
-          for (const r of rows) expected[r.source] = r.count;
-          const got = computeAdminSummary(qdb, hours, v, nowMs).trafficBySource;
-          if (!eq(Object.entries(got).sort(), Object.entries(expected).sort())) bad = bad ?? { hours, v, got, expected };
+          const want = qdb.prepare(`
+            SELECT COUNT(*) AS views, COUNT(DISTINCT session_id) AS visitors FROM analytics_page_views
+            WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V} AND ${pageViewSql()}
+          `).get(cutoff, ...(v ? [v] : [])) as { views: number; visitors: number };
+          const got = computeAdminSummary(qdb, hours, v, nowMs);
+          const groupSum = ["humanViews", "aiSearchViews", "aiCrawlerViews", "botViews", "devViews"]
+            .reduce((a, k) => a + ((got as any)[k] || 0), 0);
+          if (got.pageViews !== want.views || got.uniqueVisitors !== want.visitors || groupSum !== got.pageViews || want.views === 0) {
+            bad = bad ?? { hours, v, got, want, groupSum };
+          }
         }
       }
-      ok(bad === null, "Q4: summary trafficBySource (INDEXED BY the time-window index) equals the old query", bad);
+      ok(bad === null, "Q4: summary page views and visitors equal the SQL page-view count, and the groups add up to the total", bad);
     }
 
-    // Q5: /pages with INDEXED BY equals the old query (rollup blend empty here).
+    // Q5: /pages = page views per path from SQL, ranked by views then path.
     {
       let bad: unknown = null;
       for (const hours of [24, 720]) {
         for (const v of [undefined, "dental"] as const) {
           const cutoff = sqliteTs(nowMs - hours * 3600_000);
-          const old = oldPageRows(qdb, cutoff, 1000, v);
+          const want = sqlPageRows(qdb, cutoff, v);
           const neu = computeTopPages(qdb, hours, 1000, v, nowMs);
-          const norm = (xs: any[]) => [...xs].map((x) => [x.path, x.views, x.visitors]).sort();
-          if (!eq(norm(old), norm(neu)) || !eq(old.map((x) => x.views), neu.map((x: any) => x.views))) bad = bad ?? { hours, v, old, neu };
+          const norm = (xs: any[]) => xs.map((x) => [x.path, x.views, x.visitors]);
+          const groupsOk = neu.every((x: any) => x.humanViews + x.aiViews + x.botViews === x.views);
+          if (!eq(norm(want), norm(neu)) || !groupsOk || neu.some((x: any) => x.path.includes("wp-admin"))) bad = bad ?? { hours, v, want, neu };
         }
       }
-      ok(bad === null, "Q5: /pages (INDEXED BY the time-window index) returns the same rows and ranking as the old query", bad);
+      ok(bad === null, "Q5: /pages returns the SQL page-view counts per path, ranked by views then path, with human/AI/bot adding up", bad);
     }
 
-    // Q5b: ties around the LIMIT cut pick the same pages as the old query (tie-breaker on path).
+    // Q5b: a small LIMIT is the head of the full ranking (ties broken by path).
     {
       let bad: unknown = null;
       for (const hours of [24, 720]) {
         for (const v of [undefined, "dental"] as const) {
           for (const limit of [3, 5, 20]) {
             const cutoff = sqliteTs(nowMs - hours * 3600_000);
-            const old = oldPageRows(qdb, cutoff, limit, v).map((x: any) => x.path);
+            const want = sqlPageRows(qdb, cutoff, v).slice(0, limit).map((x: any) => x.path);
             const neu = computeTopPages(qdb, hours, limit, v, nowMs).map((x: any) => x.path);
-            if (!eq(old, neu)) bad = bad ?? { hours, v, limit, old, neu };
+            if (!eq(want, neu)) bad = bad ?? { hours, v, limit, want, neu };
           }
         }
       }
-      ok(bad === null, "Q5b: /pages with a small LIMIT returns the same pages in the same order as the old query (ties)", bad);
+      ok(bad === null, "Q5b: /pages with a small LIMIT returns the head of the full ranking (ties by path)", bad);
     }
 
     // Q6/Q7: EXPLAIN QUERY PLAN — the time-window index, not a full walk of source/path.
@@ -545,7 +556,20 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
         const analyticsRouter = require("../routes/analytics").default;
         let mode: "ok" | "fail" = "fail";
         const seen: AdminStatsQuery[] = [];
+        // The page-view routes all read one traffic report (S1); the worker's
+        // canned answer is a real report over a tiny DB: 9 page views by 4 visitors.
+        const repDb = new Database(":memory:");
+        __initSchemaForTesting(repDb as any);
+        const repTs = sqliteTs(Date.now() - 3600_000);
+        const repIns = repDb.prepare("INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at, status_code) VALUES (?, ?, 0, 'rfb', ?, 200)");
+        const gpt = "ip4:Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)";
+        for (const [p, sid] of [["/", "ip1:desktop:aaaa"], ["/sok", "ip1:desktop:aaaa"], ["/", "ip2:mobile:bbbb"], ["/om", "ip2:mobile:bbbb"],
+          ["/", "ip3:desktop:cccc"], ["/", gpt], ["/sok", gpt], ["/om", gpt], ["/oslo", gpt]]) repIns.run(p, sid, repTs);
+        const cannedReport = computeTrafficReport(repDb as any, 720, undefined, Date.now());
+        repDb.close();
         const answers: Record<string, unknown> = {
+          trafficReport: cannedReport,
+          queryStats: { totalQueries: 0, ownerQueries: 0, topSearchTerms: [] },
           summary24: {
             summary: { pageViews: 7, uniqueVisitors: 3, avgTimeOnSite: 0, totalQueries: 1, topSearchTerms: [], trafficBySource: { direct: 7 }, agentTraffic: { chatgpt: 0, claude: 0, other: 0 }, ownerStats: { pageViews: 0, queries: 0 } },
             monthlyVisits: 70,
@@ -617,12 +641,55 @@ export async function runAdminStatsTests(opts: { log?: boolean } = {}): Promise<
         ok(sumH.timeframe === "last 720 hours" && sumH.pageViews === 9 && !("monthly_visits" in sumH) &&
            prod.count === 1 && prod.limit === 20 && prod.producers[0].agentId === "a1" && prod.timeframe === "last 720 hours" &&
            cities.count === 1 && cities.cities[0].topCategory === "egg" &&
-           eq(vis, { visitors: answers.visitors }) && eq(pages, { pages: answers.pages }) &&
+           eq(vis, { visitors: visitorsFromReport(cannedReport, 50) }) && eq(pages, { pages: topPagesFromReport(cannedReport, 20) }) &&
+           vis.visitors.length === 4 && pages.pages[0].path === "/" && pages.pages[0].views === 4 &&
            eq(umb, { success: true, since_hours: 720, umbrellas: [] }),
           "H4: /summary/:hours, /producers, /cities, /visitors, /pages and /umbrella-traffic keep their JSON shapes", { sumH, prod, cities, vis, pages, umb });
         const seenKeys = seen.map(adminStatsKey);
-        ok(seenKeys.includes(adminStatsKey({ name: "producers", limit: 20, hours: 720 })) && seenKeys.includes(adminStatsKey({ name: "umbrellaTraffic", sinceHours: 720 })),
+        ok(seenKeys.includes(adminStatsKey({ name: "producers", limit: 20, hours: 720 })) && seenKeys.includes(adminStatsKey({ name: "umbrellaTraffic", sinceHours: 720 })) &&
+           seenKeys.includes(adminStatsKey({ name: "trafficReport", hours: 720 })) && seenKeys.includes(adminStatsKey({ name: "queryStats", hours: 720 })),
           "H5: the routes pass their parsed parameters to the worker task", seen);
+
+        // H6: the main-thread fallback (OFFTHREAD_STATS_DISABLED=1, or no WAL)
+        // answers /summary with the worker's own query: monthly_visits is
+        // human visits on both paths, not every client's page views.
+        const initMod = require("../database/init") as typeof import("../database/init");
+        const prevDb = initMod.getDb();
+        const fbDb = new Database(":memory:");
+        let fbServer: http.Server | null = null;
+        try {
+          __initSchemaForTesting(fbDb as any);
+          initMod.__setDbForTesting(fbDb as any);
+          const fbIns = fbDb.prepare("INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at, status_code) VALUES (?, ?, 0, 'rfb', ?, 200)");
+          for (let i = 0; i < 5; i++) fbIns.run(`/p${i}`, gpt, sqliteTs(Date.now() - 2 * 3600_000 + i * 60_000));
+          fbIns.run("/", "ip9:desktop:9999", sqliteTs(Date.now() - 3600_000));
+          const fbReader = createAdminStatsReader({
+            getDb: () => fbDb as any,
+            offThreadUsable: () => false,
+            runOffThread: () => Promise.reject(new Error("must not run off-thread")),
+            now: Date.now, ttlMs: 300_000, maxStaleMs: 600_000, retryAfterMs: 0, maxEntries: 50, log: () => {},
+          });
+          const fbApp = express();
+          fbApp.set(ADMIN_STATS_READER_APP_KEY, fbReader);
+          fbApp.use("/admin/analytics", analyticsRouter);
+          fbServer = await new Promise<http.Server>((resolve) => { const s2 = fbApp.listen(0, "127.0.0.1", () => resolve(s2)); });
+          const fbPort = (fbServer.address() as AddressInfo).port;
+          const fb = await new Promise<any>((resolve) => {
+            const rq = http.request({ host: "127.0.0.1", port: fbPort, path: "/admin/analytics/summary", method: "GET", headers: { "X-Admin-Key": KEY } }, (res) => {
+              let buf = "";
+              res.on("data", (c) => (buf += c));
+              res.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve(buf); } });
+            });
+            rq.on("error", () => resolve(null));
+            rq.end();
+          });
+          ok(fb?.pageViews === 6 && fb?.monthly_visits === 1,
+            "H6: the main-thread fallback of /summary gives the same monthly_visits as the worker (human visits: 1, not the 6 page views of all clients)", fb);
+        } finally {
+          if (fbServer) await new Promise<void>((r) => fbServer!.close(() => r()));
+          initMod.__setDbForTesting(prevDb);
+          fbDb.close();
+        }
       }
     } catch (e) {
       ok(false, "H: route tests threw", (e as Error).stack);

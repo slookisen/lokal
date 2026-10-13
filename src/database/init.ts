@@ -1462,6 +1462,17 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── client_class on page views (2026-10-13) ──────────────────
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S1: the class of
+  // the full User-Agent at write time (traffic-classifier.ts clientClassForUA).
+  // Nullable, additive, metadata-only ALTER; NULL marks a row written before
+  // the column, which readers classify from its session_id as before.
+  try {
+    db.exec(`ALTER TABLE analytics_page_views ADD COLUMN client_class TEXT`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── B4 (dev-request 2026-09-24-ai-sok-bli-svaret-rfb): inbound UTM ──
   // Nullable, additive columns. Plain ALTER TABLE ADD COLUMN is a
   // metadata-only change in SQLite (no table rewrite, safe on ~1.3M rows).
