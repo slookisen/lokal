@@ -2201,8 +2201,9 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/personvern", (_req: Request, res: Response) => {
-  // 2026-10-13: visit and search statistics described (dev-request
-  // 2026-10-13-statistikk-riktig-for-investorer, S2: searches are now logged).
+  // 2026-10-13: faktarettinger (dev-request 2026-10-06-personvernerklaeringer-del-a-na-del-b-pa-t, del A);
+  // visit and search statistics described (2026-10-13-statistikk-riktig-for-investorer, S2:
+  // searches are now logged); operator → AGENTPLATFORM.NO AS (2026-10-08).
   const updatedDate = "2026-10-13";
   const html = `
 <main>
@@ -2214,17 +2215,18 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>${companyControllerSentenceHtml("nb", { siteName: "Finn-tannlege.com", siteEmail: "kontakt@finn-tannlege.com" })}</p>
 
     <h2>Hvilke data behandler vi?</h2>
-    <p>Om klinikkene behandler vi <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>:</p>
+    <p>Katalogen bygger på <strong>offentlig tilgjengelige opplysninger</strong>. Mesteparten gjelder virksomheter, men den inneholder også opplysninger om enkeltpersoner (tannleger og annet helsepersonell, og enkeltpersonforetak):</p>
     <ul>
-      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, adresse, kontaktinformasjon og næringsgruppekode for registrerte tannlegeklinikker</li>
-      <li><strong>Offentlige helseregistre (HPR)</strong> &mdash; autorisasjon og spesialisttittel for helsepersonell i yrkesutøvelse (offentlig informasjon etter helsepersonelloven)</li>
+      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, adresse, kontaktinformasjon og næringsgruppekode for registrerte tannlegeklinikker. For enkeltpersonforetak er foretaksnavnet ofte personens eget navn.</li>
+      <li><strong>Helsepersonellregisteret (HPR)</strong> &mdash; for tannleger lagrer vi <strong>navn, HPR-nummer, spesialitet(er) og kobling til klinikk</strong>, og i noen tilfeller personens eget organisasjonsnummer og bostedsfylke. Autorisasjon og spesialisttittel er offentlig informasjon etter helsepersonelloven.</li>
       <li><strong>Klinikkenes egne offentlige nettsider</strong> &mdash; åpningstider, behandlingstilbud og presentasjonstekst</li>
+      <li><strong>Henvendelser via kontaktskjemaet</strong> &mdash; navn, e-postadresse, emne og melding du selv sender oss. Meldingen lagres for å behandle forespørselen din.</li>
     </ul>
-    <p>Vi behandler <strong>ingen pasientdata</strong>, <strong>ingen helseopplysninger om enkeltpersoner</strong> og ingen sensitiv personinformasjon utover det som er offentlig tilgjengelig i kapasitet som yrkesutøver. Om deg som besøker siden lagrer vi bare besøks- og søkestatistikken beskrevet under.</p>
+    <p>Vi behandler <strong>ingen pasientdata</strong> og <strong>ingen helseopplysninger om enkeltpersoner</strong>. Opplysningene om helsepersonell gjelder utelukkende deres yrkesutøvelse og autorisasjon. Utover henvendelser du selv sender oss, lagrer vi om deg som besøker siden bare besøks- og søkestatistikken beskrevet under.</p>
 
     <h2>Besøks- og søkestatistikk</h2>
     <p>For å forstå hvordan tjenesten brukes, registrerer serveren &mdash; uten cookies &mdash; for hvert sidebesøk hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (vi lagrer aldri hele IP-adressen) og en grov klassifisering av nettleseren (for eksempel mobil, PC eller søkemotor). Når du søker på nettsiden eller via API-et, lagrer vi i tillegg søketeksten og filtrene du valgte (for eksempel fylke, spesialitet eller akutt), antall treff og den samme IP-hashen. Når en AI-assistent bruker våre MCP- eller A2A-verktøy, logger vi verktøyet, AI-klientens nettleser-/klientstreng og en saltet IP-hash.</p>
-    <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Opplysningene deles ikke med noen.</p>
+    <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Statistikken lagres i databasen hos Fly.io (se under) og deles ikke med andre.</p>
 
     <h2>Navngitte personer</h2>
     <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>
@@ -2245,8 +2247,15 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <h2>Informasjonskapsler (cookies)</h2>
     <p>Vi bruker <strong>ingen sporingscookies</strong> og ingen markedsføringscookies. Det lagres ingen cookies på din enhet for analyseformål; statistikken over regnes ut på serveren.</p>
 
-    <h2>Tredjeparter</h2>
-    <p>Vi <strong>selger ikke</strong> og deler ikke personopplysninger med tredjeparter for kommersielle formål. Tjenesten driftes på Fly.io i EU-region (Frankfurt). Ingen persondata overføres til land utenfor EU/EØS-området.</p>
+    <h2>Tredjeparter og overføring til land utenfor EØS</h2>
+    <p>Vi <strong>selger ikke</strong> personopplysninger og deler dem ikke med tredjeparter for kommersielle formål. Vi bruker følgende leverandører til driften:</p>
+    <ul>
+      <li><strong>Fly.io</strong> &mdash; hosting og lagring av databasen. Tjenesten kjører i Fly.ios region <strong>arn (Stockholm, Sverige)</strong>, altså innenfor EØS. Fly.io er et amerikansk selskap.</li>
+      <li><strong>Cloudflare (Turnstile)</strong> &mdash; spamsjekk på kontaktskjemaet. Når du åpner kontaktsiden, lastes skriptet fra Cloudflare, og nettleserinformasjon og IP-adresse kan bli behandlet av Cloudflare, et amerikansk selskap.</li>
+      <li><strong>Anthropic (API)</strong> &mdash; en språkmodell brukes til å vurdere om en oppføring i katalogen faktisk er en tannlegeklinikk. Modellen mottar opplysninger fra Brreg (foretaksnavn, næringskode, organisasjonsform og nettadresse); for enkeltpersonforetak kan foretaksnavnet være personens navn. Anthropic er et amerikansk selskap.</li>
+      <li><strong>Google (Gmail) og Resend</strong> &mdash; e-postkorrespondanse, blant annet henvendelser til og svar fra kontakt@finn-tannlege.com. Begge er amerikanske selskaper.</li>
+    </ul>
+    <p>Bruken av Cloudflare, Anthropic, Google og Resend innebærer at personopplysninger kan bli overført til og behandlet i <strong>USA, utenfor EU/EØS</strong>. Slike overføringer krever et overføringsgrunnlag etter GDPR kapittel V. Ta kontakt på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> hvis du vil vite mer om grunnlaget for overføringen.</p>
 
     <h2>Endringer i erklæringen</h2>
     <p>Vesentlige endringer vil bli varslet på denne siden med oppdatert dato. Sist oppdatert: ${updatedDate}.</p>
