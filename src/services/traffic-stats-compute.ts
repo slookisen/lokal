@@ -23,6 +23,7 @@
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { computeTrafficReport } from "./traffic-report";
+import { getRetentionWindowDays } from "./retention-window";
 import { computeQueryStats } from "./admin-stats-compute";
 
 export interface TrafficStats {
@@ -54,15 +55,9 @@ export interface TrafficStats {
   aiQueries: number;
 }
 
-/**
- * The runtime retention window — the SAME value the daily auto-prune job uses
- * (src/index.ts: RFB_AUTO_PRUNE_DAYS env, default 60, and runAutoPrune's
- * Math.max(7, …) clamp). Read at call time, not module load, so it always
- * reflects the running configuration.
- */
-export function getRetentionWindowDays(): number {
-  return Math.max(7, parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10) || 60);
-}
+// The runtime retention window (RFB_AUTO_PRUNE_DAYS, default 60): moved to
+// retention-window.ts, re-exported here for existing importers.
+export { getRetentionWindowDays };
 
 export function emptyTrafficStats(windowDays: number = getRetentionWindowDays()): TrafficStats {
   return {

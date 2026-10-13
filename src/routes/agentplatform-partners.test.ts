@@ -59,9 +59,9 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
 
   const counts: Record<string, number> = { rfb: 1560, experiences: 563, dental: 5446 };
   const traffic: Record<string, TrafficReading> = {
-    rfb: { realVisitors: 61_234, aiCrawlerViews: 140_999, windowDays: 60 },
-    experiences: { realVisitors: 9_100, aiCrawlerViews: 13_400, windowDays: 60 },
-    dental: { realVisitors: 7_050, aiCrawlerViews: 7_700, windowDays: 60 },
+    rfb: { humanVisits: 61_234, aiCrawlerViews: 140_999, windowDays: 60 },
+    experiences: { humanVisits: 9_100, aiCrawlerViews: 13_400, windowDays: 60 },
+    dental: { humanVisits: 7_050, aiCrawlerViews: 7_700, windowDays: 60 },
   };
   const agent: AgentCallReading = { toolCalls: 5_527, windowDays: 30 };
 
@@ -123,7 +123,7 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
     const partialHtml = renderPartners("nb", partial);
     check("b10: hidden figures render no tile (only the catalog)", (partialHtml.match(/class="metric"/g) || []).length === 1 && !partialHtml.includes("besøk fra mennesker"));
     const zero = collectPlatformMetrics(
-      { readTraffic: () => ({ realVisitors: 0, aiCrawlerViews: 0, windowDays: 60 }), readAgentCalls: () => ({ toolCalls: 0, windowDays: 30 }) },
+      { readTraffic: () => ({ humanVisits: 0, aiCrawlerViews: 0, windowDays: 60 }), readAgentCalls: () => ({ toolCalls: 0, windowDays: 30 }) },
       { rfb: null, experiences: 563, dental: 5446 },
     );
     const zeroHtml = renderPartners("nb", zero);

@@ -948,12 +948,12 @@ router.get("/", (_req: Request, res: Response) => {
 
   <div class="proof-bar" aria-label="Trafikk">
     <div class="proof-inner">
-      <div><div class="proof-val">${traffic.pageViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger</div></div>
-      <div><div class="proof-val">${traffic.realVisitors.toLocaleString("nb")}</div><div class="proof-lbl">Ekte besøkende</div></div>
+      <div><div class="proof-val">${traffic.humanVisits.toLocaleString("nb")}</div><div class="proof-lbl">Besøk fra mennesker</div></div>
+      <div><div class="proof-val">${traffic.humanViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger fra mennesker</div></div>
       <div title="AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping."><div class="proof-val proof-val-muted">${traffic.aiSearchViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
       <div><div class="proof-val">${traffic.botViews.toLocaleString("nb")}</div><div class="proof-lbl">Crawlere & bots</div></div>
     </div>
-    <div class="proof-note">AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping. &middot; Siste ${traffic.windowDays} dager</div>
+    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker + AI-søk + crawlere og bots. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.</div>
   </div>
 
   <section class="section section-alt">
@@ -1071,6 +1071,8 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     // New three-bucket fields (dev-request 2026-07-21 slice A)
     realVisitors: s.realVisitors,
     humanViews: s.humanViews,
+    // S5 of 2026-10-13-statistikk-riktig-for-investorer: visits by people.
+    humanVisits: s.humanVisits,
     aiSearchViews: s.aiSearchViews,
     aiCrawlerViews: s.aiCrawlerViews,
     botViews: s.botViews,

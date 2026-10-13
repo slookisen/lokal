@@ -56,6 +56,10 @@ export interface OaHomeCounters {
   uniqueVisitors: number;
   /** Unique HUMAN sessions — honest "ekte besøkende" (NOT views). */
   realVisitors: number;
+  /** Visits by people (a new visit after 30 minutes without a page view). */
+  humanVisits: number;
+  /** Page views by people; humanViews + aiSearchViews + botViews = pageViews. */
+  humanViews: number;
   /** Page views from human-initiated AI retrieval (`*-User` agents). */
   aiSearchViews: number;
   /** All remaining non-human views (crawlers, search engines, dev, scanners). */
@@ -138,6 +142,8 @@ export function getOaHomeCounters(): OaHomeCounters {
     pageViews: traffic.pageViews,
     uniqueVisitors: traffic.uniqueVisitors,
     realVisitors: traffic.realVisitors,
+    humanVisits: traffic.humanVisits,
+    humanViews: traffic.humanViews,
     aiSearchViews: traffic.aiSearchViews,
     botViews: traffic.botViews,
     windowDays: traffic.windowDays,

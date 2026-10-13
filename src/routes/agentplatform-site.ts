@@ -164,7 +164,13 @@ export const COUNT_RETRY_MS = 30_000;
 export type ServiceCounts = Record<CatalogVertical, number | null>;
 
 export interface TrafficReading {
-  realVisitors: number;
+  /**
+   * Visits by people: a new visit after 30 minutes without a page view
+   * (traffic-report.ts). The tile used to sum realVisitors — unique IP +
+   * browser pairs — under the label «besøk» (dev-request
+   * 2026-10-13-statistikk-riktig-for-investorer, S5).
+   */
+  humanVisits: number;
   aiCrawlerViews: number;
   windowDays: number;
   /** When the figures were computed (epoch ms). */
@@ -192,7 +198,7 @@ function defaultReadTraffic(v: CatalogVertical): TrafficReading | null {
     const snap = getTrafficStatsSnapshot(v);
     if (!snap.ready) return null;
     return {
-      realVisitors: snap.stats.realVisitors,
+      humanVisits: snap.stats.humanVisits,
       aiCrawlerViews: snap.stats.aiCrawlerViews,
       windowDays: snap.stats.windowDays,
       computedAt: snap.computedAt,
@@ -240,7 +246,7 @@ export function collectPlatformMetrics(
   const catalogTotal = catalog.every((n) => n != null) ? catalog.reduce((a: number, n) => a + (n as number), 0) : null;
   const traffic = verticals.map((v) => deps.readTraffic(v));
   const allTraffic = traffic.every((t) => t != null) ? (traffic as TrafficReading[]) : null;
-  const humanVisits = allTraffic ? allTraffic.reduce((a, t) => a + t.realVisitors, 0) : null;
+  const humanVisits = allTraffic ? allTraffic.reduce((a, t) => a + t.humanVisits, 0) : null;
   const aiCrawlerViews = allTraffic ? allTraffic.reduce((a, t) => a + t.aiCrawlerViews, 0) : null;
   const windows = allTraffic ? new Set(allTraffic.map((t) => t.windowDays)) : null;
   const trafficWindowDays = windows && windows.size === 1 ? [...windows][0] : null;
@@ -371,7 +377,7 @@ const T = {
     mCatalogLabel: "oppføringer i katalogene",
     mCatalogDef: "Aktive, publiserte oppføringer akkurat nå.",
     mHumanLabel: (d: number) => `besøk fra mennesker siste ${d} dager`,
-    mHumanDef: "Økter som ikke er identifisert som roboter, crawlere eller søkemotorer.",
+    mHumanDef: "Besøk fra mennesker: et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. Roboter, crawlere, søkemotorer og AI er ikke med.",
     mCrawlerLabel: (d: number) => `sidevisninger fra AI-crawlere siste ${d} dager`,
     mCrawlerDef: "Sidevisninger fra kjente KI-crawlere, som GPTBot og ClaudeBot.",
     mAgentLabel: (d: number) => `verktøykall fra AI-agenter siste ${d} dager`,
@@ -529,7 +535,7 @@ const T = {
     mCatalogLabel: "listings in the directories",
     mCatalogDef: "Active, published listings right now.",
     mHumanLabel: (d: number) => `visits from people in the last ${d} days`,
-    mHumanDef: "Sessions not identified as bots, crawlers or search engines.",
+    mHumanDef: "Visits by people: a visit is a series of page views by one visitor with no break longer than 30 minutes. Bots, crawlers, search engines and AI are not included.",
     mCrawlerLabel: (d: number) => `page views by AI crawlers in the last ${d} days`,
     mCrawlerDef: "Page views by known AI crawlers, such as GPTBot and ClaudeBot.",
     mAgentLabel: (d: number) => `tool calls from AI agents in the last ${d} days`,

@@ -33,6 +33,7 @@ import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { getRetentionWindowDays } from "../services/retention-window";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
@@ -1118,6 +1119,9 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     // New three-bucket fields (dev-request 2026-07-21 slice A)
     realVisitors: s.realVisitors,
     humanViews: s.humanViews,
+    // S5 of 2026-10-13-statistikk-riktig-for-investorer: visits by people
+    // (a new visit after 30 minutes without a page view).
+    humanVisits: s.humanVisits,
     aiSearchViews: s.aiSearchViews,
     aiCrawlerViews: s.aiCrawlerViews,
     botViews: s.botViews,
@@ -1499,13 +1503,13 @@ router.get("/", (req: Request, res: Response) => {
     <div class="proof-bar">
       <div class="proof-inner">
         <div class="proof-item">
-          <div class="proof-val">${traffic.pageViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_pageviews"))}</div>
+          <div class="proof-val">${traffic.humanVisits.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_visits"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val">${traffic.realVisitors.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_real_visitors"))}</div>
+          <div class="proof-val">${traffic.humanViews.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_views"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
@@ -1518,7 +1522,7 @@ router.get("/", (req: Request, res: Response) => {
           <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_crawlers"))}</div>
         </div>
       </div>
-      <div class="proof-note">${escapeHtml(t(lang, "home.proof_ai_explain"))} &middot; ${escapeHtml(t(lang, "home.proof_window", { days: traffic.windowDays }))}</div>
+      <div class="proof-note">${escapeHtml(t(lang, "home.proof_total", { days: traffic.windowDays, total: traffic.pageViews.toLocaleString(numFmt) }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>
       <div class="network-strip">${escapeHtml(t(lang, "home.network_label"))}
         <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a> &middot;
         <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a>
@@ -6024,6 +6028,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] profile-activity query failed:", e);
     }
 
+    // Window of the views tiles below: the raw retention (agent-stats-compute.ts).
+    const statsDays = getRetentionWindowDays();
     const content = `
     <div class="bc"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a>${cityName ? `<span>/</span><a href="${localizedPath("/" + slugify(cityName), lang)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
@@ -6064,8 +6070,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
-          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans, last 90 days" : "Sidevisninger fra mennesker, siste 90 dager"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans &middot; 90d" : "mennesker &middot; 90d"}</span></small></div></div>
-          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last 90 days." : "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste 90 dager."}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents &middot; 90d" : "AI-agenter &middot; 90d"}</span></small></div></div>
+          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans, last ${statsDays} days" : "Sidevisninger fra mennesker, siste ${statsDays} dager"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans &middot; ${statsDays}d" : "mennesker &middot; ${statsDays}d"}</span></small></div></div>
+          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days." : "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager."}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents &middot; ${statsDays}d" : "AI-agenter &middot; ${statsDays}d"}</span></small></div></div>
         </div>
       </div>
 

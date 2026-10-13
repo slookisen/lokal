@@ -3,7 +3,8 @@
 // (skive 6). GET /api/agents/:id/stats (routes/agent-stats.ts) was the largest
 // remaining source of main-thread stalls in prod: 17 stalls over 1 s between
 // 2026-10-08 and 2026-10-11, up to 15 s right after a boot. Each cache miss
-// runs a grouped read over 90 days of the page's views plus up to
+// runs a grouped read over the window's views of the page (the raw retention,
+// 60 days; it was 90 until 2026-10-13) plus up to
 // MAX_VELOCITY_CHECKS velocity reads, and every velocity read scans a full
 // hour of analytics_page_views through the created_at index (there is no
 // session_id index).
@@ -15,7 +16,7 @@
 // here may load database/init.
 
 import type Database from "better-sqlite3";
-import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
+import { getRetentionWindowDays } from "./retention-window";
 import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
 import { classifySession, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
@@ -35,14 +36,12 @@ export interface AgentStatsPayload {
   aiBreakdown: { chatgpt: number; claude: number; other: number };
   conversationCount: number;
   lastConversations: Array<{ source: string; createdAt: string; question: string }>;
+  /** The window of humanViews/aiViews in days: the raw retention (RFB_AUTO_PRUNE_DAYS, 60). */
+  windowDays: number;
 }
 
-// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated) —
-// mirrors the JS-side cutoff used elsewhere (analytics-service.ts,
-// routes/analytics.ts) so getPrunedChatgptClaudeCounts's day-string
-// comparison lines up with the `datetime('now', '-90 days')` used in the SQL
-// below (sub-second clock skew between the two evaluations is immaterial at
-// day granularity).
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated); the
+// window cutoff below and the velocity reads compare against that format.
 export function sqliteDatetime(date: Date): string {
   return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }
@@ -88,11 +87,19 @@ export function computeAgentStats(
   path: string,
   nowMs: number
 ): AgentStatsPayload {
-  // ─── Period cutoff ───────────────────────────────────────────────
-  // 90 days. Tile labels "Sidevisninger ... siste 90 dager" must stay in
-  // sync with this; if you change the window here, also update seo.ts
-  // (search for "siste 90 dager" / "last 90 days").
-  const PERIOD_CUTOFF = "datetime('now', '-90 days')";
+  // ─── Period ──────────────────────────────────────────────────────
+  // The raw rows' retention window (60 days). It used to be 90 days: people
+  // and «other AI» were then counted over the 60 stored days only, and
+  // ChatGPT/Claude topped up from page_view_daily, which counted files and
+  // every status — one tile, three different periods and definitions
+  // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S5). The tile
+  // labels in seo.ts read windowDays.
+  const windowDays = getRetentionWindowDays();
+  const cutoffIso = sqliteDatetime(new Date(nowMs - windowDays * 24 * 60 * 60 * 1000));
+  // Page views only (page-view-definition.ts): 2xx or 304; legacy rows have no status.
+  const hasStatus = (db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>)
+    .some((c) => c.name === "status_code");
+  const statusOk = hasStatus ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
 
   // ── Views: ONE grouped read, bucketed by the shared classifier ───
   // We anchor on path equality (not LIKE) because the slug uniquely
@@ -104,9 +111,9 @@ export function computeAgentStats(
     FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at >= ${PERIOD_CUTOFF}
+      AND created_at > ?${statusOk}
     GROUP BY session_id
-  `).all(path) as Array<{ session_id: string | null; views: number; first_seen: string }>;
+  `).all(path, cutoffIso) as Array<{ session_id: string | null; views: number; first_seen: string }>;
 
   const aiRaw = { chatgpt: 0, claude: 0, other: 0 };
   const humanLooking: typeof sessions = [];
@@ -133,16 +140,8 @@ export function computeAgentStats(
     humanViews += s.views;
   });
 
-  // The 90-day window reaches past the raw-table retention, so chatgpt and
-  // claude are blended from the daily rollup (see the long note this block
-  // carried in routes/agent-stats.ts, skive 3 of dev-request
-  // 2026-09-02-analytics-historikk-rollup-lesere-foer-retention). aiOther and
-  // humanViews stay raw-only by design.
-  const cutoffIso = sqliteDatetime(new Date(nowMs - 90 * 24 * 60 * 60 * 1000));
-  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
-
-  const aiChatgpt = aiRaw.chatgpt + prunedAi.chatgpt;
-  const aiClaude = aiRaw.claude + prunedAi.claude;
+  const aiChatgpt = aiRaw.chatgpt;
+  const aiClaude = aiRaw.claude;
   const aiOther = aiRaw.other;
   const aiViews = aiChatgpt + aiClaude + aiOther;
 
@@ -204,5 +203,6 @@ export function computeAgentStats(
     aiBreakdown: { chatgpt: aiChatgpt, claude: aiClaude, other: aiOther },
     conversationCount,
     lastConversations,
+    windowDays,
   };
 }

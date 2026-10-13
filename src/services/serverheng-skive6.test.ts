@@ -125,16 +125,19 @@ export async function runServerhengSkive6Tests(opts: { log?: boolean } = {}): Pr
     const expected = computeAgentStats(writer, "agent-1", pagePath, nowMs);
     const got = await runStatsTaskOffThread<AgentStatsPayload>(dbPath, { kind: "agentStats", agentId: "agent-1", path: pagePath, nowMs });
     ok(eq(got, expected), "S1: the worker computes exactly what the synchronous agent stats compute", { got, expected });
+    // 2026-10-13 (statistikk-riktig-for-investorer, S5): the stats cover the
+    // raw retention window (60 days) from raw page views only; the
+    // page_view_daily row 80 days back is no longer added.
     ok(
-      expected.conversationCount === 2 && expected.lastConversations.length === 2 && expected.aiBreakdown.chatgpt >= 5,
-      "S2: the fixture exercises views, the rollup blend and conversations (non-trivial payload)",
+      expected.conversationCount === 2 && expected.lastConversations.length === 2 && expected.aiBreakdown.chatgpt === 1 && expected.windowDays === 60,
+      "S2: the fixture exercises views, the 60-day window (no rollup blend) and conversations (non-trivial payload)",
       expected,
     );
     // Golden values for this fixture (old route = new function was verified by
     // a differential run in review; these pin it from here on).
     ok(
-      expected.humanViews === 4 && expected.aiViews === 6 &&
-        eq(expected.aiBreakdown, { chatgpt: 5, claude: 1, other: 0 }) && expected.conversationCount === 2 &&
+      expected.humanViews === 4 && expected.aiViews === 2 &&
+        eq(expected.aiBreakdown, { chatgpt: 1, claude: 1, other: 0 }) && expected.conversationCount === 2 &&
         eq(expected.lastConversations.map((c) => [c.source, c.question]), [["mcp", "Har dere epler?"], ["a2a", "Selger dere honning?"]]),
       "S2b: golden payload for the fixture",
       expected,

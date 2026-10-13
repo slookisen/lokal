@@ -1564,7 +1564,8 @@ export function homeStrings(lang: Lang) {
     nearMeBtn: "Nær meg", nearMeRadiusLabel: "Søkeradius", nearMeLoading: "Henter posisjon…", nearMeDenied: "Posisjon avslått",
     trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
     counterAria: "Opplevagent i tall",
-    counterPageviews: "Sidevisninger", counterRealVisitors: "Ekte besøkende", counterAiSearch: "AI-søk", counterCrawlers: "Crawlere &amp; bots",
+    counterHumanVisits: "Besøk fra mennesker", counterHumanViews: "Sidevisninger fra mennesker", counterAiSearch: "AI-søk", counterCrawlers: "Crawlere &amp; bots",
+    counterTotalPre: "Sidevisninger siste", counterTotalPost: "mennesker + AI-søk + crawlere og bots. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause.",
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
     counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.",
     counterNoteShort: "AI-søk = en assistent hentet svar fra oss i sanntid.",
@@ -1632,7 +1633,8 @@ export function homeStrings(lang: Lang) {
     nearMeBtn: "Near me", nearMeRadiusLabel: "Search radius", nearMeLoading: "Locating…", nearMeDenied: "Location denied",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
     counterAria: "Opplevagent in numbers",
-    counterPageviews: "Page views", counterRealVisitors: "Real visitors", counterAiSearch: "AI search", counterCrawlers: "Crawlers &amp; bots",
+    counterHumanVisits: "Visits by people", counterHumanViews: "Page views by people", counterAiSearch: "AI search", counterCrawlers: "Crawlers &amp; bots",
+    counterTotalPre: "Page views, last", counterTotalPost: "people + AI search + crawlers and bots. A visit is a series of page views by one visitor with no break longer than 30 minutes.",
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
     counterAiExplain: "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",
     counterNoteShort: "AI search = an assistant fetched answers from us in real time.",
@@ -1684,7 +1686,8 @@ export function homeStrings(lang: Lang) {
     nearMeBtn: "Nära mig", nearMeRadiusLabel: "Sökradie", nearMeLoading: "Hämtar position…", nearMeDenied: "Position nekad",
     trustAria: "Förtroende och datakällor", trustBrreg: "Arrangörer verifierade mot Brønnøysundregistrene", trustFresh: "Innehåll uppdateras löpande", trustMachine: "Maskinläsbart för AI-agenter",
     counterAria: "Opplevagent i siffror",
-    counterPageviews: "Sidvisningar", counterRealVisitors: "Riktiga besökare", counterAiSearch: "AI-sökningar", counterCrawlers: "Sökrobotar &amp; bottar",
+    counterHumanVisits: "Besök från människor", counterHumanViews: "Sidvisningar från människor", counterAiSearch: "AI-sökningar", counterCrawlers: "Sökrobotar &amp; bottar",
+    counterTotalPre: "Sidvisningar senaste", counterTotalPost: "människor + AI-sökningar + sökrobotar och bottar. Ett besök är en följd av sidvisningar från en besökare utan längre paus än 30 minuter.",
     counterExperiences: "Upplevelser", counterProviders: "Arrangörer", counterMunicipalities: "Kommuner",
     counterAiExplain: "AI-sökning: en människa frågade ChatGPT, Claude eller Perplexity, och assistenten hämtade information från oss i realtid. Sökrobotar: automatisk indexering och skrapning.",
     counterNoteShort: "AI-sökning = en assistent hämtade svar från oss i realtid.",
@@ -1823,7 +1826,7 @@ router.get("/", (req: Request, res: Response) => {
   // for the exact scoping/exclusion rules this reuses from the RFB homepage
   // pattern). Read defensively — must never break the homepage.
   const numFmt = lang === "en" ? "en-US" : "nb-NO";
-  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, aiSearchViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null };
+  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, humanVisits: 0, humanViews: 0, aiSearchViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null };
   try {
     counters = getOaHomeCounters();
   } catch {
@@ -1845,9 +1848,9 @@ router.get("/", (req: Request, res: Response) => {
   const counterStripHtml = `
   <div class="counters" aria-label="${S.counterAria}">
     <div class="counters-inner">
-      <div class="counter-item"><div class="counter-val">${counters.pageViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterPageviews}</div></div>
+      <div class="counter-item"><div class="counter-val">${counters.humanVisits.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanVisits}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val">${counters.realVisitors.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterRealVisitors}</div></div>
+      <div class="counter-item"><div class="counter-val">${counters.humanViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanViews}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val counter-val-accent">${counters.aiSearchViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterAiSearch}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
@@ -1859,7 +1862,7 @@ router.get("/", (req: Request, res: Response) => {
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterNoteShort} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}${sinceDateFragment}</div>
+    <div class="counter-note">${S.counterTotalPre} ${counters.windowDays} ${S.counterWindowPost}: ${counters.pageViews.toLocaleString(numFmt)} = ${S.counterTotalPost} ${S.counterNoteShort}${sinceDateFragment}</div>
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>

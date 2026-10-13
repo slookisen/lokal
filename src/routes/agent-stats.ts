@@ -5,7 +5,8 @@
  *
  *  GET /api/agents/:id/stats
  *
- * Returns last-90-days view aggregates pulled from existing analytics tables.
+ * Returns view aggregates over the raw retention window (60 days; `windowDays`
+ * in the payload) pulled from existing analytics tables.
  * conversationCount and lastConversations remain all-time (cumulative engagement
  * is a meaningful lifetime metric; views are noisy and benefit from a window).
  * We do NOT
