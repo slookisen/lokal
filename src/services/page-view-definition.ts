@@ -57,9 +57,10 @@ export function isPageViewStatus(status: number | null | undefined): boolean {
   return (status >= 200 && status < 300) || status === 304;
 }
 
-/** True if the path probes for scanner targets (wp-admin, .env, .git …). */
+/** True if the path probes for scanner targets (wp-admin, .env, .git …), in any case, like the read side's LIKE. */
 export function isScannerProbePath(path: string): boolean {
-  return SCANNER_PATH_PATTERNS.some((p) => path.includes(p));
+  const lc = path.toLowerCase();
+  return SCANNER_PATH_PATTERNS.some((p) => lc.includes(p));
 }
 
 /** text/html or text/markdown (the ?format=md page for agents). */
@@ -69,16 +70,22 @@ export function isDocumentContentType(contentType: unknown): boolean {
 }
 
 /**
- * Write-time rule for the analytics middleware. Records pages answered with a
- * document (any status, so 404s and redirects stay visible for operations, and
- * 304s, which Express sends without a Content-Type), plus every scanner probe,
- * whatever it got back: the read side needs those rows to tell a scanner from a
- * person.
+ * Write-time rule for the analytics middleware. Records:
+ *   - every page answered 3xx, 4xx or 5xx, whatever its Content-Type: redirects
+ *     (Express answers a client that does not ask for HTML with text/plain),
+ *     304s (no Content-Type at all) and errors stay visible for operations and
+ *     for GET /admin/analytics/producer-outcomes;
+ *   - a page answered 2xx only when the body is a document, so a JSON endpoint
+ *     at an extension-less path is not a page view;
+ *   - every scanner probe, whatever it got back: the read side needs those rows
+ *     to tell a scanner from a person.
+ * The read side counts only 2xx and 304 as views (isPageViewStatus).
  */
 export function shouldRecordPageView(path: string, statusCode: number, contentType: unknown): boolean {
   if (isScannerProbePath(path)) return true;
   if (!isPagePath(path)) return false;
-  return statusCode === 304 || isDocumentContentType(contentType);
+  if (statusCode >= 300) return true;
+  return isDocumentContentType(contentType);
 }
 
 // ── SQL form of the rule (read time) ─────────────────────────────────
@@ -108,8 +115,8 @@ export function pagePathSql(column = "path"): string {
 /**
  * `AND`-able predicate over analytics_page_views selecting page views: the SQL
  * twin of isPagePath(path) && isPageViewStatus(status_code). `alias` qualifies
- * the columns (e.g. "pv"). page-view-definition.test.ts checks that SQL and JS
- * agree on every stored path shape.
+ * the columns (e.g. "pv"). traffic-report.test.ts checks that SQL and JS agree
+ * on every stored path shape.
  */
 export function pageViewSql(alias?: string): string {
   const c = (col: string) => (alias ? `${alias}.${col}` : col);

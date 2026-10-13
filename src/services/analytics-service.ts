@@ -640,9 +640,11 @@ export class AnalyticsService {
   private static SUMMARY_CACHE_TTL = 120_000; // 2 minutes
 
   /**
-   * Page-view count for an arbitrary window, excluding owner traffic (cached 2 min).
-   * A single indexed COUNT(*) on analytics_page_views(created_at) — cheaper than
-   * getSummary() when only the count is needed (e.g. a 30-day "monthly visits" figure).
+   * Page views of every client class in an arbitrary window, owner traffic
+   * excluded (cached 2 min). Counted by the traffic report (traffic-report.ts,
+   * totals only), so it reads every page-view row of the window: not cheap
+   * for long windows. Not the "monthly visits" figure, which is human visits
+   * (computeMonthlyHumanVisits).
    */
   getPageViewCount(hoursBack: number, vertical?: VerticalId): number {
     const cacheKey = `pvcount:${hoursBack}:${vertical || "all"}`;
@@ -651,9 +653,6 @@ export class AnalyticsService {
       return cached.data;
     }
     try {
-      // Raw count + the pruned-day portion from page_view_daily (Skive 3,
-      // dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-retention);
-      // query in admin-stats-compute.ts.
       const count = computePageViewCount(getDb(), hoursBack, vertical, Date.now());
       this._summaryCache.set(cacheKey, { data: count, time: Date.now() });
       return count;

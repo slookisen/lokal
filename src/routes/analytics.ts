@@ -7,6 +7,7 @@ import { classifySession } from "../services/traffic-classifier";
 import {
   computeUmbrellaTraffic,
   computeQueryStats,
+  runAdminStatsQuery,
   summaryFromReport,
   topPagesFromReport,
   visitorsFromReport,
@@ -258,12 +259,12 @@ router.post("/tag-owner", (req: Request, res: Response) => {
  */
 router.get("/summary", async (req: Request, res: Response) => {
   const vertical = parseVertical(req);
-  const r = await readStats<Summary24Result>(req, { name: "summary24", vertical }, () => ({
-    summary: analyticsService.getSummary(24, vertical),
-    monthlyVisits: analyticsService.getPageViewCount(24 * 30, vertical),
-    // B4 (additive): inbound utm_* attribution for the same 24h window.
-    utm: analyticsService.getUtmBreakdown(24, vertical),
-  }));
+  // The main-thread fallback (OFFTHREAD_STATS_DISABLED=1, or a DB not in WAL
+  // mode) runs the worker's own query, so monthly_visits means human visits
+  // on both paths (marketing-comms-agent quotes it in outgoing e-mail).
+  const r = await readStats<Summary24Result>(req, { name: "summary24", vertical }, () =>
+    runAdminStatsQuery(getDb(), { name: "summary24", vertical }, Date.now()) as Summary24Result,
+  );
   if (!r.ok) {
     sendAdminStatsUnavailable(res, r.error);
     return;
@@ -309,13 +310,21 @@ router.get("/summary/:hours", async (req: Request, res: Response) => {
     sendAdminStatsUnavailable(res, !rep.ok ? rep.error : (q as { error: string }).error);
     return;
   }
+  const summary = summaryFromReport(rep.value, q.value);
   res.json({
     timeframe: `last ${hours} hours`,
     vertical: vertical || "all",
     timestamp: new Date().toISOString(),
-    ...summaryFromReport(rep.value, q.value),
+    ...summary,
+    // How long raw rows are kept (the nightly prune, RFB_AUTO_PRUNE_DAYS), for the coverage note.
+    coverage: summary.coverage ? { ...summary.coverage, retentionDays: rawRetentionDays() } : undefined,
   });
 });
+
+function rawRetentionDays(): number {
+  const d = parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10);
+  return Number.isFinite(d) && d > 0 ? d : 60;
+}
 
 /**
  * GET /admin/analytics/producers
@@ -681,8 +690,10 @@ router.get("/visitors", async (req: Request, res: Response) => {
     sendAdminStatsUnavailable(res, r.error);
     return;
   }
-  // Most recently active visitors of every class, newest first.
-  res.json({ visitors: visitorsFromReport(r.value, limit) });
+  // Visitors of every class: the most page views first (as before S1), or the
+  // most recently active first with ?sort=recent (the dashboard's activity list).
+  const sort = req.query.sort === "recent" ? "recent" : "views";
+  res.json({ visitors: visitorsFromReport(r.value, limit, sort) });
 });
 
 /**
@@ -690,8 +701,9 @@ router.get("/visitors", async (req: Request, res: Response) => {
  * Hourly traffic breakdown for chart
  */
 router.get("/hourly", async (req: Request, res: Response) => {
-  // Hourly buckets up to a week (the report switches to days beyond that).
-  const hours = windowHours(req, 168);
+  // Hourly buckets up to a week, UTC days beyond (the report's series), so a
+  // longer window reads the same report as the cards instead of its own.
+  const hours = windowHours(req);
   const r = await readReport(req, hours, parseVertical(req));
   if (!r.ok) {
     sendAdminStatsUnavailable(res, r.error);
