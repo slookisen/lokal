@@ -278,9 +278,13 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
       analyticsService._summaryCache.clear();
       const summary = analyticsService.getSummary(24 * 20);
 
-      assertEq(summary.totalQueries, 2 + 5, "no-double-count (query_daily): raw(2) + rollup(5) = 7 via getSummary.totalQueries");
+      // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
+      // are counted from the stored rows by channel and client class; the old
+      // query_daily / query_text_daily rows (no client class, so bot searches
+      // cannot be told apart) are not blended in. S3 rebuilds the history.
+      assertEq(summary.totalQueries, 2, "S2: getSummary.totalQueries = the 2 stored searches; query_daily not blended in");
       const eggTerm = summary.topSearchTerms.find((t: any) => t.query === "egg");
-      assertEq(eggTerm?.count, 1 + 5, "no-double-count (query_text_daily): 'egg' = raw(1) + rollup(5) = 6 via getSummary.topSearchTerms");
+      assertEq(eggTerm?.count, 1, "S2: 'egg' = the 1 stored search; query_text_daily not blended in");
 
       process.env.ANALYTICS_ROLLUP_READ = "false";
       analyticsService._summaryCache.clear();

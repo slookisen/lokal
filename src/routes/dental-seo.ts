@@ -17,6 +17,8 @@ import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { analyticsService, isOwnerRequest } from "../services/analytics-service";
+import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
@@ -1081,6 +1083,7 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
 });
 
 router.get("/sok", (req: Request, res: Response) => {
+  const searchStarted = Date.now();
   const PAGE_SIZE = 50;
   const q = String(req.query.q || "").trim();
   const fylke = String(req.query.fylke || "").trim();
@@ -1106,6 +1109,15 @@ router.get("/sok", (req: Request, res: Response) => {
     agents = listPublicDentalAgents(filter as any, PAGE_SIZE, offset);
     total = countPublicDentalAgents(filter as any);
   } catch { /* db not ready */ }
+
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: a search is
+  // the first result page of a query or filter set (paging is not a new one).
+  if (page === 1 && Object.keys(filter).length > 0) {
+    analyticsService.trackSearchQuery(req, Date.now() - searchStarted, {
+      query: q || filterQueryText({ fylke, spesialitet, helfo: helfo || undefined, akutt: akutt || undefined, kjede }),
+      resultCount: total,
+    }, isOwnerRequest(req), { protocol: "web" });
+  }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 

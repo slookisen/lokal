@@ -1473,6 +1473,14 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: the same
+  // write-time client class on search rows (NULL = row written before).
+  try {
+    db.exec(`ALTER TABLE analytics_queries ADD COLUMN client_class TEXT`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── B4 (dev-request 2026-09-24-ai-sok-bli-svaret-rfb): inbound UTM ──
   // Nullable, additive columns. Plain ALTER TABLE ADD COLUMN is a
   // metadata-only change in SQLite (no table rewrite, safe on ~1.3M rows).

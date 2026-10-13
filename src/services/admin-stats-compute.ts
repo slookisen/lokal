@@ -33,6 +33,7 @@ import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { computeTrafficReport, type TrafficReport, type SessionRow } from "./traffic-report";
 import { pagePathSql, pageViewSql } from "./page-view-definition";
+import { A2A_REQUEST_METHODS, BOT_SEARCH_CLASSES, isFreeTextQuery, MCP_SEARCH_TOOLS } from "./search-tracking";
 import { slugify } from "../utils/slug";
 import {
   aggregateHumanReferrals,
@@ -41,8 +42,6 @@ import {
   type HumanReferralRow,
 } from "./human-referrals";
 import {
-  getPrunedQueryCount,
-  getPrunedTopQueryTerms,
   getPrunedAgentViewRows,
   getPrunedAgentViewCountsByCity,
   getPrunedQueryCountsByCity,
@@ -108,6 +107,10 @@ export interface AdminSummary {
   devViews?: number;
   /** Oldest stored page view; a window reaching further back is not fully covered. */
   coverage?: { oldestRow: string | null; complete: boolean };
+  /** Searches per channel (S2): web = /sok, api, mcp = AI search tools, a2a. */
+  searchesByChannel?: { web: number; api: number; mcp: number; a2a: number };
+  /** Searches by crawlers and other bots, not in totalQueries. */
+  botSearches?: number;
 }
 
 export function emptyAdminSummary(): AdminSummary {
@@ -123,49 +126,103 @@ export function emptyAdminSummary(): AdminSummary {
   };
 }
 
-// ── Search queries (unchanged in S1; S2 widens what is logged) ──────────
+// ── Searches ──────────────────────────────────────────────────────────
+//
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S2
+// (search-tracking.ts). A search is one of:
+//   web   a search on /sok of one of the three sites (first result page);
+//   api   a call to a public search/discover endpoint;
+//   mcp   an AI assistant's call to a search tool (analytics_mcp_calls);
+//   a2a   an A2A request to the registry agent (analytics_mcp_calls).
+// Owner traffic is left out. Searches by crawlers and other bots (client
+// class search_engine, seo_bot, social, other_bot, scanner — and scripts on
+// the web search page) are counted apart in botQueries, not in totalQueries.
+// Rows written before S2 have no class and count as they are.
+//
+// Raw rows only (60 days); the daily history for longer windows is S3.
 
 export interface QueryStats {
+  /** web + api + mcp + a2a, owner and bots excluded. */
   totalQueries: number;
   ownerQueries: number;
+  /** Free-text queries from the web and API channels, owner and bots excluded. */
   topSearchTerms: Array<{ query: string; count: number }>;
+  byChannel?: { web: number; api: number; mcp: number; a2a: number };
+  botQueries?: number;
+}
+
+function tableExists(db: Db, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+}
+
+function columnExists(db: Db, table: string, column: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === column);
 }
 
 export function computeQueryStats(db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number): QueryStats {
   const cutoff = cutoffFor(nowMs, hoursBack);
   const V = vertical ? " AND vertical_id = ?" : "";
   const vp: string[] = vertical ? [vertical] : [];
+  // COALESCE: rows written before S2 have no class; without it `NULL IN (…)`
+  // is NULL and `NOT (…)` would drop those rows instead of keeping them.
+  const cls = columnExists(db, "analytics_queries", "client_class") ? "COALESCE(client_class, '')" : "''";
+  const botClasses = BOT_SEARCH_CLASSES.map((c) => `'${c}'`).join(", ");
+  // A bot search: a bot class on any channel, or a script on the web page.
+  const isBot = `(${cls} IN (${botClasses}) OR (protocol = 'web' AND ${cls} = 'dev'))`;
 
-  const qResult = db.prepare(`
-    SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-  `).get(cutoff, ...vp) as any;
-  const totalQueries = (qResult.count as number) + getPrunedQueryCount(cutoff, vertical, db);
+  const byChannel = { web: 0, api: 0, mcp: 0, a2a: 0 };
+  let botQueries = 0;
+  let ownerQueries = 0;
+  const rows = db.prepare(`
+    SELECT protocol, is_owner, ${isBot} AS bot, COUNT(*) AS n FROM analytics_queries
+    WHERE created_at > ?${V}
+    GROUP BY protocol, is_owner, bot
+  `).all(cutoff, ...vp) as Array<{ protocol: string; is_owner: number | null; bot: number; n: number }>;
+  for (const r of rows) {
+    if (r.is_owner === 1) { ownerQueries += r.n; continue; }
+    if (r.bot) { botQueries += r.n; continue; }
+    // Legacy protocol values ('search') and anything unknown are API calls.
+    const ch = r.protocol === "web" || r.protocol === "mcp" || r.protocol === "a2a" ? r.protocol : "api";
+    byChannel[ch] += r.n;
+  }
 
-  const ownerQResult = db.prepare(`
-    SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND is_owner = 1${V}
-  `).get(cutoff, ...vp) as any;
+  // AI assistants: search tool calls and A2A requests, already logged per call.
+  if (tableExists(db, "analytics_mcp_calls")) {
+    const tools = [...MCP_SEARCH_TOOLS];
+    const methods = [...A2A_REQUEST_METHODS];
+    const mcp = db.prepare(`
+      SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
+      WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+        AND ((protocol = 'mcp' AND tool_name IN (${tools.map(() => "?").join(", ")}))
+          OR (protocol = 'a2a' AND tool_name IN (${methods.map(() => "?").join(", ")})))
+      GROUP BY protocol
+    `).all(cutoff, ...vp, ...tools, ...methods) as Array<{ protocol: string; n: number }>;
+    for (const r of mcp) {
+      if (r.protocol === "mcp") byChannel.mcp += r.n;
+      else if (r.protocol === "a2a") byChannel.a2a += r.n;
+    }
+  }
 
-  // Top search terms (excluding owner, excluding single-char autocomplete noise),
-  // blended with the pruned-day portion and re-sorted.
-  const topQueriesResult = db.prepare(`
-    SELECT query, COUNT(*) as count FROM analytics_queries
-    WHERE created_at > ?
-      AND query IS NOT NULL
-      AND LENGTH(TRIM(query)) >= 2
-      AND (is_owner IS NULL OR is_owner = 0)${V}
-    GROUP BY query
-    ORDER BY count DESC
+  // Top free-text terms from people and programs on the web and API channels.
+  const topSearchTerms = (db.prepare(`
+    SELECT lower(trim(query)) AS query, COUNT(*) AS count FROM analytics_queries
+    WHERE created_at > ?${V}
+      AND (is_owner IS NULL OR is_owner = 0)
+      AND NOT ${isBot}
+      AND query IS NOT NULL AND LENGTH(TRIM(query)) >= 2 AND TRIM(query) NOT LIKE '[%'
+    GROUP BY lower(trim(query))
+    ORDER BY count DESC, query ASC
     LIMIT 10
-  `).all(cutoff, ...vp) as any[];
-  const termTotals = new Map<string, number>();
-  for (const r of topQueriesResult) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
-  for (const r of getPrunedTopQueryTerms(cutoff, vertical, db)) termTotals.set(r.query, (termTotals.get(r.query) || 0) + r.count);
-  const topSearchTerms = [...termTotals.entries()]
-    .map(([query, count]) => ({ query, count }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 10);
+  `).all(cutoff, ...vp) as Array<{ query: string; count: number }>)
+    .filter((t) => isFreeTextQuery(t.query));
 
-  return { totalQueries, ownerQueries: ownerQResult.count as number, topSearchTerms };
+  return {
+    totalQueries: byChannel.web + byChannel.api + byChannel.mcp + byChannel.a2a,
+    ownerQueries,
+    topSearchTerms,
+    byChannel,
+    botQueries,
+  };
 }
 
 // ── Summary = traffic report + search queries ──────────────────────────
@@ -188,6 +245,8 @@ export function summaryFromReport(report: TrafficReport, q: QueryStats): AdminSu
     avgTimeOnSite: report.human.avgVisitSeconds,
     totalQueries: q.totalQueries,
     topSearchTerms: q.topSearchTerms,
+    searchesByChannel: q.byChannel,
+    botSearches: q.botQueries,
     trafficBySource,
     agentTraffic: { ...report.aiVendors },
     ownerStats: {

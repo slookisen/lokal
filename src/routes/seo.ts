@@ -27,7 +27,7 @@ import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
 import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
-import { analyticsService, parseUserAgent } from "../services/analytics-service";
+import { analyticsService, parseUserAgent, isOwnerRequest } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { getDb } from "../database/init";
@@ -1605,6 +1605,7 @@ const SEARCH_CSS = `
 `;
 
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
+  const searchStarted = Date.now();
   const lang = req.lang;
   const q = typeof req.query.q === "string" ? req.query.q : "";
   const frontendLat = parseFloat(req.query.lat as string);
@@ -1787,6 +1788,15 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // fresh /samtale/<uuid> page that the homepage then linked, feeding
     // Google an endless supply of new noindex URLs (GSC 2026-07: 808 pages
     // excluded by noindex and climbing).
+    // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: every
+    // search on this page is a search (bots too, classed at write time so the
+    // dashboard can tell them apart). A coordinates-only search is stored as
+    // "[nær meg]": counted, but kept out of the top search terms.
+    analyticsService.trackSearchQuery(req, Date.now() - searchStarted, {
+      query: q.trim() || "[nær meg]",
+      resultCount: results.length,
+    }, isOwnerRequest(req), { protocol: "web" });
+
     const searcherIsBot = parseUserAgent(req.get("user-agent") || "").isBot;
     if (results.length > 0 && !searcherIsBot) {
       try {
