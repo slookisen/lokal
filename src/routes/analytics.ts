@@ -1589,14 +1589,19 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 
 // ─── GET /admin/analytics/umbrella-traffic ──────────────────────
 // Per-umbrella (markedsnettverk) traffic breakdown.
-// For each umbrella agent (umbrella_type IS NOT NULL), returns:
-//   - pageViews_via_profile: hits on the umbrella's own /produsent/<slug>
-//   - pageViews_via_members: hits on member producers' /produsent/<slug>
-//   - ai_bot_pageviews:      either-channel hits whose session_id matches
-//                            a known AI / search-bot UA token
-//   - search_referrals:      either-channel hits whose source = 'search'
+// For each umbrella agent (umbrella_type IS NOT NULL), returns page views
+// (page-view-definition.ts; owner traffic out) on:
+//   - pageViews_via_profile: the umbrella's own /produsent/<slug>
+//   - pageViews_via_members: member producers' /produsent/<slug>
+//   - human_pageviews_profile / human_pageviews_members: the same, by people
+//   - ai_bot_pageviews:      either page set, by AI assistants and AI
+//                            crawlers (the shared traffic classifier)
+//   - search_referrals:      either page set, by people arriving from a
+//                            search engine (Google, Bing, DuckDuckGo referrer)
 //   - active_members:        count of agent_affiliations rows where
 //                            status='active' for this umbrella
+// Raw rows only (the last 60 days at most); dev-request
+// 2026-10-13-statistikk-riktig-for-investorer, S4.
 //
 // Members are joined via agent_affiliations (status='active'). Slug
 // matching uses the same rules as src/utils/slug.ts so the path lookup
@@ -1627,10 +1632,10 @@ router.get("/umbrella-traffic", async (req: Request, res: Response) => {
   }
   const sinceHours = Math.max(1, Math.min(87600, parseInt(String(rawHours || "24"), 10) || 24));
 
-  // Per umbrella: members via agent_affiliations, then four counts over
+  // Per umbrella: members via agent_affiliations, then one read of
   // analytics_page_views on the exact /produsent/<slug> paths (the path
-  // column is indexed), blended with the pruned-day rollup where the rollup
-  // matches 1:1. Queries: computeUmbrellaTraffic in admin-stats-compute.ts.
+  // column is indexed), classified per row. Queries: computeUmbrellaTraffic
+  // in admin-stats-compute.ts.
   try {
     const r = await readStats<UmbrellaTrafficBucket[]>(req, { name: "umbrellaTraffic", sinceHours }, () =>
       computeUmbrellaTraffic(getDb(), sinceHours, Date.now())

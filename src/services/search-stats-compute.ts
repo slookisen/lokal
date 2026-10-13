@@ -38,6 +38,19 @@ function columnExists(db: Db, table: string, column: string): boolean {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === column);
 }
 
+/**
+ * `AND`-able predicate leaving robots' searches out of analytics_queries rows
+ * (the same rule as computeQueryStats' bot bucket); "" on a schema without
+ * client_class. `alias` qualifies the columns.
+ */
+export function notBotSearchSql(db: Db, alias?: string): string {
+  if (!columnExists(db, "analytics_queries", "client_class")) return "";
+  const c = (col: string) => (alias ? `${alias}.${col}` : col);
+  const cls = `COALESCE(${c("client_class")}, '')`;
+  const proto = columnExists(db, "analytics_queries", "protocol") ? c("protocol") : "'api'";
+  return ` AND ${cls} NOT IN (${BOT_SEARCH_CLASSES.map((x) => `'${x}'`).join(", ")}) AND NOT (${proto} = 'web' AND ${cls} = 'dev')`;
+}
+
 export interface QueryStatsOptions {
   /** A fixed range [fromMs, toMs) instead of the trailing hours (traffic-history-compute.ts). */
   fromMs?: number;

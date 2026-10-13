@@ -286,8 +286,8 @@
                 <div id="statBots" class="stat-value red">—</div>
                 <div id="statBotsPct" class="stat-sub"></div>
             </div>
-            <div class="stat-card" style="border-left: 3px solid #f59e0b;" title="Nettlesere med eier-cookie og våre egne skript. Holdes utenfor alle andre tall.">
-                <div class="stat-label">Egen trafikk (holdt utenfor)</div>
+            <div class="stat-card" style="border-left: 3px solid #f59e0b;" title="Nettlesere med eier-cookie, flåtens egne skript og andre enkle skript (curl, python-requests, node-fetch, axios), som ikke kan skilles fra våre. Holdes utenfor alle andre tall.">
+                <div class="stat-label">Egen trafikk og skript (holdt utenfor)</div>
                 <div id="statOwner" class="stat-value" style="color:#f59e0b;">—</div>
                 <div id="statOwnerSub" class="stat-sub"></div>
             </div>
@@ -301,7 +301,7 @@
                 <li><strong>Besøk:</strong> sidevisninger fra én besøkende uten mer enn 30 minutters pause (samme regel som Google Analytics).</li>
                 <li><strong>Mennesker:</strong> alt som ikke er AI, roboter, skript, skannere (prøver wp-admin, .env o.l.) eller skrapere (flere enn 60 sider på 10 minutter eller 200 produsentsider i timen).</li>
                 <li><strong>Søk:</strong> søk på /sok (første resultatside), kall til søke-API-et, AI-assistentenes søkeverktøy (MCP), A2A-forespørsler og AI-assistenter som henter søkesiden for noen (f.eks. ChatGPT-User). Søk fra søkemotorer, AI-crawlere og andre roboter, og kall som ble avvist (f.eks. for mange forespørsler), telles ikke med.</li>
-                <li><strong>Egen trafikk</strong> (eier-cookie og egne skript) er holdt utenfor alle tall.</li>
+                <li><strong>Egen trafikk og skript</strong> (eier-cookie, flåtens skript og andre enkle skript som curl og python-requests, som ikke kan skilles fra våre) er holdt utenfor alle tall.</li>
             </ul>
         </details>
 
@@ -376,7 +376,7 @@
                 <div id="searchTerms"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel" data-rfb-only>
-                <div class="panel-title">🏙 Byer <span class="panel-note" data-raw-note></span></div>
+                <div class="panel-title" title="Byen til produsentene som ble vist, ikke byen til den som så på. Visninger av produsentsider fra mennesker; søk med by fra mennesker og programmer.">🏙 Byer (produsentenes by) <span class="panel-note" data-raw-note></span></div>
                 <div id="cityStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
@@ -400,7 +400,7 @@
         <!-- Producers + Visitors Tables -->
         <div class="panel-grid">
             <div class="panel panel-full" data-rfb-only>
-                <div class="panel-title">⭐ Mest besøkte produsenter <span class="panel-note" data-raw-note></span></div>
+                <div class="panel-title" title="Visninger av produsentsider fra mennesker. Visninger før 4. okt. 2026 kunne ikke skilles fra roboter og telles ikke.">⭐ Mest besøkte produsenter (mennesker) <span class="panel-note" data-raw-note></span></div>
                 <div id="producerTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel panel-full">
@@ -977,7 +977,7 @@
         document.getElementById("statOwner").textContent = fmtNum(o.pageViews);
         var parts = [];
         if (o.cookieViews) parts.push("nettleser " + fmtNum(o.cookieViews));
-        if (o.scriptViews) parts.push("skript " + fmtNum(o.scriptViews));
+        if (o.scriptViews) parts.push("skript (våre og andres) " + fmtNum(o.scriptViews));
         if (o.unknownViews) parts.push("eldre, ukjent " + fmtNum(o.unknownViews));
         parts.push(fmtNum(o.queries) + " søk");
         document.getElementById("statOwnerSub").textContent = parts.join(" · ");
@@ -1180,6 +1180,8 @@
             return;
         }
         var typeLabels = {
+            "market_network": "Markedsnettverk",
+            "venue": "Markedsplass",
             "industry_org": "Bransjeorg.",
             "marketplace": "Markedsplass",
             "cooperative": "Samvirke",
@@ -1192,17 +1194,20 @@
                 + '<td><a href="/produsent/' + encodeURIComponent(slug) + '" target="_blank"><strong>' + escHtml(u.name) + '</strong></a></td>'
                 + '<td><span class="badge">' + escHtml(typeLabel) + '</span></td>'
                 + '<td>' + fmtNum(u.active_members) + '</td>'
-                + '<td>' + fmtNum(u.pageViews_via_profile) + '</td>'
-                + '<td>' + fmtNum(u.pageViews_via_members) + '</td>'
+                + '<td title="Alle klienter: ' + fmtNum(u.pageViews_via_profile) + '">' + fmtNum(u.human_pageviews_profile) + '</td>'
+                + '<td title="Alle klienter: ' + fmtNum(u.pageViews_via_members) + '">' + fmtNum(u.human_pageviews_members) + '</td>'
                 + '<td>' + fmtNum(u.ai_bot_pageviews) + '</td>'
                 + '<td>' + fmtNum(u.search_referrals) + '</td>'
                 + '</tr>';
         }).join("");
         el.innerHTML = '<table class="data-table"><thead><tr>'
             + '<th>Navn</th><th>Type</th><th>Aktive medlemmer</th>'
-            + '<th>Profil-visn.</th><th>Medlem-visn.</th>'
-            + '<th>AI-bot-visn.</th><th>Søk-treff</th>'
-            + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            + '<th title="Sidevisninger fra mennesker på nettverkets egen profilside">Profil (mennesker)</th>'
+            + '<th title="Sidevisninger fra mennesker på medlemmenes profilsider">Medlemmer (mennesker)</th>'
+            + '<th title="AI-assistenter og AI-crawlere, begge sidetyper">AI-visninger</th>'
+            + '<th title="Mennesker som kom fra Google, Bing eller DuckDuckGo">Fra søkemotorer</th>'
+            + '</tr></thead><tbody>' + rows + '</tbody></table>'
+            + '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Sidevisninger. Hold musen over et tall for alle klienter (mennesker, AI og roboter).</div>';
     }
 
     // Mirrors src/utils/slug.ts for client-side link generation.
@@ -1369,7 +1374,7 @@
     }
 
     function sourceLabel(s) {
-        var labels = { direct: "Direkte", organic: "Organisk", search: "Søkemotor", social: "Sosiale medier", referral: "Referanse", unknown: "Ukjent", chatgpt: "ChatGPT", claude: "Claude", mcp: "MCP", web: "Web" };
+        var labels = { direct: "Direkte", organic: "Organisk", search: "Søkemotor", social: "Sosiale medier", referral: "Annen nettside", discovery: "Fra egne sider", ai: "AI-assistent", seo: "Ukjent (eldre)", unknown: "Ukjent", chatgpt: "ChatGPT", claude: "Claude", mcp: "MCP", web: "Web" };
         return labels[(s || "").toLowerCase()] || s || "Ukjent";
     }
 

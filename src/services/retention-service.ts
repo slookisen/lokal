@@ -1,7 +1,7 @@
 import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn, type RollupRawTable } from "./analytics-rollup-boundary";
 import { ensureTrafficHistoryForDaySync } from "./traffic-history";
-import { BOT_SEARCH_CLASSES } from "./search-tracking";
+import { notBotSearchSql } from "./search-stats-compute";
 import fs from "fs";
 
 export interface RetentionResult {
@@ -345,13 +345,6 @@ const PAGE_VIEWS_SPEC: PruneSpec = {
 // AI crawlers, scanners, scripts on the search page) are deleted without
 // rollup, like owner rows, so query_daily / query_text_daily keep people's and
 // programs' searches only. Rows without a class (written before) roll up as before.
-function notBotSearchSql(db: Db): string {
-  const has = (db.prepare("PRAGMA table_info(analytics_queries)").all() as Array<{ name: string }>).some((c) => c.name === "client_class");
-  if (!has) return "";
-  const cls = "COALESCE(client_class, '')";
-  return ` AND ${cls} NOT IN (${BOT_SEARCH_CLASSES.map((c) => `'${c}'`).join(", ")}) AND NOT (protocol = 'web' AND ${cls} = 'dev')`;
-}
-
 const QUERIES_SPEC: PruneSpec = {
   table: "analytics_queries",
   rollupSql: (db) => [

@@ -31,13 +31,15 @@ import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
-import { computeTrafficReport, type TrafficReport, type SessionRow } from "./traffic-report";
-import { pagePathSql, pageViewSql } from "./page-view-definition";
-import { computeQueryStats, type QueryStats } from "./search-stats-compute";
+import { computeTrafficReport, groupOf, type TrafficReport, type SessionRow } from "./traffic-report";
+import { isPageViewStatus } from "./page-view-definition";
+import { storedClientClass } from "./traffic-classifier";
+import { computeQueryStats, notBotSearchSql, type QueryStats } from "./search-stats-compute";
 import { computeHistoryView } from "./traffic-history-compute";
 import { slugify } from "../utils/slug";
 import {
   aggregateHumanReferrals,
+  classifyReferralSource,
   externalReferrerSqlFilter,
   type HumanReferralPattern,
   type HumanReferralRow,
@@ -46,7 +48,6 @@ import {
   getPrunedAgentViewRows,
   getPrunedAgentViewCountsByCity,
   getPrunedQueryCountsByCity,
-  getPrunedExactPathViewCount,
 } from "./analytics-rollup-reads";
 
 type Db = Database.Database;
@@ -415,6 +416,8 @@ export function computeCityStats(db: Db, hoursBack: number, vertical: VerticalId
   const cutoff = cutoffFor(nowMs, hoursBack);
   const VA = vertical ? " AND aav.vertical_id = ?" : "";
   const VQ = vertical ? " AND aq.vertical_id = ?" : "";
+  // Robots' searches (crawlers following a link with a city) are not demand.
+  const NB = notBotSearchSql(db, "aq");
   const vp: string[] = vertical ? [vertical] : [];
 
   const results = db.prepare(`
@@ -428,14 +431,14 @@ export function computeCityStats(db: Db, hoursBack: number, vertical: VerticalId
     q AS (
       SELECT aq.city, COUNT(*) AS search_queries
       FROM analytics_queries aq
-      WHERE aq.created_at > ? AND (aq.is_owner IS NULL OR aq.is_owner = 0)${VQ}
+      WHERE aq.created_at > ? AND (aq.is_owner IS NULL OR aq.is_owner = 0)${VQ}${NB}
         AND aq.city IN (SELECT city FROM v)
       GROUP BY aq.city
     ),
     c AS (
       SELECT aq.city, json_extract(aq.categories, '$[0]') AS category, COUNT(*) AS n
       FROM analytics_queries aq
-      WHERE aq.created_at > ? AND aq.categories IS NOT NULL AND (aq.is_owner IS NULL OR aq.is_owner = 0)${VQ}
+      WHERE aq.created_at > ? AND aq.categories IS NOT NULL AND (aq.is_owner IS NULL OR aq.is_owner = 0)${VQ}${NB}
         AND aq.city IN (SELECT city FROM v)
       GROUP BY aq.city, json_extract(aq.categories, '$[0]')
     ),
@@ -544,10 +547,16 @@ export interface UmbrellaTrafficBucket {
   name: string;
   umbrella_type: string;
   active_members: number;
+  /** Page views of every client class on the umbrella's own profile and its members' pages. */
   pageViews_total: number;
   pageViews_via_profile: number;
   pageViews_via_members: number;
+  /** The same, by people only (the shared classifier). */
+  human_pageviews_profile: number;
+  human_pageviews_members: number;
+  /** AI assistants and AI crawlers (classifier groups ai_search + ai_crawler). */
   ai_bot_pageviews: number;
+  /** People's page views arriving from a search engine (referrer Google, Bing, DuckDuckGo). */
   search_referrals: number;
 }
 
@@ -567,14 +576,13 @@ function umbrellaSlugify(text: string): string {
     .replace(/^-|-$/g, "");
 }
 
-// AI / bot UA tokens — the same bucket as producer-outcomes.
-const UMBRELLA_AI_TOKENS = [
-  "GPTBot", "ChatGPT", "OAI-SearchBot",
-  "ClaudeBot", "Claude-User", "Anthropic",
-  "Googlebot", "Google-Extended", "Gemini",
-  "PerplexityBot", "Perplexity-User",
-  "Bytespider", "CCBot", "Applebot", "YandexBot", "bingbot",
-];
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S4: «Søk-treff»
+// used to count rows with source = 'search' — mostly Googlebot and bingbot —
+// and «AI-bot» a token list that counted Googlebot but not ExaSearchBot. Both
+// now use the shared classifier, and «Søk-treff» means people arriving from a
+// search engine. Raw rows only: the windows the dashboard asks for are within
+// the 60 days of raw rows (longer windows show the last 60 days).
+const UMBRELLA_SEARCH_SOURCES = new Set(["google", "bing", "duckduckgo"]);
 
 /**
  * Body of GET /admin/analytics/umbrella-traffic (see the route's comment for
@@ -591,14 +599,6 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
   if (umbrellas.length === 0) return [];
 
   const cutoff = sqliteDatetime(new Date(nowMs - sinceHours * 3600 * 1000));
-  const aiClause = UMBRELLA_AI_TOKENS.map(() => "session_id LIKE ?").join(" OR ");
-  // Page views only (page-view-definition.ts); a schema without status_code
-  // (older test fixtures) is filtered on the path alone.
-  const hasStatus = (db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>)
-    .some((c) => c.name === "status_code");
-  const pageFilter = hasStatus ? pageViewSql() : pagePathSql();
-  const aiParams = UMBRELLA_AI_TOKENS.map(t => `%${t}%`);
-
   const memberCountStmt = db.prepare(`
     SELECT COUNT(*) as c FROM agent_affiliations
     WHERE umbrella_id = ? AND status = 'active'
@@ -609,75 +609,59 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
     WHERE af.umbrella_id = ? AND af.status = 'active'
   `);
 
-  const out: UmbrellaTrafficBucket[] = [];
+  // Which umbrellas each producer path belongs to, as profile or as member.
+  const buckets: UmbrellaTrafficBucket[] = [];
+  const byPath = new Map<string, Array<{ b: UmbrellaTrafficBucket; profile: boolean }>>();
   for (const u of umbrellas) {
-    const activeMembers = (memberCountStmt.get(u.id) as { c: number }).c;
     const memberNames = memberNamesStmt.all(u.id) as Array<{ name: string }>;
-
-    const umbrellaPath = `/produsent/${umbrellaSlugify(u.name)}`;
-    const memberPaths = memberNames
-      .map(m => `/produsent/${umbrellaSlugify(m.name)}`)
-      .filter(p => p !== "/produsent/"); // skip blank-name members
-
-    const profileRow = db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_page_views
-      WHERE path = ?
-        AND created_at > ?
-        AND (is_owner IS NULL OR is_owner = 0)
-        AND ${pageFilter}
-    `).get(umbrellaPath, cutoff) as { c: number };
-    const pageViews_via_profile = profileRow.c + getPrunedExactPathViewCount([umbrellaPath], cutoff, {}, db);
-
-    let pageViews_via_members = 0;
-    if (memberPaths.length > 0) {
-      const placeholders = memberPaths.map(() => "?").join(",");
-      const memberRow = db.prepare(`
-        SELECT COUNT(*) as c FROM analytics_page_views
-        WHERE path IN (${placeholders})
-          AND created_at > ?
-          AND (is_owner IS NULL OR is_owner = 0)
-          AND ${pageFilter}
-      `).get(...memberPaths, cutoff) as { c: number };
-      pageViews_via_members = memberRow.c + getPrunedExactPathViewCount(memberPaths, cutoff, {}, db);
-    }
-
-    // ai_bot_pageviews: NOT blended with the rollups (documented known gap).
-    const allPaths = [umbrellaPath, ...memberPaths];
-    const pathPlaceholders = allPaths.map(() => "?").join(",");
-    const aiRow = db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_page_views
-      WHERE path IN (${pathPlaceholders})
-        AND created_at > ?
-        AND (is_owner IS NULL OR is_owner = 0)
-        AND ${pageFilter}
-        AND (${aiClause})
-    `).get(...allPaths, cutoff, ...aiParams) as { c: number };
-    const ai_bot_pageviews = aiRow.c;
-
-    const searchRow = db.prepare(`
-      SELECT COUNT(*) as c FROM analytics_page_views
-      WHERE path IN (${pathPlaceholders})
-        AND created_at > ?
-        AND (is_owner IS NULL OR is_owner = 0)
-        AND ${pageFilter}
-        AND source = 'search'
-    `).get(...allPaths, cutoff) as { c: number };
-    const search_referrals = searchRow.c + getPrunedExactPathViewCount(allPaths, cutoff, { source: "search" }, db);
-
-    out.push({
-      id: u.id,
-      name: u.name,
-      umbrella_type: u.umbrella_type,
-      active_members: activeMembers,
-      pageViews_total: pageViews_via_profile + pageViews_via_members,
-      pageViews_via_profile,
-      pageViews_via_members,
-      ai_bot_pageviews,
-      search_referrals,
-    });
+    const b: UmbrellaTrafficBucket = {
+      id: u.id, name: u.name, umbrella_type: u.umbrella_type, active_members: (memberCountStmt.get(u.id) as { c: number }).c,
+      pageViews_total: 0, pageViews_via_profile: 0, pageViews_via_members: 0,
+      human_pageviews_profile: 0, human_pageviews_members: 0, ai_bot_pageviews: 0, search_referrals: 0,
+    };
+    buckets.push(b);
+    const add = (path: string, profile: boolean) => {
+      if (path === "/produsent/") return; // blank name
+      const list = byPath.get(path) ?? [];
+      if (!list.some((x) => x.b === b)) list.push({ b, profile });
+      byPath.set(path, list);
+    };
+    add(`/produsent/${umbrellaSlugify(u.name)}`, true);
+    for (const m of memberNames) add(`/produsent/${umbrellaSlugify(m.name)}`, false);
   }
-  out.sort((a, b) => b.pageViews_total - a.pageViews_total);
-  return out;
+
+  // One read of the window's rows on those paths (path index), classified
+  // per row with the shared classifier (write-time client_class, else the
+  // session_id): page views only (page-view-definition.ts), owner traffic out.
+  const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
+  const col = (name: string) => (cols.has(name) ? name : `NULL AS ${name}`);
+  const paths = [...byPath.keys()];
+  for (let i = 0; i < paths.length; i += 500) {
+    const chunk = paths.slice(i, i + 500);
+    const rows = db.prepare(`
+      SELECT path, session_id, ${col("client_class")}, ${col("referrer")}, ${col("status_code")}
+      FROM analytics_page_views
+      WHERE path IN (${chunk.map(() => "?").join(",")})
+        AND created_at > ?
+        AND (is_owner IS NULL OR is_owner = 0)
+    `).raw(true).all(...chunk, cutoff) as Array<[string, string | null, string | null, string | null, number | null]>;
+    for (const [path, sid, cls, referrer, status] of rows) {
+      if (!isPageViewStatus(status)) continue;
+      const g = groupOf(storedClientClass(sid ?? "", cls));
+      const human = g === "human";
+      const ai = g === "ai_search" || g === "ai_crawler";
+      const fromSearch = human && UMBRELLA_SEARCH_SOURCES.has(classifyReferralSource(referrer).key);
+      for (const { b, profile } of byPath.get(path) ?? []) {
+        if (profile) b.pageViews_via_profile += 1; else b.pageViews_via_members += 1;
+        if (human) { if (profile) b.human_pageviews_profile += 1; else b.human_pageviews_members += 1; }
+        if (ai) b.ai_bot_pageviews += 1;
+        if (fromSearch) b.search_referrals += 1;
+      }
+    }
+  }
+  for (const b of buckets) b.pageViews_total = b.pageViews_via_profile + b.pageViews_via_members;
+  buckets.sort((a, b) => b.pageViews_total - a.pageViews_total);
+  return buckets;
 }
 
 // ── /samtaler "Menneskelige besøk" strip ──────────────────────────────
