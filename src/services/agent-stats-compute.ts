@@ -3,7 +3,8 @@
 // (skive 6). GET /api/agents/:id/stats (routes/agent-stats.ts) was the largest
 // remaining source of main-thread stalls in prod: 17 stalls over 1 s between
 // 2026-10-08 and 2026-10-11, up to 15 s right after a boot. Each cache miss
-// runs a grouped read over 90 days of the page's views plus up to
+// runs a grouped read over the window's views of the page (the raw retention,
+// 60 days; it was 90 until 2026-10-13) plus up to
 // MAX_VELOCITY_CHECKS velocity reads, and every velocity read scans a full
 // hour of analytics_page_views through the created_at index (there is no
 // session_id index).
@@ -15,7 +16,7 @@
 // here may load database/init.
 
 import type Database from "better-sqlite3";
-import { getRetentionWindowDays } from "./traffic-stats-compute";
+import { getRetentionWindowDays } from "./retention-window";
 import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
 import { classifySession, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
@@ -39,12 +40,8 @@ export interface AgentStatsPayload {
   windowDays: number;
 }
 
-// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated) —
-// mirrors the JS-side cutoff used elsewhere (analytics-service.ts,
-// routes/analytics.ts) so getPrunedChatgptClaudeCounts's day-string
-// comparison lines up with the `datetime('now', '-90 days')` used in the SQL
-// below (sub-second clock skew between the two evaluations is immaterial at
-// day granularity).
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated); the
+// window cutoff below and the velocity reads compare against that format.
 export function sqliteDatetime(date: Date): string {
   return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }

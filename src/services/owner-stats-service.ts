@@ -94,8 +94,11 @@ const AI_MARKERS = {
 };
 const ALL_AI_MARKERS = [...AI_MARKERS.chatgpt, ...AI_MARKERS.claude, ...AI_MARKERS.other];
 
-// 90 days — matches agent-stats.ts's existing owner-dashboard window
-// ("Returns last-90-days view aggregates"). Keep in sync if that changes.
+// 90 days — the producer portal's window. The public producer page tiles
+// (agent-stats-compute.ts) cover the 60-day raw window since 2026-10-13; this
+// portal still counts people over the 60 stored days and tops up
+// ChatGPT/Claude from page_view_daily (follow-up in dev-request
+// 2026-10-13-statistikk-riktig-for-investorer).
 export const OWNER_STATS_WINDOW_DAYS = 90;
 const WINDOW_SQL = `datetime('now', '-${OWNER_STATS_WINDOW_DAYS} days')`;
 

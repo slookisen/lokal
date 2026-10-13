@@ -953,7 +953,7 @@ router.get("/", (_req: Request, res: Response) => {
       <div title="AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping."><div class="proof-val proof-val-muted">${traffic.aiSearchViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
       <div><div class="proof-val">${traffic.botViews.toLocaleString("nb")}</div><div class="proof-lbl">Crawlere & bots</div></div>
     </div>
-    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker + AI-søk + crawlere og bots. Et besøk er sidevisninger fra én person uten mer enn 30 minutters pause. AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.</div>
+    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker + AI-søk + crawlere og bots. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.</div>
   </div>
 
   <section class="section section-alt">

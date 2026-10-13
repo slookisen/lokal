@@ -46,7 +46,7 @@
     "stat_categories": "Categories",
     "proof_human_visits": "Visits by people",
     "proof_human_views": "Page views by people",
-    "proof_total": "Page views, last {days} days: {total} = people + AI search + crawlers and bots. A visit is page views by one person without a break of more than 30 minutes.",
+    "proof_total": "Page views, last {days} days: {total} = people + AI search + crawlers and bots. A visit is a series of page views by one visitor with no break longer than 30 minutes.",
     "proof_ai_search": "AI search",
     "proof_crawlers": "Crawlers & bots",
     "proof_ai_explain": "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",

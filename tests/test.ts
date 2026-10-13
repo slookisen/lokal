@@ -9056,13 +9056,16 @@ console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
 
   assertTrue(
     seoSrcTip.includes(
-      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste 90 dager."
+      // 2026-10-13 (statistikk-riktig-for-investorer, S5): Daniel's wording
+      // kept word for word; the number follows the real window (statsDays,
+      // the 60-day raw retention), not a fixed 90.
+      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager."
     ),
     "ai-tooltip: Norwegian branch uses the exact Daniel-confirmed wording"
   );
   assertTrue(
     seoSrcTip.includes("Every profile has this statistic.") &&
-      /It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last 90 days\./.test(seoSrcTip),
+      /It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last \$\{statsDays\} days\./.test(seoSrcTip),
     "ai-tooltip: English branch carries the equivalent wording"
   );
   assertTrue(

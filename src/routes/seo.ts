@@ -33,7 +33,7 @@ import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
-import { getRetentionWindowDays } from "../services/traffic-stats-compute";
+import { getRetentionWindowDays } from "../services/retention-window";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";

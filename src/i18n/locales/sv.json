@@ -46,7 +46,7 @@
     "stat_categories": "Kategorier",
     "proof_human_visits": "Besök från människor",
     "proof_human_views": "Sidvisningar från människor",
-    "proof_total": "Sidvisningar senaste {days} dagarna: {total} = människor + AI-sökningar + sökrobotar och bottar. Ett besök är sidvisningar från en person utan mer än 30 minuters paus.",
+    "proof_total": "Sidvisningar senaste {days} dagarna: {total} = människor + AI-sökningar + sökrobotar och bottar. Ett besök är en följd av sidvisningar från en besökare utan längre paus än 30 minuter.",
     "proof_ai_search": "AI-sökningar",
     "proof_crawlers": "Sökrobotar & bottar",
     "proof_ai_explain": "AI-sökning: en människa frågade ChatGPT, Claude eller Perplexity, och assistenten hämtade information från oss i realtid. Sökrobotar: automatisk indexering och skrapning.",
