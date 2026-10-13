@@ -20,6 +20,13 @@ primary_region = 'arn'
   # Daniel raised 6 -> 10 (live sesjon 2026-10-11): second touches (5-6/day until 27.10)
   # and new first touches (O1 + veien-til-pool released 11) now share this one cap.
   DAILY_PREP_MAX_CANDIDATES = '10'
+  # R6 nightly RFB enrichment (dev-request 2026-10-10-rfb-berikelse-nattjobb, lokal#1041):
+  # registers the 5-minute tick in src/index.ts. One run per night in 00–01Z (shares the
+  # verifier's DB tick lock, never 08:00–08:59Z), small capped batches, fill-only writes
+  # through the existing route gates, hard cap 150 LLM calls per night, never sends.
+  # Daniel turned it on (live sesjon 2026-10-12) after AC2 preview 10:39Z. Off again:
+  # set to 'false' (anything but "1"/"true" = off) and deploy; no data cleanup needed.
+  RFB_ENRICHMENT_NIGHTLY_ENABLED = 'true'
   # Gårdssalg booking dispatch master switch (dev-request 2026-07-14-booking-flyt-v1).
   # Non-secret feature flag → lives here rather than in Fly secrets. SAFE by the
   # double gate: a booking only dispatches when BOTH this is "true" AND the specific
