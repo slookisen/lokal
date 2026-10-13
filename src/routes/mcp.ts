@@ -50,6 +50,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
+import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
 
 const router = Router();
@@ -637,11 +638,24 @@ export function registerTools(
       },
     },
     async () => {
-      const stats = marketplaceRegistry.getStats();
+      // Same three figures as the rettfrabonden.com front page: the honest
+      // catalog count, and distinct cities and categories among the producers
+      // a visitor can find. getStats().totalAgents also counts inactive,
+      // unvetted and umbrella rows, and getStats().cities is the list itself.
+      const agents = marketplaceRegistry.getActiveAgents();
+      const producers = safeHonestCatalogCount("rfb") ?? agents.length;
+      const cities = new Set<string>();
+      const categories = new Set<string>();
+      for (const a of agents as any[]) {
+        const city = a.city || a.location?.city;
+        if (city) cities.add(city);
+        for (const c of a.categories || []) categories.add(c);
+      }
       const text = [
-        "📊 **Lokal — Plattformstatistikk**",
-        `Totalt agenter: ${stats.totalAgents || "?"}`,
-        `Byer: ${stats.cities || "?"}`,
+        "📊 **Rett fra Bonden — Plattformstatistikk**",
+        `Produsenter: ${producers}`,
+        `Byer: ${cities.size}`,
+        `Kategorier: ${categories.size}`,
       ].join("\n");
       return { content: [{ type: "text" as const, text }] };
     }
