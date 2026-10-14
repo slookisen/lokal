@@ -21,6 +21,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
+import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 
@@ -346,6 +347,8 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       : [];
     const tagsRelaxed = !!discoverMeta.tagsRelaxed;
     res.locals.a2aCountable = countable && results.length > 0;
+    // «Med i AI-svar»: the producers in a countable answer, once per profile.
+    recordA2aDelivery(req, res, results.map((r) => r.agent.id), queryText);
     const durationMs = Date.now() - startTime;
 
     // Complete the task with results

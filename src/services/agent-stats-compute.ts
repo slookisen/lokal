@@ -19,6 +19,7 @@ import type Database from "better-sqlite3";
 import { getRetentionWindowDays } from "./retention-window";
 import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
+import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
 
 /**
@@ -39,6 +40,12 @@ export interface AgentStatsPayload {
   lastConversations: Array<{ source: string; createdAt: string; question: string }>;
   /** The window of humanViews/aiViews in days: the raw retention (RFB_AUTO_PRUNE_DAYS, 60). */
   windowDays: number;
+  /**
+   * «Med i AI-svar»: times the profile was sent to an AI assistant (list and
+   * profile pages, MCP, A2A) in the last AI_DELIVERY_WINDOW_DAYS days
+   * (profile-ai-deliveries-compute.ts). Sent to the AI, not seen by a person.
+   */
+  aiDeliveries: AiDeliveries;
 }
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated); the
@@ -213,5 +220,6 @@ export function computeAgentStats(
     conversationCount,
     lastConversations,
     windowDays,
+    aiDeliveries: computeAiDeliveries(db, "rfb", agentId, AI_DELIVERY_WINDOW_DAYS, nowMs),
   };
 }

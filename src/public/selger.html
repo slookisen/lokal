@@ -390,7 +390,7 @@
       <div class="stats-grid" id="dashStats">
         <div class="stat-card">
           <div class="stat-number" id="statDiscovered">0</div>
-          <div class="stat-label" data-i18n="stat_discovered">Oppdaget</div>
+          <div class="stat-label" data-i18n="stat_discovered">Oppdaget (gammel livstidsteller)</div>
         </div>
         <div class="stat-card">
           <div class="stat-number" id="statContacted">0</div>
@@ -671,7 +671,7 @@
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
-              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en l&oslash;pende teller (vises i s&oslash;keresultater). Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-svar&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
           </div>
@@ -687,6 +687,16 @@
             <h2>AI-søk (siste <span class="statsWindowDays">60</span> dager)</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. AI-roboter som bare leser og indekserer sider, telles ikke her.</p>
             <div class="stats-grid" id="statsAiPlatforms"></div>
+          </div>
+
+          <div class="card">
+            <h2>Med i AI-svar</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Antall ganger profilen din er sendt til AI-assistenter som ChatGPT og Claude som svar p&aring; sp&oslash;rsm&aring;l: p&aring; en liste- eller s&oslash;keside AI-en hentet, p&aring; profilsiden din, eller i svar via MCP og A2A. Tallet viser at profilen ble sendt til AI-en, ikke hvor mange som s&aring; den. Svar AI-en gir fra sin egen hukommelse ser vi ikke, s&aring; tallet er et minimum.</p>
+            <div class="stats-grid" id="statsAiDeliveries"></div>
+            <h3>Per AI</h3>
+            <ul class="product-list" id="statsAiDeliveriesVendor"></ul>
+            <h3>Per kanal</h3>
+            <ul class="product-list" id="statsAiDeliveriesChannel"></ul>
           </div>
 
           <div class="card">
@@ -957,7 +967,7 @@
         token_placeholder: 'claim_...',
         login: 'Logg inn', logout: 'Logg ut',
         verified: 'Verifisert av eier',
-        stat_discovered: 'Oppdaget', stat_contacted: 'Kontaktet', stat_chosen: 'Valgt', stat_trust: 'Trust Score',
+        stat_discovered: 'Oppdaget (gammel livstidsteller)', stat_contacted: 'Kontaktet', stat_chosen: 'Valgt', stat_trust: 'Trust Score',
         tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_stats: 'Statistikk', tab_orders: 'Bestillinger', tab_settings: 'Innstillinger',
         profile_info: 'Butikkinformasjon',
         about_label: 'Om butikken', address_label: 'Adresse', postal_code_label: 'Postnummer',
@@ -1025,7 +1035,7 @@
         token_placeholder: 'claim_...',
         login: 'Log in', logout: 'Log out',
         verified: 'Verified by owner',
-        stat_discovered: 'Discovered', stat_contacted: 'Contacted', stat_chosen: 'Chosen', stat_trust: 'Trust Score',
+        stat_discovered: 'Discovered (old lifetime counter)', stat_contacted: 'Contacted', stat_chosen: 'Chosen', stat_trust: 'Trust Score',
         tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_stats: 'Statistics', tab_orders: 'Orders', tab_settings: 'Settings',
         profile_info: 'Shop information',
         about_label: 'About the shop', address_label: 'Address', postal_code_label: 'Postal code',
@@ -1888,7 +1898,7 @@
       // Funnel
       var f = data.funnel || { discovered: 0, viewed: 0, contactClicked: 0 };
       var funnelHtml = '';
-      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.discovered || 0) + '</div><div class="stat-label">Oppdaget</div></div>';
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.discovered || 0) + '</div><div class="stat-label">Oppdaget (gammel livstidsteller)</div></div>';
       var wd = data.windowDays || 60;
       Array.prototype.forEach.call(document.querySelectorAll('.statsWindowDays'), function(el) { el.textContent = wd; });
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.viewed || 0) + '</div><div class="stat-label">Sett (' + wd + 'd)</div></div>';
@@ -1950,6 +1960,26 @@
       aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.claude || 0) + '</div><div class="stat-label">Claude</div></div>';
       aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI</div></div>';
       document.getElementById('statsAiPlatforms').innerHTML = aiHtml;
+
+      // Med i AI-svar: last 60 days and since counting started, per AI and per channel
+      var dl = data.aiDeliveries || {};
+      var dw = dl.window || {};
+      var da = dl.allTime || {};
+      var dwDays = dw.windowDays || 60;
+      var dlHtml = '';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + dwDays + 'd)</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Sendt til AI-en (hele perioden)</div></div>';
+      document.getElementById('statsAiDeliveries').innerHTML = dlHtml;
+      var DL_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Andre AI', unknown: 'Ukjent AI' };
+      var DL_CHANNEL_LABELS = { ai_page_list: 'Liste- og s&oslash;kesider', ai_page_profile: 'Profilsiden', mcp: 'MCP', a2a: 'A2A' };
+      function dlRows(labels, w, a) {
+        w = w || {}; a = a || {};
+        return Object.keys(labels).map(function(k) {
+          return '<li class="product-item"><span class="product-name">' + labels[k] + '</span><span class="product-meta">' + (w[k] || 0) + ' (' + dwDays + 'd) &middot; ' + (a[k] || 0) + ' totalt</span></li>';
+        }).join('');
+      }
+      document.getElementById('statsAiDeliveriesVendor').innerHTML = dlRows(DL_VENDOR_LABELS, dw.byVendor, da.byVendor);
+      document.getElementById('statsAiDeliveriesChannel').innerHTML = dlRows(DL_CHANNEL_LABELS, dw.byChannel, da.byChannel);
 
       // Matching search queries
       var terms = data.matchingSearchQueries || [];
