@@ -161,11 +161,26 @@ export function parseIntent(text: string): DentalSearchParams {
 
 /**
  * Whether a message/send counts as an AI lookup («AI-søk», dev-request
- * 2026-10-13-statistikk-riktig-for-investorer, S7): an external caller (not
- * spam, a probe or our own traffic) that got data back, under the per-IP cap
- * (a2a-traffic-classifier.ts a2aLookupCountable). Logged with the call by
- * mcp-usage-logger.ts.
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it asked something, an
+ * external caller (not spam, a probe or our own traffic) got data back, under
+ * the per-IP cap (a2a-traffic-classifier.ts a2aLookupCountable). Logged with
+ * the call by mcp-usage-logger.ts.
+ *
+ * Asked something = stats, a clinic by org number, or a search with a parsed
+ * filter. A search with no filter («hi», an empty message, data {}) answers
+ * with the first 20 clinics, which is not an answer to a question.
  */
+export function dentalAskedSomething(result: object): boolean {
+  const md = (result as { result?: { metadata?: { skill?: unknown; filter?: unknown } } }).result?.metadata;
+  if (md?.skill === "tannlege_stats" || md?.skill === "tannlege_info") return true;
+  return md?.skill === "tannlege_search" && hasFilter(md.filter);
+}
+
+function hasFilter(filter: unknown): boolean {
+  return !!filter && typeof filter === "object" &&
+    Object.values(filter as Record<string, unknown>).some((v) => v !== undefined && v !== null && v !== "");
+}
+
 function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
@@ -178,6 +193,7 @@ function a2aRequestCountable(req: Request, params: unknown, result: object): boo
     ua: meta.userAgent,
     hasStructuredData: !text,
     isInternal: isInternalTraffic(meta),
+    askedSomething: dentalAskedSomething(result),
     response: result,
   });
 }

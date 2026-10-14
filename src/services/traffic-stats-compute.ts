@@ -40,8 +40,8 @@ export interface TrafficStats {
   /** Page views from autonomous AI crawlers (GPTBot, ClaudeBot, …). */
   aiCrawlerViews: number;
   /**
-   * AI agents fetching information through MCP data tools and A2A requests
-   * the spam guard let through (search-stats-compute.ts computeAiLookups).
+   * AI agents fetching information through MCP data tools and countable A2A
+   * requests (search-stats-compute.ts computeAiLookups).
    * Not page views.
    */
   aiLookups: number;

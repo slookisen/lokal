@@ -17,9 +17,11 @@
  *       that never reached the verdict.
  *   (e) the MCP tool lists cover exactly the tools each vertical's MCP server
  *       registers (a new tool must be sorted into lookup / not lookup).
- *   (f) a2aResultHasData / a2aLookupCountable: data rule, classifier and the
- *       per-IP cap per vertical.
- *   (g) the dental and experiences A2A routers leave the verdict for the logger.
+ *   (f) isNoIntentText / a2aResultHasData / a2aLookupCountable: question
+ *       rule, data rule, classifier and the per-IP cap per vertical.
+ *   (g) the dental and experiences A2A routers leave the verdict for the
+ *       logger; greetings and empty messages, which those handlers answer
+ *       with the first page of the catalogue, are not counted.
  *
  * Exported runAiLookupsTests({log}) -> Promise<TestSummary>; wired into
  * tests/test.ts. Standalone: npx tsx src/services/ai-lookups.test.ts
@@ -34,7 +36,7 @@ import { AI_LOOKUP_MCP_TOOLS, NON_LOOKUP_MCP_TOOLS, computeAiLookups, computeQue
 import { computeTrafficStats } from "./traffic-stats-compute";
 import { mcpUsageLogger } from "./mcp-usage-logger";
 import { registeredMcpToolNames } from "./mcp-tool-manifest";
-import { a2aLookupCaps, a2aLookupCountable, a2aResultHasData } from "./a2a-traffic-classifier";
+import { a2aLookupCaps, a2aLookupCountable, a2aResultHasData, isNoIntentText } from "./a2a-traffic-classifier";
 
 export interface TestSummary {
   passed: number;
@@ -118,6 +120,24 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
     ok(eq(computeAiLookups(db as any, 24, "rfb", now), { mcp: 3, a2a: 2, total: 5 }), "a2: the vertical filter keeps rfb's rows only", computeAiLookups(db as any, 24, "rfb", now));
     ok(computeAiLookups(db as any, 48, undefined, now).mcp === 6, "a3: a 48 h window takes the 30 h-old call too");
 
+    {
+      // Another vertical's tool name is an unknown tool on this server; monitors are left out on A2A too.
+      const db2 = new Database(":memory:");
+      initMod.__initSchemaForTesting(db2 as any);
+      const row = db2.prepare(`
+        INSERT INTO analytics_mcp_calls (protocol, vertical_id, tool_name, client_name, user_agent, ip_hash, is_owner, status_code, countable, created_at)
+        VALUES (?, ?, ?, NULL, ?, 'ip', 0, 200, ?, ?)
+      `);
+      row.run("mcp", "rfb", "tannlege_search", "node", null, at);
+      row.run("mcp", "dental", "lokal_search", "node", null, at);
+      row.run("mcp", "experiences", "lokal_info", "node", null, at);
+      row.run("a2a", "dental", "message/send", "UptimeRobot/2.0 (monitor)", 1, at);
+      row.run("a2a", "experiences", "message/send", "python-requests/2.31", 1, at);
+      const r = computeAiLookups(db2 as any, 24, undefined, now);
+      ok(eq(r, { mcp: 0, a2a: 1, total: 1 }), "a4: tool names count only on their own vertical's server, and monitors are left out of A2A too", r);
+      db2.close();
+    }
+
     const q = computeQueryStats(db as any, 24, undefined, now);
     ok(q.byChannel?.a2a === 2 && q.byChannel?.mcp === 2, "b1: search stats count an A2A search only with countable = 1 (MCP search tools: lokal_search, tannlege_search)", q.byChannel);
     ok(eq(q.aiLookups, all), "b2: query stats carry the same AI lookups", q.aiLookups);
@@ -197,10 +217,15 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
     ok(!a2aResultHasData({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "bad" } }), "f6: a JSON-RPC error is not");
     ok(!a2aResultHasData(null) && !a2aResultHasData({}) && !a2aResultHasData({ result: { artifacts: "x" } }), "f7: missing or malformed answers are not");
 
+    const noIntent = ["hei", "Hei!", "  ping ", "OK.", "?", "{}", "", "hi", "¿hola?".replace("hola", "hello")];
+    ok(noIntent.every((t) => isNoIntentText(t)), "f16: greetings, liveness words and messages without a word are not questions", noIntent.filter((t) => !isNoIntentText(t)));
+    const questions = ["tannlege i Oslo", "hei, finnes det akutt tannlege i Bergen?", "918800002", "0150", "{\"fylke\":\"Oslo\"}", "kategorier"];
+    ok(questions.every((t) => !isNoIntentText(t)), "f17: real questions, org numbers, postcodes and structured filters are", questions.filter((t) => isNoIntentText(t)));
+
     a2aLookupCaps.dental.reset();
     a2aLookupCaps.experiences.reset();
     const hit = answer({ count: 1, clinics: [{ id: "a" }] });
-    const base = { vertical: "dental" as const, text: "tannlege i Oslo", ua: "python-requests/2.31", hasStructuredData: false, isInternal: false, response: hit };
+    const base = { vertical: "dental" as const, text: "tannlege i Oslo", ua: "python-requests/2.31", hasStructuredData: false, isInternal: false, askedSomething: true, response: hit };
     const verdicts: boolean[] = [];
     for (let i = 0; i < 11; i++) verdicts.push(a2aLookupCountable({ ...base, ipHash: "ipCap" }));
     ok(eq(verdicts, [...Array(10).fill(true), false]), "f8: 10 lookups an hour per ip_hash count, the 11th does not", verdicts);
@@ -212,6 +237,9 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
     for (let i = 0; i < 10; i++) a2aLookupCountable({ ...base, ipHash: "ipPing", text: "ping", response: answer({ count: 0, clinics: [] }) });
     ok(!a2aLookupCountable({ ...base, ipHash: "ipPing2", text: "ping", response: answer({ count: 0, clinics: [] }) }), "f14: an answer without data is not counted");
     ok(a2aLookupCountable({ ...base, ipHash: "ipPing" }), "f15: …and does not use up the caller's cap");
+    ok(!a2aLookupCountable({ ...base, ipHash: "ipNoQ", askedSomething: false }), "f18: an answer to no question (the unfiltered first page) is not counted");
+    ok(!a2aLookupCountable({ ...base, ipHash: "ipHei", text: "hei" }), "f19: a greeting is not counted even when its answer has data");
+    ok(!a2aLookupCountable({ ...base, ipHash: "ipEmpty", text: "{}", hasStructuredData: true }), "f20: an empty structured message is not counted");
     a2aLookupCaps.dental.reset();
     a2aLookupCaps.experiences.reset();
   }
@@ -242,6 +270,21 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
         navn: "Sentrum Tannklinikk AS", org_nr: "918800002", poststed: "OSLO", fylke: "Oslo",
         adresse: "Storgata 1", telefon: "22110099", helfo_agreement: "true",
       } as any);
+      // «hei» is a substring of JESSHEIM, so a greeting finds this clinic by name search.
+      dentalStore.createDentalAgent({
+        navn: "Jessheim Tannhelse AS", org_nr: "918800003", poststed: "JESSHEIM", fylke: "Akershus",
+        adresse: "Storgata 2", telefon: "63970000", helfo_agreement: "true",
+      } as any);
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+      dbFactory.getDb("experiences");
+      const providerId = expStore.createProvider({
+        navn: "Fjord Opplevelser AS", fylke: "Oslo", kommune: "Oslo",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      } as any);
+      expStore.createExperience({
+        title: "Byvandring i Oslo", provider_id: providerId, provider_match_status: "matched",
+        kommune: "Oslo", fylke: "Oslo", category: "kultur", verification_status: "verified", confidence: "high",
+      } as any);
       dbFactory.getDb("experiences").prepare(`
         INSERT INTO experience_providers
           (id, navn, vertical, fylke, kommune, producer_type, booking_live, lat, lon, slug, enrichment_state, verification_status, source, confidence)
@@ -266,6 +309,12 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
           headers: { "content-type": "application/json", "user-agent": ua },
           body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params: { message: { role: "user", parts: [{ kind: "text", text }] } } }),
         }).then((r) => r.json() as Promise<any>);
+      const sendRaw = (path: string, message: unknown) =>
+        fetch(`http://127.0.0.1:${port}${path}/a2a`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": "python-requests/2.31" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "message/send", params: { message } }),
+        }).then((r) => r.json() as Promise<any>);
       const lastVerdict = async () => {
         await new Promise((r) => setTimeout(r, 30));
         return (db.prepare("SELECT countable FROM analytics_mcp_calls ORDER BY id DESC LIMIT 1").get() as { countable: number | null } | undefined)?.countable;
@@ -280,6 +329,22 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
       ok(await lastVerdict() === 0, "g4: dental: a lookup with no hits is not");
       await send("/d", "tannlege i Oslo", "RFB-HealthCheck/1.0");
       ok(await lastVerdict() === 0, "g5: dental: our own fleet is not");
+      // Without a parsed filter the dental handler answers with the first 20 clinics.
+      for (const [label, message] of [
+        ["«hi»", { role: "user", parts: [{ kind: "text", text: "hi" }] }],
+        ["«hei» (finds JESSHEIM by name search)", { role: "user", parts: [{ kind: "text", text: "hei" }] }],
+        ["«ab cd» (no word over 2 letters)", { role: "user", parts: [{ kind: "text", text: "ab cd" }] }],
+        ["parts: []", { role: "user", parts: [] }],
+        ["role only", { role: "user" }],
+        ["data {}", { role: "user", data: {} }],
+      ] as const) {
+        const r = await sendRaw("/d", message);
+        ok(a2aResultHasData(r) && await lastVerdict() === 0, `g5b: dental ${label}: answered with clinics, but not counted`, r?.result?.metadata ?? r);
+      }
+      const d2 = await sendRaw("/d", { role: "user", data: { fylke: "Oslo" } });
+      ok(a2aResultHasData(d2) && await lastVerdict() === 1, "g5c: dental: a structured filter that finds clinics is counted");
+      const d3 = await send("/d", "statistikk");
+      ok(a2aResultHasData(d3) && await lastVerdict() === 1, "g5d: dental: stats are counted");
 
       const e1 = await send("/e", "hvor kan jeg booke en sidersmaking i Bergen?");
       ok(a2aResultHasData(e1), "g6: experiences gårdssalg search for a seeded producer answers with data", e1?.result?.artifacts);
@@ -288,6 +353,17 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
       ok(await lastVerdict() === 0, "g8: experiences: a greeting without data is not");
       await send("/e", "hvor kan jeg booke en sidersmaking i Bergen?", "a2a-probe/1.0 (research)");
       ok(await lastVerdict() === 0, "g9: experiences: a probe UA is not");
+      // Without text or a filter the experiences handler answers with the first 20 published rows.
+      for (const [label, message] of [
+        ["parts: []", { role: "user", parts: [] }],
+        ["role only", { role: "user" }],
+        ["data {}", { role: "user", data: {} }],
+      ] as const) {
+        const r = await sendRaw("/e", message);
+        ok(a2aResultHasData(r) && await lastVerdict() === 0, `g10: experiences ${label}: answered with experiences, but not counted`, r?.result?.metadata ?? r);
+      }
+      const e2 = await send("/e", "kategorier");
+      ok(a2aResultHasData(e2) && await lastVerdict() === 1, "g11: experiences: categories are counted");
     } finally {
       if (server) await new Promise((r) => server!.close(() => r(null)));
       a2aLookupCaps.dental.reset();

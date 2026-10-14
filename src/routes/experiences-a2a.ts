@@ -348,11 +348,24 @@ export function detectGardssalgIntent(lower: string): { isGardssalg: boolean; pr
 
 /**
  * Whether a message/send counts as an AI lookup («AI-søk», dev-request
- * 2026-10-13-statistikk-riktig-for-investorer, S7): an external caller (not
- * spam, a probe or our own traffic) that got data back, under the per-IP cap
- * (a2a-traffic-classifier.ts a2aLookupCountable). Logged with the call by
- * mcp-usage-logger.ts.
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it asked something, an
+ * external caller (not spam, a probe or our own traffic) got data back, under
+ * the per-IP cap (a2a-traffic-classifier.ts a2aLookupCountable). Logged with
+ * the call by mcp-usage-logger.ts.
+ *
+ * Asked something = categories, an experience by id, a gårdssalg search, or a
+ * discover with a parsed filter. A discover with no filter (an empty message,
+ * data {}) answers with the first 20 published rows, which is not an answer
+ * to a question.
  */
+export function experiencesAskedSomething(result: object): boolean {
+  const md = (result as { result?: { metadata?: { skill?: unknown; filter?: unknown } } }).result?.metadata;
+  if (md?.skill === "opplevelser_categories" || md?.skill === "opplevelser_info" || md?.skill === "gardssalg_discover") return true;
+  const filter = md?.filter;
+  return md?.skill === "opplevelser_discover" && !!filter && typeof filter === "object" &&
+    Object.values(filter as Record<string, unknown>).some((v) => v !== undefined && v !== null && v !== "");
+}
+
 function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
@@ -364,6 +377,7 @@ function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown,
     ua: meta.userAgent,
     hasStructuredData: !text,
     isInternal: isInternalTraffic(meta),
+    askedSomething: experiencesAskedSomething(result),
     response: result,
   });
 }

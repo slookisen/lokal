@@ -259,9 +259,23 @@ export const A2A_CONVERSATION_CAP_PER_HOUR = 10;
 
 // ─── A2A lookups for «AI-søk» ───────────────────────────────────────────────
 // dev-request 2026-10-13-statistikk-riktig-for-investorer, S7. An A2A request
-// counts as an AI lookup when the caller is external (not spam, a probe or our
-// own traffic), got data back, and its ip_hash is under the per-hour cap. The
-// verdict is logged with the call (mcp-usage-logger.ts, analytics_mcp_calls.countable).
+// counts as an AI lookup when it asked something (a parsed filter or a named
+// skill, not a greeting or an empty message), the caller is external (not
+// spam, a probe or our own traffic), it got data back, and its ip_hash is
+// under the per-hour cap. The verdict is logged with the call
+// (mcp-usage-logger.ts, analytics_mcp_calls.countable).
+
+/**
+ * A whole message that is a greeting or a liveness word («hei», «ping»,
+ * «ok»), or has no word at all («?», «{}», empty). Not a question, even when
+ * the text happens to match a clinic's or a place's name.
+ */
+export function isNoIntentText(text: string | null | undefined): boolean {
+  const t = String(text ?? "").trim().toLowerCase().replace(/^[\s.!?,;:¡¿]+|[\s.!?,;:]+$/g, "");
+  if (!t) return true;
+  if (!/\p{L}{2,}/u.test(t) && !/\d{4}/.test(t)) return true;
+  return NO_INTENT_TERMS.has(t);
+}
 
 /**
  * Did a JSON-RPC message/send answer hand the caller data? A data part with
@@ -287,7 +301,12 @@ export const a2aLookupCaps = {
   experiences: new SlidingWindowCap(A2A_CONVERSATION_CAP_PER_HOUR, 60 * 60 * 1000),
 };
 
-/** Classifier + data + cap, for the dental and experiences A2A routers. Records the hit when it counts. */
+/**
+ * Question + classifier + data + cap, for the dental and experiences A2A
+ * routers. `askedSomething` is the router's call: its handler parsed a filter
+ * or ran a named skill (stats, a clinic by org number, categories …), not the
+ * unfiltered first page of the catalogue. Records the hit only when it counts.
+ */
 export function a2aLookupCountable(input: {
   vertical: keyof typeof a2aLookupCaps;
   ipHash: string;
@@ -295,8 +314,10 @@ export function a2aLookupCountable(input: {
   ua?: string;
   hasStructuredData: boolean;
   isInternal: boolean;
+  askedSomething: boolean;
   response: unknown;
 }): boolean {
+  if (!input.askedSomething || isNoIntentText(input.text)) return false;
   if (!a2aResultHasData(input.response)) return false;
   if (classifyA2aTraffic({ text: input.text, ua: input.ua, hasStructuredData: input.hasStructuredData, isInternal: input.isInternal }) !== "external") return false;
   const cap = a2aLookupCaps[input.vertical];
