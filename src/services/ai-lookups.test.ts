@@ -337,6 +337,7 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
         ["parts: []", { role: "user", parts: [] }],
         ["role only", { role: "user" }],
         ["data {}", { role: "user", data: {} }],
+        ["data with no filter key", { role: "user", data: { foo: "bar" } }],
       ] as const) {
         const r = await sendRaw("/d", message);
         ok(a2aResultHasData(r) && await lastVerdict() === 0, `g5b: dental ${label}: answered with clinics, but not counted`, r?.result?.metadata ?? r);
@@ -358,6 +359,8 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
         ["parts: []", { role: "user", parts: [] }],
         ["role only", { role: "user" }],
         ["data {}", { role: "user", data: {} }],
+        ["data with no filter key", { role: "user", data: { foo: "bar" } }],
+        ["data with only a sort order", { role: "user", data: { sort: "distance" } }],
       ] as const) {
         const r = await sendRaw("/e", message);
         ok(a2aResultHasData(r) && await lastVerdict() === 0, `g10: experiences ${label}: answered with experiences, but not counted`, r?.result?.metadata ?? r);

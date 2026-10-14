@@ -355,15 +355,15 @@ export function detectGardssalgIntent(lower: string): { isGardssalg: boolean; pr
  *
  * Asked something = categories, an experience by id, a gårdssalg search, or a
  * discover with a parsed filter. A discover with no filter (an empty message,
- * data {}) answers with the first 20 published rows, which is not an answer
- * to a question.
+ * data {}, or only a sort order) answers with the first 20 published rows,
+ * which is not an answer to a question.
  */
 export function experiencesAskedSomething(result: object): boolean {
   const md = (result as { result?: { metadata?: { skill?: unknown; filter?: unknown } } }).result?.metadata;
   if (md?.skill === "opplevelser_categories" || md?.skill === "opplevelser_info" || md?.skill === "gardssalg_discover") return true;
   const filter = md?.filter;
   return md?.skill === "opplevelser_discover" && !!filter && typeof filter === "object" &&
-    Object.values(filter as Record<string, unknown>).some((v) => v !== undefined && v !== null && v !== "");
+    Object.entries(filter as Record<string, unknown>).some(([k, v]) => k !== "sort" && v !== undefined && v !== null && v !== "");
 }
 
 function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
