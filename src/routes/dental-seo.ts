@@ -51,7 +51,7 @@ import {
 const router = Router();
 
 // The homepage strip's AI explanation (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
-const DENTAL_AI_EXPLAIN = "AI-søk: et menneske spurte ChatGPT, Claude eller en annen AI-assistent, og den hentet informasjon fra oss i sanntid, fra nettsiden eller via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.";
+const DENTAL_AI_EXPLAIN = "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perplexity …) hentet fra nettsiden i sanntid fordi noen spurte den, pluss oppslag AI-agenter gjorde i dataene våre via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";

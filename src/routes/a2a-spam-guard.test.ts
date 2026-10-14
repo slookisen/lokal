@@ -211,6 +211,14 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
         "(c) …with a Norwegian + English note");
       assertEq([convCount(), searchCount(), discoverySum()], [before.conv, before.search, before.disc],
         "(c) nothing written (conversations / search log / discovery)");
+      assertEq(r.locals?.a2aCountable, false, "(c) …and not logged as countable");
+    }
+
+    // ── (c2) food intent, no producer: not an AI lookup (S7) ────────────
+    {
+      const r = await send(router, "reinsdyrkjøtt i Vardø");
+      assertEq(dataOf(r)?.count, 0, "(c2) a food query no producer matches returns nothing");
+      assertEq(r.locals?.a2aCountable, false, "(c2) …and is not counted as an AI lookup");
     }
 
     // ── (d) spam WITH intent, and internal fleet traffic ────────────────
@@ -220,11 +228,13 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       assertEq(dataOf(r)?.count, 2, "(d) spam with a food word still gets results");
       assertEq([convCount(), searchCount(), discoverySum()], [before.conv, before.search, before.disc],
         "(d) …but leaves no conversation / search log / discovery bump");
+      assertEq(r.locals?.a2aCountable, false, "(d) …and is not logged as countable");
       const r2 = await send(router, "honning i Oslo", { ua: "RFB-HealthCheck/1.0" });
       assertEq(dataOf(r2)?.count, 2, "(d) internal fleet probe gets results");
       assertEq(dataOf(r2)?.conversations, [], "(d) …and starts no conversations");
       assertEq([convCount(), searchCount(), discoverySum()], [before.conv, before.search, before.disc],
         "(d) internal probe leaves no public trace");
+      assertEq(r2.locals?.a2aCountable, false, "(d) …and is not logged as countable");
     }
 
     // ── (e) per-ip_hash cap ──────────────────────────────────────────────
@@ -242,6 +252,7 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       assertEq(dataOf(r)?.count, 2, "(e) 11th call in the hour still gets results");
       assertEq(dataOf(r)?.conversations, [], "(e) …but starts no conversations");
       assertEq([convCount(), searchCount()], [before.conv, before.search], "(e) …and is not logged as a search");
+      assertEq(r.locals?.a2aCountable, false, "(e) …nor counted as an AI lookup");
       const other = await send(router, "honning i Oslo", { ip: "10.99.0.2" });
       assertEq(other.body?.result?.artifacts?.[0]?.parts?.[0]?.data?.conversations?.length, 2,
         "(e) the cap is per ip_hash — another caller is unaffected");

@@ -49,7 +49,7 @@
     "proof_total": "Page views, last {days} days: {total} = people {human} + AI assistants {aiPages} + AI crawlers {aiCrawlers} + other bots and scripts {otherBots}. AI search = {aiPages} pages fetched by AI assistants + {aiLookups} lookups over MCP/A2A. A visit is a series of page views by one visitor with no break longer than 30 minutes.",
     "proof_ai_search": "AI search",
     "proof_ai_crawlers": "AI crawlers",
-    "proof_ai_explain": "AI search: a person asked ChatGPT, Claude or another AI assistant, and it fetched information from us in real time, from the website or over MCP/A2A. AI crawlers: AI services that read and index the pages.",
+    "proof_ai_explain": "AI search: pages an AI assistant (ChatGPT, Claude, Perplexity …) fetched from the website in real time because someone asked it, plus lookups AI agents made in our data over MCP/A2A. AI crawlers: AI services that read and index the pages.",
     "network_label": "Part of the A2A network:",
     "network_tagline": "Built for both humans and AI agents",
     "cats_label": "Categories",

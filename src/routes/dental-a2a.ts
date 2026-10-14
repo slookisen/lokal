@@ -32,7 +32,8 @@ import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
 import { buildRequestMeta, isInternalTraffic } from "../services/conversation-service";
-import { classifyA2aTraffic } from "../services/a2a-traffic-classifier";
+import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
+import { hashIP } from "../services/analytics-service";
 
 const router = Router();
 
@@ -160,23 +161,25 @@ export function parseIntent(text: string): DentalSearchParams {
 
 /**
  * Whether a message/send counts as an AI lookup («AI-søk», dev-request
- * 2026-10-13-statistikk-riktig-for-investorer, S7): it was answered (not a
- * JSON-RPC error) and the shared A2A classifier calls it external — not
- * spam, a probe or our own traffic. Logged with the call by
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): an external caller (not
+ * spam, a probe or our own traffic) that got data back, under the per-IP cap
+ * (a2a-traffic-classifier.ts a2aLookupCountable). Logged with the call by
  * mcp-usage-logger.ts.
  */
 function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
-  if ("error" in result) return false;
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
   const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
   const meta = buildRequestMeta(req);
-  return classifyA2aTraffic({
+  return a2aLookupCountable({
+    vertical: "dental",
+    ipHash: hashIP(req.ip || "unknown"),
     text: text ?? (data !== undefined ? JSON.stringify(data) : ""),
     ua: meta.userAgent,
     hasStructuredData: !text,
     isInternal: isInternalTraffic(meta),
-  }) === "external";
+    response: result,
+  });
 }
 
 // ─── message/send handler (exported for unit tests) ──────────

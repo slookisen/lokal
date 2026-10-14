@@ -1506,10 +1506,10 @@ function initSchema(db: Database.Database): void {
   } catch {
     // Column already exists
   }
-  // …and, for A2A requests, whether the request counted: an external query
-  // with search intent under the per-IP cap, as a2a.ts's spam guard decides
-  // (1), or spam, a probe, our own traffic, no intent or capped (0). NULL =
-  // not an A2A request, or written before 2026-10-14. «AI-søk» counts only 1
+  // …and, for A2A requests, whether the request counts as an AI lookup: an
+  // external caller (not spam, a probe or our own traffic) that got data back,
+  // under the per-IP cap (1), else 0 — as the A2A routers decide. NULL = not an
+  // A2A request, or written before 2026-10-14. «AI-søk» counts only 1
   // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
   try {
     db.exec(`ALTER TABLE analytics_mcp_calls ADD COLUMN countable INTEGER`);

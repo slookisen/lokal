@@ -256,6 +256,54 @@ export class SlidingWindowCap {
 
 /** POST /a2a: max 10 conversation-creating calls per hour per ip_hash. */
 export const A2A_CONVERSATION_CAP_PER_HOUR = 10;
+
+// ─── A2A lookups for «AI-søk» ───────────────────────────────────────────────
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S7. An A2A request
+// counts as an AI lookup when the caller is external (not spam, a probe or our
+// own traffic), got data back, and its ip_hash is under the per-hour cap. The
+// verdict is logged with the call (mcp-usage-logger.ts, analytics_mcp_calls.countable).
+
+/**
+ * Did a JSON-RPC message/send answer hand the caller data? A data part with
+ * count > 0, or a non-empty data object without a count (stats, a clinic, an
+ * experience, categories). «ping», «hello» or a capability question answered
+ * with no hits or a text-only note did not.
+ */
+export function a2aResultHasData(response: unknown): boolean {
+  const r = response && typeof response === "object" ? (response as Record<string, any>) : null;
+  if (!r || r.error || !r.result || typeof r.result !== "object") return false;
+  const artifacts: any[] = Array.isArray(r.result.artifacts) ? r.result.artifacts : [];
+  return artifacts.some((a) => (Array.isArray(a?.parts) ? a.parts : []).some((p: any) => {
+    if (p?.kind !== "data" || !p.data || typeof p.data !== "object") return false;
+    const d = p.data as Record<string, unknown>;
+    if (typeof d.count === "number") return d.count > 0;
+    return Object.values(d).some((v) => (Array.isArray(v) ? v.length > 0 : v !== null && v !== undefined && v !== ""));
+  }));
+}
+
+/** Per-ip_hash cap on A2A lookups counted per vertical (the same 10 per hour as rfb's conversation cap). */
+export const a2aLookupCaps = {
+  dental: new SlidingWindowCap(A2A_CONVERSATION_CAP_PER_HOUR, 60 * 60 * 1000),
+  experiences: new SlidingWindowCap(A2A_CONVERSATION_CAP_PER_HOUR, 60 * 60 * 1000),
+};
+
+/** Classifier + data + cap, for the dental and experiences A2A routers. Records the hit when it counts. */
+export function a2aLookupCountable(input: {
+  vertical: keyof typeof a2aLookupCaps;
+  ipHash: string;
+  text: string;
+  ua?: string;
+  hasStructuredData: boolean;
+  isInternal: boolean;
+  response: unknown;
+}): boolean {
+  if (!a2aResultHasData(input.response)) return false;
+  if (classifyA2aTraffic({ text: input.text, ua: input.ua, hasStructuredData: input.hasStructuredData, isInternal: input.isInternal }) !== "external") return false;
+  const cap = a2aLookupCaps[input.vertical];
+  if (cap.isOver(input.ipHash)) return false;
+  cap.record(input.ipHash);
+  return true;
+}
 export const a2aConversationCap = new SlidingWindowCap(A2A_CONVERSATION_CAP_PER_HOUR, 60 * 60 * 1000);
 
 // ─── Since-boot decision counters (admin observability) ─────────────────────

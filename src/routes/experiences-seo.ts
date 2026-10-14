@@ -1567,7 +1567,7 @@ export function homeStrings(lang: Lang) {
     counterHumanVisits: "Besøk fra mennesker", counterHumanViews: "Sidevisninger fra mennesker", counterAiSearch: "AI-søk", counterCrawlers: "AI-crawlere",
     counterTotalPre: "Sidevisninger siste", counterPeople: "mennesker", counterAiPages: "AI-assistenter", counterAiCrawlersLc: "AI-crawlere", counterOtherBots: "andre roboter og skript", counterAiPagesNote: "sider hentet av AI-assistenter", counterAiLookupsNote: "oppslag via MCP/A2A", counterVisitDef: "Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause.",
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
-    counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller en annen AI-assistent, og den hentet informasjon fra oss i sanntid, fra nettsiden eller via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.",
+    counterAiExplain: "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perplexity …) hentet fra nettsiden i sanntid fordi noen spurte den, pluss oppslag AI-agenter gjorde i dataene våre via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.",
     counterWindowPre: "Siste", counterWindowPost: "dager",
     counterSincePre: "Tall siden",
     networkLabel: "En del av A2A-nettverket:", networkTagline: "Bygget for både mennesker og AI-agenter",
@@ -1635,7 +1635,7 @@ export function homeStrings(lang: Lang) {
     counterHumanVisits: "Visits by people", counterHumanViews: "Page views by people", counterAiSearch: "AI search", counterCrawlers: "AI crawlers",
     counterTotalPre: "Page views, last", counterPeople: "people", counterAiPages: "AI assistants", counterAiCrawlersLc: "AI crawlers", counterOtherBots: "other bots and scripts", counterAiPagesNote: "pages fetched by AI assistants", counterAiLookupsNote: "lookups over MCP/A2A", counterVisitDef: "A visit is a series of page views by one visitor with no break longer than 30 minutes.",
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
-    counterAiExplain: "AI search: a person asked ChatGPT, Claude or another AI assistant, and it fetched information from us in real time, from the website or over MCP/A2A. AI crawlers: AI services that read and index the pages.",
+    counterAiExplain: "AI search: pages an AI assistant (ChatGPT, Claude, Perplexity …) fetched from the website in real time because someone asked it, plus lookups AI agents made in our data over MCP/A2A. AI crawlers: AI services that read and index the pages.",
     counterWindowPre: "Last", counterWindowPost: "days",
     counterSincePre: "Figures since",
     networkLabel: "Part of the A2A network:", networkTagline: "Built for both humans and AI agents",
@@ -1684,10 +1684,10 @@ export function homeStrings(lang: Lang) {
     nearMeBtn: "Nära mig", nearMeRadiusLabel: "Sökradie", nearMeLoading: "Hämtar position…", nearMeDenied: "Position nekad",
     trustAria: "Förtroende och datakällor", trustBrreg: "Arrangörer verifierade mot Brønnøysundregistrene", trustFresh: "Innehåll uppdateras löpande", trustMachine: "Maskinläsbart för AI-agenter",
     counterAria: "Opplevagent i siffror",
-    counterHumanVisits: "Besök från människor", counterHumanViews: "Sidvisningar från människor", counterAiSearch: "AI-sökningar", counterCrawlers: "AI-sökrobotar",
-    counterTotalPre: "Sidvisningar senaste", counterPeople: "människor", counterAiPages: "AI-assistenter", counterAiCrawlersLc: "AI-sökrobotar", counterOtherBots: "andra robotar och skript", counterAiPagesNote: "sidor hämtade av AI-assistenter", counterAiLookupsNote: "uppslag via MCP/A2A", counterVisitDef: "Ett besök är en följd av sidvisningar från en besökare utan längre paus än 30 minuter.",
+    counterHumanVisits: "Besök från människor", counterHumanViews: "Sidvisningar från människor", counterAiSearch: "AI-sökningar", counterCrawlers: "AI-robotar",
+    counterTotalPre: "Sidvisningar senaste", counterPeople: "människor", counterAiPages: "AI-assistenter", counterAiCrawlersLc: "AI-robotar", counterOtherBots: "andra robotar och skript", counterAiPagesNote: "sidor hämtade av AI-assistenter", counterAiLookupsNote: "uppslag via MCP/A2A", counterVisitDef: "Ett besök är en följd av sidvisningar från en besökare utan längre paus än 30 minuter.",
     counterExperiences: "Upplevelser", counterProviders: "Arrangörer", counterMunicipalities: "Kommuner",
-    counterAiExplain: "AI-sökning: en människa frågade ChatGPT, Claude eller en annan AI-assistent, och den hämtade information från oss i realtid, från webbplatsen eller via MCP/A2A. AI-sökrobotar: AI-tjänster som läser och indexerar sidorna.",
+    counterAiExplain: "AI-sökningar: sidor en AI-assistent (ChatGPT, Claude, Perplexity …) hämtade från webbplatsen i realtid för att någon frågade den, plus uppslag AI-agenter gjorde i våra data via MCP/A2A. AI-robotar: AI-tjänster som läser och indexerar sidorna.",
     counterWindowPre: "Senaste", counterWindowPost: "dagarna",
     counterSincePre: "Siffror sedan",
     networkLabel: "En del av A2A-nätverket:", networkTagline: "Byggt för både människor och AI-agenter",
@@ -1859,7 +1859,7 @@ router.get("/", (req: Request, res: Response) => {
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterTotalPre} ${counters.windowDays} ${S.counterWindowPost}: ${counters.pageViews.toLocaleString(numFmt)} = ${S.counterPeople} ${counters.humanViews.toLocaleString(numFmt)} + ${S.counterAiPages} ${counters.aiSearchViews.toLocaleString(numFmt)} + ${S.counterAiCrawlersLc} ${counters.aiCrawlerViews.toLocaleString(numFmt)} + ${S.counterOtherBots} ${counters.otherBotViews.toLocaleString(numFmt)}. ${S.counterAiSearch} = ${counters.aiSearchViews.toLocaleString(numFmt)} ${S.counterAiPagesNote} + ${counters.aiLookups.toLocaleString(numFmt)} ${S.counterAiLookupsNote}. ${S.counterVisitDef}${sinceDateFragment}</div>
+    <div class="counter-note">${S.counterTotalPre} ${counters.windowDays} ${S.counterWindowPost}: ${counters.pageViews.toLocaleString(numFmt)} = ${S.counterPeople} ${counters.humanViews.toLocaleString(numFmt)} + ${S.counterAiPages} ${counters.aiSearchViews.toLocaleString(numFmt)} + ${S.counterAiCrawlersLc} ${counters.aiCrawlerViews.toLocaleString(numFmt)} + ${S.counterOtherBots} ${counters.otherBotViews.toLocaleString(numFmt)}. ${S.counterAiSearch} = ${counters.aiSearchViews.toLocaleString(numFmt)} ${S.counterAiPagesNote} + ${counters.aiLookups.toLocaleString(numFmt)} ${S.counterAiLookupsNote}. ${S.counterVisitDef} ${S.counterAiExplain}${sinceDateFragment}</div>
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>

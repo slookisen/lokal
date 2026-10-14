@@ -36,7 +36,11 @@ interface UsageRow {
   isOwner: boolean;
   /** HTTP status of the response (agent-card rows: undefined → NULL). */
   statusCode?: number;
-  /** A2A requests: the spam guard's verdict (a2a.ts, res.locals.a2aCountable); else undefined → NULL. */
+  /**
+   * A2A requests: whether the request counts as an AI lookup, as the router
+   * decided (a2a.ts; dental-a2a.ts / experiences-a2a.ts via
+   * a2aLookupCountable), passed in res.locals.a2aCountable; else undefined → NULL.
+   */
   countable?: boolean;
 }
 
@@ -130,7 +134,7 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
         const ipHash = hashIP(req.ip || "unknown");
         const isOwner = isOwnerRequest(req);
         const uaClientName = parseUserAgent(userAgent).clientName || null;
-        // Set by a2a.ts's discovery handler once its spam guard has decided.
+        // Set by the A2A routers (a2a.ts, dental-a2a.ts, experiences-a2a.ts) once they have answered.
         const a2aCountable = protocol === "a2a" && typeof res.locals?.a2aCountable === "boolean" ? res.locals.a2aCountable as boolean : undefined;
 
         for (const entry of requestEntries) {

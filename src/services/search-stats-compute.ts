@@ -7,6 +7,7 @@
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { A2A_REQUEST_METHODS, ASSISTANT_SEARCH_CLASS, BOT_SEARCH_CLASSES, isFreeTextQuery, MCP_SEARCH_TOOLS } from "./search-tracking";
+import { PROBE_CLIENT_MARKERS } from "./agent-usage-compute";
 
 type Db = Database.Database;
 
@@ -157,19 +158,39 @@ export function computeQueryStats(
 // dev-request 2026-10-13-statistikk-riktig-for-investorer, S7 (Daniel
 // 2026-10-14: «Ta med MCP/A2A i AI-søk»). An AI agent fetching information
 // from the platform through its tools rather than a web page:
-//   - MCP: a call to one of our data tools (lokal_*, tannlege_*, the
-//     experience and gårdssalg tools) or a resources/read. Handshakes and
-//     catalogue health checks (initialize, tools/list, notifications/…,
-//     ping, server/discover …) fetch nothing and are not counted.
-//   - A2A: a request (message/send, tasks/send, SendMessage) the spam guard
-//     let through (countable = 1: external, with intent, under the cap).
-// Our own traffic (is_owner) and calls answered 4xx/5xx are left out.
+//   - MCP: a call to one of our information tools (exact, case-sensitive
+//     names below), or a resources/read of rettfrabonden's lokal:// data
+//     resources. Handshakes and health checks (initialize, tools/list,
+//     notifications/…, ping, server/discover …), unknown tool names, actions
+//     (shopping cart, order status, gårdssalg booking) and the geocode helper
+//     are not lookups. Catalogue probes and monitors are left out by client
+//     name or user agent (the same markers as agent-usage-compute.ts).
+//   - A2A: a request (message/send, tasks/send, SendMessage) logged with
+//     countable = 1: external, answered with data, under the per-IP cap
+//     (a2a.ts; a2a-traffic-classifier.ts a2aLookupCountable).
+// Our own traffic (is_owner) and calls answered 4xx/5xx are left out. A tool
+// call answered with a JSON-RPC or tool error over HTTP 200 still counts: the
+// logger does not see the result.
 
-/** MCP tools outside the lokal_/tannlege_ prefixes that fetch or act on platform data. */
-export const AI_LOOKUP_MCP_TOOLS = [
-  "discover_experiences", "get_experience", "list_experience_categories",
-  "discover_gardssalg", "book_gardssalg", "resources/read",
-] as const;
+/** MCP tools that hand the caller platform information, per vertical (the registered tools minus actions and helpers). */
+export const AI_LOOKUP_MCP_TOOLS = {
+  rfb: [
+    "lokal_search", "lokal_discover", "lokal_find_offers", "lokal_info", "lokal_stats",
+    "lokal_bm_next_markets", "lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations",
+  ],
+  dental: ["tannlege_search", "tannlege_info", "tannlege_akutt", "tannlege_kjeder", "tannlege_stats"],
+  experiences: ["discover_experiences", "get_experience", "list_experience_categories", "discover_gardssalg"],
+} as const;
+
+/** Registered MCP tools that act or help rather than hand out information (not lookups). */
+export const NON_LOOKUP_MCP_TOOLS = {
+  rfb: ["lokal_cart_create", "lokal_cart_add_item", "lokal_cart_view", "lokal_cart_submit", "lokal_order_status", "lokal_geocode"],
+  dental: [],
+  experiences: ["book_gardssalg"],
+} as const;
+
+/** Client-name / user-agent markers of catalogue probes and monitors: the agentplatform.no tool-call count's list. */
+export const AI_LOOKUP_PROBE_MARKERS = PROBE_CLIENT_MARKERS;
 
 export interface AiLookups {
   mcp: number;
@@ -187,17 +208,22 @@ export function computeAiLookups(
   const V = vertical ? " AND vertical_id = ?" : "";
   const vp: string[] = vertical ? [vertical] : [];
   const okStatus = columnExists(db, "analytics_mcp_calls", "status_code") ? " AND (status_code IS NULL OR status_code < 400)" : "";
+  const tools = [...AI_LOOKUP_MCP_TOOLS.rfb, ...AI_LOOKUP_MCP_TOOLS.dental, ...AI_LOOKUP_MCP_TOOLS.experiences];
+  const ua = columnExists(db, "analytics_mcp_calls", "user_agent") ? "lower(coalesce(user_agent, ''))" : "''";
+  const probe = AI_LOOKUP_PROBE_MARKERS.map(() => `(lower(coalesce(client_name, '')) LIKE ? OR ${ua} LIKE ?)`).join(" OR ");
+  const probeParams = AI_LOOKUP_PROBE_MARKERS.flatMap((m) => [`%${m}%`, `%${m}%`]);
   const a2a = columnExists(db, "analytics_mcp_calls", "countable")
     ? `(protocol = 'a2a' AND tool_name IN (${A2A_REQUEST_METHODS.map(() => "?").join(", ")}) AND countable = 1)`
     : "0";
   const rows = db.prepare(`
     SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
     WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
-      AND ((protocol = 'mcp' AND (tool_name LIKE 'lokal\\_%' ESCAPE '\\' OR tool_name LIKE 'tannlege\\_%' ESCAPE '\\'
-             OR tool_name IN (${AI_LOOKUP_MCP_TOOLS.map(() => "?").join(", ")})))
+      AND ((protocol = 'mcp' AND (tool_name IN (${tools.map(() => "?").join(", ")})
+             OR (tool_name = 'resources/read' AND vertical_id = 'rfb'))
+             AND NOT (${probe}))
         OR ${a2a})
     GROUP BY protocol
-  `).all(...tp, ...vp, ...AI_LOOKUP_MCP_TOOLS, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS)) as Array<{ protocol: string; n: number }>;
+  `).all(...tp, ...vp, ...tools, ...probeParams, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS)) as Array<{ protocol: string; n: number }>;
   let mcp = 0;
   let a2aN = 0;
   for (const r of rows) {
