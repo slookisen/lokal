@@ -51,7 +51,7 @@ function pruneSeen(nowMs: number): void {
   for (const [k, until] of seen) if (until <= nowMs) seen.delete(k);
   // Still full: drop the oldest keys (Map keeps insertion order).
   for (const k of seen.keys()) {
-    if (seen.size < MAX_DEDUP_KEYS) break;
+    if (seen.size < MAX_DEDUP_KEYS * 0.9) break;
     seen.delete(k);
   }
 }
@@ -234,7 +234,7 @@ export function recordA2aDelivery(
     const sessionKey = sessionKeyFor(req.ip || "unknown", userAgent);
     const ids = [...profileIds];
     res.once("finish", () => {
-      if (res.statusCode >= 400) return;
+      if (res.statusCode >= 400 || res.locals?.a2aCountable !== true) return;
       recordAiDeliveries({ vertical, channel: "a2a", vendor: agentDeliveryVendor(null, userAgent), profileIds: ids, sessionKey, listKey });
     });
   } catch (err) {
