@@ -298,6 +298,10 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
             "override-active-siteroot.no",
             "override-active-thirdparty.no",
           ),
+          // dev-request 2026-10-13: the override relaxes only the domain check;
+          // as a first touch this row also needs a published-address record
+          // (Brreg for its own org_nr) — the override alone gives no exemption.
+          epost: [{ source_type: "registry", value: "post@override-active-thirdparty.no", source_url: "https://data.brreg.no/enhetsregisteret/api/enheter/200000001" }],
         }),
         brreg_verified: 1, antall_ansatte: 8, naeringskode: null,
       });

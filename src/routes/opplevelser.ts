@@ -19772,6 +19772,69 @@ export function computeGardssalgAddressBasis(
   return "unverified";
 }
 
+// dev-request 2026-10-13-opplevagent-forste-henvendelse-krever-publisert-
+// adresse: a FIRST touch (no prior real send for the provider) may only go
+// out when the exact recipient address is documented as published —
+// (a) a field_provenance email/epost record with value == address and a
+// source_url on the website's own/equivalent domain (hasHomepageEvidence +
+// the same epost adapter computeGardssalgAddressBasis uses), or (b) a
+// record with value == address whose source_url is the Brreg unit lookup
+// for the producer's OWN org_nr. Directories/social/aggregators never
+// count: only the producer's website domain and data.brreg.no for the
+// own org_nr are accepted hosts. Fail closed on any ambiguity.
+export function computeGardssalgAddressPublished(
+  epost: string | null,
+  hjemmeside: string | null,
+  fieldProvenanceRaw: string | null,
+  orgNr: string | null,
+): boolean {
+  const email = (epost ?? "").trim().toLowerCase();
+  if (!email || !email.includes("@") || !fieldProvenanceRaw) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fieldProvenanceRaw);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const prov = parsed as Record<string, unknown>;
+  const toList = (v: unknown): Record<string, unknown>[] =>
+    (Array.isArray(v) ? v : v ? [v] : []).filter(
+      (r): r is Record<string, unknown> => !!r && typeof r === "object" && !Array.isArray(r),
+    );
+  const emailRecs = toList(prov.email);
+  const epostRecs = toList(prov.epost);
+
+  // (a) website proof
+  const websiteHost = hjemmeside && hjemmeside.trim() ? hostFromUrlLike(hjemmeside) : null;
+  if (websiteHost) {
+    if (hasHomepageEvidence(emailRecs, epost, websiteHost)) return true;
+    const adapted = epostRecs
+      .filter((r) => r.source_type === undefined || r.source_type === "homepage")
+      .map((r) => ({ ...r, source_type: "homepage" }));
+    if (hasHomepageEvidence(adapted, epost, websiteHost)) return true;
+  }
+
+  // (b) registered source: Brreg unit for the producer's own org_nr only.
+  const org = (orgNr ?? "").replace(/\s+/g, "");
+  if (/^\d{9}$/.test(org)) {
+    for (const r of [...emailRecs, ...epostRecs]) {
+      if (typeof r.value !== "string" || r.value.trim().toLowerCase() !== email) continue;
+      if (typeof r.source_url !== "string") continue;
+      let u: URL;
+      try {
+        u = new URL(r.source_url.trim());
+      } catch {
+        continue;
+      }
+      if (u.protocol !== "https:" || u.hostname.toLowerCase() !== "data.brreg.no") continue;
+      const m = /^\/enhetsregisteret\/api\/enheter\/(\d{9})\/?$/.exec(u.pathname);
+      if (m && m[1] === org) return true;
+    }
+  }
+  return false;
+}
+
 // dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien (option A):
 // the daily-prep computation is extracted out of the GET route so the
 // platform-side daily send (runGardssalgOutreachDaily, further down) uses the
@@ -19871,6 +19934,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     cross_platform?: boolean;
     quarantine_until?: string;
     address_basis?: GardssalgAddressBasis;
+    address_published?: boolean;
   };
 
   // ── producer_type / naeringskode / hjemmeside / field_provenance /
@@ -19887,13 +19951,14 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       hjemmeside: string | null;
       field_provenance: string | null;
       about_text: string | null;
+      org_nr: string | null;
     }
   >();
   if (eligible.length > 0) {
     const placeholders = eligible.map(() => "?").join(", ");
     const extraRows = expDb
       .prepare(
-        `SELECT id, producer_type, naeringskode, hjemmeside, field_provenance, about_text
+        `SELECT id, producer_type, naeringskode, hjemmeside, field_provenance, about_text, org_nr
            FROM experience_providers WHERE id IN (${placeholders})`,
       )
       .all(...eligible.map((e) => e.provider_id)) as Array<{
@@ -19903,8 +19968,23 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       hjemmeside: string | null;
       field_provenance: string | null;
       about_text: string | null;
+      org_nr: string | null;
     }>;
     for (const r of extraRows) extraById.set(r.id, r);
+  }
+
+  // First-touch gate input (dev-request 2026-10-13): providers with any prior
+  // real send. Same definition of "first touch" as runGardssalgOutreachDaily.
+  const hasPriorSendIds = new Set<string>();
+  if (eligible.length > 0) {
+    const ph = eligible.map(() => "?").join(", ");
+    const sentRows = expDb
+      .prepare(
+        `SELECT DISTINCT provider_id FROM experience_outreach_sent_log
+           WHERE is_test = 0 AND provider_id IN (${ph})`,
+      )
+      .all(...eligible.map((e) => e.provider_id)) as Array<{ provider_id: string }>;
+    for (const r of sentRows) hasPriorSendIds.add(r.provider_id);
   }
 
   // ── Skive 3 checks 1-3 (see the module doc comment above the route) —
@@ -19939,6 +20019,22 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
         });
         continue;
       }
+    }
+    // dev-request 2026-10-13: a first touch needs the exact address documented
+    // as published. An active contact-email override does NOT exempt it (the
+    // override only relaxes the domain check above).
+    if (
+      !hasPriorSendIds.has(e.provider_id) &&
+      !computeGardssalgAddressPublished(e.epost, extra?.hjemmeside ?? null, extra?.field_provenance ?? null, extra?.org_nr ?? null)
+    ) {
+      skive3Excluded.push({
+        provider_id: e.provider_id,
+        name: e.navn,
+        reason: "first_touch_address_not_published",
+        address_basis: addressBasis,
+        address_published: false,
+      });
+      continue;
     }
     if (!meetsAboutCheapBar(extra?.about_text ?? null)) {
       skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "profile_text_low_quality" });
@@ -20002,6 +20098,12 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       profile_url: profileUrl,
       recipient_email: e.epost,
       address_basis: computeGardssalgAddressBasis(e.epost, extra?.hjemmeside ?? null, extra?.field_provenance ?? null),
+      address_published: computeGardssalgAddressPublished(
+        e.epost,
+        extra?.hjemmeside ?? null,
+        extra?.field_provenance ?? null,
+        extra?.org_nr ?? null,
+      ),
       producer_type: extra?.producer_type ?? null,
       antall_ansatte: readyRow?.antall_ansatte ?? null,
       kommune: readyRow?.kommune ?? null,
@@ -20127,6 +20229,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     ...(refillHints ? { refill_hints: refillHints } : {}),
     active_contact_email_overrides: activeContactEmailOverrides,
     second_line_verified_count: secondLineVerifiedCount,
+    first_touch_address_not_published_count: excluded.filter((x) => x.reason === "first_touch_address_not_published").length,
     // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
     // address each selected candidate has (reporting only, not a filter).
     recipient_address_types: countRecipientAddressTypes(candidates.map((c) => c.recipient_email)),

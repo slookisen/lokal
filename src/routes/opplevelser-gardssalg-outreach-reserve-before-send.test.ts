@@ -286,7 +286,12 @@ export function runOpplevelserGardssalgOutreachReserveBeforeSendTests(
           hjemmeside: `https://reserve-sideri-${n}.no`,
           about_text: REALISTIC_ABOUT_TEXT,
           slug: `reserve-sideri-${n}`,
-          field_provenance: VERIFIED_PROVENANCE,
+          // dev-request 2026-10-13: first touches need the address documented as
+          // published; a Brreg record for the own org_nr satisfies the gate.
+          field_provenance: JSON.stringify({
+            ...JSON.parse(VERIFIED_PROVENANCE),
+            epost: [{ source_type: "registry", value: emailOf(n), source_url: `https://data.brreg.no/enhetsregisteret/api/enheter/${300000000 + n}` }],
+          }),
         });
         return id;
       };

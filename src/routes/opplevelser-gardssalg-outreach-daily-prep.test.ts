@@ -190,6 +190,10 @@ function homepageEmailProvenance(email: string, websiteUrl: string): string {
   });
 }
 
+function brregUnitUrl(orgNr: string): string {
+  return `https://data.brreg.no/enhetsregisteret/api/enheter/${orgNr}`;
+}
+
 // Grep 6 slice 1 (DAILY_PREP_MAX_CANDIDATES env knob): saves/restores
 // process.env.DAILY_PREP_MAX_CANDIDATES around a single case via try/finally
 // so a failing assertion inside `fn` can never leak the value into a later
@@ -300,7 +304,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       initMod.__setDbForTesting(rfbDb as any);
       initMod.__initSchemaForTesting(rfbDb as any);
 
-      const insertProvider = expDb.prepare(
+      const insertProviderRaw = expDb.prepare(
         `INSERT INTO experience_providers
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
@@ -314,6 +318,27 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
             @brreg_verified, @antall_ansatte, @naeringskode,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+
+      // dev-request 2026-10-13 (first touch needs a published address): every
+      // pre-existing fixture below is a first touch (no prior send), so the new
+      // gate would exclude them all for a reason unrelated to what each case
+      // tests. This wrapper gives any fixture with a non-null field_provenance
+      // and no email/epost key a Brreg-own-org_nr record for its address (a
+      // source that does not change address_basis). The new gate's own cases
+      // (block (q)) use insertProviderRaw and set provenance explicitly.
+      const insertProvider = {
+        run(p: any) {
+          let fp = p.field_provenance;
+          if (fp) {
+            const o = JSON.parse(fp);
+            if (!("email" in o) && !("epost" in o)) {
+              o.epost = [{ source_type: "registry", value: p.epost, source_url: brregUnitUrl(p.org_nr) }];
+              fp = JSON.stringify(o);
+            }
+          }
+          return insertProviderRaw.run({ ...p, field_provenance: fp });
+        },
+      };
 
       // ── prov-a-freemail: would_send, address_basis freemail ────────────
       insertProvider.run({
@@ -1060,6 +1085,84 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         "p5: second_line_verified_count is 0 when no candidate went through on that basis",
       );
       expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-mismatch-real-dailyprep'`).run();
+
+      // ══ (q) dev-request 2026-10-13: a FIRST touch (no prior real send) needs
+      // the exact address documented as published (website proof, or a Brreg
+      // record for the producer's OWN org_nr). Second touches are unchanged;
+      // an active contact-email override gives no exemption. Fixtures use
+      // insertProviderRaw so their provenance is exactly what is written. ════
+      const qFixture = (id: string, orgNr: string, epost: string, hjemmeside: string | null, fp: unknown) =>
+        insertProviderRaw.run({
+          id, navn: `Q ${id}`, org_nr: orgNr, kommune: "Voss",
+          rfb_seed_source: "rfb-seed", producer_type: "sideri",
+          epost, telefon: null, hjemmeside,
+          about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+          products: "Sider", content_source: "provider_site",
+          booking_live: 0, catalog_hidden: 0, slug: `${id}-gard`, field_provenance: JSON.stringify(fp),
+          brreg_verified: 1, antall_ansatte: 3, naeringskode: null,
+        });
+      const qVerified = { hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-08-09T00:00:00.000Z" } };
+      const qSecondLine = { second_line_verification: { verified: true, at: "2026-09-01T00:00:00.000Z", sources: ["brreg", "1881"], judge_reason: "identity match" } };
+      const qRec = (value: string, source_url: string, source_type = "registry") => [{ source_type, value, source_url }];
+
+      // q-1 first touch, same_domain, no proof -> excluded
+      qFixture("q-01-samedomain-noproof", "400000001", "post@q01-fixture.no", "https://q01-fixture.no", qVerified);
+      // q-2 first touch, same_domain, website proof -> passes
+      qFixture("q-02-samedomain-proof", "400000002", "post@q02-fixture.no", "https://q02-fixture.no",
+        { ...qVerified, email: qRec("Post@Q02-Fixture.no ", "https://q02-fixture.no/kontakt", "homepage") });
+      // q-3 first touch, second-line verified, no website, no source -> excluded
+      qFixture("q-03-secondline-nosource", "400000003", "post@q03-fixture.no", null, qSecondLine);
+      // q-4 Brreg record for the producer's own org_nr -> passes
+      qFixture("q-04-brreg-own", "400000004", "post@q04-fixture.no", null,
+        { ...qSecondLine, epost: qRec("post@q04-fixture.no", "https://data.brreg.no/enhetsregisteret/api/enheter/400000004") });
+      // q-5 Brreg record for ANOTHER org_nr -> excluded
+      qFixture("q-05-brreg-other", "400000005", "post@q05-fixture.no", null,
+        { ...qSecondLine, epost: qRec("post@q05-fixture.no", "https://data.brreg.no/enhetsregisteret/api/enheter/999999999") });
+      // q-6 directory source with matching value -> excluded
+      qFixture("q-06-directory", "400000006", "post@q06-fixture.no", null,
+        { ...qSecondLine, epost: qRec("post@q06-fixture.no", "https://www.gulesider.no/q06/bedrifter", "directory") });
+      // q-7 SECOND touch (prior real send beyond cooldown), same_domain, no proof -> passes (unchanged)
+      qFixture("q-07-second-touch", "400000007", "post@q07-fixture.no", "https://q07-fixture.no", qVerified);
+      expDb
+        .prepare(
+          `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, channel, is_test)
+           VALUES ('q-07-second-touch', 'post@q07-fixture.no', ?, 'email', 0)`,
+        )
+        .run(new Date(Date.now() - 400 * 24 * 3600 * 1000).toISOString());
+      // q-8 active override, unverified domain, first touch, no proof -> override passes the
+      // domain check but gives NO exemption from the first-touch gate
+      qFixture("q-08-override", "400000008", "post@q08-third-domain.no", "https://q08-fixture.no",
+        { ...qVerified, contact_email_domain_override: { approved_email: "post@q08-third-domain.no" } });
+
+      await withDailyCapEnv("10", async () => {
+        const q = await callRoute(opplevelserRouter, { headers: auth });
+        assertEq(q.status, 200, "q0: first-touch gate batch -> 200");
+        const qCand = new Map((q.body.candidates as any[]).map((c) => [c.provider_id, c]));
+        const qExcl = new Map((q.body.excluded as any[]).map((e) => [e.provider_id, e]));
+        const NEW = "first_touch_address_not_published";
+        assertEq(qExcl.get("q-01-samedomain-noproof")?.reason, NEW, "q1: first touch same_domain without proof -> excluded");
+        assertEq(qExcl.get("q-01-samedomain-noproof")?.address_basis, "same_domain_as_website", "q1b: excluded row keeps address_basis label");
+        assertTrue(!qCand.has("q-01-samedomain-noproof"), "q1c: not a candidate");
+        assertTrue(qCand.has("q-02-samedomain-proof"), "q2: first touch same_domain WITH website proof -> passes");
+        assertEq(qCand.get("q-02-samedomain-proof")?.address_published, true, "q2b: candidate carries address_published true");
+        assertEq(qCand.get("q-02-samedomain-proof")?.address_basis, "same_domain_as_website", "q2c: address_basis label unchanged");
+        assertEq(qExcl.get("q-03-secondline-nosource")?.reason, NEW, "q3: second-line (no website) without published source -> excluded");
+        assertTrue(qCand.has("q-04-brreg-own"), "q4: Brreg record for the producer's own org_nr -> passes");
+        assertEq(qCand.get("q-04-brreg-own")?.address_published, true, "q4b: address_published true");
+        assertEq(qExcl.get("q-05-brreg-other")?.reason, NEW, "q5: Brreg record for a different org_nr -> excluded");
+        assertEq(qExcl.get("q-06-directory")?.reason, NEW, "q6: directory source -> excluded");
+        assertTrue(qCand.has("q-07-second-touch"), "q7: second touch same_domain without proof -> passes unchanged");
+        assertEq(qCand.get("q-07-second-touch")?.address_published, false, "q7b: second touch carries address_published false (label only)");
+        assertEq(qExcl.get("q-08-override")?.reason, NEW, "q8: active override gives no first-touch exemption");
+        assertTrue(!qCand.has("q-08-override"), "q8b: override fixture is not a candidate");
+        assertEq(q.body.first_touch_address_not_published_count, 5, "q9: top-level count of the new reason (q1,q3,q5,q6,q8)");
+        assertTrue(
+          (q.body.candidates as any[]).every((c) => c.address_published === true || qCand.get("q-07-second-touch") === c),
+          "q10: every selected first touch has address_published true",
+        );
+      });
+      expDb.prepare(`DELETE FROM experience_providers WHERE id LIKE 'q-%'`).run();
+      expDb.prepare(`DELETE FROM experience_outreach_sent_log WHERE provider_id LIKE 'q-%'`).run();
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));
