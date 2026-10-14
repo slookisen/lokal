@@ -15,6 +15,11 @@
  *   (d) mcp-usage-logger.ts stores the A2A verdict a handler leaves in
  *       res.locals.a2aCountable (1/0), NULL for MCP calls and for A2A calls
  *       that never reached the verdict.
+ *   (h) computeAiLookupBreakdown: the rows add up to computeAiLookups' total for
+ *       the same window and vertical, with per-row distinct counts and
+ *       per-vertical ip_hash concentration.
+ *   (i) an MCP call with the fleet UA / client name ("rfb-…") is stored as
+ *       internal (is_owner = 1) and is not counted in «AI-søk».
  *   (e) the MCP tool lists cover exactly the tools each vertical's MCP server
  *       registers (a new tool must be sorted into lookup / not lookup).
  *   (f) isNoIntentText / a2aResultHasData / a2aLookupCountable: question
@@ -32,7 +37,7 @@ import express from "express";
 import * as http from "http";
 import type { AddressInfo } from "net";
 import * as initMod from "../database/init";
-import { AI_LOOKUP_MCP_TOOLS, NON_LOOKUP_MCP_TOOLS, computeAiLookups, computeQueryStats } from "./search-stats-compute";
+import { AI_LOOKUP_MCP_TOOLS, NON_LOOKUP_MCP_TOOLS, computeAiLookupBreakdown, computeAiLookups, computeQueryStats } from "./search-stats-compute";
 import { computeTrafficStats } from "./traffic-stats-compute";
 import { mcpUsageLogger } from "./mcp-usage-logger";
 import { registeredMcpToolNames } from "./mcp-tool-manifest";
@@ -153,7 +158,70 @@ export async function runAiLookupsTests(opts: { log?: boolean } = {}): Promise<T
       "c1: «AI-søk» = AI search pages + MCP/A2A lookups (rfb)", { aiSearchViews: t.aiSearchViews, aiLookups: t.aiLookups, aiSearchTotal: t.aiSearchTotal });
     ok(t.aiCrawlerViews === 4 && t.otherBotViews === 1 && t.humanViews + t.aiSearchViews + t.aiCrawlerViews + t.otherBotViews === t.pageViews,
       "c2: AI crawlers on their own; people + AI search pages + AI crawlers + other bots = page views", t);
+
+    // (h) the breakdown on the same window: rows add up to the headline number.
+    {
+      const mk = db.prepare(`
+        INSERT INTO analytics_mcp_calls (protocol, vertical_id, tool_name, client_name, user_agent, ip_hash, is_owner, status_code, countable, created_at)
+        VALUES (?, ?, ?, ?, 'ua', ?, 0, 200, ?, ?)
+      `);
+      // A heavy single-IP client on rfb, plus distinct days for one client.
+      for (let i = 0; i < 6; i++) mk.run("mcp", "rfb", "lokal_search", "claude-code", "ipHeavy", null, ts(now - (i + 1) * H));
+      mk.run("mcp", "rfb", "lokal_search", "claude-code", "ipHeavy", null, ts(now - 20 * H));
+      mk.run("mcp", "rfb", "lokal_search", null, "ipX", null, at);
+      for (const w of [24, 48]) {
+        for (const v of [undefined, "rfb", "dental", "experiences"] as const) {
+          const b = computeAiLookupBreakdown(db as any, w, v, now);
+          const t = computeAiLookups(db as any, w, v, now);
+          ok(b.total === t.total && b.rows.reduce((a, r) => a + r.calls, 0) === t.total,
+            `h1: breakdown rows add up to computeAiLookups.total (${w} h, ${v ?? "all"})`, { rows: b.rows.reduce((a, r) => a + r.calls, 0), total: t.total });
+        }
+      }
+      const b = computeAiLookupBreakdown(db as any, 24, "rfb", now);
+      const cc = b.rows.find((r) => r.clientName === "claude-code" && r.tool === "lokal_search");
+      ok(!!cc && cc.calls === 7 && cc.distinctIpHashes === 1 && cc.distinctDays >= 1 && cc.firstSeen <= cc.lastSeen && cc.vertical === "rfb" && cc.protocol === "mcp",
+        "h2: a row carries calls, distinctIpHashes, distinctDays, firstSeen and lastSeen", cc);
+      ok(b.rows.every((r) => r.vertical === "rfb"), "h3: the vertical filter keeps rfb's rows only");
+      const conc = b.concentration.find((c) => c.vertical === "rfb" && c.protocol === "all");
+      ok(!!conc && conc.calls === b.total && conc.top1Share > 0.5 && conc.top1Share <= conc.top5Share && conc.top5Share <= 1,
+        "h4: concentration: the heavy ip_hash dominates the top-1 share", conc);
+      ok(b.concentration.some((c) => c.vertical === "rfb" && c.protocol === "a2a" && c.calls === 2), "h5: A2A (countable = 1) has its own concentration row", b.concentration);
+      ok(!JSON.stringify(b).includes("127.0.0.1"), "h6: only ip hashes in the output");
+    }
     db.close();
+  }
+
+  // ── (i) fleet MCP clients are stored as internal ────────────────────
+  {
+    const prev = initMod.__peekDbForTesting();
+    const db = new Database(":memory:");
+    initMod.__setDbForTesting(db as any);
+    initMod.__initSchemaForTesting(db as any);
+    let server: http.Server | undefined;
+    try {
+      const app = express();
+      app.use(express.json());
+      app.use("/mcp", mcpUsageLogger("mcp", "rfb"), (_req, res) => { res.json({ jsonrpc: "2.0", id: 1, result: {} }); });
+      server = await new Promise<http.Server>((resolve) => { const s = app.listen(0, () => resolve(s)); });
+      const port = (server.address() as AddressInfo).port;
+      const post = (body: unknown, headers: Record<string, string> = {}) =>
+        fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }).then((r) => r.text());
+      const call = (id: number) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "lokal_search" } });
+      await post(call(1), { "user-agent": "rfb-fleet-check/1.0" });            // fleet UA
+      await post({ jsonrpc: "2.0", id: 2, method: "initialize", params: { clientInfo: { name: "rfb-fleet-check", version: "1" } } }, { "user-agent": "node" }); // fleet client name
+      await post(call(3), { "user-agent": "claude-code/1.0" });                // an outside client
+      await new Promise((r) => setTimeout(r, 30));
+      const rows = db.prepare("SELECT tool_name, user_agent, is_owner FROM analytics_mcp_calls ORDER BY id").all();
+      ok(eq(rows.map((r: any) => r.is_owner), [1, 1, 0]), "i1: a call with the fleet UA or client name is stored as internal (is_owner = 1); an outside client is not", rows);
+      const r = computeAiLookups(db as any, 24, undefined, Date.now());
+      ok(r.mcp === 1 && r.total === 1, "i2: internal fleet calls are not counted in «AI-søk»; the outside client is", r);
+      const bd = computeAiLookupBreakdown(db as any, 24, undefined, Date.now());
+      ok(bd.total === 1 && bd.rows.length === 1 && bd.rows[0].clientName !== "rfb-fleet-check", "i3: nor in the breakdown", bd.rows);
+    } finally {
+      if (server) await new Promise((r) => server!.close(() => r(null)));
+      initMod.__setDbForTesting(prev as any);
+      db.close();
+    }
   }
 
   // ── (d) the logger stores the A2A verdict ───────────────────────────

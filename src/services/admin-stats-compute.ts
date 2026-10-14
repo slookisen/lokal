@@ -34,7 +34,7 @@ import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { computeTrafficReport, groupOf, type TrafficReport, type SessionRow } from "./traffic-report";
 import { isPageViewStatus } from "./page-view-definition";
 import { storedClientClass } from "./traffic-classifier";
-import { computeQueryStats, notBotSearchSql, type QueryStats } from "./search-stats-compute";
+import { computeAiLookupBreakdown, computeQueryStats, notBotSearchSql, type QueryStats } from "./search-stats-compute";
 import { computeHistoryView } from "./traffic-history-compute";
 import { slugify } from "../utils/slug";
 import {
@@ -730,6 +730,8 @@ export type AdminStatsQuery =
   // cache entry and one computation.
   | { name: "trafficReport"; hours: number; vertical?: VerticalId }
   | { name: "queryStats"; hours: number; vertical?: VerticalId }
+  // GET /admin/analytics/mcp-usage aiLookups: who makes the AI lookups (search-stats-compute.ts).
+  | { name: "aiLookupBreakdown"; hours: number; vertical?: VerticalId }
   | { name: "summary24"; vertical?: VerticalId }
   | { name: "summary"; hours: number; vertical?: VerticalId }
   | { name: "producers"; limit: number; hours: number; vertical?: VerticalId }
@@ -765,6 +767,8 @@ export function runAdminStatsQuery(db: Db, query: AdminStatsQuery, nowMs: number
       return computeTrafficReport(db, query.hours, query.vertical, nowMs);
     case "queryStats":
       return computeQueryStats(db, query.hours, query.vertical, nowMs);
+    case "aiLookupBreakdown":
+      return computeAiLookupBreakdown(db, query.hours, query.vertical, nowMs);
     case "summary24":
       return {
         summary: computeAdminSummary(db, 24, query.vertical, nowMs),
