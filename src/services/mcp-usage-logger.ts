@@ -16,6 +16,7 @@
 import { Request, Response, NextFunction } from "express";
 import { getDb } from "../database/init";
 import { parseUserAgent, isOwnerRequest, hashIP, type VerticalId } from "./analytics-service";
+import { buildRequestMeta, isInternalTraffic } from "./conversation-service";
 
 export type McpUsageProtocol = "mcp" | "a2a" | "agent_card";
 
@@ -132,7 +133,10 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
         const durationMs = Date.now() - startTime;
         const userAgent = req.get("user-agent") || "";
         const ipHash = hashIP(req.ip || "unknown");
-        const isOwner = isOwnerRequest(req);
+        // Own traffic: owner cookie / owner UA (analytics) OR the same rule as A2A's
+        // isInternalTraffic (admin key, owner cookie, internal UA markers such as
+        // "rfb-"). Stored as is_owner = 1, which AI-søk and the client stats leave out.
+        const isOwner = isOwnerRequest(req) || isInternalTraffic(buildRequestMeta(req));
         const uaClientName = parseUserAgent(userAgent).clientName || null;
         // Set by the A2A routers (a2a.ts, dental-a2a.ts, experiences-a2a.ts) once they have answered.
         const a2aCountable = protocol === "a2a" && typeof res.locals?.a2aCountable === "boolean" ? res.locals.a2aCountable as boolean : undefined;
@@ -148,7 +152,8 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
             userAgent,
             ipHash,
             durationMs,
-            isOwner,
+            // A fleet client that names itself (initialize.clientInfo.name "rfb-…") is internal too.
+            isOwner: isOwner || isInternalTraffic({ userAgent: initInfo.name || "" }),
             statusCode: res.statusCode,
             countable: a2aCountable,
           });
@@ -183,7 +188,7 @@ export function agentCardUsageLogger(vertical: VerticalId) {
           userAgent,
           ipHash: hashIP(req.ip || "unknown"),
           durationMs: Date.now() - startTime,
-          isOwner: isOwnerRequest(req),
+          isOwner: isOwnerRequest(req) || isInternalTraffic(buildRequestMeta(req)),
           statusCode: res.statusCode,
         });
       } catch (err) {

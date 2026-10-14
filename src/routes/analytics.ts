@@ -22,6 +22,7 @@ import { computeTrafficReport, deviceForSession, type TrafficReport } from "../s
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
 import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
+import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -392,7 +393,7 @@ router.get("/cities", async (req: Request, res: Response) => {
  *   hours=24 (default)
  *   vertical=rfb|dental|experiences (default: all, or host-locked)
  */
-router.get("/mcp-usage", (req: Request, res: Response) => {
+router.get("/mcp-usage", async (req: Request, res: Response) => {
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
   const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
   const vf = verticalFilter(req);
@@ -435,6 +436,21 @@ router.get("/mcp-usage", (req: Request, res: Response) => {
 
   const totalCalls = totalsByProtocol.reduce((sum, r) => sum + r.calls, 0);
 
+  // «AI-søk» lookups per vertical x client x tool, same counting rules as
+  // computeAiLookups (search-stats-compute.ts). Heavy on prod-size tables, so
+  // it runs in the stats worker's admin lane like the other admin statistics;
+  // if that fails the rest of the response is still served.
+  let aiLookups: unknown;
+  try {
+    const r = await readStats<AiLookupBreakdown>(req, { name: "aiLookupBreakdown", hours, vertical: parseVertical(req) }, () =>
+      computeAiLookupBreakdown(getDb(), hours, parseVertical(req), Date.now()),
+    );
+    aiLookups = r.ok ? r.value : { error: r.error };
+  } catch (err) {
+    console.error("[analytics] mcp-usage aiLookups error:", err);
+    aiLookups = { error: String(err) };
+  }
+
   res.json({
     timeframe: `last ${hours} hours`,
     vertical: parseVertical(req) || "all",
@@ -444,6 +460,7 @@ router.get("/mcp-usage", (req: Request, res: Response) => {
     byTool,
     byClient,
     byVertical,
+    aiLookups,
   });
 });
 

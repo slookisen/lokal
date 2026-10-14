@@ -200,10 +200,15 @@ export interface AiLookups {
   total: number;
 }
 
-export function computeAiLookups(
-  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions = {},
-): AiLookups {
-  if (!tableExists(db, "analytics_mcp_calls")) return { mcp: 0, a2a: 0, total: 0 };
+/**
+ * The one definition of "a counted AI lookup" on analytics_mcp_calls: a WHERE
+ * clause (no leading WHERE) plus its parameters. computeAiLookups and
+ * computeAiLookupBreakdown both read through it, so the breakdown can never
+ * drift from the headline number.
+ */
+function aiLookupWhere(
+  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions,
+): { sql: string; params: string[] } {
   const ranged = opts.fromMs !== undefined && opts.toMs !== undefined;
   const timeSql = ranged ? "created_at >= ? AND created_at < ?" : "created_at > ?";
   const tp: string[] = ranged ? [cutoffFor(opts.fromMs!, 0), cutoffFor(opts.toMs!, 0)] : [cutoffFor(nowMs, hoursBack)];
@@ -222,14 +227,27 @@ export function computeAiLookups(
   const a2a = columnExists(db, "analytics_mcp_calls", "countable")
     ? `(protocol = 'a2a' AND tool_name IN (${A2A_REQUEST_METHODS.map(() => "?").join(", ")}) AND countable = 1)`
     : "0";
-  const rows = db.prepare(`
-    SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
-    WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
+  // Own traffic is stamped is_owner = 1 when it is logged (mcp-usage-logger.ts:
+  // admin key, owner cookie, internal UA / client-name markers such as "rfb-").
+  return {
+    sql: `${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
       AND ((protocol = 'mcp' AND (${toolSql} OR (tool_name = 'resources/read' AND vertical_id = 'rfb')))
         OR ${a2a})
-      AND NOT (${probe})
+      AND NOT (${probe})`,
+    params: [...tp, ...vp, ...toolParams, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS), ...probeParams],
+  };
+}
+
+export function computeAiLookups(
+  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions = {},
+): AiLookups {
+  if (!tableExists(db, "analytics_mcp_calls")) return { mcp: 0, a2a: 0, total: 0 };
+  const w = aiLookupWhere(db, hoursBack, vertical, nowMs, opts);
+  const rows = db.prepare(`
+    SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
+    WHERE ${w.sql}
     GROUP BY protocol
-  `).all(...tp, ...vp, ...toolParams, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS), ...probeParams) as Array<{ protocol: string; n: number }>;
+  `).all(...w.params) as Array<{ protocol: string; n: number }>;
   let mcp = 0;
   let a2aN = 0;
   for (const r of rows) {
@@ -237,4 +255,91 @@ export function computeAiLookups(
     else if (r.protocol === "a2a") a2aN += r.n;
   }
   return { mcp, a2a: a2aN, total: mcp + a2aN };
+}
+
+export interface AiLookupBreakdownRow {
+  vertical: string;
+  protocol: "mcp" | "a2a";
+  clientName: string;
+  tool: string;
+  calls: number;
+  distinctIpHashes: number;
+  distinctDays: number;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+export interface AiLookupConcentration {
+  vertical: string;
+  /** "all" = MCP and A2A together (the AI-søk number). */
+  protocol: "all" | "mcp" | "a2a";
+  calls: number;
+  distinctIpHashes: number;
+  /** Share (0–1) of the calls from the single largest ip_hash. */
+  top1Share: number;
+  /** Share (0–1) of the calls from the five largest ip_hashes. */
+  top5Share: number;
+}
+
+export interface AiLookupBreakdown {
+  /** Sum of rows[].calls; equals computeAiLookups(...).total for the same window and vertical. */
+  total: number;
+  rows: AiLookupBreakdownRow[];
+  concentration: AiLookupConcentration[];
+}
+
+const share = (n: number, total: number): number => (total > 0 ? Math.round((n / total) * 10000) / 10000 : 0);
+
+/**
+ * Who makes the AI lookups: the rows computeAiLookups counts, split per
+ * vertical x client_name x tool (A2A: tool = the JSON-RPC method), plus how
+ * concentrated each vertical is on its largest ip_hashes (hashes only, never
+ * raw IPs; a missing hash is one "unknown" bucket).
+ */
+export function computeAiLookupBreakdown(
+  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions = {},
+): AiLookupBreakdown {
+  if (!tableExists(db, "analytics_mcp_calls")) return { total: 0, rows: [], concentration: [] };
+  const w = aiLookupWhere(db, hoursBack, vertical, nowMs, opts);
+  const rows = (db.prepare(`
+    SELECT vertical_id AS vertical, protocol, COALESCE(client_name, 'unknown') AS clientName, tool_name AS tool,
+           COUNT(*) AS calls, COUNT(DISTINCT COALESCE(ip_hash, 'unknown')) AS distinctIpHashes,
+           COUNT(DISTINCT date(created_at)) AS distinctDays, MIN(created_at) AS firstSeen, MAX(created_at) AS lastSeen
+    FROM analytics_mcp_calls
+    WHERE ${w.sql}
+    GROUP BY vertical_id, protocol, COALESCE(client_name, 'unknown'), tool_name
+    ORDER BY calls DESC, vertical_id, clientName, tool_name
+  `).all(...w.params) as AiLookupBreakdownRow[]);
+  const perIp = db.prepare(`
+    SELECT vertical_id AS vertical, protocol, COALESCE(ip_hash, 'unknown') AS ip, COUNT(*) AS n
+    FROM analytics_mcp_calls
+    WHERE ${w.sql}
+    GROUP BY vertical_id, protocol, COALESCE(ip_hash, 'unknown')
+  `).all(...w.params) as Array<{ vertical: string; protocol: "mcp" | "a2a"; ip: string; n: number }>;
+
+  const buckets = new Map<string, Map<string, number>>(); // "vertical|protocol" -> ip -> n
+  const add = (key: string, ip: string, n: number) => {
+    const m = buckets.get(key) ?? new Map<string, number>();
+    m.set(ip, (m.get(ip) ?? 0) + n);
+    buckets.set(key, m);
+  };
+  for (const r of perIp) {
+    add(`${r.vertical}|${r.protocol}`, r.ip, r.n);
+    add(`${r.vertical}|all`, r.ip, r.n);
+  }
+  const concentration: AiLookupConcentration[] = [...buckets.entries()].map(([key, m]) => {
+    const [v, protocol] = key.split("|");
+    const counts = [...m.values()].sort((a, b) => b - a);
+    const calls = counts.reduce((a, b) => a + b, 0);
+    return {
+      vertical: v,
+      protocol: protocol as AiLookupConcentration["protocol"],
+      calls,
+      distinctIpHashes: counts.length,
+      top1Share: share(counts[0] ?? 0, calls),
+      top5Share: share(counts.slice(0, 5).reduce((a, b) => a + b, 0), calls),
+    };
+  }).sort((a, b) => a.vertical.localeCompare(b.vertical) || a.protocol.localeCompare(b.protocol));
+
+  return { total: rows.reduce((a, r) => a + r.calls, 0), rows, concentration };
 }
