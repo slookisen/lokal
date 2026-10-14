@@ -5443,6 +5443,29 @@ function initSchema(db: Database.Database): void {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
   }
 
+  // ─── profile_ai_deliveries (dev-request 2026-10-14-med-i-ai-svar-per-profil, S1) ───
+  // «Med i AI-svar»: how many times each profile was sent to an AI assistant,
+  // per UTC day x channel (ai_page_list | ai_page_profile | mcp | a2a) x AI
+  // (chatgpt | claude | perplexity | other | unknown). Daily sums only, no
+  // session, IP or user agent; written in batches by profile-ai-deliveries.ts.
+  // Additive; kept beyond the 60-day raw retention like traffic_history.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS profile_ai_deliveries (
+        vertical_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        ai_vendor TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (vertical_id, profile_id, day, channel, ai_vendor)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_deliveries_vertical_day ON profile_ai_deliveries(vertical_id, day)`);
+  } catch (err) {
+    console.error("Migration profile_ai_deliveries failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

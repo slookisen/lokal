@@ -83,6 +83,7 @@
 import type Database from "better-sqlite3";
 import { COUNTABLE_CONV_SQL } from "./a2a-traffic-classifier";
 import { aiVendorBucket, storedClientClass, uaFromSessionId } from "./traffic-classifier";
+import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { getRetentionWindowDays } from "./retention-window";
 
 /** The portal's window: the raw retention (RFB_AUTO_PRUNE_DAYS, 60), as on the public producer page. */
@@ -189,6 +190,12 @@ export interface OwnerStats {
   conversationsByChannel: OwnerStatsChannelCount[];
   contactClicksByKind: OwnerStatsClickKindCount[];
   funnel: OwnerStatsFunnel;
+  /**
+   * «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+   * the profile was sent to an AI assistant, last AI_DELIVERY_WINDOW_DAYS days
+   * and since counting started, per AI and per channel.
+   */
+  aiDeliveries: { window: AiDeliveries; allTime: AiDeliveries };
 }
 
 /**
@@ -339,5 +346,9 @@ export function getOwnerStats(db: Database.Database, agentId: string, path: stri
     conversationsByChannel,
     contactClicksByKind,
     funnel,
+    aiDeliveries: {
+      window: computeAiDeliveries(db, "rfb", agentId, AI_DELIVERY_WINDOW_DAYS, Date.now()),
+      allTime: computeAiDeliveries(db, "rfb", agentId, null, Date.now()),
+    },
   };
 }

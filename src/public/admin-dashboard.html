@@ -403,6 +403,10 @@
                 <div class="panel-title" title="Visninger av produsentsider fra mennesker. Visninger før 4. okt. 2026 kunne ikke skilles fra roboter og telles ikke.">⭐ Mest besøkte produsenter (mennesker) <span class="panel-note" data-raw-note></span></div>
                 <div id="producerTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
+            <div class="panel panel-full" data-rfb-only>
+                <div class="panel-title" title="Antall ganger profiler er sendt til AI-assistenter (ChatGPT, Claude m.fl.) som svar på spørsmål: liste- og søkesider og profilsider AI-en hentet, MCP-verktøy og A2A-svar. Viser ikke hvor mange som så profilen. Egen trafikk, prober, crawlere og mennesker telles ikke. Faste perioder, uavhengig av tidsvalget over.">📤 Med i AI-svar (sendt til AI-en)</div>
+                <div id="aiDeliveriesPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
             <div class="panel panel-full">
                 <div class="panel-title">👥 Siste aktivitet (alle klienter) <span class="panel-note" data-raw-note></span></div>
                 <div id="visitorTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
@@ -683,6 +687,15 @@
         .catch(function(err) {
             console.error("Dashboard load failed:", err);
         });
+
+        // «Med i AI-svar»: fixed 60 days + whole period, loaded on its own so a
+        // failure here never blanks the rest of the dashboard.
+        if (rfbOnly) {
+            api("/ai-deliveries?limit=10").then(renderAiDeliveries).catch(function(err) {
+                console.error("ai-deliveries load failed:", err);
+                document.getElementById("aiDeliveriesPanel").innerHTML = '<div class="empty-state">Kunne ikke hente tallene</div>';
+            });
+        }
 
         // «Begge»-visning: hent eksplisitte per-vertikal-tall til
         // sammenligningsstripen (uavhengig av hovedlastingen over).
@@ -1165,6 +1178,30 @@
             return '<tr><td><strong>' + escHtml(p.agentName) + '</strong></td><td>' + escHtml(p.city || "—") + '</td><td>' + fmtNum(p.viewCount) + '</td><td><span class="badge ' + badgeClass(p.topSource) + '">' + escHtml(sourceLabel(p.topSource)) + '</span></td></tr>';
         }).join("");
         el.innerHTML = '<table class="data-table"><thead><tr><th>Produsent</th><th>By</th><th>Visninger</th><th>Kilde</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    // ─── Med i AI-svar (profiles sent to AI assistants) ──
+    function renderAiDeliveries(d) {
+        var el = document.getElementById("aiDeliveriesPanel");
+        if (!d || !d.window) { el.innerHTML = '<div class="empty-state">Ingen tall enda</div>'; return; }
+        var VENDORS = { chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", other: "Andre AI", unknown: "Ukjent AI" };
+        var CHANNELS = { ai_page_list: "Liste- og søkesider", ai_page_profile: "Profilsider", mcp: "MCP", a2a: "A2A" };
+        var w = d.window, a = d.allTime || {};
+        function split(labels, key) {
+            return Object.keys(labels).map(function(k) {
+                return '<tr><td>' + escHtml(labels[k]) + '</td><td>' + fmtNum((w[key] || {})[k]) + '</td><td>' + fmtNum((a[key] || {})[k]) + '</td></tr>';
+            }).join("");
+        }
+        var html = '<div style="margin-bottom:8px"><strong>' + fmtNum(w.total) + '</strong> ganger sendt til AI-en siste ' + fmtNum(d.windowDays) + ' dager · <strong>' + fmtNum(a.total) + '</strong> i hele perioden</div>';
+        html += '<table class="data-table"><thead><tr><th>Per AI / kanal</th><th>' + fmtNum(d.windowDays) + ' d</th><th>Hele perioden</th></tr></thead><tbody>'
+            + split(VENDORS, "byVendor") + split(CHANNELS, "byChannel") + '</tbody></table>';
+        var top = d.top || [];
+        html += top.length
+            ? '<table class="data-table" style="margin-top:8px"><thead><tr><th>Topp profiler (' + fmtNum(d.windowDays) + ' d)</th><th>Sendt til AI-en</th></tr></thead><tbody>'
+                + top.map(function(p) { return '<tr><td><strong>' + escHtml(p.name || p.profileId) + '</strong></td><td>' + fmtNum(p.total) + '</td></tr>'; }).join("")
+                + '</tbody></table>'
+            : '<div class="empty-state">Ingen profiler sendt til AI-en enda</div>';
+        el.innerHTML = html;
     }
 
     // ─── Recent activity (every client class, newest first) ──

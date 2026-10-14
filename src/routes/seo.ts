@@ -37,6 +37,8 @@ import { getRetentionWindowDays } from "../services/retention-window";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
+import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
@@ -1129,6 +1131,9 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     // crawlers shown on their own, the rest is otherBotViews.
     aiLookups: s.aiLookups,
     aiSearchTotal: s.aiSearchTotal,
+    // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+    // profiles were sent to AI assistants in the window, all profiles summed.
+    aiDeliveries: s.aiDeliveries,
     otherBotViews: s.otherBotViews,
     botViews: s.botViews,
     windowDays: s.windowDays,
@@ -1594,6 +1599,8 @@ ${umbrellaSectionHtml}
       </div>
     </section>`;
 
+    // «Med i AI-svar»: the featured producers on the page, for an AI assistant's fetch.
+    recordAiPageDelivery(req, res, "ai_page_list", featured.map((a: any) => a.id));
     res.send(shell(
       t(lang, "home.title"),
       t(lang, "home.description", { count: totalAgents }),
@@ -2006,6 +2013,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     })();
     </script>`;
 
+    recordAiPageDelivery(req, res, "ai_page_list", results.map((r: any) => r.agent.id));
     res.send(shell(
       q ? `${q} \u2014 ${t(lang, "search.title")}` : pageHeading,
       // B3: the meta description must not claim proximity either when the geo
@@ -3724,6 +3732,7 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
       { name, url: BASE_URL + localizedPath("/kategori/" + slug, lang) },
     ]);
 
+    recordAiPageDelivery(req, res, "ai_page_list", members.map((a: any) => a.id));
     res.send(shell(title, metaDesc, content, {
       canonical: BASE_URL + localizedPath("/kategori/" + slug, lang),
       jsonLd: [jsonLd, breadcrumbJsonLd],
@@ -4025,6 +4034,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       <div class="city-grid">${producerCards}</div>
     </section>`;
 
+    recordAiPageDelivery(req, res, "ai_page_list", cityAgents.map((a: any) => a.id));
     res.send(shell(
       t(lang, "city.title", { city: cityName }),
       t(lang, "city.description", { count: cityAgents.length, city: cityName }),
@@ -6086,6 +6096,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
           <div class="pf-stat" data-stat="human" title="${lang === "en" ? `Page views from humans, last ${statsDays} days` : `Sidevisninger fra mennesker, siste ${statsDays} dager`}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `humans &middot; ${statsDays}d` : `mennesker &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days.` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager.`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `AI agents &middot; ${statsDays}d` : `AI-agenter &middot; ${statsDays}d`}</span></small></div></div>
+          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was sent to AI assistants such as ChatGPT and Claude as part of an answer, last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål, siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? "In AI answers" : "Med i AI-svar"}<br><span class="pf-stat-meta">${lang === "en" ? `sent to the AI &middot; ${AI_DELIVERY_WINDOW_DAYS}d` : `sendt til AI-en &middot; ${AI_DELIVERY_WINDOW_DAYS}d`}</span></small></div></div>
         </div>
       </div>
 
@@ -6243,6 +6254,24 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 if (parts.length) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + parts.join(" · "));
               }
             }
+            // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times the
+            // profile was sent to an AI, split per AI in the tooltip.
+            var d = s.aiDeliveries;
+            if (d && d.total > 0) {
+              var tile = document.querySelector('[data-stat="aiDeliveries"]');
+              if (tile) {
+                tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
+                tile.style.display = "flex";
+                var v = d.byVendor || {};
+                var vp = [];
+                if (v.chatgpt) vp.push("ChatGPT " + v.chatgpt);
+                if (v.claude) vp.push("Claude " + v.claude);
+                if (v.perplexity) vp.push("Perplexity " + v.perplexity);
+                if (v.other) vp.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + v.other);
+                if (v.unknown) vp.push(${JSON.stringify(lang === "en" ? "Unknown" : "Ukjent")} + " " + v.unknown);
+                if (vp.length) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + vp.join(" · "));
+              }
+            }
           })
           .catch(function () { /* fail-quiet — no UI on error */ });
 
@@ -6272,6 +6301,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const pageTitle = buildProducerPageTitle(agent.name, cityName, lang, updatedAtDate);
     const pageMetaDescription = buildProducerMetaDescription(agent.name, cityName, lang, safeDescription, primaryCategory, productsList.length);
 
+    recordAiPageDelivery(req, res, "ai_page_profile", [agent.id]);
     res.send(shell(
       pageTitle,
       pageMetaDescription,

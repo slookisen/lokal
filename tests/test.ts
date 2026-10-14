@@ -42487,6 +42487,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-med-i-ai-svar-per-profil, S1: «Med i AI-svar», each
+  // profile counted when it is sent to an AI (list/profile pages, MCP, A2A).
+  // Swaps getDb() (restored in finally), so serial.
+  console.log("\n── Med i AI-svar: profiles sent to AI assistants ──");
+  try {
+    const { runProfileAiDeliveriesTests } = require("../src/services/profile-ai-deliveries.test") as
+      typeof import("../src/services/profile-ai-deliveries.test");
+    const r = await runProfileAiDeliveriesTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-deliveries: " + f);
+    console.log(`  profile-ai-deliveries: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-deliveries: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-deliveries: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and

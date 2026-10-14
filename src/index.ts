@@ -3,6 +3,7 @@ import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
+import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -1460,6 +1461,11 @@ app.listen(Number(PORT), HOST, async () => {
   // awaits one run before deleting. Disable with TRAFFIC_HISTORY_DISABLED=1.
   startTrafficHistoryScheduler({ getDb: () => getDb(), bootDelayMs: 6 * 60_000 });
 
+  // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
+  // in-memory delivery counts are written as daily sums every minute and on
+  // shutdown (below).
+  startAiDeliveriesFlusher();
+
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
   // ~7–8 MB/day). Fires once per day inside the 03:00–03:59 UTC window
@@ -2281,7 +2287,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
+process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
 
 export default app;

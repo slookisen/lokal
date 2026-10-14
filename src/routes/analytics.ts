@@ -23,6 +23,7 @@ import { computeHistoryView, type HistoryView } from "../services/traffic-histor
 import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
+import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, computeAiDeliveryTopProfiles } from "../services/profile-ai-deliveries-compute";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -356,6 +357,44 @@ router.get("/producers", async (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     producers,
   });
+});
+
+/**
+ * GET /admin/analytics/ai-deliveries
+ * «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+ * profiles were sent to AI assistants, platform sum for the last
+ * AI_DELIVERY_WINDOW_DAYS days and since counting started (per AI and per
+ * channel), plus the top profiles. Reads the daily sums in
+ * profile_ai_deliveries (one row per profile x day x channel x AI), small
+ * enough to read on the request.
+ * Query params:
+ *   vertical=rfb|dental|experiences (default: all, or host-locked)
+ *   limit=10 (default; max 50)
+ */
+router.get("/ai-deliveries", (req: Request, res: Response) => {
+  try {
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 10));
+    const vertical = parseVertical(req);
+    const db = getDb();
+    const now = Date.now();
+    const nameStmt = db.prepare("SELECT name FROM agents WHERE id = ?");
+    const withNames = (rows: Array<{ profileId: string; total: number }>) =>
+      rows.map((r) => ({ ...r, name: (nameStmt.get(r.profileId) as { name: string } | undefined)?.name ?? null }));
+    // Top lists per vertical; with no vertical, rfb (the only vertical counted in S1).
+    const topVertical = vertical ?? "rfb";
+    res.json({
+      vertical: vertical || "all",
+      windowDays: AI_DELIVERY_WINDOW_DAYS,
+      window: computeAiDeliveries(db, vertical, undefined, AI_DELIVERY_WINDOW_DAYS, now),
+      allTime: computeAiDeliveries(db, vertical, undefined, null, now),
+      topVertical,
+      top: withNames(computeAiDeliveryTopProfiles(db, topVertical, AI_DELIVERY_WINDOW_DAYS, now, limit)),
+      topAllTime: withNames(computeAiDeliveryTopProfiles(db, topVertical, null, now, limit)),
+    });
+  } catch (err) {
+    console.error("[analytics] ai-deliveries error:", err);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
 /**

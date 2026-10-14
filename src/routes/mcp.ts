@@ -47,6 +47,7 @@ import {
 import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
+import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
@@ -274,6 +275,22 @@ export function registerTools(
   // lokal_cart_submit description/schema below (prepayment, skive 2).
   const paymentsOn = isPaymentsEnabled();
 
+  // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
+  // producers a data tool hands the caller, counted per profile with the
+  // computeAiLookups rules (profile-ai-deliveries.ts recordMcpDelivery).
+  type ToolExtra = { sessionId?: string; requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
+  const deliver = (tool: string, args: unknown, extra: ToolExtra, profileIds: string[]) => {
+    recordMcpDelivery({
+      vertical: "rfb",
+      tool,
+      args,
+      profileIds,
+      clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+      headers: extra?.requestInfo?.headers,
+      sessionId: extra?.sessionId,
+    });
+  };
+
   // Tool 1: Natural language search
   server.registerTool(
     "lokal_search",
@@ -305,7 +322,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ query, lat, lng, radius_km, limit }) => {
+    async ({ query, lat, lng, radius_km, limit }, extra) => {
       const q = query || "";
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
@@ -438,6 +455,7 @@ export function registerTools(
         }
       });
 
+      deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
     }
   );
@@ -482,7 +500,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }) => {
+    async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
       // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
       // passed top-level, but discover() reads `location: {lat, lng}` — so the
       // distance filter never ran and every call returned a nationwide list
@@ -537,6 +555,7 @@ export function registerTools(
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 
+      deliver("lokal_discover", { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
     }
   );
@@ -558,7 +577,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ agentId }) => {
+    async ({ agentId }, extra) => {
       const info = knowledgeService.getAgentInfo(agentId);
       if (!info) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
@@ -618,6 +637,7 @@ export function registerTools(
         sections.push(`\n---\n_${meta.disclaimer}${src}_`);
       }
 
+      deliver("lokal_info", { agentId }, extra, [agent.id]);
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
     }
   );
@@ -760,7 +780,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ umbrellaId, limit }) => {
+    async ({ umbrellaId, limit }, extra) => {
       const db = getDb();
       const umbrella = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND umbrella_type IS NOT NULL AND is_active = 1"
@@ -794,6 +814,7 @@ export function registerTools(
         sections.push(`- **${m.name}**${where}${labelStr}`);
         sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
       }
+      deliver("lokal_get_umbrella_members", { umbrellaId, limit }, extra, rows.map((m: any) => m.id));
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
     }
   );
@@ -1026,7 +1047,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ items, near, lat, lng, radius_km }) => {
+    async ({ items, near, lat, lng, radius_km }, extra) => {
       const foreign = foreignPlaceIn(near);
       if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
@@ -1053,6 +1074,7 @@ export function registerTools(
         results.push(result);
       }
 
+      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra, results.flatMap((r) => r.offers.map((o) => o.producer.agent_id)));
       return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
     }
   );

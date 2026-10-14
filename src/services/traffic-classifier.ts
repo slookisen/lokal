@@ -239,9 +239,19 @@ export function isScannerUA(userAgent: string): boolean {
  * must only pass UAs that already classified as AI.
  */
 export function aiVendorBucket(userAgent: string): "chatgpt" | "claude" | "other" {
+  const v = aiAssistantVendor(userAgent);
+  return v === "perplexity" ? "other" : v;
+}
+
+/**
+ * aiVendorBucket with Perplexity as a bucket of its own, for «Med i AI-svar»
+ * (profile-ai-deliveries.ts). The AI-søk splits above keep their three buckets.
+ */
+export function aiAssistantVendor(userAgent: string): "chatgpt" | "claude" | "perplexity" | "other" {
   const ua = userAgent || "";
   if (/GPTBot|ChatGPT|OAI-SearchBot/i.test(ua)) return "chatgpt";
   if (/Claude|anthropic/i.test(ua)) return "claude";
+  if (/Perplexity/i.test(ua)) return "perplexity";
   return "other";
 }
 

@@ -25,6 +25,7 @@ import type { VerticalId } from "./analytics-service";
 import { computeTrafficReport } from "./traffic-report";
 import { getRetentionWindowDays } from "./retention-window";
 import { computeQueryStats } from "./admin-stats-compute";
+import { computeAiDeliveries } from "./profile-ai-deliveries-compute";
 
 export interface TrafficStats {
   pageViews: number;
@@ -47,6 +48,12 @@ export interface TrafficStats {
   aiLookups: number;
   /** «AI-søk»: aiSearchViews (pages an assistant fetched for someone) + aiLookups (MCP/A2A). */
   aiSearchTotal: number;
+  /**
+   * «Med i AI-svar»: profiles sent to AI assistants in the window, summed over
+   * all profiles (profile-ai-deliveries-compute.ts). One AI fetch of a list of
+   * 20 profiles is 20 here.
+   */
+  aiDeliveries: number;
   /**
    * Page views by search engines, SEO bots, social previews, scripts,
    * scanners and other bots (not AI crawlers).
@@ -84,6 +91,7 @@ export function emptyTrafficStats(windowDays: number = getRetentionWindowDays())
     aiCrawlerViews: 0,
     aiLookups: 0,
     aiSearchTotal: 0,
+    aiDeliveries: 0,
     otherBotViews: 0,
     botViews: 0,
     windowDays,
@@ -138,6 +146,7 @@ export function computeTrafficStats(
     aiCrawlerViews,
     aiLookups,
     aiSearchTotal: aiSearchViews + aiLookups,
+    aiDeliveries: computeAiDeliveries(db, vertical, undefined, windowDays, nowMs).total,
     otherBotViews: botViews - aiCrawlerViews,
     botViews,
     windowDays,
