@@ -231,6 +231,15 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         },
       };
 
+      // dev-request 2026-10-13: these fixtures are first touches, which now need
+      // the exact address documented as published; a Brreg record for the
+      // producer's own org_nr satisfies the gate without changing anything else.
+      const withBrregEmail = (fp: string, email: string, orgNr: string): string =>
+        JSON.stringify({
+          ...JSON.parse(fp),
+          epost: [{ source_type: "registry", value: email, source_url: `https://data.brreg.no/enhetsregisteret/api/enheter/${orgNr}` }],
+        });
+
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
@@ -249,13 +258,13 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         id: "prov-alpha", navn: "Alpha Sideri", org_nr: "200000001", kommune: "Voss", producer_type: "sideri",
         epost: "post@alpha-sideri.no", hjemmeside: "https://alpha-sideri.no",
         about_text: REALISTIC_ABOUT_TEXT, products: "Sider, eplemost", slug: "alpha-sideri",
-        field_provenance: VERIFIED_PROVENANCE,
+        field_provenance: withBrregEmail(VERIFIED_PROVENANCE, "post@alpha-sideri.no", "200000001"),
       });
       insertProvider.run({
         id: "prov-beta", navn: "Beta Bryggeri", org_nr: "200000002", kommune: "Ulvik", producer_type: "bryggeri",
         epost: "post@beta-bryggeri.no", hjemmeside: "https://beta-bryggeri.no",
         about_text: REALISTIC_ABOUT_TEXT, products: "Øl, juleøl", slug: "beta-bryggeri",
-        field_provenance: VERIFIED_PROVENANCE,
+        field_provenance: withBrregEmail(VERIFIED_PROVENANCE, "post@beta-bryggeri.no", "200000002"),
       });
 
       const auth = { "x-admin-key": testKey };
@@ -443,8 +452,8 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(prep.status, 200, "h5: daily-prep route still 200 after extraction");
       assertEq(
         Object.keys(prep.body).filter((k) => k !== "refill_hints"),
-        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count", "recipient_address_types"],
-        "h6: daily-prep response shape unchanged (recipient_address_types appended last, 2026-10-08)",
+        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count", "first_touch_address_not_published_count", "recipient_address_types"],
+        "h6: daily-prep response shape (recipient_address_types appended last, 2026-10-08; first_touch_address_not_published_count added 2026-10-13)",
       );
       assertEq(prep.body.pool.daily_cap, 4, "h7: daily-prep still reports the cap");
       assertEq(prep.body.candidates.length, 0, "h8: both providers now in cooldown -> no candidates");

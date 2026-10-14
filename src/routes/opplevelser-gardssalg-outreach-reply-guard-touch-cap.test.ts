@@ -106,7 +106,12 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
         insertProvider.run({
           id, navn: id, org_nr: String(300000000 + seq), epost: `post@${domain}`,
           hjemmeside: `https://${domain}`, about_text: REALISTIC_ABOUT_TEXT, slug: id,
-          field_provenance: VERIFIED_PROVENANCE,
+          // dev-request 2026-10-13: first touches (prov-a-fresh) need the address
+          // documented as published; a Brreg record for the own org_nr does it.
+          field_provenance: JSON.stringify({
+            ...JSON.parse(VERIFIED_PROVENANCE),
+            epost: [{ source_type: "registry", value: `post@${domain}`, source_url: `https://data.brreg.no/enhetsregisteret/api/enheter/${300000000 + seq}` }],
+          }),
         });
         return `post@${domain}`;
       };
