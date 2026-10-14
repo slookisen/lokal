@@ -671,21 +671,21 @@
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
-              &laquo;Sett&raquo; og &laquo;kontakt-klikk&raquo; er siste 90 dager. &laquo;Oppdaget&raquo; er en l&oslash;pende teller (vises i s&oslash;keresultater). Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en l&oslash;pende teller (vises i s&oslash;keresultater). Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
           </div>
 
           <div class="card">
-            <h2>Visninger etter kilde (siste 90 dager)</h2>
+            <h2>Visninger fra mennesker etter kilde (siste <span class="statsWindowDays">60</span> dager)</h2>
             <div id="statsViewsBySource" style="display:flex;flex-direction:column;gap:0.5rem;"></div>
             <h3>Siste 30 dager</h3>
             <div id="statsViewsTrend"></div>
           </div>
 
           <div class="card">
-            <h2>AI-plattform (siste 90 dager)</h2>
-            <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din.</p>
+            <h2>AI-søk (siste <span class="statsWindowDays">60</span> dager)</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. AI-roboter som bare leser og indekserer sider, telles ikke her.</p>
             <div class="stats-grid" id="statsAiPlatforms"></div>
           </div>
 
@@ -1842,7 +1842,7 @@
         .finally(function() { statsLoading = false; });
     }
 
-    var SOURCE_LABELS = { direct: 'Direkte', organic: 'Organisk', search: 'Søk', social: 'Sosiale medier', referral: 'Henvisning' };
+    var SOURCE_LABELS = { direct: 'Direkte', organic: 'Organisk', search: 'Søk', social: 'Sosiale medier', referral: 'Henvisning', unknown: 'Ukjent' };
     var CHANNEL_LABELS = { web: 'Nettside', a2a: 'A2A', mcp: 'MCP', api: 'API/annet' };
     var CLICK_KIND_LABELS = { email: 'E-post', phone: 'Telefon', website: 'Nettside' };
     function clickKindLabel(kind) {
@@ -1889,8 +1889,10 @@
       var f = data.funnel || { discovered: 0, viewed: 0, contactClicked: 0 };
       var funnelHtml = '';
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.discovered || 0) + '</div><div class="stat-label">Oppdaget</div></div>';
-      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.viewed || 0) + '</div><div class="stat-label">Sett (90d)</div></div>';
-      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.contactClicked || 0) + '</div><div class="stat-label">Kontakt-klikk (90d)</div></div>';
+      var wd = data.windowDays || 60;
+      Array.prototype.forEach.call(document.querySelectorAll('.statsWindowDays'), function(el) { el.textContent = wd; });
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.viewed || 0) + '</div><div class="stat-label">Sett (' + wd + 'd)</div></div>';
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.contactClicked || 0) + '</div><div class="stat-label">Kontakt-klikk (' + wd + 'd)</div></div>';
       document.getElementById('statsFunnel').innerHTML = funnelHtml;
 
       // Views by source
@@ -1909,7 +1911,7 @@
       document.getElementById('statsViewsBySource').innerHTML = vbsHtml || '<p style="color:var(--gray-500);font-size:0.9rem;">Ingen visninger registrert enn&aring;.</p>';
 
       // Views trend: combined daily total across all sources, last 30 days
-      // of the already-fetched 90-day daily array (no new fetch).
+      // of the already-fetched daily array (no new fetch).
       var daily = vbs.daily || [];
       var trendEl = document.getElementById('statsViewsTrend');
       if (daily.length) {
@@ -1918,7 +1920,7 @@
           byDate[row.date] = (byDate[row.date] || 0) + (row.count || 0);
         });
         // Anchor on the last 30 calendar days ending today (UTC, matching the
-        // backend's strftime('%Y-%m-%d', created_at) date strings), zero-filling
+        // backend's YYYY-MM-DD day strings), zero-filling
         // any day with no recorded views -- not just the sparse set of dates
         // that happen to have >=1 view.
         var todayStr = new Date().toISOString().slice(0, 10);
