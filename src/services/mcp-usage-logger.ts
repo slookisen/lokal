@@ -36,6 +36,8 @@ interface UsageRow {
   isOwner: boolean;
   /** HTTP status of the response (agent-card rows: undefined → NULL). */
   statusCode?: number;
+  /** A2A requests: the spam guard's verdict (a2a.ts, res.locals.a2aCountable); else undefined → NULL. */
+  countable?: boolean;
 }
 
 // tools/call carries the actual tool in params.name; every other JSON-RPC
@@ -64,13 +66,23 @@ function clientInfoFor(entry: JsonRpcLikeEntry): { name: string | null; version:
   };
 }
 
+// Whether analytics_mcp_calls has the countable column (added 2026-10-14);
+// older test schemas may not.
+const hasCountableColumn = new WeakMap<object, boolean>();
+
 function insertUsageRow(row: UsageRow): void {
   try {
     const db = getDb();
+    let withCountable = hasCountableColumn.get(db);
+    if (withCountable === undefined) {
+      withCountable = (db.prepare("PRAGMA table_info(analytics_mcp_calls)").all() as Array<{ name: string }>).some((c) => c.name === "countable");
+      hasCountableColumn.set(db, withCountable);
+    }
+    const countable = row.countable === undefined ? null : row.countable ? 1 : 0;
     db.prepare(`
       INSERT INTO analytics_mcp_calls
-        (protocol, vertical_id, tool_name, client_name, client_version, user_agent, ip_hash, duration_ms, is_owner, status_code)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (protocol, vertical_id, tool_name, client_name, client_version, user_agent, ip_hash, duration_ms, is_owner, status_code${withCountable ? ", countable" : ""})
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?${withCountable ? ", ?" : ""})
     `).run(
       row.protocol,
       row.vertical,
@@ -82,6 +94,7 @@ function insertUsageRow(row: UsageRow): void {
       row.durationMs,
       row.isOwner ? 1 : 0,
       row.statusCode ?? null,
+      ...(withCountable ? [countable] : []),
     );
   } catch (err) {
     console.error("[mcp-usage-logger] Failed to log usage:", err);
@@ -117,6 +130,8 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
         const ipHash = hashIP(req.ip || "unknown");
         const isOwner = isOwnerRequest(req);
         const uaClientName = parseUserAgent(userAgent).clientName || null;
+        // Set by a2a.ts's discovery handler once its spam guard has decided.
+        const a2aCountable = protocol === "a2a" && typeof res.locals?.a2aCountable === "boolean" ? res.locals.a2aCountable as boolean : undefined;
 
         for (const entry of requestEntries) {
           const initInfo = clientInfoFor(entry);
@@ -131,6 +146,7 @@ export function mcpUsageLogger(protocol: "mcp" | "a2a", vertical: VerticalId) {
             durationMs,
             isOwner,
             statusCode: res.statusCode,
+            countable: a2aCountable,
           });
         }
       } catch (err) {

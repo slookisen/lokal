@@ -62,6 +62,14 @@ export interface OaHomeCounters {
   humanViews: number;
   /** Page views from human-initiated AI retrieval (`*-User` agents). */
   aiSearchViews: number;
+  /** AI agents' lookups over MCP/A2A (traffic-stats-compute.ts). Not page views. */
+  aiLookups: number;
+  /** «AI-søk» = aiSearchViews + aiLookups. */
+  aiSearchTotal: number;
+  /** Page views from AI crawlers (GPTBot, ClaudeBot, …). */
+  aiCrawlerViews: number;
+  /** Page views from other bots and scripts; humanViews + aiSearchViews + aiCrawlerViews + otherBotViews = pageViews. */
+  otherBotViews: number;
   /** All remaining non-human views (crawlers, search engines, dev, scanners). */
   botViews: number;
   /** Effective data window (days) = the auto-prune retention, runtime value. */
@@ -145,6 +153,10 @@ export function getOaHomeCounters(): OaHomeCounters {
     humanVisits: traffic.humanVisits,
     humanViews: traffic.humanViews,
     aiSearchViews: traffic.aiSearchViews,
+    aiLookups: traffic.aiLookups,
+    aiSearchTotal: traffic.aiSearchTotal,
+    aiCrawlerViews: traffic.aiCrawlerViews,
+    otherBotViews: traffic.otherBotViews,
     botViews: traffic.botViews,
     windowDays: traffic.windowDays,
     realHumans: traffic.realHumans,

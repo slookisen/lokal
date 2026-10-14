@@ -50,6 +50,9 @@ import {
 
 const router = Router();
 
+// The homepage strip's AI explanation (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
+const DENTAL_AI_EXPLAIN = "AI-søk: et menneske spurte ChatGPT, Claude eller en annen AI-assistent, og den hentet informasjon fra oss i sanntid, fra nettsiden eller via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.";
+
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
@@ -950,10 +953,10 @@ router.get("/", (_req: Request, res: Response) => {
     <div class="proof-inner">
       <div><div class="proof-val">${traffic.humanVisits.toLocaleString("nb")}</div><div class="proof-lbl">Besøk fra mennesker</div></div>
       <div><div class="proof-val">${traffic.humanViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger fra mennesker</div></div>
-      <div title="AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping."><div class="proof-val proof-val-muted">${traffic.aiSearchViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
-      <div><div class="proof-val">${traffic.botViews.toLocaleString("nb")}</div><div class="proof-lbl">Crawlere & bots</div></div>
+      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val proof-val-muted">${traffic.aiSearchTotal.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
+      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val">${traffic.aiCrawlerViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-crawlere</div></div>
     </div>
-    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker + AI-søk + crawlere og bots. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.</div>
+    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker ${traffic.humanViews.toLocaleString("nb")} + AI-assistenter ${traffic.aiSearchViews.toLocaleString("nb")} + AI-crawlere ${traffic.aiCrawlerViews.toLocaleString("nb")} + andre roboter og skript ${traffic.otherBotViews.toLocaleString("nb")}. AI-søk = ${traffic.aiSearchViews.toLocaleString("nb")} sider hentet av AI-assistenter + ${traffic.aiLookups.toLocaleString("nb")} oppslag via MCP/A2A. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. ${DENTAL_AI_EXPLAIN}</div>
   </div>
 
   <section class="section section-alt">
@@ -1075,6 +1078,12 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     humanVisits: s.humanVisits,
     aiSearchViews: s.aiSearchViews,
     aiCrawlerViews: s.aiCrawlerViews,
+    // S7 of 2026-10-13-statistikk-riktig-for-investorer: «AI-søk» = aiSearchViews
+    // (pages AI assistants fetched for someone) + aiLookups (MCP/A2A); AI
+    // crawlers shown on their own, the rest is otherBotViews.
+    aiLookups: s.aiLookups,
+    aiSearchTotal: s.aiSearchTotal,
+    otherBotViews: s.otherBotViews,
     botViews: s.botViews,
     windowDays: s.windowDays,
     // Back-compat fields (old consumers)

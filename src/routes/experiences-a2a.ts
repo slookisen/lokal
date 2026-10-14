@@ -51,7 +51,8 @@ import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from 
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
-import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
+import { conversationService, buildRequestMeta, isInternalTraffic, type RequestMeta } from "../services/conversation-service";
+import { classifyA2aTraffic } from "../services/a2a-traffic-classifier";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -342,6 +343,26 @@ export function detectGardssalgIntent(lower: string): { isGardssalg: boolean; pr
     }
   }
   return { isGardssalg: false };
+}
+
+/**
+ * Whether a message/send counts as an AI lookup («AI-søk», dev-request
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it was answered (not a
+ * JSON-RPC error) and the shared A2A classifier calls it external — not
+ * spam, a probe or our own traffic. Logged with the call by
+ * mcp-usage-logger.ts.
+ */
+function a2aRequestCountable(meta: RequestMeta, params: unknown, result: object): boolean {
+  if ("error" in result) return false;
+  const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
+  const text = extractText(message);
+  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  return classifyA2aTraffic({
+    text: text ?? (data !== undefined ? JSON.stringify(data) : ""),
+    ua: meta.userAgent,
+    hasStructuredData: !text,
+    isInternal: isInternalTraffic(meta),
+  }) === "external";
 }
 
 // ─── message/send handler (exported for unit tests) ──────────
@@ -758,7 +779,9 @@ router.post("/a2a", (req: Request, res: Response) => {
     switch (method) {
       case "message/send":
       case "tasks/send": { // Backward-compat alias for older A2A clients (<0.3)
-        const result = handleExperiencesMessageSend(params, id, { requestMeta: buildRequestMeta(req) });
+        const requestMeta = buildRequestMeta(req);
+        const result = handleExperiencesMessageSend(params, id, { requestMeta });
+        (res.locals ||= {}).a2aCountable = a2aRequestCountable(requestMeta, params, result);
         res.json(result);
         break;
       }

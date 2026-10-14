@@ -40,6 +40,20 @@ export interface TrafficStats {
   /** Page views from autonomous AI crawlers (GPTBot, ClaudeBot, …). */
   aiCrawlerViews: number;
   /**
+   * AI agents fetching information through MCP data tools and A2A requests
+   * the spam guard let through (search-stats-compute.ts computeAiLookups).
+   * Not page views.
+   */
+  aiLookups: number;
+  /** «AI-søk»: aiSearchViews (pages an assistant fetched for someone) + aiLookups (MCP/A2A). */
+  aiSearchTotal: number;
+  /**
+   * Page views by search engines, SEO bots, social previews, scripts,
+   * scanners and other bots (not AI crawlers).
+   * Invariant: humanViews + aiSearchViews + aiCrawlerViews + otherBotViews === pageViews.
+   */
+  otherBotViews: number;
+  /**
    * Everything non-human and non-ai_search: ai_crawler + search_engine +
    * seo_bot + social + dev + other_bot + scanner views.
    * Invariant: humanViews + aiSearchViews + botViews === pageViews.
@@ -68,6 +82,9 @@ export function emptyTrafficStats(windowDays: number = getRetentionWindowDays())
     humanVisits: 0,
     aiSearchViews: 0,
     aiCrawlerViews: 0,
+    aiLookups: 0,
+    aiSearchTotal: 0,
+    otherBotViews: 0,
     botViews: 0,
     windowDays,
     realHumans: 0,
@@ -108,6 +125,8 @@ export function computeTrafficStats(
   // also holds people's searches on the sites, so it is no longer all AI.
   const q = computeQueryStats(db, windowDays * 24, vertical, nowMs);
   const aiQueries = (q.byChannel?.mcp ?? 0) + (q.byChannel?.a2a ?? 0) + (q.byChannel?.ai ?? 0);
+  // S7 (Daniel 2026-10-14): «AI-søk» also counts AI agents' lookups over MCP/A2A.
+  const aiLookups = q.aiLookups?.total ?? 0;
 
   return {
     pageViews: report.totals.views,
@@ -117,6 +136,9 @@ export function computeTrafficStats(
     humanVisits: report.groups.human.visits,
     aiSearchViews,
     aiCrawlerViews,
+    aiLookups,
+    aiSearchTotal: aiSearchViews + aiLookups,
+    otherBotViews: botViews - aiCrawlerViews,
     botViews,
     windowDays,
     realHumans: humanViews,

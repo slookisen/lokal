@@ -28,6 +28,8 @@ export interface QueryStats {
    */
   byChannel?: { web: number; api: number; mcp: number; a2a: number; ai: number };
   botQueries?: number;
+  /** AI agents' lookups over MCP data tools and countable A2A requests (computeAiLookups, S7). */
+  aiLookups?: AiLookups;
 }
 
 function tableExists(db: Db, name: string): boolean {
@@ -104,11 +106,14 @@ export function computeQueryStats(
     // A call answered 4xx/5xx (a rate limiter's 429, a bad request) is not a
     // search; rows written before the status was stored count as they are.
     const okStatus = columnExists(db, "analytics_mcp_calls", "status_code") ? " AND (status_code IS NULL OR status_code < 400)" : "";
+    // An A2A request counts only when the spam guard let it through (S7);
+    // rows written before the verdict was stored cannot be told from spam.
+    const a2aCountable = columnExists(db, "analytics_mcp_calls", "countable") ? " AND countable = 1" : "";
     const mcp = db.prepare(`
       SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
       WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
         AND ((protocol = 'mcp' AND tool_name IN (${tools.map(() => "?").join(", ")}))
-          OR (protocol = 'a2a' AND tool_name IN (${methods.map(() => "?").join(", ")})))
+          OR (protocol = 'a2a' AND tool_name IN (${methods.map(() => "?").join(", ")})${a2aCountable}))
       GROUP BY protocol
     `).all(...tp, ...vp, ...tools, ...methods) as Array<{ protocol: string; n: number }>;
     for (const r of mcp) {
@@ -144,5 +149,60 @@ export function computeQueryStats(
     topSearchTerms,
     byChannel,
     botQueries,
+    aiLookups: computeAiLookups(db, hoursBack, vertical, nowMs, opts),
   };
+}
+
+// ─── AI lookups over MCP and A2A ─────────────────────────────────────────
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S7 (Daniel
+// 2026-10-14: «Ta med MCP/A2A i AI-søk»). An AI agent fetching information
+// from the platform through its tools rather than a web page:
+//   - MCP: a call to one of our data tools (lokal_*, tannlege_*, the
+//     experience and gårdssalg tools) or a resources/read. Handshakes and
+//     catalogue health checks (initialize, tools/list, notifications/…,
+//     ping, server/discover …) fetch nothing and are not counted.
+//   - A2A: a request (message/send, tasks/send, SendMessage) the spam guard
+//     let through (countable = 1: external, with intent, under the cap).
+// Our own traffic (is_owner) and calls answered 4xx/5xx are left out.
+
+/** MCP tools outside the lokal_/tannlege_ prefixes that fetch or act on platform data. */
+export const AI_LOOKUP_MCP_TOOLS = [
+  "discover_experiences", "get_experience", "list_experience_categories",
+  "discover_gardssalg", "book_gardssalg", "resources/read",
+] as const;
+
+export interface AiLookups {
+  mcp: number;
+  a2a: number;
+  total: number;
+}
+
+export function computeAiLookups(
+  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions = {},
+): AiLookups {
+  if (!tableExists(db, "analytics_mcp_calls")) return { mcp: 0, a2a: 0, total: 0 };
+  const ranged = opts.fromMs !== undefined && opts.toMs !== undefined;
+  const timeSql = ranged ? "created_at >= ? AND created_at < ?" : "created_at > ?";
+  const tp: string[] = ranged ? [cutoffFor(opts.fromMs!, 0), cutoffFor(opts.toMs!, 0)] : [cutoffFor(nowMs, hoursBack)];
+  const V = vertical ? " AND vertical_id = ?" : "";
+  const vp: string[] = vertical ? [vertical] : [];
+  const okStatus = columnExists(db, "analytics_mcp_calls", "status_code") ? " AND (status_code IS NULL OR status_code < 400)" : "";
+  const a2a = columnExists(db, "analytics_mcp_calls", "countable")
+    ? `(protocol = 'a2a' AND tool_name IN (${A2A_REQUEST_METHODS.map(() => "?").join(", ")}) AND countable = 1)`
+    : "0";
+  const rows = db.prepare(`
+    SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
+    WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
+      AND ((protocol = 'mcp' AND (tool_name LIKE 'lokal\\_%' ESCAPE '\\' OR tool_name LIKE 'tannlege\\_%' ESCAPE '\\'
+             OR tool_name IN (${AI_LOOKUP_MCP_TOOLS.map(() => "?").join(", ")})))
+        OR ${a2a})
+    GROUP BY protocol
+  `).all(...tp, ...vp, ...AI_LOOKUP_MCP_TOOLS, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS)) as Array<{ protocol: string; n: number }>;
+  let mcp = 0;
+  let a2aN = 0;
+  for (const r of rows) {
+    if (r.protocol === "mcp") mcp += r.n;
+    else if (r.protocol === "a2a") a2aN += r.n;
+  }
+  return { mcp, a2a: a2aN, total: mcp + a2aN };
 }

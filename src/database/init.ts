@@ -1506,6 +1506,16 @@ function initSchema(db: Database.Database): void {
   } catch {
     // Column already exists
   }
+  // …and, for A2A requests, whether the request counted: an external query
+  // with search intent under the per-IP cap, as a2a.ts's spam guard decides
+  // (1), or spam, a probe, our own traffic, no intent or capped (0). NULL =
+  // not an A2A request, or written before 2026-10-14. «AI-søk» counts only 1
+  // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
+  try {
+    db.exec(`ALTER TABLE analytics_mcp_calls ADD COLUMN countable INTEGER`);
+  } catch {
+    // Column already exists
+  }
 
   // ─── B4 (dev-request 2026-09-24-ai-sok-bli-svaret-rfb): inbound UTM ──
   // Nullable, additive columns. Plain ALTER TABLE ADD COLUMN is a

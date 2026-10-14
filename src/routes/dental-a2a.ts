@@ -31,6 +31,8 @@ import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
+import { buildRequestMeta, isInternalTraffic } from "../services/conversation-service";
+import { classifyA2aTraffic } from "../services/a2a-traffic-classifier";
 
 const router = Router();
 
@@ -154,6 +156,27 @@ export function parseIntent(text: string): DentalSearchParams {
   }
 
   return params;
+}
+
+/**
+ * Whether a message/send counts as an AI lookup («AI-søk», dev-request
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it was answered (not a
+ * JSON-RPC error) and the shared A2A classifier calls it external — not
+ * spam, a probe or our own traffic. Logged with the call by
+ * mcp-usage-logger.ts.
+ */
+function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
+  if ("error" in result) return false;
+  const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
+  const text = extractText(message);
+  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  const meta = buildRequestMeta(req);
+  return classifyA2aTraffic({
+    text: text ?? (data !== undefined ? JSON.stringify(data) : ""),
+    ua: meta.userAgent,
+    hasStructuredData: !text,
+    isInternal: isInternalTraffic(meta),
+  }) === "external";
 }
 
 // ─── message/send handler (exported for unit tests) ──────────
@@ -334,6 +357,7 @@ router.post("/a2a", (req: Request, res: Response) => {
     switch (method) {
       case "message/send": {
         const result = handleDentalMessageSend(params, id);
+        (res.locals ||= {}).a2aCountable = a2aRequestCountable(req, params, result);
         res.json(result);
         break;
       }

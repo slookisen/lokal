@@ -317,6 +317,9 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const capKey = req.ip ? hashIP(req.ip) : "unknown";
   const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
   const countable = trafficClass === "external" && hasIntent && !rateCapped;
+  // Logged with the call (mcp-usage-logger.ts): «AI-søk» counts only these
+  // (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
+  (res.locals ||= {}).a2aCountable = countable;
 
   // Execute discovery
   const startTime = Date.now();

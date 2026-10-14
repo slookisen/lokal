@@ -1124,6 +1124,12 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     humanVisits: s.humanVisits,
     aiSearchViews: s.aiSearchViews,
     aiCrawlerViews: s.aiCrawlerViews,
+    // S7 of 2026-10-13-statistikk-riktig-for-investorer: «AI-søk» = aiSearchViews
+    // (pages AI assistants fetched for someone) + aiLookups (MCP/A2A); AI
+    // crawlers shown on their own, the rest is otherBotViews.
+    aiLookups: s.aiLookups,
+    aiSearchTotal: s.aiSearchTotal,
+    otherBotViews: s.otherBotViews,
     botViews: s.botViews,
     windowDays: s.windowDays,
     // Back-compat fields (old consumers)
@@ -1513,16 +1519,24 @@ router.get("/", (req: Request, res: Response) => {
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
-          <div class="proof-val proof-val-purple">${traffic.aiSearchViews.toLocaleString(numFmt)}</div>
+          <div class="proof-val proof-val-purple">${traffic.aiSearchTotal.toLocaleString(numFmt)}</div>
           <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_search"))}</div>
         </div>
         <div class="proof-sep"></div>
-        <div class="proof-item">
-          <div class="proof-val">${traffic.botViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_crawlers"))}</div>
+        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
+          <div class="proof-val">${traffic.aiCrawlerViews.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_crawlers"))}</div>
         </div>
       </div>
-      <div class="proof-note">${escapeHtml(t(lang, "home.proof_total", { days: traffic.windowDays, total: traffic.pageViews.toLocaleString(numFmt) }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>
+      <div class="proof-note">${escapeHtml(t(lang, "home.proof_total", {
+        days: traffic.windowDays,
+        total: traffic.pageViews.toLocaleString(numFmt),
+        human: traffic.humanViews.toLocaleString(numFmt),
+        aiPages: traffic.aiSearchViews.toLocaleString(numFmt),
+        aiCrawlers: traffic.aiCrawlerViews.toLocaleString(numFmt),
+        otherBots: traffic.otherBotViews.toLocaleString(numFmt),
+        aiLookups: traffic.aiLookups.toLocaleString(numFmt),
+      }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>
       <div class="network-strip">${escapeHtml(t(lang, "home.network_label"))}
         <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a> &middot;
         <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a>

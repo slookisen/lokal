@@ -40,6 +40,8 @@ export interface TestSummary {
 interface RouteResult {
   status: number;
   body: any;
+  /** res.locals after the handler (a2aCountable: the verdict mcp-usage-logger.ts stores, S7). */
+  locals?: any;
 }
 
 function callRoute(
@@ -60,8 +62,9 @@ function callRoute(
     };
     const res: any = {
       statusCode: 200,
+      locals: {},
       status(code: number) { this.statusCode = code; return this; },
-      json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+      json(payload: any) { resolve({ status: this.statusCode, body: payload, locals: this.locals }); return this; },
       setHeader() { return this; },
       header() { return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
@@ -176,6 +179,7 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       const cls = db.prepare(`SELECT DISTINCT traffic_class t FROM conversations WHERE task_id = ?`).all(honeyTaskId) as Array<{ t: string }>;
       assertEq(cls.map(x => x.t), ["external"], "(a) stored traffic_class = external");
       assertEq(d?.note, undefined, "(a) no note on a normal hit");
+      assertEq(r.locals?.a2aCountable, true, "(a) the call is logged as countable («AI-søk», S7)");
     }
 
     // ── (b) real prod spam/probe payloads: no trace at all ───────────────
@@ -188,6 +192,7 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       assertEq(convCount(), before.conv, `(b) ${s.label}: no conversation rows`);
       assertEq(searchCount(), before.search, `(b) ${s.label}: no 'search' interaction`);
       assertEq(discoverySum(), before.disc, `(b) ${s.label}: no discovery-counter writes`);
+      assertEq(r.locals?.a2aCountable, false, `(b) ${s.label}: logged as not countable`);
     }
     {
       const r = await send(router, '{"module": "ziwei-comm-module/v1", "implant_id": "x"}', { ua: "Mozilla/5.0 (compatible; ziwei-implant/1.0)" });

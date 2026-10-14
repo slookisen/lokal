@@ -118,15 +118,19 @@ export async function runSearchTrackingTests(opts: { log?: boolean } = {}): Prom
     m.run("mcp", "rfb", "lokal_info", 0, at); // not a search tool
     m.run("mcp", "rfb", "tools/list", 0, at);
     m.run("mcp", "rfb", "lokal_search", 1, at); // owner
-    m.run("a2a", "rfb", "message/send", 0, at);
-    m.run("a2a", "rfb", "SendMessage", 0, at); // A2A v1.0
-    m.run("a2a", "rfb", "message/stream", 0, at); // not implemented anywhere (-32601)
-    m.run("a2a", "rfb", "tasks/get", 0, at);
+    // A2A requests carry the spam guard's verdict since S7 (countable); only 1 is a search.
+    const a2a = db.prepare(`INSERT INTO analytics_mcp_calls (protocol, vertical_id, tool_name, is_owner, created_at, countable) VALUES ('a2a', 'rfb', ?, 0, ?, ?)`);
+    a2a.run("message/send", at, 1);
+    a2a.run("SendMessage", at, 1); // A2A v1.0
+    a2a.run("message/stream", at, 1); // not implemented anywhere (-32601)
+    a2a.run("tasks/get", at, null);
+    a2a.run("message/send", at, 0); // spam, a probe or no intent
+    a2a.run("message/send", at, null); // written before the verdict was stored
     db.prepare(`INSERT INTO analytics_mcp_calls (protocol, vertical_id, tool_name, is_owner, created_at, status_code) VALUES ('mcp', 'dental', 'tannlege_search', 0, ?, 429)`).run(at);
 
     const all = computeQueryStats(db as any, 24, undefined, now);
     ok(eq(all.byChannel, { web: 5, api: 4, mcp: 2, a2a: 2, ai: 1 }) && all.totalQueries === 14,
-      "b1: web 5, api 4 (incl. a script, a filter search and two legacy rows), mcp 2 search tools (not the 429), a2a 2 (message/send, SendMessage; not message/stream), ai 1 assistant fetch", all);
+      "b1: web 5, api 4 (incl. a script, a filter search and two legacy rows), mcp 2 search tools (not the 429), a2a 2 (message/send, SendMessage with countable = 1; not message/stream, not a 0 or NULL verdict), ai 1 assistant fetch", all);
     ok(all.botQueries === 3 && all.ownerQueries === 1, "b2: the crawler's, the AI crawler's and the script's /sok searches are bots; owner apart", all);
     ok(eq(all.topSearchTerms, [{ query: "egg", count: 2 }, { query: "økologisk", count: 2 }, { query: "melk", count: 1 }, { query: "ost", count: 1 }, { query: "rabarbra", count: 1 }, { query: "smør", count: 1 }]),
       "b3: top terms: free text only, case merged (Æ/Ø/Å too) and spaces trimmed, no bots, owner or filter text", all.topSearchTerms);

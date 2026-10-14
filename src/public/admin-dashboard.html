@@ -974,7 +974,8 @@
               + (s.botSearches ? " · " + fmtNum(s.botSearches) + " fra roboter holdt utenfor" : "")
             : "";
         document.getElementById("statAiSearch").textContent = fmtNum(s.aiSearchViews);
-        document.getElementById("statAiSearchPct").textContent = pct(s.aiSearchViews, total) + " av visningene";
+        document.getElementById("statAiSearchPct").textContent = pct(s.aiSearchViews, total) + " av visningene"
+            + (s.aiLookups != null ? " · + " + fmtNum(s.aiLookups) + " oppslag via MCP/A2A (AI-søk på sidene: " + fmtNum((s.aiSearchViews || 0) + s.aiLookups) + ")" : "");
         document.getElementById("statAiCrawlers").textContent = fmtNum(s.aiCrawlerViews);
         document.getElementById("statAiCrawlersPct").textContent = pct(s.aiCrawlerViews, total) + " av visningene";
         document.getElementById("statBots").textContent = fmtNum(botViews);
