@@ -334,7 +334,7 @@ ${WIDGET_HELPERS}
       chips([categoryLabel(e.category), place(e), price(e), duration(e), io, seasons(e.season)]) +
       (e.description ? "<p>" + esc(e.description) + "</p>" : "") +
       (e.meeting_point ? '<p class="muted">' + esc(t("Oppmøte: ", "Meeting point: ") + e.meeting_point) + "</p>" : "") +
-      '<p class="muted">' + esc(t("Booking og betaling skjer direkte hos tilbyderen.", "Booking and payment happen directly with the provider.")) + "</p>" +
+      '<p class="muted">' + esc(t("Booking og betaling skjer direkte hos tilbyderen. Bekreft gjeldende pris og tilgjengelighet hos tilbyderen.", "Booking and payment happen directly with the provider. Confirm current prices and availability with the provider.")) + "</p>" +
       '<div class="actions">' +
         (providerUrl ? '<button type="button" class="primary" data-href="' + esc(providerUrl) + '">' + esc(t("Til tilbyderen \\u2197", "Go to provider \\u2197")) + "</button>" : "") +
         (url ? '<button type="button" data-href="' + esc(url) + '">opplevagent.no \\u2197</button>' : "") +

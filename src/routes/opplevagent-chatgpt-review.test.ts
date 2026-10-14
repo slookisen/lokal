@@ -258,8 +258,8 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       assertEq(discoverTool?._meta?.ui?.resourceUri, "ui://opplevagent/experiences-list-2026-10-12", "e5: discovery points at the adult-price list template (ui.resourceUri)");
       assertEq(discoverTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experiences-list-2026-10-12", "e5b: … and the ChatGPT alias openai/outputTemplate");
       const getTool = tools.find((t) => t.name === "get_experience");
-      assertEq(getTool?._meta?.ui?.resourceUri, "ui://opplevagent/experience-detail-2026-10-12", "e6: details point at the adult-price template (ui.resourceUri)");
-      assertEq(getTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experience-detail-2026-10-12", "e6b: … and the ChatGPT alias openai/outputTemplate");
+      assertEq(getTool?._meta?.ui?.resourceUri, "ui://opplevagent/experience-detail-2026-10-14", "e6: details point at the current template (ui.resourceUri)");
+      assertEq(getTool?._meta?.["openai/outputTemplate"], "ui://opplevagent/experience-detail-2026-10-14", "e6b: … and the ChatGPT alias openai/outputTemplate");
 
       // ── (a) structuredContent on the two widget-backed tools ──────────
       const disc = await rpc("tools/call", { name: "discover_experiences", arguments: { fylke: "Troms", season: "winter" } });
@@ -362,7 +362,7 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
         "i3: /vilkar describes visit requests (NO + EN): forwarded by email, never a confirmed booking");
 
       // ── (b) templates: MIME type, CSP, and the host API they use ──────
-      for (const uri of ["ui://opplevagent/experiences-list-2026-10-12", "ui://opplevagent/experience-detail-2026-10-12", "ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
+      for (const uri of ["ui://opplevagent/experiences-list-2026-10-12", "ui://opplevagent/experience-detail-2026-10-14", "ui://opplevagent/experience-detail-2026-10-12", "ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
         const read = await rpc("resources/read", { uri });
         const c = read.result?.contents?.[0] ?? {};
         assertEq(c.mimeType, "text/html;profile=mcp-app", `b1: ${uri} is served as an MCP Apps resource (text/html;profile=mcp-app)`);
@@ -378,7 +378,8 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
 
       for (const uri of ["ui://opplevagent/experiences-list", "ui://opplevagent/experience-detail"]) {
         const legacy = (await rpc("resources/read", { uri })).result?.contents?.[0]?.text;
-        const current = (await rpc("resources/read", { uri: uri + "-2026-10-12" })).result?.contents?.[0]?.text;
+        const currentUri = uri.endsWith("experience-detail") ? uri + "-2026-10-14" : uri + "-2026-10-12";
+        const current = (await rpc("resources/read", { uri: currentUri })).result?.contents?.[0]?.text;
         assertTrue(typeof current === "string" && current === legacy, "adult-resource: legacy alias keeps current compatible template");
       }
       // ── (a) the widget scripts render late-arriving data ──────────────
