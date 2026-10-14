@@ -627,10 +627,10 @@ function jsonToolResult(payload: Record<string, unknown>, isError = false) {
 // empty; opplevagent.no is listed as the one trusted openExternal target.
 export const WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
 export const WIDGET_DOMAIN = "https://opplevagent.no";
-// A new reference makes the adult-price template available immediately.
+// New references make changed templates available without the host's old cache.
 // Keep the previous references readable for already-open conversations.
 export const WIDGET_LIST_URI = "ui://opplevagent/experiences-list-2026-10-12";
-export const WIDGET_DETAIL_URI = "ui://opplevagent/experience-detail-2026-10-12";
+export const WIDGET_DETAIL_URI = "ui://opplevagent/experience-detail-2026-10-14";
 
 function registerWidgetResource(
   server: McpServer,
@@ -935,6 +935,8 @@ export function registerExperienceTools(
     "Experience cards for existing conversations.");
   registerWidgetResource(server, "experience-detail-legacy", "ui://opplevagent/experience-detail", EXPERIENCE_DETAIL_HTML,
     "An experience detail card for existing conversations.");
+  registerWidgetResource(server, "experience-detail-adult-price", "ui://opplevagent/experience-detail-2026-10-12", EXPERIENCE_DETAIL_HTML,
+    "An experience detail card for existing adult-price conversations.");
 
   // Tool 3: get_experience
   server.registerTool(
