@@ -12,7 +12,9 @@
  * Covers:
  *   (a) path-scoping — only rows for the exact produsent-page path count.
  *   (b) vertical-scoping — an 'rfb' row on the SAME path string never leaks in.
- *   (c) human vs. AI-bot split via the session_id UA-marker technique.
+ *   (c) people vs. AI search with the shared classifier (2026-10-14, S6):
+ *       ChatGPT-User/Claude-User are AI search; AI crawlers (ClaudeBot) and
+ *       search engines are neither; a 404 is not a page view.
  *   (d) owner/fleet-traffic exclusion (is_owner=1).
  *   (e) the honest "notAvailable" list is always present (never silently
  *       fabricated conversations/contact-click/AI-recommendation numbers).
@@ -78,8 +80,13 @@ export function runGardssalgOwnerStatsServiceTests(opts: { log?: boolean } = {})
     // 2 real human views on the produsent page (distinct sessions).
     insert.run(path, "human-1:Mozilla/5.0 (Macintosh) Chrome/120", 0, "experiences");
     insert.run(path, "human-2:Mozilla/5.0 (Windows) Firefox/119", 0, "experiences");
-    // 1 AI-bot view.
+    // 1 AI search view (an assistant fetching the page for a person).
+    insert.run(path, "ai-1:Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)", 0, "experiences");
+    // An AI crawler, a search engine and a 404 — neither people nor AI search.
     insert.run(path, "bot-1:Mozilla/5.0 (compatible; ClaudeBot/1.0)", 0, "experiences");
+    insert.run(path, "bot-2:Mozilla/5.0 (compatible; Googlebot/2.1)", 0, "experiences");
+    rfbDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, status_code) VALUES (?, ?, 0, 'experiences', 404)`)
+      .run(path, "human-404:Mozilla/5.0 (Macintosh) Chrome/120");
     // 1 fleet/internal view — must be excluded from BOTH counters.
     insert.run(path, "owner-1:Lokal-Enricher/1.0", 1, "experiences");
     // Same path, but on the 'rfb' vertical — must never leak in (vertical-scoping).
@@ -91,11 +98,11 @@ export function runGardssalgOwnerStatsServiceTests(opts: { log?: boolean } = {})
 
     assertEq(stats.path, path, "a1: stats echo back the requested path");
     assertEq(stats.humanViews, 2, "a2: humanViews counts only the 2 real human views on THIS path");
-    assertEq(stats.aiBotViews, 1, "a3: aiBotViews counts the 1 ClaudeBot view on THIS path");
-    assertEq(stats.humanViews + stats.aiBotViews, 3, "b1: the rfb-vertical row and the fleet row are both excluded (2 human + 1 bot == 3, not 5)");
+    assertEq([stats.aiSearchViews, stats.aiBotViews], [1, 1], "a3: AI search counts the 1 Claude-User view on THIS path; the ClaudeBot crawl and Googlebot are not counted");
+    assertEq(stats.humanViews + stats.aiSearchViews, 3, "b1: the rfb-vertical row, the fleet row, the bots and the 404 are all excluded (2 people + 1 AI search)");
     assertTrue(Array.isArray(stats.notAvailable) && stats.notAvailable.length > 0, "e1: notAvailable is a non-empty, honest list of what this tab does NOT show");
     assertTrue(stats.notAvailable.some((s) => /anbefaling/i.test(s)), "e2: notAvailable explicitly names AI-recommendation counts as unavailable (never fabricated)");
-    assertEq(stats.windowDays, 90, "c1: windowDays matches the documented 90-day window");
+    assertEq(stats.windowDays, 60, "c1: windowDays is the 60-day raw retention, as on the RFB owner portal");
 
     // A path with zero rows -> zero, not an error.
     const emptyStats = svc.getGardssalgOwnerStats("/kategori/gardssalg/produsent/ingen-visninger");

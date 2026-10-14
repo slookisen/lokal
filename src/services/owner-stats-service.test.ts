@@ -11,19 +11,23 @@
  * pattern as profile-activity-service.test.ts.
  *
  * Covers:
- *   (a) viewsBySource: totals per analytics_page_views.source, AI-bot rows
- *       excluded from totals (they're counted separately in aiPlatforms),
- *       owner rows excluded, rows older than the 90-day window excluded,
- *       a different agent's path never bleeds in, daily bucket counts sum
- *       back to the same totals.
- *   (b) aiPlatforms: chatgpt/claude/other split, owner rows excluded.
+ *   (a) viewsBySource: totals per analytics_page_views.source of people's
+ *       page views; AI, search engines, SEO bots, scripts, scanners (also a
+ *       browser-looking session stored as scanner) and non-2xx/304 rows
+ *       excluded, owner rows excluded, rows older than the 60-day window
+ *       excluded, a different agent's path never bleeds in, daily bucket
+ *       counts sum back to the same totals.
+ *   (b) aiPlatforms: AI search only (ChatGPT-User, Claude-User,
+ *       Perplexity-User) split chatgpt/claude/other; AI crawlers (GPTBot,
+ *       ClaudeBot) and Googlebot are not counted
+ *       (dev-request 2026-10-13-statistikk-riktig-for-investorer, S6).
  *   (c) matchingSearchQueries: grouped by exact query_text, ordered by
  *       frequency, single-char query_text excluded, another seller's
  *       conversations never counted.
  *   (d) conversationsByChannel: grouped by conversations.source, NULL
  *       source coalesced to 'api', another seller's rows never counted.
  *   (e) contactClicksByKind: is_bot=1 rows excluded, rows outside the
- *       90-day window excluded, another agent's clicks never counted.
+ *       60-day window excluded, another agent's clicks never counted.
  *   (f) funnel: discovered from agent_metrics.times_discovered (0 when no
  *       row), viewed = the same bot/owner-excluded human view count as
  *       group (a), contactClicked = sum of group (e).
@@ -50,6 +54,8 @@ function buildSchema(db: Database.Database): void {
       source TEXT DEFAULT 'unknown',
       session_id TEXT,
       is_owner INTEGER DEFAULT 0,
+      status_code INTEGER,
+      client_class TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE conversations (
@@ -119,22 +125,40 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
        VALUES (?, ?, ?, ?, datetime('now', ?))`,
     );
 
-    // Human views inside the 90d window, by source: direct x3, search x2, organic x1
+    // Human views inside the 60d window, by source: direct x3, search x2, organic x1
     for (let i = 0; i < 3; i++) insertPv.run(PATH, "direct", `iphash-d${i}:Mozilla/5.0 (Macintosh) Chrome/120`, 0, `-${i + 1} days`);
     for (let i = 0; i < 2; i++) insertPv.run(PATH, "search", `iphash-s${i}:Mozilla/5.0 (Macintosh) Chrome/120`, 0, "-3 days");
     insertPv.run(PATH, "organic", "iphash-o0:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-4 days");
 
-    // AI-bot views inside the window: chatgpt x4, claude x2, other(Googlebot) x1 —
-    // must be EXCLUDED from viewsBySource totals but counted in aiPlatforms.
-    for (let i = 0; i < 4; i++) insertPv.run(PATH, "direct", `iphash-gpt-${i}:Mozilla/5.0 (compatible; GPTBot/1.0)`, 0, "-2 days");
-    for (let i = 0; i < 2; i++) insertPv.run(PATH, "direct", `iphash-claude-${i}:Mozilla/5.0 (compatible; ClaudeBot/1.0)`, 0, "-1 days");
+    // AI search inside the window: chatgpt x4, claude x2, other (Perplexity) x1 —
+    // EXCLUDED from viewsBySource totals, counted in aiPlatforms.
+    for (let i = 0; i < 4; i++) insertPv.run(PATH, "direct", `iphash-gpt-${i}:Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot`, 0, "-2 days");
+    for (let i = 0; i < 2; i++) insertPv.run(PATH, "direct", `iphash-claude-${i}:Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)`, 0, "-1 days");
+    insertPv.run(PATH, "direct", "iphash-pplx:Mozilla/5.0 (compatible; Perplexity-User/1.0)", 0, "-1 days");
+    // Neither people nor AI search: AI crawlers, a search engine, an SEO bot, a script, a scanner.
+    for (let i = 0; i < 4; i++) insertPv.run(PATH, "direct", `iphash-gptbot-${i}:Mozilla/5.0 (compatible; GPTBot/1.0)`, 0, "-2 days");
+    for (let i = 0; i < 2; i++) insertPv.run(PATH, "direct", `iphash-claudebot-${i}:Mozilla/5.0 (compatible; ClaudeBot/1.0)`, 0, "-1 days");
     insertPv.run(PATH, "direct", "iphash-google:Mozilla/5.0 (compatible; Googlebot/2.1)", 0, "-1 days");
+    insertPv.run(PATH, "search", "iphash-bing:Mozilla/5.0 (compatible; bingbot/2.0)", 0, "-1 days");
+    insertPv.run(PATH, "direct", "iphash-ahrefs:Mozilla/5.0 (compatible; AhrefsBot/7.0)", 0, "-1 days");
+    insertPv.run(PATH, "direct", "iphash-curl:curl/8.0", 0, "-1 days");
+    insertPv.run(PATH, "direct", "iphash-scan:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36", 0, "-1 days");
+    // A browser-looking session stored at write time as a scanner, with an older unclassed row: the whole session is out.
+    db.prepare(`INSERT INTO analytics_page_views (path, source, session_id, is_owner, client_class, created_at) VALUES (?, 'direct', ?, 0, 'scanner', datetime('now', '-1 days'))`)
+      .run(PATH, "iphash-bucket:desktop:0123456789abcdef");
+    insertPv.run(PATH, "direct", "iphash-bucket:desktop:0123456789abcdef", 0, "-2 days");
+    // A redirect and a 404 are not page views.
+    for (const status of [301, 404]) {
+      db.prepare(`INSERT INTO analytics_page_views (path, source, session_id, is_owner, status_code, created_at) VALUES (?, 'direct', ?, 0, ?, datetime('now', '-1 days'))`)
+        .run(PATH, `iphash-st${status}:Mozilla/5.0 (Macintosh) Chrome/120`, status);
+    }
 
     // Owner view — normal browser UA, but is_owner=1 — must be fully excluded.
     insertPv.run(PATH, "direct", "iphash-owner:Mozilla/5.0 (Macintosh) Chrome/120", 1, "-1 days");
 
-    // Human view OUTSIDE the 90-day window — must be excluded.
+    // Human views OUTSIDE the 60-day window — must be excluded (also one the old 90-day window took).
     insertPv.run(PATH, "direct", "iphash-old:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-120 days");
+    insertPv.run(PATH, "direct", "iphash-old70:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-70 days");
 
     // Noise on a different agent's path — must never bleed into these counts.
     insertPv.run(OTHER_PATH, "direct", "iphash-other:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-1 days");
@@ -175,6 +199,7 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     for (let i = 0; i < 5; i++) insertClick.run(AGENT_ID, "email", 1, "-1 days");
     // Out-of-window clicks — must be excluded.
     for (let i = 0; i < 4; i++) insertClick.run(AGENT_ID, "phone", 0, "-120 days");
+    insertClick.run(AGENT_ID, "phone", 0, "-70 days"); // inside the old 90-day window, outside the 60-day one
     // Noise on a different agent — must never bleed in.
     for (let i = 0; i < 10; i++) insertClick.run(OTHER_AGENT, "email", 0, "-1 days");
 
@@ -196,9 +221,9 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     assertTrue(stats.viewsBySource.daily.length > 0, "viewsBySource: daily array is non-empty");
 
     // ── (b) aiPlatforms ─────────────────────────────────────────────
-    assertEq(stats.aiPlatforms.chatgpt, 4, "aiPlatforms: 4 ChatGPT views");
-    assertEq(stats.aiPlatforms.claude, 2, "aiPlatforms: 2 Claude views");
-    assertEq(stats.aiPlatforms.other, 1, "aiPlatforms: 1 other-AI (Googlebot) view");
+    assertEq(stats.aiPlatforms.chatgpt, 4, "aiPlatforms: 4 ChatGPT-User views (GPTBot crawls not counted)");
+    assertEq(stats.aiPlatforms.claude, 2, "aiPlatforms: 2 Claude-User views (ClaudeBot crawls not counted)");
+    assertEq(stats.aiPlatforms.other, 1, "aiPlatforms: 1 other AI search (Perplexity-User); Googlebot is not AI");
     assertEq(stats.aiPlatforms.total, 7, "aiPlatforms: total = chatgpt+claude+other = 7");
 
     // ── (c) matchingSearchQueries ───────────────────────────────────
@@ -221,7 +246,7 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     for (const row of stats.contactClicksByKind) clickMap[row.kind] = row.count;
     assertEq(clickMap.website, 3, "contactClicksByKind: website=3");
     assertEq(clickMap.email, 2, "contactClicksByKind: email=2 (5 bot rows excluded)");
-    assertEq(clickMap.phone, 1, "contactClicksByKind: phone=1 (4 out-of-window rows excluded)");
+    assertEq(clickMap.phone, 1, "contactClicksByKind: phone=1 (5 out-of-window rows excluded)");
 
     // ── (f) funnel ─────────────────────────────────────────────────
     assertEq(stats.funnel.discovered, 42, "funnel: discovered = agent_metrics.times_discovered");
@@ -247,7 +272,7 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     assertEq(emptyStats.conversationsByChannel, [], "empty-agent: no channels");
     assertEq(emptyStats.contactClicksByKind, [], "empty-agent: no contact clicks");
     assertEq(emptyStats.funnel, { discovered: 0, viewed: 0, contactClicked: 0 }, "empty-agent: all-zero funnel, never throws");
-    assertEq(emptyStats.windowDays, 90, "windowDays: exported constant is 90");
+    assertEq(emptyStats.windowDays, 60, "windowDays: the 60-day raw retention, as on the public producer page");
   } finally {
     db.close();
   }

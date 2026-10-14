@@ -17,20 +17,23 @@
 //
 // What DOES exist and IS usable: analytics_page_views (src/database/init.ts)
 // is a CROSS-VERTICAL table (vertical_id column, stamped from the Host header
-// by analytics-service.ts's request middleware — the exact mechanism
-// oa-home-counters.ts already relies on for the opplevagent homepage counter
-// strip) that logs every page view by path, with a session_id encoding the
-// UA (used everywhere else in this codebase, e.g. owner-stats-service.ts, to
-// classify bot/AI-crawler traffic via LIKE match) and an is_owner flag
-// (fleet/internal traffic). A gårdssalg produsent page view
-// (/kategori/gardssalg/produsent/<slug>) is logged there exactly like any
-// other opplevagent page. So v1 of this owner's "Statistikk" tab shows
-// ONLY: human page views vs. AI-bot page views on the producer's own
-// /kategori/gardssalg/produsent/<slug> page, over the same 90-day window RFB
-// uses. It does NOT show conversations, contact-clicks, matching search
-// queries, or a discovery funnel — those tables simply don't have a gårdssalg
-// analogue. This is a documented, honest gap (never fabricated) per the
-// dev-request's own instruction: "v1 shows only what's actually available."
+// by analytics-service.ts's request middleware) that logs every page view by
+// path. A gårdssalg produsent page view (/kategori/gardssalg/produsent/<slug>)
+// is logged there exactly like any other opplevagent page. So this owner's
+// "Statistikk" tab shows ONLY: page views by people and AI search on the
+// producer's own page. It does NOT show conversations, contact-clicks,
+// matching search queries, or a discovery funnel — those tables simply don't
+// have a gårdssalg analogue (documented, honest gap — "v1 shows only what's
+// actually available").
+//
+// Since 2026-10-14 (dev-request 2026-10-13-statistikk-riktig-for-investorer,
+// S6) the same definitions as the RFB owner portal and the public producer
+// pages (owner-stats-service.ts readPathViewGroups): page views only
+// (2xx/304), each session classed once by the class stored at write time,
+// over the raw retention window (60 days); «AI» is AI search only (an
+// assistant fetching the page for a person), not AI crawlers. Before that,
+// LIKE marker lists counted bingbot/curl/scanners as people and Googlebot as
+// AI, every status, over 90 days, with a page_view_daily top-up.
 //
 // Reads analytics_page_views from the RFB/shared lokal.db (via
 // src/database/init.ts's getDb(), NOT db-factory's experiences.db handle) —
@@ -38,28 +41,16 @@
 // Read-only; never writes.
 
 import { getDb as getRfbDb } from "../database/init";
-import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
-
-// Same UA-marker technique + lists as owner-stats-service.ts / agent-stats.ts
-// (session_id = "<ipHash>:<userAgent>", LIKE-matched). Duplicated rather than
-// imported, same as owner-stats-service.ts itself already does relative to
-// agent-stats.ts (see that file's own "SYNC-TODO" comment) — mirror any new
-// marker added there here too.
-const ALL_AI_MARKERS = [
-  "GPTBot", "ChatGPT", "OAI-SearchBot",
-  "ClaudeBot", "Claude-User", "Anthropic",
-  "Gemini", "Google-Extended", "PerplexityBot", "Perplexity-User",
-  "CCBot", "Bytespider", "Applebot-Extended", "YandexAdditional",
-  "NotHumanSearch", "DuckDuckBot", "Googlebot",
-];
-
-export const GARDSSALG_OWNER_STATS_WINDOW_DAYS = 90; // matches RFB's window
-const WINDOW_SQL = `datetime('now', '-${GARDSSALG_OWNER_STATS_WINDOW_DAYS} days')`;
+import { ownerStatsWindowDays, readPathViewGroups } from "./owner-stats-service";
 
 export interface GardssalgOwnerStats {
   windowDays: number;
   path: string;
+  /** Page views by people. */
   humanViews: number;
+  /** AI search: an assistant (ChatGPT, Claude, Perplexity …) fetched the page for a person. AI crawlers are not counted. */
+  aiSearchViews: number;
+  /** Same value as aiSearchViews, kept for older clients of this endpoint. */
   aiBotViews: number;
   /** Honest, explicit acknowledgment of what this tab does NOT show — the
    * portal UI renders this list so an owner never wonders why a number is
@@ -76,39 +67,21 @@ const NOT_AVAILABLE = [
 
 export function getGardssalgOwnerStats(path: string): GardssalgOwnerStats {
   const db = getRfbDb();
-  const aiClause = ALL_AI_MARKERS.map(() => "session_id LIKE ?").join(" OR ");
-  const aiParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
-  const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
-  const aiNotParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
-
-  const baseWhere = `path = ? AND vertical_id = 'experiences' AND (is_owner IS NULL OR is_owner = 0) AND created_at >= ${WINDOW_SQL}`;
-
-  const human = db
-    .prepare(`SELECT COUNT(*) as c FROM analytics_page_views WHERE ${baseWhere} AND ${aiNotClause}`)
-    .get(path, ...aiNotParams) as { c: number } | undefined;
-
-  const bot = db
-    .prepare(`SELECT COUNT(*) as c FROM analytics_page_views WHERE ${baseWhere} AND (${aiClause})`)
-    .get(path, ...aiParams) as { c: number } | undefined;
-
-  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
-  // retention): same 90-day window as RFB's owner-stats-service.ts. Blend
-  // the chatgpt/claude portion of aiBotViews exactly (page_view_daily's
-  // bot_type token sets match ALL_AI_MARKERS' chatgpt/claude entries
-  // byte-for-byte — see getPrunedChatgptClaudeCounts's doc comment in
-  // analytics-rollup-reads.ts); the remaining "other" AI markers (Gemini,
-  // Perplexity-User, YandexAdditional, NotHumanSearch, …) and humanViews stay
-  // raw-only — same documented, pre-existing classification-scheme mismatch
-  // as every other reader here, not fixed in this slice.
-  const cutoffIso = new Date(Date.now() - GARDSSALG_OWNER_STATS_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+  const windowDays = ownerStatsWindowDays();
+  const cutoffIso = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
     .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
-  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, vertical: "experiences" });
-
+  let humanViews = 0;
+  let aiSearchViews = 0;
+  for (const g of readPathViewGroups(db, path, cutoffIso, { vertical: "experiences" })) {
+    if (g.cls === "human") humanViews += g.views;
+    else if (g.cls === "ai_search") aiSearchViews += g.views;
+  }
   return {
-    windowDays: GARDSSALG_OWNER_STATS_WINDOW_DAYS,
+    windowDays,
     path,
-    humanViews: human?.c ?? 0,
-    aiBotViews: (bot?.c ?? 0) + prunedAi.chatgpt + prunedAi.claude,
+    humanViews,
+    aiSearchViews,
+    aiBotViews: aiSearchViews,
     notAvailable: NOT_AVAILABLE,
   };
 }

@@ -6491,6 +6491,11 @@ const _m2Promise = (async function runOwnerPortalTests() {
         `INSERT INTO analytics_page_views (path, source, session_id, is_owner, created_at)
          VALUES (?, 'direct', 'iphash2:Mozilla/5.0 (compatible; GPTBot/1.0)', 0, datetime('now', '-1 days'))`
       ).run(OS_PATH);
+      // 2026-10-14 (statistikk-riktig-for-investorer, S6): the portal's AI split is AI search only.
+      portalDb.prepare(
+        `INSERT INTO analytics_page_views (path, source, session_id, is_owner, created_at)
+         VALUES (?, 'direct', 'iphash3:Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot', 0, datetime('now', '-1 days'))`
+      ).run(OS_PATH);
       portalDb.prepare(
         `INSERT INTO conversations (id, seller_agent_id, source, query_text, created_at)
          VALUES ('os-c1', ?, 'web', 'Har dere egg?', datetime('now', '-1 days'))`
@@ -6515,9 +6520,9 @@ const _m2Promise = (async function runOwnerPortalTests() {
       assertEq(withAuth.status, 200, "m2-owner-stats: with valid session returns 200");
       const parsed = JSON.parse(withAuth.body);
       assertTrue(parsed.success === true, "m2-owner-stats: success=true");
-      assertEq(parsed.windowDays, 90, "m2-owner-stats: windowDays=90");
-      assertEq(parsed.viewsBySource.totals.direct, 1, "m2-owner-stats: 1 human direct view (GPTBot row excluded)");
-      assertEq(parsed.aiPlatforms.chatgpt, 1, "m2-owner-stats: 1 ChatGPT view counted in aiPlatforms");
+      assertEq(parsed.windowDays, 60, "m2-owner-stats: windowDays=60 (the raw retention, as on the public producer page)");
+      assertEq(parsed.viewsBySource.totals.direct, 1, "m2-owner-stats: 1 human direct view (GPTBot and ChatGPT-User rows excluded)");
+      assertEq(parsed.aiPlatforms.chatgpt, 1, "m2-owner-stats: 1 ChatGPT-User fetch counted as AI search; the GPTBot crawl is not");
       assertTrue(
         Array.isArray(parsed.matchingSearchQueries) && parsed.matchingSearchQueries.some((q: any) => q.term === "Har dere egg?"),
         "m2-owner-stats: matchingSearchQueries includes the seeded conversation query"

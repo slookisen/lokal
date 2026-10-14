@@ -19,11 +19,17 @@
  *
  * Bot/owner filtering summary (verified against init.ts):
  *
- *   - analytics_page_views: HAS is_owner (excluded below) and session_id,
- *     which the rest of the codebase (agent-stats.ts, profile-activity-
- *     service.ts) already uses as the bot-detection idiom for this table —
- *     AI-bot UA markers are baked into session_id ("<ipHash>:<userAgent>")
- *     and excluded/split via LIKE, same marker lists as those two files.
+ *   - analytics_page_views: HAS is_owner (excluded below). Since 2026-10-14
+ *     (dev-request 2026-10-13-statistikk-riktig-for-investorer, S6) it is
+ *     read with the same definitions as the public producer page
+ *     (agent-stats-compute.ts, profile-activity-service.ts): page views only
+ *     (2xx/304), each session classed once by the class stored at write time
+ *     (traffic-classifier storedClientClass, the session_id for legacy rows),
+ *     over the raw retention window (60 days). People are 'human'; the AI
+ *     split is AI search only (an assistant fetching the page for a person),
+ *     not AI crawlers. No page_view_daily top-up: it counted crawlers and
+ *     files. Before that, LIKE marker lists counted bingbot/curl/scanners as
+ *     people and Googlebot/GPTBot as AI, over 90 days.
  *
  *   - analytics_agent_views: has is_owner but NO session_id/UA column at
  *     all, so bot traffic can never be excluded here — and in practice its
@@ -75,32 +81,74 @@
  */
 
 import type Database from "better-sqlite3";
-import { getPrunedChatgptClaudeCounts } from "./analytics-rollup-reads";
 import { COUNTABLE_CONV_SQL } from "./a2a-traffic-classifier";
+import { aiVendorBucket, storedClientClass, uaFromSessionId } from "./traffic-classifier";
+import { getRetentionWindowDays } from "./retention-window";
 
-// ─── AI bot UA markers ────────────────────────────────────────────────
-// Same technique + marker lists as agent-stats.ts / profile-activity-
-// service.ts (session_id = "<ipHash>:<userAgent>", LIKE-matched).
-// Duplicated rather than imported — see the SYNC-TODO in agent-stats.ts;
-// mirror any new marker added there here too.
-const AI_MARKERS = {
-  chatgpt: ["GPTBot", "ChatGPT", "OAI-SearchBot"],
-  claude: ["ClaudeBot", "Claude-User", "Anthropic"],
-  other: [
-    "Gemini", "Google-Extended", "PerplexityBot", "Perplexity-User",
-    "CCBot", "Bytespider", "Applebot-Extended", "YandexAdditional",
-    "NotHumanSearch", "DuckDuckBot", "Googlebot",
-  ],
-};
-const ALL_AI_MARKERS = [...AI_MARKERS.chatgpt, ...AI_MARKERS.claude, ...AI_MARKERS.other];
+/** The portal's window: the raw retention (RFB_AUTO_PRUNE_DAYS, 60), as on the public producer page. */
+export function ownerStatsWindowDays(): number {
+  return getRetentionWindowDays();
+}
 
-// 90 days — the producer portal's window. The public producer page tiles
-// (agent-stats-compute.ts) cover the 60-day raw window since 2026-10-13; this
-// portal still counts people over the 60 stored days and tops up
-// ChatGPT/Claude from page_view_daily (follow-up in dev-request
-// 2026-10-13-statistikk-riktig-for-investorer).
-export const OWNER_STATS_WINDOW_DAYS = 90;
-const WINDOW_SQL = `datetime('now', '-${OWNER_STATS_WINDOW_DAYS} days')`;
+function cutoffIsoFor(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+export interface PathViewGroup {
+  /** 'human', 'ai_search', 'ai_crawler', … — the session's class (stored at write time, else from its session_id). */
+  cls: string;
+  sessionId: string;
+  source: string | null;
+  /** UTC day, YYYY-MM-DD. */
+  day: string;
+  views: number;
+}
+
+/**
+ * The page views of one path since `cutoffIso`, grouped by session, source
+ * and day, each group carrying its SESSION's class: page views only (2xx/304;
+ * legacy rows without a status count), owner rows out, NULL session_id out.
+ * Every row of a session has the same UA, so the session's class is the class
+ * stored on any of its rows (MAX, as profile-activity-service.ts), else the
+ * class recovered from its session_id. Shared by the RFB and gårdssalg owner
+ * portals. No per-session velocity check (scrapers): the public producer tile
+ * (agent-stats-compute.ts) runs that off-thread.
+ */
+export function readPathViewGroups(
+  db: Database.Database,
+  path: string,
+  cutoffIso: string,
+  opts: { vertical?: string } = {},
+): PathViewGroup[] {
+  const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
+  const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
+  const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
+  const source = cols.has("source") ? "source" : "NULL";
+  const vertical = opts.vertical ? " AND vertical_id = ?" : "";
+  const rows = db.prepare(`
+    SELECT session_id, ${source} AS source, substr(created_at, 1, 10) AS day,
+           ${clientClass} AS client_class, COUNT(*) AS views
+    FROM analytics_page_views
+    WHERE path = ?${vertical}
+      AND (is_owner IS NULL OR is_owner = 0)
+      AND created_at >= ?${statusOk}
+      AND session_id IS NOT NULL
+    GROUP BY session_id, ${source}, day
+  `).all(...(opts.vertical ? [path, opts.vertical] : [path]), cutoffIso) as Array<{
+    session_id: string; source: string | null; day: string; client_class: string | null; views: number;
+  }>;
+  const stored = new Map<string, string>();
+  for (const r of rows) {
+    if (r.client_class && (!stored.has(r.session_id) || r.client_class > stored.get(r.session_id)!)) stored.set(r.session_id, r.client_class);
+  }
+  return rows.map((r) => ({
+    cls: storedClientClass(r.session_id, stored.get(r.session_id) ?? null),
+    sessionId: r.session_id,
+    source: r.source,
+    day: r.day,
+    views: r.views,
+  }));
+}
 
 // analytics_page_views.source enum, per its CREATE TABLE comment in init.ts.
 const PAGE_VIEW_SOURCES = ["direct", "organic", "search", "social", "referral"] as const;
@@ -143,104 +191,42 @@ export interface OwnerStats {
   funnel: OwnerStatsFunnel;
 }
 
-function likeClause(markers: string[]): { clause: string; params: string[] } {
-  return {
-    clause: markers.map(() => "session_id LIKE ?").join(" OR "),
-    params: markers.map((m) => `%${m}%`),
-  };
-}
-
 /**
- * Group 1: profile page views over the last 90 days, broken down both by
- * total-per-source and by day+source (for a simple trend line). Bot UA
- * markers and owner (is_owner) rows excluded — see module doc for why this
- * uses analytics_page_views rather than analytics_agent_views.
+ * Groups 1 and 2 and the funnel's "viewed", from one read of the path's page
+ * views over the window: views by source (total and per day) and the
+ * funnel count are people's page views; the AI split is AI search only.
  */
-function getViewsBySource(db: Database.Database, path: string): OwnerStatsViewsBySource {
-  const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
-  const aiNotParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
-
+function getPathViews(db: Database.Database, path: string, windowDays: number): {
+  viewsBySource: OwnerStatsViewsBySource;
+  aiPlatforms: OwnerStatsAiPlatforms;
+  humanViews: number;
+} {
   const totals: Record<string, number> = {};
-  for (const source of PAGE_VIEW_SOURCES) {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) as c FROM analytics_page_views
-         WHERE path = ? AND source = ?
-           AND (is_owner IS NULL OR is_owner = 0)
-           AND created_at >= ${WINDOW_SQL}
-           AND ${aiNotClause}`,
-      )
-      .get(path, source, ...aiNotParams) as { c: number } | undefined;
-    totals[source] = row?.c ?? 0;
+  for (const source of PAGE_VIEW_SOURCES) totals[source] = 0;
+  const daily = new Map<string, number>();
+  const ai = { chatgpt: 0, claude: 0, other: 0 };
+  let humanViews = 0;
+  for (const g of readPathViewGroups(db, path, cutoffIsoFor(windowDays))) {
+    if (g.cls === "human") {
+      humanViews += g.views;
+      const source = g.source || "unknown";
+      if (source in totals) totals[source] += g.views;
+      const key = `${g.day}|${source}`;
+      daily.set(key, (daily.get(key) ?? 0) + g.views);
+    } else if (g.cls === "ai_search") {
+      ai[aiVendorBucket(uaFromSessionId(g.sessionId))] += g.views;
+    }
   }
-
-  const dailyRows = db
-    .prepare(
-      `SELECT strftime('%Y-%m-%d', created_at) as date, source, COUNT(*) as c
-       FROM analytics_page_views
-       WHERE path = ?
-         AND (is_owner IS NULL OR is_owner = 0)
-         AND created_at >= ${WINDOW_SQL}
-         AND ${aiNotClause}
-       GROUP BY date, source
-       ORDER BY date ASC`,
-    )
-    .all(path, ...aiNotParams) as Array<{ date: string; source: string | null; c: number }>;
-
   return {
-    totals,
-    daily: dailyRows.map((r) => ({ date: r.date, source: r.source || "unknown", count: r.c })),
+    viewsBySource: {
+      totals,
+      daily: [...daily.entries()]
+        .map(([key, count]) => { const [date, source] = key.split("|"); return { date, source, count }; })
+        .sort((a, b) => a.date.localeCompare(b.date) || a.source.localeCompare(b.source)),
+    },
+    aiPlatforms: { ...ai, total: ai.chatgpt + ai.claude + ai.other },
+    humanViews,
   };
-}
-
-/**
- * Group 2: AI-platform split (chatgpt/claude/other) over the same 90-day
- * window, via the same session_id UA-marker technique as views-by-source
- * and agent-stats.ts. Owner rows excluded.
- */
-function getAiPlatforms(db: Database.Database, path: string): OwnerStatsAiPlatforms {
-  function bucket(markers: string[]): number {
-    const { clause, params } = likeClause(markers);
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) as c FROM analytics_page_views
-         WHERE path = ? AND (is_owner IS NULL OR is_owner = 0)
-           AND created_at >= ${WINDOW_SQL}
-           AND (${clause})`,
-      )
-      .get(path, ...params) as { c: number } | undefined;
-    return row?.c ?? 0;
-  }
-  // Skive 3 (dev-request 2026-09-02-analytics-historikk-rollup-lesere-foer-
-  // retention): same 90-day window as agent-stats.ts, same reasoning — blend
-  // chatgpt/claude exactly (page_view_daily's bot_type token sets match
-  // AI_MARKERS.chatgpt/.claude byte-for-byte), leave `other` raw-only
-  // (rollup's bot_type classifier doesn't line up 1:1 with AI_MARKERS.other —
-  // see getPrunedChatgptClaudeCounts's doc comment in analytics-rollup-
-  // reads.ts). Documented known gap, not an oversight.
-  const cutoffIso = new Date(Date.now() - OWNER_STATS_WINDOW_DAYS * 24 * 60 * 60 * 1000)
-    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
-  const prunedAi = getPrunedChatgptClaudeCounts(cutoffIso, { path, db });
-  const chatgpt = bucket(AI_MARKERS.chatgpt) + prunedAi.chatgpt;
-  const claude = bucket(AI_MARKERS.claude) + prunedAi.claude;
-  const other = bucket(AI_MARKERS.other);
-  return { chatgpt, claude, other, total: chatgpt + claude + other };
-}
-
-/** Human (non-AI-bot, non-owner) page views in the 90-day window — reused for the funnel's "viewed" stage. */
-function getHumanViews(db: Database.Database, path: string): number {
-  const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
-  const aiNotParams = ALL_AI_MARKERS.map((m) => `%${m}%`);
-  const row = db
-    .prepare(
-      `SELECT COUNT(*) as c FROM analytics_page_views
-       WHERE path = ?
-         AND (is_owner IS NULL OR is_owner = 0)
-         AND created_at >= ${WINDOW_SQL}
-         AND ${aiNotClause}`,
-    )
-    .get(path, ...aiNotParams) as { c: number } | undefined;
-  return row?.c ?? 0;
 }
 
 /**
@@ -293,17 +279,17 @@ function getConversationsByChannel(db: Database.Database, agentId: string): Owne
  * grouped by kind, is_bot excluded. Labeled "kontakt-klikk" in the UI —
  * click intent, not confirmed contact (see dev-request spec).
  */
-function getContactClicksByKind(db: Database.Database, agentId: string): OwnerStatsClickKindCount[] {
+function getContactClicksByKind(db: Database.Database, agentId: string, windowDays: number): OwnerStatsClickKindCount[] {
   const rows = db
     .prepare(
       `SELECT kind, COUNT(*) as cnt
        FROM contact_clicks
        WHERE agent_id = ? AND is_bot = 0
-         AND created_at >= ${WINDOW_SQL}
+         AND created_at >= datetime('now', ?)
        GROUP BY kind
        ORDER BY cnt DESC`,
     )
-    .all(agentId) as Array<{ kind: string; cnt: number }>;
+    .all(agentId, `-${windowDays} days`) as Array<{ kind: string; cnt: number }>;
   return rows.map((r) => ({ kind: r.kind, count: r.cnt }));
 }
 
@@ -311,22 +297,21 @@ function getContactClicksByKind(db: Database.Database, agentId: string): OwnerSt
  * Group 6: discovered → viewed → kontakt-klikk funnel.
  *  - discovered: agent_metrics.times_discovered (pre-existing lifetime
  *    counter; not bot/owner-filterable — see module doc).
- *  - viewed: human (bot+owner-excluded) profile page views, 90-day window.
- *  - contactClicked: sum of the 90-day, bot-excluded contact-click counts
+ *  - viewed: people's profile page views over the window (getPathViews).
+ *  - contactClicked: sum of the window's bot-excluded contact-click counts
  *    already computed for group 5 (passed in — avoids re-querying).
  */
 function getFunnel(
   db: Database.Database,
   agentId: string,
-  path: string,
+  humanViews: number,
   contactClickedTotal: number,
 ): OwnerStatsFunnel {
   const metricsRow = db
     .prepare(`SELECT times_discovered FROM agent_metrics WHERE agent_id = ?`)
     .get(agentId) as { times_discovered: number } | undefined;
   const discovered = metricsRow?.times_discovered ?? 0;
-  const viewed = getHumanViews(db, path);
-  return { discovered, viewed, contactClicked: contactClickedTotal };
+  return { discovered, viewed: humanViews, contactClicked: contactClickedTotal };
 }
 
 /**
@@ -336,16 +321,16 @@ function getFunnel(
  * the same slug derivation).
  */
 export function getOwnerStats(db: Database.Database, agentId: string, path: string): OwnerStats {
-  const viewsBySource = getViewsBySource(db, path);
-  const aiPlatforms = getAiPlatforms(db, path);
+  const windowDays = ownerStatsWindowDays();
+  const { viewsBySource, aiPlatforms, humanViews } = getPathViews(db, path, windowDays);
   const matchingSearchQueries = getMatchingSearchQueries(db, agentId);
   const conversationsByChannel = getConversationsByChannel(db, agentId);
-  const contactClicksByKind = getContactClicksByKind(db, agentId);
+  const contactClicksByKind = getContactClicksByKind(db, agentId, windowDays);
   const contactClickedTotal = contactClicksByKind.reduce((sum, r) => sum + r.count, 0);
-  const funnel = getFunnel(db, agentId, path, contactClickedTotal);
+  const funnel = getFunnel(db, agentId, humanViews, contactClickedTotal);
 
   return {
-    windowDays: OWNER_STATS_WINDOW_DAYS,
+    windowDays,
     viewsBySource,
     aiPlatforms,
     matchingSearchQueries,

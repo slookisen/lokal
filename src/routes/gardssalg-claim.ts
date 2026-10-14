@@ -588,8 +588,8 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
             var note = document.getElementById("gc-stats-note");
             if (!el || !j || !j.success) return;
             el.innerHTML =
-              '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.humanViews + '</div><div class="gc-stat-label">Sidevisninger (' + j.stats.windowDays + ' dager)</div></div>' +
-              '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.aiBotViews + '</div><div class="gc-stat-label">AI/bot-trafikk</div></div>';
+              '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.humanViews + '</div><div class="gc-stat-label">Sidevisninger fra mennesker (' + j.stats.windowDays + ' dager)</div></div>' +
+              '<div class="gc-stat" title="Ganger en AI-assistent (ChatGPT, Claude, Perplexity …) hentet siden din for noen som spurte"><div class="gc-stat-num">' + j.stats.aiSearchViews + '</div><div class="gc-stat-label">AI-søk (' + j.stats.windowDays + ' dager)</div></div>';
             if (note && j.stats.notAvailable && j.stats.notAvailable.length) {
               note.textContent = "Ikke tilgjengelig ennå: " + j.stats.notAvailable.join(", ") + ".";
             }
