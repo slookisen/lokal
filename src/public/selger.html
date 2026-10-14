@@ -1842,7 +1842,7 @@
         .finally(function() { statsLoading = false; });
     }
 
-    var SOURCE_LABELS = { direct: 'Direkte', organic: 'Organisk', search: 'Søk', social: 'Sosiale medier', referral: 'Henvisning' };
+    var SOURCE_LABELS = { direct: 'Direkte', organic: 'Organisk', search: 'Søk', social: 'Sosiale medier', referral: 'Henvisning', unknown: 'Ukjent' };
     var CHANNEL_LABELS = { web: 'Nettside', a2a: 'A2A', mcp: 'MCP', api: 'API/annet' };
     var CLICK_KIND_LABELS = { email: 'E-post', phone: 'Telefon', website: 'Nettside' };
     function clickKindLabel(kind) {
@@ -1920,7 +1920,7 @@
           byDate[row.date] = (byDate[row.date] || 0) + (row.count || 0);
         });
         // Anchor on the last 30 calendar days ending today (UTC, matching the
-        // backend's strftime('%Y-%m-%d', created_at) date strings), zero-filling
+        // backend's YYYY-MM-DD day strings), zero-filling
         // any day with no recorded views -- not just the sparse set of dates
         // that happen to have >=1 view.
         var todayStr = new Date().toISOString().slice(0, 10);

@@ -156,6 +156,10 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     // Owner view — normal browser UA, but is_owner=1 — must be fully excluded.
     insertPv.run(PATH, "direct", "iphash-owner:Mozilla/5.0 (Macintosh) Chrome/120", 1, "-1 days");
 
+    // A legacy human view without a source: counted under «unknown», so the totals add up to «Sett».
+    db.prepare(`INSERT INTO analytics_page_views (path, source, session_id, is_owner, created_at) VALUES (?, NULL, ?, 0, datetime('now', '-2 days'))`)
+      .run(PATH, "iphash-nosrc:Mozilla/5.0 (Macintosh) Chrome/120");
+
     // Human views OUTSIDE the 60-day window — must be excluded (also one the old 90-day window took).
     insertPv.run(PATH, "direct", "iphash-old:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-120 days");
     insertPv.run(PATH, "direct", "iphash-old70:Mozilla/5.0 (Macintosh) Chrome/120", 0, "-70 days");
@@ -215,6 +219,7 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
     assertEq(stats.viewsBySource.totals.organic, 1, "viewsBySource: 1 organic");
     assertEq(stats.viewsBySource.totals.social, 0, "viewsBySource: 0 social");
     assertEq(stats.viewsBySource.totals.referral, 0, "viewsBySource: 0 referral");
+    assertEq(stats.viewsBySource.totals.unknown, 1, "viewsBySource: 1 legacy view without a source, under unknown");
     const dailySum = stats.viewsBySource.daily.reduce((sum, r) => sum + r.count, 0);
     const totalsSum = Object.values(stats.viewsBySource.totals).reduce((s, n) => s + n, 0);
     assertEq(dailySum, totalsSum, "viewsBySource: daily bucket counts sum to the same total as totals-by-source");
@@ -250,7 +255,8 @@ export function runOwnerStatsServiceTests(opts: { log?: boolean } = {}): TestSum
 
     // ── (f) funnel ─────────────────────────────────────────────────
     assertEq(stats.funnel.discovered, 42, "funnel: discovered = agent_metrics.times_discovered");
-    assertEq(stats.funnel.viewed, 6, "funnel: viewed = 6 (same bot/owner-excluded human views as viewsBySource totals sum)");
+    assertEq(stats.funnel.viewed, 7, "funnel: viewed = 7 (people's page views)");
+    assertEq(Object.values(stats.viewsBySource.totals).reduce((a, b) => a + b, 0), stats.funnel.viewed, "viewsBySource: the totals add up to the funnel's viewed");
     assertEq(stats.funnel.contactClicked, 6, "funnel: contactClicked = 6 (sum of contactClicksByKind)");
 
     // ── (g) isolation + empty-agent behaviour ────────────────────────

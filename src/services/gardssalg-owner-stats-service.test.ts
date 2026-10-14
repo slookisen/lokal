@@ -87,6 +87,9 @@ export function runGardssalgOwnerStatsServiceTests(opts: { log?: boolean } = {})
     insert.run(path, "bot-2:Mozilla/5.0 (compatible; Googlebot/2.1)", 0, "experiences");
     rfbDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, status_code) VALUES (?, ?, 0, 'experiences', 404)`)
       .run(path, "human-404:Mozilla/5.0 (Macintosh) Chrome/120");
+    // A human view older than the 60-day window — excluded.
+    rfbDb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at) VALUES (?, ?, 0, 'experiences', datetime('now', '-70 days'))`)
+      .run(path, "human-old:Mozilla/5.0 (Macintosh) Chrome/120");
     // 1 fleet/internal view — must be excluded from BOTH counters.
     insert.run(path, "owner-1:Lokal-Enricher/1.0", 1, "experiences");
     // Same path, but on the 'rfb' vertical — must never leak in (vertical-scoping).

@@ -100,7 +100,7 @@ function getViews30(db: Database.Database, path: string): ProfileActivityViews {
     FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at >= ?${statusOk}
+      AND created_at > ?${statusOk}
       AND session_id IS NOT NULL
     GROUP BY session_id
   `).all(path, cutoffIso) as Array<{ session_id: string; client_class: string | null; views: number }>;

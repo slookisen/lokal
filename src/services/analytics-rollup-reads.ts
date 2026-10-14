@@ -83,9 +83,8 @@ function resolvePrunedWindow(cutoffIso: string, table: RawTable, dbHandle?: Db):
 /**
  * Runs `fn(window, db)` guarded by resolvePrunedWindow + a try/catch,
  * returning `fallback` otherwise. `dbHandle` is optional — most readers use
- * the global getDb() singleton (the default), but a couple (owner-stats-
- * service.ts, profile-activity-service.ts) are deliberately parameterized on
- * an explicit `db` handle instead, so `fn` always gets a concrete handle to
+ * the global getDb() singleton (the default), but some are deliberately
+ * parameterized on an explicit `db` handle instead, so `fn` always gets a concrete handle to
  * query with rather than reaching for the global itself.
  */
 function withPrunedWindow<T>(
@@ -143,10 +142,12 @@ export function getPrunedPageViewsBySource(cutoffIso: string, vertical?: Vertica
  * 'chatgpt'/'claude' — the ONLY two rollup bot_type buckets whose UA-token
  * set (see retention-service.ts's BOT_TYPE_CASE) is byte-identical to every
  * reader's own AI_MARKERS.chatgpt/.claude list (GPTBot/ChatGPT/OAI-SearchBot
- * and ClaudeBot/Claude-User/Anthropic respectively). Used by
- * AnalyticsService.getSummary.agentTraffic AND by every per-agent/per-path
- * reader's chatgpt/claude buckets (agent-stats.ts, owner-stats-service.ts,
- * profile-activity-service.ts, gardssalg-owner-stats-service.ts).
+ * and ClaudeBot/Claude-User/Anthropic respectively). No production reader
+ * uses it since 2026-10-14: the per-path producer readers (agent-stats-
+ * compute.ts, profile-activity-service.ts, owner-stats-service.ts,
+ * gardssalg-owner-stats-service.ts) stopped adding it — it counted crawlers
+ * and files, and their windows sit inside the raw rows
+ * (dev-request 2026-10-13-statistikk-riktig-for-investorer).
  *
  * Deliberately does NOT extend to an "other AI" bucket: rollup's
  * 'other_bot' classification is a broader/different token match than any

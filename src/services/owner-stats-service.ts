@@ -90,7 +90,7 @@ export function ownerStatsWindowDays(): number {
   return getRetentionWindowDays();
 }
 
-function cutoffIsoFor(days: number): string {
+export function cutoffIsoFor(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }
 
@@ -131,7 +131,7 @@ export function readPathViewGroups(
     FROM analytics_page_views
     WHERE path = ?${vertical}
       AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at >= ?${statusOk}
+      AND created_at > ?${statusOk}
       AND session_id IS NOT NULL
     GROUP BY session_id, ${source}, day
   `).all(...(opts.vertical ? [path, opts.vertical] : [path]), cutoffIso) as Array<{
@@ -209,8 +209,10 @@ function getPathViews(db: Database.Database, path: string, windowDays: number): 
   for (const g of readPathViewGroups(db, path, cutoffIsoFor(windowDays))) {
     if (g.cls === "human") {
       humanViews += g.views;
-      const source = g.source || "unknown";
-      if (source in totals) totals[source] += g.views;
+      // Rows without a known source (legacy) still count, under «unknown», so
+      // the totals add up to the funnel's «Sett».
+      const source = g.source && Object.prototype.hasOwnProperty.call(totals, g.source) ? g.source : "unknown";
+      totals[source] = (totals[source] ?? 0) + g.views;
       const key = `${g.day}|${source}`;
       daily.set(key, (daily.get(key) ?? 0) + g.views);
     } else if (g.cls === "ai_search") {

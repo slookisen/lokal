@@ -41,7 +41,7 @@
 // Read-only; never writes.
 
 import { getDb as getRfbDb } from "../database/init";
-import { ownerStatsWindowDays, readPathViewGroups } from "./owner-stats-service";
+import { cutoffIsoFor, ownerStatsWindowDays, readPathViewGroups } from "./owner-stats-service";
 
 export interface GardssalgOwnerStats {
   windowDays: number;
@@ -68,8 +68,7 @@ const NOT_AVAILABLE = [
 export function getGardssalgOwnerStats(path: string): GardssalgOwnerStats {
   const db = getRfbDb();
   const windowDays = ownerStatsWindowDays();
-  const cutoffIso = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
-    .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const cutoffIso = cutoffIsoFor(windowDays);
   let humanViews = 0;
   let aiSearchViews = 0;
   for (const g of readPathViewGroups(db, path, cutoffIso, { vertical: "experiences" })) {
