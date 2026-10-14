@@ -101,10 +101,14 @@ export async function runServerhengSkive6Tests(opts: { log?: boolean } = {}): Pr
     const pagePath = "/produsent/testgarden";
     const ins = writer.prepare("INSERT INTO analytics_page_views (path, session_id, created_at, is_owner) VALUES (?,?,?,?)");
     // human-looking browser session with a few views, a GPTBot crawl, a
-    // ClaudeBot crawl, an owner view, and a fast scraper-like session.
+    // ClaudeBot crawl (crawlers: not on the AI tile), a ChatGPT-User and a
+    // Claude-User fetch (AI search: counted), an owner view, and a fast
+    // scraper-like session.
     for (let i = 0; i < 3; i++) ins.run(pagePath, "ip1:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36", sqliteAgo((i + 1) * 3_600_000), 0);
     ins.run(pagePath, "ip2:Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)", sqliteAgo(86_400_000), 0);
     ins.run(pagePath, "ip3:Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)", sqliteAgo(2 * 86_400_000), 0);
+    ins.run(pagePath, "ip7:Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot", sqliteAgo(3 * 86_400_000), 0);
+    ins.run(pagePath, "ip8:Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)", sqliteAgo(4 * 86_400_000), 0);
     ins.run(pagePath, "ip4:desktop:owner", sqliteAgo(60_000), 1);
     const scraper = "ip5:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
     const base = Date.now() - 5 * 3_600_000;

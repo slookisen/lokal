@@ -14,9 +14,11 @@
  *       derived source of those rows, not the old hard-coded 'seo'.
  *   (d) GET /api/agents/:id/stats on the shared classifier: bingbot,
  *       PetalBot, AhrefsBot and ExaSearchBot never increment humanViews; a
- *       normal Chrome UA does; GPTBot → chatgpt, Claude-User → claude,
- *       ExaSearchBot → other; Googlebot/DuckDuckBot are neither human nor
- *       AI; velocity scrapers (10-minute and hourly rules) are excluded.
+ *       normal Chrome UA does; the AI tile counts AI search only
+ *       (Claude-User → claude), so AI crawlers (GPTBot, ExaSearchBot) are
+ *       not counted (Daniel 2026-10-13); Googlebot/DuckDuckBot are neither
+ *       human nor AI; velocity scrapers (10-minute and hourly rules) are
+ *       excluded.
  *   (e) the 120 s response cache returns the same payload within the TTL
  *       (even after new rows land) and a fresh one after it (pinned clock).
  *
@@ -195,6 +197,16 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
         [{ agent_id: "low-trust", view_source: "discovery", is_owner: 0, traffic_category: "human" }],
         "a5: a profile visit books exactly one row: own-domain Referer → 'discovery', human, not owner",
       );
+      // The rendered tiles carry the real window, not template text (2026-10-13:
+      // S5 put ${statsDays} inside plain quotes, so the page showed it literally).
+      const days = require("../services/retention-window").getRetentionWindowDays();
+      assertTrue(
+        !profile.body.includes("${") &&
+          profile.body.includes(`Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${days} dager.`) &&
+          profile.body.includes(`Sidevisninger fra mennesker, siste ${days} dager`) &&
+          profile.body.includes(`mennesker &middot; ${days}d`) && profile.body.includes(`AI-agenter &middot; ${days}d`),
+        `a6: the rendered stat tiles and the approved AI tooltip show the window (${days} days), no raw \${…}`,
+      );
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -299,7 +311,7 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
       view(botSid("20.0.0.4", UA.exa));
       let s = await stats();
       assertEq(s.humanViews, 0, "d1: bingbot / PetalBot / AhrefsBot / ExaSearchBot add NOTHING to humanViews");
-      assertEq(s.aiBreakdown, { chatgpt: 0, claude: 0, other: 1 }, "d2: ExaSearchBot is an AI crawler (other); bingbot/PetalBot/AhrefsBot are not AI");
+      assertEq(s.aiBreakdown, { chatgpt: 0, claude: 0, other: 0 }, "d2: ExaSearchBot is an AI crawler, not AI search: not counted; bingbot/PetalBot/AhrefsBot are not AI");
 
       // Search engines the old list called "AI other".
       resetStatsCache(() => clock);
@@ -310,8 +322,8 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
       s = await stats();
       assertEq(
         [s.humanViews, s.aiViews, s.aiBreakdown],
-        [0, 3, { chatgpt: 1, claude: 1, other: 1 }],
-        "d3: Googlebot/DuckDuckBot are search_engine (neither human nor AI); GPTBot → chatgpt, Claude-User → claude",
+        [0, 1, { chatgpt: 0, claude: 1, other: 0 }],
+        "d3: Googlebot/DuckDuckBot are search_engine (neither human nor AI); GPTBot is a crawler (not counted); Claude-User → claude",
       );
 
       // A real visitor (current bucketed session_id format) counts.

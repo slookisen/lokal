@@ -12,7 +12,11 @@
  * Covers:
  *   (a) views30: human vs AI-agent split (chatgpt/claude/other), owner rows
  *       excluded, rows older than 30 days excluded, a different agent's
- *       path never bleeds into these counts.
+ *       path never bleeds into these counts. AI-agent lookups are AI search
+ *       only (ChatGPT-User, Claude-User, Perplexity-User); AI crawlers,
+ *       search engines, SEO bots, scripts and scanners are neither people
+ *       nor AI lookups, and a non-2xx/304 response is not a page view
+ *       (dev-request 2026-10-13-statistikk-riktig-for-investorer, S5).
  *   (b) topQueryTerms: grouped by exact query_text, ordered by frequency,
  *       capped at 3, single-char/empty/null query_text excluded, another
  *       agent's conversations never counted.
@@ -44,6 +48,8 @@ function buildSchema(db: Database.Database): void {
       path TEXT NOT NULL,
       session_id TEXT,
       is_owner INTEGER DEFAULT 0,
+      status_code INTEGER,
+      client_class TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE conversations (
@@ -105,10 +111,28 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     for (let i = 0; i < 4; i++) {
       insertPv.run(PATH, `iphash${i}:Mozilla/5.0 (Macintosh) Chrome/120`, 0, "-5 days");
     }
-    // 3 ChatGPT + 2 Claude + 1 other-AI (Googlebot) inside the window
-    for (let i = 0; i < 3; i++) insertPv.run(PATH, `iphash-gpt-${i}:Mozilla/5.0 (compatible; GPTBot/1.0)`, 0, "-2 days");
-    for (let i = 0; i < 2; i++) insertPv.run(PATH, `iphash-claude-${i}:Mozilla/5.0 (compatible; ClaudeBot/1.0)`, 0, "-1 days");
+    // AI search inside the window: 3 ChatGPT + 2 Claude + 1 other (Perplexity)
+    for (let i = 0; i < 3; i++) insertPv.run(PATH, `iphash-gpt-${i}:Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot`, 0, "-2 days");
+    for (let i = 0; i < 2; i++) insertPv.run(PATH, `iphash-claude-${i}:Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)`, 0, "-1 days");
+    insertPv.run(PATH, "iphash-pplx:Mozilla/5.0 (compatible; Perplexity-User/1.0)", 0, "-3 days");
+    // Neither people nor AI lookups: AI crawlers, search engines, SEO bots, scripts, a fake-stale-Chrome scanner
+    insertPv.run(PATH, "iphash-gptbot:Mozilla/5.0 (compatible; GPTBot/1.0)", 0, "-2 days");
+    insertPv.run(PATH, "iphash-claudebot:Mozilla/5.0 (compatible; ClaudeBot/1.0)", 0, "-1 days");
     insertPv.run(PATH, "iphash-google:Mozilla/5.0 (compatible; Googlebot/2.1)", 0, "-3 days");
+    insertPv.run(PATH, "iphash-bing:Mozilla/5.0 (compatible; bingbot/2.0)", 0, "-3 days");
+    insertPv.run(PATH, "iphash-ahrefs:Mozilla/5.0 (compatible; AhrefsBot/7.0)", 0, "-3 days");
+    insertPv.run(PATH, "iphash-curl:curl/8.0", 0, "-3 days");
+    insertPv.run(PATH, "iphash-scan:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36", 0, "-3 days");
+    // A browser-looking session whose class was stored at write time as a scanner (full UA),
+    // with an older row of the same session from before the column (no class): the whole session is out.
+    db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, client_class, created_at) VALUES (?, ?, 0, 'scanner', datetime('now', '-3 days'))`)
+      .run(PATH, "iphash-bucket:desktop:0123456789abcdef");
+    insertPv.run(PATH, "iphash-bucket:desktop:0123456789abcdef", 0, "-4 days");
+    // A redirect and a 404 are not page views
+    db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, created_at) VALUES (?, ?, 0, ?, datetime('now', '-3 days'))`)
+      .run(PATH, "iphash-redirect:Mozilla/5.0 (Macintosh) Chrome/120", 301);
+    db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, created_at) VALUES (?, ?, 0, ?, datetime('now', '-3 days'))`)
+      .run(PATH, "iphash-404:Mozilla/5.0 (Macintosh) Chrome/120", 404);
     // 1 owner view — must be excluded entirely, even though it's a normal browser UA
     insertPv.run(PATH, "iphash-owner:Mozilla/5.0 (Macintosh) Chrome/120", 1, "-1 days");
     // 1 human view OUTSIDE the 30-day window — must be excluded from views30
@@ -158,11 +182,22 @@ export function runProfileActivityServiceTests(opts: { log?: boolean } = {}): Te
     const activity = getProfileActivity(db, AGENT_ID, PATH);
 
     // ── (a) views30 ─────────────────────────────────────────────────
-    assertEq(activity.views30.human, 4, "views30: 4 human views (owner + >30d-old excluded)");
-    assertEq(activity.views30.aiBreakdown.chatgpt, 3, "views30: 3 ChatGPT views");
-    assertEq(activity.views30.aiBreakdown.claude, 2, "views30: 2 Claude views");
-    assertEq(activity.views30.aiBreakdown.other, 1, "views30: 1 other-AI (Googlebot) view");
+    assertEq(activity.views30.human, 4, "views30: 4 human views (owner, >30d-old, bots, scripts, scanners, redirects and 404s excluded)");
+    assertEq(activity.views30.aiBreakdown.chatgpt, 3, "views30: 3 ChatGPT-User views (GPTBot crawl not counted)");
+    assertEq(activity.views30.aiBreakdown.claude, 2, "views30: 2 Claude-User views (ClaudeBot crawl not counted)");
+    assertEq(activity.views30.aiBreakdown.other, 1, "views30: 1 other AI search (Perplexity-User); Googlebot is not AI");
     assertEq(activity.views30.ai, 6, "views30: ai = chatgpt+claude+other = 6");
+    assertEq(activity.views30.days, 30, "views30: a 30-day window (inside the 60-day raw retention)");
+
+    // A raw retention shorter than 30 days shortens the window (and the label reads it).
+    const prevPrune = process.env.RFB_AUTO_PRUNE_DAYS;
+    process.env.RFB_AUTO_PRUNE_DAYS = "7"; // the lowest retention getRetentionWindowDays allows
+    try {
+      const short = getProfileActivity(db, AGENT_ID, PATH).views30;
+      assertEq([short.days, short.human, short.ai], [7, 4, 6], "views30: retention 7 days → a 7-day window (every fixture view is ≤ 5 days old)");
+    } finally {
+      if (prevPrune === undefined) delete process.env.RFB_AUTO_PRUNE_DAYS; else process.env.RFB_AUTO_PRUNE_DAYS = prevPrune;
+    }
 
     // ── (b) topQueryTerms ───────────────────────────────────────────
     assertEq(activity.topQueryTerms.length, 3, "topQueryTerms: capped at 3");
