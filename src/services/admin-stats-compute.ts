@@ -103,6 +103,8 @@ export interface AdminSummary {
   humanVisitors?: number;
   humanVisits?: number;
   aiSearchViews?: number;
+  /** AI agents' lookups over MCP/A2A (search-stats-compute.ts computeAiLookups); «AI-søk» on the sites = aiSearchViews + this. */
+  aiLookups?: number;
   aiCrawlerViews?: number;
   /** Search engines, SEO tools, link previews, other bots, scanners and scrapers. */
   botViews?: number;
@@ -183,6 +185,7 @@ export function summaryFromReport(report: TrafficReport, q: QueryStats): AdminSu
     humanVisitors: report.groups.human.visitors,
     humanVisits: report.groups.human.visits,
     aiSearchViews: report.groups.ai_search.views,
+    aiLookups: q.aiLookups?.total ?? 0,
     aiCrawlerViews: report.groups.ai_crawler.views,
     botViews: report.groups.bot.views,
     devViews: report.groups.dev.views,

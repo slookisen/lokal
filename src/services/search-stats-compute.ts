@@ -7,6 +7,7 @@
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import { A2A_REQUEST_METHODS, ASSISTANT_SEARCH_CLASS, BOT_SEARCH_CLASSES, isFreeTextQuery, MCP_SEARCH_TOOLS } from "./search-tracking";
+import { PROBE_CLIENT_MARKERS } from "./agent-usage-compute";
 
 type Db = Database.Database;
 
@@ -28,6 +29,8 @@ export interface QueryStats {
    */
   byChannel?: { web: number; api: number; mcp: number; a2a: number; ai: number };
   botQueries?: number;
+  /** AI agents' lookups over MCP data tools and countable A2A requests (computeAiLookups, S7). */
+  aiLookups?: AiLookups;
 }
 
 function tableExists(db: Db, name: string): boolean {
@@ -104,11 +107,15 @@ export function computeQueryStats(
     // A call answered 4xx/5xx (a rate limiter's 429, a bad request) is not a
     // search; rows written before the status was stored count as they are.
     const okStatus = columnExists(db, "analytics_mcp_calls", "status_code") ? " AND (status_code IS NULL OR status_code < 400)" : "";
+    // An A2A request counts only with countable = 1 (S7: it asked something,
+    // an external caller, data back, under the per-IP cap); rows written
+    // before the verdict was stored cannot be told from spam.
+    const a2aCountable = columnExists(db, "analytics_mcp_calls", "countable") ? " AND countable = 1" : "";
     const mcp = db.prepare(`
       SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
       WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
         AND ((protocol = 'mcp' AND tool_name IN (${tools.map(() => "?").join(", ")}))
-          OR (protocol = 'a2a' AND tool_name IN (${methods.map(() => "?").join(", ")})))
+          OR (protocol = 'a2a' AND tool_name IN (${methods.map(() => "?").join(", ")})${a2aCountable}))
       GROUP BY protocol
     `).all(...tp, ...vp, ...tools, ...methods) as Array<{ protocol: string; n: number }>;
     for (const r of mcp) {
@@ -144,5 +151,90 @@ export function computeQueryStats(
     topSearchTerms,
     byChannel,
     botQueries,
+    aiLookups: computeAiLookups(db, hoursBack, vertical, nowMs, opts),
   };
+}
+
+// ─── AI lookups over MCP and A2A ─────────────────────────────────────────
+// dev-request 2026-10-13-statistikk-riktig-for-investorer, S7 (Daniel
+// 2026-10-14: «Ta med MCP/A2A i AI-søk»). An AI agent fetching information
+// from the platform through its tools rather than a web page:
+//   - MCP: a call to one of the vertical's information tools (exact,
+//     case-sensitive names below), or a resources/read of rettfrabonden's
+//     lokal:// data resources. Handshakes and health checks (initialize,
+//     tools/list, notifications/…, ping, server/discover …), unknown tool
+//     names, actions (shopping cart, order status, gårdssalg booking) and the
+//     geocode helper are not lookups.
+//   - A2A: a request (message/send, tasks/send, SendMessage) logged with
+//     countable = 1: it asked something, external, answered with data, under
+//     the per-IP cap (a2a.ts; a2a-traffic-classifier.ts a2aLookupCountable).
+// Catalogue probes and monitors are left out on both protocols by client name
+// or user agent (the same markers as agent-usage-compute.ts).
+// Our own traffic (is_owner) and calls answered 4xx/5xx are left out. A tool
+// call answered with a JSON-RPC or tool error over HTTP 200 still counts: the
+// logger does not see the result.
+
+/** MCP tools that hand the caller platform information, per vertical (the registered tools minus actions and helpers). */
+export const AI_LOOKUP_MCP_TOOLS = {
+  rfb: [
+    "lokal_search", "lokal_discover", "lokal_find_offers", "lokal_info", "lokal_stats",
+    "lokal_bm_next_markets", "lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations",
+  ],
+  dental: ["tannlege_search", "tannlege_info", "tannlege_akutt", "tannlege_kjeder", "tannlege_stats"],
+  experiences: ["discover_experiences", "get_experience", "list_experience_categories", "discover_gardssalg"],
+} as const;
+
+/** Registered MCP tools that act or help rather than hand out information (not lookups). */
+export const NON_LOOKUP_MCP_TOOLS = {
+  rfb: ["lokal_cart_create", "lokal_cart_add_item", "lokal_cart_view", "lokal_cart_submit", "lokal_order_status", "lokal_geocode"],
+  dental: [],
+  experiences: ["book_gardssalg"],
+} as const;
+
+/** Client-name / user-agent markers of catalogue probes and monitors: the agentplatform.no tool-call count's list. */
+export const AI_LOOKUP_PROBE_MARKERS = PROBE_CLIENT_MARKERS;
+
+export interface AiLookups {
+  mcp: number;
+  a2a: number;
+  total: number;
+}
+
+export function computeAiLookups(
+  db: Db, hoursBack: number, vertical: VerticalId | undefined, nowMs: number, opts: QueryStatsOptions = {},
+): AiLookups {
+  if (!tableExists(db, "analytics_mcp_calls")) return { mcp: 0, a2a: 0, total: 0 };
+  const ranged = opts.fromMs !== undefined && opts.toMs !== undefined;
+  const timeSql = ranged ? "created_at >= ? AND created_at < ?" : "created_at > ?";
+  const tp: string[] = ranged ? [cutoffFor(opts.fromMs!, 0), cutoffFor(opts.toMs!, 0)] : [cutoffFor(nowMs, hoursBack)];
+  const V = vertical ? " AND vertical_id = ?" : "";
+  const vp: string[] = vertical ? [vertical] : [];
+  const okStatus = columnExists(db, "analytics_mcp_calls", "status_code") ? " AND (status_code IS NULL OR status_code < 400)" : "";
+  // Each vertical's own tools: a dental tool name called on rfb's server is an unknown tool there.
+  const verticals = Object.keys(AI_LOOKUP_MCP_TOOLS) as Array<keyof typeof AI_LOOKUP_MCP_TOOLS>;
+  const toolSql = verticals
+    .map((v) => `(vertical_id = ? AND tool_name IN (${AI_LOOKUP_MCP_TOOLS[v].map(() => "?").join(", ")}))`)
+    .join(" OR ");
+  const toolParams = verticals.flatMap((v) => [v, ...AI_LOOKUP_MCP_TOOLS[v]]);
+  const ua = columnExists(db, "analytics_mcp_calls", "user_agent") ? "lower(coalesce(user_agent, ''))" : "''";
+  const probe = AI_LOOKUP_PROBE_MARKERS.map(() => `(lower(coalesce(client_name, '')) LIKE ? OR ${ua} LIKE ?)`).join(" OR ");
+  const probeParams = AI_LOOKUP_PROBE_MARKERS.flatMap((m) => [`%${m}%`, `%${m}%`]);
+  const a2a = columnExists(db, "analytics_mcp_calls", "countable")
+    ? `(protocol = 'a2a' AND tool_name IN (${A2A_REQUEST_METHODS.map(() => "?").join(", ")}) AND countable = 1)`
+    : "0";
+  const rows = db.prepare(`
+    SELECT protocol, COUNT(*) AS n FROM analytics_mcp_calls
+    WHERE ${timeSql} AND (is_owner IS NULL OR is_owner = 0)${okStatus}${V}
+      AND ((protocol = 'mcp' AND (${toolSql} OR (tool_name = 'resources/read' AND vertical_id = 'rfb')))
+        OR ${a2a})
+      AND NOT (${probe})
+    GROUP BY protocol
+  `).all(...tp, ...vp, ...toolParams, ...(a2a === "0" ? [] : A2A_REQUEST_METHODS), ...probeParams) as Array<{ protocol: string; n: number }>;
+  let mcp = 0;
+  let a2aN = 0;
+  for (const r of rows) {
+    if (r.protocol === "mcp") mcp += r.n;
+    else if (r.protocol === "a2a") a2aN += r.n;
+  }
+  return { mcp, a2a: a2aN, total: mcp + a2aN };
 }

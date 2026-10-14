@@ -42462,6 +42462,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-13-statistikk-riktig-for-investorer, S7: «AI-søk»
+  // counts AI agents' lookups over MCP/A2A too; the A2A spam guard's verdict
+  // is stored with each call. Swaps getDb() (logger part), so serial.
+  console.log("\n── statistikk S7: AI lookups over MCP/A2A ──");
+  try {
+    const { runAiLookupsTests } = require("../src/services/ai-lookups.test") as
+      typeof import("../src/services/ai-lookups.test");
+    const r = await runAiLookupsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("ai-lookups: " + f);
+    console.log(`  ai-lookups: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`ai-lookups: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ ai-lookups: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and

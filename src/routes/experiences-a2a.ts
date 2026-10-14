@@ -51,7 +51,9 @@ import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from 
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
-import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
+import { conversationService, buildRequestMeta, isInternalTraffic, type RequestMeta } from "../services/conversation-service";
+import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
+import { hashIP } from "../services/analytics-service";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -342,6 +344,42 @@ export function detectGardssalgIntent(lower: string): { isGardssalg: boolean; pr
     }
   }
   return { isGardssalg: false };
+}
+
+/**
+ * Whether a message/send counts as an AI lookup («AI-søk», dev-request
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it asked something, an
+ * external caller (not spam, a probe or our own traffic) got data back, under
+ * the per-IP cap (a2a-traffic-classifier.ts a2aLookupCountable). Logged with
+ * the call by mcp-usage-logger.ts.
+ *
+ * Asked something = categories, an experience by id, a gårdssalg search, or a
+ * discover with a parsed filter. A discover with no filter (an empty message,
+ * data {}, or only a sort order) answers with the first 20 published rows,
+ * which is not an answer to a question.
+ */
+export function experiencesAskedSomething(result: object): boolean {
+  const md = (result as { result?: { metadata?: { skill?: unknown; filter?: unknown } } }).result?.metadata;
+  if (md?.skill === "opplevelser_categories" || md?.skill === "opplevelser_info" || md?.skill === "gardssalg_discover") return true;
+  const filter = md?.filter;
+  return md?.skill === "opplevelser_discover" && !!filter && typeof filter === "object" &&
+    Object.entries(filter as Record<string, unknown>).some(([k, v]) => k !== "sort" && v !== undefined && v !== null && v !== "");
+}
+
+function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
+  const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
+  const text = extractText(message);
+  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  return a2aLookupCountable({
+    vertical: "experiences",
+    ipHash,
+    text: text ?? (data !== undefined ? JSON.stringify(data) : ""),
+    ua: meta.userAgent,
+    hasStructuredData: !text,
+    isInternal: isInternalTraffic(meta),
+    askedSomething: experiencesAskedSomething(result),
+    response: result,
+  });
 }
 
 // ─── message/send handler (exported for unit tests) ──────────
@@ -758,7 +796,9 @@ router.post("/a2a", (req: Request, res: Response) => {
     switch (method) {
       case "message/send":
       case "tasks/send": { // Backward-compat alias for older A2A clients (<0.3)
-        const result = handleExperiencesMessageSend(params, id, { requestMeta: buildRequestMeta(req) });
+        const requestMeta = buildRequestMeta(req);
+        const result = handleExperiencesMessageSend(params, id, { requestMeta });
+        (res.locals ||= {}).a2aCountable = a2aRequestCountable(hashIP(req.ip || "unknown"), requestMeta, params, result);
         res.json(result);
         break;
       }

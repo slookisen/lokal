@@ -317,6 +317,11 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const capKey = req.ip ? hashIP(req.ip) : "unknown";
   const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
   const countable = trafficClass === "external" && hasIntent && !rateCapped;
+  // Logged with the call (mcp-usage-logger.ts): «AI-søk» counts a countable
+  // request that got results (dev-request 2026-10-13-statistikk-riktig-for-
+  // investorer, S7). Set again once discovery has answered; an invalid query
+  // or an error stays not countable.
+  (res.locals ||= {}).a2aCountable = false;
 
   // Execute discovery
   const startTime = Date.now();
@@ -340,6 +345,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable })
       : [];
     const tagsRelaxed = !!discoverMeta.tagsRelaxed;
+    res.locals.a2aCountable = countable && results.length > 0;
     const durationMs = Date.now() - startTime;
 
     // Complete the task with results

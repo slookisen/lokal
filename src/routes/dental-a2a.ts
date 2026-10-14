@@ -31,6 +31,9 @@ import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
+import { buildRequestMeta, isInternalTraffic } from "../services/conversation-service";
+import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
+import { hashIP } from "../services/analytics-service";
 
 const router = Router();
 
@@ -154,6 +157,45 @@ export function parseIntent(text: string): DentalSearchParams {
   }
 
   return params;
+}
+
+/**
+ * Whether a message/send counts as an AI lookup («AI-søk», dev-request
+ * 2026-10-13-statistikk-riktig-for-investorer, S7): it asked something, an
+ * external caller (not spam, a probe or our own traffic) got data back, under
+ * the per-IP cap (a2a-traffic-classifier.ts a2aLookupCountable). Logged with
+ * the call by mcp-usage-logger.ts.
+ *
+ * Asked something = stats, a clinic by org number, or a search with a parsed
+ * filter. A search with no filter («hi», an empty message, data {}) answers
+ * with the first 20 clinics, which is not an answer to a question.
+ */
+export function dentalAskedSomething(result: object): boolean {
+  const md = (result as { result?: { metadata?: { skill?: unknown; filter?: unknown } } }).result?.metadata;
+  if (md?.skill === "tannlege_stats" || md?.skill === "tannlege_info") return true;
+  return md?.skill === "tannlege_search" && hasFilter(md.filter);
+}
+
+function hasFilter(filter: unknown): boolean {
+  return !!filter && typeof filter === "object" &&
+    Object.values(filter as Record<string, unknown>).some((v) => v !== undefined && v !== null && v !== "");
+}
+
+function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
+  const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
+  const text = extractText(message);
+  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  const meta = buildRequestMeta(req);
+  return a2aLookupCountable({
+    vertical: "dental",
+    ipHash: hashIP(req.ip || "unknown"),
+    text: text ?? (data !== undefined ? JSON.stringify(data) : ""),
+    ua: meta.userAgent,
+    hasStructuredData: !text,
+    isInternal: isInternalTraffic(meta),
+    askedSomething: dentalAskedSomething(result),
+    response: result,
+  });
 }
 
 // ─── message/send handler (exported for unit tests) ──────────
@@ -334,6 +376,7 @@ router.post("/a2a", (req: Request, res: Response) => {
     switch (method) {
       case "message/send": {
         const result = handleDentalMessageSend(params, id);
+        (res.locals ||= {}).a2aCountable = a2aRequestCountable(req, params, result);
         res.json(result);
         break;
       }
