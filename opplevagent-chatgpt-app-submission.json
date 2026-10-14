@@ -82,7 +82,7 @@
       "description": "Details for one named experience. Renders the experience-detail card.",
       "user_prompt": "Show me the details of the Arctic Explorer northern lights cruise in Tromsø",
       "tools_triggered": "discover_experiences, get_experience",
-      "expected_output": "The record for Arctic Explorer — Northern Lights Cruise from Tromsø: category sightseeing, Tromsø (Troms), from NOK 800, about 3 hours, runs autumn to spring. The experience-detail card shows these facts, a note that booking and payment happen with the provider, a Go to provider button (arcticexplorer.no) and an opplevagent.no link.",
+      "expected_output": "The record for Arctic Explorer — Northern Lights Cruise from Tromsø: category sightseeing, Tromsø (Troms), from NOK 990 per adult, about 4 hours, runs autumn to spring. The experience-detail card shows these facts, a note that booking and payment happen with the provider, a Go to provider button (arcticexplorer.no) and an opplevagent.no link.",
       "expected_output_url": null,
       "file_attachment_urls": null
     },
