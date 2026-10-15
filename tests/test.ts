@@ -34893,12 +34893,18 @@ const _dispatchTickSuitePromise: Promise<void> = new Promise<void>(r => { _dispa
   db.pragma("journal_mode = DELETE");
   db.pragma("foreign_keys = ON");
   const prevFireRoutines = process.env.FIRE_ROUTINES;
+  // Per-routine overrides (FIRE_ROUTINE_<AGENT>_TOKEN/_TRIG) also feed the routine map;
+  // clear them too, or a developer shell that has one set would make test B fire for real.
+  const prevFireRoutineOverrides = Object.fromEntries(
+    Object.keys(process.env).filter((k) => /^FIRE_ROUTINE_.+_(TOKEN|TRIG)$/.test(k)).map((k) => [k, process.env[k]]),
+  );
   const prevActiveStart = process.env.DISPATCH_ACTIVE_START_UTC;
   const prevActiveEnd = process.env.DISPATCH_ACTIVE_END_UTC;
   try {
     initModTick.__setDbForTesting(db);
     initModTick.__initSchemaForTesting(db);
     delete process.env.FIRE_ROUTINES;             // active-mode tests must hit the no-routine defer path
+    for (const k of Object.keys(prevFireRoutineOverrides)) delete process.env[k];
     delete process.env.DISPATCH_ACTIVE_START_UTC; // default 0/24 → always inside the active window
     delete process.env.DISPATCH_ACTIVE_END_UTC;
 
@@ -34980,6 +34986,7 @@ const _dispatchTickSuitePromise: Promise<void> = new Promise<void>(r => { _dispa
     failures.push(`tick: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
     if (prevFireRoutines === undefined) delete process.env.FIRE_ROUTINES; else process.env.FIRE_ROUTINES = prevFireRoutines;
+    for (const [k, v] of Object.entries(prevFireRoutineOverrides)) process.env[k] = v;
     if (prevActiveStart === undefined) delete process.env.DISPATCH_ACTIVE_START_UTC; else process.env.DISPATCH_ACTIVE_START_UTC = prevActiveStart;
     if (prevActiveEnd === undefined) delete process.env.DISPATCH_ACTIVE_END_UTC; else process.env.DISPATCH_ACTIVE_END_UTC = prevActiveEnd;
     initModTick.__setDbForTesting(prevDbTick);

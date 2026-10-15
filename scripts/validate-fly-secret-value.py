@@ -101,14 +101,18 @@ def main() -> int:
         if not value:
             fail(name, f"value was only the {prefix!r} prefix, with nothing after it")
 
-    # Only structured values get the JSON treatment; a plain flag such as
-    # RETENTION_JOB_ENABLED=true passes through untouched.
+    # Structured values get the JSON treatment. A plain value is checked only when
+    # its NAME says it is a credential (e.g. FIRE_ROUTINE_<AGENT>_TOKEN), so the
+    # 2026-09-03 "TOKEN" placeholder cannot slip through as a one-field secret; a
+    # plain flag such as RETENTION_JOB_ENABLED=true passes through untouched.
     if value.lstrip()[:1] in "{[":
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError as err:
             fail(name, f"looks like JSON but does not parse ({err})")
         walk(parsed, name)
+    elif CREDENTIAL_KEY.search(name):
+        walk(value, name, name)
 
     out_path = os.environ.get("SECRET_LINE_OUT")
     if out_path:

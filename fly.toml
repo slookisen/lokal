@@ -27,6 +27,13 @@ primary_region = 'arn'
   # Daniel turned it on (live sesjon 2026-10-12) after AC2 preview 10:39Z. Off again:
   # set to 'false' (anything but "1"/"true" = off) and deploy; no data cleanup needed.
   RFB_ENRICHMENT_NIGHTLY_ENABLED = 'true'
+  # Loop-dispatcher /fire target for experiences-enrichment (routes/admin-loop-dispatch.ts,
+  # FIRE_ROUTINE_<AGENT>_TRIG override). Every off-cycle wake of this routine got HTTP 401
+  # "Token is not authorized for this routine" 2026-09-04 → 2026-10-15: the pair stored in
+  # the FIRE_ROUTINES secret is not this routine's. The routine id is not a secret, so it
+  # lives here; the matching token is the Fly secret FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TOKEN
+  # (set via the "Fly Secrets Sync" workflow). Remove this line to fall back to FIRE_ROUTINES.
+  FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TRIG = 'trig_016QXopY6XgnYSQ2kfVX2Utb'
   # Gårdssalg booking dispatch master switch (dev-request 2026-07-14-booking-flyt-v1).
   # Non-secret feature flag → lives here rather than in Fly secrets. SAFE by the
   # double gate: a booking only dispatches when BOTH this is "true" AND the specific

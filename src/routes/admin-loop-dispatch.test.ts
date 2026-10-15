@@ -12,7 +12,8 @@
  *   d2  FIRE_ROUTINE_<AGENT>_TOKEN / _TRIG override one field of one entry.
  *   d3  an override can add an allowlisted agent missing from the JSON (both
  *       fields needed), and works when FIRE_ROUTINES is unset or unparseable.
- *   d4  the diag never carries trig/token values.
+ *   d4  the diag never carries trig/token values; set-but-unapplied override
+ *       NAMES are listed in override_ignored.
  *   d5  envelope status: completed / partial / failed.
  *   d6  runDispatchTick records the envelope with dispatchEnvelopeStatus().
  * Pure — env is injected; no DB, no network.
@@ -82,6 +83,11 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
       assertEq(map, {}, "d1: bad JSON → empty map");
       assertTrue(diag.present && !diag.parse_ok && typeof diag.parse_error === "string", "d1: bad JSON → parse_error set");
     }
+    for (const notObject of ["null", "[1,2]", '"text"', "42"]) {
+      const { map, diag } = parseRoutines({ FIRE_ROUTINES: notObject });
+      assertEq(map, {}, `d1: JSON ${notObject} (not an object) → empty map`);
+      assertTrue(!diag.parse_ok && typeof diag.parse_error === "string", `d1: JSON ${notObject} → parse_ok=false with parse_error (never both)`);
+    }
 
     // ── d2: per-routine override of one field ───────────────────────────────
     assertEq(fireRoutineEnvStem("experiences-enrichment"), "EXPERIENCES_ENRICHMENT", "d2: env stem upper-cases and maps '-' to '_'");
@@ -126,7 +132,8 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
     {
       const { map, diag } = parseRoutines({ FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TOKEN: "tok_exp_new" });
       assertEq(map, {}, "d3: a token alone cannot create an entry with no trig");
-      assertEq(diag.override_keys, [], "d3: incomplete override not reported");
+      assertEq(diag.override_keys, [], "d3: incomplete override not reported as applied");
+      assertEq(diag.override_ignored, ["FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TOKEN"], "d3: … but named in override_ignored");
     }
     {
       const { map } = parseRoutines({
@@ -137,8 +144,18 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
       assertEq(map, { "lokal-agent-enrichment": { trig: "trig_lae", token: "tok_lae" } }, "d3: overrides still apply when FIRE_ROUTINES is unparseable");
     }
     {
-      const { map } = parseRoutines({ FIRE_ROUTINE_NOT_AN_AGENT_TRIG: "t", FIRE_ROUTINE_NOT_AN_AGENT_TOKEN: "k" });
+      const { map, diag } = parseRoutines({ FIRE_ROUTINE_NOT_AN_AGENT_TRIG: "t", FIRE_ROUTINE_NOT_AN_AGENT_TOKEN: "k" });
       assertEq(map, {}, "d3: an agent neither in the JSON nor in DEFAULT_ALLOWLIST is not created");
+      assertEq(diag.override_ignored, ["FIRE_ROUTINE_NOT_AN_AGENT_TOKEN", "FIRE_ROUTINE_NOT_AN_AGENT_TRIG"], "d3: unknown-agent overrides are named in override_ignored (sorted)");
+    }
+    {
+      const { map, diag } = parseRoutines({ FIRE_ROUTINES: json, FIRE_ROUTINE_ORCHESTRATOR_TOKEN: "tok_short_key" });
+      assertEq(map["platform-orchestrator"], { trig: "trig_orch", token: "tok_orch" }, "d3: a short-key override name (ORCHESTRATOR) is not applied");
+      assertEq(diag.override_ignored, ["FIRE_ROUTINE_ORCHESTRATOR_TOKEN"], "d3: … and is reported in override_ignored instead of vanishing");
+    }
+    {
+      const { diag } = parseRoutines({ FIRE_ROUTINES: json, FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TOKEN: "tok_exp_new", FIRE_ROUTINE_FOO_SECRET: "x" });
+      assertEq(diag.override_ignored, [], "d3: applied overrides and unrelated FIRE_ROUTINE_* vars are not listed as ignored");
     }
 
     // ── d4: the diag never leaks values ─────────────────────────────────────
@@ -150,6 +167,8 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
       });
       const s = JSON.stringify(diag);
       assertTrue(!/tok_|trig_/.test(s), "d4: diag carries no trig/token values");
+      const { diag: d2 } = parseRoutines({ FIRE_ROUTINE_NOT_AN_AGENT_TOKEN: "tok_secret_value" });
+      assertTrue(!JSON.stringify(d2).includes("tok_secret_value"), "d4: override_ignored lists names, never values");
     }
 
     // ── d5: envelope status ─────────────────────────────────────────────────

@@ -83,7 +83,7 @@ import {
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
-import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
+import adminLoopDispatchRoutes, { parseRoutines, runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
@@ -894,7 +894,8 @@ app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes
 // run-ledger; ?alert=1 emails when a watcher is silent.
 app.use("/admin/loop-heartbeat", adminLimiter, adminLoopHeartbeatRoutes);
 // P2.5: deterministic /fire dispatcher (server-migration plan). Shadow-safe — only
-// POSTs the routine /fire API when FIRE_ROUTINES is set AND mode=active.
+// POSTs the routine /fire API when a routine is configured (FIRE_ROUTINES and/or
+// FIRE_ROUTINE_<AGENT>_TOKEN/_TRIG) AND mode=active.
 app.use("/admin/loop-dispatch", adminLimiter, adminLoopDispatchRoutes);
 // Phase 2: server-side platform-verifier (deterministic probe loop, dry_run default)
 app.use("/admin/run-platform-verifier", adminLimiter, adminRunPlatformVerifierRoutes);
@@ -2244,15 +2245,17 @@ if (
 // maxWakes 4/tick, allowlist — all untouched.
 //
 // Kill-switch: DISPATCH_TICK_DISABLED=1 (env-only rollback, no deploy).
-// Skipped entirely when FIRE_ROUTINES is unset (nothing could fire anyway —
+// Skipped entirely when no routine is configured — neither FIRE_ROUTINES nor any
+// FIRE_ROUTINE_<AGENT>_TOKEN/_TRIG pair maps one (nothing could fire anyway —
 // also keeps dev/CI silent). Interval override: DISPATCH_TICK_INTERVAL_MIN
 // (clamped to [2, 120] by resolveTickIntervalMin).
-if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
+const dispatchRoutinesConfigured = Object.keys(parseRoutines().map).length > 0;
+if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
   console.log(
     "[dispatch-tick] disabled — " +
     (process.env.DISPATCH_TICK_DISABLED === "1"
       ? "DISPATCH_TICK_DISABLED=1 (kill-switch)"
-      : "FIRE_ROUTINES unset (nothing could fire)"),
+      : "no routine configured (FIRE_ROUTINES / FIRE_ROUTINE_<AGENT>_* unset — nothing could fire)"),
   );
 } else {
   const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);

@@ -7,7 +7,8 @@
 // without a configured routine are left to the Cowork dispatcher (incremental P2.5
 // → P3 migration). No LLM; read-only on the ledger except recording its own envelope.
 //
-// SHADOW-SAFE: with `FIRE_ROUTINES` unset OR mode != active it computes + returns the
+// SHADOW-SAFE: with no routine configured (no `FIRE_ROUTINES` entry and no
+// `FIRE_ROUTINE_<AGENT>_TOKEN/_TRIG` pair) OR mode != active it computes + returns the
 // wake decisions but fires NOTHING — so it can deploy and run in shadow alongside the
 // Cowork dispatcher for the ≥3-day parity window before cutover.
 //
@@ -88,6 +89,8 @@ export interface RoutineDiag {
   mapped_keys: string[];
   /** Agents whose entry came (wholly or partly) from FIRE_ROUTINE_<AGENT>_* env vars. */
   override_keys: string[];
+  /** FIRE_ROUTINE_*_TOKEN/_TRIG variable NAMES that are set but were not applied (unknown agent, or no trig/token to pair with). */
+  override_ignored: string[];
 }
 
 /** Env-var stem for an agent's per-routine override: "experiences-enrichment" → "EXPERIENCES_ENRICHMENT". */
@@ -115,13 +118,17 @@ export function parseRoutines(
     raw_keys: [],
     mapped_keys: [],
     override_keys: [],
+    override_ignored: [],
   };
   const map: Record<string, RoutineRef> = {};
   if (raw) {
     try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("FIRE_ROUTINES is not a JSON object");
+      }
       diag.parse_ok = true;
-      for (const [agent, v] of Object.entries(parsed)) {
+      for (const [agent, v] of Object.entries(parsed as Record<string, unknown>)) {
         diag.raw_keys.push(agent);
         const ref = v as { trig?: unknown; token?: unknown };
         if (ref && typeof ref.trig === "string" && typeof ref.token === "string") {
@@ -134,17 +141,27 @@ export function parseRoutines(
     }
   }
   const candidates = new Set([...Object.keys(map), ...DEFAULT_ALLOWLIST]);
+  const usedOverrideVars = new Set<string>();
   for (const agent of candidates) {
     const stem = fireRoutineEnvStem(agent);
-    const token = (env[`FIRE_ROUTINE_${stem}_TOKEN`] || "").trim();
-    const trig = (env[`FIRE_ROUTINE_${stem}_TRIG`] || "").trim();
+    const tokenVar = `FIRE_ROUTINE_${stem}_TOKEN`;
+    const trigVar = `FIRE_ROUTINE_${stem}_TRIG`;
+    const token = (env[tokenVar] || "").trim();
+    const trig = (env[trigVar] || "").trim();
     if (!token && !trig) continue;
     const merged = { trig: trig || map[agent]?.trig || "", token: token || map[agent]?.token || "" };
     if (merged.trig && merged.token) {
       map[agent] = merged;
       diag.override_keys.push(agent);
+      if (token) usedOverrideVars.add(tokenVar);
+      if (trig) usedOverrideVars.add(trigVar);
     }
   }
+  // A misspelt, unknown-agent or half-set override would otherwise be silently ignored —
+  // the very failure mode this override exists to make visible. Names only, never values.
+  diag.override_ignored = Object.keys(env)
+    .filter((k) => /^FIRE_ROUTINE_.+_(TOKEN|TRIG)$/.test(k) && (env[k] || "").trim() !== "" && !usedOverrideVars.has(k))
+    .sort();
   diag.mapped_keys = Object.keys(map);
   return { map, diag };
 }
@@ -251,7 +268,7 @@ export interface DispatchTickResult extends DispatchPlan {
 
 /**
  * One dispatch tick: plan the wake-list from the run-ledger, fire each woken
- * agent's Cloud Routine (active mode + FIRE_ROUTINES only), record fire-markers
+ * agent's Cloud Routine (active mode + a configured routine only), record fire-markers
  * for successful fires, and record a loop-dispatcher envelope IF anything fired.
  *
  * Extracted verbatim from the POST handler (dev-requests/2026-07-09-loop-dispatch-
@@ -388,7 +405,7 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
 }
 
 // POST /admin/loop-dispatch?mode=shadow|active
-//   Decides the wake-list; in active mode (and with FIRE_ROUTINES set) POSTs /fire
+//   Decides the wake-list; in active mode (and with a routine configured) POSTs /fire
 //   to each woken agent that has a routine. Records a loop-dispatcher envelope when
 //   anything fired. Thin wrapper over runDispatchTick() — same body the self-tick runs.
 router.post("/", async (req: Request, res: Response) => {
