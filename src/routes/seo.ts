@@ -6255,12 +6255,27 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
               }
             }
             // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times the
-            // profile was sent to an AI, split per AI in the tooltip.
+            // profile was sent to an AI, split per AI in the tooltip. Until the counting
+            // has run a full window the tile says «siden <dato>», and at 0 it shows the
+            // date the counting started instead of 0 (Daniel 2026-10-15).
             var d = s.aiDeliveries;
-            if (d && d.total > 0) {
+            var sinceMs = d && d.countingSince ? Date.parse(d.countingSince + "T00:00:00Z") : NaN;
+            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
+            var partial = !!sinceTxt && d.windowDays && (Date.now() - sinceMs) < (d.windowDays - 1) * 86400000;
+            // Shown with deliveries, or at 0 while the counting is younger than the window;
+            // a 0 over a full window stays hidden, as before.
+            if (d && (d.total > 0 || partial)) {
               var tile = document.querySelector('[data-stat="aiDeliveries"]');
               if (tile) {
-                tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
+                var meta = tile.querySelector(".pf-stat-meta");
+                if (d.total > 0) {
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
+                  if (partial && meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
+                } else {
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${JSON.stringify(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
+                  if (meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
+                }
+                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${JSON.stringify(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
                 tile.style.display = "flex";
                 var v = d.byVendor || {};
                 var vp = [];

@@ -23,6 +23,14 @@ export const AI_DELIVERY_WINDOW_DAYS = 60;
 export interface AiDeliveries {
   /** null = the whole period since the counting started. */
   windowDays: number | null;
+  /**
+   * First day ('YYYY-MM-DD', UTC) with any delivery in the vertical (all
+   * verticals without one), whatever the profile: when the counting started
+   * there. null = nothing counted yet. Shown as «fra/siden <dato>» so a new
+   * count is never read as a full 60 days, and a profile at 0 shows the date
+   * instead of 0 (Daniel 2026-10-15).
+   */
+  countingSince: string | null;
   total: number;
   byVendor: Record<AiDeliveryVendor, number>;
   byChannel: Record<AiDeliveryChannel, number>;
@@ -50,6 +58,7 @@ function firstDay(windowDays: number, nowMs: number): string {
 export function emptyAiDeliveries(windowDays: number | null): AiDeliveries {
   return {
     windowDays,
+    countingSince: null,
     total: 0,
     byVendor: { chatgpt: 0, claude: 0, perplexity: 0, other: 0, unknown: 0 },
     byChannel: { ai_page_list: 0, ai_page_profile: 0, mcp: 0, a2a: 0 },
@@ -66,6 +75,7 @@ export function computeAiDeliveries(
 ): AiDeliveries {
   const out = emptyAiDeliveries(windowDays);
   if (!tableExists(db)) return out;
+  out.countingSince = countingSince(db, vertical);
   const where = ["1 = 1"];
   const params: string[] = [];
   if (vertical !== undefined) { where.push("vertical_id = ?"); params.push(vertical); }
@@ -83,6 +93,14 @@ export function computeAiDeliveries(
     out.total += r.n;
   }
   return out;
+}
+
+/** First day with any delivery in the vertical (all verticals without one); null when none. Uses the (vertical_id, day) index. */
+function countingSince(db: Db, vertical: string | undefined): string | null {
+  const row = (vertical !== undefined
+    ? db.prepare("SELECT MIN(day) AS d FROM profile_ai_deliveries WHERE vertical_id = ?").get(vertical)
+    : db.prepare("SELECT MIN(day) AS d FROM profile_ai_deliveries").get()) as { d: string | null } | undefined;
+  return row?.d ?? null;
 }
 
 /** The profiles sent to AI assistants most often in the window. */

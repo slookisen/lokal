@@ -1192,7 +1192,10 @@
                 return '<tr><td>' + escHtml(labels[k]) + '</td><td>' + fmtNum((w[key] || {})[k]) + '</td><td>' + fmtNum((a[key] || {})[k]) + '</td></tr>';
             }).join("");
         }
-        var html = '<div style="margin-bottom:8px"><strong>' + fmtNum(w.total) + '</strong> ganger sendt til AI-en siste ' + fmtNum(d.windowDays) + ' dager · <strong>' + fmtNum(a.total) + '</strong> i hele perioden</div>';
+        var since = w.countingSince ? Date.parse(w.countingSince + "T00:00:00Z") : NaN;
+        var sinceTxt = isNaN(since) ? "" : new Date(since).toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+        var html = '<div style="margin-bottom:8px"><strong>' + fmtNum(w.total) + '</strong> ganger sendt til AI-en siste ' + fmtNum(d.windowDays) + ' dager · <strong>' + fmtNum(a.total) + '</strong> i hele perioden'
+            + (sinceTxt ? ' · tellingen startet ' + escHtml(sinceTxt) : '') + '</div>';
         html += '<table class="data-table"><thead><tr><th>Per AI / kanal</th><th>' + fmtNum(d.windowDays) + ' d</th><th>Hele perioden</th></tr></thead><tbody>'
             + split(VENDORS, "byVendor") + split(CHANNELS, "byChannel") + '</tbody></table>';
         var top = d.top || [];
