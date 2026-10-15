@@ -709,6 +709,12 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
         },
         "AC7 N3: e-mail / web addresses, > 6 words, > 60 chars and a trailing full stop are rejected even though they are on the page",
       );
+      const contactPage = "Gårdsbutikk hagvoll.no — Ring 99887766 eller Tlf: 998 87 766. Vi selger Helmelk 1 l og Ost 500 g.";
+      assertEq(
+        onPage(["hagvoll.no", "Ring 99887766", "Tlf: 998 87 766", "Helmelk 1 l", "Ost 500 g"], contactPage),
+        { kept: ["Helmelk 1 l", "Ost 500 g"], dropped: [], rejected: ["hagvoll.no", "Ring 99887766", "Tlf: 998 87 766"] },
+        "AC7 N3: a bare host name and phone numbers on the page are rejected; short quantities in product names are kept",
+      );
       assertEq(
         onPage(["Ost og smør", "Fire ord er nok her"], "Ost og smør. Fire ord er nok her."),
         { kept: ["Ost og smør", "Fire ord er nok her"], dropped: [], rejected: [] },

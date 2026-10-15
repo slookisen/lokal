@@ -2044,6 +2044,10 @@ function hcrNotProductShaped(name: string): boolean {
   return (
     name.length > HCR_PRODUCT_NAME_MAX_CHARS ||
     /@|:\/\/|www\./i.test(name) ||
+    // a bare host name ("hagvoll.no") or a phone number / long digit run
+    // ("Tlf: 99887766", "998 87 766") is contact data, never a product name
+    /[a-z0-9]\.[a-z]{2,}\b/i.test(name) ||
+    /\d(?:[\s.-]?\d){6,}/.test(name) ||
     name.split(" ").length > HCR_PRODUCT_NAME_MAX_WORDS ||
     /[.!?:;…]$/.test(name)
   );
