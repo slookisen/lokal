@@ -37,7 +37,7 @@ export function parseUserAgent(ua: string): UAParseResult {
     return { isBot: true, clientType: "chatgpt", clientName: "ChatGPT" };
   }
   if (lower.includes("chatgpt")) return { isBot: false, clientType: "chatgpt", clientName: "ChatGPT" };
-  if (lower.includes("claudebot") || lower.includes("claude-user") || lower.includes("claude-web") || lower.includes("anthropic-ai")) {
+  if (lower.includes("claudebot") || lower.includes("claude-searchbot") || lower.includes("claude-user") || lower.includes("claude-web") || lower.includes("anthropic-ai")) {
     return { isBot: true, clientType: "claude", clientName: "Claude" };
   }
   if (lower.includes("claude")) return { isBot: false, clientType: "claude", clientName: "Claude" };
@@ -157,7 +157,9 @@ function utmValues(v: string | string[] | null | undefined): string[] {
 
 function aiKeyFromUtmSource(v: string | string[] | null | undefined): string | null {
   // First whitelist hit wins, so an array classifies as AI regardless of order.
-  for (const val of utmValues(v)) for (const [token, key] of AI_UTM_SOURCES) if (val.includes(token)) return key;
+  // Exact value or the token as a domain prefix (perplexity.ai) — never a substring, so a producer's own
+  // campaign («claudes-gard», «geminifarm») is not counted as an AI click.
+  for (const val of utmValues(v)) for (const [token, key] of AI_UTM_SOURCES) if (val === token || val.startsWith(token + ".")) return key;
   return null;
 }
 

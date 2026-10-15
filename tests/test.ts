@@ -467,6 +467,7 @@ assertEq(classifyAssistant("ChatGPT").label, "ChatGPT", "assistant: ChatGPT clie
   assertEq(pua("Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)").isBot, true, "parseUserAgent: ChatGPT-User is a bot");
   assertEq(pua("Mozilla/5.0 (compatible; GPTBot/1.2)").isBot, true, "parseUserAgent: GPTBot is a bot");
   assertEq(pua("Mozilla/5.0 (compatible; ClaudeBot/1.0)").isBot, true, "parseUserAgent: ClaudeBot is a bot");
+  assertEq(pua("Claude-SearchBot/1.0").isBot, true, "parseUserAgent: Claude-SearchBot is a bot");
   assertEq(pua("Claude-User/1.0").isBot, true, "parseUserAgent: Claude-User is a bot");
   assertEq(pua("Mozilla/5.0 (iPhone) ChatGPT/1.2026 Safari").isBot, false, "parseUserAgent: app-browser UA with 'ChatGPT' is not a bot");
   assertEq(pua("Mozilla/5.0 (iPhone) Claude/1.0 Safari").isBot, false, "parseUserAgent: app-browser UA with 'Claude' is not a bot");
@@ -2724,6 +2725,9 @@ console.log("── human-visits strip: referral classification + aggregation �
     assertEq(classifyAiClickSource({ utm_source: "chatgpt.com" }), "chatgpt", "aiClick: utm_source=chatgpt.com");
     assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "chatgpt", "aiClick: array, first whitelist hit");
     assertEq(classifyAiClickSource({ utm_source: ["claude", "chatgpt.com"] }), "claude", "aiClick: array, reversed order is still AI");
+    assertEq(classifyAiClickSource({ utm_source: "claudes-gard" }), null, "aiClick: producer campaign containing claude is not AI");
+    assertEq(classifyAiClickSource({ utm_source: "geminifarm" }), null, "aiClick: geminifarm is not AI");
+    assertEq(classifyAiClickSource({ utm_source: "perplexity.ai" }), "perplexity", "aiClick: perplexity.ai prefix is AI");
     assertEq(classifyAiClickSource({ utm_campaign: "ai_search" }), "other", "aiClick: ai_search campaign alone → other");
     assertEq(classifyAiClickSource({ utm_source: "agentplatform.no" }), null, "aiClick: agentplatform.no is not AI");
     assertEq(classifyAiClickSource({ referrer: "https://sylteogrokt.no/", utm_source: "sommer" }), null, "aiClick: sylteogrokt.no is not AI");
