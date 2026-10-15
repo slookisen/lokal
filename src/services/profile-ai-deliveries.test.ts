@@ -30,6 +30,7 @@
  */
 
 import Database from "better-sqlite3";
+import * as vm from "vm";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as path from "path";
@@ -228,10 +229,23 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       assertTrue(human.body.includes("sendt til AI-en &middot; 60d"), "(d) tile meta «sendt til AI-en · 60d»");
       assertTrue(human.body.includes("Tallet viser ikke hvor mange som så den."), "(d) help text: it does not show how many saw it");
       assertTrue(human.body.includes("s.aiDeliveries"), "(d) the tile is filled from /api/agents/:id/stats aiDeliveries");
+      assertTrue(human.body.includes("d.total > 0 || d.countingSince"), "(d) the tile also shows at 0 once the counting has a start date");
+      assertTrue(human.body.includes('"Fra "') && human.body.includes('"sendt til AI-en · siden "'), "(d) at 0 it shows «Fra <dato>»; in the first window «siden <dato>»");
+      assertTrue(human.body.includes('"nb-NO"'), "(d) Norwegian date format on the Norwegian page");
       assertTrue(!human.body.includes("${"), "(d) rendered HTML has no literal ${");
       assertTrue(!/vist i ChatGPT/i.test(human.body), "(d) never «vist i ChatGPT»");
       const en = invoke("/produsent/:slug", "/en/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, lang: "en", ip: "198.51.100.21" });
       assertTrue(en.body.includes("In AI answers") && !en.body.includes("${"), "(d) English tile renders without ${");
+      assertTrue(en.body.includes('"Since "') && en.body.includes('"en-GB"'), "(d) English: «Since <date>», English date format");
+      // Every inline script on the page must compile: a "\n" written without the
+      // template-literal escape becomes a raw newline inside a JS string.
+      for (const [lang, body] of [["no", human.body], ["en", en.body]] as const) {
+        const scripts = [...body.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)]
+          .filter((m) => !/type="application\/(ld\+)?json"/.test(m[0]))
+          .map((m) => m[1]);
+        const broken = scripts.filter((code) => { try { new vm.Script(code); return false; } catch { return true; } });
+        assertEq(broken.length, 0, `(d) ${lang}: every inline script on the producer page compiles`);
+      }
     }
 
     // ── (e) MCP ────────────────────────────────────────────────────────
@@ -340,6 +354,16 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       assertEq(top.map((t) => `${t.profileId}:${t.total}`).join(","), "p-1:7,p-2:1", "(g) admin top list (60 d)");
       const topAll = compute.computeAiDeliveryTopProfiles(db as any, "rfb", null, now, 1);
       assertEq(topAll.map((t) => `${t.profileId}:${t.total}`).join(","), "p-1:11", "(g) admin top list (whole period, limit)");
+
+      // The start date of the counting (Daniel 2026-10-15: show «fra <dato>» instead of 0).
+      assertEq(s.aiDeliveries.countingSince, old, "(g) countingSince: the vertical's first day, also when the window leaves it out");
+      assertEq(compute.computeAiDeliveries(db as any, "rfb", "p-unseen", 60, now).countingSince, old, "(g) a profile with 0 deliveries still gets the vertical's start date");
+      assertEq(compute.computeAiDeliveries(db as any, "rfb", "p-unseen", 60, now).total, 0, "(g) …and total 0");
+      assertEq(compute.computeAiDeliveries(db as any, "dental", undefined, 60, now).countingSince, today, "(g) countingSince per vertical");
+      assertEq(compute.computeAiDeliveries(db as any, undefined, undefined, null, now).countingSince, old, "(g) countingSince across verticals");
+      assertEq(compute.computeAiDeliveries(db as any, "experiences", undefined, 60, now).countingSince, null, "(g) a vertical with no deliveries: countingSince null");
+      assertEq(o.aiDeliveries.window.countingSince, old, "(g) owner stats carry countingSince");
+      assertEq(compute.emptyAiDeliveries(60).countingSince, null, "(g) empty payload: countingSince null");
     }
 
     // ── (h) vendor buckets ─────────────────────────────────────────────
@@ -356,7 +380,9 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       const selger = fs.readFileSync(path.join(__dirname, "../public/selger.html"), "utf8");
       const admin = fs.readFileSync(path.join(__dirname, "../public/admin-dashboard.html"), "utf8");
       assertTrue(selger.includes("<h2>Med i AI-svar</h2>") && selger.includes("statsAiDeliveries"), "(i) selger.html has the «Med i AI-svar» card");
-      assertTrue(selger.includes("Sendt til AI-en (") && selger.includes("Sendt til AI-en (hele perioden)"), "(i) selger.html: 60 d and whole period");
+      assertTrue(selger.includes("Sendt til AI-en (") && selger.includes("'hele perioden'"), "(i) selger.html: 60 d and whole period");
+      assertTrue(selger.includes("'siden ' + dlSince") && selger.includes("'fra ' + dlSince"), "(i) selger.html: «siden <dato>» in the first window, whole period «fra <dato>»");
+      assertTrue(admin.includes("tellingen startet "), "(i) admin: shows when the counting started");
       assertTrue(selger.includes("statsAiDeliveriesVendor") && selger.includes("statsAiDeliveriesChannel"), "(i) selger.html: per AI and per channel");
       assertTrue(selger.includes("ikke hvor mange som s&aring; den"), "(i) selger.html help text: not how many saw it");
       assertTrue(selger.includes("Oppdaget (gammel livstidsteller)"), "(i) selger.html marks «Oppdaget» as the old lifetime counter");

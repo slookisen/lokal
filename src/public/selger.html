@@ -1966,16 +1966,22 @@
       var dw = dl.window || {};
       var da = dl.allTime || {};
       var dwDays = dw.windowDays || 60;
+      // Counting started on dw.countingSince: until a full window has passed the label
+      // says «siden <dato>», and the whole period «fra <dato>» (Daniel 2026-10-15).
+      var dlSinceMs = dw.countingSince ? Date.parse(dw.countingSince + 'T00:00:00Z') : NaN;
+      var dlSince = isNaN(dlSinceMs) ? '' : new Date(dlSinceMs).toLocaleDateString('nb-NO', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+      var dlPartial = !!dlSince && (Date.now() - dlSinceMs) < (dwDays - 1) * 86400000;
+      var dlWinLabel = dlPartial ? 'siden ' + dlSince : dwDays + 'd';
       var dlHtml = '';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + dwDays + 'd)</div></div>';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Sendt til AI-en (hele perioden)</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + dlWinLabel + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + (dlSince ? 'fra ' + dlSince : 'hele perioden') + ')</div></div>';
       document.getElementById('statsAiDeliveries').innerHTML = dlHtml;
       var DL_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Andre AI', unknown: 'Ukjent AI' };
       var DL_CHANNEL_LABELS = { ai_page_list: 'Liste- og s&oslash;kesider', ai_page_profile: 'Profilsiden', mcp: 'MCP', a2a: 'A2A' };
       function dlRows(labels, w, a) {
         w = w || {}; a = a || {};
         return Object.keys(labels).map(function(k) {
-          return '<li class="product-item"><span class="product-name">' + labels[k] + '</span><span class="product-meta">' + (w[k] || 0) + ' (' + dwDays + 'd) &middot; ' + (a[k] || 0) + ' totalt</span></li>';
+          return '<li class="product-item"><span class="product-name">' + labels[k] + '</span><span class="product-meta">' + (w[k] || 0) + ' (' + dlWinLabel + ') &middot; ' + (a[k] || 0) + ' totalt</span></li>';
         }).join('');
       }
       document.getElementById('statsAiDeliveriesVendor').innerHTML = dlRows(DL_VENDOR_LABELS, dw.byVendor, da.byVendor);
