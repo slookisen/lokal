@@ -166,6 +166,19 @@ function phoneDigits(s: string): string {
 }
 
 /**
+ * Digits of a quote with every international Swedish prefix inside it turned
+ * into the national 0, so "Ring +46 (0)31-123 45 67" carries 0311234567. The
+ * value side only sees a lone number, but a quote is running text where the
+ * +46 sits mid-sentence (run 2026-10-14: 4 of 13 refusals were this).
+ */
+export function quotePhoneDigits(s: string): string {
+  // "00" only counts as the international prefix when no digit stands right before
+  // it: "031-12 00 46" and "kl 9.00 46 …" are national digits and a time, not +46
+  // (review 2026-10-15, B1).
+  return s.replace(/(?:\+|(?<!\d[\s.,:-]?)\b00)\s*46[\s-]*(?:\(\s*0\s*\)[\s-]*)?/g, "0").replace(/\D/g, "");
+}
+
+/**
  * Replaces personnummer-shaped numbers in raw page text before it is stored.
  * `keepDigits` exempts the declared business phone: about one Swedish phone
  * number in a hundred has the date+Luhn shape, and redacting it would break the
@@ -303,7 +316,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
     } else {
       const d = phoneDigits(v);
       if (!SWEDISH_PHONE_RE.test(d)) errors.push("bad_value:business_phone");
-      else if (!own.some((s) => phoneDigits(s.quote || "").includes(d))) errors.push("business_phone_not_in_quote");
+      else if (!own.some((s) => phoneDigits(s.quote || "").includes(d) || quotePhoneDigits(s.quote || "").includes(d))) errors.push("business_phone_not_in_quote");
     }
   }
   if (fields.visit_address) {

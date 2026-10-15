@@ -15,6 +15,8 @@ export const JUDGE_LEASE_MS = 2 * 60 * 60 * 1000;
 export const EXCERPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_ATTEMPTS = 3;
 export const MAX_LEASE = 25;
+/** One excerpt holds the paragraphs the fields come from, not a whole page (run 2026-10-14: whole pages carried owners' names). */
+export const MAX_EXCERPT_CHARS = 3000;
 export const QUALITY_WINDOW = 50;
 export const QUALITY_MIN_N = 20;
 export const QUALITY_MAX_ENTITY_MISMATCH = 0.1;
@@ -97,7 +99,12 @@ function unitView(u: UnitRow) {
 
 export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number; exhausted: number; stale_drafts: number } {
   const t = iso(now);
-  const excerpts = db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes;
+  // Excerpts exist only for drafts waiting for a judge: expired ones go, and so do any left
+  // behind by an older version or an edge path (review 2026-10-15, B2: the pre-change
+  // excerpts of 2026-10-13/14 would otherwise sit for 30 days).
+  const excerpts =
+    db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes +
+    db.prepare("DELETE FROM excerpts WHERE candidate_id NOT IN (SELECT candidate_id FROM drafts WHERE status = 'awaiting_judge')").run().changes;
   const leases = db
     .prepare("UPDATE candidates SET status = 'new', lease_run_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE status = 'leased' AND lease_expires_at < ?")
     .run(t, t).changes;
@@ -250,7 +257,8 @@ export function submitDraft(
     if (!excerptHostAllowed(host, websiteHost)) throw new HttpError(400, "excerpt_host_not_allowed", { host });
     perHost.set(host, (perHost.get(host) || 0) + 1);
     if ((perHost.get(host) as number) > 4) throw new HttpError(400, "more_than_4_pages_from_one_site", { host });
-    const r = redactExcerpt(e.text.slice(0, 8000), declaredPhoneDigits(fields));
+    if (e.text.length > MAX_EXCERPT_CHARS) throw new HttpError(400, "excerpt_too_long", { host, max_chars: MAX_EXCERPT_CHARS });
+    const r = redactExcerpt(e.text, declaredPhoneDigits(fields));
     redacted += r.redacted;
     // fetched_at is set by the server: a client value is free text that could
     // carry anything (review 2026-10-13).
@@ -375,7 +383,11 @@ export function submitVerdict(
     throw new HttpError(400, "approve_inconsistent_with_checks");
   }
   const status = verdict === "approve" ? "approved" : verdict === "reject" ? "rejected" : "needs_review";
-  db.transaction(() => {
+  // Once judged, the page excerpts have done their job. They are the one place
+  // in this base where page text (and so owners' names) can sit, so they go now
+  // instead of waiting out the 30-day TTL (run 2026-10-14, Daniel's choice
+  // 2026-10-15). A human review re-reads the live page.
+  const excerptsDeleted = db.transaction(() => {
     db.prepare(
       `INSERT INTO verdicts (draft_id, judge_run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, excerpt_verified, field_results_json, reasons, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -394,13 +406,14 @@ export function submitVerdict(
     );
     db.prepare("UPDATE drafts SET status = 'judged', judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE draft_id = ?").run(draftId);
     db.prepare("UPDATE candidates SET status = ?, status_reason = ?, updated_at = ? WHERE candidate_id = ?").run(status, `judge:${verdict}`, t, d.candidate_id);
+    return db.prepare("DELETE FROM excerpts WHERE candidate_id = ?").run(d.candidate_id).changes;
   })();
 
   const quality = qualityWindow(db);
   if (quality.n >= QUALITY_MIN_N && quality.entity_mismatch_rate > QUALITY_MAX_ENTITY_MISMATCH) {
     pause(db, `quality: entity mismatch ${(quality.entity_mismatch_rate * 100).toFixed(1)} % over the last ${quality.n} verdicts`, now);
   }
-  return { draft_id: draftId, candidate_status: status, quality, paused: pausedState(db) };
+  return { draft_id: draftId, candidate_status: status, excerpts_deleted: excerptsDeleted, quality, paused: pausedState(db) };
 }
 
 export function qualityWindow(db: DB) {
@@ -428,6 +441,7 @@ export function stats(db: DB) {
   const outcomes = db.prepare("SELECT outcome, COUNT(*) AS n FROM outcomes GROUP BY outcome").all() as Array<{ outcome: string; n: number }>;
   const units = (db.prepare("SELECT COUNT(*) AS n FROM register_units WHERE country = 'se' AND active = 1").get() as { n: number }).n;
   const awaitingJudge = (db.prepare("SELECT COUNT(*) AS n FROM drafts WHERE status = 'awaiting_judge'").get() as { n: number }).n;
+  const excerptsStored = (db.prepare("SELECT COUNT(*) AS n FROM excerpts").get() as { n: number }).n;
   const counties: Record<string, Record<string, number>> = {};
   for (const r of byCounty) (counties[r.county] ||= {})[r.status] = r.n;
   return {
@@ -436,21 +450,33 @@ export function stats(db: DB) {
     candidates_by_county: counties,
     build_outcomes: Object.fromEntries(outcomes.map((r) => [r.outcome, r.n])),
     drafts_awaiting_judge: awaitingJudge,
+    excerpts_stored: excerptsStored,
     quality_last_verdicts: qualityWindow(db),
     paused: pausedState(db),
   };
 }
 
-/** Random approved profiles with their fields, for a human spot check (DPIA T3). */
-export function sample(db: DB, n: number) {
+/**
+ * Random approved profiles with their fields, for a human spot check (DPIA T3).
+ * `since` (ISO time) limits it to profiles approved after that moment, so the
+ * morning check can sample last night's work.
+ */
+export function sample(db: DB, n: number, since?: unknown) {
+  let after = "";
+  if (since !== undefined && since !== "") {
+    if (typeof since !== "string" || Number.isNaN(Date.parse(since))) throw new HttpError(400, "bad_since");
+    after = new Date(since).toISOString();
+  }
   const rows = db
     .prepare(
       `SELECT c.candidate_id, d.draft_id, d.fields_json, u.* FROM candidates c
        JOIN drafts d ON d.candidate_id = c.candidate_id AND d.status = 'judged'
        JOIN register_units u ON u.unit_id = c.candidate_id
-       WHERE c.status = 'approved' ORDER BY RANDOM() LIMIT ?`,
+       WHERE c.status = 'approved'
+         AND EXISTS (SELECT 1 FROM verdicts v WHERE v.draft_id = d.draft_id AND v.verdict = 'approve' AND v.created_at > ?)
+       ORDER BY RANDOM() LIMIT ?`,
     )
-    .all(Math.max(1, Math.min(25, n))) as Array<UnitRow & { candidate_id: string; draft_id: number; fields_json: string }>;
+    .all(after, Math.max(1, Math.min(25, n))) as Array<UnitRow & { candidate_id: string; draft_id: number; fields_json: string }>;
   return rows.map((r) => ({ candidate_id: r.candidate_id, draft_id: r.draft_id, unit: unitView(r), fields: JSON.parse(r.fields_json) }));
 }
 
