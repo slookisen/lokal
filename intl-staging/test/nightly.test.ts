@@ -267,3 +267,20 @@ test("an import that retires a unit drops the excerpts of its superseded draft",
   assert.equal((db.prepare("SELECT status FROM drafts WHERE candidate_id = ?").get(CID) as any).status, "superseded");
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM excerpts WHERE candidate_id = ?").get(CID) as any).n, 0);
 });
+
+test("purge drops excerpts that no waiting draft needs (left by an older version)", async () => {
+  const { app, db } = await seeded();
+  await withServer(app, async (base) => {
+    await call(base, "POST", "/candidates/lease", { run_id: "build-n10", n: 5 });
+    assert.equal((await call(base, "POST", `/candidates/${encodeURIComponent(CID)}/draft`, draft("build-n10"))).status, 200);
+  });
+  // An orphan, as an older version would have left after a verdict.
+  db.prepare("INSERT INTO excerpts (candidate_id, url, text, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?)").run(
+    CID2, PAGE2, PAGE2_TEXT, "2026-10-14T09:00:00.000Z", "2026-11-13T09:00:00.000Z",
+  );
+  await withServer(app, async (base) => {
+    assert.equal((await call(base, "POST", "/purge")).status, 200);
+  });
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM excerpts WHERE candidate_id = ?").get(CID2) as any).n, 0, "orphan dropped");
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM excerpts WHERE candidate_id = ?").get(CID) as any).n, 1, "waiting draft keeps its excerpts");
+});

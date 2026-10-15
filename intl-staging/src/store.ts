@@ -99,7 +99,12 @@ function unitView(u: UnitRow) {
 
 export function purge(db: DB, now: Date): { excerpts_deleted: number; leases_released: number; judge_leases_released: number; exhausted: number; stale_drafts: number } {
   const t = iso(now);
-  const excerpts = db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes;
+  // Excerpts exist only for drafts waiting for a judge: expired ones go, and so do any left
+  // behind by an older version or an edge path (review 2026-10-15, B2: the pre-change
+  // excerpts of 2026-10-13/14 would otherwise sit for 30 days).
+  const excerpts =
+    db.prepare("DELETE FROM excerpts WHERE expires_at < ?").run(t).changes +
+    db.prepare("DELETE FROM excerpts WHERE candidate_id NOT IN (SELECT candidate_id FROM drafts WHERE status = 'awaiting_judge')").run().changes;
   const leases = db
     .prepare("UPDATE candidates SET status = 'new', lease_run_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE status = 'leased' AND lease_expires_at < ?")
     .run(t, t).changes;
