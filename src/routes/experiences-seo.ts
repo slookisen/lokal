@@ -33,6 +33,8 @@ import * as QRCode from "qrcode";
 import * as fs from "fs";
 import * as path from "path";
 import { analyticsService } from "../services/analytics-service";
+import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
@@ -3658,6 +3660,7 @@ ${oaSiteNav({ lang, path: noPath, switcher: switcherOn })}
     ${place ? `<p class="place"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>${escapeHtml(place)}</p>` : ""}
     <div class="badges">${badges.join("")}</div>
   </header>
+  ${aiDeliveriesTileFor("experiences", exp.id)}
   <div class="layout">
     <article>
       ${heroMedia}
@@ -4658,6 +4661,7 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -5257,7 +5261,7 @@ function gardssalgCardTitleAndSted(p: GardssalgProviderRow): { title: string; st
   return { title: navn, sted: dbSted };
 }
 
-function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: number }): string | null {
+function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: number; ids?: string[] }): string | null {
   const typeSlug = opts.typeSlug ?? null;
   const typeDef = typeSlug ? GARDSSALG_TYPE_PAGES[typeSlug] : undefined;
   if (typeSlug && !typeDef) return null; // unknown slug — caller next()s
@@ -5266,6 +5270,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   const PAGE_SIZE = 24;
   const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE, typeFilter);
   const total = countGardssalgProviders(typeFilter);
+  opts.ids?.push(...providers.map((p) => p.id)); // «Med i AI-svar»: the producers on this page
   // Empty type → null (caller next()s to the 404): a zero-provider type page
   // must never be a live, indexable thin page. The BASE catalog deliberately
   // keeps its pre-S3 zero-state render (kg-zero in tests/test.ts).
@@ -5501,9 +5506,11 @@ ${oaSiteFooter({})}
 
 router.get("/kategori/gardssalg", (req: Request, res: Response) => {
   // Base catalog never returns null (no typeSlug → neither null path applies).
-  const html = renderGardssalgCatalogPage({ page: parsePage(req.query.page) }) as string;
+  const ids: string[] = [];
+  const html = renderGardssalgCatalogPage({ page: parsePage(req.query.page), ids }) as string;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", ids, "experiences");
   res.send(html);
 });
 
@@ -5529,10 +5536,12 @@ router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: 
     return;
   }
   if (!Object.hasOwn(GARDSSALG_TYPE_PAGES, raw)) return next();
-  const html = renderGardssalgCatalogPage({ typeSlug: raw, page: parsePage(req.query.page) });
+  const ids: string[] = [];
+  const html = renderGardssalgCatalogPage({ typeSlug: raw, page: parsePage(req.query.page), ids });
   if (html === null) return next(); // empty type — 404-guarded, never a thin page
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", ids, "experiences");
   res.send(html);
 });
 
@@ -5988,6 +5997,7 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
   <nav class="breadcrumb" aria-label="${L.crumbsGs}">
     <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a> · <a href="/kategori/gardssalg">${L.gsCrumb}</a> · ${escapeHtml(provider.navn)}
   </nav>
+  ${aiDeliveriesTileFor("experiences", String(provider.id))}
   <div class="produsent-layout">
     <article>
       <div class="info-card">
@@ -6070,6 +6080,7 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=300");
+    recordAiPageDelivery(req, res, "ai_page_profile", [String(provider.id)], "experiences");
     res.send(html);
   },
 );
@@ -7533,6 +7544,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -7704,6 +7716,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", effectiveRows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -7829,6 +7842,7 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", effectiveRows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -7954,6 +7968,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -8081,6 +8096,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -8183,6 +8199,7 @@ function toNearbyCardRows(nearby: ReturnType<typeof discoverExperiences>): {
     if (!e.slug) continue;
     distanceMap.set(e.slug, { distance_km: e.distance_km ?? null, geo_precision: e.geo_precision ?? null });
     rows.push({
+      id: e.id,
       slug: e.slug,
       title: e.title,
       title_no: e.title_no ?? null,
@@ -8708,6 +8725,7 @@ ${oaSiteFooter({})}
 </body>
 </html>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", [...rows.map((r) => r.id), ...producerRows.map((r) => r.id)].filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
 
@@ -8752,6 +8770,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  recordAiPageDelivery(req, res, "ai_page_profile", [exp.id], "experiences");
   res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang));
 });
 

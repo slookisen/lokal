@@ -42507,6 +42507,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-med-i-ai-svar-per-profil, S2: the same counting for
+  // finn-tannlege and opplevagent (incl. gårdssalg). Swaps getDb() and the
+  // dental / experiences db handles (restored in finally), so serial.
+  console.log("\n── Med i AI-svar S2: dental and experiences ──");
+  try {
+    const { runProfileAiDeliveriesS2Tests } = require("../src/services/profile-ai-deliveries-s2.test") as
+      typeof import("../src/services/profile-ai-deliveries-s2.test");
+    const r = await runProfileAiDeliveriesS2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-deliveries-s2: " + f);
+    console.log(`  profile-ai-deliveries-s2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-deliveries-s2: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-deliveries-s2: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and

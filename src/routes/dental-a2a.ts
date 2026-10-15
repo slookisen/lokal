@@ -34,6 +34,7 @@ import { dentalLimiter } from "../middleware/security";
 import { buildRequestMeta, isInternalTraffic } from "../services/conversation-service";
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
+import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 
 const router = Router();
 
@@ -196,6 +197,22 @@ function a2aRequestCountable(req: Request, params: unknown, result: object): boo
     askedSomething: dentalAskedSomething(result),
     response: result,
   });
+}
+
+/** Clinic ids in a message/send answer (the search list or the single clinic). */
+export function dentalAnswerProfileIds(answer: unknown): string[] {
+  const ids: string[] = [];
+  const artifacts = (answer as any)?.result?.artifacts;
+  if (!Array.isArray(artifacts)) return ids;
+  for (const a of artifacts) {
+    for (const part of Array.isArray(a?.parts) ? a.parts : []) {
+      const d = part?.data;
+      if (!d || typeof d !== "object") continue;
+      if (Array.isArray(d.clinics)) for (const c of d.clinics) if (typeof c?.id === "string") ids.push(c.id);
+      if (a.name === "dental-clinic" && typeof d.id === "string") ids.push(d.id);
+    }
+  }
+  return ids;
 }
 
 // ─── message/send handler (exported for unit tests) ──────────
@@ -377,6 +394,8 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "message/send": {
         const result = handleDentalMessageSend(params, id);
         (res.locals ||= {}).a2aCountable = a2aRequestCountable(req, params, result);
+        // «Med i AI-svar»: the clinics in a countable answer, once per profile.
+        recordA2aDelivery(req, res, dentalAnswerProfileIds(result), JSON.stringify(params ?? null), "dental");
         res.json(result);
         break;
       }

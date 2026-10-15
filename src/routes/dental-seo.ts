@@ -21,6 +21,8 @@ import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
@@ -1225,6 +1227,7 @@ router.get("/sok", (req: Request, res: Response) => {
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: q ? `${escapeHtml(q)} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
     description: `Søk blant ${total} tannlegeklinikker i Norge. Filtrer på Helfo-avtale, spesialitet og fylke.`,
@@ -1603,6 +1606,7 @@ function renderClinicProfile(
     </div>
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
+    ${aiDeliveriesTileFor("dental", agent.id)}
     ${inactiveNotice}
     ${thinProfileCta}
     ${omOssSection}
@@ -1619,6 +1623,7 @@ function renderClinicProfile(
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_profile", [agent.id], "dental");
   res.send(dentalShell(html, {
     title: `${profileTitleCore} | Finn-tannlege.com`,
     description: metaDesc,
@@ -1750,6 +1755,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: `Tannleger i ${escapeHtml(matchedFylke.fylke)} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
@@ -2435,6 +2441,7 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   ]);
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: `${displayNavn} — Tannlegespesialister i Norge | Finn-tannlege.com`,
     description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.`,
@@ -2533,6 +2540,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: `Tannlege i ${escapeHtml(titledSted)} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,

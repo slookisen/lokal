@@ -590,6 +590,14 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
             el.innerHTML =
               '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.humanViews + '</div><div class="gc-stat-label">Sidevisninger fra mennesker (' + j.stats.windowDays + ' dager)</div></div>' +
               '<div class="gc-stat" title="Ganger en AI-assistent (ChatGPT, Claude, Perplexity …) hentet siden din for noen som spurte"><div class="gc-stat-num">' + j.stats.aiSearchViews + '</div><div class="gc-stat-label">AI-søk (' + j.stats.windowDays + ' dager)</div></div>';
+            // «Med i AI-svar»: sent to the AI, not seen by a person; a minimum.
+            var dl = j.stats.aiDeliveries;
+            if (dl && dl.window && dl.allTime) {
+              var dlTip = "Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål. Tallet viser ikke hvor mange som så den.";
+              el.innerHTML +=
+                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.window.total + '</div><div class="gc-stat-label">Med i AI-svar, sendt til AI-en (' + dl.window.windowDays + ' dager)</div></div>' +
+                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.allTime.total + '</div><div class="gc-stat-label">Med i AI-svar, sendt til AI-en (hele perioden)</div></div>';
+            }
             if (note && j.stats.notAvailable && j.stats.notAvailable.length) {
               note.textContent = "Ikke tilgjengelig ennå: " + j.stats.notAvailable.join(", ") + ".";
             }
@@ -760,7 +768,7 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", (req: Request, 
   if (!provider) return res.status(404).json({ success: false, error: "provider_not_found" });
 
   const path = `/kategori/gardssalg/produsent/${provider.slug || ""}`;
-  const stats = getGardssalgOwnerStats(path);
+  const stats = getGardssalgOwnerStats(path, providerId);
   res.setHeader("Cache-Control", "private, max-age=60");
   return res.json({ success: true, stats });
 });

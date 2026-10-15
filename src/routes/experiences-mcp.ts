@@ -138,6 +138,7 @@ import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-wid
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
+import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 
 const router = Router();
 
@@ -669,6 +670,22 @@ export function registerExperienceTools(
   getClientIdentity?: () => string | undefined,
   getRequestMeta?: () => RequestMeta | undefined,
 ): void {
+  // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the
+  // experiences / gårdssalg producers a data tool hands the caller, counted
+  // with the same rules as rfb (profile-ai-deliveries.ts recordMcpDelivery).
+  type ToolExtra = { sessionId?: string; requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
+  const deliver = (tool: string, args: unknown, extra: ToolExtra, profileIds: string[]) => {
+    recordMcpDelivery({
+      vertical: "experiences",
+      tool,
+      args,
+      profileIds,
+      clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+      headers: extra?.requestInfo?.headers,
+      sessionId: extra?.sessionId,
+    });
+  };
+
   // Tool 1: discover_experiences
   server.registerTool(
     "discover_experiences",
@@ -711,7 +728,7 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Found experiences",
       },
     },
-    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }) => {
+    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -827,6 +844,7 @@ export function registerExperienceTools(
           });
         } catch { /* fail-open: never affects the tool result */ }
 
+        deliver("discover_experiences", filter, extra, results.map((e) => e.id));
         // structuredContent is what the experiences-list widget reads
         // (window.openai.toolOutput); the text block keeps the same JSON for
         // MCP clients without widget support.
@@ -971,7 +989,7 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Loaded experience",
       },
     },
-    async ({ id }) => {
+    async ({ id }, extra) => {
       try {
         // Publish-gated read (see the import comment above): a row failing
         // the publish gate returns the exact same not-found result as a
@@ -1028,6 +1046,7 @@ export function registerExperienceTools(
           });
         } catch { /* fail-open: never affects the tool result */ }
 
+        deliver("get_experience", { id }, extra, [experience.id]);
         // structuredContent feeds the experience-detail widget; see discover_experiences.
         return {
           structuredContent: result,
@@ -1087,7 +1106,7 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }) => {
+    async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
       try {
         const foreign = outsideNorwayPlace({ fylke, kommune, query, lat, lng });
         if (foreign) return outsideNorwayResult(foreign, "gardssalg_producers", { fylke, kommune, query });
@@ -1169,6 +1188,7 @@ export function registerExperienceTools(
           });
         } catch { /* fail-open: never affects the tool result */ }
 
+        deliver("discover_gardssalg", filter, extra, results.map((row) => row.id));
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };

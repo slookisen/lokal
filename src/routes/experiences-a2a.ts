@@ -54,6 +54,7 @@ import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, isInternalTraffic, type RequestMeta } from "../services/conversation-service";
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
+import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -765,6 +766,24 @@ export function handleExperiencesMessageSend(
   }
 }
 
+/** Experience and gårdssalg ids in a message/send answer (discover lists or the single experience). */
+export function experiencesAnswerProfileIds(answer: unknown): string[] {
+  const ids: string[] = [];
+  const artifacts = (answer as any)?.result?.artifacts;
+  if (!Array.isArray(artifacts)) return ids;
+  for (const a of artifacts) {
+    for (const part of Array.isArray(a?.parts) ? a.parts : []) {
+      const d = part?.data;
+      if (!d || typeof d !== "object") continue;
+      for (const list of [d.experiences, d.producers]) {
+        if (Array.isArray(list)) for (const x of list) if (typeof x?.id === "string") ids.push(x.id);
+      }
+      if (a.name === "experience" && typeof d.id === "string") ids.push(d.id);
+    }
+  }
+  return ids;
+}
+
 // ─── Apply jsonRpcLimiter to /a2a on this router ──────────────
 // See module docstring for why this is done here rather than in index.ts.
 router.use(jsonRpcLimiter);
@@ -799,6 +818,8 @@ router.post("/a2a", (req: Request, res: Response) => {
         const requestMeta = buildRequestMeta(req);
         const result = handleExperiencesMessageSend(params, id, { requestMeta });
         (res.locals ||= {}).a2aCountable = a2aRequestCountable(hashIP(req.ip || "unknown"), requestMeta, params, result);
+        // «Med i AI-svar»: the experiences / producers in a countable answer, once per profile.
+        recordA2aDelivery(req, res, experiencesAnswerProfileIds(result), JSON.stringify(params ?? null), "experiences");
         res.json(result);
         break;
       }
