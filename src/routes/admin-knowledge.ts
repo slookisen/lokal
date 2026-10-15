@@ -87,7 +87,7 @@
 //     (A2A repo) — SKILL update that makes use of this endpoint.
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, isOwnPlatformHomepage } from "../database/init";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423 with
@@ -97,7 +97,11 @@ import {
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
   enrichmentWritePauseBlockForAgents,
 } from "../services/enrichment-write-pause";
-import { isDirectoryOrAggregatorHost, categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
+import {
+  isDirectoryOrAggregatorHost,
+  categoriesLackWebsiteCorroboration,
+  hostFromUrlLike,
+} from "../services/cross-source-validator";
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
 // see the truncation-sweep router at the bottom of this file.
@@ -115,6 +119,7 @@ import {
   mapToPlatformCategories,
   meetsAboutQualityBar,
   pageLooksLikeThemeSpam,
+  PLATFORM_CATEGORIES,
 } from "../services/search-enrich";
 import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
 // dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
@@ -1803,7 +1808,7 @@ async function hcrFetchHtml(url: string, io?: HcrFetchIo): Promise<string | null
  * null only if the primary homepage cannot be fetched.
  */
 type HcrFetchOutcome =
-  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
+  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string; finalUrl: string }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
 async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Promise<HcrFetchOutcome> {
@@ -1832,7 +1837,7 @@ async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Pr
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, finalUrl: primary.finalUrl || fetchUrl };
 }
 
 type HcrTargetRow = {
@@ -1848,6 +1853,8 @@ type HcrFieldWrite = {
   onAgents: boolean;
   /** Provenance record only — the column itself is left as stored (categoriesCorroborateOnly). */
   provenanceOnly?: boolean;
+  /** source_url for this candidate's provenance record; default the requested homepage URL. */
+  sourceUrl?: string;
 };
 
 /**
@@ -1937,9 +1944,16 @@ export interface HomepageContentRefreshOptions {
    *     `changed[].fields`;
    *   - otherwise nothing is written for categories, reported in
    *     `skipped_unsubstantiated` with a reason starting with
-   *     HCR_CATEGORIES_NOT_SUPPORTED — also when the page's about summary was
-   *     rejected as theme spam, or field_provenance.website_ownership is
-   *     "unverified" (a wrong-entity site never corroborates anything).
+   *     HCR_CATEGORIES_NOT_SUPPORTED. Refused outright (same reason prefix,
+   *     the cause in brackets): a homepage — requested or final after a
+   *     redirect — on a directory/social/aggregator host or on our own
+   *     platform domain, unreadable field_provenance, website_ownership
+   *     "unverified" (wrong-entity site), an about summary rejected as theme
+   *     spam, and a stored category that maps to no platform category.
+   * Stored values are compared lower-cased and mapped to platform keys
+   * (berries → fruit, bread → bakery) for the comparison only; the stored
+   * list itself is never rewritten. The provenance source_url is the final
+   * URL after redirects.
    * Empty/malformed or already corroborated stored categories: unchanged
    * behaviour. Every other field and guard is unchanged.
    */
@@ -1951,14 +1965,61 @@ export const HCR_CATEGORIES_CORROBORATED = "categories_corroborated";
 /** `skipped_unsubstantiated` reason prefix: a stored category the homepage does not support. */
 export const HCR_CATEGORIES_NOT_SUPPORTED = "categories_not_supported_by_homepage";
 
-/** field_provenance.website_ownership.status === "unverified" (wrong-entity site); junk → false. */
-function hcrWebsiteOwnershipUnverified(fieldProvenanceJson: string | null | undefined): boolean {
+/**
+ * categoriesCorroborateOnly: why field_provenance rules out corroboration —
+ * website_ownership "unverified" (wrong-entity site), or a column that cannot
+ * be read (fail closed: a provenance write would otherwise replace the junk
+ * wholesale). Absent column (no knowledge row yet) → null.
+ */
+function hcrProvenanceCorroborationRefusal(fieldProvenanceJson: string | null | undefined): string | null {
+  if (fieldProvenanceJson === null || fieldProvenanceJson === undefined) return null;
+  let parsed: unknown;
   try {
-    const wo = fieldProvenanceJson ? JSON.parse(fieldProvenanceJson)?.website_ownership : null;
-    return !!wo && typeof wo === "object" && wo.status === "unverified";
+    parsed = JSON.parse(fieldProvenanceJson);
   } catch {
-    return false;
+    return "unreadable field_provenance";
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unreadable field_provenance";
+  const wo = (parsed as Record<string, unknown>).website_ownership;
+  return !!wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified"
+    ? "website ownership unverified"
+    : null;
+}
+
+/**
+ * categoriesCorroborateOnly: why a homepage URL may never corroborate
+ * anything — our own platform domain (isOwnPlatformHomepage, the pool view's
+ * rule), or a directory/social/aggregator host: the cross-source list
+ * (isDirectoryOrAggregatorHost) plus the website-discovery exclusion R6 uses
+ * (rfbWebsiteHostExclusionReason: social, directory and known-hijacked hosts).
+ * An unparseable host fails closed.
+ */
+function hcrCorroborationHostRefusal(url: string): string | null {
+  if (isOwnPlatformHomepage({ website: url })) return "own platform domain";
+  const host = hostFromUrlLike(url);
+  if (!host) return "directory/social host";
+  if (isDirectoryOrAggregatorHost(host)) return "directory/social host";
+  // Lazy: admin-rfb-website-discovery imports this module (mergeFieldProvenance),
+  // so a top-level import would be circular. Same idiom as productsAreGenericCategoryNames.
+  const wd = require("./admin-rfb-website-discovery") as typeof import("./admin-rfb-website-discovery");
+  if (wd.rfbWebsiteHostExclusionReason(host)) return "directory/social host";
+  return null;
+}
+
+/**
+ * A stored category value as the platform key it stands for, for the
+ * corroboration comparison only: lower-cased; a platform key stays itself
+ * ("other" excepted — the extraction never infers it); otherwise the
+ * extraction's own product-key mapping (berries → fruit, bread → bakery).
+ * null = maps to nothing the page could ever show.
+ */
+function hcrStoredCategoryPlatformKey(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const k = v.trim().toLowerCase();
+  if (!k || k === "other") return null;
+  if (PLATFORM_CATEGORIES.includes(k)) return k;
+  const mapped = mapToPlatformCategories([k]);
+  return mapped.length === 1 ? mapped[0]! : null;
 }
 
 /**
@@ -2258,7 +2319,7 @@ export async function refreshHomepageContent(
       return;
     }
     if (!dryRun) recordHcrFetchSuccess(agentId);
-    const { primaryHtml, combinedHtml, fetchUrl } = fetched;
+    const { primaryHtml, combinedHtml, fetchUrl, finalUrl } = fetched;
     // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
     // beskrivelser: THIS loop is the path that wrote the live casino copy
     // (provenance last_verified 2026-09-11..16 on all four hijacked
@@ -2373,36 +2434,48 @@ export async function refreshHomepageContent(
       const stored = hcrStoredCategoryList(cur?.categories);
       if (stored && categoriesLackWebsiteCorroboration(cur?.categories, cur?.field_provenance)) {
         corroborateStored = stored;
-        // A page whose summary reads as gambling copy (hijacked/lapsed domain)
-        // or a wrong-entity site is no source for anyone's categories.
-        if (skippedUnsubstantiated.some((s) => s.agent_id === agentId && s.reason === HCR_THEME_SPAM_CANDIDATE_REASON)) {
-          corroborateRefusal = "homepage summary reads as theme spam";
-        } else if (hcrWebsiteOwnershipUnverified(cur?.field_provenance)) {
-          corroborateRefusal = "website ownership unverified";
-        }
+        // Only the producer's OWN site may corroborate (requested URL and the
+        // final one after redirects), never a wrong-entity or unreadable
+        // record, never a page whose summary reads as gambling copy, and never
+        // a stored value the page's extraction could not even express.
+        const unmapped = stored.find((c) => hcrStoredCategoryPlatformKey(c) === null);
+        corroborateRefusal =
+          hcrCorroborationHostRefusal(fetchUrl) ??
+          hcrCorroborationHostRefusal(finalUrl) ??
+          hcrProvenanceCorroborationRefusal(cur?.field_provenance) ??
+          (skippedUnsubstantiated.some((s) => s.agent_id === agentId && s.reason === HCR_THEME_SPAM_CANDIDATE_REASON)
+            ? "homepage summary reads as theme spam"
+            : null) ??
+          (unmapped !== undefined ? `unmapped stored category: ${String(unmapped).trim()}` : null);
       }
     }
     if (corroborateStored) {
       const onPage = new Set(platformCategories);
+      // EVERY stored category must be on the page (compared as platform keys).
       const supported =
         corroborateRefusal === null &&
-        corroborateStored.every((c) => typeof c === "string" && c.trim() !== "" && onPage.has(c.trim().toLowerCase()));
+        corroborateStored.every((c) => {
+          const key = hcrStoredCategoryPlatformKey(c);
+          return key !== null && onPage.has(key);
+        });
       const storedText = corroborateStored.map((c) => String(c).trim()).join(",");
       if (supported) {
         // The page supports every stored category: keep the list exactly as
         // stored (the page's extra keywords are not added) and record the
-        // homepage as its source. Still decided by canCorrectFactualField below.
+        // homepage (final URL) as its source. Still decided by
+        // canCorrectFactualField below.
         candidates.push({
           field: "categories",
           value: storedText,
           columnVal: null,
           onAgents: true,
           provenanceOnly: true,
+          sourceUrl: finalUrl,
         });
       } else {
         skippedUnsubstantiated.push({
           agent_id: agentId,
-          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${corroborateRefusal ? `${corroborateRefusal}; ` : ""}stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"})`,
+          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${corroborateRefusal ?? `stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"}`})`,
         });
       }
     } else if (platformCategories.length > 0) {
@@ -2468,7 +2541,7 @@ export async function refreshHomepageContent(
       // source — that is what makes canCorrectFactualField allow overwriting a
       // google_places value (and a pure-add when the field is empty).
       const incomingFieldProv = [
-        { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: fetchUrl },
+        { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: cand.sourceUrl ?? fetchUrl },
       ];
       const decision = canCorrectFactualField({
         field: cand.field,

@@ -80,7 +80,9 @@
  *       directory host, not on our own domain, site answers); through the
  *       real executor the stored list is corroborated (provenance only, list
  *       unchanged) or left alone when the page does not support it — never
- *       replaced; both outcomes are tallied in the step's envelope claim
+ *       replaced, also on thin rows the old rule takes; a thin row on a
+ *       social host is refused (directory/social host); both outcomes are
+ *       tallied in the step's envelope claim
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-enrichment-nightly.test.ts
@@ -1383,11 +1385,15 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       pool("hc-dead", { status: 404 });
       pool("hc-nocats", { cats: "[]" });
       pool("hc-mixed", { cats: JSON.stringify(["fruit"]), prov: "{}" }); // about text not homepage-sourced yet
+      // Thin rows (taken by the OLD rule, before any host check): one on a
+      // social-media host, one whose stored categories the page contradicts.
+      pool("hc-thin-fb", { site: "https://www.facebook.com/hc-thin-gard", about: "", products: "[]" });
+      pool("hc-thin-uncorr", { cats: JSON.stringify(["fruit"]), about: "", products: "[]" });
       const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
       const pc = p.steps.find((x) => x.step === "content_refresh")!;
       assertEq(
         pc.selected_ids,
-        ["hc-pool", "hc-fruit", "hc-thin", "hc-mixed"],
+        ["hc-pool", "hc-fruit", "hc-thin", "hc-mixed", "hc-thin-fb", "hc-thin-uncorr"],
         "hc1: content-qualified rows with uncorroborated categories are eligible; corroborated / no categories / own domain / dead site are not; the old condition (thin content) still applies",
       );
       assertEq(pc.skipped, { skipped_directory_or_social_host: 2 }, "hc1: a social / directory homepage is counted as skipped_directory_or_social_host, never selected");
@@ -1406,12 +1412,12 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const prov = (id: string) => (db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as { field_provenance: string }).field_provenance;
       assertEq(
         st.outcomes,
-        { categories_corroborated: 1, categories_not_supported_by_homepage: 1, unchanged: 1, refreshed: 1 },
+        { categories_corroborated: 1, categories_not_supported_by_homepage: 3, unchanged: 1, refreshed: 1 },
         "hc2: the real executor reports categories_corroborated and categories_not_supported_by_homepage as their own outcomes (hc-thin: corroborated already, unchanged; hc-mixed: about written → refreshed)",
       );
       assertEq(
         st.extra?.categories_corroboration,
-        { corroborated: 1, categories_not_supported_by_homepage: 2 },
+        { corroborated: 1, categories_not_supported_by_homepage: 4 },
         "hc2: extra.categories_corroboration tallies every row, also the refreshed one whose categories the page did not support",
       );
       assertEq(
@@ -1419,7 +1425,10 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
         [["fruit"], undefined, "object"],
         "hc2: hc-mixed — about written as today, categories left alone",
       );
-      assertTrue(!fetched.some((u) => u.includes("facebook.com") || u.includes("1881.no") || u.includes("rettfrabonden.com")), "hc2: no social / directory / own-domain page was fetched");
+      assertTrue(
+        !fetched.some((u) => u.includes("facebook.com/hc-gard") || u.includes("1881.no") || u.includes("rettfrabonden.com")),
+        "hc2: no social / directory / own-domain page was fetched for the new routing",
+      );
       assertEq(JSON.parse(cats("hc-pool")), ["vegetables"], "hc3: corroborated — stored [vegetables] unchanged (the page's meat/honey are not added)");
       assertEq(
         (JSON.parse(prov("hc-pool")).categories as any[]).map((x: any) => [x.source_type, x.value, x.source_url]),
@@ -1448,8 +1457,23 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const claim = JSON.parse(env.claims).find((c: any) => c.meta?.kind === "rfb_enrichment_step_content_refresh");
       assertEq(
         [claim?.meta?.outcomes?.categories_corroborated, claim?.meta?.rejected_reasons?.categories_not_supported_by_homepage, "categories_corroborated" in (claim?.meta?.rejected_reasons ?? {}), claim?.meta?.extra?.categories_corroboration],
-        [1, 1, false, { corroborated: 1, categories_not_supported_by_homepage: 2 }],
+        [1, 3, false, { corroborated: 1, categories_not_supported_by_homepage: 4 }],
         "hc7: the envelope claim shows both (corroborated counts as written, not supported as a rejected reason)",
+      );
+      // B1: a thin row on a social host is still taken by the old rule and
+      // fetched, but its page never corroborates anything.
+      const rowOf = (id: string) => st.rows.find((x) => x.agent_id === id);
+      assertEq(
+        [rowOf("hc-thin-fb")?.outcome, rowOf("hc-thin-fb")?.detail, JSON.parse(cats("hc-thin-fb")), JSON.parse(prov("hc-thin-fb")).categories],
+        ["categories_not_supported_by_homepage", "categories_not_supported_by_homepage (directory/social host)", ["vegetables"], undefined],
+        "hc8 (B1): thin row on facebook.com — no website_homepage source for its categories, refused as directory/social host",
+      );
+      // Deliberate narrowing: R6 no longer REPLACES uncorroborated categories on
+      // thin rows (the route without the option would write [meat, vegetables, honey]).
+      assertEq(
+        [rowOf("hc-thin-uncorr")?.outcome, JSON.parse(cats("hc-thin-uncorr")), JSON.parse(prov("hc-thin-uncorr")).categories],
+        ["categories_not_supported_by_homepage", ["fruit"], undefined],
+        "hc9: thin uncorroborated row — R6 corroborates or leaves alone, never replaces (stored [fruit] kept, page's [meat, vegetables, honey] not written)",
       );
     });
   } catch (err) {

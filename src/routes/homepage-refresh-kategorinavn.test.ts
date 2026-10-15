@@ -17,8 +17,12 @@
  *   AC5  categoriesCorroborateOnly (the nightly R6 job's option): a non-empty,
  *        uncorroborated stored category list is corroborated (provenance only,
  *        list unchanged) when the page supports every stored category, else
- *        left alone with a categories_not_supported_by_homepage reason (also on
- *        a wrong-entity site or a theme-spam summary); empty stored categories,
+ *        left alone with a categories_not_supported_by_homepage reason: partial
+ *        support, a directory/social/own-domain homepage (also after a
+ *        redirect), a wrong-entity site, unreadable field_provenance, a
+ *        theme-spam summary, an unmapped stored value ("other"). Stored values
+ *        compare case-insensitively and as platform keys (berries → fruit);
+ *        the provenance source_url is the final URL. Empty stored categories,
  *        the curated lock and every caller without the option behave as before.
  *
  * Standalone: npx tsx src/routes/homepage-refresh-kategorinavn.test.ts
@@ -304,11 +308,22 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     const SPAM_SUMMARY_HTML =
       `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
       `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården, og spiller casino med gjestene hver helg.</p></body></html>`;
-    const corrFetch = async (url: string) =>
-      new Response(new URL(url).host.startsWith("c-spam") ? SPAM_SUMMARY_HTML : CORR_HTML, {
-        status: 200,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+    // Extracts [fruit] only ("bær" → berries → fruit).
+    const FRUIT_HTML =
+      `<html><head><title>Frukt Gård</title></head><body><h1>Frukt Gård</h1>` +
+      `<p>Vi selger bær, epler og plommer rett fra gården.</p></body></html>`;
+    // Requested host → final URL after a redirect (fetchPage reads resp.url).
+    const REDIRECTS: Record<string, string> = {
+      "c-redir-bad.kat-test.no": "https://www.facebook.com/c-redir-bad",
+      "c-redir-ok.kat-test.no": "https://www.c-redir-ok-ny.no/",
+    };
+    const corrFetch = async (url: string) => {
+      const host = new URL(url).host;
+      const html = host.startsWith("c-spam") ? SPAM_SUMMARY_HTML : host.startsWith("c-berries") ? FRUIT_HTML : CORR_HTML;
+      const resp = new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      if (REDIRECTS[host]) Object.defineProperty(resp, "url", { value: REDIRECTS[host] });
+      return resp;
+    };
     const gpProv = { about: [GP(OLD_ABOUT)], categories: [GP("vegetables")] };
     seed("c-veg", { cats: ["vegetables"], products: REAL, prov: gpProv });
     seed("c-fruit", { cats: ["fruit", "berries"], products: REAL, prov: gpProv });
@@ -318,7 +333,22 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     seed("c-noopt", { cats: ["vegetables"], products: REAL, prov: gpProv });
     seed("c-wrongent", { cats: ["vegetables"], products: REAL, prov: { ...gpProv, website_ownership: { status: "unverified" } } });
     seed("c-spam", { cats: ["vegetables"], products: REAL, prov: gpProv });
-    const tgt = (id: string) => ({ agent_id: id, name: `Gård ${id}`, homepage_url: `https://${id}.kat-test.no` });
+    seed("c-partial", { cats: ["vegetables", "fruit"], products: REAL, prov: gpProv });
+    seed("c-case", { cats: ["Vegetables"], products: REAL, prov: gpProv });
+    seed("c-berries", { cats: ["berries"], products: REAL, prov: gpProv });
+    seed("c-other", { cats: ["vegetables", "other"], products: REAL, prov: gpProv });
+    seed("c-badprov", { cats: ["vegetables"], products: REAL, prov: gpProv });
+    db.prepare(`UPDATE agent_knowledge SET field_provenance = '{not json' WHERE agent_id = 'c-badprov'`).run();
+    for (const id of ["c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok"]) {
+      seed(id, { cats: ["vegetables"], products: REAL, prov: gpProv });
+    }
+    // Homepages on a social / directory host and on our own domain.
+    const HOSTED: Record<string, string> = {
+      "c-fb": "https://www.facebook.com/c-fb",
+      "c-dir": "https://www.1881.no/c-dir",
+      "c-own": "https://rettfrabonden.com/produsent/c-own",
+    };
+    const tgt = (id: string) => ({ agent_id: id, name: `Gård ${id}`, homepage_url: HOSTED[id] ?? `https://${id}.kat-test.no` });
     const catsOf = (id: string) => (db.prepare(`SELECT categories FROM agents WHERE id = ?`).get(id) as any).categories;
     const provOf = (id: string) =>
       (db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).field_provenance;
@@ -330,7 +360,10 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     );
     const corr = await mod.refreshHomepageContent(
       db as any,
-      [tgt("c-veg"), tgt("c-fruit"), tgt("c-empty"), tgt("c-locked"), tgt("c-wrongent"), tgt("c-spam")] as any,
+      [
+        "c-veg", "c-fruit", "c-empty", "c-locked", "c-wrongent", "c-spam", "c-partial", "c-case", "c-berries",
+        "c-other", "c-badprov", "c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok",
+      ].map(tgt) as any,
       { dryRun: false, fetchImpl: corrFetch as any, categoriesCorroborateOnly: true },
     );
     const noopt = await mod.refreshHomepageContent(db as any, [tgt("c-noopt")] as any, {
@@ -413,6 +446,49 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       mod.HCR_THEME_SPAM_CANDIDATE_REASON,
       "AC5 c-spam: the theme-spam reason stays first (the morning send's hijacked check reads the first one)",
     );
+
+    // review B1/B2/N1/N3/N4 — refusals: nothing written for categories, exact reason
+    const catReason = (id: string) =>
+      corr.skipped_unsubstantiated.find((x) => x.agent_id === id && x.reason.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED))?.reason;
+    const hasHpCats = (id: string) => {
+      try {
+        return JSON.stringify(JSON.parse(provOf(id)).categories ?? null).includes("website_homepage");
+      } catch {
+        return false;
+      }
+    };
+    const refusals: Array<[string, string, unknown[], string]> = [
+      ["c-partial", "stored: vegetables,fruit; homepage: meat,vegetables,honey", ["vegetables", "fruit"], "B2 partial support ([vegetables, fruit] vs page [meat, vegetables, honey]) — every stored category must be on the page, not some"],
+      ["c-fb", "directory/social host", ["vegetables"], "B1 social-media homepage (facebook.com)"],
+      ["c-dir", "directory/social host", ["vegetables"], "B1 directory homepage (1881.no)"],
+      ["c-own", "own platform domain", ["vegetables"], "B1 our own platform domain"],
+      ["c-redir-bad", "directory/social host", ["vegetables"], "N1 a redirect that lands on a social-media host"],
+      ["c-other", "unmapped stored category: other", ["vegetables", "other"], "N3 a stored value that maps to no platform key (other)"],
+      ["c-badprov", "unreadable field_provenance", ["vegetables"], "N4 unreadable field_provenance fails closed"],
+    ];
+    for (const [id, why, storedCats, label] of refusals) {
+      assertEq(
+        [catReason(id), JSON.parse(catsOf(id)), hasHpCats(id), changedOf(corr, id).includes(mod.HCR_CATEGORIES_CORROBORATED)],
+        [`${mod.HCR_CATEGORIES_NOT_SUPPORTED} (${why})`, storedCats, false, false],
+        `AC5 ${label}: nothing written for categories, reason recorded`,
+      );
+    }
+    assertEq(cvs.categoriesLackWebsiteCorroboration(catsOf("c-partial"), provOf("c-partial")), true, "AC5 B2: the partially supported row is still held by the gate");
+
+    // review N1/N3 + casing — corroborated, stored value never rewritten
+    const corroborated: Array<[string, string, string, string]> = [
+      ["c-case", '["Vegetables"]', "Vegetables", "https://c-case.kat-test.no"],
+      ["c-berries", '["berries"]', "berries", "https://c-berries.kat-test.no"],
+      ["c-redir-ok", '["vegetables"]', "vegetables", "https://www.c-redir-ok-ny.no/"],
+    ];
+    for (const [id, col, val, url] of corroborated) {
+      const hpRecs = (JSON.parse(provOf(id)).categories as any[]).filter((r) => r.source_type === "website_homepage");
+      assertEq(
+        [catsOf(id), hpRecs.map((r) => [r.value, r.source_url]), cvs.categoriesLackWebsiteCorroboration(catsOf(id), provOf(id))],
+        [col, [[val, url]], false],
+        `AC5 ${id}: corroborated (${id === "c-case" ? "stored casing compared case-insensitively" : id === "c-berries" ? "stored berries compared as fruit" : "source_url is the final URL after a same-owner redirect"}); stored column byte-identical`,
+      );
+    }
 
     // without the option (route / morning send): replacement exactly as before
     assertEq(JSON.parse(catsOf("c-noopt")), ["meat", "vegetables", "honey"], "AC5 regression: WITHOUT the option the stored categories are still replaced");

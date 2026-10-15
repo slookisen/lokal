@@ -54,7 +54,9 @@
 //                           page supports EVERY stored category
 //                           (categories_corroborated), else nothing is
 //                           written for it (categories_not_supported_by_
-//                           homepage).
+//                           homepage) — always so on a directory/social/
+//                           aggregator host or our own domain, also after a
+//                           redirect, whichever rule selected the row.
 //   5  reverify             runVerifierBatch({agentIds}) with the tick path's
 //                           Brreg lookup, one row per call: every row steps
 //                           1–4 changed tonight first, then cohort rows whose
