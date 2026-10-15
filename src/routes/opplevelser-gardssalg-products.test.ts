@@ -211,6 +211,48 @@ export function runOpplevelserGardssalgProductsTests(
         assertEq(r, ["Eplesider", "Eplemost"], "pg-2h: valid array still returned unchanged with diagnosticOut passed");
         assertEq(diag.outcome, "products_found", "pg-2i: diagnosticOut.outcome = products_found for a valid array response");
       }
+      // ── pg-svc (dev-request 2026-10-15-rfb-generiske-produktnavn-ekte-navn-
+      //    fra-nettsted): the helper now lives in services/gardssalg-product-
+      //    list.ts. Its two additive knobs are inert for this module's
+      //    callers: no signal key in the request unless one is passed, the
+      //    Skive 4 retry unless turned off, and the LLM meter note is a no-op
+      //    outside a meter scope. The nightly RFB job turns the retry off (at
+      //    most ONE model call per row) and counts each request. ────────────
+      {
+        const meterMod = require("../services/llm-call-meter") as typeof import("../services/llm-call-meter");
+        const svc = require("../services/gardssalg-product-list") as typeof import("../services/gardssalg-product-list");
+        assertEq(svc.generateGardssalgProductList === generateGardssalgProductList, true, "pg-svc-a: opplevelser re-exports the service's function (one implementation)");
+        assertEq("signal" in (capturedInit ?? {}), false, "pg-svc-b: without a signal the request init is exactly as before (no signal key)");
+        let n = 0;
+        const inits: any[] = [];
+        globalThis.fetch = (async (_url: any, init: any) => {
+          n++;
+          inits.push(init);
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "dette er ikke JSON" }], stop_reason: "end_turn" }) };
+        }) as unknown as typeof fetch;
+        assertEq([await generateGardssalgProductList(SOURCE_TEXT), n], [null, 2], "pg-svc-c: default — an unparseable answer is retried once (2 calls, unchanged)");
+        n = 0;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const ctl = new AbortController();
+        const meter = meterMod.createLlmCallMeter();
+        const r = await meterMod.runWithLlmCallMeter(meter, () =>
+          svc.generateGardssalgProductList(SOURCE_TEXT, diag, { retryOnUnparseable: false, signal: ctl.signal }),
+        );
+        assertEq(
+          [r, n, diag.outcome, inits[inits.length - 1].signal === ctl.signal, meter.calls, meter.bySource],
+          [null, 1, "invalid_unparseable", true, 1, { "product-list-extractor": 1 }],
+          "pg-svc-d: retryOnUnparseable:false → exactly ONE call; the signal reaches fetch; the call is counted on the meter as product-list-extractor",
+        );
+        n = 0;
+        const outside = meterMod.createLlmCallMeter();
+        await generateGardssalgProductList(SOURCE_TEXT);
+        assertEq([n, outside.calls], [2, 0], "pg-svc-e: outside a meter scope nothing is counted anywhere");
+        delete process.env.ANTHROPIC_API_KEY;
+        const m2 = meterMod.createLlmCallMeter();
+        await meterMod.runWithLlmCallMeter(m2, () => svc.generateGardssalgProductList(SOURCE_TEXT, undefined, { retryOnUnparseable: false }));
+        assertEq(m2.calls, 0, "pg-svc-f: no API key → no request, nothing counted");
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+      }
 
       // ── pg-3: source text capped in the prompt. Bound to the exported
       //    constant, not a literal: the cap moved once already (6 000 ->

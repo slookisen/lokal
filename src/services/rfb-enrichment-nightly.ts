@@ -57,6 +57,17 @@
 //                           homepage) — always so on a directory/social/
 //                           aggregator host or our own domain, also after a
 //                           redirect, whichever rule selected the row.
+//                           A row whose stored products are only category
+//                           names (generic_products_only) also gets ONE
+//                           model call (the gårdssalg product-name helper,
+//                           retry off, counted as product-list-extractor):
+//                           names found verbatim on the producer's own page
+//                           replace the generic list (products_replaced →
+//                           step 5); nothing usable → products_not_supported_
+//                           by_homepage (stamped). Same host/ownership/theme-
+//                           spam refusals and curated lock as above. No API
+//                           key → the row runs without the call; LLM budget
+//                           spent → the row waits for another night.
 //   5  reverify             runVerifierBatch({agentIds}) with the tick path's
 //                           Brreg lookup, one row per call: every row steps
 //                           1–4 changed tonight first, then cohort rows whose
@@ -108,7 +119,9 @@
 //     that dies mid-way still counts; unreadable → no LLM budget). A row is
 //     only started if its worst case (LLM_CALLS_PER_ROW_MAX) still fits; once
 //     it does not, every LLM-needing step stops for the night (no queue
-//     builds up). Real calls are counted by the judges themselves
+//     builds up). content_refresh is the exception: its model call is per
+//     row (generic products only), so only those rows wait; the step goes on
+//     for the rest. Real calls are counted by the judges themselves
 //     (llm-call-meter.ts) and reported with an estimated cost.
 //   • One apply run per night (cron or manual), stamped the moment a run
 //     takes the lock (so a run that dies still uses up the night); a manual
@@ -152,6 +165,8 @@ import {
 import { outreachSentLogHasVerticalColumn } from "./outreach-suppression-signals";
 import { createLlmCallMeter, runWithLlmCallMeter, type LlmCallMeter } from "./llm-call-meter";
 import { refreshRfbCandidateHomepage } from "./rfb-marketing-daily";
+import { generateGardssalgProductList, type GardssalgProductsExtractionDiagnostic } from "./gardssalg-product-list";
+import type { HcrProductNamesExtractor } from "../routes/admin-knowledge";
 import { classifyTerminalRow } from "../routes/admin-agents-terminal-repark";
 import { productsAreGenericCategoryNames } from "../routes/admin-outreach-candidates";
 import { isPlatformOwnedEmailDomain } from "../routes/admin-agents-contact-email-write";
@@ -236,6 +251,13 @@ export const RFB_ENRICHMENT_EMAIL_DOMAIN_QUEUE_REASON = "email_domain_candidate"
 export const RFB_ENRICHMENT_CATEGORIES_CORROBORATED = "categories_corroborated";
 /** content_refresh: a stored category is not on the homepage; nothing written for categories (a real per-row outcome). */
 export const RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED = "categories_not_supported_by_homepage";
+/** content_refresh: generic stored products replaced by real names found verbatim on the producer's own page (→ step 5). */
+export const RFB_ENRICHMENT_PRODUCTS_REPLACED = "products_replaced";
+/** content_refresh: no usable product names on the homepage (or refused); nothing written for products (a real per-row outcome). */
+export const RFB_ENRICHMENT_PRODUCTS_NOT_SUPPORTED = "products_not_supported_by_homepage";
+/** content_refresh: the product-name model call failed / was not started (deadline) — transient, retried next night. */
+export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_FAILED = "products_extraction_failed";
+export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_SKIPPED = "products_extraction_skipped";
 
 export type RfbEnrichmentStep =
   | "url_check"
@@ -353,13 +375,56 @@ export function resolveRfbEnrichmentWindowHours(): number[] {
  *     e-mail candidate → at most one judgeContactCandidate call.
  *   reverify: at most one second-line judge call, and only when
  *     RFB_SECOND_LINE_VERIFICATION_ENABLED is "true" (read per run).
+ *   content_refresh: at most one product-list-extractor call (the gårdssalg
+ *     product-name helper with its retry turned off), and only for a row
+ *     whose stored products are generic category names — the per-row figure
+ *     is rfbEnrichmentRowLlmCallsMax; other rows reserve nothing.
  *   everything else: deterministic, no model call.
  */
 export function rfbEnrichmentLlmCallsPerRowMax(step: RfbEnrichmentStep): number {
-  if (step === "brreg_contact" || step === "contact_extraction") return 1;
+  if (step === "brreg_contact" || step === "contact_extraction" || step === "content_refresh") return 1;
   if (step === "reverify") return process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED === "true" ? 1 : 0;
   return 0;
 }
+
+/**
+ * Steps whose model call is optional per row: when tonight's LLM budget is
+ * spent, only the rows that would need it are left for another night (not
+ * attempted, not stamped); the step itself still runs for the others.
+ */
+const RFB_ENRICHMENT_LLM_OPTIONAL_STEPS: ReadonlySet<RfbEnrichmentStep> = new Set(["content_refresh"]);
+
+/** The product-name model call needs ANTHROPIC_API_KEY; without it the step runs without that call. */
+export function rfbEnrichmentProductNamesLlmAvailable(): boolean {
+  return (process.env.ANTHROPIC_API_KEY ?? "").trim() !== "";
+}
+
+/** content_refresh: the row's stored products are only category names (the gate's generic_products_only). */
+function rfbEnrichmentRowWantsProductNames(step: RfbEnrichmentStep, row: RfbEnrichmentCohortRow): boolean {
+  return step === "content_refresh" && productsAreGenericCategoryNames(row.products);
+}
+
+/** Worst-case model calls for THIS row (the reservation): see rfbEnrichmentLlmCallsPerRowMax. */
+export function rfbEnrichmentRowLlmCallsMax(step: RfbEnrichmentStep, row: RfbEnrichmentCohortRow): number {
+  if (step === "content_refresh") {
+    return rfbEnrichmentRowWantsProductNames(step, row) && rfbEnrichmentProductNamesLlmAvailable() ? 1 : 0;
+  }
+  return rfbEnrichmentLlmCallsPerRowMax(step);
+}
+
+/**
+ * The real product-name extractor R6 hands to the refresh: the gårdssalg
+ * helper (generateGardssalgProductList — same prompt: only names that are in
+ * the source text) with its one retry OFF, so a row makes at most ONE model
+ * call (its reservation), counted on the run's meter as product-list-extractor.
+ */
+export const rfbEnrichmentProductNameExtractor: HcrProductNamesExtractor = async (pageText, io) => {
+  const diag: GardssalgProductsExtractionDiagnostic = {};
+  const names = await generateGardssalgProductList(pageText, diag, { retryOnUnparseable: false, signal: io.signal });
+  if (names && names.length > 0) return { outcome: "names", names };
+  if (diag.outcome === "sentinel_no_products") return { outcome: "none" };
+  return { outcome: "failed", detail: [diag.outcome ?? "infra_failure", diag.invalid_reason].filter(Boolean).join(":") };
+};
 
 // ─── Scheduling ────────────────────────────────────────────────────────────
 
@@ -1343,6 +1408,11 @@ const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
   // contact extraction: the host is in a temporary 429 cooldown (NB3).
   // (`fetch_failed` stays a real outcome: the site may really be dead.)
   "cooldown_skipped",
+  // content_refresh: the product-name model call failed (API/network/
+  // unparseable answer) or was not started (too close to the deadline) and
+  // nothing else was written — retried next night, not parked.
+  "products_extraction_failed",
+  "products_extraction_skipped",
 ]);
 
 /**
@@ -1382,6 +1452,11 @@ export interface RfbEnrichmentRowOutcome {
    * corroboration, also when another outcome — e.g. refreshed — wins).
    */
   categories_corroboration?: string;
+  /**
+   * content_refresh only: what the product-name step did for a row whose
+   * stored products were generic (tallied in extra.product_names).
+   */
+  product_names?: string;
   /** Something was written (a column, or a review-queue proposal). */
   written: boolean;
   /** A producer column changed — the row goes to step 5. */
@@ -1445,12 +1520,24 @@ export interface RfbEnrichmentExecutors {
   brregContact(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   bmHarvest(args: RfbEnrichmentBmArgs): Promise<RfbEnrichmentBmOutcome>;
   contactExtraction(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
-  contentRefresh(row: RfbEnrichmentCohortRow, deadlineAtMs: number): Promise<RfbEnrichmentRowOutcome>;
+  /**
+   * opts.productNames: the row's LLM reservation is in place — hand the
+   * refresh the product-name extractor (generic stored products only).
+   */
+  contentRefresh(row: RfbEnrichmentCohortRow, deadlineAtMs: number, opts?: { productNames?: boolean }): Promise<RfbEnrichmentRowOutcome>;
   reverify(agentId: string): Promise<RfbEnrichmentReverifyOutcome>;
 }
 
-/** The real executors: each one is an existing tool, unchanged. */
-export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): RfbEnrichmentExecutors {
+/**
+ * The real executors: each one is an existing tool, unchanged.
+ * `productNameExtractor`: the product-name model call content_refresh uses
+ * (default the real one; tests pass a stub — never a real model call).
+ */
+export function createDefaultRfbEnrichmentExecutors(
+  db: Db,
+  batchId: string,
+  productNameExtractor: HcrProductNamesExtractor = rfbEnrichmentProductNameExtractor,
+): RfbEnrichmentExecutors {
   let wdState: { existing: Set<string>; proposed: Set<string>; counters: RfbWdFallbackCounters } | null = null;
   return {
     async urlCheck(row) {
@@ -1573,18 +1660,31 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
       return { outcome, written, changed: written, ...(item?.detail ? { detail: String(item.detail) } : {}) };
     },
 
-    async contentRefresh(row, deadlineAtMs) {
+    async contentRefresh(row, deadlineAtMs, opts) {
       // categoriesCorroborateOnly: stored categories are corroborated or left
       // alone, never replaced by the page's keyword extraction (header, step 4).
-      const r = await refreshRfbCandidateHomepage(db, row.id, { deadlineAt: deadlineAtMs, categoriesCorroborateOnly: true });
+      // extractProductNames: only when the step reserved this row's one model
+      // call (generic stored products, API key present, budget left).
+      const r = await refreshRfbCandidateHomepage(db, row.id, {
+        deadlineAt: deadlineAtMs,
+        categoriesCorroborateOnly: true,
+        ...(opts?.productNames ? { extractProductNames: productNameExtractor } : {}),
+      });
       if (r.outcome === "write_paused") {
         return { outcome: "write_paused", written: false, changed: false, stop: "enrichment_write_paused" };
       }
       const fields = r.fields ?? [];
       const written = r.outcome === "refreshed" || fields.length > 0;
       let outcome: string = r.outcome;
-      if (r.categories_corroboration === "corroborated" && r.outcome === "refreshed") {
+      if (r.product_names === "products_replaced" && r.outcome === "refreshed") {
+        outcome = RFB_ENRICHMENT_PRODUCTS_REPLACED;
+      } else if (r.categories_corroboration === "corroborated" && r.outcome === "refreshed") {
         outcome = RFB_ENRICHMENT_CATEGORIES_CORROBORATED;
+      } else if (r.outcome === "unchanged" && (r.product_names === "products_extraction_failed" || r.product_names === "products_extraction_skipped")) {
+        // Nothing written and the model call did not happen / answer: retry tomorrow.
+        outcome = r.product_names;
+      } else if (r.outcome === "unchanged" && r.product_names === "products_not_supported_by_homepage") {
+        outcome = RFB_ENRICHMENT_PRODUCTS_NOT_SUPPORTED;
       } else if (r.categories_corroboration === "categories_not_supported_by_homepage" && r.outcome === "unchanged") {
         outcome = RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED;
       }
@@ -1597,6 +1697,7 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
         written,
         changed: written,
         ...(r.categories_corroboration ? { categories_corroboration: r.categories_corroboration } : {}),
+        ...(r.product_names ? { product_names: r.product_names } : {}),
         ...(r.outcome === "failed" ? { error: true } : {}),
         ...(detail ? { detail } : {}),
       };
@@ -1715,6 +1816,8 @@ export interface RfbEnrichmentNightlyReport {
 export interface RfbEnrichmentNightlyDeps {
   /** Replace any of the real executors (tests). */
   executors?: Partial<RfbEnrichmentExecutors>;
+  /** The real content_refresh executor's product-name model call (tests: a stub). */
+  productNameExtractor?: HcrProductNamesExtractor;
   /** The run's clock (tests); default: `now` plus real elapsed time. */
   clock?: () => Date;
 }
@@ -2067,7 +2170,10 @@ interface RunContext {
 async function runSteps(rc: RunContext): Promise<void> {
   const { db, report, now, clock, meter, llmCap, usdPerCall } = rc;
   const batchId = `rfb-enrichment-nightly-${now.toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`;
-  const exec: RfbEnrichmentExecutors = { ...createDefaultRfbEnrichmentExecutors(db, batchId), ...(rc.deps?.executors ?? {}) };
+  const exec: RfbEnrichmentExecutors = {
+    ...createDefaultRfbEnrichmentExecutors(db, batchId, rc.deps?.productNameExtractor),
+    ...(rc.deps?.executors ?? {}),
+  };
 
   const cohort = await loadRfbEnrichmentCohort(db);
   report.cohort = { considered: cohort.considered, eligible: cohort.rows.length, excluded: cohort.excluded, by_tier: cohort.by_tier };
@@ -2145,9 +2251,12 @@ async function runSteps(rc: RunContext): Promise<void> {
   const skipStep = (step: RfbEnrichmentStep, cap: number): string | null => {
     if (globalStop) return globalStop;
     if (cap <= 0) return "cap_zero";
-    if (rfbEnrichmentLlmCallsPerRowMax(step) > 0 && llmCapReached) return "llm_cap_reached";
+    // A step whose model call is optional per row still runs for the rows
+    // that need none (RFB_ENRICHMENT_LLM_OPTIONAL_STEPS).
+    const stepLlm = RFB_ENRICHMENT_LLM_OPTIONAL_STEPS.has(step) ? 0 : rfbEnrichmentLlmCallsPerRowMax(step);
+    if (stepLlm > 0 && llmCapReached) return "llm_cap_reached";
     if (WRITING_STEPS.has(step) && writesPaused) return "enrichment_write_paused";
-    return stopBefore(step, rfbEnrichmentLlmCallsPerRowMax(step));
+    return stopBefore(step, stepLlm);
   };
 
   const finishStep = (sr: RfbEnrichmentStepReport, t0: number, llmBefore: number): void => {
@@ -2157,6 +2266,13 @@ async function runSteps(rc: RunContext): Promise<void> {
     sr.rows = sr.rows.slice(0, 100);
     report.steps.push(sr);
     if (sr.stopped_reason && !report.stopped_reason) report.stopped_reason = `${sr.step}:${sr.stopped_reason}`;
+  };
+
+  /** extra[group][key] += 1 (the step's envelope claim carries extra). */
+  const tallyExtra = (sr: RfbEnrichmentStepReport, group: string, key: string): void => {
+    const extra = (sr.extra ??= {});
+    const m = (extra[group] ??= {}) as Record<string, number>;
+    m[key] = (m[key] ?? 0) + 1;
   };
 
   const tally = (sr: RfbEnrichmentStepReport, agentId: string, out: RfbEnrichmentRowOutcome): void => {
@@ -2174,12 +2290,13 @@ async function runSteps(rc: RunContext): Promise<void> {
       const tallyMap = (extra.categories_corroboration ??= {}) as Record<string, number>;
       tallyMap[out.categories_corroboration] = (tallyMap[out.categories_corroboration] ?? 0) + 1;
     }
+    if (out.product_names) tallyExtra(sr, "product_names", out.product_names);
     sr.rows.push({ agent_id: agentId, outcome: out.outcome, ...(out.detail ? { detail: out.detail.slice(0, 200) } : {}) });
   };
 
   const runRowStep = async (
     step: RfbEnrichmentStep,
-    run: (row: RfbEnrichmentCohortRow) => Promise<RfbEnrichmentRowOutcome>,
+    run: (row: RfbEnrichmentCohortRow, rowLlm: number) => Promise<RfbEnrichmentRowOutcome>,
   ): Promise<void> => {
     const t0 = Date.now();
     const llmBefore = meter.calls;
@@ -2200,7 +2317,7 @@ async function runSteps(rc: RunContext): Promise<void> {
         ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
       };
     }
-    const perRowLlm = rfbEnrichmentLlmCallsPerRowMax(step);
+    const llmOptional = RFB_ENRICHMENT_LLM_OPTIONAL_STEPS.has(step);
     // Brreg outage guard (R3-NB1): consecutive brreg_contact_fetch_failed rows
     // are held back unstamped; a different outcome (or the end of the step)
     // stamps them as the real per-row outcomes they were, while the third in
@@ -2212,26 +2329,45 @@ async function runSteps(rc: RunContext): Promise<void> {
     };
     for (const row of sel.rows) {
       await yieldToEventLoop();
-      const stop = stopBefore(step, perRowLlm);
+      const perRowLlm = rfbEnrichmentRowLlmCallsMax(step, row);
+      const stop = stopBefore(step, llmOptional ? 0 : perRowLlm);
       if (stop) {
         sr.stopped_reason = stop;
         break;
       }
+      if (llmOptional && rfbEnrichmentRowWantsProductNames(step, row) && perRowLlm === 0) {
+        // No API key: the row runs without the product-name call.
+        tallyExtra(sr, "product_names", "skipped_no_api_key");
+      }
+      if (llmOptional && perRowLlm > 0 && (llmCapReached || meter.calls + perRowLlm > llmCap)) {
+        // Tonight's LLM budget is spent: this row (it needs the model call) is
+        // left for another night — not attempted, not stamped; rows that need
+        // no call go on.
+        llmCapReached = true;
+        tallyExtra(sr, "product_names", "skipped_llm_cap");
+        continue;
+      }
       const reserved = reserveLlm(perRowLlm);
       if (reserved === null) {
-        sr.stopped_reason = "llm_counter_unwritable";
-        break;
+        if (llmOptional) {
+          // Counter unwritable: llmCapReached is set; run the row without the call.
+          tallyExtra(sr, "product_names", "skipped_llm_counter_unwritable");
+        } else {
+          sr.stopped_reason = "llm_counter_unwritable";
+          break;
+        }
       }
       const callsBefore = meter.calls;
+      const rowLlm = reserved ?? 0;
       let out: RfbEnrichmentRowOutcome;
       try {
-        out = await run(row);
+        out = await run(row, rowLlm);
       } catch (err) {
         out = { outcome: "error", written: false, changed: false, error: true, detail: errMessage(err) };
       }
       // A route call that timed out (504) may still be working, and its judge
       // call can land AFTER this point (B1): keep at least the reservation.
-      settleLlm(reserved, settledLlmCalls(out.outcome, out.stop, reserved, meter.calls - callsBefore));
+      settleLlm(rowLlm, settledLlmCalls(out.outcome, out.stop, rowLlm, meter.calls - callsBefore));
       tally(sr, row.id, out);
       if (step === "brreg_contact" && out.outcome === RFB_ENRICHMENT_BRREG_FETCH_FAILED) {
         pendingFetchFailed.push({ id: row.id, outcome: out.outcome });
@@ -2333,8 +2469,13 @@ async function runSteps(rc: RunContext): Promise<void> {
 
   // 3–4
   await runRowStep("contact_extraction", (row) => exec.contactExtraction(row));
-  await runRowStep("content_refresh", (row) =>
-    exec.contentRefresh(row, Math.min(Date.now() + RFB_ENRICHMENT_REFRESH_PER_ROW_MS, Date.now() + (rc.writeDeadline.getTime() - clock().getTime()))),
+  await runRowStep("content_refresh", (row, rowLlm) =>
+    exec.contentRefresh(
+      row,
+      Math.min(Date.now() + RFB_ENRICHMENT_REFRESH_PER_ROW_MS, Date.now() + (rc.writeDeadline.getTime() - clock().getTime())),
+      // The product-name call only with this row's reservation in place.
+      rowLlm > 0 ? { productNames: true } : undefined,
+    ),
   );
 
   // 5 — re-verify: tonight's changed rows first, then unreachable-site rows.
@@ -2561,7 +2702,11 @@ function isWrittenOutcome(step: RfbEnrichmentStep, outcome: string): boolean {
     case "contact_extraction":
       return outcome === "written";
     case "content_refresh":
-      return outcome === "refreshed" || outcome === RFB_ENRICHMENT_CATEGORIES_CORROBORATED;
+      return (
+        outcome === "refreshed" ||
+        outcome === RFB_ENRICHMENT_CATEGORIES_CORROBORATED ||
+        outcome === RFB_ENRICHMENT_PRODUCTS_REPLACED
+      );
     case "reverify":
       return outcome !== "error" && outcome !== "not_found";
   }

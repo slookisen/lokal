@@ -158,10 +158,14 @@ import {
   HCR_CATEGORIES_CORROBORATED,
   HCR_CATEGORIES_NOT_SUPPORTED,
   HCR_DEADLINE_EXCEEDED,
+  HCR_PRODUCTS_EXTRACTION_FAILED,
+  HCR_PRODUCTS_EXTRACTION_SKIPPED,
+  HCR_PRODUCTS_NOT_SUPPORTED,
   HCR_THEME_SPAM_CANDIDATE_REASON,
   HCR_THEME_SPAM_PAGE_ERROR,
   refreshHomepageContent,
   selectHomepageContentRefreshTargetsByIds,
+  type HcrProductNamesExtractor,
 } from "../routes/admin-knowledge";
 import { slugify } from "../utils/slug";
 import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "./recipient-policy";
@@ -682,6 +686,20 @@ export interface RfbHomepageRefreshRow {
    * written for categories). Absent when the option did not apply.
    */
   categories_corroboration?: "corroborated" | "categories_not_supported_by_homepage";
+  /**
+   * Only with opts.extractProductNames (the nightly R6 job; never the morning
+   * send) and a row whose stored products were generic category names:
+   * replaced (real names from the page written), not supported (nothing
+   * usable on the page, or refused), extraction failed / skipped (not
+   * called or no answer), curated_locked. Absent when the option did not
+   * apply (e.g. the stored products were not generic).
+   */
+  product_names?:
+    | "products_replaced"
+    | "products_not_supported_by_homepage"
+    | "products_extraction_failed"
+    | "products_extraction_skipped"
+    | "products_curated_locked";
   ms: number;
 }
 
@@ -694,6 +712,8 @@ export type RfbHomepageRefreshFn = (
     fetchImpl?: typeof fetch;
     /** refreshHomepageContent's categoriesCorroborateOnly — R6 only, never the morning send. */
     categoriesCorroborateOnly?: boolean;
+    /** refreshHomepageContent's extractProductNames — R6 only, never the morning send. */
+    extractProductNames?: HcrProductNamesExtractor;
   },
 ) => Promise<RfbHomepageRefreshRow>;
 
@@ -726,6 +746,7 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
         deadlineAt: opts.deadlineAt,
         fetchImpl: opts.fetchImpl,
         ...(opts.categoriesCorroborateOnly ? { categoriesCorroborateOnly: true } : {}),
+        ...(opts.extractProductNames ? { extractProductNames: opts.extractProductNames } : {}),
       }),
       timedOut,
     ]).finally(() => clearTimeout(timer));
@@ -744,10 +765,27 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
             )
           ? "categories_not_supported_by_homepage"
           : undefined;
+    // extractProductNames only (never set by the morning send).
+    const productReason = (prefix: string) =>
+      raced.skipped_unsubstantiated.some((c) => c.agent_id === agentId && c.reason.startsWith(prefix));
+    const productNames: RfbHomepageRefreshRow["product_names"] = !opts.extractProductNames
+      ? undefined
+      : changed?.fields.includes("products")
+        ? "products_replaced"
+        : productReason(HCR_PRODUCTS_NOT_SUPPORTED)
+          ? "products_not_supported_by_homepage"
+          : productReason(HCR_PRODUCTS_EXTRACTION_FAILED)
+            ? "products_extraction_failed"
+            : productReason(HCR_PRODUCTS_EXTRACTION_SKIPPED)
+              ? "products_extraction_skipped"
+              : curated?.includes("products")
+                ? "products_curated_locked"
+                : undefined;
     const extra = {
       ...(curated ? { curated_locked: curated } : {}),
       ...(rejected ? { rejected } : {}),
       ...(corroboration ? { categories_corroboration: corroboration } : {}),
+      ...(productNames ? { product_names: productNames } : {}),
     };
     // Hijacked domain: the page-level skip (nothing written) or the
     // candidate-level rejection (other fields may still have been written).

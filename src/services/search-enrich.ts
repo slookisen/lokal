@@ -51,8 +51,10 @@ const NAME_STOPWORDS: ReadonlySet<string> = new Set([
 
 // Strip Norwegian accents / diacritics to their ASCII base so "Nalums" and
 // "Nålums" stem identically and so email local-parts (always ASCII) can be
-// compared against name stems.
-function stripNorwegianAccents(s: string): string {
+// compared against name stems. Exported for the homepage refresh's
+// product-name check (routes/admin-knowledge.ts), which must fold names and
+// page text exactly like this module's own matchers do.
+export function stripNorwegianAccents(s: string): string {
   return s
     .replace(/å/g, "a")
     .replace(/æ/g, "ae")

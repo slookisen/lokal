@@ -25,6 +25,14 @@
  *        a non-platform key (berries) needs that same keyword on the page, not
  *        just its platform category; the provenance source_url is the final URL. Empty stored categories,
  *        the curated lock and every caller without the option behave as before.
+ *   AC7  (dev-request 2026-10-15-rfb-generiske-produktnavn-ekte-navn-fra-
+ *        nettsted) extractProductNames (R6 only; stub extractor): real names
+ *        found verbatim on the page replace generic stored products
+ *        (website_homepage provenance, page source_url); off-page names are
+ *        dropped; an empty / all-category-names / failed result writes nothing;
+ *        no call for a curated lock, a wrong-entity / theme-spam / facebook
+ *        page, real stored products, a dry run, too little time; a late
+ *        answer writes nothing; without the option nothing changes.
  *   AC6  (dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
  *        ubekreftede-kategorier) POST /admin/homepage-content-refresh refreshes
  *        its AUTO-selected targets with categoriesCorroborateOnly (dry run and
@@ -664,6 +672,150 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       } finally {
         (globalThis as any).fetch = prevFetch;
       }
+    }
+    db.prepare(`DELETE FROM agent_knowledge`).run();
+    db.prepare(`DELETE FROM agents`).run();
+
+    // AC7 — dev-request 2026-10-15-rfb-generiske-produktnavn-ekte-navn-fra-
+    // nettsted: extractProductNames (R6 only). The extractor is a stub — no
+    // model call anywhere.
+    {
+      const onPage = mod.hcrProductNamesOnPage;
+      assertEq(
+        onPage(["Helmelk", "Skummamelk", "Kakao", "helmelk", 7, " ", "Gårdsegg", "Bringebærsaft"], "Vi selger HELMELK, skummamelk og gardsegg. Bringebaersaft i sesong."),
+        { kept: ["Helmelk", "Skummamelk", "Gårdsegg", "Bringebærsaft"], dropped: ["Kakao"] },
+        "AC7 hcrProductNamesOnPage: verbatim after the same fold (case, å→a, æ→ae), deduped, non-strings/blanks dropped, off-page names dropped",
+      );
+      assertEq(onPage(["Egg"], "Eggedosis og eggerøre."), { kept: [], dropped: ["Egg"] }, "AC7 hcrProductNamesOnPage: whole words only (Egg is not in «Eggedosis»)");
+      assertEq(
+        onPage(Array.from({ length: 25 }, (_, i) => `Ost${i}`), Array.from({ length: 25 }, (_, i) => `Ost${i}`).join(" ")).kept.length,
+        mod.HCR_PRODUCT_NAMES_MAX,
+        "AC7 hcrProductNamesOnPage: capped at HCR_PRODUCT_NAMES_MAX (20)",
+      );
+
+      const PN_GENERIC = JSON.stringify([{ name: "Meieri", category: "dairy", seasonal: false }]);
+      const PN_PAGE = (marker: string) =>
+        `<html><head><title>Hagvoll</title><meta property="og:description" content="${PAGE_ABOUT}"></head>` +
+        `<body><h1>Produkter</h1><p>Fra fjøset: Helmelk, Skummamelk og Sjokolademelk. ${marker}</p></body></html>`;
+      const PN_SPAM_PAGE =
+        `<html><head><title>Hagvoll</title></head><body><h1>Hagvoll</h1>` +
+        `<p>Fra fjøset: Helmelk og Skummamelk rett fra gården, og vi spiller casino med gjestene hver helg. [pn-spam]</p></body></html>`;
+      const pnFetch = async (url: string) => {
+        const host = new URL(url).host;
+        const marker = `[${host.split(".")[0]}]`;
+        const html = host.startsWith("pn-spam")
+          ? PN_SPAM_PAGE
+          : PN_PAGE(host.startsWith("pn-generic-result") ? `Gårdens meieri og honning. ${marker}` : marker);
+        return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      };
+      const calls: string[] = [];
+      const ANSWERS: Record<string, any> = {
+        "pn-ok": { outcome: "names", names: ["Helmelk", "Skummamelk", "Sjokolademelk", "Kakao"] },
+        "pn-generic-result": { outcome: "names", names: ["Meieri", "Honning"] }, // on the page, but only category names
+        "pn-none": { outcome: "none" },
+        "pn-offpage": { outcome: "names", names: ["Kakao", "Iskrem"] },
+        "pn-failed": { outcome: "failed", detail: "infra_failure" },
+        "pn-owner": { outcome: "names", names: ["Helmelk"] },
+      };
+      const stub: any = async (text: string) => {
+        const id = (text.match(/\[(pn-[a-z-]+)\]/) ?? [])[1] ?? "?";
+        calls.push(id);
+        if (id === "pn-throws") throw new Error("boom");
+        return ANSWERS[id] ?? { outcome: "names", names: ["Helmelk"] };
+      };
+      const gp = { about: [HP(PAGE_ABOUT)], description: [HP(PAGE_ABOUT)], categories: [HP("dairy")] };
+      for (const id of ["pn-ok", "pn-generic-result", "pn-none", "pn-offpage", "pn-failed", "pn-throws", "pn-locked", "pn-wrongent", "pn-spam", "pn-fb", "pn-real", "pn-noopt", "pn-owner"]) {
+        seed(id, { cats: ["dairy"], products: id === "pn-real" ? REAL : PN_GENERIC, prov: gp });
+      }
+      db.prepare(`UPDATE agent_knowledge SET curated_fields = '{"products":true}' WHERE agent_id = 'pn-locked'`).run();
+      db.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = 'pn-wrongent'`).run(JSON.stringify({ ...gp, website_ownership: { status: "unverified" } }));
+      db.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = 'pn-owner'`).run(
+        JSON.stringify({ ...gp, products: [{ source_type: "owner", value: "Meieri", fetched_at: "2026-01-01T00:00:00.000Z" }] }),
+      );
+      const pnT = (id: string) => ({ agent_id: id, name: id, homepage_url: id === "pn-fb" ? "https://www.facebook.com/pn-fb" : `https://${id}.kat-test.no` });
+      const productsOf = (id: string) => (db.prepare(`SELECT products FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).products;
+      const pnReason = (r: any, id: string) => r.skipped_unsubstantiated.filter((x: any) => x.agent_id === id && x.reason.startsWith("products_")).map((x: any) => x.reason);
+
+      const pr = await mod.refreshHomepageContent(
+        db as any,
+        ["pn-ok", "pn-generic-result", "pn-none", "pn-offpage", "pn-failed", "pn-throws", "pn-locked", "pn-wrongent", "pn-spam", "pn-fb", "pn-real", "pn-owner"].map(pnT) as any,
+        { dryRun: false, fetchImpl: pnFetch as any, categoriesCorroborateOnly: true, extractProductNames: stub },
+      );
+      assertEq(
+        calls.slice().sort(),
+        ["pn-failed", "pn-generic-result", "pn-none", "pn-offpage", "pn-ok", "pn-owner", "pn-throws"],
+        "AC7: the extractor runs once per generic row on the producer's own page — never for a curated lock, a wrong-entity site, a theme-spam summary, a facebook homepage or a row with real products",
+      );
+      assertEq(
+        [JSON.parse(productsOf("pn-ok")).map((p: any) => [p.name, p.category]), changedOf(pr, "pn-ok").includes("products"), pr.by_field.products],
+        [[["Helmelk", "dairy"], ["Skummamelk", "dairy"], ["Sjokolademelk", "dairy"]], true, 1],
+        "AC7 pn-ok: names on the page written (Kakao dropped), reported as a products write",
+      );
+      const okProv = JSON.parse(provOf("pn-ok")).products as any[];
+      assertEq(
+        okProv.map((r) => [r.source_type, r.value, r.source_url]),
+        [["website_homepage", "Helmelk, Skummamelk, Sjokolademelk", "https://pn-ok.kat-test.no"]],
+        "AC7 pn-ok: website_homepage provenance with the page source_url",
+      );
+      assertEq(aoc.productsAreGenericCategoryNames(productsOf("pn-ok")), false, "AC7 pn-ok: the gate's generic_products_only no longer holds the row");
+      const notSupported: Array<[string, string]> = [
+        ["pn-generic-result", "products_not_supported_by_homepage (only category names: Meieri, Honning)"],
+        ["pn-none", "products_not_supported_by_homepage (no product names on the page)"],
+        ["pn-offpage", "products_not_supported_by_homepage (no name found verbatim on the page: Kakao, Iskrem)"],
+        ["pn-failed", "products_extraction_failed (infra_failure)"],
+        ["pn-throws", "products_extraction_failed (threw: boom)"],
+        ["pn-wrongent", "products_not_supported_by_homepage (website ownership unverified)"],
+        ["pn-spam", "products_not_supported_by_homepage (homepage summary reads as theme spam)"],
+        ["pn-fb", "products_not_supported_by_homepage (directory/social host)"],
+        ["pn-owner", "products_not_supported_by_homepage (write refused: new_not_two_tierA_or_owner)"],
+      ];
+      for (const [id, why] of notSupported) {
+        assertEq([pnReason(pr, id), productsOf(id)], [[why], PN_GENERIC], `AC7 ${id}: nothing written for products — ${why}`);
+      }
+      assertEq(
+        [productsOf("pn-locked"), pr.skipped_curated.find((x) => x.agent_id === "pn-locked")?.fields, pnReason(pr, "pn-locked")],
+        [PN_GENERIC, ["products"], []],
+        "AC7 pn-locked: the curated lock holds (no call, reported in skipped_curated)",
+      );
+      assertEq([productsOf("pn-real"), pnReason(pr, "pn-real")], [REAL, []], "AC7 pn-real: real stored products — no call, nothing written");
+
+      // without the option (route / morning send): products untouched, no call
+      calls.length = 0;
+      const np = await mod.refreshHomepageContent(db as any, [pnT("pn-noopt")] as any, { dryRun: false, fetchImpl: pnFetch as any });
+      assertEq([calls.length, productsOf("pn-noopt"), np.by_field.products], [0, PN_GENERIC, 0], "AC7 regression: WITHOUT the option no extractor call, products untouched");
+
+      // dry run / deadline: never called
+      seed("pn-dry", { cats: ["dairy"], products: PN_GENERIC, prov: gp });
+      calls.length = 0;
+      const dr = await mod.refreshHomepageContent(db as any, [pnT("pn-dry")] as any, { dryRun: true, fetchImpl: pnFetch as any, extractProductNames: stub });
+      assertEq([calls.length, pnReason(dr, "pn-dry")], [0, ["products_extraction_skipped (dry run)"]], "AC7 dry run: no extractor call (no model spend for a preview)");
+      const near = await mod.refreshHomepageContent(db as any, [pnT("pn-dry")] as any, {
+        dryRun: false,
+        fetchImpl: pnFetch as any,
+        extractProductNames: stub,
+        deadlineAt: Date.now() + mod.HCR_PRODUCT_NAMES_MIN_REMAINING_MS - 500,
+      });
+      assertEq([calls.length, pnReason(near, "pn-dry"), productsOf("pn-dry")], [0, ["products_extraction_skipped (refresh deadline too close)"], PN_GENERIC], "AC7 deadline: not started with too little time left");
+      // an answer after the deadline writes nothing at all
+      const before = provOf("pn-dry");
+      // 1.5 s of head room over the minimum so a slow CI host still starts the call.
+      const lateDeadline = Date.now() + mod.HCR_PRODUCT_NAMES_MIN_REMAINING_MS + 1_500;
+      const slow: any = async () => {
+        // answers just after the deadline (an extractor that ignored its signal)
+        await new Promise((res) => setTimeout(res, Math.max(0, lateDeadline - Date.now()) + 30));
+        return { outcome: "names", names: ["Helmelk"] };
+      };
+      const late = await mod.refreshHomepageContent(db as any, [pnT("pn-dry")] as any, {
+        dryRun: false,
+        fetchImpl: pnFetch as any,
+        extractProductNames: slow,
+        deadlineAt: lateDeadline,
+      });
+      assertEq(
+        [late.errors.map((e) => e.error.split(" ")[0]), productsOf("pn-dry"), provOf("pn-dry") === before],
+        [["refresh_deadline_exceeded"], PN_GENERIC, true],
+        "AC7 deadline: an extractor answer after the deadline writes nothing (refresh_deadline_exceeded)",
+      );
     }
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();
