@@ -267,8 +267,16 @@ export function runGardssalgVisitProposalsJobTests(opts: { log?: boolean } = {})
         };
         const NOW = new Date("2026-10-16T12:00:00Z");
         const env = { GARDSSALG_VISIT_PROPOSALS_JOB_ENABLED: "true", A2A_READ_PAT: "test-pat" };
+        // The apply function is bound to THIS test's route-module instance
+        // (the one sharing our in-memory db-factory singleton). The job's own
+        // default resolves it with a dynamic import, which in the shared
+        // one-process test runner can hand back a module instance loaded by
+        // an earlier block — correct in prod, wrong here (see tests/test.ts
+        // "SHARED GLOBAL STATE").
+        const applyViaRoute = (_db: any, items: unknown[], o: any) =>
+          route.applyGardssalgVisitProposals(items, { dryRun: false, homepageFetchImpl: o.homepageFetchImpl, logTag: o.logTag });
         const tick = (over: Record<string, unknown> = {}) =>
-          job.tickGardssalgVisitProposals({ fetchImpl: ghFetch, now: NOW, env, expDb, mainDb: () => init.getDb() as any, ...over } as any);
+          job.tickGardssalgVisitProposals({ fetchImpl: ghFetch, now: NOW, env, expDb, mainDb: () => init.getDb() as any, apply: applyViaRoute, ...over } as any);
         const runsFor = () => (init.getDb() as any).prepare("SELECT * FROM runs WHERE agent = ? ORDER BY rowid").all(job.GARDSSALG_VISIT_PROPOSALS_AGENT) as any[];
 
         gh.calls.length = 0;
