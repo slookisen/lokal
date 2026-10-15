@@ -46893,6 +46893,27 @@ runSerial(async () => {
   }
 });
 
+// Prod 2026-09-04 → 2026-10-15: /fire to experiences-enrichment returned 401
+// "Token is not authorized for this routine" 158 times while the dispatcher
+// envelope said "completed". Per-routine FIRE_ROUTINE_<AGENT>_TOKEN/_TRIG
+// overrides + a truthful envelope status (routes/admin-loop-dispatch.ts).
+// Pure, no DB — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── prod 2026-10-15: loop-dispatch per-routine /fire overrides + envelope status ──");
+  try {
+    const { runAdminLoopDispatchTests } = require("../src/routes/admin-loop-dispatch.test") as
+      typeof import("../src/routes/admin-loop-dispatch.test");
+    const ld = runAdminLoopDispatchTests({ log: false });
+    passed += ld.passed;
+    failed += ld.failed;
+    for (const f of ld.failures) failures.push("admin-loop-dispatch: " + f);
+    console.log(`  admin-loop-dispatch: ${ld.passed} passed, ${ld.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-loop-dispatch: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
 // platform-side daily RFB outreach send (services/rfb-marketing-daily.ts) —
 // guards G1–G4, dry run, reserve-before-send fail-closed, restart/second-tick

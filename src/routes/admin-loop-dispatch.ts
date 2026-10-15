@@ -13,6 +13,12 @@
 //
 // Config (env, all optional until cutover):
 //   FIRE_ROUTINES             JSON map  { "<agent>": { "trig": "...", "token": "..." }, ... }
+//   FIRE_ROUTINE_<AGENT>_TOKEN / FIRE_ROUTINE_<AGENT>_TRIG
+//                             per-routine override of one map entry, <AGENT> = the canonical
+//                             agent name upper-cased with non-alphanumerics as "_" (e.g.
+//                             FIRE_ROUTINE_EXPERIENCES_ENRICHMENT_TOKEN). Each routine has its own
+//                             /fire token, so replacing one no longer means rebuilding the whole
+//                             JSON secret (2026-10-15: experiences-enrichment 401 for 41 days).
 //   DISPATCH_FIRE_MODE        "shadow" (default) | "active"   — `?mode=` query overrides
 //   DISPATCH_ACTIVE_START_UTC inclusive hour, default 0  (24/7; dev-requests/2026-07-08-spine-24-7-active-window.md)
 //   DISPATCH_ACTIVE_END_UTC   exclusive hour, default 24 (24/7) — set e.g. 5/21 to restore a night pause
@@ -80,16 +86,27 @@ export interface RoutineDiag {
   parse_error: string | null;
   raw_keys: string[];
   mapped_keys: string[];
+  /** Agents whose entry came (wholly or partly) from FIRE_ROUTINE_<AGENT>_* env vars. */
+  override_keys: string[];
+}
+
+/** Env-var stem for an agent's per-routine override: "experiences-enrichment" → "EXPERIENCES_ENRICHMENT". */
+export function fireRoutineEnvStem(agent: string): string {
+  return agent.toUpperCase().replace(/[^A-Z0-9]/g, "_");
 }
 
 /**
  * Parse `FIRE_ROUTINES` (a JSON map agent → {trig, token}) into a canonical map + a
  * diagnostic. Short keys (controller/orchestrator/supervisor/verifier) are normalised to the
- * full agent names so the dispatch lookup (which keys off next_suggested) matches. The diag
+ * full agent names so the dispatch lookup (which keys off next_suggested) matches. Then
+ * FIRE_ROUTINE_<AGENT>_TOKEN / _TRIG override single fields per agent (agents in the map or in
+ * DEFAULT_ALLOWLIST); an agent missing from the map needs both to get an entry. The diag
  * exposes only presence/length/parse-state/key-NAMES — never the trig/token values.
  */
-function parseRoutines(): { map: Record<string, RoutineRef>; diag: RoutineDiag } {
-  const raw = process.env.FIRE_ROUTINES;
+export function parseRoutines(
+  env: NodeJS.ProcessEnv = process.env,
+): { map: Record<string, RoutineRef>; diag: RoutineDiag } {
+  const raw = env.FIRE_ROUTINES;
   const diag: RoutineDiag = {
     present: !!raw,
     length: raw ? raw.length : 0,
@@ -97,27 +114,51 @@ function parseRoutines(): { map: Record<string, RoutineRef>; diag: RoutineDiag }
     parse_error: null,
     raw_keys: [],
     mapped_keys: [],
+    override_keys: [],
   };
   const map: Record<string, RoutineRef> = {};
-  if (!raw) return { map, diag };
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
-    diag.parse_ok = true;
-  } catch (err: any) {
-    diag.parse_error = String(err?.message || err).slice(0, 120);
-    return { map, diag };
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      diag.parse_ok = true;
+      for (const [agent, v] of Object.entries(parsed)) {
+        diag.raw_keys.push(agent);
+        const ref = v as { trig?: unknown; token?: unknown };
+        if (ref && typeof ref.trig === "string" && typeof ref.token === "string") {
+          const canonical = ROUTINE_ALIAS[agent] || agent;
+          map[canonical] = { trig: ref.trig, token: ref.token };
+        }
+      }
+    } catch (err: any) {
+      diag.parse_error = String(err?.message || err).slice(0, 120);
+    }
   }
-  for (const [agent, v] of Object.entries(parsed)) {
-    diag.raw_keys.push(agent);
-    const ref = v as { trig?: unknown; token?: unknown };
-    if (ref && typeof ref.trig === "string" && typeof ref.token === "string") {
-      const canonical = ROUTINE_ALIAS[agent] || agent;
-      map[canonical] = { trig: ref.trig, token: ref.token };
+  const candidates = new Set([...Object.keys(map), ...DEFAULT_ALLOWLIST]);
+  for (const agent of candidates) {
+    const stem = fireRoutineEnvStem(agent);
+    const token = (env[`FIRE_ROUTINE_${stem}_TOKEN`] || "").trim();
+    const trig = (env[`FIRE_ROUTINE_${stem}_TRIG`] || "").trim();
+    if (!token && !trig) continue;
+    const merged = { trig: trig || map[agent]?.trig || "", token: token || map[agent]?.token || "" };
+    if (merged.trig && merged.token) {
+      map[agent] = merged;
+      diag.override_keys.push(agent);
     }
   }
   diag.mapped_keys = Object.keys(map);
   return { map, diag };
+}
+
+/**
+ * Envelope status for one dispatch tick. A failed /fire must not read as a clean run:
+ * experiences-enrichment got HTTP 401 ("Token is not authorized for this routine") 158
+ * times over 41 days (2026-09-04 → 2026-10-15) while every envelope said "completed",
+ * so no tier that counts non-completed runs ever saw it.
+ */
+export function dispatchEnvelopeStatus(fired: ReadonlyArray<{ ok: boolean }>): "completed" | "partial" | "failed" {
+  const failedCount = fired.filter((f) => !f.ok).length;
+  if (failedCount === 0) return "completed";
+  return failedCount < fired.length ? "partial" : "failed";
 }
 
 async function fireRoutine(
@@ -295,7 +336,7 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
     trigger_source: "cron",
     started_at: startedAt,
     finished_at: finishedAt,
-    status: "completed",
+    status: dispatchEnvelopeStatus(fired),
     claims: [
       {
         type: "db_state_change",
