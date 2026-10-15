@@ -91,7 +91,10 @@
  *       is rejected, a facebook homepage is refused before any call, a row
  *       with real products makes none; calls are counted (by_source
  *       product-list-extractor), the cap holds (the row that does not fit
- *       waits unstamped, the step goes on), no API key → no call
+ *       waits unstamped, the step goes on), no API key → no call; the real
+ *       extractor's mapping (stubbed model API: sentinel / [] → none,
+ *       unparseable / API error → failed); an empty answer is stamped
+ *       products_not_supported_by_homepage, a failed call stays transient
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-enrichment-nightly.test.ts
@@ -1647,7 +1650,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       assertEq(
         JSON.parse(products(done2)).map((p: any) => [p.name, p.category]),
         [["Gårdsegg", "eggs"]],
-        "pn11: «Gårdsegg» is found on the page (same folding: å) and written, category from its own keyword",
+        "pn11: «Gårdsegg» is found on the page (same folding: å) and written; category eggs from the generic list's single category [Egg] (the fallback — «gårdsegg» has no keyword of its own)",
       );
 
       // Night 3: no API key — no call, the row runs without it.
@@ -1661,6 +1664,77 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
         [llmCalls.length, r3.llm.calls, products("pn-nokey"), rowOf(st3, "pn-nokey") !== undefined, rowOf(st3, capped[0]) !== undefined, (st3.extra?.product_names as any)?.skipped_no_api_key],
         [0, 0, GEN_DAIRY, true, true, 2],
         "pn12: without ANTHROPIC_API_KEY no model call is made; the rows still run (skipped_no_api_key: pn-nokey and the row that waited for budget on night 2)",
+      );
+
+      // pn13 — the real extractor's mapping (review round: (b) + N1). The
+      // model API is a stub on the global fetch — no request leaves the process.
+      setEnv({ ANTHROPIC_API_KEY: "test-key-never-sent" });
+      let modelAnswer: () => Promise<Response> = async () => new Response("{}", { status: 500 });
+      let modelRequests = 0;
+      const pageFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = async (url: any, init?: any) => {
+        if (new URL(String(url)).host === "api.anthropic.com") {
+          modelRequests++;
+          return modelAnswer();
+        }
+        return pageFetch(url, init);
+      };
+      const textAnswer = (text: string) => async () =>
+        new Response(JSON.stringify({ content: [{ type: "text", text }], stop_reason: "end_turn" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      const mapping: Array<[string, () => Promise<Response>, unknown]> = [
+        ["names", textAnswer(JSON.stringify(["Helmelk", "Skummamelk"])), { outcome: "names", names: ["Helmelk", "Skummamelk"] }],
+        ["sentinel", textAnswer("INGEN_PRODUKTER_FUNNET"), { outcome: "none" }],
+        ["literal []", textAnswer("[]"), { outcome: "none", detail: "empty_after_filter" }],
+        ["array of blanks", textAnswer(JSON.stringify(["", " ", 7])), { outcome: "none", detail: "empty_after_filter" }],
+        ["prose (not JSON)", textAnswer("Produktene er Helmelk og Skummamelk."), { outcome: "failed", detail: "invalid_unparseable:not_json" }],
+        ["an object (not an array)", textAnswer(JSON.stringify({ products: ["Helmelk"] })), { outcome: "failed", detail: "invalid_unparseable:not_array" }],
+        ["HTTP 529", async () => new Response("overloaded", { status: 529 }), { outcome: "failed", detail: "infra_failure" }],
+        ["network error", async () => { throw new Error("ECONNRESET"); }, { outcome: "failed", detail: "infra_failure" }],
+      ];
+      for (const [label, answer, want] of mapping) {
+        modelAnswer = answer;
+        modelRequests = 0;
+        const got = await job.rfbEnrichmentProductNameExtractor("Fra fjøset: Helmelk og Skummamelk.", {});
+        assertEq([got, modelRequests], [want, 1], `pn13: real extractor, model answer ${label} → ${JSON.stringify(want)} (exactly one request: the retry is off)`);
+      }
+
+      // pn14 — N1 through the step: an answer with nothing usable on the page
+      // (names not on it, or the model's literal []) is deterministic for that
+      // page → products_not_supported_by_homepage, stamped (14-day retry); a
+      // genuine failure stays transient (not stamped, retried next night).
+      llmCalls.length = 0;
+      const NIGHT4 = new Date("2026-10-15T00:10:00Z");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10", ANTHROPIC_API_KEY: "test-key-never-sent" });
+      PAGES["pn-off.no"] = page("Helmelk og Skummamelk. [off]");
+      PAGES["pn-fail.no"] = page("Helmelk og Skummamelk. [fail]");
+      PAGES["pn-empty.no"] = page("Velkommen til gården. [empty]");
+      ANSWERS["[off]"] = { outcome: "names", names: ["Kakao", "Iskrem"] };
+      ANSWERS["[fail]"] = { outcome: "failed", detail: "infra_failure" };
+      modelAnswer = textAnswer("[]");
+      modelRequests = 0;
+      pnRow("pn-off", { products: GEN_DAIRY });
+      pnRow("pn-fail", { products: GEN_DAIRY });
+      pnRow("pn-empty", { products: GEN_DAIRY });
+      const night4Extractor = async (text: string, io: { signal?: AbortSignal }) =>
+        text.includes("[empty]") ? job.rfbEnrichmentProductNameExtractor(text, io) : stubExtractor(text);
+      const r4 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT4, deps: { productNameExtractor: night4Extractor } });
+      const st4 = r4.steps.find((x) => x.step === "content_refresh")!;
+      assertEq(
+        ["pn-off", "pn-empty", "pn-fail"].map((id) => [id, rowOf(st4, id)?.outcome, stampOf(id), products(id) === GEN_DAIRY]),
+        [
+          ["pn-off", "products_not_supported_by_homepage", "products_not_supported_by_homepage", true],
+          ["pn-empty", "products_not_supported_by_homepage", "products_not_supported_by_homepage", true],
+          ["pn-fail", "products_extraction_failed", null, true],
+        ],
+        "pn14: names not on the page / the model's [] → products_not_supported_by_homepage, stamped; a failed call → products_extraction_failed, unstamped (retried next night)",
+      );
+      assertEq(
+        [modelRequests, String(rowOf(st4, "pn-empty")?.detail ?? "").includes("no product names on the page: empty_after_filter")],
+        [1, true],
+        "pn14: the [] row made its one (stubbed) model request; the reason names empty_after_filter",
       );
     });
   } catch (err) {

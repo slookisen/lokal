@@ -32,7 +32,10 @@
  *        dropped; an empty / all-category-names / failed result writes nothing;
  *        no call for a curated lock, a wrong-entity / theme-spam / facebook
  *        page, real stored products, a dry run, too little time; a late
- *        answer writes nothing; without the option nothing changes.
+ *        answer writes nothing; without the option nothing changes. Names
+ *        are written as the page spells them; addresses / sentences / over-
+ *        long strings are rejected; a homepage-sourced generic list is still
+ *        replaced (the gate's generic-names rule).
  *   AC6  (dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
  *        ubekreftede-kategorier) POST /admin/homepage-content-refresh refreshes
  *        its AUTO-selected targets with categoriesCorroborateOnly (dry run and
@@ -328,7 +331,8 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       `<p>Vi selger bær (berries), epler og plommer rett fra gården.</p></body></html>`;
     // dev-request 2026-10-15-kategori-nokkelord-ae-og-drikke: Norwegian berry
     // words only ("bær" folds to "baer"; the lexicon is folded the same way),
-    // and a cidery's drinks (eplesider/most/juice → beverages).
+    // and a cidery's drinks (eplesider/juice → beverages; the bare "most" is
+    // not a keyword).
     const BAER_HTML =
       `<html><head><title>Bringebærlandet</title></head><body><h1>Bringebærlandet</h1>` +
       `<p>Vi dyrker bringebær og blåbær, og selger dem rett fra gården.</p></body></html>`;
@@ -544,7 +548,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
             "c-redir-ok": "source_url is the final URL after a same-owner redirect",
             "c-baer": "stored berries on a page that only says «bringebær og blåbær»",
             "c-baer-fruit": "stored fruit on a page whose only fruit words are «bringebær/blåbær» (berries map to fruit)",
-            "c-sider": "stored beverages on a cidery page (eplesider/most/juice)",
+            "c-sider": "stored beverages on a cidery page (eplesider/juice)",
           }[id]
         }); stored column byte-identical`,
       );
@@ -683,10 +687,33 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       const onPage = mod.hcrProductNamesOnPage;
       assertEq(
         onPage(["Helmelk", "Skummamelk", "Kakao", "helmelk", 7, " ", "Gårdsegg", "Bringebærsaft"], "Vi selger HELMELK, skummamelk og gardsegg. Bringebaersaft i sesong."),
-        { kept: ["Helmelk", "Skummamelk", "Gårdsegg", "Bringebærsaft"], dropped: ["Kakao"] },
-        "AC7 hcrProductNamesOnPage: verbatim after the same fold (case, å→a, æ→ae), deduped, non-strings/blanks dropped, off-page names dropped",
+        { kept: ["HELMELK", "skummamelk", "gardsegg", "Bringebaersaft"], dropped: ["Kakao"], rejected: [] },
+        "AC7 hcrProductNamesOnPage: verbatim after the same fold (case, å→a, æ→ae), deduped, non-strings/blanks dropped, off-page names dropped; kept as the PAGE spells them",
       );
-      assertEq(onPage(["Egg"], "Eggedosis og eggerøre."), { kept: [], dropped: ["Egg"] }, "AC7 hcrProductNamesOnPage: whole words only (Egg is not in «Eggedosis»)");
+      assertEq(onPage(["Egg"], "Eggedosis og eggerøre."), { kept: [], dropped: ["Egg"], rejected: [] }, "AC7 hcrProductNamesOnPage: whole words only (Egg is not in «Eggedosis»)");
+      // N2: the page's own spelling and case, never the model's string
+      assertEq(onPage(["Smor"], "Vi selger «Smør» fra egen gård."), { kept: ["Smør"], dropped: [], rejected: [] }, "AC7 N2: model «Smor» on a page saying «Smør» → «Smør» (the page's spelling)");
+      assertEq(onPage(["smør"], "SMØR\nSmør og fløte fra fjøset."), { kept: ["Smør"], dropped: [], rejected: [] }, "AC7 N2: an all-caps heading loses to the body's «Smør»");
+      assertEq(onPage(["Smør"], "smør og Smør"), { kept: ["Smør"], dropped: [], rejected: [] }, "AC7 N2: the occurrence identical to the model's string wins");
+      assertEq(onPage(["Gårds  egg"], "Fersk GÅRDS\n  egg"), { kept: ["GÅRDS egg"], dropped: [], rejected: [] }, "AC7 N2: whitespace collapsed in the page substring");
+      assertEq(onPage(["Gårdsost"], "Ga\u030Ardsost fra Valdres"), { kept: ["Ga\u030Ardsost"], dropped: [], rejected: [] }, "AC7 N2: a decomposed å (a + combining ring) is kept whole in the page substring");
+      // N3: on the page, but not product names
+      const LONG = "Ekstra lagret gårdsost med karve og en hint av honning fra egne bier";
+      const shapePage = `Kontakt post@example.no eller www.kat-test.no / https://kat-test.no. Vi selger ost og smør fra egen gård hver dag. ${LONG}. Ost og smør. Rømme.`;
+      assertEq(
+        onPage(["post@example.no", "www.kat-test.no", "https://kat-test.no", "Vi selger ost og smør fra egen gård hver dag", LONG, "Ost og smør.", "Rømme"], shapePage),
+        {
+          kept: ["Rømme"],
+          dropped: [],
+          rejected: ["post@example.no", "www.kat-test.no", "https://kat-test.no", "Vi selger ost og smør fra egen gård hver dag", LONG, "Ost og smør."],
+        },
+        "AC7 N3: e-mail / web addresses, > 6 words, > 60 chars and a trailing full stop are rejected even though they are on the page",
+      );
+      assertEq(
+        onPage(["Ost og smør", "Fire ord er nok her"], "Ost og smør. Fire ord er nok her."),
+        { kept: ["Ost og smør", "Fire ord er nok her"], dropped: [], rejected: [] },
+        "AC7 N3: a short multi-word name (≤ 6 words, no end punctuation) is kept",
+      );
       assertEq(
         onPage(Array.from({ length: 25 }, (_, i) => `Ost${i}`), Array.from({ length: 25 }, (_, i) => `Ost${i}`).join(" ")).kept.length,
         mod.HCR_PRODUCT_NAMES_MAX,
@@ -759,7 +786,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       );
       assertEq(aoc.productsAreGenericCategoryNames(productsOf("pn-ok")), false, "AC7 pn-ok: the gate's generic_products_only no longer holds the row");
       const notSupported: Array<[string, string]> = [
-        ["pn-generic-result", "products_not_supported_by_homepage (only category names: Meieri, Honning)"],
+        ["pn-generic-result", "products_not_supported_by_homepage (only category names: meieri, honning)"], // as the page spells them
         ["pn-none", "products_not_supported_by_homepage (no product names on the page)"],
         ["pn-offpage", "products_not_supported_by_homepage (no name found verbatim on the page: Kakao, Iskrem)"],
         ["pn-failed", "products_extraction_failed (infra_failure)"],
@@ -778,6 +805,52 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
         "AC7 pn-locked: the curated lock holds (no call, reported in skipped_curated)",
       );
       assertEq([productsOf("pn-real"), pnReason(pr, "pn-real")], [REAL, []], "AC7 pn-real: real stored products — no call, nothing written");
+
+      // (a) a generic stored list that ALREADY carries a website_homepage
+      // products source: only the gate's generic-names rule (existingValue /
+      // incomingValue) lets real names through — provenance alone refuses.
+      assertEq(
+        mod.canCorrectFactualField({
+          field: "products",
+          existingFieldProvenance: [HP("Meieri")],
+          websiteOwnershipUnverified: false,
+          incomingFieldProvenance: [HP("Helmelk")],
+          isCurated: false,
+        }).allowed,
+        false,
+        "AC7 pn-hpprov (premise): without the values, a homepage-sourced generic list is not replaceable",
+      );
+      seed("pn-hpprov", { cats: ["dairy"], products: PN_GENERIC, prov: { ...gp, products: [HP("Meieri")] } });
+      seed("pn-empty", { cats: ["dairy"], products: PN_GENERIC, prov: gp });
+      seed("pn-shape", { cats: ["dairy"], products: PN_GENERIC, prov: gp });
+      ANSWERS["pn-hpprov"] = { outcome: "names", names: ["Smor", "Helmelk"] };
+      ANSWERS["pn-empty"] = { outcome: "none", detail: "empty_after_filter" };
+      ANSWERS["pn-shape"] = { outcome: "names", names: ["post@example.no", "Fra fjøset: Helmelk, Skummamelk og Sjokolademelk."] };
+      const pr2 = await mod.refreshHomepageContent(db as any, ["pn-hpprov", "pn-empty", "pn-shape"].map(pnT) as any, {
+        dryRun: false,
+        fetchImpl: pnFetch as any,
+        categoriesCorroborateOnly: true,
+        extractProductNames: stub,
+      });
+      assertEq(
+        [
+          JSON.parse(productsOf("pn-hpprov")).map((p: any) => p.name),
+          changedOf(pr2, "pn-hpprov").includes("products"),
+          (JSON.parse(provOf("pn-hpprov")).products as any[]).map((r) => [r.source_type, r.value]),
+        ],
+        [["Helmelk"], true, [["website_homepage", "Meieri"], ["website_homepage", "Helmelk"]]],
+        "AC7 pn-hpprov: a homepage-sourced generic list IS replaced (ok_existing_generic_category_names needs existingValue/incomingValue; the provenance is append-only); «Smor» is not on the page",
+      );
+      assertEq(
+        [pnReason(pr2, "pn-empty"), productsOf("pn-empty")],
+        [["products_not_supported_by_homepage (no product names on the page: empty_after_filter)"], PN_GENERIC],
+        "AC7 pn-empty: an empty model answer is not supported (deterministic), with its detail",
+      );
+      assertEq(
+        [pnReason(pr2, "pn-shape"), productsOf("pn-shape")],
+        [["products_not_supported_by_homepage (2 rejected as not product-shaped)"], PN_GENERIC],
+        "AC7 N3 pn-shape: only non-product shapes → nothing written; the reason counts them and never echoes them (an address may be among them)",
+      );
 
       // without the option (route / morning send): products untouched, no call
       calls.length = 0;

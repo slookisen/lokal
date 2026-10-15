@@ -1007,13 +1007,17 @@ const CONTENT_CATEGORY_LEXICON_SOURCE: ReadonlyArray<readonly [string, readonly 
   ]],
   ["honey", ["honning", "honey", "birokt"]],
   ["herbs", ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"]],
-  // Drinks a farm sells. NOT the bare "sider": it is also the plural of
-  // "side" (a web page — the WordPress "Sider" widget, "andre sider"), so it
-  // would tag any site; the cidery itself ("sideri") and the compounds carry
-  // it. "most" is guarded against English use (CONTENT_KEYWORD_PATTERNS).
+  // Drinks a farm sells. Only words that mean nothing else: NOT the bare
+  // "sider" (also the plural of "side", a web page — the WordPress "Sider"
+  // widget, "andre sider"), NOT the bare "most" (English "most": "is most
+  // famous", "what we love most", "most visitors" — the refresh also reads
+  // English /about pages) and NOT the bare "saft" (café noise: "kaffe og saft
+  // i kafeen"). The cidery itself ("sideri") and the Norwegian compounds
+  // carry it.
   ["beverages", [
     "sideri", "eplesider", "pæresider", "cider", "eplecider",
-    "most", "eplemost", "pæremost", "juice", "eplejuice", "saft",
+    "eplemost", "pæremost", "juice", "eplejuice",
+    "eplesaft", "bringebærsaft", "solbærsaft", "rabarbrasaft", "hyllebærsaft", "hylleblomstsaft",
   ]],
 ];
 
@@ -1026,21 +1030,10 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
   ([category, keywords]) => [category, Array.from(new Set(keywords.map(foldContentKeyword)))] as const,
 );
 
-/**
- * Whole-word pattern per (folded) keyword. A keyword that is also a common
- * English word gets its English contexts excluded: "most" (Norwegian: apple
- * must) never counts in "the most", "at most", "our most", "most of" or "most
- * popular" — an English page of a farm that sells no drinks.
- */
+/** Whole-word pattern per (folded) keyword, built once. */
 const CONTENT_KEYWORD_PATTERNS: ReadonlyMap<string, RegExp> = new Map(
   CONTENT_CATEGORY_LEXICON.flatMap(([, keywords]) =>
-    keywords.map((kw): [string, RegExp] => {
-      const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (kw === "most") {
-        return [kw, /(?<!\b(?:the|at|our|your|their|its)\s+)\bmost\b(?!\s+(?:of|popular)\b)/];
-      }
-      return [kw, new RegExp(`\\b${esc}\\b`)];
-    }),
+    keywords.map((kw): [string, RegExp] => [kw, new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`)]),
   ),
 );
 

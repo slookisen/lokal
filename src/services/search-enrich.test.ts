@@ -357,7 +357,7 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
   // ── dev-request 2026-10-15-kategori-nokkelord-ae-og-drikke ────────────────
   // The page text is folded with æ → "ae", so the berry/pear keywords must be
   // folded the same way ("bær" → "baer"); the bare "bar" is gone; drinks
-  // (sider/most/juice/saft) map to beverages.
+  // (sideri, eplesider, eplemost, solbærsaft, cider, juice …) map to beverages.
   {
     const cats = (html: string) => {
       const text = extractVisibleText(html);
@@ -388,26 +388,41 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     ]) {
       assertEq(extractProductMentions(t), [], `kategori-ae: «${t}» → no category (no berries/fruit)`);
     }
-    // drinks → beverages
+    // drinks → beverages (only words that mean nothing else: the cidery, the
+    // Norwegian compounds, cider, juice — review round B1)
     const drinkCases: Array<[string, string]> = [
       ["<p>Aga Sideri produserer eplesider og juice av høg kvalitet.</p>", "eplesider/juice"],
-      ["<p>Kaldpressa most fra egne epler.</p>", "most"],
       ["<p>Eplemost og pæremost på flaske.</p>", "eplemost/pæremost"],
+      ["<p>Kaldpressa eplemost.</p>", "eplemost"],
       ["<p>Vi selger juice.</p>", "juice"],
-      ["<p>Hjemmelaget saft.</p>", "saft"],
+      ["<p>Hjemmelaget solbærsaft.</p>", "solbærsaft"],
+      ["<p>Eplesaft, bringebærsaft og rabarbrasaft.</p>", "eplesaft/bringebærsaft/rabarbrasaft"],
+      ["<p>Hyllebærsaft på flaske.</p>", "hyllebærsaft"],
       ["<p>Craft cider from Hardanger.</p>", "cider"],
       ["<p>Velkommen til Aga Sideri.</p>", "sideri"],
     ];
     for (const [html, label] of drinkCases) {
       assertTrue(cats(html).includes("beverages"), `kategori-ae: «${label}» → beverages`);
     }
-    assertEq(cats("<p>Kaldpressa most fra egne epler.</p>"), ["fruit", "beverages"], "kategori-ae: most + epler → [fruit, beverages] (canonical order)");
-    // English "most", bare "sider" (= web pages) and "saftig" never mean drinks
+    assertEq(cats("<p>Eplemost fra egne epler.</p>"), ["fruit", "beverages"], "kategori-ae: eplemost + epler → [fruit, beverages] (canonical order)");
+    assertEq(extractProductMentions("Eplemost"), ["beverages"], "kategori-ae: «Eplemost» alone → [beverages]");
+    assertEq(extractProductMentions("Solbærsaft"), ["beverages"], "kategori-ae: «Solbærsaft» alone → [beverages] (not berries: whole words only)");
+    // English "most" (the refresh also reads English /about pages), the bare
+    // "most"/"saft" (café noise), bare "sider" (= web pages) and "saftig"
+    // never mean drinks.
     for (const t of [
       "The most beautiful farm in Norway.",
       "Our most popular products are lamb and eggs.",
       "Most of our customers come in summer.",
       "We sell at most twice a week.",
+      "The farm is most famous for its lamb.",
+      "Our farm is most beautiful in May.",
+      "This is what we love most.",
+      "Most visitors come in July.",
+      "Farmer Ola and his most loyal customers.",
+      "Kaldpressa most fra egne epler.",
+      "Vi serverer kaffe og saft i kafeen.",
+      "Kaffe og saft.",
       "Andre sider: Om oss, Kontakt.",
       "Saftig lammekjøtt.",
     ]) {

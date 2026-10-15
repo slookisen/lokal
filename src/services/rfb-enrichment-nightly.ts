@@ -255,7 +255,7 @@ export const RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED = "categories_not_supported
 export const RFB_ENRICHMENT_PRODUCTS_REPLACED = "products_replaced";
 /** content_refresh: no usable product names on the homepage (or refused); nothing written for products (a real per-row outcome). */
 export const RFB_ENRICHMENT_PRODUCTS_NOT_SUPPORTED = "products_not_supported_by_homepage";
-/** content_refresh: the product-name model call failed / was not started (deadline) — transient, retried next night. */
+/** content_refresh: the product-name model call failed (API/network/timeout/unparseable) / was not started (deadline) — transient, retried next night. */
 export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_FAILED = "products_extraction_failed";
 export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_SKIPPED = "products_extraction_skipped";
 
@@ -417,12 +417,22 @@ export function rfbEnrichmentRowLlmCallsMax(step: RfbEnrichmentStep, row: RfbEnr
  * helper (generateGardssalgProductList — same prompt: only names that are in
  * the source text) with its one retry OFF, so a row makes at most ONE model
  * call (its reservation), counted on the run's meter as product-list-extractor.
+ *
+ * A well-formed answer with no usable name — the sentinel, a literal `[]`, or
+ * an array whose every entry the helper's own filter drops
+ * (invalid_unparseable / empty_after_filter) — is the model's answer for THIS
+ * page: `none` (→ products_not_supported_by_homepage, stamped, 14-day retry).
+ * Only a failure that may not repeat (network / timeout / API error / no text
+ * block / not JSON / not an array) is `failed` (transient, retried next night).
  */
 export const rfbEnrichmentProductNameExtractor: HcrProductNamesExtractor = async (pageText, io) => {
   const diag: GardssalgProductsExtractionDiagnostic = {};
   const names = await generateGardssalgProductList(pageText, diag, { retryOnUnparseable: false, signal: io.signal });
   if (names && names.length > 0) return { outcome: "names", names };
   if (diag.outcome === "sentinel_no_products") return { outcome: "none" };
+  if (diag.outcome === "invalid_unparseable" && diag.invalid_reason === "empty_after_filter") {
+    return { outcome: "none", detail: "empty_after_filter" };
+  }
   return { outcome: "failed", detail: [diag.outcome ?? "infra_failure", diag.invalid_reason].filter(Boolean).join(":") };
 };
 
@@ -1409,8 +1419,10 @@ const TRANSIENT_ROW_OUTCOMES: ReadonlySet<string> = new Set([
   // (`fetch_failed` stays a real outcome: the site may really be dead.)
   "cooldown_skipped",
   // content_refresh: the product-name model call failed (API/network/
-  // unparseable answer) or was not started (too close to the deadline) and
-  // nothing else was written — retried next night, not parked.
+  // timeout/unparseable answer) or was not started (too close to the
+  // deadline) and nothing else was written — retried next night, not parked.
+  // (An empty answer — no product names, or none usable on the page — is
+  // products_not_supported_by_homepage: a real per-row outcome, stamped.)
   "products_extraction_failed",
   "products_extraction_skipped",
 ]);

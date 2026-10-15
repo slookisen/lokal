@@ -1987,8 +1987,11 @@ export interface HomepageContentRefreshOptions {
    * unreadable field_provenance, an about summary rejected as theme spam) or
    * when `products` is curated-locked. Only names found VERBATIM on that text
    * (hcrProductNamesOnPage: same lowercase + stripNorwegianAccents fold, whole
-   * words) are kept, at most HCR_PRODUCT_NAMES_MAX; an empty result or one
-   * that is itself only category names writes nothing. The rest replaces the
+   * words) are kept, written as the PAGE spells them, at most
+   * HCR_PRODUCT_NAMES_MAX; addresses, sentences and over-long strings are
+   * rejected even when on the page; an empty result (the model's own "no
+   * products" included — products_not_supported_by_homepage, not a failure)
+   * or one that is itself only category names writes nothing. The rest replaces the
    * stored products through canCorrectFactualField (stored and new value
    * passed: ok_existing_generic_category_names; the curated lock wins) with a
    * website_homepage provenance record whose source_url is the final page
@@ -2005,7 +2008,7 @@ export interface HomepageContentRefreshOptions {
 /** What a product-name extractor made of a page (R6: the gårdssalg LLM helper). */
 export type HcrProductNamesExtraction =
   | { outcome: "names"; names: readonly unknown[] }
-  | { outcome: "none" }
+  | { outcome: "none"; detail?: string }
   | { outcome: "failed"; detail?: string };
 /** Page text → product names; at most one model call. Never expected to throw (a throw counts as failed). */
 export type HcrProductNamesExtractor = (pageText: string, io: { signal?: AbortSignal }) => Promise<HcrProductNamesExtraction>;
@@ -2021,40 +2024,111 @@ export const HCR_PRODUCT_NAMES_MAX = 20;
 /** The extractor is not started with less time than this left before deadlineAt. */
 export const HCR_PRODUCT_NAMES_MIN_REMAINING_MS = 5_000;
 
+/** A product name longer than this is not a name (the gårdssalg helper's own item cap). */
+export const HCR_PRODUCT_NAME_MAX_CHARS = 60;
+/** A product name with more words than this is a sentence, not a name. */
+export const HCR_PRODUCT_NAME_MAX_WORDS = 6;
+
 /** Lowercase + stripNorwegianAccents + collapsed whitespace — search-enrich's own matching fold. */
 function hcrFoldText(s: string): string {
   return stripNorwegianAccents(s.toLowerCase()).replace(/\s+/g, " ").trim();
 }
 
 /**
+ * A candidate that is not a product name even when it is on the page: an
+ * e-mail or web address ("@", "://", "www."), a sentence (more than
+ * HCR_PRODUCT_NAME_MAX_WORDS words, or ending in sentence punctuation) or
+ * longer than HCR_PRODUCT_NAME_MAX_CHARS. `name` is whitespace-collapsed.
+ */
+function hcrNotProductShaped(name: string): boolean {
+  return (
+    name.length > HCR_PRODUCT_NAME_MAX_CHARS ||
+    /@|:\/\/|www\./i.test(name) ||
+    name.split(" ").length > HCR_PRODUCT_NAME_MAX_WORDS ||
+    /[.!?:;…]$/.test(name)
+  );
+}
+
+/**
+ * hcrFoldText's fold of `text` (without the trim), plus for every folded
+ * UTF-16 unit the [start, end) range of the original characters it came
+ * from, so a match in the folded text maps back to the page's own spelling.
+ */
+function hcrFoldWithMap(text: string): { folded: string; start: number[]; end: number[] } {
+  let folded = "";
+  const start: number[] = [];
+  const end: number[] = [];
+  let i = 0;
+  for (const ch of text) {
+    const j = i + ch.length;
+    if (/\s/.test(ch)) {
+      if (folded.endsWith(" ")) end[end.length - 1] = j;
+      else {
+        folded += " ";
+        start.push(i);
+        end.push(j);
+      }
+    } else {
+      const f = stripNorwegianAccents(ch.toLowerCase());
+      if (f === "" && end.length > 0) end[end.length - 1] = j; // a combining mark joins its base letter
+      for (let k = 0; k < f.length; k++) {
+        start.push(i);
+        end.push(j);
+      }
+      folded += f;
+    }
+    i = j;
+  }
+  return { folded, start, end };
+}
+
+/**
  * The extractor's names that appear VERBATIM in `pageText` (both folded the
  * same way, matched as whole words), deduped on the folded form, in the
- * extractor's order and spelling, capped at `max`. Non-strings, blanks and
- * one-letter names are dropped. PURE.
+ * extractor's order, capped at `max` — each written as the PAGE spells it
+ * («Smør», not the model's "Smor"): the occurrence identical to the model's
+ * string if there is one, else the first that is not all upper case (a
+ * heading), else the first. `dropped`: names not on the page. `rejected`:
+ * names that are not product-shaped (hcrNotProductShaped — never echoed in a
+ * reason, they may be addresses). Non-strings, blanks and one-letter names
+ * are ignored. PURE.
  */
 export function hcrProductNamesOnPage(
   names: readonly unknown[],
   pageText: string,
   max: number = HCR_PRODUCT_NAMES_MAX,
-): { kept: string[]; dropped: string[] } {
-  const hay = hcrFoldText(pageText);
+): { kept: string[]; dropped: string[]; rejected: string[] } {
+  const page = hcrFoldWithMap(pageText);
   const kept: string[] = [];
   const dropped: string[] = [];
+  const rejected: string[] = [];
   const seen = new Set<string>();
   for (const raw of names) {
     if (typeof raw !== "string") continue;
     const name = raw.replace(/\s+/g, " ").trim();
     const folded = hcrFoldText(name);
     if (folded.length < 2 || seen.has(folded)) continue;
-    const esc = folded.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (new RegExp(`(?<![\\p{L}\\p{N}])${esc}(?![\\p{L}\\p{N}])`, "u").test(hay)) {
-      seen.add(folded);
-      if (kept.length < max) kept.push(name);
-    } else {
-      dropped.push(name);
+    if (hcrNotProductShaped(name)) {
+      rejected.push(name);
+      continue;
     }
+    const esc = folded.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const onPage = Array.from(page.folded.matchAll(new RegExp(`(?<![\\p{L}\\p{N}])${esc}(?![\\p{L}\\p{N}])`, "gu")), (m) =>
+      pageText
+        .slice(page.start[m.index!]!, page.end[m.index! + m[0].length - 1]!)
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+    if (onPage.length === 0) {
+      dropped.push(name);
+      continue;
+    }
+    seen.add(folded);
+    const allCaps = (x: string) => x === x.toLocaleUpperCase("nb-NO") && x !== x.toLocaleLowerCase("nb-NO");
+    const asOnPage = onPage.find((x) => x === name) ?? onPage.find((x) => !allCaps(x)) ?? onPage[0]!;
+    if (kept.length < max) kept.push(asOnPage);
   }
-  return { kept, dropped };
+  return { kept, dropped, rejected };
 }
 
 /** Platform category key per CATEGORY_LABEL_NO label, lower-cased ("bakervarer" → "bakery"). */
@@ -2623,19 +2697,26 @@ export async function refreshHomepageContent(
               reason: `${HCR_PRODUCTS_EXTRACTION_FAILED}${extraction.detail ? ` (${extraction.detail})` : ""}`,
             });
           } else {
-            const { kept, dropped } =
-              extraction.outcome === "names" ? hcrProductNamesOnPage(extraction.names, productSource) : { kept: [], dropped: [] };
+            const { kept, dropped, rejected } =
+              extraction.outcome === "names"
+                ? hcrProductNamesOnPage(extraction.names, productSource)
+                : { kept: [], dropped: [], rejected: [] };
             const infos = hcrProductInfosFor(kept, cur.products);
             const infosJson = JSON.stringify(infos);
             if (kept.length === 0) {
-              skippedUnsubstantiated.push({
-                agent_id: agentId,
-                reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (${
-                  extraction.outcome === "none"
-                    ? "no product names on the page"
-                    : `no name found verbatim on the page${dropped.length > 0 ? `: ${dropped.slice(0, 5).join(", ")}` : ""}`
-                })`,
-              });
+              // Deterministic for this page (the model's own "no products",
+              // or nothing usable on it): stamped by R6, retried in 14 days.
+              const why =
+                extraction.outcome === "none"
+                  ? `no product names on the page${extraction.detail ? `: ${extraction.detail}` : ""}`
+                  : [
+                      ...(dropped.length > 0 || rejected.length === 0
+                        ? [`no name found verbatim on the page${dropped.length > 0 ? `: ${dropped.slice(0, 5).join(", ")}` : ""}`]
+                        : []),
+                      // counted, never echoed (an e-mail/web address may be among them)
+                      ...(rejected.length > 0 ? [`${rejected.length} rejected as not product-shaped`] : []),
+                    ].join("; ");
+              skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (${why})` });
             } else if (productsAreGenericCategoryNames(infosJson)) {
               skippedUnsubstantiated.push({
                 agent_id: agentId,
