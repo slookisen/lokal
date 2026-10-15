@@ -310,11 +310,18 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
       `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården, og spiller casino med gjestene hver helg.</p></body></html>`;
     // Names berries: product keywords [fruit, berries] → platform [fruit].
-    // (The lexicon's berry keywords match "berries", not the accented "bær",
-    // which its accent folding turns into "baer".)
     const BERRIES_HTML =
       `<html><head><title>Bær Gård</title></head><body><h1>Bær Gård</h1>` +
       `<p>Vi selger bær (berries), epler og plommer rett fra gården.</p></body></html>`;
+    // dev-request 2026-10-15-kategori-nokkelord-ae-og-drikke: Norwegian berry
+    // words only ("bær" folds to "baer"; the lexicon is folded the same way),
+    // and a cidery's drinks (eplesider/most/juice → beverages).
+    const BAER_HTML =
+      `<html><head><title>Bringebærlandet</title></head><body><h1>Bringebærlandet</h1>` +
+      `<p>Vi dyrker bringebær og blåbær, og selger dem rett fra gården.</p></body></html>`;
+    const SIDER_HTML =
+      `<html><head><title>Aga Sideri</title></head><body><h1>Aga Sideri</h1>` +
+      `<p>Me produserer eplesider, most og juice av høg kvalitet.</p></body></html>`;
     // Apples only: product keywords [fruit] → platform [fruit]; no berries.
     const APPLES_HTML =
       `<html><head><title>Eple Gård</title></head><body><h1>Eple Gård</h1>` +
@@ -333,7 +340,11 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
           ? BERRIES_HTML
           : host.startsWith("c-apples")
             ? APPLES_HTML
-            : CORR_HTML;
+            : host.startsWith("c-baer")
+              ? BAER_HTML
+              : host.startsWith("c-sider")
+                ? SIDER_HTML
+                : CORR_HTML;
       const resp = new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
       if (REDIRECTS[host]) Object.defineProperty(resp, "url", { value: REDIRECTS[host] });
       return resp;
@@ -354,6 +365,10 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     seed("c-badprov", { cats: ["vegetables"], products: REAL, prov: gpProv });
     db.prepare(`UPDATE agent_knowledge SET field_provenance = '{not json' WHERE agent_id = 'c-badprov'`).run();
     seed("c-apples", { cats: ["berries"], products: REAL, prov: gpProv });
+    seed("c-baer", { cats: ["berries"], products: REAL, prov: gpProv });
+    seed("c-baer-fruit", { cats: ["fruit"], products: REAL, prov: gpProv });
+    seed("c-sider", { cats: ["beverages"], products: REAL, prov: gpProv });
+    seed("c-sider-fruit", { cats: ["beverages", "fruit"], products: REAL, prov: gpProv });
     for (const id of ["c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok", "c-hijacked", "c-unparse"]) {
       seed(id, { cats: ["vegetables"], products: REAL, prov: gpProv });
     }
@@ -379,7 +394,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       [
         "c-veg", "c-fruit", "c-empty", "c-locked", "c-wrongent", "c-spam", "c-partial", "c-case", "c-berries",
         "c-other", "c-badprov", "c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok", "c-apples", "c-hijacked",
-        "c-unparse",
+        "c-unparse", "c-baer", "c-baer-fruit", "c-sider", "c-sider-fruit",
       ].map(tgt) as any,
       { dryRun: false, fetchImpl: corrFetch as any, categoriesCorroborateOnly: true },
     );
@@ -500,15 +515,33 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       ["c-case", '["Vegetables"]', "Vegetables", "https://c-case.kat-test.no"],
       ["c-berries", '["berries"]', "berries", "https://c-berries.kat-test.no"],
       ["c-redir-ok", '["vegetables"]', "vegetables", "https://www.c-redir-ok-ny.no/"],
+      ["c-baer", '["berries"]', "berries", "https://c-baer.kat-test.no"],
+      ["c-baer-fruit", '["fruit"]', "fruit", "https://c-baer-fruit.kat-test.no"],
+      ["c-sider", '["beverages"]', "beverages", "https://c-sider.kat-test.no"],
     ];
     for (const [id, col, val, url] of corroborated) {
       const hpRecs = (JSON.parse(provOf(id)).categories as any[]).filter((r) => r.source_type === "website_homepage");
       assertEq(
         [catsOf(id), hpRecs.map((r) => [r.value, r.source_url]), cvs.categoriesLackWebsiteCorroboration(catsOf(id), provOf(id))],
         [col, [[val, url]], false],
-        `AC5 ${id}: corroborated (${id === "c-case" ? "stored casing compared case-insensitively" : id === "c-berries" ? "stored berries on a page that names berries" : "source_url is the final URL after a same-owner redirect"}); stored column byte-identical`,
+        `AC5 ${id}: corroborated (${
+          {
+            "c-case": "stored casing compared case-insensitively",
+            "c-berries": "stored berries on a page that names berries",
+            "c-redir-ok": "source_url is the final URL after a same-owner redirect",
+            "c-baer": "stored berries on a page that only says «bringebær og blåbær»",
+            "c-baer-fruit": "stored fruit on a page whose only fruit words are «bringebær/blåbær» (berries map to fruit)",
+            "c-sider": "stored beverages on a cidery page (eplesider/most/juice)",
+          }[id]
+        }); stored column byte-identical`,
       );
     }
+    // A cidery page names drinks, not fruit: [beverages, fruit] is partial support.
+    assertEq(
+      [catReason("c-sider-fruit"), JSON.parse(catsOf("c-sider-fruit")), hasHpCats("c-sider-fruit")],
+      [`${mod.HCR_CATEGORIES_NOT_SUPPORTED} (stored: beverages,fruit; homepage: beverages)`, ["beverages", "fruit"], false],
+      "AC5 kategori-ae: stored [beverages, fruit] on a drinks-only page is still refused (every stored category must be on the page)",
+    );
 
     // without the option (route / morning send): replacement exactly as before
     assertEq(JSON.parse(catsOf("c-noopt")), ["meat", "vegetables", "honey"], "AC5 regression: WITHOUT the option the stored categories are still replaced");

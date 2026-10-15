@@ -950,11 +950,22 @@ export function extractProseText(html: string): string {
 
 // Norwegian → category vocabulary, mirroring the platform's canonical map in
 // services/marketplace-registry.ts (categoryMap) and routes/seo.ts
-// (CATEGORY_MAP). Kept local (dependency-free, accent-stripped at match time)
-// so this module stays a leaf importer of cross-source-validator only. The 10
-// category keys MUST match the platform set: vegetables, fruit, berries, dairy,
-// eggs, meat, fish, bread, honey, herbs.
-const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+// (CATEGORY_MAP). Kept local (dependency-free) so this module stays a leaf
+// importer of cross-source-validator only. The 11 category keys MUST map onto
+// the platform set (PRODUCT_KEY_TO_PLATFORM below): vegetables, fruit,
+// berries, dairy, eggs, meat, fish, bread, honey, herbs, beverages.
+//
+// Keywords may be written in normal Norwegian spelling: the list is folded at
+// load (CONTENT_CATEGORY_LEXICON below) through the SAME lowercase +
+// stripNorwegianAccents the page text gets in extractProductMentions, so both
+// sides always compare in one form. dev-request 2026-10-15-kategori-
+// nokkelord-ae-og-drikke: the berry/pear words used to be written "bar",
+// "jordbar", "pare" — but the folding turns æ into "ae" ("bær" → "baer"), so
+// they never matched Norwegian text, and the bare "bar" only ever matched the
+// English/Norwegian "bar" (kaffebar, bar). The accent-less compounds stay as
+// a fallback where they mean nothing else ("bringebar"); "bar", "pare" and
+// "parer" (also the verb "pare", to mate) are gone.
+const CONTENT_CATEGORY_LEXICON_SOURCE: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["vegetables", [
     "gronnsaker", "gronnsak", "gront", "vegetables", "poteter", "potet",
     "gulrotter", "gulrot", "lok", "kal", "tomat", "tomater", "agurk",
@@ -963,12 +974,14 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
     "nepe", "pastinakk", "andelslandbruk",
   ]],
   ["fruit", [
-    "frukt", "fruit", "epler", "eple", "parer", "pare", "plommer", "plomme",
-    "kirsebar", "moreller", "rips", "stikkelsbar", "druer",
+    "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
+    "kirsebær", "kirsebar", "moreller", "rips", "stikkelsbær", "stikkelsbar", "druer",
   ]],
   ["berries", [
-    "bar", "berries", "jordbar", "blabar", "bringebar", "tyttebar",
-    "solbar", "multe", "multer", "markjordbar",
+    "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær", "solbær",
+    "markjordbær", "multe", "multer",
+    // accent-less spellings (no other meaning)
+    "jordbar", "blabar", "bringebar", "tyttebar", "solbar", "markjordbar",
   ]],
   ["dairy", [
     "meieri", "dairy", "melk", "ost", "smor", "yoghurt", "flote", "romme",
@@ -992,7 +1005,42 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
   ]],
   ["honey", ["honning", "honey", "birokt"]],
   ["herbs", ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"]],
+  // Drinks a farm sells. NOT the bare "sider": it is also the plural of
+  // "side" (a web page — the WordPress "Sider" widget, "andre sider"), so it
+  // would tag any site; the cidery itself ("sideri") and the compounds carry
+  // it. "most" is guarded against English use (CONTENT_KEYWORD_PATTERNS).
+  ["beverages", [
+    "sideri", "eplesider", "pæresider", "cider", "eplecider",
+    "most", "eplemost", "pæremost", "juice", "eplejuice", "saft",
+  ]],
 ];
+
+/** Same fold as the page text in extractProductMentions. */
+function foldContentKeyword(kw: string): string {
+  return stripNorwegianAccents(kw.toLowerCase());
+}
+
+const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = CONTENT_CATEGORY_LEXICON_SOURCE.map(
+  ([category, keywords]) => [category, Array.from(new Set(keywords.map(foldContentKeyword)))] as const,
+);
+
+/**
+ * Whole-word pattern per (folded) keyword. A keyword that is also a common
+ * English word gets its English contexts excluded: "most" (Norwegian: apple
+ * must) never counts in "the most", "at most", "our most", "most of" or "most
+ * popular" — an English page of a farm that sells no drinks.
+ */
+const CONTENT_KEYWORD_PATTERNS: ReadonlyMap<string, RegExp> = new Map(
+  CONTENT_CATEGORY_LEXICON.flatMap(([, keywords]) =>
+    keywords.map((kw): [string, RegExp] => {
+      const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (kw === "most") {
+        return [kw, /(?<!\b(?:the|at|our|your|their|its)\s+)\bmost\b(?!\s+(?:of|popular)\b)/];
+      }
+      return [kw, new RegExp(`\\b${esc}\\b`)];
+    }),
+  ),
+);
 
 /**
  * Detect distinctive Norwegian BUSINESS-TYPE tokens that appear in the page
@@ -1041,8 +1089,7 @@ export function extractProductMentions(text: string): string[] {
   const out: string[] = [];
   for (const [category, keywords] of CONTENT_CATEGORY_LEXICON) {
     for (const kw of keywords) {
-      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
-      if (re.test(hay)) {
+      if (CONTENT_KEYWORD_PATTERNS.get(kw)!.test(hay)) {
         if (!out.includes(category)) out.push(category);
         break; // one hit is enough to include the category
       }
@@ -1616,6 +1663,7 @@ const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
   bread: "bakery",
   honey: "honey",
   herbs: "herbs",
+  beverages: "beverages",
 };
 
 // Distinctive business-type tokens (from extractBusinessTypeTokens) → the
