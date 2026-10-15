@@ -43861,6 +43861,27 @@ runSerial(async () => {
   }
 });
 
+// Tillegg 2026-10-15 «4b-forslag»: gårdssalg visit-text proposals — the
+// candidates GET, the shared apply function behind POST /admin/gardssalg-
+// visit-proposals-write (server re-fetch + verbatim evidence + overlap) and
+// the hourly job on the shared proposal file queue. api.anthropic.com is
+// counted and asserted zero. Serial: in-memory DB + globalThis.fetch.
+runSerial(async () => {
+  console.log("\n── tillegg 2026-10-15 «4b-forslag»: gardssalg-visit-proposals (candidates, write, job) ──");
+  try {
+    const { runGardssalgVisitProposalsJobTests } = require("../src/services/gardssalg-visit-proposals-job.test") as
+      typeof import("../src/services/gardssalg-visit-proposals-job.test");
+    const vp = await runGardssalgVisitProposalsJobTests({ log: false });
+    passed += vp.passed;
+    failed += vp.failed;
+    for (const f of vp.failures) failures.push("gardssalg-visit-proposals-job: " + f);
+    console.log(`  gardssalg-visit-proposals-job: ${vp.passed} passed, ${vp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-visit-proposals-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
 // 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
 // /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —

@@ -2246,6 +2246,38 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_description_proposal_failures failed:", err);
   }
 
+  // ─── gardssalg_visit_proposal_files / _failures (A2A dev-request
+  // 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+  // tillegg 2026-10-15 «4b-forslag») — the once-per-file ledger + per-path
+  // failure counter for the gårdssalg visit-text proposals job
+  // (services/gardssalg-visit-proposals-job.ts), same shape and same
+  // semantics as the two description-proposals tables right above (shared
+  // mechanics in services/proposal-file-queue.ts). Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_visit_proposal_files (
+        path TEXT PRIMARY KEY,
+        sha TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        result_json TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_visit_proposal_files failed:", err);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_visit_proposal_failures (
+        path TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_failed_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_visit_proposal_failures failed:", err);
+  }
+
   // ─── experience_data_corrections (POST /admin/experiences-data-corrections,
   // routes/opplevelser.ts) ───────────────────────────────────────────────
   // One row per APPLIED, source-backed factual correction of one logical
