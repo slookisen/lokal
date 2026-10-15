@@ -461,6 +461,16 @@ assertTrue(!isAutoReply({ senderRole: "buyer", metadata: undefined as any }),
 
 // Item 2 — classifyAssistant: reuse parseUserAgent, never guess.
 assertEq(classifyAssistant("ChatGPT").label, "ChatGPT", "assistant: ChatGPT client-id classified");
+{
+  // Bot flag = the exact traffic-classifier tokens; a bare app-browser name is a person.
+  const { parseUserAgent: pua } = require("../src/services/human-referrals");
+  assertEq(pua("Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)").isBot, true, "parseUserAgent: ChatGPT-User is a bot");
+  assertEq(pua("Mozilla/5.0 (compatible; GPTBot/1.2)").isBot, true, "parseUserAgent: GPTBot is a bot");
+  assertEq(pua("Mozilla/5.0 (compatible; ClaudeBot/1.0)").isBot, true, "parseUserAgent: ClaudeBot is a bot");
+  assertEq(pua("Claude-User/1.0").isBot, true, "parseUserAgent: Claude-User is a bot");
+  assertEq(pua("Mozilla/5.0 (iPhone) ChatGPT/1.2026 Safari").isBot, false, "parseUserAgent: app-browser UA with 'ChatGPT' is not a bot");
+  assertEq(pua("Mozilla/5.0 (iPhone) Claude/1.0 Safari").isBot, false, "parseUserAgent: app-browser UA with 'Claude' is not a bot");
+}
 assertEq(classifyAssistant("Claude Desktop").label, "Claude", "assistant: Claude Desktop → Claude");
 assertEq(classifyAssistant("Perplexity").label, "Perplexity", "assistant: Perplexity classified");
 assertEq(classifyAssistant("Gemini").label, "Gemini", "assistant: Gemini classified");
@@ -2690,6 +2700,36 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertEq(classifyReferralSource("https://chatgpt.com/").key, "chatgpt", "classify: chatgpt.com");
   assertEq(classifyReferralSource("https://chat.openai.com/").key, "chatgpt", "classify: chat.openai.com");
   assertEq(classifyReferralSource("https://www.perplexity.ai/").key, "perplexity", "classify: perplexity");
+  // AI hosts matched on the parsed host, not a substring (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil).
+  assertEq(classifyReferralSource("https://claude.ai/chat/abc").key, "claude", "classify: claude.ai → AI (claude)");
+  assertEq(classifyReferralSource("https://chat.mistral.ai/").key, "mistral", "classify: chat.mistral.ai");
+  assertEq(classifyReferralSource("https://www.meta.ai/").key, "metaai", "classify: meta.ai");
+  assertEq(classifyReferralSource("https://grok.com/").key, "grok", "classify: grok.com");
+  assertEq(classifyReferralSource("https://chat.deepseek.com/").key, "deepseek", "classify: chat.deepseek.com");
+  assertEq(classifyReferralSource("https://you.com/search?q=x").key, "you", "classify: you.com");
+  assertEq(classifyReferralSource("https://sylteogrokt.no/").key, "annet", "classify: sylteogrokt.no is NOT AI");
+  assertEq(classifyReferralSource("https://thankyou.com/").key, "annet", "classify: thankyou.com is NOT AI");
+  assertEq(classifyReferralSource("https://t.co/abc").key, "sosial", "classify: t.co is social");
+  assertEq(classifyReferralSource("https://evil.example/?u=chatgpt.com").key, "annet", "classify: AI host in a query string is not AI");
+  assertEq(classifyReferralSource("https://kagi.com/search?q=x").key, "annet", "classify: kagi search stays a plain site");
+  assertEq(classifyReferralSource("https://kagi.com/assistant/abc").key, "kagi", "classify: kagi.com/assistant → AI");
+  assertEq(classifyReferralSource(null, { utm_source: "claude", utm_campaign: "ai_search" }).key, "claude", "classify: no referrer + utm_source=claude → AI (claude)");
+  assertEq(classifyReferralSource(null, { utm_source: "agentplatform.no" }).key, "direkte", "classify: utm_source outside the whitelist is not AI");
+  assertEq(classifyReferralSource(null, { utm_source: "bondens-nyhetsbrev", utm_campaign: "sommer" }).key, "direkte", "classify: a producer's own campaign is not AI");
+  assertEq(classifyReferralSource("https://www.google.com/", { utm_source: ["rfb", "chatgpt.com"] }).key, "chatgpt", "classify: utm_source array (ours + ChatGPT's) → AI regardless of order");
+  {
+    const { classifyAiClickSource } = require("../src/services/human-referrals");
+    assertEq(classifyAiClickSource({ referrer: "https://claude.ai/" }), "claude", "aiClick: claude.ai referrer");
+    assertEq(classifyAiClickSource({ utm_source: "claude", utm_campaign: "ai_search" }), "claude", "aiClick: utm_source=claude without referrer");
+    assertEq(classifyAiClickSource({ utm_source: "chatgpt.com" }), "chatgpt", "aiClick: utm_source=chatgpt.com");
+    assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "chatgpt", "aiClick: array, first whitelist hit");
+    assertEq(classifyAiClickSource({ utm_source: ["claude", "chatgpt.com"] }), "claude", "aiClick: array, reversed order is still AI");
+    assertEq(classifyAiClickSource({ utm_campaign: "ai_search" }), "other", "aiClick: ai_search campaign alone → other");
+    assertEq(classifyAiClickSource({ utm_source: "agentplatform.no" }), null, "aiClick: agentplatform.no is not AI");
+    assertEq(classifyAiClickSource({ referrer: "https://sylteogrokt.no/", utm_source: "sommer" }), null, "aiClick: sylteogrokt.no is not AI");
+    assertEq(classifyAiClickSource({ referrer: "https://chat.mistral.ai/" }), "other", "aiClick: other AI hosts → other");
+    assertEq(classifyAiClickSource({}), null, "aiClick: nothing → null");
+  }
   // Ordering guard: gemini/bard live on *.google.com — must NOT fall through to google.
   assertEq(classifyReferralSource("https://gemini.google.com/app").key, "gemini", "classify: gemini before google");
   assertEq(classifyReferralSource("https://duckduckgo.com/").key, "duckduckgo", "classify: duckduckgo");
@@ -2736,14 +2776,16 @@ console.log("── human-visits strip: referral classification + aggregation �
 
   // Threshold: google (5) and perplexity (3) show; bing (2) suppressed.
   assertTrue(!!byKey.google, "human-visits: google pattern present (≥3)");
-  assertTrue(!!byKey.perplexity, "human-visits: perplexity pattern present (=3)");
+  assertTrue(!!byKey.ai, "human-visits: AI sources grouped in ONE 'AI-assistenter' card (perplexity ×3 ≥ threshold)");
+  assertEq(byKey.ai.sourceLabel, "AI-assistenter", "human-visits: AI card label");
+  assertTrue(!byKey.perplexity, "human-visits: no separate per-AI card");
   assertTrue(!byKey.bing, "human-visits: bing SUPPRESSED (<3 threshold)");
   assertTrue(!byKey.intern, "human-visits: own-domain 'intern' never shown");
   assertTrue(!byKey.direkte, "human-visits: direct visits never shown");
 
   // Internal (owner) + bot rows excluded → google = 5 human sessions, not 7.
   assertEq(byKey.google.visitCount, 5, "human-visits: google visitCount excludes owner + bot");
-  assertEq(byKey.perplexity.visitCount, 3, "human-visits: perplexity visitCount = 3");
+  assertEq(byKey.ai.visitCount, 3, "human-visits: AI card visitCount = 3");
 
   // Producer naming (public names only) + "+N andre" for the unresolved 3rd.
   assertEq(byKey.google.topProducers.length, 2, "human-visits: names up to 2 producers");

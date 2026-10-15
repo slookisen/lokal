@@ -342,11 +342,21 @@ export function computeTrafficReport(
   const sessions = new Interner();
   const paths = new Interner();
   const referrers = new Interner();
+  // utm_source + utm_campaign of the landing, only for rows that carry one (-1 = none):
+  // an AI UTM mark classifies a visit that has no referrer (classifyReferralSource).
+  const utmMarks = new Interner();
+  const utmOf = (u: number) => {
+    if (u < 0) return undefined;
+    const [utm_source, utm_campaign] = utmMarks.values[u]!.split("\u0000");
+    return { utm_source, utm_campaign };
+  };
+
   let cap = 1 << 14;
   let sIdx = new Int32Array(cap);
   let tsArr = new Float64Array(cap);
   let pIdx = new Int32Array(cap);
   let rIdx = new Int32Array(cap);
+  let uIdx = new Int32Array(cap);
   let visitStart = new Uint8Array(cap);
   let n = 0;
   const grow = () => {
@@ -355,6 +365,7 @@ export function computeTrafficReport(
     const t2 = new Float64Array(cap); t2.set(tsArr); tsArr = t2;
     const p2 = new Int32Array(cap); p2.set(pIdx); pIdx = p2;
     const r2 = new Int32Array(cap); r2.set(rIdx); rIdx = r2;
+    const u2 = new Int32Array(cap); u2.set(uIdx); uIdx = u2;
     const v2 = new Uint8Array(cap); v2.set(visitStart); visitStart = v2;
   };
 
@@ -384,7 +395,7 @@ export function computeTrafficReport(
   // form (pageViewSql) runs string functions on every row and, with the probe
   // scan it replaces, made a 60-day report about 40 % slower.
   const rowStmt = db.prepare(`
-    SELECT session_id, ${col("client_class")}, path, created_at, ${col("referrer")}, ${col("is_owner")}, ${statusCol}
+    SELECT session_id, ${col("client_class")}, path, created_at, ${col("referrer")}, ${col("is_owner")}, ${statusCol}, ${col("utm_source")}, ${col("utm_campaign")}
     FROM analytics_page_views${indexHint(db, V ? vertical : undefined)}
     WHERE ${timeSql}${V}
     ORDER BY created_at
@@ -405,7 +416,7 @@ export function computeTrafficReport(
   // raw(): rows as arrays, not objects — ~1.5M rows for 60 days, so the
   // per-row allocation matters. Column order is the SELECT above.
   for (const r of rowStmt.raw(true).iterate(...tp, ...vp) as Iterable<[
-    string | null, string | null, string, string, string | null, number | null, number | null,
+    string | null, string | null, string, string, string | null, number | null, number | null, string | null, string | null,
   ]>) {
     const sid = r[0] ?? "";
     const clientClass = r[1];
@@ -451,6 +462,7 @@ export function computeTrafficReport(
       pIdx[n] = p;
       const referrer = r[4];
       rIdx[n] = referrer && referrer.trim() ? referrers.id(referrer) : -1;
+      uIdx[n] = r[7] || r[8] ? utmMarks.id(`${r[7] ?? ""}\u0000${r[8] ?? ""}`) : -1;
     }
 
     const isNewVisit = sViews[s] === 0 || ts - sLast[s] > VISIT_GAP_MS;
@@ -576,7 +588,7 @@ export function computeTrafficReport(
 
     if (g === "human" && visitStart[i]) {
       const referrer = rIdx[i] >= 0 ? referrers.values[rIdx[i]] : null;
-      const src = classifyReferralSource(referrer);
+      const src = classifyReferralSource(referrer, utmOf(uIdx[i]));
       // A visit that "starts" from one of our own pages is a person coming
       // back after more than 30 minutes: direct, not internal.
       const key = src.key === "intern" ? "direkte" : src.key;
@@ -633,7 +645,7 @@ export function computeTrafficReport(
       sp.add(p);
       if (!sessionEntry.has(s)) {
         const referrer = rIdx[i] >= 0 ? referrers.values[rIdx[i]] : null;
-        const k = classifyReferralSource(referrer).key;
+        const k = classifyReferralSource(referrer, utmOf(uIdx[i])).key;
         sessionEntry.set(s, k === "intern" ? "direkte" : k);
       }
     }

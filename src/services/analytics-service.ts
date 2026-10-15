@@ -24,6 +24,7 @@ import {
 import {
   parseUserAgent,
   classifyReferralSource,
+  isAiReferralKey,
   aggregateHumanReferrals,
   MIN_HUMAN_REFERRAL_COUNT,
   type HumanReferralRow,
@@ -313,11 +314,12 @@ setInterval(() => sessionManager.cleanup(), 5 * 60 * 1000);
  */
 export type AgentViewSource = "direct" | "discovery" | "search" | "ai" | "social" | "referral";
 export function agentViewSourceFor(referrer: string | null | undefined): AgentViewSource {
-  switch (classifyReferralSource(referrer).key) {
+  const key = classifyReferralSource(referrer).key;
+  if (isAiReferralKey(key)) return "ai";
+  switch (key) {
     case "direkte": return "direct";
     case "intern": return "discovery";
     case "google": case "bing": case "duckduckgo": return "search";
-    case "chatgpt": case "perplexity": case "gemini": case "copilot": return "ai";
     case "sosial": return "social";
     default: return "referral";
   }
@@ -752,11 +754,12 @@ export class AnalyticsService {
       // of slice-4's is_internal on conversations. Bot exclusion + classification
       // + threshold happen in aggregateHumanReferrals().
       const rows = db.prepare(`
-        SELECT referrer, path, session_id, is_owner
+        SELECT referrer, path, session_id, is_owner, utm_source, utm_campaign
         FROM analytics_page_views
         WHERE created_at > ?
           AND (is_owner IS NULL OR is_owner = 0)
-          AND referrer IS NOT NULL AND TRIM(referrer) != ''${V}
+          AND ((referrer IS NOT NULL AND TRIM(referrer) != '')
+               OR (utm_source IS NOT NULL AND utm_source != '') OR utm_campaign = 'ai_search')${V}
       `).all(cutoff, ...vp) as HumanReferralRow[];
 
       if (rows.length === 0) return [];
