@@ -1929,9 +1929,11 @@ export interface HomepageContentRefreshOptions {
    */
   fetchImpl?: typeof fetch;
   /**
-   * NEVER set by the route or the morning send (unset = byte-identical
-   * behaviour). Set only by the nightly RFB enrichment job (R6,
-   * services/rfb-enrichment-nightly.ts) through refreshRfbCandidateHomepage.
+   * NEVER set by the morning send or for the route's explicit agentIds (unset =
+   * byte-identical behaviour). Set by the nightly RFB enrichment job (R6,
+   * services/rfb-enrichment-nightly.ts) through refreshRfbCandidateHomepage,
+   * and by the route for its AUTO-selected targets (dev-request 2026-10-15-
+   * homepage-refresh-autoutvalg-erstatter-ikke-ubekreftede-kategorier).
    *
    * When set, and the stored agents.categories is a non-empty list that is not
    * yet corroborated (categoriesLackWebsiteCorroboration — the outreach gate's
@@ -2084,7 +2086,10 @@ export const HCR_THEME_SPAM_CANDIDATE_REASON =
  * (categories only: the refresh writes categories, never products, so a
  * category-name-only products list with corroborated categories is not
  * selectable). Those rows were never picked before, so categories_not_corroborated
- * stood forever. The extension group is ordered by
+ * stood forever. (Since dev-request 2026-10-15-homepage-refresh-autoutvalg-
+ * erstatter-ikke-ubekreftede-kategorier the route refreshes these targets
+ * with categoriesCorroborateOnly: a non-empty stored list is corroborated or
+ * left alone, never replaced.) The extension group is ordered by
  * homepage_content_checked_at (NULL first, stamped on every apply attempt),
  * then updated_at, so a row the refresh cannot fix moves to the back. At least half of `limit` is reserved
  * for this group when it has that many rows, so a long first group cannot
@@ -2720,9 +2725,13 @@ homepageContentRefreshRouter.post(
 
     // ── Target selection ─────────────────────────────────────────────────────
     let targets: HcrTargetRow[];
+    // Auto-selected targets corroborate stored categories, never replace them
+    // (see the refresh call below); explicit agentIds keep today's behaviour.
+    let autoSelected = false;
     if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
       targets = selectHomepageContentRefreshTargetsByIds(db, body.agentIds as unknown[], limit);
     } else {
+      autoSelected = true;
       // Auto-select: producers (non-umbrella) WITH a website AND existing
       // about/products, whose CONTENT provenance does NOT yet carry a
       // website_homepage source for about/products/description/categories — i.e.
@@ -2776,10 +2785,54 @@ homepageContentRefreshRouter.post(
     // ── Per-agent processing: refreshHomepageContent() above (extracted
     // verbatim, dev-request 2026-09-19-rfb-marketing-utsending-inn-i-
     // plattformjobben) — same response shape, same key order. ──────────────
-    const result = await refreshHomepageContent(db, targets, { dryRun });
-    res.json({ dry_run: dryRun, ...result });
+    //
+    // dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
+    // ubekreftede-kategorier: an AUTO-selected target (no agentIds — the
+    // routine lokal-agent-enrichment's Phase 4c) is refreshed with
+    // categoriesCorroborateOnly, the rule R6 uses: a non-empty, uncorroborated
+    // stored category list is never REPLACED by the page's keyword extraction
+    // (Holm Gård: stored [vegetables] → extracted [meat, vegetables, honey,
+    // fish, herbs]); it only gains a website_homepage source when the
+    // producer's own page supports every stored category, else nothing is
+    // written for categories. Dry run and apply alike. Empty stored categories
+    // and every other field: unchanged. Explicit agentIds (a deliberate
+    // operator action, already behind canCorrectFactualField and the curated
+    // lock) keep the replacing behaviour, byte for byte. Deviation from R2
+    // (2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter), which
+    // had the auto-select replace them.
+    const result = await refreshHomepageContent(db, targets, {
+      dryRun,
+      ...(autoSelected ? { categoriesCorroborateOnly: true } : {}),
+    });
+    res.json({
+      dry_run: dryRun,
+      ...result,
+      // Auto-select only (last key; the explicit-ids response is unchanged):
+      // the corroboration tally, keyed like R6's extra.categories_corroboration.
+      ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
+    });
   },
 );
+
+/**
+ * Per-agent tally of a categoriesCorroborateOnly refresh, keyed like R6's
+ * step extra.categories_corroboration: `corroborated` (stored list unchanged,
+ * website_homepage source added — or, in a dry run, would be) and
+ * `categories_not_supported_by_homepage` (nothing written for categories).
+ */
+export function homepageContentRefreshCorroborationTally(
+  result: HomepageContentRefreshResult,
+): { corroborated: number; categories_not_supported_by_homepage: number } {
+  const corroborated = new Set(
+    result.changed.filter((c) => c.fields.includes(HCR_CATEGORIES_CORROBORATED)).map((c) => c.agent_id),
+  );
+  const notSupported = new Set(
+    result.skipped_unsubstantiated
+      .filter((s) => s.reason.startsWith(HCR_CATEGORIES_NOT_SUPPORTED))
+      .map((s) => s.agent_id),
+  );
+  return { corroborated: corroborated.size, categories_not_supported_by_homepage: notSupported.size };
+}
 
 // ─── GET/POST /admin/description-truncation-sweep (dev-request ──────────────
 //     2026-07-01-cs-corrections-profile-quality, item C) ────────────────────

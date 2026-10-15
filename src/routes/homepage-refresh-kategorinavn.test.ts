@@ -25,6 +25,11 @@
  *        a non-platform key (berries) needs that same keyword on the page, not
  *        just its platform category; the provenance source_url is the final URL. Empty stored categories,
  *        the curated lock and every caller without the option behave as before.
+ *   AC6  (dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
+ *        ubekreftede-kategorier) POST /admin/homepage-content-refresh refreshes
+ *        its AUTO-selected targets with categoriesCorroborateOnly (dry run and
+ *        apply) and answers with a categories_corroboration tally; explicit
+ *        agentIds still replace.
  *
  * Standalone: npx tsx src/routes/homepage-refresh-kategorinavn.test.ts
  */
@@ -558,6 +563,108 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       [1, 1],
       "AC5: by_field.categories counts only real column writes (c-empty / c-noopt)",
     );
+    db.prepare(`DELETE FROM agent_knowledge`).run();
+    db.prepare(`DELETE FROM agents`).run();
+
+    // AC6 — dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
+    // ubekreftede-kategorier: POST /admin/homepage-content-refresh refreshes its
+    // AUTO-selected targets with categoriesCorroborateOnly (dry run and apply);
+    // explicit agentIds keep replacing. The route takes no fetch seam, so the
+    // global fetch is stubbed for these calls only.
+    {
+      const route = mod.homepageContentRefreshRouter as any;
+      const callRoute = (body: any, query: Record<string, string> = {}): Promise<{ status: number; body: any }> =>
+        new Promise((resolve) => {
+          const headers: Record<string, string> = { "x-admin-key": testKey, "content-type": "application/json" };
+          const req: any = {
+            method: "POST", url: "/homepage-content-refresh", originalUrl: "/homepage-content-refresh",
+            query, headers, body, ip: "127.0.0.1", get: (n: string) => headers[n.toLowerCase()],
+          };
+          const res: any = {
+            statusCode: 200,
+            status(c: number) { this.statusCode = c; return this; },
+            json(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
+          };
+          route.handle(req, res, (err?: any) => resolve({ status: 500, body: { error: String(err ?? "unmatched") } }));
+        });
+      const gpProvA = { about: [GP(OLD_ABOUT)], categories: [GP("vegetables")] };
+      // fresh group (no website_homepage source anywhere) and extension group
+      // (homepage-sourced about, categories uncorroborated) alike.
+      seed("au-veg", { cats: ["vegetables"], products: REAL, prov: gpProvA, updated: "2020-03-01T00:00:00.000Z" });
+      seed("au-partial", { cats: ["vegetables", "fruit"], products: REAL, prov: gpProvA, updated: "2020-03-02T00:00:00.000Z" });
+      seed("au-ext", { cats: ["vegetables"], products: REAL, prov: { about: [HP("x")], categories: [GP("vegetables")] }, updated: "2020-03-03T00:00:00.000Z" });
+      seed("au-empty", { cats: null, products: REAL, prov: { about: [GP(OLD_ABOUT)] }, updated: "2020-03-04T00:00:00.000Z" });
+      const AU = ["au-veg", "au-partial", "au-ext", "au-empty"];
+      const prevFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = async () =>
+        new Response(CORR_HTML, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      try {
+        const snap = () => AU.map((id) => [catsOf(id), provOf(id)]);
+        const before = JSON.stringify(snap());
+        const dry = await callRoute({ limit: 25 });
+        assertEq(
+          [dry.status, dry.body.dry_run, JSON.stringify(snap()) === before],
+          [200, true, true],
+          "AC6 dry run: auto-select answers 200 and writes nothing",
+        );
+        assertEq(
+          [changedOf(dry.body, "au-veg").includes(mod.HCR_CATEGORIES_CORROBORATED), changedOf(dry.body, "au-veg").includes("categories")],
+          [true, false],
+          "AC6 dry run: the auto-selected [vegetables] row is reported as categories_corroborated, not a categories write",
+        );
+        assertEq(
+          dry.body.categories_corroboration,
+          { corroborated: 2, categories_not_supported_by_homepage: 1 },
+          "AC6 dry run: categories_corroboration tally (au-veg + au-ext corroborated, au-partial not supported)",
+        );
+
+        const applied = await callRoute({ limit: 25 }, { apply: "1" });
+        assertEq([applied.status, applied.body.dry_run], [200, false], "AC6 apply: auto-select answers 200");
+        // corroborated: column unchanged, website_homepage provenance added
+        for (const id of ["au-veg", "au-ext"]) {
+          const hpRecs = (JSON.parse(provOf(id)).categories as any[]).filter((r) => r.source_type === "website_homepage");
+          assertEq(
+            [catsOf(id), hpRecs.map((r) => [r.value, r.source_url]), cvs.categoriesLackWebsiteCorroboration(catsOf(id), provOf(id))],
+            ['["vegetables"]', [["vegetables", `https://${id}.kat-test.no`]], false],
+            `AC6 apply ${id}: stored [vegetables] on a [meat, vegetables, honey] page stays [vegetables] (byte-identical) and gains a website_homepage source`,
+          );
+        }
+        // partial support: nothing written for categories
+        assertEq(
+          [
+            JSON.parse(catsOf("au-partial")),
+            (JSON.parse(provOf("au-partial")).categories as any[]).map((r) => r.source_type),
+            applied.body.skipped_unsubstantiated.find((s: any) => s.agent_id === "au-partial" && s.reason.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED))?.reason,
+          ],
+          [["vegetables", "fruit"], ["google_places"], `${mod.HCR_CATEGORIES_NOT_SUPPORTED} (stored: vegetables,fruit; homepage: meat,vegetables,honey)`],
+          "AC6 apply: partial support ([vegetables, fruit]) writes nothing for categories",
+        );
+        // empty stored categories: written from the page as before
+        assertEq(JSON.parse(catsOf("au-empty")), ["meat", "vegetables", "honey"], "AC6 apply: empty stored categories are still written from the page");
+        // other fields unchanged by the option
+        assertEq(
+          (db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = 'au-veg'`).get() as any).about,
+          PAGE_ABOUT,
+          "AC6 apply: about is still written from the homepage",
+        );
+        assertEq(
+          [applied.body.categories_corroboration, Object.keys(applied.body).pop()],
+          [{ corroborated: 2, categories_not_supported_by_homepage: 1 }, "categories_corroboration"],
+          "AC6 apply: the tally is in the response, as its last key",
+        );
+
+        // explicit agentIds: replacement exactly as before, no tally key
+        seed("ex-veg", { cats: ["vegetables"], products: REAL, prov: gpProvA });
+        const explicit = await callRoute({ agentIds: ["ex-veg"], apply: true });
+        assertEq(
+          [JSON.parse(catsOf("ex-veg")), changedOf(explicit.body, "ex-veg").includes("categories"), "categories_corroboration" in explicit.body],
+          [["meat", "vegetables", "honey"], true, false],
+          "AC6 explicit agentIds: stored [vegetables] is REPLACED by the page's categories as before; no tally key",
+        );
+      } finally {
+        (globalThis as any).fetch = prevFetch;
+      }
+    }
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();
 
