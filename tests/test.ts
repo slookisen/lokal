@@ -43819,6 +43819,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content queue
+// (drink first) drained by a server-side daily job through the SAME shared
+// core as POST /admin/gardssalg-content-refresh, with llm:false — every call
+// to api.anthropic.com is counted and asserted zero. Serial: in-memory DB +
+// globalThis.fetch.
+runSerial(async () => {
+  console.log("\n── tillegg 2026-10-15 «4b-det»: gardssalg-content-refresh-job (server-side, llm:false) ──");
+  try {
+    const { runGardssalgContentRefreshJobTests } = require("../src/services/gardssalg-content-refresh-job.test") as
+      typeof import("../src/services/gardssalg-content-refresh-job.test");
+    const gj = await runGardssalgContentRefreshJobTests({ log: false });
+    passed += gj.passed;
+    failed += gj.failed;
+    for (const f of gj.failures) failures.push("gardssalg-content-refresh-job: " + f);
+    console.log(`  gardssalg-content-refresh-job: ${gj.passed} passed, ${gj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-content-refresh-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
 // 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
 // /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —
