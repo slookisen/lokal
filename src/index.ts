@@ -2255,7 +2255,9 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
     "[dispatch-tick] disabled — " +
     (process.env.DISPATCH_TICK_DISABLED === "1"
       ? "DISPATCH_TICK_DISABLED=1 (kill-switch)"
-      : "no routine configured (FIRE_ROUTINES / FIRE_ROUTINE_<AGENT>_* unset — nothing could fire)"),
+      : process.env.FIRE_ROUTINES && !parseRoutines().diag.parse_ok
+        ? "no routine configured (FIRE_ROUTINES is set but does not parse — see GET /admin/loop-dispatch fire_routines.parse_error)"
+        : "no routine configured (FIRE_ROUTINES / FIRE_ROUTINE_<AGENT>_* unset — nothing could fire)"),
   );
 } else {
   const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);

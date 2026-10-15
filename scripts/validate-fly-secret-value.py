@@ -102,7 +102,7 @@ def main() -> int:
             fail(name, f"value was only the {prefix!r} prefix, with nothing after it")
 
     # Structured values get the JSON treatment. A plain value is checked only when
-    # its NAME says it is a credential (e.g. FIRE_ROUTINE_<AGENT>_TOKEN), so the
+    # its NAME ends in _TOKEN (e.g. FIRE_ROUTINE_<AGENT>_TOKEN), so the
     # 2026-09-03 "TOKEN" placeholder cannot slip through as a one-field secret; a
     # plain flag such as RETENTION_JOB_ENABLED=true passes through untouched.
     if value.lstrip()[:1] in "{[":
@@ -111,8 +111,14 @@ def main() -> int:
         except json.JSONDecodeError as err:
             fail(name, f"looks like JSON but does not parse ({err})")
         walk(parsed, name)
-    elif CREDENTIAL_KEY.search(name):
+    elif name.endswith("_TOKEN"):
+        # Name-based only for *_TOKEN (whole last segment): a substring match on
+        # "key"/"secret" would also catch e.g. MONKEY_ENABLED or a legitimately
+        # short INDEXNOW_KEY on a re-sync.
         walk(value, name, name)
+    elif name.startswith("FIRE_ROUTINE_") and name.endswith("_TRIG"):
+        if not re.fullmatch(r"trig_[A-Za-z0-9]{8,}", value.strip()):
+            fail(name, "does not look like a routine id (expected trig_ followed by letters/digits)")
 
     out_path = os.environ.get("SECRET_LINE_OUT")
     if out_path:
