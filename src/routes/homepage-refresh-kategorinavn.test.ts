@@ -14,6 +14,12 @@
  *   AC4  (gate part) GET /admin/outreach-candidates names the rows held only by
  *        generic_products_only / categories_not_corroborated in
  *        data_quality_held (last key); the suppression itself is unchanged.
+ *   AC5  categoriesCorroborateOnly (the nightly R6 job's option): a non-empty,
+ *        uncorroborated stored category list is corroborated (provenance only,
+ *        list unchanged) when the page supports every stored category, else
+ *        left alone with a categories_not_supported_by_homepage reason (also on
+ *        a wrong-entity site or a theme-spam summary); empty stored categories,
+ *        the curated lock and every caller without the option behave as before.
  *
  * Standalone: npx tsx src/routes/homepage-refresh-kategorinavn.test.ts
  */
@@ -282,6 +288,146 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       (db.prepare(`SELECT homepage_content_checked_at AS c FROM agent_knowledge WHERE agent_id = 'rot-dry'`).get() as any).c,
       null,
       "AC3b: a dry run stamps nothing",
+    );
+    db.prepare(`DELETE FROM agent_knowledge`).run();
+    db.prepare(`DELETE FROM agents`).run();
+
+    // AC5 — categoriesCorroborateOnly (the nightly R6 job's option): a
+    // non-empty, uncorroborated stored category list is never replaced by the
+    // page's keyword extraction. The page below extracts [meat, vegetables, honey].
+    const cvs = require("../services/cross-source-validator") as typeof import("../services/cross-source-validator");
+    const CORR_HTML =
+      `<html><head><title>Grønt Gård</title><meta property="og:description" content="${PAGE_ABOUT}"></head>` +
+      `<body><h1>Grønt Gård</h1><p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården.</p></body></html>`;
+    // Same categories, but the about summary carries a gambling term (the
+    // candidate-level theme-spam rejection; the page as a whole is not spam).
+    const SPAM_SUMMARY_HTML =
+      `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
+      `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården, og spiller casino med gjestene hver helg.</p></body></html>`;
+    const corrFetch = async (url: string) =>
+      new Response(new URL(url).host.startsWith("c-spam") ? SPAM_SUMMARY_HTML : CORR_HTML, {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    const gpProv = { about: [GP(OLD_ABOUT)], categories: [GP("vegetables")] };
+    seed("c-veg", { cats: ["vegetables"], products: REAL, prov: gpProv });
+    seed("c-fruit", { cats: ["fruit", "berries"], products: REAL, prov: gpProv });
+    seed("c-empty", { cats: null, products: REAL, prov: { about: [GP(OLD_ABOUT)] } });
+    seed("c-locked", { cats: ["vegetables"], products: REAL, prov: gpProv });
+    db.prepare(`UPDATE agent_knowledge SET curated_fields = '{"categories":true}' WHERE agent_id = 'c-locked'`).run();
+    seed("c-noopt", { cats: ["vegetables"], products: REAL, prov: gpProv });
+    seed("c-wrongent", { cats: ["vegetables"], products: REAL, prov: { ...gpProv, website_ownership: { status: "unverified" } } });
+    seed("c-spam", { cats: ["vegetables"], products: REAL, prov: gpProv });
+    const tgt = (id: string) => ({ agent_id: id, name: `Gård ${id}`, homepage_url: `https://${id}.kat-test.no` });
+    const catsOf = (id: string) => (db.prepare(`SELECT categories FROM agents WHERE id = ?`).get(id) as any).categories;
+    const provOf = (id: string) =>
+      (db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).field_provenance;
+    const aboutOf = (id: string) => (db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).about;
+    assertEq(
+      ["c-veg", "c-fruit", "c-locked", "c-noopt"].map((id) => cvs.categoriesLackWebsiteCorroboration(catsOf(id), provOf(id))),
+      [true, true, true, true],
+      "AC5 fixture: the stored categories are held by the gate (categories_not_corroborated)",
+    );
+    const corr = await mod.refreshHomepageContent(
+      db as any,
+      [tgt("c-veg"), tgt("c-fruit"), tgt("c-empty"), tgt("c-locked"), tgt("c-wrongent"), tgt("c-spam")] as any,
+      { dryRun: false, fetchImpl: corrFetch as any, categoriesCorroborateOnly: true },
+    );
+    const noopt = await mod.refreshHomepageContent(db as any, [tgt("c-noopt")] as any, {
+      dryRun: false,
+      fetchImpl: corrFetch as any,
+    });
+    const changedOf = (r: typeof corr, id: string) => r.changed.find((c) => c.agent_id === id)?.fields ?? [];
+
+    // corroborated: list unchanged, homepage source added, gate passes
+    assertEq(JSON.parse(catsOf("c-veg")), ["vegetables"], "AC5 corroborate: stored [vegetables] stays exactly [vegetables] (meat/honey from the page NOT added)");
+    const vegCat = JSON.parse(provOf("c-veg")).categories as any[];
+    const vegHp = vegCat.filter((r) => r.source_type === "website_homepage");
+    assertEq(
+      vegHp.map((r) => [r.value, r.source_url, typeof r.fetched_at]),
+      [["vegetables", "https://c-veg.kat-test.no", "string"]],
+      "AC5 corroborate: one website_homepage provenance record for the stored value, with the page source_url",
+    );
+    assertEq(vegCat.length, 2, "AC5 corroborate: the earlier google_places record is kept (merge, not replace)");
+    assertEq(cvs.categoriesLackWebsiteCorroboration(catsOf("c-veg"), provOf("c-veg")), false, "AC5 corroborate: the row now passes the gate's categories test");
+    assertEq(changedOf(corr, "c-veg").includes(mod.HCR_CATEGORIES_CORROBORATED), true, "AC5 corroborate: reported as categories_corroborated in changed[].fields");
+    assertEq(changedOf(corr, "c-veg").includes("categories"), false, "AC5 corroborate: NOT reported as a categories column write");
+
+    // not supported: nothing written for categories, reason recorded, gate holds
+    assertEq(JSON.parse(catsOf("c-fruit")), ["fruit", "berries"], "AC5 not supported: stored [fruit, berries] unchanged");
+    assertEq(
+      (JSON.parse(provOf("c-fruit")).categories as any[]).map((r) => r.source_type),
+      ["google_places"],
+      "AC5 not supported: no categories provenance added",
+    );
+    assertEq(cvs.categoriesLackWebsiteCorroboration(catsOf("c-fruit"), provOf("c-fruit")), true, "AC5 not supported: the gate still holds the row");
+    const fruitReason = corr.skipped_unsubstantiated.find((s) => s.agent_id === "c-fruit")?.reason ?? "";
+    assertEq(
+      [fruitReason.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED), fruitReason.includes("fruit,berries"), fruitReason.includes("meat,vegetables,honey")],
+      [true, true, true],
+      "AC5 not supported: skip reason categories_not_supported_by_homepage with stored and page categories",
+    );
+    assertEq(
+      changedOf(corr, "c-fruit").some((f) => f === "categories" || f === mod.HCR_CATEGORIES_CORROBORATED),
+      false,
+      "AC5 not supported: nothing reported written for categories",
+    );
+
+    // empty stored categories: today's behaviour (the page's categories are written)
+    assertEq(JSON.parse(catsOf("c-empty")), ["meat", "vegetables", "honey"], "AC5 empty stored: categories written from the page as today");
+    assertEq(
+      (JSON.parse(provOf("c-empty")).categories as any[]).map((r) => [r.source_type, r.value]),
+      [["website_homepage", "meat,vegetables,honey"]],
+      "AC5 empty stored: website_homepage provenance as today",
+    );
+    assertEq(changedOf(corr, "c-empty").includes("categories"), true, "AC5 empty stored: reported as a categories write as today");
+
+    // the curated lock still wins
+    assertEq(
+      [JSON.parse(catsOf("c-locked")), (JSON.parse(provOf("c-locked")).categories as any[]).length],
+      [["vegetables"], 1],
+      "AC5 curated lock: nothing written for categories",
+    );
+    assertEq(
+      corr.skipped_curated.find((s) => s.agent_id === "c-locked")?.fields,
+      ["categories"],
+      "AC5 curated lock: reported in skipped_curated",
+    );
+
+    // a wrong-entity site / a theme-spam summary never corroborates
+    for (const [id, why] of [["c-wrongent", "website ownership unverified"], ["c-spam", "homepage summary reads as theme spam"]] as const) {
+      const reasons = corr.skipped_unsubstantiated.filter((x) => x.agent_id === id).map((x) => x.reason);
+      assertEq(
+        [JSON.parse(catsOf(id)), (JSON.parse(provOf(id)).categories as any[]).map((r) => r.source_type)],
+        [["vegetables"], ["google_places"]],
+        `AC5 ${id}: nothing written for categories although the page lists every stored category`,
+      );
+      assertEq(
+        reasons.some((r) => r.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED) && r.includes(why)),
+        true,
+        `AC5 ${id}: reported as ${mod.HCR_CATEGORIES_NOT_SUPPORTED} (${why})`,
+      );
+    }
+    assertEq(
+      corr.skipped_unsubstantiated.find((x) => x.agent_id === "c-spam")?.reason,
+      mod.HCR_THEME_SPAM_CANDIDATE_REASON,
+      "AC5 c-spam: the theme-spam reason stays first (the morning send's hijacked check reads the first one)",
+    );
+
+    // without the option (route / morning send): replacement exactly as before
+    assertEq(JSON.parse(catsOf("c-noopt")), ["meat", "vegetables", "honey"], "AC5 regression: WITHOUT the option the stored categories are still replaced");
+    assertEq(changedOf(noopt, "c-noopt").includes("categories"), true, "AC5 regression: reported as a categories write");
+    assertEq(
+      noopt.skipped_unsubstantiated.some((s) => s.reason.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED)),
+      false,
+      "AC5 regression: no corroboration reason without the option",
+    );
+    // other fields: same as without the option
+    assertEq([aboutOf("c-veg"), aboutOf("c-noopt")], [PAGE_ABOUT, PAGE_ABOUT], "AC5: about is written the same with and without the option");
+    assertEq(
+      [corr.by_field.categories, noopt.by_field.categories],
+      [1, 1],
+      "AC5: by_field.categories counts only real column writes (c-empty / c-noopt)",
     );
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();

@@ -1841,7 +1841,14 @@ type HcrTargetRow = {
   homepage_url: string | null;
 };
 
-type HcrFieldWrite = { field: string; value: string; columnVal: unknown; onAgents: boolean };
+type HcrFieldWrite = {
+  field: string;
+  value: string;
+  columnVal: unknown;
+  onAgents: boolean;
+  /** Provenance record only — the column itself is left as stored (categoriesCorroborateOnly). */
+  provenanceOnly?: boolean;
+};
 
 /**
  * The route's explicit-`agentIds` target selection, extracted unchanged
@@ -1914,6 +1921,59 @@ export interface HomepageContentRefreshOptions {
    * it, unchanged). Unset = the global fetch, as the route always used.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * NEVER set by the route or the morning send (unset = byte-identical
+   * behaviour). Set only by the nightly RFB enrichment job (R6,
+   * services/rfb-enrichment-nightly.ts) through refreshRfbCandidateHomepage.
+   *
+   * When set, and the stored agents.categories is a non-empty list that is not
+   * yet corroborated (categoriesLackWebsiteCorroboration — the outreach gate's
+   * own test), the page's keyword-extracted categories never REPLACE the
+   * stored ones (that extraction is too noisy to be written as the truth):
+   *   - every stored category is among the page's categories → the stored
+   *     list stays exactly as it is and only a website_homepage provenance
+   *     record for it is added (through canCorrectFactualField, so the curated
+   *     lock still wins); reported as HCR_CATEGORIES_CORROBORATED in
+   *     `changed[].fields`;
+   *   - otherwise nothing is written for categories, reported in
+   *     `skipped_unsubstantiated` with a reason starting with
+   *     HCR_CATEGORIES_NOT_SUPPORTED — also when the page's about summary was
+   *     rejected as theme spam, or field_provenance.website_ownership is
+   *     "unverified" (a wrong-entity site never corroborates anything).
+   * Empty/malformed or already corroborated stored categories: unchanged
+   * behaviour. Every other field and guard is unchanged.
+   */
+  categoriesCorroborateOnly?: boolean;
+}
+
+/** `changed[].fields` token: stored categories corroborated (provenance only, column untouched). */
+export const HCR_CATEGORIES_CORROBORATED = "categories_corroborated";
+/** `skipped_unsubstantiated` reason prefix: a stored category the homepage does not support. */
+export const HCR_CATEGORIES_NOT_SUPPORTED = "categories_not_supported_by_homepage";
+
+/** field_provenance.website_ownership.status === "unverified" (wrong-entity site); junk → false. */
+function hcrWebsiteOwnershipUnverified(fieldProvenanceJson: string | null | undefined): boolean {
+  try {
+    const wo = fieldProvenanceJson ? JSON.parse(fieldProvenanceJson)?.website_ownership : null;
+    return !!wo && typeof wo === "object" && wo.status === "unverified";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The stored agents.categories as a list when it is a non-empty JSON array
+ * (the same "has a value" test categoriesLackWebsiteCorroboration uses);
+ * null for empty, absent or malformed. Elements are returned as stored.
+ */
+function hcrStoredCategoryList(categoriesJson: string | null | undefined): unknown[] | null {
+  if (!categoriesJson) return null;
+  try {
+    const parsed = JSON.parse(categoriesJson);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Error text for an agent whose fetch outlived HomepageContentRefreshOptions.deadlineAt. */
@@ -2295,7 +2355,57 @@ export async function refreshHomepageContent(
     // (generic_products_only) and which locked the field against later fixes.
     // extractProductMentions yields category keys, not product names, so there
     // is no real product list to write from this page.
-    if (platformCategories.length > 0) {
+    //
+    // categoriesCorroborateOnly (R6 only — see HomepageContentRefreshOptions):
+    // a non-empty, uncorroborated stored list is never replaced. Read here,
+    // after the fetch, so this read and the write below stay in one
+    // synchronous stretch (nothing can change the column in between).
+    let corroborateStored: unknown[] | null = null;
+    let corroborateRefusal: string | null = null;
+    if (opts.categoriesCorroborateOnly) {
+      const cur = db
+        .prepare(
+          `SELECT a.categories AS categories, k.field_provenance AS field_provenance
+             FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id = ?`,
+        )
+        .get(agentId) as { categories: string | null; field_provenance: string | null } | undefined;
+      const stored = hcrStoredCategoryList(cur?.categories);
+      if (stored && categoriesLackWebsiteCorroboration(cur?.categories, cur?.field_provenance)) {
+        corroborateStored = stored;
+        // A page whose summary reads as gambling copy (hijacked/lapsed domain)
+        // or a wrong-entity site is no source for anyone's categories.
+        if (skippedUnsubstantiated.some((s) => s.agent_id === agentId && s.reason === HCR_THEME_SPAM_CANDIDATE_REASON)) {
+          corroborateRefusal = "homepage summary reads as theme spam";
+        } else if (hcrWebsiteOwnershipUnverified(cur?.field_provenance)) {
+          corroborateRefusal = "website ownership unverified";
+        }
+      }
+    }
+    if (corroborateStored) {
+      const onPage = new Set(platformCategories);
+      const supported =
+        corroborateRefusal === null &&
+        corroborateStored.every((c) => typeof c === "string" && c.trim() !== "" && onPage.has(c.trim().toLowerCase()));
+      const storedText = corroborateStored.map((c) => String(c).trim()).join(",");
+      if (supported) {
+        // The page supports every stored category: keep the list exactly as
+        // stored (the page's extra keywords are not added) and record the
+        // homepage as its source. Still decided by canCorrectFactualField below.
+        candidates.push({
+          field: "categories",
+          value: storedText,
+          columnVal: null,
+          onAgents: true,
+          provenanceOnly: true,
+        });
+      } else {
+        skippedUnsubstantiated.push({
+          agent_id: agentId,
+          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${corroborateRefusal ? `${corroborateRefusal}; ` : ""}stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"})`,
+        });
+      }
+    } else if (platformCategories.length > 0) {
       // categories (agents table) — JSON array of platform category keys.
       candidates.push({
         field: "categories",
@@ -2382,7 +2492,9 @@ export async function refreshHomepageContent(
     }
     if (fieldsToWrite.length === 0) return;
 
-    const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
+    const writtenFields = Array.from(
+      new Set(fieldsToWrite.map((f) => (f.provenanceOnly ? HCR_CATEGORIES_CORROBORATED : f.field))),
+    );
     for (const f of writtenFields) {
       if (f in byField) byField[f] = (byField[f] ?? 0) + 1;
     }
@@ -2400,8 +2512,9 @@ export async function refreshHomepageContent(
     }
     const provJson = JSON.stringify(mergedProv);
 
-    const akUpdates = fieldsToWrite.filter((f) => !f.onAgents); // about / products
-    const agentUpdates = fieldsToWrite.filter((f) => f.onAgents); // description / categories
+    // A provenance-only candidate (categoriesCorroborateOnly) writes no column.
+    const akUpdates = fieldsToWrite.filter((f) => !f.onAgents && !f.provenanceOnly); // about / products
+    const agentUpdates = fieldsToWrite.filter((f) => f.onAgents && !f.provenanceOnly); // description / categories
 
     try {
       const tx = db.transaction(() => {

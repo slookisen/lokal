@@ -75,6 +75,12 @@
  *       the cohort: through the real in-process route a stored e-mail/phone
  *       is never replaced, a blank one is filled, and a matched producer
  *       outside the cohort (already contacted) is left alone
+ *   (hc) held pool rows: a content-qualified row whose stored categories lack
+ *       homepage corroboration is routed to content_refresh (not on a social/
+ *       directory host, not on our own domain, site answers); through the
+ *       real executor the stored list is corroborated (provenance only, list
+ *       unchanged) or left alone when the page does not support it — never
+ *       replaced; both outcomes are tallied in the step's envelope claim
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-enrichment-nightly.test.ts
@@ -223,6 +229,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       city?: string;
       vertical_id?: string;
       catalog_hidden?: number;
+      categories?: string | null;
       k?:
         | false
         | {
@@ -238,6 +245,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
             curated_fields?: string | null;
             enrichment_status?: string;
             phone?: string | null;
+            field_provenance?: string;
           };
     } = {},
   ): void {
@@ -261,6 +269,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
     if (o.vertical_id !== undefined) cols.vertical_id = o.vertical_id;
     if (o.catalog_hidden !== undefined) cols.catalog_hidden = o.catalog_hidden;
     if (o.city !== undefined) cols.city = o.city;
+    if (o.categories !== undefined) cols.categories = o.categories;
     const names = Object.keys(cols);
     db.prepare(`INSERT INTO agents (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`).run(
       ...names.map((n) => cols[n]),
@@ -280,6 +289,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       "curated_fields",
       "enrichment_status",
       "phone",
+      "field_provenance",
     ] as const) {
       if ((k as any)[key] !== undefined) kc[key] = (k as any)[key];
     }
@@ -1337,6 +1347,110 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const bs = rb.steps.find((x) => x.step === "brreg_contact")!;
       assertEq([bs.selected, calls.length, bs.attempted, bs.stopped_reason], [6, 3, 3, "brreg_unavailable"], "z5 (R3-NB1): three consecutive fetch failures stop the Brreg step; nothing after them runs");
       assertEq(count("rfb_enrichment_nightly_attempts"), 0, "z5: and none of the three is parked");
+    });
+
+    // ── (hc) held pool rows: uncorroborated categories → content_refresh ──
+    await withDb("hc", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10" });
+      const cvs = require("./cross-source-validator") as typeof import("./cross-source-validator");
+      const REAL3 = JSON.stringify([{ name: "Lammepølse" }, { name: "Spekeskinke" }, { name: "Eplemost" }]);
+      // about/description already homepage-sourced, so the refresh writes
+      // nothing but (possibly) the categories provenance on these rows.
+      const hp = (v: string) => [{ source_type: "website_homepage", value: v, fetched_at: "2026-01-01T00:00:00.000Z" }];
+      const TEXT_HP = { about: hp(LONG_ABOUT), description: hp(LONG_ABOUT) };
+      const NO_CATS = JSON.stringify(TEXT_HP);
+      const HP = JSON.stringify({ ...TEXT_HP, categories: hp("vegetables") });
+      const pool = (id: string, o: { site?: string; cats?: string; prov?: string; about?: string; products?: string; status?: number } = {}) =>
+        seedAgent(id, {
+          categories: o.cats ?? JSON.stringify(["vegetables"]),
+          k: {
+            website: o.site ?? `https://${id}.no`,
+            email: `post@${id}.no`,
+            about: o.about ?? LONG_ABOUT,
+            products: o.products ?? REAL3,
+            url_last_status: o.status ?? 200,
+            url_last_probed: "2026-10-11T00:00:00Z",
+            field_provenance: o.prov ?? NO_CATS,
+          },
+        });
+      pool("hc-pool");
+      pool("hc-fruit", { cats: JSON.stringify(["fruit", "berries"]) });
+      pool("hc-fb", { site: "https://www.facebook.com/hc-gard" });
+      pool("hc-dir", { site: "https://www.1881.no/hc-gard" });
+      pool("hc-corr", { prov: HP });
+      pool("hc-thin", { prov: HP, about: "", products: "[]" });
+      pool("hc-own", { site: "https://rettfrabonden.com/produsent/hc-own" });
+      pool("hc-dead", { status: 404 });
+      pool("hc-nocats", { cats: "[]" });
+      pool("hc-mixed", { cats: JSON.stringify(["fruit"]), prov: "{}" }); // about text not homepage-sourced yet
+      const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
+      const pc = p.steps.find((x) => x.step === "content_refresh")!;
+      assertEq(
+        pc.selected_ids,
+        ["hc-pool", "hc-fruit", "hc-thin", "hc-mixed"],
+        "hc1: content-qualified rows with uncorroborated categories are eligible; corroborated / no categories / own domain / dead site are not; the old condition (thin content) still applies",
+      );
+      assertEq(pc.skipped, { skipped_directory_or_social_host: 2 }, "hc1: a social / directory homepage is counted as skipped_directory_or_social_host, never selected");
+
+      const PAGE =
+        `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
+        `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården.</p></body></html>`;
+      const fetched: string[] = [];
+      (globalThis as any).fetch = async (url: any) => {
+        fetched.push(String(url));
+        return new Response(PAGE, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      };
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT });
+      const st = r.steps.find((x) => x.step === "content_refresh")!;
+      const cats = (id: string) => (db.prepare(`SELECT categories FROM agents WHERE id = ?`).get(id) as { categories: string }).categories;
+      const prov = (id: string) => (db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as { field_provenance: string }).field_provenance;
+      assertEq(
+        st.outcomes,
+        { categories_corroborated: 1, categories_not_supported_by_homepage: 1, unchanged: 1, refreshed: 1 },
+        "hc2: the real executor reports categories_corroborated and categories_not_supported_by_homepage as their own outcomes (hc-thin: corroborated already, unchanged; hc-mixed: about written → refreshed)",
+      );
+      assertEq(
+        st.extra?.categories_corroboration,
+        { corroborated: 1, categories_not_supported_by_homepage: 2 },
+        "hc2: extra.categories_corroboration tallies every row, also the refreshed one whose categories the page did not support",
+      );
+      assertEq(
+        [JSON.parse(cats("hc-mixed")), JSON.parse(prov("hc-mixed")).categories, typeof JSON.parse(prov("hc-mixed")).about],
+        [["fruit"], undefined, "object"],
+        "hc2: hc-mixed — about written as today, categories left alone",
+      );
+      assertTrue(!fetched.some((u) => u.includes("facebook.com") || u.includes("1881.no") || u.includes("rettfrabonden.com")), "hc2: no social / directory / own-domain page was fetched");
+      assertEq(JSON.parse(cats("hc-pool")), ["vegetables"], "hc3: corroborated — stored [vegetables] unchanged (the page's meat/honey are not added)");
+      assertEq(
+        (JSON.parse(prov("hc-pool")).categories as any[]).map((x: any) => [x.source_type, x.value, x.source_url]),
+        [["website_homepage", "vegetables", "https://hc-pool.no"]],
+        "hc3: a website_homepage source with the page URL was recorded",
+      );
+      assertEq(cvs.categoriesLackWebsiteCorroboration(cats("hc-pool"), prov("hc-pool")), false, "hc3: the row now passes categoriesLackWebsiteCorroboration");
+      assertEq(
+        [JSON.parse(cats("hc-fruit")), JSON.parse(prov("hc-fruit")).categories, cvs.categoriesLackWebsiteCorroboration(cats("hc-fruit"), prov("hc-fruit"))],
+        [["fruit", "berries"], undefined, true],
+        "hc4: not supported — nothing written for categories and the gate still holds the row",
+      );
+      assertTrue(st.changed_agent_ids.includes("hc-pool") && !st.changed_agent_ids.includes("hc-fruit"), "hc5: only the corroborated row counts as changed (goes on to re-verification)");
+      const stamped = db
+        .prepare(`SELECT agent_id, last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'content_refresh' AND agent_id IN ('hc-pool', 'hc-fruit') ORDER BY agent_id`)
+        .all();
+      assertEq(
+        stamped,
+        [
+          { agent_id: "hc-fruit", last_outcome: "categories_not_supported_by_homepage" },
+          { agent_id: "hc-pool", last_outcome: "categories_corroborated" },
+        ],
+        "hc6: both are real per-row outcomes (stamped — the retry window applies)",
+      );
+      const env = db.prepare(`SELECT claims FROM runs WHERE run_id = ?`).get(r.run_id) as { claims: string };
+      const claim = JSON.parse(env.claims).find((c: any) => c.meta?.kind === "rfb_enrichment_step_content_refresh");
+      assertEq(
+        [claim?.meta?.outcomes?.categories_corroborated, claim?.meta?.rejected_reasons?.categories_not_supported_by_homepage, "categories_corroborated" in (claim?.meta?.rejected_reasons ?? {}), claim?.meta?.extra?.categories_corroboration],
+        [1, 1, false, { corroborated: 1, categories_not_supported_by_homepage: 2 }],
+        "hc7: the envelope claim shows both (corroborated counts as written, not supported as a rejected reason)",
+      );
     });
   } catch (err) {
     failed++;

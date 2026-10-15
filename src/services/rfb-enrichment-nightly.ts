@@ -43,7 +43,18 @@
 //                           write-pause gate + target filter + per-agent body,
 //                           R2 rules included) for rows whose site answers
 //                           and whose content is under the pool threshold or
-//                           only category names.
+//                           only category names — or whose stored categories
+//                           lack homepage corroboration (the outreach gate's
+//                           categories_not_corroborated hold) on a homepage
+//                           that is not a social/directory/aggregator host.
+//                           Always with categoriesCorroborateOnly: a non-
+//                           empty, uncorroborated stored category list is
+//                           never replaced by the page's keyword extraction;
+//                           it only gains a website_homepage source when the
+//                           page supports EVERY stored category
+//                           (categories_corroborated), else nothing is
+//                           written for it (categories_not_supported_by_
+//                           homepage).
 //   5  reverify             runVerifierBatch({agentIds}) with the tick path's
 //                           Brreg lookup, one row per call: every row steps
 //                           1–4 changed tonight first, then cohort rows whose
@@ -130,7 +141,12 @@ import { publicListableSql } from "./agent-visibility";
 import { customerRuleSql } from "./customer-rule";
 import { isBlocked } from "./blocklist-service";
 import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
-import { FREE_MAIL_DOMAINS, hostFromUrlLike, isDirectoryOrAggregatorHost } from "./cross-source-validator";
+import {
+  FREE_MAIL_DOMAINS,
+  categoriesLackWebsiteCorroboration,
+  hostFromUrlLike,
+  isDirectoryOrAggregatorHost,
+} from "./cross-source-validator";
 import { outreachSentLogHasVerticalColumn } from "./outreach-suppression-signals";
 import { createLlmCallMeter, runWithLlmCallMeter, type LlmCallMeter } from "./llm-call-meter";
 import { refreshRfbCandidateHomepage } from "./rfb-marketing-daily";
@@ -214,6 +230,10 @@ export const RFB_ENRICHMENT_BRREG_FETCH_FAILED = "brreg_contact_fetch_failed";
 export const RFB_ENRICHMENT_BRREG_OUTAGE_STREAK = 3;
 /** Queue `reason` for step 2's candidates (approval reads confidence, not reason). */
 export const RFB_ENRICHMENT_EMAIL_DOMAIN_QUEUE_REASON = "email_domain_candidate";
+/** content_refresh: the homepage supports every stored category; a website_homepage source was added (list unchanged). */
+export const RFB_ENRICHMENT_CATEGORIES_CORROBORATED = "categories_corroborated";
+/** content_refresh: a stored category is not on the homepage; nothing written for categories (a real per-row outcome). */
+export const RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED = "categories_not_supported_by_homepage";
 
 export type RfbEnrichmentStep =
   | "url_check"
@@ -1126,13 +1146,21 @@ function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: S
         trimmed(r.k_email) === "" &&
         rfbEnrichmentSiteAnswers(r)
       );
-    case "content_refresh":
-      return (
-        homepageOf(r) !== "" &&
-        !isOwnPlatformHomepage({ website: r.k_website, url: r.a_url }) &&
-        rfbEnrichmentSiteAnswers(r) &&
-        (!isContentQualified({ about: r.about, products: r.products }) || productsAreGenericCategoryNames(r.products))
-      );
+    case "content_refresh": {
+      const url = homepageOf(r);
+      if (url === "" || isOwnPlatformHomepage({ website: r.k_website, url: r.a_url }) || !rfbEnrichmentSiteAnswers(r)) {
+        return false;
+      }
+      if (!isContentQualified({ about: r.about, products: r.products }) || productsAreGenericCategoryNames(r.products)) {
+        return true;
+      }
+      // Content is enough, but the outreach gate holds the row on
+      // categories_not_corroborated (agents.categories without a homepage/
+      // owner source). Only the producer's own site may corroborate them.
+      if (!categoriesLackWebsiteCorroboration(r.categories, r.field_provenance)) return false;
+      if (rfbEnrichmentHomepageHostExcluded(url)) return "skipped_directory_or_social_host";
+      return true;
+    }
     case "reverify": {
       const since = parseMs(r.homepage_unreachable_since);
       return since !== null && since <= ctx.nowMs - RFB_ENRICHMENT_UNREACHABLE_DAYS * 86_400_000;
@@ -1346,6 +1374,12 @@ export function isTransientRfbEnrichmentOutcome(out: { outcome: string; error?: 
 export interface RfbEnrichmentRowOutcome {
   /** Short outcome code; tallied in `outcomes`. */
   outcome: string;
+  /**
+   * content_refresh only: what the categories-corroborate-only refresh did
+   * with the stored categories (tallied in the step's extra.categories_
+   * corroboration, also when another outcome — e.g. refreshed — wins).
+   */
+  categories_corroboration?: string;
   /** Something was written (a column, or a review-queue proposal). */
   written: boolean;
   /** A producer column changed — the row goes to step 5. */
@@ -1538,18 +1572,31 @@ export function createDefaultRfbEnrichmentExecutors(db: Db, batchId: string): Rf
     },
 
     async contentRefresh(row, deadlineAtMs) {
-      const r = await refreshRfbCandidateHomepage(db, row.id, { deadlineAt: deadlineAtMs });
+      // categoriesCorroborateOnly: stored categories are corroborated or left
+      // alone, never replaced by the page's keyword extraction (header, step 4).
+      const r = await refreshRfbCandidateHomepage(db, row.id, { deadlineAt: deadlineAtMs, categoriesCorroborateOnly: true });
       if (r.outcome === "write_paused") {
         return { outcome: "write_paused", written: false, changed: false, stop: "enrichment_write_paused" };
       }
       const fields = r.fields ?? [];
       const written = r.outcome === "refreshed" || fields.length > 0;
+      let outcome: string = r.outcome;
+      if (r.categories_corroboration === "corroborated" && r.outcome === "refreshed") {
+        outcome = RFB_ENRICHMENT_CATEGORIES_CORROBORATED;
+      } else if (r.categories_corroboration === "categories_not_supported_by_homepage" && r.outcome === "unchanged") {
+        outcome = RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED;
+      }
+      const detail = [
+        ...(fields.length > 0 ? [fields.join(",")] : []),
+        ...(r.error || r.rejected ? [String(r.error ?? r.rejected)] : []),
+      ].join("; ");
       return {
-        outcome: r.outcome,
+        outcome,
         written,
         changed: written,
+        ...(r.categories_corroboration ? { categories_corroboration: r.categories_corroboration } : {}),
         ...(r.outcome === "failed" ? { error: true } : {}),
-        ...(fields.length > 0 ? { detail: fields.join(",") } : r.error || r.rejected ? { detail: String(r.error ?? r.rejected) } : {}),
+        ...(detail ? { detail } : {}),
       };
     },
 
@@ -2120,6 +2167,11 @@ async function runSteps(rc: RunContext): Promise<void> {
       changed.set(agentId, sr.step);
       sr.changed_agent_ids.push(agentId);
     }
+    if (out.categories_corroboration) {
+      const extra = (sr.extra ??= {});
+      const tallyMap = (extra.categories_corroboration ??= {}) as Record<string, number>;
+      tallyMap[out.categories_corroboration] = (tallyMap[out.categories_corroboration] ?? 0) + 1;
+    }
     sr.rows.push({ agent_id: agentId, outcome: out.outcome, ...(out.detail ? { detail: out.detail.slice(0, 200) } : {}) });
   };
 
@@ -2507,7 +2559,7 @@ function isWrittenOutcome(step: RfbEnrichmentStep, outcome: string): boolean {
     case "contact_extraction":
       return outcome === "written";
     case "content_refresh":
-      return outcome === "refreshed";
+      return outcome === "refreshed" || outcome === RFB_ENRICHMENT_CATEGORIES_CORROBORATED;
     case "reverify":
       return outcome !== "error" && outcome !== "not_found";
   }

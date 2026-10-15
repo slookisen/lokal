@@ -155,6 +155,8 @@ import { knowledgeService } from "./knowledge-service";
 import { classifyAboutCheapBar, meetsAboutQualityBar } from "./search-enrich";
 import { enrichmentWritePauseBlockForAgents } from "./enrichment-write-pause";
 import {
+  HCR_CATEGORIES_CORROBORATED,
+  HCR_CATEGORIES_NOT_SUPPORTED,
   HCR_DEADLINE_EXCEEDED,
   HCR_THEME_SPAM_CANDIDATE_REASON,
   HCR_THEME_SPAM_PAGE_ERROR,
@@ -673,6 +675,13 @@ export interface RfbHomepageRefreshRow {
   /** About/description candidate dropped (the route's skipped_unsubstantiated). */
   rejected?: string;
   error?: string;
+  /**
+   * Only with opts.categoriesCorroborateOnly (the nightly R6 job; never the
+   * morning send): the stored categories were corroborated by the homepage
+   * (provenance added, list unchanged), or not supported by it (nothing
+   * written for categories). Absent when the option did not apply.
+   */
+  categories_corroboration?: "corroborated" | "categories_not_supported_by_homepage";
   ms: number;
 }
 
@@ -680,7 +689,12 @@ export interface RfbHomepageRefreshRow {
 export type RfbHomepageRefreshFn = (
   db: Db,
   agentId: string,
-  opts: { deadlineAt: number; fetchImpl?: typeof fetch },
+  opts: {
+    deadlineAt: number;
+    fetchImpl?: typeof fetch;
+    /** refreshHomepageContent's categoriesCorroborateOnly — R6 only, never the morning send. */
+    categoriesCorroborateOnly?: boolean;
+  },
 ) => Promise<RfbHomepageRefreshRow>;
 
 /**
@@ -707,15 +721,34 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
       timer = setTimeout(() => resolve("timed_out"), Math.max(0, opts.deadlineAt - Date.now()) + 250);
     });
     const raced = await Promise.race([
-      refreshHomepageContent(db, targets, { dryRun: false, deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl }),
+      refreshHomepageContent(db, targets, {
+        dryRun: false,
+        deadlineAt: opts.deadlineAt,
+        fetchImpl: opts.fetchImpl,
+        ...(opts.categoriesCorroborateOnly ? { categoriesCorroborateOnly: true } : {}),
+      }),
       timedOut,
     ]).finally(() => clearTimeout(timer));
     if (raced === "timed_out") return done({ outcome: "timeout", error: HCR_DEADLINE_EXCEEDED });
     const curated = raced.skipped_curated.find((c) => c.agent_id === agentId)?.fields;
     const rejected = raced.skipped_unsubstantiated.find((c) => c.agent_id === agentId)?.reason;
-    const extra = { ...(curated ? { curated_locked: curated } : {}), ...(rejected ? { rejected } : {}) };
     const err = raced.errors.find((e) => e.agent_id === agentId)?.error;
     const changed = raced.changed.find((c) => c.agent_id === agentId);
+    // categoriesCorroborateOnly only (never set by the morning send).
+    const corroboration: RfbHomepageRefreshRow["categories_corroboration"] = !opts.categoriesCorroborateOnly
+      ? undefined
+      : changed?.fields.includes(HCR_CATEGORIES_CORROBORATED)
+        ? "corroborated"
+        : raced.skipped_unsubstantiated.some(
+              (c) => c.agent_id === agentId && c.reason.startsWith(HCR_CATEGORIES_NOT_SUPPORTED),
+            )
+          ? "categories_not_supported_by_homepage"
+          : undefined;
+    const extra = {
+      ...(curated ? { curated_locked: curated } : {}),
+      ...(rejected ? { rejected } : {}),
+      ...(corroboration ? { categories_corroboration: corroboration } : {}),
+    };
     // Hijacked domain: the page-level skip (nothing written) or the
     // candidate-level rejection (other fields may still have been written).
     if (err?.startsWith(HCR_THEME_SPAM_PAGE_ERROR) || rejected === HCR_THEME_SPAM_CANDIDATE_REASON) {
