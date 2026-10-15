@@ -918,6 +918,78 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(daily.findRfbMarketingRecentBounces(db, new Date(), null), [], "j10: soft / >48h / non-rfb sends never trigger");
     }
 
+    // ── (j2) charter guardrails hard_bounce_rate / opt_out_honored_pct ─────
+    {
+      const seedSend = (email: string, hoursAgo: number, vertical = "rfb") =>
+        db
+          .prepare(
+            `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+             VALUES ('x', ?, datetime('now', ?), 'email', ?, 'test:guardrail', ?)`,
+          )
+          .run(email, `-${hoursAgo} hours`, `g-${email}-${hoursAgo}`, vertical);
+      const bounceAt = (email: string, type: string, hoursAgo: number) =>
+        db
+          .prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type) VALUES (?, datetime('now', ?), ?)`)
+          .run(email, `-${hoursAgo} hours`, type);
+
+      // Zero denominator: no sends → defined values, not NaN / null.
+      freshDb();
+      const empty = daily.computeRfbMarketingGuardrailMetrics(db, new Date());
+      assertEq(
+        [empty.contacted, empty.hard_bounce_rate, empty.opt_out_honored_pct, Number.isNaN(empty.hard_bounce_rate)],
+        [0, 0, 1, false],
+        "g1: no sends → hard_bounce_rate 0, opt_out_honored_pct 1 (defined)",
+      );
+
+      // A known hard bounce on a recent send → rate > 0; soft / non-rfb / old sends are not counted.
+      freshDb();
+      seedSend("post@a.gard-test.no", 5);
+      seedSend("post@b.gard-test.no", 5);
+      seedSend("post@c.gard-test.no", 5);
+      seedSend("post@d.gard-test.no", 5);
+      seedSend("post@soft.gard-test.no", 5);
+      seedSend("post@gammel.gard-test.no", 100);
+      seedSend("post@opplev.gard-test.no", 5, "experiences");
+      bounceAt("post@a.gard-test.no", "hard", 1);
+      bounceAt("post@soft.gard-test.no", "soft", 1);
+      bounceAt("post@gammel.gard-test.no", "hard", 1);
+      bounceAt("post@opplev.gard-test.no", "hard", 1);
+      const m = daily.computeRfbMarketingGuardrailMetrics(db, new Date());
+      assertEq([m.contacted, m.hard_bounced, m.hard_bounce_rate], [5, 1, 0.2], "g2: one hard bounce in 5 contacted recipients → 0.2 (> 0)");
+      assertEq(m.hard_bounced_emails, ["post@a.gard-test.no"], "g3: names the bounced recipient");
+      assertEq([m.opt_out_violations, m.opt_out_honored_pct], [0, 1], "g4: nobody opted out → 1.0");
+
+      // Opt-out ALREADY on file before the send → violation; opt-out after the send → honoured.
+      freshDb();
+      seedSend("post@before.gard-test.no", 5);
+      seedSend("post@after.gard-test.no", 5);
+      seedSend("post@complaint.gard-test.no", 5);
+      seedSend("post@ok.gard-test.no", 5);
+      const blk = db.prepare(`INSERT INTO agent_blocklist (identifier_type, identifier_value, created_at) VALUES ('email', ?, datetime('now', ?))`);
+      blk.run("post@before.gard-test.no", "-10 hours");
+      blk.run("post@after.gard-test.no", "-1 hours");
+      bounceAt("post@complaint.gard-test.no", "complaint", 20);
+      const o = daily.computeRfbMarketingGuardrailMetrics(db, new Date());
+      assertEq([o.contacted, o.opt_out_violations, o.opt_out_honored_pct], [4, 2, 0.5], "g5: blocklist/complaint on file before the send counts, later opt-out does not");
+      assertEq(o.opt_out_violation_emails, ["post@before.gard-test.no", "post@complaint.gard-test.no"], "g6: names the violating recipients");
+
+      // End to end: the run envelope carries both numeric claims (not null),
+      // even when G3 auto-pauses the run on the very bounce being measured.
+      freshDb();
+      seedProducer("g-1", "Garantert Gård", "post@garantert.gard-test.no");
+      seedSend("post@prev.gard-test.no", 2);
+      bounceAt("post@prev.gard-test.no", "hard", 1);
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+      await run(true, { transport: makeTransport() });
+      const gClaims = JSON.parse(runsRows().slice(-1)[0].claims) as Array<any>;
+      const hb = gClaims.find((c) => c.meta?.kind === "hard_bounce_rate");
+      const oo = gClaims.find((c) => c.meta?.kind === "opt_out_honored_pct");
+      assertTrue(
+        typeof hb?.value === "number" && hb.value > 0 && hb.value <= 1 && typeof oo?.value === "number" && oo.value === 1,
+        "g7: envelope posts numeric hard_bounce_rate (> 0 for the known hard bounce) and opt_out_honored_pct",
+      );
+    }
+
     // ── (k) G3 — health red ────────────────────────────────────────────────
     freshDb();
     seedProducer("k-1", "Helse Gård", "post@helse.gard-test.no");
