@@ -2231,6 +2231,11 @@ export async function runVerifierBatch(opts: {
   // below. Default undefined/empty — every existing caller and test is
   // byte-identical unless it explicitly passes this.
   agentIds?: string[];
+  // Test seam ONLY: the fetch used by the Phase-2D link-freshness probe
+  // (probeAgentUrl below). Production leaves it undefined → global fetch.
+  // Without it a test that seeds a real-looking homepage made a live HTTP
+  // request (intg-3 / polsemakeri.no turned red when that site went down).
+  urlProbeFetch?: FetchLike;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -2433,7 +2438,7 @@ export async function runVerifierBatch(opts: {
     let probeResult: { status: number; ok: boolean; durationMs: number } | null = null;
     let urlDemoted = false;
     if (agent.website) {
-      probeResult = await probeAgentUrl(agent.website);
+      probeResult = await probeAgentUrl(agent.website, { fetchImpl: opts.urlProbeFetch });
       if (!probeResult.ok) {
         console.log(
           `[enrichment] URL probe failed for agent ${agent.id}: status=${probeResult.status}`
