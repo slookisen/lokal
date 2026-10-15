@@ -4111,25 +4111,55 @@ export function isGardssalgContactEmailFlaggedForReview(
   }
 }
 
-router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; cohort?: unknown };
+// ─── runGardssalgContentRefresh — the shared core behind
+// POST /admin/gardssalg-content-refresh AND the server-side daily job
+// (services/gardssalg-content-refresh-job.ts; A2A dev-request
+// 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// tillegg 2026-10-15 «4b-det»). The route is a thin HTTP wrapper below; the
+// job calls this function directly with `llm: false`. Same mechanism as
+// applyPrewrittenExperienceDescriptions: one implementation, two callers,
+// so a row is selected, gated, fetched, extracted and written by exactly the
+// same code whichever side invokes it.
+//
+// `llm` (default true, the route's historical behaviour): when false, EVERY
+// model call site in this function is skipped — the about/visit quality
+// judge (meetsGardssalgAboutQualityBar), the opening-hours generator, the
+// about/visit rewrite generator, the about generator, the Del-A3 visit
+// generator+judge and the products generator. What still runs is fully
+// deterministic: selection, the three pre-fetch gates, the crawl (A2's
+// need-driven sub-page order), extractive summaries, JSON-LD opening hours
+// (Del A4) and the no-yield bookkeeping (Del B1). A deterministic candidate
+// that WOULD have gone to the judge is reported as `judge_required` in
+// field_diagnostic (additive outcome) and does NOT count as a no-yield
+// strike — the row has not been proven empty, it is waiting for a judge
+// (the subscription-side «4b-forslag» lane). Daniel 2026-10-08: the server
+// job never calls an LLM.
+export type GardssalgContentRefreshInput = {
+  apply: boolean;
+  limit?: unknown;
+  providerIds?: unknown;
+  cohort?: unknown;
+  /** false = no model call of any kind (server-side job). Default true. */
+  llm?: boolean;
+};
+export type GardssalgContentRefreshOutcome = { status: number; body: any };
 
-  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
-  const apply =
-    body.apply === true ||
-    body.apply === 1 ||
-    body.apply === "1" ||
-    body.apply === "true" ||
-    req.query?.apply === "1" ||
-    req.query?.apply === "true";
+export async function runGardssalgContentRefresh(
+  input: GardssalgContentRefreshInput
+): Promise<GardssalgContentRefreshOutcome> {
+  const body = { providerIds: input.providerIds, limit: input.limit, cohort: input.cohort };
+  const apply = input.apply === true;
   const dryRun = !apply;
+  const llmAllowed = input.llm !== false;
+  // Rows whose deterministic extraction found a cheap-bar-passing candidate
+  // that only a judge could admit — meaningful only when llmAllowed=false.
+  let judgeRequiredRows = 0;
 
   // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
   if (apply) {
     const pauseBlock = experiencesWritePauseBlock();
     if (pauseBlock) {
-      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
-      return;
+      return { status: ENRICHMENT_WRITE_PAUSE_HTTP_STATUS, body: pauseBlock };
     }
   }
 
@@ -4177,11 +4207,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   let cohortRestingTotal: number | null = null;
   const hasProviderIds = Array.isArray(body.providerIds) && body.providerIds.length > 0;
   if (!hasProviderIds && body.cohort !== undefined && body.cohort !== null && body.cohort !== "drink") {
-    res.status(400).json({
-      error: "invalid_cohort",
-      message: 'cohort must be "drink" (the only cohort mode this route supports) or omitted for auto-select',
-    });
-    return;
+    return {
+      status: 400,
+      body: {
+        error: "invalid_cohort",
+        message: 'cohort must be "drink" (the only cohort mode this route supports) or omitted for auto-select',
+      },
+    };
   }
   if (hasProviderIds) {
     selection = "provider_ids";
@@ -4306,7 +4338,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     | "unverified_website"
     | "fetch_error"
     | "fetch_failed"
-    | "products_already_present";
+    | "products_already_present"
+    // llm:false caller (server-side job): the products generator is a model
+    // call, so it is never invoked — the column stays as it was.
+    | "llm_disabled";
   type GardssalgProductsOutcome =
     | "products_found"
     | "sentinel_no_products"
@@ -4378,6 +4413,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     | "below_quality_bar"
     | "already_present"
     | "fetch_empty"
+    // llm:false caller only (server-side job, tillegg 2026-10-15 «4b-det»):
+    // the deterministic extraction found a cheap-bar-passing candidate (or an
+    // opening-hours trigger) for a blank field, but admitting it needs the
+    // judge, which this caller may not invoke. Reporting-only; these rows are
+    // the input to the subscription-side «4b-forslag» lane and are NOT
+    // counted as a no-yield strike.
+    | "judge_required"
     // dev-request 2026-09-07-drikke-berikelse-besokstekst-uttrekk-og-no-
     // yield-backoff, Del A3: ADDITIVE outcome distinguishing a visit_text
     // write produced by the source-grounded LLM generator+judge from an
@@ -4433,6 +4475,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       case "invalid_unparseable": return "below_quality_bar";
       case "infra_failure": return "fetch_empty";
       case "generator_not_invoked:products_already_present": return "already_present";
+      case "generator_not_invoked:llm_disabled": return "judge_required";
       default: return "fetch_empty";
     }
   }
@@ -4625,10 +4668,12 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // status; cost stays bounded because meetsGardssalgAboutQualityBar's own
     // cheap-bar prefilter means a candidate that couldn't possibly qualify
     // never reaches the LLM (unchanged from before).
-    const candidateAbout = (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about"))
+    // llm:false: the judge is a model call -> no extractive candidate can be
+    // admitted; the row is reported as judge_required below instead.
+    const candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
       ? aboutSummary
       : null;
-    const candidateVisitRaw = (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit"))
+    const candidateVisitRaw = (llmAllowed && (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit")))
       ? visitSummary
       : null;
     // Duplicate-field guard (dev-request 2026-07-20-kvalitetsgate slice 1 —
@@ -4657,7 +4702,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // sources; "llm_generated" is reserved for visit_text's A3 path only).
     const candidateHours = jsonLdHours
       ? jsonLdHours
-      : hoursTrigger && hoursTrigger.trim()
+      : hoursTrigger && hoursTrigger.trim() && llmAllowed
         ? await generateGardssalgOpeningHoursFromSource(contentText, t.navn)
         : null;
 
@@ -4768,7 +4813,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // a fresh judge call when the earlier check never actually ran.
     let rewriteAbout: string | null = null;
     let rewriteVisit: string | null = null;
-    if (!wouldWriteActions.about_text && gardssalgRewriteEligible(t.about_text)) {
+    if (llmAllowed && !wouldWriteActions.about_text && gardssalgRewriteEligible(t.about_text)) {
       const aboutCurrentRewriteContaminated = aboutCurrentCheapBarPass && candidateAbout
         ? aboutCurrentContaminated
         : !(await meetsGardssalgAboutQualityBar(t.about_text, t.navn, "about"));
@@ -4781,7 +4826,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         }
       }
     }
-    if (!wouldWriteActions.visit_text && gardssalgRewriteEligible(t.visit_text)) {
+    if (llmAllowed && !wouldWriteActions.visit_text && gardssalgRewriteEligible(t.visit_text)) {
       const visitCurrentRewriteContaminated = visitCurrentCheapBarPass && candidateVisit
         ? visitCurrentContaminated
         : !(await meetsGardssalgAboutQualityBar(t.visit_text, t.navn, "visit"));
@@ -4807,7 +4852,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // (dry-run still calls the LLM so the preview is real; dry-run still
     // writes nothing regardless of the LLM's answer).
     let generatedAbout: string | null = null;
-    if (!wouldWriteActions.about_text && isBlank(t.about_text)) {
+    if (llmAllowed && !wouldWriteActions.about_text && isBlank(t.about_text)) {
       generatedAbout = await generateGardssalgAboutFromSource(contentText, t.navn);
       if (generatedAbout) {
         wouldWriteActions.about_text = "filled";
@@ -4856,6 +4901,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     let llmGeneratedVisitText: string | null = null;
     let visitLlmGenerated = false;
     if (
+      llmAllowed &&
       !wouldWriteActions.visit_text &&
       isBlank(t.visit_text) &&
       process.env.GARDSSALG_VISIT_LLM_ENABLED !== "false" &&
@@ -4885,7 +4931,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // block can reuse the real outcome instead of re-deriving it — see
     // mapProductsOutcomeToFieldDiagnostic's doc comment above.
     let productsOutcomeForFieldDiag: GardssalgProductsOutcome;
-    if (gardssalgProductsEligible(t.products)) {
+    if (gardssalgProductsEligible(t.products) && !llmAllowed) {
+      // llm:false caller: the products generator is a model call. Report the
+      // gate honestly and leave the (blank) column alone.
+      pushProductsNotInvokedDiagnostic(providerId, "llm_disabled", {
+        content_chars_full: contentText.length,
+        pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
+      });
+      productsOutcomeForFieldDiag = "generator_not_invoked:llm_disabled";
+    } else if (gardssalgProductsEligible(t.products)) {
       // Skive 1 diagnostic capture — see productsDiagnostic's doc comment
       // above. contentText here is the FULL, pre-cap combined page text (the
       // same value handed to generateGardssalgProductList below); the cap
@@ -5022,6 +5076,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       if (contentIsNearEmpty) return "fetch_empty";
       if (!isBlank(currentValue)) return "already_present";
       if (isBlank(rawSummary)) return "no_candidate_section";
+      if (!llmAllowed && meetsAboutCheapBar(rawSummary)) return "judge_required";
       if (!candidate) return "below_quality_bar";
       return "already_present";
     }
@@ -5039,7 +5094,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             // it" bucket about_text/visit_text already report via
             // extractiveFieldDiagOutcome above. Reachable now that the trigger
             // firing no longer guarantees a written candidate (spec C).
-            : "below_quality_bar";
+            // llm:false: the generator was never allowed to run -> the row is
+            // waiting for a judge, not declined by one.
+            : !llmAllowed
+              ? "judge_required"
+              : "below_quality_bar";
     // Del A3: visit_text's diagnostic outcome is "llm_generated" specifically
     // when THIS run's write came from generateGardssalgVisitFromSource +
     // judgeGardssalgVisitCandidateWithSource — checked BEFORE falling back to
@@ -5058,14 +5117,24 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     });
 
     const wouldWrite = Object.keys(wouldWriteActions);
+    // llm:false: a row whose only missing piece is the judge has NOT been
+    // proven empty — it must not accrue a no-yield strike (Del B) or it would
+    // rest for 14 days before the subscription-side judge ever sees it.
+    const judgeRequiredThisRow =
+      !llmAllowed &&
+      ((isBlank(t.about_text) && !isBlank(aboutSummary) && meetsAboutCheapBar(aboutSummary)) ||
+        (isBlank(t.visit_text) && !isBlank(visitSummary) && meetsAboutCheapBar(visitSummary)) ||
+        (isBlank(t.opening_hours_text) && !isBlank(hoursTrigger) && !jsonLdHours));
+    if (judgeRequiredThisRow) judgeRequiredRows++;
     if (wouldWrite.length === 0) {
       // Del B (dev-request 2026-09-08-drikke-no-yield-backoff): mirrors the
       // generic content-refresh route's recordProviderContentYield(id, false)
       // call at the equivalent "scanned but nothing extractable" point (see
       // that route ~2503-2509) — this row reached scanned++ (above) but
       // ended up with zero candidate fields, so bump content_no_yield_streak.
-      // Apply mode only; dry-run stays fully read-only.
-      if (apply) {
+      // Apply mode only; dry-run stays fully read-only. Never for a
+      // judge_required row (see above).
+      if (apply && !judgeRequiredThisRow) {
         try { recordProviderContentYield(providerId, false); } catch { /* best-effort */ }
       }
       return;
@@ -5173,8 +5242,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     await Promise.all(slice.map((t) => processOne(t)));
   }
 
-  res.json({
+  return { status: 200, body: {
     dry_run: dryRun,
+    // llm:false = the server-side job's mode (no model call of any kind);
+    // judge_required_rows counts rows that found a candidate only a judge
+    // could admit (always 0 when llm is true).
+    llm: llmAllowed,
+    judge_required_rows: judgeRequiredRows,
     // Which target-selection mode served this call, and (drink_cohort only)
     // the eligible queue depth before `limit` — so a run report can say
     // "N thin verified drink rows remain" instead of guessing from `scanned`.
@@ -5232,7 +5306,29 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // attempted/yield contract. 0/0 whenever GARDSSALG_HEADLESS_FALLBACK_
     // ENABLED is off or no processed row was eligible; never absent.
     ...tallyGardssalgRenderStats(renderDiagnostic),
+  } };
+}
+
+router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; cohort?: unknown };
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  // The HTTP route keeps its historical behaviour: model calls allowed
+  // (each still behind its own env switch, e.g. GARDSSALG_VISIT_LLM_ENABLED).
+  const out = await runGardssalgContentRefresh({
+    apply,
+    limit: body.limit,
+    providerIds: body.providerIds,
+    cohort: body.cohort,
+    llm: true,
   });
+  res.status(out.status).json(out.body);
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-retro-scan (admin) ───────────────
@@ -36539,6 +36635,28 @@ router.post("/admin/experiences-data-corrections/revert", requireAdmin, (req: Re
 // last 20 processed proposal files with their totals / error.
 router.get("/admin/experiences-description-proposals-status", requireAdmin, (_req: Request, res: Response) => {
   res.json({ success: true, ...getExperienceDescriptionProposalsStatus(getExpDb("experiences") as any) });
+});
+
+// ─── Server-side gårdssalg content-refresh job (A2A dev-request
+// 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// tillegg 2026-10-15 «4b-det») — read-only status + manual run ────────────
+import {
+  getGardssalgContentRefreshJobStatus,
+  runGardssalgContentRefreshDaily,
+} from "../services/gardssalg-content-refresh-job";
+
+router.get("/admin/gardssalg-content-refresh-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgContentRefreshJobStatus() });
+});
+
+// Manual run, same code path as the daily tick. Dry-run by default; `apply`
+// must be sent explicitly. Never calls an LLM either way (llm:false), so an
+// operator can rehearse exactly what the job would do tonight.
+router.post("/admin/gardssalg-content-refresh-job-run", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const report = await runGardssalgContentRefreshDaily({ apply, trigger: "manual" });
+  res.json({ success: true, ...report });
 });
 
 export default router;

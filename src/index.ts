@@ -1968,6 +1968,48 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void experienceProposalsTick(); }, 60 * 60_000);
 }
 
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
+// queue (drink cohort first, then generic) drained by the platform once a
+// day, exactly like gardssalg-outreach-daily below ───────────────────────
+//
+// Checks every 10 minutes; fires once inside the configured UTC hour
+// (GARDSSALG_CONTENT_REFRESH_JOB_WINDOW_HOUR_UTC, default 03) via
+// shouldRunGardssalgContentRefreshDaily. The run calls the SAME shared core
+// as POST /admin/gardssalg-content-refresh with llm:false — the job never
+// calls an LLM (Daniel 2026-10-08). OFF by default:
+// GARDSSALG_CONTENT_REFRESH_JOB_ENABLED=true turns it on, and flipping it
+// back is the rollback. The last-completed stamp is persisted
+// (boot_job_state), so a deploy inside the window cannot run it twice.
+// Manual/dry runs: POST /api/opplevelser/admin/gardssalg-content-refresh-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgCrRunAt: Date | null = null;
+  let gardssalgCrRunning = false;
+  const gardssalgCrDailyTick = trackJob("gardssalg-content-refresh-daily", async () => {
+    if (gardssalgCrRunning) return;
+    gardssalgCrRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgContentRefreshDaily } = await import("./services/gardssalg-content-refresh-job");
+      const t = await tickGardssalgContentRefreshDaily({ now, lastRunAt: lastGardssalgCrRunAt });
+      lastGardssalgCrRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-content-refresh-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `drink=${r.totals.drink_enriched} generic=${r.totals.generic_enriched} scanned=${r.totals.scanned} ` +
+          `calls=${r.totals.calls} judge_required=${r.totals.judge_required_rows} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-content-refresh-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgCrRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgCrDailyTick(); }, 7 * 60_000);
+  setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
 // (option A, Daniel GO 2026-09-05): gårdssalg outreach is sent by the
 // platform itself once a day ──────────────────────────────────────────
