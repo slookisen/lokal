@@ -41,6 +41,7 @@
 // Read-only; never writes.
 
 import { getDb as getRfbDb } from "../database/init";
+import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { cutoffIsoFor, ownerStatsWindowDays, readPathViewGroups } from "./owner-stats-service";
 
 export interface GardssalgOwnerStats {
@@ -52,6 +53,12 @@ export interface GardssalgOwnerStats {
   aiSearchViews: number;
   /** Same value as aiSearchViews, kept for older clients of this endpoint. */
   aiBotViews: number;
+  /**
+   * «Med i AI-svar»: times the producer was sent to an AI assistant (list and
+   * profile pages, MCP, A2A), last AI_DELIVERY_WINDOW_DAYS days and since the
+   * counting started, per AI and per channel. Present when the provider id is given.
+   */
+  aiDeliveries?: { window: AiDeliveries; allTime: AiDeliveries };
   /** Honest, explicit acknowledgment of what this tab does NOT show — the
    * portal UI renders this list so an owner never wonders why a number is
    * "missing" (never silently omitted). */
@@ -65,7 +72,7 @@ const NOT_AVAILABLE = [
   "Søk som traff profilen din",
 ];
 
-export function getGardssalgOwnerStats(path: string): GardssalgOwnerStats {
+export function getGardssalgOwnerStats(path: string, providerId?: string): GardssalgOwnerStats {
   const db = getRfbDb();
   const windowDays = ownerStatsWindowDays();
   const cutoffIso = cutoffIsoFor(windowDays);
@@ -81,6 +88,12 @@ export function getGardssalgOwnerStats(path: string): GardssalgOwnerStats {
     humanViews,
     aiSearchViews,
     aiBotViews: aiSearchViews,
+    ...(providerId ? {
+      aiDeliveries: {
+        window: computeAiDeliveries(db, "experiences", providerId, AI_DELIVERY_WINDOW_DAYS, Date.now()),
+        allTime: computeAiDeliveries(db, "experiences", providerId, null, Date.now()),
+      },
+    } : {}),
     notAvailable: NOT_AVAILABLE,
   };
 }

@@ -849,6 +849,8 @@ export function getRelatedPublishedExperiences(
 // One card's worth of columns — the shared listing-row shape used by every
 // browse page (index/category/fylke/provider/search).
 export type ExperienceCardRow = {
+  /** Experience id; read by the «Med i AI-svar» counting on list pages (S2). Absent on rows built elsewhere. */
+  id?: string;
   slug: string;
   title: string;
   // Norwegian display title (dev-request 2026-07-04-opplevagent-dedup-og-
@@ -878,7 +880,7 @@ export type ExperienceCardRow = {
 };
 
 const CARD_COLS =
-  "e.slug AS slug, e.title AS title, e.title_no AS title_no, e.description AS description, " +
+  "e.id AS id, e.slug AS slug, e.title AS title, e.title_no AS title_no, e.description AS description, " +
   "e.content_field_evidence AS content_field_evidence, " +
   "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
   "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
@@ -895,6 +897,7 @@ const CARD_COLS =
  *  public ExperienceCardRow shape, attaching the derived `tags`. */
 function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
   return {
+    id: row.id as string,
     slug: row.slug as string,
     title: row.title as string,
     title_no: (row.title_no as string | null) ?? null,

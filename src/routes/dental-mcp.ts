@@ -27,6 +27,7 @@ import {
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 
 import { clinicProfileUrl } from "./dental-seo";
 import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
@@ -126,6 +127,22 @@ export function buildSearchResults(
 // ─── Tool registrations ──────────────────────────────────────
 
 export function registerDentalTools(server: McpServer): void {
+  // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the
+  // clinics a data tool hands the caller, counted with the same rules as rfb
+  // (profile-ai-deliveries.ts recordMcpDelivery).
+  type ToolExtra = { sessionId?: string; requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
+  const deliver = (tool: string, args: unknown, extra: ToolExtra, profileIds: string[]) => {
+    recordMcpDelivery({
+      vertical: "dental",
+      tool,
+      args,
+      profileIds,
+      clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+      headers: extra?.requestInfo?.headers,
+      sessionId: extra?.sessionId,
+    });
+  };
+
   // Tool 1: tannlege_search
   server.registerTool(
     "tannlege_search",
@@ -146,7 +163,7 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ query, fylke, spesialitet, helfo, akutt, limit }) => {
+    async ({ query, fylke, spesialitet, helfo, akutt, limit }, extra) => {
       try {
         const filter: Record<string, unknown> = {};
         if (query) filter.q = query;
@@ -160,6 +177,7 @@ export function registerDentalTools(server: McpServer): void {
         const klinikker = buildSearchResults(agents);
 
         const result = { count: total, klinikker };
+        deliver("tannlege_search", { query, fylke, spesialitet, helfo, akutt, limit }, extra, agents.map((a) => a.id));
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -192,7 +210,7 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ org_nr, id }) => {
+    async ({ org_nr, id }, extra) => {
       try {
         if (!org_nr && !id) {
           return {
@@ -257,6 +275,7 @@ export function registerDentalTools(server: McpServer): void {
           profil_url,
         };
 
+        deliver("tannlege_info", { org_nr, id }, extra, [agent.id]);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
