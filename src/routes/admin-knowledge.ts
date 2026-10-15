@@ -1950,10 +1950,11 @@ export interface HomepageContentRefreshOptions {
    *     platform domain, unreadable field_provenance, website_ownership
    *     "unverified" (wrong-entity site), an about summary rejected as theme
    *     spam, and a stored category that maps to no platform category.
-   * Stored values are compared lower-cased and mapped to platform keys
-   * (berries → fruit, bread → bakery) for the comparison only; the stored
-   * list itself is never rewritten. The provenance source_url is the final
-   * URL after redirects.
+   * Stored values are compared lower-cased: a platform key against the page's
+   * platform categories, a key that only maps to one (berries, bread) against
+   * the page's own product keywords (the same lexicon key must be there); the
+   * stored list itself is never rewritten. The provenance source_url is the
+   * final URL after redirects.
    * Empty/malformed or already corroborated stored categories: unchanged
    * behaviour. Every other field and guard is unchanged.
    */
@@ -1997,21 +1998,24 @@ function hcrProvenanceCorroborationRefusal(fieldProvenanceJson: string | null | 
 function hcrCorroborationHostRefusal(url: string): string | null {
   if (isOwnPlatformHomepage({ website: url })) return "own platform domain";
   const host = hostFromUrlLike(url);
-  if (!host) return "directory/social host";
+  if (!host) return "unparseable host";
   if (isDirectoryOrAggregatorHost(host)) return "directory/social host";
   // Lazy: admin-rfb-website-discovery imports this module (mergeFieldProvenance),
   // so a top-level import would be circular. Same idiom as productsAreGenericCategoryNames.
   const wd = require("./admin-rfb-website-discovery") as typeof import("./admin-rfb-website-discovery");
-  if (wd.rfbWebsiteHostExclusionReason(host)) return "directory/social host";
+  const why = wd.rfbWebsiteHostExclusionReason(host);
+  if (why === "known_hijacked_domain") return "known hijacked host";
+  if (why) return "directory/social host";
   return null;
 }
 
 /**
- * A stored category value as the platform key it stands for, for the
- * corroboration comparison only: lower-cased; a platform key stays itself
- * ("other" excepted — the extraction never infers it); otherwise the
- * extraction's own product-key mapping (berries → fruit, bread → bakery).
- * null = maps to nothing the page could ever show.
+ * A stored category value as the platform key it stands for, lower-cased: a
+ * platform key stays itself ("other" excepted — the extraction never infers
+ * it); otherwise the extraction's own product-key mapping (berries → fruit,
+ * bread → bakery). null = maps to nothing the page could ever show. Used to
+ * find unmappable values; the page comparison itself is
+ * hcrStoredCategoryOnPage.
  */
 function hcrStoredCategoryPlatformKey(v: unknown): string | null {
   if (typeof v !== "string") return null;
@@ -2020,6 +2024,23 @@ function hcrStoredCategoryPlatformKey(v: unknown): string | null {
   if (PLATFORM_CATEGORIES.includes(k)) return k;
   const mapped = mapToPlatformCategories([k]);
   return mapped.length === 1 ? mapped[0]! : null;
+}
+
+/**
+ * Does the page show this stored category? A platform key (fruit, meat, …)
+ * compares against the page's platform categories. A key that only maps to
+ * one (berries, bread) needs that SAME lexicon key among the page's product
+ * mentions: "epler" puts fruit on the page but says nothing about berries.
+ */
+function hcrStoredCategoryOnPage(
+  v: unknown,
+  pagePlatformCategories: ReadonlySet<string>,
+  pageProductKeys: readonly string[],
+): boolean {
+  const key = hcrStoredCategoryPlatformKey(v);
+  if (key === null) return false;
+  const raw = String(v).trim().toLowerCase();
+  return raw === key ? pagePlatformCategories.has(key) : pageProductKeys.includes(raw);
 }
 
 /**
@@ -2451,14 +2472,15 @@ export async function refreshHomepageContent(
     }
     if (corroborateStored) {
       const onPage = new Set(platformCategories);
-      // EVERY stored category must be on the page (compared as platform keys).
+      // EVERY stored category must be on the page (hcrStoredCategoryOnPage).
       const supported =
-        corroborateRefusal === null &&
-        corroborateStored.every((c) => {
-          const key = hcrStoredCategoryPlatformKey(c);
-          return key !== null && onPage.has(key);
-        });
+        corroborateRefusal === null && corroborateStored.every((c) => hcrStoredCategoryOnPage(c, onPage, productCats));
       const storedText = corroborateStored.map((c) => String(c).trim()).join(",");
+      // A stored lexicon-only key (berries, bread) is judged on the page's
+      // keywords, so name them in the reason too.
+      const lexiconOnly = corroborateStored.some(
+        (c) => typeof c === "string" && !PLATFORM_CATEGORIES.includes(c.trim().toLowerCase()),
+      );
       if (supported) {
         // The page supports every stored category: keep the list exactly as
         // stored (the page's extra keywords are not added) and record the
@@ -2475,7 +2497,12 @@ export async function refreshHomepageContent(
       } else {
         skippedUnsubstantiated.push({
           agent_id: agentId,
-          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${corroborateRefusal ?? `stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"}`})`,
+          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${
+            corroborateRefusal ??
+            `stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"}${
+              lexiconOnly ? `; page keywords: ${productCats.join(",") || "none"}` : ""
+            }`
+          })`,
         });
       }
     } else if (platformCategories.length > 0) {

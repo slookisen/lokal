@@ -20,9 +20,10 @@
  *        left alone with a categories_not_supported_by_homepage reason: partial
  *        support, a directory/social/own-domain homepage (also after a
  *        redirect), a wrong-entity site, unreadable field_provenance, a
- *        theme-spam summary, an unmapped stored value ("other"). Stored values
- *        compare case-insensitively and as platform keys (berries → fruit);
- *        the provenance source_url is the final URL. Empty stored categories,
+ *        theme-spam summary, an unmapped stored value ("other"), a known
+ *        hijacked or unparseable host. Stored values compare case-insensitively;
+ *        a non-platform key (berries) needs that same keyword on the page, not
+ *        just its platform category; the provenance source_url is the final URL. Empty stored categories,
  *        the curated lock and every caller without the option behave as before.
  *
  * Standalone: npx tsx src/routes/homepage-refresh-kategorinavn.test.ts
@@ -308,18 +309,31 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     const SPAM_SUMMARY_HTML =
       `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
       `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården, og spiller casino med gjestene hver helg.</p></body></html>`;
-    // Extracts [fruit] only ("bær" → berries → fruit).
-    const FRUIT_HTML =
-      `<html><head><title>Frukt Gård</title></head><body><h1>Frukt Gård</h1>` +
-      `<p>Vi selger bær, epler og plommer rett fra gården.</p></body></html>`;
+    // Names berries: product keywords [fruit, berries] → platform [fruit].
+    // (The lexicon's berry keywords match "berries", not the accented "bær",
+    // which its accent folding turns into "baer".)
+    const BERRIES_HTML =
+      `<html><head><title>Bær Gård</title></head><body><h1>Bær Gård</h1>` +
+      `<p>Vi selger bær (berries), epler og plommer rett fra gården.</p></body></html>`;
+    // Apples only: product keywords [fruit] → platform [fruit]; no berries.
+    const APPLES_HTML =
+      `<html><head><title>Eple Gård</title></head><body><h1>Eple Gård</h1>` +
+      `<p>Vi selger epler og plommer rett fra gården.</p></body></html>`;
     // Requested host → final URL after a redirect (fetchPage reads resp.url).
     const REDIRECTS: Record<string, string> = {
       "c-redir-bad.kat-test.no": "https://www.facebook.com/c-redir-bad",
       "c-redir-ok.kat-test.no": "https://www.c-redir-ok-ny.no/",
+      "c-unparse.kat-test.no": "https:///no-host",
     };
     const corrFetch = async (url: string) => {
       const host = new URL(url).host;
-      const html = host.startsWith("c-spam") ? SPAM_SUMMARY_HTML : host.startsWith("c-berries") ? FRUIT_HTML : CORR_HTML;
+      const html = host.startsWith("c-spam")
+        ? SPAM_SUMMARY_HTML
+        : host.startsWith("c-berries")
+          ? BERRIES_HTML
+          : host.startsWith("c-apples")
+            ? APPLES_HTML
+            : CORR_HTML;
       const resp = new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
       if (REDIRECTS[host]) Object.defineProperty(resp, "url", { value: REDIRECTS[host] });
       return resp;
@@ -339,7 +353,8 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     seed("c-other", { cats: ["vegetables", "other"], products: REAL, prov: gpProv });
     seed("c-badprov", { cats: ["vegetables"], products: REAL, prov: gpProv });
     db.prepare(`UPDATE agent_knowledge SET field_provenance = '{not json' WHERE agent_id = 'c-badprov'`).run();
-    for (const id of ["c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok"]) {
+    seed("c-apples", { cats: ["berries"], products: REAL, prov: gpProv });
+    for (const id of ["c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok", "c-hijacked", "c-unparse"]) {
       seed(id, { cats: ["vegetables"], products: REAL, prov: gpProv });
     }
     // Homepages on a social / directory host and on our own domain.
@@ -347,6 +362,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       "c-fb": "https://www.facebook.com/c-fb",
       "c-dir": "https://www.1881.no/c-dir",
       "c-own": "https://rettfrabonden.com/produsent/c-own",
+      "c-hijacked": "https://storbuktgard.no/",
     };
     const tgt = (id: string) => ({ agent_id: id, name: `Gård ${id}`, homepage_url: HOSTED[id] ?? `https://${id}.kat-test.no` });
     const catsOf = (id: string) => (db.prepare(`SELECT categories FROM agents WHERE id = ?`).get(id) as any).categories;
@@ -362,7 +378,8 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       db as any,
       [
         "c-veg", "c-fruit", "c-empty", "c-locked", "c-wrongent", "c-spam", "c-partial", "c-case", "c-berries",
-        "c-other", "c-badprov", "c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok",
+        "c-other", "c-badprov", "c-fb", "c-dir", "c-own", "c-redir-bad", "c-redir-ok", "c-apples", "c-hijacked",
+        "c-unparse",
       ].map(tgt) as any,
       { dryRun: false, fetchImpl: corrFetch as any, categoriesCorroborateOnly: true },
     );
@@ -465,6 +482,9 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       ["c-redir-bad", "directory/social host", ["vegetables"], "N1 a redirect that lands on a social-media host"],
       ["c-other", "unmapped stored category: other", ["vegetables", "other"], "N3 a stored value that maps to no platform key (other)"],
       ["c-badprov", "unreadable field_provenance", ["vegetables"], "N4 unreadable field_provenance fails closed"],
+      ["c-apples", "stored: berries; homepage: fruit; page keywords: fruit", ["berries"], "round 2 N1: stored [berries] on a page that only names apples (fruit on the page, berries not)"],
+      ["c-hijacked", "known hijacked host", ["vegetables"], "round 2 N2: a known hijacked domain (storbuktgard.no)"],
+      ["c-unparse", "unparseable host", ["vegetables"], "round 2 N2: a final URL whose host cannot be read"],
     ];
     for (const [id, why, storedCats, label] of refusals) {
       assertEq(
@@ -486,7 +506,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       assertEq(
         [catsOf(id), hpRecs.map((r) => [r.value, r.source_url]), cvs.categoriesLackWebsiteCorroboration(catsOf(id), provOf(id))],
         [col, [[val, url]], false],
-        `AC5 ${id}: corroborated (${id === "c-case" ? "stored casing compared case-insensitively" : id === "c-berries" ? "stored berries compared as fruit" : "source_url is the final URL after a same-owner redirect"}); stored column byte-identical`,
+        `AC5 ${id}: corroborated (${id === "c-case" ? "stored casing compared case-insensitively" : id === "c-berries" ? "stored berries on a page that names berries" : "source_url is the final URL after a same-owner redirect"}); stored column byte-identical`,
       );
     }
 
