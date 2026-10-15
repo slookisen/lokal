@@ -40,6 +40,10 @@ function tokenMatches(given: string, expected: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
+/** register/search budget: plenty for one lookup per web find, too little to walk the register. */
+export const REGISTER_SEARCH_MAX = 120;
+export const REGISTER_SEARCH_WINDOW_MS = 10 * 60 * 1000;
+
 export function createApp(deps: AppDeps) {
   const { db, now } = deps;
   const app = express();
@@ -111,8 +115,25 @@ export function createApp(deps: AppDeps) {
   };
 
   app.get("/stats", wrap(() => ({ ...stats(db), last_import: lastImport(db), import: importState, disk_used_pct: diskUsedPct(deps.dataDir), db_mb: Math.round(dbBytes(deps.dbFile) / 1048576) })));
-  app.get("/sample", wrap((req) => ({ profiles: sample(db, Number(req.query.n) || 10) })));
-  app.get("/register/search", wrap((req) => registerSearch(db, { name: req.query.name, town: req.query.town })));
+  app.get("/sample", wrap((req) => ({ profiles: sample(db, Number(req.query.n) || 10, req.query.since) })));
+  // Search mode starts from a web find and looks up its name here. Looping
+  // keywords × towns through this route instead walks the register like a
+  // list-all (DPIA T10; run 2026-10-14 made ~2 240 calls), so it is capped.
+  let searchHits: number[] = [];
+  app.get(
+    "/register/search",
+    (_req, res, next) => {
+      const t = now().getTime();
+      searchHits = searchHits.filter((x) => x > t - REGISTER_SEARCH_WINDOW_MS);
+      if (searchHits.length >= REGISTER_SEARCH_MAX) {
+        const retry = Math.ceil((searchHits[0] + REGISTER_SEARCH_WINDOW_MS - t) / 1000);
+        return res.status(429).json({ error: "rate_limited", detail: { max: REGISTER_SEARCH_MAX, window_s: REGISTER_SEARCH_WINDOW_MS / 1000, retry_after_s: retry } });
+      }
+      searchHits.push(t);
+      next();
+    },
+    wrap((req) => registerSearch(db, { name: req.query.name, town: req.query.town })),
+  );
 
   app.post("/candidates/lease", guardWrites, wrap((req) => leaseCandidates(db, req.body || {}, now())));
   app.post("/candidates/from-search", guardWrites, wrap((req) => addSearchCandidate(db, req.body || {}, now())));

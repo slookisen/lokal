@@ -25,7 +25,8 @@ drafts in A2A `strategic-decisions/se-dk-fase1/` (LIA SE, DPIA).
 - **Judge queue**: a separate judge run (a different `run_id` from the builder) leases drafts with their excerpts and
   posts `approve`, `reject` or `needs_review`. An `approve` that contradicts its own checks is refused.
 - **Brakes**: the line pauses itself when more than 10 % of the last ≥ 20 verdicts found the wrong entity, or when
-  the volume is ≥ 80 % full or the database exceeds 2 GB (`507`). Page excerpts are deleted after 30 days.
+  the volume is ≥ 80 % full or the database exceeds 2 GB (`507`). Page excerpts are deleted as soon as a draft is judged,
+  and at the latest after 30 days.
 
 ## First-time setup (Daniel, from a machine with `flyctl`)
 
@@ -40,9 +41,34 @@ curl https://rfb-intl-staging.fly.dev/health
 echo "$TOKEN"   # copy it into the Claude environment (next step), then clear your terminal
 ```
 
-Then, in the Claude cloud environment the batch routine runs in, add a **network secret** for host
-`rfb-intl-staging.fly.dev` with header `Authorization: Bearer <TOKEN>`. The routine never sees the token; the proxy adds
-it. Later deploys: `cd intl-staging && fly deploy`.
+Then, in the Claude cloud environment the batch routine runs in, add a **network secret**:
+- **Host:** `rfb-intl-staging.fly.dev`
+- **Type:** Bearer
+- **Header:** `Authorization`
+- **Prefix:** `Bearer`
+- **Value:** only the 64 hex characters of the token. No `Bearer` and no `<` or `>`: the prefix field already adds
+  `Bearer `.
+
+The routine never sees the token; the proxy adds it. Later deploys: `cd intl-staging && fly deploy`.
+
+**On Windows**, the commands above are bash. In `cmd` (Ledetekst), `$TOKEN` and `$(…)` are *not* expanded. The token
+then becomes the literal text `$TOKEN`, which anyone can guess (incident 2026-10-14). Make the values like this
+instead, in one `cmd` window:
+
+```
+powershell -NoProfile -Command "$b=New-Object byte[] 32;[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b);[BitConverter]::ToString($b).Replace('-','').ToLower()" > "%TEMP%\rfb1.txt"
+powershell -NoProfile -Command "$b=New-Object byte[] 32;[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b);[BitConverter]::ToString($b).Replace('-','').ToLower()" > "%TEMP%\rfb2.txt"
+set /p TOKEN=<"%TEMP%\rfb1.txt"
+set /p HMAC=<"%TEMP%\rfb2.txt"
+del "%TEMP%\rfb1.txt" "%TEMP%\rfb2.txt"
+fly secrets set --app rfb-intl-staging INTL_STAGING_TOKEN=%TOKEN% INTL_STAGING_HMAC_KEY=%HMAC%
+curl.exe -s -H "Authorization: Bearer %TOKEN%" https://rfb-intl-staging.fly.dev/stats
+curl.exe -s -H "Authorization: Bearer $TOKEN" https://rfb-intl-staging.fly.dev/stats
+<nul set /p "=%TOKEN%" | clip
+```
+
+The first `curl.exe` must return the stats. The second must return `{"error":"unauthorized"}`; that proves the token is
+not the literal text. The last line copies the token without a newline, ready to paste into **Value**.
 
 The machine uses `auto_stop_machines = "suspend"`, so it sleeps when nobody calls it and costs only the volume.
 
@@ -57,8 +83,8 @@ while sleep 60; do curl -sS -H "Authorization: Bearer $TOKEN" https://rfb-intl-s
 
 Stop the loop when `state` is `done` (or `failed` — then run it again). Later weekly re-imports are done by the routine.
 
-**Data lifetime.** Page excerpts are deleted 30 days after they were fetched (on a timer, and on the first requests
-after the machine wakes). Fly keeps daily volume snapshots for about 5 days, so deleted data can live that long in a
+**Data lifetime.** Page excerpts are deleted when the draft is judged. Excerpts of drafts nobody judges are deleted 30
+days after they were fetched (on a timer, and on the first requests after the machine wakes). Fly keeps daily volume snapshots for about 5 days, so deleted data can live that long in a
 snapshot. Register units that leave the register are marked inactive; rejected drafts and verdicts are kept as an
 audit trail until a retention rule is decided.
 
@@ -70,15 +96,15 @@ filter). That is an ordinary restart of `lokal`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | status, pause flag, disk %, DB size |
-| GET | `/stats` | counts per status and county, build outcomes, judge quality window, last import |
+| GET | `/stats` | counts per status and county, build outcomes, judge quality window, `excerpts_stored`, last import |
 | POST | `/import/se` · GET `/import/status` | run the register import (poll status every minute; the polling also keeps the machine awake) |
 | POST | `/candidates/lease` | `{run_id, n≤25, county?}` → candidates with register data |
-| GET | `/register/search?name=&town=` | match a producer found by web search to a register unit |
+| GET | `/register/search?name=&town=` | match a producer found by web search to a register unit (at most 120 calls per 10 min, then `429 rate_limited`) |
 | POST | `/candidates/from-search` | `{run_id, org_nr}` → adds and leases an in-scope unit |
-| POST | `/candidates/:id/draft` | `{run_id, outcome, fields?, excerpts?}` |
+| POST | `/candidates/:id/draft` | `{run_id, outcome, fields?, excerpts?}`: at most 8 excerpts, 4 per site, 3 000 characters each (`400 excerpt_too_long`) |
 | POST | `/judge/lease` | `{run_id, n≤25}` → drafts from other runs, with excerpts |
-| POST | `/drafts/:id/verdict` | `{run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, excerpt_verified?, field_results, reasons}` |
-| GET | `/sample?n=10` | random approved profiles for a human spot check |
+| POST | `/drafts/:id/verdict` | `{run_id, verdict, entity_match, direct_sale_ok, language_ok, personal_data_found, excerpt_verified?, field_results, reasons}`. The candidate's excerpts are deleted when the verdict is stored (`excerpts_deleted`) |
+| GET | `/sample?n=10&since=<ISO>` | random approved profiles (n ≤ 25) for a spot check; `since` limits it to profiles approved after that time |
 | POST | `/pause` · `/resume` · `/purge` · `/optout` | operations (`/resume` also restarts the quality window, whatever the pause reason) |
 
 ## Local development
