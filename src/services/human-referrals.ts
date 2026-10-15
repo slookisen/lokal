@@ -97,7 +97,7 @@ export interface ReferralSourceClass {
 // search/social checks below (Gemini/Bard live on *.google.com).
 
 /** Keys classifyReferralSource returns for an AI assistant. */
-export const AI_REFERRAL_KEYS = ["chatgpt", "claude", "perplexity", "gemini", "copilot", "mistral", "metaai", "grok", "deepseek", "you", "kagi"] as const;
+export const AI_REFERRAL_KEYS = ["chatgpt", "claude", "perplexity", "gemini", "copilot", "mistral", "metaai", "grok", "deepseek", "you", "kagi", "annenai"] as const;
 export function isAiReferralKey(key: string): boolean {
   return (AI_REFERRAL_KEYS as readonly string[]).includes(key);
 }
@@ -118,7 +118,7 @@ const AI_REFERRAL_HOSTS: Array<[string, string, string]> = [
 
 const AI_LABELS: Record<string, string> = {
   chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot",
-  mistral: "Mistral", metaai: "Meta AI", grok: "Grok", deepseek: "DeepSeek", you: "You.com", kagi: "Kagi Assistant",
+  mistral: "Mistral", metaai: "Meta AI", grok: "Grok", deepseek: "DeepSeek", you: "You.com", kagi: "Kagi Assistant", annenai: "Annen AI",
 };
 
 /** Lower-cased host of a referrer URL; null when it does not parse. */
@@ -141,7 +141,7 @@ function aiKeyFromReferrer(ref: string): string | null {
 // UTM fallback, whitelist ONLY (our own addAiUtmParams utm_source=<client> plus what
 // ChatGPT & co. append themselves). Not agentplatform.no, not producers' own campaigns.
 const AI_UTM_SOURCES: Array<[string, string]> = [
-  ["chatgpt.com", "chatgpt"], ["copilot.com", "copilot"], ["perplexity", "perplexity"], ["claude", "claude"], ["gemini", "gemini"],
+  ["chatgpt.com", "chatgpt"], ["chatgpt", "chatgpt"], ["copilot.com", "copilot"], ["github_copilot", "copilot"], ["perplexity", "perplexity"], ["claude", "claude"], ["gemini", "gemini"],
 ];
 
 export interface AiClickInput {
@@ -184,7 +184,7 @@ export function classifyReferralSource(
     // No referrer (Referrer-Policy: no-referrer in AI apps): the UTM mark is all there is.
     const k = utm ? aiKeyFromUtmSource(utm.utm_source) : null;
     if (k) return { key: k, label: AI_LABELS[k]! };
-    if (utm && utmValues(utm.utm_campaign).includes("ai_search")) return { key: "claude", label: AI_LABELS.claude! };
+    if (utm && utmValues(utm.utm_campaign).includes("ai_search")) return { key: "annenai", label: AI_LABELS.annenai! };
     return { key: "direkte", label: "Direkte" };
   }
   const ref = String(referrer).toLowerCase();

@@ -2715,6 +2715,9 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertEq(classifyReferralSource("https://kagi.com/search?q=x").key, "annet", "classify: kagi search stays a plain site");
   assertEq(classifyReferralSource("https://kagi.com/assistant/abc").key, "kagi", "classify: kagi.com/assistant → AI");
   assertEq(classifyReferralSource(null, { utm_source: "claude", utm_campaign: "ai_search" }).key, "claude", "classify: no referrer + utm_source=claude → AI (claude)");
+  assertEq(classifyReferralSource(null, { utm_source: "chatgpt", utm_campaign: "ai_search" }).key, "chatgpt", "classify: no referrer + utm_source=chatgpt → ChatGPT");
+  assertEq(classifyReferralSource(null, { utm_source: "github_copilot", utm_campaign: "ai_search" }).key, "copilot", "classify: github_copilot → copilot");
+  assertEq(classifyReferralSource(null, { utm_campaign: "ai_search" }).key, "annenai", "classify: ai_search campaign alone → Annen AI, not a named client");
   assertEq(classifyReferralSource(null, { utm_source: "agentplatform.no" }).key, "direkte", "classify: utm_source outside the whitelist is not AI");
   assertEq(classifyReferralSource(null, { utm_source: "bondens-nyhetsbrev", utm_campaign: "sommer" }).key, "direkte", "classify: a producer's own campaign is not AI");
   assertEq(classifyReferralSource("https://www.google.com/", { utm_source: ["rfb", "chatgpt.com"] }).key, "chatgpt", "classify: utm_source array (ours + ChatGPT's) → AI regardless of order");
@@ -2726,6 +2729,7 @@ console.log("── human-visits strip: referral classification + aggregation �
     assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "chatgpt", "aiClick: array, first whitelist hit");
     assertEq(classifyAiClickSource({ utm_source: ["claude", "chatgpt.com"] }), "claude", "aiClick: array, reversed order is still AI");
     assertEq(classifyAiClickSource({ utm_source: "claudes-gard" }), null, "aiClick: producer campaign containing claude is not AI");
+    assertEq(classifyAiClickSource({ utm_source: "chatgpt", utm_campaign: "ai_search" }), "chatgpt", "aiClick: utm_source=chatgpt without referrer");
     assertEq(classifyAiClickSource({ utm_source: "geminifarm" }), null, "aiClick: geminifarm is not AI");
     assertEq(classifyAiClickSource({ utm_source: "perplexity.ai" }), "perplexity", "aiClick: perplexity.ai prefix is AI");
     assertEq(classifyAiClickSource({ utm_campaign: "ai_search" }), "other", "aiClick: ai_search campaign alone → other");
