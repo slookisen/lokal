@@ -676,6 +676,13 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove that.
         "services/experience-description-proposals-job.test.ts",
         "services/experience-description-proposals-job.ts",
+        // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
+        // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+        // tillegg 2026-10-15): the daily job drives the SAME shared core as
+        // POST /admin/gardssalg-content-refresh, which enforces the
+        // experiences pause itself (423); the job imports only the status
+        // constant to recognise that 423 and end the run as `paused`.
+        "services/gardssalg-content-refresh-job.ts",
         "services/rfb-marketing-daily.test.ts",
         "services/rfb-marketing-daily.ts",
         // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
