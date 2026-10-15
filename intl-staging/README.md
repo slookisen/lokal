@@ -52,8 +52,13 @@ Then, in the Claude cloud environment the batch routine runs in, add a **network
 The routine never sees the token; the proxy adds it. Later deploys: `cd intl-staging && fly deploy`.
 
 **On Windows**, the commands above are bash. In `cmd` (Ledetekst), `$TOKEN` and `$(…)` are *not* expanded. The token
-then becomes the literal text `$TOKEN`, which anyone can guess (incident 2026-10-14). Make the values like this
-instead, in one `cmd` window:
+then becomes the literal text `$TOKEN`, which anyone can guess (incident 2026-10-14).
+
+- **First setup:** run `fly apps create`, `fly volumes create` and `fly deploy` first, then the block below.
+- **Changing only the token later:** leave `INTL_STAGING_HMAC_KEY` out of `fly secrets set`. A new HMAC key makes
+  the opt-out list unreadable, so the next import could bring back a unit that asked to be removed.
+
+Make the values like this instead, in one `cmd` window:
 
 ```
 powershell -NoProfile -Command "$b=New-Object byte[] 32;[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b);[BitConverter]::ToString($b).Replace('-','').ToLower()" > "%TEMP%\rfb1.txt"
@@ -68,7 +73,8 @@ curl.exe -s -H "Authorization: Bearer $TOKEN" https://rfb-intl-staging.fly.dev/s
 ```
 
 The first `curl.exe` must return the stats. The second must return `{"error":"unauthorized"}`; that proves the token is
-not the literal text. The last line copies the token without a newline, ready to paste into **Value**.
+not the literal text. The last line copies the token without a newline, ready to paste into **Value**. Clear the
+clipboard history afterwards (Win+V → Clear all), and close the window so `%TOKEN%` is gone.
 
 The machine uses `auto_stop_machines = "suspend"`, so it sleeps when nobody calls it and costs only the volume.
 

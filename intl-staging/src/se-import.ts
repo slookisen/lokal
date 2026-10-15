@@ -390,11 +390,14 @@ export async function runSeImport(
       const excl = db.prepare("UPDATE candidates SET status = 'excluded', status_reason = 'register_inactive', lease_run_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE candidate_id = ? AND status != 'approved'");
       const review = db.prepare("UPDATE candidates SET status = 'needs_review', status_reason = 'register_inactive', updated_at = ? WHERE candidate_id = ? AND status = 'approved'");
       const supersede = db.prepare("UPDATE drafts SET status = 'superseded', judge_lease_run_id = NULL, judge_lease_expires_at = NULL WHERE candidate_id = ? AND status = 'awaiting_judge'");
+      // A superseded draft is never judged, so its page excerpts go now too, as on a verdict.
+      const dropExcerpts = db.prepare("DELETE FROM excerpts WHERE candidate_id = ?");
       for (const s of stale) {
         deact.run(nowIso, s.unit_id);
         excl.run(nowIso, s.unit_id);
         review.run(nowIso, s.unit_id);
         supersede.run(s.unit_id);
+        dropExcerpts.run(s.unit_id);
       }
       counts.deactivated_units = stale.length;
     });

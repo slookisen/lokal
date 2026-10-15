@@ -40,9 +40,15 @@ function tokenMatches(given: string, expected: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
-/** register/search budget: plenty for one lookup per web find, too little to walk the register. */
+/**
+ * register/search budget: plenty for one lookup per web find. The 10-minute cap slows a
+ * keyword × town loop; the daily cap is what stops it (one night at 120/10 min would
+ * still be 2 880 calls, more than the 2 240 of 2026-10-14; review 2026-10-15, N2).
+ */
 export const REGISTER_SEARCH_MAX = 120;
 export const REGISTER_SEARCH_WINDOW_MS = 10 * 60 * 1000;
+export const REGISTER_SEARCH_DAILY_MAX = 600;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function createApp(deps: AppDeps) {
   const { db, now } = deps;
@@ -118,15 +124,21 @@ export function createApp(deps: AppDeps) {
   app.get("/sample", wrap((req) => ({ profiles: sample(db, Number(req.query.n) || 10, req.query.since) })));
   // Search mode starts from a web find and looks up its name here. Looping
   // keywords × towns through this route instead walks the register like a
-  // list-all (DPIA T10; run 2026-10-14 made ~2 240 calls), so it is capped.
+  // list-all (DPIA T10; run 2026-10-14 made ~2 240 calls), so it is capped per
+  // 10 minutes and per 24 hours (in memory: one machine, reset on restart).
   let searchHits: number[] = [];
   app.get(
     "/register/search",
     (_req, res, next) => {
       const t = now().getTime();
-      searchHits = searchHits.filter((x) => x > t - REGISTER_SEARCH_WINDOW_MS);
-      if (searchHits.length >= REGISTER_SEARCH_MAX) {
-        const retry = Math.ceil((searchHits[0] + REGISTER_SEARCH_WINDOW_MS - t) / 1000);
+      searchHits = searchHits.filter((x) => x > t - DAY_MS);
+      if (searchHits.length >= REGISTER_SEARCH_DAILY_MAX) {
+        const retry = Math.ceil((searchHits[0] + DAY_MS - t) / 1000);
+        return res.status(429).json({ error: "rate_limited", detail: { max: REGISTER_SEARCH_DAILY_MAX, window_s: DAY_MS / 1000, retry_after_s: retry } });
+      }
+      const recent = searchHits.filter((x) => x > t - REGISTER_SEARCH_WINDOW_MS);
+      if (recent.length >= REGISTER_SEARCH_MAX) {
+        const retry = Math.ceil((recent[0] + REGISTER_SEARCH_WINDOW_MS - t) / 1000);
         return res.status(429).json({ error: "rate_limited", detail: { max: REGISTER_SEARCH_MAX, window_s: REGISTER_SEARCH_WINDOW_MS / 1000, retry_after_s: retry } });
       }
       searchHits.push(t);

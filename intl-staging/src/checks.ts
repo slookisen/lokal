@@ -172,7 +172,10 @@ function phoneDigits(s: string): string {
  * +46 sits mid-sentence (run 2026-10-14: 4 of 13 refusals were this).
  */
 export function quotePhoneDigits(s: string): string {
-  return s.replace(/(?:\+|\b00)\s*46[\s-]*(?:\(\s*0\s*\)[\s-]*)?/g, "0").replace(/\D/g, "");
+  // "00" only counts as the international prefix when no digit stands right before
+  // it: "031-12 00 46" and "kl 9.00 46 …" are national digits and a time, not +46
+  // (review 2026-10-15, B1).
+  return s.replace(/(?:\+|(?<!\d[\s.,:-]?)\b00)\s*46[\s-]*(?:\(\s*0\s*\)[\s-]*)?/g, "0").replace(/\D/g, "");
 }
 
 /**
@@ -313,7 +316,7 @@ export function checkDraft(fields: Record<string, FieldValue>, excerpts: Excerpt
     } else {
       const d = phoneDigits(v);
       if (!SWEDISH_PHONE_RE.test(d)) errors.push("bad_value:business_phone");
-      else if (!own.some((s) => quotePhoneDigits(s.quote || "").includes(d))) errors.push("business_phone_not_in_quote");
+      else if (!own.some((s) => phoneDigits(s.quote || "").includes(d) || quotePhoneDigits(s.quote || "").includes(d))) errors.push("business_phone_not_in_quote");
     }
   }
   if (fields.visit_address) {
