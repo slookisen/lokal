@@ -229,7 +229,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       assertTrue(human.body.includes("sendt til AI-en &middot; 60d"), "(d) tile meta «sendt til AI-en · 60d»");
       assertTrue(human.body.includes("Tallet viser ikke hvor mange som så den."), "(d) help text: it does not show how many saw it");
       assertTrue(human.body.includes("s.aiDeliveries"), "(d) the tile is filled from /api/agents/:id/stats aiDeliveries");
-      assertTrue(human.body.includes("d.total > 0 || d.countingSince"), "(d) the tile also shows at 0 once the counting has a start date");
+      assertTrue(human.body.includes("d.total > 0 || partial"), "(d) the tile also shows at 0 while the counting is younger than the window");
       assertTrue(human.body.includes('"Fra "') && human.body.includes('"sendt til AI-en · siden "'), "(d) at 0 it shows «Fra <dato>»; in the first window «siden <dato>»");
       assertTrue(human.body.includes('"nb-NO"'), "(d) Norwegian date format on the Norwegian page");
       assertTrue(!human.body.includes("${"), "(d) rendered HTML has no literal ${");
