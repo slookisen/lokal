@@ -1,5 +1,6 @@
 
 import { Router, Request, Response } from "express";
+import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import {
   listPublicDentalAgents,
   countPublicDentalAgents,
@@ -1810,8 +1811,8 @@ router.get("/om", (_req: Request, res: Response) => {
 // GET /sitemap.xml
 // ═══════════════════════════════════════════════════════════
 
-router.get("/sitemap.xml", (_req: Request, res: Response) => {
-  try {
+function buildDentalSitemapXml(): string {
+  {
     const today = new Date().toISOString().split("T")[0];
     let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
     try { stats = getCachedDentalStats(); } catch { /* ok */ }
@@ -1877,12 +1878,32 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
 
     xml += "\n</urlset>";
+    return xml;
+  }
+}
+
+// Slice C (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx): short-TTL in-memory
+// cache (same SITEMAP_CACHE_TTL_MS as rfb). Single domain per router -> one entry.
+const dentalSitemapCache = createSitemapCache("dental", buildDentalSitemapXml);
+export function getDentalSitemapXml(now?: number, build?: () => string): string {
+  return dentalSitemapCache.get(now, build);
+}
+export function __resetDentalSitemapCacheForTesting(): void {
+  dentalSitemapCache.reset();
+}
+
+router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  const startedAt = Date.now();
+  try {
+    const xml = getDentalSitemapXml();
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
   } catch (err) {
     console.error("[dental-sitemap] error:", err);
     res.status(500).send("Error generating sitemap");
   }
+  logSlowSitemap("dental", startedAt);
 });
 
 // ═══════════════════════════════════════════════════════════

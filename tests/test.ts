@@ -20789,6 +20789,8 @@ withFreshModules([
   });
   dbForGardssalgP2.prepare("UPDATE experience_providers SET producer_type = ?, catalog_hidden = 1 WHERE id = ?").run("sideri", hiddenGardssalgIdP2);
 
+  // slice C: sitemap is TTL-cached; data changed since smP2 -> drop the cache.
+  (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).__resetExperiencesSitemapCacheForTesting();
   const smGardssalgP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
   assertEq(smGardssalgP2.status, 200, "p2-06i: sitemap.xml (gårdssalg producers seeded) → 200");
 
@@ -43332,6 +43334,24 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("sitemap-cache: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-29-gsc-strukturerte-data-og-5xx slice C: dental/experiences
+// sitemap TTL cache + [sitemap-slow] log (src/routes/sitemap-cache-util.ts).
+runSerial(async () => {
+  console.log("\n── gsc slice C: sitemap cache util (dental/experiences) ──");
+  try {
+    const { runSitemapCacheUtilTests } = require("../src/routes/sitemap-cache-util.test") as
+      typeof import("../src/routes/sitemap-cache-util.test");
+    const sc = await runSitemapCacheUtilTests({ log: false });
+    passed += sc.passed;
+    failed += sc.failed;
+    for (const f of sc.failures) failures.push("sitemap-cache-util: " + f);
+    console.log(`  sitemap-cache-util: ${sc.passed} passed, ${sc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("sitemap-cache-util: unexpected error: " + String(err?.message || err));
   }
 });
 

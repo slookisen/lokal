@@ -185,6 +185,7 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
       db.prepare("UPDATE experiences SET updated_at = ? WHERE id = ?").run("2021-06-15 08:30:00", newerExpId);
 
       const today = new Date().toISOString().slice(0, 10);
+      (require("./experiences-seo") as typeof import("./experiences-seo")).__resetExperiencesSitemapCacheForTesting();
       const sm1 = invokeGet(router, "/sitemap.xml");
       assertEq(sm1.status, 200, "gsc-b-00: GET /sitemap.xml -> 200");
       const catMatch = sm1.body.match(/<url><loc>[^<]*\/kategori\/vinter_sno<\/loc>[\s\S]*?<lastmod>([^<]+)<\/lastmod><\/url>/);
@@ -232,6 +233,8 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
 
       assertTrue(expStore.countGardssalgProviders() >= 5, "gsc-b-06: seeded >= GARDSSALG_VISIBILITY_THRESHOLD gårdssalg providers");
 
+      // slice C: sitemap is now TTL-cached; data changed since sm1 -> drop it.
+      (require("./experiences-seo") as typeof import("./experiences-seo")).__resetExperiencesSitemapCacheForTesting();
       const sm2 = invokeGet(router, "/sitemap.xml");
       assertEq(sm2.status, 200, "gsc-b-07: GET /sitemap.xml -> 200 (after gårdssalg seed)");
 

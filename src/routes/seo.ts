@@ -16,6 +16,7 @@
  *   GET /robots.txt           → Crawl instructions
  */
 
+import { resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -6339,15 +6340,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 // SITEMAP_CACHE_TTL_MS, default 30 min, clamped to 10–60 min. The agent list is
 // itself cached ~60 s and has no public invalidation hook, so TTL alone bounds
 // staleness (sitemap freshness is not time-critical).
-const SITEMAP_TTL_MIN_MS = 10 * 60_000;
-const SITEMAP_TTL_DEFAULT_MS = 30 * 60_000;
-const SITEMAP_TTL_MAX_MS = 60 * 60_000;
-
-export function resolveSitemapCacheTtlMs(raw: string | undefined = process.env.SITEMAP_CACHE_TTL_MS): number {
-  const n = Number(raw);
-  if (raw === undefined || raw.trim() === "" || !Number.isFinite(n)) return SITEMAP_TTL_DEFAULT_MS;
-  return Math.min(SITEMAP_TTL_MAX_MS, Math.max(SITEMAP_TTL_MIN_MS, Math.floor(n)));
-}
+export { resolveSitemapCacheTtlMs };
 
 let sitemapCache: { xml: string; builtAt: number } | null = null;
 
@@ -6505,14 +6498,17 @@ export function buildSitemapXml(): string {
 }
 
 router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  const startedAt = Date.now();
   try {
     const xml = getSitemapXml();
     res.header("Content-Type", "application/xml");
     res.header("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
+    logSlowSitemap("rfb", startedAt);
   } catch (err) {
     console.error("Sitemap error:", err);
     res.status(500).send("Error generating sitemap");
+    logSlowSitemap("rfb", startedAt);
   }
 });
 
