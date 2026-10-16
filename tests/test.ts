@@ -30860,7 +30860,9 @@ withFreshModules([
   assertTrue(profGP.body.includes('property="og:type" content="website"'), "gp-09b: og:type present");
   assertTrue(profGP.body.includes(`property="og:url" content="https://opplevagent.no/kategori/gardssalg/produsent/${slugGP}"`),
     "gp-09c: og:url is the canonical profile URL");
-  assertTrue(profGP.body.includes('name="twitter:card" content="summary"'), "gp-09d: twitter:card present");
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S3:
+  // a PNG share card, so the large-image card.
+  assertTrue(profGP.body.includes('name="twitter:card" content="summary_large_image"'), "gp-09d: twitter:card present");
 
   // gp-10: bare-minimum producer (no adresse/lat/lon/epost/telefon/hjemmeside)
   // still renders 200, with the honest-omission fallbacks — no fabricated
@@ -41989,6 +41991,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-jsonld: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S3:
+// og:image is a pre-rendered 1200×630 PNG card per category (+ default),
+// served by GET /og/:cat.png; twitter:card summary_large_image. Locks the
+// committed PNG set to CATEGORY_LABELS and to the card SVGs it came from.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata E2-S3: PNG share cards ──");
+  try {
+    const { runExperiencesSeoOgPngTests } = require("../src/routes/experiences-seo-og-png.test") as
+      typeof import("../src/routes/experiences-seo-og-png.test");
+    const eog = await runExperiencesSeoOgPngTests({ log: false });
+    passed += eog.passed;
+    failed += eog.failed;
+    for (const f of eog.failures) failures.push("experiences-seo-og-png: " + f);
+    console.log(`  experiences-seo-og-png: ${eog.passed} passed, ${eog.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-og-png: unexpected error: " + String(err?.message || err));
   }
 });
 

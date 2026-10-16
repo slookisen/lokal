@@ -20,9 +20,10 @@
  *       offersWithoutPrice 0; no «InStock» and no `availability` anywhere;
  *       no TouristAttraction carries offers, provider or touristType; the
  *       TouristAttraction name, the Service name, the BreadcrumbList's last
- *       item, og:title, the share-image label and alt, the visible
- *       breadcrumb and <title> all use the <h1>'s title; the Service links
- *       to the place by @id; BreadcrumbList kept.
+ *       item, og:title, the share-image alt, the visible breadcrumb and
+ *       <title> all use the <h1>'s title (E2-S3: the share image itself is
+ *       the category's PNG card, without a title); the Service links to the
+ *       place by @id; BreadcrumbList kept.
  *   (b) each case's exact nodes: alternateName only when the title differs;
  *       category as keywords / serviceType; the Offer is exactly
  *       {price, priceCurrency, url?, name?} (no availability); a provider-
@@ -36,6 +37,12 @@
  *       ReserveAction whose EntryPoint is the page's own /book CTA, no
  *       offers; paused page → no potentialAction and no offers; both clean
  *       under the shared invariants.
+ *   (e) lokal#1097 review follow-ups, landed with E2-S3: S1 — the «publiseres
+ *       fortløpende» placeholder names the <h1>'s title (title_no on /no, the
+ *       original on /en with the switcher off, a published EN title with it
+ *       on); S4 — a per_adult Offer.name follows the page language
+ *       («Voksenpris» on /no and on /en with the switcher off, «Adult price»
+ *       on /en with it on).
  *
  * Run standalone: npx tsx src/routes/experiences-seo-jsonld.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -189,6 +196,9 @@ export function runExperiencesSeoJsonLdTests(opts: { log?: boolean } = {}): Prom
       const adult = mk("Fjordsafari med rib", { provider_id: provId, price_from: 990, price_unit: "per_adult" });
       const noProvider = mk("Nordlysjakt med buss", { price_from: 800, price_unit: "per_person" });
       const bare = mk("Utsiktspunkt ved fjorden", { category: null });
+      // (e) #1097 S1: title_no and no description → the placeholder lede.
+      const placeholder = mk("Kayak Tour Lofoten", { provider_id: provId });
+      db.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run("Kajakktur i Lofoten", placeholder.id);
       // A published EN title for the noPrice row (served only with the switcher on).
       db.prepare(
         `INSERT INTO profile_translations (platform, entity_type, entity_id, field, lang, source_text, source_hash, translated_text, status, published_at)
@@ -232,10 +242,8 @@ export function runExperiencesSeoJsonLdTests(opts: { log?: boolean } = {}): Prom
         assertTrue(crumbItems.length >= 2 && crumbItems[crumbItems.length - 1]?.name === c.h1 && crumbItems[crumbItems.length - 1]?.item === canonical,
           `jl-a8 ${c.key}: BreadcrumbList kept, last item is the <h1> at the canonical URL`);
         assertTrue(metaProperty(body, "og:title") === c.h1, `jl-a9 ${c.key}: og:title is the <h1> (got «${metaProperty(body, "og:title")}»)`);
-        let ogLabel: string | null = null;
-        try { ogLabel = new URL(metaProperty(body, "og:image")).searchParams.get("label"); } catch { /* stays null */ }
-        assertTrue(ogLabel === c.h1 && metaProperty(body, "og:image:alt").startsWith(`${c.h1}`),
-          `jl-a10 ${c.key}: share-image label and alt use the <h1> (got «${ogLabel}»)`);
+        assertTrue(metaProperty(body, "og:image:alt").startsWith(`${c.h1}`),
+          `jl-a10 ${c.key}: the share-image alt uses the <h1> (got «${metaProperty(body, "og:image:alt")}»)`);
         assertTrue(visibleCrumbLast(body) === c.h1, `jl-a11 ${c.key}: the visible breadcrumb ends with the <h1> (got «${visibleCrumbLast(body)}»)`);
         assertTrue(titleTag(body).startsWith(c.h1), `jl-a12 ${c.key}: <title> starts with the <h1>`);
         assertTrue(ta?.["@id"] === `${canonical}#attraction`, `jl-a13 ${c.key}: TouristAttraction has @id <canonical>#attraction`);
@@ -271,8 +279,8 @@ export function runExperiencesSeoJsonLdTests(opts: { log?: boolean } = {}): Prom
       {
         const { blocks } = pages.get("per_adult")!;
         const service = blocks.find((b) => b["@type"] === "Service");
-        assertEq(service?.offers, { "@type": "Offer", price: 990, priceCurrency: "NOK", name: "Adult price", url: "https://hval.example.no" },
-          "jl-b10: per_adult → the Offer is named «Adult price»; without a booking URL it points to the provider's site");
+        assertEq(service?.offers, { "@type": "Offer", price: 990, priceCurrency: "NOK", name: "Voksenpris", url: "https://hval.example.no" },
+          "jl-b10: per_adult → the Offer is named «Voksenpris» on /no (#1097 S4); without a booking URL it points to the provider's site");
       }
       {
         const { blocks } = pages.get("without provider")!;
@@ -368,6 +376,35 @@ export function runExperiencesSeoJsonLdTests(opts: { log?: boolean } = {}): Prom
           "jl-d8: paused booking → neither a ReserveAction nor an Offer");
         assertEq(forbiddenNodes(pausedBlocks), [], "jl-d9: paused page: no forbidden node (shared checker)");
         assertEq(offersWithoutPrice(pausedBlocks), 0, "jl-d10: paused page: offersWithoutPrice is 0");
+      }
+
+      // ── (e) lokal#1097 review follow-ups: S1 placeholder lede, S4 Offer.name ─
+      {
+        const placeholderLede = (html: string): string =>
+          unescapeHtml(/<p class="lede lede-soft">([^<]*)<\/p>/.exec(html)?.[1] ?? "");
+        const adultOfferName = async (lang: "no" | "en"): Promise<unknown> =>
+          (jsonLdBlocks((await callHtmlRoute(router, `/opplevelse/${adult.slug}`, lang)).body) as any[])
+            .find((b) => b["@type"] === "Service")?.offers?.name;
+
+        const no = await callHtmlRoute(router, `/opplevelse/${placeholder.slug}`);
+        assertTrue(h1Text(no.body) === "Kajakktur i Lofoten" && placeholderLede(no.body).includes("Kajakktur i Lofoten er en ")
+          && !placeholderLede(no.body).includes("Kayak Tour Lofoten"),
+          `jl-e1: /no: the placeholder names the <h1> (title_no), not the original title (got «${placeholderLede(no.body)}»)`);
+        const en = await callHtmlRoute(router, `/opplevelse/${placeholder.slug}`, "en");
+        assertTrue(h1Text(en.body) === "Kayak Tour Lofoten" && placeholderLede(en.body).includes("Kayak Tour Lofoten er en "),
+          `jl-e2: /en, switcher off: the placeholder names the <h1> (the original title, tnr-4d) (got «${placeholderLede(en.body)}»)`);
+        assertEq(await adultOfferName("en"), "Voksenpris", "jl-e3: /en, switcher off (lang=\"nb\"): the per_adult Offer stays «Voksenpris»");
+
+        process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
+        try {
+          const tr = await callHtmlRoute(router, `/opplevelse/${noPrice.slug}`, "en");
+          assertTrue(placeholderLede(tr.body).includes("Mountain hike on Senja er en "),
+            `jl-e4: switcher on + published EN title: the placeholder names the <h1> (got «${placeholderLede(tr.body)}»)`);
+          assertEq(await adultOfferName("en"), "Adult price", "jl-e5: switcher on: /en names the per_adult Offer «Adult price»");
+          assertEq(await adultOfferName("no"), "Voksenpris", "jl-e6: switcher on: /no keeps «Voksenpris»");
+        } finally {
+          delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+        }
       }
 
       return { passed, failed, failures };
