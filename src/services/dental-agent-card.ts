@@ -84,15 +84,16 @@ export function getDentalAgentCard(honestCount?: number | null): object {
           "produsent/skrive-nøkkel, men finn-tannlege.com har ingen skrive-API, så her betyr " +
           "X-API-Key utelukkende denne valgfrie forbrukernøkkelen. " +
           "Søk er allerede helt åpent uten nøkkel. Gir en egen forbrukslogg; " +
-          "rate-grensen på finn-tannlege.com er per i dag en flat IP-kvote som IKKE økes av " +
-          "nøkkelen. " +
+          "rate-grensen på finn-tannlege.com (1000 kall per 15 min, per MCP-økt på /mcp, ellers " +
+          "per IP) økes IKKE av nøkkelen. " +
           "Voluntary, completely free identity key for AI agents — get one via POST /api/keys " +
           "(optional label/contact_email in the JSON body), no login or account needed. " +
           "The same header name (X-API-Key) may elsewhere also be used for a separate, " +
           "unrelated producer/write key, but finn-tannlege.com has no write API, so here " +
           "X-API-Key refers exclusively to this optional consumer key. " +
           "Search is already fully open without a key. Grants a usage-ledger record; " +
-          "finn-tannlege.com's rate limit is currently a flat per-IP quota not raised by a key.",
+          "finn-tannlege.com's rate limit (1000 calls per 15 minutes, per MCP session on /mcp, " +
+          "otherwise per IP) is not raised by a key.",
       },
     },
     skills: [

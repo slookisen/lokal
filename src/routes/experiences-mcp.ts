@@ -38,8 +38,11 @@
  * every tool returns a graceful "ingen data / not available" text result —
  * never throws (mirrors safeCategories() in experiences-seo.ts).
  *
- * Rate limiting: uses jsonRpcLimiter (same limiter as experiences-a2a.ts).
- * The host-gate in index.ts inserts /mcp BEFORE /a2a, so the global
+ * Rate limiting: this router's own chain from middleware/mcp-rate-limit.ts
+ * (profile `experiences`): IP brake, a quota per MCP session, and a stricter
+ * quota on book_gardssalg (EXPERIENCES_MCP_SIDE_EFFECT_TOOLS). It shares no
+ * bucket with /a2a, which keeps jsonRpcLimiter (experiences-a2a.ts). The
+ * host-gate in index.ts inserts /mcp BEFORE /a2a, so the global
  * app.use('/a2a', jsonRpcLimiter) mount is never reached for MCP requests.
  */
 
@@ -137,7 +140,7 @@ import {
 } from "../services/gardssalg-booking-resolve";
 
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
-import { jsonRpcLimiter } from "../middleware/security";
+import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
@@ -214,8 +217,18 @@ export function buildExperienceVisibilityFields(e: {
   };
 }
 
-// Apply rate limiting to all routes on this router (same pattern as dental-mcp.ts)
-router.use(jsonRpcLimiter);
+// The tools with a real outbound effect (producer + guest e-mails), metered
+// by the profile's stricter side-effect quota. The list lives in the profile
+// (middleware/mcp-rate-limit.ts); every tool registered with
+// readOnlyHint: false must be in it (mcp-rate-limit-verticals.test.ts).
+export const EXPERIENCES_MCP_SIDE_EFFECT_TOOLS: ReadonlySet<string> = MCP_RATE_LIMIT_PROFILES.experiences.sideEffect.tools;
+
+// Rate limiting for all routes on this router (dev-request
+// 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt): this router's own
+// buckets — IP brake, then a quota per MCP session (else per recognized
+// consumer key, else per IP), then the book_gardssalg quota. Not
+// jsonRpcLimiter, which /a2a keeps. See middleware/mcp-rate-limit.ts.
+router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.experiences, isKnownSession: hasExperiencesMcpSession }).chain);
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
 // Deliberate, narrow exception to this module's content-isolation from the rfb DB:
@@ -1601,6 +1614,12 @@ interface ExperiencesMcpSession {
 
 const experiencesSessions = new Map<string, ExperiencesMcpSession>();
 const EXPERIENCES_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// The rate limiter's "is this a live session?" check (router.use near the
+// top of this file): only a session this router minted gets its own bucket.
+export function hasExperiencesMcpSession(sessionId: string): boolean {
+  return experiencesSessions.has(sessionId);
+}
 
 // Cleanup stale sessions every 5 minutes (mirrors dental-mcp.ts)
 setInterval(() => {

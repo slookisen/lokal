@@ -47607,3 +47607,26 @@ runSerial(async () => {
     failures.push("rfb-places-match-guard: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt (S1 + S2):
+// Opplevagent and Finn-tannlege /mcp limited per MCP session by their own
+// chains (createMcpRateLimiters), sharing no bucket with /a2a or
+// /api/tannlege; made-up session ids and unrecognized keys get no bucket of
+// their own on any of the three /mcp; side-effect sets match the tools'
+// readOnlyHint. Real routers over real HTTP, a fresh X-Forwarded-For address
+// per scenario (100.64.0.0/10) and fresh session ids — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S1+S2: per-session MCP rate limits (Opplevagent, Finn-tannlege, RFB) ──");
+  try {
+    const { runMcpRateLimitVerticalsTests } = require("../src/middleware/mcp-rate-limit-verticals.test") as
+      typeof import("../src/middleware/mcp-rate-limit-verticals.test");
+    const mrv = await runMcpRateLimitVerticalsTests({ log: false });
+    passed += mrv.passed;
+    failed += mrv.failed;
+    for (const f of mrv.failures) failures.push("mcp-rate-limit-verticals: " + f);
+    console.log(`  mcp-rate-limit-verticals: ${mrv.passed} passed, ${mrv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-rate-limit-verticals: unexpected error: " + String(err?.message || err));
+  }
+});

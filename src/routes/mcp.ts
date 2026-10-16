@@ -1412,6 +1412,13 @@ function detectMcpClient(req: Request): string | undefined {
 const sessions = new Map<string, McpSession>();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// The /mcp rate limiter's "is this a live session?" check (mcpPrimaryKey in
+// middleware/mcp-rate-limit.ts): only a session this router minted gets its
+// own bucket. Read-only; nothing here changes session handling.
+export function hasMcpSession(sessionId: string): boolean {
+  return sessions.has(sessionId);
+}
+
 // Cleanup stale sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
