@@ -7,8 +7,15 @@
 // vertical config (src/config/dental-search-vocabulary.ts), so another
 // vertical can reuse these primitives with its own word lists.
 
-import { __FYLKE_INTERNAL, fylkeEquivalents, normaliseFylke, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from "../norway-fylke";
-import { kommuner2024, officialPoststeder } from "../norway-postnummer";
+import {
+  __FYLKE_INTERNAL,
+  EQUIVALENCE_CLASSES,
+  fylkeEquivalents,
+  normaliseFylke,
+  NON_KOMMUNE_REGION_LABELS,
+  REGION_TO_KOMMUNER,
+} from "../norway-fylke";
+import { kommuner2024, officialPoststedFylker } from "../norway-postnummer";
 
 /** NFC + Unicode-aware lower case (folds Æ/Ø/Å, unlike SQLite's LOWER()). */
 export function normalize(text: string): string {
@@ -156,7 +163,30 @@ export function buildPlaceGazetteer(input: {
   };
 }
 
-let _officialKeys: Set<string> | null = null;
+// placeKey(official poststed) -> the fylker its postnumre lie in.
+let _officialFylker: Map<string, readonly string[]> | null = null;
+
+function officialFylkerByKey(): Map<string, readonly string[]> {
+  if (_officialFylker) return _officialFylker;
+  const byKey = new Map<string, Set<string>>();
+  for (const [name, fylker] of officialPoststedFylker()) {
+    const k = placeKey(name);
+    const set = byKey.get(k) ?? new Set<string>();
+    for (const f of fylker) set.add(f);
+    byKey.set(k, set);
+  }
+  _officialFylker = new Map([...byKey].map(([k, set]) => [k, [...set]]));
+  return _officialFylker;
+}
+
+/**
+ * The fylker an official poststed lies in, for any stored spelling of it
+ * ("BERGEN", "Bergen" -> ["Vestland"]); [] when it is not an official
+ * poststed. Read from the bundled postnummer register, never a DB.
+ */
+export function fylkerForPoststed(spelling: string): readonly string[] {
+  return officialFylkerByKey().get(placeKey(spelling)) ?? [];
+}
 
 /**
  * The Norwegian gazetteer: `poststedSpellings` (stored poststed values, most
@@ -167,9 +197,9 @@ let _officialKeys: Set<string> | null = null;
  * poststed column ("Baerum", "Indre Oestfold") resolves as the kommune.
  */
 export function buildNorwegianGazetteer(poststedSpellings: Iterable<string>): PlaceGazetteer {
-  _officialKeys ??= new Set(officialPoststeder().map(placeKey));
+  const officialKeys = officialFylkerByKey();
   const official: string[] = [];
-  for (const s of poststedSpellings) if (_officialKeys.has(placeKey(s))) official.push(s);
+  for (const s of poststedSpellings) if (officialKeys.has(placeKey(s))) official.push(s);
   return buildPlaceGazetteer({
     poststeder: official,
     kommuner: kommuner2024().map((k) => k.kommune),
@@ -180,9 +210,10 @@ export function buildNorwegianGazetteer(poststedSpellings: Iterable<string>): Pl
 
 let _fylkeNames: Array<readonly [string, string]> | null = null;
 // Every canonical 2024 fylke plus the historical halves it absorbed
-// (Hordaland, Sør-Trøndelag, …), each mapped to the canonical name. The
-// re-split 2020 names (Viken, Vestfold og Telemark, Troms og Finnmark) cover
-// several of today's fylker and are left out: no single fylke filter fits.
+// (Hordaland, Sør-Trøndelag, …), each mapped to the canonical name, and the
+// re-split 2020 names (Viken, Vestfold og Telemark, Troms og Finnmark) mapped
+// to themselves: they cover several of today's fylker, which the caller
+// reads with mergedFylkeParts().
 function norwegianFylkeNames(): Array<readonly [string, string]> {
   if (_fylkeNames) return _fylkeNames;
   const out: Array<readonly [string, string]> = [];
@@ -191,39 +222,55 @@ function norwegianFylkeNames(): Array<readonly [string, string]> {
       if (normaliseFylke(name) === canonical) out.push([name, canonical]);
     }
   }
+  for (const [merged] of EQUIVALENCE_CLASSES) out.push([merged, merged]);
   _fylkeNames = out;
   return out;
+}
+
+/**
+ * Today's fylker a re-split 2020 fylke name covers ("Viken" -> Akershus,
+ * Buskerud, Østfold), or null for any other name.
+ */
+export function mergedFylkeParts(name: string): readonly string[] | null {
+  const cls = EQUIVALENCE_CLASSES.find((c) => c[0] === name);
+  return cls ? cls.slice(1) : null;
 }
 
 const KIND_ORDER: readonly PlaceKind[] = ["poststed", "kommune", "region", "fylke"];
 
 /**
- * Find one place in `tokens`: the longest phrase first, and for equal length
- * the order poststed, kommune, region, fylke. Whole tokens only, so "Tromsø"
+ * Every place in `tokens`, in one pass: the longest phrase first, and for
+ * equal length the leftmost, each kind tried in the order poststed, kommune,
+ * region, fylke. Matches never overlap (a token belongs to at most one), so
+ * the work is linear in the number of tokens. Whole tokens only, so "Tromsø"
  * is the poststed TROMSØ and never the fylke Troms. A `null` token (already
  * used by the caller, e.g. for a specialty) never takes part in a phrase; a
  * phrase made only of `notAlone` words (stopwords such as "time") is skipped.
  */
-export function detectPlace(
+export function detectPlaces(
   tokens: ReadonlyArray<string | null>,
   gazetteer: PlaceGazetteer,
   opts: { notAlone?: ReadonlySet<string> } = {}
-): PlaceMatch | null {
+): PlaceMatch[] {
+  const used = tokens.map((t) => t === null);
+  const out: PlaceMatch[] = [];
   for (let len = Math.min(gazetteer.maxWords, tokens.length); len >= 1; len--) {
     for (let start = 0; start + len <= tokens.length; start++) {
-      const slice = tokens.slice(start, start + len);
-      if (slice.some((t) => t === null)) continue;
-      const words = slice as string[];
+      if (used.slice(start, start + len).some(Boolean)) continue;
+      const words = tokens.slice(start, start + len) as string[];
       if (opts.notAlone && words.every((w) => opts.notAlone!.has(w))) continue;
       const phrase = words.join(" ");
       const k = placeKey(phrase);
       for (const kind of KIND_ORDER) {
         const hit = lookup(gazetteer, kind, k);
-        if (hit) return { kind, name: hit[0], values: hit, phrase, start, length: len };
+        if (!hit) continue;
+        out.push({ kind, name: hit[0], values: hit, phrase, start, length: len });
+        used.fill(true, start, start + len);
+        break;
       }
     }
   }
-  return null;
+  return out;
 }
 
 function lookup(g: PlaceGazetteer, kind: PlaceKind, k: string): readonly string[] | null {

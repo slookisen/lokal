@@ -7,9 +7,10 @@
 //
 // All words are lower case and in the form tokenize() produces (hyphens split
 // words: "helfo-avtale" is the tokens "helfo", "avtale"). Specialty synonyms
-// and triggers match a whole token sequence where the LAST word may continue
-// ("kjeveortoped" also matches "kjeveortopeden"); stopwords match whole
-// tokens only.
+// match a whole token sequence where the LAST word may continue
+// ("kjeveortoped" also matches "kjeveortopeden"). Triggers and stopwords
+// match whole tokens only, so each inflected trigger form is listed: a
+// clinic name such as "Akuttklinikken" or "Helfotannlegen" stays a name word.
 
 export interface SearchSpecialty {
   /** Stored specialty name; mirrors SPECIALTY_PAGES[].navn in routes/dental-seo.ts (checked by a test). */
@@ -31,9 +32,9 @@ export interface SearchVocabulary {
   /** Whole tokens dropped before name matching; never a place on their own. */
   stopwords: ReadonlySet<string>;
   specialties: readonly SearchSpecialty[];
-  /** Emergency-duty triggers -> acute filter. */
+  /** Emergency-duty triggers -> acute filter (whole tokens). */
   akutt: readonly string[];
-  /** Helfo direct-billing triggers -> helfo filter. */
+  /** Helfo direct-billing triggers -> helfo filter (whole tokens). */
   helfo: readonly string[];
   /** A trigger right after one of these is not applied ("uten helfo"). */
   negations: ReadonlySet<string>;
@@ -54,6 +55,14 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
     "of", "av", "etter", "hvor", "where", "hva", "what", "hvilke", "hvilken", "which", "ikke", "not", "no",
     "nærmeste", "nearest", "close", "beste", "best", "god", "gode", "good",
     "hos", "as", "by", "byen", "city", "kommune", "kommunen", "municipality", "fylke", "fylket", "county",
+    "er", "is", "are", "det", "den", "de", "it", "this", "there", "noen", "some", "any", "on", "do", "does",
+    "tar", "imot", "take", "takes", "accept", "accepts", "accepting", "ny", "nye", "new", "please",
+    "åpen", "åpent", "åpne", "open", "pasient", "pasienter", "patient", "patients", "hjelp", "help",
+    "sentrum", "downtown", "du", "dere", "vi", "oss", "you", "your", "we", "us", "our", "could", "would",
+    "will", "get", "give", "tell", "about", "om", "gi", "kunne", "available", "ledig", "ledige",
+    "appointment", "appointments", "book", "booking", "bestille",
+    // who it is for: most clinics treat children ("barnetannlege" is the specialty pedodonti)
+    "barn", "barna", "children", "child", "kids", "kid", "voksne", "adults", "familie", "family",
     // words that read like places but are not meant as one here ("en time", Time kommune)
     "time", "timer", "dag", "today", "idag", "nå", "now", "avtale", "agreement", "område", "area",
   ]),
@@ -68,7 +77,7 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
     {
       canonical: "oral kirurgi og oral medisin",
       slug: "oral-kirurgi-og-oral-medisin",
-      synonyms: ["oral kirurgi og oral medisin", "oral kirurgi", "oral medisin", "oralkirurg", "oralkirurgi",
+      synonyms: ["oral kirurgi og oral medisin", "oral kirurgi", "oral kirurg", "oral medisin", "oralkirurg", "oralkirurgi",
         "oral surgeon", "oral surgery"],
       title_stems: ["oralkirurg"],
     },
@@ -105,17 +114,24 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
       title_stems: ["radiolog"],
     },
   ],
-  akutt: ["akutt", "tannlegevakt", "emergency", "urgent", "øyeblikkelig hjelp"],
-  helfo: ["helfo", "direkteoppgjør", "direkteoppgjor", "direct billing"],
+  akutt: ["akutt", "akuttvakt", "akuttvakta", "akuttvakten", "akutthjelp", "akuttime", "akuttimer",
+    "akuttbehandling", "akuttpasient", "akuttpasienter", "tannlegevakt", "tannlegevakta", "tannlegevakten",
+    "tannvakt", "emergency", "urgent", "øyeblikkelig hjelp"],
+  helfo: ["helfo", "helfoavtale", "helfoavtalen", "direkteoppgjør", "direkteoppgjor", "direct billing"],
   negations: new Set(["uten", "ikke", "without", "not", "no"]),
 };
 
-/** The vocabulary entry for a stored specialty name or slug (case-insensitive), or null. */
+/**
+ * The vocabulary entry for a whole specialty value: the stored name, its
+ * slug or one of its synonyms ("kjeveortoped", "Orthodontist"), ignoring
+ * case, spaces and hyphens. null when none matches.
+ */
 export function findSearchSpecialty(
-  nameOrSlug: string,
+  value: string,
   vocabulary: SearchVocabulary = DENTAL_SEARCH_VOCABULARY
 ): SearchSpecialty | null {
-  const v = (nameOrSlug || "").trim().toLowerCase();
+  const key = (s: string) => String(s ?? "").trim().toLowerCase().replace(/[\s-]+/g, " ");
+  const v = key(value);
   if (!v) return null;
-  return vocabulary.specialties.find((s) => s.canonical === v || s.slug === v) ?? null;
+  return vocabulary.specialties.find((s) => [s.canonical, s.slug, ...s.synonyms].some((w) => key(w) === v)) ?? null;
 }

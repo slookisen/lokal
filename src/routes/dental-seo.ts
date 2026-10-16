@@ -40,7 +40,7 @@ import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } f
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch, type DentalSearchTolkning } from "../services/dental-query-parser";
-import { getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -132,7 +132,6 @@ export function findSpecialtyBySlug(slug: string): SpecialtyPage | undefined {
 // Cache getDentalStats() results in this module. dental-store has no cache
 // so API consumers always get fresh data; only SSR pages use the cache.
 let _dentalStatsCache: { value: ReturnType<typeof getDentalStats>; expires: number } | null = null;
-const DENTAL_STATS_TTL_MS = 60_000;
 
 function getCachedDentalStats(): ReturnType<typeof getDentalStats> {
   const now = Date.now();

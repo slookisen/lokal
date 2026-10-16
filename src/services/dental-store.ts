@@ -203,7 +203,9 @@ export const AffiliationSchema = z.object({
 });
 export type Affiliation = z.infer<typeof AffiliationSchema>;
 
-export const ListFilterSchema = z.object({
+// The field filters; ListFilterSchema below adds `natural`, whose two
+// branches are field filters themselves.
+const ListFilterFieldsSchema = z.object({
   fylke: z.string().optional(),
   chain_brand: z.string().optional(),
   specialty: z.string().optional(),
@@ -221,9 +223,27 @@ export const ListFilterSchema = z.object({
   //   name_terms:    every word must occur in navn or poststed (AND).
   //   poststed_in:   every stored spelling of one place ("BERGEN", "Bergen").
   //   postnummer_in: a kommune's postnumre (kommune that is not a poststed).
+  //   fylke_in:      a re-split 2020 fylke ("Viken") and today's fylker in it.
   name_terms: z.array(z.string().min(1).max(100)).min(1).max(6).optional(),
   poststed_in: z.array(z.string().min(1).max(100)).min(1).max(20).optional(),
   postnummer_in: z.array(z.string().regex(/^\d{4}$/)).min(1).max(400).optional(),
+  fylke_in: z.array(z.string().min(1).max(100)).min(1).max(8).optional(),
+});
+type ListFilterFields = z.infer<typeof ListFilterFieldsSchema>;
+
+export const ListFilterSchema = ListFilterFieldsSchema.extend({
+  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): a free-text
+  // query as planDentalSearch() read it. A row matches when it matches the
+  // `parsed` fields OR the old reading of the same text (`legacy`: the whole
+  // text as q, or A2A's keyword reading), so a query never loses a clinic
+  // the old search found; the list functions put `legacy` matches first.
+  // An empty `parsed` matches every row. Not read from GET /agents params.
+  natural: z
+    .object({
+      parsed: ListFilterFieldsSchema,
+      legacy: ListFilterFieldsSchema.refine((f) => Object.values(f).some((v) => v !== undefined), "natural.legacy needs a field"),
+    })
+    .optional(),
 });
 export type ListFilter = z.infer<typeof ListFilterSchema>;
 
@@ -456,9 +476,10 @@ export function getDentalAgentById(
 function pushSpecialtyClause(
   where: string[],
   params: Record<string, unknown>,
-  specialty: string
+  specialty: string,
+  name = "specialty"
 ): void {
-  const m = specialtyMatch(specialty, "specialty");
+  const m = specialtyMatch(specialty, name);
   where.push(m.sql);
   Object.assign(params, m.params);
 }
@@ -466,41 +487,51 @@ function pushSpecialtyClause(
 // The specialty predicate shared by pushSpecialtyClause() (list/count) and
 // getAvailableSpecialties() (the /sok dropdown), so a specialty the dropdown
 // offers always returns the clinics it counted. Params are named
-// `<prefix>`, `<prefix>Person`, `<prefix>Title`, `<prefix>Stem<i>`.
+// `<prefix>`, `<prefix>Person`, `<prefix>Canon`, `<prefix>CanonPerson`,
+// `<prefix>Title<i>`.
 function specialtyMatch(specialty: string, prefix: string): { sql: string; params: Record<string, unknown> } {
-  const parts = [
-    `available_specialties LIKE @${prefix}`,
-    `specialists LIKE @${prefix}Person`,
-    `nb_lower(specialists) LIKE @${prefix}Title`,
-  ];
-  const params: Record<string, unknown> = {
+  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2): a slug or a
+  // synonym from the vocabulary ("kjeveortoped", "orthodontist", A2A's
+  // "oral kirurgi") also matches the stored name it stands for. The clauses
+  // for the value as given come first and are unchanged, so this only widens.
+  const entry = findSearchSpecialty(specialty);
+  const names = entry && entry.canonical !== specialty.toLowerCase() ? [specialty, entry.canonical] : [specialty];
+  const parts: string[] = [];
+  const params: Record<string, unknown> = {};
+  names.forEach((name, i) => {
+    const p = i === 0 ? prefix : `${prefix}Canon`;
+    parts.push(`available_specialties LIKE @${p}`, `specialists LIKE @${p}Person`);
     // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
-    [prefix]: `%"${specialty}"%`,
+    params[p] = `%"${name}"%`;
     // specialists: [{"name":"...","specialty":"oral kirurgi og oral medisin"}]
     //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
     //   colon-space variant; JSON.stringify emits no space, so this is exact).
-    [`${prefix}Person`]: `%"specialty":"${specialty}"%`,
-    // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): also
-    // match on the deep-scrape specialists[].title free-text field (e.g.
-    // "Spesialist i periodonti") -- NOT just the structured .specialty field
-    // above. This is genuinely free text (arbitrary casing/phrasing), so this
-    // clause substring-matches the lower-cased specialists blob for the
-    // lower-cased specialty word inside a "title": key, via the same
-    // Unicode-aware nb_lower() scalar function pushFreeTextClause uses (plain
-    // LIKE doesn't case-fold æ/ø/å). Additive — the two clauses above are
-    // untouched, this only widens what counts as a match.
-    [`${prefix}Title`]: `%"title":"%${specialty.toLowerCase()}%`,
-  };
-  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2): a fourth clause
-  // per title stem from the search vocabulary. A title reads "Kjeveortoped",
-  // not "kjeveortopedi", so the clause above missed it (REST measured 94 for
-  // specialty=kjeveortopedi against 157 for the stem). Same loose
-  // `"title":"%…%` shape as the title clause; a specialty not in the
-  // vocabulary keeps exactly the three clauses above.
-  (findSearchSpecialty(specialty)?.title_stems ?? []).forEach((stem, i) => {
-    parts.push(`nb_lower(specialists) LIKE @${prefix}Stem${i}`);
-    params[`${prefix}Stem${i}`] = `%"title":"%${stem}%`;
+    params[`${p}Person`] = `%"specialty":"${name}"%`;
   });
+  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): also
+  // match on the deep-scrape specialists[].title free-text field (e.g.
+  // "Spesialist i periodonti") -- NOT just the structured .specialty field
+  // above. This is genuinely free text (arbitrary casing/phrasing), so this
+  // clause substring-matches the lower-cased specialists blob for the
+  // lower-cased specialty word inside a "title": key, via the same
+  // Unicode-aware nb_lower() scalar function pushFreeTextClause uses (plain
+  // LIKE doesn't case-fold æ/ø/å). Additive — the two clauses above are
+  // untouched, this only widens what counts as a match.
+  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2): the vocabulary's
+  // title stems are matched the same way. A title reads "Kjeveortoped", not
+  // "kjeveortopedi", so the name alone missed it (REST measured 94 for
+  // specialty=kjeveortopedi against 157 for the stem). A word that contains
+  // another one in the list is left out: "%kjeveortoped%" already matches
+  // every title "%kjeveortopedi%" does, and each clause costs an
+  // nb_lower(specialists) call per row. A specialty not in the vocabulary
+  // keeps exactly the three clauses it had.
+  const words = [...new Set([...names.map((n) => n.toLowerCase()), ...(entry?.title_stems ?? [])])];
+  words
+    .filter((w) => !words.some((other) => other !== w && w.includes(other)))
+    .forEach((w, i) => {
+      parts.push(`nb_lower(specialists) LIKE @${prefix}Title${i}`);
+      params[`${prefix}Title${i}`] = `%"title":"%${w}%`;
+    });
   return { sql: `(${parts.join(" OR ")})`, params };
 }
 
@@ -518,10 +549,11 @@ function specialtyMatch(specialty: string, prefix: string): { sql: string; param
 function pushFreeTextClause(
   where: string[],
   params: Record<string, unknown>,
-  q: string
+  q: string,
+  name = "q"
 ): void {
-  where.push("(nb_lower(navn) LIKE @q OR nb_lower(poststed) LIKE @q)");
-  params.q = `%${q.toLowerCase()}%`;
+  where.push(`(nb_lower(navn) LIKE @${name} OR nb_lower(poststed) LIKE @${name})`);
+  params[name] = `%${q.toLowerCase()}%`;
 }
 
 // ─── One WHERE builder for every list/count (dev-request 2026-10-16-
@@ -545,9 +577,10 @@ export interface DentalWhereOptions {
 export function buildDentalWhere(
   parsed: ListFilter,
   opts: DentalWhereOptions = {}
-): { where: string[]; params: Record<string, unknown> } {
+): { where: string[]; params: Record<string, unknown>; orderFirst: string[] } {
   const where: string[] = [];
   const params: Record<string, unknown> = {};
+  const orderFirst: string[] = [];
 
   if (opts.publicOnly) {
     // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
@@ -570,61 +603,93 @@ export function buildDentalWhere(
     where.push(DENTAL_CLINIC_CLASS_SQL);
   }
 
-  if (parsed.fylke) {
+  pushFieldClauses(where, params, parsed, opts, "");
+
+  if (parsed.natural) {
+    // explicit fields AND (parsed OR legacy); `legacy` matches sort first.
+    // A branch without a clause matches every row. The two branches get
+    // their own parameter names (prefixes np/nl).
+    const parsedPart: string[] = [];
+    const legacyPart: string[] = [];
+    pushFieldClauses(parsedPart, params, parsed.natural.parsed, opts, "np_");
+    pushFieldClauses(legacyPart, params, parsed.natural.legacy, opts, "nl_");
+    if (legacyPart.length > 0) {
+      const legacySql = `(${legacyPart.join(" AND ")})`;
+      if (parsedPart.length > 0) where.push(`((${parsedPart.join(" AND ")}) OR ${legacySql})`);
+      orderFirst.push(`CASE WHEN ${legacySql} THEN 0 ELSE 1 END ASC`);
+    }
+  }
+
+  return { where, params, orderFirst };
+}
+
+// The clauses for the field filters, AND-ed into `where`. `p` prefixes every
+// parameter name ("" for the top level), so the branches of `natural` can
+// carry the same fields without a name clash.
+function pushFieldClauses(
+  where: string[],
+  params: Record<string, unknown>,
+  f: ListFilterFields,
+  opts: DentalWhereOptions,
+  p: string
+): void {
+  if (f.fylke) {
     // Input folded to the canonical 2024 name ("vestland", "Hordaland" ->
     // "Vestland"). The raw value stays in the IN list, so a value stored
     // verbatim (e.g. "Ukjent", which has no canonical form) still matches.
     // The column stays bare so idx_dental_fylke is used.
-    const canonical = normaliseFylke(parsed.fylke) ?? parsed.fylke;
-    pushEqualsAny(where, params, "fylke", "fylke", [canonical, parsed.fylke]);
+    const canonical = normaliseFylke(f.fylke) ?? f.fylke;
+    pushEqualsAny(where, params, "fylke", `${p}fylke`, [canonical, f.fylke]);
   }
-  if (parsed.chain_brand) {
-    where.push("chain_brand = @chain_brand");
-    params.chain_brand = parsed.chain_brand;
+  if (f.chain_brand) {
+    where.push(`chain_brand = @${p}chain_brand`);
+    params[`${p}chain_brand`] = f.chain_brand;
   }
-  if (parsed.verification_status && !(opts.publicOnly && parsed.verification_status === "rejected")) {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
+  if (f.verification_status && !(opts.publicOnly && f.verification_status === "rejected")) {
+    where.push(`verification_status = @${p}verification_status`);
+    params[`${p}verification_status`] = f.verification_status;
   }
-  if (parsed.specialty) {
-    pushSpecialtyClause(where, params, parsed.specialty);
+  if (f.specialty) {
+    pushSpecialtyClause(where, params, f.specialty, `${p}specialty`);
   }
   // PR-109 / PR-105 additive filters
-  if (parsed.q) {
-    pushFreeTextClause(where, params, parsed.q);
+  if (f.q) {
+    pushFreeTextClause(where, params, f.q, `${p}q`);
   }
-  if (parsed.helfo_agreement !== undefined) {
-    where.push("helfo_agreement = @helfo_agreement");
-    params.helfo_agreement = parsed.helfo_agreement;
+  if (f.helfo_agreement !== undefined) {
+    where.push(`helfo_agreement = @${p}helfo_agreement`);
+    params[`${p}helfo_agreement`] = f.helfo_agreement;
   }
-  if (parsed.acute_vakt !== undefined) {
-    where.push("acute_vakt = @acute_vakt");
-    params.acute_vakt = parsed.acute_vakt;
+  if (f.acute_vakt !== undefined) {
+    where.push(`acute_vakt = @${p}acute_vakt`);
+    params[`${p}acute_vakt`] = f.acute_vakt;
   }
-  if (parsed.enrichment_state !== undefined) {
-    where.push("enrichment_state = @enrichment_state");
-    params.enrichment_state = parsed.enrichment_state;
+  if (f.enrichment_state !== undefined) {
+    where.push(`enrichment_state = @${p}enrichment_state`);
+    params[`${p}enrichment_state`] = f.enrichment_state;
   }
-  if (parsed.poststed) {
+  if (f.poststed) {
     // poststed is stored upper case by Posten/BRREG convention ("BERGEN"),
     // but not on every row. The given value plus its upper-case form, both
     // against the bare column so /sted/:slug keeps idx_dental_poststed.
-    pushEqualsAny(where, params, "poststed", "poststed", [parsed.poststed.toLocaleUpperCase("nb-NO"), parsed.poststed]);
+    pushEqualsAny(where, params, "poststed", `${p}poststed`, [f.poststed.toLocaleUpperCase("nb-NO"), f.poststed]);
   }
-  if (parsed.poststed_in) {
-    pushEqualsAny(where, params, "poststed", "poststedIn", parsed.poststed_in);
+  if (f.poststed_in) {
+    pushEqualsAny(where, params, "poststed", `${p}poststedIn`, f.poststed_in);
   }
-  if (parsed.postnummer_in) {
-    pushEqualsAny(where, params, "postnummer", "postnummerIn", parsed.postnummer_in);
+  if (f.postnummer_in) {
+    pushEqualsAny(where, params, "postnummer", `${p}postnummerIn`, f.postnummer_in);
   }
-  if (parsed.name_terms) {
-    parsed.name_terms.forEach((term, i) => {
-      where.push(`(nb_lower(navn) LIKE @nameTerm${i} ESCAPE '\\' OR nb_lower(poststed) LIKE @nameTerm${i} ESCAPE '\\')`);
-      params[`nameTerm${i}`] = `%${escapeLike(term.toLowerCase())}%`;
+  if (f.fylke_in) {
+    pushEqualsAny(where, params, "fylke", `${p}fylkeIn`, f.fylke_in);
+  }
+  if (f.name_terms) {
+    f.name_terms.forEach((term, i) => {
+      const name = `${p}nameTerm${i}`;
+      where.push(`(nb_lower(navn) LIKE @${name} ESCAPE '\\' OR nb_lower(poststed) LIKE @${name} ESCAPE '\\')`);
+      params[name] = `%${escapeLike(term.toLowerCase())}%`;
     });
   }
-
-  return { where, params };
 }
 
 // `column = @name` for one distinct value, `column IN (@name0, @name1, …)`
@@ -1315,12 +1380,12 @@ export function listDentalAgents(
 ): Array<DentalAgent & { id: string }> {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-  const { where, params } = buildDentalWhere(parsed, opts);
+  const { where, params, orderFirst } = buildDentalWhere(parsed, opts);
 
   const sql =
     "SELECT * FROM dental_agents" +
     (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
-    " ORDER BY navn ASC LIMIT @limit OFFSET @offset";
+    ` ORDER BY ${[...orderFirst, "navn ASC"].join(", ")} LIMIT @limit OFFSET @offset`;
 
   params.limit = Math.max(1, Math.min(500, limit));
   params.offset = Math.max(0, offset);
@@ -1405,12 +1470,13 @@ export function listPublicDentalAgents(
   const db = getDb("dental");
   // Same publicOnly WHERE as countPublicDentalAgents(), so the count and the
   // list it describes never diverge.
-  const { where, params } = buildDentalWhere(parsed, { publicOnly: true });
+  const { where, params, orderFirst } = buildDentalWhere(parsed, { publicOnly: true });
 
   const sql =
     "SELECT * FROM dental_agents" +
     ` WHERE ${where.join(" AND ")}` +
     " ORDER BY" +
+    orderFirst.map((o) => ` ${o},`).join("") +
     "  CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC," +
     "  CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC," +
     "  CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC," +
@@ -1423,6 +1489,9 @@ export function listPublicDentalAgents(
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   return rows.map(hydrateAgent);
 }
+
+// getAvailableSpecialties()'s prepared statements, by SQL text, per handle.
+const _specialtyStatements = new WeakMap<object, Map<string, ReturnType<ReturnType<typeof getDb>["prepare"]>>>();
 
 /**
  * Returns the subset of `candidates` (canonical specialty names) for which
@@ -1444,18 +1513,22 @@ export function getAvailableSpecialties(candidates: string[]): string[] {
   // specialists[].title) as pushSpecialtyClause() above — the dropdown must
   // not hide a specialty that /spesialitet/:slug would actually return
   // clinics for. dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2):
-  // the very same predicate (specialtyMatch), title stems included.
+  // the very same predicate (specialtyMatch), title stems included. Most
+  // specialties give the same SQL text, and /sok calls this on every
+  // request, so each text is prepared once per database handle.
+  const statements = _specialtyStatements.get(db) ?? new Map();
+  _specialtyStatements.set(db, statements);
   return candidates.filter((name) => {
     const m = specialtyMatch(name, "s");
-    const row = db.prepare(
-      `SELECT 1 FROM dental_agents
+    const sql = `SELECT 1 FROM dental_agents
        WHERE verification_status != 'rejected'
          AND (is_inactive IS NULL OR is_inactive = 0)
          AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
          AND ${m.sql}
-       LIMIT 1`
-    ).get(m.params);
-    return !!row;
+       LIMIT 1`;
+    let stmt = statements.get(sql);
+    if (!stmt) statements.set(sql, (stmt = db.prepare(sql)));
+    return !!stmt.get(m.params);
   });
 }
 

@@ -10,7 +10,7 @@
  *          kommune table (kommune-fylke-2024.json) — fails on a stale file.
  *   P7     meta names source, licence, fetched_at and kommune basis.
  *   P8     the file is read lazily, once — not at import time.
- *   P9     kommuner2024 / officialPoststeder feed the search gazetteer.
+ *   P9     kommuner2024 / officialPoststedFylker feed the search gazetteer.
  *
  * Standalone: npx tsx src/services/norway-postnummer.test.ts
  * Wired into tests/test.ts via runNorwayPostnummerTests().
@@ -133,9 +133,13 @@ export function runNorwayPostnummerTests(opts: { log?: boolean } = {}): TestSumm
     assertTrue(kommuner.some((k) => k.kommunenummer === "3201" && k.kommune === "Bærum"), "P9a: kommuner2024 lists Bærum");
     assertEq(kommuner.filter((k) => k.kommune === "Herøy").length, 2, "P9b: both Herøy kommuner are listed under their display name");
     assertTrue(!kommuner.some((k) => /\(/.test(k.kommune)), "P9c: display names carry no ' (<fylke>)' disambiguator");
-    const official = new Set(pn.officialPoststeder());
-    assertTrue(official.has("SANDVIKA") && official.has("OSLO") && official.has("MO I RANA"), "P9d: officialPoststeder has SANDVIKA, OSLO, MO I RANA");
+    const officialFylker = pn.officialPoststedFylker();
+    const official = new Set(officialFylker.keys());
+    assertTrue(official.has("SANDVIKA") && official.has("OSLO") && official.has("MO I RANA"), "P9d: officialPoststedFylker has SANDVIKA, OSLO, MO I RANA");
     assertTrue(!official.has("BÆRUM") && !official.has("KRISTIANSAND"), "P9e: a kommune name that is not a poststed is not listed");
+    assertEq([officialFylker.get("BERGEN"), officialFylker.get("SANDVIKA"), officialFylker.get("TROMSØ")], [["Vestland"], ["Akershus"], ["Troms"]], "P9f: each poststed carries the fylke its postnumre lie in");
+    assertTrue([...officialFylker.values()].every((f) => f.length >= 1), "P9g: every official poststed has at least one fylke");
+    assertTrue(pn.officialPoststedFylker() === officialFylker, "P9h: computed once");
 
     // ── test seam ─────────────────────────────────────────────────────────
     pn.__setPostnummerRowsForTesting([{ postnummer: "1234", poststed: "TESTSTED", kommunenummer: "0301" }]);

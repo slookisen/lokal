@@ -146,11 +146,24 @@ export function kommuner2024(): Array<{ kommunenummer: string; kommune: string }
   return out;
 }
 
-/** Distinct official poststed names (as Posten writes them, upper case). */
-export function officialPoststeder(): string[] {
-  const names = new Set<string>();
-  for (const r of load().byPostnummer.values()) if (r.poststed) names.add(r.poststed);
-  return [...names];
+let poststedFylker: Map<string, string[]> | null = null;
+
+/**
+ * Each official poststed name (as Posten writes it, upper case) -> the 2024
+ * fylker its postnumre lie in. Computed once.
+ */
+export function officialPoststedFylker(): ReadonlyMap<string, readonly string[]> {
+  if (poststedFylker) return poststedFylker;
+  const out = new Map<string, string[]>();
+  for (const r of load().byPostnummer.values()) {
+    if (!r.poststed) continue;
+    const fylke = resolveFylke2024({ kommunenummer: r.kommunenummer });
+    const list = out.get(r.poststed) ?? [];
+    if ("fylke" in fylke && !list.includes(fylke.fylke)) list.push(fylke.fylke);
+    out.set(r.poststed, list);
+  }
+  poststedFylker = out;
+  return out;
 }
 
 /** The file's `meta` block (source, licence, fetched_at, kommune_basis). */
@@ -161,4 +174,5 @@ export function postnummerDatasetMeta(): PostnummerDatasetMeta | null {
 /** Test-only: inject rows instead of the bundled file, or null to re-read it. */
 export function __setPostnummerRowsForTesting(rows: PostnummerRow[] | null): void {
   loaded = rows ? index(rows, null) : null;
+  poststedFylker = null;
 }

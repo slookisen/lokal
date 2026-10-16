@@ -96,7 +96,8 @@ function extractText(msg: unknown): string | null {
 // through the shared parser (services/dental-query-parser.ts), the same one
 // MCP tannlege_search and /sok use. The keyword matcher below
 // (legacyParseIntent) stays as the rollback (DENTAL_QUERY_PARSER_DISABLED=1)
-// and as the fallback when the parsed filter finds nothing.
+// and as the old reading planDentalSearch keeps next to the parsed one: its
+// hits stay in the result and come first, so no message finds fewer clinics.
 
 const FYLKER = [
   "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",

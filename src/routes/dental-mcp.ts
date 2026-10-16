@@ -30,7 +30,6 @@ import {
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
-import { findSearchSpecialty } from "../config/dental-search-vocabulary";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 
 import { clinicProfileUrl } from "./dental-seo";
@@ -171,11 +170,12 @@ export function registerDentalTools(server: McpServer): void {
       try {
         // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): `query`
         // goes through the shared parser; the explicit arguments win over
-        // what it found (helfo/akutt false removes a parsed one). A slug
-        // («oral-kirurgi-og-oral-medisin») is read as its stored name.
+        // what it found (helfo/akutt false removes a parsed one). The store
+        // also reads a slug or synonym in `spesialitet` («kjeveortoped»,
+        // «orthodontist») as the stored specialty name.
         const explicit: Record<string, unknown> = {};
         if (fylke) explicit.fylke = fylke;
-        if (spesialitet) explicit.specialty = findSearchSpecialty(spesialitet)?.canonical ?? spesialitet;
+        if (spesialitet) explicit.specialty = spesialitet;
         if (helfo !== undefined) explicit.helfo_agreement = helfo ? "true" : undefined;
         if (akutt !== undefined) explicit.acute_vakt = akutt ? 1 : undefined;
 
