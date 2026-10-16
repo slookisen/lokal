@@ -46799,6 +46799,34 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-opplevagent-mcp-fritekst-query (S1-S3):
+// discover_experiences reads its free-text `query`. The shared intent module
+// (parity), the frozen MCP contract (OpenAI review), the interpreter + MCP
+// acceptance criteria and the submission replay. Own in-memory DBs (restored
+// in finally) — runSerial, next to the ChatGPT review block.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-mcp-fritekst-query: free-text query, contract freeze, replay ──");
+  type Summary = { passed: number; failed: number; failures: string[] };
+  const suites: Array<[string, () => Summary | Promise<Summary>]> = [
+    ["experiences-query-intent-parity", () => (require("../src/services/experiences-query-intent-parity.test") as typeof import("../src/services/experiences-query-intent-parity.test")).runExperiencesQueryIntentParityTests({ log: false })],
+    ["opplevagent-mcp-contract-freeze", () => (require("../src/routes/opplevagent-mcp-contract-freeze.test") as typeof import("../src/routes/opplevagent-mcp-contract-freeze.test")).runOpplevagentMcpContractFreezeTests({ log: false })],
+    ["opplevagent-mcp-query-intent", () => (require("../src/routes/opplevagent-mcp-query-intent.test") as typeof import("../src/routes/opplevagent-mcp-query-intent.test")).runOpplevagentMcpQueryIntentTests({ log: false })],
+    ["opplevagent-submission-replay", () => (require("../src/routes/opplevagent-submission-replay.test") as typeof import("../src/routes/opplevagent-submission-replay.test")).runOpplevagentSubmissionReplayTests({ log: false })],
+  ];
+  for (const [name, run] of suites) {
+    try {
+      const r = await run();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${name}: ` + f);
+      console.log(`  ${name}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${name}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});
+
 // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B1: seo.ts's
 // jsonLd.makesOffer builder no longer drops products without a parseable
 // numeric price — every named product gets an Offer, `price` is included

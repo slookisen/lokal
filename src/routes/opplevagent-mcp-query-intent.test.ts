@@ -1,0 +1,417 @@
+/**
+ * opplevagent-mcp-query-intent.test.ts — dev-request
+ * 2026-10-16-opplevagent-mcp-fritekst-query, S2 + S3.
+ *
+ * Bug (live 2026-10-16): discover_experiences with only
+ * {query:"hvalsafari i Tromsø"} answered filter_applied:{} and the first rows
+ * of the whole country in title order — none in Tromsø, none about whales.
+ *
+ * Covers:
+ *   (u) interpretDiscoverQuery() on its own: place / region / fylke, the
+ *       ambiguous place words, season / weather / category words, stopwords,
+ *       search words, explicit arguments winning.
+ *   (s) experience-store: text_terms (AND, synonyms, title_no, subcategory,
+ *       title hits first, LIKE escaping), RELAX_ORDER, protectKeys,
+ *       widenKommuneToFylke, publishedKommuneSet().
+ *   (m) the MCP tool over a real session: acceptance criteria 1-7 of S2 and
+ *       the S3 criteria, explicit arguments winning, logging without the raw
+ *       query, calls without `query` unchanged.
+ *
+ * Exports the fixture and the MCP session helper for
+ * opplevagent-submission-replay.test.ts.
+ *
+ * Standalone: npx tsx src/routes/opplevagent-mcp-query-intent.test.ts
+ * Wired into the gate via tests/test.ts.
+ */
+
+import express from "express";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+type ExpStore = typeof import("../services/experience-store");
+
+/**
+ * A small catalogue shaped like the live one for the submission's test
+ * cases: Tromsø winter rows incl. Arctic Explorer, whale rows (title,
+ * title_no and description-only hits), summer-only rows in Troms, wildlife in
+ * several counties, the Lofoten region, Geiranger filed under Stranda, a
+ * published kommune named Time, and an unpublished row in Finnsnes. No row in
+ * Finnmark, Storslett or Alta. Every row has a price, so a max_price filter
+ * can find nothing.
+ */
+export function seedOpplevagentQueryFixture(expStore: ExpStore, db: { prepare(sql: string): { run(...a: unknown[]): unknown } }): Record<string, string> {
+  const providerId = expStore.createProvider({
+    navn: "Fixture Opplevelser AS", fylke: "Troms", kommune: "Tromsø",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const ids: Record<string, string> = {};
+  const add = (key: string, row: Record<string, unknown>, titleNo?: string) => {
+    ids[key] = expStore.createExperience({
+      provider_id: providerId, provider_match_status: "matched",
+      verification_status: "verified", confidence: "high",
+      ...row,
+    } as any);
+    if (titleNo) db.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run(titleNo, ids[key]);
+  };
+  const troms = { kommune: "Tromsø", fylke: "Troms" };
+  add("arctic", { ...troms, title: "Arctic Explorer — Northern Lights Cruise from Tromsø", category: "sightseeing_transport", season: ["autumn", "winter", "spring"], price_from: 990, price_unit: "per_adult", description: "A four-hour evening cruise under the aurora." });
+  add("aurora", { ...troms, title: "Aurora Safari Camp — Fjord Tours Tromsø", category: "natur_friluft", season: ["vinter"], price_from: 1500 });
+  add("dogTromso", { ...troms, title: "Dog sledding in Tromsø", category: "vinter_sno", season: ["winter"], price_from: 1800 });
+  add("whaleSafari", { ...troms, title: "Winter Whale Safari from Tromsø", category: "dyreliv_safari", season: ["winter"], price_from: 1600 }, "Vinterhvalsafari fra Tromsø");
+  add("whaleWatching", { ...troms, title: "Silent Whale Watching — Brim Explorer Tromsø", category: "sightseeing_transport", season: ["winter"], price_from: 1700 });
+  add("museum", { ...troms, title: "Polar Museum Tromsø", category: "kultur_historie", season: ["all_year"], price_from: 120, description: "Exhibits on Arctic hunting, including a whale skeleton." });
+  add("kayakTromso", { ...troms, title: "Midnight Sun Kayak Tromsø", category: "natur_friluft", season: ["summer"], price_from: 900 });
+  add("kayakSenja", { kommune: "Senja", fylke: "Troms", title: "Sea kayaking on Senja", category: "natur_friluft", season: ["summer"], price_from: 1100 });
+  add("dogSenja", { kommune: "Senja", fylke: "Troms", title: "Dog sledding on Senja", category: "vinter_sno", season: ["winter"], price_from: 1900 });
+  add("dogLyngen", { kommune: "Lyngen", fylke: "Troms", title: "Dog sledding in Lyngen", category: "vinter_sno", season: ["winter"], price_from: 2000 });
+  add("andenes", { kommune: "Andøy", fylke: "Nordland", title: "Andenes Whale Safari", category: "dyreliv_safari", season: ["all_year"], price_from: 1300 });
+  add("lofotenWalk", { kommune: "Svolvær", fylke: "Nordland", title: "Lofoten Fishing Village Walk", category: "kultur_historie", season: ["all_year"], price_from: 300 });
+  add("eagle", { kommune: "Leknes", fylke: "Nordland", title: "Ørnesafari i Lofoten", category: "dyreliv_safari", season: ["summer"], price_from: 850 });
+  add("orca", { kommune: "Nærøysund", fylke: "Trøndelag", title: "Orca safari with Northern Explorers", category: "dyreliv_safari", season: ["winter"], price_from: 1400 });
+  add("aquarium", { kommune: "Ålesund", fylke: "Møre og Romsdal", title: "Atlanterhavsparken aquarium", category: "dyreliv_safari", season: ["all_year"], price_from: 300 });
+  add("geiranger", { kommune: "Stranda", fylke: "Møre og Romsdal", title: "Geirangerfjord Cruise", category: "sightseeing_transport", season: ["summer"], price_from: 600, description: "Sightseeing cruise from Geiranger." }, "Fjordcruise på Geirangerfjorden");
+  add("sirdal", { kommune: "Sirdal", fylke: "Agder", title: "Dog sledding in Sirdal", category: "dyreliv_safari", season: ["winter"], price_from: 1500 });
+  add("floibanen", { kommune: "Bergen", fylke: "Vestland", title: "Fløibanen funicular", category: "sightseeing_transport", season: ["all_year"], price_from: 150 });
+  add("fishMarket", { kommune: "Bergen", fylke: "Vestland", title: "Bergen Fish Market food walk", category: "mat_drikke", subcategory: "matvandring", season: ["all_year"], price_from: 450 });
+  add("viking", { kommune: "Oslo", fylke: "Oslo", title: "Viking Ship Museum", category: "kultur_historie", season: ["all_year"], price_from: 160 });
+  add("jaermuseet", { kommune: "Time", fylke: "Rogaland", title: "Jærmuseet", category: "kultur_historie", season: ["all_year"], price_from: 200 });
+  add("unpublished", { kommune: "Finnsnes", fylke: "Troms", title: "Hidden spa", category: "velvaere_spa", season: ["all_year"], price_from: 700, verification_status: "needs_review" });
+  return ids;
+}
+
+function parseJsonRpcBody(text: string, contentType: string | null): any {
+  if (contentType && contentType.includes("text/event-stream")) {
+    const dataLine = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("data:"))
+      .pop();
+    if (!dataLine) throw new Error("no SSE data: line found in response body: " + text.slice(0, 300));
+    return JSON.parse(dataLine.slice("data:".length).trim());
+  }
+  return JSON.parse(text);
+}
+
+// Plain node:http POST — not globalThis.fetch, which other suites stub.
+function httpPost(url: string, body: string, headers: Record<string, string>): Promise<{ headers: http.IncomingHttpHeaders; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method: "POST", headers: { ...headers, "Content-Length": Buffer.byteLength(body).toString() } }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve({ headers: res.headers, text: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+/** A real MCP session on the experiences router; `discover(args)` returns the tool's structuredContent. */
+export async function openOpplevagentMcpSession(mcpModule: typeof import("./experiences-mcp")): Promise<{
+  discover: (args: Record<string, unknown>) => Promise<any>;
+  call: (name: string, args: Record<string, unknown>) => Promise<any>;
+  close: () => Promise<void>;
+}> {
+  const app = express();
+  app.use(express.json());
+  app.use((req: express.Request, res: express.Response, next: express.NextFunction) => (mcpModule.default as any)(req, res, next));
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+  const baseHeaders = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+  const initRes = await httpPost(url, JSON.stringify({
+    jsonrpc: "2.0", method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "query-intent-test", version: "1.0.0" } },
+    id: "init",
+  }), baseHeaders);
+  const sessionId = initRes.headers["mcp-session-id"] as string | undefined;
+  let rpcId = 0;
+  const call = async (name: string, args: Record<string, unknown>) => {
+    const res = await httpPost(
+      url,
+      JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name, arguments: args }, id: String(++rpcId) }),
+      { ...baseHeaders, ...(sessionId ? { "mcp-session-id": sessionId } : {}) },
+    );
+    return parseJsonRpcBody(res.text, (res.headers["content-type"] as string | undefined) ?? null).result;
+  };
+  return {
+    call,
+    discover: async (args) => {
+      const r = await call("discover_experiences", args);
+      const text = JSON.parse(r?.content?.[0]?.text ?? "{}");
+      if (JSON.stringify(text) !== JSON.stringify(r?.structuredContent)) throw new Error("structuredContent differs from the text block");
+      return r?.structuredContent;
+    },
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+export function runOpplevagentMcpQueryIntentTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`;
+      failures.push(msg);
+      if (log) console.log("  " + msg);
+    }
+  }
+
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
+  return (async () => {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
+      require.resolve("../database/db-factory"),
+      require.resolve("../services/experience-store"),
+      require.resolve("../services/experiences-query-intent"),
+      require.resolve("./experiences-mcp"),
+    ]);
+    const conversation = (require("../services/conversation-service") as typeof import("../services/conversation-service")).conversationService;
+    const realStartConversation = conversation.startConversation;
+    let session: Awaited<ReturnType<typeof openOpplevagentMcpSession>> | undefined;
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const expStore = require("../services/experience-store") as ExpStore;
+      const qi = require("../services/experiences-query-intent") as typeof import("../services/experiences-query-intent");
+      const { interpretDiscoverQuery } = qi;
+      const { REGION_TO_KOMMUNER, __FYLKE_INTERNAL } = require("../services/norway-fylke") as typeof import("../services/norway-fylke");
+
+      // ── (u) interpretDiscoverQuery, with a fixed published-kommune list ──
+      const published = new Set(["Tromsø", "Bergen", "Oslo", "Stranda", "Time", "Svolvær", "Leknes"]);
+      const read = (q: string, explicit: Record<string, unknown> = {}) => interpretDiscoverQuery(q, explicit, { publishedKommuner: published });
+
+      assertEq(read("hvalsafari i Tromsø"), { hasContent: true, kommune: "Tromsø", terms: ["hvalsafari"] }, "u1: «hvalsafari i Tromsø» → kommune Tromsø + search word hvalsafari");
+      assertEq(read("whale safari in Tromso").kommune, "Tromsø", "u2: æ/ø/å are folded for place names: «Tromso» is Tromsø");
+      assertEq(read("Tromsøs beste aktiviteter").kommune, "Tromsø", "u3: a genitive -s still names the place");
+      assertEq(read("Lofoten").kommuner, [...REGION_TO_KOMMUNER.Lofoten], "u4: a curated region expands to its kommune list");
+      assertEq(read("Hva kan vi finne på i Troms om vinteren?"), { hasContent: true, fylke: "Troms", season: "winter" }, "u5: fylke + season, no search words, never the category vinter_sno");
+      assertEq(read("Tromsø i Troms").kommune, "Tromsø", "u6: kommune wins over fylke");
+      assertEq(read("Tromsø i Troms").fylke, undefined, "u6b: … and the fylke word is used up, not a second filter");
+      assertEq(read("Svolvær i Lofoten").kommune, "Svolvær", "u7: kommune wins over region");
+      assertEq(read("Leknes i Lofoten"), { hasContent: true, kommune: "Leknes" }, "u7b: … also when the region name is the longer one");
+      assertEq(read("Geiranger fjordcruise"), { hasContent: true, fylke: "Møre og Romsdal", terms: ["geiranger", "fjordcruise"] },
+        "u8: a gazetteer kommune with nothing published (Geiranger) becomes its fylke, and its name a search word");
+      assertEq(interpretDiscoverQuery("Geiranger fjordcruise", {}, { publishedKommuner: null }).kommune, "Geiranger", "u8b: without the published list the gazetteer name is used as is");
+      assertEq(read("kajakk i Vesterålen"), { hasContent: true, fylke: "Nordland", terms: ["kajakk", "vesterålen"] }, "u9: a district (no kommune, no region) is searched in its fylke with its name as a search word");
+      assertEq(read("Møre og Romsdal").fylke, "Møre og Romsdal", "u10: a multi-word fylke is matched as a phrase, not as kommune 'Romsdal'");
+
+      // Ambiguous place words and false positives (AC6).
+      assertEq(read("ski touring"), { hasContent: true, terms: ["ski", "touring"] }, "u11: «ski touring» sets no kommune");
+      assertEq(read("a good time in Bergen").kommune, "Bergen", "u12: «a good time in Bergen» → Bergen, not Time");
+      assertEq(read("arrive in time for northern lights").kommune, undefined, "u13: «in time» is not the kommune Time");
+      assertEq(read("Time to see the northern lights").kommune, undefined, "u14: a capital at the start of a sentence does not make Time a place");
+      assertEq(read("things to do in Time").kommune, "Time", "u15: capitalised mid-sentence, Time is the kommune");
+      assertEq(read("slappe av i sola i Bergen").kommune, "Bergen", "u16: «i sola» (in the sun) is not Sola");
+      assertEq(read("se hvaler i Tromsø").kommune, "Tromsø", "u17: «hvaler» (whales) is not the kommune Hvaler");
+      assertEq(read("opplevelser på Hvaler").kommune === undefined && read("opplevelser på Hvaler").fylke, "Østfold", "u17b: capitalised Hvaler is the place (searched in Østfold, as it has nothing published)");
+      assertEq(read("i moss").fylke, "Østfold", "u18: a preposition before «moss» marks the place (Moss → Østfold, nothing published)");
+      assertEq(read("moss walks").fylke, undefined, "u19: lower-case «moss» without a preposition is no place");
+      assertEq(read("such as these").fylke, undefined, "u20: «as» is never Ås (own spelling only)");
+      assertTrue(Object.keys(qi.AMBIGUOUS_PLACE_WORDS).every((name) => name in __FYLKE_INTERNAL.CITY_TO_FYLKE_RAW),
+        "u21: every AMBIGUOUS_PLACE_WORDS entry is a gazetteer name");
+
+      // Season and weather words: whole words only.
+      assertEq(read("våre beste opplevelser i Oslo").season, undefined, "u22: «våre» is not the season vår");
+      assertEq(read("hva skjer i Oslo i vår").season, "spring", "u23: «i vår» at the end of the sentence is this spring");
+      assertEq(read("i vår familie").season, undefined, "u24: «i vår familie» (our family) is no season");
+      assertEq(read("waterfall hike").season, undefined, "u25: «waterfall» is not autumn");
+      assertEq(read("regnbue over Bergen").weather, undefined, "u26: «regnbue» is not rain");
+      assertEq(read("regnværsdag i Bergen").weather, "rain", "u27: «regnværsdag» is rain");
+      assertEq(read("winter activities").category, undefined, "u28: «winter» sets the season, never the category vinter_sno");
+
+      // Category words.
+      assertEq(read("Find wildlife and animal experiences in Norway"), { hasContent: true, category: "dyreliv_safari" },
+        "u29: wildlife → dyreliv_safari; «animal» used up; «Norway» = the whole country");
+      assertEq(read("Find wildlife and animal experiences in Norway", { category: "dyreliv_safari" }), { hasContent: true },
+        "u30: with an explicit category the alias words are used up and nothing else is read");
+      assertEq(read("during our stay in Bergen"), { hasContent: true, kommune: "Bergen" }, "u31: a generic alias («stay») does not set the category and is no search word");
+      assertEq(read("gårdssalg i Bergen").category, undefined, "u32: the gårdssalg alias never becomes an experience category");
+
+      // Explicit arguments win.
+      assertEq(read("hvalsafari i Bergen", { kommune: "Tromsø" }), { hasContent: true },
+        "u33: with an explicit place nothing is read as place, and no search words");
+      assertEq(read("wildlife in Tromsø", { category: "kultur_historie" }), { hasContent: true, kommune: "Tromsø" },
+        "u34: an explicit category wins; the place is still read");
+      assertEq(read("Tromsø om sommeren", { season: "winter" }).season, undefined, "u35: an explicit season wins");
+      assertEq(read("Hva kan vi finne på i Troms om vinteren?", { fylke: "Troms", season: "winter" }), { hasContent: true },
+        "u36: query + the same structured arguments reads nothing extra");
+      assertEq(read("what can we do in Norway"), { hasContent: false }, "u37: a general question has no content words");
+      assertEq(read("tour for 4 people").terms, undefined, "u38: numbers and stopwords are no search words");
+      assertEq(read("alpha beta gamma delta epsilon zeta eta theta").terms?.length, qi.MAX_TEXT_TERMS, "u39: at most MAX_TEXT_TERMS search words");
+
+      // ── Fixture DB ────────────────────────────────────────────────────
+      const db = dbFactory.getDb("experiences");
+      const ids = seedOpplevagentQueryFixture(expStore, db as any);
+
+      // ── (s) experience-store ──────────────────────────────────────────
+      const titles = (f: Record<string, unknown>) => expStore.discoverExperiences(f as any, 50).map((e) => e.title);
+      assertEq(titles({ text_terms: ["whale"] }), ["Andenes Whale Safari", "Silent Whale Watching — Brim Explorer Tromsø", "Winter Whale Safari from Tromsø", "Polar Museum Tromsø"],
+        "s1: text_terms match title or description; title hits rank before the description-only hit");
+      assertEq(titles({ text_terms: ["hval"] }).includes("Andenes Whale Safari"), true, "s2: SEARCH_SYNONYMS expand a Norwegian word (hval → whale)");
+      assertEq(titles({ text_terms: ["fjordcruise"] }), ["Geirangerfjord Cruise"], "s3: title_no is searched");
+      assertEq(titles({ text_terms: ["matvandring"] }), ["Bergen Fish Market food walk"], "s4: subcategory is searched");
+      assertEq(titles({ text_terms: ["whale", "andenes"] }), ["Andenes Whale Safari"], "s5: every term must match (AND)");
+      assertEq(titles({ text_terms: ["ørnesafari"] }), ["Ørnesafari i Lofoten"], "s6: a lower-case ø matches a stored capital Ø");
+      assertEq(titles({ text_terms: ["%"] }), [], "s7: a LIKE wildcard in a term matches literally, not everything");
+      assertEq(expStore.countDiscoverExperiences({ text_terms: ["whale"] }), 4, "s8: countDiscoverExperiences applies text_terms too");
+      assertEq(expStore.expandSearchTerm("hvalsafari"), ["hvalsafari", "whale"], "s9: expandSearchTerm is exported");
+
+      const r1 = expStore.discoverExperiencesRelaxed({ kommune: "Tromsø", category: "dyreliv_safari", text_terms: ["zzz"] }, 20);
+      assertEq(r1.relaxedKeys, ["text_terms"], "s10: text_terms is relaxed first, the category stays");
+      const r2 = expStore.discoverExperiencesRelaxed({ fylke: "Finnmark" }, 20);
+      assertTrue(r2.results.length > 0 && r2.relaxedKeys.join() === "fylke", "s11: without options a place without rows is still relaxed away (REST/A2A unchanged)");
+      const r3 = expStore.discoverExperiencesRelaxed({ fylke: "Finnmark", category: "dyreliv_safari" }, 20, { protectKeys: ["fylke"] });
+      assertEq([r3.results.length, r3.relaxedKeys], [0, ["category"]], "s12: a protected key is never dropped");
+      const r4 = expStore.discoverExperiencesRelaxed({ kommune: "Storslett", category: "mat_drikke" }, 20, { protectKeys: ["kommune"], widenKommuneToFylke: true });
+      assertTrue(r4.results.length > 0 && r4.results.every((e) => e.fylke === "Troms") && r4.appliedFilter.fylke === "Troms" && !r4.appliedFilter.kommune,
+        "s13: an empty kommune is widened once to its fylke (Storslett → Troms)");
+      assertEq(r4.relaxedKeys, [expStore.KOMMUNE_TO_FYLKE_STEP, "category"], "s14: … reported as kommune→fylke, then the other relaxed keys");
+      const r5 = expStore.discoverExperiencesRelaxed({ kommune: "Ukjentby" }, 20, { protectKeys: ["kommune"], widenKommuneToFylke: true });
+      assertEq([r5.results.length, r5.relaxedKeys], [0, []], "s15: a kommune without a known fylke stays an honest zero");
+      assertEq(expStore.formatFilterLabels(["text_terms", expStore.KOMMUNE_TO_FYLKE_STEP]), "fritekst, kommune→fylke", "s16: labels for text_terms and the widening");
+      assertTrue(expStore.buildNarrowingSuggestions(r1.results, r1.relaxedKeys).some((s) => s.includes("category=dyreliv_safari")),
+        "s17: dropped search words suggest the categories the results have");
+      const kommuner = expStore.publishedKommuneSet();
+      assertTrue(kommuner.has("Tromsø") && kommuner.has("Stranda") && kommuner.has("Time") && !kommuner.has("Finnsnes"),
+        "s18: publishedKommuneSet holds the kommuner of published rows only");
+
+      // ── (m) MCP tool ──────────────────────────────────────────────────
+      const logged: string[] = [];
+      conversation.startConversation = ((o: { queryText?: string }) => { logged.push(String(o.queryText ?? "")); return undefined as any; }) as any;
+      const mcpModule = require("./experiences-mcp") as typeof import("./experiences-mcp");
+      session = await openOpplevagentMcpSession(mcpModule);
+      const discover = session.discover;
+
+      // AC1
+      const whale = await discover({ query: "hvalsafari i Tromsø" });
+      assertTrue(whale.count > 0 && whale.experiences.every((e: any) => e.kommune === "Tromsø"), "m1: AC1 every row is in Tromsø");
+      assertEq(whale.experiences.map((e: any) => e.id), [ids.whaleWatching, ids.whaleSafari, ids.museum], "m2: AC1 whale rows only, title hits first");
+      assertEq([whale.filter_applied.kommune, whale.filter_applied.text_terms], ["Tromsø", ["hvalsafari"]], "m3: AC1 filter_applied.kommune is Tromsø");
+      assertEq(whale.query_interpretation, { source: "query", kommune: "Tromsø", terms: ["hvalsafari"] }, "m4: AC1 query_interpretation.source is query");
+      assertTrue(logged.some((l) => l.includes('"kommune":"Tromsø"') && l.includes('"text_terms_count":1')) && !logged.some((l) => /hvalsafari/i.test(l)),
+        "m5: the log has the structured keys and the number of search words, never the words or the raw query");
+
+      // AC2
+      const lofoten = await discover({ query: "Lofoten" });
+      assertEq(lofoten.filter_applied.kommuner, [...REGION_TO_KOMMUNER.Lofoten], "m6: AC2 filter_applied.kommuner is the Lofoten list");
+      assertTrue(lofoten.count === 2 && lofoten.experiences.every((e: any) => REGION_TO_KOMMUNER.Lofoten.includes(e.kommune)), "m7: AC2 no row outside Lofoten");
+
+      // AC3
+      const geiranger = await discover({ query: "Geiranger fjordcruise" });
+      assertEq([geiranger.filter_applied.fylke, geiranger.filter_applied.kommune, geiranger.filter_applied.text_terms], ["Møre og Romsdal", undefined, ["geiranger", "fjordcruise"]],
+        "m8: AC3 Geiranger → fylke Møre og Romsdal plus search words, no kommune");
+      assertEq(geiranger.experiences.map((e: any) => e.id), [ids.geiranger], "m9: AC3 the fjord cruise, not an unfiltered list");
+
+      // AC4
+      const nonsense = await discover({ query: "zzzqqq" });
+      assertTrue(nonsense.count === 0 && nonsense.experiences.length === 0 && nonsense.zero_hit_reason === "unrecognized_query",
+        "m10: AC4 «zzzqqq» → count 0, zero_hit_reason unrecognized_query");
+      assertTrue(Array.isArray(nonsense.valid_categories) && nonsense.valid_categories.includes("dyreliv_safari"), "m11: AC4 … with valid_categories");
+      const adventure = await discover({ query: "adventure" });
+      assertTrue(adventure.count === 0 && adventure.zero_hit_reason === "unrecognized_query", "m12: content words with nothing to search by → unrecognized_query, no query run");
+
+      // AC5
+      const norway = await discover({ query: "what can we do in Norway" });
+      assertTrue(norway.count > 0 && !norway.zero_hit_reason && JSON.stringify(norway.filter_applied) === "{}" && norway.query_interpretation === undefined,
+        "m13: AC5 a general question still browses the catalogue");
+
+      // AC6
+      const goodTime = await discover({ query: "a good time in Bergen" });
+      assertTrue(goodTime.filter_applied.kommune === "Bergen" && goodTime.experiences.every((e: any) => e.kommune === "Bergen"), "m14: AC6 «a good time in Bergen» → Bergen, not Time");
+      const ski = await discover({ query: "ski touring" });
+      assertTrue(ski.filter_applied.kommune === undefined && ski.count === 0, "m15: AC6 «ski touring» sets no kommune (and finds nothing)");
+
+      // AC7 + S3: a kommune without rows, given or read from the query.
+      const storslett = await discover({ kommune: "Storslett" });
+      assertTrue(storslett.count > 0 && storslett.experiences.every((e: any) => e.fylke === "Troms"), "m16: S3 an empty kommune in Troms gives Troms rows");
+      assertEq(storslett.relaxed_filters, ["kommune→fylke"], "m17: S3 … with relaxed_filters kommune→fylke");
+      const storslettFood = await discover({ kommune: "Storslett", category: "mat_drikke" });
+      assertTrue(storslettFood.experiences.every((e: any) => e.fylke === "Troms") && !(storslettFood.relaxed_filters.includes("kommune") && storslettFood.relaxed_filters.includes("fylke")),
+        "m18: AC7 explicit empty kommune: never relaxed to both kommune and fylke");
+      const storslettQuery = await discover({ query: "matvandring i Storslett" });
+      assertTrue(storslettQuery.count > 0 && storslettQuery.experiences.every((e: any) => e.fylke === "Troms") && !storslettQuery.relaxed_filters.includes("kommune") && !storslettQuery.relaxed_filters.includes("fylke"),
+        "m19: AC7 empty kommune from the query: Troms rows, place never relaxed");
+      const unknownPlace = await discover({ kommune: "Ukjentby" });
+      assertTrue(unknownPlace.count === 0 && unknownPlace.experiences.length === 0 && unknownPlace.zero_hit_reason === "place_no_match",
+        "m20: S3 {kommune:'Ukjentby'} never gives a nationwide list");
+      const finnmark = await discover({ fylke: "Finnmark" });
+      assertTrue(finnmark.count === 0 && finnmark.zero_hit_reason === "place_no_match" && finnmark.relaxed_filters === undefined,
+        "m21: an explicit fylke without rows is an honest zero");
+      assertTrue(Array.isArray(finnmark.suggestions) && finnmark.suggestions.length > 0 && /Ingen opplevelser funnet i Finnmark/.test(finnmark.summary),
+        "m22: … with suggestions and a summary that names the place");
+      const alta = await discover({ query: "Hva kan vi gjøre i Alta?" });
+      assertTrue(alta.count === 0 && alta.zero_hit_reason === "place_no_match" && alta.filter_applied.fylke === "Finnmark",
+        "m23: a place read from the query with nothing there → place_no_match, not the whole country");
+
+      // Relaxation of everything the query asked for.
+      const spa = await discover({ query: "spa" });
+      assertTrue(spa.count === 0 && spa.zero_hit_reason === "relaxation_exhausted" && spa.relaxed_filters.includes("category"),
+        "m24: a query whose only filter (category) is relaxed away → relaxation_exhausted, not the catalogue");
+
+      // Explicit arguments win.
+      const explicitPlace = await discover({ query: "hvalsafari i Bergen", kommune: "Tromsø" });
+      assertTrue(explicitPlace.filter_applied.kommune === "Tromsø" && explicitPlace.filter_applied.text_terms === undefined && explicitPlace.query_interpretation === undefined && explicitPlace.count === 7,
+        "m25: an explicit kommune wins; the query adds no search words");
+      const explicitCategory = await discover({ query: "wildlife in Tromsø", category: "kultur_historie" });
+      assertEq([explicitCategory.filter_applied.category, explicitCategory.experiences.map((e: any) => e.id)], ["kultur_historie", [ids.museum]],
+        "m26: an explicit category wins over the query's alias word");
+
+      // Calls without `query` are unchanged.
+      const noQuery = await discover({ max_price: 10 });
+      assertTrue(noQuery.count > 0 && JSON.stringify(noQuery.relaxed_filters) === '["max_price"]' && !noQuery.zero_hit_reason && noQuery.query_interpretation === undefined,
+        "m27: without query, the old relaxation (max_price dropped) is unchanged");
+      const tromsWinter = await discover({ fylke: "Troms", season: "winter" });
+      assertEq(Object.keys(tromsWinter), ["summary", "count", "filter_applied", "experiences"], "m28: a structured call answers with exactly the old fields");
+    } catch (err: any) {
+      failed++;
+      failures.push("opplevagent-mcp-query-intent: unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      conversation.startConversation = realStartConversation;
+      if (session) await session.close();
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting();
+      } catch {
+        // best-effort cleanup
+      }
+      restoreModuleCache();
+    }
+
+    return { passed, failed, failures };
+  })();
+}
+
+// Standalone runner: `npx tsx src/routes/opplevagent-mcp-query-intent.test.ts`
+if (require.main === module) {
+  runOpplevagentMcpQueryIntentTests({ log: true }).then((summary) => {
+    console.log(`\n${summary.passed} passed, ${summary.failed} failed`);
+    for (const f of summary.failures) console.log(f);
+    process.exit(summary.failed > 0 ? 1 : 0);
+  });
+}

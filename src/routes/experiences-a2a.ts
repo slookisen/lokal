@@ -47,7 +47,7 @@ import {
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from "../services/norway-fylke";
+import { matchesAsWordPrefix, parseExperiencesIntent } from "../services/experiences-query-intent";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
@@ -60,6 +60,8 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
 // call site never passes a catalog_hidden arg either.
 import { isBookingPaused } from "../services/booking-store";
+
+export { parseExperiencesIntent };
 
 const router = Router();
 
@@ -148,153 +150,11 @@ function extractText(msg: unknown): string | null {
 }
 
 // ─── Intent parser ───────────────────────────────────────────
-// Extracts discovery parameters from a Norwegian/English natural-language
-// query. Keeps it simple: keyword matching on known fylker + signals.
-
-const FYLKER = [
-  "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",
-  "telemark", "agder", "rogaland", "vestland", "møre og romsdal",
-  "trøndelag", "nordland", "troms", "finnmark", "svalbard",
-];
-
-// The indoor/outdoor keywords are short Norwegian substrings ("inne", "ute")
-// that collide with unrelated words — e.g. "finne" (to find) contains "inne",
-// which previously forced indoor_outdoor="indoor" on any query using the verb
-// "finne" (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering:
-// "hva kan vi finne på i Tromsø om vinteren?" wrongly excluded outdoor results).
-// JS's \b doesn't treat æøå as word characters, so a plain regex \b boundary
-// can't be used here. This checks the actual preceding character is not a
-// Unicode letter/digit, while leaving the keyword's own end open so inflected
-// continuations ("inne" + "ndørs" → "innendørs") still match.
-function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
-  let from = 0;
-  for (;;) {
-    const idx = haystack.indexOf(keyword, from);
-    if (idx === -1) return false;
-    const precedingChar = idx > 0 ? haystack[idx - 1] : "";
-    if (!/[\p{L}\p{N}]/u.test(precedingChar)) return true;
-    from = idx + 1;
-  }
-}
-
-// Known kommune (city/municipality) display names, reused from
-// norway-fylke.ts rather than hand-rolling a second list. Checked BEFORE
-// the FYLKER substring loop below: a kommune name is the more specific
-// signal, and several kommune names substring-match into FYLKER (e.g.
-// "Tromsø" contains "troms"), which previously produced a wrong/
-// over-broad fylke instead of the intended kommune (the flagship demo
-// query "hva kan vi finne på i Tromsø om vinteren?" — dev-request
-// 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
-// Excludes traditional region/valley/district labels (Romsdal, Sunnmøre, …)
-// that appear in CITY_TO_FYLKE_RAW for fylke-resolution purposes but are
-// NOT themselves a literal DB `kommune` value — see NON_KOMMUNE_REGION_LABELS
-// in norway-fylke.ts for why (caught in PR #146 review: "Møre og Romsdal"
-// queries were regressing to a nonexistent `kommune: "Romsdal"` match).
-const KOMMUNE_NAMES: string[] = Object.keys(__FYLKE_INTERNAL.CITY_TO_FYLKE_RAW)
-  .filter(name => !NON_KOMMUNE_REGION_LABELS.has(name));
-
-// Detect a kommune name in `lower` (already-lowercased text) using the same
-// word-boundary-aware matching as the indoor/outdoor keywords. When several
-// kommune names match (e.g. short kommune "Os" is a substring-prefix of
-// "Oslo"), the LONGEST match wins — this resolves the common
-// short-name-inside-longer-name case without needing a full tokeniser.
-// NOTE: this does not fully solve general false positives from very short
-// kommune names that happen to be substring-prefixes of unrelated Norwegian
-// words with no longer kommune name present (e.g. "Os" inside "oster"/
-// "ost", or "Time" ["hour"] inside an unrelated "en time i ..." phrase) —
-// left out of scope per the dev-request (word-boundary matching already
-// eliminates the worse substring-inside-a-word bug class; full NLP
-// disambiguation of short ambiguous place names is a separate concern).
-function detectKommune(lower: string): string | null {
-  let best: string | null = null;
-  for (const display of KOMMUNE_NAMES) {
-    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
-      if (!best || display.length > best.length) best = display;
-    }
-  }
-  return best;
-}
-
-// Curated tourist-region names (dev-request 2026-09-21-opplevagent-
-// discovery-regionnavn-utenfor-kommune-fylke) — see REGION_TO_KOMMUNER in
-// norway-fylke.ts for the region -> kommune-list mapping itself, and that
-// export's own doc comment for why this is a SEPARATE list from
-// KOMMUNE_NAMES rather than more fake 1:1 kommune synonyms. Checked with the
-// exact same word-boundary-aware technique as detectKommune() above (longest
-// match wins on the rare chance two region names both match).
-const REGION_NAMES: string[] = Object.keys(REGION_TO_KOMMUNER);
-
-function detectRegion(lower: string): string | null {
-  let best: string | null = null;
-  for (const display of REGION_NAMES) {
-    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
-      if (!best || display.length > best.length) best = display;
-    }
-  }
-  return best;
-}
-
-export function parseExperiencesIntent(text: string): DiscoverFilter {
-  const lower = text.toLowerCase();
-  const params: DiscoverFilter = {};
-
-  // Kommune detection takes priority over fylke AND over a curated region
-  // match (see detectKommune above) — a caller who named an exact kommune
-  // shouldn't have it shadowed by a broader region/fylke constraint. Only
-  // when no kommune matched do we check for a curated multi-kommune region
-  // name (e.g. "Lofoten" -> its constituent kommuner, dev-request 2026-09-
-  // 21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke); only when
-  // NEITHER a kommune NOR a region matched do we fall back to fylke
-  // detection, exactly as before this region-detection feature existed —
-  // so an existing kommune/fylke-only query (e.g. "Tromsø", "Finnmark")
-  // produces a byte-identical filter to before.
-  const kommune = detectKommune(lower);
-  if (kommune) {
-    params.kommune = kommune;
-  } else {
-    const region = detectRegion(lower);
-    if (region) {
-      params.kommuner = [...REGION_TO_KOMMUNER[region]];
-    } else {
-      // Fylke detection — only when no kommune or curated region matched.
-      for (const f of FYLKER) {
-        if (lower.includes(f)) {
-          params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
-          break;
-        }
-      }
-    }
-  }
-
-  // Weather detection
-  if (lower.includes("regn") || lower.includes("rain")) {
-    params.weather = "rain";
-  } else if (lower.includes("snø") || lower.includes("snow")) {
-    params.weather = "snow";
-  } else if (lower.includes("sol") || lower.includes("clear") || lower.includes("fint vær")) {
-    params.weather = "clear";
-  }
-
-  // Indoor / outdoor detection (word-prefix-aware — see matchesAsWordPrefix)
-  if (matchesAsWordPrefix(lower, "inne") || matchesAsWordPrefix(lower, "indoor")) {
-    params.indoor_outdoor = "indoor";
-  } else if (matchesAsWordPrefix(lower, "ute") || matchesAsWordPrefix(lower, "outdoor") || matchesAsWordPrefix(lower, "friluft")) {
-    params.indoor_outdoor = "outdoor";
-  }
-
-  // Season detection
-  if (lower.includes("vinter") || lower.includes("winter")) {
-    params.season = "winter";
-  } else if (lower.includes("sommer") || lower.includes("summer")) {
-    params.season = "summer";
-  } else if (lower.includes("vår") || lower.includes("spring")) {
-    params.season = "spring";
-  } else if (lower.includes("høst") || lower.includes("autumn") || lower.includes("fall")) {
-    params.season = "autumn";
-  }
-
-  return params;
-}
+// parseExperiencesIntent() and its helpers (FYLKER, matchesAsWordPrefix,
+// detectKommune, detectRegion) live in services/experiences-query-intent.ts
+// (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S1), shared with the
+// MCP tool. Re-exported here so existing callers keep importing it from this
+// router.
 
 // ─── Gårdssalg intent detection (dev-request 2026-07-25-gardssalg-a2a-nl-
 // routing) ──────────────────────────────────────────────────────────────

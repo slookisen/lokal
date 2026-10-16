@@ -17,7 +17,7 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
-import { fylkeEquivalents } from "./norway-fylke";
+import { fylkeEquivalents, normaliseFylke } from "./norway-fylke";
 // dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
 // phone guard the rfb `agent_knowledge` write path already uses (dev-request
 // 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
@@ -286,6 +286,14 @@ const DiscoverFilterBaseSchema = z.object({
   lng: z.number().min(-180).max(180).optional(),
   radius_km: z.number().positive().max(5000).optional(),
   sort: z.enum(["distance"]).optional(),
+  // Free-text search words (dev-request 2026-10-16-opplevagent-mcp-fritekst-
+  // query, S2): the words of discover_experiences' `query` that are no place,
+  // category, season, weather or stopword — set by interpretDiscoverQuery()
+  // (experiences-query-intent.ts). Every term must hit title, title_no,
+  // description or subcategory (SEARCH_SYNONYMS-expanded); rows with the
+  // terms in the title rank first. Relaxed first. Additive: omitted, the
+  // query is byte-identical to before.
+  text_terms: z.array(z.string()).optional(),
 });
 export const DiscoverFilterSchema = DiscoverFilterBaseSchema.refine(
   (f) => (f.lat === undefined) === (f.lng === undefined),
@@ -1454,7 +1462,7 @@ const SEARCH_SYNONYMS: Record<string, string[]> = {
 };
 
 /** Expand one query token with Norwegian→English synonyms (returns ≥1 term). */
-function expandSearchTerm(term: string): string[] {
+export function expandSearchTerm(term: string): string[] {
   const lower = term.toLowerCase();
   const synonyms = SEARCH_SYNONYMS[lower] ?? [];
   return synonyms.length > 0 ? [lower, ...synonyms] : [lower];
@@ -1629,6 +1637,8 @@ function buildDiscoverWhere(f: DiscoverFilter): {
   hasGeo: boolean;
   originLat: number | undefined;
   originLng: number | undefined;
+  /** ORDER BY expression (higher first) counting the text_terms found in the title; null without text_terms. */
+  titleRankSql: string | null;
 } {
   // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
   // high/medium + provider brreg_active + canonical (never a dedup-merged
@@ -1710,7 +1720,28 @@ function buildDiscoverWhere(f: DiscoverFilter): {
   if (typeof f.duration_max === "number") { where.push("(e.duration_min IS NULL OR e.duration_min <= @dmax)"); params.dmax = f.duration_max; }
   if (f.language) { where.push("(e.languages IS NULL OR e.languages LIKE @lang)"); params.lang = `%"${f.language}"%`; }
 
-  return { where, params, hasGeo, originLat, originLng };
+  // text_terms: AND over the terms, each an OR over its SEARCH_SYNONYMS
+  // variants and the four text columns. gardssalgLikePattern() escapes LIKE
+  // metacharacters and turns æ/ø/å into `_`, because SQLite's lower() folds
+  // ASCII only ("Ørnesafari" must still match "ørnesafari").
+  let titleRankSql: string | null = null;
+  if (f.text_terms && f.text_terms.length > 0) {
+    const titleHits: string[] = [];
+    f.text_terms.forEach((term, i) => {
+      const keys = expandSearchTerm(term).map((variant, vi) => {
+        const k = `tt${i}_${vi}`;
+        params[k] = `%${gardssalgLikePattern(variant)}%`;
+        return k;
+      });
+      const like = (cols: string[]) =>
+        keys.flatMap((k) => cols.map((c) => `lower(COALESCE(${c},'')) LIKE @${k} ESCAPE '\\'`)).join(" OR ");
+      where.push(`(${like(["e.title", "e.title_no", "e.description", "e.subcategory"])})`);
+      titleHits.push(`(CASE WHEN ${like(["e.title", "e.title_no"])} THEN 1 ELSE 0 END)`);
+    });
+    titleRankSql = titleHits.join(" + ");
+  }
+
+  return { where, params, hasGeo, originLat, originLng, titleRankSql };
 }
 
 /**
@@ -1752,6 +1783,38 @@ export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
     )
     .get(params) as { total: number } | undefined;
   return row?.total ?? 0;
+}
+
+// How long publishedKommuneSet() reuses its answer. New kommuner appear only
+// when a bulk load publishes rows; five minutes late is harmless there.
+const PUBLISHED_KOMMUNE_SET_TTL_MS = 5 * 60_000;
+let publishedKommuneCache: { db: unknown; at: number; set: ReadonlySet<string> } | null = null;
+
+/**
+ * The kommune values that have at least one experience /discover can return
+ * (PUBLISH_GATE_SQL). interpretDiscoverQuery() (experiences-query-intent.ts)
+ * checks a kommune read from free text against it: a gazetteer name with
+ * nothing published under it (a bygd such as Geiranger, or a town the
+ * catalogue files under its kommune) is searched as its fylke instead of
+ * returning nothing (dev-request 2026-10-16-opplevagent-mcp-fritekst-query,
+ * S2). Cached for PUBLISHED_KOMMUNE_SET_TTL_MS per DB handle. Read-only.
+ */
+export function publishedKommuneSet(): ReadonlySet<string> {
+  const db = getDb(VERTICAL);
+  const now = Date.now();
+  if (publishedKommuneCache && publishedKommuneCache.db === db && now - publishedKommuneCache.at < PUBLISHED_KOMMUNE_SET_TTL_MS) {
+    return publishedKommuneCache.set;
+  }
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT e.kommune AS kommune FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${PUBLISH_GATE_SQL} AND e.kommune IS NOT NULL AND TRIM(e.kommune) != ''`
+    )
+    .all() as Array<{ kommune: string }>;
+  const set: ReadonlySet<string> = new Set(rows.map((r) => r.kommune));
+  publishedKommuneCache = { db, at: now, set };
+  return set;
 }
 
 /**
@@ -1803,7 +1866,7 @@ export function discoverExperiences(
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
-  const { where, params, hasGeo, originLat, originLng } = buildDiscoverWhere(f);
+  const { where, params, hasGeo, originLat, originLng, titleRankSql } = buildDiscoverWhere(f);
 
   // When a geo origin is given, the true top-N-by-distance can't be decided
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
@@ -1817,7 +1880,7 @@ export function discoverExperiences(
     SELECT e.* FROM experiences e
     LEFT JOIN experience_providers p ON p.id = e.provider_id
     WHERE ${where.join(" AND ")}
-    ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
+    ORDER BY ${titleRankSql ? `${titleRankSql} DESC, ` : ""}CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
     LIMIT @limit
   `;
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
@@ -1873,7 +1936,9 @@ export function formatDistanceLabel(
 // almost certainly over-constrained. On zero hits we relax filters one at a
 // time, weakest/most-peripheral constraint first, until results appear.
 // Location is the user's core intent, so fylke/kommune are relaxed last.
+// text_terms (free-text search words, the least certain signal) go first.
 const RELAX_ORDER: Array<keyof DiscoverFilter> = [
+  "text_terms",
   "duration_max",
   "max_price",
   "language",
@@ -1905,13 +1970,42 @@ const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   lng: "lengdegrad",
   radius_km: "søkeradius",
   sort: "sortering",
+  text_terms: "fritekst",
 };
+
+/**
+ * The one-time widening of a kommune without hits to its fylke
+ * (discoverExperiencesRelaxed's widenKommuneToFylke, dev-request
+ * 2026-10-16-opplevagent-mcp-fritekst-query S3). Reported in relaxed_filters
+ * next to the dropped filter keys.
+ */
+export const KOMMUNE_TO_FYLKE_STEP = "kommune→fylke" as const;
+
+/** One relaxation step: a dropped filter key, or the kommune→fylke widening. */
+export type RelaxStep = keyof DiscoverFilter | typeof KOMMUNE_TO_FYLKE_STEP;
 
 export interface RelaxedDiscoverResult {
   results: Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }>;
   originalFilter: DiscoverFilter;
   appliedFilter: DiscoverFilter;
-  relaxedKeys: Array<keyof DiscoverFilter>;
+  relaxedKeys: RelaxStep[];
+}
+
+/**
+ * Opt-in limits on the relaxation (dev-request 2026-10-16-opplevagent-mcp-
+ * fritekst-query, S2/S3 — used by discover_experiences; REST and A2A pass
+ * none and keep the old behaviour).
+ */
+export interface DiscoverRelaxOptions {
+  /** Keys never dropped: the place, so a place search never turns into a nationwide list. */
+  protectKeys?: ReadonlyArray<keyof DiscoverFilter>;
+  /**
+   * When a kommune finds nothing even with every other relaxable filter
+   * dropped, search once more with its fylke instead (from the caller's fylke,
+   * or the kommune's fylke via normaliseFylke / CITY_TO_FYLKE_RAW), keeping
+   * the fylke too. relaxedKeys then starts with KOMMUNE_TO_FYLKE_STEP.
+   */
+  widenKommuneToFylke?: boolean;
 }
 
 /**
@@ -1919,27 +2013,50 @@ export interface RelaxedDiscoverResult {
  * (weakest first, per RELAX_ORDER) and retries until results appear or every
  * filter is exhausted. Always returns whichever result set it landed on,
  * plus which keys were dropped so the caller can surface a relaxation note.
+ * See DiscoverRelaxOptions for the protected-place variant.
  */
 export function discoverExperiencesRelaxed(
   filter: DiscoverFilter = {},
-  limit = 20
+  limit = 20,
+  opts: DiscoverRelaxOptions = {}
 ): RelaxedDiscoverResult {
   const original = DiscoverFilterSchema.parse(filter);
-  let results = discoverExperiences(original, limit);
-  if (results.length > 0) {
-    return { results, originalFilter: original, appliedFilter: original, relaxedKeys: [] };
+  const protect = new Set<keyof DiscoverFilter>(opts.protectKeys ?? []);
+  const first = relaxUntilHits(original, limit, protect);
+  const fylke = opts.widenKommuneToFylke && original.kommune && first.results.length === 0
+    ? original.fylke ?? normaliseFylke(original.kommune)
+    : null;
+  if (!fylke) {
+    return { results: first.results, originalFilter: original, appliedFilter: first.applied, relaxedKeys: first.relaxedKeys };
   }
+  const { kommune: _kommune, ...withoutKommune } = original;
+  const second = relaxUntilHits({ ...withoutKommune, fylke }, limit, new Set([...protect, "fylke"]));
+  return {
+    results: second.results,
+    originalFilter: original,
+    appliedFilter: second.applied,
+    relaxedKeys: [KOMMUNE_TO_FYLKE_STEP, ...second.relaxedKeys],
+  };
+}
 
-  const working: DiscoverFilter = { ...original };
-  const relaxedKeys: Array<keyof DiscoverFilter> = [];
+function relaxUntilHits(
+  start: DiscoverFilter,
+  limit: number,
+  protect: ReadonlySet<keyof DiscoverFilter>
+): { results: RelaxedDiscoverResult["results"]; applied: DiscoverFilter; relaxedKeys: RelaxStep[] } {
+  let results = discoverExperiences(start, limit);
+  if (results.length > 0) return { results, applied: start, relaxedKeys: [] };
+
+  const working: DiscoverFilter = { ...start };
+  const relaxedKeys: RelaxStep[] = [];
   for (const key of RELAX_ORDER) {
-    if (working[key] === undefined) continue;
+    if (working[key] === undefined || protect.has(key)) continue;
     delete working[key];
     relaxedKeys.push(key);
     results = discoverExperiences(working, limit);
     if (results.length > 0) break;
   }
-  return { results, originalFilter: original, appliedFilter: working, relaxedKeys };
+  return { results, applied: working, relaxedKeys };
 }
 
 /**
@@ -1949,12 +2066,12 @@ export function discoverExperiencesRelaxed(
  * relaxation-exhausted zero-hit message in experiences-a2a.ts) never
  * hand-duplicate the label table.
  */
-export function formatFilterLabels(keys: Array<keyof DiscoverFilter>): string {
-  return keys.map((k) => FILTER_LABELS[k]).join(", ");
+export function formatFilterLabels(keys: ReadonlyArray<RelaxStep>): string {
+  return keys.map((k) => (k === KOMMUNE_TO_FYLKE_STEP ? k : FILTER_LABELS[k])).join(", ");
 }
 
 /** Bilingual note describing which filters were relaxed to produce results. Null if none were. */
-export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): string | null {
+export function buildRelaxationNote(relaxedKeys: ReadonlyArray<RelaxStep>): string | null {
   if (relaxedKeys.length === 0) return null;
   const labels = formatFilterLabels(relaxedKeys);
   return (
@@ -1970,7 +2087,7 @@ export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): s
  */
 export function buildNarrowingSuggestions(
   results: Array<Pick<Experience, "category" | "kommune" | "fylke">>,
-  relaxedKeys: Array<keyof DiscoverFilter>,
+  relaxedKeys: ReadonlyArray<RelaxStep>,
   limit = 3
 ): string[] {
   if (relaxedKeys.length === 0) return [];
@@ -1978,13 +2095,15 @@ export function buildNarrowingSuggestions(
   const distinct = (vals: Array<string | null | undefined>) =>
     Array.from(new Set(vals.filter((v): v is string => !!v)));
 
-  if (relaxedKeys.includes("category")) {
+  // Dropped search words are answered like a dropped category: name the
+  // categories the remaining results do have.
+  if (relaxedKeys.includes("category") || relaxedKeys.includes("text_terms")) {
     for (const c of distinct(results.map((r) => r.category))) {
       if (suggestions.length >= limit) break;
       suggestions.push(`Prøv kategori=${c} / Try category=${c}`);
     }
   }
-  if (suggestions.length < limit && relaxedKeys.includes("kommune")) {
+  if (suggestions.length < limit && (relaxedKeys.includes("kommune") || relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP))) {
     for (const k of distinct(results.map((r) => r.kommune))) {
       if (suggestions.length >= limit) break;
       suggestions.push(`Prøv kommune=${k} / Try kommune=${k}`);
