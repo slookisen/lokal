@@ -47210,6 +47210,22 @@ runSerial(async () => {
   }
 });
 
+runSerial(async () => {
+  console.log("\n── distribution-metadata: static catalog claims <= distribution/catalog-claims.json floors ──");
+  try {
+    const { runDistributionMetadataTests } = require("../src/routes/distribution-metadata.test") as
+      typeof import("../src/routes/distribution-metadata.test");
+    const dm = await runDistributionMetadataTests({ log: false });
+    passed += dm.passed;
+    failed += dm.failed;
+    for (const f of dm.failures) failures.push("distribution-metadata: " + f);
+    console.log(`  distribution-metadata: ${dm.passed} passed, ${dm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("distribution-metadata: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-08-discovery-paritet-og-ett-katalogtall (phase 1) + 2026-10-06
 // addendum: ONE catalog number per vertical across llms.txt / agent card / mcp.json /
 // server-card / agents.json / /api/stats / /health, tool lists == live tools/list for

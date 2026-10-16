@@ -2,7 +2,7 @@
 
 **Live:** https://rettfrabonden.com | **MCP Server:** https://rettfrabonden.com/mcp | **API Spec:** https://rettfrabonden.com/openapi.yaml
 
-Rett fra Bonden is the discovery layer for local food in Norway. 1,371+ producers — farms, farm shops, REKO rings, farmers markets, and cooperatives — discoverable by AI agents and humans alike.
+Rett fra Bonden is the discovery layer for local food in Norway. 1,500+ producers — farms, farm shops, REKO rings, farmers markets, and cooperatives — discoverable by AI agents and humans alike.
 
 Not an app. Not a webshop. **Infrastructure** — the DNS for food agents.
 
@@ -100,7 +100,7 @@ Full spec: https://rettfrabonden.com/openapi.yaml
 - **MCP 2025-06-18** over Streamable HTTP + stdio (remote + local)
 - **A2A v1.0.0** compliant (JSON-RPC 2.0 + Agent Card)
 - **Value-based matching** — no ads, no pay-to-rank
-- **1,386+ agents** across 374+ Norwegian cities
+- **1,500+ agents** across 374+ Norwegian cities
 
 ## For producers
 

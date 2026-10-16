@@ -2,7 +2,7 @@
 
 MCP server for [finn-tannlege.com](https://finn-tannlege.com) — find Norwegian dental clinics from Claude Desktop, ChatGPT, Cursor, and other AI assistants.
 
-~6,900 clinics with Helfo-agreement, specialty, emergency-duty (akuttvakt), and chain data.
+5,400+ clinics with Helfo-agreement, specialty, emergency-duty (akuttvakt), and chain data.
 
 ## Install
 

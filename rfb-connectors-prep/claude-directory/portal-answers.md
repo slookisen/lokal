@@ -80,7 +80,7 @@ Answer for the portal's "what does this connector do / does it read or write" st
 ```
 Rett fra Bonden is Norway's open directory of small-scale food producers — farms, farm
 shops, REKO rings, farmers' markets and cooperatives. The connector lets Claude search
-more than 1,600 producers by place, product type, category or certification, read a
+more than 1,500 producers by place, product type, category or certification, read a
 producer's product range, look up which networks a producer belongs to, and find upcoming
 farmers'-market dates. Prices appear only where a producer has supplied them — most
 records today carry product names without a price.
@@ -170,6 +170,6 @@ instructions and prompts in `test-instructions.md` in this directory.
 - **No PNG icon route on the domain.** `favicon.svg` serves 200 but is SVG;
   `favicon-192.png` 404s (dev-request `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`).
   The icon is therefore uploaded as a file from `../assets/`, not linked as a URL.
-- **Producer count is deliberately imprecise** («over 1 600»). The platform's counters
+- **Producer count is deliberately imprecise** («over 1 500»). The platform's counters
   disagree — 1631 in `llms.txt`, 1712/1764 in `/health`, 1764 in `.well-known/mcp.json` —
   because they count different sets. A permanent listing should not pin one of them.
