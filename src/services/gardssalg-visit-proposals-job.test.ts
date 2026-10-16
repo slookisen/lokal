@@ -145,6 +145,34 @@ export function runGardssalgVisitProposalsJobTests(opts: { log?: boolean } = {})
         assertEq(r2.body.eligible_total, 3, "a14: eligible_total unaffected by limit");
         const r3 = await call("GET", "/admin/gardssalg-visit-candidates?limit=999");
         assertTrue(r3.body.returned <= route.GARDSSALG_VISIT_CANDIDATES_MAX_LIMIT, "a15: limit capped");
+        assertEq([r3.body.truncated, typeof r3.body.elapsed_ms, r3.body.time_budget_ms, r3.body.per_row_timeout_ms],
+          [false, "number", route.GARDSSALG_VISIT_CANDIDATES_TIME_BUDGET_MS, route.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS],
+          "a16: budget fields present; a fast crawl is not truncated");
+
+        // a17: a homepage whose fetch never resolves must not hold the request
+        // past the per-row cap — it comes back as fetch_ok:false/time_budget
+        // (the routine turns that into a fetch_failed skip item).
+        seed("vp-hang", { created_at: "2026-01-00 00:00:00" });
+        const prevFetchA = globalThis.fetch;
+        const prevPerRow = process.env.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS;
+        process.env.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS = "1500";
+        // A fetch that never settles and ignores abort — the crawl's own
+        // per-page timeout cannot rescue it, only the per-row cap can.
+        globalThis.fetch = (async (url: any, init?: any) => {
+          const u = new URL(String(url));
+          if (u.hostname === "vp-hang.example.no") return new Promise(() => { /* never */ });
+          return prevFetchA(url, init);
+        }) as typeof fetch;
+        const t0 = Date.now();
+        const rh = await call("GET", "/admin/gardssalg-visit-candidates?limit=4");
+        const hang = rh.body.items.find((i: any) => i.provider_id === "vp-hang");
+        assertTrue(!!hang && hang.fetch_ok === false && String(hang.fetch_reason).startsWith("time_budget"), `a17-1: hanging homepage reported as fetch_ok:false/time_budget (got ${JSON.stringify(hang && { ok: hang.fetch_ok, r: hang.fetch_reason })})`);
+        assertTrue(Date.now() - t0 < 1500 + 10_000, "a17-2: the request returned shortly after the per-row cap, not after the crawl's own timeouts");
+        assertEq(rh.body.per_row_timeout_ms, 1500, "a17-3: the env override is reported in the response");
+        assertTrue(rh.body.items.some((i: any) => i.provider_id === "vp-a" && i.fetch_ok), "a17-4: the other rows in the same batch still came back crawled");
+        globalThis.fetch = prevFetchA;
+        if (prevPerRow === undefined) delete process.env.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS; else process.env.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS = prevPerRow;
+        expDb.prepare("DELETE FROM experience_providers WHERE id = 'vp-hang'").run();
       }
 
       // ═══════════════ B. write endpoint / shared apply ═════════════════
