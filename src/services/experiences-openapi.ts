@@ -39,6 +39,9 @@ export function getExperiencesOpenapi(): object {
             "experiences. All parameters are optional and combinable. Only " +
             "verified experiences whose provider is brreg-active and whose " +
             "confidence is medium/high are surfaced. " +
+            "The request can also be sent in the user's own words in `q` (e.g. `q=hvalsafari i Tromsø`); the server " +
+            "reads place, category, season, weather and search words from it the same way as the MCP tool " +
+            "`discover_experiences` reads its `query`, and returns what it read in `query_interpretation`. " +
             "`category=gardssalg_smaking` routes to a distinct vertical — Brreg-registered " +
             "farm-sale drink producers (gårdssalg) stored separately from `experiences` — and " +
             "returns `vertical:\"gardssalg\"` with GardssalgProducer-shaped rows instead (see " +
@@ -73,11 +76,24 @@ export function getExperiencesOpenapi(): object {
               name: "q",
               in: "query",
               description:
-                "Gårdssalg-only: free-text lookup of ONE specific producer by name and/or place (e.g. «Fjordgard Bryggeri», " +
-                "«Egge gård Steinkjer»). Every word must match the producer's name, URL slug, place (poststed) or municipality; " +
-                "exact name matches rank first. Use the returned `id` as `provider_id` when booking. Ignored outside `category=gardssalg_smaking`.",
+                "Free text; its meaning depends on the branch. " +
+                "Experiences (any `category` other than `gardssalg_smaking`): the user's request in a few words, including " +
+                "any place they named (e.g. «hvalsafari i Tromsø», «what to do in Lofoten in winter»). The server reads the " +
+                "place (kommune, region, fylke or landsdel), category, season, weather, indoor/outdoor and search words from " +
+                "it — the same reading as the `query` of the MCP tool `discover_experiences`, from local data only — and " +
+                "returns what it read in `query_interpretation`. Explicit parameters always win: `q` only fills what they " +
+                "leave empty, and adds no search words when a place (fylke, kommune or lat/lng) or category parameter is given. A place, given or read " +
+                "from `q`, is never relaxed away: a kommune without hits is widened once to its fylke, otherwise the answer is " +
+                "`count: 0` with `zero_hit_reason`. A place outside Norway answers `out_of_area: true` with no results. " +
+                "Without `q` (or with a blank one) the experiences branch is unchanged. " +
+                "Gårdssalg (`category=gardssalg_smaking`): lookup of ONE specific producer by name and/or place (e.g. «Fjordgard " +
+                "Bryggeri», «Egge gård Steinkjer»). Every word must match the producer's name, URL slug, place (poststed) or " +
+                "municipality; exact name matches rank first. Use the returned `id` as `provider_id` when booking.",
               schema: { type: "string", maxLength: 200 },
-              example: "Fjordgard Bryggeri",
+              examples: {
+                experience: { value: "hvalsafari i Tromsø", summary: "Experiences: a request in the user's words" },
+                gardssalg: { value: "Fjordgard Bryggeri", summary: "Gårdssalg: one producer by name (with category=gardssalg_smaking)" },
+              },
             },
             { name: "indoor_outdoor", in: "query", description: "Indoor / outdoor preference", schema: { type: "string", enum: ["indoor", "outdoor", "both"] } },
             { name: "weather", in: "query", description: "Weather hint — rain/snow prefer indoor & weather-independent", schema: { type: "string", enum: ["rain", "snow", "clear", "any"] } },
@@ -102,8 +118,50 @@ export function getExperiencesOpenapi(): object {
                     type: "object",
                     properties: {
                       vertical: { type: "string", enum: ["experiences", "gardssalg"] },
-                      query: { type: "object" },
+                      query: { type: "object", description: "The filter that was searched; with `q`, including what was read from it." },
                       count: { type: "integer" },
+                      total: { type: "integer", description: "Experiences: all published rows matching the applied filter (`count` is this page)." },
+                      relaxed_filters: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Experiences: filters dropped because the original ones found nothing, or «kommune→fylke» when a kommune was widened to its fylke.",
+                      },
+                      note: { type: "string", description: "Experiences: bilingual explanation of a relaxation or of a zero answer." },
+                      suggestions: { type: "array", items: { type: "string" } },
+                      query_interpretation: {
+                        type: "object",
+                        description: "Only with `q`, when something was read from it.",
+                        properties: {
+                          source: { type: "string", enum: ["query"] },
+                          kommune: { type: "string" },
+                          kommuner: { type: "array", items: { type: "string" }, description: "The kommuner of a region (e.g. Lofoten)." },
+                          fylke: { type: "string" },
+                          fylker: { type: "array", items: { type: "string" }, description: "The fylker of a landsdel (e.g. Nord-Norge)." },
+                          category: { type: "string" },
+                          season: { type: "string", enum: ["winter", "summer", "spring", "autumn"] },
+                          weather: { type: "string", enum: ["rain", "snow", "clear"] },
+                          indoor_outdoor: { type: "string", enum: ["indoor", "outdoor"] },
+                          terms: {
+                            type: "array",
+                            items: { type: "string" },
+                            description: "Search words, looked up in the title, Norwegian title, description and subcategory: the rows with all of them, or, when no row has all, the rows with the most of them (`note` says how many).",
+                          },
+                        },
+                      },
+                      zero_hit_reason: {
+                        type: "string",
+                        enum: ["unrecognized_query", "place_no_match", "relaxation_exhausted"],
+                        description:
+                          "Only with `q`, when `count` is 0 instead of an unrelated list: `q` gave nothing to search by or its search words " +
+                          "match nothing; the place has no experiences; or every filter read from `q` had to be dropped.",
+                      },
+                      out_of_area: { type: "boolean", description: "Only with `q`: it names a place outside Norway; no results are suggested." },
+                      place: { type: "string", description: "With `out_of_area`: the place named." },
+                      valid_categories: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "With `zero_hit_reason: unrecognized_query`, or when `q` asks for gårdssalg: the experience category slugs.",
+                      },
                       results: {
                         type: "array",
                         items: { oneOf: [{ $ref: "#/components/schemas/Experience" }, { $ref: "#/components/schemas/GardssalgProducer" }] },
@@ -111,6 +169,34 @@ export function getExperiencesOpenapi(): object {
                     },
                   },
                   examples: {
+                    experiencesQuery: {
+                      summary: "q=hvalsafari i Tromsø",
+                      value: {
+                        vertical: "experiences",
+                        query: { kommune: "Tromsø", text_terms: ["hvalsafari"] },
+                        count: 1,
+                        total: 1,
+                        query_interpretation: { source: "query", kommune: "Tromsø", terms: ["hvalsafari"] },
+                        results: [
+                          {
+                            id: "3f1c9a52-8d47-4b8e-9a1f-2c6d5e7b8a90",
+                            slug: "winter-whale-safari-from-tromso--3f1c9a52",
+                            title: "Winter Whale Safari from Tromsø",
+                            title_no: "Vinterhvalsafari fra Tromsø",
+                            category: "dyreliv_safari",
+                            fylke: "Troms",
+                            kommune: "Tromsø",
+                            indoor_outdoor: "outdoor",
+                            duration_min: 420,
+                            price_from: 1600,
+                            price_band: "premium",
+                            booking_url: "https://example.com/whale-safari",
+                            confidence: "high",
+                            tags: ["sesong"],
+                          },
+                        ],
+                      },
+                    },
                     gardssalg: {
                       summary: "category=gardssalg_smaking&fylke=Vestland",
                       value: {

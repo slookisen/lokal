@@ -46805,7 +46805,8 @@ runSerial(async () => {
 // discover_experiences reads its free-text `query`. The shared intent module
 // (parity), the frozen MCP contract (OpenAI review), the interpreter + MCP
 // acceptance criteria and the submission replay. Own in-memory DBs (restored
-// in finally) — runSerial, next to the ChatGPT review block.
+// in finally) — runSerial, next to the ChatGPT review block. S4: REST
+// /discover?q= reads it the same way (incl. parity with MCP).
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16-opplevagent-mcp-fritekst-query: free-text query, contract freeze, replay ──");
   type Summary = { passed: number; failed: number; failures: string[] };
@@ -46814,6 +46815,7 @@ runSerial(async () => {
     ["opplevagent-mcp-contract-freeze", () => (require("../src/routes/opplevagent-mcp-contract-freeze.test") as typeof import("../src/routes/opplevagent-mcp-contract-freeze.test")).runOpplevagentMcpContractFreezeTests({ log: false })],
     ["opplevagent-mcp-query-intent", () => (require("../src/routes/opplevagent-mcp-query-intent.test") as typeof import("../src/routes/opplevagent-mcp-query-intent.test")).runOpplevagentMcpQueryIntentTests({ log: false })],
     ["opplevagent-submission-replay", () => (require("../src/routes/opplevagent-submission-replay.test") as typeof import("../src/routes/opplevagent-submission-replay.test")).runOpplevagentSubmissionReplayTests({ log: false })],
+    ["opplevelser-discover-query", () => (require("../src/routes/opplevelser-discover-query.test") as typeof import("../src/routes/opplevelser-discover-query.test")).runOpplevelserDiscoverQueryTests({ log: false })],
   ];
   for (const [name, run] of suites) {
     try {

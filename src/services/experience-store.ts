@@ -1835,11 +1835,22 @@ function buildDiscoverWhere(f: DiscoverFilter, textTermsAny = false): {
  * uses before its exact in-JS haversine cut), so it can slightly overcount at
  * the box's corners for that one filter combination. Every other filter
  * combination — including the fylke/category case this fix targets — is exact.
+ *
+ * `opts.textTermsMatched`: a discoverExperiencesRelaxed() result's
+ * textTermsMatched. Its rows have that many of filter.text_terms, not all of
+ * them, so this counts the rows with at least that many instead (REST
+ * /discover?q=, dev-request 2026-10-16-opplevagent-mcp-fritekst-query S4);
+ * without it the total of such a page would be 0.
  */
-export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
+export function countDiscoverExperiences(filter: DiscoverFilter = {}, opts: { textTermsMatched?: number } = {}): number {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
-  const { where, params } = buildDiscoverWhere(f);
+  const atLeast = opts.textTermsMatched;
+  const { where, params, textMatchedSql } = buildDiscoverWhere(f, atLeast !== undefined);
+  if (textMatchedSql && atLeast !== undefined) {
+    where.push(`${textMatchedSql} >= @textTermsAtLeast`);
+    params.textTermsAtLeast = atLeast;
+  }
   const row = db
     .prepare(
       `SELECT COUNT(*) AS total FROM experiences e
@@ -2093,8 +2104,9 @@ export interface RelaxedDiscoverResult {
 
 /**
  * Opt-in limits on the relaxation (dev-request 2026-10-16-opplevagent-mcp-
- * fritekst-query, S2/S3 — used by discover_experiences; REST and A2A pass
- * none and keep the old behaviour).
+ * fritekst-query, S2/S3 — used by discover_experiences and, with a free-text
+ * `q`, by REST /discover (S4); REST without `q` and A2A pass none and keep the
+ * old behaviour).
  */
 export interface DiscoverRelaxOptions {
   /** Keys never dropped: the place, so a place search never turns into a nationwide list. */
