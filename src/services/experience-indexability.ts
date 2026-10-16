@@ -22,10 +22,9 @@
 //     isOpplevagentLangSwitcherEnabled(): anything but "false" = on. With
 //     "false" every page is `index, follow` and listed, as before.
 //
-// isExperienceIndexable()/renderableExperienceDescription() are pure.
-// experienceDescriptionsBySlug() reads the db handle it is given.
+// Everything here is pure. The sitemap gets each row's description from
+// listPublishedExperienceSlugs() (experience-store.ts), behind the publish gate.
 
-import type Database from "better-sqlite3";
 import { isJunkDescription } from "./description-quality";
 
 /** robots meta / X-Robots-Tag value for a page that must not be indexed. */
@@ -59,18 +58,4 @@ export function isExperienceIndexable(row: { description?: string | null }): boo
  */
 export function shouldNoindexExperience(row: { description?: string | null }): boolean {
   return isPlaceholderNoindexEnabled() && !isExperienceIndexable(row);
-}
-
-/**
- * slug → raw description for every slugged experience row, in one query.
- * The publish gate is NOT applied here: the sitemap walks
- * listPublishedExperienceSlugs() (the gate's single owner) and only looks
- * descriptions up in this map. experiences.slug is UNIQUE, so the lookup is
- * unambiguous.
- */
-export function experienceDescriptionsBySlug(db: Database.Database): Map<string, string | null> {
-  const rows = db
-    .prepare("SELECT slug, description FROM experiences WHERE slug IS NOT NULL")
-    .all() as Array<{ slug: string; description: string | null }>;
-  return new Map(rows.map((r) => [r.slug, r.description]));
 }
