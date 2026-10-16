@@ -48,7 +48,13 @@ import {
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-import { interpretDiscoverQuery, matchesAsWordPrefix, parseExperiencesIntent } from "../services/experiences-query-intent";
+import {
+  interpretDiscoverQuery,
+  isStockfishPurchase,
+  matchesAsWordPrefix,
+  parseExperiencesIntent,
+} from "../services/experiences-query-intent";
+import { foreignPlaceIn } from "../services/outside-norway";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
@@ -161,13 +167,19 @@ function extractText(msg: unknown): string | null {
  * The search words of a message in which parseExperiencesIntent() found
  * nothing ("hvalsafari"), read by interpretDiscoverQuery() — the interpreter
  * discover_experiences and REST /discover?q= use (dev-request 2026-10-16-
- * opplevagent-mcp-fritekst-query, S5). Undefined when the interpreter reads a
- * place that parseExperiencesIntent() does not know ("hvalsafari i
- * Nord-Norge", "i Lyngen", "Hordaland"): the place words are no search words
- * there, so the rest alone would answer a place question with rows from the
- * whole country. parseExperiencesIntent() itself is unchanged.
+ * opplevagent-mcp-fritekst-query, S5). parseExperiencesIntent() itself is
+ * unchanged. Undefined, so the message keeps its count:0 answer:
+ *   - when it names a place outside Norway ("kongekrabbe i Russland") or asks
+ *     to buy food ("kjøpe tørrfisk"): the early returns of discover_experiences
+ *     and REST run before the interpreter (felles regel 3), and a Norwegian
+ *     row that mentions Russia must not answer a question about Russia;
+ *   - when the interpreter reads a place that parseExperiencesIntent() does
+ *     not know ("hvalsafari i Nord-Norge", "i Lyngen", "Hordaland"): the place
+ *     words are no search words there, so the rest alone would answer a place
+ *     question with rows from the whole country.
  */
 function messageSearchTerms(text: string): string[] | undefined {
+  if (foreignPlaceIn(text) || isStockfishPurchase(text)) return undefined;
   const read = interpretDiscoverQuery(text);
   if (read.kommune || read.kommuner || read.fylke || read.fylker) return undefined;
   return read.terms;

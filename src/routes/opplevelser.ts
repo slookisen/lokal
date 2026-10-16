@@ -952,9 +952,9 @@ import { judgeOrgnrIdentityMatch } from "../services/orgnr-identity-judge";
 import { rfbWdPageReferencesOwnHost } from "./admin-rfb-website-discovery";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S4: GET /discover
 // reads `q` for experiences with the interpreter discover_experiences (MCP)
-// uses, and answers a place outside Norway like it does.
-import { GARDSSALG_CATEGORY, interpretDiscoverQuery, listCategorySlugs } from "../services/experiences-query-intent";
-import { foreignPlaceIn } from "../services/outside-norway";
+// uses, and answers a place outside Norway and a food purchase like it does.
+import { GARDSSALG_CATEGORY, interpretDiscoverQuery, isStockfishPurchase, listCategorySlugs } from "../services/experiences-query-intent";
+import { outsideNorwayPlace } from "../services/outside-norway";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -1126,8 +1126,9 @@ function discoverResultRow(e: DiscoverResult, hasGeo: boolean) {
  * first rows of the whole country. It is now read like discover_experiences'
  * `query` (experiences-mcp.ts), with the same interpreter and rules, so MCP
  * and REST (Custom GPT, npm) answer one request the same way:
- *   - a place outside Norway in `q` (and no place parameter) is answered
- *     out_of_area, with no rows;
+ *   - a place outside Norway (in fylke/kommune, an origin outside Norway, or
+ *     in `q` when no place parameter is given) is answered out_of_area, and
+ *     a food purchase («buy stockfish») out_of_scope, both with no rows;
  *   - interpretDiscoverQuery() fills only the keys the parameters left empty;
  *     what it read is returned as query_interpretation;
  *   - the place, given or read from `q`, is never relaxed away: a kommune
@@ -1137,14 +1138,20 @@ function discoverResultRow(e: DiscoverResult, hasGeo: boolean) {
  *     away: count 0 (unrecognized_query / relaxation_exhausted), never the
  *     unfiltered catalogue.
  * The answer keeps the branch's shape (vertical, query, count, total, note,
- * results) and adds query_interpretation, zero_hit_reason, out_of_area/place
- * and valid_categories where they apply. Mutates `filter` (the request's own).
+ * results) and adds query_interpretation, zero_hit_reason, out_of_area/place,
+ * out_of_scope/scope_reason and valid_categories where they apply. Mutates
+ * `filter` (the request's own).
  */
 function discoverFromFreeText(filter: DiscoverFilter, queryText: string, limit: number): Record<string, unknown> {
   const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
-  // As in discover_experiences: `q` decides on a foreign place only when no
-  // place parameter was given ("flying in from London" next to kommune=Tromsø).
-  const foreign = filter.fylke || filter.kommune || hasGeo ? null : foreignPlaceIn(queryText);
+  // The early returns of discover_experiences, in its order (felles regel 3).
+  // `q` decides on a foreign place only when no place parameter was given
+  // ("flying in from London" next to kommune=Tromsø).
+  const placeGiven = Boolean(filter.fylke || filter.kommune) || hasGeo;
+  const foreign = outsideNorwayPlace({
+    fylke: filter.fylke, kommune: filter.kommune, lat: filter.lat, lng: filter.lng,
+    query: placeGiven ? undefined : queryText,
+  });
   if (foreign) {
     const place = foreign.replace(/(^|[\s-])(\p{L})/gu, (_m, sep: string, ch: string) => sep + ch.toLocaleUpperCase("nb-NO"));
     return {
@@ -1160,6 +1167,22 @@ function discoverFromFreeText(filter: DiscoverFilter, queryText: string, limit: 
       results: [],
     };
   }
+  if (isStockfishPurchase(queryText)) {
+    return {
+      vertical: "experiences",
+      query: filter,
+      count: 0,
+      total: 0,
+      out_of_scope: true,
+      scope_reason: "food_product_purchase",
+      note:
+        "Opplevagent finner opplevelser og gårdssalg med drikke, ikke utsalg for kjøp av tørrfisk. " +
+        "Kjøp av matvarer faller utenfor søket. Ingen opplevelser foreslås. / " +
+        "Opplevagent covers experiences and farm-sale drink producers, not buying stockfish. " +
+        "Food-product purchases are outside this search. No experiences are suggested.",
+      results: [],
+    };
+  }
 
   // The parameters' keys: parseDiscoverQuery() leaves the absent ones undefined.
   const explicitKeyCount = Object.values(filter).filter((v) => v !== undefined).length;
@@ -1168,6 +1191,9 @@ function discoverFromFreeText(filter: DiscoverFilter, queryText: string, limit: 
     category: filter.category, season: filter.season, weather: filter.weather, indoor_outdoor: filter.indoor_outdoor,
   });
   const fromQuery: Array<keyof DiscoverFilter> = [];
+  // As discover_experiences' fill. The `filter[key] !== undefined` half is
+  // defensive only: interpretDiscoverQuery() already leaves a given key
+  // empty, and the parameters have no kommuner/fylker/text_terms.
   const fill = <K extends keyof DiscoverFilter>(key: K, value: DiscoverFilter[K] | undefined) => {
     if (value === undefined || filter[key] !== undefined) return;
     filter[key] = value;

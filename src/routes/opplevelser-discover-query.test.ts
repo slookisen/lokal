@@ -11,17 +11,19 @@
  *   (r) REST with `q`: the S4 acceptance criterion (only Tromsø rows and a
  *       query_interpretation field), the S2 criteria seen through REST
  *       (region, bygd → fylke, nonsense, a general question, false
- *       positives, an empty place), out_of_area, the gårdssalg pointer,
- *       explicit parameters winning, `total` agreeing with the page when
- *       search words are relaxed gradually, and `q` in the gårdssalg branch
- *       untouched.
+ *       positives, an empty place), out_of_area (also for a foreign
+ *       fylke/kommune or origin), out_of_scope for buying stockfish, the
+ *       gårdssalg pointer, explicit parameters winning, `total` agreeing with
+ *       the page when search words are relaxed gradually, and `q` in the
+ *       gårdssalg branch untouched.
  *   (n) REST without `q` (or with a blank or repeated one): the old answer,
  *       incl. the old relaxation of a place (no place protection).
  *   (p) parity: REST ?q= and MCP {query} give the same filter,
  *       query_interpretation, rows, relaxed_filters and zero_hit_reason for
  *       the submission's prompts and the S2 cases.
  *   (s) countDiscoverExperiences(filter, {textTermsMatched}).
- *   (o) /openapi.json documents `q` for both branches and the new fields.
+ *   (o) /openapi.json documents `q` for both branches and the new fields,
+ *       within the GPT Actions description limits.
  *
  * Fixture: opplevagent-mcp-query-intent.test.ts. The MCP side runs over an
  * in-memory transport, not HTTP: the gate's MCP suites share one per-IP
@@ -177,6 +179,31 @@ export function runOpplevelserDiscoverQueryTests(opts: { log?: boolean } = {}): 
       const london = await rest(`kommune=Troms%C3%B8&q=${encodeURIComponent("flying in from London, what can we do?")}`);
       assertTrue(london.out_of_area === undefined && london.count === 7 && london.results.every((e: any) => e.kommune === "Tromsø"),
         "r18: a foreign word next to an explicit place is not out_of_area (the place parameter decides)");
+      // The place parameters themselves are checked too, as discover_experiences
+      // does (outsideNorwayPlace); without q they keep the old answer (n1).
+      for (const [params, place] of [["kommune=Kenya&q=safari", "Kenya"], [`fylke=Spania&q=${encodeURIComponent("hva kan vi gjøre")}`, "Spania"], ["lat=0&lng=0&q=hvalsafari", "0, 0"]]) {
+        const r = await rest(params);
+        assertTrue(r.out_of_area === true && r.place === place && r.count === 0 && r.results.length === 0 && r.zero_hit_reason === undefined,
+          `r24: ?${decodeURIComponent(params)} is outside Norway: out_of_area «${place}», no rows`);
+      }
+      // An origin in Norway is searched (the fixture's one geocoded row).
+      db.prepare("UPDATE experiences SET loc_lat = 69.65, loc_lon = 18.95, geo_precision = 'address' WHERE id = ?").run(ids.whaleSafari);
+      const nearTromso = await rest("lat=69.65&lng=18.96&q=hvalsafari");
+      assertTrue(nearTromso.out_of_area === undefined && JSON.stringify(rowIds(nearTromso)) === JSON.stringify([ids.whaleSafari]) &&
+        typeof nearTromso.results[0].distance_km === "number", "r24b: an origin in Norway with q is searched, with distances");
+
+      // Buying stockfish is out of scope, as discover_experiences; a place
+      // outside Norway is checked first; food experiences stay supported.
+      const stockfish = await q("Where can I buy stockfish in Lofoten?");
+      assertTrue(stockfish.out_of_scope === true && stockfish.scope_reason === "food_product_purchase" && stockfish.count === 0 && stockfish.total === 0 &&
+        stockfish.results.length === 0 && JSON.stringify(stockfish.query) === "{}" && stockfish.query_interpretation === undefined && /tørrfisk/.test(stockfish.note),
+        "r25: «Where can I buy stockfish in Lofoten?» → out_of_scope, no Lofoten rows");
+      const stockfishAbroad = await q("buy stockfish in Iceland");
+      assertTrue(stockfishAbroad.out_of_area === true && stockfishAbroad.place === "Iceland" && stockfishAbroad.out_of_scope === undefined,
+        "r25b: a purchase abroad is out_of_area first (discover_experiences' order)");
+      const stockfishMuseum = await q("stockfish museum in Lofoten");
+      assertTrue(stockfishMuseum.out_of_scope === undefined && JSON.stringify(stockfishMuseum.query.kommuner) === JSON.stringify(REGION_TO_KOMMUNER.Lofoten),
+        "r25c: «stockfish museum in Lofoten» is an experience search, not out_of_scope");
 
       // Gårdssalg read from q points to the gårdssalg branch.
       const farm = await q("gårdssalg i Bergen");
@@ -202,13 +229,13 @@ export function runOpplevelserDiscoverQueryTests(opts: { log?: boolean } = {}): 
         "r23: category=gardssalg_smaking keeps q as its producer lookup; nothing is interpreted");
 
       // ── (n) without q: the old answer ────────────────────────────────
-      for (const params of ["fylke=Troms", "fylke=Troms&season=winter", "kommune=Ukjentby", "category=foo", "max_price=10", "limit=3"]) {
+      for (const params of ["fylke=Troms", "fylke=Troms&season=winter", "kommune=Ukjentby", "category=foo", "max_price=10", "limit=3", "kommune=Kenya", "lat=0&lng=0"]) {
         const plain = await rest(params);
         const blank = await rest(`${params}&q=`);
         const spaces = await rest(`${params}&q=%20%20%20`);
         assertTrue(JSON.stringify(plain) === JSON.stringify(blank) && JSON.stringify(plain) === JSON.stringify(spaces),
           `n1: ?${params} answers the same with a blank q`);
-        assertTrue(!["query_interpretation", "zero_hit_reason", "out_of_area", "place", "valid_categories"].some((k) => k in plain),
+        assertTrue(!["query_interpretation", "zero_hit_reason", "out_of_area", "place", "out_of_scope", "scope_reason", "valid_categories"].some((k) => k in plain),
           `n2: ?${params} carries none of the q-only fields`);
       }
       const ukjentby = await rest("kommune=Ukjentby");
@@ -246,8 +273,10 @@ export function runOpplevelserDiscoverQueryTests(opts: { log?: boolean } = {}): 
         zero_hit_reason: b.zero_hit_reason,
         out_of_area: b.out_of_area,
         place: b.place,
+        out_of_scope: b.out_of_scope,
+        scope_reason: b.scope_reason,
       });
-      const parityCases: Array<Record<string, string>> = [
+      const parityCases: Array<Record<string, string | number>> = [
         // The submission's discover_experiences prompts (P1, P2, P4, N1, N3).
         { query: "Hva kan vi finne på i Troms om vinteren?" },
         { query: "Show me the details of the Arctic Explorer northern lights cruise in Tromsø" },
@@ -266,10 +295,14 @@ export function runOpplevelserDiscoverQueryTests(opts: { log?: boolean } = {}): 
         { category: "dyreliv_safari", query: "wildlife experiences across Norway, preferably with whales" },
         { category: "kultur_historie", query: "wildlife in Tromsø" },
         { fylke: "Troms", season: "winter", query: "Hva kan vi finne på i Troms om vinteren?" },
+        // The early returns: a foreign place parameter or origin, and buying stockfish.
+        { kommune: "Kenya", query: "safari" }, { fylke: "Spania", query: "hva kan vi gjøre" },
+        { lat: 0, lng: 0, query: "hvalsafari" }, { lat: 69.65, lng: 18.96, query: "hvalsafari" },
+        { query: "Where can I buy stockfish in Lofoten?" }, { query: "buy stockfish in Iceland" }, { query: "stockfish museum in Lofoten" },
       ];
       for (const args of parityCases) {
         const mcp = await mcpDiscover(args);
-        const params = Object.entries(args).map(([k, v]) => `${k === "query" ? "q" : k}=${encodeURIComponent(v)}`).join("&");
+        const params = Object.entries(args).map(([k, v]) => `${k === "query" ? "q" : k}=${encodeURIComponent(String(v))}`).join("&");
         const r = await rest(params);
         assertEq(view(r.query, r, r.results), view(mcp.filter_applied, mcp, mcp.experiences), `p1: REST ?${decodeURIComponent(params)} answers like MCP`);
         assertEq(r.count, mcp.count, `p2: … same count (${mcp.count})`);
@@ -284,11 +317,25 @@ export function runOpplevelserDiscoverQueryTests(opts: { log?: boolean } = {}): 
         "o1: openapi documents q for both branches (no longer «Gårdssalg-only»)");
       assertEq(Object.keys(qParam.examples), ["experience", "gardssalg"], "o2: … with an example for each branch");
       const props = discover.responses["200"].content["application/json"].schema.properties;
-      assertTrue(["total", "query_interpretation", "zero_hit_reason", "out_of_area", "place", "valid_categories", "relaxed_filters", "note"].every((k) => k in props) &&
+      assertTrue(["total", "query_interpretation", "zero_hit_reason", "out_of_area", "place", "out_of_scope", "scope_reason", "valid_categories", "relaxed_filters", "note"].every((k) => k in props) &&
         JSON.stringify(props.zero_hit_reason.enum) === '["unrecognized_query","place_no_match","relaxation_exhausted"]',
         "o3: the response schema declares the fields an answer with q can carry");
       const example = discover.responses["200"].content["application/json"].examples.experiencesQuery.value;
       assertEq([example.query, example.query_interpretation], [whale.query, whale.query_interpretation], "o4: the q example matches what the server answers");
+      // GPT Actions (the Custom GPT imports this schema) caps an endpoint's
+      // summary/description at 300 characters and a parameter's description
+      // at 700 (OpenAI, "Production notes on GPT Actions"). Every parameter and
+      // summary fits; the /discover description (549 characters) was already
+      // over 300 before `q` was documented and is unchanged here.
+      const tooLong: string[] = [];
+      for (const [path, ops] of Object.entries((getExperiencesOpenapi() as any).paths as Record<string, Record<string, any>>)) {
+        for (const [method, op] of Object.entries(ops)) {
+          if (String(op.summary ?? "").length > 300) tooLong.push(`${method} ${path} summary`);
+          for (const param of op.parameters ?? []) if (String(param.description ?? "").length > 700) tooLong.push(`${method} ${path} ?${param.name}`);
+        }
+      }
+      assertEq(tooLong, [], "o5: every summary ≤ 300 and every parameter description ≤ 700 characters (GPT Actions limits)");
+      assertTrue(!/`q`/.test(discover.description), "o6: the /discover description is not lengthened; `q` is documented on the parameter");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-discover-query: unexpected error: " + String(err?.stack || err?.message || err));

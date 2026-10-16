@@ -11,6 +11,9 @@
  *      same names, so existing callers and tests see the same functions.
  *   S2 added interpretDiscoverQuery(): discover_experiences' free-text
  *      `query` read as place, category, season, weather and search words.
+ *   S4/S5 moved isStockfishPurchase() here from routes/experiences-mcp.ts,
+ *      so REST /discover?q= and the A2A search words refuse the same
+ *      food-purchase request as discover_experiences.
  *
  * Platform-neutral: imports only norway-fylke (the local gazetteer) and
  * experience-store (the catalogue), never a route, so MCP, REST and A2A can
@@ -797,4 +800,21 @@ export function interpretDiscoverQuery(
     out.terms = terms.slice(0, MAX_TEXT_TERMS);
   }
   return out;
+}
+
+// ─── Out of scope: buying food (moved from routes/experiences-mcp.ts) ──────
+// Unchanged; experiences-mcp.ts imports it from here so discover_experiences,
+// REST /discover?q= (S4) and the A2A search words (S5) run the same early
+// return (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, felles regel 3).
+
+/** Refuse the observed retail request without excluding food experiences. */
+export function isStockfishPurchase(query: string | undefined): boolean {
+  if (!query) return false;
+  const request = query.normalize("NFKC").toLowerCase().replace(/ø/g, "o");
+  if (!/\b(?:stock[ -]?fish|torrfisk)\b/.test(request)) return false;
+  // Buying the food itself takes precedence over incidental museum/tour words.
+  if (/\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:some|fresh|dried|local|the|litt|fersk|lokal)\s+)*(?:stock[ -]?fish|torrfisk)\b(?!\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?))/i.test(request)) return true;
+  // Only an actual experience object qualifies, not a museum/tour mentioned elsewhere.
+  if (/\b(?:stock[ -]?fish|torrfisk)\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?)\b|\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:a|an|the|some|en|et)\s+)?(?:tickets?|tours?|tastings?|workshops?|experiences?|cooking\s+class(?:es)?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b/.test(request)) return false;
+  return /\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille|shops?|stores?|sellers?|butikker?|utsalg)\b/.test(request);
 }

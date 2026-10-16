@@ -39,9 +39,6 @@ export function getExperiencesOpenapi(): object {
             "experiences. All parameters are optional and combinable. Only " +
             "verified experiences whose provider is brreg-active and whose " +
             "confidence is medium/high are surfaced. " +
-            "The request can also be sent in the user's own words in `q` (e.g. `q=hvalsafari i Tromsø`); the server " +
-            "reads place, category, season, weather and search words from it the same way as the MCP tool " +
-            "`discover_experiences` reads its `query`, and returns what it read in `query_interpretation`. " +
             "`category=gardssalg_smaking` routes to a distinct vertical — Brreg-registered " +
             "farm-sale drink producers (gårdssalg) stored separately from `experiences` — and " +
             "returns `vertical:\"gardssalg\"` with GardssalgProducer-shaped rows instead (see " +
@@ -76,19 +73,13 @@ export function getExperiencesOpenapi(): object {
               name: "q",
               in: "query",
               description:
-                "Free text; its meaning depends on the branch. " +
-                "Experiences (any `category` other than `gardssalg_smaking`): the user's request in a few words, including " +
-                "any place they named (e.g. «hvalsafari i Tromsø», «what to do in Lofoten in winter»). The server reads the " +
-                "place (kommune, region, fylke or landsdel), category, season, weather, indoor/outdoor and search words from " +
-                "it — the same reading as the `query` of the MCP tool `discover_experiences`, from local data only — and " +
-                "returns what it read in `query_interpretation`. Explicit parameters always win: `q` only fills what they " +
-                "leave empty, and adds no search words when a place (fylke, kommune or lat/lng) or category parameter is given. A place, given or read " +
-                "from `q`, is never relaxed away: a kommune without hits is widened once to its fylke, otherwise the answer is " +
-                "`count: 0` with `zero_hit_reason`. A place outside Norway answers `out_of_area: true` with no results. " +
-                "Without `q` (or with a blank one) the experiences branch is unchanged. " +
-                "Gårdssalg (`category=gardssalg_smaking`): lookup of ONE specific producer by name and/or place (e.g. «Fjordgard " +
-                "Bryggeri», «Egge gård Steinkjer»). Every word must match the producer's name, URL slug, place (poststed) or " +
-                "municipality; exact name matches rank first. Use the returned `id` as `provider_id` when booking.",
+                "Experiences: the user's request in their own words, with any place named (e.g. «hvalsafari i Tromsø»). " +
+                "Read like `query` of the MCP tool `discover_experiences` (place, category, season, weather, search words); " +
+                "what was read is returned in `query_interpretation`. Explicit parameters win; `q` only fills what they leave " +
+                "empty. A place is never relaxed away: no hits gives `count: 0` and `zero_hit_reason`. A place outside Norway " +
+                "gives `out_of_area`, buying food (e.g. stockfish) `out_of_scope`, both with no results. " +
+                "Gårdssalg (`category=gardssalg_smaking`): lookup of ONE producer by name and/or place (e.g. «Fjordgard " +
+                "Bryggeri»); every word must match. Book with its `id` as `provider_id`.",
               schema: { type: "string", maxLength: 200 },
               examples: {
                 experience: { value: "hvalsafari i Tromsø", summary: "Experiences: a request in the user's words" },
@@ -155,8 +146,13 @@ export function getExperiencesOpenapi(): object {
                           "Only with `q`, when `count` is 0 instead of an unrelated list: `q` gave nothing to search by or its search words " +
                           "match nothing; the place has no experiences; or every filter read from `q` had to be dropped.",
                       },
-                      out_of_area: { type: "boolean", description: "Only with `q`: it names a place outside Norway; no results are suggested." },
+                      out_of_area: {
+                        type: "boolean",
+                        description: "Only with `q`: the request names a place outside Norway (in `q`, fylke, kommune or lat/lng); no results are suggested.",
+                      },
                       place: { type: "string", description: "With `out_of_area`: the place named." },
+                      out_of_scope: { type: "boolean", description: "Only with `q`: the request is outside experience discovery (buying food); no results are suggested." },
+                      scope_reason: { type: "string", enum: ["food_product_purchase"], description: "With `out_of_scope`: why." },
                       valid_categories: {
                         type: "array",
                         items: { type: "string" },

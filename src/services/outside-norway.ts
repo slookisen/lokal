@@ -17,6 +17,8 @@
  * Norwegian search, which is worse than the miss.
  */
 
+import { isPlausibleNorwayCoord } from "./geo-distance";
+
 const FOREIGN_PLACES: readonly string[] = [
   // Countries (English + Norwegian spellings)
   "kenya", "tanzania", "uganda", "south africa", "sør-afrika", "egypt", "morocco", "marokko",
@@ -57,6 +59,28 @@ export function foreignPlaceIn(text: string | null | undefined): string | null {
   if (!t.trim()) return null;
   for (const { name, re } of PATTERNS) {
     if (re.test(t)) return name;
+  }
+  return null;
+}
+
+/**
+ * The place a discover call names outside Norway — a foreign county/kommune/
+ * query word, or an origin outside Norway's bounding box — or null. Without
+ * this check "Kenya" was relaxed away like an over-narrow filter and the
+ * caller got a nationwide Norwegian list, the opposite of the submission's
+ * negative test case (ChatGPT app re-review 2026-10-03).
+ *
+ * Moved unchanged from routes/experiences-mcp.ts (which re-exports it) so
+ * discover_experiences and REST /discover?q= run the same check (dev-request
+ * 2026-10-16-opplevagent-mcp-fritekst-query, S4).
+ */
+export function outsideNorwayPlace(args: {
+  fylke?: string; kommune?: string; query?: string; lat?: number; lng?: number;
+}): string | null {
+  const named = foreignPlaceIn(args.fylke) ?? foreignPlaceIn(args.kommune) ?? foreignPlaceIn(args.query);
+  if (named) return named;
+  if (typeof args.lat === "number" && typeof args.lng === "number" && !isPlausibleNorwayCoord(args.lat, args.lng)) {
+    return `${args.lat}, ${args.lng}`;
   }
   return null;
 }

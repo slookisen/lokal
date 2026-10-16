@@ -45,7 +45,10 @@
  * interpreter (interpretDiscoverQuery) are tried — every word must be in the
  * row. "hvalsafari" now finds the whale safari; "zzzqqq ingen treff xyzzy"
  * and a place parseExperiencesIntent() does not know ("hvalsafari i
- * Nord-Norge") still answer count:0 / unrecognized_query.
+ * Nord-Norge") still answer count:0 / unrecognized_query. So do a place
+ * outside Norway ("kongekrabbe i Russland", 9m) and a food purchase ("kjøpe
+ * tørrfisk", 9n), even though a Norwegian row contains every word: the early
+ * returns of discover_experiences and REST run before the interpreter.
  *
  * Follows the exact precedent of experiences-a2a.test.ts / opplevelser-
  * discover-relax.test.ts: exported runExperiencesA2aZeroHitTests(opts),
@@ -136,6 +139,25 @@ export function runExperiencesA2aZeroHitTests(opts: { log?: boolean } = {}): Pro
         price_from: 1300, duration_min: 240, indoor_outdoor: "outdoor",
         weather_dependent: 1, season: ["winter"],
         description: "Se spermhval og spekkhoggere fra båt.",
+      });
+      // S5 (9m, 9n): Norwegian rows whose text names a foreign country or
+      // buying stockfish, so a search-word hit is possible for those messages.
+      const borderRow = {
+        provider_id: providerId, provider_match_status: "matched", kommune: "Sør-Varanger", fylke: "Finnmark",
+        category: "dyreliv_safari", verification_status: "verified", confidence: "high",
+        price_from: 1900, duration_min: 180, indoor_outdoor: "outdoor", weather_dependent: 1, season: ["winter"],
+      } as const;
+      expStore.createExperience({
+        ...borderRow, title: "King Crab Safari Kirkenes",
+        description: "Kongekrabbe fra Barentshavet, like ved grensen til Russland. A king crab safari by the border with Russia.",
+      });
+      expStore.createExperience({
+        ...borderRow, title: "Husky safari Pasvik",
+        description: "Hundekjøring i Pasvikdalen, mellom Finland og Russland.",
+      });
+      expStore.createExperience({
+        ...borderRow, kommune: "Moskenes", fylke: "Nordland", category: "kultur_historie", title: "Lofoten Tørrfiskmuseum",
+        description: "Om tørrfisk fra Lofoten. I butikken kan du kjøpe tørrfisk; you can buy stockfish in the shop.",
       });
 
       // ── 1. Nonsense text -> count:0, unrecognized_query ───────────────
@@ -267,6 +289,32 @@ export function runExperiencesA2aZeroHitTests(opts: { log?: boolean } = {}): Pro
       assertTrue(r9hei.result?.metadata?.zero_hit_reason === "unrecognized_query" &&
         (r9hei.result?.artifacts?.[0]?.parts?.[0]?.text as string).startsWith("Fant ingen gjenkjennelige søkekriterier"),
         "9l: a greeting has no search words and keeps the old summary");
+
+      // A place outside Norway (B1 of the PR #1093 review) and a food purchase:
+      // the old count:0 answer, although a Norwegian row has every search word.
+      const oldZero = (r: any) => [r.result?.metadata?.skill, r.result?.metadata?.zero_hit_reason, r.result?.artifacts?.[1]?.parts?.[0]?.data?.count,
+        r.result?.metadata?.filter, (r.result?.artifacts?.[0]?.parts?.[0]?.text as string).startsWith("Fant ingen gjenkjennelige søkekriterier")];
+      const guarded: Array<[string, string, string]> = [
+        ["9m", "kongekrabbe i Russland", "King Crab Safari Kirkenes"],
+        ["9m", "king crab safari in Russia", "King Crab Safari Kirkenes"],
+        ["9m", "husky safari Finland", "Husky safari Pasvik"],
+        ["9n", "kjøpe tørrfisk", "Lofoten Tørrfiskmuseum"],
+        ["9n", "Where can I buy stockfish?", "Lofoten Tørrfiskmuseum"],
+      ];
+      const { interpretDiscoverQuery } = require("../services/experiences-query-intent") as typeof import("../services/experiences-query-intent");
+      for (const [label, text, row] of guarded) {
+        const terms = interpretDiscoverQuery(text).terms ?? [];
+        assertTrue(Object.keys(a2a.parseExperiencesIntent(text)).length === 0 &&
+          expStore.discoverExperiences({ text_terms: terms }, 20).some((e) => e.title === row),
+          `${label}: «${text}» reaches the search-word step, and «${row}» has every search word (${terms.join(", ")})`);
+        const r: any = handleExperiencesMessageSend({ message: text }, "z9g");
+        assertEq(oldZero(r), ["opplevelser_discover", "unrecognized_query", 0, {}, true], `${label}: «${text}» → the old count:0 answer, no Norwegian rows`);
+        assertTrue(!a2a.experiencesAskedSomething(r), `${label}: «${text}» is not counted as a lookup`);
+      }
+      // The same words without the foreign place or the purchase still find the rows.
+      for (const [text, row] of [["kongekrabbe", "King Crab Safari Kirkenes"], ["husky", "Husky safari Pasvik"], ["tørrfisk", "Lofoten Tørrfiskmuseum"]]) {
+        assertEq(titlesOf(handleExperiencesMessageSend({ message: text }, "z9o")), [row], `9o: «${text}» alone finds «${row}»`);
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-a2a-zero-hit: unexpected error: " + String(err?.stack || err?.message || err));
