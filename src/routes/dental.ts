@@ -836,7 +836,12 @@ router.get(
 //
 // Query params:
 //   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
-//                        for an unparseable value)
+//                        for an unparseable value). Converted to SQLite
+//                        'YYYY-MM-DD HH:MM:SS' (UTC) before the comparison:
+//                        last_enriched_at is stored via datetime('now') in
+//                        that format, and comparing it as text against an
+//                        ISO string ('T' separator) dropped same-day rows
+//                        (' ' < 'T').
 //   ?limit=<int>       — default 10, clamped to [1, 50]
 //   ?with_fields=1     — only clinics with at least one checkable value
 //                        (telefon, adresse or om_oss non-empty). Off by default.
@@ -854,12 +859,13 @@ router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: 
     const db = getDb("dental");
 
     const DEFAULT_SINCE_DAYS = 7;
-    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const toSqliteDatetime = (d: Date): string => d.toISOString().slice(0, 19).replace("T", " ");
+    let since = toSqliteDatetime(new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000));
     const sinceParam = req.query.since;
     if (typeof sinceParam === "string" && sinceParam.trim()) {
       const parsed = new Date(sinceParam);
       if (!isNaN(parsed.getTime())) {
-        since = parsed.toISOString();
+        since = toSqliteDatetime(parsed);
       }
     }
 
