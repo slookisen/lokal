@@ -4,7 +4,10 @@
  *
  * Covers:
  *   AC1 — gårdssalg pages carry no InStock Offer while booking is paused
- *         (and keep it when booking is live).
+ *         (and no ReserveAction either). A live-booking page signals the
+ *         visit request as a ReserveAction, not as a price-less Offer
+ *         (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-
+ *         og-places-treffvakt, S5).
  *   AC2 — get_experience returns provider{name,org_nr,website,phone},
  *         profile_url and source_url (null, never "", when unknown) for 10/10.
  *   AC3 — discover_experiences with group_size/age/language returns
@@ -167,6 +170,8 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
         assertTrue(r.handled && r.status === 200, `ac1-0: paused page renders (status ${r.status})`);
         assertTrue(!r.body.includes("InStock"), "ac1-1: paused gårdssalg page has no InStock");
         assertTrue(!ldBlocks(r.body).some((b) => b.offers), "ac1-2: paused gårdssalg page has no offers node");
+        assertTrue(!ldBlocks(r.body).some((b) => b.potentialAction) && !r.body.includes("ReserveAction"),
+          "ac1-2b: paused gårdssalg page has no potentialAction (ReserveAction) either");
         assertTrue(!r.body.includes("inkluderer typisk"), "ac6-1: no 'inkluderer typisk' without visit_text");
         assertTrue(!r.body.includes("Book et besøk"), "ac6-2: no 'Book et besøk' without visit_text");
         assertTrue(r.body.includes("Spør Pauset Bryggeri direkte om det går an å komme på besøk."), "ac6-3: neutral visit text");
@@ -179,7 +184,14 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/aktivt-bryggeri");
         assertTrue(r.handled && r.status === 200, `ac1-3: live page renders (status ${r.status})`);
-        assertTrue(ldBlocks(r.body).some((b) => b.offers?.availability === "https://schema.org/InStock"), "ac1-4: live-booking page keeps its Offer");
+        // S5 rewrote ac1-4 («live-booking page keeps its Offer»): the visit has
+        // no price, so the live page carries a ReserveAction to /book instead.
+        const biz = ldBlocks(r.body).find((b) => b["@type"] === "LocalBusiness");
+        assertTrue(biz?.potentialAction?.["@type"] === "ReserveAction"
+          && biz.potentialAction.target?.["@type"] === "EntryPoint"
+          && biz.potentialAction.target.urlTemplate === "https://opplevagent.no/kategori/gardssalg/book/aktivt-bryggeri",
+          `ac1-4: live-booking page signals a ReserveAction to /book (got ${JSON.stringify(biz?.potentialAction)})`);
+        assertTrue(!ldBlocks(r.body).some((b) => b.offers) && !r.body.includes("InStock"), "ac1-5: … and no Offer / InStock");
       }
 
       // ── AC5: no EN signals while the flag is off ──

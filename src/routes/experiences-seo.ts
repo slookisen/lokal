@@ -3375,6 +3375,8 @@ function renderOpplevelseDetail(
   // tr is also {} while the switcher is off. The page is then lang="nb" with
   // the NO canonical (K16), so translated body text under it would be English
   // marked as Norwegian; with the switcher off, EN stays hidden throughout.
+  // E2-S2: the site nav and footer take uiLang too (they took lang, so /en
+  // with the switcher off had English menus under lang="nb").
   const switcherOn = isOpplevagentLangSwitcherEnabled();
   const uiLang: Lang = switcherOn ? lang : "no";
   const L = oaProfileLabels(uiLang);
@@ -3559,14 +3561,28 @@ function renderOpplevelseDetail(
     ? `<section class="related" aria-labelledby="rel-h"><h2 id="rel-h">Flere ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelser</h2><div class="rel-grid">${relCards}</div></section>`
     : "";
 
-  // JSON-LD: TouristAttraction + BreadcrumbList.
+  // JSON-LD: TouristAttraction (the place) + Service (who offers it, at what
+  // price) + BreadcrumbList. dev-request 2026-10-16-opplevagent-
+  // indekserbarhet-og-strukturdata, E2-S2:
+  //   - name is displayTitle, the title of the <h1>, <title>, og:title and
+  //     breadcrumb (it was exp.title while the <h1> on /no showed title_no);
+  //     the original title stays as alternateName.
+  //   - offers and provider are not TouristAttraction properties in
+  //     schema.org, so they live on a separate Service node linked to the
+  //     place by @id (areaServed). touristType is an audience, not a
+  //     category, so the category goes in keywords.
+  //   - no availability: no row field says whether a date can be booked, so
+  //     the old blanket InStock was a claim nobody made.
+  const attractionId = `${canonical}#attraction`;
   const ld: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "TouristAttraction",
-    name: exp.title,
+    "@id": attractionId,
+    name: displayTitle,
+    ...(displayTitle !== exp.title ? { alternateName: exp.title } : {}),
     description: metaDesc,
     url: canonical,
-    touristType: catLabel(cat),
+    ...(cat ? { keywords: catLabel(cat) } : {}),
     address: { "@type": "PostalAddress", addressLocality: exp.kommune || undefined, addressRegion: exp.fylke || undefined, addressCountry: "NO" },
   };
   // Structured data must never publish a coordinate we would refuse to draw.
@@ -3585,28 +3601,37 @@ function renderOpplevelseDetail(
   // Offer — only when there is a concrete starting price. Price bands alone are
   // too coarse for a valid schema.org Offer (no numeric price), so band-only
   // rows are intentionally left without an Offer node.
+  let offer: Record<string, unknown> | null = null;
   if (exp.price_from) {
-    const offer: Record<string, unknown> = {
-      "@type": "Offer",
-      price: exp.price_from,
-      priceCurrency: "NOK",
-      availability: "https://schema.org/InStock",
-    };
+    offer = { "@type": "Offer", price: exp.price_from, priceCurrency: "NOK" };
     if (exp.price_unit === "per_adult") offer.name = "Adult price";
     if (bookingUrl || provSite) offer.url = bookingUrl || provSite;
-    ld.offers = offer;
   }
-  if (provName) ld.provider = { "@type": "Organization", name: provName, ...(provSite ? { url: provSite } : {}) };
+  // The Service node is rendered only when it says something the place does
+  // not: a provider or a price. It is a top-level block of its own (no
+  // @graph), so a reader that takes `offers` off any block still finds it.
+  const service: Record<string, unknown> | null = provName || offer
+    ? {
+        "@context": "https://schema.org",
+        "@type": "Service",
+        "@id": `${canonical}#service`,
+        name: displayTitle,
+        ...(cat ? { serviceType: catLabel(cat) } : {}),
+        areaServed: { "@id": attractionId },
+        ...(provName ? { provider: { "@type": "Organization", name: provName, ...(provSite ? { url: provSite } : {}) } } : {}),
+        ...(offer ? { offers: offer } : {}),
+      }
+    : null;
   const breadcrumb = {
     "@context": "https://schema.org",
     "@type": "BreadcrumbList",
     itemListElement: [
       { "@type": "ListItem", position: 1, name: "Forsiden", item: url },
       ...(cat ? [{ "@type": "ListItem", position: 2, name: catLabel(cat), item: `${url}/kategori/${encodeURIComponent(cat)}` }] : []),
-      { "@type": "ListItem", position: cat ? 3 : 2, name: exp.title, item: canonical },
+      { "@type": "ListItem", position: cat ? 3 : 2, name: displayTitle, item: canonical },
     ],
   };
-  const ldScripts = [ld, breadcrumb]
+  const ldScripts = [ld, ...(service ? [service] : []), breadcrumb]
     .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
 
@@ -3620,10 +3645,10 @@ function renderOpplevelseDetail(
   // Per-page branded og:image (dev-request
   // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — experience
   // title as the main label, category as sublabel/accent, replacing the
-  // domain-wide favicon.svg fallback. No extra DB query: cat/exp.title are
-  // already in scope.
-  const ogImage = ogImageUrl(url, exp.title, { sublabel: cat ? catLabel(cat) : null, cat });
-  const ogImageAlt = `${exp.title}${cat ? " — " + catLabel(cat) : ""} | Opplevagent`;
+  // domain-wide favicon.svg fallback. No extra DB query: cat/displayTitle are
+  // already in scope. displayTitle, like og:title (E2-S2).
+  const ogImage = ogImageUrl(url, displayTitle, { sublabel: cat ? catLabel(cat) : null, cat });
+  const ogImageAlt = `${displayTitle}${cat ? " — " + catLabel(cat) : ""} | Opplevagent`;
 
   return `<!doctype html>
 <html lang="${htmlLangAttr(uiLang)}">
@@ -3637,7 +3662,7 @@ function renderOpplevelseDetail(
 <link rel="canonical" href="${canonical}">${switcherOn ? "\n" + oaHreflangLinks(url, noPath) : ""}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 ${pwaHeadTags({ includeThemeColor: false })}
-<meta property="og:title" content="${escapeHtml(switcherOn ? displayTitle : exp.title)}">
+<meta property="og:title" content="${escapeHtml(displayTitle)}">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
 <meta property="og:url" content="${canonical}">
@@ -3766,10 +3791,10 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">${L.skip}</a>
-${oaSiteNav({ lang, path: noPath, switcher: switcherOn })}
+${oaSiteNav({ lang: uiLang, path: noPath, switcher: switcherOn })}
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="${L.crumbs}">
-    <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(switcherOn ? displayTitle : exp.title)}
+    <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(displayTitle)}
   </nav>
   <header class="head">
     <h1>${escapeHtml(displayTitle)}</h1>
@@ -3793,7 +3818,7 @@ ${oaSiteNav({ lang, path: noPath, switcher: switcherOn })}
   </div>
   ${relBlock}
 </main>
-${oaSiteFooter({ lang })}
+${oaSiteFooter({ lang: uiLang })}
 </body>
 </html>`;
 }
@@ -5964,10 +5989,9 @@ router.get(
            <span><strong>${escapeHtml(sted || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
          </div>`;
 
-    // JSON-LD: LocalBusiness (the produsent's physical premises) + offers for
-    // the visit + BreadcrumbList. No numeric price exists yet on this row, so
-    // — same discipline as the /opplevelse/:slug Offer block — `offers`
-    // describes the bookable visit without inventing a price.
+    // JSON-LD: LocalBusiness (the produsent's physical premises), with a
+    // ReserveAction for the visit request while booking is live, +
+    // BreadcrumbList.
     //
     // description: real enriched about_text (truncated to ~300 chars, same cap
     // discipline as summarizeAbout) when present — a more accurate/faithful
@@ -6009,15 +6033,18 @@ router.get(
     // epostUnderReview's comment there (AC4).
     if (provider.epost && !epostUnderReview) ld.email = provider.epost;
     // Machine signal must match reality: an InStock Offer pointing at /book
-    // while booking is paused told agents a visit could be reserved. The
-    // provider row carries no price, so a live-booking Offer stays price-less
-    // as before; a paused page gets no Offer at all.
+    // while booking is paused told agents a visit could be reserved, so a
+    // paused page says nothing about booking. dev-request 2026-10-16-rfb-
+    // strukturerte-data-tredjepartsrating-og-places-treffvakt, S5: a live page
+    // signals the visit request as an action, not as an Offer. The provider
+    // row carries no price, and an Offer without one is not a valid offer
+    // (offersWithoutPrice in tests/helpers/jsonld-invariants.ts); /book sends
+    // a request the producer answers, which is what ReserveAction says.
     if (!bookingPaused) {
-      ld.offers = {
-        "@type": "Offer",
-        name: `Gårdsbesøk og smaking hos ${provider.navn}`,
-        url: `${url}${bookHref}`,
-        availability: "https://schema.org/InStock",
+      ld.potentialAction = {
+        "@type": "ReserveAction",
+        name: `Be om gårdsbesøk hos ${provider.navn}`,
+        target: { "@type": "EntryPoint", urlTemplate: `${url}${bookHref}` },
       };
     }
     const breadcrumb = {

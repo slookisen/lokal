@@ -410,7 +410,11 @@ export function runExperiencesSeoKortFortaltTests(opts: { log?: boolean } = {}):
         assertTrue(ogDescription(r.body) === meta, "kf-d12: og:description is the same sentence");
         const ld = ldBlocks(r.body).find((b) => b["@type"] === "TouristAttraction");
         assertTrue(ld?.description === meta, "kf-d13: JSON-LD description is the same sentence");
-        assertTrue(ld?.name === "Fjordsafari med rib" && ld?.offers?.price === 990, "kf-d14: the rest of the JSON-LD is untouched (E2-S2 owns it)");
+        // E2-S2 moved the Offer from the TouristAttraction to a Service node
+        // (experiences-seo-jsonld.test.ts); the price is still the row's.
+        const service = ldBlocks(r.body).find((b) => b["@type"] === "Service");
+        assertTrue(ld?.name === "Fjordsafari med rib" && service?.offers?.price === 990 && service?.name === ld?.name,
+          "kf-d14: the rest of the JSON-LD names the same title and the row's price (on the Service node since E2-S2)");
         assertTrue(!r.body.includes("fra 990 kr"), "kf-d15: per_adult is never «fra» anywhere on the page");
       }
       {

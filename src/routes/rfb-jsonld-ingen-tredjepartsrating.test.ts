@@ -18,7 +18,9 @@
  *       externalReviews to the page today, so the seeded reviews only guard
  *       the day it does; seo.ts has no Review builder either way.)
  *   (C) Opplevagent and (D) finn-tannlege pages: forbiddenNodes is [] on
- *       every page tested (dental with a stored Google rating on the clinic).
+ *       every page tested (dental with a stored Google rating on the clinic);
+ *       on Opplevagent, offersWithoutPrice is 0 too (S5: the live gårdssalg
+ *       page signals a ReserveAction instead of a price-less Offer).
  *
  * Harnesses: (B) same as rfb-makesoffer-price-optional.test.ts (own
  * `Database(":memory:")`, the real seo.ts handler off the route stack);
@@ -315,7 +317,10 @@ export async function runRfbJsonLdIngenTredjepartsratingTests(opts: { log?: bool
       ]) {
         const r = await callHtmlRoute(seoRouter, path);
         assertTrue(r.handled && r.status === 200, `oa ${path}: renders 200 (status ${r.status})`);
-        assertCleanPage(r.body, `oa ${path}`);
+        const blocks = assertCleanPage(r.body, `oa ${path}`);
+        // S5: the live gårdssalg page's price-less Offer is gone, so the
+        // permanent no-Offer-without-price invariant now holds for OA too.
+        assertEq(offersWithoutPrice(blocks), 0, `oa ${path}: offersWithoutPrice is 0`);
       }
     } catch (err) {
       failed++;
