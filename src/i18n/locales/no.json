@@ -162,7 +162,10 @@
     "show_on_google_maps": "Vis på Google Maps",
     "disclaimer_public": "Denne informasjonen er basert på offentlig tilgjengelige kilder og kan være utdatert. Kontakt selger direkte for oppdatert informasjon.",
     "disclaimer_owner": "Denne informasjonen er verifisert av eieren.",
-    "season_note_nb": "Notat på norsk"
+    "season_note_nb": "Notat på norsk",
+    "rating_on_source": "på {source}",
+    "rating_count_on_source": "{count} anmeldelser på {source}",
+    "rating_count_on_source_one": "{count} anmeldelse på {source}"
   },
   "common": {
     "see_profile": "Se profil →",

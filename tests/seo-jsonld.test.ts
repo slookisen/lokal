@@ -132,16 +132,30 @@ expectTrue(
   expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (total+categories+price) -> exactly 3 questions");
 }
 
-console.log("── WO-17: seo.ts source-presence assertions ──");
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+// (S1) replaces WO-17's presence checks with absence invariants: no
+// third-party rating/review markup, no invented reviewCount/author, no fixed
+// return/shipping terms. Brand stays. The rendered-page checks live in
+// src/routes/rfb-jsonld-ingen-tredjepartsrating.test.ts.
+console.log("── WO-17 → 2026-10-16 S1: seo.ts JSON-LD source assertions ──");
 const seoSrc = readFileSync(join(__dirname, "..", "src", "routes", "seo.ts"), "utf8");
-expectMatch(seoSrc, /hasMerchantReturnPolicy/, "seo.ts contains hasMerchantReturnPolicy");
-expectMatch(seoSrc, /shippingDetails/, "seo.ts contains shippingDetails");
+function expectNoMatch(haystack: string, needle: RegExp, label: string) {
+  if (!needle.test(haystack)) ok(label);
+  else fail(label, `pattern ${needle} still present`);
+}
 expectMatch(seoSrc, /"@type":\s*"Brand"/, "seo.ts contains Brand @type");
-expectMatch(seoSrc, /"@type":\s*"MerchantReturnPolicy"/, "seo.ts contains MerchantReturnPolicy @type");
-expectMatch(seoSrc, /"@type":\s*"OfferShippingDetails"/, "seo.ts contains OfferShippingDetails @type");
-expectMatch(seoSrc, /merchantReturnDays:\s*14|"merchantReturnDays":\s*14/, "seo.ts sets 14-day Norwegian angrerett");
-expectMatch(seoSrc, /product\.aggregateRating\s*=\s*jsonLd\.aggregateRating/, "seo.ts propagates aggregateRating to inner Product");
-expectMatch(seoSrc, /product\.review\s*=\s*jsonLd\.review\.slice\(0,\s*3\)/, "seo.ts propagates review (capped to 3) to inner Product");
+expectNoMatch(seoSrc, /"hasMerchantReturnPolicy"\s*:/, "seo.ts has no fixed hasMerchantReturnPolicy");
+expectNoMatch(seoSrc, /"shippingDetails"\s*:/, "seo.ts has no fixed shippingDetails");
+expectNoMatch(seoSrc, /"@type":\s*"MerchantReturnPolicy"/, "seo.ts has no MerchantReturnPolicy @type");
+expectNoMatch(seoSrc, /"@type":\s*"OfferShippingDetails"/, "seo.ts has no OfferShippingDetails @type");
+expectNoMatch(seoSrc, /"merchantReturnDays"\s*:/, "seo.ts sets no merchantReturnDays");
+expectNoMatch(seoSrc, /"@type":\s*"AggregateRating"/, "seo.ts builds no AggregateRating itself");
+expectNoMatch(seoSrc, /"@type":\s*"Review"/, "seo.ts builds no Review nodes");
+expectNoMatch(seoSrc, /product\.(aggregateRating|review)\s*=/, "seo.ts copies no rating/review onto Product");
+expectNoMatch(seoSrc, /reviewCount"?\s*:[^,\n]*\|\|\s*1\b/, "seo.ts has no invented reviewCount fallback (|| 1)");
+expectNoMatch(seoSrc, /"name":\s*r\.author\s*\|\|\s*"Kunde"/, "seo.ts has no invented JSON-LD review author («Kunde»)");
+expectMatch(seoSrc, /buildRatingJsonLd\(\{\s*source:\s*"google"/, "seo.ts routes the Google rating through buildRatingJsonLd");
+expectMatch(seoSrc, /\.\.\.buildOfferPolicyJsonLd\(/, "seo.ts takes Offer return/shipping nodes from buildOfferPolicyJsonLd");
 
 console.log("\n── geo-content-structured-data: producer FAQPage JSON-LD assertions ──");
 expectMatch(seoSrc, /function buildProducerFaqJsonLd/, "seo.ts defines buildProducerFaqJsonLd");
@@ -149,7 +163,7 @@ expectMatch(seoSrc, /"@type":\s*"FAQPage"/, "seo.ts contains FAQPage @type");
 expectMatch(seoSrc, /"@type":\s*"Question"/, "seo.ts contains Question @type");
 expectMatch(seoSrc, /"@type":\s*"Answer"/, "seo.ts contains Answer @type");
 expectMatch(seoSrc, /if \(qas\.length < 2\) return null;/, "seo.ts FAQ builder quality-gates on 2+ real answers (no thin pages)");
-expectMatch(seoSrc, /jsonLd:\s*faqJsonLd\s*\?\s*\[jsonLd,\s*faqJsonLd\]\s*:\s*jsonLd/, "seo.ts wires FAQPage block into the producer page's JSON-LD array");
+expectMatch(seoSrc, /jsonLd:\s*faqJsonLd\s*\?\s*\[jsonLd,\s*faqJsonLd,\s*breadcrumbJsonLd\]\s*:\s*\[jsonLd,\s*breadcrumbJsonLd\]/, "seo.ts wires FAQPage block into the producer page's JSON-LD array (next to the BreadcrumbList)");
 expectMatch(seoSrc, /function buildCityFaqJsonLd/, "seo.ts defines buildCityFaqJsonLd");
 expectMatch(seoSrc, /if \(cityFaqJsonLd\) jsonLdItems\.push\(cityFaqJsonLd\);/, "seo.ts wires the city FAQPage block into the city page's JSON-LD array");
 
@@ -184,3 +198,6 @@ if (failed > 0) {
   console.log(failures.join("\n"));
   process.exit(1);
 }
+// Importing seo.ts / experiences-seo.ts starts timers that would keep a green
+// standalone run alive forever; this file is not imported by tests/test.ts.
+process.exit(0);

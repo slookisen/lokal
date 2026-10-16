@@ -8859,29 +8859,31 @@ console.log("\n── PR-30: source-presence checks on seo.ts ──");
   );
 }
 
-// ── WO-17: Search Console JSON-LD + sitemap-404 source-presence ──
+// ── WO-17: Search Console JSON-LD + sitemap-404 source checks ──
 // Regression guard for the 2026-05-15 MerchantListing + Product-snippet
 // reports and the 2026-05-14 sitemap-404 report. Source-grep style mirrors
 // the PR-30 block above. Behavioural-render checks live in
-// tests/seo-jsonld.test.ts (standalone, runnable via tsx).
-console.log("\n── WO-17: seo.ts source-presence (JSON-LD + sitemap) ──");
+// tests/seo-jsonld.test.ts (standalone, runnable via tsx) and
+// src/routes/rfb-jsonld-ingen-tredjepartsrating.test.ts.
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+// (S1) turns the JSON-LD presence checks into absence invariants: no
+// third-party rating/review markup (incl. the Product copy), no invented
+// reviewCount, no fixed return/shipping terms. Brand + sitemap checks stay.
+console.log("\n── WO-17 / 2026-10-16 S1: seo.ts JSON-LD + sitemap source checks ──");
 {
   const fsWo17 = require("fs");
   const seoSrcWo17 = fsWo17.readFileSync("src/routes/seo.ts", "utf8");
-  assertTrue(seoSrcWo17.includes("hasMerchantReturnPolicy"), "wo17: seo.ts contains hasMerchantReturnPolicy");
-  assertTrue(seoSrcWo17.includes("shippingDetails"), "wo17: seo.ts contains shippingDetails");
   assertTrue(/"@type":\s*"Brand"/.test(seoSrcWo17), "wo17: seo.ts contains Brand @type");
-  assertTrue(/"@type":\s*"MerchantReturnPolicy"/.test(seoSrcWo17), "wo17: seo.ts contains MerchantReturnPolicy @type");
-  assertTrue(/"@type":\s*"OfferShippingDetails"/.test(seoSrcWo17), "wo17: seo.ts contains OfferShippingDetails @type");
-  assertTrue(seoSrcWo17.includes("merchantReturnDays"), "wo17: seo.ts sets merchantReturnDays");
-  assertTrue(
-    seoSrcWo17.includes("product.aggregateRating = jsonLd.aggregateRating"),
-    "wo17: seo.ts propagates aggregateRating to inner Product",
-  );
-  assertTrue(
-    seoSrcWo17.includes("product.review = jsonLd.review.slice(0, 3)"),
-    "wo17: seo.ts propagates review (capped to 3) to inner Product",
-  );
+  assertTrue(!/"hasMerchantReturnPolicy"\s*:/.test(seoSrcWo17), "s1: seo.ts has no fixed hasMerchantReturnPolicy");
+  assertTrue(!/"shippingDetails"\s*:/.test(seoSrcWo17), "s1: seo.ts has no fixed shippingDetails");
+  assertTrue(!/"@type":\s*"MerchantReturnPolicy"/.test(seoSrcWo17), "s1: seo.ts has no MerchantReturnPolicy @type");
+  assertTrue(!/"@type":\s*"OfferShippingDetails"/.test(seoSrcWo17), "s1: seo.ts has no OfferShippingDetails @type");
+  assertTrue(!/"merchantReturnDays"\s*:/.test(seoSrcWo17), "s1: seo.ts sets no merchantReturnDays");
+  assertTrue(!/"@type":\s*"AggregateRating"/.test(seoSrcWo17), "s1: seo.ts builds no AggregateRating itself");
+  assertTrue(!/"@type":\s*"Review"/.test(seoSrcWo17), "s1: seo.ts builds no Review nodes");
+  assertTrue(!/product\.(aggregateRating|review)\s*=/.test(seoSrcWo17), "s1: seo.ts copies no rating/review onto Product");
+  assertTrue(!/reviewCount"?\s*:[^,\n]*\|\|\s*1\b/.test(seoSrcWo17), "s1: seo.ts has no invented reviewCount fallback (|| 1)");
+  assertTrue(!/"name":\s*r\.author\s*\|\|\s*"Kunde"/.test(seoSrcWo17), "s1: seo.ts has no invented JSON-LD review author");
   // Sitemap 404 gate
   assertTrue(seoSrcWo17.includes("skippedCount"), "wo17: sitemap loop tracks skippedCount");
   assertTrue(
@@ -47396,5 +47398,70 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("bm-producer-harvest-fill-only: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+// (S1 + S2): the shared structured-data policy module — no third-party
+// rating markup, no invented reviewCount, no default return/shipping terms,
+// attributed rating text with a count only when known, mode 'hidden'. Pure;
+// flips the module's test-only display mode (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S1+S2: structured-data-policy ──");
+  try {
+    const { runStructuredDataPolicyTests } = require("../src/services/structured-data-policy.test") as
+      typeof import("../src/services/structured-data-policy.test");
+    const sdp = runStructuredDataPolicyTests({ log: false });
+    passed += sdp.passed;
+    failed += sdp.failed;
+    for (const f of sdp.failures) failures.push("structured-data-policy: " + f);
+    console.log(`  structured-data-policy: ${sdp.passed} passed, ${sdp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("structured-data-policy: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, S1: rendered JSON-LD on RFB /produsent/:slug (Google
+// rating 4.6/236 and 4.6/NULL, priced + unpriced product) has 0
+// aggregateRating/review/hasMerchantReturnPolicy/shippingDetails and keeps
+// Product price/brand; the shared forbiddenNodes check also runs on
+// Opplevagent and finn-tannlege pages. Pins its own in-memory DB and the
+// experiences/dental db-factory paths (restored in finally) — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S1: JSON-LD without third-party rating (RFB/OA/dental) ──");
+  try {
+    const { runRfbJsonLdIngenTredjepartsratingTests } = require("../src/routes/rfb-jsonld-ingen-tredjepartsrating.test") as
+      typeof import("../src/routes/rfb-jsonld-ingen-tredjepartsrating.test");
+    const jl = await runRfbJsonLdIngenTredjepartsratingTests({ log: false });
+    passed += jl.passed;
+    failed += jl.failed;
+    for (const f of jl.failures) failures.push("rfb-jsonld-ingen-tredjepartsrating: " + f);
+    console.log(`  rfb-jsonld-ingen-tredjepartsrating: ${jl.passed} passed, ${jl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-jsonld-ingen-tredjepartsrating: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, S2: the visible rating on the producer profile and both
+// rich homepage cards names Google, shows a count only when known (no
+// "0 anmeldelser"), and disappears in RATING_DISPLAY_MODE 'hidden'. Own
+// in-memory DB + the module's test-only display mode (both restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S2: visible rating with source attribution ──");
+  try {
+    const { runRfbRatingVisningKildeangivelseTests } = require("../src/routes/rfb-rating-visning-kildeangivelse.test") as
+      typeof import("../src/routes/rfb-rating-visning-kildeangivelse.test");
+    const rv = await runRfbRatingVisningKildeangivelseTests({ log: false });
+    passed += rv.passed;
+    failed += rv.failed;
+    for (const f of rv.failures) failures.push("rfb-rating-visning-kildeangivelse: " + f);
+    console.log(`  rfb-rating-visning-kildeangivelse: ${rv.passed} passed, ${rv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-rating-visning-kildeangivelse: unexpected error: " + String(err?.message || err));
   }
 });

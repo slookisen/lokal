@@ -9,7 +9,10 @@
  * Offers without price): only products with a valid numeric price > 0 become
  * Offer/Product; unpriced ones go to a name-only hasOfferCatalog; makesOffer
  * is omitted (never []) when nothing is priced. Also unit-tests parseNokPrice,
- * buildBmEventJsonLd and the permanent "no Offer without price" invariant.
+ * buildBmEventJsonLd and the permanent "no Offer without price" invariant
+ * (offersWithoutPrice, now in tests/helpers/jsonld-invariants.ts). Since
+ * dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+ * (S1) the inner Offer carries no return/shipping terms.
  *
  * Same synthetic router.handle()-less harness as
  * rfb-trust-score-public-display-removed.test.ts (own `Database(":memory:")`,
@@ -37,6 +40,7 @@
  */
 
 import Database from "better-sqlite3";
+import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes } from "../../tests/helpers/jsonld-invariants";
 
 export interface TestSummary {
   passed: number;
@@ -175,26 +179,17 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       assertTrue(inner.priceCurrency === "NOK", "priced: inner offers.priceCurrency is NOK");
       assertTrue(inner.availability === "https://schema.org/InStock", "priced: inner offers.availability is InStock");
       assertTrue(inner.seller && inner.seller["@type"] === "LocalBusiness", "priced: inner offers.seller is still present");
-      assertTrue(!!inner.hasMerchantReturnPolicy, "priced: inner offers.hasMerchantReturnPolicy is still present");
-      assertTrue(inner.hasMerchantReturnPolicy.merchantReturnDays === 14, "priced: hasMerchantReturnPolicy.merchantReturnDays is unchanged (14)");
-      assertTrue(!!inner.shippingDetails, "priced: inner offers.shippingDetails is still present");
-      assertTrue(inner.shippingDetails["@type"] === "OfferShippingDetails", "priced: shippingDetails @type is unchanged");
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+      // (S1): WO-17's fixed return/shipping terms are gone (no per-producer policy).
+      assertTrue(!("hasMerchantReturnPolicy" in inner), "priced: inner offers has no hasMerchantReturnPolicy");
+      assertTrue(!("shippingDetails" in inner), "priced: inner offers has no shippingDetails");
+      assertTrue(forbiddenNodes(jsonLdBlocks(r.body)).length === 0, "priced: no forbidden rating/review/return/shipping node anywhere");
     }
 
-    /** Permanent invariant (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx): no Offer without numeric price > 0, anywhere in the JSON-LD. */
-    function offersWithoutPrice(node: any): number {
-      let bad = 0;
-      if (Array.isArray(node)) { for (const n of node) bad += offersWithoutPrice(n); return bad; }
-      if (node && typeof node === "object") {
-        if (node["@type"] === "Offer" && !(typeof node.price === "number" && node.price > 0)) bad++;
-        for (const k of Object.keys(node)) bad += offersWithoutPrice(node[k]);
-      }
-      return bad;
-    }
-    function allJsonLd(body: string): any[] {
-      return [...body.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
-        .map(b => { try { return JSON.parse(b[1]); } catch { return null; } }).filter(Boolean);
-    }
+    // Permanent invariant (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx):
+    // offersWithoutPrice now lives in tests/helpers/jsonld-invariants.ts so the
+    // other sites' page tests can run the same walk (Opplevagent in S5).
+    const allJsonLd = (body: string): any[] => jsonLdBlocks(body) as any[];
     function mainLd(body: string): any {
       for (const p of allJsonLd(body)) for (const c of (Array.isArray(p) ? p : [p])) if (c && c["@type"] && c.name) return c;
       return null;
