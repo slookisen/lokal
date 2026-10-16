@@ -212,13 +212,20 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
             'high', 'chromegard-sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
       ).run();
 
-      // Fixture for (i): one published experience in Vestland/Bergen/
+      // Fixture for (i): published experiences in Vestland/Bergen/
       // natur_friluft so /fylke/Vestland, /kommune/Bergen and
       // /kategori/natur_friluft/Bergen all render live (non-404) pages, plus
-      // its provider's slug for /tilbyder/<slug>.
+      // the first provider's slug for /tilbyder/<slug>. Two rows, because the
+      // combo page needs ≥2 experiences to be served rather than redirected
+      // to /kommune/Bergen (dev-request 2026-10-16-opplevagent-stedssider-
+      // kvalitet, E4-S1).
       const iProviderId = seedPublishedExperience(store, {
         fylke: "Vestland", kommune: "Bergen", category: "natur_friluft",
         title: "Fjellvandring i Bergen (chrome-regresjon)",
+      });
+      seedPublishedExperience(store, {
+        fylke: "Vestland", kommune: "Bergen", category: "natur_friluft",
+        title: "Fløyen på ski (chrome-regresjon)",
       });
       store.backfillProviderSlugs();
       const iProviderSlug = (db.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(iProviderId) as { slug: string }).slug;
