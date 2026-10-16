@@ -58,6 +58,8 @@ import {
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
+  formatFilterLabels,
+  KOMMUNE_TO_FYLKE_STEP,
   listCategories,
   // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-
   // inflow slice (2026-08-25): get_experience reads through the PUBLISH-
@@ -139,6 +141,16 @@ import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+// dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
+// (S1, moved from this file) and the free-text `query` interpreter (S2).
+import {
+  GARDSSALG_CATEGORY,
+  interpretDiscoverQuery,
+  listCategorySlugs,
+  normalizeExperienceCategory,
+} from "../services/experiences-query-intent";
+
+export { normalizeExperienceCategory };
 
 const router = Router();
 
@@ -253,9 +265,6 @@ export function detectExperiencesMcpClient(req: Request): string | undefined {
 
 // ─── Zod input schemas (exported for testing) ─────────────────
 
-/** list_experience_categories' synthetic entry for the discover_gardssalg vertical. */
-const GARDSSALG_CATEGORY = "gardssalg_smaking";
-
 export const DiscoverExperiencesInputSchema = {
   query: z.string().optional().describe(
     "The user's request in a few words, including any place they named — e.g. 'safari lodge in Kenya', " +
@@ -319,52 +328,10 @@ export const DiscoverExperiencesInputSchema = {
   ),
 };
 
-// ChatGPT app review 2026-09-24: this tool's own description used to offer
-// 'vinter' as a category example — not a slug that exists (the real one is
-// 'vinter_sno'), so a model copying it got the category silently relaxed
-// away. The description now lists the real slugs; this maps the obvious
-// plain-word guesses (Norwegian or English) onto them.
-//
-// Re-review 2026-10-03: a model also passes the human label it showed the
-// user ("wildlife & safari", "Food and drink") or an invented slug
-// ("wildlife_safari"). Those missed the table above, the filter was relaxed
-// away and the list mixed every category — test case 4 promises wildlife
-// only. Multi-word values are now split into words and the first word with
-// an alias wins; anything still unrecognised is reported back by
-// discover_experiences instead of being silently dropped.
-const CATEGORY_ALIASES: Record<string, string> = {
-  kultur: "kultur_historie", historie: "kultur_historie", culture: "kultur_historie", cultural: "kultur_historie", history: "kultur_historie", museum: "kultur_historie", museums: "kultur_historie",
-  natur: "natur_friluft", friluft: "natur_friluft", friluftsliv: "natur_friluft", nature: "natur_friluft", outdoors: "natur_friluft", outdoor: "natur_friluft",
-  adrenalin: "adrenalin_action", adrenaline: "adrenalin_action", action: "adrenalin_action", adventure: "adrenalin_action",
-  sightseeing: "sightseeing_transport", transport: "sightseeing_transport",
-  overnatting: "overnatting_opplevelse", accommodation: "overnatting_opplevelse", stay: "overnatting_opplevelse", stays: "overnatting_opplevelse",
-  dyreliv: "dyreliv_safari", safari: "dyreliv_safari", safaris: "dyreliv_safari", wildlife: "dyreliv_safari", animals: "dyreliv_safari", animal: "dyreliv_safari", dyr: "dyreliv_safari",
-  vinter: "vinter_sno", winter: "vinter_sno", "snø": "vinter_sno", sno: "vinter_sno", snow: "vinter_sno",
-  mat: "mat_drikke", drikke: "mat_drikke", food: "mat_drikke", "food_drink": "mat_drikke",
-  "velvære": "velvaere_spa", velvaere: "velvaere_spa", spa: "velvaere_spa", wellness: "velvaere_spa",
-  // Not an experience category: list_experience_categories appends this
-  // synthetic entry for the separate discover_gardssalg tool.
-  gardssalg: GARDSSALG_CATEGORY, "gårdssalg": GARDSSALG_CATEGORY, "farm-sale": GARDSSALG_CATEGORY, "farm_sale": GARDSSALG_CATEGORY,
-};
-
-export function normalizeExperienceCategory(category: string): string {
-  const key = category.trim().toLowerCase();
-  if (CATEGORY_ALIASES[key]) return CATEGORY_ALIASES[key];
-  if (listCategorySlugs().includes(key)) return key;
-  for (const word of key.split(/[^a-z0-9æøå]+/)) {
-    if (CATEGORY_ALIASES[word]) return CATEGORY_ALIASES[word];
-  }
-  return category.trim();
-}
-
-/** The experience category slugs that currently have published listings. */
-function listCategorySlugs(): string[] {
-  try {
-    return listCategories().map((c) => c.category);
-  } catch {
-    return [];
-  }
-}
+// CATEGORY_ALIASES / normalizeExperienceCategory() / listCategorySlugs() live in
+// services/experiences-query-intent.ts (dev-request 2026-10-16-opplevagent-mcp-
+// fritekst-query, S1), shared with the free-text interpreter; normalizeExperienceCategory
+// is re-exported above for existing callers.
 
 /**
  * The place a discover call names outside Norway — a foreign county/kommune/
@@ -763,8 +730,10 @@ export function registerExperienceTools(
         // be relaxed away like an over-narrow filter, so the caller silently
         // got every category. Say so instead and name the valid slugs; the
         // gårdssalg entry from list_experience_categories points at its own
-        // tool. (ChatGPT app re-review 2026-10-03.)
-        if (filter.category) {
+        // tool. (ChatGPT app re-review 2026-10-03.) Also run for a category
+        // read from `query` below ("gårdssalg i Hardanger").
+        const categoryPointer = (extraFields: Record<string, unknown> = {}) => {
+          if (!filter.category) return null;
           const slugs = listCategorySlugs();
           const pointer =
             filter.category === GARDSSALG_CATEGORY
@@ -772,16 +741,148 @@ export function registerExperienceTools(
               : slugs.length > 0 && !slugs.includes(filter.category)
                 ? `Ukjent kategori «${filter.category}». Gyldige kategorier: ${slugs.join(", ")}. / Unknown category "${filter.category}". Valid categories: ${slugs.join(", ")}.`
                 : null;
-          if (pointer) {
-            const result = { summary: pointer, count: 0, filter_applied: filter, valid_categories: slugs, experiences: [] };
-            return {
-              structuredContent: result,
-              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-            };
+          if (!pointer) return null;
+          const result = { summary: pointer, count: 0, filter_applied: filter, ...extraFields, valid_categories: slugs, experiences: [] };
+          return {
+            structuredContent: result,
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          };
+        };
+        const explicitCategoryPointer = categoryPointer();
+        if (explicitCategoryPointer) return explicitCategoryPointer;
+
+        // ── Free-text `query` (dev-request 2026-10-16-opplevagent-mcp-fritekst-
+        // query, S2). It used to be read only by the two checks above, so a
+        // query-only call ("hvalsafari i Tromsø") searched with an empty filter
+        // and got the first rows of the whole country. The query now fills the
+        // keys the caller left empty; explicit arguments always win (see
+        // interpretDiscoverQuery for the place and search-word rules).
+        const explicitKeyCount = Object.keys(filter).length;
+        const fromQuery: Array<keyof DiscoverFilter> = [];
+        let queryInterpretation: Record<string, unknown> | undefined;
+        let queryHasContent = false;
+        if (queryText) {
+          const read = interpretDiscoverQuery(queryText, { fylke, kommune, lat, lng, category: filter.category, season, weather, indoor_outdoor });
+          queryHasContent = read.hasContent;
+          const fill = <K extends keyof DiscoverFilter>(key: K, value: DiscoverFilter[K] | undefined) => {
+            if (value === undefined || filter[key] !== undefined) return;
+            filter[key] = value;
+            fromQuery.push(key);
+          };
+          fill("kommune", read.kommune);
+          fill("kommuner", read.kommuner);
+          fill("fylke", read.fylke);
+          fill("fylker", read.fylker);
+          fill("category", read.category);
+          fill("season", read.season);
+          fill("weather", read.weather);
+          fill("indoor_outdoor", read.indoor_outdoor);
+          fill("text_terms", read.terms);
+          if (fromQuery.length > 0) {
+            const { hasContent: _hasContent, ...values } = read;
+            queryInterpretation = { source: "query", ...values };
           }
         }
+        // "gårdssalg i Hardanger" gets the same pointer as category='gardssalg'.
+        if (filter.category === GARDSSALG_CATEGORY && fromQuery.includes("category")) {
+          const pointer = categoryPointer({ query_interpretation: queryInterpretation });
+          if (pointer) return pointer;
+        }
 
-        const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit ?? 20);
+        // Every answer below is logged and counted the same way. Logged as
+        // structured keys only: never the raw query, and of the search words
+        // only how many there were (felles regel 5).
+        const finish = (result: Record<string, unknown>, deliveredIds: string[]) => {
+          const { text_terms: loggedTerms, ...loggedFilter } = filter;
+          const logged = loggedTerms ? { ...loggedFilter, text_terms_count: loggedTerms.length } : loggedFilter;
+          try {
+            logExperiencesInteraction({
+              skill: "discover_experiences",
+              queryText: Object.keys(logged).length ? JSON.stringify(logged) : undefined,
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+
+          deliver("discover_experiences", filter, extra, deliveredIds);
+          // structuredContent is what the experiences-list widget reads
+          // (window.openai.toolOutput); the text block keeps the same JSON for
+          // MCP clients without widget support.
+          return {
+            structuredContent: result,
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          };
+        };
+
+        // Zero answers instead of a list that only looks like a match (the A2A
+        // guard of lokal#824, mirrored): the query had words but nothing to
+        // search by; the place has nothing; or every filter read from the
+        // query was relaxed away, leaving the unfiltered catalogue. The place,
+        // given or read from the query, is never relaxed away (S2, S3): a
+        // kommune without hits is widened once to its fylke, then it is zero.
+        // Search words are relaxed gradually before they are dropped
+        // (discoverExperiencesRelaxed), so this zero means no row has any of them.
+        let zeroHitReason: "unrecognized_query" | "place_no_match" | "relaxation_exhausted" | undefined =
+          queryHasContent && fromQuery.length === 0 && explicitKeyCount === 0 ? "unrecognized_query" : undefined;
+        let termsMatchedNothing = false;
+        const placeKeys = (["kommune", "kommuner", "fylke", "fylker"] as const).filter((k) => filter[k] !== undefined);
+        const relaxed = zeroHitReason
+          ? null
+          : discoverExperiencesRelaxed(filter, limit ?? 20, { protectKeys: placeKeys, widenKommuneToFylke: true });
+        const results = relaxed?.results ?? [];
+        const relaxedKeys = relaxed?.relaxedKeys ?? [];
+        if (relaxed && results.length === 0 && placeKeys.length > 0) {
+          zeroHitReason = "place_no_match";
+        } else if (relaxed && fromQuery.length > 0 && relaxedKeys.length > 0 && Object.values(relaxed.appliedFilter).every((v) => v === undefined)) {
+          termsMatchedNothing = fromQuery.every((k) => k === "text_terms") && explicitKeyCount === 0;
+          zeroHitReason = termsMatchedNothing ? "unrecognized_query" : "relaxation_exhausted";
+        }
+        if (zeroHitReason) {
+          let summary: string;
+          let suggestions: string[] = [];
+          if (zeroHitReason === "place_no_match") {
+            const place = filter.kommune ?? filter.kommuner?.join(", ") ?? filter.fylke ?? filter.fylker?.join(", ");
+            const widenedTo = relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP) ? relaxed?.appliedFilter.fylke : undefined;
+            summary =
+              `Ingen opplevelser funnet i ${place}${widenedTo ? ` eller ellers i ${widenedTo}` : ""}. ` +
+              "Opplevagent viser ikke treff fra resten av landet i stedet. / " +
+              `No experiences found in ${place}${widenedTo ? ` or elsewhere in ${widenedTo}` : ""}. ` +
+              "Opplevagent does not fall back to results from the rest of the country.";
+            // Places that do have experiences for the rest of the request; each
+            // suggestion returns hits.
+            const { kommune: _k, kommuner: _ks, fylke: _f, fylker: _fs, ...rest } = filter;
+            suggestions = buildNarrowingSuggestions(discoverExperiencesRelaxed(rest, limit ?? 20).results, ["kommune", "fylke"]);
+          } else if (termsMatchedNothing) {
+            summary =
+              "Søket nevner verken sted, kategori, sesong eller vær, og ingen opplevelse inneholder søkeordene i det — ingen treff. " +
+              "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+              "The query names no place, category, season or weather, and no experience contains its search words — no matches. " +
+              'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+          } else if (zeroHitReason === "unrecognized_query") {
+            summary =
+              "Fant ingen gjenkjennelige søkekriterier eller treff i søket (sted, kategori, sesong, vær eller søkeord) — ingen treff. " +
+              "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+              "No recognisable criteria or matches in the query (place, category, season, weather or keywords) — no matches. " +
+              'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+          } else {
+            const labels = formatFilterLabels(relaxedKeys);
+            summary =
+              `Ingen opplevelser funnet med filtrene fra søket — heller ikke etter å ha løsnet: ${labels}. / ` +
+              `No experiences found for the filters read from the query — not even after relaxing: ${labels}.`;
+            suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+          }
+          return finish({
+            summary,
+            count: 0,
+            filter_applied: filter,
+            query_interpretation: queryInterpretation,
+            relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+            suggestions: suggestions.length > 0 ? suggestions : undefined,
+            zero_hit_reason: zeroHitReason,
+            valid_categories: zeroHitReason === "unrecognized_query" ? listCategorySlugs() : undefined,
+            experiences: [],
+          }, []);
+        }
+
         const relaxationNote = buildRelaxationNote(relaxedKeys);
 
         let summary =
@@ -789,6 +890,12 @@ export function registerExperienceTools(
             ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
             : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
         if (relaxationNote) summary += ` ${relaxationNote}`;
+        if (relaxed?.textTermsMatched !== undefined) {
+          const termCount = filter.text_terms?.length ?? 0;
+          summary +=
+            ` Ingen opplevelse inneholder alle ${termCount} søkeordene; disse inneholder ${relaxed.textTermsMatched} av dem. /` +
+            ` No experience contains all ${termCount} search words; these contain ${relaxed.textTermsMatched} of them.`;
+        }
 
         const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
 
@@ -830,28 +937,14 @@ export function registerExperienceTools(
           summary,
           count: results.length,
           filter_applied: filter,
+          query_interpretation: queryInterpretation,
           unfilterable_fields: unfilterable.length > 0 ? unfilterable : undefined,
           relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
           suggestions: suggestions.length > 0 ? suggestions : undefined,
           experiences: formatted,
         };
 
-        try {
-          logExperiencesInteraction({
-            skill: "discover_experiences",
-            queryText: Object.keys(filter).length ? JSON.stringify(filter) : undefined,
-            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
-          });
-        } catch { /* fail-open: never affects the tool result */ }
-
-        deliver("discover_experiences", filter, extra, results.map((e) => e.id));
-        // structuredContent is what the experiences-list widget reads
-        // (window.openai.toolOutput); the text block keeps the same JSON for
-        // MCP clients without widget support.
-        return {
-          structuredContent: result,
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-        };
+        return finish(result, results.map((e) => e.id));
       } catch (err: any) {
         // Defensive: DB not open or other failure -> graceful degradation
         if (err.message?.includes("database") || err.message?.includes("no such table") || err.message?.includes("getDb")) {

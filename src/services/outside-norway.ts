@@ -35,6 +35,11 @@ const FOREIGN_PLACES: readonly string[] = [
   "san francisco", "chicago", "toronto", "tokyo", "beijing", "shanghai", "bangkok", "sydney",
   "stockholm", "gothenburg", "göteborg", "copenhagen", "københavn", "helsinki", "reykjavik",
   "edinburgh", "dublin", "munich", "münchen", "hamburg", "zurich", "zürich", "geneva", "genève",
+  // Holiday destinations, and foreign names that start with a Norwegian
+  // place name (Gran, Alta, Bergen): read word by word, "på Gran Canaria"
+  // gave Norwegian rows (dev-request 2026-10-16-opplevagent-mcp-fritekst-query).
+  "gran canaria", "kanariøyene", "canary islands", "tenerife", "mallorca", "majorca", "alta badia",
+  "bergen op zoom",
 ];
 
 const WORD_CHAR = "a-z0-9æøåäöüéèàáâêëïíóôúçñ";
