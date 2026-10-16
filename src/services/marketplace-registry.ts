@@ -49,6 +49,7 @@ import {
 import { safeHonestCatalogCount } from "./honest-count";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
+import { distributionFor } from "../config/distribution-channels";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1366,67 +1367,10 @@ class MarketplaceRegistry {
       // and `name` here.
       // Prefixed with `x-` to follow the in-file extension convention
       // (matches `x-lokal` below) and stay safe with strict A2A validators.
-      "x-distribution": [
-        {
-          channel: "smithery",
-          url: "https://smithery.ai/servers/@slookisen/rettfrabonden",
-          install: "https://server.smithery.ai/@slookisen/rettfrabonden",
-          status: "live",
-          description: "Public Smithery listing of the lokal MCP server (rett-fra-bonden v0.4.0). Reads are open; writes require X-API-Key.",
-        },
-        {
-          channel: "npm",
-          url: "https://www.npmjs.com/package/lokal-mcp",
-          install: "npx lokal-mcp",
-          status: "live",
-          description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
-        },
-        {
-          channel: "a2a-registry",
-          url: "https://a2aregistry.org/agents/00157ca1-450f-4341-91a5-dbcab7a667ef",
-          install: `${baseUrl}/.well-known/agent-card.json`,
-          status: "live",
-          description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
-        },
-        {
-          channel: "official-mcp-registry",
-          url: "https://registry.modelcontextprotocol.io/v0/servers?search=lokal",
-          install: "npx lokal-mcp",
-          status: "live",
-          description: "Official Model Context Protocol Registry — io.github.slookisen/lokal-mcp@0.4.0 (isLatest=true).",
-        },
-        {
-          channel: "glama",
-          url: "https://glama.ai/mcp/servers/lokal-mcp",
-          install: "npx lokal-mcp",
-          status: "live",
-          description: "Glama MCP servers directory listing.",
-        },
-        {
-          channel: "mcp-so",
-          url: "https://mcp.so/server/lokal-mcp",
-          install: "npx lokal-mcp",
-          status: "live",
-          description: "mcp.so MCP servers directory listing.",
-        },
-        {
-          channel: "custom-gpt",
-          url: "https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden",
-          install: "https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden",
-          status: "live",
-          description: "ChatGPT Custom GPT — Rett fra Bonden local-food discovery; Actions on rettfrabonden.com/openapi.yaml.",
-        },
-        {
-          channel: "agenstry",
-          url: "https://agenstry.com/agents/rettfrabonden.com",
-          install: `${baseUrl}/.well-known/agent-card.json`,
-          status: "live",
-          description: "Agenstry A2A agent directory — auto-indexed from agent-card.json. 1,750+ agents indexed; drift-monitored.",
-        },
-        // acp-product-feed (/api/marketplace/catalog/acp-feed.csv) is deliberately NOT
-        // advertised here while the feed has 0 rows (dev-request 2026-09-08-discovery-
-        // paritet-og-ett-katalogtall, item 3); re-add it when it serves rows.
-      ],
+      "x-distribution": distributionFor("rfb", `${baseUrl}/.well-known/agent-card.json`),
+      // acp-product-feed (/api/marketplace/catalog/acp-feed.csv) is deliberately NOT
+      // advertised here while the feed has 0 rows (dev-request 2026-09-08-discovery-
+      // paritet-og-ett-katalogtall, item 3); re-add it when it serves rows.
 
       // ─── Lokal-specific metadata ───────────────────────────
       "x-lokal": {
