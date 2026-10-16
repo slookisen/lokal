@@ -25,6 +25,14 @@
  * on a mismatch (no new spend), no Brreg lookup on a mismatch, and the
  * "[places-match-guard]" log line.
  *
+ * Review round 1 (PR #1090): the BEST-named confident candidate wins, not the
+ * first ("Hov Gård" with [Nordre Hov Gård, Hov Gård] in one postal code took
+ * Nordre's rating, address and phone); two differently named candidates that
+ * nearly tie below 0.9 → place_mismatch "ambiguous"; the RFB-only
+ * farm-qualifier veto (Nordre vs Søndre Hov Gård); the suffix strip and the
+ * Text Search query stay linear on long runs of spaces and give the same
+ * output as the old regexes.
+ *
  * Harness: better-sqlite3 ":memory:" + __setDbForTesting/__initSchemaForTesting,
  * the real marketplace router driven through router.handle() with a fake
  * req/res, globalThis.fetch and console.warn stubbed (restored in finally).
@@ -143,6 +151,29 @@ const ASK_RINGSAKER = place("Ask", "2380", "Brumunddal", {
   rating: 4.7,
   userRatingCount: 33,
   formattedAddress: "Askvegen 2, 2380 Brumunddal",
+});
+// Review round 1 (B1): three farms in one postal code. For a producer "Hov
+// Gård", Nordre/Søndre Hov Gård score 0.67 each — over the 0.55 bar.
+const NORDRE_HOV = place("Nordre Hov Gård", "2335", "Stange", {
+  id: "place-nordre-hov",
+  rating: 4.9,
+  userRatingCount: 812,
+  formattedAddress: "Hovsvegen 10, 2335 Stange",
+  internationalPhoneNumber: "+47 11 11 11 11",
+});
+const SONDRE_HOV = place("Søndre Hov Gård", "2335", "Stange", {
+  id: "place-sondre-hov",
+  rating: 4.8,
+  userRatingCount: 97,
+  formattedAddress: "Hovsvegen 30, 2335 Stange",
+  internationalPhoneNumber: "+47 22 22 22 22",
+});
+const HOV = place("Hov Gård", "2335", "Stange", {
+  id: "place-hov",
+  rating: 4.3,
+  userRatingCount: 14,
+  formattedAddress: "Hovsvegen 20, 2335 Stange",
+  internationalPhoneNumber: "+47 33 33 33 33",
 });
 
 // Pre-S3 FieldMasks, verbatim — the new masks must equal these plus
@@ -289,13 +320,113 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
     const first = pm.pickConfidentPlace(haugenSki, [HAUGEN_SKI, { ...HAUGEN_SKI, id: "dup" }] as any[]);
     assertEq((first.place as any)?.id, "place-haugen-ski", "U06: two confident candidates → Google's first wins");
     const none = pm.pickConfidentPlace(haugenSki, [MATHALLEN_OSLO, HAUGEN_OPPDAL] as any[]);
-    assertEq([none.place, none.index, none.placeName, none.nameSim], [null, -1, "Haugen Gård", 1],
+    assertEq([none.place, none.index, none.placeName, none.nameSim, none.reason], [null, -1, "Haugen Gård", 1, "no_confident_candidate"],
       "U07: no confident candidate → null; reports the best-named candidate for the log");
     const empty = pm.pickConfidentPlace(haugenSki, []);
-    assertEq([empty.place, empty.index, empty.placeName, empty.nameSim], [null, -1, "", 0], "U08: no candidates → null, empty report");
+    assertEq([empty.place, empty.index, empty.placeName, empty.nameSim, empty.reason], [null, -1, "", 0, "no_candidates"],
+      "U08: no candidates → null, empty report");
     assertEq(pm.pickConfidentPlace(haugenSki, null).place, null, "U09: null candidate list → null");
     assertEq((pm.pickConfidentPlace(haugenSki, [null, undefined, HAUGEN_SKI] as any[]).place as any)?.id, "place-haugen-ski",
       "U10: null entries in the list are skipped");
+    assertEq(pm.pickConfidentPlace(haugenSki, [HAUGEN_SKI] as any[]).reason, null, "U10b: a picked place has reason null");
+  }
+
+  // ── Review round 1, B1: the best-named confident candidate wins ────────
+  {
+    const hov = pm.rfbPlaceMatchEntity({ name: "Hov Gård", postalCode: "2335", city: "Stange" });
+    const nordreSim = pm.placeNameSimilarity(hov, "Nordre Hov Gård");
+    assertTrue(nordreSim >= pm.NAME_SIM_THRESHOLD && nordreSim < pm.PICK_CLEAR_NAME_SIM && pm.isConfidentPlaceMatch(hov, NORDRE_HOV as any),
+      "U41: 'Nordre Hov Gård' passes the shared rule on its own for producer 'Hov Gård' (0.67, same postal code) — the B1 setup");
+    const b1 = pm.pickConfidentPlace(hov, [NORDRE_HOV, HOV] as any[]);
+    assertEq([b1.index, (b1.place as any)?.id, b1.nameSim, b1.reason], [1, "place-hov", 1, null],
+      "U42 (B1): [near-namesake, exact] in one postal code → the exact match at index 1, not places[0]");
+    const b1r = pm.pickConfidentPlace(hov, [HOV, NORDRE_HOV] as any[]);
+    assertEq([b1r.index, (b1r.place as any)?.id], [0, "place-hov"], "U43: [exact, near-namesake] → the exact match at index 0");
+    const tie = pm.pickConfidentPlace(hov, [NORDRE_HOV, SONDRE_HOV] as any[]);
+    assertEq([tie.place, tie.index, tie.reason, tie.placeName, tie.rival, Math.round(tie.nameSim * 100) / 100],
+      [null, -1, "ambiguous", "Nordre Hov Gård", "Søndre Hov Gård", 0.67],
+      "U44: two differently named candidates tie below 0.9 (Nordre/Søndre Hov Gård) → none picked, reason ambiguous");
+    const tie3 = pm.pickConfidentPlace(hov, [NORDRE_HOV, SONDRE_HOV, HOV] as any[]);
+    assertEq((tie3.place as any)?.id, "place-hov", "U45: …but an exact match in the same answer still wins (≥ 0.9 is clear)");
+    const otherPostal = pm.pickConfidentPlace(hov, [NORDRE_HOV, place("Søndre Hov Gård", "2340", "Løten")] as any[]);
+    assertEq((otherPostal.place as any)?.id, "place-nordre-hov",
+      "U46: a near-tie that fails the location check is no rival (only passing candidates count)");
+    const sameName = pm.pickConfidentPlace(hov, [NORDRE_HOV, { ...NORDRE_HOV, id: "nordre-dup" }] as any[]);
+    assertEq((sameName.place as any)?.id, "place-nordre-hov",
+      "U47: two passing listings with the same name are no rival → Google's first, as U06");
+
+    const haugen = pm.rfbPlaceMatchEntity({ name: "Haugen Gård", postalCode: "1400", city: "Ski" });
+    const kafe = place("Haugen Gård Kafé", "1400", "Ski", { id: "kafe" });
+    const butikk = place("Haugen Gårdsbutikk", "1400", "Ski", { id: "butikk" });
+    const utsalg = place("Haugen Gårdsutsalg", "1400", "Ski", { id: "utsalg" });
+    const gaard = place("Haugen Gaard", "1400", "Ski", { id: "gaard" });
+    assertEq((pm.pickConfidentPlace(haugen, [butikk, kafe] as any[]).place as any)?.id, "kafe",
+      "U48: best below 0.9 (0.80) but the rival is ≥ PICK_TIE_MARGIN behind (0.74) → the best is picked");
+    assertEq(pm.pickConfidentPlace(haugen, [butikk, utsalg] as any[]).reason, "ambiguous",
+      "U49: equal 0.74 for two different names → ambiguous");
+    assertEq((pm.pickConfidentPlace(haugen, [gaard, HAUGEN_SKI] as any[]).place as any)?.id, "place-haugen-ski",
+      "U50: best ≥ PICK_CLEAR_NAME_SIM (1.00) is picked even with a different name within the margin (0.95)");
+    assertEq([pm.PICK_CLEAR_NAME_SIM, pm.PICK_TIE_MARGIN], [0.9, 0.05], "U51: pick thresholds 0.9 / 0.05");
+
+    // Caller veto (generic; RFB passes the farm-qualifier rule).
+    const vetoed = pm.pickConfidentPlace(haugenSki, [HAUGEN_SKI] as any[], () => "test_veto");
+    assertEq([vetoed.place, vetoed.reason, vetoed.placeName], [null, "test_veto", "Haugen Gård"],
+      "U52: a veto rejects a candidate the shared rule accepts and names its label");
+    const vetoFirst = pm.pickConfidentPlace(haugenSki, [HAUGEN_SKI, { ...HAUGEN_SKI, id: "second" }] as any[],
+      (() => { let n = 0; return () => (n++ === 0 ? "test_veto" : null); })());
+    assertEq((vetoFirst.place as any)?.id, "second", "U53: a vetoed candidate is skipped; the next confident one is picked");
+    assertEq(pm.pickConfidentPlace(haugenSki, [HAUGEN_OPPDAL] as any[], () => "test_veto").reason, "no_confident_candidate",
+      "U54: a candidate failing the shared rule reports no_confident_candidate (the veto is not consulted)");
+  }
+
+  // ── Review round 1, F1: RFB-only farm-qualifier veto ───────────────────
+  {
+    assertTrue(pm.farmQualifiersConflict("Nordre Hov Gård", "Søndre Hov Gård"), "U55: Nordre vs Søndre Hov Gård → conflict");
+    assertTrue(pm.farmQualifiersConflict("Store Ree", "Lille Ree Gård"), "U56: Store vs Lille → conflict");
+    assertTrue(pm.farmQualifiersConflict("AUSTRE MOLAND", "Vestre Moland"), "U57: nynorsk Austre vs Vestre, any case → conflict");
+    assertTrue(!pm.farmQualifiersConflict("Hov Gård", "Nordre Hov Gård"), "U58: one side without a qualifier → no conflict (name similarity decides)");
+    assertTrue(!pm.farmQualifiersConflict("Nordre Hov Gård", "Nordre Hov Gård"), "U59: same qualifier → no conflict");
+    assertTrue(!pm.farmQualifiersConflict("Store Nordre Hov", "Nordre Hov"), "U60: one qualifier set inside the other → no conflict");
+    assertTrue(!pm.farmQualifiersConflict("Nordre Hov Gård — Ytre Enebakk", "Nordre Hov Gård"),
+      "U61: a qualifier in the platform's «— Sted» suffix does not count");
+    assertTrue(!pm.farmQualifiersConflict("Storeng Gård", "Lille Storeng"), "U62: qualifiers are whole words ('Storeng' is no 'store')");
+
+    const nordre = pm.rfbPlaceMatchEntity({ name: "Nordre Hov Gård", postalCode: "2335", city: "Stange" });
+    assertTrue(pm.isConfidentPlaceMatch(nordre, SONDRE_HOV as any) && pm.placeNameSimilarity(nordre, "Søndre Hov Gård") > 0.75,
+      "U63: the shared rule (dental's) accepts Søndre Hov Gård for Nordre Hov Gård (0.79) — unchanged for dental");
+    const q = pm.pickRfbPlace(nordre, [SONDRE_HOV] as any[]);
+    assertEq([q.place, q.reason, q.placeName], [null, "qualifier_conflict", "Søndre Hov Gård"],
+      "U64: pickRfbPlace vetoes it → place_mismatch reason qualifier_conflict");
+    assertEq((pm.pickRfbPlace(nordre, [SONDRE_HOV, NORDRE_HOV] as any[]).place as any)?.id, "place-nordre-hov",
+      "U65: …and takes the right farm when it is in the same answer");
+  }
+
+  // ── Review round 1, F3: linear suffix strip and Text Search query ──────
+  {
+    const legacyStrip = (n: string) => (n || "").split(/\s*[—–]\s*|\s+-\s+/)[0]!.trim();
+    const legacyQuery = (n: string, c: string) => `${n} ${c} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+    const names = [
+      "", "Alm Gård — Feios", "Alm Gård–Feios", "Alm Gård - Feios", "Alm Gård -Feios", "Alm Gård- Feios",
+      "Midt-Telemark Bigard", "  — Feios", "A - B — C", "A — B - C", "A  -  B", "a--b", "a - - b", "a -- b",
+      "Øvre-Ål Gård — Ål", "Gård\t-\tSted", "x \u00a0— y", "Hov Gård –  Stange ", " lead", "trail - ", "-",
+    ];
+    let sameStrip = 0;
+    let sameQuery = 0;
+    for (const n of names) {
+      if (pm.stripPlatformPlaceSuffix(n) === legacyStrip(n)) sameStrip++;
+      if (pm.rfbPlacesTextQuery(n, "Ski") === legacyQuery(n, "Ski") && pm.rfbPlacesTextQuery(n, "") === legacyQuery(n, "")) sameQuery++;
+    }
+    assertEq(sameStrip, names.length, `U66: stripPlatformPlaceSuffix === the old split regex on all ${names.length} names`);
+    assertEq(sameQuery, names.length, `U67: rfbPlacesTextQuery === the routes' old replace on all ${names.length} names (with/without city)`);
+    assertEq(pm.rfbPlacesTextQuery("Haugen Gård — Ski", "Ski"), "Haugen Gård Ski Ski Norway", "U68: query shape «<name> <city> Norway»");
+
+    const spaces = "A" + " ".repeat(200_000) + "B";
+    const t0 = Date.now();
+    pm.stripPlatformPlaceSuffix(spaces);
+    pm.rfbPlacesTextQuery(spaces, spaces);
+    pm.pickRfbPlace(pm.rfbPlaceMatchEntity({ name: spaces, postalCode: "1400" }), [place(spaces, "1400", "Ski")] as any[]);
+    const ms = Date.now() - t0;
+    assertTrue(ms < 1000, `U69: 200k spaces through strip, query and pick in ${ms} ms (< 1000; the old regexes took ~1 s at 50k)`);
   }
 
   // ── Acceptance (b), (c), (f) at the rule level ─────────────────────────
@@ -355,15 +486,25 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
   // ── Kill switch + log line ────────────────────────────────────────────
   {
     assertEq(pm.PLACES_MATCH_GUARD_ENABLED, true, "U36: PLACES_MATCH_GUARD_ENABLED defaults to true");
-    const producer = { name: "Bergen Mathall", postalCode: "5013", city: "Bergen" };
-    assertEq(pm.pickRfbPlace(producer, [MATHALLEN_OSLO] as any[]).place, null, "U37: guard on → Mathallen Oslo not picked");
-    const off = pm.pickRfbPlace(producer, [MATHALLEN_OSLO, BERGEN_MATHALL] as any[], false);
-    assertEq([(off.place as any)?.id, off.index], ["place-mathallen-oslo", 0], "U38: guard off → places[0], the pre-S3 behaviour");
-    assertEq(pm.pickRfbPlace(producer, [], false).place, null, "U39: guard off, no candidates → null");
-    const line = pm.formatPlacesMatchGuardLog("agent-x", pm.pickRfbPlace(producer, [MATHALLEN_OSLO] as any[]), 1, producer);
+    const entity = pm.rfbPlaceMatchEntity({ name: "Bergen Mathall", postalCode: "5013", city: "Bergen" });
+    assertEq(pm.pickRfbPlace(entity, [MATHALLEN_OSLO] as any[]).place, null, "U37: guard on → Mathallen Oslo not picked");
+    const off = pm.pickRfbPlace(entity, [MATHALLEN_OSLO, BERGEN_MATHALL] as any[], false);
+    assertEq([(off.place as any)?.id, off.index, off.reason], ["place-mathallen-oslo", 0, null], "U38: guard off → places[0], the pre-S3 behaviour");
+    const nordre = pm.rfbPlaceMatchEntity({ name: "Nordre Hov Gård", postalCode: "2335", city: "Stange" });
+    assertEq((pm.pickRfbPlace(nordre, [SONDRE_HOV] as any[], false).place as any)?.id, "place-sondre-hov",
+      "U38b: guard off → no qualifier veto either");
+    assertEq(pm.pickRfbPlace(entity, [], false).place, null, "U39: guard off, no candidates → null");
+    const line = pm.formatPlacesMatchGuardLog("agent-x", pm.pickRfbPlace(entity, [MATHALLEN_OSLO] as any[]), 1, entity);
     assertEq(line,
       '[places-match-guard] rejected Places hit for agent agent-x: place_mismatch (place "Mathallen Oslo", nameSim 0.62, 1 candidate(s); producer 5013 Bergen)',
       "U40: log line format (same shape as [brreg-address-guard])");
+    const hov = pm.rfbPlaceMatchEntity({ name: "Hov Gård", postalCode: "2335", city: "Stange" });
+    assertEq(pm.formatPlacesMatchGuardLog("agent-y", pm.pickRfbPlace(hov, [NORDRE_HOV, SONDRE_HOV] as any[]), 2, hov),
+      '[places-match-guard] rejected Places hit for agent agent-y: place_mismatch (place "Nordre Hov Gård", nameSim 0.67, ambiguous with "Søndre Hov Gård", 2 candidate(s); producer 2335 Stange)',
+      "U40b: log line names the ambiguous rival");
+    assertEq(pm.formatPlacesMatchGuardLog("agent-z", pm.pickRfbPlace(nordre, [SONDRE_HOV] as any[]), 1, nordre),
+      '[places-match-guard] rejected Places hit for agent agent-z: place_mismatch (place "Søndre Hov Gård", nameSim 0.79, qualifier_conflict, 1 candidate(s); producer 2335 Stange)',
+      "U40c: log line names the veto");
   }
 
   // ═════════════════════════════════════════════════════════════════════
@@ -435,6 +576,9 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
       });
       return { status: r.status, row: r.body?.data?.results?.[0], body: r.body };
     };
+    // Brreg name lookups are cached per process ("<name>|<postal>"); a test
+    // asserting "no Brreg lookup" clears it first so a cache hit cannot pass it.
+    const { __clearBrregCacheForTesting } = require("../services/brreg-client") as typeof import("../services/brreg-client");
     const runSingle = (id: string) => callRoute(router, { url: `/admin/google-rating/${id}`, headers: adminHeaders, body: {} });
     const lastMask = () => placesCalls[placesCalls.length - 1]?.mask;
 
@@ -460,11 +604,13 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
       insertAgent("pmg-b", "Haugen Gård", "Ski", { postal_code: "1400" });
       placesAnswer = [HAUGEN_OPPDAL];
       const trustBefore = trust("pmg-b");
+      __clearBrregCacheForTesting();
       const brregBefore = brregCalls;
       const warnBefore = warnings.length;
       const r = await runBatch("pmg-b");
-      assertEq([r.status, r.row?.status, r.row?.placeName, r.row?.nameSim], [200, "place_mismatch", "Haugen Gård", 1],
-        "R06 (b): same-named place in Oppdal → place_mismatch, reports the rejected place");
+      assertEq([r.status, r.row?.status, r.row?.mismatchReason, r.row?.placeName, r.row?.nameSim],
+        [200, "place_mismatch", "no_confident_candidate", "Haugen Gård", 1],
+        "R06 (b): same-named place in Oppdal → place_mismatch, reports the rejected place and why");
       const k = row("pmg-b");
       assertEq([k.google_rating, k.google_review_count, k.address, k.phone], [null, null, null, null],
         "R07 (b): no rating, count, address or phone written");
@@ -522,6 +668,46 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         "R21 (f): stored rating neither overwritten nor nulled (no nulling in S3); no address/phone");
     }
 
+    // ── Review round 1, B1: [near-namesake, exact] in one postal code ───
+    {
+      insertAgent("pmg-b1", "Hov Gård", "Stange", { postal_code: "2335" });
+      placesAnswer = [NORDRE_HOV, HOV];
+      const r = await runBatch("pmg-b1");
+      assertEq([r.row?.status, r.row?.googleRating, r.row?.googleReviewCount], ["enriched", 4.3, 14],
+        "R38 (B1): 'Hov Gård' gets Hov Gård's 4.3/14, not Nordre Hov Gård's 4.9/812 at places[0]");
+      const k = row("pmg-b1");
+      assertEq([k.google_rating, k.google_review_count, k.address, k.phone], [4.3, 14, "Hovsvegen 20, 2335 Stange", "+4733333333"],
+        "R39 (B1): address and phone also from Hov Gård");
+      assertTrue(!/Hovsvegen 10|11111111/.test(String(k.field_provenance)), "R40 (B1): nothing of Nordre Hov Gård in provenance");
+    }
+
+    // ── Review round 1: ambiguous answer → nothing written ───────────────
+    {
+      insertAgent("pmg-amb", "Hov Gård", "Stange", { postal_code: "2335" });
+      placesAnswer = [NORDRE_HOV, SONDRE_HOV];
+      __clearBrregCacheForTesting();
+      const brregBefore = brregCalls;
+      const warnBefore = warnings.length;
+      const r = await runBatch("pmg-amb");
+      assertEq([r.row?.status, r.row?.mismatchReason, r.row?.placeName], ["place_mismatch", "ambiguous", "Nordre Hov Gård"],
+        "R41: Nordre and Søndre Hov Gård tie for 'Hov Gård' → place_mismatch, reason ambiguous");
+      const k = row("pmg-amb");
+      assertEq([k.google_rating, k.address, k.phone], [null, null, null], "R42: ambiguous → no rating, address or phone");
+      assertEq(brregCalls, brregBefore, "R43: ambiguous → no Brreg lookup");
+      assertTrue(warnings.slice(warnBefore).some((l) => l.includes('ambiguous with "Søndre Hov Gård"')),
+        "R44: the warn line names the rival");
+    }
+
+    // ── Review round 1, F1: farm-qualifier veto on the route ─────────────
+    {
+      insertAgent("pmg-q", "Nordre Hov Gård — Stange", "Stange", { postal_code: "2335" });
+      placesAnswer = [SONDRE_HOV];
+      const r = await runBatch("pmg-q");
+      assertEq([r.row?.status, r.row?.mismatchReason], ["place_mismatch", "qualifier_conflict"],
+        "R45 (F1): 'Nordre Hov Gård — Stange' vs Søndre Hov Gård in the same postal code → place_mismatch");
+      assertEq([row("pmg-q").google_rating, row("pmg-q").address], [null, null], "R46 (F1): nothing written");
+    }
+
     // ── Repeat-run (Pro mask) path ──────────────────────────────────────
     {
       insertAgent("pmg-pro", "Haugen Gård", "Ski", {
@@ -558,7 +744,8 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
       placesAnswer = [HAUGEN_OPPDAL];
       const warnBefore = warnings.length;
       let r = await runSingle("pmg-g1");
-      assertEq([r.status, r.body?.success, r.body?.found, r.body?.status, r.body?.placeName], [200, true, false, "place_mismatch", "Haugen Gård"],
+      assertEq([r.status, r.body?.success, r.body?.found, r.body?.status, r.body?.mismatchReason, r.body?.placeName],
+        [200, true, false, "place_mismatch", "no_confident_candidate", "Haugen Gård"],
         "R29 (g): single route, same-named place in Oppdal → place_mismatch");
       assertEq(row("pmg-g1").google_rating, null, "R30 (g): single route wrote no rating");
       assertTrue(warnings.slice(warnBefore).some((l) => l.startsWith("[places-match-guard] rejected Places hit for agent pmg-g1:")),
@@ -572,6 +759,18 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
       assertEq([r.body?.hasRating, r.body?.googleRating, r.body?.placeName], [true, 4.2, "Bergen Mathall"],
         "R33 (g): single route takes the confident places[1]");
       assertEq([row("pmg-g2").google_rating, row("pmg-g2").google_review_count], [4.2, 900], "R34 (g): …and stores its rating");
+
+      insertAgent("pmg-g3", "Hov Gård", "Stange", { postal_code: "2335" });
+      placesAnswer = [NORDRE_HOV, HOV];
+      r = await runSingle("pmg-g3");
+      assertEq([r.body?.hasRating, r.body?.googleRating, r.body?.placeName], [true, 4.3, "Hov Gård"],
+        "R47 (g, B1): single route takes the exact match at places[1], not Nordre Hov Gård");
+      assertEq([row("pmg-g3").google_rating, row("pmg-g3").google_review_count], [4.3, 14], "R48 (g, B1): …and stores its rating");
+      placesAnswer = [NORDRE_HOV, SONDRE_HOV];
+      insertAgent("pmg-g4", "Hov Gård", "Stange", { postal_code: "2335" });
+      r = await runSingle("pmg-g4");
+      assertEq([r.body?.status, r.body?.mismatchReason, row("pmg-g4").google_rating], ["place_mismatch", "ambiguous", null],
+        "R49 (g): single route, ambiguous answer → place_mismatch, nothing stored");
     }
 
     // ── (h) write pause still answers 423 before any Places call ───────
@@ -605,10 +804,11 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
     if (prevPlacesKey === undefined) delete process.env.GOOGLE_PLACES_API_KEY;
     else process.env.GOOGLE_PLACES_API_KEY = prevPlacesKey;
+    initMod.__setDbForTesting(prevDb as any);
     try {
-      if (prevDb) initMod.__setDbForTesting(prevDb);
+      db.close();
     } catch {
-      /* best-effort restore */
+      /* ignore */
     }
   }
 

@@ -13,12 +13,17 @@
 //   isConfidentPlaceMatch(entity, place) — the PR-128 rule, moved unchanged
 //                                          (dental-places.ts maps its clinic
 //                                          fields onto it)
-//   pickConfidentPlace(entity, places)   — the first confident candidate in
-//                                          one Text Search answer (the other
-//                                          candidates cost nothing extra)
+//   pickConfidentPlace(entity, places)   — the BEST-named confident candidate
+//                                          in one Text Search answer (the
+//                                          other candidates cost nothing
+//                                          extra); none when two differently
+//                                          named ones nearly tie
 //   rfbPlaceMatchEntity(producer)        — RFB name + location → entity
-//   pickRfbPlace(producer, places)       — the RFB routes' entry point, behind
-//                                          PLACES_MATCH_GUARD_ENABLED
+//   pickRfbPlace(entity, places)         — the RFB routes' entry point, behind
+//                                          PLACES_MATCH_GUARD_ENABLED; adds
+//                                          the RFB-only farm-qualifier veto
+//   rfbPlacesTextQuery(name, city)       — the Text Search query both RFB
+//                                          routes send
 //   formatPlacesMatchGuardLog(...)       — the "[places-match-guard]" line,
 //                                          same shape as the Brreg guard's
 //
@@ -31,6 +36,16 @@ export const NAME_SIM_THRESHOLD = 0.55;
 // When the entity has no postal code we can only cross-check on town name,
 // which is weaker — require a higher name similarity on that path.
 export const NAME_SIM_THRESHOLD_POSTSTED_ONLY = 0.65;
+
+// ─── Pick thresholds (S3) ──────────────────────────────────────────────
+// Several candidates in one answer can pass the guard: "Nordre Hov Gård"
+// clears the 0.55 bar for a producer "Hov Gård" in the same postal code
+// (0.67). The best-named one wins. Below PICK_CLEAR_NAME_SIM, a differently
+// named passing candidate within PICK_TIE_MARGIN of it means the answer cannot
+// tell them apart (for "Hov Gård": Nordre and Søndre Hov Gård, 0.67 each), so
+// none is picked.
+export const PICK_CLEAR_NAME_SIM = 0.9;
+export const PICK_TIE_MARGIN = 0.05;
 
 // Kill switch for the RFB call sites ONLY (pickRfbPlace). Dental always
 // guards. Rollback without a revert: a one-line PR setting this to false,
@@ -118,31 +133,79 @@ export function isConfidentPlaceMatch(
 
 // ─── pickConfidentPlace ────────────────────────────────────────────────
 export interface PlacePick<P> {
-  /** First candidate, in Google's order, that passes the guard; null when none does. */
+  /** The picked candidate; null when none passed or the best ones nearly tie. */
   place: P | null;
-  /** Index of `place` in the candidate list; -1 when none passed. */
+  /** Index of `place` in the candidate list; -1 when none was picked. */
   index: number;
-  /** Name similarity of `place` — or, when none passed, of the best-named candidate. */
+  /**
+   * Name similarity of `place` — or, when none was picked, of the best
+   * passing candidate (ambiguous) or else the best-named candidate.
+   */
   nameSim: number;
   /** Display name of that same candidate ("" when there were no candidates). */
   placeName: string;
+  /**
+   * Why `place` is null: "no_candidates", "no_confident_candidate",
+   * "ambiguous", or the label a veto returned for the reported candidate.
+   * null when a place was picked.
+   */
+  reason: string | null;
+  /** "ambiguous" only: the display name of the near-tying rival. */
+  rival?: string;
 }
 
+/**
+ * Pick from one Text Search answer. Among the candidates that pass
+ * isConfidentPlaceMatch (and the optional caller veto), the highest name
+ * similarity wins; on equal similarity Google's order decides. When that best
+ * candidate scores below PICK_CLEAR_NAME_SIM and a passing candidate with a
+ * different (normalised) name scores within PICK_TIE_MARGIN of it, nothing is
+ * picked (reason "ambiguous").
+ *
+ * `veto(placeName)` lets a caller reject a candidate the shared rule would
+ * accept; it returns a reason label, or null to let it through.
+ */
 export function pickConfidentPlace<P extends MatchablePlace>(
   entity: PlaceMatchEntity,
-  places: readonly (P | null | undefined)[] | null | undefined
+  places: readonly (P | null | undefined)[] | null | undefined,
+  veto?: (placeName: string) => string | null
 ): PlacePick<P> {
   const list = Array.isArray(places) ? places : [];
-  let best: { nameSim: number; placeName: string } | null = null;
+  const passing: { place: P; index: number; nameSim: number; placeName: string }[] = [];
+  let bestNamed: { nameSim: number; placeName: string; reason: string } | null = null;
   for (let i = 0; i < list.length; i++) {
     const place = list[i];
     if (!place) continue;
     const placeName = place.displayName?.text ?? "";
     const nameSim = placeNameSimilarity(entity, placeName);
-    if (corroborates(entity, place, nameSim)) return { place, index: i, nameSim, placeName };
-    if (!best || nameSim > best.nameSim) best = { nameSim, placeName };
+    let rejected: string | null = corroborates(entity, place, nameSim) ? null : "no_confident_candidate";
+    if (!rejected && veto) rejected = veto(placeName);
+    if (!rejected) passing.push({ place, index: i, nameSim, placeName });
+    else if (!bestNamed || nameSim > bestNamed.nameSim) bestNamed = { nameSim, placeName, reason: rejected };
   }
-  return { place: null, index: -1, nameSim: best?.nameSim ?? 0, placeName: best?.placeName ?? "" };
+
+  if (passing.length === 0) {
+    return {
+      place: null,
+      index: -1,
+      nameSim: bestNamed?.nameSim ?? 0,
+      placeName: bestNamed?.placeName ?? "",
+      reason: bestNamed?.reason ?? "no_candidates",
+    };
+  }
+
+  let top = passing[0]!;
+  for (const c of passing) if (c.nameSim > top.nameSim) top = c; // strict: ties keep Google's order
+  if (top.nameSim < PICK_CLEAR_NAME_SIM) {
+    const topKey = normaliseForMatch(top.placeName);
+    const rival = passing.find(
+      (c) => c !== top && top.nameSim - c.nameSim < PICK_TIE_MARGIN && normaliseForMatch(c.placeName) !== topKey
+    );
+    if (rival) {
+      return { place: null, index: -1, nameSim: top.nameSim, placeName: top.placeName, reason: "ambiguous", rival: rival.placeName };
+    }
+  }
+  return { place: top.place, index: top.index, nameSim: top.nameSim, placeName: top.placeName, reason: null };
 }
 
 // ─── RFB adapter ────────────────────────────────────────────────────────
@@ -160,9 +223,35 @@ export interface RfbPlaceMatchInput {
  * en dash with or without spaces, or a hyphen WITH spaces on both sides (the
  * same split as contact-normalizer's own-name rule). An in-word hyphen
  * ("Midt-Telemark", "Øvre-Ål") is part of the name and never splits.
+ *
+ * Same result as split(/\s*[—–]\s*|\s+-\s+/)[0].trim(), but that pattern
+ * backtracks quadratically on a long run of spaces; these fixed-width
+ * alternatives scan once, and trim() drops the spaces next to the dash.
  */
 export function stripPlatformPlaceSuffix(name: string): string {
-  return (name || "").split(/\s*[—–]\s*|\s+-\s+/)[0]!.trim();
+  const s = name || "";
+  const m = /[—–]|\s-\s/.exec(s);
+  return (m ? s.slice(0, m.index) : s).trim();
+}
+
+/**
+ * The Text Search query both RFB rating routes send: «<name> <city> Norway»
+ * with every dash (em, en, hyphen) and the spaces around it turned into one
+ * space. Same output as the routes' pre-S3 regex replace (optional spaces, a
+ * dash, optional spaces → " ", then trim), without its quadratic backtracking
+ * on long runs of spaces: split on the dash alone, trim the pieces' inner ends.
+ */
+export function rfbPlacesTextQuery(name: string, city: string): string {
+  const parts = `${name} ${city} Norway`.split(/[—–-]/);
+  return parts
+    .map((p, i) => {
+      let t = p;
+      if (i > 0) t = t.trimStart();
+      if (i < parts.length - 1) t = t.trimEnd();
+      return t;
+    })
+    .join(" ")
+    .trim();
 }
 
 /**
@@ -198,38 +287,78 @@ export function rfbPlaceMatchEntity(input: RfbPlaceMatchInput): PlaceMatchEntity
   };
 }
 
+// Farm-name qualifiers. «Nordre Hov» and «Søndre Hov» are different farms,
+// yet their names score 0.79 against each other — enough for the shared rule
+// in a shared postal code. Bokmål forms plus the nynorsk austre/søre/vesle.
+const FARM_QUALIFIERS = new Set(
+  ["nordre", "søndre", "søre", "øvre", "nedre", "vestre", "østre", "austre", "indre", "ytre", "midtre", "store", "lille", "vesle"]
+    .map(normaliseForMatch)
+);
+
+function farmQualifiers(name: string): Set<string> {
+  return new Set(normaliseForMatch(stripPlatformPlaceSuffix(name)).split(" ").filter((w) => FARM_QUALIFIERS.has(w)));
+}
+
 /**
- * The RFB routes' entry point. Guard on (default): the first confident
- * candidate, or place:null. Guard off (PLACES_MATCH_GUARD_ENABLED = false):
- * Google's first candidate, exactly the pre-guard behaviour. `guardEnabled`
- * is a parameter only so the switch itself can be tested.
+ * True when each name carries a qualifier word the other lacks: «Nordre Hov
+ * Gård» vs «Søndre Hov Gård», «Store Ree» vs «Lille Ree». One name without
+ * any qualifier («Hov Gård» vs «Nordre Hov Gård») is not a conflict — name
+ * similarity decides that, as before. RFB only (pickRfbPlace).
+ */
+export function farmQualifiersConflict(a: string, b: string): boolean {
+  const qa = farmQualifiers(a);
+  const qb = farmQualifiers(b);
+  return [...qa].some((w) => !qb.has(w)) && [...qb].some((w) => !qa.has(w));
+}
+
+/**
+ * The RFB routes' entry point, given rfbPlaceMatchEntity(producer). Guard on
+ * (default): pickConfidentPlace plus the farm-qualifier veto, so dental's
+ * rule is untouched. Guard off (PLACES_MATCH_GUARD_ENABLED = false): Google's
+ * first candidate, exactly the pre-guard behaviour. `guardEnabled` is a
+ * parameter only so the switch itself can be tested.
  */
 export function pickRfbPlace<P extends MatchablePlace>(
-  producer: RfbPlaceMatchInput,
+  entity: PlaceMatchEntity,
   places: readonly (P | null | undefined)[] | null | undefined,
   guardEnabled: boolean = PLACES_MATCH_GUARD_ENABLED
 ): PlacePick<P> {
-  const entity = rfbPlaceMatchEntity(producer);
-  if (guardEnabled) return pickConfidentPlace(entity, places);
+  if (guardEnabled) {
+    return pickConfidentPlace(entity, places, (placeName) =>
+      farmQualifiersConflict(entity.name, placeName) ? "qualifier_conflict" : null
+    );
+  }
   const first = (Array.isArray(places) ? places[0] : null) ?? null;
   const placeName = first?.displayName?.text ?? "";
-  return { place: first, index: first ? 0 : -1, nameSim: placeNameSimilarity(entity, placeName), placeName };
+  return {
+    place: first,
+    index: first ? 0 : -1,
+    nameSim: placeNameSimilarity(entity, placeName),
+    placeName,
+    reason: first ? null : "no_candidates",
+  };
 }
 
 /**
  * The guard's warn line — same shape as the Brreg guard's
  * ("[brreg-address-guard] rejected name hit for agent …: <reason> (…)").
+ * An "ambiguous" or vetoed pick names that reason after nameSim.
  */
 export function formatPlacesMatchGuardLog(
   agentId: string,
   pick: PlacePick<unknown>,
   candidates: number,
-  producer: RfbPlaceMatchInput
+  entity: PlaceMatchEntity
 ): string {
-  const entity = rfbPlaceMatchEntity(producer);
+  const why =
+    pick.reason === "ambiguous"
+      ? `, ambiguous with "${pick.rival ?? ""}"`
+      : pick.reason && pick.reason !== "no_confident_candidate" && pick.reason !== "no_candidates"
+        ? `, ${pick.reason}`
+        : "";
   return (
     `[places-match-guard] rejected Places hit for agent ${agentId}: place_mismatch ` +
-    `(place "${pick.placeName}", nameSim ${pick.nameSim.toFixed(2)}, ${candidates} candidate(s); ` +
+    `(place "${pick.placeName}", nameSim ${pick.nameSim.toFixed(2)}${why}, ${candidates} candidate(s); ` +
     `producer ${entity.postalCode ?? "-"} ${entity.postalTown ?? "-"})`
   );
 }
