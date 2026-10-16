@@ -156,7 +156,8 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
         const adult = await callHtmlRoute(seoRouter, "/opplevelse/vm-exp-0");
         assertTrue(adult.status === 200 && adult.body.includes("990 kr per voksen"), "adult-seo: detail shows adult basis");
         assertTrue(!adult.body.includes("fra 990 kr"), "adult-seo: adult price is not claimed as cheapest age price");
-        assertTrue(ldBlocks(adult.body).some((b) => b.offers?.price === 990 && b.offers?.name === "Adult price"), "adult-seo: structured offer labels adult basis");
+        // Offer.name in the page language (lokal#1097 review S4, landed with E2-S3).
+        assertTrue(ldBlocks(adult.body).some((b) => b.offers?.price === 990 && b.offers?.name === "Voksenpris"), "adult-seo: structured offer labels adult basis");
         const listing = await callHtmlRoute(seoRouter, "/kategori/mat_drikke");
         assertTrue(listing.status === 200 && listing.body.includes("Voksenpris 990 kr"), "adult-seo: list card labels adult price");
         db.prepare("UPDATE experiences SET price_unit = 'unknown' WHERE id = ?").run(expIds[0]);

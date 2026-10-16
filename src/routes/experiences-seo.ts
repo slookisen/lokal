@@ -218,7 +218,7 @@ import {
   parentOrganizationJsonLd,
   toSiteLang,
 } from "../services/company-legal";
-import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
+import { renderExperienceOgImageSvg, resolveOgAccentColor, DEFAULT_OG_ACCENT } from "../services/experience-og-image";
 import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-palette";
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
 // (gårdssalg-kort-konsistens): the SAME "Navn — Sted" display-suffix parser
@@ -390,6 +390,9 @@ function oaProfileLabels(lang: Lang) {
     // «Kort fortalt» box + the facts it adds (services/experience-page-facts.ts).
     kfHeading: "Kort fortalt", kfUpdated: "Sist oppdatert",
     fPlace: "Sted", fAge: "Alder", fBooking: "Bestilling", fProvider: "Tilbyder", perAdult: " per voksen", inPlace: "i",
+    // E2-S3 (lokal#1097 review S4): the JSON-LD Offer.name for a per_adult
+    // price, in the page's language (it was English on every page).
+    adultPrice: "Voksenpris",
     ageFrom: (n: number) => `fra ${n} år`,
     ageSuitability: { all: "Alle aldre", family: "Familievennlig", adults: "Voksne", kids: "Barn" },
     bookingType: { instant: "Direkte hos tilbyderen", request: "På forespørsel hos tilbyderen", external: "Via tilbyderens bestillingsside", none: "Ingen forhåndsbestilling" },
@@ -410,6 +413,7 @@ function oaProfileLabels(lang: Lang) {
     booking: "Booking", provider: "Provider", place: "Location",
     kfHeading: "At a glance", kfUpdated: "Last updated",
     fPlace: "Location", fAge: "Age", fBooking: "Booking", fProvider: "Provider", perAdult: " per adult", inPlace: "in",
+    adultPrice: "Adult price",
     ageFrom: (n: number) => `from age ${n}`,
     ageSuitability: { all: "All ages", family: "Family-friendly", adults: "Adults", kids: "Children" },
     bookingType: { instant: "Directly with the provider", request: "On request with the provider", external: "Via the provider's booking page", none: "No advance booking" },
@@ -430,6 +434,7 @@ function oaProfileLabels(lang: Lang) {
     booking: "Bokning", provider: "Arrangör", place: "Plats",
     kfHeading: "I korthet", kfUpdated: "Senast uppdaterad",
     fPlace: "Plats", fAge: "Ålder", fBooking: "Bokning", fProvider: "Arrangör", perAdult: " per vuxen", inPlace: "i",
+    adultPrice: "Vuxenpris",
     ageFrom: (n: number) => `från ${n} år`,
     ageSuitability: { all: "Alla åldrar", family: "Familjevänlig", adults: "Vuxna", kids: "Barn" },
     bookingType: { instant: "Direkt hos arrangören", request: "På förfrågan hos arrangören", external: "Via arrangörens bokningssida", none: "Ingen förhandsbokning" },
@@ -1170,7 +1175,10 @@ export function stillSketchCss(motif: StillSketchMotif): string {
   }
 }
 
-const CATEGORY_LABELS: Record<string, string> = {
+// Exported for the share-card PNG set (opplevagentOgPngCards() below), which
+// is derived from these keys and locked against them by
+// experiences-seo-og-png.test.ts.
+export const CATEGORY_LABELS: Record<string, string> = {
   vinter_sno: "Vinter & snø",
   sightseeing_transport: "Sightseeing & transport",
   dyreliv_safari: "Dyreliv & safari",
@@ -1330,18 +1338,46 @@ ${paths}
 </svg>`;
 }
 
-// Build the URL for a page's per-page branded og:image (dev-request
-// 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — served by the
-// GET /og-image.svg route below. Query-param based (not a new path segment)
-// so it can't collide with existing /kategori/:category-style routes and
-// needs no DB round-trip (callers already have label/sublabel/category in
-// hand while building the page).
-function ogImageUrl(url: string, label: string, opts?: { sublabel?: string | null; cat?: string | null }): string {
-  const params = new URLSearchParams();
-  params.set("label", label);
-  if (opts?.sublabel) params.set("sublabel", opts.sublabel);
-  if (opts?.cat) params.set("cat", opts.cat);
-  return `${url}/og-image.svg?${params.toString()}`;
+// Share images (og:image / twitter:image) — dev-request 2026-10-16-
+// opplevagent-indekserbarhet-og-strukturdata, E2-S3. Many link previews
+// (Facebook, LinkedIn, X, Slack) do not render SVG, so pages point at a PNG
+// card instead of the per-page /og-image.svg (dev-request 2026-07-12-
+// opplevagent-serp-innholdsberikelse, item 3; that route stays for links
+// already shared). One 1200×630 card per CATEGORY_LABELS key plus a default,
+// drawn by the same renderExperienceOgImageSvg() and pre-rendered to
+// src/public/og/opplevagent/<key>.png by scripts/render-oa-og-png.mjs — no
+// rasterizer at runtime. The card carries no page title (og:title does), so
+// the set stays small and static.
+export const OG_PNG_DEFAULT_KEY = "default";
+const OG_PNG_PUBLIC_DIR = "og/opplevagent"; // under src/public
+// tEXt keyword under which each PNG records the SHA-256 of the SVG it was
+// rendered from, so a test can tell a stale PNG from a current one.
+export const OG_PNG_SOURCE_KEYWORD = "oa-og-svg-sha256";
+const OG_PNG_CATEGORY_SUBLABEL = "Håndplukkede norske opplevelser";
+const OG_PNG_DEFAULT_LABEL = "Norske opplevelser";
+const OG_PNG_DEFAULT_SUBLABEL = "Søkbart for folk og AI-agenter";
+
+/** The share-card set the PNGs are rendered from: every CATEGORY_LABELS key,
+ *  then the default card. Read by scripts/render-oa-og-png.mjs and by the
+ *  tests that lock the committed PNGs to it. */
+export function opplevagentOgPngCards(): Array<{ key: string; svg: string }> {
+  return [
+    ...Object.entries(CATEGORY_LABELS).map(([key, label]) => ({
+      key,
+      svg: renderExperienceOgImageSvg({ label, sublabel: OG_PNG_CATEGORY_SUBLABEL, accent: resolveOgAccentColor(key) }),
+    })),
+    {
+      key: OG_PNG_DEFAULT_KEY,
+      svg: renderExperienceOgImageSvg({ label: OG_PNG_DEFAULT_LABEL, sublabel: OG_PNG_DEFAULT_SUBLABEL, accent: DEFAULT_OG_ACCENT }),
+    },
+  ];
+}
+
+/** og:image URL for a page: its category's card, or the default card for no,
+ *  an unknown or a legacy category. Served by GET /og/:cat.png below. */
+export function ogImageUrl(url: string, cat?: string | null): string {
+  const key = cat && Object.prototype.hasOwnProperty.call(CATEGORY_LABELS, cat) ? cat : OG_PNG_DEFAULT_KEY;
+  return `${url}/og/${key}.png`;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2079,6 +2115,8 @@ router.get("/", (req: Request, res: Response) => {
     .join("\n");
 
   const desc = S.metaDesc;
+  // E2-S3: the default PNG card (it was the square app icon, favicon.svg).
+  const ogImage = ogImageUrl(url);
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -2102,12 +2140,14 @@ ${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:url" content="${canonical}">
 <meta property="og:locale" content="${ogLocale(lang)}">
 <meta property="og:site_name" content="Opplevagent">
-<meta property="og:image" content="${url}/favicon.svg">
+<meta property="og:image" content="${ogImage}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="${escapeHtml(S.ogImageAlt)}">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Opplevagent">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
-<meta name="twitter:image" content="${url}/favicon.svg">
+<meta name="twitter:image" content="${ogImage}">
 ${ldScripts}
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
@@ -3478,7 +3518,7 @@ function renderOpplevelseDetail(
     : "";
   const descBlock = safeExpDescription
     ? `<p class="lede">${escapeHtml(safeExpDescription)}</p>${descAutoBadge}`
-    : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(exp.title)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
+    : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(displayTitle)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
 
   // Booking CTA.
   const bookingUrl = safeHttpUrl(exp.booking_url);
@@ -3604,7 +3644,7 @@ function renderOpplevelseDetail(
   let offer: Record<string, unknown> | null = null;
   if (exp.price_from) {
     offer = { "@type": "Offer", price: exp.price_from, priceCurrency: "NOK" };
-    if (exp.price_unit === "per_adult") offer.name = "Adult price";
+    if (exp.price_unit === "per_adult") offer.name = L.adultPrice;
     if (bookingUrl || provSite) offer.url = bookingUrl || provSite;
   }
   // The Service node is rendered only when it says something the place does
@@ -3642,12 +3682,10 @@ function renderOpplevelseDetail(
     titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : displayTitle
   );
 
-  // Per-page branded og:image (dev-request
-  // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — experience
-  // title as the main label, category as sublabel/accent, replacing the
-  // domain-wide favicon.svg fallback. No extra DB query: cat/displayTitle are
-  // already in scope. displayTitle, like og:title (E2-S2).
-  const ogImage = ogImageUrl(url, displayTitle, { sublabel: cat ? catLabel(cat) : null, cat });
+  // Share image: the category's PNG card (E2-S3; default card for no or an
+  // unknown category). The title is in og:title and the alt text, which use
+  // displayTitle like the <h1> (E2-S2).
+  const ogImage = ogImageUrl(url, cat);
   const ogImageAlt = `${displayTitle}${cat ? " — " + catLabel(cat) : ""} | Opplevagent`;
 
   return `<!doctype html>
@@ -3672,7 +3710,7 @@ ${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 ${ldScripts}
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
@@ -4493,6 +4531,10 @@ function renderBrowsePage(opts: {
   // announces which category it is before a single card is read.
   accentColor?: string;
   accentLabel?: string;
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S3:
+  // the category whose PNG share card this page uses. Passed ONLY by
+  // /kategori/:category; every other caller gets the default card.
+  ogCategory?: string;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -4565,15 +4607,11 @@ function renderBrowsePage(opts: {
     (page > 1 ? `<link rel="prev" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page - 1}`)}">\n` : "") +
     (page < totalPages ? `<link rel="next" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page + 1}`)}">\n` : "");
 
-  // Per-page branded og:image (dev-request
-  // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — replaces the
-  // domain-wide favicon.svg fallback. renderBrowsePage() is shared by
-  // /tilbyder/:id, /kategori/:category, /fylke/:fylke, /kommune/:kommune,
-  // /opplevelser, and /sok; opts carries no category-ish field common to all
-  // of them, so this shared page type gets the neutral brand-default accent
-  // (see resolveOgAccentColor()'s fallback) rather than inventing a new opts
-  // field just for this.
-  const ogImage = ogImageUrl(url, opts.h1);
+  // Share image (E2-S3): renderBrowsePage() is shared by /tilbyder/:id,
+  // /kategori/:category, /fylke/:fylke, /kommune/:kommune, /opplevelser and
+  // /sok. A category page shows its category's PNG card; the others show the
+  // default card. The page's own name is in og:title and the alt text.
+  const ogImage = ogImageUrl(url, opts.ogCategory);
   const ogImageAlt = `${opts.h1} | Opplevagent`;
 
   // See the useSharedChrome/sketchMotif doc comments above — every value
@@ -4610,7 +4648,7 @@ ${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 ${ldScripts}
 <style>${BROWSE_CSS}${sketchCss}${chromeCss}</style>
 ${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
@@ -6060,11 +6098,9 @@ router.get(
       .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
       .join("\n");
 
-    // Per-page branded og:image (dev-request
-    // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — provider name
-    // as label, "Gårdssalg og smaking" as sublabel, keyed to the gardssalg
-    // accent color. Replaces the domain-wide favicon.svg fallback.
-    const ogImage = ogImageUrl(url, provider.navn, { sublabel: "Gårdssalg og smaking", cat: "gardssalg" });
+    // Share image: the gårdssalg PNG card (E2-S3). The producer's name is in
+    // og:title and the alt text.
+    const ogImage = ogImageUrl(url, "gardssalg");
     const ogImageAlt = `${provider.navn} — Gårdssalg og smaking | Opplevagent`;
 
     const html = `<!doctype html>
@@ -6087,7 +6123,7 @@ ${pwaHeadTags()}
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 ${ldScripts}
 <style>
 ${BROWSE_CSS}
@@ -7688,6 +7724,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     // categoryColor() the cards in the grid below it are painted with.
     accentColor: categoryColor(category),
     accentLabel: "Kategori",
+    ogCategory: category,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -8949,6 +8986,11 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 // caches (Slack/X/etc.) already do their own long-lived caching regardless.
 // renderExperienceOgImageSvg() itself bounds/truncates label/sublabel, so an
 // absurdly long query string degrades gracefully rather than erroring.
+//
+// Since E2-S3 (dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+// strukturdata) no page links here: og:image is a PNG card (GET
+// /og/:cat.png below). The route stays so links already shared keep their
+// preview.
 // ═══════════════════════════════════════════════════════════
 router.get("/og-image.svg", (req: Request, res: Response) => {
   const label = String(req.query.label ?? "").trim() || "Opplevagent";
@@ -9025,6 +9067,23 @@ router.get("/favicon-512.png", serveOpplevagentPublicFile("opplevagent-favicon-5
 router.get("/sw.js", serveOpplevagentPublicFile("opplevagent-sw.js", "text/javascript; charset=utf-8"));
 router.get("/offline.html", serveOpplevagentPublicFile("opplevagent-offline.html", "text/html; charset=utf-8"));
 router.get("/install-prompt.js", serveOpplevagentPublicFile("opplevagent-install-prompt.js", "text/javascript; charset=utf-8"));
+
+// GET /og/:cat.png — the pre-rendered PNG share cards (dev-request
+// 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S3; see
+// ogImageUrl()). Only the card set's own keys are served: the param is a
+// lookup key, never part of a file path, so `/og/..%2Fx.png` and unknown
+// categories fall through to the 404 page.
+const OG_PNG_HANDLERS = new Map(
+  [...Object.keys(CATEGORY_LABELS), OG_PNG_DEFAULT_KEY].map((key) => [
+    key,
+    serveOpplevagentPublicFile(`${OG_PNG_PUBLIC_DIR}/${key}.png`, "image/png"),
+  ]),
+);
+router.get("/og/:cat.png", (req: Request, res: Response, next: NextFunction) => {
+  const serve = OG_PNG_HANDLERS.get(String(req.params.cat));
+  if (!serve) return next();
+  return serve(req, res, next);
+});
 
 router.get("/manifest.json", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/json");

@@ -45,10 +45,12 @@
  *       (still 200, still valid-looking SVG, body bounded).
  *   (h) GET /og-image.svg: no query params at all still serves a fallback
  *       "Opplevagent"-labeled image (never errors on missing input).
- *   (i) Wiring regression: `${url}/favicon.svg` as og:image now appears
- *       exactly once in experiences-seo.ts (the homepage's, explicitly out
- *       of scope for this item) — the opplevelse-detail, browse, and
- *       gardssalg-produsent sites were all migrated off it.
+ *   (i) Wiring regression: `${url}/favicon.svg` as og:image no longer
+ *       appears in experiences-seo.ts — the opplevelse-detail, browse, and
+ *       gardssalg-produsent sites were migrated off it here, and the
+ *       homepage (out of scope for this item) followed in dev-request
+ *       2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S3, which
+ *       also moved all four to PNG share cards (experiences-seo-og-png.test.ts).
  */
 
 import Database from "better-sqlite3";
@@ -250,8 +252,8 @@ export function runExperienceOgImageTests(opts: { log?: boolean } = {}): Promise
       const fs = require("fs");
       const expSeoSrc = fs.readFileSync(require.resolve("../routes/experiences-seo"), "utf8");
       const faviconOgImageCount = (expSeoSrc.match(/og:image" content="\$\{url\}\/favicon\.svg"/g) || []).length;
-      assertEq(faviconOgImageCount, 1,
-        "i1: exactly one remaining favicon.svg og:image fallback (the homepage's, explicitly out of scope) — opplevelse-detail/browse/gardssalg-produsent were migrated to /og-image.svg");
+      assertEq(faviconOgImageCount, 0,
+        "i1: no favicon.svg og:image fallback remains — opplevelse-detail/browse/gardssalg-produsent were migrated here, the homepage in E2-S3 (2026-10-16)");
       const newRouteOgImageUsages = (expSeoSrc.match(/ogImageUrl\(url,/g) || []).length;
       assertEq(newRouteOgImageUsages, 3,
         "i2: ogImageUrl() is wired into exactly the three in-scope templates (opplevelse-detail, browse, gardssalg-produsent)");
