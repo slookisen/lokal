@@ -36367,8 +36367,32 @@ import {
   GARDSSALG_VISIT_PROPOSALS_SCHEMA,
 } from "../services/gardssalg-visit-proposals-job";
 
-export const GARDSSALG_VISIT_CANDIDATES_DEFAULT_LIMIT = 10;
+export const GARDSSALG_VISIT_CANDIDATES_DEFAULT_LIMIT = 6;
 export const GARDSSALG_VISIT_CANDIDATES_MAX_LIMIT = 25;
+// The candidates GET crawls synchronously inside one HTTP request, and the
+// edge proxy in front of the app answers 502 «upstream request failed» when
+// the app has not replied within about a minute (measured 2026-10-16 08:40Z:
+// the routine's first `limit=10` call — up to 10 rows × 5 pages × 10 s each
+// — never came back). So the request carries a hard time budget: no new
+// batch starts after TIME_BUDGET_MS, and a single row is abandoned after
+// PER_ROW_TIMEOUT_MS (reported as fetch_ok:false / time_budget, which the
+// routine turns into a `fetch_failed` skip item, which stamps the row to the
+// back of the queue — a chronically slow site cannot block the head of the
+// queue forever). The response says when it stopped early (`truncated`).
+export const GARDSSALG_VISIT_CANDIDATES_TIME_BUDGET_MS = 35_000;
+export const GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS = 20_000;
+/** Env overrides (operational knobs; tests shorten them): positive integers
+ *  in ms, anything else falls back to the constants above. */
+function resolveGardssalgVisitCandidatesBudgets(env: Record<string, string | undefined> = process.env): { budgetMs: number; perRowMs: number } {
+  const pos = (raw: string | undefined, fallback: number): number => {
+    const n = parseInt(String(raw ?? ""), 10);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+  };
+  return {
+    budgetMs: pos(env.GARDSSALG_VISIT_CANDIDATES_TIME_BUDGET_MS, GARDSSALG_VISIT_CANDIDATES_TIME_BUDGET_MS),
+    perRowMs: pos(env.GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS, GARDSSALG_VISIT_CANDIDATES_PER_ROW_TIMEOUT_MS),
+  };
+}
 export const GARDSSALG_VISIT_WRITE_MAX_ITEMS = 25;
 export const GARDSSALG_VISIT_WRITE_MAX_WRITE_ITEMS = 10;
 export const GARDSSALG_VISIT_MIN_CHARS = 40;
@@ -36644,11 +36668,28 @@ router.get("/admin/gardssalg-visit-candidates", requireAdmin, async (req: Reques
     current: { about_text: string | null; opening_hours_text: string | null };
   };
   const items: Item[] = [];
+  const startedAt = Date.now();
+  const { budgetMs, perRowMs } = resolveGardssalgVisitCandidatesBudgets();
+  let truncated = false;
+  const ROW_TIMEOUT = Symbol("row_timeout");
   const one = async (t: GardssalgContentRefreshTarget): Promise<void> => {
     const base = { provider_id: t.id, navn: t.navn, hjemmeside: t.hjemmeside, current: { about_text: t.about_text, opening_hours_text: t.opening_hours_text } };
     let fetched: CrFetchOutcome;
     try {
-      fetched = await crFetchGardssalgContent(t.hjemmeside, true);
+      // Per-row cap: the crawl itself keeps running to its own timeouts in
+      // the background (it cannot be cancelled), but this request stops
+      // waiting for it.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const raced = await Promise.race([
+        crFetchGardssalgContent(t.hjemmeside, true),
+        new Promise<typeof ROW_TIMEOUT>((resolve) => { timer = setTimeout(() => resolve(ROW_TIMEOUT), perRowMs); }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (raced === ROW_TIMEOUT) {
+        items.push({ ...base, fetch_ok: false, fetch_reason: `time_budget:row>${perRowMs}ms` });
+        return;
+      }
+      fetched = raced;
     } catch (e: any) {
       items.push({ ...base, fetch_ok: false, fetch_reason: `fetch_error:${String(e?.message ?? e).slice(0, 80)}` });
       return;
@@ -36666,6 +36707,12 @@ router.get("/admin/gardssalg-visit-candidates", requireAdmin, async (req: Reques
     });
   };
   for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    if (Date.now() - startedAt > budgetMs) {
+      // Rows not started are simply not returned (they stay at the head of
+      // the queue for the next call); the response says so.
+      truncated = true;
+      break;
+    }
     await Promise.all(targets.slice(i, i + CR_CONCURRENCY).map(one));
   }
   // Keep the queue order (oldest-attempted first) in the response.
@@ -36675,6 +36722,11 @@ router.get("/admin/gardssalg-visit-candidates", requireAdmin, async (req: Reques
     success: true,
     eligible_total,
     returned: items.length,
+    requested: targets.length,
+    truncated,
+    elapsed_ms: Date.now() - startedAt,
+    time_budget_ms: budgetMs,
+    per_row_timeout_ms: perRowMs,
     rules: {
       schema: GARDSSALG_VISIT_PROPOSALS_SCHEMA,
       max_items_per_file: GARDSSALG_VISIT_WRITE_MAX_ITEMS,
