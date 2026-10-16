@@ -54,7 +54,7 @@ const CHANNELS: Record<DistributionVertical, Entry[]> = {
     },
     {
       channel: "a2a-registry",
-      url: "https://a2aregistry.org/agents/00157ca1-450f-4341-91a5-dbcab7a667ef",
+      url: "https://a2aregistry.org/agents/00157ca1-450f-4341-91a5-dbcab7a667ef/",
       install: AGENT_CARD,
       description: A2A_DESC,
     },
@@ -122,7 +122,7 @@ const CHANNELS: Record<DistributionVertical, Entry[]> = {
     },
     {
       channel: "a2a-registry",
-      url: "https://a2aregistry.org/agents/cd035cbe-46f9-4591-889e-e4fa20663113",
+      url: "https://a2aregistry.org/agents/cd035cbe-46f9-4591-889e-e4fa20663113/",
       install: AGENT_CARD,
       description: A2A_DESC,
     },
@@ -160,7 +160,7 @@ const CHANNELS: Record<DistributionVertical, Entry[]> = {
     },
     {
       channel: "a2a-registry",
-      url: "https://a2aregistry.org/agents/38eee4e2-cb59-4562-90d1-416ce91ca2bd",
+      url: "https://a2aregistry.org/agents/38eee4e2-cb59-4562-90d1-416ce91ca2bd/",
       install: AGENT_CARD,
       description: A2A_DESC,
     },
