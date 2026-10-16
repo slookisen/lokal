@@ -38,6 +38,7 @@ import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
 import { mcpIpEmergencyBrakeLimiter, mcpPrimaryLimiter, mcpCartToolLimiter } from "./middleware/mcp-rate-limit";
+import { installClientIp, resolveClientIpConfig } from "./middleware/client-ip";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
@@ -195,22 +196,32 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Proxy trust ─────────────────────────────────────────────
-// Fly.io (and most PaaS) terminates TLS and forwards requests
-// via a reverse proxy that sets X-Forwarded-For.  Without this
-// setting Express ignores that header, which:
-//   1. Breaks express-rate-limit (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
-//   2. Makes req.ip return the internal proxy IP, not the client
-//   3. Breaks req.protocol (always "http" instead of "https")
-// "true" = trust the first proxy hop, which is Fly's edge.
-app.set("trust proxy", true);
+// ─── Proxy trust + client IP (dev-request 2026-10-16-klient-ip-fra-fly-client-ip) ───
+// Fly.io terminates TLS and forwards requests via its proxy, which appends
+// to X-Forwarded-For. installClientIp() sets `trust proxy` = true — trust
+// EVERY hop, NOT "the first hop": req.ip is the left-most X-Forwarded-For
+// entry, and req.protocol/req.secure follow the proxy — and mounts
+// middleware/client-ip.ts, which in mode `enforce` rewrites X-Forwarded-For
+// to Fly's own Fly-Client-IP, so a client can no longer pick its own req.ip
+// (and a fresh bucket on every IP-keyed limiter) by sending that header.
+// Mode: CLIENT_IP_MODE (legacy | shadow | enforce), default
+// CLIENT_IP_MODE_DEFAULT; always legacy, i.e. today's behaviour, off Fly.
+// Mounted FIRST — before requestTrackerMiddleware, the www redirect, the host
+// gates and every limiter — so everything that reads req.ip sees the
+// normalized value (pinned by client-ip.test.ts). Never set `trust proxy`
+// anywhere else, and never to 1, 2 or a subnet (see installClientIp).
+// A CDN or another proxy in front of Fly breaks this design's premise
+// (Fly-Client-IP would be the CDN's address): revise middleware/client-ip.ts
+// BEFORE any such DNS switch.
+installClientIp(app, resolveClientIpConfig(process.env));
 
 // ─── Event-loop stall monitor (dev-request 2026-09-19-prod-event-loop-stall-
 // mcp-unhealthy) ────────────────────────────────────────────────
 // Observability only: records when the single event loop every host shares is
 // blocked, together with the requests in flight and the background jobs
-// running at that moment. Mounted FIRST so every request on every host is in
-// the in-flight set. Details: src/services/event-loop-monitor.ts.
+// running at that moment. Mounted right after installClientIp (whose
+// middleware is synchronous and only reads/rewrites headers), so every request
+// on every host is in the in-flight set. Details: src/services/event-loop-monitor.ts.
 // Report: GET /admin/analytics/ops/event-loop. Kill switch: EVENT_LOOP_MONITOR_DISABLED=1.
 startEventLoopMonitor();
 // Slice 1 of 2026-10-08-serverheng…: persist stalls/slow requests/slow jobs to

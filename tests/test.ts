@@ -47681,3 +47681,25 @@ runSerial(async () => {
     failures.push("mcp-rate-limit-verticals: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1 (T1–T16): the
+// client-IP choke point (middleware/client-ip.ts) — enforce makes req.ip
+// Fly-Client-IP whatever X-Forwarded-For says, every fallback is today's
+// behaviour, shadow/legacy change nothing, the collapse breaker, the stats
+// line, and index.ts mounting it first. Own Express apps over real HTTP,
+// injected clock and log sinks; no DB, no env or global mutation — tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1: client IP from Fly-Client-IP ──");
+  try {
+    const { runClientIpTests } = require("../src/middleware/client-ip.test") as
+      typeof import("../src/middleware/client-ip.test");
+    const cip = await runClientIpTests({ log: false });
+    passed += cip.passed;
+    failed += cip.failed;
+    for (const f of cip.failures) failures.push("client-ip: " + f);
+    console.log(`  client-ip: ${cip.passed} passed, ${cip.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("client-ip: unexpected error: " + String(err?.message || err));
+  }
+});

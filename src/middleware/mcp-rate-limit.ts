@@ -69,7 +69,9 @@ import rateLimit, { ipKeyGenerator, type RateLimitRequestHandler, type Store } f
 import { Request, Response } from "express";
 import { keyedMax } from "./security";
 
-// trustProxy: same reason as security.ts (Fly's edge proxy is trusted).
+// trustProxy: same reason as security.ts's sharedValidate (a static check on
+// `trust proxy` === true; the real guard is middleware/client-ip.ts, which
+// decides what req.ip, and so every IP key below, is).
 // creationStack: the Opplevagent and Finn-tannlege routers — and so their
 // chains — are require()d by index.ts's host gates on the first request to
 // that host, which express-rate-limit would report as "created in a request

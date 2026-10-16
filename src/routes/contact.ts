@@ -69,13 +69,13 @@ function inferPlatform(req: Request): Platform {
   return "rfb";
 }
 
-/** Extract the real client IP, respecting X-Forwarded-For (Fly.io). */
+/**
+ * The client IP for the per-IP limit above: req.ip, the one value
+ * middleware/client-ip.ts normalizes (dev-request
+ * 2026-10-16-klient-ip-fra-fly-client-ip). Never parse X-Forwarded-For here:
+ * its first entry is whatever the client chose to send.
+ */
 function clientIp(req: Request): string {
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) {
-    const first = (Array.isArray(xff) ? xff[0] : xff).split(",")[0].trim();
-    if (first) return first;
-  }
   return req.ip || "unknown";
 }
 

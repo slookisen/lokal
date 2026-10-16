@@ -36,8 +36,9 @@ const resendWebhookLimiter = rateLimit({
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  // Same acknowledgement as middleware/security.ts's sharedValidate: Fly's
-  // edge proxy is trusted infrastructure ("trust proxy" = true in index.ts).
+  // Same reason as middleware/security.ts's sharedValidate: a static check
+  // on `trust proxy` === true (trust every hop, set by installClientIp in
+  // index.ts); what req.ip is, is decided by middleware/client-ip.ts.
   validate: { trustProxy: false },
   message: { error: "rate_limited" },
 });
