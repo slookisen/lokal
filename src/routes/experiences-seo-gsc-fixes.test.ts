@@ -15,6 +15,10 @@
  *   (b) sitemap.xml lastmod honesty: category/gårdssalg-category/produsent
  *       lastmod reflects real underlying data (MAX(updated_at) / per-row
  *       updated_at), not a blanket "today" stamped on every request.
+ *       Since dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+ *       strukturdata (E1-S1) a detail page is listed only when it has a real
+ *       description, so the detail-lastmod fixture carries one and its
+ *       description-less sibling is asserted absent.
  *
  * Exported runExperiencesSeoGscFixesTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/routes/experiences-seo-gsc-fixes.test.ts
@@ -176,9 +180,12 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
         category: "vinter_sno", fylke: "Rogaland", kommune: "Sauda", indoor_outdoor: "outdoor",
         confidence: "high", verification_status: "verified",
       });
+      // E1-S1: a description, so the detail page is indexable and listed.
+      // The older row has none — a placeholder page, left out of the sitemap.
       const newerExpId = expStore.createExperience({
         title: "Langrenn i Svandalen", provider_id: provId, provider_match_status: "matched",
         category: "vinter_sno", fylke: "Rogaland", kommune: "Sauda", indoor_outdoor: "outdoor",
+        description: "Preparerte langrennsløyper i Svandalen, med lysløype om kvelden.",
         confidence: "high", verification_status: "verified",
       });
       db.prepare("UPDATE experiences SET updated_at = ? WHERE id = ?").run("2020-01-05 10:00:00", olderExpId);
@@ -201,6 +208,13 @@ export async function runExperiencesSeoGscFixesTests(opts: { log?: boolean } = {
       const detailMatch = sm1.body.match(new RegExp(`<url><loc>[^<]*/opplevelse/${newerSlug}</loc>[\\s\\S]*?<lastmod>([^<]+)</lastmod></url>`));
       assertTrue(!!detailMatch, "gsc-b-04: sitemap has the detail-page entry for the newer experience");
       if (detailMatch) assertEq(detailMatch[1], "2021-06-15", "gsc-b-05: detail-page lastmod is still the row's own updated_at");
+      // gsc-b-05b (E1-S1, negative): the description-less older row is a
+      // placeholder page — noindex, so not in the sitemap — while its
+      // category entry above still counts it for lastmod (gsc-b-02 is
+      // computed over published rows, not over listed detail pages).
+      const olderSlug = (expStore.getExperienceById(olderExpId) as any).slug as string;
+      assertTrue(!sm1.body.includes(`/opplevelse/${olderSlug}<`),
+        "gsc-b-05b: a published experience without a description is NOT in the sitemap");
 
       // ── gårdssalg category + produsent lastmod ────────────────────────────
       // Seed >= GARDSSALG_VISIBILITY_THRESHOLD (5) providers with producer_type

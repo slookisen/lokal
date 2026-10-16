@@ -41902,6 +41902,44 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
+// one indexability rule for /opplevelse/<slug>'s robots meta, X-Robots-Tag
+// and sitemap entry (placeholder pages → noindex, follow and not listed).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata E1-S1: one indexability rule ──");
+  try {
+    const { runExperiencesSeoIndexabilityTests } = require("../src/routes/experiences-seo-indexability.test") as
+      typeof import("../src/routes/experiences-seo-indexability.test");
+    const eix = await runExperiencesSeoIndexabilityTests({ log: false });
+    passed += eix.passed;
+    failed += eix.failed;
+    for (const f of eix.failures) failures.push("experiences-seo-indexability: " + f);
+    console.log(`  experiences-seo-indexability: ${eix.passed} passed, ${eix.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-indexability: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E3-S1:
+// no translated body text on /en profile pages while the language switcher
+// is off (lang="nb" + NO canonical must not carry English text).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata E3-S1: EN body text gated on the switcher ──");
+  try {
+    const { runExperiencesSeoEnTranslationGateTests } = require("../src/routes/experiences-seo-en-translation-gate.test") as
+      typeof import("../src/routes/experiences-seo-en-translation-gate.test");
+    const eetg = await runExperiencesSeoEnTranslationGateTests({ log: false });
+    passed += eetg.passed;
+    failed += eetg.failed;
+    for (const f of eetg.failures) failures.push("experiences-seo-en-translation-gate: " + f);
+    console.log(`  experiences-seo-en-translation-gate: ${eetg.passed} passed, ${eetg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-en-translation-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
 // opplevagent.no ALWAYS searched the generic `experiences` table, never the
 // gårdssalg (farm-sale drink producer) vertical in `experience_providers`.
