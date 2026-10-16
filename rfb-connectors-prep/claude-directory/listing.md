@@ -27,7 +27,7 @@ Norwegian farm food, straight from the producer
 Alternative if a more literal one is wanted:
 
 ```
-Find and order from 1,600+ Norwegian food producers
+Find and order from 1,500+ Norwegian food producers
 ```
 51 characters (measured) — also inside the limit, but it pins a number into a permanent
 field; the first option is preferred for that reason.
@@ -36,7 +36,7 @@ field; the first option is preferred for that reason.
 
 ```
 Rett fra Bonden ("Straight from the Farmer") connects you directly with small-scale food
-producers across Norway. Search more than 1,600 farms, farm shops, REKO rings, farmers'
+producers across Norway. Search more than 1,500 farms, farm shops, REKO rings, farmers'
 markets and cooperatives by place, product type or category — cheese, meat, vegetables,
 honey, fish, baked goods and farm-made specialties.
 

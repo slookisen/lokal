@@ -59,7 +59,7 @@ submission, nothing that creates or modifies a record.
 
 ```
 finn-tannlege.com is an independent search service for Norwegian dental clinics. The
-connector lets Claude search roughly 6,961 clinics by county, specialty, whether the
+connector lets Claude search more than 5,400 clinics by county, specialty, whether the
 clinic has a Helfo direct-billing agreement, and whether it offers emergency duty
 (akuttvakt), and to read the full record for any one clinic.
 

@@ -35,7 +35,7 @@ Norwegian dentists: Helfo, specialty and emergency
 
 ```
 finn-tannlege.com is an independent search service covering Norwegian dental clinics —
-roughly 6,900 of them, from single-dentist practices to large clinics, across every
+more than 5,400 of them, from single-dentist practices to large clinics, across every
 county.
 
 Search by place, by specialty, or by the two things that actually change what a visit
@@ -79,7 +79,7 @@ Secondary: **Search** or **Reference** — the service is a directory, not a car
 - **No `Ø` place name appears in this copy.** Search does not case-fold `Ø` today
   (`"Tromsø"` returns 0 live, `"TROMSØ"` returns 79), so an example city spelled with `Ø`
   would advertise a query that fails. Routed to the dev-request queue as a server defect.
-- The clinic figure is given as "roughly 6,900" rather than the exact live 6,961, because
+- The clinic figure is given as "more than 5,400" (a conservative floor, see distribution/catalog-claims.json) rather than the exact live count, because
   the count moves daily and the listing text is not easy to edit afterwards. The exact
   figure belongs in `tannlege_stats` output, where it stays current on its own.
 

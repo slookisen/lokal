@@ -1,0 +1,9 @@
+{
+  "_comment": "Conservative floors for catalog-size claims in static distribution files (npm/registry metadata, READMEs, connector listings). Honest count rounded DOWN to the hundred (2026-10-16: rfb 1563, dental 5446). Immutable artefacts must never claim more than these floors. Locked by src/routes/distribution-metadata.test.ts.",
+  "updated": "2026-10-16",
+  "floors": {
+    "rfb": 1500,
+    "dental": 5400,
+    "opplevelser": 500
+  }
+}

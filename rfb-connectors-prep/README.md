@@ -44,9 +44,9 @@ platform-orchestrator wake that built this package
   bytes) — that is what `.well-known/mcp.json` points its `icon` field at — but `.ico` is
   not what the directory wants, so the icon is supplied as a **file upload** from `assets/`,
   not as a URL.
-- **Producer count:** use the form **«over 1 600»** / "more than 1,600". Deliberate: the
+- **Producer count:** use the form **«over 1 500»** / "more than 1,500". Deliberate: the
   platform's own three counters disagree and each is honest about a different thing —
-  `llms.txt` says 1631 registered producers, `/health` reports `agents: 1712` /
+  `llms.txt` said registered producers: 1631 (2026-08), `/health` reports `agents: 1712` /
   `totalAgents: 1764`, and `.well-known/mcp.json` says 1764. None of them is wrong; they
   count different sets. Do not paste a precise figure into a permanent listing.
 
