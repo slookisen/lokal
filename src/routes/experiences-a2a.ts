@@ -32,6 +32,7 @@ import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import {
+  discoverExperiences,
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
@@ -47,7 +48,13 @@ import {
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-import { matchesAsWordPrefix, parseExperiencesIntent } from "../services/experiences-query-intent";
+import {
+  interpretDiscoverQuery,
+  isStockfishPurchase,
+  matchesAsWordPrefix,
+  parseExperiencesIntent,
+} from "../services/experiences-query-intent";
+import { foreignPlaceIn } from "../services/outside-norway";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
@@ -155,6 +162,28 @@ function extractText(msg: unknown): string | null {
 // (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S1), shared with the
 // MCP tool. Re-exported here so existing callers keep importing it from this
 // router.
+
+/**
+ * The search words of a message in which parseExperiencesIntent() found
+ * nothing ("hvalsafari"), read by interpretDiscoverQuery() — the interpreter
+ * discover_experiences and REST /discover?q= use (dev-request 2026-10-16-
+ * opplevagent-mcp-fritekst-query, S5). parseExperiencesIntent() itself is
+ * unchanged. Undefined, so the message keeps its count:0 answer:
+ *   - when it names a place outside Norway ("kongekrabbe i Russland") or asks
+ *     to buy food ("kjøpe tørrfisk"): the early returns of discover_experiences
+ *     and REST run before the interpreter (felles regel 3), and a Norwegian
+ *     row that mentions Russia must not answer a question about Russia;
+ *   - when the interpreter reads a place that parseExperiencesIntent() does
+ *     not know ("hvalsafari i Nord-Norge", "i Lyngen", "Hordaland"): the place
+ *     words are no search words there, so the rest alone would answer a place
+ *     question with rows from the whole country.
+ */
+function messageSearchTerms(text: string): string[] | undefined {
+  if (foreignPlaceIn(text) || isStockfishPurchase(text)) return undefined;
+  const read = interpretDiscoverQuery(text);
+  if (read.kommune || read.kommuner || read.fylke || read.fylker) return undefined;
+  return read.terms;
+}
 
 // ─── Gårdssalg intent detection (dev-request 2026-07-25-gardssalg-a2a-nl-
 // routing) ──────────────────────────────────────────────────────────────
@@ -494,11 +523,60 @@ export function handleExperiencesMessageSend(
     // reaches here with non-empty messageText, so it is unaffected — see the
     // messageText/filter construction above.
     if (messageText && messageText.trim().length > 0 && Object.keys(filter).length === 0) {
-      const summaryText =
-        "Fant ingen gjenkjennelige søkekriterier i spørringen (kommune/fylke, sesong, vær, inne/ute) — ingen treff. " +
-        "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
-        "No recognisable search criteria in the query (kommune/fylke, season, weather, indoor/outdoor) — no matches. " +
-        'Try e.g. "what can we do in Tromsø in winter?".';
+      // dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S5: first the
+      // message's search words (messageSearchTerms). Every word must be in
+      // the row (discoverExperiences, not the relaxed search): dropping words
+      // until something matches would turn "zzzqqq ingen treff xyzzy" into
+      // the rows that happen to say "ingen".
+      const textTerms = messageSearchTerms(messageText);
+      const keywordHits = textTerms ? discoverExperiences({ text_terms: textTerms }, 20) : [];
+      if (textTerms && keywordHits.length > 0) {
+        const termList = textTerms.join(", ");
+        const keywordSummary =
+          `Fant ${keywordHits.length} opplevelse(r) som inneholder søkeordene (${termList}). ` +
+          "Spørringen nevner verken kommune/fylke, sesong, vær eller inne/ute. / " +
+          `Found ${keywordHits.length} experience(s) containing the search words (${termList}). ` +
+          "The query names no kommune/fylke, season, weather or indoor/outdoor.";
+
+        try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText, ctx }); } catch { /* fail-open: never affects the response */ }
+
+        return rpcOk(id, {
+          taskId: `experiences-discover-${Date.now()}`,
+          status: { state: "completed", timestamp: new Date().toISOString() },
+          artifacts: [
+            {
+              artifactId: "discover-summary",
+              name: "experience-discover-summary",
+              parts: [{ kind: "text", text: keywordSummary }],
+            },
+            {
+              artifactId: "discover-results",
+              name: "experience-discover-results",
+              parts: [{
+                kind: "data",
+                // A text message has no origin: no distance fields (as hasGeo below).
+                data: { count: keywordHits.length, experiences: keywordHits.map(({ distance_km, geo_precision, ...rest }) => rest) },
+              }],
+            },
+          ],
+          metadata: {
+            skill: "opplevelser_discover",
+            filter: { text_terms: textTerms },
+            parsedFrom: messageText,
+          },
+        });
+      }
+
+      // Search words that were tried and matched nothing get their own text.
+      const summaryText = textTerms
+        ? "Spørringen nevner verken kommune/fylke, sesong, vær eller inne/ute, og ingen opplevelse inneholder alle søkeordene i den — ingen treff. " +
+          "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
+          "The query names no kommune/fylke, season, weather or indoor/outdoor, and no experience contains all of its search words — no matches. " +
+          'Try e.g. "what can we do in Tromsø in winter?".'
+        : "Fant ingen gjenkjennelige søkekriterier i spørringen (kommune/fylke, sesong, vær, inne/ute) — ingen treff. " +
+          "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
+          "No recognisable search criteria in the query (kommune/fylke, season, weather, indoor/outdoor) — no matches. " +
+          'Try e.g. "what can we do in Tromsø in winter?".';
 
       try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
 

@@ -45,7 +45,7 @@
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
-import { foreignPlaceIn } from "../services/outside-norway";
+import { outsideNorwayPlace } from "../services/outside-norway";
 import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -146,11 +146,12 @@ import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import {
   GARDSSALG_CATEGORY,
   interpretDiscoverQuery,
+  isStockfishPurchase,
   listCategorySlugs,
   normalizeExperienceCategory,
 } from "../services/experiences-query-intent";
 
-export { normalizeExperienceCategory };
+export { normalizeExperienceCategory, outsideNorwayPlace };
 
 const router = Router();
 
@@ -333,23 +334,12 @@ export const DiscoverExperiencesInputSchema = {
 // fritekst-query, S1), shared with the free-text interpreter; normalizeExperienceCategory
 // is re-exported above for existing callers.
 
-/**
- * The place a discover call names outside Norway — a foreign county/kommune/
- * query word, or an origin outside Norway's bounding box — or null. Without
- * this check "Kenya" was relaxed away like an over-narrow filter and the
- * caller got a nationwide Norwegian list, the opposite of the submission's
- * negative test case (ChatGPT app re-review 2026-10-03).
- */
-export function outsideNorwayPlace(args: {
-  fylke?: string; kommune?: string; query?: string; lat?: number; lng?: number;
-}): string | null {
-  const named = foreignPlaceIn(args.fylke) ?? foreignPlaceIn(args.kommune) ?? foreignPlaceIn(args.query);
-  if (named) return named;
-  if (typeof args.lat === "number" && typeof args.lng === "number" && !isPlausibleNorwayCoord(args.lat, args.lng)) {
-    return `${args.lat}, ${args.lng}`;
-  }
-  return null;
-}
+// outsideNorwayPlace() (the Norway-only check of discover_experiences and
+// discover_gardssalg) and isStockfishPurchase() (the food-purchase early
+// return) live in services/outside-norway.ts and services/experiences-query-
+// intent.ts (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S4/S5),
+// unchanged, so REST /discover?q= and A2A apply the same checks;
+// outsideNorwayPlace is re-exported above for existing callers.
 
 /**
  * Server-wide guidance returned from `initialize`. ChatGPT reads these
@@ -400,18 +390,6 @@ function outsideNorwayResult(rawPlace: string, listKey: "experiences" | "gardssa
     ...(listKey === "experiences" ? { structuredContent: result } : {}),
     content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
   };
-}
-
-/** Refuse the observed retail request without excluding food experiences. */
-function isStockfishPurchase(query: string | undefined): boolean {
-  if (!query) return false;
-  const request = query.normalize("NFKC").toLowerCase().replace(/ø/g, "o");
-  if (!/\b(?:stock[ -]?fish|torrfisk)\b/.test(request)) return false;
-  // Buying the food itself takes precedence over incidental museum/tour words.
-  if (/\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:some|fresh|dried|local|the|litt|fersk|lokal)\s+)*(?:stock[ -]?fish|torrfisk)\b(?!\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?))/i.test(request)) return true;
-  // Only an actual experience object qualifies, not a museum/tour mentioned elsewhere.
-  if (/\b(?:stock[ -]?fish|torrfisk)\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?)\b|\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:a|an|the|some|en|et)\s+)?(?:tickets?|tours?|tastings?|workshops?|experiences?|cooking\s+class(?:es)?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b/.test(request)) return false;
-  return /\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille|shops?|stores?|sellers?|butikker?|utsalg)\b/.test(request);
 }
 
 function stockfishPurchaseResult(filter: object) {

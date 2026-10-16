@@ -50,6 +50,11 @@ import {
   buildFylkeInClause,
   buildRelaxationNote,
   buildNarrowingSuggestions,
+  // dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S4: the zero
+  // answers of GET /discover?q= (see discoverFromFreeText).
+  formatFilterLabels,
+  KOMMUNE_TO_FYLKE_STEP,
+  type DiscoverFilter,
   listCategories,
   createProvider,
   getProviderByOrgnr,
@@ -945,6 +950,11 @@ import { judgeOrgnrIdentityMatch } from "../services/orgnr-identity-judge";
 // mechanism, two callers — reused as-is from admin-rfb-website-discovery.ts,
 // never reimplemented here. See tryGardssalgCandidateHosts below.
 import { rfbWdPageReferencesOwnHost } from "./admin-rfb-website-discovery";
+// dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S4: GET /discover
+// reads `q` for experiences with the interpreter discover_experiences (MCP)
+// uses, and answers a place outside Norway and a food purchase like it does.
+import { GARDSSALG_CATEGORY, interpretDiscoverQuery, isStockfishPurchase, listCategorySlugs } from "../services/experiences-query-intent";
+import { outsideNorwayPlace } from "../services/outside-norway";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -1078,9 +1088,237 @@ function parseDiscoverQuery(req: Request) {
   });
 }
 
+type DiscoverResult = ReturnType<typeof discoverExperiencesRelaxed>["results"][number];
+
+/** One row of the experiences branch of GET /discover; one shape with and without `q`. */
+function discoverResultRow(e: DiscoverResult, hasGeo: boolean) {
+  return {
+    id: e.id,
+    slug: e.slug,
+    title: e.title,
+    title_no: e.title_no,
+    category: e.category,
+    fylke: e.fylke,
+    kommune: e.kommune,
+    indoor_outdoor: e.indoor_outdoor,
+    duration_min: e.duration_min,
+    price_from: e.price_from,
+    price_band: e.price_band,
+    booking_url: e.booking_url,
+    confidence: e.confidence,
+    tags: e.tags,
+    ...(hasGeo
+      ? {
+          distance_km: e.distance_km ?? null,
+          // Honesty about precision: 'address' = geocoded from the
+          // provider's exact street address; 'kommune' = a municipality
+          // centroid (approximate) — never presented as an exact distance.
+          geo_precision: e.geo_precision ?? null,
+        }
+      : {}),
+  };
+}
+
+/**
+ * GET /discover with a free-text `q`, experiences branch (dev-request
+ * 2026-10-16-opplevagent-mcp-fritekst-query, S4). `q` used to be read by the
+ * gårdssalg branch only, so ?q=hvalsafari%20i%20Tromsø answered with the
+ * first rows of the whole country. It is now read like discover_experiences'
+ * `query` (experiences-mcp.ts), with the same interpreter and rules, so MCP
+ * and REST (Custom GPT, npm) answer one request the same way:
+ *   - a place outside Norway (in fylke/kommune, an origin outside Norway, or
+ *     in `q` when no place parameter is given) is answered out_of_area, and
+ *     a food purchase («buy stockfish») out_of_scope, both with no rows;
+ *   - interpretDiscoverQuery() fills only the keys the parameters left empty;
+ *     what it read is returned as query_interpretation;
+ *   - the place, given or read from `q`, is never relaxed away: a kommune
+ *     without hits is widened once to its fylke, then the answer is count 0
+ *     (zero_hit_reason place_no_match);
+ *   - words but nothing to search by, or every filter read from `q` relaxed
+ *     away: count 0 (unrecognized_query / relaxation_exhausted), never the
+ *     unfiltered catalogue.
+ * The answer keeps the branch's shape (vertical, query, count, total, note,
+ * results) and adds query_interpretation, zero_hit_reason, out_of_area/place,
+ * out_of_scope/scope_reason and valid_categories where they apply. Mutates
+ * `filter` (the request's own).
+ */
+function discoverFromFreeText(filter: DiscoverFilter, queryText: string, limit: number): Record<string, unknown> {
+  const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+  // The early returns of discover_experiences, in its order (felles regel 3).
+  // `q` decides on a foreign place only when no place parameter was given
+  // ("flying in from London" next to kommune=Tromsø).
+  const placeGiven = Boolean(filter.fylke || filter.kommune) || hasGeo;
+  const foreign = outsideNorwayPlace({
+    fylke: filter.fylke, kommune: filter.kommune, lat: filter.lat, lng: filter.lng,
+    query: placeGiven ? undefined : queryText,
+  });
+  if (foreign) {
+    const place = foreign.replace(/(^|[\s-])(\p{L})/gu, (_m, sep: string, ch: string) => sep + ch.toLocaleUpperCase("nb-NO"));
+    return {
+      vertical: "experiences",
+      query: filter,
+      count: 0,
+      total: 0,
+      out_of_area: true,
+      place,
+      note:
+        `Opplevagent dekker bare opplevelser og gårdssalg i Norge, og «${place}» ligger utenfor. Ingen treff foreslås. / ` +
+        `Opplevagent only covers experiences and farm-sale producers in Norway; "${place}" is outside that, so nothing is suggested.`,
+      results: [],
+    };
+  }
+  if (isStockfishPurchase(queryText)) {
+    return {
+      vertical: "experiences",
+      query: filter,
+      count: 0,
+      total: 0,
+      out_of_scope: true,
+      scope_reason: "food_product_purchase",
+      note:
+        "Opplevagent finner opplevelser og gårdssalg med drikke, ikke utsalg for kjøp av tørrfisk. " +
+        "Kjøp av matvarer faller utenfor søket. Ingen opplevelser foreslås. / " +
+        "Opplevagent covers experiences and farm-sale drink producers, not buying stockfish. " +
+        "Food-product purchases are outside this search. No experiences are suggested.",
+      results: [],
+    };
+  }
+
+  // The parameters' keys: parseDiscoverQuery() leaves the absent ones undefined.
+  const explicitKeyCount = Object.values(filter).filter((v) => v !== undefined).length;
+  const read = interpretDiscoverQuery(queryText, {
+    fylke: filter.fylke, kommune: filter.kommune, lat: filter.lat, lng: filter.lng,
+    category: filter.category, season: filter.season, weather: filter.weather, indoor_outdoor: filter.indoor_outdoor,
+  });
+  const fromQuery: Array<keyof DiscoverFilter> = [];
+  // As discover_experiences' fill. The `filter[key] !== undefined` half is
+  // defensive only: interpretDiscoverQuery() already leaves a given key
+  // empty, and the parameters have no kommuner/fylker/text_terms.
+  const fill = <K extends keyof DiscoverFilter>(key: K, value: DiscoverFilter[K] | undefined) => {
+    if (value === undefined || filter[key] !== undefined) return;
+    filter[key] = value;
+    fromQuery.push(key);
+  };
+  fill("kommune", read.kommune);
+  fill("kommuner", read.kommuner);
+  fill("fylke", read.fylke);
+  fill("fylker", read.fylker);
+  fill("category", read.category);
+  fill("season", read.season);
+  fill("weather", read.weather);
+  fill("indoor_outdoor", read.indoor_outdoor);
+  fill("text_terms", read.terms);
+  const { hasContent, ...readValues } = read;
+  const queryInterpretation = fromQuery.length > 0 ? { source: "query", ...readValues } : undefined;
+
+  // "gårdssalg i Bergen": the producers are this endpoint's other branch.
+  if (filter.category === GARDSSALG_CATEGORY && fromQuery.includes("category")) {
+    return {
+      vertical: "experiences",
+      query: filter,
+      count: 0,
+      total: 0,
+      query_interpretation: queryInterpretation,
+      note:
+        "Gårdssalg-produsenter søkes med category=gardssalg_smaking (q er da et oppslag av én produsent på navn og sted). / " +
+        "Farm-sale drink producers are searched with category=gardssalg_smaking (q then looks up one producer by name and place).",
+      valid_categories: listCategorySlugs(),
+      results: [],
+    };
+  }
+
+  // The same zero answers as discover_experiences, decided the same way.
+  let zeroHitReason: "unrecognized_query" | "place_no_match" | "relaxation_exhausted" | undefined =
+    hasContent && fromQuery.length === 0 && explicitKeyCount === 0 ? "unrecognized_query" : undefined;
+  let termsMatchedNothing = false;
+  const placeKeys = (["kommune", "kommuner", "fylke", "fylker"] as const).filter((k) => filter[k] !== undefined);
+  const relaxed = zeroHitReason
+    ? null
+    : discoverExperiencesRelaxed(filter, limit, { protectKeys: placeKeys, widenKommuneToFylke: true });
+  const relaxedKeys = relaxed?.relaxedKeys ?? [];
+  if (relaxed && relaxed.results.length === 0 && placeKeys.length > 0) {
+    zeroHitReason = "place_no_match";
+  } else if (relaxed && fromQuery.length > 0 && relaxedKeys.length > 0 && Object.values(relaxed.appliedFilter).every((v) => v === undefined)) {
+    termsMatchedNothing = fromQuery.every((k) => k === "text_terms") && explicitKeyCount === 0;
+    zeroHitReason = termsMatchedNothing ? "unrecognized_query" : "relaxation_exhausted";
+  }
+
+  if (zeroHitReason || !relaxed) {
+    let note: string;
+    let suggestions: string[] = [];
+    if (zeroHitReason === "place_no_match") {
+      const place = filter.kommune ?? filter.kommuner?.join(", ") ?? filter.fylke ?? filter.fylker?.join(", ");
+      const widenedTo = relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP) ? relaxed?.appliedFilter.fylke : undefined;
+      note =
+        `Ingen opplevelser funnet i ${place}${widenedTo ? ` eller ellers i ${widenedTo}` : ""}. ` +
+        "Opplevagent viser ikke treff fra resten av landet i stedet. / " +
+        `No experiences found in ${place}${widenedTo ? ` or elsewhere in ${widenedTo}` : ""}. ` +
+        "Opplevagent does not fall back to results from the rest of the country.";
+      // Places that do have experiences for the rest of the request.
+      const { kommune: _k, kommuner: _ks, fylke: _f, fylker: _fs, ...rest } = filter;
+      suggestions = buildNarrowingSuggestions(discoverExperiencesRelaxed(rest, limit).results, ["kommune", "fylke"]);
+    } else if (termsMatchedNothing) {
+      note =
+        "Søket nevner verken sted, kategori, sesong eller vær, og ingen opplevelse inneholder søkeordene i det — ingen treff. " +
+        "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+        "The query names no place, category, season or weather, and no experience contains its search words — no matches. " +
+        'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+    } else if (zeroHitReason === "unrecognized_query") {
+      note =
+        "Fant ingen gjenkjennelige søkekriterier eller treff i søket (sted, kategori, sesong, vær eller søkeord) — ingen treff. " +
+        "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+        "No recognisable criteria or matches in the query (place, category, season, weather or keywords) — no matches. " +
+        'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+    } else {
+      const labels = formatFilterLabels(relaxedKeys);
+      note =
+        `Ingen opplevelser funnet med filtrene fra søket — heller ikke etter å ha løsnet: ${labels}. / ` +
+        `No experiences found for the filters read from the query — not even after relaxing: ${labels}.`;
+      suggestions = buildNarrowingSuggestions(relaxed?.results ?? [], relaxedKeys);
+    }
+    return {
+      vertical: "experiences",
+      query: filter,
+      count: 0,
+      total: 0,
+      query_interpretation: queryInterpretation,
+      relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+      note,
+      suggestions: suggestions.length > 0 ? suggestions : undefined,
+      zero_hit_reason: zeroHitReason,
+      valid_categories: zeroHitReason === "unrecognized_query" ? listCategorySlugs() : undefined,
+      results: [],
+    };
+  }
+
+  const { results, appliedFilter, textTermsMatched } = relaxed;
+  let note = buildRelaxationNote(relaxedKeys) ?? undefined;
+  if (textTermsMatched !== undefined) {
+    const termCount = filter.text_terms?.length ?? 0;
+    note =
+      (note ? `${note} ` : "") +
+      `Ingen opplevelse inneholder alle ${termCount} søkeordene; disse inneholder ${textTermsMatched} av dem. / ` +
+      `No experience contains all ${termCount} search words; these contain ${textTermsMatched} of them.`;
+  }
+  const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+  return {
+    vertical: "experiences",
+    query: filter,
+    count: results.length,
+    total: countDiscoverExperiences(appliedFilter, { textTermsMatched }),
+    query_interpretation: queryInterpretation,
+    relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+    note,
+    suggestions: suggestions.length > 0 ? suggestions : undefined,
+    results: results.map((e) => discoverResultRow(e, hasGeo)),
+  };
+}
+
 // ─── GET /api/opplevelser/discover — intent discovery ───────────────
 // «Hva kan vi finne på i Oslo (det regner)»:
 //   /api/opplevelser/discover?fylke=Oslo&weather=rain&group_size=4
+// or in the user's own words:
+//   /api/opplevelser/discover?q=hvalsafari%20i%20Troms%C3%B8
 router.get("/discover", (req: Request, res: Response) => {
   try {
     const filter = parseDiscoverQuery(req);
@@ -1157,6 +1395,16 @@ router.get("/discover", (req: Request, res: Response) => {
       return;
     }
 
+    // Free text for experiences (dev-request 2026-10-16-opplevagent-mcp-
+    // fritekst-query, S4): see discoverFromFreeText. Only the first 300
+    // characters are read, as in discover_experiences. Without `q` (or with a
+    // blank one) everything below is unchanged.
+    const queryText = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 300) : "";
+    if (queryText) {
+      res.json(discoverFromFreeText(filter, queryText, limit));
+      return;
+    }
+
     const { results, relaxedKeys, appliedFilter } = discoverExperiencesRelaxed(filter, limit);
     const note = buildRelaxationNote(relaxedKeys);
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
@@ -1181,31 +1429,7 @@ router.get("/discover", (req: Request, res: Response) => {
       relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
       note: note ?? undefined,
       suggestions: suggestions.length > 0 ? suggestions : undefined,
-      results: results.map((e) => ({
-        id: e.id,
-        slug: e.slug,
-        title: e.title,
-        title_no: e.title_no,
-        category: e.category,
-        fylke: e.fylke,
-        kommune: e.kommune,
-        indoor_outdoor: e.indoor_outdoor,
-        duration_min: e.duration_min,
-        price_from: e.price_from,
-        price_band: e.price_band,
-        booking_url: e.booking_url,
-        confidence: e.confidence,
-        tags: e.tags,
-        ...(hasGeo
-          ? {
-              distance_km: e.distance_km ?? null,
-              // Honesty about precision: 'address' = geocoded from the
-              // provider's exact street address; 'kommune' = a municipality
-              // centroid (approximate) — never presented as an exact distance.
-              geo_precision: e.geo_precision ?? null,
-            }
-          : {}),
-      })),
+      results: results.map((e) => discoverResultRow(e, hasGeo)),
     });
   } catch (err) {
     if (err instanceof z.ZodError) {
