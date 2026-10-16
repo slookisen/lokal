@@ -47465,3 +47465,25 @@ runSerial(async () => {
     failures.push("rfb-rating-visning-kildeangivelse: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (S3): shared Places match guard (services/places-match.ts). The
+// RFB rating routes write rating/address/phone only from a candidate whose
+// name and postal code / town match; dental's isConfidentPlaceMatch is pinned
+// to its pre-S3 behaviour. Swaps the getDb() singleton, the global fetch and
+// console.warn (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S3: shared Places match guard ──");
+  try {
+    const { runRfbPlacesMatchGuardTests } = require("../src/routes/rfb-places-match-guard.test") as
+      typeof import("../src/routes/rfb-places-match-guard.test");
+    const pmg = await runRfbPlacesMatchGuardTests({ log: false });
+    passed += pmg.passed;
+    failed += pmg.failed;
+    for (const f of pmg.failures) failures.push("rfb-places-match-guard: " + f);
+    console.log(`  rfb-places-match-guard: ${pmg.passed} passed, ${pmg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-places-match-guard: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -362,16 +362,31 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
       });
       db.prepare(
         `INSERT INTO agent_knowledge
-           (agent_id, address, phone, field_provenance, google_enterprise_fetched_at, data_enriched_at)
-         VALUES (?, ?, '+4799999999', ?, datetime('now'), NULL)`,
+           (agent_id, address, postal_code, phone, field_provenance, google_enterprise_fetched_at, data_enriched_at)
+         VALUES (?, ?, '1400', '+4799999999', ?, datetime('now'), NULL)`,
       ).run(id, addr, existingProv);
 
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+      // places-treffvakt (S3): the batch only writes a Places candidate whose
+      // name and postal code match the agent, so the stubbed answer is this
+      // agent (its name, its postal code 1400). Without that the no-op below
+      // would pass vacuously on a place_mismatch.
       (globalThis as any).fetch = async (url: string) => {
         if (typeof url === "string" && url.includes("places.googleapis.com")) {
           return {
             ok: true,
             status: 200,
-            json: async () => ({ places: [{ id: "place-f-1", formattedAddress: addr }] }),
+            json: async () => ({
+              places: [{
+                id: "place-f-1",
+                displayName: { text: "f-writesite-agent" },
+                formattedAddress: addr,
+                addressComponents: [
+                  { longText: "1400", shortText: "1400", types: ["postal_code"] },
+                  { longText: "Ski", shortText: "Ski", types: ["postal_town"] },
+                ],
+              }],
+            }),
           } as any;
         }
         return { ok: false, status: 404, json: async () => ({}), text: async () => "" } as any;
@@ -389,6 +404,7 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
         body: { agentIds: [id], include_address_phone: true, max_details_calls: 0 },
       });
       assertEq(noopResult.status, 200, "f1: POST /admin/google-rating-batch -> 200");
+      assertEq(noopResult.body?.data?.results?.[0]?.status, "enriched_addr_phone_only", "f1b: the Places answer matched the agent (not a place_mismatch)");
       assertEq(knowledgeDataEnrichedAt(id), null, "f2: no-op Google answer (same address, already-recorded provenance) does NOT stamp data_enriched_at");
 
       // Genuine write: a fresh agent with an EMPTY address column -> writeAddr
@@ -396,8 +412,8 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
       const id2 = "f-writesite-agent-2";
       insertAgent(id2, { url: "https://f-writesite-2.example.com" });
       db.prepare(
-        `INSERT INTO agent_knowledge (agent_id, address, phone, field_provenance, google_enterprise_fetched_at, data_enriched_at)
-         VALUES (?, NULL, NULL, '{}', datetime('now'), NULL)`,
+        `INSERT INTO agent_knowledge (agent_id, address, postal_code, phone, field_provenance, google_enterprise_fetched_at, data_enriched_at)
+         VALUES (?, NULL, '1400', NULL, '{}', datetime('now'), NULL)`,
       ).run(id2);
       const writeResult = await callRoute(router, {
         method: "POST",

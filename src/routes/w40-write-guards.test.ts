@@ -647,7 +647,18 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
             ok: true,
             status: 200,
             json: async () => ({
-              places: [{ id: "place-kv", rating: 4.8, userRatingCount: 40, formattedAddress: KVESTAD_ROAD, internationalPhoneNumber: "+4755555555" }],
+              places: [{
+                id: "place-kv",
+                displayName: { text: "Kvestad Sideri" },
+                rating: 4.8,
+                userRatingCount: 40,
+                formattedAddress: KVESTAD_ROAD,
+                internationalPhoneNumber: "+4755555555",
+                addressComponents: [
+                  { longText: "5776", shortText: "5776", types: ["postal_code"] },
+                  { longText: "Nå", shortText: "Nå", types: ["postal_town"] },
+                ],
+              }],
             }),
           } as any;
         }
@@ -669,13 +680,22 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
         }
         return { ok: false, status: 404, json: async () => ({}), text: async () => "" } as any;
       };
-      const runBatch = (id: string) =>
-        callRoute(mpRouter, {
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+      // places-treffvakt (S3): the batch writes only a Places candidate whose
+      // name and postal code match the agent, so every Kvestad agent carries
+      // Kvestad's postal code (the stubbed answer above is Kvestad Sideri).
+      const runBatch = (id: string) => {
+        db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, postal_code) VALUES (?, '5776')
+           ON CONFLICT(agent_id) DO UPDATE SET postal_code = excluded.postal_code`,
+        ).run(id);
+        return callRoute(mpRouter, {
           method: "POST",
           url: "/admin/google-rating-batch",
           headers: adminHeaders,
           body: { agentIds: [id], include_address_phone: true, max_details_calls: 0 },
         });
+      };
 
       // G1: empty column, homepage street address on record, Google road-only -> not written.
       insertAgent("kv-g1", "Kvestad Sideri Gee En");

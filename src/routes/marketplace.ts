@@ -29,6 +29,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
+import { rfbPlaceMatchEntity, pickRfbPlace, rfbPlacesTextQuery, formatPlacesMatchGuardLog } from "../services/places-match";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
 import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
@@ -2564,7 +2565,7 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
 
   const { agent, knowledge: k } = info;
   const city = (agent as any).city || "";
-  const searchQuery = `${agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+  const searchQuery = rfbPlacesTextQuery(agent.name, city);
 
   try {
     // Google Places Text Search (New API)
@@ -2573,7 +2574,9 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": placesKey,
-        "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName,places.formattedAddress",
+        // places.addressComponents (Pro tier; the call is Enterprise already
+        // through rating) feeds the places-match guard below.
+        "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.addressComponents",
       },
       body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
     });
@@ -2592,8 +2595,26 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
       return;
     }
 
-    // Take the first result — verify it's a reasonable match
-    const place = places[0];
+    // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+    // places-treffvakt (S3): the best-named CONFIDENT candidate (name +
+    // postal code / town, services/places-match.ts), never places[0]
+    // unchecked. No confident or no unambiguous candidate → nothing is written.
+    const entity = rfbPlaceMatchEntity({ name: agent.name, postalCode: k.postalCode, city });
+    const pick = pickRfbPlace(entity, places as any[]);
+    if (!pick.place) {
+      console.warn(formatPlacesMatchGuardLog(agentId, pick, places.length, entity));
+      res.json({
+        success: true,
+        found: false,
+        status: "place_mismatch",
+        mismatchReason: pick.reason,
+        placeName: pick.placeName,
+        nameSim: Math.round(pick.nameSim * 100) / 100,
+        message: `Ingen sikker Google Places-treff for "${searchQuery}" (navn og sted stemmer ikke)`,
+      });
+      return;
+    }
+    const place = pick.place;
     const rating = place.rating;
     const reviewCount = place.userRatingCount || 0;
     const placeName = place.displayName?.text || "";
@@ -2724,16 +2745,20 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // Google call entirely when there's nothing left to fetch (no
   // address/phone backfill requested either).
   //
-  // Full/first-time field masks — UNCHANGED from pre-existing behavior.
+  // Full/first-time field masks. dev-request 2026-10-16-rfb-strukturerte-
+  // data-tredjepartsrating-og-places-treffvakt (S3) added
+  // places.addressComponents to all three masks: the places-match guard below
+  // reads its postal_code / postal_town. It is a Pro-tier field, so no mask
+  // changes SKU tier.
   const enterpriseFieldMask = wantAddrPhone
-    ? "places.id,places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
-    : "places.rating,places.userRatingCount,places.displayName";
+    ? "places.id,places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.addressComponents"
+    : "places.rating,places.userRatingCount,places.displayName,places.addressComponents";
   // Repeat-run field mask — Essentials/Pro tier only (no rating,
   // userRatingCount, or internationalPhoneNumber). formattedAddress is
   // Pro-tier and still useful for the PR-82 address backfill below; phone
   // backfill for these agents runs through the PR-29 Place Details (New)
   // fallback instead, which is a separate (non-Enterprise) SKU.
-  const proFieldMask = "places.id,places.displayName,places.formattedAddress";
+  const proFieldMask = "places.id,places.displayName,places.formattedAddress,places.addressComponents";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
 
@@ -2862,7 +2887,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     const fieldMask = requestEnterprise ? enterpriseFieldMask : proFieldMask;
 
     const city = (info.agent as any).city || "";
-    const searchQuery = `${info.agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+    const searchQuery = rfbPlacesTextQuery(info.agent.name, city);
 
     try {
       if (requestEnterprise) enterpriseCalls++; else proCalls++;
@@ -2888,7 +2913,39 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       if (!resp.ok) { results.push({ agentId, status: "api_error", code: resp.status }); continue; }
 
       const data = await resp.json() as any;
-      const place = (data.places || [])[0];
+      const candidates: any[] = Array.isArray(data.places) ? data.places : [];
+
+      // ── places-match guard (dev-request 2026-10-16-rfb-strukturerte-data-
+      // tredjepartsrating-og-places-treffvakt, S3) ─────────────────────────
+      // Google's answer is a candidate list for a free-text query. Of the
+      // candidates whose name AND postal code / town match this agent
+      // (services/places-match.ts, the guard dental uses), take the
+      // best-named one — never places[0] unchecked, which is how Bergen
+      // Mathall got Mathallen Oslo's rating (2026-07-16). Candidates but none
+      // confident (or two differently named ones nearly tie) → place_mismatch:
+      // no rating upsert, no address/phone write, no google_places
+      // provenance, no Brreg lookup or Details call. The Enterprise attempt
+      // is still recorded (the call was spent), exactly like a no_rating answer.
+      const entity = rfbPlaceMatchEntity({ name: info.agent.name, postalCode: info.knowledge.postalCode, city });
+      const pick = pickRfbPlace(entity, candidates);
+      if (candidates.length > 0 && !pick.place) {
+        console.warn(formatPlacesMatchGuardLog(agentId, pick, candidates.length, entity));
+        results.push({
+          agentId,
+          name: info.agent.name,
+          status: "place_mismatch",
+          mismatchReason: pick.reason,
+          placeName: pick.placeName,
+          nameSim: Math.round(pick.nameSim * 100) / 100,
+          googleRating: state?.existingRating ?? undefined,
+          googleReviewCount: state?.existingReviewCount ?? undefined,
+        });
+        if (requestEnterprise) markEnterpriseFetched(agentId);
+        continue;
+      }
+      // null only when Google returned no candidates at all (handled below
+      // exactly as before: no_rating / skipped_has_rating).
+      const place = pick.place;
 
       if (requestEnterprise) {
         if (!place?.rating) {
