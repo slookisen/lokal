@@ -23,6 +23,12 @@ Or add to Claude Desktop config (`~/.claude/claude_desktop_config.json`):
 }
 ```
 
+## How it works
+
+Since 0.2.0 the package is a thin stdio bridge to the live remote server
+(`https://finn-tannlege.com/mcp`). Tools, descriptions and instructions always match the
+remote service, so the npm package and the remote never drift. Remote rate limits apply.
+
 ## Remote (Streamable HTTP)
 
 For ChatGPT and other remote MCP clients, paste this URL directly:
@@ -55,7 +61,7 @@ statistikk tannleger per fylke
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FINN_TANNLEGE_URL` | `https://finn-tannlege.com` | Override API base URL |
+| `FINN_TANNLEGE_URL` | `https://finn-tannlege.com` | Override the remote base URL (or a full `/mcp` URL) |
 
 ## License
 

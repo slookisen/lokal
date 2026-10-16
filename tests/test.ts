@@ -47226,6 +47226,22 @@ runSerial(async () => {
   }
 });
 
+runSerial(async () => {
+  console.log("\n── mcp-stdio-bridge: finn-tannlege-mcp stdio bridge vs the real dental /mcp ──");
+  try {
+    const { runMcpStdioBridgeTests } = require("../src/routes/mcp-stdio-bridge.test") as
+      typeof import("../src/routes/mcp-stdio-bridge.test");
+    const sb = await runMcpStdioBridgeTests({ log: false });
+    passed += sb.passed;
+    failed += sb.failed;
+    for (const f of sb.failures) failures.push("mcp-stdio-bridge: " + f);
+    console.log(`  mcp-stdio-bridge: ${sb.passed} passed, ${sb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-stdio-bridge: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-08-discovery-paritet-og-ett-katalogtall (phase 1) + 2026-10-06
 // addendum: ONE catalog number per vertical across llms.txt / agent card / mcp.json /
 // server-card / agents.json / /api/stats / /health, tool lists == live tools/list for

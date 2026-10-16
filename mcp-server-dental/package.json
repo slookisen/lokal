@@ -1,6 +1,6 @@
 {
   "name": "finn-tannlege-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mcpName": "io.github.slookisen/finn-tannlege-mcp",
   "description": "MCP server for finn-tannlege.com — find Norwegian dental clinics from Claude Desktop, ChatGPT, and other AI assistants. 5,400+ clinics with Helfo-agreement, specialty, and emergency-duty data.",
   "main": "index.js",
@@ -10,6 +10,7 @@
   "type": "module",
   "files": [
     "index.js",
+    "stdio-bridge.js",
     "README.md",
     "server.json"
   ],
@@ -28,8 +29,7 @@
   "author": "Daniel Fredriksen",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "repository": {
     "type": "git",

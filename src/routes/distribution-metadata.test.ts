@@ -138,8 +138,8 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
     (JSON.parse(read("mcp-server/package.json")).files as string[]).includes("server.json"));
   check("dist-13 dental server.json websiteUrl", JSON.parse(read("mcp-server-dental/server.json")).websiteUrl === "https://finn-tannlege.com");
   check("dist-14 opplevagent server.json websiteUrl", JSON.parse(read("mcp-server-opplevagent/server.json")).websiteUrl === "https://opplevagent.no");
-  check("dist-15 dental package versions unchanged (0.1.0)",
-    JSON.parse(read("mcp-server-dental/package.json")).version === "0.1.0" && JSON.parse(read("mcp-server-dental/server.json")).version === "0.1.0");
+  check("dist-15 dental package versions are 0.2.0 (stdio bridge, G1-S2a)",
+    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.0" && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.0");
 
   return { passed, failed, failures };
 }
