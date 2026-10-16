@@ -41940,6 +41940,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
+// «Kort fortalt» box + facts table + fallback meta/JSON-LD description from
+// one fact list (services/experience-page-facts.ts), and the lokal#1092
+// review follow-ups (per_adult via uiLang, sitemap log line, description on
+// PublishedSlugRow).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata E2-S1: «Kort fortalt» + fact-based meta ──");
+  try {
+    const { runExperiencesSeoKortFortaltTests } = require("../src/routes/experiences-seo-kort-fortalt.test") as
+      typeof import("../src/routes/experiences-seo-kort-fortalt.test");
+    const ekf = await runExperiencesSeoKortFortaltTests({ log: false });
+    passed += ekf.passed;
+    failed += ekf.failed;
+    for (const f of ekf.failures) failures.push("experiences-seo-kort-fortalt: " + f);
+    console.log(`  experiences-seo-kort-fortalt: ${ekf.passed} passed, ${ekf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-kort-fortalt: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
 // opplevagent.no ALWAYS searched the generic `experiences` table, never the
 // gårdssalg (farm-sale drink producer) vertical in `experience_providers`.

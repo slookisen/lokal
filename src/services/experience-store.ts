@@ -787,7 +787,7 @@ export const PUBLISH_GATE_SQL_EXCEPT_STATUS = PUBLISH_GATE_OTHER_CLAUSES.join(" 
 
 export function getPublishedExperienceBySlug(
   slug: string
-): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null }) | null {
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; updated_at: string | null }) | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
@@ -799,7 +799,11 @@ export function getPublishedExperienceBySlug(
     .get({ slug }) as Record<string, unknown> | undefined;
   if (!row) return null;
   const hydrated = hydrateExperience(row);
-  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id) };
+  // updated_at: the detail page's «Sist oppdatert» (dev-request 2026-10-16-
+  // opplevagent-indekserbarhet-og-strukturdata, E2-S1), the same value as its
+  // sitemap lastmod. Only here, not in hydrateExperience(): MCP outputs that
+  // hydrate rows stay byte-identical.
+  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id), updated_at: (row.updated_at as string | null) ?? null };
 }
 
 export function getProviderById(id: string): Record<string, unknown> | null {
@@ -812,12 +816,16 @@ export function getProviderById(id: string): Record<string, unknown> | null {
   );
 }
 
-export type PublishedSlugRow = { slug: string; updated_at: string | null };
+// `description` (dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+// strukturdata, lokal#1092 review S3): the sitemap needs it for
+// shouldNoindexExperience() and reads it here, behind the publish gate, instead
+// of in a second unfiltered query.
+export type PublishedSlugRow = { slug: string; updated_at: string | null; description: string | null };
 export function listPublishedExperienceSlugs(): PublishedSlugRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT e.slug AS slug, e.updated_at AS updated_at
+      `SELECT e.slug AS slug, e.updated_at AS updated_at, e.description AS description
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}

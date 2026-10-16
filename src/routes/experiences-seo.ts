@@ -50,8 +50,21 @@ import {
   NOINDEX_FOLLOW,
   renderableExperienceDescription,
   shouldNoindexExperience,
-  experienceDescriptionsBySlug,
 } from "../services/experience-indexability";
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
+// one fact list for the «Kort fortalt» box, the facts table and the fallback
+// meta/JSON-LD description of a page without a description.
+import {
+  META_DESCRIPTION_MAX_LENGTH,
+  TABLE_FACT_KEYS,
+  KORT_FORTALT_FACT_KEYS,
+  buildExperienceFacts,
+  buildExperienceFactSentence,
+  formatFactDate,
+  pickFacts,
+  type ExperienceFact,
+  type ExperienceFactWords,
+} from "../services/experience-page-facts";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
@@ -373,6 +386,14 @@ function oaProfileLabels(lang: Lang) {
     fGroup: "Gruppe", fPrice: "Pris", fLanguages: "Språk", fAccess: "Tilgjengelighet", fMeeting: "Oppmøte",
     approx: "ca.", min: "min", persons: "personer", upTo: "inntil", from: "fra", perPerson: " pr. person", perGroup: " pr. gruppe", kr: "kr",
     booking: "Bestilling", provider: "Tilbyder", place: "Sted",
+    // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
+    // «Kort fortalt» box + the facts it adds (services/experience-page-facts.ts).
+    kfHeading: "Kort fortalt", kfUpdated: "Sist oppdatert",
+    fPlace: "Sted", fAge: "Alder", fBooking: "Bestilling", fProvider: "Tilbyder", perAdult: " per voksen", inPlace: "i",
+    ageFrom: (n: number) => `fra ${n} år`,
+    ageSuitability: { all: "Alle aldre", family: "Familievennlig", adults: "Voksne", kids: "Barn" },
+    bookingType: { instant: "Direkte hos tilbyderen", request: "På forespørsel hos tilbyderen", external: "Via tilbyderens bestillingsside", none: "Ingen forhåndsbestilling" },
+    brregVerified: "Brreg-verifisert",
     ctaBook: "Book / les mer hos tilbyder →", ctaSite: "Besøk tilbyderens nettside →", ctaSoft: "Bestilling skjer hos tilbyder. Kontaktinfo kommer.",
     phone: "Telefon", provVerified: "✓ Verifisert mot Brønnøysundregistrene", provPending: "Tilbyder under verifisering.",
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
@@ -387,6 +408,12 @@ function oaProfileLabels(lang: Lang) {
     fGroup: "Group size", fPrice: "Price", fLanguages: "Languages", fAccess: "Accessibility", fMeeting: "Meeting point",
     approx: "approx.", min: "min", persons: "people", upTo: "up to", from: "from", perPerson: " per person", perGroup: " per group", kr: "NOK",
     booking: "Booking", provider: "Provider", place: "Location",
+    kfHeading: "At a glance", kfUpdated: "Last updated",
+    fPlace: "Location", fAge: "Age", fBooking: "Booking", fProvider: "Provider", perAdult: " per adult", inPlace: "in",
+    ageFrom: (n: number) => `from age ${n}`,
+    ageSuitability: { all: "All ages", family: "Family-friendly", adults: "Adults", kids: "Children" },
+    bookingType: { instant: "Directly with the provider", request: "On request with the provider", external: "Via the provider's booking page", none: "No advance booking" },
+    brregVerified: "Brreg-verified",
     ctaBook: "Book / read more at the provider →", ctaSite: "Visit the provider's website →", ctaSoft: "Booking is handled by the provider. Contact details coming.",
     phone: "Phone", provVerified: "✓ Verified against the Norwegian business registry", provPending: "Provider verification pending.",
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
@@ -401,6 +428,12 @@ function oaProfileLabels(lang: Lang) {
     fGroup: "Gruppstorlek", fPrice: "Pris", fLanguages: "Språk", fAccess: "Tillgänglighet", fMeeting: "Mötesplats",
     approx: "ca", min: "min", persons: "personer", upTo: "upp till", from: "från", perPerson: " per person", perGroup: " per grupp", kr: "NOK",
     booking: "Bokning", provider: "Arrangör", place: "Plats",
+    kfHeading: "I korthet", kfUpdated: "Senast uppdaterad",
+    fPlace: "Plats", fAge: "Ålder", fBooking: "Bokning", fProvider: "Arrangör", perAdult: " per vuxen", inPlace: "i",
+    ageFrom: (n: number) => `från ${n} år`,
+    ageSuitability: { all: "Alla åldrar", family: "Familjevänlig", adults: "Vuxna", kids: "Barn" },
+    bookingType: { instant: "Direkt hos arrangören", request: "På förfrågan hos arrangören", external: "Via arrangörens bokningssida", none: "Ingen förhandsbokning" },
+    brregVerified: "Brreg-verifierad",
     ctaBook: "Boka / läs mer hos arrangören →", ctaSite: "Besök arrangörens webbplats →", ctaSoft: "Bokning sker hos arrangören. Kontaktuppgifter kommer.",
     phone: "Telefon", provVerified: "✓ Verifierad mot Brønnøysundregistrene", provPending: "Arrangören verifieras.",
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
@@ -2683,13 +2716,19 @@ function buildExperiencesSitemapXml(): string {
     // a page that is noindex (placeholder, no real description) is not
     // listed — same shouldNoindexExperience() verdict the page itself and its
     // X-Robots-Tag header use, so the sitemap can never list a noindex page.
-    const descriptionBySlug = experienceDescriptionsBySlug(getExpDbForReise("experiences"));
+    // E2-S1 (lokal#1092 review S2/S3): the description comes with the
+    // published slug row, and one log line per build makes the listed and
+    // skipped counts readable without crawling the sitemap.
+    let detailListed = 0;
+    let detailNoindexSkipped = 0;
     for (const row of listPublishedExperienceSlugs()) {
       if (!row.slug) continue;
-      if (shouldNoindexExperience({ description: descriptionBySlug.get(row.slug) })) continue;
+      if (shouldNoindexExperience(row)) { detailNoindexSkipped++; continue; }
       const lastmod = (row.updated_at || today).slice(0, 10);
       xml += `\n  <url><loc>${url}/opplevelse/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
+      detailListed++;
     }
+    console.log(`[experiences-sitemap] detail listed=${detailListed} noindex_skipped=${detailNoindexSkipped}`);
   } catch { /* experiences DB not open — static sitemap only */ }
   try {
     // Gårdssalg producer profiles (dev-request 2026-07-19-gardssalg-agent-flater,
@@ -3203,6 +3242,25 @@ const PRICE_BAND_LABELS: Record<string, string> = {
   premium: "Premium", ukjent: "Pris ikke oppgitt",
 };
 
+/** The words buildExperienceFacts() writes in: the detail page's labels for
+ *  `uiLang` plus the value labels above (dev-request 2026-10-16-opplevagent-
+ *  indekserbarhet-og-strukturdata, E2-S1). Takes the UI language, never
+ *  req.lang. */
+export function experienceFactWords(uiLang: Lang): ExperienceFactWords {
+  return {
+    ...oaProfileLabels(uiLang),
+    catLabel,
+    seasonLabel,
+    ioLabel,
+    priceBandLabel: (band: string) => PRICE_BAND_LABELS[band] || band,
+  };
+}
+
+/** A fact's value cell, linked when it has a page. */
+function factValueHtml(f: ExperienceFact): string {
+  return f.href ? `<a href="${escapeHtml(f.href)}">${escapeHtml(f.value)}</a>` : escapeHtml(f.value);
+}
+
 // dev-request 2026-07-04-opplevagent-taksonomi-filtre: Norwegian display
 // labels for the derived cross-cutting filter tags (experience-tags.ts).
 // Order matches EXPERIENCE_TAGS — drives both card badges and the /sok
@@ -3293,9 +3351,11 @@ function renderOpplevelseDetail(
   related: RelatedExperienceRow[],
   url: string,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2:
-  // req.lang — only the visible <h1> uses it (title_no || title fallback on
-  // /no, original title always on /en). Breadcrumb/JSON-LD/OG-meta/<title>
-  // tag are deliberately NOT touched this slice — still the original title.
+  // req.lang — picks the <h1> (title_no || title fallback on /no, original
+  // title always on /en); with the switcher on also the translations (tr) and
+  // the canonical. This page's own labels, units and facts follow uiLang
+  // below, not lang (dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+  // strukturdata).
   lang: Lang,
   // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
   // shouldNoindexExperience(exp), computed ONCE by the route, which also sets
@@ -3355,10 +3415,19 @@ function renderOpplevelseDetail(
   const displayTitle = lang === "no" ? (exp.title_no || exp.title) : (tr.title || exp.title);
   const displayMeetingPoint = exp.meeting_point ? (tr.meeting_point || exp.meeting_point) : exp.meeting_point;
 
-  // Meta description: own summary if present, else a generated one.
-  const metaDescRaw = safeExpDescription
-    || `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — håndplukkede norske opplevelser med Brreg-verifiserte tilbydere.`;
-  const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
+  // one fact list (services/experience-page-facts.ts) for the «Kort fortalt»
+  // box, the facts table and the fallback description below, in uiLang.
+  const factWords = experienceFactWords(uiLang);
+  const pageFacts = buildExperienceFacts({ ...exp, meeting_point: displayMeetingPoint }, provider, factWords);
+
+  // Meta description: own summary if present, else a deterministic sentence
+  // from the row's own facts (unique per page; it replaced one shared
+  // template for every page without a description).
+  const metaDescRaw = safeExpDescription || buildExperienceFactSentence(displayTitle, pageFacts, factWords);
+  const metaDesc = metaDescRaw.length > META_DESCRIPTION_MAX_LENGTH
+    ? metaDescRaw.slice(0, META_DESCRIPTION_MAX_LENGTH - 3).trim() + "…"
+    : metaDescRaw;
 
   // Badges row.
   // Daniel 2026-08-24: every category-bearing element on this page takes the
@@ -3372,36 +3441,23 @@ function renderOpplevelseDetail(
   for (const s of exp.season || []) badges.push(`<span class="badge">${escapeHtml(seasonLabel(s))}</span>`);
   if (brregVerified) badges.push(`<span class="badge badge-verified" title="Tilbyder verifisert mot Brønnøysundregistrene">✓ Brreg-verifisert</span>`);
 
-  // Facts table.
-  const facts: Array<[string, string]> = [];
-  if (cat) facts.push([L.fCategory, `<a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`]);
-  if (exp.fylke) facts.push([L.fFylke, `<a href="/fylke/${encodeURIComponent(exp.fylke)}">${escapeHtml(exp.fylke)}</a>`]);
-  if (exp.kommune) facts.push([L.fKommune, `<a href="/kommune/${encodeURIComponent(exp.kommune)}">${escapeHtml(exp.kommune)}</a>`]);
-  if (exp.indoor_outdoor) facts.push([L.fIndoor, escapeHtml(ioLabel(exp.indoor_outdoor))]);
-  if ((exp.season || []).length) facts.push([L.fSeason, escapeHtml((exp.season || []).map(seasonLabel).join(", "))]);
-  if (exp.duration_min || exp.duration_max) {
-    const d = exp.duration_min && exp.duration_max && exp.duration_min !== exp.duration_max
-      ? `${exp.duration_min}–${exp.duration_max} ${L.min}`
-      : `${L.approx} ${exp.duration_min || exp.duration_max} ${L.min}`;
-    facts.push([L.fDuration, escapeHtml(d)]);
-  }
-  if (exp.group_min || exp.group_max) {
-    const g = exp.group_min && exp.group_max ? `${exp.group_min}–${exp.group_max} ${L.persons}`
-      : exp.group_max ? `${L.upTo} ${exp.group_max} ${L.persons}` : `${L.from} ${exp.group_min} ${L.persons}`;
-    facts.push([L.fGroup, escapeHtml(g)]);
-  }
-  if (exp.price_from || exp.price_band) {
-    const unit = exp.price_unit === "per_adult" ? (lang === "en" ? " per adult" : lang === "sv" ? " per vuxen" : " per voksen")
-      : exp.price_unit === "per_person" ? L.perPerson : exp.price_unit === "per_group" ? L.perGroup : "";
-    const pr = exp.price_from
-      ? `${exp.price_unit === "per_adult" ? "" : L.from + " "}${exp.price_from} ${L.kr}${unit}`
-      : (PRICE_BAND_LABELS[String(exp.price_band)] || String(exp.price_band));
-    facts.push([L.fPrice, escapeHtml(pr)]);
-  }
-  if ((exp.languages || []).length) facts.push([L.fLanguages, escapeHtml((exp.languages || []).join(", "))]);
-  if ((exp.accessibility || []).length) facts.push([L.fAccess, escapeHtml((exp.accessibility || []).join(", "))]);
-  if (displayMeetingPoint) facts.push([L.fMeeting, escapeHtml(displayMeetingPoint)]);
-  const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
+  // Facts table — the same rows as before E2-S1, now from pageFacts.
+  const factsRows = pickFacts(pageFacts, TABLE_FACT_KEYS)
+    .map((f) => `<tr><th scope="row">${escapeHtml(f.label)}</th><td>${factValueHtml(f)}</td></tr>`)
+    .join("");
+
+  // «Kort fortalt» (E2-S1): answer-first box over the lede on every detail
+  // page — structured facts from pageFacts, not another summary next to the
+  // faktalinje text. «Sist oppdatert» is the row's updated_at, the same date
+  // as its sitemap lastmod.
+  const kfItems = pickFacts(pageFacts, KORT_FORTALT_FACT_KEYS)
+    .map((f) => `<div><dt>${escapeHtml(f.label)}</dt><dd>${factValueHtml(f)}</dd></div>`)
+    .join("");
+  const kfUpdated = formatFactDate(exp.updated_at, uiLang);
+  const kortFortalt = `<section class="kort-fortalt" style="border-left-color:${catColor}" aria-labelledby="kf-h">
+        <h2 id="kf-h">${L.kfHeading}</h2>${kfItems ? `<dl>${kfItems}</dl>` : ""}${kfUpdated ? `
+        <p class="kf-updated">${L.kfUpdated} <time datetime="${kfUpdated.iso}">${escapeHtml(kfUpdated.text)}</time></p>` : ""}
+      </section>`;
 
   // Hero media — real photo when the row has one (enrichment-gated), else a
   // branded category placeholder. exp is typed without an image column today.
@@ -3662,6 +3718,15 @@ ${ldScripts}
   .facts th,.facts td{text-align:left;padding:12px 16px;font-size:.92rem;border-bottom:1px solid var(--line);vertical-align:top}
   .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
   .facts th{width:38%;color:var(--mist);font-weight:600}
+  /* «Kort fortalt» (dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+     strukturdata, E2-S1): the answer-first facts over the lede. The left
+     edge takes the category colour inline, like .rel-card. */
+  .kort-fortalt{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--fjord-700);border-radius:var(--r-md);padding:16px 18px;margin:0 0 22px;box-shadow:var(--sh-sm)}
+  .kort-fortalt h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:10px}
+  .kort-fortalt dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px 20px}
+  .kort-fortalt dt{font-size:.78rem;font-weight:600;color:var(--mist)}
+  .kort-fortalt dd{font-size:.95rem;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+  .kf-updated{margin-top:12px;font-size:.8rem;color:var(--mist)}
   .evidence{margin-top:16px;font-size:.84rem;color:var(--mist)}
   .aside{display:flex;flex-direction:column;gap:16px;position:sticky;top:78px}
   @media(max-width:860px){.aside{position:static}}
@@ -3715,6 +3780,7 @@ ${oaSiteNav({ lang, path: noPath, switcher: switcherOn })}
   <div class="layout">
     <article>
       ${heroMedia}
+      ${kortFortalt}
       ${descBlock}
       <table class="facts"><caption class="skip-link">${L.factsCaption}</caption><tbody>${factsRows}</tbody></table>
       ${evBlock}
