@@ -7,11 +7,17 @@
  * shapes a model may send: only `query`, only structured arguments, and
  * both. Each shape must keep the case's invariant, and "both" must return the
  * same id list as "structured only" — adding the user's words to a
- * structured call never changes the answer OpenAI already reviewed.
+ * structured call never changes the answer OpenAI already reviewed. With
+ * only `query`, P1/P2/P4 must be read exactly (no relaxation, and P1/P4 no
+ * search words).
  *
- * The other submission cases (P3 categories, P5 gårdssalg, N1/N2 no tool)
- * use tools and instructions this dev-request does not touch; the contract
- * freeze (opplevagent-mcp-contract-freeze.test.ts) pins those.
+ * N1 ("Book the northern lights cruise … charge my credit card now") calls no
+ * tool in the submission, but a model that passes the request in `query`, as
+ * the instructions ask, must still find the cruise so the answer can point to
+ * its booking page: replayed query-only. The other submission cases (P3
+ * categories, P5 gårdssalg, N2 no tool) use tools and instructions this
+ * dev-request does not touch; the contract freeze
+ * (opplevagent-mcp-contract-freeze.test.ts) pins those.
  *
  * Fixture: seedOpplevagentQueryFixture() from
  * opplevagent-mcp-query-intent.test.ts.
@@ -35,6 +41,8 @@ interface ReplayCase {
   structured: Record<string, unknown>;
   /** Returns the names of the invariants a result breaks (empty = holds). */
   check: (r: any, ids: Record<string, string>) => string[];
+  /** Query-only must be read exactly: no relaxed filter, and (searchWords false) no search words. */
+  exact?: { searchWords: boolean };
 }
 
 export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -70,6 +78,7 @@ export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}
         ...(r.experiences.some((e: any) => e.id === ids.arctic) ? [] : ["Arctic Explorer listed"]),
         ...(r.filter_applied.category === undefined ? [] : ["category is not vinter_sno"]),
       ],
+      exact: { searchWords: false },
     },
     {
       id: "P2",
@@ -79,6 +88,7 @@ export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}
         ...(r.experiences.some((e: any) => e.id === ids.arctic) ? [] : ["Arctic Explorer among the hits"]),
         ...(r.experiences.every((e: any) => e.kommune === "Tromsø") ? [] : ["only Tromsø"]),
       ],
+      exact: { searchWords: true },
     },
     {
       id: "P4",
@@ -89,6 +99,7 @@ export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}
         ...(["fylke", "kommune", "kommuner"].every((k) => r.filter_applied[k] === undefined) ? [] : ["no place filter (Norway = whole country)"]),
         ...(new Set(r.experiences.map((e: any) => e.fylke)).size >= 3 ? [] : ["several counties"]),
       ],
+      exact: { searchWords: false },
     },
     {
       id: "N3",
@@ -138,7 +149,29 @@ export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}
         }
         assertEq(results.both.experiences.map((e: any) => e.id), results.structured.experiences.map((e: any) => e.id),
           `r2-${c.id}: «both» returns the same id list as «structured only»`);
+        assertEq(results.both.relaxed_filters, results.structured.relaxed_filters, `r2b-${c.id}: «both» relaxes what «structured only» relaxes`);
+        if (c.exact) {
+          assertEq([results.query.relaxed_filters, c.exact.searchWords || results.query.filter_applied.text_terms === undefined], [undefined, true],
+            `r2c-${c.id}: query-only is read exactly (no relaxed filter${c.exact.searchWords ? "" : ", no search words"})`);
+        }
       }
+
+      // P4 reworded: the model passes the category and paraphrases the request.
+      // The leftover words are no search words, so no "filters relaxed" banner.
+      const p4Structured = await session.discover(cases[2].structured);
+      for (const query of ["wildlife experiences across Norway", "animal encounters anywhere in Norway, ideally whales"]) {
+        const r = await session.discover({ ...cases[2].structured, query });
+        assertEq([r.experiences.map((e: any) => e.id), r.relaxed_filters, r.filter_applied.text_terms],
+          [p4Structured.experiences.map((e: any) => e.id), undefined, undefined],
+          `r5-P4: category + reworded query «${query}» = structured only, nothing relaxed`);
+      }
+
+      // N1 query-only: the cruise is found despite the payment words.
+      const n1Prompt = "Book the northern lights cruise for two people and charge my credit card now";
+      assertEq(prompts.includes(n1Prompt), true, "r0-N1: the replayed prompt is a submission test case");
+      const n1 = await session.discover({ query: n1Prompt });
+      assertEq([n1.experiences.some((e: any) => e.id === ids.arctic), n1.zero_hit_reason, Object.keys(n1.filter_applied)],
+        [true, undefined, ["text_terms"]], "r6-N1: query-only lists the Arctic Explorer cruise, filtered by its words, not the whole catalogue");
 
       const p2 = await session.discover({ query: cases[1].prompt });
       assertEq(p2.experiences[0]?.id, ids.arctic, "r3-P2: with only the query, Arctic Explorer is the first hit (kommune Tromsø + title words)");

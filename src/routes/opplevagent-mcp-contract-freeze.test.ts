@@ -13,7 +13,9 @@
  *   - tools/list (the whole result, plus one hash per tool so a failure names
  *     the tool that changed)
  *   - resources/list
- *   - resources/read for WIDGET_LIST_URI and WIDGET_DETAIL_URI
+ *   - resources/read for every URI resources/list names (the current widget
+ *     URIs WIDGET_LIST_URI / WIDGET_DETAIL_URI and the older ones still served
+ *     to clients that cached them)
  *
  * The hashes live in tests/fixtures/opplevagent-mcp-contract-freeze.json.
  * Changing them is a deliberate act: only after the review is done, or
@@ -119,8 +121,13 @@ export async function currentOpplevagentContractHashes(): Promise<Record<string,
       "tools/list": sha256(toolsList),
     };
     for (const tool of toolsList?.tools ?? []) hashes[`tools/list#${tool.name}`] = sha256(tool);
-    hashes["resources/list"] = sha256(await rpc("resources/list", {}));
+    const resourcesList = await rpc("resources/list", {});
+    hashes["resources/list"] = sha256(resourcesList);
+    const uris: string[] = (resourcesList?.resources ?? []).map((r: { uri: string }) => r.uri);
     for (const uri of [mcpModule.WIDGET_LIST_URI, mcpModule.WIDGET_DETAIL_URI]) {
+      if (!uris.includes(uri)) uris.push(uri);
+    }
+    for (const uri of uris) {
       hashes[`resources/read#${uri}`] = sha256(await rpc("resources/read", { uri }));
     }
     return hashes;

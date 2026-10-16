@@ -1,5 +1,5 @@
 {
-  "_doc": "SHA-256 of the Opplevagent MCP contract (tools/list, initialize instructions, widget resources) frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-16-opplevagent-mcp-fritekst-query (felles regel 1). Pinned at lokal a6edc5cb. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/opplevagent-mcp-contract-freeze.test.ts --print",
+  "_doc": "SHA-256 of the Opplevagent MCP contract (tools/list, initialize instructions, every resource in resources/list) frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-16-opplevagent-mcp-fritekst-query (felles regel 1). Pinned at lokal a6edc5cb; the three older widget URIs added in fix round 1 hash the same at a6edc5cb and 73f3da15. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/opplevagent-mcp-contract-freeze.test.ts --print",
   "hashes": {
     "initialize.instructions": "90d33b8a6a982c420c2f38d905ef22b1baa1334e72866712e5821b37220cb560",
     "tools/list": "143e0fcc89f7d6fb000b1f461d8543a0d179655d0fc439fcc84f6e78a7d8bf34",
@@ -10,6 +10,9 @@
     "tools/list#book_gardssalg": "515222aac19889f364350fd5419be2f163c9fc921bf966e72864a7b186d8bd6d",
     "resources/list": "8599eaf7ef5f585ed3ac456f014a5a73359507078927969aa35f4c3e4fa972a2",
     "resources/read#ui://opplevagent/experiences-list-2026-10-12": "746bd4b8f37852668a61d11c9931c9fd1baf579dbf87ae33f55c98052868c3e2",
-    "resources/read#ui://opplevagent/experience-detail-2026-10-14": "23b2bfc6877fb5e053f5fde8c2c42e3b6a1921fe416f8d3047ec83d52fb0c241"
+    "resources/read#ui://opplevagent/experience-detail-2026-10-14": "23b2bfc6877fb5e053f5fde8c2c42e3b6a1921fe416f8d3047ec83d52fb0c241",
+    "resources/read#ui://opplevagent/experiences-list": "f419fb2c2c5b56fc4c6cf49df18f4e4ee0a76d7d27db7c5be6af45741f20d2d8",
+    "resources/read#ui://opplevagent/experience-detail": "2588d8075a40d5aa64182d3033a833568af02ccdf1749e810e9d082164650f65",
+    "resources/read#ui://opplevagent/experience-detail-2026-10-12": "a44609d5cbcb203381949ab6f1c1ceb7e04cad6363236440eb111bd75eee5602"
   }
 }

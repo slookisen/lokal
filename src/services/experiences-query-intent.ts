@@ -17,7 +17,7 @@
  * all use it without an import cycle. No outside service is called.
  */
 
-import type { DiscoverFilter } from "./experience-store";
+import { MAX_TEXT_TERMS, MAX_TEXT_TERM_LENGTH, type DiscoverFilter } from "./experience-store";
 import {
   __FYLKE_INTERNAL,
   NON_KOMMUNE_REGION_LABELS,
@@ -27,10 +27,11 @@ import {
   normaliseFylke,
 } from "./norway-fylke";
 
-// experience-store is required at call time, not imported at the top (same
-// pattern as honest-count.ts): test blocks swap a fresh experience-store /
-// db-factory copy into require.cache, and a top-level import would keep
-// calling whichever copy was cached when this module was first loaded.
+// experience-store's functions are required at call time, not imported at the
+// top (same pattern as honest-count.ts): test blocks swap a fresh
+// experience-store / db-factory copy into require.cache, and a top-level
+// import would keep calling whichever copy was cached when this module was
+// first loaded. Its constants (MAX_TEXT_TERMS …) are the same in every copy.
 function experienceStore(): typeof import("./experience-store") {
   return require("./experience-store") as typeof import("./experience-store");
 }
@@ -249,9 +250,10 @@ export function listCategorySlugs(): string[] {
 
 export type QuerySeason = "winter" | "summer" | "spring" | "autumn";
 export type QueryWeather = "rain" | "snow" | "clear";
+export type QueryIndoorOutdoor = "indoor" | "outdoor";
 
 /** A word right before an ambiguous place name that marks it as a place ("i Moss", "in Moss"). */
-export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "near", "around", "rundt"]);
+export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "nær", "near", "around", "rundt"]);
 
 /**
  * Gazetteer names (CITY_TO_FYLKE_RAW) that are also everyday words. They are
@@ -264,6 +266,9 @@ export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på"
  *     days", "i otta" (at dawn), "en lakselv" (a salmon river);
  *   - "preposition_or_capital": as above, or right after a PLACE_PREPOSITIONS
  *     word ("i moss").
+ * A longer gazetteer name that starts with one of these words needs that
+ * word in its own spelling too: "bo i Telemark" (stay in Telemark) is the
+ * fylke Telemark, not the kommune Bø i Telemark.
  */
 export const AMBIGUOUS_PLACE_WORDS: Readonly<Record<string, "capital" | "preposition_or_capital">> = {
   Time: "capital", Sola: "capital", Stranda: "capital", Hvaler: "capital", Olden: "capital", Otta: "capital",
@@ -274,6 +279,19 @@ export const AMBIGUOUS_PLACE_WORDS: Readonly<Record<string, "capital" | "preposi
   Loen: "preposition_or_capital", Bryne: "preposition_or_capital", Klepp: "preposition_or_capital",
   Reine: "preposition_or_capital", Frosta: "preposition_or_capital",
 };
+
+/**
+ * Former county names, read as a fylke by interpretDiscoverQuery() only
+ * (parseExperiencesIntent() keeps its FYLKER list, so A2A is unchanged).
+ * normaliseFylke() turns each into the name the discover filter searches: a
+ * 2020-2023 merged fylke stays itself and covers its parts through
+ * fylkeEquivalents() ("Troms og Finnmark" is Troms and Finnmark), an older one
+ * becomes its successor ("Hordaland" is Vestland).
+ */
+export const FORMER_FYLKE_NAMES: readonly string[] = [
+  "Troms og Finnmark", "Vestfold og Telemark", "Viken",
+  "Hordaland", "Sogn og Fjordane", "Hedmark", "Oppland", "Aust-Agder", "Vest-Agder", "Sør-Trøndelag", "Nord-Trøndelag",
+];
 
 /**
  * Season words, matched as whole words ("våre" is not "vår", "waterfall" is
@@ -298,12 +316,26 @@ export const CONTEXTUAL_SEASON_WORDS: Readonly<Record<string, { season: QuerySea
   "vår": { season: "spring", after: ["i", "neste", "denne", "til"] },
 };
 
-/** Weather words, matched as whole words ("regnbue" is not "regn"). */
+/**
+ * Weather words, matched as whole words ("regnbue" is not "regn"). The place
+ * names among them count as weather only where they are no place: "i sola"
+ * (in the sun) is weather, "i Sola" the kommune (AMBIGUOUS_PLACE_WORDS).
+ */
 export const WEATHER_WORDS: Readonly<Record<string, QueryWeather>> = {
   regn: "rain", regner: "rain", "regnvær": "rain", "regnværsdag": "rain", regnfull: "rain", regnfullt: "rain",
   rain: "rain", rainy: "rain", raining: "rain",
   "snør": "snow", "snøvær": "snow", "snøfall": "snow", snowing: "snow", snowfall: "snow",
-  sol: "clear", solskinn: "clear", sunny: "clear", sunshine: "clear",
+  sol: "clear", sola: "clear", solen: "clear", solskinn: "clear", sunny: "clear", sunshine: "clear",
+};
+
+/**
+ * Indoor/outdoor words, matched as whole words ("outdoor activities in Oslo").
+ * «inne» and «ute» are left out: as everyday words ("inne i byen", "spise
+ * ute") they say nothing about the activity.
+ */
+export const INDOOR_OUTDOOR_WORDS: Readonly<Record<string, QueryIndoorOutdoor>> = {
+  indoor: "indoor", indoors: "indoor", "innendørs": "indoor", innendors: "indoor",
+  outdoor: "outdoor", outdoors: "outdoor", "utendørs": "outdoor", utendors: "outdoor",
 };
 
 /** Words for the whole country: no place filter ("Find wildlife experiences in Norway"). */
@@ -314,17 +346,21 @@ export const WHOLE_COUNTRY_WORDS: ReadonlySet<string> = new Set([
 /**
  * CATEGORY_ALIASES words too general in a sentence to set the category from
  * free text ("during our stay", "an Arctic adventure"). Like every alias word
- * they are used up and never become a search word.
+ * they are used up and never become a search word, and they do not count as
+ * content: a query of only such words ("adventure") browses like a general
+ * question.
  */
 export const GENERIC_CATEGORY_ALIAS_WORDS: ReadonlySet<string> = new Set([
-  "stay", "stays", "adventure", "action", "transport", "outdoor", "outdoors",
+  "stay", "stays", "adventure", "action", "transport",
 ]);
 
 /**
  * Words that carry no search meaning on their own: question words, pronouns,
- * prepositions, request verbs, "experiences"/"activities", praise words and
- * who is travelling (a keyword filter on "family" would only keep the rows
- * whose text happens to say so). Norwegian and English.
+ * prepositions, request verbs, "experiences"/"activities", praise words, time
+ * words, number words and who is travelling (a keyword filter on "family"
+ * would only keep the rows whose text happens to say so). Norwegian and
+ * English. A word missing here costs little: discoverExperiencesRelaxed()
+ * relaxes the search words one at a time.
  */
 export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
   // Norwegian
@@ -345,8 +381,10 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
   "fint", "flott", "flotte", "gøy", "morsom", "morsomme", "morsomt", "artig", "spennende", "populær",
   "populære", "kjent", "kjente", "lokal", "lokale", "unik", "unike", "topp", "her", "der", "nå", "neste",
   "dag", "dagen", "dager", "helg", "helgen", "uke", "uka", "ferie", "ferien", "tid", "vær", "været",
-  "skjer", "skje", "kommer", "bor", "besøker", "reiser",
-  "familie", "familien", "barn", "barna", "venner", "par", "hei", "takk",
+  "kveld", "kvelden", "skjer", "skje", "kommer", "bo", "bor", "besøker", "reiser", "hele", "landet",
+  "kommune", "kommunen", "fylke", "fylket",
+  "familie", "familien", "barn", "barna", "venner", "par", "voksen", "voksne", "person", "personer",
+  "gjester", "fem", "seks", "sju", "syv", "åtte", "ni", "ti", "hei", "takk",
   // English
   "what", "where", "which", "how", "when", "why", "who", "can", "could", "would", "should", "will", "may",
   "might", "must", "do", "does", "did", "me", "my", "we", "us", "our", "you", "your", "they", "them",
@@ -360,15 +398,18 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
   "planning", "book", "things", "thing", "stuff", "something", "activities", "activity", "experiences",
   "experience", "ideas", "idea", "options", "places", "place", "spots", "attractions", "attraction",
   "sights", "tours", "tour", "trips", "trip", "excursions", "excursion", "day", "days", "weekend", "week",
-  "today", "tomorrow", "next", "time", "good", "great", "nice", "fun", "cool", "top", "awesome",
+  "today", "tonight", "tomorrow", "next", "time", "good", "great", "nice", "fun", "cool", "top", "awesome",
   "amazing", "interesting", "unique", "popular", "famous", "local", "beautiful", "worth", "here", "there",
   "now", "details", "detail", "info", "information", "family", "families", "kids", "children", "couple",
-  "friends", "people", "hi", "hello", "thanks", "happening", "happens", "arrive", "arriving", "travel",
-  "travelling", "traveling", "fly", "flying", "staying", "spend", "spending",
+  "friends", "people", "persons", "adult", "adults", "guests", "two", "three", "four", "five", "six",
+  "seven", "eight", "nine", "ten", "hi", "hello", "thanks", "happening", "happens", "arrive", "arriving",
+  "travel", "travelling", "traveling", "fly", "flying", "staying", "spend", "spending", "across",
+  "throughout", "anywhere", "everywhere", "whole", "entire", "country", "county", "municipality",
 ]);
 
-/** At most this many search words reach the filter (every one must match: AND). */
-export const MAX_TEXT_TERMS = 6;
+// The limits live with DiscoverFilterSchema (experience-store.ts), which
+// enforces them; re-exported here with the rest of the configuration.
+export { MAX_TEXT_TERMS, MAX_TEXT_TERM_LENGTH };
 
 /** The structured arguments a caller passed next to `query`. They always win. */
 export interface DiscoverQueryExplicitArgs {
@@ -379,6 +420,7 @@ export interface DiscoverQueryExplicitArgs {
   category?: string;
   season?: string;
   weather?: string;
+  indoor_outdoor?: string;
 }
 
 /** What interpretDiscoverQuery() read from the text — only keys the explicit arguments left empty. */
@@ -386,12 +428,14 @@ export interface DiscoverQueryInterpretation {
   kommune?: string;
   kommuner?: string[];
   fylke?: string;
+  /** May be GARDSSALG_CATEGORY: the query asks for gårdssalg, which has its own tool. */
   category?: string;
   season?: QuerySeason;
   weather?: QueryWeather;
+  indoor_outdoor?: QueryIndoorOutdoor;
   /** Search words for DiscoverFilter.text_terms, lower case, query order. */
   terms?: string[];
-  /** The query has at least one word that is not a stopword or the country itself. */
+  /** The query has a word that is no stopword, generic alias word or the country itself. */
   hasContent: boolean;
 }
 
@@ -401,6 +445,11 @@ interface QueryToken {
   fold: string;
   start: number;
   end: number;
+}
+
+/** table[key] for the table's own entries only: a query word such as "constructor" is no entry. */
+function lookup<V>(table: Readonly<Record<string, V>>, key: string): V | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
 }
 
 function tokenizeQuery(text: string): QueryToken[] {
@@ -419,12 +468,34 @@ interface PlaceCandidate {
   kind: PlaceKind;
   /** 0 kommune, 1 region/district, 2 fylke — the same priority as parseExperiencesIntent(). */
   tier: number;
+  /** The name's words, folded (æ/ø/å → ae/o/a). */
   words: string[];
-  ambiguous?: "capital" | "preposition_or_capital";
+  /** The name's words in their own spelling, lower case. */
+  lowerWords: string[];
+  /**
+   * Own spelling only, and: "capital" / "preposition_or_capital" (see
+   * AMBIGUOUS_PLACE_WORDS), or "preposition" — right after a
+   * PLACE_PREPOSITIONS word, or the whole query (catalogue-only kommuner).
+   */
+  ambiguous?: "capital" | "preposition_or_capital" | "preposition";
+  /** The first word must be in its own spelling: an AMBIGUOUS_PLACE_WORDS entry starts the name ("Bø i Telemark"). */
+  ownSpellingFirst: boolean;
+  /** A kommune known from the catalogue (publishedKommuneSet) and not from the gazetteer. */
+  publishedOnly: boolean;
 }
 
-function placeCandidate(name: string, kind: PlaceKind, tier: number): PlaceCandidate {
-  return { name, kind, tier, words: tokenizeQuery(name).map((t) => t.fold), ambiguous: AMBIGUOUS_PLACE_WORDS[name] };
+function placeCandidate(name: string, kind: PlaceKind, tier: number, publishedOnly = false): PlaceCandidate {
+  const tokens = tokenizeQuery(name);
+  return {
+    name,
+    kind,
+    tier,
+    words: tokens.map((t) => t.fold),
+    lowerWords: tokens.map((t) => t.lower),
+    ambiguous: publishedOnly ? "preposition" : lookup(AMBIGUOUS_PLACE_WORDS, name),
+    ownSpellingFirst: tokens.length > 1 && lookup(AMBIGUOUS_PLACE_WORDS, tokens[0].raw) !== undefined,
+    publishedOnly,
+  };
 }
 
 // Districts in CITY_TO_FYLKE_RAW that are no kommune and no curated region
@@ -436,8 +507,58 @@ const PLACE_CANDIDATES: readonly PlaceCandidate[] = [
   ...[...NON_KOMMUNE_REGION_LABELS]
     .filter((name) => !(name in REGION_TO_KOMMUNER) && cityToFylke(name))
     .map((name) => placeCandidate(name, "district", 1)),
-  ...FYLKER.map((name) => placeCandidate(name, "fylke", 2)),
+  ...[...FYLKER, ...FORMER_FYLKE_NAMES].map((name) => placeCandidate(name, "fylke", 2)),
 ];
+
+// The gazetteer's names at any level, and its kommune, region and district
+// names, folded: see publishedOnlyCandidates().
+const GAZETTEER_NAME_KEYS: ReadonlySet<string> = new Set(PLACE_CANDIDATES.map((c) => c.words.join(" ")));
+const GAZETTEER_SUBFYLKE_KEYS: ReadonlySet<string> = new Set(PLACE_CANDIDATES.filter((c) => c.tier < 2).map((c) => c.words.join(" ")));
+
+/** Whether some run of consecutive `words` is a gazetteer kommune, region or district name. */
+function containsSubfylkeName(words: readonly string[]): boolean {
+  for (let from = 0; from < words.length; from++) {
+    for (let to = from + 1; to <= words.length; to++) {
+      if (GAZETTEER_SUBFYLKE_KEYS.has(words.slice(from, to).join(" "))) return true;
+    }
+  }
+  return false;
+}
+
+/** A catalogue kommune value that reads as one name: letters only, one to three words. */
+const CLEAN_KOMMUNE_VALUE = /^\p{L}{2,}(?:[ -]\p{L}+){0,2}$/u;
+/** Words that make a catalogue value a description rather than a name ("Lyngen kommune"). */
+const NOT_A_NAME_WORDS: ReadonlySet<string> = new Set(["kommune", "kommun", "herad", "municipality"]);
+
+const publishedOnlyCache = new WeakMap<ReadonlySet<string>, readonly PlaceCandidate[]>();
+
+/**
+ * Kommuner the catalogue has but the gazetteer lacks (Lyngen, Sirdal, Vågan
+ * …), from publishedKommuneSet(): the DB, no outside call. A catalogue value
+ * can be an everyday word ("Fjord", "Strand", "Sel" is a seal), so it counts
+ * as a place only in its own spelling and right after a place preposition,
+ * or as the whole query ("i Lyngen", "Lyngen"; not "Lyngen Alps skiing",
+ * which searches the word). Left out: values the gazetteer already reads
+ * (Senja stays a region), values with a gazetteer kommune, region or
+ * district name in them (a stray "Tromsø sentrum" must not shadow Tromsø),
+ * stopwords and values that are no clean name.
+ */
+function publishedOnlyCandidates(published: ReadonlySet<string> | null): readonly PlaceCandidate[] {
+  if (!published) return [];
+  let cached = publishedOnlyCache.get(published);
+  if (!cached) {
+    cached = [...published]
+      .filter((value) => CLEAN_KOMMUNE_VALUE.test(value))
+      .map((value) => placeCandidate(value, "kommune", 0, true))
+      .filter((c) =>
+        !GAZETTEER_NAME_KEYS.has(c.words.join(" ")) &&
+        !containsSubfylkeName(c.words) &&
+        !c.lowerWords.some((w) => NOT_A_NAME_WORDS.has(w)) &&
+        !(c.lowerWords.length === 1 && QUERY_STOPWORDS.has(c.lowerWords[0])));
+    publishedOnlyCache.set(published, cached);
+  }
+  return cached;
+}
 
 function startsSentence(tokens: readonly QueryToken[], i: number, text: string): boolean {
   return i === 0 || /[.!?]/.test(text.slice(tokens[i - 1].end, tokens[i].start));
@@ -447,19 +568,26 @@ function endsClause(tokens: readonly QueryToken[], i: number, text: string): boo
   return i === tokens.length - 1 || /[.!?,;:]/.test(text.slice(tokens[i].end, tokens[i + 1].start));
 }
 
+function afterPreposition(tokens: readonly QueryToken[], i: number): boolean {
+  return i > 0 && PLACE_PREPOSITIONS.has(tokens[i - 1].lower);
+}
+
 function placeMatchesAt(c: PlaceCandidate, tokens: readonly QueryToken[], i: number, text: string): boolean {
-  if (i + c.words.length > tokens.length) return false;
+  const n = c.words.length;
+  if (i + n > tokens.length) return false;
   if (c.ambiguous) {
+    if (!c.lowerWords.every((w, k) => tokens[i + k].lower === w)) return false;
+    if (c.ambiguous === "preposition") return afterPreposition(tokens, i) || tokens.length === n;
     const t = tokens[i];
-    if (t.lower !== c.name.toLocaleLowerCase("nb-NO")) return false;
     const capital = t.raw[0] !== t.raw[0].toLocaleLowerCase("nb-NO");
     if (capital && (!startsSentence(tokens, i, text) || tokens.length === 1)) return true;
-    return c.ambiguous === "preposition_or_capital" && i > 0 && PLACE_PREPOSITIONS.has(tokens[i - 1].lower);
+    return c.ambiguous === "preposition_or_capital" && afterPreposition(tokens, i);
   }
+  if (c.ownSpellingFirst && tokens[i].lower !== c.lowerWords[0]) return false;
   return c.words.every((w, k) => {
     const f = tokens[i + k].fold;
     // The last word may carry a genitive -s: "Tromsøs beste", "Lofotens".
-    return f === w || (k === c.words.length - 1 && f === w + "s");
+    return f === w || (k === n - 1 && f === w + "s");
   });
 }
 
@@ -486,22 +614,30 @@ function safePublishedKommuneSet(): ReadonlySet<string> | null {
  *   empty, and the place only when no fylke, kommune or lat/lng was given
  *   (the handler's placeGiven rule). Words naming an already-given value are
  *   used up and never become search words.
- * - Place: kommune, then a curated region (REGION_TO_KOMMUNER) or district,
- *   then fylke; longest name first within a level. Whole words only, with
- *   æ/ø/å folded ("Tromso" is Tromsø), except AMBIGUOUS_PLACE_WORDS. A
- *   kommune without published experiences (a bygd such as Geiranger, or a
- *   town the catalogue files under its kommune) becomes its fylke, and its
- *   name a search word.
- * - Season, weather and category from SEASON_WORDS, WEATHER_WORDS and
- *   CATEGORY_ALIASES. Season words never set the category vinter_sno.
- * - Search words: what is left after stopwords, at most MAX_TEXT_TERMS. Read
- *   only when the query is also the place source: a caller that passed the
- *   place has structured its request, and its leftover words ("flying in
- *   from London", "details of") are conversation, not a filter. So adding
- *   `query` to a structured call never narrows it by keyword.
+ * - Place: whole words, with æ/ø/å folded ("Tromso" is Tromsø) except
+ *   AMBIGUOUS_PLACE_WORDS. Gazetteer kommuner, the kommuner only the
+ *   catalogue has (publishedOnlyCandidates), curated regions
+ *   (REGION_TO_KOMMUNER), districts, fylker and FORMER_FYLKE_NAMES. A name
+ *   inside a longer matched name is part of it ("Romsdal" in "Møre og
+ *   Romsdal"). Then kommune before region/district before fylke, as in
+ *   parseExperiencesIntent(); within a level the name right after a place
+ *   preposition ("flying from Bergen, what to do in Oslo"), else the first
+ *   one named. A gazetteer kommune without published experiences (a bygd
+ *   such as Geiranger, or a town the catalogue files under its kommune)
+ *   becomes its fylke, and its name a search word.
+ * - Season, weather, indoor/outdoor and category from SEASON_WORDS,
+ *   WEATHER_WORDS, INDOOR_OUTDOOR_WORDS and CATEGORY_ALIASES. Season words
+ *   never set the category vinter_sno.
+ * - Search words: what is left after stopwords, at most MAX_TEXT_TERMS, each
+ *   at most MAX_TEXT_TERM_LENGTH long. Read only when the caller passed
+ *   neither a place nor a category: those name what the request is about, and
+ *   the leftover words of a call that structured them ("wildlife experiences
+ *   across Norway", "details of") are conversation, not a filter. So adding
+ *   `query` to a call with a structured place or category never narrows it
+ *   by keyword; it can still fill an empty key (a place, a season).
  *
  * `opts.publishedKommuner` replaces the catalogue lookup (tests); null skips
- * the published-kommune check.
+ * the catalogue: no published-kommune check and no catalogue-only kommuner.
  */
 export function interpretDiscoverQuery(
   queryText: string,
@@ -518,30 +654,32 @@ export function interpretDiscoverQuery(
   const placeGiven = Boolean(explicit.fylke || explicit.kommune) ||
     (typeof explicit.lat === "number" && typeof explicit.lng === "number");
   if (!placeGiven) {
-    const matches: Array<{ c: PlaceCandidate; at: number }> = [];
-    for (const c of PLACE_CANDIDATES) {
-      for (let i = 0; i < tokens.length; i++) if (placeMatchesAt(c, tokens, i, queryText)) matches.push({ c, at: i });
+    const published = opts.publishedKommuner !== undefined ? opts.publishedKommuner : safePublishedKommuneSet();
+    const matches: Array<{ c: PlaceCandidate; at: number; len: number }> = [];
+    for (const c of [...PLACE_CANDIDATES, ...publishedOnlyCandidates(published)]) {
+      for (let i = 0; i < tokens.length; i++) {
+        if (placeMatchesAt(c, tokens, i, queryText)) matches.push({ c, at: i, len: c.words.length });
+      }
     }
-    let best: { c: PlaceCandidate; at: number } | undefined;
-    for (const m of matches) {
-      // Every place word is used up, also a second, unused place name.
-      for (let k = 0; k < m.c.words.length; k++) used[m.at + k] = true;
-      if (!best || m.c.tier < best.c.tier || (m.c.tier === best.c.tier && m.c.name.length > best.c.name.length)) best = m;
-    }
+    // Every place word is used up, also one of a second, unused place name.
+    for (const m of matches) for (let k = 0; k < m.len; k++) used[m.at + k] = true;
+    const best = matches
+      .filter((m) => !matches.some((o) => o.len > m.len && o.at <= m.at && m.at + m.len <= o.at + o.len))
+      .sort((a, b) =>
+        a.c.tier - b.c.tier ||
+        Number(afterPreposition(tokens, b.at)) - Number(afterPreposition(tokens, a.at)) ||
+        a.at - b.at)[0];
     if (best) {
       out.hasContent = true;
       const { c } = best;
-      const published = c.kind === "kommune"
-        ? (opts.publishedKommuner !== undefined ? opts.publishedKommuner : safePublishedKommuneSet())
-        : null;
       if (c.kind === "region") {
         out.kommuner = [...REGION_TO_KOMMUNER[c.name]];
       } else if (c.kind === "fylke") {
         out.fylke = normaliseFylke(c.name) ?? c.name.charAt(0).toUpperCase() + c.name.slice(1);
-      } else if (c.kind === "kommune" && isPublishedKommune(c.name, published)) {
+      } else if (c.kind === "kommune" && (c.publishedOnly || isPublishedKommune(c.name, published))) {
         out.kommune = c.name;
       } else {
-        // A district, or a kommune with nothing published under that name.
+        // A district, or a gazetteer kommune with nothing published under that name.
         const fylke = cityToFylke(c.name);
         if (fylke) out.fylke = fylke;
         termAt.set(best.at, c.name.toLocaleLowerCase("nb-NO"));
@@ -551,8 +689,8 @@ export function interpretDiscoverQuery(
 
   tokens.forEach((t, i) => {
     if (used[i]) return;
-    const contextual = CONTEXTUAL_SEASON_WORDS[t.lower];
-    const season = SEASON_WORDS[t.lower] ??
+    const contextual = lookup(CONTEXTUAL_SEASON_WORDS, t.lower);
+    const season = lookup(SEASON_WORDS, t.lower) ??
       (contextual && i > 0 && contextual.after.includes(tokens[i - 1].lower) && endsClause(tokens, i, queryText) ? contextual.season : undefined);
     if (season) {
       used[i] = true;
@@ -560,30 +698,36 @@ export function interpretDiscoverQuery(
       if (!explicit.season && !out.season) out.season = season;
       return;
     }
-    const weather = WEATHER_WORDS[t.lower];
+    const weather = lookup(WEATHER_WORDS, t.lower);
     if (weather) {
       used[i] = true;
       out.hasContent = true;
       if (!explicit.weather && !out.weather) out.weather = weather;
       return;
     }
-    const category = CATEGORY_ALIASES[t.lower];
-    if (category) {
+    const indoorOutdoor = lookup(INDOOR_OUTDOOR_WORDS, t.lower);
+    if (indoorOutdoor) {
       used[i] = true;
       out.hasContent = true;
-      if (!explicit.category && !out.category && category !== GARDSSALG_CATEGORY && !GENERIC_CATEGORY_ALIAS_WORDS.has(t.lower)) {
-        out.category = category;
-      }
+      if (!explicit.indoor_outdoor && !out.indoor_outdoor) out.indoor_outdoor = indoorOutdoor;
+      return;
+    }
+    const category = lookup(CATEGORY_ALIASES, t.lower);
+    if (category) {
+      used[i] = true;
+      if (GENERIC_CATEGORY_ALIAS_WORDS.has(t.lower)) return;
+      out.hasContent = true;
+      if (!explicit.category && !out.category) out.category = category;
       return;
     }
     if (WHOLE_COUNTRY_WORDS.has(t.lower) || QUERY_STOPWORDS.has(t.lower)) return;
-    // Single letters and bare numbers ("for 4 people") are no search words.
-    if (t.lower.length < 2 || /^\p{N}+$/u.test(t.lower)) return;
+    // Single letters, bare numbers ("for 4 people") and over-long tokens are no search words.
+    if (t.lower.length < 2 || t.lower.length > MAX_TEXT_TERM_LENGTH || /^\p{N}+$/u.test(t.lower)) return;
     out.hasContent = true;
     termAt.set(i, t.lower);
   });
 
-  if (!placeGiven && termAt.size > 0) {
+  if (!placeGiven && !explicit.category && termAt.size > 0) {
     const terms = [...new Set([...termAt.entries()].sort((a, b) => a[0] - b[0]).map(([, w]) => w))];
     out.terms = terms.slice(0, MAX_TEXT_TERMS);
   }

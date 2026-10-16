@@ -730,8 +730,10 @@ export function registerExperienceTools(
         // be relaxed away like an over-narrow filter, so the caller silently
         // got every category. Say so instead and name the valid slugs; the
         // gårdssalg entry from list_experience_categories points at its own
-        // tool. (ChatGPT app re-review 2026-10-03.)
-        if (filter.category) {
+        // tool. (ChatGPT app re-review 2026-10-03.) Also run for a category
+        // read from `query` below ("gårdssalg i Hardanger").
+        const categoryPointer = (extraFields: Record<string, unknown> = {}) => {
+          if (!filter.category) return null;
           const slugs = listCategorySlugs();
           const pointer =
             filter.category === GARDSSALG_CATEGORY
@@ -739,14 +741,15 @@ export function registerExperienceTools(
               : slugs.length > 0 && !slugs.includes(filter.category)
                 ? `Ukjent kategori «${filter.category}». Gyldige kategorier: ${slugs.join(", ")}. / Unknown category "${filter.category}". Valid categories: ${slugs.join(", ")}.`
                 : null;
-          if (pointer) {
-            const result = { summary: pointer, count: 0, filter_applied: filter, valid_categories: slugs, experiences: [] };
-            return {
-              structuredContent: result,
-              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-            };
-          }
-        }
+          if (!pointer) return null;
+          const result = { summary: pointer, count: 0, filter_applied: filter, ...extraFields, valid_categories: slugs, experiences: [] };
+          return {
+            structuredContent: result,
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          };
+        };
+        const explicitCategoryPointer = categoryPointer();
+        if (explicitCategoryPointer) return explicitCategoryPointer;
 
         // ── Free-text `query` (dev-request 2026-10-16-opplevagent-mcp-fritekst-
         // query, S2). It used to be read only by the two checks above, so a
@@ -759,7 +762,7 @@ export function registerExperienceTools(
         let queryInterpretation: Record<string, unknown> | undefined;
         let queryHasContent = false;
         if (queryText) {
-          const read = interpretDiscoverQuery(queryText, { fylke, kommune, lat, lng, category: filter.category, season, weather });
+          const read = interpretDiscoverQuery(queryText, { fylke, kommune, lat, lng, category: filter.category, season, weather, indoor_outdoor });
           queryHasContent = read.hasContent;
           const fill = <K extends keyof DiscoverFilter>(key: K, value: DiscoverFilter[K] | undefined) => {
             if (value === undefined || filter[key] !== undefined) return;
@@ -772,11 +775,17 @@ export function registerExperienceTools(
           fill("category", read.category);
           fill("season", read.season);
           fill("weather", read.weather);
+          fill("indoor_outdoor", read.indoor_outdoor);
           fill("text_terms", read.terms);
           if (fromQuery.length > 0) {
             const { hasContent: _hasContent, ...values } = read;
             queryInterpretation = { source: "query", ...values };
           }
+        }
+        // "gårdssalg i Hardanger" gets the same pointer as category='gardssalg'.
+        if (filter.category === GARDSSALG_CATEGORY && fromQuery.includes("category")) {
+          const pointer = categoryPointer({ query_interpretation: queryInterpretation });
+          if (pointer) return pointer;
         }
 
         // Every answer below is logged and counted the same way. Logged as
@@ -809,8 +818,11 @@ export function registerExperienceTools(
         // query was relaxed away, leaving the unfiltered catalogue. The place,
         // given or read from the query, is never relaxed away (S2, S3): a
         // kommune without hits is widened once to its fylke, then it is zero.
+        // Search words are relaxed one at a time before they are dropped
+        // (discoverExperiencesRelaxed), so this zero means no row has any of them.
         let zeroHitReason: "unrecognized_query" | "place_no_match" | "relaxation_exhausted" | undefined =
           queryHasContent && fromQuery.length === 0 && explicitKeyCount === 0 ? "unrecognized_query" : undefined;
+        let termsMatchedNothing = false;
         const placeKeys = (["kommune", "kommuner", "fylke"] as const).filter((k) => filter[k] !== undefined);
         const relaxed = zeroHitReason
           ? null
@@ -820,7 +832,8 @@ export function registerExperienceTools(
         if (relaxed && results.length === 0 && placeKeys.length > 0) {
           zeroHitReason = "place_no_match";
         } else if (relaxed && fromQuery.length > 0 && relaxedKeys.length > 0 && Object.values(relaxed.appliedFilter).every((v) => v === undefined)) {
-          zeroHitReason = fromQuery.every((k) => k === "text_terms") && explicitKeyCount === 0 ? "unrecognized_query" : "relaxation_exhausted";
+          termsMatchedNothing = fromQuery.every((k) => k === "text_terms") && explicitKeyCount === 0;
+          zeroHitReason = termsMatchedNothing ? "unrecognized_query" : "relaxation_exhausted";
         }
         if (zeroHitReason) {
           let summary: string;
@@ -837,6 +850,12 @@ export function registerExperienceTools(
             // suggestion returns hits.
             const { kommune: _k, kommuner: _ks, fylke: _f, ...rest } = filter;
             suggestions = buildNarrowingSuggestions(discoverExperiencesRelaxed(rest, limit ?? 20).results, ["kommune", "fylke"]);
+          } else if (termsMatchedNothing) {
+            summary =
+              "Søket nevner verken sted, kategori, sesong eller vær, og ingen opplevelse inneholder søkeordene i det — ingen treff. " +
+              "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+              "The query names no place, category, season or weather, and no experience contains its search words — no matches. " +
+              'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
           } else if (zeroHitReason === "unrecognized_query") {
             summary =
               "Fant ingen gjenkjennelige søkekriterier eller treff i søket (sted, kategori, sesong, vær eller søkeord) — ingen treff. " +
@@ -870,6 +889,12 @@ export function registerExperienceTools(
             ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
             : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
         if (relaxationNote) summary += ` ${relaxationNote}`;
+        if (relaxed?.textTermsMatched !== undefined) {
+          const termCount = filter.text_terms?.length ?? 0;
+          summary +=
+            ` Ingen opplevelse inneholder alle ${termCount} søkeordene; disse inneholder ${relaxed.textTermsMatched} av dem. /` +
+            ` No experience contains all ${termCount} search words; these contain ${relaxed.textTermsMatched} of them.`;
+        }
 
         const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
 
