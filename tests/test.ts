@@ -37965,7 +37965,8 @@ console.log("\n── city-normalizer: normalizeCityLabel + getStats() byer-coun
 // fabricated content; happy path: real catalog-grounded facts only). Plus an
 // HTTP-level check (same :memory: DB + sync mock req/res pattern as
 // sq-caticon/gardssalg-homepage-count above) that the /kategori/:category/:kommune
-// route ACTUALLY 200s a real combo and ACTUALLY 404s a thin one end-to-end —
+// route ACTUALLY 200s a real combo and ACTUALLY never serves a thin one
+// (404 before, 301 to /kommune since 2026-10-16 E4-S1) end-to-end —
 // this is the exact category of bug the PR-149 incident note warns about
 // (tests-green but broken/never-served in practice), so this slice verifies
 // the route handler + DB read together, not just the pure builder functions.
@@ -38051,7 +38052,8 @@ console.log("\n── geo-produkt-by-query-landing: buildProduktByFaqJsonLd / bu
 // :memory: DB (not just the pure builder functions above) — a real combo
 // (>=2 facts) must actually 200 with a FAQPage block and appear in the
 // sitemap; a thin combo (1 experience, unmatched provider, no price -> only
-// 1 real fact) must actually 404 via next() and be ABSENT from the sitemap.
+// 1 real fact) must never be served (301 to its /kommune page since E4-S1 of
+// 2026-10-16-opplevagent-stedssider-kvalitet) and be ABSENT from the sitemap.
 // This is the regression guard the PR-149 incident note calls for: prove the
 // route+DB path end-to-end, not only the isolated pure function.
 console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + sitemap (real :memory: DB) ──");
@@ -38113,18 +38115,19 @@ withFreshModules([
     );
     assertTrue(!!layerPBH, "geo-pb-http-00: router has GET /kategori/:category/:kommune layer");
 
-    function invoke(category: string, kommune: string): { status: number; body: string; nextCalled: boolean } {
-      let body = ""; let status = 200; let nextCalled = false;
+    function invoke(category: string, kommune: string): { status: number; body: string; nextCalled: boolean; location: string | null } {
+      let body = ""; let status = 200; let nextCalled = false; let location: string | null = null;
       const res: any = {
         statusCode: 200, setHeader: () => {},
         status: (c: number) => { status = c; return res; },
         send: (b: unknown) => { body = String(b); return res; },
         json: (o: unknown) => { body = JSON.stringify(o); return res; },
+        redirect: (c: number, loc: string) => { status = c; location = loc; return res; },
       };
       const req: any = { path: `/kategori/${category}/${kommune}`, hostname: "opplevagent.no", params: { category, kommune }, query: {}, lang: "no" };
       const handler = layerPBH.route.stack[layerPBH.route.stack.length - 1].handle;
       handler(req, res, () => { nextCalled = true; });
-      return { status, body, nextCalled };
+      return { status, body, nextCalled, location };
     }
 
     const realResult = invoke("mat_drikke", "Asker");
@@ -38136,8 +38139,14 @@ withFreshModules([
     assertTrue(realResult.body.includes("350"), "geo-pb-http-06: real combo -> the real stated price is on the page (not fabricated)");
     assertTrue(!/Rett fra Bonden/i.test(realResult.body) && !/tannlege/i.test(realResult.body), "geo-pb-http-07: no cross-vertical leak");
 
+    // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: a cell
+    // with experiences below the combo gate is 301'd to its /kommune page
+    // (was a 404 via next() before), still without rendering anything.
     const thinResult = invoke("fisketur", "Kragerø");
-    assertTrue(thinResult.nextCalled, "geo-pb-http-08: thin combo (1 fact only, unmatched provider + no price) -> handler calls next() (404), page is NOT served");
+    assertTrue(
+      !thinResult.nextCalled && thinResult.status === 301 && thinResult.location === `/kommune/${encodeURIComponent("Kragerø")}`,
+      `geo-pb-http-08: thin combo (1 fact only, unmatched provider + no price) -> 301 to /kommune/Krager%C3%B8, page is NOT served (got ${thinResult.status} ${thinResult.location})`
+    );
     assertTrue(!thinResult.body.includes("FAQPage"), "geo-pb-http-09: thin combo -> no FAQPage block ever rendered (nothing rendered at all)");
 
     const unknownResult = invoke("mat_drikke", "Nowhereville");
@@ -38165,7 +38174,7 @@ withFreshModules([
       "geo-pb-http-13: sitemap.xml does NOT include the thin combo's URL (no orphan/thin sitemap entry)"
     );
 
-    console.log("  geo-produkt-by-http: OK (13 tests: route-registered/200-real/FAQPage-present/question-present/labels-real/price-real/no-leak/404-thin/no-FAQPage-thin/404-unknown/sitemap-registered/sitemap-includes-real/sitemap-excludes-thin)");
+    console.log("  geo-produkt-by-http: OK (13 tests: route-registered/200-real/FAQPage-present/question-present/labels-real/price-real/no-leak/301-thin/no-FAQPage-thin/404-unknown/sitemap-registered/sitemap-includes-real/sitemap-excludes-thin)");
   } catch (err) {
     failed++;
     failures.push(`geo-pb-http: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
@@ -42011,6 +42020,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-og-png: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: one
+// configurable combo gate (≥2 experiences + ≥2 real facts) for
+// /kategori/:category/:kommune, its sitemap entries and the /kommune
+// category chips; a cell below the gate answers 301 to /kommune/<k>.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-stedssider-kvalitet E4-S1: one combo gate for route, sitemap and /kommune chips ──");
+  try {
+    const { runExperiencesSeoProduktByGateTests } = require("../src/routes/experiences-seo-produktby-gate.test") as
+      typeof import("../src/routes/experiences-seo-produktby-gate.test");
+    const epbg = await runExperiencesSeoProduktByGateTests({ log: false });
+    passed += epbg.passed;
+    failed += epbg.failed;
+    for (const f of epbg.failures) failures.push("experiences-seo-produktby-gate: " + f);
+    console.log(`  experiences-seo-produktby-gate: ${epbg.passed} passed, ${epbg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-produktby-gate: unexpected error: " + String(err?.message || err));
   }
 });
 

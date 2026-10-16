@@ -46,10 +46,16 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
 // one indexability verdict drives the detail page's robots meta, its
 // X-Robots-Tag header and its sitemap.xml entry — see the module's header.
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: one combo
+// gate for /kategori/:category/:kommune, its sitemap entries and the
+// /kommune category chips.
 import {
   NOINDEX_FOLLOW,
   renderableExperienceDescription,
   shouldNoindexExperience,
+  isProduktByCellIndexable,
+  produktByMinExperiences,
+  countProduktByRealFacts,
 } from "../services/experience-indexability";
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
 // one fact list for the «Kort fortalt» box, the facts table and the fallback
@@ -2725,21 +2731,24 @@ function buildExperiencesSitemapXml(): string {
   } catch { /* experiences DB not open */ }
   try {
     // GEO query-landing pages (dev-request 2026-06-30-geo-content-structured-data):
-    // one <url> per (category, kommune) combo that clears the SAME
-    // >=2-real-facts quality gate the /kategori/:category/:kommune route
-    // itself requires just to 200 (see that route's comment) -- so a URL
-    // only ever lands here if the route would actually serve it, never a
-    // thin/empty combinatorial cell. listProduktByCombos() already returns
-    // only combos with >=1 published experience (one GROUP BY query, not a
-    // full category × kommune cross-product), so this gate check is a cheap
+    // one <url> per (category, kommune) combo the /kategori/:category/:kommune
+    // route itself serves. dev-request 2026-10-16-opplevagent-stedssider-
+    // kvalitet, E4-S1: both read the one isProduktByCellIndexable() gate
+    // (experience-indexability.ts), so a URL only lands here if the route
+    // would 200 it, never one it redirects. listProduktByCombos() already
+    // returns only combos with >=1 published experience (one GROUP BY query,
+    // not a full category × kommune cross-product), so this is a cheap
     // in-memory filter over that one result set, not a query per candidate.
+    let comboListed = 0;
+    let comboBelowGate = 0;
     for (const row of listProduktByCombos()) {
       if (!row.category || !row.kommune) continue;
-      const factCount = (row.total > 0 ? 1 : 0) + (row.providerCount > 0 ? 1 : 0) + (row.minPriceFrom !== null ? 1 : 0);
-      if (factCount < 2) continue;
+      if (!isProduktByCellIndexable(row)) { comboBelowGate++; continue; }
       const lastmod = (row.lastmod || today).slice(0, 10);
       xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.5</priority><lastmod>${lastmod}</lastmod></url>`;
+      comboListed++;
     }
+    console.log(`[experiences-sitemap] produkt_by listed=${comboListed} below_gate_skipped=${comboBelowGate} min_experiences=${produktByMinExperiences()}`);
   } catch { /* experiences DB not open */ }
   try {
     // Slug backfill already ran near the top of this handler (before the
@@ -4691,6 +4700,29 @@ function kommuneChips(fylke: string): string {
     .map((k) => `<a class="chip" href="/kommune/${encodeURIComponent(k.kommune)}">${escapeHtml(k.kommune)} <span class="n">${k.count}</span></a>`)
     .join("");
   return `<div class="chips" role="list" aria-label="Kommuner i ${escapeHtml(fylke)}">${chips}</div>`;
+}
+
+// Category chips for a kommune page (dev-request 2026-10-16-opplevagent-
+// stedssider-kvalitet, E4-S1): one chip per /kategori/<cat>/<kommune> combo
+// page that clears isProduktByCellIndexable() -- the gate the combo route and
+// the sitemap read too, so a chip never links to a cell that redirects back
+// here. One listProduktByCombos() query, filtered in memory; its rows come
+// largest first. Same chip markup as facetChips()'s category chips, colour
+// dot included. "" when the kommune has no combo page to link; a failed
+// query is logged (not a silent catch) and the page renders without chips.
+function produktByChips(kommune: string): string {
+  let combos: ReturnType<typeof listProduktByCombos> = [];
+  try {
+    combos = listProduktByCombos().filter((c) => c.kommune === kommune && !!c.category && isProduktByCellIndexable(c));
+  } catch (e) {
+    console.error(`[experiences-seo] /kommune/${kommune} category chips failed:`, e);
+    return "";
+  }
+  if (combos.length === 0) return "";
+  const chips = combos
+    .map((c) => `<a class="chip" href="/kategori/${encodeURIComponent(c.category)}/${encodeURIComponent(kommune)}"><span class="chip-dot" aria-hidden="true" style="background:${categoryColor(c.category)}"></span>${escapeHtml(catLabel(c.category))} <span class="n">${c.total}</span></a>`)
+    .join("");
+  return `<div class="chips" role="list" aria-label="Kategorier i ${escapeHtml(kommune)}">${chips}</div>`;
 }
 
 // Facet chips (categories + fylker) for the index page top.
@@ -8013,7 +8045,9 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     total: effectiveTotal,
     page: effectivePage,
     pageSize: effectivePageSize,
-    extraTopHtml: searchBox("") + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
+    // E4-S1: the combo pages for this kommune, in the same slot /fylke puts
+    // its kommuneChips().
+    extraTopHtml: searchBox("") + produktByChips(kommune) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
@@ -8044,13 +8078,16 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
 // content penalty): total===0 -> 404 via next(), same baseline as every
 // sibling browse route. ADDITIONALLY -- and unlike /kategori/:category and
 // /kommune/:kommune, where an insufficient-facts result only suppresses the
-// FAQ block while the page still renders -- this route requires the SAME
-// ≥2-real-facts bar (see buildProduktByFaqJsonLd/buildProduktByAnswerFirstOpening)
-// just to SERVE the page at all. Below that bar we 404 via next() rather than
-// render a real-but-thin single-item page, so this combinatorial route can
-// never be pointed at (or link/sitemap into) a near-empty cell. The sitemap
-// loop applies the identical gate over listProduktByCombos() so a URL only
-// ever appears there if this handler would actually 200 it.
+// FAQ block while the page still renders -- this route only SERVES a cell
+// that clears isProduktByCellIndexable() (experience-indexability.ts:
+// ≥ produktByMinExperiences() experiences, default 2, AND the ≥2-real-facts
+// bar of buildProduktByFaqJsonLd/buildProduktByAnswerFirstOpening).
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: a cell with
+// experiences that is below the gate answers 301 to /kommune/<kommune>,
+// which lists the same experiences (an indexed thin URL hands its signal on
+// instead of turning into a 404). The sitemap loop and the /kommune category
+// chips read the same predicate, so a URL is only ever listed or linked if
+// this handler would actually 200 it.
 router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: NextFunction) => {
   const category = String(req.params.category || "");
   const kommune = String(req.params.kommune || "");
@@ -8068,8 +8105,8 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
   const label = catLabel(category);
   const canonicalPath = `/kategori/${encodeURIComponent(category)}/${encodeURIComponent(kommune)}`;
 
-  // Quality gate: needs >=2 real catalog facts (same bar as the FAQ block) to
-  // be served at all -- see the route comment above. Computed BEFORE paging
+  // Quality gate: isProduktByCellIndexable() decides whether the cell is
+  // served at all -- see the route comment above. Computed BEFORE paging
   // through rows so a thin combo never renders any HTML, not even a
   // near-empty grid. Any error here fails safe to 404 (no orphan/broken
   // page), logged (not a silent catch) per the PR-149 incident lesson.
@@ -8080,11 +8117,13 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     console.error(`[experiences-seo] /kategori/${category}/${kommune} produkt×by stats failed:`, e);
     return next();
   }
-  const factCount =
-    (stats.total > 0 ? 1 : 0) + (stats.providerCount > 0 ? 1 : 0) + (stats.minPriceFrom !== null ? 1 : 0);
-  if (factCount < 2) {
-    console.log(`[experiences-seo] /kategori/${category}/${kommune}: below quality gate (${factCount} real facts, ${total} experience${total === 1 ? "" : "s"}) -- not served (404), not sitemapped`);
-    return next();
+  if (!isProduktByCellIndexable(stats)) {
+    const minExperiences = produktByMinExperiences();
+    console.log(`[experiences-seo] /kategori/${category}/${kommune}: below combo gate (${stats.total} experience${stats.total === 1 ? "" : "s"}, min ${minExperiences}; ${countProduktByRealFacts(stats)} real facts) -- 301 to /kommune, not sitemapped`);
+    // The threshold is an env setting (rollback = "1"), so the redirect is
+    // permanent for crawlers but not pinned forever in browser caches.
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.redirect(301, `/kommune/${encodeURIComponent(kommune)}`);
   }
 
   try {
@@ -8119,11 +8158,11 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     minPriceFrom: stats.minPriceFrom,
   });
   if (!answerFirst) {
-    // Should not happen given the factCount>=2 gate above already passed,
+    // Should not happen given the combo gate above already passed,
     // but if the two functions' gates ever drift, fail safe to a generic
     // (still real, non-fabricated) lede rather than throw -- logged, not
     // swallowed, per the PR-149 incident lesson.
-    console.log(`[experiences-seo] /kategori/${category}/${kommune}: answer-first opening unexpectedly null despite factCount>=2 -- falling back to generic lede`);
+    console.log(`[experiences-seo] /kategori/${category}/${kommune}: answer-first opening unexpectedly null despite passing the combo gate -- falling back to generic lede`);
   }
   const lede = answerFirst || `${label} i ${kommune}.`;
 
