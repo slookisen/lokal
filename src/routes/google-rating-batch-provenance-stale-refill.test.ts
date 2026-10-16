@@ -181,12 +181,19 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
   const ADMIN_KEY = process.env.ADMIN_KEY || "grb-provenance-stale-refill-test-key";
   const GADDR = "Storgata 1, 1400 Ski";
   const GPHONE = "+4712345678";
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (S3): the batch now writes only a Places candidate whose name
+  // and town match the agent. Every agent here is the same producer in Ski,
+  // and the stubbed Places answer is that producer (displayName +
+  // addressComponents), so each scenario still reaches the PR-82 block.
+  const PRODUCER_NAME = "Kafferøst AS";
+  const PRODUCER_CITY = "Ski";
 
   function insertAgent(id: string, url: string): void {
     db.prepare(
-      `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, created_at)
-       VALUES (?, ?, 't', 't', '', ?, 'producer', ?, 'rfb', '2026-01-01 00:00:00')`,
-    ).run(id, id, url, `key-${id}`);
+      `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, city, created_at)
+       VALUES (?, ?, 't', 't', '', ?, 'producer', ?, 'rfb', ?, '2026-01-01 00:00:00')`,
+    ).run(id, PRODUCER_NAME, url, `key-${id}`, PRODUCER_CITY);
   }
 
   function fieldSourceCount(explainBody: any, field: string): number {
@@ -211,7 +218,18 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
           ok: true,
           status: 200,
           json: async () => ({
-            places: [{ id: "place-1", rating: 4.5, userRatingCount: 10, formattedAddress: GADDR, internationalPhoneNumber: GPHONE }],
+            places: [{
+              id: "place-1",
+              displayName: { text: "Kafferøst" },
+              rating: 4.5,
+              userRatingCount: 10,
+              formattedAddress: GADDR,
+              internationalPhoneNumber: GPHONE,
+              addressComponents: [
+                { longText: "1400", shortText: "1400", types: ["postal_code"] },
+                { longText: "Ski", shortText: "Ski", types: ["postal_town"] },
+              ],
+            }],
           }),
         } as any;
       }
