@@ -2049,9 +2049,10 @@ IKKE en pålogging eller et krav for å bruke tjenesten.
   \`key\` — vis den KUN denne ene gangen, den kan ikke hentes igjen.
 - Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
 - Fordel: kallene dine telles i en aggregert forbrukslogg (kun endepunkt/verktøynavn og dato —
-  aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com er i dag en flat
-  IP-kvote (1000/15 min) som IKKE er høyere med nøkkel — den høyere rate-grensen som nøkkelen
-  gir på enkelte andre vertikaler på plattformen er ikke koblet på her ennå.
+  aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com (1000 kall per
+  15 min — per MCP-økt på \`/mcp\`, ellers per IP) er IKKE høyere med nøkkel — den høyere
+  rate-grensen som nøkkelen gir på enkelte andre vertikaler på plattformen er ikke koblet på
+  her ennå.
 - Tilbakekall/slett: \`POST ${DENTAL_BASE_URL}/api/keys/revoke\` (stanser nøkkelen, historikk
   beholdes) eller \`POST ${DENTAL_BASE_URL}/api/keys/erase\` (GDPR-sletting av label/e-post).
   Begge tar \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
@@ -2065,9 +2066,9 @@ Voluntary — every search/read endpoint above already works with no key, and th
 login or a requirement to use the service. Get a free key via \`POST /api/keys\`
 (optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call, and
 revoke/erase it any time via \`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: unlike
-some other verticals on this platform, finn-tannlege.com's rate limit is currently a flat
-per-IP quota not yet raised by a key — the key still gets your calls counted in the usage
-ledger.
+some other verticals on this platform, finn-tannlege.com's rate limit (1000 calls per 15
+minutes — per MCP session on \`/mcp\`, otherwise per IP) is not yet raised by a key — the key
+still gets your calls counted in the usage ledger.
 
 ## Datakvalitet og verifisering
 
@@ -2616,7 +2617,7 @@ Description: Norwegian dental practice directory — find and compare dental cli
 Languages: no, en
 Categories: dental, healthcare, directory, norway
 Region: NO
-Rate-limit: 300 requests per 15 minutes (general)
+Rate-limit: 1000 requests per 15 minutes (REST and A2A per IP, MCP per session)
 Rate-limit: 500 requests per hour (admin)
 Contact: https://github.com/slookisen/lokal/issues
 `);

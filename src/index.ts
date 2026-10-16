@@ -365,7 +365,9 @@ if (process.env.ENABLE_DENTAL === "1") {
     }
 
     // /mcp endpoint → dental Streamable HTTP MCP router (PR-114)
-    // dentalMcpRouter applies its own rate limiting (dentalLimiter).
+    // dentalMcpRouter applies its own rate limiting: its own per-session
+    // chain from middleware/mcp-rate-limit.ts, not dentalLimiter. It runs
+    // after mcpUsageLogger, so its 429s are logged.
     if (p === "/mcp" || p.startsWith("/mcp/")) {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const dentalMcpRouter = require("./routes/dental-mcp").default;
@@ -448,7 +450,9 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
     }
 
     // /mcp endpoint → experiences Streamable HTTP MCP router (orchestrator-pr-33)
-    // experiencesMcpRouter applies its own rate limiting (jsonRpcLimiter).
+    // experiencesMcpRouter applies its own rate limiting: its own per-session
+    // chain from middleware/mcp-rate-limit.ts, not the /a2a jsonRpcLimiter. It
+    // runs after mcpUsageLogger, so its 429s are logged.
     // Mounted BEFORE /a2a so a dental-style host-dispatch ordering is preserved
     // and opplevagent /mcp requests never fall through to rfb's /mcp router.
     if (p === "/mcp" || p.startsWith("/mcp/")) {

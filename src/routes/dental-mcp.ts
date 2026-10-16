@@ -31,15 +31,19 @@ import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 
 import { clinicProfileUrl } from "./dental-seo";
 import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
-import { dentalLimiter } from "../middleware/security";
+import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { companyFooterLineHtml } from "../services/company-legal";
 
 const router = Router();
 
-// Apply rate limiting to all routes on this router (same pattern as dental-a2a.ts)
-router.use(dentalLimiter);
+// Rate limiting for all routes on this router (dev-request
+// 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt): this router's own
+// buckets — IP brake, then a quota per MCP session (else per recognized
+// consumer key, else per IP). Not dentalLimiter, which /api/tannlege and
+// dental /a2a keep. See middleware/mcp-rate-limit.ts.
+router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSession: hasDentalMcpSession }).chain);
 
 // ─── Zod input schemas (exported for testing — pr114-01) ─────
 
@@ -443,6 +447,12 @@ interface DentalMcpSession {
 
 const dentalSessions = new Map<string, DentalMcpSession>();
 const DENTAL_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// The rate limiter's "is this a live session?" check (router.use at the top
+// of this file): only a session this router minted gets its own bucket.
+export function hasDentalMcpSession(sessionId: string): boolean {
+  return dentalSessions.has(sessionId);
+}
 
 // Cleanup stale sessions every 5 minutes
 setInterval(() => {
