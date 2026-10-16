@@ -43,6 +43,15 @@ import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { generalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, looksTruncatedMidWord } from "../services/description-quality";
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
+// one indexability verdict drives the detail page's robots meta, its
+// X-Robots-Tag header and its sitemap.xml entry — see the module's header.
+import {
+  NOINDEX_FOLLOW,
+  renderableExperienceDescription,
+  shouldNoindexExperience,
+  experienceDescriptionsBySlug,
+} from "../services/experience-indexability";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
@@ -2670,8 +2679,14 @@ function buildExperiencesSitemapXml(): string {
     }
   } catch { /* experiences DB not open */ }
   try {
+    // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
+    // a page that is noindex (placeholder, no real description) is not
+    // listed — same shouldNoindexExperience() verdict the page itself and its
+    // X-Robots-Tag header use, so the sitemap can never list a noindex page.
+    const descriptionBySlug = experienceDescriptionsBySlug(getExpDbForReise("experiences"));
     for (const row of listPublishedExperienceSlugs()) {
       if (!row.slug) continue;
+      if (shouldNoindexExperience({ description: descriptionBySlug.get(row.slug) })) continue;
       const lastmod = (row.updated_at || today).slice(0, 10);
       xml += `\n  <url><loc>${url}/opplevelse/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
@@ -3281,7 +3296,11 @@ function renderOpplevelseDetail(
   // req.lang — only the visible <h1> uses it (title_no || title fallback on
   // /no, original title always on /en). Breadcrumb/JSON-LD/OG-meta/<title>
   // tag are deliberately NOT touched this slice — still the original title.
-  lang: Lang
+  lang: Lang,
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
+  // shouldNoindexExperience(exp), computed ONCE by the route, which also sets
+  // the matching X-Robots-Tag header — the meta tag and header share one value.
+  noindex: boolean
 ): string {
   if (!exp) return "";
   const slug = exp.slug || "";
@@ -3292,11 +3311,15 @@ function renderOpplevelseDetail(
   //   tr     — PUBLISHED, reviewed+verified translations of title/description/
   //            meeting_point for this row; {} unless
   //            PROFILE_TRANSLATIONS_SERVE_ENABLED === "true".
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E3-S1:
+  // tr is also {} while the switcher is off. The page is then lang="nb" with
+  // the NO canonical (K16), so translated body text under it would be English
+  // marked as Norwegian; with the switcher off, EN stays hidden throughout.
   const switcherOn = isOpplevagentLangSwitcherEnabled();
   const uiLang: Lang = switcherOn ? lang : "no";
   const L = oaProfileLabels(uiLang);
   const noPath = `/opplevelse/${encodeURIComponent(slug)}`;
-  const tr = lang !== "no"
+  const tr = lang !== "no" && switcherOn
     ? getPublishedProfileTranslations(getExpDbForReise("experiences"), "opplevagent", "experience", String(exp.id), lang)
     : {};
   const canonical = `${url}${switcherOn ? localizedPath(noPath, lang) : noPath}`;
@@ -3316,11 +3339,15 @@ function renderOpplevelseDetail(
   // description must never render (dev-request 2026-07-04-rfb-datakvalitet
   // item 1, render-guard-only slice — same guard used for producer
   // descriptions in src/routes/seo.ts). Computed once, reused by both the
-  // meta description and the visible lede below.
-  let safeExpDescription = exp.description ? String(exp.description) : "";
-  if (safeExpDescription && isJunkDescription(safeExpDescription)) {
+  // meta description and the visible lede below. dev-request 2026-10-16-
+  // opplevagent-indekserbarhet-og-strukturdata, E1-S1: the guard is
+  // renderableExperienceDescription(), the same function behind
+  // shouldNoindexExperience(), so the placeholder renders exactly on the
+  // pages that are noindex (kill switch on).
+  const rawExpDescription = exp.description ? String(exp.description) : "";
+  let safeExpDescription = renderableExperienceDescription(rawExpDescription);
+  if (rawExpDescription.trim() && !safeExpDescription) {
     console.log(`[description-guard] suppressed junk description (opplevelse detail) for ${exp.id} (${exp.title})`);
-    safeExpDescription = "";
   }
   // Translated body text (only when a published translation exists for the
   // exact field; the Norwegian value is the fallback, never overwritten).
@@ -3549,7 +3576,7 @@ function renderOpplevelseDetail(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
-<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="robots" content="${noindex ? NOINDEX_FOLLOW : "index, follow, max-snippet:-1, max-image-preview:large"}">
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">${switcherOn ? "\n" + oaHreflangLinks(url, noPath) : ""}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -5684,13 +5711,16 @@ router.get(
     // two-flag model as renderOpplevelseDetail() — chrome labels follow
     // req.lang only while OPPLEVAGENT_LANG_SWITCHER_ENABLED, translated body
     // fields only while PROFILE_TRANSLATIONS_SERVE_ENABLED (and only the
-    // fields that actually have a published translation).
+    // fields that actually have a published translation). dev-request
+    // 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E3-S1: and only
+    // while the switcher is on — with it off the page is lang="nb" with the
+    // NO canonical, so no translated body text under it.
     const lang: Lang = req.lang;
     const switcherOn = isOpplevagentLangSwitcherEnabled();
     const uiLang: Lang = switcherOn ? lang : "no";
     const L = oaProfileLabels(uiLang);
     const noPath = `/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
-    const tr = lang !== "no"
+    const tr = lang !== "no" && switcherOn
       ? getPublishedProfileTranslations(getExpDbForReise("experiences"), "opplevagent", "provider", String(provider.id), lang)
       : {};
     const canonical = `${url}${switcherOn ? localizedPath(noPath, lang) : noPath}`;
@@ -8792,10 +8822,15 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
     related = [];
   }
 
+  // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
+  // one verdict for the X-Robots-Tag header here and the robots meta tag in
+  // the page (passed in, not recomputed). Still 200 and still published.
+  const noindex = shouldNoindexExperience(exp);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  if (noindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_profile", [exp.id], "experiences");
-  res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang));
+  res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang, noindex));
 });
 
 
