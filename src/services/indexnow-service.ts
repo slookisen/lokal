@@ -64,3 +64,73 @@ export function pingIndexNow(urls: string[], host: string): void {
     console.warn(`[indexnow] ping setup failed for ${host}:`, err instanceof Error ? err.message : err);
   }
 }
+
+// ─── submitIndexNow — awaited, batched submit (dev-request 2026-10-16-indexnow-alle-verter, S1) ───
+// Unlike pingIndexNow this is awaited by the caller (the sitemap-diff job) and reports
+// a status per chunk. It never throws. URLs that do not start with the host's baseUrl are
+// dropped before the POST (a foreign host would make IndexNow answer 422).
+
+export type IndexNowChunkResult = "ok" | "bad_request" | "key_invalid" | "host_mismatch" | "rate_limited" | "http_error" | "network_error";
+
+export interface IndexNowChunkStatus {
+  status: number; // HTTP status, 0 on network error / timeout
+  result: IndexNowChunkResult;
+  sent: number;
+}
+
+export interface SubmitIndexNowResult {
+  chunks: IndexNowChunkStatus[];
+  sent: number; // URLs in chunks that were accepted (200/202)
+  dropped_foreign: number;
+}
+
+export interface SubmitIndexNowOptions {
+  fetchImpl?: typeof fetch;
+  chunkSize?: number; // default 1000; IndexNow spec max is 10 000 per POST
+  baseUrl?: string; // default https://<host>
+}
+
+export function classifyIndexNowStatus(status: number): IndexNowChunkResult {
+  if (status === 200 || status === 202) return "ok";
+  if (status === 400) return "bad_request";
+  if (status === 403) return "key_invalid";
+  if (status === 422) return "host_mismatch";
+  if (status === 429) return "rate_limited";
+  return "http_error";
+}
+
+export async function submitIndexNow(
+  host: string,
+  urls: string[],
+  opts: SubmitIndexNowOptions = {},
+): Promise<SubmitIndexNowResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const chunkSize = Math.min(10_000, Math.max(1, Math.floor(opts.chunkSize ?? 1000)));
+  const baseUrl = (opts.baseUrl ?? `https://${host}`).replace(/\/+$/, "");
+  const own = urls.filter((u) => typeof u === "string" && (u === baseUrl || u.startsWith(baseUrl + "/")));
+  const out: SubmitIndexNowResult = { chunks: [], sent: 0, dropped_foreign: urls.length - own.length };
+  for (let i = 0; i < own.length; i += chunkSize) {
+    const chunk = own.slice(i, i + chunkSize);
+    try {
+      const res = await doFetch(INDEXNOW_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({
+          host,
+          key: INDEXNOW_KEY,
+          keyLocation: `https://${host}/${INDEXNOW_KEY}.txt`,
+          urlList: chunk,
+        }),
+        signal: AbortSignal.timeout(INDEXNOW_TIMEOUT_MS),
+      });
+      const result = classifyIndexNowStatus(res.status);
+      if (result === "ok") out.sent += chunk.length;
+      else console.warn(`[indexnow] submit non-2xx for ${host}: ${res.status} (${result})`);
+      out.chunks.push({ status: res.status, result, sent: chunk.length });
+    } catch (err) {
+      console.warn(`[indexnow] submit failed for ${host}:`, err instanceof Error ? err.message : err);
+      out.chunks.push({ status: 0, result: "network_error", sent: chunk.length });
+    }
+  }
+  return out;
+}

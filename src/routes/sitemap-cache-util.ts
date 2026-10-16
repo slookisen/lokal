@@ -21,12 +21,22 @@ export function resolveSitemapCacheTtlMs(raw: string | undefined = process.env.S
 
 export interface SitemapCache {
   get(now?: number, build?: () => string): string;
+  /** Cached `{xml, builtAt}` or null — never builds (dev-request 2026-10-16-indexnow-alle-verter, S1). */
+  peek(): { xml: string; builtAt: number } | null;
   reset(): void;
+}
+
+// Module register so other services can reach a vertical's cache without importing its
+// route file. createSitemapCache fills it; the last cache created for a vertical wins.
+const registeredCaches = new Map<string, SitemapCache>();
+
+export function getRegisteredSitemapCache(vertical: string): SitemapCache | null {
+  return registeredCaches.get(vertical) ?? null;
 }
 
 export function createSitemapCache(vertical: string, defaultBuild: () => string): SitemapCache {
   let cache: { xml: string; builtAt: number } | null = null;
-  return {
+  const handle: SitemapCache = {
     get(now: number = Date.now(), build: () => string = defaultBuild): string {
       if (cache && now - cache.builtAt < resolveSitemapCacheTtlMs()) return cache.xml;
       try {
@@ -37,10 +47,15 @@ export function createSitemapCache(vertical: string, defaultBuild: () => string)
       }
       return cache.xml;
     },
+    peek(): { xml: string; builtAt: number } | null {
+      return cache ? { xml: cache.xml, builtAt: cache.builtAt } : null;
+    },
     reset(): void {
       cache = null;
     },
   };
+  registeredCaches.set(vertical, handle);
+  return handle;
 }
 
 /** One line, no body: `[sitemap-slow] <vertical> <ms>ms` when elapsed > 3 s. */
