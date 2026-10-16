@@ -96,7 +96,7 @@ export function runOpplevagentSubmissionReplayTests(opts: { log?: boolean } = {}
       structured: { category: "dyreliv_safari" },
       check: (r) => [
         ...(r.count > 0 && r.experiences.every((e: any) => e.category === "dyreliv_safari") ? [] : ["only dyreliv_safari"]),
-        ...(["fylke", "kommune", "kommuner"].every((k) => r.filter_applied[k] === undefined) ? [] : ["no place filter (Norway = whole country)"]),
+        ...(["fylke", "kommune", "kommuner", "fylker"].every((k) => r.filter_applied[k] === undefined) ? [] : ["no place filter (Norway = whole country)"]),
         ...(new Set(r.experiences.map((e: any) => e.fylke)).size >= 3 ? [] : ["several counties"]),
       ],
       exact: { searchWords: false },

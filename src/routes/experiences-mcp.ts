@@ -772,6 +772,7 @@ export function registerExperienceTools(
           fill("kommune", read.kommune);
           fill("kommuner", read.kommuner);
           fill("fylke", read.fylke);
+          fill("fylker", read.fylker);
           fill("category", read.category);
           fill("season", read.season);
           fill("weather", read.weather);
@@ -818,12 +819,12 @@ export function registerExperienceTools(
         // query was relaxed away, leaving the unfiltered catalogue. The place,
         // given or read from the query, is never relaxed away (S2, S3): a
         // kommune without hits is widened once to its fylke, then it is zero.
-        // Search words are relaxed one at a time before they are dropped
+        // Search words are relaxed gradually before they are dropped
         // (discoverExperiencesRelaxed), so this zero means no row has any of them.
         let zeroHitReason: "unrecognized_query" | "place_no_match" | "relaxation_exhausted" | undefined =
           queryHasContent && fromQuery.length === 0 && explicitKeyCount === 0 ? "unrecognized_query" : undefined;
         let termsMatchedNothing = false;
-        const placeKeys = (["kommune", "kommuner", "fylke"] as const).filter((k) => filter[k] !== undefined);
+        const placeKeys = (["kommune", "kommuner", "fylke", "fylker"] as const).filter((k) => filter[k] !== undefined);
         const relaxed = zeroHitReason
           ? null
           : discoverExperiencesRelaxed(filter, limit ?? 20, { protectKeys: placeKeys, widenKommuneToFylke: true });
@@ -839,7 +840,7 @@ export function registerExperienceTools(
           let summary: string;
           let suggestions: string[] = [];
           if (zeroHitReason === "place_no_match") {
-            const place = filter.kommune ?? filter.kommuner?.join(", ") ?? filter.fylke;
+            const place = filter.kommune ?? filter.kommuner?.join(", ") ?? filter.fylke ?? filter.fylker?.join(", ");
             const widenedTo = relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP) ? relaxed?.appliedFilter.fylke : undefined;
             summary =
               `Ingen opplevelser funnet i ${place}${widenedTo ? ` eller ellers i ${widenedTo}` : ""}. ` +
@@ -848,7 +849,7 @@ export function registerExperienceTools(
               "Opplevagent does not fall back to results from the rest of the country.";
             // Places that do have experiences for the rest of the request; each
             // suggestion returns hits.
-            const { kommune: _k, kommuner: _ks, fylke: _f, ...rest } = filter;
+            const { kommune: _k, kommuner: _ks, fylke: _f, fylker: _fs, ...rest } = filter;
             suggestions = buildNarrowingSuggestions(discoverExperiencesRelaxed(rest, limit ?? 20).results, ["kommune", "fylke"]);
           } else if (termsMatchedNothing) {
             summary =

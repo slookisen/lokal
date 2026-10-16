@@ -42,9 +42,10 @@ type ExpStore = typeof import("../services/experience-store");
  * title_no and description-only hits), summer-only rows in Troms, wildlife in
  * several counties, the Lofoten region, Geiranger filed under Stranda, a
  * published kommune named Time, a Rauma row whose title has "Romsdal" in it,
- * kommuner the gazetteer lacks (Lyngen, Sirdal, Rauma), and an unpublished
- * row in Finnsnes. No row in Finnmark, Storslett or Alta. Every row has a
- * price, so a max_price filter can find nothing.
+ * kommuner the gazetteer lacks (Lyngen, Sirdal, Rauma) — four of them named
+ * like everyday words (Gran, Strand, Øyer, Fjord) — and an unpublished row
+ * in Finnsnes. No row in Finnmark, Storslett or Alta. Every row has a price,
+ * so a max_price filter can find nothing.
  */
 export function seedOpplevagentQueryFixture(expStore: ExpStore, db: { prepare(sql: string): { run(...a: unknown[]): unknown } }): Record<string, string> {
   const providerId = expStore.createProvider({
@@ -83,6 +84,11 @@ export function seedOpplevagentQueryFixture(expStore: ExpStore, db: { prepare(sq
   add("fishMarket", { kommune: "Bergen", fylke: "Vestland", title: "Bergen Fish Market food walk", category: "mat_drikke", subcategory: "matvandring", season: ["all_year"], price_from: 450 });
   add("viking", { kommune: "Oslo", fylke: "Oslo", title: "Viking Ship Museum", category: "kultur_historie", season: ["all_year"], price_from: 160 });
   add("jaermuseet", { kommune: "Time", fylke: "Rogaland", title: "Jærmuseet", category: "kultur_historie", season: ["all_year"], price_from: 200 });
+  // Catalogue kommuner whose names are also words: "Gran" (Canaria), "strand", "øyer" (islands), "fjord".
+  add("glassverk", { kommune: "Gran", fylke: "Innlandet", title: "Glassblowing at Hadeland Glassverk", category: "kultur_historie", season: ["all_year"], price_from: 250 });
+  add("preikestolen", { kommune: "Strand", fylke: "Rogaland", title: "Preikestolen guided hike", category: "natur_friluft", season: ["summer"], price_from: 950 });
+  add("hafjell", { kommune: "Øyer", fylke: "Innlandet", title: "Hafjell Alpinsenter day pass", category: "vinter_sno", season: ["winter"], price_from: 600 });
+  add("valldal", { kommune: "Fjord", fylke: "Møre og Romsdal", title: "Valldal strawberry farm tour", category: "mat_drikke", season: ["summer"], price_from: 350 });
   add("unpublished", { kommune: "Finnsnes", fylke: "Troms", title: "Hidden spa", category: "velvaere_spa", season: ["all_year"], price_from: 700, verification_status: "needs_review" });
   return ids;
 }
@@ -307,7 +313,43 @@ export function runOpplevagentMcpQueryIntentTests(opts: { log?: boolean } = {}):
       assertEq(readC("i Senja").kommuner, [...REGION_TO_KOMMUNER.Senja], "u45: a name the gazetteer already reads keeps its gazetteer meaning (region Senja)");
       assertEq([readC("ting å gjøre i Tromsø kommune").kommune, readC("ting å gjøre i Tromsø sentrum").kommune], ["Tromsø", "Tromsø"],
         "u46: a stray catalogue value with a gazetteer kommune in it does not shadow that kommune");
-      assertEq(readC("i Indre Østfold").kommune, "Indre Østfold", "u47: a catalogue kommune with a fylke name in it is that kommune"); 
+      assertEq(readC("i Indre Østfold").kommune, "Indre Østfold", "u47: a catalogue kommune with a fylke name in it is that kommune");
+
+      // Fix round 2, B1: catalogue kommuner named like everyday words rank after
+      // every gazetteer place, need a capital after the preposition, and are no
+      // part of a longer capitalised name.
+      const everyday = new Set([...withCatalogue, "Gran", "Strand", "Øyer", "Vik", "Nes", "Sel", "Berg"]);
+      const readE = (q: string) => interpretDiscoverQuery(q, {}, { publishedKommuner: everyday });
+      assertEq([readE("things to do in Gran Canaria"), readE("hva kan vi gjøre på Gran Canaria")],
+        [{ hasContent: true, terms: ["gran", "canaria"] }, { hasContent: true, terms: ["gran", "canaria"] }],
+        "u48: «Gran Canaria» is not the kommune Gran: a capitalised word follows it");
+      assertEq(readE("bading på strand i Bergen"), { hasContent: true, kommune: "Bergen", terms: ["bading", "strand"] },
+        "u49: «på strand i Bergen» is Bergen, not the kommune Strand");
+      assertEq(readE("hva kan vi gjøre på øyer i Lofoten"), { hasContent: true, kommuner: [...REGION_TO_KOMMUNER.Lofoten], terms: ["øyer"] },
+        "u50: «på øyer i Lofoten» is the region Lofoten, not the kommune Øyer");
+      assertEq(readE("kayaking in fjord landscapes near Bergen"), { hasContent: true, kommune: "Bergen", terms: ["kayaking", "fjord", "landscapes"] },
+        "u51: «in fjord landscapes near Bergen» is Bergen, not the kommune Fjord");
+      assertEq([readE("bading på Strand i Bergen"), readE("hva kan vi gjøre på Øyer i Lofoten").kommuner, readE("kayaking in Fjord near Bergen").kommune, readE("på Sel i Innlandet").fylke],
+        [{ hasContent: true, kommune: "Bergen", terms: ["bading", "strand"] }, [...REGION_TO_KOMMUNER.Lofoten], "Bergen", "Innlandet"],
+        "u52: capitalised too, a catalogue-only kommune loses to a gazetteer kommune, region or fylke, and its word stays a search word");
+      assertEq([readE("alpint i Øyer"), readE("øyer").kommune, readE("dog sledding in lyngen").kommune, readE("dog sledding in Lyngen Alps").kommune],
+        [{ hasContent: true, kommune: "Øyer", terms: ["alpint"] }, "Øyer", undefined, undefined],
+        "u53: a catalogue-only kommune is read capitalised after a preposition, or as the whole query; not in lower case, not before another name");
+
+      // Fix round 2, F12: landsdeler are places.
+      const north = ["Nordland", "Troms", "Finnmark"];
+      assertEq(read("Nord-Norge vinter"), { hasContent: true, fylker: north, season: "winter" }, "u54: «Nord-Norge» is its fylker, not the search word «nord»");
+      assertEq([read("Northern Norway in winter").fylker, read("Nordnorge").fylker, read("hva skjer på Vestlandet?").fylker, read("Sørlandets strender").fylker],
+        [north, north, ["Rogaland", "Vestland", "Møre og Romsdal"], ["Agder"]], "u55: English, one-word, definite and genitive landsdel names");
+      assertEq([read("Tromsø i Nord-Norge"), read("Troms, Nord-Norge").fylke], [{ hasContent: true, kommune: "Tromsø" }, "Troms"],
+        "u56: a kommune or fylke wins over its landsdel");
+      assertEq(read("northern lights in Norway"), { hasContent: true, terms: ["northern", "lights"] }, "u57: «northern … Norway» apart is no landsdel");
+      assertTrue(Object.values(qi.LANDSDEL_TO_FYLKER).every((fylker) => fylker.every((f) => normaliseFylke(f) === f)) &&
+        Object.values(qi.LANDSDEL_ALIASES).every((l) => l in qi.LANDSDEL_TO_FYLKER), "u58: every landsdel fylke is a current fylke name; every alias names a landsdel");
+
+      // Fix round 2, F15: what is left of a contraction is no search word.
+      assertEq([read("I don't want a guide in Bergen").terms, read("we'll see whales, won't we? in Tromsø").terms], [["guide"], ["whales"]],
+        "u59: «don», «won», «ll» and «t» are no search words");
 
       // ── Fixture DB ────────────────────────────────────────────────────
       const db = dbFactory.getDb("experiences");
@@ -361,6 +403,58 @@ export function runOpplevagentMcpQueryIntentTests(opts: { log?: boolean } = {}):
         [false, false, false], "s23: DiscoverFilterSchema bounds text_terms (count, length, empty) (F10)");
       assertEq([expStore.expandSearchTerm("constructor"), titles({ text_terms: ["constructor"] })], [["constructor"], []],
         "s24: a term named like an Object.prototype key is searched literally (no crash)");
+
+      // Fix round 2, F11: plural and definite forms also find the base form — in discover only.
+      assertEq([expStore.textTermVariants("fjords"), expStore.textTermVariants("whales"), expStore.textTermVariants("hvalsafarier"),
+        expStore.textTermVariants("nordlyset"), expStore.textTermVariants("fjordene"), expStore.textTermVariants("market")],
+        [["fjords", "fjord"], ["whales", "whale"], ["hvalsafarier", "hvalsafari", "whale"],
+          ["nordlyset", "aurora", "northern lights", "nordlys"], ["fjordene", "fjord"], ["market"]],
+        "s25: textTermVariants strips the longest ending that leaves five letters, and expands both forms");
+      assertEq([expStore.expandSearchTerm("fjords"), expStore.expandSearchTerm("nordlyset")], [["fjords"], ["nordlyset", "aurora", "northern lights"]],
+        "s26: web /sok's expandSearchTerm has no stem; «nordlyset» is a SEARCH_SYNONYMS entry");
+      assertEq(titles({ text_terms: ["fjords"] }), ["Aurora Safari Camp — Fjord Tours Tromsø", "Geirangerfjord Cruise"], "s27: «fjords» finds the rows that say fjord");
+      assertEq(titles({ text_terms: ["hvalsafarier"] }), titles({ text_terms: ["hvalsafari"] }), "s28: «hvalsafarier» finds what «hvalsafari» finds");
+
+      // Fix round 2, F12: fylker (a landsdel) is any of its fylker, and a place key like the others.
+      assertEq(titles({ fylker: ["Nordland", "Finnmark"] }).sort(), titles({ fylke: "Nordland" }).sort(), "s29: fylker matches any of its fylker (Finnmark has none)");
+      assertEq(titles({ fylker: ["Nordland", "Troms"] }).length, titles({ fylke: "Nordland" }).length + titles({ fylke: "Troms" }).length, "s30: … each with its own rows");
+      assertEq(expStore.countDiscoverExperiences({ fylker: ["Nordland", "Troms"] }), titles({ fylker: ["Nordland", "Troms"] }).length, "s31: countDiscoverExperiences applies fylker too");
+      assertEq([expStore.buildFylkeInClause(["Troms", "Finnmark"], "e.fylke", "fylker"), expStore.buildFylkeInClause("Troms", "e.fylke")],
+        [{ sql: "e.fylke IN (@fylker0, @fylker1, @fylker2)", params: { fylker0: "Troms", fylker1: "Troms og Finnmark", fylker2: "Finnmark" } },
+          { sql: "e.fylke IN (@fylke0, @fylke1)", params: { fylke0: "Troms", fylke1: "Troms og Finnmark" } }],
+        "s32: buildFylkeInClause takes a list (each fylke's equivalents, once each); one fylke is unchanged");
+      const r10 = expStore.discoverExperiencesRelaxed({ fylker: ["Finnmark"] }, 20, { protectKeys: ["fylker"] });
+      const r11 = expStore.discoverExperiencesRelaxed({ fylker: ["Finnmark"] }, 20);
+      assertEq([r10.results.length, r10.relaxedKeys, r11.relaxedKeys, expStore.formatFilterLabels(["fylker"])], [0, [], ["fylker"], "fylker"],
+        "s33: a protected fylker is never dropped; unprotected it is relaxed last, labelled «fylker»");
+
+      // Fix round 2, F14: the text_terms step is one query, not one per number of terms.
+      let scans = 0;
+      const realPrepare = (db as any).prepare;
+      (db as any).prepare = function (this: unknown, sql: string) {
+        if (/FROM experiences e[\s\S]*LIMIT @limit/.test(sql)) scans++;
+        return realPrepare.call(this, sql);
+      };
+      let r12: ReturnType<ExpStore["discoverExperiencesRelaxed"]>;
+      try {
+        r12 = expStore.discoverExperiencesRelaxed({ text_terms: ["orca", "zz1", "zz2", "zz3", "zz4", "zz5"] }, 20);
+      } finally {
+        (db as any).prepare = realPrepare;
+      }
+      assertEq([scans, r12.results.map((e) => e.id), r12.textTermsMatched, r12.relaxedKeys], [2, [ids.orca], 1, ["text_terms"]],
+        "s34: one word of six matches: two queries (all terms, then the most terms), not six");
+      // With a radius, the rows with the most terms are picked after the radius cut.
+      const setLoc = (db as any).prepare("UPDATE experiences SET loc_lat = ?, loc_lon = ?, geo_precision = ? WHERE id = ?");
+      setLoc.run(69.65, 18.96, "address", ids.arctic);
+      setLoc.run(70.05, 20.16, "address", ids.orca); // inside the 50 km box around Tromsø, about 64 km away
+      try {
+        const r13 = expStore.discoverExperiencesRelaxed({ lat: 69.65, lng: 18.96, radius_km: 50, text_terms: ["northern", "orca"] }, 20);
+        assertEq([r13.results.map((e) => e.id), r13.textTermsMatched, r13.relaxedKeys], [[ids.arctic], 1, ["text_terms"]],
+          "s35: the row with both terms is outside the radius: the row inside with one of them, not a dropped search");
+      } finally {
+        setLoc.run(null, null, null, ids.arctic);
+        setLoc.run(null, null, null, ids.orca);
+      }
       const kommuner = expStore.publishedKommuneSet();
       assertTrue(kommuner.has("Tromsø") && kommuner.has("Stranda") && kommuner.has("Time") && !kommuner.has("Finnsnes"),
         "s18: publishedKommuneSet holds the kommuner of published rows only");
@@ -451,7 +545,7 @@ export function runOpplevagentMcpQueryIntentTests(opts: { log?: boolean } = {}):
       assertEq([moreQuery.filter_applied, moreQuery.relaxed_filters, moreQuery.experiences.map((e: any) => e.id)],
         [{ fylke: "Møre og Romsdal" }, undefined, moreStructured.experiences.map((e: any) => e.id)],
         "m30: «i Møre og Romsdal» answers like {fylke:'Møre og Romsdal'} — not just the row that says Romsdal");
-      assertEq(moreStructured.count, 3, "m30b: … the three Møre og Romsdal rows");
+      assertEq(moreStructured.count, 4, "m30b: … the four Møre og Romsdal rows");
       const tfQuery = await discover({ query: "Hva kan vi finne på i Troms og Finnmark?" });
       const tfStructured = await discover({ fylke: "Troms og Finnmark" });
       assertEq([tfQuery.filter_applied.fylke, tfQuery.zero_hit_reason, tfQuery.experiences.map((e: any) => e.id)],
@@ -481,6 +575,58 @@ export function runOpplevagentMcpQueryIntentTests(opts: { log?: boolean } = {}):
       const lyngen = await discover({ query: "dog sledding in Lyngen" });
       assertEq([lyngen.filter_applied.kommune, lyngen.relaxed_filters, lyngen.experiences.map((e: any) => e.id)], ["Lyngen", undefined, [ids.dogLyngen]],
         "m37: «in Lyngen» is the catalogue kommune Lyngen");
+
+      // Fix round 2, B1: catalogue kommuner named like everyday words (Gran, Strand, Øyer, Fjord).
+      for (const q of ["things to do in Gran Canaria", "hva kan vi gjøre på Gran Canaria"]) {
+        const r = await discover({ query: q });
+        assertTrue(r.out_of_area === true && r.place === "Gran Canaria" && r.count === 0 && r.experiences.length === 0,
+          `m38: «${q}» is outside Norway: no Norwegian rows, not the kommune Gran`);
+      }
+      for (const [q, place] of [["skiing in Alta Badia", "Alta Badia"], ["a day trip to Bergen op Zoom", "Bergen Op Zoom"]]) {
+        const r = await discover({ query: q });
+        assertTrue(r.out_of_area === true && r.place === place && r.count === 0, `m48: «${q}» is outside Norway, not the kommune ${place.split(" ")[0]} (F13)`);
+      }
+      const beach = await discover({ query: "bading på strand i Bergen" });
+      assertTrue(beach.filter_applied.kommune === "Bergen" && beach.count > 0 && beach.experiences.every((e: any) => e.kommune === "Bergen"),
+        "m39: «bading på strand i Bergen» → Bergen, not the kommune Strand (Preikestolen)");
+      const islands = await discover({ query: "hva kan vi gjøre på øyer i Lofoten" });
+      assertTrue(JSON.stringify(islands.filter_applied.kommuner) === JSON.stringify(REGION_TO_KOMMUNER.Lofoten) && islands.filter_applied.kommune === undefined &&
+        islands.count > 0 && islands.experiences.every((e: any) => REGION_TO_KOMMUNER.Lofoten.includes(e.kommune)),
+        "m40: «på øyer i Lofoten» → Lofoten, not the kommune Øyer (Hafjell)");
+      const fjordBergen = await discover({ query: "kayaking in fjord landscapes near Bergen" });
+      assertTrue(fjordBergen.filter_applied.kommune === "Bergen" && fjordBergen.count > 0 && fjordBergen.experiences.every((e: any) => e.kommune === "Bergen"),
+        "m41: «kayaking in fjord landscapes near Bergen» → Bergen, not the kommune Fjord");
+      const oyer = await discover({ query: "alpint i Øyer" });
+      assertEq([oyer.filter_applied.kommune, oyer.experiences.map((e: any) => e.id)], ["Øyer", [ids.hafjell]],
+        "m42: written as a name after a preposition, Øyer is still the catalogue kommune");
+
+      // Fix round 2, F12: a landsdel is a protected place, never the search word «nord».
+      const northWinter = await discover({ query: "Nord-Norge vinter" });
+      assertTrue(JSON.stringify(northWinter.filter_applied.fylker) === '["Nordland","Troms","Finnmark"]' && northWinter.filter_applied.season === "winter" &&
+        northWinter.filter_applied.text_terms === undefined && northWinter.relaxed_filters === undefined && northWinter.count > 0 &&
+        northWinter.experiences.every((e: any) => ["Nordland", "Troms"].includes(e.fylke)),
+        "m43: «Nord-Norge vinter» → winter rows in the northern fylker, not from Bergen, Oslo and Ålesund");
+      assertEq(northWinter.query_interpretation, { source: "query", fylker: ["Nordland", "Troms", "Finnmark"], season: "winter" },
+        "m44: … reported in query_interpretation");
+      // Sørlandet (Agder) has one row, Sirdal; unpublished for this check.
+      const setStatus = db.prepare("UPDATE experiences SET verification_status = ? WHERE id = ?");
+      setStatus.run("needs_review", ids.sirdal);
+      try {
+        const south = await discover({ query: "hundekjøring på Sørlandet" });
+        assertTrue(south.count === 0 && south.experiences.length === 0 && south.zero_hit_reason === "place_no_match" &&
+          JSON.stringify(south.filter_applied.fylker) === '["Agder"]' && /Ingen opplevelser funnet i Agder/.test(south.summary),
+          "m47: a landsdel with nothing published is an honest zero, never the rest of the country");
+      } finally {
+        setStatus.run("verified", ids.sirdal);
+      }
+
+      // Fix round 2, F11: plural and definite forms.
+      const fjords = await discover({ query: "Norwegian fjords" });
+      assertTrue(fjords.count === 2 && !fjords.zero_hit_reason && JSON.stringify(fjords.filter_applied.text_terms) === '["fjords"]' && fjords.relaxed_filters === undefined,
+        "m45: «Norwegian fjords» finds the fjord rows, not unrecognized_query");
+      const auroraTromso = await discover({ query: "nordlyset i Tromsø" });
+      assertTrue(auroraTromso.filter_applied.kommune === "Tromsø" && auroraTromso.relaxed_filters === undefined && auroraTromso.experiences.some((e: any) => e.id === ids.arctic),
+        "m46: «nordlyset i Tromsø» finds the northern-lights cruise without relaxing");
 
       // Explicit arguments win.
       const explicitPlace = await discover({ query: "hvalsafari i Bergen", kommune: "Tromsø" });

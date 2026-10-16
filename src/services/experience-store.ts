@@ -278,6 +278,12 @@ const DiscoverFilterBaseSchema = z.object({
   // single-kommune filter is entirely unaffected. See buildKommuneInClause()
   // below for how this drives the SQL WHERE-builder.
   kommuner: z.array(z.string()).optional(),
+  // Several fylker at once: a landsdel ("Nord-Norge") read from
+  // discover_experiences' free-text `query` (LANDSDEL_TO_FYLKER in
+  // experiences-query-intent.ts, dev-request 2026-10-16-opplevagent-mcp-
+  // fritekst-query). Each fylke matches with its reform-era spellings, as
+  // `fylke` does. Additive: no transport takes it as an argument.
+  fylker: z.array(z.string()).optional(),
   category: z.string().optional(),
   indoor_outdoor: IndoorOutdoorSchema.optional(),
   weather: z.enum(["rain", "snow", "clear", "any"]).optional(),
@@ -1449,6 +1455,7 @@ const SEARCH_SYNONYMS: Record<string, string[]> = {
   hval:        ["whale"],
   hvalsafari:  ["whale"],
   nordlys:     ["aurora", "northern lights"],
+  nordlyset:   ["aurora", "northern lights"],
   brevandring: ["glacier"],
   isbre:       ["glacier"],
   hundespann:  ["dog"],
@@ -1473,6 +1480,31 @@ export function expandSearchTerm(term: string): string[] {
   // Own entries only: "constructor" is a word, not Object.prototype's.
   const synonyms = Object.prototype.hasOwnProperty.call(SEARCH_SYNONYMS, lower) ? SEARCH_SYNONYMS[lower] : [];
   return synonyms.length > 0 ? [lower, ...synonyms] : [lower];
+}
+
+/**
+ * Word endings stripped from a DiscoverFilter.text_terms word for one more,
+ * shorter variant, so a plural or definite form also finds the base form in
+ * the text: "fjords" → fjord, "whales" → whale, "nordlyset" → nordlys,
+ * "hvalsafarier" → hvalsafari, "fjordene" → fjord. The longest ending that
+ * leaves at least MIN_TEXT_TERM_STEM_LENGTH letters goes ("market" keeps its
+ * "et": "mark" would also hit Finnmark and Telemark). A stem only adds
+ * matches: it is a prefix of the word, and the text is LIKE-searched for
+ * substrings. Used by buildDiscoverWhere() (textTermVariants) only; web /sok
+ * (searchPublishedExperiences → expandSearchTerm) is unchanged.
+ */
+export const TEXT_TERM_STEM_SUFFIXES: readonly string[] = ["ene", "ane", "ies", "er", "ar", "en", "et", "es", "s"];
+export const MIN_TEXT_TERM_STEM_LENGTH = 5;
+
+/** The LIKE variants of one text_terms word: itself, its stem, and the SEARCH_SYNONYMS of both. */
+export function textTermVariants(term: string): string[] {
+  const lower = term.toLowerCase();
+  const suffix = TEXT_TERM_STEM_SUFFIXES
+    .filter((s) => lower.endsWith(s) && lower.length - s.length >= MIN_TEXT_TERM_STEM_LENGTH)
+    .sort((a, b) => b.length - a.length)[0];
+  const variants = expandSearchTerm(lower);
+  if (suffix) variants.push(...expandSearchTerm(lower.slice(0, -suffix.length)));
+  return [...new Set(variants)];
 }
 
 /** Free-text search over PUBLISHED experiences (title/description/category/place).
@@ -1534,11 +1566,14 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
  * future-proofing costs nothing) bind non-colliding placeholder names.
  */
 export function buildFylkeInClause(
-  fylke: string,
+  fylke: string | readonly string[],
   column = "fylke",
   paramPrefix = "fylke"
 ): { sql: string; params: Record<string, string> } {
-  const equivalents = fylkeEquivalents(fylke);
+  // Several fylker (DiscoverFilter.fylker): any of them, each with its equivalents.
+  const equivalents = typeof fylke === "string"
+    ? fylkeEquivalents(fylke)
+    : [...new Set(fylke.flatMap((f) => fylkeEquivalents(f)))];
   const params: Record<string, string> = {};
   const placeholders = equivalents.map((v, i) => {
     const key = `${paramPrefix}${i}`;
@@ -1638,10 +1673,11 @@ export function seasonFilterSpellings(season: string): string[] {
  * Pure — no DB access, no LIMIT/params.limit (that's caller-specific: a page
  * query needs it, a COUNT(*) doesn't).
  *
- * `textTermsMin` (discoverExperiencesRelaxed only): a row needs at least that
- * many of f.text_terms instead of all of them.
+ * `textTermsAny` (discoverExperiencesRelaxed only): a row needs at least one
+ * of several f.text_terms instead of all of them; textMatchedSql then counts
+ * how many it has.
  */
-function buildDiscoverWhere(f: DiscoverFilter, textTermsMin?: number): {
+function buildDiscoverWhere(f: DiscoverFilter, textTermsAny = false): {
   where: string[];
   params: Record<string, unknown>;
   hasGeo: boolean;
@@ -1649,6 +1685,8 @@ function buildDiscoverWhere(f: DiscoverFilter, textTermsMin?: number): {
   originLng: number | undefined;
   /** ORDER BY prefix for text_terms (rows with more of the terms, then more in the title, first); "" without text_terms. */
   textOrderSql: string;
+  /** With textTermsAny: the SQL expression for how many of f.text_terms a row has. */
+  textMatchedSql?: string;
 } {
   // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
   // high/medium + provider brreg_active + canonical (never a dedup-merged
@@ -1705,6 +1743,11 @@ function buildDiscoverWhere(f: DiscoverFilter, textTermsMin?: number): {
     where.push(sql);
     Object.assign(params, kommunerParams);
   }
+  if (f.fylker && f.fylker.length > 0) {
+    const { sql, params: fylkerParams } = buildFylkeInClause(f.fylker, "e.fylke", "fylker");
+    where.push(sql);
+    Object.assign(params, fylkerParams);
+  }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
   if (f.indoor_outdoor) { where.push("e.indoor_outdoor IN (@io, 'both')"); params.io = f.indoor_outdoor; }
   // Rain/snow → prefer indoor + weather-independent.
@@ -1730,17 +1773,19 @@ function buildDiscoverWhere(f: DiscoverFilter, textTermsMin?: number): {
   if (typeof f.duration_max === "number") { where.push("(e.duration_min IS NULL OR e.duration_min <= @dmax)"); params.dmax = f.duration_max; }
   if (f.language) { where.push("(e.languages IS NULL OR e.languages LIKE @lang)"); params.lang = `%"${f.language}"%`; }
 
-  // text_terms: AND over the terms, each an OR over its SEARCH_SYNONYMS
-  // variants and the four text columns. gardssalgLikePattern() escapes LIKE
-  // metacharacters and turns æ/ø/å into `_`, because SQLite's lower() folds
-  // ASCII only ("Ørnesafari" must still match "ørnesafari"). With
-  // textTermsMin, the per-term matches are counted instead of all required.
+  // text_terms: AND over the terms, each an OR over its variants
+  // (textTermVariants: stem and SEARCH_SYNONYMS) and the four text columns.
+  // gardssalgLikePattern() escapes LIKE metacharacters and turns æ/ø/å into
+  // `_`, because SQLite's lower() folds ASCII only ("Ørnesafari" must still
+  // match "ørnesafari"). With textTermsAny, one term is enough and the
+  // per-term matches are counted.
   let textOrderSql = "";
+  let textMatchedSql: string | undefined;
   if (f.text_terms && f.text_terms.length > 0) {
     const termHits: string[] = [];
     const titleHits: string[] = [];
     f.text_terms.forEach((term, i) => {
-      const keys = expandSearchTerm(term).map((variant, vi) => {
+      const keys = textTermVariants(term).map((variant, vi) => {
         const k = `tt${i}_${vi}`;
         params[k] = `%${gardssalgLikePattern(variant)}%`;
         return k;
@@ -1751,18 +1796,17 @@ function buildDiscoverWhere(f: DiscoverFilter, textTermsMin?: number): {
       titleHits.push(`(CASE WHEN ${like(["e.title", "e.title_no"])} THEN 1 ELSE 0 END)`);
     });
     const titleRank = `(${titleHits.join(" + ")}) DESC, `;
-    if (textTermsMin !== undefined && textTermsMin < termHits.length) {
-      const matched = termHits.map((h) => `(CASE WHEN ${h} THEN 1 ELSE 0 END)`).join(" + ");
-      where.push(`(${matched}) >= @ttMin`);
-      params.ttMin = Math.max(1, textTermsMin);
-      textOrderSql = `(${matched}) DESC, ${titleRank}`;
+    if (textTermsAny && termHits.length > 1) {
+      textMatchedSql = `(${termHits.map((h) => `(CASE WHEN ${h} THEN 1 ELSE 0 END)`).join(" + ")})`;
+      where.push(`(${termHits.join(" OR ")})`);
+      textOrderSql = `${textMatchedSql} DESC, ${titleRank}`;
     } else {
       where.push(...termHits);
       textOrderSql = titleRank;
     }
   }
 
-  return { where, params, hasGeo, originLat, originLng, textOrderSql };
+  return { where, params, hasGeo, originLat, originLng, textOrderSql, textMatchedSql };
 }
 
 /**
@@ -1886,19 +1930,24 @@ export function discoverExperiences(
   filter: DiscoverFilter = {},
   limit = 20
 ): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
-  return queryDiscoverExperiences(filter, limit);
+  return queryDiscoverExperiences(filter, limit).results;
 }
 
-/** discoverExperiences() plus buildDiscoverWhere()'s textTermsMin, for discoverExperiencesRelaxed(). */
+/**
+ * discoverExperiences(), plus the text_terms step of
+ * discoverExperiencesRelaxed() with `textTermsAny`: the rows with the most
+ * of several f.text_terms (at least one), and how many that is. One query,
+ * where trying "all but one, all but two, …" took up to n-1 scans.
+ */
 function queryDiscoverExperiences(
   filter: DiscoverFilter,
   limit: number,
-  textTermsMin?: number
-): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
+  textTermsAny = false
+): { results: Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }>; textTermsMatched?: number } {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
-  const { where, params, hasGeo, originLat, originLng, textOrderSql } = buildDiscoverWhere(f, textTermsMin);
+  const { where, params, hasGeo, originLat, originLng, textOrderSql, textMatchedSql } = buildDiscoverWhere(f, textTermsAny);
 
   // When a geo origin is given, the true top-N-by-distance can't be decided
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
@@ -1909,7 +1958,7 @@ function queryDiscoverExperiences(
   params.limit = hasGeo ? GEO_CANDIDATE_CAP : Math.max(1, Math.min(100, limit));
 
   const sql = `
-    SELECT e.* FROM experiences e
+    SELECT e.*${textMatchedSql ? `, ${textMatchedSql} AS text_terms_matched` : ""} FROM experiences e
     LEFT JOIN experience_providers p ON p.id = e.provider_id
     WHERE ${where.join(" AND ")}
     ORDER BY ${textOrderSql}CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
@@ -1918,7 +1967,17 @@ function queryDiscoverExperiences(
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   const hydrated = rows.map(hydrateExperience);
 
-  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") return hydrated;
+  // textTermsAny: keep the rows with the most terms. SQL orders by that
+  // count, but the radius cut below can remove the first rows, so the top
+  // is taken from what is left.
+  const matchedById = textMatchedSql ? new Map(rows.map((r) => [r.id as string, Number(r.text_terms_matched)])) : null;
+  const withMostTerms = <T extends { id: string }>(list: T[]): { results: T[]; textTermsMatched?: number } => {
+    if (!matchedById || list.length === 0) return { results: list };
+    const top = Math.max(...list.map((e) => matchedById.get(e.id) ?? 0));
+    return { results: list.filter((e) => matchedById.get(e.id) === top), textTermsMatched: top };
+  };
+
+  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") return withMostTerms(hydrated);
 
   // Exact haversine distance + radius cut + ascending-distance sort. The
   // WHERE clause above already guarantees loc_lat/loc_lon/geo_precision are
@@ -1932,8 +1991,9 @@ function queryDiscoverExperiences(
     const radiusKm = f.radius_km;
     withDistance = withDistance.filter((e) => e.distance_km <= radiusKm);
   }
-  withDistance.sort((a, b) => a.distance_km - b.distance_km);
-  return withDistance.slice(0, Math.max(1, Math.min(100, limit)));
+  const { results, textTermsMatched } = withMostTerms(withDistance);
+  results.sort((a, b) => a.distance_km - b.distance_km);
+  return { results: results.slice(0, Math.max(1, Math.min(100, limit))), textTermsMatched };
 }
 
 // ─── Distance/precision label (dev-request 2026-07-04-opplevagent-naer-meg-
@@ -1983,12 +2043,14 @@ const RELAX_ORDER: Array<keyof DiscoverFilter> = [
   "kommune",
   "kommuner",
   "fylke",
+  "fylker",
 ];
 
 const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   fylke: "fylke",
   kommune: "kommune",
   kommuner: "kommuner",
+  fylker: "fylker",
   category: "kategori",
   indoor_outdoor: "innendørs/utendørs",
   weather: "vær",
@@ -2051,10 +2113,10 @@ export interface DiscoverRelaxOptions {
  * (weakest first, per RELAX_ORDER) and retries until results appear or every
  * filter is exhausted. Always returns whichever result set it landed on,
  * plus which keys were dropped so the caller can surface a relaxation note.
- * Several text_terms are relaxed one at a time before they are dropped: rows
- * with all but one of them, then all but two, … down to one
- * (textTermsMatched), so one word that no row has ("tonight", "credit")
- * does not throw away the others. See DiscoverRelaxOptions for the
+ * Several text_terms are relaxed gradually before they are dropped: when no
+ * row has all of them, the rows with the most of them (at least one;
+ * textTermsMatched), so one word that no row has ("tonight", "credit") does
+ * not throw away the others. See DiscoverRelaxOptions for the
  * protected-place variant.
  */
 export function discoverExperiencesRelaxed(
@@ -2094,11 +2156,9 @@ function relaxUntilHits(
   const relaxedKeys: RelaxStep[] = [];
   for (const key of RELAX_ORDER) {
     if (working[key] === undefined || protect.has(key)) continue;
-    if (key === "text_terms" && working.text_terms) {
-      for (let min = working.text_terms.length - 1; min >= 1; min--) {
-        results = queryDiscoverExperiences(working, limit, min);
-        if (results.length > 0) return { results, applied: working, relaxedKeys: [...relaxedKeys, key], textTermsMatched: min };
-      }
+    if (key === "text_terms" && working.text_terms && working.text_terms.length > 1) {
+      const most = queryDiscoverExperiences(working, limit, true);
+      if (most.results.length > 0) return { results: most.results, applied: working, relaxedKeys: [...relaxedKeys, key], textTermsMatched: most.textTermsMatched };
     }
     delete working[key];
     relaxedKeys.push(key);

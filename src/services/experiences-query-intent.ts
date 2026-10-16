@@ -294,6 +294,31 @@ export const FORMER_FYLKE_NAMES: readonly string[] = [
 ];
 
 /**
+ * Landsdeler (parts of the country) and their fylker. interpretDiscoverQuery()
+ * reads one as a place covering all of them (DiscoverFilter.fylker). Without
+ * it "Nord-Norge vinter" kept "nord" as a search word, relaxed it away and
+ * answered with winter rows from Bergen, Oslo and Ålesund. Names whose extent
+ * people disagree on ("Sør-Norge", "Southern Norway": Agder, or everything
+ * south of Trøndelag?) are left out: a missing name costs a search word, a
+ * wrong one gives a wrong place.
+ */
+export const LANDSDEL_TO_FYLKER: Readonly<Record<string, readonly string[]>> = {
+  "Nord-Norge": ["Nordland", "Troms", "Finnmark"],
+  "Midt-Norge": ["Trøndelag", "Møre og Romsdal"],
+  "Vestlandet": ["Rogaland", "Vestland", "Møre og Romsdal"],
+  "Sørlandet": ["Agder"],
+  "Østlandet": ["Oslo", "Akershus", "Østfold", "Buskerud", "Innlandet", "Vestfold", "Telemark"],
+};
+
+/** Other names for the LANDSDEL_TO_FYLKER entries: one-word, nynorsk and English. */
+export const LANDSDEL_ALIASES: Readonly<Record<string, string>> = {
+  Nordnorge: "Nord-Norge", "Nord-Noreg": "Nord-Norge", "Northern Norway": "Nord-Norge", "North Norway": "Nord-Norge",
+  Midtnorge: "Midt-Norge", "Midt-Noreg": "Midt-Norge", "Central Norway": "Midt-Norge", "Mid-Norway": "Midt-Norge",
+  "Western Norway": "Vestlandet", "West Norway": "Vestlandet", "Fjord Norway": "Vestlandet",
+  Austlandet: "Østlandet", "Eastern Norway": "Østlandet", "East Norway": "Østlandet",
+};
+
+/**
  * Season words, matched as whole words ("våre" is not "vår", "waterfall" is
  * not "fall"). A season word sets `season`, never the category vinter_sno:
  * "om vinteren" asks for what is on in winter, which includes northern-lights
@@ -405,6 +430,9 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
   "seven", "eight", "nine", "ten", "hi", "hello", "thanks", "happening", "happens", "arrive", "arriving",
   "travel", "travelling", "traveling", "fly", "flying", "staying", "spend", "spending", "across",
   "throughout", "anywhere", "everywhere", "whole", "entire", "country", "county", "municipality",
+  // What is left of a contraction once the apostrophe splits it ("don't" → "don", "we'll" → "ll").
+  "don", "doesn", "didn", "isn", "aren", "wasn", "weren", "won", "wouldn", "couldn", "shouldn", "haven",
+  "hasn", "ll", "ve", "re", "let", "lets",
 ]);
 
 // The limits live with DiscoverFilterSchema (experience-store.ts), which
@@ -428,6 +456,8 @@ export interface DiscoverQueryInterpretation {
   kommune?: string;
   kommuner?: string[];
   fylke?: string;
+  /** The fylker of a landsdel (LANDSDEL_TO_FYLKER). */
+  fylker?: string[];
   /** May be GARDSSALG_CATEGORY: the query asks for gårdssalg, which has its own tool. */
   category?: string;
   season?: QuerySeason;
@@ -461,12 +491,21 @@ function tokenizeQuery(text: string): QueryToken[] {
   return tokens;
 }
 
-type PlaceKind = "kommune" | "region" | "district" | "fylke";
+type PlaceKind = "kommune" | "region" | "district" | "fylke" | "landsdel";
+
+/**
+ * Place levels, most specific first. Kommune before region/district before
+ * fylke is parseExperiencesIntent()'s priority; a landsdel is wider than a
+ * fylke. A kommune only the catalogue knows (publishedOnlyCandidates) comes
+ * after every gazetteer level: its name may be an everyday word ("på øyer",
+ * "strand"), so a place the gazetteer knows wins over it.
+ */
+const PLACE_TIER = { kommune: 0, region: 1, district: 1, fylke: 2, landsdel: 3, catalogueKommune: 4 } as const;
 
 interface PlaceCandidate {
   name: string;
   kind: PlaceKind;
-  /** 0 kommune, 1 region/district, 2 fylke — the same priority as parseExperiencesIntent(). */
+  /** PLACE_TIER: lower wins. */
   tier: number;
   /** The name's words, folded (æ/ø/å → ae/o/a). */
   words: string[];
@@ -474,10 +513,9 @@ interface PlaceCandidate {
   lowerWords: string[];
   /**
    * Own spelling only, and: "capital" / "preposition_or_capital" (see
-   * AMBIGUOUS_PLACE_WORDS), or "preposition" — right after a
-   * PLACE_PREPOSITIONS word, or the whole query (catalogue-only kommuner).
+   * AMBIGUOUS_PLACE_WORDS), or "catalogue" — see catalogueNameAt().
    */
-  ambiguous?: "capital" | "preposition_or_capital" | "preposition";
+  ambiguous?: "capital" | "preposition_or_capital" | "catalogue";
   /** The first word must be in its own spelling: an AMBIGUOUS_PLACE_WORDS entry starts the name ("Bø i Telemark"). */
   ownSpellingFirst: boolean;
   /** A kommune known from the catalogue (publishedKommuneSet) and not from the gazetteer. */
@@ -492,7 +530,7 @@ function placeCandidate(name: string, kind: PlaceKind, tier: number, publishedOn
     tier,
     words: tokens.map((t) => t.fold),
     lowerWords: tokens.map((t) => t.lower),
-    ambiguous: publishedOnly ? "preposition" : lookup(AMBIGUOUS_PLACE_WORDS, name),
+    ambiguous: publishedOnly ? "catalogue" : lookup(AMBIGUOUS_PLACE_WORDS, name),
     ownSpellingFirst: tokens.length > 1 && lookup(AMBIGUOUS_PLACE_WORDS, tokens[0].raw) !== undefined,
     publishedOnly,
   };
@@ -502,12 +540,13 @@ function placeCandidate(name: string, kind: PlaceKind, tier: number, publishedOn
 // (Hallingdal, Jæren, Vesterålen, …): their fylke is known, so a query naming
 // one is searched in that fylke with the district's name as a search word.
 const PLACE_CANDIDATES: readonly PlaceCandidate[] = [
-  ...KOMMUNE_NAMES.map((name) => placeCandidate(name, "kommune", 0)),
-  ...REGION_NAMES.map((name) => placeCandidate(name, "region", 1)),
+  ...KOMMUNE_NAMES.map((name) => placeCandidate(name, "kommune", PLACE_TIER.kommune)),
+  ...REGION_NAMES.map((name) => placeCandidate(name, "region", PLACE_TIER.region)),
   ...[...NON_KOMMUNE_REGION_LABELS]
     .filter((name) => !(name in REGION_TO_KOMMUNER) && cityToFylke(name))
-    .map((name) => placeCandidate(name, "district", 1)),
-  ...[...FYLKER, ...FORMER_FYLKE_NAMES].map((name) => placeCandidate(name, "fylke", 2)),
+    .map((name) => placeCandidate(name, "district", PLACE_TIER.district)),
+  ...[...FYLKER, ...FORMER_FYLKE_NAMES].map((name) => placeCandidate(name, "fylke", PLACE_TIER.fylke)),
+  ...[...Object.keys(LANDSDEL_TO_FYLKER), ...Object.keys(LANDSDEL_ALIASES)].map((name) => placeCandidate(name, "landsdel", PLACE_TIER.landsdel)),
 ];
 
 // The gazetteer's names at any level, and its kommune, region and district
@@ -535,13 +574,13 @@ const publishedOnlyCache = new WeakMap<ReadonlySet<string>, readonly PlaceCandid
 /**
  * Kommuner the catalogue has but the gazetteer lacks (Lyngen, Sirdal, Vågan
  * …), from publishedKommuneSet(): the DB, no outside call. A catalogue value
- * can be an everyday word ("Fjord", "Strand", "Sel" is a seal), so it counts
- * as a place only in its own spelling and right after a place preposition,
- * or as the whole query ("i Lyngen", "Lyngen"; not "Lyngen Alps skiing",
- * which searches the word). Left out: values the gazetteer already reads
- * (Senja stays a region), values with a gazetteer kommune, region or
- * district name in them (a stray "Tromsø sentrum" must not shadow Tromsø),
- * stopwords and values that are no clean name.
+ * can be an everyday word ("Fjord", "Strand", "Øyer" are islands, "Sel" is a
+ * seal) or the start of a foreign name ("Gran Canaria"), so it is read only
+ * as written in catalogueNameAt() and ranks after every gazetteer place
+ * (PLACE_TIER). Left out: values the gazetteer already reads (Senja stays a
+ * region), values with a gazetteer kommune, region or district name in them
+ * (a stray "Tromsø sentrum" must not shadow Tromsø), stopwords and values
+ * that are no clean name.
  */
 function publishedOnlyCandidates(published: ReadonlySet<string> | null): readonly PlaceCandidate[] {
   if (!published) return [];
@@ -549,7 +588,7 @@ function publishedOnlyCandidates(published: ReadonlySet<string> | null): readonl
   if (!cached) {
     cached = [...published]
       .filter((value) => CLEAN_KOMMUNE_VALUE.test(value))
-      .map((value) => placeCandidate(value, "kommune", 0, true))
+      .map((value) => placeCandidate(value, "kommune", PLACE_TIER.catalogueKommune, true))
       .filter((c) =>
         !GAZETTEER_NAME_KEYS.has(c.words.join(" ")) &&
         !containsSubfylkeName(c.words) &&
@@ -572,15 +611,32 @@ function afterPreposition(tokens: readonly QueryToken[], i: number): boolean {
   return i > 0 && PLACE_PREPOSITIONS.has(tokens[i - 1].lower);
 }
 
+function isCapitalised(token: QueryToken): boolean {
+  return token.raw[0] !== token.raw[0].toLocaleLowerCase("nb-NO");
+}
+
+/**
+ * Whether a catalogue-only kommune (publishedOnlyCandidates) at
+ * tokens[i, i+n) is written as that place: the whole query ("Lyngen"), or
+ * capitalised right after a place preposition ("i Lyngen") and not followed
+ * by another capitalised word, which makes it part of a longer name
+ * ("på Gran Canaria", "in Lyngen Alps"). "på øyer", "på strand" and
+ * "in fjord landscapes" name no kommune.
+ */
+function catalogueNameAt(tokens: readonly QueryToken[], i: number, n: number, text: string): boolean {
+  if (tokens.length === n) return true;
+  if (!afterPreposition(tokens, i) || !isCapitalised(tokens[i])) return false;
+  const next = tokens[i + n];
+  return !(next && /^[\s-]+$/.test(text.slice(tokens[i + n - 1].end, next.start)) && isCapitalised(next));
+}
+
 function placeMatchesAt(c: PlaceCandidate, tokens: readonly QueryToken[], i: number, text: string): boolean {
   const n = c.words.length;
   if (i + n > tokens.length) return false;
   if (c.ambiguous) {
     if (!c.lowerWords.every((w, k) => tokens[i + k].lower === w)) return false;
-    if (c.ambiguous === "preposition") return afterPreposition(tokens, i) || tokens.length === n;
-    const t = tokens[i];
-    const capital = t.raw[0] !== t.raw[0].toLocaleLowerCase("nb-NO");
-    if (capital && (!startsSentence(tokens, i, text) || tokens.length === 1)) return true;
+    if (c.ambiguous === "catalogue") return catalogueNameAt(tokens, i, n, text);
+    if (isCapitalised(tokens[i]) && (!startsSentence(tokens, i, text) || tokens.length === 1)) return true;
     return c.ambiguous === "preposition_or_capital" && afterPreposition(tokens, i);
   }
   if (c.ownSpellingFirst && tokens[i].lower !== c.lowerWords[0]) return false;
@@ -615,16 +671,18 @@ function safePublishedKommuneSet(): ReadonlySet<string> | null {
  *   (the handler's placeGiven rule). Words naming an already-given value are
  *   used up and never become search words.
  * - Place: whole words, with æ/ø/å folded ("Tromso" is Tromsø) except
- *   AMBIGUOUS_PLACE_WORDS. Gazetteer kommuner, the kommuner only the
- *   catalogue has (publishedOnlyCandidates), curated regions
- *   (REGION_TO_KOMMUNER), districts, fylker and FORMER_FYLKE_NAMES. A name
- *   inside a longer matched name is part of it ("Romsdal" in "Møre og
- *   Romsdal"). Then kommune before region/district before fylke, as in
- *   parseExperiencesIntent(); within a level the name right after a place
+ *   AMBIGUOUS_PLACE_WORDS. Gazetteer kommuner, curated regions
+ *   (REGION_TO_KOMMUNER), districts, fylker, FORMER_FYLKE_NAMES, landsdeler
+ *   (LANDSDEL_TO_FYLKER) and the kommuner only the catalogue has
+ *   (publishedOnlyCandidates). A name inside a longer matched name is part
+ *   of it ("Romsdal" in "Møre og Romsdal"). Then the most specific level
+ *   (PLACE_TIER: kommune, region/district, fylke, landsdel, then a
+ *   catalogue-only kommune); within a level the name right after a place
  *   preposition ("flying from Bergen, what to do in Oslo"), else the first
  *   one named. A gazetteer kommune without published experiences (a bygd
  *   such as Geiranger, or a town the catalogue files under its kommune)
- *   becomes its fylke, and its name a search word.
+ *   becomes its fylke, and its name a search word. A catalogue-only kommune
+ *   that loses to another place stays an ordinary word.
  * - Season, weather, indoor/outdoor and category from SEASON_WORDS,
  *   WEATHER_WORDS, INDOOR_OUTDOOR_WORDS and CATEGORY_ALIASES. Season words
  *   never set the category vinter_sno.
@@ -661,19 +719,26 @@ export function interpretDiscoverQuery(
         if (placeMatchesAt(c, tokens, i, queryText)) matches.push({ c, at: i, len: c.words.length });
       }
     }
-    // Every place word is used up, also one of a second, unused place name.
-    for (const m of matches) for (let k = 0; k < m.len; k++) used[m.at + k] = true;
     const best = matches
       .filter((m) => !matches.some((o) => o.len > m.len && o.at <= m.at && m.at + m.len <= o.at + o.len))
       .sort((a, b) =>
         a.c.tier - b.c.tier ||
         Number(afterPreposition(tokens, b.at)) - Number(afterPreposition(tokens, a.at)) ||
         a.at - b.at)[0];
+    // Every gazetteer place word is used up, also one of a second, unused
+    // place name. A catalogue-only kommune that lost stays an ordinary word:
+    // it is the least certain place signal ("strand" in "på Strand i Bergen").
+    for (const m of matches) {
+      if (m.c.publishedOnly && m !== best) continue;
+      for (let k = 0; k < m.len; k++) used[m.at + k] = true;
+    }
     if (best) {
       out.hasContent = true;
       const { c } = best;
       if (c.kind === "region") {
         out.kommuner = [...REGION_TO_KOMMUNER[c.name]];
+      } else if (c.kind === "landsdel") {
+        out.fylker = [...LANDSDEL_TO_FYLKER[lookup(LANDSDEL_ALIASES, c.name) ?? c.name]];
       } else if (c.kind === "fylke") {
         out.fylke = normaliseFylke(c.name) ?? c.name.charAt(0).toUpperCase() + c.name.slice(1);
       } else if (c.kind === "kommune" && (c.publishedOnly || isPublishedKommune(c.name, published))) {
