@@ -5678,7 +5678,13 @@ async function runIntegrationTests(): Promise<void> {
       "pool_eligible", "intg-3: stegB — aggregate verdict is pool_eligible (only address gates)");
 
     const mockHeadProbe3 = async (_url: string) => 200 as number | null;
-    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe3 });
+    // urlProbeFetch: the link-freshness probe used to hit the real
+    // https://polsemakeri.no — the pool assertion below went red when that
+    // site went down (2026-10-15). A live site is not part of this fixture.
+    const result = await runVerifierBatch({
+      db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe3,
+      urlProbeFetch: async () => ({ status: 200 }),
+    });
     const agentResult = result.results.find((r) => r.agent_id === "agent-partial-owner");
     assertTrue(!!agentResult, "intg-3: agent-partial-owner found in results");
     assertEq(

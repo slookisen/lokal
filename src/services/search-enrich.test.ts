@@ -354,6 +354,82 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(products.includes("dairy"), "myrdalgard/W33: ysteri/geitost still triggers dairy");
   }
 
+  // ── dev-request 2026-10-15-kategori-nokkelord-ae-og-drikke ────────────────
+  // The page text is folded with æ → "ae", so the berry/pear keywords must be
+  // folded the same way ("bær" → "baer"); the bare "bar" is gone; drinks
+  // (sideri, eplesider, eplemost, solbærsaft, cider, juice …) map to beverages.
+  {
+    const cats = (html: string) => {
+      const text = extractVisibleText(html);
+      return mapToPlatformCategories(extractProductMentions(text), extractBusinessTypeTokens(text));
+    };
+    const berryCases: Array<[string, string]> = [
+      ["<p>Vi selger bringebær fra egen åker.</p>", "bringebær"],
+      ["<p>Ferske blåbær i august.</p>", "blåbær"],
+      ["<p>Selvplukk av jordbær og solbær.</p>", "jordbær/solbær"],
+      ["<p>BRINGEBÆR og TYTTEBÆR</p>", "upper-case BRINGEBÆR/TYTTEBÆR"],
+      ["<p>Vi selger bær hele sommeren.</p>", "bær"],
+      ["<p>Bringebar og blabar (uten æ).</p>", "accent-less bringebar/blabar"],
+    ];
+    for (const [html, label] of berryCases) {
+      assertTrue(extractProductMentions(extractVisibleText(html)).includes("berries"), `kategori-ae: «${label}» → berries`);
+      assertEq(cats(html), ["fruit"], `kategori-ae: «${label}» → platform [fruit]`);
+    }
+    assertTrue(extractProductMentions("Søte pærer og epler fra Hardanger.").includes("fruit"), "kategori-ae: «pærer» → fruit");
+    assertEq(extractProductMentions("Vi har pære i sesong."), ["fruit"], "kategori-ae: «pære» alone → fruit");
+    assertEq(extractProductMentions("Kirsebær og stikkelsbær."), ["fruit"], "kategori-ae: «kirsebær/stikkelsbær» → fruit");
+    // no berries from "bar" (bar, kaffebar) or from "bærekraft"/"bære"
+    for (const t of [
+      "Besøk vår bar og kafé.",
+      "Kaffebar med utsikt over fjorden.",
+      "Vi driver bærekraftig landbruk.",
+      "Bar disk, bar mark.",
+      "Vi parer sauene i november.",
+    ]) {
+      assertEq(extractProductMentions(t), [], `kategori-ae: «${t}» → no category (no berries/fruit)`);
+    }
+    // drinks → beverages (only words that mean nothing else: the cidery, the
+    // Norwegian compounds, cider, juice — review round B1)
+    const drinkCases: Array<[string, string]> = [
+      ["<p>Aga Sideri produserer eplesider og juice av høg kvalitet.</p>", "eplesider/juice"],
+      ["<p>Eplemost og pæremost på flaske.</p>", "eplemost/pæremost"],
+      ["<p>Kaldpressa eplemost.</p>", "eplemost"],
+      ["<p>Vi selger juice.</p>", "juice"],
+      ["<p>Hjemmelaget solbærsaft.</p>", "solbærsaft"],
+      ["<p>Eplesaft, bringebærsaft og rabarbrasaft.</p>", "eplesaft/bringebærsaft/rabarbrasaft"],
+      ["<p>Hyllebærsaft på flaske.</p>", "hyllebærsaft"],
+      ["<p>Craft cider from Hardanger.</p>", "cider"],
+      ["<p>Velkommen til Aga Sideri.</p>", "sideri"],
+    ];
+    for (const [html, label] of drinkCases) {
+      assertTrue(cats(html).includes("beverages"), `kategori-ae: «${label}» → beverages`);
+    }
+    assertEq(cats("<p>Eplemost fra egne epler.</p>"), ["fruit", "beverages"], "kategori-ae: eplemost + epler → [fruit, beverages] (canonical order)");
+    assertEq(extractProductMentions("Eplemost"), ["beverages"], "kategori-ae: «Eplemost» alone → [beverages]");
+    assertEq(extractProductMentions("Solbærsaft"), ["beverages"], "kategori-ae: «Solbærsaft» alone → [beverages] (not berries: whole words only)");
+    // English "most" (the refresh also reads English /about pages), the bare
+    // "most"/"saft" (café noise), bare "sider" (= web pages) and "saftig"
+    // never mean drinks.
+    for (const t of [
+      "The most beautiful farm in Norway.",
+      "Our most popular products are lamb and eggs.",
+      "Most of our customers come in summer.",
+      "We sell at most twice a week.",
+      "The farm is most famous for its lamb.",
+      "Our farm is most beautiful in May.",
+      "This is what we love most.",
+      "Most visitors come in July.",
+      "Farmer Ola and his most loyal customers.",
+      "Kaldpressa most fra egne epler.",
+      "Vi serverer kaffe og saft i kafeen.",
+      "Kaffe og saft.",
+      "Andre sider: Om oss, Kontakt.",
+      "Saftig lammekjøtt.",
+    ]) {
+      assertTrue(!extractProductMentions(t).includes("beverages"), `kategori-ae: «${t}» → no beverages`);
+    }
+  }
+
   // extractProductMentions: empty / no-hit cases.
   {
     assertEq(extractProductMentions(""), [], "extractProductMentions: empty → []");
@@ -847,6 +923,7 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     // bread→bakery, berries→fruit; output is canonical PLATFORM_CATEGORIES order.
     assertEq(mapToPlatformCategories(["bread"]), ["bakery"], "map: lexicon 'bread' → platform 'bakery'");
     assertEq(mapToPlatformCategories(["berries"]), ["fruit"], "map: lexicon 'berries' → platform 'fruit'");
+    assertEq(mapToPlatformCategories(["beverages"]), ["beverages"], "map: lexicon 'beverages' → platform 'beverages'");
     assertEq(
       mapToPlatformCategories(["fish", "meat", "dairy"]),
       ["meat", "dairy", "fish"],
