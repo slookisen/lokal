@@ -35,6 +35,12 @@ import { DENTAL_CLINIC_CLASS_SQL } from "./dental-catalog-class";
 // ByOrgnr) deliberately do NOT -- the probe's PUT write path and by-id
 // read-back go through them; public callers check isDentalSyntheticProbeId().
 import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2): fylke input is
+// folded to the canonical 2024 name, name words are LIKE-escaped, and the
+// specialty filter also matches the vocabulary's title stems.
+import { normaliseFylke } from "./norway-fylke";
+import { escapeLike } from "./search-intent/norwegian-query";
+import { findSearchSpecialty } from "../config/dental-search-vocabulary";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -210,6 +216,14 @@ export const ListFilterSchema = z.object({
   enrichment_state: z.enum(["raw", "enriched", "thin_site"]).optional(),
   // PR-116: bysidesfilter
   poststed: z.string().optional(),
+  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2), set by
+  // dental-query-parser.ts. Not read from GET /agents query params.
+  //   name_terms:    every word must occur in navn or poststed (AND).
+  //   poststed_in:   every stored spelling of one place ("BERGEN", "Bergen").
+  //   postnummer_in: a kommune's postnumre (kommune that is not a poststed).
+  name_terms: z.array(z.string().min(1).max(100)).min(1).max(6).optional(),
+  poststed_in: z.array(z.string().min(1).max(100)).min(1).max(20).optional(),
+  postnummer_in: z.array(z.string().regex(/^\d{4}$/)).min(1).max(400).optional(),
 });
 export type ListFilter = z.infer<typeof ListFilterSchema>;
 
@@ -444,25 +458,50 @@ function pushSpecialtyClause(
   params: Record<string, unknown>,
   specialty: string
 ): void {
-  where.push(
-    "(available_specialties LIKE @specialty OR specialists LIKE @specialtyPerson OR nb_lower(specialists) LIKE @specialtyTitle)"
-  );
-  // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
-  params.specialty = `%"${specialty}"%`;
-  // specialists: [{"name":"...","specialty":"oral kirurgi og oral medisin"}]
-  //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
-  //   colon-space variant; JSON.stringify emits no space, so this is exact).
-  params.specialtyPerson = `%"specialty":"${specialty}"%`;
-  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): also
-  // match on the deep-scrape specialists[].title free-text field (e.g.
-  // "Spesialist i periodonti") -- NOT just the structured .specialty field
-  // above. This is genuinely free text (arbitrary casing/phrasing), so this
-  // clause substring-matches the lower-cased specialists blob for the
-  // lower-cased specialty word inside a "title": key, via the same
-  // Unicode-aware nb_lower() scalar function pushFreeTextClause uses (plain
-  // LIKE doesn't case-fold æ/ø/å). Additive — the two clauses above are
-  // untouched, this only widens what counts as a match.
-  params.specialtyTitle = `%"title":"%${specialty.toLowerCase()}%`;
+  const m = specialtyMatch(specialty, "specialty");
+  where.push(m.sql);
+  Object.assign(params, m.params);
+}
+
+// The specialty predicate shared by pushSpecialtyClause() (list/count) and
+// getAvailableSpecialties() (the /sok dropdown), so a specialty the dropdown
+// offers always returns the clinics it counted. Params are named
+// `<prefix>`, `<prefix>Person`, `<prefix>Title`, `<prefix>Stem<i>`.
+function specialtyMatch(specialty: string, prefix: string): { sql: string; params: Record<string, unknown> } {
+  const parts = [
+    `available_specialties LIKE @${prefix}`,
+    `specialists LIKE @${prefix}Person`,
+    `nb_lower(specialists) LIKE @${prefix}Title`,
+  ];
+  const params: Record<string, unknown> = {
+    // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
+    [prefix]: `%"${specialty}"%`,
+    // specialists: [{"name":"...","specialty":"oral kirurgi og oral medisin"}]
+    //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
+    //   colon-space variant; JSON.stringify emits no space, so this is exact).
+    [`${prefix}Person`]: `%"specialty":"${specialty}"%`,
+    // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5c): also
+    // match on the deep-scrape specialists[].title free-text field (e.g.
+    // "Spesialist i periodonti") -- NOT just the structured .specialty field
+    // above. This is genuinely free text (arbitrary casing/phrasing), so this
+    // clause substring-matches the lower-cased specialists blob for the
+    // lower-cased specialty word inside a "title": key, via the same
+    // Unicode-aware nb_lower() scalar function pushFreeTextClause uses (plain
+    // LIKE doesn't case-fold æ/ø/å). Additive — the two clauses above are
+    // untouched, this only widens what counts as a match.
+    [`${prefix}Title`]: `%"title":"%${specialty.toLowerCase()}%`,
+  };
+  // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2): a fourth clause
+  // per title stem from the search vocabulary. A title reads "Kjeveortoped",
+  // not "kjeveortopedi", so the clause above missed it (REST measured 94 for
+  // specialty=kjeveortopedi against 157 for the stem). Same loose
+  // `"title":"%…%` shape as the title clause; a specialty not in the
+  // vocabulary keeps exactly the three clauses above.
+  (findSearchSpecialty(specialty)?.title_stems ?? []).forEach((stem, i) => {
+    parts.push(`nb_lower(specialists) LIKE @${prefix}Stem${i}`);
+    params[`${prefix}Stem${i}`] = `%"title":"%${stem}%`;
+  });
+  return { sql: `(${parts.join(" OR ")})`, params };
 }
 
 // dev-request 2026-08-24-tannlege-sok-case-folding-oe: the free-text `q`
@@ -483,6 +522,131 @@ function pushFreeTextClause(
 ): void {
   where.push("(nb_lower(navn) LIKE @q OR nb_lower(poststed) LIKE @q)");
   params.q = `%${q.toLowerCase()}%`;
+}
+
+// ─── One WHERE builder for every list/count (dev-request 2026-10-16-
+// tannlege-sok-naturlig-sprak, S2) ─────────────────────────────────────────
+// listDentalAgents, countDentalAgents, countPublicDentalAgents and
+// listPublicDentalAgents each carried their own copy of these clauses, and
+// they had drifted: countDentalAgents never applied `poststed`. All four now
+// build their WHERE here.
+//   publicOnly        visitor-facing surfaces: no rejected or closed clinics,
+//                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), and a
+//                     verification_status filter of 'rejected' is ignored.
+//   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
+//   excludeNonClinic  GET /discover's opt-in catalog_class filter.
+// The synthetic probe row is skipped for every caller.
+export interface DentalWhereOptions {
+  publicOnly?: boolean;
+  excludeParked?: boolean;
+  excludeNonClinic?: boolean;
+}
+
+export function buildDentalWhere(
+  parsed: ListFilter,
+  opts: DentalWhereOptions = {}
+): { where: string[]; params: Record<string, unknown> } {
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  if (opts.publicOnly) {
+    // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
+    // closed clinics (is_inactive=1, set via /admin/dental/mark-inactive) are
+    // hidden from every public-facing path, unconditionally -- same shape as
+    // the verification_status='rejected' exclusion.
+    where.push("verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)");
+    // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
+    // catalog_class exclusion is UNCONDITIONAL for public surfaces. Uses the
+    // lenient DENTAL_CLINIC_CLASS_SQL (NULL/"ukjent" stay eligible, only
+    // positively-classified person_enk/lab_leverandor/holding rows are
+    // excluded) -- see its doc comment in dental-catalog-class.ts.
+    where.push(DENTAL_CLINIC_CLASS_SQL);
+  }
+  where.push(DENTAL_NOT_SYNTHETIC_PROBE_SQL);
+  if (opts.excludeParked && process.env.DENTAL_HOMEPAGE_PARKING_DISABLED !== "true") {
+    where.push("(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))");
+  }
+  if (opts.excludeNonClinic && !opts.publicOnly) {
+    where.push(DENTAL_CLINIC_CLASS_SQL);
+  }
+
+  if (parsed.fylke) {
+    // Input folded to the canonical 2024 name ("vestland", "Hordaland" ->
+    // "Vestland"). The raw value stays in the IN list, so a value stored
+    // verbatim (e.g. "Ukjent", which has no canonical form) still matches.
+    // The column stays bare so idx_dental_fylke is used.
+    const canonical = normaliseFylke(parsed.fylke) ?? parsed.fylke;
+    pushEqualsAny(where, params, "fylke", "fylke", [canonical, parsed.fylke]);
+  }
+  if (parsed.chain_brand) {
+    where.push("chain_brand = @chain_brand");
+    params.chain_brand = parsed.chain_brand;
+  }
+  if (parsed.verification_status && !(opts.publicOnly && parsed.verification_status === "rejected")) {
+    where.push("verification_status = @verification_status");
+    params.verification_status = parsed.verification_status;
+  }
+  if (parsed.specialty) {
+    pushSpecialtyClause(where, params, parsed.specialty);
+  }
+  // PR-109 / PR-105 additive filters
+  if (parsed.q) {
+    pushFreeTextClause(where, params, parsed.q);
+  }
+  if (parsed.helfo_agreement !== undefined) {
+    where.push("helfo_agreement = @helfo_agreement");
+    params.helfo_agreement = parsed.helfo_agreement;
+  }
+  if (parsed.acute_vakt !== undefined) {
+    where.push("acute_vakt = @acute_vakt");
+    params.acute_vakt = parsed.acute_vakt;
+  }
+  if (parsed.enrichment_state !== undefined) {
+    where.push("enrichment_state = @enrichment_state");
+    params.enrichment_state = parsed.enrichment_state;
+  }
+  if (parsed.poststed) {
+    // poststed is stored upper case by Posten/BRREG convention ("BERGEN"),
+    // but not on every row. The given value plus its upper-case form, both
+    // against the bare column so /sted/:slug keeps idx_dental_poststed.
+    pushEqualsAny(where, params, "poststed", "poststed", [parsed.poststed.toLocaleUpperCase("nb-NO"), parsed.poststed]);
+  }
+  if (parsed.poststed_in) {
+    pushEqualsAny(where, params, "poststed", "poststedIn", parsed.poststed_in);
+  }
+  if (parsed.postnummer_in) {
+    pushEqualsAny(where, params, "postnummer", "postnummerIn", parsed.postnummer_in);
+  }
+  if (parsed.name_terms) {
+    parsed.name_terms.forEach((term, i) => {
+      where.push(`(nb_lower(navn) LIKE @nameTerm${i} ESCAPE '\\' OR nb_lower(poststed) LIKE @nameTerm${i} ESCAPE '\\')`);
+      params[`nameTerm${i}`] = `%${escapeLike(term.toLowerCase())}%`;
+    });
+  }
+
+  return { where, params };
+}
+
+// `column = @name` for one distinct value, `column IN (@name0, @name1, …)`
+// for several -- bound parameters only, and an indexable bare column.
+function pushEqualsAny(
+  where: string[],
+  params: Record<string, unknown>,
+  column: string,
+  name: string,
+  values: readonly string[]
+): void {
+  const distinct = [...new Set(values)];
+  if (distinct.length === 1) {
+    where.push(`${column} = @${name}`);
+    params[name] = distinct[0];
+    return;
+  }
+  const names = distinct.map((v, i) => {
+    params[`${name}${i}`] = v;
+    return `@${name}${i}`;
+  });
+  where.push(`${column} IN (${names.join(", ")})`);
 }
 
 // ── Dead-homepage parking (enrichment-metode slice 1, 2026-07-16) ────────────
@@ -1151,51 +1315,7 @@ export function listDentalAgents(
 ): Array<DentalAgent & { id: string }> {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
-  // Unconditional (not an opt): the synthetic probe row is never a clinic for
-  // any caller of this listing (GET /agents, GET /discover).
-  const where: string[] = [DENTAL_NOT_SYNTHETIC_PROBE_SQL];
-  const params: Record<string, unknown> = {};
-
-  if (opts.excludeParked && process.env.DENTAL_HOMEPAGE_PARKING_DISABLED !== "true") {
-    where.push("(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))");
-  }
-  if (opts.excludeNonClinic) {
-    where.push(DENTAL_CLINIC_CLASS_SQL);
-  }
-
-  if (parsed.fylke) {
-    where.push("fylke = @fylke");
-    params.fylke = parsed.fylke;
-  }
-  if (parsed.chain_brand) {
-    where.push("chain_brand = @chain_brand");
-    params.chain_brand = parsed.chain_brand;
-  }
-  if (parsed.verification_status) {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
-  if (parsed.specialty) {
-    pushSpecialtyClause(where, params, parsed.specialty);
-  }
-  // PR-109 / PR-105 additive filters
-  if (parsed.q) {
-    pushFreeTextClause(where, params, parsed.q);
-  }
-  if (parsed.helfo_agreement !== undefined) {
-    where.push("helfo_agreement = @helfo_agreement");
-    params.helfo_agreement = parsed.helfo_agreement;
-  }
-  if (parsed.acute_vakt !== undefined) {
-    where.push("acute_vakt = @acute_vakt");
-    params.acute_vakt = parsed.acute_vakt;
-  }
-  if (parsed.enrichment_state !== undefined) {
-    where.push("enrichment_state = @enrichment_state");
-    params.enrichment_state = parsed.enrichment_state;
-  }
-  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
+  const { where, params } = buildDentalWhere(parsed, opts);
 
   const sql =
     "SELECT * FROM dental_agents" +
@@ -1215,18 +1335,7 @@ export function listDentalAgents(
 export function countDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
-  const where: string[] = [DENTAL_NOT_SYNTHETIC_PROBE_SQL];
-  const params: Record<string, unknown> = {};
-
-  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
-  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
-  if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
-  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
-  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
-  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
-  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+  const { where, params } = buildDentalWhere(parsed);
 
   const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
     (where.length ? ` WHERE ${where.join(" AND ")}` : "");
@@ -1242,41 +1351,9 @@ export function countDentalAgents(filter: ListFilter = {}): number {
 export function countPublicDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
-  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
-  // closed clinics (is_inactive=1, set via /admin/dental/mark-inactive) are
-  // hidden from every public-facing path, unconditionally -- same shape as
-  // the verification_status='rejected' exclusion right above.
-  const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"];
-  const params: Record<string, unknown> = {};
-  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
-  // catalog_class exclusion is now UNCONDITIONAL for this public surface
-  // (was gated behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" in slice 1b's
-  // gradual, default-OFF rollout below -- that rollout is graduated to
-  // permanent-on here). Uses the SAME lenient DENTAL_CLINIC_CLASS_SQL the
-  // claim-pool/Places auto-select already use (NULL/"ukjent" stay eligible,
-  // only positively-classified person_enk/lab_leverandor/holding rows are
-  // excluded) rather than the dev-request text's literal stricter
-  // klinikk/offentlig_klinikk-only wording — see DENTAL_CLINIC_CLASS_SQL's
-  // doc comment in dental-catalog-class.ts for why (the stricter clause
-  // broke a large slice of the pre-existing dental test suite, whose
-  // fixtures predate catalog_class and are therefore NULL, not yet a proven
-  // non-clinic).
-  where.push(DENTAL_CLINIC_CLASS_SQL);
-  where.push(DENTAL_NOT_SYNTHETIC_PROBE_SQL);
-
-  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
-  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
-  if (parsed.verification_status && parsed.verification_status !== "rejected") {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
-  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
-  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
-  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
-  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
-  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
+  // Rejected, permanently closed and non-clinic rows are never counted here
+  // (see buildDentalWhere's publicOnly).
+  const { where, params } = buildDentalWhere(parsed, { publicOnly: true });
 
   const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
     ` WHERE ${where.join(" AND ")}`;
@@ -1326,31 +1403,9 @@ export function listPublicDentalAgents(
 ): Array<DentalAgent & { id: string }> {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
-  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
-  // closed clinics (is_inactive=1, set via /admin/dental/mark-inactive) are
-  // hidden from every public-facing path, unconditionally -- same shape as
-  // the verification_status='rejected' exclusion right below.
-  const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"]; // always exclude rejected + inactive
-  const params: Record<string, unknown> = {};
-  // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
-  // unconditional honest-count filter as countPublicDentalAgents() above --
-  // kept in sync so the count and the list it describes never diverge.
-  where.push(DENTAL_CLINIC_CLASS_SQL);
-  where.push(DENTAL_NOT_SYNTHETIC_PROBE_SQL);
-
-  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
-  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
-  if (parsed.verification_status && parsed.verification_status !== "rejected") {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
-  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
-  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
-  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
-  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
-  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
+  // Same publicOnly WHERE as countPublicDentalAgents(), so the count and the
+  // list it describes never diverge.
+  const { where, params } = buildDentalWhere(parsed, { publicOnly: true });
 
   const sql =
     "SELECT * FROM dental_agents" +
@@ -1388,17 +1443,18 @@ export function getAvailableSpecialties(candidates: string[]): string[] {
   // three-way match (available_specialties / specialists[].specialty /
   // specialists[].title) as pushSpecialtyClause() above — the dropdown must
   // not hide a specialty that /spesialitet/:slug would actually return
-  // clinics for.
-  const stmt = db.prepare(
-    `SELECT 1 FROM dental_agents
-     WHERE verification_status != 'rejected'
-       AND (is_inactive IS NULL OR is_inactive = 0)
-       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
-       AND (available_specialties LIKE @s OR specialists LIKE @p OR nb_lower(specialists) LIKE @t)
-     LIMIT 1`
-  );
+  // clinics for. dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2):
+  // the very same predicate (specialtyMatch), title stems included.
   return candidates.filter((name) => {
-    const row = stmt.get({ s: `%"${name}"%`, p: `%"specialty":"${name}"%`, t: `%"title":"%${name.toLowerCase()}%` });
+    const m = specialtyMatch(name, "s");
+    const row = db.prepare(
+      `SELECT 1 FROM dental_agents
+       WHERE verification_status != 'rejected'
+         AND (is_inactive IS NULL OR is_inactive = 0)
+         AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
+         AND ${m.sql}
+       LIMIT 1`
+    ).get(m.params);
     return !!row;
   });
 }

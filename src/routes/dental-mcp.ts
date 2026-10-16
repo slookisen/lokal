@@ -24,9 +24,13 @@ import {
   getDentalAgentById,
   getDentalStats,
   listChains,
+  listPoststeder,
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { planDentalSearch } from "../services/dental-query-parser";
+import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { findSearchSpecialty } from "../config/dental-search-vocabulary";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 
 import { clinicProfileUrl } from "./dental-seo";
@@ -165,18 +169,27 @@ export function registerDentalTools(server: McpServer): void {
     },
     async ({ query, fylke, spesialitet, helfo, akutt, limit }, extra) => {
       try {
-        const filter: Record<string, unknown> = {};
-        if (query) filter.q = query;
-        if (fylke) filter.fylke = fylke;
-        if (spesialitet) filter.specialty = spesialitet;
-        if (helfo === true) filter.helfo_agreement = "true";
-        if (akutt === true) filter.acute_vakt = 1;
+        // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): `query`
+        // goes through the shared parser; the explicit arguments win over
+        // what it found (helfo/akutt false removes a parsed one). A slug
+        // («oral-kirurgi-og-oral-medisin») is read as its stored name.
+        const explicit: Record<string, unknown> = {};
+        if (fylke) explicit.fylke = fylke;
+        if (spesialitet) explicit.specialty = findSearchSpecialty(spesialitet)?.canonical ?? spesialitet;
+        if (helfo !== undefined) explicit.helfo_agreement = helfo ? "true" : undefined;
+        if (akutt !== undefined) explicit.acute_vakt = akutt ? 1 : undefined;
 
-        const agents = listPublicDentalAgents(filter as any, limit ?? 10);
-        const total = countPublicDentalAgents(filter as any);
+        const plan = planDentalSearch({
+          query,
+          explicit,
+          gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+          count: (f) => countPublicDentalAgents(f as any),
+        });
+        const agents = listPublicDentalAgents(plan.filter as any, limit ?? 10);
         const klinikker = buildSearchResults(agents);
 
-        const result = { count: total, klinikker };
+        // `tolkning` (only when a query was parsed) says what the search used.
+        const result = { count: plan.count, klinikker, ...(plan.tolkning ? { tolkning: plan.tolkning } : {}) };
         deliver("tannlege_search", { query, fylke, spesialitet, helfo, akutt, limit }, extra, agents.map((a) => a.id));
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
