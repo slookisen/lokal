@@ -30844,6 +30844,11 @@ withFreshModules([
   // page must not publish an InStock Offer pointing at the booking route.
   assertEq(localBizGP?.offers, undefined,
     "gp-08h: LocalBusiness has no offers node while booking is paused");
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt, S5: a live page signals booking as a ReserveAction; a paused
+  // page carries neither that nor an Offer.
+  assertEq(localBizGP?.potentialAction, undefined,
+    "gp-08h2: … and no potentialAction (ReserveAction) while booking is paused");
   const breadcrumbGP = ldObjsGP.find((o: any) => o["@type"] === "BreadcrumbList");
   assertTrue(!!breadcrumbGP, "gp-08i: a BreadcrumbList JSON-LD block is present");
   assertEq(breadcrumbGP?.itemListElement?.length, 3, "gp-08j: breadcrumb has 3 items (Forsiden / Gårdssalg og smaking / provider)");
@@ -38967,10 +38972,15 @@ withFreshModules([
   assertEq(detailNoTitleNoEN.status, 200, "tnr-4g: GET /opplevelse/<slug> for the title_no-less row (lang=en) → 200");
   assertTrue(detailNoTitleNoEN.body.includes(`<h1>${ONLY_TITLE}</h1>`), "tnr-4h: detail <h1> falls back to `title` on /en when title_no is NULL");
 
-  // ── tnr-5: breadcrumb text is explicitly NOT touched this slice — still
-  //    the original title even on /no with title_no set. ───────────────
-  assertTrue(detailWithNoNO.body.includes(`<span class="sep">/</span>${ENGLISH_TITLE}\n`),
-    "tnr-5: breadcrumb still uses the original title on /no (out of scope this slice, per the dev-request)");
+  // ── tnr-5: the breadcrumb follows the <h1> — title_no on /no when set,
+  //    the original title on /en (dev-request 2026-10-16-opplevagent-
+  //    indekserbarhet-og-strukturdata, E2-S2: one title everywhere; this
+  //    was left on the original title by the slice above). ─────────────
+  assertTrue(detailWithNoNO.body.includes(`<span class="sep">/</span>${NORSK_TITLE_NO}\n`)
+    && !detailWithNoNO.body.includes(`<span class="sep">/</span>${ENGLISH_TITLE}\n`),
+    "tnr-5: breadcrumb follows title_no on /no, like the <h1>");
+  assertTrue(detailWithNoEN.body.includes(`<span class="sep">/</span>${ENGLISH_TITLE}\n`),
+    "tnr-5b: breadcrumb keeps the original title on /en, like the <h1>");
 
   if (prevPathTNR === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathTNR;
@@ -41958,6 +41968,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-kort-fortalt: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S2:
+// /opplevelse/<slug> JSON-LD with one title everywhere, offers/provider on a
+// Service node, no blanket InStock; nav/footer follow uiLang. Plus
+// 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S5:
+// gårdssalg producer pages signal a ReserveAction, never a price-less Offer.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata E2-S2 + RFB S5: valid structured data ──");
+  try {
+    const { runExperiencesSeoJsonLdTests } = require("../src/routes/experiences-seo-jsonld.test") as
+      typeof import("../src/routes/experiences-seo-jsonld.test");
+    const ejl = await runExperiencesSeoJsonLdTests({ log: false });
+    passed += ejl.passed;
+    failed += ejl.failed;
+    for (const f of ejl.failures) failures.push("experiences-seo-jsonld: " + f);
+    console.log(`  experiences-seo-jsonld: ${ejl.passed} passed, ${ejl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-jsonld: unexpected error: " + String(err?.message || err));
   }
 });
 
