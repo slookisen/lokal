@@ -45,6 +45,9 @@ import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
+// rating markup, Offer return/shipping terms and the visible rating text.
+import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay } from "../services/structured-data-policy";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
@@ -907,10 +910,11 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
 
-  // Rating: ★ 4.7 (159)
-  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
-    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}${knowledge.googleReviewCount ? ` (${knowledge.googleReviewCount})` : ""}</span>`
-    : "";
+  // Rating: "★ 4.7 · 159 anmeldelser på Google". The stored rating is Google's,
+  // so the source is always named (dev-request 2026-10-16-rfb-strukturerte-data-
+  // tredjepartsrating-og-places-treffvakt, S2).
+  const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
+  const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
   // Product summary line: top 3 product names with category-emoji + "+N produkter"
   const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
@@ -988,9 +992,9 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
 
-  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
-    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}</span>`
-    : "";
+  // Same attributed rating text as the ultra-rich card (S2).
+  const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
+  const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
   // Address line: full address, or fall back to city
   const addressVal = knowledge?.address || city;
@@ -5686,33 +5690,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       }));
     }
 
-    // Aggregate rating from Google
-    if (k.googleRating) {
-      jsonLd.aggregateRating = {
-        "@type": "AggregateRating",
-        "ratingValue": k.googleRating,
-        "bestRating": 5,
-        "worstRating": 1,
-        "reviewCount": k.googleReviewCount || 1,
-      };
-    }
+    // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (S1): the stored rating and externalReviews come from third parties
+    // (Google Places), and Google's review-snippet guidelines only accept
+    // ratings a site collects itself, so neither becomes rating/review
+    // markup (the policy module returns null for any non-first-party
+    // source). The rating is shown as text naming Google (S2); reviewsHtml
+    // below is unchanged.
+    const ratingJsonLd = buildRatingJsonLd({ source: "google", rating: k.googleRating, count: k.googleReviewCount });
+    if (ratingJsonLd) jsonLd.aggregateRating = ratingJsonLd;
+    const profileRating = formatRatingDisplay({ rating: k.googleRating, count: k.googleReviewCount, source: "google" }, lang);
 
-    // Reviews from external sources (JSON-LD + visible HTML)
-    const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
-    if (reviewsList.length) {
-      jsonLd.review = reviewsList.slice(0, 5).map((r: any) => ({
-        "@type": "Review",
-        "reviewBody": r.text || "",
-        "reviewRating": r.rating ? {
-          "@type": "Rating",
-          "ratingValue": r.rating,
-          "bestRating": 5,
-        } : undefined,
-        "author": { "@type": "Person", "name": r.author || "Kunde" },
-        ...(r.date ? { "datePublished": r.date } : {}),
-      }));
-    }
     // Build visible reviews HTML
+    const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
     const reviewsHtml = reviewsList.length
       ? reviewsList.slice(0, 5).map((r: any) => {
           const stars = r.rating ? "&#11088;".repeat(Math.min(Math.round(r.rating), 5)) : "";
@@ -5774,34 +5764,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
             "seller": { "@type": "LocalBusiness", "name": agent.name },
-            // WO-17: 14-day Norwegian angrerett (distance-sale law default).
-            "hasMerchantReturnPolicy": {
-              "@type": "MerchantReturnPolicy",
-              "applicableCountry": "NO",
-              "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
-              "merchantReturnDays": 14,
-              "returnMethod": "https://schema.org/ReturnByMail",
-              "returnFees": "https://schema.org/FreeReturn",
-            },
-            // WO-17: local-pickup is the realistic default for rettfrabonden
-            // producers. Per-producer overrides are out of scope for this WO.
-            "shippingDetails": {
-              "@type": "OfferShippingDetails",
-              "shippingRate": {
-                "@type": "MonetaryAmount",
-                "value": 0,
-                "currency": "NOK",
-              },
-              "shippingDestination": {
-                "@type": "DefinedRegion",
-                "addressCountry": "NO",
-              },
-              "deliveryTime": {
-                "@type": "ShippingDeliveryTime",
-                "handlingTime": { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 1, "unitCode": "DAY" },
-                "transitTime":  { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 2, "unitCode": "DAY" },
-              },
-            },
+            // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+            // (S1): return and shipping terms only from the producer's own
+            // policy. WO-17's fixed "14 days free return by post, 0 kr
+            // shipping" was a claim the platform cannot back (pickup sale of
+            // fresh goods). No per-producer policy is stored, so this adds
+            // nothing.
+            ...buildOfferPolicyJsonLd(null),
           },
         };
 
@@ -5810,14 +5779,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           product.image = imagesList[0];
         }
 
-        // WO-17: propagate parent rating/review to inner Product so Google's
-        // "Product snippets" report sees them on the right entity.
-        if (jsonLd.aggregateRating) {
-          product.aggregateRating = jsonLd.aggregateRating;
-        }
-        if (Array.isArray(jsonLd.review) && jsonLd.review.length) {
-          product.review = jsonLd.review.slice(0, 3); // cap to keep payload small
-        }
+        // No rating/review on the Product: a producer's rating is not a
+        // rating of this product (WO-17's copy is gone with the source, S1).
 
         return {
           "@type": "Offer",
@@ -6094,7 +6057,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         })()}
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
-          ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
+          ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
           <div class="pf-stat" data-stat="human" title="${lang === "en" ? `Page views from humans, last ${statsDays} days` : `Sidevisninger fra mennesker, siste ${statsDays} dager`}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `humans &middot; ${statsDays}d` : `mennesker &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days.` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager.`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `AI agents &middot; ${statsDays}d` : `AI-agenter &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was sent to AI assistants such as ChatGPT and Claude as part of an answer, last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål, siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? "In AI answers" : "Med i AI-svar"}<br><span class="pf-stat-meta">${lang === "en" ? `sent to the AI &middot; ${AI_DELIVERY_WINDOW_DAYS}d` : `sendt til AI-en &middot; ${AI_DELIVERY_WINDOW_DAYS}d`}</span></small></div></div>
