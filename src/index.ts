@@ -1970,6 +1970,39 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, tillegg 2026-10-15 «4b-forslag»: gårdssalg
+// visit-text proposals — same file-queue mechanics as the description
+// proposals job above (services/proposal-file-queue.ts), reading
+// `gardssalg-visit-proposals/` in slookisen/A2A and storing through
+// applyGardssalgVisitProposals() with the server re-fetching every source.
+// Never calls an LLM. OFF by default: GARDSSALG_VISIT_PROPOSALS_JOB_ENABLED
+// === "true" turns it on; flipping it back is the rollback. First tick 6
+// minutes after boot, hourly after that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let gardssalgVisitProposalsRunning = false;
+  const gardssalgVisitProposalsTick = trackJob("gardssalg-visit-proposals", async () => {
+    if (gardssalgVisitProposalsRunning) return;
+    gardssalgVisitProposalsRunning = true;
+    try {
+      const { tickGardssalgVisitProposals } = await import("./services/gardssalg-visit-proposals-job");
+      const r = await tickGardssalgVisitProposals();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[gardssalg-visit-proposals] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-visit-proposals] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgVisitProposalsRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgVisitProposalsTick(); }, 6 * 60_000);
+  setInterval(() => { void gardssalgVisitProposalsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
