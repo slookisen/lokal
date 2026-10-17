@@ -34,6 +34,7 @@ import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { generalLimiter } from "../middleware/security";
 // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
 // the existing pure classifiers rather than reinventing name-word / host
 // checks. DENTAL_NAME_WORDS is the SAME "does this name read as a dental
@@ -1210,7 +1211,14 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
   });
 });
 
-router.get("/sok", (req: Request, res: Response) => {
+// generalLimiter on the route, like /sok in seo.ts and experiences-seo.ts
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, I-T revision). The
+// finn-tannlege.com host gate in src/index.ts hands every non-API path to this
+// router before any limiter mount, so this free-text search — a count, a page
+// of rows and the specialty list per request, any ?side= — had none. Same
+// shared instance and quota as the other /sok pages; dentalLimiter stays the
+// /api/tannlege quota for the enrichment workers.
+router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   const searchStarted = Date.now();
   const PAGE_SIZE = 50;
   const q = String(req.query.q || "").trim();

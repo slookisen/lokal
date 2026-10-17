@@ -587,6 +587,9 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           "/api/marketplace/search", "/api/marketplace/discover/x", "/api/marketplace/searchx",
           "/api/tannlege", "/api/tannlege/klinikker", "/api/tannlegex", "/Api/Tannlege/x",
           "/ut/a1/web", "/utx", "/reise", "/en/reise", "/sv/reise", "/sok", "/sok/", "/en/sok", "/sok/x",
+          "/for-tilbydere/finn", "/For-Tilbydere/Finn/", "/en/for-tilbydere/finn", "/for-tilbydere", "/for-tilbydere/finnx",
+          "/kategori/gardssalg/book/gard-x", "/kategori/gardssalg/book/gard-x/", "/kategori/gardssalg/book",
+          "/kategori/gardssalg/book/gard-x/confirm/R1",
           "/a2a", "/en/a2a", "/mcp", "/mcp/x", "/health", "/", "/produsent/x",
         ].map((p) => [p, ac2LimitersFor(p)]),
         [
@@ -594,6 +597,9 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           ["/api/marketplace/search", ["general", "search"]], ["/api/marketplace/discover/x", ["general", "search"]], ["/api/marketplace/searchx", ["general"]],
           ["/api/tannlege", ["dental"]], ["/api/tannlege/klinikker", ["dental"]], ["/api/tannlegex", []], ["/Api/Tannlege/x", ["general", "dental"]],
           ["/ut/a1/web", ["general"]], ["/utx", []], ["/reise", ["general"]], ["/en/reise", ["general"]], ["/sv/reise", ["general"]], ["/sok", ["general"]], ["/sok/", ["general"]], ["/en/sok", ["general"]], ["/sok/x", []],
+          ["/for-tilbydere/finn", ["general"]], ["/For-Tilbydere/Finn/", ["general"]], ["/en/for-tilbydere/finn", ["general"]], ["/for-tilbydere", []], ["/for-tilbydere/finnx", []],
+          ["/kategori/gardssalg/book/gard-x", ["general"]], ["/kategori/gardssalg/book/gard-x/", ["general"]], ["/kategori/gardssalg/book", []],
+          ["/kategori/gardssalg/book/gard-x/confirm/R1", []],
           ["/a2a", ["a2a", "dental"]], ["/en/a2a", ["a2a", "dental"]], ["/mcp", ["mcp"]], ["/mcp/x", ["mcp"]], ["/health", []], ["/", []], ["/produsent/x", []],
         ],
         "C7: ac2LimitersFor mirrors the mounts (segment-wise, case-insensitive, after the /en and /sv strip): search is also general; /api/tannlege* is not general (generalLimiter's case-sensitive skip) but dental; /a2a counts against jsonRpcLimiter and dentalLimiter"
@@ -905,9 +911,15 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           'index.ts: app.use("/reise", generalLimiter);',
           'index.ts: app.use("/ut", generalLimiter);',
           "routes/dental-a2a.ts: router.use(dentalLimiter);",
+          'routes/dental-seo.ts: router.get("/sok", generalLimiter, (req: Request, res: Response) => {',
           'routes/experiences-a2a.ts: router.use(jsonRpcLimiter);',
+          'routes/experiences-seo.ts: router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) => {',
+          'routes/experiences-seo.ts: router.get("/reise", generalLimiter, async (req: Request, res: Response) => {',
           'routes/experiences-seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
           'routes/seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
+          // POST /kategori/gardssalg/book/:providerSlug (experiences-seo.ts) carries generalLimiter on a line of
+          // its own, which the import-list rule above skips; host-gate-rate-limit.test.ts (a1) ties every
+          // route-level generalLimiter, by reference, to ac2LimitersFor.
         ],
         "H: generalLimiter, searchLimiter, jsonRpcLimiter and dentalLimiter are applied exactly where ac2LimitersFor counts them"
       );

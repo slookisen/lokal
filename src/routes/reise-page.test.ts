@@ -76,6 +76,9 @@ function invoke(
       hostname,
       query: Object.fromEntries(new URLSearchParams(qs || "")),
       headers: { host: hostname },
+      // OpplevAgent /reise now runs generalLimiter first (I-T), which keys on
+      // req.ip — set it as Express would, like the /sok harnesses do.
+      ip: "127.0.0.1",
       lang: "no",
       get(name: string) { return name.toLowerCase() === "host" ? hostname : undefined; },
     };
