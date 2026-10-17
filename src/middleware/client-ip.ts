@@ -41,8 +41,9 @@
  * `clientIp.ac2` is the server's own verdict on each AC2 criterion
  * (evaluateClientIpAc2). Trinn 1d makes AC2 measure what enforce would do:
  * the fanIn ratio over 20 min (FANIN_WINDOWS), /mcp rated the way the MCP
- * limiters key it (ac2LimitersFor), and hours_covered from the time each
- * window was actually measured (coveredMs).
+ * limiters key it, with the routers' own session check (ac2LimitersFor,
+ * mcpSessionKeyed), and hours_covered from the time each window was actually
+ * measured (coveredMs).
  *
  * The failure mode guarded hardest is "every client in one bucket" (a 429
  * wave on all three sites):
@@ -438,9 +439,11 @@ export interface ClientIpStatsLine extends ClientIpCounters {
  *   dental   dentalLimiter 1000: /api/tannlege and /a2a on finn-tannlege.com
  *            (dental-a2a.ts).
  *   mcp      the smallest MCP primary ceiling, 200 (mcp-rate-limit.ts), per
- *            vertical. The primary keys a request on its MCP session when it
- *            names one, so only /mcp without a session counts (trinn 1d;
- *            review S2 of PR #1130): `initialize`, and anything sent bare.
+ *            vertical. The primary keys a request on its MCP session only
+ *            when the router holds that session, so only /mcp it keys on the
+ *            IP counts (trinn 1d; review S2 of PR #1130, B1 of PR #1151):
+ *            `initialize`, anything sent bare, and an id the router no longer
+ *            holds (every deploy empties the maps; 30 min idle drops one).
  *   mcp_brake the MCP brake, 3 000 (mcp-rate-limit.ts), keyed on the IP for
  *            every /mcp request on all three verticals: what a shared egress
  *            with many sessions meets first.
@@ -475,14 +478,18 @@ const under = (path: string, mount: string): boolean => path === mount || path.s
  * any method, though only its POST is limited, and the claim paths on every
  * host, though only opplevagent.no serves them — the path is all this sees),
  * /a2a against both jsonRpcLimiter and dentalLimiter, /mcp summed over the
- * verticals' own chains: against the brake always, against the primary only
- * when `mcpSessionKeyed` is false (see mcpSessionKeyed). Each count is thus
- * at least the key's count in that limiter, never below it — save an
- * mcp-session-id of the right shape that the router no longer holds — so the
- * criterion may fail early, but never passes a key at 80 % of a rated limiter.
+ * verticals' own chains: against the brake always, against the primary
+ * unless `sessionKeyed()` (mcpSessionKeyed: the primary keys it on a session
+ * a router holds). sessionKeyed is called only for a path under /mcp
+ * (review S1 of PR #1151). Each count is thus at least the key's count in
+ * that limiter, never below it — save a session one vertical's router holds
+ * sent to another vertical's /mcp (isKnownToAnMcpRouter is the union; this
+ * runs before the host gates), which only a client mixing up its servers'
+ * ids does — so the criterion may fail early, but never passes a key at 80 %
+ * of a rated limiter.
  * Exported for client-ip-shadow-store.test.ts.
  */
-export function ac2LimitersFor(path: string, mcpSessionKeyed = false): Ac2FanInLimiter[] {
+export function ac2LimitersFor(path: string, sessionKeyed: () => boolean = () => false): Ac2FanInLimiter[] {
   const p = stripLangPrefix(path);
   const lower = p.toLowerCase();
   const out: Ac2FanInLimiter[] = [];
@@ -503,7 +510,7 @@ export function ac2LimitersFor(path: string, mcpSessionKeyed = false): Ac2FanInL
   if (under(lower, "/a2a")) out.push("a2a", "dental");
   else if (under(lower, "/api/tannlege")) out.push("dental");
   if (under(lower, "/mcp")) {
-    if (!mcpSessionKeyed) out.push("mcp");
+    if (!sessionKeyed()) out.push("mcp");
     out.push("mcp_brake");
   }
   return out;
@@ -511,16 +518,64 @@ export function ac2LimitersFor(path: string, mcpSessionKeyed = false): Ac2FanInL
 
 /**
  * Whether the MCP primary limiter keys this request on its session rather
- * than on the IP (trinn 1d; review S2 of PR #1130): mcpPrimaryKey's own rule,
- * so the two cannot drift — a UUID-shaped mcp-session-id. Whether the router
- * still holds that session is not visible here (this runs before the routers
- * and does not load their session maps), so an expired or made-up id, which
- * the primary keys on the IP, counts against the brake only. A client the
- * router answers 404 re-initializes without one, and that counts.
+ * than on the IP (trinn 1d; review S2 of PR #1130, B1 of PR #1151):
+ * mcpPrimaryKey itself, given the routers' own session check as the three
+ * primaries are, so the two cannot drift — a UUID-shaped mcp-session-id that
+ * `isKnownSession` says a router holds. An id no router holds (after a
+ * deploy, or 30 min idle) or a made-up one is keyed on the IP and counts
+ * against the primary. Without isKnownSession, or if it throws, false: every
+ * /mcp counts against the primary too, trinn 1c's upper bound.
  * Exported for client-ip-shadow-store.test.ts.
  */
-export function mcpSessionKeyed(req: Request): boolean {
-  return req.headers["mcp-session-id"] !== undefined && mcpPrimaryKey(req).startsWith("sid:");
+export function mcpSessionKeyed(req: Request, isKnownSession?: (sessionId: string) => boolean): boolean {
+  if (!isKnownSession || req.headers["mcp-session-id"] === undefined) return false;
+  try {
+    return mcpPrimaryKey(req, isKnownSession).startsWith("sid:");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The MCP routers' own "do I hold this session?" checks: what each
+ * vertical's primary is given as isKnownSession (mcp-rate-limit.ts's
+ * isLiveRfbMcpSession → hasMcpSession; experiences-mcp.ts; dental-mcp.ts).
+ * Pinned against those three chains by client-ip-shadow-store.test.ts.
+ */
+export const MCP_ROUTER_SESSION_CHECKS = [
+  { module: "../routes/mcp", check: "hasMcpSession" },
+  { module: "../routes/experiences-mcp", check: "hasExperiencesMcpSession" },
+  { module: "../routes/dental-mcp", check: "hasDentalMcpSession" },
+] as const;
+
+// MCP_ROUTER_SESSION_CHECKS' files, resolved on first use (null: not found).
+let mcpRouterFiles: Array<string | null> | null = null;
+
+/**
+ * installClientIp's default isKnownMcpSession: does one of the MCP routers
+ * hold this session? The union over the verticals, as this runs before the
+ * host gates. Read only from a router module already loaded, never loading
+ * one: index.ts loads dental-mcp and experiences-mcp on their host's first
+ * /mcp, a router not loaded has minted no session, and loading it here would
+ * pull its whole tool surface into the request path.
+ * Exported for client-ip-shadow-store.test.ts.
+ */
+export function isKnownToAnMcpRouter(sessionId: string): boolean {
+  if (mcpRouterFiles === null) {
+    mcpRouterFiles = MCP_ROUTER_SESSION_CHECKS.map(({ module }) => {
+      try {
+        return require.resolve(module);
+      } catch {
+        return null;
+      }
+    });
+  }
+  for (let i = 0; i < MCP_ROUTER_SESSION_CHECKS.length; i++) {
+    const file = mcpRouterFiles[i];
+    const check = file === null ? undefined : require.cache[file]?.exports?.[MCP_ROUTER_SESSION_CHECKS[i].check];
+    if (typeof check === "function" && check(sessionId) === true) return true;
+  }
+  return false;
 }
 
 /** AC2 in the dev-request's `## Acceptance criteria`. */
@@ -821,6 +876,13 @@ export interface ClientIpMiddlewareOptions {
    * installClientIp: default the main-DB store on Fly, none off Fly.
    */
   store?: ClientIpShadowStore | null;
+  /**
+   * Trinn 1d: the MCP routers' own session check, as their primaries get it
+   * (see mcpSessionKeyed). createClientIpMiddleware: default none, so every
+   * /mcp counts against the primary. installClientIp: default
+   * isKnownToAnMcpRouter.
+   */
+  isKnownMcpSession?: (sessionId: string) => boolean;
 }
 
 export type ClientIpMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
@@ -847,6 +909,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   const logError = opts.logError ?? console.error;
   const mode = cfg.mode;
   const store = opts.store ?? null;
+  const isKnownMcpSession = opts.isKnownMcpSession;
   const statsKey = createStatsKey(crypto.randomBytes(16));
   const breaker = new CollapseBreaker();
   let current: StatsWindow | null = null;
@@ -1042,7 +1105,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
         entry.n++;
         const reqPath = typeof req.path === "string" ? req.path : "";
         entry.paths[pathClass(reqPath)]++;
-        for (const l of ac2LimitersFor(reqPath, mcpSessionKeyed(req))) entry.limits[l]++;
+        for (const l of ac2LimitersFor(reqPath, () => mcpSessionKeyed(req, isKnownMcpSession))) entry.limits[l]++;
         addCapped(entry.legacy, legacyKey, FANIN_CAP);
         const family = uaFamily(req.headers["user-agent"]);
         entry.ua.set(family, (entry.ua.get(family) ?? 0) + 1);
@@ -1143,12 +1206,14 @@ export function __resetInstalledClientIpForTesting(): void {
  * The mounted instance is what getInstalledClientIpSnapshot reads.
  * Trinn 1c: on Fly its closed windows go to the main-DB store unless
  * opts.store says otherwise; off Fly (local dev, CI, `npm test`) nothing
- * touches the DB.
+ * touches the DB. Trinn 1d: /mcp is rated with the routers' own session
+ * check (isKnownToAnMcpRouter) unless opts.isKnownMcpSession says otherwise.
  */
 export function installClientIp(app: Application, cfg: ClientIpConfig, opts: ClientIpMiddlewareOptions = {}): ClientIpMiddleware {
   app.set("trust proxy", true);
   const store = opts.store !== undefined ? opts.store : cfg.onFly ? createClientIpShadowStore() : null;
-  const middleware = createClientIpMiddleware(cfg, { ...opts, store });
+  const isKnownMcpSession = opts.isKnownMcpSession ?? isKnownToAnMcpRouter;
+  const middleware = createClientIpMiddleware(cfg, { ...opts, store, isKnownMcpSession });
   app.use(middleware);
   installed = middleware;
   (opts.log ?? console.log)(`[boot] client-ip mode=${cfg.mode} onFly=${cfg.onFly} reason=${cfg.reason}`);

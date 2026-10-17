@@ -33,9 +33,13 @@
  *   I  trinn 1d, AC2 measures what enforce would do: the fanIn ratio over
  *      20 min is an upper bound for every 15-min span (two bursts 11 min
  *      apart, review S1 of PR #1130; a seeded sweep against a brute-force
- *      sliding 15-min count), top15m unchanged; /mcp with an MCP session
- *      counts only against the brake, bare /mcp against the primary too
- *      (review S2), by mcpPrimaryKey's own rule; covered_ms — a process
+ *      sliding 15-min count), top15m unchanged; /mcp with a session its
+ *      router holds counts only against the brake, any other /mcp (bare, a
+ *      stale or made-up id) against the primary too (review S2; B1 of PR
+ *      #1151), by mcpPrimaryKey with the routers' own session check — in
+ *      parity with the real MCP chains over HTTP (RateLimit-Remaining, their
+ *      stores, their 429s), and through installClientIp's default
+ *      (isKnownToAnMcpRouter) with the real routers; covered_ms — a process
  *      starting mid-window covers the rest of it only, two machines in one
  *      window count it once, the migration keeps old rows as full windows;
  *      the store's timer flush runs inside trackJob.
@@ -49,7 +53,12 @@
 
 import Database from "better-sqlite3";
 import express from "express";
+import { MemoryStore } from "express-rate-limit";
+import { randomUUID } from "crypto";
+import { once } from "events";
 import fs from "fs";
+import http from "http";
+import type { AddressInfo } from "net";
 import os from "os";
 import path from "path";
 import {
@@ -60,6 +69,8 @@ import {
   evaluateClientIpAc2,
   getInstalledClientIpSnapshot,
   installClientIp,
+  isKnownToAnMcpRouter,
+  MCP_ROUTER_SESSION_CHECKS,
   mcpSessionKeyed,
   __resetInstalledClientIpForTesting,
   type ClientIpAc2,
@@ -68,7 +79,7 @@ import {
   type ClientIpCumulative,
   type ClientIpOpsSnapshot,
 } from "../middleware/client-ip";
-import { MCP_RATE_LIMIT_PROFILES, mcpPrimaryKey } from "../middleware/mcp-rate-limit";
+import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES, mcpPrimaryKey, type McpLimiterName } from "../middleware/mcp-rate-limit";
 import { __setDbAccessorFailureForTesting } from "../database/init";
 import { getEventLoopReport } from "./event-loop-monitor";
 import {
@@ -175,6 +186,42 @@ function fakeReq(o: { fci?: unknown; xff?: unknown; ip?: string; path?: string; 
   return { headers, path: o.path ?? "/api/x", ip: o.ip };
 }
 
+/** One request over real HTTP (Node's http client: other suites stub the global fetch); the body is drained, not kept. */
+function httpRequest(
+  port: number,
+  method: "GET" | "POST",
+  reqPath: string,
+  headers: Record<string, string>,
+  body?: unknown
+): Promise<{ status: number; headers: http.IncomingHttpHeaders }> {
+  const payload = body === undefined ? "" : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: reqPath,
+        method,
+        headers: { ...headers, ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}) },
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers }));
+      }
+    );
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** An express app on an ephemeral local port. */
+async function listen(app: express.Express): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = app.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return { port: (server.address() as AddressInfo).port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
 const rowCount = (db: Database.Database): number => (db.prepare("SELECT COUNT(*) AS c FROM client_ip_shadow_windows").get() as any).c;
 
 export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -223,10 +270,15 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
   }
 
   /** A middleware with a settable clock; send() is one request at the current clock. */
-  function rig(cfg: ClientIpConfig, store: ClientIpShadowStore | null, onRequest?: (inRequest: boolean) => void) {
+  function rig(
+    cfg: ClientIpConfig,
+    store: ClientIpShadowStore | null,
+    onRequest?: (inRequest: boolean) => void,
+    isKnownMcpSession?: (sessionId: string) => boolean
+  ) {
     let clock = T0;
     const lines: string[] = [];
-    const mw = createClientIpMiddleware(cfg, { now: () => clock, log: (l) => lines.push(l), logError: () => {}, store });
+    const mw = createClientIpMiddleware(cfg, { now: () => clock, log: (l) => lines.push(l), logError: () => {}, store, isKnownMcpSession });
     const sendReq = (req: any, at?: number) => {
       if (at !== undefined) clock = at;
       onRequest?.(true);
@@ -999,6 +1051,13 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
     }
 
     // ── I. Trinn 1d: AC2 measures what enforce would do ──
+    /** The one stored row's fanIn: the count against its limiter, the limiter, the ratio (6 decimals), the fanIn. */
+    const storedFanIn = (db: Database.Database): unknown[] => {
+      const rows = db.prepare("SELECT fanin_ratio, fanin_class, fanin_fan_in FROM client_ip_shadow_windows").all() as any[];
+      const f = rows.length === 1 ? rows[0] : null;
+      if (!f || f.fanin_ratio === null) return [null, null, null, null];
+      return [Math.round(f.fanin_ratio * AC2_FANIN_LIMITS[f.fanin_class as keyof typeof AC2_FANIN_LIMITS]), f.fanin_class, Math.round(f.fanin_ratio * 1e6) / 1e6, f.fanin_fan_in];
+    };
     /** Requests in time order (the rig's clock only moves forward), each at its own `at`. */
     const play = (r: ReturnType<typeof rig>, evs: Array<{ at: number; o: Parameters<typeof fakeReq>[0] }>) => {
       for (const e of [...evs].sort((a, b) => a.at - b.at)) r.send(e.o, e.at);
@@ -1016,6 +1075,9 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       return out;
     };
     const MIN = 60_000;
+    /** An MCP session id of the shape the routers mint (crypto.randomUUID), and one of that shape no router holds. */
+    const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const STALE_SID = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
     {
       // I1 (review S1 of PR #1130): 160 + 160 /api/products from one key (fanIn 3), over 4:00–4:50 and 15:00–15:50.
       // In enforce express-rate-limit opens the key's 15-min window at its first hit (4:00) and counts both bursts in
@@ -1104,42 +1166,84 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       assertTrue(missedBy3 > 0, `I1b: (the sweep has teeth) in ${missedBy3} of 30 runs the largest 3-window count was below the 15-min span count`);
     }
     {
-      // I2 (review S2 of PR #1130): /mcp as the MCP chain keys it. Only bare /mcp counts against the primary's 200;
-      // every /mcp counts against the brake's 3 000. mcpSessionKeyed is mcpPrimaryKey's own session rule.
-      const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+      // I2 (review S2 of PR #1130, B1 of PR #1151): /mcp as the MCP chain keys it. The primary keys a request on its
+      // session only when the router holds it (mcpPrimaryKey with the router's isKnownSession, as all three chains call
+      // it — H, I6), so only /mcp it keys on the IP counts against its 200; every /mcp counts against the brake's 3 000.
+      const held = new Set([SID]);
+      const isHeld = (id: string) => held.has(id);
       const cases: Array<[string, unknown, boolean]> = [
         ["no header", undefined, false],
-        ["a UUID-shaped id", SID, true],
+        ["a session the router holds", SID, true],
+        ["a UUID-shaped id the router no longer holds (a deploy emptied its map)", STALE_SID, false],
         ["upper case (no server mints one)", SID.toUpperCase(), false],
         ["padded", ` ${SID}`, false],
         ["made up", "not-a-session", false],
         ["10 KB", "a".repeat(10_000), false],
         ["a repeated header, joined", `${SID}, ${SID}`, false],
-        ["an array, the first UUID-shaped", [SID, "x"], true],
+        ["an array, the first held", [SID, "x"], true],
+        ["an array, the first not held", [STALE_SID, SID], false],
         ["empty", "", false],
       ];
+      const mcpReq = (sid: unknown) => fakeReq({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid });
       assertEq(
-        cases.map(([label, sid]) => {
-          const req = fakeReq({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid });
-          return [label, mcpSessionKeyed(req), mcpPrimaryKey(req).startsWith("sid:")];
-        }),
-        cases.map(([label, , want]) => [label, want, want]),
-        "I2: mcpSessionKeyed is exactly when mcpPrimaryKey keys on the session (a UUID-shaped mcp-session-id), header form by header form"
+        cases.map(([label, sid]) => [label, mcpSessionKeyed(mcpReq(sid), isHeld), mcpPrimaryKey(mcpReq(sid), isHeld)]),
+        cases.map(([label, , want]) => [label, want, want ? `sid:${SID}` : "ip:198.51.100.9"]),
+        "I2: given the router's session check, mcpSessionKeyed is true exactly when the real primary's key (mcpPrimaryKey with isKnownSession) is the session, header form by header form; a stale UUID is keyed on the IP"
       );
       assertEq(
-        ([["/mcp", true], ["/mcp/x", true], ["/en/mcp", true], ["/mcp", false], ["/api/products", true], ["/a2a", true]] as Array<[string, boolean]>).map(([p, k]) => [p, k, ac2LimitersFor(p, k)]),
-        [["/mcp", true, ["mcp_brake"]], ["/mcp/x", true, ["mcp_brake"]], ["/en/mcp", true, ["mcp_brake"]], ["/mcp", false, ["mcp", "mcp_brake"]], ["/api/products", true, ["general"]], ["/a2a", true, ["a2a", "dental"]]],
-        "I2: with an MCP session /mcp counts against the brake only; off /mcp the flag changes nothing"
+        [
+          mcpSessionKeyed(mcpReq(SID)),
+          (() => {
+            try {
+              return mcpSessionKeyed(mcpReq(SID), () => {
+                throw new Error("session map unavailable");
+              });
+            } catch {
+              return "threw";
+            }
+          })(),
+          mcpPrimaryKey(mcpReq(STALE_SID)),
+        ],
+        [false, false, `sid:${STALE_SID}`],
+        "I2: without the routers' check, or when it throws, never session-keyed (every /mcp counts against the primary, 1c's upper bound) — mcpPrimaryKey without the check would key a stale UUID on the session, which no chain does"
       );
+      let asked = 0;
+      const keyed = (v: boolean) => () => {
+        asked++;
+        return v;
+      };
+      assertEq(
+        ([["/mcp", true], ["/mcp/x", true], ["/en/mcp", true], ["/mcp", false], ["/api/products", true], ["/a2a", true], ["/health", true]] as Array<[string, boolean]>).map(([p, k]) => [p, k, ac2LimitersFor(p, keyed(k))]),
+        [["/mcp", true, ["mcp_brake"]], ["/mcp/x", true, ["mcp_brake"]], ["/en/mcp", true, ["mcp_brake"]], ["/mcp", false, ["mcp", "mcp_brake"]], ["/api/products", true, ["general"]], ["/a2a", true, ["a2a", "dental"]], ["/health", true, []]],
+        "I2: session-keyed /mcp counts against the brake only; off /mcp the flag changes nothing"
+      );
+      assertEq(asked, 4, "I2: … and the session check is asked only for the 4 paths under /mcp (review S1 of PR #1151)");
+      {
+        // Through the middleware: the routers' check runs for /mcp with a session header, never for another path.
+        const checked: string[] = [];
+        const r = rig(SHADOW, null, undefined, (id) => {
+          checked.push(id);
+          return held.has(id);
+        });
+        r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/api/products", sid: SID });
+        r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp" });
+        r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid: "not-a-session" });
+        r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid: STALE_SID });
+        r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid: SID });
+        assertEq([checked, r.mw.snapshot().errors], [[STALE_SID, SID], 0], "I2: the session check runs once per UUID-shaped id on /mcp, never off /mcp or for a malformed id");
+      }
       const sidOf = (i: number) => `00000000-0000-4000-8000-${String(i % 30).padStart(12, "0")}`;
-      /** One key (fanIn 3) in one window: `bare` /mcp without a session, `keyed` with one of 30 sessions (or `sid`). */
-      const rateMcp = (bare: number, keyed: number, sid?: (i: number) => unknown) => {
+      const staleOf = (i: number) => `ffffffff-0000-4000-8000-${String(i).padStart(12, "0")}`;
+      const live = new Set(Array.from({ length: 30 }, (_, i) => sidOf(i)));
+      const isLive = (id: string) => live.has(id);
+      /** One key (fanIn 3) in one window: `bare` /mcp without a session, then `withSid` with sid(i) (default: 30 live sessions). */
+      const rateMcp = (bare: number, withSid: number, sid: (i: number) => unknown = sidOf, isKnown: ((id: string) => boolean) | null = isLive) => {
         const db = freshDb();
         const s = storeOn(db);
-        const r = rig(SHADOW, s.store);
+        const r = rig(SHADOW, s.store, undefined, isKnown ?? undefined);
         const evs: Array<{ at: number; o: Parameters<typeof fakeReq>[0] }> = [];
         for (let i = 0; i < bare; i++) evs.push(fanIn3(T0 + i, "/mcp"));
-        for (let i = 0; i < keyed; i++) evs.push(fanIn3(T0 + bare + i, "/mcp", (sid ?? sidOf)(i)));
+        for (let i = 0; i < withSid; i++) evs.push(fanIn3(T0 + bare + i, "/mcp", sid(i)));
         evs.push({ at: T0 + W, o: { fci: "198.51.100.200", xff: flyXff("198.51.100.200"), ip: "198.51.100.200" } });
         play(r, evs);
         s.setNow(T0 + W + 1000);
@@ -1149,11 +1253,221 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         db.close();
         return [f === null ? null : Math.round(f.ratio * 1e6) / 1e6, f?.class ?? null, snap.ac2?.criteria.fanin_limit_ratio.pass];
       };
-      assertEq(rateMcp(0, 300), [0.1, "mcp_brake", true], "I2: 300 /mcp over 30 sessions → 300 of the brake's 3 000 (0.1), not 300 of the primary's 200 (1.5): passes");
-      assertEq(rateMcp(150, 300), [0.75, "mcp", true], "I2: 150 bare (initialize) + 300 in sessions → the primary 150 of 200 (0.75), the brake 450 of 3 000: passes");
+      assertEq(rateMcp(0, 300), [0.1, "mcp_brake", true], "I2: 300 /mcp in 30 sessions the router holds → 300 of the brake's 3 000 (0.1), not 300 of the primary's 200 (1.5): passes");
+      assertEq(rateMcp(150, 300), [0.75, "mcp", true], "I2: 150 bare (initialize) + 300 in held sessions → the primary 150 of 200 (0.75), the brake 450 of 3 000: passes");
       assertEq(rateMcp(170, 0), [0.85, "mcp", false], "I2: 170 bare /mcp → 170 of the primary's 200 (0.85): fails");
-      assertEq(rateMcp(0, 2400), [0.8, "mcp_brake", false], "I2: 2 400 /mcp in sessions → the brake at 80 % of 3 000: fails");
+      assertEq(rateMcp(0, 2400), [0.8, "mcp_brake", false], "I2: 2 400 /mcp in held sessions → the brake at 80 % of 3 000: fails");
       assertEq(rateMcp(0, 170, () => SID.toUpperCase()), [0.85, "mcp", false], "I2: 170 /mcp with an id the primary does not key on (not UUID-shaped) → counted as bare: fails");
+      assertEq(rateMcp(0, 170, staleOf), [0.85, "mcp", false], "I2: 170 /mcp on UUID-shaped ids no router holds → the primary keys them on the IP, so they count: fails");
+      assertEq(rateMcp(0, 300, sidOf, null), [1.5, "mcp", false], "I2: without the routers' check (createClientIpMiddleware's default) even held sessions count against the primary: 1.5, fails early");
+      assertEq(
+        rateMcp(120, 120, staleOf),
+        [1.2, "mcp", false],
+        "I2 (review B1 of PR #1151): a fanIn-3 key reconnecting 120 sessions after a deploy (120 requests on the old ids, 120 bare initialize) is 240 of the primary's 200 on the IP, as enforce counts it (40 × 429): 1.2, fails — the first 1d round stored 0.6 and passed"
+      );
+    }
+    {
+      // I5 (review B1 of PR #1151): parity with the real MCP chains. This middleware in enforce (so the limiters key on
+      // Fly-Client-IP), then a vertical's production chain (createMcpRateLimiters, on MemoryStores the test can read)
+      // and a stub router; the chain and the middleware get the same session check. What AC2 counts against mcp and
+      // mcp_brake is what the primary counts on the IP (its store, the last bare request's RateLimit-Remaining, its
+      // 429s) and what the brake counts. (An enforce row is read as stored: cumulative sums shadow rows only, C8.)
+      const FCI = "198.51.100.9";
+      const heldIds = Array.from({ length: 30 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`);
+      const held = new Set(heldIds);
+      const isHeld = (id: string) => held.has(id);
+      /** `held`, `stale` (UUID-shaped, not held), `madeUp` session ids, then `bare` requests (last), from one key with fanIn 3. */
+      const parity = async (profile: keyof typeof MCP_RATE_LIMIT_PROFILES, mix: { held: number; stale: number; madeUp: number; bare: number }) => {
+        const db = freshDb();
+        const s = storeOn(db);
+        let clock = T0;
+        const mw = createClientIpMiddleware(ENFORCE, { now: () => clock, log: () => {}, logError: () => {}, store: s.store, isKnownMcpSession: isHeld });
+        const stores: Partial<Record<McpLimiterName, MemoryStore>> = {};
+        const chain = createMcpRateLimiters({
+          ...MCP_RATE_LIMIT_PROFILES[profile],
+          isKnownSession: isHeld,
+          createStore: (l) => (stores[l] = new MemoryStore()),
+        }).chain;
+        const app = express();
+        app.set("trust proxy", true);
+        app.use(mw);
+        app.use("/mcp", chain, (_req: express.Request, res: express.Response) => {
+          res.json({ ok: true });
+        });
+        const sids: Array<string | undefined> = [
+          ...Array.from({ length: mix.held }, (_, i) => heldIds[i % heldIds.length]),
+          ...Array.from({ length: mix.stale }, (_, i) => `ffffffff-0000-4000-8000-${String(i).padStart(12, "0")}`),
+          ...Array.from({ length: mix.madeUp }, () => "not-a-session"),
+          ...Array.from({ length: mix.bare }, () => undefined),
+        ];
+        const statuses: number[] = [];
+        let remaining = NaN;
+        const srv = await listen(app);
+        try {
+          for (let i = 0; i < sids.length; i++) {
+            const headers: Record<string, string> = { "Fly-Client-IP": FCI, "X-Forwarded-For": flyXff(FCI, `203.0.113.${i % 3}`) };
+            if (sids[i] !== undefined) headers["Mcp-Session-Id"] = sids[i] as string;
+            const res = await httpRequest(srv.port, "GET", "/mcp", headers);
+            statuses.push(res.status);
+            remaining = Number(res.headers["ratelimit-remaining"]);
+          }
+        } finally {
+          await srv.close();
+        }
+        // A request in the next window closes this one; the store writes it.
+        clock = T0 + W;
+        mw(fakeReq({ fci: "198.51.100.200", xff: flyXff("198.51.100.200"), ip: "198.51.100.200" }), {} as any, () => {});
+        s.setNow(T0 + W + 1000);
+        s.store.flush();
+        const f = storedFanIn(db);
+        db.close();
+        return [
+          (await stores.primary?.get(`ip:${FCI}`))?.totalHits ?? 0,
+          (await stores.brake?.get(FCI))?.totalHits ?? 0,
+          remaining,
+          statuses.filter((x) => x === 429).length,
+          ...f,
+        ];
+      };
+      for (const profile of ["rfb", "experiences", "dental"] as const) {
+        const limit = MCP_RATE_LIMIT_PROFILES[profile].primary.anonymousMax;
+        assertEq(
+          await parity(profile, { held: 30, stale: 20, madeUp: 5, bare: 11 }),
+          [36, 66, limit - 36, 0, 36, "mcp", 0.18, 3],
+          `I5 (${profile}): 30 held + 20 stale + 5 made-up + 11 bare → the real primary counts 36 on the IP (RateLimit-Remaining ${limit - 36}), the brake 66; AC2 counted 36 against mcp`
+        );
+        assertEq(
+          await parity(profile, { held: 40, stale: 0, madeUp: 0, bare: 1 }),
+          [1, 41, limit - 1, 0, 41, "mcp_brake", 0.013667, 3],
+          `I5 (${profile}): 40 held + 1 bare → the primary counts 1 on the IP, the brake 41; AC2 counted 41 against mcp_brake`
+        );
+      }
+      assertEq(
+        await parity("experiences", { held: 0, stale: 120, madeUp: 0, bare: 120 }),
+        [240, 240, 0, 40, 240, "mcp", 1.2, 3],
+        "I5 (review B1 of PR #1151): 120 stale ids + 120 bare initialize after a deploy → the real primary counts 240 of 200 on the IP and answers 40 × 429; AC2 stores 1.2 against mcp (I2: fanin_limit_ratio fails)"
+      );
+    }
+    {
+      // I6 (review B1 of PR #1151): installClientIp's default session check is the three routers' own, the
+      // isKnownSession each vertical's primary is built with — read from router modules already loaded, never loading one.
+      const srcRoot = path.join(__dirname, "..");
+      const middlewareDir = path.join(srcRoot, "middleware");
+      const built: Array<{ module: string; check: string }> = [];
+      let calls = 0;
+      for (const rel of fs.readdirSync(srcRoot, { recursive: true }) as string[]) {
+        if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.endsWith(".d.ts")) continue;
+        const file = path.join(srcRoot, rel);
+        const src = fs.readFileSync(file, "utf8");
+        calls += src
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.includes("createMcpRateLimiters(") && !/^(\/\/|\*|\/\*)/.test(l) && !l.startsWith("export function createMcpRateLimiters(")).length;
+        for (const m of src.matchAll(/createMcpRateLimiters\(\{ \.\.\.MCP_RATE_LIMIT_PROFILES\.\w+, isKnownSession: (\w+) \}\)/g)) {
+          // The router's own export, or (RFB's chain, built in mcp-rate-limit.ts) a function that require()s it.
+          const via = src.match(new RegExp(`function ${m[1]}\\(sessionId: string\\): boolean \\{\\s*return \\(require\\("([^"]+)"\\)[^\\n]*?\\)\\.(\\w+)\\(sessionId\\);`));
+          const own = new RegExp(`export function ${m[1]}\\(sessionId: string\\): boolean`).test(src);
+          const target = via ? path.join(path.dirname(file), via[1]) : own ? file.replace(/\.ts$/, "") : "?";
+          built.push({ module: path.relative(middlewareDir, target).split(path.sep).join("/"), check: via ? via[2] : m[1] });
+        }
+      }
+      const byModule = (a: { module: string }, b: { module: string }) => a.module.localeCompare(b.module);
+      assertEq(
+        [built.sort(byModule), calls],
+        [[...MCP_ROUTER_SESSION_CHECKS].map((c) => ({ module: c.module, check: c.check })).sort(byModule), 3],
+        "I6: MCP_ROUTER_SESSION_CHECKS is exactly the isKnownSession of every production MCP chain (RFB's through mcp-rate-limit.ts's require of routes/mcp), and no chain is built without one"
+      );
+      const routerFiles = MCP_ROUTER_SESSION_CHECKS.map((c) => require.resolve(path.join(middlewareDir, c.module)));
+      const loaded = () => routerFiles.map((f) => f in require.cache);
+      const before = [Object.keys(require.cache).length, loaded()];
+      assertEq(
+        [isKnownToAnMcpRouter(STALE_SID), Object.keys(require.cache).length, loaded()],
+        [false, ...before],
+        `I6: a UUID no router minted is not known, and asking loads no module (router modules loaded now: ${JSON.stringify(before[1])})`
+      );
+
+      // The real routers: a session any of them minted is known, through each router's own map.
+      const routers: Record<string, express.Router> = {
+        rfb: (require("../routes/mcp") as { default: express.Router }).default,
+        experiences: (require("../routes/experiences-mcp") as { default: express.Router }).default,
+        dental: (require("../routes/dental-mcp") as { default: express.Router }).default,
+      };
+      const MCP_ACCEPT = "application/json, text/event-stream";
+      const INIT = {
+        jsonrpc: "2.0",
+        id: "init",
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "client-ip-shadow-store-test", version: "1.0.0" } },
+      };
+      // A client address of its own (TEST-NET-1, random): the routers' module-level chains are shared with other suites.
+      const FCI = `192.0.2.${1 + Math.floor(Math.random() * 254)}`;
+      let spoof = 0;
+      const hdr = (sid?: string): Record<string, string> => ({
+        Accept: MCP_ACCEPT,
+        "Fly-Client-IP": FCI,
+        "X-Forwarded-For": flyXff(FCI, `203.0.113.${spoof++ % 3}`),
+        ...(sid === undefined ? {} : { "Mcp-Session-Id": sid }),
+      });
+      __setDbAccessorFailureForTesting(new Error("I6: initialize, tools/list and a 404 read no DB"));
+      try {
+        const minted: Array<[string, boolean, boolean]> = [];
+        for (const [name, router] of Object.entries(routers)) {
+          const app = express();
+          app.set("trust proxy", true);
+          app.use(express.json());
+          app.use("/mcp", router);
+          const srv = await listen(app);
+          try {
+            const res = await httpRequest(srv.port, "POST", "/mcp", hdr(), INIT);
+            const sid = String(res.headers["mcp-session-id"] ?? "");
+            minted.push([name, res.status === 200 && /^[0-9a-f-]{36}$/.test(sid), isKnownToAnMcpRouter(sid)]);
+          } finally {
+            await srv.close();
+          }
+        }
+        assertEq(
+          [minted, isKnownToAnMcpRouter(randomUUID())],
+          [[["rfb", true, true], ["experiences", true, true], ["dental", true, true]], false],
+          "I6: a session each real router minted on initialize is known to isKnownToAnMcpRouter; a fresh UUID is not"
+        );
+
+        // End to end: installClientIp's default in enforce in front of the real Opplevagent router and its own chain.
+        const db = freshDb();
+        const s = storeOn(db);
+        let clock = T0;
+        const app = express();
+        const mw = installClientIp(app, ENFORCE, { now: () => clock, log: () => {}, logError: () => {}, store: s.store });
+        app.use(express.json());
+        app.use("/mcp", routers.experiences);
+        const srv = await listen(app);
+        let flow: unknown[] = [];
+        try {
+          const first = await httpRequest(srv.port, "POST", "/mcp", hdr(), INIT); // the IP
+          const sid = String(first.headers["mcp-session-id"] ?? "");
+          const statuses = [first.status, (await httpRequest(srv.port, "POST", "/mcp", hdr(sid), { jsonrpc: "2.0", method: "notifications/initialized" })).status];
+          for (let i = 1; i <= 5; i++) statuses.push((await httpRequest(srv.port, "POST", "/mcp", hdr(sid), { jsonrpc: "2.0", id: i, method: "tools/list", params: {} })).status);
+          for (let i = 0; i < 3; i++) statuses.push((await httpRequest(srv.port, "POST", "/mcp", hdr(randomUUID()), { jsonrpc: "2.0", id: 9, method: "tools/list", params: {} })).status); // the IP
+          const last = await httpRequest(srv.port, "POST", "/mcp", hdr(), INIT); // the IP
+          statuses.push(last.status);
+          flow = [statuses, Number(first.headers["ratelimit-remaining"]) - Number(last.headers["ratelimit-remaining"])];
+        } finally {
+          await srv.close();
+          __resetInstalledClientIpForTesting();
+        }
+        clock = T0 + W;
+        mw(fakeReq({ fci: "198.51.100.200", xff: flyXff("198.51.100.200"), ip: "198.51.100.200" }), {} as any, () => {});
+        s.setNow(T0 + W + 1000);
+        s.store.flush();
+        const f = storedFanIn(db);
+        db.close();
+        assertEq(
+          [...flow, f[0], f[1], f[3]],
+          [[200, 202, 200, 200, 200, 200, 200, 404, 404, 404, 200], 4, 5, "mcp", 3],
+          "I6: through installClientIp's default and the real Opplevagent router, AC2 counts against mcp exactly the 5 requests its primary keyed on the IP (2 initialize, 3 stale ids: RateLimit-Remaining fell by 4 after the first), not the 6 in the session"
+        );
+      } finally {
+        __setDbAccessorFailureForTesting(null);
+      }
     }
     {
       // I3: covered_ms. A process starting mid-window (a deploy, first request at 12:02:37) measured 2:23 of it, not 5 min.

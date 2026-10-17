@@ -48645,7 +48645,8 @@ runSerial(async () => {
 // survives deploys and clientIp.ac2 is the server's own AC2 verdict
 // (thresholds, ready only at ≥48 h). Trinn 1d (section I): the fanIn ratio
 // over 20 min bounds every 15-min limiter window, /mcp rated as the MCP
-// chain keys it (session → brake only), covered_ms for a restart's partial
+// chain keys it (a session its router holds → brake only; parity with the
+// real chains and routers over HTTP), covered_ms for a restart's partial
 // window, and the store's flush timer inside trackJob. Own in-memory /
 // temp-file DBs, injected clocks; the DB-accessor failure hook and installed
 // slot reset — tail.
