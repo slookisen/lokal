@@ -42588,6 +42588,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (a): a
+// category label can never be put in a cart. cart-service refuses it with 422
+// category_label in addCartItem, in chooseCartWishOffer (before the wish's row
+// is touched) and in submitCart (a label line already in a cart), through the
+// REST routes and the MCP cart tools; a real product, a priced category name
+// and an owner-set row still can. Own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S2a (no category label in the cart) ──");
+  try {
+    const { runRfbKurvvaktKategorietiketterTests } = require("../src/routes/rfb-kurvvakt-kategorietiketter.test") as
+      typeof import("../src/routes/rfb-kurvvakt-kategorietiketter.test");
+    const r = await runRfbKurvvaktKategorietiketterTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-kurvvakt-kategorietiketter: " + f);
+    console.log(`  rfb-kurvvakt-kategorietiketter: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kurvvakt-kategorietiketter: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no
