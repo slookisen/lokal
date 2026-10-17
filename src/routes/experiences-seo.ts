@@ -6797,8 +6797,15 @@ ${BROWSE_CSS}
 // sendBookingConfirmation() service functions the JSON API uses; redirects
 // (303, so a reload doesn't resubmit) to the confirmation page on success or
 // back to the panel with ?error=<code> on failure.
+//
+// generalLimiter first, before the body is parsed (dev-request
+// 2026-10-17-integrasjonstest-oppfolging, I-T revision): the JS path posts to
+// /api/opplevelser/book, which index.ts's `app.use("/api", generalLimiter)`
+// covers, but this form post never reaches that mount — the host gate routes
+// it here. Each accepted post writes a booking row and sends two e-mails.
 router.post(
   "/kategori/gardssalg/book/:providerSlug",
+  generalLimiter,
   express.urlencoded({ extended: false }),
   (req: Request, res: Response, next: NextFunction) => {
     const slug = String(req.params.providerSlug || "");
@@ -10144,7 +10151,10 @@ router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
 
 // GET /for-tilbydere/finn?q= — search-your-business results. noindex,follow
 // (like /sok); empty/missing q renders the form + a hint, never an error.
-router.get("/for-tilbydere/finn", (req: Request, res: Response) => {
+// generalLimiter like /sok (dev-request 2026-10-17-integrasjonstest-oppfolging,
+// I-T revision): it runs the same free-text LIKE search as /sok's producer
+// section, and the host gate sends it here before any index.ts limiter mount.
+router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
   let hits: GardssalgSearchByQueryRow[] = [];
   if (q) {
@@ -10737,7 +10747,17 @@ const REISE_CSS = `
 .reise-empty{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:22px;margin:18px 0;line-height:1.6}
 `;
 
-router.get("/reise", async (req: Request, res: Response) => {
+// generalLimiter on the route, like /sok above (dev-request
+// 2026-10-17-integrasjonstest-oppfolging, I-T). src/index.ts's
+// `app.use("/reise", generalLimiter)` never sees an opplevagent.no request:
+// the host gate hands every non-API path to this router first, and the 404
+// catch-all below ends the chain. So this page — two geocodes, a Mapbox call
+// and a route-cache insert per distinct from/to pair — had no limiter at all
+// on this host. Same shared instance as RFB /reise and /sok, so one visitor
+// has one quota; /en/reise is covered too (langMiddleware strips /en before
+// the gate). Not added in seo.ts: RFB /reise already passes the index.ts
+// mount, and a second limiter there would count every request twice.
+router.get("/reise", generalLimiter, async (req: Request, res: Response) => {
   const from = typeof req.query.from === "string" ? req.query.from.trim() : "";
   const to = typeof req.query.to === "string" ? req.query.to.trim() : "";
   const drinkOnly = req.query.drink === "true";

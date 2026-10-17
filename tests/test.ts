@@ -42846,6 +42846,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-T: the opplevagent.no
+// and finn-tannlege.com host gates route every non-API path to their SEO
+// routers before index.ts's `app.use("/reise", generalLimiter)`, so OA /reise
+// (geocodes + Mapbox) had no limiter. It now carries generalLimiter on the
+// route, as do OA /for-tilbydere/finn, the OA booking form post and dental
+// /sok (the slice's revision). Wiring by reference + index.ts order + real
+// HTTP up to the 429, on its own TEST-NET-2 client keys (reset before and
+// after) — see host-gate-rate-limit.test.ts's header.
+runSerial(async () => {
+  console.log("\n── I-T: limiters behind the opplevagent.no / finn-tannlege.com host gates ──");
+  try {
+    const { runHostGateRateLimitTests } = require("../src/routes/host-gate-rate-limit.test") as
+      typeof import("../src/routes/host-gate-rate-limit.test");
+    const hgr = await runHostGateRateLimitTests({ log: false });
+    passed += hgr.passed;
+    failed += hgr.failed;
+    for (const f of hgr.failures) failures.push("host-gate-rate-limit: " + f);
+    console.log(`  host-gate-rate-limit: ${hgr.passed} passed, ${hgr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("host-gate-rate-limit: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a +
 // 1c — the RFB coordinate foundation. 948 of 1 499 active producers had
 // seed-time coordinates of unrecorded provenance and 551 had NONE at all
