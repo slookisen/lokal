@@ -2573,6 +2573,11 @@ const GUIDE_MAT_AI_CSS = `
 // content is fixed/curated editorial copy, not derived from a possibly-thin
 // DB row, so there is no 2-real-facts quality gate here — the page always
 // emits its FAQPage block. Exported for tests.
+// Prices, here and in the tool cards on the page, are worded the way
+// lokal_search and lokal_info describe them: products «med pris der
+// produsenten har oppgitt den» / "with a price where the producer has stated
+// one", never a full price list, since most producers list no prices
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, I-P / MCP2-02).
 export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
   const en = lang === "en";
   const qas: Array<{ q: string; a: string }> = en ? [
@@ -2582,7 +2587,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "What tools does the lokal MCP server expose?",
-      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's full price list and contact details; lokal_find_offers looks up, per shopping-list item, which nearby producers sell it and whether an order can be placed with them; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
+      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's listed products, with a price where the producer has stated one, and contact details; lokal_find_offers looks up, per shopping-list item, which nearby producers sell it and whether an order can be placed with them; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
     },
     {
       q: "Does it cost anything to use the MCP server?",
@@ -2605,7 +2610,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "Hvilke verktøy har lokal MCP-serveren?",
-      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer full prisliste og kontaktinfo for én produsent; lokal_find_offers finner, for hver vare på en handleliste, hvilke produsenter i nærheten som selger den og om du kan bestille hos dem; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
+      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer produktene og kontaktinfo for én produsent, med pris der produsenten har oppgitt den; lokal_find_offers finner, for hver vare på en handleliste, hvilke produsenter i nærheten som selger den og om du kan bestille hos dem; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
     },
     {
       q: "Koster det noe å bruke MCP-serveren?",
@@ -2867,14 +2872,14 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>The tools, exactly as registered</h2>
     <p class="gma-group-label">Search &amp; discovery</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the full priced product list for specific matches.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the listed products for specific matches, with a price where the producer has stated one.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Structured search filtered by category, tags, and geographic distance.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Resolves a Norwegian place name (city, kommune, fylke) to lat/lng coordinates for use with <code>lokal_discover</code>'s distance filter.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Platform statistics — total producers and cities covered.</p></div>
     </div>
     <p class="gma-group-label">Producer detail</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_info</code><p>A single producer's complete product catalog with prices, contact details, opening hours, and delivery options.</p></div>
+      <div class="gma-tool"><code>lokal_info</code><p>A single producer's listed products, with a price where the producer has stated one, plus contact details, opening hours, and delivery options.</p></div>
     </div>
     <p class="gma-group-label">Markets, venues &amp; certifications</p>
     <div class="gma-tools">
@@ -2885,7 +2890,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Shopping cart (pickup${isPaymentsEnabled() ? "" : ", no online payment"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from priced products, submit it as a pickup order per producer, and check order status. ${isPaymentsEnabled() ? "Producers that take prepayment send a Stripe payment link you approve yourself; everyone else is paid directly on pickup." : "No payment happens in the AI flow — you pay the producer directly on pickup."}</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from listed products, submit it as a pickup order per producer, and check order status. ${isPaymentsEnabled() ? "Producers that take prepayment send a Stripe payment link you approve yourself; everyone else is paid directly on pickup." : "No payment happens in the AI flow — you pay the producer directly on pickup."}</p></div>
     </div>
 
     <h2>Try asking your assistant</h2>
@@ -2925,14 +2930,14 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>Verktøyene, slik de faktisk er registrert</h2>
     <p class="gma-group-label">Søk og oppdagelse</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og full priset produktliste for spesifikke treff.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og produktene for spesifikke treff, med pris der produsenten har oppgitt den.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Strukturert søk filtrert på kategori, tags og geografisk avstand.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Slår opp et norsk stedsnavn (by, kommune, fylke) som lat/lng-koordinater for bruk med avstandsfilteret i <code>lokal_discover</code>.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Plattformstatistikk — totalt antall produsenter og byer dekket.</p></div>
     </div>
     <p class="gma-group-label">Produsentdetaljer</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_info</code><p>Én produsents komplette produktkatalog med priser, kontaktdetaljer, åpningstider og leveringsalternativer.</p></div>
+      <div class="gma-tool"><code>lokal_info</code><p>Én produsents produkter, med pris der produsenten har oppgitt den, og kontaktdetaljer, åpningstider og leveringsalternativer.</p></div>
     </div>
     <p class="gma-group-label">Markeder, salgssteder og sertifiseringer</p>
     <div class="gma-tools">
@@ -2943,7 +2948,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Handlekurv (henting${isPaymentsEnabled() ? "" : ", ingen nettbetaling"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra prisede produkter, send den som en henteordre per produsent, og sjekk ordrestatus. ${isPaymentsEnabled() ? "Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du godkjenner selv. Alle andre betaler du direkte ved henting." : "Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting."}</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra produktene, send den som en henteordre per produsent, og sjekk ordrestatus. ${isPaymentsEnabled() ? "Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du godkjenner selv. Alle andre betaler du direkte ved henting." : "Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting."}</p></div>
     </div>
 
     <h2>Prøv å spørre assistenten din</h2>

@@ -225,7 +225,7 @@ import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
-import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { registeredMcpTools, type McpToolEntry } from "../services/mcp-tool-manifest";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, /vilkar operator,
 // JSON-LD parentOrganization and the MCP server-card vendor all come from
@@ -3438,16 +3438,95 @@ const MAX_TITLE = 70;
 // the budget. Either way, any trailing whitespace or dangling punctuation
 // (dash/en-dash/em-dash, comma, period, ampersand, slash) left by the cut is
 // trimmed so the result never looks broken.
+//
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-P (IDX2-05): a cut
+// that ended on a preposition still read as broken in SERPs — «Arctic Circle
+// Raceway — motorsport like sør for», «Norsk Tindemuseum — klatringshistorie
+// i hjertet av». Of the 415 /opplevelse pages in the sitemap, read in both
+// languages (2026-10-17), 122 Norwegian and 230 English titles took the
+// truncation path.
+// A title that fits is still returned unchanged; on the truncation path:
+//   1. A title with a subtitle («Navn — tagline», «Navn – tagline»,
+//      «Navn: tagline») is cut at the last separator whose head fits the
+//      budget and fills at least TITLE_MIN_KEEP of it, the floor the word cut
+//      uses too: the name without a stub of tagline («… on the Namsen —
+//      Norway's»). A shorter head falls through to 2, which keeps the start of
+//      the tagline. Cutting every subtitle down to its head, short heads
+//      included, gave distinct pages one <title>: in the live sample, 2
+//      Norwegian and 9 English groups («Dalane Folkemuseum», «Hardanger
+//      Folkemuseum», «TusenFryd» …), against 0 on the old cut, with the median
+//      Norwegian cut title down from 52 to 20 chars. With the floor: 0 groups
+//      in either language, median 49.
+//   2. Otherwise the word-boundary cut above.
+// Either way tidyCutTitle() then drops an unclosed «(…» and trailing
+// closed-class words (TITLE_TRAILING_WORDS), never down to nothing. The h1,
+// og:title and description still carry the full title.
+const TITLE_SEPARATOR_RE = /\s+[—–-]\s+|:\s+/g;
+const TITLE_MIN_KEEP = 0.6;
+// Prepositions, conjunctions and articles a cut title must not end on, bokmål,
+// nynorsk and English (titles come in both). Lower-case; only read on the
+// truncation path, and only for the last word left by the cut. Left out on
+// purpose: «å», which is also the place Å («Rorbuer i Å»), and «per», which
+// is also a name. «by» (Norwegian «city») and «to» (Norwegian «two») stay:
+// in the live titles they are English prepositions («by Torget», «Railway to»;
+// 1 and 20 titles, none Norwegian), and when a Norwegian one is dropped the
+// word before it still ends the title cleanly («… i Bergen by» → «… i Bergen»).
+const TITLE_TRAILING_WORDS: ReadonlySet<string> = new Set([
+  "i", "på", "til", "fra", "frå", "av", "med", "ved", "for", "om", "hos", "mot", "etter", "før",
+  "under", "over", "mellom", "gjennom", "langs", "rundt", "uten", "utan", "innen", "nær", "bak",
+  "foran", "blant", "via", "inkl", "og", "eller", "men", "samt", "som", "at", "enn",
+  "en", "ei", "et", "ein", "eit", "den", "det", "de", "dei",
+  "a", "an", "the", "and", "or", "but", "of", "in", "on", "to", "from", "with", "by", "near",
+  "into", "onto", "across", "around", "through", "along", "between", "among", "about", "incl",
+]);
+const TITLE_DANGLING_PUNCT_RE = /[\s\-–—,.&/:;]+$/;
+
+function tidyCutTitle(cut: string): string {
+  let out = cut.trimEnd().replace(TITLE_DANGLING_PUNCT_RE, "").trimEnd();
+  const open = out.lastIndexOf("(");
+  if (open > 0 && open > out.lastIndexOf(")")) out = out.slice(0, open).trimEnd().replace(TITLE_DANGLING_PUNCT_RE, "").trimEnd();
+  for (;;) {
+    const sp = out.lastIndexOf(" ");
+    if (sp <= 0 || !TITLE_TRAILING_WORDS.has(out.slice(sp + 1).toLowerCase())) return out;
+    out = out.slice(0, sp).trimEnd().replace(TITLE_DANGLING_PUNCT_RE, "").trimEnd();
+  }
+}
+
 export function seoPageTitle(main: string): string {
   if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
   const budget = MAX_TITLE - BRAND.length;
+  const minKeep = Math.floor(budget * TITLE_MIN_KEEP);
+  let headEnd = -1;
+  for (const m of main.matchAll(TITLE_SEPARATOR_RE)) {
+    const head = main.slice(0, m.index).trimEnd();
+    if (head.length > budget) break;
+    if (head.length >= minKeep) headEnd = m.index;
+  }
+  if (headEnd > 0) return tidyCutTitle(main.slice(0, headEnd)) + BRAND;
   let truncated = main.slice(0, budget);
   const lastSpace = truncated.lastIndexOf(" ");
-  if (lastSpace >= Math.floor(budget * 0.6)) {
+  if (lastSpace >= minKeep) {
     truncated = truncated.slice(0, lastSpace);
   }
-  truncated = truncated.trimEnd().replace(/[\s\-–—,.&/]+$/, "").trimEnd();
-  return truncated + BRAND;
+  return tidyCutTitle(truncated) + BRAND;
+}
+
+// The place after the title in an /opplevelse <title>: «kommune, fylke», or
+// the name once when kommune and fylke are the same name (Oslo is both, and
+// «Klatring i Oslo Klatrepark – Oslo, Oslo» named it twice; I-P / IDX2-05).
+// Distinct names give exactly what the page's own place line gives.
+export function titlePlace(kommune: string | null | undefined, fylke: string | null | undefined): string {
+  if (kommune && fylke && kommune.trim().toLowerCase() === fylke.trim().toLowerCase()) return kommune;
+  return [kommune, fylke].filter(Boolean).join(", ");
+}
+
+// The <title> of an /opplevelse page: the title with its place when that
+// fits, else the title alone, cut by seoPageTitle(). Exported so the tests run
+// the live-title corpus through the same cascade the page uses.
+export function opplevelseSeoTitle(displayTitle: string, kommune: string | null | undefined, fylke: string | null | undefined): string {
+  const loc = titlePlace(kommune, fylke);
+  const withPlace = `${displayTitle}${loc ? " – " + loc : ""}`;
+  return seoPageTitle(withPlace.length + BRAND.length <= MAX_TITLE ? withPlace : displayTitle);
 }
 
 function renderOpplevelseDetail(
@@ -3741,11 +3820,8 @@ function renderOpplevelseDetail(
     .join("\n");
 
   // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
-  // (BRAND/MAX_TITLE/seoPageTitle are module-scope, defined above this function.)
-  const titleWithPlace = `${displayTitle}${place ? " – " + place : ""}`;
-  const title = seoPageTitle(
-    titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : displayTitle
-  );
+  // (opplevelseSeoTitle/seoPageTitle are module-scope, defined above this function.)
+  const title = opplevelseSeoTitle(displayTitle, exp.kommune, exp.fylke);
 
   // Share image: the category's PNG card (E2-S3; default card for no or an
   // unknown category). The title is in og:title and the alt text, which use
@@ -9521,8 +9597,10 @@ router.get("/logo.svg", (_req: Request, res: Response) => {
 // ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
 const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}.legal-company{margin-top:.35rem}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}table{border-collapse:collapse;width:100%;margin:.5rem 0}th,td{border:1px solid #e4ded0;padding:.35rem .55rem;text-align:left;vertical-align:top;font-size:.92rem}`;
 // `seo` (dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-4): a
-// self-referencing canonical and a meta description, for a page that is in
-// the sitemap. Passed by /proveniens; the other callers render as before.
+// canonical and a meta description. Passed by /proveniens (IDX-4) and, since
+// I-P (MCP2-05), by /personvern and /vilkar: those answer on several paths
+// (/privacy, /terms, /tos …) and are linked from both languages, so every
+// alias names the one URL the connector packs and the footer use.
 function legalPage(title: string, bodyHtml: string, seo?: { canonicalPath: string; metaDesc: string }): string {
   const seoTags = seo
     ? `<meta name="description" content="${escapeHtml(seo.metaDesc)}"><link rel="canonical" href="${escapeHtml(`${baseUrl()}${seo.canonicalPath}`)}">`
@@ -9628,7 +9706,10 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Delete data</strong> — ask for deletion at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Tell us if you also want the email correspondence with us deleted.</li>
 <li><strong>Object</strong> — you can object at any time to our showing a profile about you or your business, or to our emailing you about it. Reply “fjern” and the profile is hidden and we do not contact you again.</li>
 <li><strong>Complain</strong> — you can complain to the Norwegian Data Protection Authority (Datatilsynet, datatilsynet.no).</li></ul>
-<h2>Contact</h2><p>${companyControllerSentenceHtml("en", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>`));
+<h2>Contact</h2><p>${companyControllerSentenceHtml("en", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>`, {
+    canonicalPath: "/personvern",
+    metaDesc: "Personvernerklæring for Opplevagent: hvilke opplysninger vi samler inn, rettslig grunnlag, hvem som får dem, lagringstid og rettighetene dine. Også på engelsk.",
+  }));
 });
 
 router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, res: Response) => {
@@ -9657,7 +9738,10 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>4. Accuracy</h2><p>Data is gathered from public sources. <strong>The service is provided "as is".</strong> Verify price, season, and booking links directly with the provider before booking.</p>
 <h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, visits, conduct of experiences, quality, or disputes between users and providers or producers. Opplevagent passes visit requests on but is not responsible for the producer's answer.</p>
 <h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
-<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at the company's ordinary venue.</p>`));
+<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at the company's ordinary venue.</p>`, {
+    canonicalPath: "/vilkar",
+    metaDesc: "Vilkår for bruk av Opplevagent: hva tjenesten er, besøksforespørsler til gårdssalg, akseptabel og forbudt bruk, ansvar og gjeldende rett. Også på engelsk.",
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -10252,10 +10336,10 @@ ${oaSiteFooter({})}
 // Track C: usage-content — autonomous, in-charter: improving discoverability
 // of the already-shipped opplevagent-mcp server, not a new feature/vertical).
 //
-// Static, hand-authored how-to page cross-referencing the REAL tools
-// registered in src/routes/experiences-mcp.ts (discover_experiences,
-// list_experience_categories, get_experience) — never invented names.
-// Unlike rettfrabonden.com's /teknologi, this vertical has no existing
+// Hand-authored how-to page whose tool list and tools FAQ are generated from
+// the tools src/routes/experiences-mcp.ts registers (see
+// opplevagentMcpGuideTools() below) — never invented names, never a missing
+// one. Unlike rettfrabonden.com's /teknologi, this vertical has no existing
 // MCP-setup page, so the connection steps live directly on this page.
 // Bilingual (req.lang), mirroring the "/" home route's lang convention.
 // ═══════════════════════════════════════════════════════════
@@ -10293,12 +10377,111 @@ a:hover{text-decoration:none}
 @media (max-width:600px){.gom-hero h1{font-size:1.6rem}}
 `;
 
-// Static FAQ content for /guide-opplevelser-mcp. Curated editorial copy
-// (not derived from a possibly-thin DB row), so unlike
-// buildCategoryFaqJsonLd/buildKommuneFaqJsonLd there is no 2-real-facts
-// quality gate — the page always emits its FAQPage block. Exported for tests.
-export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any {
+// The tools on /guide-opplevelser-mcp (dev-request 2026-10-17-integrasjonstest-
+// oppfolging, I-P / MCP2-01). The list and the tools FAQ answer are generated
+// from registeredMcpTools("experiences"): the tools the live /mcp server
+// registers, in registration order. The hand-written list it replaces had 3
+// of the 5 tools, so the page that is the connector packs' documentation URL
+// left out discover_gardssalg and book_gardssalg. The copy below is the
+// editorial text per tool:
+//   - `card` is trusted HTML for the tool card (it marks parameters with <code>);
+//   - `faq` is plain text for the FAQ answer and its FAQPage JSON-LD;
+//   - `bookingFaq` is a sentence the booking question adds when the tool is
+//     registered.
+// A registered tool with no entry here is still listed, with its registered
+// description from tools/list (English). seo-sidetekster.test.ts
+// fails until it gets an entry, and checks that every <code> parameter here is
+// in the tool's input schema.
+type GuideLang = "no" | "en";
+interface GuideToolCopy { card: string; faq: string; bookingFaq?: string }
+
+const OA_MCP_GUIDE_TOOL_COPY: Record<string, Record<GuideLang, GuideToolCopy>> = {
+  discover_experiences: {
+    no: {
+      card: "Søk i opplevelsene. Skriv ønsket med egne ord i <code>query</code>, f.eks. «hvalsafari i Tromsø», eller filtrer på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, maks pris og varighet. Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer tittel, kategori, sted, beskrivelse og bookinglenke når den finnes.",
+      faq: "discover_experiences søker i opplevelsene, med ønsket i fritekst (query) eller med filtre på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, pris og varighet",
+    },
+    en: {
+      card: "Search the experiences. Put the request in your own words in <code>query</code>, e.g. \"whale safari in Tromsø\", or filter by county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, max price, and duration. With <code>lat</code>/<code>lng</code> the nearest come first. Returns title, category, location, description, and booking URL when there is one.",
+      faq: "discover_experiences searches the experiences, with the request in free text (query) or with filters for county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, price, and duration",
+    },
+  },
+  list_experience_categories: {
+    no: {
+      card: "Lister alle kategorier med et levende antall verifiserte opplevelser — nyttig før du kaller discover_experiences med et spesifikt kategorifilter.",
+      faq: "list_experience_categories lister alle kategorier med et levende antall",
+    },
+    en: {
+      card: "Lists every experience category with a live count of verified experiences — useful before calling discover_experiences with a specific category filter.",
+      faq: "list_experience_categories lists every category with a live count",
+    },
+  },
+  get_experience: {
+    no: {
+      card: "Henter fullstendige detaljer for én opplevelse via UUID — beskrivelse, gruppe-/aldersgrenser, pris, varighet, språk og bookinginfo. Hent UUID-en fra resultater fra discover_experiences.",
+      faq: "get_experience henter fullstendige detaljer for én opplevelse via UUID",
+    },
+    en: {
+      card: "Fetches full details for one experience by its UUID — description, group/age limits, price, duration, languages, and booking info. Obtain the UUID from discover_experiences results.",
+      faq: "get_experience fetches full details for one experience by its UUID",
+    },
+  },
+  discover_gardssalg: {
+    no: {
+      card: "Finner gårdssalg: bryggerier, ciderier, vingårder, destillerier, gårdskafeer, mjøderier og seltzerier som selger rett fra gården. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
+      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg (bryggeri, cideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query",
+    },
+    en: {
+      card: "Finds farm sales (gårdssalg): breweries, cideries, wineries, distilleries, farm cafés, meaderies, and seltzer makers that sell straight from the farm. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
+      faq: "discover_gardssalg finds drink producers with a farm sale (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query",
+    },
+  },
+  book_gardssalg: {
+    no: {
+      card: "Sender en besøksforespørsel til en gårdssalg-produsent, med ønsket tid, antall personer og gjestens navn og e-post. Forespørselen står ventende til produsenten svarer på e-post: bekrefter, foreslår et annet tidspunkt eller avslår. Verktøyet lager aldri en bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket. Gjesten får en statuslenke på e-post. Bare produsenter som tar imot forespørsler nå, kan få en.",
+      faq: "book_gardssalg sender en besøksforespørsel til en gårdssalg-produsent, og forespørselen står ventende til produsenten svarer på e-post",
+      bookingFaq: "For gårdssalg sender book_gardssalg en besøksforespørsel til produsenten. Den står ventende til produsenten svarer på e-post, så det er ingen bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket.",
+    },
+    en: {
+      card: "Sends a visit request to a farm-sale (gårdssalg) producer, with the requested time, party size, and the guest's name and email. The request stays pending until the producer replies by email: confirms, proposes another time, or declines. The tool never creates a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit. The guest gets a status link by email. Only producers that take requests right now can receive one.",
+      faq: "book_gardssalg sends a visit request to a farm-sale producer, and the request stays pending until the producer replies by email",
+      bookingFaq: "For farm sales (gårdssalg), book_gardssalg sends a visit request to the producer. It stays pending until the producer replies by email, so it is not a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit.",
+    },
+  },
+};
+
+export interface OpplevagentMcpGuideTool {
+  name: string;
+  /** The card body: the curated HTML, or the registered description escaped. */
+  cardHtml: string;
+  /** Plain text for the tools FAQ answer. */
+  faq: string;
+  bookingFaq: string | null;
+  /** False when the tool has no entry in OA_MCP_GUIDE_TOOL_COPY. */
+  curated: boolean;
+}
+
+/** The guide's tools: one per registered tool, in registration order. `tools` is for tests. */
+export function opplevagentMcpGuideTools(lang: Lang, tools: McpToolEntry[] = registeredMcpTools("experiences")): OpplevagentMcpGuideTool[] {
+  const key: GuideLang = lang === "en" ? "en" : "no";
+  return tools.map((t) => {
+    const copy = OA_MCP_GUIDE_TOOL_COPY[t.name]?.[key];
+    if (copy) return { name: t.name, cardHtml: copy.card, faq: copy.faq, bookingFaq: copy.bookingFaq ?? null, curated: true };
+    return { name: t.name, cardHtml: escapeHtml(t.description), faq: `${t.name}: ${t.description.replace(/[.!?]+$/, "")}`, bookingFaq: null, curated: false };
+  });
+}
+
+// FAQ content for /guide-opplevelser-mcp. Curated editorial copy (not derived
+// from a possibly-thin DB row), so unlike buildCategoryFaqJsonLd/
+// buildKommuneFaqJsonLd there is no 2-real-facts quality gate — the page
+// always emits its FAQPage block. The tools answer and the gårdssalg sentence
+// of the booking answer come from opplevagentMcpGuideTools(), so the FAQ names
+// the same tools as the list. Exported for tests; `tools` is for tests.
+export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string, tools: McpToolEntry[] = registeredMcpTools("experiences")): any {
   const en = lang === "en";
+  const guideTools = opplevagentMcpGuideTools(lang, tools);
+  const toolsAnswer = guideTools.map((t) => t.faq).join("; ") + ".";
+  const bookingExtra = guideTools.map((t) => t.bookingFaq).filter((s): s is string => !!s).map((s) => " " + s).join("");
   const qas: Array<{ q: string; a: string }> = en ? [
     {
       q: "Which AI assistants work with opplevagent-mcp?",
@@ -10306,7 +10489,7 @@ export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any 
     },
     {
       q: "What tools does the opplevagent MCP server expose?",
-      a: "discover_experiences filters by county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, price, and duration; list_experience_categories lists every category with a live count; get_experience fetches full details for one experience by its UUID.",
+      a: toolsAnswer,
     },
     {
       q: "Does using the MCP server cost anything?",
@@ -10314,7 +10497,7 @@ export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any 
     },
     {
       q: "Can I book an experience directly through my AI assistant?",
-      a: "The assistant surfaces a booking_url (and booking_type) per experience from discover_experiences/get_experience; booking itself happens on the provider's own site or via that link, not inside the MCP conversation.",
+      a: "The assistant surfaces a booking_url (and booking_type) per experience from discover_experiences/get_experience; booking itself happens on the provider's own site or via that link, not inside the MCP conversation." + bookingExtra,
     },
     {
       q: "How do I set up opplevagent-mcp in Claude Desktop or ChatGPT?",
@@ -10327,7 +10510,7 @@ export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any 
     },
     {
       q: "Hvilke verktøy har opplevagent MCP-serveren?",
-      a: "discover_experiences filtrerer på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, pris og varighet; list_experience_categories lister alle kategorier med et levende antall; get_experience henter fullstendige detaljer for én opplevelse via UUID.",
+      a: toolsAnswer,
     },
     {
       q: "Koster det noe å bruke MCP-serveren?",
@@ -10335,7 +10518,7 @@ export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any 
     },
     {
       q: "Kan jeg booke en opplevelse direkte gjennom AI-assistenten?",
-      a: "Assistenten viser en booking_url (og booking_type) per opplevelse fra discover_experiences/get_experience; selve bookingen skjer hos tilbyderens egen side eller via den lenken, ikke inne i MCP-samtalen.",
+      a: "Assistenten viser en booking_url (og booking_type) per opplevelse fra discover_experiences/get_experience; selve bookingen skjer hos tilbyderens egen side eller via den lenken, ikke inne i MCP-samtalen." + bookingExtra,
     },
     {
       q: "Hvordan setter jeg opp opplevagent-mcp i Claude Desktop eller ChatGPT?",
@@ -10360,9 +10543,13 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   const lang: Lang = req.lang === "en" ? "en" : "no";
   const en = lang === "en";
   const canonical = en ? `${url}/en/guide-opplevelser-mcp` : `${url}/guide-opplevelser-mcp`;
-  const faqJsonLd = buildOpplevagentMcpGuideFaqJsonLd(lang, canonical);
+  const tools = registeredMcpTools("experiences");
+  const faqJsonLd = buildOpplevagentMcpGuideFaqJsonLd(lang, canonical, tools);
   const faqHtml = faqJsonLd.mainEntity.map((qa: any) =>
     `<div class="gom-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`
+  ).join("");
+  const toolsHtml = opplevagentMcpGuideTools(lang, tools).map((t) =>
+    `\n      <div class="gom-tool"><code>${escapeHtml(t.name)}</code><p>${t.cardHtml}</p></div>`
   ).join("");
 
   const content = en ? `
@@ -10372,13 +10559,10 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   </section>
   <section class="gom-sec">
     <h2>What is this?</h2>
-    <p>Opplevagent runs a remote MCP (Model Context Protocol) server at <code>https://opplevagent.no/mcp</code>. Once your AI assistant is connected, it can search, filter, and read our verified experience catalog directly — the same data behind <a href="/opplevelser">the browse pages</a>, but callable as tools inside a conversation.</p>
+    <p>Opplevagent runs a remote MCP (Model Context Protocol) server at <code>https://opplevagent.no/mcp</code>. Once your AI assistant is connected, it can search, filter, and read our verified experience catalog directly — the same data behind <a href="/opplevelser">the browse pages</a>, but callable as tools inside a conversation. It can also find farm sales (gårdssalg) at Norwegian drink producers and send a producer a visit request.</p>
 
     <h2>The tools, exactly as registered</h2>
-    <div class="gom-tools">
-      <div class="gom-tool"><code>discover_experiences</code><p>Search by county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, max price, and duration. Returns title, category, location, description, and booking URL.</p></div>
-      <div class="gom-tool"><code>list_experience_categories</code><p>Lists every experience category with a live count of verified experiences — useful before calling discover_experiences with a specific category filter.</p></div>
-      <div class="gom-tool"><code>get_experience</code><p>Fetches full details for one experience by its UUID — description, group/age limits, price, duration, languages, and booking info. Obtain the UUID from discover_experiences results.</p></div>
+    <div class="gom-tools">${toolsHtml}
     </div>
 
     <h2>Try asking your assistant</h2>
@@ -10389,6 +10573,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
       <li>"Whale safari Tromsø"</li>
       <li>"Family-friendly activities under 500 kr"</li>
       <li>"What categories of experiences exist in Norway?"</li>
+      <li>"Farm-sale cider in Hardanger"</li>
     </ul></div>
 
     <h2>Get started</h2>
@@ -10417,13 +10602,10 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   </section>
   <section class="gom-sec">
     <h2>Hva er dette?</h2>
-    <p>Opplevagent kjører en ekstern MCP (Model Context Protocol)-server på <code>https://opplevagent.no/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte opplevelsesregister direkte — samme data som driver <a href="/opplevelser">nettleser-sidene</a>, men tilgjengelig som verktøy i en samtale.</p>
+    <p>Opplevagent kjører en ekstern MCP (Model Context Protocol)-server på <code>https://opplevagent.no/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte opplevelsesregister direkte — samme data som driver <a href="/opplevelser">nettleser-sidene</a>, men tilgjengelig som verktøy i en samtale. Den kan også finne gårdssalg hos norske drikkeprodusenter og sende en besøksforespørsel til produsenten.</p>
 
     <h2>Verktøyene, slik de faktisk er registrert</h2>
-    <div class="gom-tools">
-      <div class="gom-tool"><code>discover_experiences</code><p>Søk på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, maks pris og varighet. Returnerer tittel, kategori, sted, beskrivelse og bookinglenke.</p></div>
-      <div class="gom-tool"><code>list_experience_categories</code><p>Lister alle kategorier med et levende antall verifiserte opplevelser — nyttig før du kaller discover_experiences med et spesifikt kategorifilter.</p></div>
-      <div class="gom-tool"><code>get_experience</code><p>Henter fullstendige detaljer for én opplevelse via UUID — beskrivelse, gruppe-/aldersgrenser, pris, varighet, språk og bookinginfo. Hent UUID-en fra resultater fra discover_experiences.</p></div>
+    <div class="gom-tools">${toolsHtml}
     </div>
 
     <h2>Prøv å spørre assistenten din</h2>
@@ -10434,6 +10616,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
       <li>«Hvalsafari Tromsø»</li>
       <li>«Familievennlige aktiviteter under 500 kr»</li>
       <li>«Hvilke typer opplevelser finnes i Norge?»</li>
+      <li>«Gårdssalg med cider i Hardanger»</li>
     </ul></div>
 
     <h2>Kom i gang</h2>

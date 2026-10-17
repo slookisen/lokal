@@ -518,7 +518,11 @@ export function runExperiencesSeoIndeksTekstTests(opts: { log?: boolean } = {}):
           `ib-e2: /proveniens has a meta description that names its source (got ${JSON.stringify(desc)})`);
         assertTrue(!!desc && !/sertifiser|certif|complian/i.test(desc), "ib-e3: the description makes no certification or compliance claim");
         const privacy = await callHtmlRoute(router, "/personvern");
-        assertTrue(privacy.status === 200 && !privacy.body.includes('rel="canonical"'), "ib-e4: the other legal pages render as before (legalPage() without seo)");
+        // Since I-P (MCP2-05) /personvern sends its own seo too; the full
+        // check of it and its aliases is in seo-sidetekster.test.ts.
+        assertTrue(privacy.status === 200 && (privacy.body.match(/rel="canonical"/g) || []).length === 1
+          && privacy.body.includes('<link rel="canonical" href="https://opplevagent.no/personvern">'),
+          "ib-e4: another legal page gets its own canonical, not /proveniens's");
       }
 
       // ── (f) SD-09: ItemList names = card titles ────────────────────────────
