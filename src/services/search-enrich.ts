@@ -1646,8 +1646,10 @@ export const PLATFORM_CATEGORIES: readonly string[] = [
 // keys (which include "bread" and "berries"); map those onto the platform
 // vocabulary above. "bread" → "bakery"; "berries" → "fruit" (the platform set
 // has no separate berries key — berries are sold under fruit). Everything else
-// is already a platform key and passes through unchanged.
-const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
+// is already a platform key and passes through unchanged. Exported for the
+// offers' short-term category check (catalog-offers.ts, slice I-V), whose
+// keyword map (marketplace-registry.ts) has the same keys.
+export const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
   vegetables: "vegetables",
   fruit: "fruit",
   berries: "fruit",

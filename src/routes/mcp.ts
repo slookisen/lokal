@@ -566,12 +566,20 @@ function productsWithMatchesShown(products: readonly unknown[], isMatch: (p: unk
  * counts as a tag («<b>», «</p>», «<a href=…>»), so «a < b» and «<3» stay;
  * each pattern is linear in the text. Text without a tag is returned exactly
  * as normalizeProse gives it.
+ * Slice I-V: a stored description can end inside a tag, cut off before its
+ * «>» («<div data-…», «<link rel='stylesheet' …»). A «<» (or «</») and a
+ * letter with no «<» or «>» after it, to the end of the text, is such a
+ * fragment and is removed too. The trade-off: a tag left unclosed in the
+ * middle of the text looks the same, so the text after it goes with it
+ * («Velkommen <img src="x" Vi selger lam» keeps «Velkommen»). Showing less is
+ * the safer side; a tag's attributes never reach the text.
  */
 export function mcpProse(text: string | null | undefined, lineBreak = "\n"): string {
   const prose = normalizeProse(text);
   const withBreaks = prose
     .replace(/<br\s*\/?>|<\/(?:p|div|li|h[1-6]|tr)\s*>/gi, "\n")
-    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?\/?>/g, "");
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?\/?>/g, "")
+    .replace(/<\/?[a-zA-Z][^<>]*$/, "");
   if (withBreaks === prose) return prose;
   return withBreaks
     .split("\n")

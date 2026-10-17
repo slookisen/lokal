@@ -356,8 +356,13 @@ const CLIENT_SCRIPT = `
     head.appendChild(mk('span', { cls: 'hl-badge' + (orderable ? '' : ' warn'), text: orderable ? C.can_order : C.contact_only }));
     lbl.appendChild(head);
     var bits = [];
-    if (p.city) bits.push(String(p.city));
-    if (typeof p.distance_km === 'number') bits.push(p.distance_km + ' ' + C.km);
+    // I-V: a producer placed at a centroid has no km figure, and its distance_label («i Ski-området») names the place.
+    var approx = typeof p.distance_km !== 'number' && p.distance_label ? String(p.distance_label) : '';
+    if (approx) bits.push(approx);
+    else {
+      if (p.city) bits.push(String(p.city));
+      if (typeof p.distance_km === 'number') bits.push(p.distance_km + ' ' + C.km);
+    }
     if (o.product_name) bits.push(String(o.product_name));
     if (typeof o.price_nok === 'number') bits.push(o.price_nok + ' kr' + (o.unit ? '/' + o.unit : ''));
     lbl.appendChild(mk('div', { cls: 'hl-meta', text: bits.join(' · ') }));

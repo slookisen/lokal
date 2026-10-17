@@ -81,6 +81,8 @@ export interface CatalogRow {
   /** producer_dashboard: set by the owner (availability_updated_at = ownerSetAt). */
   ownerSet?: boolean;
   availability?: string;
+  /** products.category (I-V); null when left out, as for most rows the sync writes. */
+  category?: string;
 }
 
 export interface Seed {
@@ -162,8 +164,8 @@ export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt
     VALUES (?, ?, '91234567', ?, ?, ?, 'verified')
   `);
   const catalogStmt = db.prepare(`
-    INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at, category)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const s of seeds) {
     agentStmt.run(s.id, s.name, s.description ?? `Beskrivelse av ${s.name}`, `${s.id}@example.no`, `https://${s.id}.example.no`,
@@ -171,7 +173,7 @@ export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt
     knowledgeStmt.run(s.id, `${s.city}veien 1`, `${s.id}@example.no`, JSON.stringify(s.products), s.about ?? null);
     s.catalog.forEach((c, i) => {
       catalogStmt.run(`${s.id}-p${i}`, s.id, c.name, c.name.toLowerCase(), c.priceNok ?? null, c.unit ?? null, c.availability ?? "in_stock",
-        c.ownerSet ? "producer_dashboard" : "enrichment", c.ownerSet ? ownerSetAt : null);
+        c.ownerSet ? "producer_dashboard" : "enrichment", c.ownerSet ? ownerSetAt : null, c.category ?? null);
     });
   }
 }
@@ -288,8 +290,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
       honningB: await findOffers({ q: "honning", near: "Bergen" }),
       eggB: await findOffers({ q: "egg", near: "Bergen" }),
     };
+    // Slice I-V: one offer per producer, so Tirslaugtrøa's priced «Løvetannhonning» stands for its two honeys.
     assertEq(offerRows(searches.honningT), [
-      "Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning", "Tirslaugtrøa Bigård Fixture: Lynghonning",
+      "Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning",
     ], "offers «honning» near Trondheim: the bakery's and the mixed shop's label rows are gone; the owner-set row and real products stay, nearest first");
     assertEq(offerRows(searches.eggT), ["Blandet Gårdsutsalg Fixture: Frittgående egg"],
       "offers «egg» near Trondheim: the label rows «Egg» are gone, the real eggs stay");

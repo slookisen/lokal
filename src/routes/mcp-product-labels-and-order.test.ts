@@ -544,8 +544,9 @@ export async function runMcpProductLabelsAndOrderTests(opts: { log?: boolean } =
     ], ["Vi er en gård.\nVi selger egg.", "Ost og smør fra gården", "Linje 1\nLinje 2\nLinje 3", "Åpent\nhver lørdag", "Torg\nEgg\nOst", "Honning"],
     "AI2-08 mcpProse: paragraphs and list items become lines, inline tags go, an encoded tag goes too, empty lines are dropped");
     {
+      // Slice I-V: «x <y» at the very end is a cut-off tag now (rfb-offers-priser-ordgrense-avstand.test.ts); inside the text it stays.
       const corpus = ["", "Gårdsbutikk med egg & ost.", "a < b og 3 > 2", "<3 honning", "Pris: 50 < 60 kr", "Multi\nlinje\n\ntekst",
-        "  innrykk  ", "you&#039;ll find", "Bær &amp; Co", "e-post: post@gard.no, https://gard.no/?a=1&b=2", "x <y", "5 <= 6"];
+        "  innrykk  ", "you&#039;ll find", "Bær &amp; Co", "e-post: post@gard.no, https://gard.no/?a=1&b=2", "x <y og 1 < 2", "5 <= 6"];
       assertEq(corpus.map((s) => mcpProse(s)), corpus.map((s) => normalizeProse(s)),
         "AI2-08 byte-like: text without a tag is exactly normalizeProse's (entities, «<» in text, newlines)");
       assertEq([mcpProse(null), mcpProse(undefined)], ["", ""], "AI2-08 mcpProse: no text gives empty text");
