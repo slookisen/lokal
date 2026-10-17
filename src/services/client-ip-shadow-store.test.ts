@@ -30,6 +30,15 @@
  *      store by default.
  *   H  AC2_FANIN_LIMITS pinned against the limiter sources, ac2LimitersFor
  *      against every place the four 15-min limiters are applied.
+ *   I  trinn 1d, AC2 measures what enforce would do: the fanIn ratio over
+ *      20 min is an upper bound for every 15-min span (two bursts 11 min
+ *      apart, review S1 of PR #1130; a seeded sweep against a brute-force
+ *      sliding 15-min count), top15m unchanged; /mcp with an MCP session
+ *      counts only against the brake, bare /mcp against the primary too
+ *      (review S2), by mcpPrimaryKey's own rule; covered_ms — a process
+ *      starting mid-window covers the rest of it only, two machines in one
+ *      window count it once, the migration keeps old rows as full windows;
+ *      the store's timer flush runs inside trackJob.
  *
  * Own in-memory / temp-file DBs, injected clocks, no timers except B's one
  * short unref'd timer (stopped). The DB-accessor failure hook and the
@@ -51,6 +60,7 @@ import {
   evaluateClientIpAc2,
   getInstalledClientIpSnapshot,
   installClientIp,
+  mcpSessionKeyed,
   __resetInstalledClientIpForTesting,
   type ClientIpAc2,
   type ClientIpConfig,
@@ -58,10 +68,12 @@ import {
   type ClientIpCumulative,
   type ClientIpOpsSnapshot,
 } from "../middleware/client-ip";
-import { MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
+import { MCP_RATE_LIMIT_PROFILES, mcpPrimaryKey } from "../middleware/mcp-rate-limit";
 import { __setDbAccessorFailureForTesting } from "../database/init";
+import { getEventLoopReport } from "./event-loop-monitor";
 import {
   CLIENT_IP_WINDOW_RETENTION_DAYS,
+  FLUSH_JOB_NAME,
   createClientIpShadowStore,
   type ClientIpShadowStore,
   type ClientIpShadowStoreDeps,
@@ -94,6 +106,7 @@ const COLUMNS = [
   "n", "fci_valid", "fallback_missing", "fallback_invalid", "fallback_non_public", "fallback_hc", "errors",
   "xff_client_supplied", "agree_fci_edge_n", "agree_fci_edge_agree", "agree_legacy_eq_fci_n", "agree_legacy_eq_fci_agree",
   "would_trip", "top_overflow", "fanin_ratio", "fanin_class", "fanin_fan_in", "fanin_ua", "created_at",
+  "covered_ms",
 ];
 const NO_NONZERO_WINDOWS = { top_overflow: { windows: 0, last: null }, invalid_non_public: { windows: 0, last: null } };
 const CRITERIA = [
@@ -101,16 +114,30 @@ const CRITERIA = [
   "agree_legacy_eq_fci", "would_trip", "fanin_limit_ratio", "top_overflow",
 ];
 
-function loadDdl(): string {
+/** The table's migration, read out of database/init.ts (not copied): trinn 1c's CREATE + index, and every later ALTER on it. */
+function loadDdl(): { create: string; alters: string[] } {
   const src = fs.readFileSync(path.join(__dirname, "..", "database", "init.ts"), "utf8");
   const m = src.match(/CREATE TABLE IF NOT EXISTS client_ip_shadow_windows \([\s\S]*?\);\s*CREATE INDEX IF NOT EXISTS idx_client_ip_shadow_windows_start[^;]*;/);
   if (!m) throw new Error("client_ip_shadow_windows DDL not found in database/init.ts");
-  return m[0];
+  return { create: m[0], alters: src.match(/ALTER TABLE client_ip_shadow_windows ADD COLUMN [^`]*/g) ?? [] };
+}
+
+/** What init.ts runs on boot: the CREATE, then each ALTER, a duplicate column ignored as init.ts does. */
+function migrate(db: Database.Database): void {
+  const ddl = loadDdl();
+  db.exec(ddl.create);
+  for (const stmt of ddl.alters) {
+    try {
+      db.exec(stmt);
+    } catch (err: any) {
+      if (!String(err?.message || "").includes("duplicate column name")) throw err;
+    }
+  }
 }
 
 function freshDb(): Database.Database {
   const db = new Database(":memory:");
-  db.exec(loadDdl());
+  migrate(db);
   return db;
 }
 
@@ -130,19 +157,21 @@ function counters(k = 1): ClientIpCounters {
   };
 }
 
-const rec = (windowStart: number, k = 1, fanIn: ClientIpWindowRecord["fanIn"] = null): ClientIpWindowRecord => ({
+const rec = (windowStart: number, k = 1, fanIn: ClientIpWindowRecord["fanIn"] = null, coveredMs = W): ClientIpWindowRecord => ({
   windowStart,
   mode: "shadow",
   counters: counters(k),
   fanIn,
+  coveredMs,
 });
 
 /** A request object as the middleware sees it. */
-function fakeReq(o: { fci?: unknown; xff?: unknown; ip?: string; path?: string; ua?: string }): any {
+function fakeReq(o: { fci?: unknown; xff?: unknown; ip?: string; path?: string; ua?: string; sid?: unknown }): any {
   const headers: Record<string, unknown> = {};
   if (o.fci !== undefined) headers["fly-client-ip"] = o.fci;
   if (o.xff !== undefined) headers["x-forwarded-for"] = o.xff;
   if (o.ua !== undefined) headers["user-agent"] = o.ua;
+  if (o.sid !== undefined) headers["mcp-session-id"] = o.sid;
   return { headers, path: o.path ?? "/api/x", ip: o.ip };
 }
 
@@ -231,8 +260,12 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       assertTrue(!cols.some((c) => /(^|_)(ip|key|hash)($|_)/.test(c)), "A: no IP, key or hash column");
       const idx = (db.prepare("PRAGMA index_list(client_ip_shadow_windows)").all() as any[]).map((i) => i.name);
       assertTrue(idx.includes("idx_client_ip_shadow_windows_start") && idx.some((i) => i.startsWith("sqlite_autoindex")), "A: window_start index + the UNIQUE (machine, window_start) index");
-      db.exec(loadDdl());
-      assertEq(cols.length, COLUMNS.length, "A: the migration is idempotent (re-run without error)");
+      migrate(db);
+      assertEq(
+        (db.prepare("PRAGMA table_info(client_ip_shadow_windows)").all() as any[]).map((c) => c.name),
+        COLUMNS,
+        "A: the migration is idempotent (re-run without error, no column added twice)"
+      );
       db.close();
     }
 
@@ -454,7 +487,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       // C4: a restart — a new process and DB connection — reads the old windows and keeps summing.
       const file = path.join(tmp, "restart.db");
       const dbA = new Database(file);
-      dbA.exec(loadDdl());
+      migrate(dbA);
       const a = storeOn(dbA);
       const ra = rig(SHADOW, a.store);
       for (let w = 0; w < 5; w++) normalWindow(ra, w); // windows 0..3 close; window 4 is open at "SIGTERM"
@@ -469,7 +502,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       dbA.close();
 
       const dbB = new Database(file);
-      dbB.exec(loadDdl());
+      migrate(dbB);
       const b = storeOn(dbB);
       const rb = rig(SHADOW, b.store);
       const fresh = rb.mw.opsSnapshot();
@@ -522,7 +555,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       db.close();
     }
     {
-      // C7: the per-window fanIn ratio — a top key with fanIn > 1, its requests per limiter over the 15-min top list / that limit.
+      // C7: the per-window fanIn ratio — a key with fanIn > 1, its requests per limiter over the window and the 3 before it (20 min, trinn 1d) / that limit.
       const db = freshDb();
       const s = storeOn(db);
       const r = rig(SHADOW, s.store);
@@ -553,14 +586,14 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           [iso(T0), 0.333333, "general", 2, "ai_search:chatgpt"],
           [iso(T0 + W), 0.8, "general", 2, "ai_search:chatgpt"],
           [iso(T0 + 2 * W), 0.8, "general", 2, "ai_search:chatgpt"],
-          [iso(T0 + 3 * W), 0.466667, "general", 2, "ai_search:chatgpt"],
-          [iso(T0 + 4 * W), 0.3, "mcp", 2, "ai_search:chatgpt"],
-          [iso(T0 + 5 * W), null, null, null, null],
+          [iso(T0 + 3 * W), 0.8, "general", 2, "ai_search:chatgpt"],
+          [iso(T0 + 4 * W), 0.466667, "general", 2, "ai_search:chatgpt"],
+          [iso(T0 + 5 * W), 0.3, "mcp", 2, "ai_search:chatgpt"],
         ],
-        "C7: per window, the 15-min top list's largest requests/limit of a fanIn > 1 key (/api 100 → 240 → 240 of 300, 140 as the first window leaves, then /mcp 60 of 200); a fanIn 1 key (290 /api) is never rated"
+        "C7: per window, the 20-min span's largest requests/limit of a fanIn > 1 key (/api 100 → 240 of 300 while the first window is in the span, 140 once it leaves, then bare /mcp 60 of the primary's 200); a fanIn 1 key (290 /api) is never rated"
       );
       const snap = r.mw.opsSnapshot();
-      assertEq(cum(snap).fanin_max, { ratio: 0.8, class: "general", fanIn: 2, ua: "ai_search:chatgpt", window_start: iso(T0 + 2 * W) }, "C7: cumulative.fanin_max is the largest stored (newest on a tie), with its class, fanIn and UA family");
+      assertEq(cum(snap).fanin_max, { ratio: 0.8, class: "general", fanIn: 2, ua: "ai_search:chatgpt", window_start: iso(T0 + 3 * W) }, "C7: cumulative.fanin_max is the largest stored (newest on a tie), with its class, fanIn and UA family");
       assertEq(snap.ac2?.criteria.fanin_limit_ratio, { value: 0.8, threshold: 0.8, op: "<", pass: false }, "C7: a fanIn > 1 key at 80 % of its limit fails the criterion");
       db.close();
     }
@@ -593,7 +626,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           "/kategori/gardssalg/eier/gard-x", "/kategori/gardssalg/eier/magic-link-verify", "/Kategori/Gardssalg/Eier/p1/request",
           "/en/kategori/gardssalg/eier/gard-x/portal", "/kategori/gardssalg/eier", "/kategori/gardssalg/eierx", "/kategori/gardssalg",
           "/api/opplevelser/gardssalg-claim/p1/session-status",
-          "/a2a", "/en/a2a", "/mcp", "/mcp/x", "/health", "/", "/produsent/x",
+          "/a2a", "/en/a2a", "/mcp", "/mcp/x", "/MCP", "/en/mcp", "/mcpx", "/health", "/", "/produsent/x",
         ].map((p) => [p, ac2LimitersFor(p)]),
         [
           ["/api/products", ["general"]], ["/api", ["general"]], ["/api/", ["general"]], ["/API/products", ["general"]], ["/apix", []], ["/en/api/products", ["general"]],
@@ -606,9 +639,11 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           ["/kategori/gardssalg/eier/gard-x", ["general"]], ["/kategori/gardssalg/eier/magic-link-verify", ["general"]], ["/Kategori/Gardssalg/Eier/p1/request", ["general"]],
           ["/en/kategori/gardssalg/eier/gard-x/portal", ["general"]], ["/kategori/gardssalg/eier", ["general"]], ["/kategori/gardssalg/eierx", []], ["/kategori/gardssalg", []],
           ["/api/opplevelser/gardssalg-claim/p1/session-status", ["general"]],
-          ["/a2a", ["a2a", "dental"]], ["/en/a2a", ["a2a", "dental"]], ["/mcp", ["mcp"]], ["/mcp/x", ["mcp"]], ["/health", []], ["/", []], ["/produsent/x", []],
+          ["/a2a", ["a2a", "dental"]], ["/en/a2a", ["a2a", "dental"]],
+          ["/mcp", ["mcp", "mcp_brake"]], ["/mcp/x", ["mcp", "mcp_brake"]], ["/MCP", ["mcp", "mcp_brake"]], ["/en/mcp", ["mcp", "mcp_brake"]], ["/mcpx", []],
+          ["/health", []], ["/", []], ["/produsent/x", []],
         ],
-        "C7: ac2LimitersFor mirrors the mounts (segment-wise, case-insensitive, after the /en and /sv strip): search is also general; /api/tannlege* is not general (generalLimiter's case-sensitive skip) but dental; /a2a counts against jsonRpcLimiter and dentalLimiter"
+        "C7: ac2LimitersFor mirrors the mounts (segment-wise, case-insensitive, after the /en and /sv strip): search is also general; /api/tannlege* is not general (generalLimiter's case-sensitive skip) but dental; /a2a counts against jsonRpcLimiter and dentalLimiter; bare /mcp against the MCP primary and the brake"
       );
       // One key (fanIn 3) in one window; the fanIn ratio, its limiter, and whether the criterion passes.
       const rate = (traffic: Array<[string, number]>) => {
@@ -885,10 +920,23 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         return m ? Number(m[1]) : null;
       };
       const mcp = Object.values(MCP_RATE_LIMIT_PROFILES).map((p) => p.primary);
+      const brakes = Object.values(MCP_RATE_LIMIT_PROFILES).map((p) => p.brake);
       assertEq(
-        [AC2_FANIN_LIMITS, ceiling("generalLimiter"), flat("searchLimiter"), ceiling("jsonRpcLimiter"), flat("dentalLimiter"), Math.min(...mcp.map((p) => p.anonymousMax)), mcp.every((p) => p.windowMs === 15 * 60_000)],
-        [{ general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200 }, 300, 150, 200, 1000, 200, true],
-        "H: AC2_FANIN_LIMITS = generalLimiter / searchLimiter / jsonRpcLimiter / dentalLimiter / the smallest MCP primary ceiling, all per 15 min"
+        [
+          AC2_FANIN_LIMITS, ceiling("generalLimiter"), flat("searchLimiter"), ceiling("jsonRpcLimiter"), flat("dentalLimiter"),
+          Math.min(...mcp.map((p) => p.anonymousMax)), mcp.every((p) => p.windowMs === 15 * 60_000),
+          Math.min(...brakes.map((b) => b.max)), brakes.every((b) => b.windowMs === 15 * 60_000),
+        ],
+        [{ general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200, mcp_brake: 3000 }, 300, 150, 200, 1000, 200, true, 3000, true],
+        "H: AC2_FANIN_LIMITS = generalLimiter / searchLimiter / jsonRpcLimiter / dentalLimiter / the smallest MCP primary ceiling / the smallest MCP brake, all per 15 min"
+      );
+      // Trinn 1d: how every vertical's MCP chain keys — the brake on the IP for every /mcp, the primary by mcpPrimaryKey (session first).
+      const mcpSrc = fs.readFileSync(path.join(srcRoot, "middleware", "mcp-rate-limit.ts"), "utf8");
+      assertTrue(
+        /const brake = rateLimit\(\{[^}]*?keyGenerator: mcpIpKey,\s*\}\);/.test(mcpSrc) &&
+          /const primary = rateLimit\(\{[^}]*?keyGenerator: \(req\) => mcpPrimaryKey\(req, isKnownSession\),\s*\}\);/.test(mcpSrc) &&
+          /chain: sideEffect \? \[brake, primary, sideEffect\] : \[brake, primary\]/.test(mcpSrc),
+        "H: the MCP brake is keyed on the IP and the primary by mcpPrimaryKey, both in every vertical's chain — what ac2LimitersFor's mcp / mcp_brake mirror"
       );
       assertTrue(
         /skip: \(req\) => \{\s*const fullPath = \(req\.baseUrl \|\| ""\) \+ \(req\.path \|\| ""\);\s*return fullPath\.startsWith\("\/api\/tannlege"\);\s*\}/.test(sec),
@@ -948,6 +996,273 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           at("app.use(langMiddleware);") < at("const DENTAL_HOSTS"),
         "H: langMiddleware runs after this middleware and before the limiters and host gates, so ac2LimitersFor strips /en and /sv itself"
       );
+    }
+
+    // ── I. Trinn 1d: AC2 measures what enforce would do ──
+    /** Requests in time order (the rig's clock only moves forward), each at its own `at`. */
+    const play = (r: ReturnType<typeof rig>, evs: Array<{ at: number; o: Parameters<typeof fakeReq>[0] }>) => {
+      for (const e of [...evs].sort((a, b) => a.at - b.at)) r.send(e.o, e.at);
+    };
+    /** One client behind Fly-Client-IP 198.51.100.9 rotating three spoofed X-Forwarded-For values: fanIn 3. */
+    let spoofSeq = 0;
+    const fanIn3 = (at: number, pathName = "/api/products", sid?: unknown) => {
+      const spoof = `203.0.113.${spoofSeq++ % 3}`;
+      return { at, o: { fci: "198.51.100.9", xff: flyXff("198.51.100.9", spoof), ip: spoof, path: pathName, sid } };
+    };
+    /** Fly's health check every 30 s over [from, to), from an ordinary client (fanIn 1, never rated). */
+    const healthChecks = (from: number, to: number) => {
+      const out: Array<{ at: number; o: Parameters<typeof fakeReq>[0] }> = [];
+      for (let t = from; t < to; t += 30_000) out.push({ at: t, o: { fci: "198.51.100.200", xff: flyXff("198.51.100.200"), ip: "198.51.100.200", path: "/health" } });
+      return out;
+    };
+    const MIN = 60_000;
+    {
+      // I1 (review S1 of PR #1130): 160 + 160 /api/products from one key (fanIn 3), over 4:00–4:50 and 15:00–15:50.
+      // In enforce express-rate-limit opens the key's 15-min window at its first hit (4:00) and counts both bursts in
+      // it: 320 of generalLimiter's 300, 20 × 429. Over 3 windows each burst was rated alone (160/300 = 0.533, passed).
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      const evs = [...healthChecks(T0, T0 + 4 * W + 1)];
+      for (const from of [T0 + 4 * MIN, T0 + 15 * MIN]) for (let i = 0; i < 160; i++) evs.push(fanIn3(from + Math.floor((i * 50_000) / 160)));
+      play(r, evs);
+      s.setNow(T0 + 4 * W + 1000);
+      s.store.flush();
+      const rows = (db.prepare("SELECT window_start, fanin_ratio, fanin_class, fanin_fan_in FROM client_ip_shadow_windows ORDER BY window_start").all() as any[]).map((x) => [
+        x.window_start, x.fanin_ratio === null ? null : Math.round(x.fanin_ratio * 1e6) / 1e6, x.fanin_class, x.fanin_fan_in,
+      ]);
+      assertEq(
+        rows,
+        [
+          [iso(T0), 0.533333, "general", 3],
+          [iso(T0 + W), 0.533333, "general", 3],
+          [iso(T0 + 2 * W), 0.533333, "general", 3],
+          [iso(T0 + 3 * W), 1.066667, "general", 3],
+        ],
+        "I1: the window of the second burst is rated over the 20 min that hold both bursts: 320 of 300 (1.067), where 3 windows gave 0.533"
+      );
+      const snap = r.mw.opsSnapshot();
+      assertEq(
+        [cum(snap).fanin_max?.window_start, snap.ac2?.criteria.fanin_limit_ratio.pass],
+        [iso(T0 + 3 * W), false],
+        "I1: … so fanin_limit_ratio fails, as enforce would answer 20 × 429"
+      );
+      const line3 = JSON.parse(r.lines[3] ?? "{}");
+      const top = (line3.top15m ?? []).find((t: any) => t.fanIn === 3);
+      assertEq([line3.window_start, top?.n, top?.api, r.lines.length], [iso(T0 + 3 * W), 160, 160, 4], "I1: the log line's top15m is still the 15-min list (the second burst alone, 160)");
+      db.close();
+    }
+    {
+      // I1b: seeded burst patterns. The stored fanin_max is exactly the largest 4-window count / 300, and never below the
+      // key's largest count in a 15-min span starting at one of its requests (where express-rate-limit opens a window).
+      let seed = 0x2545f491;
+      const rnd = () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed / 2 ** 32;
+      };
+      const bad: string[] = [];
+      let missedBy3 = 0;
+      for (let run = 0; run < 30; run++) {
+        const times: number[] = [];
+        const bursts = 2 + Math.floor(rnd() * 4);
+        for (let b = 0; b < bursts; b++) {
+          const start = Math.floor(rnd() * 50 * MIN);
+          const size = 20 + Math.floor(rnd() * 180);
+          const len = Math.floor(rnd() * 3 * MIN);
+          for (let i = 0; i < size; i++) times.push(start + Math.floor((i * len) / size));
+        }
+        times.sort((a, b) => a - b);
+        let span15 = 0;
+        for (let i = 0, j = 0; i < times.length; i++) {
+          while (j < times.length && times[j] < times[i] + 15 * MIN) j++;
+          span15 = Math.max(span15, j - i);
+        }
+        const perWindow = new Map<number, number>();
+        for (const t of times) perWindow.set(Math.floor(t / W), (perWindow.get(Math.floor(t / W)) ?? 0) + 1);
+        const maxOver = (span: number) => {
+          let best = 0;
+          for (let w = 0; w <= 12; w++) {
+            let sum = 0;
+            for (let k = w - span + 1; k <= w; k++) sum += perWindow.get(k) ?? 0;
+            best = Math.max(best, sum);
+          }
+          return best;
+        };
+        if (maxOver(3) < span15) missedBy3++;
+        const db = freshDb();
+        const s = storeOn(db);
+        const r = rig(SHADOW, s.store);
+        play(r, [...healthChecks(T0, T0 + 13 * W + 1), ...times.map((t) => fanIn3(T0 + t))]);
+        s.setNow(T0 + 13 * W + 1000);
+        s.store.flush();
+        const f = cum(r.mw.opsSnapshot()).fanin_max;
+        const count = f === null ? 0 : Math.round(f.ratio * AC2_FANIN_LIMITS.general);
+        if (count !== maxOver(4) || count < span15) bad.push(`run ${run}: stored ${count}, 4-window ${maxOver(4)}, 15-min span ${span15}`);
+        db.close();
+      }
+      assertEq(bad, [], "I1b: 30 seeded burst patterns — fanin_max is the largest 4-window count, and never below the largest 15-min span count (an upper bound in time)");
+      assertTrue(missedBy3 > 0, `I1b: (the sweep has teeth) in ${missedBy3} of 30 runs the largest 3-window count was below the 15-min span count`);
+    }
+    {
+      // I2 (review S2 of PR #1130): /mcp as the MCP chain keys it. Only bare /mcp counts against the primary's 200;
+      // every /mcp counts against the brake's 3 000. mcpSessionKeyed is mcpPrimaryKey's own session rule.
+      const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+      const cases: Array<[string, unknown, boolean]> = [
+        ["no header", undefined, false],
+        ["a UUID-shaped id", SID, true],
+        ["upper case (no server mints one)", SID.toUpperCase(), false],
+        ["padded", ` ${SID}`, false],
+        ["made up", "not-a-session", false],
+        ["10 KB", "a".repeat(10_000), false],
+        ["a repeated header, joined", `${SID}, ${SID}`, false],
+        ["an array, the first UUID-shaped", [SID, "x"], true],
+        ["empty", "", false],
+      ];
+      assertEq(
+        cases.map(([label, sid]) => {
+          const req = fakeReq({ fci: "198.51.100.9", xff: flyXff("198.51.100.9"), ip: "198.51.100.9", path: "/mcp", sid });
+          return [label, mcpSessionKeyed(req), mcpPrimaryKey(req).startsWith("sid:")];
+        }),
+        cases.map(([label, , want]) => [label, want, want]),
+        "I2: mcpSessionKeyed is exactly when mcpPrimaryKey keys on the session (a UUID-shaped mcp-session-id), header form by header form"
+      );
+      assertEq(
+        ([["/mcp", true], ["/mcp/x", true], ["/en/mcp", true], ["/mcp", false], ["/api/products", true], ["/a2a", true]] as Array<[string, boolean]>).map(([p, k]) => [p, k, ac2LimitersFor(p, k)]),
+        [["/mcp", true, ["mcp_brake"]], ["/mcp/x", true, ["mcp_brake"]], ["/en/mcp", true, ["mcp_brake"]], ["/mcp", false, ["mcp", "mcp_brake"]], ["/api/products", true, ["general"]], ["/a2a", true, ["a2a", "dental"]]],
+        "I2: with an MCP session /mcp counts against the brake only; off /mcp the flag changes nothing"
+      );
+      const sidOf = (i: number) => `00000000-0000-4000-8000-${String(i % 30).padStart(12, "0")}`;
+      /** One key (fanIn 3) in one window: `bare` /mcp without a session, `keyed` with one of 30 sessions (or `sid`). */
+      const rateMcp = (bare: number, keyed: number, sid?: (i: number) => unknown) => {
+        const db = freshDb();
+        const s = storeOn(db);
+        const r = rig(SHADOW, s.store);
+        const evs: Array<{ at: number; o: Parameters<typeof fakeReq>[0] }> = [];
+        for (let i = 0; i < bare; i++) evs.push(fanIn3(T0 + i, "/mcp"));
+        for (let i = 0; i < keyed; i++) evs.push(fanIn3(T0 + bare + i, "/mcp", (sid ?? sidOf)(i)));
+        evs.push({ at: T0 + W, o: { fci: "198.51.100.200", xff: flyXff("198.51.100.200"), ip: "198.51.100.200" } });
+        play(r, evs);
+        s.setNow(T0 + W + 1000);
+        s.store.flush();
+        const snap = r.mw.opsSnapshot();
+        const f = cum(snap).fanin_max;
+        db.close();
+        return [f === null ? null : Math.round(f.ratio * 1e6) / 1e6, f?.class ?? null, snap.ac2?.criteria.fanin_limit_ratio.pass];
+      };
+      assertEq(rateMcp(0, 300), [0.1, "mcp_brake", true], "I2: 300 /mcp over 30 sessions → 300 of the brake's 3 000 (0.1), not 300 of the primary's 200 (1.5): passes");
+      assertEq(rateMcp(150, 300), [0.75, "mcp", true], "I2: 150 bare (initialize) + 300 in sessions → the primary 150 of 200 (0.75), the brake 450 of 3 000: passes");
+      assertEq(rateMcp(170, 0), [0.85, "mcp", false], "I2: 170 bare /mcp → 170 of the primary's 200 (0.85): fails");
+      assertEq(rateMcp(0, 2400), [0.8, "mcp_brake", false], "I2: 2 400 /mcp in sessions → the brake at 80 % of 3 000: fails");
+      assertEq(rateMcp(0, 170, () => SID.toUpperCase()), [0.85, "mcp", false], "I2: 170 /mcp with an id the primary does not key on (not UUID-shaped) → counted as bare: fails");
+    }
+    {
+      // I3: covered_ms. A process starting mid-window (a deploy, first request at 12:02:37) measured 2:23 of it, not 5 min.
+      // Its later windows' first requests come 7 s after their starts: they still count in full.
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      play(r, healthChecks(T0 + 157_000, T0 + 3 * W + 30_000));
+      s.setNow(T0 + 3 * W + 30_000);
+      s.store.flush();
+      assertEq(
+        (db.prepare("SELECT window_start, covered_ms FROM client_ip_shadow_windows ORDER BY window_start").all() as any[]).map((x) => [x.window_start, x.covered_ms]),
+        [[iso(T0), 143_000], [iso(T0 + W), W], [iso(T0 + 2 * W), W]],
+        "I3: first request 2:37 into a window → that row covers 143 000 ms; every later one the full 300 000, though its first request came at :07"
+      );
+      assertEq([cum(r.mw.opsSnapshot()).windows, cum(r.mw.opsSnapshot()).hours_covered], [3, (143_000 + 2 * W) / H], "I3: … so hours_covered is 12 min 23 s over 3 windows, not 15 min");
+      // The restart itself: process A's open window (3) is never stored; process B starts 3:30 into it.
+      const b = storeOn(db);
+      const rb = rig(SHADOW, b.store);
+      play(rb, healthChecks(T0 + 3 * W + 210_000, T0 + 5 * W + 1));
+      b.setNow(T0 + 5 * W + 1000);
+      b.store.flush();
+      assertEq(
+        [(db.prepare("SELECT covered_ms FROM client_ip_shadow_windows WHERE window_start = ?").get(iso(T0 + 3 * W)) as any)?.covered_ms, cum(rb.mw.opsSnapshot()).hours_covered],
+        [90_000, (143_000 + 2 * W + 90_000 + W) / H],
+        "I3: after a restart 3:30 into window 3, B's first row covers 90 000 ms; hours_covered continues from A's rows"
+      );
+      db.close();
+    }
+    {
+      // I3: the 48 h gate after a mid-window start: 576 stored windows are 47.96 h, so ready comes one window later.
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      for (let i = 0; i < 9; i++) r.ordinary(`198.51.0.${i}`, T0 + 150_000 + i * 1000);
+      for (let w = 1; w <= 576; w++) {
+        normalWindow(r, w);
+        s.setNow(T0 + w * W + 60_000);
+        s.store.flush();
+      }
+      const before = r.mw.opsSnapshot();
+      assertEq(
+        [cum(before).windows, before.ac2?.ready, failing(before.ac2), before.ac2?.criteria.hours_covered.value],
+        [576, false, ["hours_covered"], (575 * W + 150_000) / H],
+        "I3: 576 stored windows, the first one partial (47.96 h) → ac2.ready false on hours_covered alone"
+      );
+      r.ordinary("198.51.100.250", T0 + 577 * W);
+      s.setNow(T0 + 577 * W + 60_000);
+      s.store.flush();
+      const after = r.mw.opsSnapshot();
+      assertEq([cum(after).windows, after.ac2?.ready, after.ac2?.criteria.hours_covered.value], [577, true, (576 * W + 150_000) / H], "I3: the 577th (48.04 h) → ready");
+      db.close();
+    }
+    {
+      // I3: two machines in one window measured it once: the larger covered_ms, never the sum; other modes are not summed.
+      const db = freshDb();
+      const a = storeOn(db);
+      const b = storeOn(db, { machine: "m2" });
+      const e = storeOn(db, { machine: "m3" });
+      a.store.enqueue(rec(T0, 1, null, 100_000));
+      b.store.enqueue(rec(T0, 1, null, 250_000));
+      a.store.enqueue(rec(T0 + W, 1, null, W));
+      b.store.enqueue(rec(T0 + W, 1, null, W));
+      e.store.enqueue({ ...rec(T0 + 2 * W), mode: "enforce" });
+      a.store.flush();
+      b.store.flush();
+      e.store.flush();
+      const t = a.store.totals("shadow");
+      assertEq([t.rows, t.windows, t.coveredMs, a.store.totals("enforce").coveredMs], [4, 2, 250_000 + W, W], "I3: per window the larger covered_ms (250 000 + 300 000), not the sum (950 000); the enforce row only in an enforce read");
+      db.close();
+    }
+    {
+      // I3: the migration on a table trinn 1c created, with rows: covered_ms is added NOT NULL DEFAULT 300 000, so a row
+      // stored before 1d counts as the full window it counted as then; re-running it changes nothing.
+      const ddl = loadDdl();
+      assertEq(ddl.alters, ["ALTER TABLE client_ip_shadow_windows ADD COLUMN covered_ms INTEGER NOT NULL DEFAULT 300000"], "I3: the one ALTER on the table, additive with a default");
+      const db = new Database(":memory:");
+      db.exec(ddl.create);
+      db.prepare(
+        "INSERT INTO client_ip_shadow_windows (window_start, machine, mode, n, fci_valid, fallback_missing, fallback_invalid, fallback_non_public, fallback_hc, errors, xff_client_supplied, agree_fci_edge_n, agree_fci_edge_agree, agree_legacy_eq_fci_n, agree_legacy_eq_fci_agree, would_trip, top_overflow, created_at) VALUES (?, 'm1', 'shadow', 9, 9, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 0, 0, ?)"
+      ).run(iso(T0), iso(T0 + W));
+      migrate(db);
+      migrate(db);
+      const col = (db.prepare("PRAGMA table_info(client_ip_shadow_windows)").all() as any[]).find((c) => c.name === "covered_ms");
+      const s = storeOn(db);
+      s.store.enqueue(rec(T0 + W, 1, null, 150_000));
+      s.store.flush();
+      assertEq(
+        [col?.type, col?.notnull, col?.dflt_value, (db.prepare("SELECT covered_ms FROM client_ip_shadow_windows ORDER BY window_start").all() as any[]).map((x) => x.covered_ms), s.store.totals("shadow").coveredMs],
+        ["INTEGER", 1, "300000", [W, 150_000], W + 150_000],
+        "I3: the old row reads 300 000 (a full window, as before); a new row stores its own covered_ms"
+      );
+      db.close();
+    }
+    {
+      // I4: the store's timer flush runs inside trackJob, so a stall or a [slow-job] line names it.
+      const db = freshDb();
+      const during: string[][] = [];
+      const s = storeOn(db, { flushEveryMs: 10, getDb: () => { during.push(getEventLoopReport().activeJobsNow.map((j) => j.name)); return db; } });
+      s.store.enqueue(rec(T0));
+      for (let i = 0; i < 50 && rowCount(db) === 0; i++) await new Promise((res) => setTimeout(res, 10));
+      s.store.stop();
+      assertEq(
+        [FLUSH_JOB_NAME, rowCount(db), during.length > 0 && during.every((names) => names.includes(FLUSH_JOB_NAME))],
+        ["client-ip-shadow-flush", 1, true],
+        "I4: while the timer's flush touches the DB it is an active job named client-ip-shadow-flush"
+      );
+      assertTrue(!getEventLoopReport().activeJobsNow.some((j) => j.name === FLUSH_JOB_NAME), "I4: … and no longer once it returns");
+      db.close();
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

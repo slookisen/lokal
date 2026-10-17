@@ -39,7 +39,10 @@
  * (services/client-ip-shadow-store.ts, written by a timer, never by the
  * request path), so `clientIp.cumulative` sums every deploy and
  * `clientIp.ac2` is the server's own verdict on each AC2 criterion
- * (evaluateClientIpAc2).
+ * (evaluateClientIpAc2). Trinn 1d makes AC2 measure what enforce would do:
+ * the fanIn ratio over 20 min (FANIN_WINDOWS), /mcp rated the way the MCP
+ * limiters key it (ac2LimitersFor), and hours_covered from the time each
+ * window was actually measured (coveredMs).
  *
  * The failure mode guarded hardest is "every client in one bucket" (a 429
  * wave on all three sites):
@@ -72,6 +75,7 @@ import type { Application, NextFunction, Request, Response } from "express";
 import { ipKeyGenerator } from "express-rate-limit";
 import { aiAssistantVendor, classifyUA } from "../services/traffic-classifier";
 import { stripLangPrefix } from "../i18n/t";
+import { mcpPrimaryKey } from "./mcp-rate-limit";
 import {
   createClientIpShadowStore,
   type ClientIpShadowStore,
@@ -307,6 +311,15 @@ class CollapseBreaker {
 
 const STATS_WINDOW_MS = 5 * 60_000;
 const TOP_WINDOWS = 3; // top list spans 3 stats windows = 15 min, the limiters' window
+// AC2's fanIn ratio spans 4 stats windows = 20 min (trinn 1d; review S1 of PR
+// #1130). express-rate-limit starts a key's 15-min window at its first hit,
+// not on a 5-min boundary, so one limiter window can touch 4 stats windows,
+// and over 3 two bursts 11 min apart each fell in a different span (320 in
+// one limiter window rated 0.533). The last of those 4 with traffic is closed
+// and rated over itself and the 3 before it, so every 15-min span is inside
+// some rated span: an upper bound in time, as ac2LimitersFor is one in path
+// space. Steady traffic is rated at 4/3 of its 15-min count (fails early).
+const FANIN_WINDOWS = 4;
 const TOP_N = 5;
 const TOP_CAP = 1024;
 const FANIN_CAP = 8;
@@ -342,6 +355,8 @@ interface StatsCounters {
 
 interface StatsWindow extends StatsCounters {
   index: number;
+  /** Trinn 1d: when this process began measuring the window — its first request in its first window, else the start. */
+  measuredFrom: number;
   dFci: Set<string>;
   dEdge: Set<string>;
   dLegacy: Set<string>;
@@ -407,9 +422,9 @@ export interface ClientIpStatsLine extends ClientIpCounters {
 /**
  * The limits behind AC2's fanIn criterion ("no top key with fanIn > 1 at
  * ≥ 80 % of its smallest limit"): every IP-keyed limiter with a 15-min
- * window (the top list's span), at its anonymous ceiling. One limiter
- * instance keeps one count per key on every path it is mounted on, so a key
- * is rated per limiter, not per path (review B1 of PR #1130):
+ * window, at its anonymous ceiling, rated over FANIN_WINDOWS (20 min). One
+ * limiter instance keeps one count per key on every path it is mounted on,
+ * so a key is rated per limiter, not per path (review B1 of PR #1130):
  *   general  generalLimiter 300 (security.ts): /api except /api/tannlege*,
  *            /ut and /reise (index.ts), /sok (seo.ts, experiences-seo.ts,
  *            dental-seo.ts), /reise, /for-tilbydere/finn and the gårdssalg
@@ -423,17 +438,20 @@ export interface ClientIpStatsLine extends ClientIpCounters {
  *   dental   dentalLimiter 1000: /api/tannlege and /a2a on finn-tannlege.com
  *            (dental-a2a.ts).
  *   mcp      the smallest MCP primary ceiling, 200 (mcp-rate-limit.ts), per
- *            vertical; every /mcp request counts, an upper bound of the
- *            `initialize` calls it keys on the IP.
- * ac2LimitersFor maps a path to them. Not rated: the limiters with another
+ *            vertical. The primary keys a request on its MCP session when it
+ *            names one, so only /mcp without a session counts (trinn 1d;
+ *            review S2 of PR #1130): `initialize`, and anything sent bare.
+ *   mcp_brake the MCP brake, 3 000 (mcp-rate-limit.ts), keyed on the IP for
+ *            every /mcp request on all three verticals: what a shared egress
+ *            with many sessions meets first.
+ * ac2LimitersFor maps a request to them. Not rated: the limiters with another
  * window — registrationLimiter and consumerKeyIssuanceLimiter (50 an hour),
  * cartWishesLimiter and the MCP sideEffect quota (20 a minute),
  * resendWebhookLimiter (120 a minute, Svix only), adminLimiter (500 an hour,
- * admin key) — and the MCP brake (3 000, above every primary). A key near one
- * of those does not fail the criterion.
+ * admin key). A key near one of those does not fail the criterion.
  * Pinned against the limiter sources and mounts by client-ip-shadow-store.test.ts.
  */
-export const AC2_FANIN_LIMITS = { general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200 } as const;
+export const AC2_FANIN_LIMITS = { general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200, mcp_brake: 3000 } as const;
 
 export type Ac2FanInLimiter = keyof typeof AC2_FANIN_LIMITS;
 
@@ -445,22 +463,26 @@ const under = (path: string, mount: string): boolean => path === mount || path.s
 /**
  * The AC2_FANIN_LIMITS limiters a request to `path` (req.path here) counts
  * against, as the limiter mounts see it: after langMiddleware's /en and /sv
- * strip (it runs after this middleware), matched like Express matches a
- * mount or a route (case-insensitive, whole segments, an optional trailing
- * slash), with generalLimiter's own case-sensitive /api/tannlege skip.
+ * strip (it runs after this middleware; /sv is stripped here even while
+ * SV_LOCALE_ENABLED is off and langMiddleware leaves it, an over-count —
+ * review S5 of PR #1130), matched like Express matches a mount or a route
+ * (case-insensitive, whole segments, an optional trailing slash), with
+ * generalLimiter's own case-sensitive /api/tannlege skip.
  * The host gates are not mirrored (this runs before them), so a path that
  * reaches a limiter on some host counts against it on every host: /ut,
  * /reise, /sok, /for-tilbydere/finn, /kategori/gardssalg/book/<slug> and
  * everything under /kategori/gardssalg/eier as general (the booking path for
  * any method, though only its POST is limited, and the claim paths on every
  * host, though only opplevagent.no serves them — the path is all this sees),
- * /a2a against both jsonRpcLimiter and
- * dentalLimiter, /mcp summed over the verticals' own chains. Each count is
- * thus at least the key's count in that limiter, never below it: the
+ * /a2a against both jsonRpcLimiter and dentalLimiter, /mcp summed over the
+ * verticals' own chains: against the brake always, against the primary only
+ * when `mcpSessionKeyed` is false (see mcpSessionKeyed). Each count is thus
+ * at least the key's count in that limiter, never below it — save an
+ * mcp-session-id of the right shape that the router no longer holds — so the
  * criterion may fail early, but never passes a key at 80 % of a rated limiter.
  * Exported for client-ip-shadow-store.test.ts.
  */
-export function ac2LimitersFor(path: string): Ac2FanInLimiter[] {
+export function ac2LimitersFor(path: string, mcpSessionKeyed = false): Ac2FanInLimiter[] {
   const p = stripLangPrefix(path);
   const lower = p.toLowerCase();
   const out: Ac2FanInLimiter[] = [];
@@ -480,8 +502,25 @@ export function ac2LimitersFor(path: string): Ac2FanInLimiter[] {
   if (under(lower, "/api/marketplace/search") || under(lower, "/api/marketplace/discover")) out.push("search");
   if (under(lower, "/a2a")) out.push("a2a", "dental");
   else if (under(lower, "/api/tannlege")) out.push("dental");
-  if (under(lower, "/mcp")) out.push("mcp");
+  if (under(lower, "/mcp")) {
+    if (!mcpSessionKeyed) out.push("mcp");
+    out.push("mcp_brake");
+  }
   return out;
+}
+
+/**
+ * Whether the MCP primary limiter keys this request on its session rather
+ * than on the IP (trinn 1d; review S2 of PR #1130): mcpPrimaryKey's own rule,
+ * so the two cannot drift — a UUID-shaped mcp-session-id. Whether the router
+ * still holds that session is not visible here (this runs before the routers
+ * and does not load their session maps), so an expired or made-up id, which
+ * the primary keys on the IP, counts against the brake only. A client the
+ * router answers 404 re-initializes without one, and that counts.
+ * Exported for client-ip-shadow-store.test.ts.
+ */
+export function mcpSessionKeyed(req: Request): boolean {
+  return req.headers["mcp-session-id"] !== undefined && mcpPrimaryKey(req).startsWith("sid:");
 }
 
 /** AC2 in the dev-request's `## Acceptance criteria`. */
@@ -496,9 +535,9 @@ export const AC2_THRESHOLDS = {
   maxFanInRatio: 0.8,
 } as const;
 
-/** A closed window's largest fanIn ratio: of the 15-min top keys with fanIn > 1, the one closest to a limit. */
+/** A closed window's largest fanIn ratio: of the keys with fanIn > 1 over it and the 3 windows before it (20 min), the one closest to a limit. */
 export interface ClientIpWindowFanIn {
-  /** The key's requests counted against limiter `class` over the 15-min top list / AC2_FANIN_LIMITS[class]. */
+  /** The key's requests counted against limiter `class` over those 20 min / AC2_FANIN_LIMITS[class]. */
   ratio: number;
   /** The limiter (AC2_FANIN_LIMITS key) it is closest to. */
   class: Ac2FanInLimiter;
@@ -522,7 +561,12 @@ export interface ClientIpCumulative {
   /** Stored rows: one per machine per 5-min window. */
   windows: number;
   machines: number;
-  /** Distinct stored windows × 5 min, in hours: gaps (a restart's unstored window, idle time) do not count. */
+  /**
+   * Measured time in hours: per distinct stored window, the largest covered_ms
+   * of its rows (trinn 1d: a process's first window only from its first
+   * request; two machines in one window count it once). Gaps (a restart's
+   * unstored window, idle time) do not count.
+   */
   hours_covered: number;
   /** The stats line's additive counters summed over every stored row; n = requests. */
   counters: ClientIpCounters;
@@ -595,7 +639,7 @@ function cumulativeFrom(t: ClientIpStoredTotals, writer: ClientIpShadowWriterSta
     until: t.last === null ? null : new Date(Date.parse(t.last) + STATS_WINDOW_MS).toISOString(),
     windows: t.rows,
     machines: t.machines,
-    hours_covered: (t.windows * STATS_WINDOW_MS) / 3_600_000,
+    hours_covered: t.coveredMs / 3_600_000,
     counters: t.counters,
     fanin_max: t.fanInMax,
     nonzero_windows: t.nonzero,
@@ -682,9 +726,10 @@ function countersOut(c: StatsCounters): ClientIpCounters {
   };
 }
 
-function newWindow(index: number): StatsWindow {
+function newWindow(index: number, measuredFrom = index * STATS_WINDOW_MS): StatsWindow {
   return {
     index,
+    measuredFrom,
     ...newCounters(),
     dFci: new Set(),
     dEdge: new Set(),
@@ -728,16 +773,17 @@ function newTopEntry(): TopEntry {
   return {
     n: 0,
     paths: { api: 0, a2a: 0, mcp: 0, other: 0 },
-    limits: { general: 0, search: 0, a2a: 0, dental: 0, mcp: 0 },
+    limits: { general: 0, search: 0, a2a: 0, dental: 0, mcp: 0, mcp_brake: 0 },
     legacy: new Set(),
     ua: new Map(),
   };
 }
 
 /**
- * Of the merged 15-min top keys with fanIn > 1, the one closest to one of
- * its limiters: its largest count / AC2_FANIN_LIMITS over every limiter, so
- * its smallest limit relative to its traffic (first wins a tie); null if none.
+ * Of the merged top keys (FANIN_WINDOWS, 20 min) with fanIn > 1, the one
+ * closest to one of its limiters: its largest count / AC2_FANIN_LIMITS over
+ * every limiter, so its smallest limit relative to its traffic (first wins a
+ * tie); null if none.
  */
 function fanInMax(merged: Map<string, TopEntry>): ClientIpWindowFanIn | null {
   let best: ClientIpWindowFanIn | null = null;
@@ -749,6 +795,15 @@ function fanInMax(merged: Map<string, TopEntry>): ClientIpWindowFanIn | null {
     }
   }
   return best;
+}
+
+/**
+ * How much of window w this process measured, ms (trinn 1d): from
+ * measuredFrom (inside the window, set by windowAt) to the window's end. A
+ * restart mid-window thus covers only the rest of that window, not all of it.
+ */
+function coveredMs(w: StatsWindow): number {
+  return (w.index + 1) * STATS_WINDOW_MS - w.measuredFrom;
 }
 
 // ─── Middleware ─────────────────────────────────────────────────────────
@@ -795,17 +850,18 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   const statsKey = createStatsKey(crypto.randomBytes(16));
   const breaker = new CollapseBreaker();
   let current: StatsWindow | null = null;
-  // Only the top maps of the previous TOP_WINDOWS - 1 windows are kept, for top15m.
+  // Only the top maps of the previous FANIN_WINDOWS - 1 windows are kept: for
+  // top15m (the last TOP_WINDOWS - 1 of them) and the fanIn ratio (all).
   let history: Array<Pick<StatsWindow, "index" | "top">> = [];
   // Since-boot totals of every closed window (plain numbers), folded in by windowAt.
   const closed = newCounters();
   let firstIndex: number | null = null;
   let lastT = 0;
 
-  /** The top maps of w and the windows before it within TOP_WINDOWS (15 min), merged per key. */
-  function mergedTop(w: StatsWindow): Map<string, TopEntry> {
+  /** The top maps of w and the windows before it within `span` windows (TOP_WINDOWS: 15 min), merged per key. */
+  function mergedTop(w: StatsWindow, span: number = TOP_WINDOWS): Map<string, TopEntry> {
     const merged = new Map<string, TopEntry>();
-    for (const win of [...history.filter((h) => w.index - h.index < TOP_WINDOWS && h.index < w.index), w]) {
+    for (const win of [...history.filter((h) => w.index - h.index < span && h.index < w.index), w]) {
       for (const [key, e] of win.top) {
         let m = merged.get(key);
         if (!m) {
@@ -889,11 +945,21 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     };
   }
 
-  /** Hands a closed window to the store: O(1), never throws, no DB here (the store's timer writes). */
-  function persist(w: StatsWindow, merged: Map<string, TopEntry>): void {
+  /**
+   * Hands a closed window to the store, with its fanIn ratio over
+   * FANIN_WINDOWS and the time it was measured: once per closed window, never
+   * throws, no DB here (the store's timer writes).
+   */
+  function persist(w: StatsWindow): void {
     if (!store) return;
     try {
-      store.enqueue({ windowStart: w.index * STATS_WINDOW_MS, mode, counters: countersOut(w), fanIn: fanInMax(merged) });
+      store.enqueue({
+        windowStart: w.index * STATS_WINDOW_MS,
+        mode,
+        counters: countersOut(w),
+        fanIn: fanInMax(mergedTop(w, FANIN_WINDOWS)),
+        coveredMs: coveredMs(w),
+      });
     } catch {
       /* persistence must never fail a request or stop the rotation */
     }
@@ -915,17 +981,19 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     if (current && current.index === index) return current;
     if (current) {
       if (current.n > 0 || current.errors > 0) {
-        const merged = mergedTop(current);
-        log(JSON.stringify(line(current, t, merged)));
-        persist(current, merged);
+        log(JSON.stringify(line(current, t)));
+        persist(current);
       }
       addCounters(closed, current);
       history = [...history, { index: current.index, top: current.top }].filter(
-        (h) => index - h.index < TOP_WINDOWS && h.index < index
+        (h) => index - h.index < FANIN_WINDOWS && h.index < index
       );
     }
-    if (firstIndex === null) firstIndex = index;
-    current = newWindow(index);
+    // Trinn 1d: the process's first window is measured from its first
+    // request (a restart mid-window), every later one from its start.
+    const first = firstIndex === null;
+    if (first) firstIndex = index;
+    current = newWindow(index, first ? t : index * STATS_WINDOW_MS);
     return current;
   }
 
@@ -974,7 +1042,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
         entry.n++;
         const reqPath = typeof req.path === "string" ? req.path : "";
         entry.paths[pathClass(reqPath)]++;
-        for (const l of ac2LimitersFor(reqPath)) entry.limits[l]++;
+        for (const l of ac2LimitersFor(reqPath, mcpSessionKeyed(req))) entry.limits[l]++;
         addCapped(entry.legacy, legacyKey, FANIN_CAP);
         const family = uaFamily(req.headers["user-agent"]);
         entry.ua.set(family, (entry.ua.get(family) ?? 0) + 1);
