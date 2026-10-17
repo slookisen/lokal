@@ -74,7 +74,7 @@ const BLANDET_PRODUCTS = [
 /** The label names of the fixtures' enrichment rows (no price, not owner-set). */
 const FIXTURE_LABEL_NAMES = ["Kjøtt", "Meieri", "Grønnsaker", "Bakervarer", "Honning", "Egg", "Fisk", "Urter"];
 
-interface CatalogRow {
+export interface CatalogRow {
   name: string;
   priceNok?: number;
   unit?: string;
@@ -83,7 +83,7 @@ interface CatalogRow {
   availability?: string;
 }
 
-interface Seed {
+export interface Seed {
   id: string;
   name: string;
   lat: number;
@@ -143,9 +143,10 @@ export function sqliteTimestamp(d: Date): string {
  * The fixtures in `db`: verified, owner-claimed, opted-in producers (so an
  * offer is orderable), their knowledge and catalog rows. `ownerSetAt` is the
  * availability_updated_at of the owner-set rows. Exported so main's output
- * can be captured with the same data.
+ * can be captured with the same data. `seeds` replaces the fixtures, written
+ * in the order given (I-S2's order test in rfb-kategoritreff-i-offers.test.ts).
  */
-export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt: string): void {
+export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt: string, seeds: readonly Seed[] = SEED): void {
   const agentStmt = db.prepare(`
     INSERT INTO agents
       (id, name, description, provider, contact_email, url, version, role, api_key,
@@ -164,7 +165,7 @@ export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt
     INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  for (const s of SEED) {
+  for (const s of seeds) {
     agentStmt.run(s.id, s.name, s.description ?? `Beskrivelse av ${s.name}`, `${s.id}@example.no`, `https://${s.id}.example.no`,
       `key-${s.id}`, s.lat, s.lng, s.city, JSON.stringify(s.categories));
     knowledgeStmt.run(s.id, `${s.city}veien 1`, `${s.id}@example.no`, JSON.stringify(s.products), s.about ?? null);
@@ -326,7 +327,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
       // GET /api/marketplace/catalog/offers — also what the shopping list page (handleliste-page.ts) fetches.
       for (const [q, near, key] of [["honning", "Trondheim", "honningT"], ["egg", "Bergen", "eggB"]] as const) {
         const r = await callRoute(catalogRouter, "/offers", { q, near, radius_km: "50", limit: "5" });
-        assertEq([r.status, Object.keys(r.body).sort()], [200, ["offers", "term"]], `GET /catalog/offers «${q}» near ${near}: 200, envelope unchanged`);
+        // I-S2 adds category_matches beside offers when the page has room (rfb-kategoritreff-i-offers.test.ts).
+        assertEq([r.status, Object.keys(r.body).sort()], [200, ["category_matches", "offers", "term"]],
+          `GET /catalog/offers «${q}» near ${near}: 200, {term, offers} plus I-S2's category_matches`);
         assertEq(r.body, searches[key], `GET /catalog/offers «${q}» near ${near}: findOffers' filtered result`);
       }
       const r = await tools.get("lokal_find_offers")!.handler({ items: ["honning", "egg"], near: "Trondheim" });
@@ -422,7 +425,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
         honningB: await findOffers({ q: "honning", near: "Bergen" }),
         eggB: await findOffers({ q: "egg", near: "Bergen" }),
       };
-      assertEq(again, searches, "byte-like: real products and owner-set rows are the same offers, field by field, with or without the label rows");
+      const offersOf = (r: Record<string, { offers: unknown[] }>) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v.offers]));
+      assertEq(offersOf(again), offersOf(searches),
+        "byte-like: real products and owner-set rows are the same offers, field by field, with or without the label rows");
     }
   } finally {
     console.log = prevLog;
