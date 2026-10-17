@@ -1,6 +1,6 @@
 // ─── Structured-data policy: what JSON-LD may claim, how ratings are shown ──
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
-// S1 + S2.
+// S1 + S2 and S4-A1a.
 //
 // Measured live 2026-10-16: 35 of 40 /produsent/:slug pages carried Google's
 // rating as their own LocalBusiness.aggregateRating (plus a copy on every
@@ -17,7 +17,11 @@
 //      No data source holds one, so Offers carry neither node.
 //   4. A third-party rating may be SHOWN on the page as text that names its
 //      source, with a count only when the count is known, and not at all in
-//      RATING_DISPLAY_MODE 'hidden'.
+//      RATING_DISPLAY_MODE 'hidden' (the mode since S4-A1a, for RFB and
+//      finn-tannlege).
+//   5. A stored Google rating is never passed on in API, A2A or MCP output
+//      (S4-A1a). knowledgeService.getAgentInfo leaves it out unless one of the
+//      site's own pages asks for it, and there rule 4 decides.
 //
 // The page tests check the same rules against the rendered RFB, Opplevagent
 // and dental JSON-LD (tests/helpers/jsonld-invariants.ts).
@@ -85,12 +89,16 @@ export function buildOfferPolicyJsonLd(policy: OfferPolicy | null | undefined): 
 export type RatingDisplayMode = "attributed" | "hidden";
 
 /**
- * How a stored third-party rating is shown. Daniel's rating policy (Places
- * ToS/caching, choice A/B/C in the dev-request) is still open: 'attributed'
- * is choice A and the default until then; choice B is this line set to
- * 'hidden'.
+ * How a stored third-party rating is shown, on rettfrabonden.com and
+ * finn-tannlege.com alike. 'hidden' since S4-A1a: Daniel's decision 2
+ * (2026-10-17) is to phase the stored Google ratings out (choice A). The terms
+ * check (protocols/juridisk-sjekk-google-ratinger-2026-10-17.md) found that
+ * storing them is not allowed, and that showing them in a directory is not an
+ * allowed use under the EEA terms. The stored values stay untouched;
+ * 'attributed' would show them again with «Google» as the source (S2), and is
+ * not to be set back without Daniel.
  */
-export const RATING_DISPLAY_MODE: RatingDisplayMode = "attributed";
+export const RATING_DISPLAY_MODE: RatingDisplayMode = "hidden";
 
 let ratingDisplayModeForTesting: RatingDisplayMode | null = null;
 

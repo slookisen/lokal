@@ -34,6 +34,7 @@ import { INDEXNOW_KEY } from "../services/indexnow-service";
 // dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
 // shell's JSON-LD goes through the serializer that escapes < > & U+2028 U+2029.
 import { jsonLdScriptTag } from "../services/safe-script-json";
+import { formatRatingDisplay } from "../services/structured-data-policy";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -1462,13 +1463,14 @@ function renderClinicProfile(
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
   // ── Rating badge (Google Places)
-  // Only render when rating is non-null; never show "0 anmeldelser" noise.
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const stars = "★".repeat(Math.round(ratingVal)) + "☆".repeat(Math.max(0, 5 - Math.round(ratingVal)));
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${stars} ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</span>`);
+  // The stored rating (PR-130) goes through the same policy as on RFB
+  // (structured-data-policy.ts), here and in the info row below: nothing in
+  // RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a (dev-request
+  // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt);
+  // otherwise Google named as the source and never "0 anmeldelser".
+  const ratingDisplay = formatRatingDisplay({ rating: agent.rating, count: agent.rating_count, source: "google" }, "no");
+  if (ratingDisplay) {
+    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${escapeHtml(ratingDisplay.text)}</span>`);
   }
 
   // ── Price band badge
@@ -1523,12 +1525,9 @@ function renderClinicProfile(
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
   if (agent.chain_brand) infoItems.push(`<div class="info-item"><div class="info-label">Kjede</div><div class="info-value">${escapeHtml(agent.chain_brand)}</div></div>`);
-  // Rating info item — only if rating is present
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering (Google)</div><div class="info-value">★ ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</div></div>`);
+  // Rating info item — the badge's text, under the same policy (S4-A1a)
+  if (ratingDisplay) {
+    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering</div><div class="info-value">${escapeHtml(ratingDisplay.text)}</div></div>`);
   }
   // Price band info item — only if present and not 'ukjent'
   if ((agent as any).price_band && (agent as any).price_band !== "ukjent") {

@@ -684,8 +684,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,
       deliveryRadius: knowledge.deliveryRadius,
-      googleRating: knowledge.googleRating,
-      googleReviewCount: knowledge.googleReviewCount,
+      // No googleRating/googleReviewCount: passing Google's rating on is
+      // "reshare" under its Places terms (dev-request 2026-10-16-rfb-
+      // strukturerte-data-tredjepartsrating-og-places-treffvakt, S4-A1a).
       externalLinks: knowledge.externalLinks,
       seasonality: knowledge.seasonality,
       about: safeAbout,

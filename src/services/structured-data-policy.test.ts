@@ -1,6 +1,7 @@
 /**
  * structured-data-policy.test.ts — dev-request
- * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S1 + S2.
+ * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S1 + S2
+ * and S4-A1a.
  *
  * Pure unit tests (no DB, no network) for src/services/structured-data-policy.ts:
  *   S1 — buildRatingJsonLd returns null for every third-party source and never
@@ -8,7 +9,9 @@
  *        explicit per-producer policy.
  *   S2 — formatRatingDisplay names the source in no/en/sv, shows a count only
  *        when it is known (never "0 anmeldelser"), and shows nothing in mode
- *        'hidden'; the default mode is 'attributed'.
+ *        'hidden'.
+ *   S4-A1a — the default mode is 'hidden' (Daniel's decision 2=A), so the
+ *        routes, which pass no mode, show no Google rating.
  * The rendered pages are covered by src/routes/rfb-jsonld-ingen-tredjepartsrating.test.ts
  * (JSON-LD, all three sites) and src/routes/rfb-rating-visning-kildeangivelse.test.ts
  * (visible text).
@@ -88,7 +91,7 @@ export function runStructuredDataPolicyTests(opts: { log?: boolean } = {}): Test
     );
 
     // ── S2: visible rating text ───────────────────────────────────────
-    assertEq(RATING_DISPLAY_MODE, "attributed", "s2-01: default display mode is 'attributed' until Daniel's rating choice");
+    assertEq(RATING_DISPLAY_MODE, "hidden", "s2-01: default display mode is 'hidden' (S4-A1a, Daniel's decision 2=A)");
     const g = (rating: number | null | undefined, count: number | null | undefined, lang: Lang) =>
       formatRatingDisplay({ rating, count, source: "google" }, lang, "attributed");
 
@@ -129,12 +132,17 @@ export function runStructuredDataPolicyTests(opts: { log?: boolean } = {}): Test
     }
 
     // The mode the routes use (default param) follows the test override.
+    for (const lang of ["no", "en", "sv"] as Lang[]) {
+      for (const count of [236, 1, null]) {
+        assertEq(formatRatingDisplay({ rating: 4.6, count, source: "google" }, lang), null,
+          `s2-16: ${lang}, count ${String(count)}: the default mode shows no Google rating (S4-A1a)`);
+      }
+    }
+    __setRatingDisplayModeForTesting("attributed");
     assertEq(formatRatingDisplay({ rating: 4.6, count: 236, source: "google" }, "no")?.text, "★ 4.6 · 236 anmeldelser på Google",
-      "s2-16: default mode renders attributed");
-    __setRatingDisplayModeForTesting("hidden");
-    assertEq(formatRatingDisplay({ rating: 4.6, count: 236, source: "google" }, "no"), null, "s2-17: override 'hidden' reaches the default mode");
+      "s2-17: override 'attributed' reaches the default mode");
     __setRatingDisplayModeForTesting(null);
-    assertEq(formatRatingDisplay({ rating: 4.6, count: 236, source: "google" }, "no")?.score, "4.6", "s2-18: clearing the override restores 'attributed'");
+    assertEq(formatRatingDisplay({ rating: 4.6, count: 236, source: "google" }, "no"), null, "s2-18: clearing the override restores 'hidden'");
   } catch (err) {
     failed++;
     failures.push(`structured-data-policy: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
@@ -146,7 +154,7 @@ export function runStructuredDataPolicyTests(opts: { log?: boolean } = {}): Test
 }
 
 if (require.main === module) {
-  console.log("── structured-data-policy (dev-request 2026-10-16 S1+S2) unit tests ──");
+  console.log("── structured-data-policy (dev-request 2026-10-16 S1+S2, S4-A1a) unit tests ──");
   const r = runStructuredDataPolicyTests({ log: true });
   console.log(`\nstructured-data-policy: ${r.passed} passed, ${r.failed} failed`);
   if (r.failed > 0) {

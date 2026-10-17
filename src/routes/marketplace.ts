@@ -1107,11 +1107,10 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (k.deliveryRadius != null) card.deliveryRadius = k.deliveryRadius;
     if (k.minOrderValue != null) card.minOrderValue = k.minOrderValue;
 
-    // Google rating
-    if (k.ratings?.google?.score) {
-      card.googleRating = k.ratings.google.score;
-      card.googleReviewCount = k.ratings.google.reviews || 0;
-    }
+    // No Google rating (googleRating, googleReviewCount and its invented 0):
+    // getAgentInfo no longer carries it, because passing it on is "reshare"
+    // under Google's Places terms (dev-request 2026-10-16-rfb-strukturerte-
+    // data-tredjepartsrating-og-places-treffvakt, S4-A1a).
 
     // About text (richer than description)
     if (k.about) card["x-lokal"].about = k.about;
