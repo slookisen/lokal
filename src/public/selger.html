@@ -349,6 +349,13 @@
           <label>Telefon (valgfritt)</label>
           <input type="tel" id="claimPhone" />
         </div>
+        <!-- Decision 11=A: the code goes only to the farm's own e-mail; a
+             profile without one, or a listed address the claimant says is
+             wrong, goes to manual approval instead. -->
+        <div class="form-group">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer;"><input type="checkbox" id="claimListedEmailWrong" style="width:auto;"> E-postadressen som står på profilen er feil eller utdatert</label>
+          <div class="form-hint">Koden sendes bare til gårdens egen e-postadresse, ikke til adressen over. Har profilen ingen e-post, eller er den feil, går kravet til manuell godkjenning, og vi kontakter deg på adressen over.</div>
+        </div>
         <button class="btn btn-primary" id="btnRequestClaim">Bekreft at dette er min butikk</button>
       </div>
 
@@ -360,7 +367,7 @@
           <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
         </div>
         <h2>Skriv inn bekreftelseskode</h2>
-        <p style="color: var(--gray-500); margin-bottom: 1rem;">Vi har sendt en 6-sifret kode til din e-post.</p>
+        <p style="color: var(--gray-500); margin-bottom: 1rem;">Vi har sendt en 6-sifret kode til gårdens egen e-postadresse. Koden er gyldig i 24 timer.</p>
         <div id="verifyAlert"></div>
         <div class="form-group">
           <label>Kode</label>
@@ -1246,7 +1253,9 @@
     var claimAgentId = null;
     var claimId = null;
     var devVerificationCode = null;
-    var claimSource = (new URLSearchParams(window.location.search)).get('ref') || 'organic';
+    // Clipped to the server's 64-character cap on `source`, so a long ?ref=
+    // in a link never makes the claim itself fail.
+    var claimSource = ((new URLSearchParams(window.location.search)).get('ref') || 'organic').slice(0, 64);
 
     function startClaim(agent) {
       claimAgentId = agent.id;
@@ -1264,13 +1273,17 @@
         showAlert('claimAlert', t('your_name') + ' & ' + t('your_email') + ' required', 'error');
         return;
       }
+      var listedEmailWrong = document.getElementById('claimListedEmailWrong').checked === true;
       this.disabled = true;
       try {
         var res = await api('/agents/' + claimAgentId + '/claim', {
           method: 'POST',
-          body: JSON.stringify({ name: name, email: email, phone: phone || undefined, source: claimSource })
+          body: JSON.stringify({ name: name, email: email, phone: phone || undefined, source: claimSource, listedEmailWrong: listedEmailWrong })
         });
-        if (res.success) {
+        if (res.success && res.data && res.data.status === 'pending_review') {
+          // Decision 11=A: no code was sent; the claim waits for manual approval.
+          showAlert('claimAlert', escHtml(res.message) || 'Kravet er sendt til manuell godkjenning.', 'success', true);
+        } else if (res.success) {
           claimId = res.data.claimId;
           devVerificationCode = res.data.verificationCode;
 
@@ -1301,6 +1314,9 @@
           if (devVerificationCode) {
             showAlert('verifyAlert', 'Koden din er: <strong>' + escHtml(devVerificationCode) + '</strong> (e-post er ikke satt opp ennå)', 'info', true);
             document.getElementById('verifyCode').value = devVerificationCode;
+          } else if (res.data.sentTo) {
+            // The farm's address, masked by the server (p*****t@g******.no).
+            showAlert('verifyAlert', 'Koden er sendt til gårdens e-post: ' + escHtml(res.data.sentTo), 'info', true);
           }
         } else {
           showAlert('claimAlert', escHtml(res.error) || t('claim_error'), 'error');
@@ -2904,11 +2920,15 @@
             'info', true);
 
           // Auto-claim: step 1 — request claim
+          var claimQueued = false;
           try {
             var claimRes = await api('/agents/' + agentId + '/claim', {
               method: 'POST',
               body: JSON.stringify({ name: name, email: email })
             });
+            // Decision 11=A: a new profile has no listed farm e-mail yet, so
+            // the claim waits for manual approval instead of getting a code.
+            claimQueued = !!(claimRes.success && claimRes.data && claimRes.data.status === 'pending_review');
 
             if (claimRes.success && claimRes.data) {
               var autoClaimId = claimRes.data.claimId;
@@ -2955,12 +2975,20 @@
             console.error('Auto-claim failed:', autoClaimErr);
           }
 
-          // Fallback: if auto-claim failed, show manual instructions
-          showAlert('regAlert',
-            '<strong style="font-size:1.1rem;">Agenten «' + escHtml(name) + '» er registrert!</strong>' +
-            '<br><br><strong>Neste steg:</strong> Søk opp «' + escHtml(name) + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
-            '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
-            'success', true);
+          if (claimQueued) {
+            showAlert('regAlert',
+              '<strong style="font-size:1.1rem;">Agenten «' + escHtml(name) + '» er registrert!</strong>' +
+              '<br><br>Kravet ditt om eierskap er sendt til manuell godkjenning, og vi kontakter deg på e-post.' +
+              '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
+              'success', true);
+          } else {
+            // Fallback: if auto-claim failed, show manual instructions
+            showAlert('regAlert',
+              '<strong style="font-size:1.1rem;">Agenten «' + escHtml(name) + '» er registrert!</strong>' +
+              '<br><br><strong>Neste steg:</strong> Søk opp «' + escHtml(name) + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
+              '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
+              'success', true);
+          }
 
           document.getElementById('regAlert').scrollIntoView({ behavior: 'smooth', block: 'center' });
 

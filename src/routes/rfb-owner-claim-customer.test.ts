@@ -81,11 +81,13 @@ export async function runRfbOwnerClaimCustomerTests(opts: { log?: boolean } = {}
       insA.run(id, `Gård ${id}`, `post@${id}.gard-test.no`, `key-${id}`, o.claimedAt ?? null, o.claimedVia ?? null, o.origin ?? "discovery");
       insK.run(id, `post@${id}.gard-test.no`, GOOD_ABOUT, `2026-01-01 00:00:${String(seq % 60).padStart(2, "0")}`);
     }
+    // A code_sent claim carries the farm address its code went to (decision
+    // 11=A: verifyClaim accepts only such codes) — the listed one from seed().
     function claim(id: string, agentId: string, status: string, verifiedAt: string | null, code = "123456"): void {
       db.prepare(
-        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, verification_code, status, source, expires_at, created_at, verified_at)
-         VALUES (?, ?, 'Eier', ?, ?, ?, 'organic', datetime('now','+7 days'), '2026-07-20T00:00:00.000Z', ?)`,
-      ).run(id, agentId, `${agentId}@owner.no`, code, status, verifiedAt);
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, verification_code, status, source, expires_at, created_at, verified_at, code_sent_to)
+         VALUES (?, ?, 'Eier', ?, ?, ?, 'organic', datetime('now','+7 days'), '2026-07-20T00:00:00.000Z', ?, ?)`,
+      ).run(id, agentId, `${agentId}@owner.no`, code, status, verifiedAt, status === "code_sent" ? `post@${agentId}.gard-test.no` : null);
     }
 
     // ── (a)+(b) the rule + the outreach gate ──────────────────────────────
@@ -125,7 +127,7 @@ export async function runRfbOwnerClaimCustomerTests(opts: { log?: boolean } = {}
 
     seed("vc-new");
     claim("c-vc-new", "vc-new", "code_sent", null, "111111");
-    const r1 = knowledgeService.verifyClaim("c-vc-new", "111111");
+    const r1 = knowledgeService.verifyClaim("c-vc-new", "111111", "vc-new");
     ok(r1.success, "(c) verifyClaim succeeds");
     const a1 = agentRow("vc-new");
     ok(!!a1.claimed_at && a1.claimed_via === "claim", "(c) verifyClaim sets claimed_at + claimed_via='claim'");
@@ -134,19 +136,23 @@ export async function runRfbOwnerClaimCustomerTests(opts: { log?: boolean } = {}
 
     seed("vc-old", { claimedAt: "2026-02-02T00:00:00.000Z", claimedVia: "admin" });
     claim("c-vc-old", "vc-old", "code_sent", null, "222222");
-    knowledgeService.verifyClaim("c-vc-old", "222222");
+    // Decision 11=A: claimed_at set means the profile has an owner, so the
+    // right code sends this claim to the admin queue; approving it still must
+    // not overwrite the existing stamp.
+    knowledgeService.verifyClaim("c-vc-old", "222222", "vc-old");
+    knowledgeService.approveClaimReview("c-vc-old");
     const a2 = agentRow("vc-old");
     eq([a2.claimed_at, a2.claimed_via], ["2026-02-02T00:00:00.000Z", "admin"], "(c) verifyClaim does not overwrite existing claimed_at/claimed_via");
 
     seed("vc-self", { origin: "self_registered" });
     claim("c-vc-self", "vc-self", "code_sent", null, "333333");
-    knowledgeService.verifyClaim("c-vc-self", "333333");
+    knowledgeService.verifyClaim("c-vc-self", "333333", "vc-self");
     const a3 = agentRow("vc-self");
     ok(!!a3.claimed_at && a3.is_verified === 0, "(c) self_registered: claimed_at set, badge still withheld");
 
     seed("vc-bad");
     claim("c-vc-bad", "vc-bad", "code_sent", null, "444444");
-    knowledgeService.verifyClaim("c-vc-bad", "999999");
+    knowledgeService.verifyClaim("c-vc-bad", "999999", "vc-bad");
     eq(agentRow("vc-bad").claimed_at, null, "(c) wrong code -> claimed_at untouched");
 
     // ── (d) backfill route ────────────────────────────────────────────────

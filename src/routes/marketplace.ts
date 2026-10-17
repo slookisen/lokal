@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type ClaimRateLimitScope } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -42,6 +42,10 @@ import {
 import { randomUUID } from "crypto";
 import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+// Decision 11=A: the claim response shows the farm address masked, the same
+// helper the Opplevagent claim page uses; per-IP limit on claim requests.
+import { maskEmail } from "../services/gardssalg-claim";
+import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
@@ -1664,19 +1668,99 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 
 // ═══════════════════════════════════════════════════════════════
 // CLAIM SYSTEM — Sellers take ownership of their agent
-// Flow:
-//   1. POST /agents/:id/claim         → Request claim (get verification code)
+// Flow (decision 11=A, dev-request 2026-10-17-rfb-claim-verifisering-mot-
+// kjent-kontakt; the rule is documented in knowledge-service.ts):
+//   1. POST /agents/:id/claim         → code to the FARM's own e-mail, or the
+//                                        claim waits in the admin queue
 //   2. POST /agents/:id/claim/verify  → Submit code → get claim token
 //   3. PUT  /agents/:id/knowledge     → Update info (with claim token)
+// A queued claim gets its token only through POST /admin/agents/claim-review-
+// approve (routes/admin-agents.ts).
 // ═══════════════════════════════════════════════════════════════
+
+/**
+ * May a DRY_RUN claim code be put in the response? Only off production:
+ * never with NODE_ENV=production and never on Fly (FLY_APP_NAME), whatever
+ * else is set — a production deploy without SMTP must not hand out codes
+ * (finding rfb-claim-kode-i-svaret-ved-dry-run).
+ */
+export function mayReturnDevClaimCode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_ENV !== "production" && !(env.FLY_APP_NAME ?? "").trim();
+}
+
+const CLAIM_QUEUED_MESSAGES: Record<ClaimReviewReason, string> = {
+  no_known_email: "Profilen har ingen kjent e-postadresse vi kan sende koden til. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+  listed_email_wrong: "Takk for beskjeden om e-postadressen. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+  has_owner: "Profilen har allerede en eier. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+};
+
+// The claimId of a sent code lives only in the requester's browser, so the
+// per-profile answer points to the queue, never to "use the code".
+const CLAIM_RATE_LIMITED_MESSAGES: Record<ClaimRateLimitScope, string> = {
+  profile: "Det er nylig sendt en kode til gårdens e-post, og en ny kode kan ikke sendes ennå. Har du ikke tilgang til den e-posten, eller er adressen på profilen feil? Kryss av for «E-postadressen som står på profilen er feil eller utdatert», så går kravet til manuell godkjenning.",
+  platform: "Det er sendt mange koder akkurat nå. Prøv igjen om en time.",
+  review_profile: "Det ligger allerede flere krav på denne profilen til manuell godkjenning. Vi går gjennom dem og tar kontakt. Prøv igjen senere.",
+  review_platform: "Det har kommet mange krav til manuell godkjenning akkurat nå. Prøv igjen om en time.",
+};
+
+const CLAIM_REVIEW_REASON_LABELS: Record<ClaimReviewReason, string> = {
+  no_known_email: "profilen har ingen kjent e-postadresse",
+  listed_email_wrong: "den som krever, sier at e-postadressen på profilen er feil",
+  has_owner: "profilen har allerede en eier",
+};
+
+/** Caps on what the public claim form may store — an unauthenticated write,
+ *  so no field may grow agent_claims without bound. */
+const CLAIM_FIELD_MAX_LENGTH = { name: 200, email: EMAIL_ADDRESS_MAX_LENGTH, phone: 40, source: 64 } as const;
+
+/** Why a POST /agents/:id/claim body is refused (400), or null. The lengths
+ *  are checked before the address shape, so that check only sees a short
+ *  string. phone and source are optional strings. */
+function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unknown; source: unknown }): string | null {
+  const max = CLAIM_FIELD_MAX_LENGTH;
+  const optional = (v: unknown, limit: number) => v === undefined || v === null || (typeof v === "string" && v.length <= limit);
+  if (typeof b.name !== "string" || b.name.length > max.name) return `Ugyldig navn (maks ${max.name} tegn)`;
+  if (typeof b.email !== "string" || b.email.length > max.email || !isSingleEmailAddress(normalizeEmail(b.email))) {
+    return "Ugyldig e-postadresse";
+  }
+  if (!optional(b.phone, max.phone)) return `Ugyldig telefonnummer (maks ${max.phone} tegn)`;
+  if (!optional(b.source, max.source)) return `Ugyldig kilde (maks ${max.source} tegn)`;
+  return null;
+}
+
+/** Tells the admin (ADMIN_NOTIFICATION_EMAIL) that a claim entered the admin
+ *  queue. Fire-and-forget, like the verified-claim notice below; the queue's
+ *  own caps bound how often it fires. */
+function notifyAdminClaimQueued(claimId: string): void {
+  try {
+    const row = getDb().prepare(
+      `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, a.name AS agent_name
+         FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
+    ).get(claimId) as { agent_id: string; claimant_name: string; claimant_email: string; review_reason: ClaimReviewReason | null; agent_name: string } | undefined;
+    if (!row) return;
+    const reason = row.review_reason ? CLAIM_REVIEW_REASON_LABELS[row.review_reason] ?? row.review_reason : "ukjent";
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason)
+      .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
+  } catch (err: any) {
+    console.error("[Admin notify] claim-review notice error:", err?.message);
+  }
+}
 
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
 
-router.post("/agents/:id/claim", async (req: Request, res: Response) => {
-  const { name, email, phone, source } = req.body;
+router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, res: Response) => {
+  const { name, email, phone, source, listedEmailWrong } = req.body ?? {};
   const agentId = req.params.id as string;
   if (!name || !email) {
     res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
+    return;
+  }
+  // Every field is capped (an unauthenticated write). The address is stored
+  // and, after an admin approval, receives the login link — so it has to be
+  // one address.
+  const fieldError = claimRequestFieldError({ name, email, phone, source });
+  if (fieldError) {
+    res.status(400).json({ success: false, error: fieldError });
     return;
   }
 
@@ -1692,7 +1776,28 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
       claimantEmail: email,
       claimantPhone: phone,
       source: source || 'organic',
+      listedEmailWrong: listedEmailWrong === true,
     });
+
+    if (result.kind === "already_owner") {
+      res.status(400).json({ success: false, error: "Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post." });
+      return;
+    }
+    if (result.kind === "rate_limited") {
+      res.status(429).json({ success: false, error: CLAIM_RATE_LIMITED_MESSAGES[result.scope] });
+      return;
+    }
+    if (result.kind === "queued") {
+      // No code and no token: Daniel decides in the admin queue, and is told
+      // once per new entry (not on a repeat of the same claimant).
+      if (result.created) notifyAdminClaimQueued(result.claimId);
+      res.status(202).json({
+        success: true,
+        message: CLAIM_QUEUED_MESSAGES[result.reason],
+        data: { claimId: result.claimId, status: "pending_review", reason: result.reason },
+      });
+      return;
+    }
 
     // Get agent name for the email
     // dev-request 2026-08-03-mikhailo-quarantine-gates: claim-email bookkeeping,
@@ -1704,41 +1809,61 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
     const agent = agents.find((a: any) => a.id === agentId);
     const agentName = agent?.name || "Ukjent produsent";
 
-    // Send verification code via email (graceful fallback if SMTP not configured)
-    const emailResult = await emailService.sendVerificationCode(email, result.verificationCode, agentName);
+    // The code goes to the farm's own address, never to the typed `email`
+    // (unless that IS the farm's address).
+    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agentName);
+    const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
+    const returnDevCode = dryRun && mayReturnDevClaimCode();
+    if (!emailResult.success || (dryRun && !returnDevCode)) {
+      // Nothing reached the farm (a send error, or SMTP not set up in
+      // production): the claim is expired and the farm may ask again.
+      knowledgeService.markClaimCodeUnsent(result.claimId);
+      res.status(502).json({ success: false, error: "Vi fikk ikke sendt koden nå. Prøv igjen senere, eller kontakt oss." });
+      return;
+    }
 
-    // Build response — include code in dev/dry-run mode, hide in production
-    const responseData: any = { claimId: result.claimId };
-    if (emailResult.messageId === "DRY_RUN") {
-      // SMTP not configured — return code in response so dev/testing still works
+    // The recipient is shown masked, never in full.
+    const sentTo = maskEmail(result.recipient);
+    const responseData: any = { claimId: result.claimId, status: "code_sent", sentTo, expiresInHours: CLAIM_CODE_VALID_HOURS };
+    if (returnDevCode) {
+      // SMTP not configured off production — return code in response so dev/testing still works
       responseData.verificationCode = result.verificationCode;
       responseData._note = "E-post ikke konfigurert. Koden vises kun i testmodus.";
     }
 
     res.json({
       success: true,
-      message: emailResult.messageId === "DRY_RUN"
+      message: returnDevCode
         ? "Verifiseringskode generert (e-post ikke aktiv ennå)."
-        : `Verifiseringskode sendt til ${email}.`,
+        : `Verifiseringskode sendt til gårdens e-post ${sentTo}.`,
       data: responseData,
     });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: err.message });
+    // The detail (e.g. an SQLite constraint message) is logged, not returned:
+    // it says nothing a claimant can act on.
+    console.error(`[claim] request for agent ${agentId} failed:`, err?.message ?? err);
+    res.status(500).json({ success: false, error: "Noe gikk galt med kravet. Prøv igjen senere, eller kontakt oss." });
   }
 });
 
 // ─── POST /agents/:id/claim/verify — Verify claim ──────────
 
 router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
-  const { claimId, code } = req.body;
+  const { claimId, code } = req.body ?? {};
   const agentId = req.params.id as string;
-  if (!claimId || !code) {
+  if (!claimId || !code || typeof claimId !== "string") {
     res.status(400).json({ success: false, error: "claimId og code er påkrevd" });
     return;
   }
 
-  const result = knowledgeService.verifyClaim(claimId, code);
+  // Bound to :id — a claim on another profile is not found (decision 11=A hardening).
+  const result = knowledgeService.verifyClaim(claimId, code, agentId);
   if (!result.success) {
+    if (result.status === "pending_review") {
+      if (result.queued) notifyAdminClaimQueued(claimId);
+      res.status(409).json({ success: false, error: result.error, data: { claimId, status: "pending_review" } });
+      return;
+    }
     res.status(400).json({ success: false, error: result.error });
     return;
   }

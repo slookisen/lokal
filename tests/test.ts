@@ -48017,6 +48017,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt (decision
+// 11=A): the claim code goes only to the farm's own e-mail, else the admin
+// queue; one code per profile per 24 h, platform cap, 5 wrong codes, verify
+// bound to :id, no code in a production response, the status-CHECK rebuild.
+// Pins the getDb() singleton to its own in-memory DB and stubs the e-mail
+// transporter (both restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt: RFB claim rule 11=A ──");
+  try {
+    const { runRfbClaimKjentKontaktTests } = require("../src/routes/rfb-claim-kjent-kontakt.test") as
+      typeof import("../src/routes/rfb-claim-kjent-kontakt.test");
+    const ck = await runRfbClaimKjentKontaktTests({ log: false });
+    passed += ck.passed;
+    failed += ck.failed;
+    for (const f of ck.failures) failures.push("rfb-claim-kjent-kontakt: " + f);
+    console.log(`  rfb-claim-kjent-kontakt: ${ck.passed} passed, ${ck.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-kjent-kontakt: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-01-rfb-contact-extraction-laas-henger: run-locks of
 // POST /admin/rfb-contact-extraction and /admin/gardssalg-contact-extraction
 // carry { startedAt, runId } with an upper bound (stale takeover, runId-guarded

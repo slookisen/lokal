@@ -4,6 +4,8 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription, normalizeProse } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
+import { normalizeEmail } from "./blocklist-service";
+import { customerRuleSql } from "./customer-rule";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -361,6 +363,131 @@ export function productsWriteError(products: unknown): KnowledgeFieldError | nul
   return null;
 }
 
+// ─── Claim rule: decision 11=A ───────────────────────────────────────────
+// Daniel 2026-10-17 (daniel-responses/2026-10-17-live-del-a-gjort-og-
+// beslutninger-1-11.md, decision 11), dev-request 2026-10-17-rfb-claim-
+// verifisering-mot-kjent-kontakt. Before this rule the code went to whatever
+// `email` the claimant typed, so anyone could become a farm's "owner", get
+// the "Verifisert av eier" badge and change its contact fields.
+//   1. The code goes ONLY to the farm's own e-mail (resolveFarmContactEmail).
+//      The address the claimant types gets it only when it IS that address.
+//   2. No farm e-mail, or the claimant says the listed one is wrong → the
+//      claim waits in the admin queue (status 'pending_review'): no code, no
+//      token, no badge, no write access until Daniel approves it.
+//   3. The profile already has an owner (customerRuleSql) → always the admin
+//      queue, also when the e-mail matches. The owner keeps token and access;
+//      no claim row is deleted any more.
+//   4. At most ONE code per profile per rolling 24 h, whoever asks.
+// Hardening A needs, now that guessing the code sent to the farm's inbox is
+// the way in: a crypto code that lives 24 h (was Math.random(), 7 days), 5
+// wrong tries expire the claim, verify is bound to the profile id, and a
+// platform-wide hourly cap on code sends — one code per profile alone would
+// still let the form mail hundreds of producers. The admin queue is bounded
+// the same way, not by IP: a few open entries per profile and a platform-wide
+// hourly cap on new entries, so the public form can neither grow agent_claims
+// without limit nor bury real claims in Daniel's queue. The per-IP limit is
+// rfbClaimRequestLimiter (middleware/security.ts).
+export const CLAIM_CODE_VALID_HOURS = 24;
+const CLAIM_TOKEN_VALID_MS = 30 * 24 * 60 * 60 * 1000;
+/** RFC 5321's limit on an address; isSingleEmailAddress refuses longer. */
+export const EMAIL_ADDRESS_MAX_LENGTH = 254;
+// Defaults of claimLimits(); each is also the name of the env var that sets it.
+/** Wrong codes per claim; the last one expires the claim. */
+export const CLAIM_CODE_MAX_FAILED_ATTEMPTS = 5;
+/** Rolling window in which one profile gets at most one code (rule 4). */
+export const CLAIM_CODE_PROFILE_WINDOW_HOURS = 24;
+/** Code sends across all profiles per rolling hour. */
+export const CLAIM_CODE_SENDS_PER_HOUR_MAX = 10;
+/** Open admin-queue entries per profile. */
+export const CLAIM_REVIEW_OPEN_PER_PROFILE_MAX = 3;
+/** New admin-queue entries across all profiles per rolling hour. */
+export const CLAIM_REVIEW_INSERTS_PER_HOUR_MAX = 20;
+/** Most entries GET /admin/agents/claim-review-queue returns (oldest first). */
+export const CLAIM_REVIEW_QUEUE_LIST_MAX = 200;
+
+export interface ClaimLimits {
+  maxFailedAttempts: number;
+  profileWindowHours: number;
+  codeSendsPerHourMax: number;
+  reviewOpenPerProfileMax: number;
+  reviewInsertsPerHourMax: number;
+}
+
+function intEnv(env: NodeJS.ProcessEnv, name: string, dflt: number, min: number, max: number): number {
+  const raw = String(env[name] ?? "").trim();
+  if (!/^\d+$/.test(raw)) return dflt;
+  return Math.min(max, Math.max(min, Number.parseInt(raw, 10)));
+}
+
+/**
+ * The claim limits, read from env on every call (unset or junk → the
+ * default). The two decision 11=A sets — one code per profile per 24 h and 5
+ * wrong codes — are clamped so env can only make them stricter.
+ */
+export function claimLimits(env: NodeJS.ProcessEnv = process.env): ClaimLimits {
+  return {
+    maxFailedAttempts: intEnv(env, "CLAIM_CODE_MAX_FAILED_ATTEMPTS", CLAIM_CODE_MAX_FAILED_ATTEMPTS, 1, CLAIM_CODE_MAX_FAILED_ATTEMPTS),
+    profileWindowHours: intEnv(env, "CLAIM_CODE_PROFILE_WINDOW_HOURS", CLAIM_CODE_PROFILE_WINDOW_HOURS, CLAIM_CODE_PROFILE_WINDOW_HOURS, 7 * 24),
+    codeSendsPerHourMax: intEnv(env, "CLAIM_CODE_SENDS_PER_HOUR_MAX", CLAIM_CODE_SENDS_PER_HOUR_MAX, 1, 100),
+    reviewOpenPerProfileMax: intEnv(env, "CLAIM_REVIEW_OPEN_PER_PROFILE_MAX", CLAIM_REVIEW_OPEN_PER_PROFILE_MAX, 1, 20),
+    reviewInsertsPerHourMax: intEnv(env, "CLAIM_REVIEW_INSERTS_PER_HOUR_MAX", CLAIM_REVIEW_INSERTS_PER_HOUR_MAX, 1, 200),
+  };
+}
+
+/** Why a claim waits in the admin queue (agent_claims.review_reason). */
+export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_owner";
+
+/** Which limit refused a request: a code send (rule 4 / the platform cap) or
+ *  a new admin-queue entry (per profile / the platform cap). */
+export type ClaimRateLimitScope = "profile" | "platform" | "review_profile" | "review_platform";
+
+export type ClaimRequestResult =
+  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string }
+  /** `created` is false when the claimant's own open entry is returned. */
+  | { kind: "queued"; claimId: string; reason: ClaimReviewReason; created: boolean }
+  | { kind: "rate_limited"; scope: ClaimRateLimitScope }
+  /** The address is this profile's owner's own: log in by e-mail instead. */
+  | { kind: "already_owner" };
+
+export interface ClaimReviewEntry {
+  claim_id: string;
+  agent_id: string;
+  agent_name: string | null;
+  /** The profile's listed contact e-mail now (public). */
+  listed_email: string | null;
+  claimant_name: string;
+  claimant_email: string;
+  claimant_phone: string | null;
+  reason: ClaimReviewReason;
+  /** Set only when the claimant entered the right code sent to this farm address
+   *  and the claim was queued because the profile got an owner meanwhile. */
+  proven_email: string | null;
+  /** 1 when the profile has an owner now (customer rule). */
+  has_owner: number;
+  source: string | null;
+  created_at: string;
+}
+
+/** One plausible address and nothing else (a listed field can hold two
+ *  addresses or prose). A shape check, not RFC validation: delivery is what
+ *  proves an address. Linear on any input: the length is checked first, and
+ *  the domain labels exclude the dot, so each character has one place in the
+ *  pattern (a domain class that also took '.' backtracked quadratically —
+ *  "a@" + "."×200k held the event loop for ~24 s). */
+export function isSingleEmailAddress(value: string): boolean {
+  return value.length <= EMAIL_ADDRESS_MAX_LENGTH &&
+    /^[^\s@,;:<>()]+@[^\s@,;:<>().]+(?:\.[^\s@,;:<>().]+)+$/.test(value);
+}
+
+/** Constant-time compare of the stored code with the one entered. */
+function claimCodeMatches(stored: unknown, entered: unknown): boolean {
+  const given = typeof entered === "number" ? String(entered) : entered;
+  if (typeof stored !== "string" || typeof given !== "string") return false;
+  const a = Buffer.from(stored);
+  const b = Buffer.from(given.trim());
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 class KnowledgeService {
 
   // ─── Get knowledge for an agent ──────────────────────────
@@ -662,6 +789,8 @@ class KnowledgeService {
   }
 
   // ─── Claim system ──────────────────────────────────────
+  // Who may become a profile's owner: decision 11=A, see the block above the
+  // class (CLAIM_CODE_* constants).
 
   isAgentClaimed(agentId: string): boolean {
     const db = getDb();
@@ -671,48 +800,167 @@ class KnowledgeService {
     return row.c > 0;
   }
 
+  /** Rule 3's "already has an owner": the shared customer rule (claimed_at
+   *  set, or a verified claim) — one definition, services/customer-rule.ts. */
+  private agentHasOwner(agentId: string): boolean {
+    const row = getDb().prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+      .get(agentId) as { owned: number } | undefined;
+    return !!row?.owned;
+  }
+
+  /**
+   * The farm's own e-mail — the only address a claim code may go to (rule 1).
+   * In this order:
+   *   (a) the contact e-mail listed on the profile (agent_knowledge.email, the
+   *       one shown publicly);
+   *   (b) else an address the platform delivered e-mail to for this profile
+   *       without a bounce: outreach_sent_log for the agent_id and no
+   *       email_bounces row — the RFB twin of wasEpostDeliveredOutreachNoBounce()
+   *       in gardssalg-claim.ts.
+   * Never an address derived from a domain (Daniel 2026-08-06: never guess an
+   * e-mail address). null → the claim goes to the admin queue. Returned
+   * normalized (trim + lower case) like createMagicLink's lookup, so the
+   * owner's e-mail login reaches the same inbox.
+   */
+  resolveFarmContactEmail(agentId: string): string | null {
+    const db = getDb();
+    const listed = db.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as
+      { email: string | null } | undefined;
+    const listedEmail = normalizeEmail(listed?.email);
+    if (isSingleEmailAddress(listedEmail)) return listedEmail;
+    try {
+      const delivered = db.prepare(
+        `SELECT LOWER(TRIM(o.recipient_email)) AS email
+           FROM outreach_sent_log o
+          WHERE o.agent_id = ? AND o.vertical_id = 'rfb' AND o.recipient_email IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM email_bounces b WHERE LOWER(TRIM(b.email)) = LOWER(TRIM(o.recipient_email)))
+          ORDER BY o.sent_at DESC, o.id DESC`
+      ).all(agentId) as Array<{ email: string }>;
+      return delivered.map((r) => r.email).find(isSingleEmailAddress) ?? null;
+    } catch (err) {
+      // Fails closed: no farm address proven → admin queue, never a code.
+      console.warn(`[claim] delivered-outreach lookup failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * A claim request under decision 11=A:
+   *   - "already_owner": the address is the owner's own (as before): that
+   *     owner logs in by e-mail instead;
+   *   - "queued": the claim waits in the admin queue (rule 2 or 3); one open
+   *     entry per claimant and profile, a repeat returns it;
+   *   - "rate_limited": nothing is written — a code went to this profile in
+   *     the window (rule 4) or the platform's hourly code cap is reached, or,
+   *     for a new queue entry, the profile's open entries or the platform's
+   *     hourly entries are at their cap (claimLimits);
+   *   - "code_sent": a new code for `recipient`, the farm's own address. The
+   *     caller sends it; if that fails it calls markClaimCodeUnsent().
+   */
   requestClaim(agentId: string, opts: {
     claimantName: string;
     claimantEmail: string;
     claimantPhone?: string;
     source?: string;
-  }): { claimId: string; verificationCode: string } {
+    /** The claimant says the profile's listed address is wrong or outdated. */
+    listedEmailWrong?: boolean;
+  }): ClaimRequestResult {
     const db = getDb();
-    const id = uuid();
-    const code = this.generateVerificationCode();
-    const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+    const claimantEmail = normalizeEmail(opts.claimantEmail);
+    const limits = claimLimits();
+    // Claims matching `where` created in the last `hours`. created_at is
+    // ISO-8601 ("…T…Z") while datetime('now', …) is "… …", so both go through
+    // datetime() — a bare string compare would count the whole UTC day (see
+    // isClaimRateLimited in gardssalg-claim.ts). Each `where` is its own
+    // prepared statement, so the per-profile ones use the agent_id index.
+    const createdSince = (where: string, hours: number, ...params: unknown[]): number => (db.prepare(
+      `SELECT COUNT(*) AS n FROM agent_claims
+        WHERE ${where} AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
+    ).get(...params, hours) as { n: number }).n;
+    return db.transaction((): ClaimRequestResult => {
+      // Check if this specific email already has a verified claim on this agent
+      const existingClaim = db.prepare(
+        "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'verified'"
+      ).get(agentId, claimantEmail) as any;
+      if (existingClaim.c > 0) return { kind: "already_owner" };
 
-    // Check if this specific email already has a verified claim on this agent
-    const existingClaim = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND claimant_email = ? AND status = 'verified'"
-    ).get(agentId, opts.claimantEmail) as any;
-    if (existingClaim.c > 0) {
-      throw new Error("Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post.");
-    }
+      const farmEmail = this.resolveFarmContactEmail(agentId);
+      const hasOwner = this.agentHasOwner(agentId);
+      const now = new Date().toISOString();
 
-    // Clear any stale pending claims (since email isn't implemented yet,
-    // users can't complete old claims — let them try again)
-    db.prepare(
-      "DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')"
-    ).run(agentId);
+      if (hasOwner || !farmEmail || opts.listedEmailWrong) {
+        const reason: ClaimReviewReason = hasOwner ? "has_owner" : !farmEmail ? "no_known_email" : "listed_email_wrong";
+        const open = db.prepare(
+          "SELECT id, review_reason FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'pending_review' LIMIT 1"
+        ).get(agentId, claimantEmail) as { id: string; review_reason: ClaimReviewReason } | undefined;
+        if (open) return { kind: "queued", claimId: open.id, reason: open.review_reason, created: false };
+        // Bounds that do not depend on the client's IP: open entries on this
+        // profile, and new entries platform-wide in the last hour (every
+        // entry has review_reason, also one queued at verify time).
+        const openOnProfile = (db.prepare(
+          "SELECT COUNT(*) AS n FROM agent_claims WHERE agent_id = ? AND status = 'pending_review'"
+        ).get(agentId) as { n: number }).n;
+        if (openOnProfile >= limits.reviewOpenPerProfileMax) return { kind: "rate_limited", scope: "review_profile" };
+        if (createdSince("review_reason IS NOT NULL", 1) >= limits.reviewInsertsPerHourMax) {
+          return { kind: "rate_limited", scope: "review_platform" };
+        }
+        const id = uuid();
+        db.prepare(`
+          INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, status, review_reason, source, created_at)
+          VALUES (?, ?, ?, ?, ?, 'manual', 'pending_review', ?, ?, ?)
+        `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, reason, opts.source || 'organic', now);
+        return { kind: "queued", claimId: id, reason, created: true };
+      }
 
-    db.prepare(`
-      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, source, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?, ?)
-    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now);
+      // Rule 4 and the platform cap count code sends (code_sent_to set).
+      if (createdSince("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) >= 1) {
+        return { kind: "rate_limited", scope: "profile" };
+      }
+      if (createdSince("code_sent_to IS NOT NULL", 1) >= limits.codeSendsPerHourMax) return { kind: "rate_limited", scope: "platform" };
 
-    return { claimId: id, verificationCode: code };
+      // A new code replaces the previous one. Open codes used to be DELETEd
+      // here; now they are marked. Rows from before this rule (no
+      // code_sent_to) are left as they are — verifyClaim refuses them.
+      db.prepare(
+        "UPDATE agent_claims SET status = 'superseded' WHERE agent_id = ? AND status = 'code_sent' AND code_sent_to IS NOT NULL"
+      ).run(agentId);
+
+      const id = uuid();
+      const code = this.generateVerificationCode();
+      const expiresAt = new Date(Date.now() + CLAIM_CODE_VALID_HOURS * 60 * 60 * 1000).toISOString();
+      db.prepare(`
+        INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts)
+        VALUES (?, ?, ?, ?, ?, 'email', ?, 'code_sent', ?, ?, ?, ?, 0)
+      `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now, farmEmail);
+      return { kind: "code_sent", claimId: id, verificationCode: code, recipient: farmEmail };
+    })();
   }
 
-  verifyClaim(claimId: string, code: string): { success: boolean; claimToken?: string; error?: string } {
+  /** The code e-mail was not sent: the claim is expired and gives its place
+   *  in the per-profile and platform counts back (no code reached anyone). */
+  markClaimCodeUnsent(claimId: string): void {
+    getDb().prepare(
+      "UPDATE agent_claims SET status = 'expired', code_sent_to = NULL WHERE id = ? AND status = 'code_sent'"
+    ).run(claimId);
+  }
+
+  verifyClaim(claimId: string, code: unknown, agentId: string): { success: boolean; claimToken?: string; error?: string; status?: string; queued?: boolean } {
     const db = getDb();
     const claim = db.prepare("SELECT * FROM agent_claims WHERE id = ?").get(claimId) as any;
 
-    if (!claim) return { success: false, error: "Claim not found" };
+    // A claim on another profile is answered exactly like an unknown one.
+    if (!claim || claim.agent_id !== agentId) return { success: false, error: "Claim not found" };
     if (claim.status === "verified") return { success: false, error: "Already verified" };
-    if (claim.status === "expired" || claim.status === "rejected") {
+    if (claim.status === "pending_review") {
+      return { success: false, status: "pending_review", error: "Kravet venter på manuell godkjenning." };
+    }
+    if (claim.status === "expired" || claim.status === "rejected" || claim.status === "superseded") {
       return { success: false, error: `Claim is ${claim.status}` };
+    }
+    // A code from before decision 11=A went to whatever address the claimant
+    // typed, so it is not accepted (the row itself is left as it is).
+    if (!claim.code_sent_to) {
+      return { success: false, error: "Koden er ikke lenger gyldig. Be om en ny kode." };
     }
 
     // Check expiry
@@ -721,20 +969,56 @@ class KnowledgeService {
       return { success: false, error: "Claim has expired" };
     }
 
-    // Verify code
-    if (claim.verification_code !== code) {
-      return { success: false, error: "Invalid verification code" };
+    // Verify code — the last allowed wrong one (claimLimits, 5) expires the
+    // claim, so even the right code no longer works after that. The count is
+    // raised in SQL, never from the value read above.
+    if (!claimCodeMatches(claim.verification_code, code)) {
+      db.prepare(
+        `UPDATE agent_claims
+            SET failed_attempts = COALESCE(failed_attempts, 0) + 1,
+                status = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN 'expired' ELSE status END
+          WHERE id = ? AND status = 'code_sent'`
+      ).run(claimLimits().maxFailedAttempts, claimId);
+      const after = db.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as { status: string } | undefined;
+      return after?.status === "expired"
+        ? { success: false, error: "For mange feil koder. Kravet er utløpt – be om en ny kode." }
+        : { success: false, error: "Invalid verification code" };
     }
 
+    // Rule 3 holds at verify time too: if the profile got an owner after the
+    // code was sent (an admin approval), the claim goes to the admin queue.
+    // `queued` marks the move, so the caller tells the admin once.
+    if (this.agentHasOwner(agentId)) {
+      db.prepare("UPDATE agent_claims SET status = 'pending_review', review_reason = 'has_owner' WHERE id = ?").run(claimId);
+      return { success: false, status: "pending_review", queued: true, error: "Profilen har fått en eier i mellomtiden. Kravet er sendt til manuell godkjenning." };
+    }
+
+    const claimToken = db.transaction(() => this.grantClaimOwnership(claim, claim.code_sent_to, "claim"))();
+    return { success: true, claimToken };
+  }
+
+  /**
+   * Makes a claim the profile's owner: status 'verified', a new 30-day claim
+   * token, and claimant_email = `ownerEmail` — the farm address the code went
+   * to, or the address Daniel approved — so e-mail login (createMagicLink)
+   * reaches that inbox. The address the claimant typed is kept for audit in
+   * claimant_email_typed. Shared by verifyClaim and approveClaimReview, so the
+   * badge gate and the owner stamp below are the same on both paths.
+   */
+  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | "admin_approval"): string {
+    const db = getDb();
+    const claimId = claim.id;
     // Success — generate claim token for future management (expires in 30 days)
     const claimToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
     const now = new Date().toISOString();
-    const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const tokenExpiry = new Date(Date.now() + CLAIM_TOKEN_VALID_MS).toISOString();
 
+    // SET reads the row as it was, so claimant_email_typed gets the typed address.
     db.prepare(`
-      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?
+      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?,
+             claimant_email_typed = COALESCE(claimant_email_typed, claimant_email), claimant_email = ?
       WHERE id = ?
-    `).run(claimToken, tokenExpiry, now, claimId);
+    `).run(claimToken, tokenExpiry, now, ownerEmail, claimId);
 
     // ─── dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 2) ──────────
     // Mark agent as verified — EXCEPT when the agent's own registration is
@@ -762,6 +1046,9 @@ class KnowledgeService {
     // A discovery-origin (or any legacy/NULL-defaulted, pre-migration) row is
     // BYTE-IDENTICAL to pre-gate behaviour: the UPDATE below fires
     // unconditionally whenever origin !== 'self_registered'.
+    //
+    // Decision 11=A: an admin-approved claim (approveClaimReview) passes this
+    // same gate — approving a claim does not give a self_registered row the badge.
     const claimedAgent = db.prepare("SELECT origin FROM agents WHERE id = ?").get(claim.agent_id) as
       { origin: string | null } | undefined;
     if (claimedAgent?.origin !== "self_registered") {
@@ -777,11 +1064,13 @@ class KnowledgeService {
     // set by an earlier claim). Applies to self_registered rows too — the
     // ownership is real even though the public badge is withheld above.
     // agent_claims carries no user id, so claimed_by_user_id is left alone.
+    // claimed_via is 'claim' for the code path, 'admin_approval' for a claim
+    // Daniel approved from the admin queue (decision 11=A).
     db.prepare(`
       UPDATE agents
-         SET claimed_at = ?, claimed_via = COALESCE(claimed_via, 'claim')
+         SET claimed_at = ?, claimed_via = COALESCE(claimed_via, ?)
        WHERE id = ? AND claimed_at IS NULL
-    `).run(now, claim.agent_id);
+    `).run(now, claimedVia, claim.agent_id);
 
     // Update knowledge data_source
     const knowledge = this.getKnowledge(claim.agent_id);
@@ -790,7 +1079,75 @@ class KnowledgeService {
         .run(claim.agent_id);
     }
 
-    return { success: true, claimToken };
+    return claimToken;
+  }
+
+  // ─── Admin queue (decision 11=A, rules 2 and 3) ─────────────────────────
+  // Read and decided through GET /admin/agents/claim-review-queue and POST
+  // /admin/agents/claim-review-approve|-reject (routes/admin-agents.ts).
+
+  /** Claims waiting for Daniel, oldest first: at most `limit` entries, and
+   *  `total` waiting in all. */
+  listClaimReviewQueue(limit: number = CLAIM_REVIEW_QUEUE_LIST_MAX): { total: number; entries: ClaimReviewEntry[] } {
+    const db = getDb();
+    const total = (db.prepare(
+      "SELECT COUNT(*) AS n FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.status = 'pending_review'"
+    ).get() as { n: number }).n;
+    const entries = db.prepare(`
+      SELECT c.id AS claim_id, c.agent_id, a.name AS agent_name, k.email AS listed_email,
+             c.claimant_name, c.claimant_email, c.claimant_phone, c.review_reason AS reason,
+             c.code_sent_to AS proven_email, ${customerRuleSql("a")} AS has_owner,
+             c.source, c.created_at
+        FROM agent_claims c
+        JOIN agents a ON a.id = c.agent_id
+        LEFT JOIN agent_knowledge k ON k.agent_id = c.agent_id
+       WHERE c.status = 'pending_review'
+       ORDER BY c.created_at ASC, c.id ASC
+       LIMIT ?
+    `).all(limit) as ClaimReviewEntry[];
+    return { total, entries };
+  }
+
+  /**
+   * Approves a queued claim: it becomes an owner (grantClaimOwnership — the
+   * badge follows the quarantine gate, claimed_via = 'admin_approval') bound
+   * to `approvedEmail`. When none is passed: the farm address the claimant
+   * proved with the right code (proven_email — a claim queued at verify time
+   * because the profile got an owner meanwhile), else the address the
+   * claimant gave. An existing owner keeps its own claim and token. The
+   * caller sends the login link to `email`.
+   */
+  approveClaimReview(claimId: string, approvedEmail?: string):
+    | { ok: true; agentId: string; email: string; isVerified: boolean }
+    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" } {
+    const db = getDb();
+    const claim = db.prepare("SELECT id, agent_id, status, claimant_email, code_sent_to FROM agent_claims WHERE id = ?").get(claimId) as
+      { id: string; agent_id: string; status: string; claimant_email: string; code_sent_to: string | null } | undefined;
+    if (!claim || !db.prepare("SELECT 1 FROM agents WHERE id = ?").get(claim.agent_id)) return { ok: false, error: "not_found" };
+    if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
+    const email = normalizeEmail(approvedEmail ?? claim.code_sent_to ?? claim.claimant_email);
+    if (!isSingleEmailAddress(email)) return { ok: false, error: "invalid_email" };
+    db.transaction(() => {
+      db.prepare("UPDATE agent_claims SET verification_method = 'manual' WHERE id = ?").run(claimId);
+      this.grantClaimOwnership(claim, email, "admin_approval");
+    })();
+    const agent = db.prepare("SELECT is_verified FROM agents WHERE id = ?").get(claim.agent_id) as { is_verified: number } | undefined;
+    return { ok: true, agentId: claim.agent_id, email, isVerified: agent?.is_verified === 1 };
+  }
+
+  /** Rejects a queued claim: status 'rejected' (with Daniel's note); the
+   *  profile is not touched. */
+  rejectClaimReview(claimId: string, note?: string):
+    | { ok: true; agentId: string }
+    | { ok: false; error: "not_found" | "not_pending_review" } {
+    const db = getDb();
+    const claim = db.prepare("SELECT agent_id, status FROM agent_claims WHERE id = ?").get(claimId) as
+      { agent_id: string; status: string } | undefined;
+    if (!claim) return { ok: false, error: "not_found" };
+    if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
+    db.prepare("UPDATE agent_claims SET status = 'rejected', notes = COALESCE(?, notes) WHERE id = ? AND status = 'pending_review'")
+      .run(note ?? null, claimId);
+    return { ok: true, agentId: claim.agent_id };
   }
 
   getClaimByToken(token: string): { agentId: string; claimantName: string; claimantEmail: string } | null {
@@ -911,8 +1268,10 @@ class KnowledgeService {
 
   // ─── Private helpers ─────────────────────────────────────
 
+  // Six digits from the crypto RNG (was Math.random(), finding
+  // rfb-claim-kode-kan-gjettes).
   private generateVerificationCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    return crypto.randomInt(100000, 1000000).toString();
   }
 
   private mergeKnowledge(existing: AgentKnowledge, update: Partial<AgentKnowledge>): AgentKnowledge {
