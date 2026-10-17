@@ -5929,11 +5929,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // opens/closes are clock times as "HH:MM" ("12.00" and the number 10 are
     // "12:00" and "10:00"; stored "HH:MM" is unchanged); an entry whose times
     // are not clock times is left out (it gave "opens": "closed").
+    // I-J: an entry in schema.org's own form whose period is two ISO dates in
+    // order (validFrom/validThrough of utils/opening-hours.ts; Hovdneset Gård,
+    // Fridays 1.7.–31.10.2026) has the validity dates, so it is stated with
+    // them: schema.org's way to give seasonal hours, and the source's own
+    // values. Any other period (text, one end, or dates that are not ISO
+    // dates or out of order) is still left out, as I-H decided.
     const specHours = hoursList.flatMap((h) => {
-      if (!h.days.length || h.period || h.open === undefined || h.close === undefined) return [];
+      const validity = h.validFrom && h.validThrough ? { validFrom: h.validFrom, validThrough: h.validThrough } : null;
+      if (!h.days.length || (h.period && !validity) || h.open === undefined || h.close === undefined) return [];
       const opens = clockTime(h.open);
       const closes = clockTime(h.close);
-      return opens && closes ? [{ days: h.days, opens, closes }] : [];
+      return opens && closes ? [{ days: h.days, opens, closes, validity }] : [];
     });
     if (specHours.length) {
       const schemaDay = (d: number) => `https://schema.org/${WEEKDAY_NAMES.en[d]}`;
@@ -5942,6 +5949,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         "dayOfWeek": h.days.length === 1 ? schemaDay(h.days[0]!) : h.days.map(schemaDay),
         "opens": h.opens,
         "closes": h.closes,
+        ...(h.validity ?? {}),
       }));
     }
 

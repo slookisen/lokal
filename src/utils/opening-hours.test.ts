@@ -30,6 +30,14 @@
  *   (g) the producers of the review's live sample whose hours the page, or
  *       lokal_info and the auto-reply, did not show (their stored values,
  *       2026-10-17): each now has entries with its days and times or text.
+ *   (h) slice I-J (FUNN rfb-apningstider-to-uleste-former): schema.org's
+ *       form ({dayOfWeek, opens, closes, description, validFrom,
+ *       validThrough}; Hovdneset Gård) and {byAppointment: true,
+ *       description} (Små Vesen), with their live values: dayOfWeek as a
+ *       name, a URI or a list; validity as Norwegian dates, ISO dates kept
+ *       only when both are dates in order; "Etter avtale" not said twice;
+ *       neither gives an "open now" claim. Their keys are read only in their
+ *       form: outside it an entry reads as before I-J.
  *
  * Exported runOpeningHoursTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/utils/opening-hours.test.ts
@@ -377,12 +385,112 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
     }
   }
 
+  // ══ (h) I-J: schema.org's form and the byAppointment form ════════════
+  {
+    const n = normalizeOpeningHours;
+    // Stored values from GET /api/marketplace/agents/:id/card, 2026-10-17
+    // (main: no entries for either, so no hours card, no lokal_info line).
+    const hovdneset = [{ dayOfWeek: "Friday", opens: "12:00", closes: "17:00", description: "Grønnsakstor på Rena torg – sesongutsalg, juli–oktober", validFrom: "2026-07-01", validThrough: "2026-10-31" }];
+    const smaVesen = [{ description: "Utsalet i bryggeriet er ope på førespurnad – ring 476 82 708. Elles når det er annonsert på Facebook. Sjølvbetening frå kjøleskåp utanfor døra (alkoholfri drikke og ølglas), betal med Vipps.", byAppointment: true }];
+    assertEq(n(hovdneset), [{
+      days: [4], label: "Friday", open: "12:00", close: "17:00", period: "1.7.–31.10.2026",
+      validFrom: "2026-07-01", validThrough: "2026-10-31", note: "Grønnsakstor på Rena torg – sesongutsalg, juli–oktober",
+    }], "h Hovdneset Gård: Friday 12:00–17:00, the description as note, the validity as period and ISO dates (main: no entry)");
+    assertEq(openingHoursText(hovdneset), "Fre 12:00–17:00 (1.7.–31.10.2026)", "h Hovdneset Gård as text: the period with the times, the note left out as for every timed entry");
+    const hovEntry = n(hovdneset)[0];
+    assertEq(hovEntry && [entryDaysLabel(hovEntry, "no"), entryDaysLabel(hovEntry, "en")], ["Fredag", "Friday"],
+      "h Hovdneset Gård: the day column is \"Fredag\", \"Friday\" on /en");
+    assertEq(n(smaVesen), [{ days: [], label: "", note: `Etter avtale; ${smaVesen[0]!.description}` }],
+      "h Små Vesen: one note-only entry, \"Etter avtale\" and the description (main: no entry)");
+    assertEq(openingHoursText(smaVesen), `Etter avtale; ${smaVesen[0]!.description}`, "h Små Vesen as text");
+
+    // dayOfWeek: a name in any case, schema.org's URI (https or http), a list; the same day tables as every other form.
+    const day = (dayOfWeek: unknown) => n([{ dayOfWeek, opens: "10:00", closes: "14:00" }]).map((e) => [e.days, e.label]);
+    assertEq(day("https://schema.org/Saturday"), [[[5], "Saturday"]], "h dayOfWeek: schema.org's URI is the day (the label is its name)");
+    assertEq(day(" http://schema.org/Sunday "), [[[6], "Sunday"]], "h dayOfWeek: the http URI, trimmed");
+    assertEq(day("HTTPS://SCHEMA.ORG/monday"), [[[0], "monday"]], "h dayOfWeek: the URI in any case");
+    assertEq(day("friday"), [[[4], "friday"]], "h dayOfWeek: a name in lower case");
+    assertEq(day("Fredag"), [[[4], "Fredag"]], "h dayOfWeek: a Norwegian name, as the other forms read it");
+    assertEq(day(["Monday", "https://schema.org/Tuesday", "Wednesday"]), [[[0, 1, 2], "Monday, Tuesday, Wednesday"]], "h dayOfWeek: a list of names and URIs");
+    assertEq(day("https://schema.org/PublicHolidays"), [[[], "PublicHolidays"]], "h dayOfWeek: a DayOfWeek that is no weekday is a label, shown as written");
+    assertEq(day(["Monday", "https://schema.org/PublicHolidays"]), [[[], "Monday, PublicHolidays"]], "h dayOfWeek: a list with a name that is no weekday names none, as {days: [...]}");
+    assertEq(day("https://example.org/Friday"), [[[], "https://example.org/Friday"]], "h dayOfWeek: another site's URI is no weekday");
+    assertEq([day(5), day({ "@id": "https://schema.org/Friday" }), day([5, null])], [[[[], ""]], [[[], ""]], [[[], ""]]],
+      "h dayOfWeek that is not text: no day, the times stay (as a day that is not text)");
+
+    // opens/closes are the times by the rules of the other forms.
+    assertEq(n([{ dayOfWeek: "Saturday", opens: 10, closes: 15 }]), [{ days: [5], label: "Saturday", open: "10", close: "15" }], "h opens/closes: numbers are their digits");
+    assertEq(n([{ dayOfWeek: "Sunday", opens: "closed", closes: "closed" }]), [{ days: [6], label: "Sunday", note: "Stengt" }], "h opens/closes: \"closed\" is a closed day");
+    assertEq(n([{ dayOfWeek: "Friday", opens: "12:00" }, { dayOfWeek: "Friday", closes: "17:00", validFrom: "2026-07-01", validThrough: "2026-10-31" }]), [],
+      "h a lone time says nothing, and a period alone neither: left out, as {period}");
+    assertEq(n([{ dayOfWeek: "Friday", description: "  Kun etter bestilling  " }]), [{ days: [4], label: "Friday", note: "Kun etter bestilling" }],
+      "h description without times is a note-only entry for its day, trimmed");
+    assertEq(n([{ dayOfWeek: "Friday", opens: "12:00", closes: "17:00", description: "   " }, { dayOfWeek: "Friday", opens: "12:00", closes: "17:00", description: 7 }]), [
+      { days: [4], label: "Friday", open: "12:00", close: "17:00" }, { days: [4], label: "Friday", open: "12:00", close: "17:00" },
+    ], "h a blank description, or one that is not text, is no note");
+    assertEq(n([{ dayOfWeek: "Friday", opens: "12:00", closes: "17:00", open: "08:00", close: "09:00", note: "x", period: "April", hours: "01-02", day: "mon" }]),
+      [{ days: [4], label: "Friday", open: "12:00", close: "17:00" }],
+      "h an entry with dayOfWeek reads schema.org's keys only (not mixed with the generic ones)");
+
+    // validFrom/validThrough as the period.
+    const validity = (validFrom: unknown, validThrough: unknown) => {
+      const e = n([{ dayOfWeek: "Friday", opens: "12:00", closes: "17:00", validFrom, validThrough }])[0];
+      return e ? [e.period ?? null, e.validFrom ?? null, e.validThrough ?? null] : "no entry";
+    };
+    assertEq(validity("2026-07-01", "2026-10-31"), ["1.7.–31.10.2026", "2026-07-01", "2026-10-31"], "h validity: within one year, \"1.7.–31.10.2026\"");
+    assertEq(validity("2026-11-01", "2027-03-31"), ["1.11.2026–31.3.2027", "2026-11-01", "2027-03-31"], "h validity: across a new year, both years");
+    assertEq(validity("2026-12-24", "2026-12-24"), ["24.12.2026", "2026-12-24", "2026-12-24"], "h validity: one day");
+    assertEq(validity(" 2026-07-01 ", "2026-10-31"), ["1.7.–31.10.2026", "2026-07-01", "2026-10-31"], "h validity: an ISO date is trimmed");
+    assertEq(validity("2026-07-01", undefined), ["fra 1.7.2026", null, null], "h validity: only the first day, \"fra\"; no ISO dates (JSON-LD needs both)");
+    assertEq(validity(null, "2026-10-31"), ["til 31.10.2026", null, null], "h validity: only the last day, \"til\"");
+    assertEq(validity("juli", "oktober"), ["juli–oktober", null, null], "h validity: text that is no ISO date is shown as written");
+    assertEq(validity("2026-07-01", "oktober"), ["1.7.2026–oktober", null, null], "h validity: one ISO date and one text");
+    assertEq(validity("2026-02-30", "2026-10-31"), ["2026-02-30–31.10.2026", null, null], "h validity: a date that is not in the calendar is not an ISO date");
+    assertEq(validity("2026-10-31", "2026-07-01"), ["31.10.2026–1.7.2026", null, null], "h validity: dates out of order are shown as written, with no ISO dates");
+    assertEq([validity("2026-7-1", "2026-10-31"), validity("2026-07-01T00:00:00Z", "2026-10-31"), validity("0050-01-01", "2026-10-31")],
+      [["2026-7-1–31.10.2026", null, null], ["2026-07-01T00:00:00Z–31.10.2026", null, null], ["0050-01-01–31.10.2026", null, null]],
+      "h validity: only \"YYYY-MM-DD\" is an ISO date (no short form, no time; year 0050 is not read as 1950)");
+    assertEq([validity(undefined, undefined), validity("", "  "), validity(20260701, { d: 1 })], [[null, null, null], [null, null, null], [null, null, null]],
+      "h validity: none, blank or not text is no period");
+
+    // byAppointment: true.
+    assertEq(n([{ byAppointment: true }]), [{ days: [], label: "", note: "Etter avtale" }], "h byAppointment alone is \"Etter avtale\"");
+    assertEq(n([{ byAppointment: true, description: "Åpent etter avtale — ring først" }, { byAppointment: true, description: "By appointment only" }]), [
+      { days: [], label: "", note: "Åpent etter avtale — ring først" }, { days: [], label: "", note: "By appointment only" },
+    ], "h byAppointment: a description that says so already is not prefixed (\"Etter avtale\" not said twice)");
+    assertEq(n([{ byAppointment: true, description: "Ring først", note: "Vipps" }]), [{ days: [], label: "", note: "Etter avtale; Ring først; Vipps" }],
+      "h byAppointment: the description, then a note");
+    assertEq(n([{ byAppointment: true, dayOfWeek: "https://schema.org/Saturday", description: "Ring først" }]), [{ days: [5], label: "Saturday", note: "Etter avtale; Ring først" }],
+      "h byAppointment in schema.org's form: by appointment on its day; the description once");
+    assertEq(n([{ byAppointment: true, day: "by-appointment", note: "Ring eller send SMS" }]), [{ days: [], label: "", note: "Etter avtale; Ring eller send SMS" }],
+      "h byAppointment with the by-appointment marker: the marker is not shown");
+    for (const flag of [false, "true", 1, null, "yes"]) {
+      assertEq(n([{ byAppointment: flag, description: "Ring først" }]), [], `h byAppointment ${JSON.stringify(flag)} is not the form: left out, as before I-J`);
+    }
+
+    // Parity: outside their forms, their keys are not read, so every form read before I-J reads as before.
+    const declared = [{ day: "mon", open: "10:00", close: "17:00" }];
+    assertEq(n([{ ...declared[0], description: "Grønnsakstor", validFrom: "2026-07-01", validThrough: "2026-10-31", opens: "08:00", closes: "09:00", byAppointment: false }]),
+      n(declared), "h parity: {day, open, close} with description, validFrom/validThrough, opens/closes and byAppointment: false reads as {day, open, close}");
+    assertEq(n([{ day: "by-appointment", note: "Åpent etter avtale — ring eller send SMS" }]), [{ days: [], label: "", note: "Åpent etter avtale — ring eller send SMS" }],
+      "h parity: {day: by-appointment, note} is unchanged (no \"Etter avtale\" added)");
+    assertEq(n([{ day: "sat", opens: "10:00", closes: "14:00" }, { description: "Selvbetjent" }, { validFrom: "2026-07-01", validThrough: "2026-10-31" }, { dayOfWeek: null, opens: "10:00", closes: "14:00" }]), [],
+      "h parity: opens/closes, description or validity without dayOfWeek (or with dayOfWeek null) say nothing, as before I-J");
+
+    // Neither form gives an "open now" claim: the period may not hold, and a note says no times.
+    assertEq(openingStatusAt(n(hovdneset), new Date("2026-07-03T11:00:00Z")), null,
+      "h open now: Hovdneset on a Friday at 13:00 in its season gives no claim (an entry with a period counts for none, as I-H)");
+    assertEq(openingStatusAt(n(smaVesen), new Date("2026-07-03T11:00:00Z")), null, "h open now: Små Vesen gives no claim");
+    assertEq(openingStatusAt(n([{ dayOfWeek: "Friday", opens: "12:00", closes: "17:00" }]), new Date("2026-07-03T11:00:00Z"))?.isOpen, true,
+      "h open now: schema.org's form without validity counts as any timed entry (Friday 13:00 is open)");
+  }
+
   return { passed, failed, failures };
 }
 
 // Standalone runner: `npx tsx src/utils/opening-hours.test.ts`
 if (require.main === module) {
-  console.log("── opening-hours (I-H: one reading of opening hours) ──");
+  console.log("── opening-hours (I-H, I-J: one reading of opening hours) ──");
   const r = runOpeningHoursTests({ log: true });
   console.log(`\nopening-hours: ${r.passed} passed, ${r.failed} failed`);
   if (r.failed > 0) {
