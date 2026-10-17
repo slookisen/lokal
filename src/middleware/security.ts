@@ -160,10 +160,16 @@ export function sanitizeInput(req: Request, _res: Response, next: NextFunction) 
 }
 
 // ─── Rate Limiter shared config ─────────────────────────────
-// Fly.io sits behind a reverse proxy, so we use `trust proxy: true`
-// in Express.  express-rate-limit v7+ throws ERR_ERL_PERMISSIVE_TRUST_PROXY
-// unless we explicitly acknowledge this.  We disable that specific
-// validation — Fly's edge proxy is trusted infrastructure.
+// `trust proxy` is true (set by installClientIp, src/index.ts): Express
+// trusts EVERY hop, so req.ip — the default key of every limiter here — is
+// the LEFT-most X-Forwarded-For entry. Fly's proxy appends to a client-sent
+// X-Forwarded-For instead of overwriting it, so that entry is only the real
+// client once middleware/client-ip.ts has rewritten the header from
+// Fly-Client-IP (mode `enforce`); in `legacy` and `shadow` a client can
+// still choose its own key (dev-request 2026-10-16-klient-ip-fra-fly-client-ip).
+// express-rate-limit's ERR_ERL_PERMISSIVE_TRUST_PROXY check is static — it
+// fires on `trust proxy` === true whatever the header holds — so it stays
+// disabled; the guard is client-ip.ts and its tests.
 const sharedValidate = { trustProxy: false } as const;
 
 // ─── Consumer-key rate-limit differentiation ────────────────
