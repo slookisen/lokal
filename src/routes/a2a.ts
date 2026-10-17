@@ -14,7 +14,7 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -656,7 +656,10 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       email: knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
-      products: knowledge.products?.map((p: any) => ({
+      // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
+      // text, `products?.map` threw, and so did `p.name` on a null product;
+      // it is read in getAgentInfo's fixed shape (productEntries).
+      products: productEntries(knowledge.products).map((p: any) => ({
         name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
         price: p.price, priceUnit: p.priceUnit,
       })),
