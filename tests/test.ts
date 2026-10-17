@@ -47760,3 +47760,36 @@ runSerial(async () => {
     failures.push("client-ip: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-E (SD-01, SD-02): RFB
+// producer and place pages show their FAQPage as a visible <section id="faq">
+// built from the same object (shared services/faq-section.ts), and a fylke
+// slug (/vestland) lists the producers placed in that fylke with the real
+// count, the sitemap using the same predicate. Own in-memory DB — tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-E: RFB visible FAQ + fylke pages ──");
+  try {
+    const { runFaqSectionTests } = require("../src/services/faq-section.test") as
+      typeof import("../src/services/faq-section.test");
+    const fs = runFaqSectionTests({ log: false });
+    passed += fs.passed;
+    failed += fs.failed;
+    for (const f of fs.failures) failures.push("faq-section: " + f);
+    console.log(`  faq-section: ${fs.passed} passed, ${fs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("faq-section: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runRfbSynligFaqOgFylkessiderTests } = require("../src/routes/rfb-synlig-faq-og-fylkessider.test") as
+      typeof import("../src/routes/rfb-synlig-faq-og-fylkessider.test");
+    const sff = await runRfbSynligFaqOgFylkessiderTests({ log: false });
+    passed += sff.passed;
+    failed += sff.failed;
+    for (const f of sff.failures) failures.push("rfb-synlig-faq-og-fylkessider: " + f);
+    console.log(`  rfb-synlig-faq-og-fylkessider: ${sff.passed} passed, ${sff.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-synlig-faq-og-fylkessider: unexpected error: " + String(err?.message || err));
+  }
+});
