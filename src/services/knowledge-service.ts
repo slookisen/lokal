@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription, normalizeProse } from "./description-quality";
+import { textEntries } from "../utils/text-entries";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -27,18 +28,21 @@ import { isJunkDescription, normalizeProse } from "./description-quality";
 //                        without dropping the relevance signal for search.
 //
 // Pure function — does not mutate the input array.
+//
+// Integration test 2026-10-17 (I-F): `raw` is DB JSON, so it is read with
+// textEntries — text entries, trimmed; a list stored as one string is one
+// entry. A number or an object among the entries used to reach `.trim()` and
+// throw out of every reader (lokal_info, lokal_search, /agents/:id/info).
 export function relabelCertifications(
-  raw: string[] | undefined | null,
+  raw: unknown,
   debioVerified: boolean,
 ): string[] {
-  const list = Array.isArray(raw) ? raw.slice() : [];
-  const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s.trim());
-  const isOrganicClaim = (s: string) =>
-    /^øk(o(logisk)?)?\b/i.test(s.trim()) || /^organic\b/i.test(s.trim());
+  const list = textEntries(raw);
+  const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s);
+  const isOrganicClaim = (s: string) => /^øk(o(logisk)?)?\b/i.test(s) || /^organic\b/i.test(s);
   const out: string[] = [];
   let hadDebioOrOrganicSeed = false;
   for (const item of list) {
-    if (!item) continue;
     if (isDebioClaim(item) || isOrganicClaim(item)) {
       hadDebioOrOrganicSeed = true;
       continue; // dropped — re-emitted below per verification status
@@ -158,14 +162,32 @@ export function isProductNoise(name: string): boolean {
   return false;
 }
 
+/**
+ * A product's price field as text. Integration test 2026-10-17 (I-F): the
+ * products column is DB JSON, and a price is stored as a number (150) as well
+ * as text ("275/kg"); a number reached `.trim()` in parseProductPrice and
+ * threw out of lokal_info and lokal_search. Text is returned as it is (the
+ * callers trim it), a positive number as its digits, and anything else is no
+ * price — 0 included, which the old `p.price || ""` read as no price too.
+ */
+export function productPriceText(price: unknown): string {
+  if (typeof price === "string") return price;
+  return typeof price === "number" && Number.isFinite(price) && price > 0 ? String(price) : "";
+}
+
 /** Parse price from a product name like "Lammelår – kr 275/kg" → { cleanName, price } */
 export function parseProductPrice(p: ProductInfo): { cleanName: string; price: string | null; section: string | null } {
-  const name = (p.name || "").trim();
+  // I-F: `p` is one entry of the products DB JSON, so each field is read by
+  // its type: a name that is not text is no name, and the price goes through
+  // productPriceText. Text values give exactly the result they gave before.
+  const entry: Partial<Record<keyof ProductInfo, unknown>> = p && typeof p === "object" ? p : {};
+  const name = typeof entry.name === "string" ? entry.name.trim() : "";
+  const priceText = productPriceText(entry.price);
 
   // Section header?
   if (isProductHeader(name)) {
     const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
-    const subInfo = p.price && !/^\d/.test(p.price) ? p.price : null;
+    const subInfo = priceText && !/^\d/.test(priceText) ? priceText : null;
     return { cleanName: headerText, price: null, section: subInfo || headerText };
   }
 
@@ -173,7 +195,7 @@ export function parseProductPrice(p: ProductInfo): { cleanName: string; price: s
   if (isProductNoise(name)) return { cleanName: name, price: null, section: null };
 
   // Use existing price field if it has a numeric value
-  let price = (p.price || "").trim();
+  let price = priceText.trim();
   if (price && !/\d/.test(price)) price = ""; // non-numeric price field = descriptor, not price
 
   let cleanName = name;
@@ -257,19 +279,64 @@ export interface AgentInfoResponse {
   };
 }
 
+// ─── Integration test 2026-10-17 (I-F): field shapes of getAgentInfo ──────
+// The knowledge columns are JSON whose shape nothing enforces: a list stored
+// as one string, null, numbers or objects among its entries, a product with
+// no text name. getAgentInfo feeds lokal_info, lokal_search, the producer
+// pages and GET /agents/:id/info, so it hands each field over in the shape
+// its type declares: list-of-text fields go through textEntries, and the
+// lists of records keep the entries a reader can use. Values that already
+// have that shape come through unchanged, apart from trimmed text entries.
+// The fields inside a product (price, category …) are typed where they are
+// read, e.g. parseProductPrice.
+
+/** The entries of a list of records a reader can use: objects, and text (a free-text entry). */
+function recordEntries(value: unknown): unknown[] {
+  return Array.isArray(value)
+    ? value.filter((e) => typeof e === "string" || (e !== null && typeof e === "object" && !Array.isArray(e)))
+    : [];
+}
+
+/** products: text entries, and product objects with a text name, the field every reader keys on. */
+function productEntries(value: unknown): ProductInfo[] {
+  return recordEntries(value)
+    .filter((e) => typeof e === "string" || typeof (e as { name?: unknown }).name === "string") as ProductInfo[];
+}
+
+/**
+ * openingHours: an array (today's format), or free text such as
+ * "Man–fre 10–17", which lokal_info, the producer page and the agent card
+ * show as text (slice I-A). The declared type has no text variant, but those
+ * readers check for it. Anything else is no opening hours.
+ */
+function openingHoursField(value: unknown): OpeningHour[] {
+  if (typeof value === "string") return value.trim() ? (value as unknown as OpeningHour[]) : [];
+  return recordEntries(value) as OpeningHour[];
+}
+
+/** A JSON object, or {} for anything else (text, a list, null). */
+function plainObjectOrEmpty(value: unknown): Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
+}
+
 class KnowledgeService {
 
   // ─── Get knowledge for an agent ──────────────────────────
+  // Integration test 2026-10-17 (I-F): a JSON column that does not parse is
+  // read as empty and logged (jsonColumn), so one bad row no longer throws out
+  // of lokal_info, a whole lokal_search answer or llms-full.txt.
   getKnowledge(agentId: string): AgentKnowledge | null {
-    const db = getDb();
-    const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
+    const row = this.selectKnowledgeRow(agentId);
+    return row ? this.rowToKnowledge(row, "lenient") : null;
+  }
+
+  private selectKnowledgeRow(agentId: string): any {
+    return getDb().prepare(`SELECT agent_id, address, postal_code, website, phone, email,
       opening_hours, products, about, specialties, certifications, payment_methods,
       delivery_options, google_rating, google_review_count, tripadvisor_rating,
       external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
       data_source, auto_sources, last_enriched_at,
-      owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
-    if (!row) return null;
-    return this.rowToKnowledge(row);
+      owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
   }
 
   // ─── Get structured info response for buyer agents ────────
@@ -300,7 +367,7 @@ class KnowledgeService {
         trustScore: agent.trust_score,
         isVerified: agent.is_verified === 1,
         isClaimed,
-        languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
+        languages: textEntries(this.jsonColumn(agentId, "agents.languages", agent.languages, ["no"], "lenient")),
         schemaVersion: agent.schema_version || "urn:a2a:1.0",
         agentVersion: agent.agent_version || 1,
         debioVerified,
@@ -313,8 +380,10 @@ class KnowledgeService {
         // "tell me about this seller" endpoint — never return an invalid phone.
         phone: isDisplayablePhone(knowledge?.phone) ? knowledge?.phone : undefined,
         email: knowledge?.email,
-        openingHours: knowledge?.openingHours || [],
-        products: knowledge?.products || [],
+        // I-F: each JSON field in the shape its type declares — see
+        // openingHoursField and the helpers above the class.
+        openingHours: openingHoursField(knowledge?.openingHours),
+        products: productEntries(knowledge?.products),
         // dev-request 2026-07-04-rfb-datakvalitet item 1 (description
         // sanitizer, render-guard-only slice): mirrors the isDisplayablePhone
         // guard above — this feeds the public buyer-facing "tell me about
@@ -323,13 +392,13 @@ class KnowledgeService {
         // must never be returned as if it were a real description/about text.
         about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
         description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
-        specialties: knowledge?.specialties || [],
+        specialties: textEntries(knowledge?.specialties),
         // PR-95: rewrite certifications to reflect debio_verified flag.
         certifications: relabelCertifications(knowledge?.certifications, debioVerified),
-        paymentMethods: knowledge?.paymentMethods || [],
-        deliveryOptions: knowledge?.deliveryOptions || [],
-        images: knowledge?.images || [],
-        seasonality: knowledge?.seasonality || [],
+        paymentMethods: textEntries(knowledge?.paymentMethods),
+        deliveryOptions: textEntries(knowledge?.deliveryOptions),
+        images: textEntries(knowledge?.images),
+        seasonality: recordEntries(knowledge?.seasonality) as SeasonalProduct[],
         deliveryRadius: knowledge?.deliveryRadius,
         minOrderValue: knowledge?.minOrderValue,
         ratings: this.buildRatings(knowledge),
@@ -338,7 +407,7 @@ class KnowledgeService {
       },
       meta: {
         dataSource,
-        autoSources: knowledge?.autoSources || [],
+        autoSources: textEntries(knowledge?.autoSources),
         lastUpdated,
         disclaimer: dataSource === "owner"
           ? "Denne informasjonen er verifisert av eieren."
@@ -388,7 +457,12 @@ class KnowledgeService {
   // ─── Set/update knowledge (used by enrichment + owner) ────
   upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void {
     const db = getDb();
-    const existing = this.getKnowledge(agentId);
+    // I-F: the merge base is read strictly. The merge below writes every
+    // column back, so a lenient read would replace a column that does not
+    // parse with its empty value. Such a row still fails the write, as
+    // before — this change repairs no data.
+    const existingRow = this.selectKnowledgeRow(agentId);
+    const existing = existingRow ? this.rowToKnowledge(existingRow, "strict") : null;
     const now = new Date().toISOString();
 
     // Write-time contact guard (dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
@@ -823,10 +897,13 @@ class KnowledgeService {
       deliveryRadius: update.deliveryRadius ?? existing.deliveryRadius,
       minOrderValue: update.minOrderValue ?? existing.minOrderValue,
       dataSource: update.dataSource || existing.dataSource,
-      autoSources: [...new Set([...(existing.autoSources || []), ...(update.autoSources || [])])],
+      // I-F: spreading a list stored as one string gave one source per letter,
+      // and spreading a string or an array into preferences gave one key per
+      // character or entry. Only text entries and plain objects are merged.
+      autoSources: [...new Set([...textEntries(existing.autoSources), ...textEntries(update.autoSources)])],
       lastEnrichedAt: update.lastEnrichedAt ?? existing.lastEnrichedAt,
       ownerUpdatedAt: update.ownerUpdatedAt ?? existing.ownerUpdatedAt,
-      preferences: { ...(existing.preferences || {}), ...(update.preferences || {}) },
+      preferences: { ...plainObjectOrEmpty(existing.preferences), ...plainObjectOrEmpty(update.preferences) },
     };
   }
 
@@ -842,7 +919,27 @@ class KnowledgeService {
     return Object.keys(ratings).length > 0 ? ratings : undefined;
   }
 
-  private rowToKnowledge(row: any): AgentKnowledge {
+  /**
+   * One JSON column of a read. Integration test 2026-10-17 (I-F): text that
+   * does not parse threw out of every reader. A lenient read gives the
+   * fallback instead and logs `[knowledge-guard]` with the agent id and the
+   * column, never the value: it can hold contact details, and JSON.parse's
+   * own message quotes it. A strict read throws, as every read did before.
+   */
+  private jsonColumn<T>(agentId: string, column: string, text: unknown, fallback: T, mode: "strict" | "lenient"): T {
+    if (!text) return fallback;
+    if (mode === "strict") return JSON.parse(text as string);
+    try {
+      return JSON.parse(text as string);
+    } catch {
+      console.error(`[knowledge-guard] agent ${agentId}: ${column} is not valid JSON, read as empty`);
+      return fallback;
+    }
+  }
+
+  private rowToKnowledge(row: any, mode: "strict" | "lenient"): AgentKnowledge {
+    const json = <T>(column: string, fallback: T): T =>
+      this.jsonColumn(row.agent_id, `agent_knowledge.${column}`, row[column], fallback, mode);
     return {
       agentId: row.agent_id,
       address: row.address,
@@ -850,28 +947,28 @@ class KnowledgeService {
       website: row.website,
       phone: row.phone,
       email: row.email,
-      openingHours: row.opening_hours ? JSON.parse(row.opening_hours) : [],
-      products: row.products ? JSON.parse(row.products) : [],
+      openingHours: json("opening_hours", []),
+      products: json("products", []),
       about: row.about,
-      specialties: row.specialties ? JSON.parse(row.specialties) : [],
-      certifications: row.certifications ? JSON.parse(row.certifications) : [],
-      paymentMethods: row.payment_methods ? JSON.parse(row.payment_methods) : [],
-      deliveryOptions: row.delivery_options ? JSON.parse(row.delivery_options) : [],
+      specialties: json("specialties", []),
+      certifications: json("certifications", []),
+      paymentMethods: json("payment_methods", []),
+      deliveryOptions: json("delivery_options", []),
       googleRating: row.google_rating,
       googleReviewCount: row.google_review_count,
       tripadvisorRating: row.tripadvisor_rating,
-      externalReviews: row.external_reviews ? JSON.parse(row.external_reviews) : [],
-      externalLinks: row.external_links ? JSON.parse(row.external_links) : [],
-      images: row.images ? JSON.parse(row.images) : [],
-      seasonality: row.seasonality ? JSON.parse(row.seasonality) : [],
+      externalReviews: json("external_reviews", []),
+      externalLinks: json("external_links", []),
+      images: json("images", []),
+      seasonality: json("seasonality", []),
       deliveryRadius: row.delivery_radius || undefined,
       minOrderValue: row.min_order_value || undefined,
       dataSource: row.data_source || "auto",
-      autoSources: row.auto_sources ? JSON.parse(row.auto_sources) : [],
+      autoSources: json("auto_sources", []),
       lastEnrichedAt: row.last_enriched_at,
       ownerUpdatedAt: row.owner_updated_at,
-      preferences: row.preferences ? JSON.parse(row.preferences) : {},
-      curatedFields: row.curated_fields ? JSON.parse(row.curated_fields) : {},
+      preferences: json("preferences", {}),
+      curatedFields: json("curated_fields", {}),
     };
   }
 
