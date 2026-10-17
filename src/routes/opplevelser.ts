@@ -34116,6 +34116,23 @@ export function isExperienceDescriptionCandidateRow(r: ExperienceDescriptionCand
  * route and GET /admin/experiences-description-candidates share one
  * implementation. Pure read: no fetch, no LLM, no write.
  */
+/** The 13 fact labels buildExperienceDescriptionFacts() can emit (S1 innsyn:
+ *  the complement of a thin row's present labels = its missing fact fields). */
+const EXP_DESC_ALL_FACT_LABELS = [
+  "Kategori", "Underkategori", "Sted", "Sesong", "Inne eller ute", "Varighet",
+  "Gruppestørrelse", "Pris", "Språk", "Tilgjengelighet", "Oppmøtested", "Bestilling", "Tilbyder",
+] as const;
+
+/** Read-only insight into the description queue (dev-request 2026-10-16-
+ *  berikelse-ruting-og-beskrivelseskø-innsyn, S1). Purely additive: does not
+ *  influence selection, order, cooldown or fingerprints. */
+export interface ExperienceDescriptionQueueDiagnostics {
+  cooldown_by_reason: Record<string, number>;
+  cooldown_release_by_date: Record<string, number>;
+  thin_data_missing_fields: Record<string, number>;
+  placeholder_by_scope: { in_scope: number; out_of_scope: number };
+}
+
 export function selectExperienceDescriptionQueue(
   db: ReturnType<typeof getExpDb>,
   ids: string[] | null
@@ -34129,6 +34146,7 @@ export function selectExperienceDescriptionQueue(
     skipped_recently_attempted: number;
     skipped_thin_data_precheck: number;
   };
+  queueDiagnostics: ExperienceDescriptionQueueDiagnostics;
 } {
   const sql =
     `SELECT ${EXP_DESC_CANDIDATE_SELECT_COLUMNS}
@@ -34188,24 +34206,29 @@ export function selectExperienceDescriptionQueue(
   // `ids` list BYPASSES the cooldown (the operator asked for those rows by
   // name) but never the publish gate above.
   const recentAttempts = new Map<string, string>();
+  const attemptMeta = new Map<string, { outcome: string; reason: string | null; attempted_at: string; days: number }>();
   if (!ids) {
     // Both windows evaluated in SQL (one clock, SQLite's), the choice
     // between them made per row in JS from the stored outcome/reason.
     const attemptRows = db.prepare(
-      `SELECT experience_id, facts_fingerprint, outcome, reason,
+      `SELECT experience_id, facts_fingerprint, outcome, reason, attempted_at,
               (attempted_at > datetime('now', ?)) AS within_short
          FROM experience_description_attempts
         WHERE attempted_at > datetime('now', ?)`
     ).all(
       `-${EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS} days`,
       `-${EXP_DESC_ATTEMPT_COOLDOWN_DAYS} days`
-    ) as Array<{ experience_id: string; facts_fingerprint: string; outcome: string; reason: string | null; within_short: number }>;
+    ) as Array<{ experience_id: string; facts_fingerprint: string; outcome: string; reason: string | null; attempted_at: string; within_short: number }>;
     for (const a of attemptRows) {
       const days = experienceDescriptionAttemptCooldownDays(a.outcome, a.reason);
       if (days <= EXP_DESC_ATTEMPT_COOLDOWN_SHORT_DAYS && !a.within_short) continue; // short window already over
       recentAttempts.set(a.experience_id, a.facts_fingerprint);
+      attemptMeta.set(a.experience_id, { outcome: a.outcome, reason: a.reason, attempted_at: a.attempted_at, days });
     }
   }
+  const cooldownByReason: Record<string, number> = {};
+  const cooldownReleaseByDate: Record<string, number> = {};
+  const thinDataMissingFields: Record<string, number> = {};
   let skippedRecentlyAttempted = 0;
   let skippedThinDataPrecheck = 0;
   const eligibleRows: ExperienceDescriptionCandidate[] = [];
@@ -34213,6 +34236,16 @@ export function selectExperienceDescriptionQueue(
     const fp = recentAttempts.get(row.id);
     if (fp !== undefined && fp === experienceDescriptionFactsFingerprint(row)) {
       skippedRecentlyAttempted++;
+      const m = attemptMeta.get(row.id);
+      if (m) {
+        const key = `${m.outcome}:${m.reason ?? ""}`;
+        cooldownByReason[key] = (cooldownByReason[key] ?? 0) + 1;
+        const t = Date.parse(`${m.attempted_at.replace(" ", "T")}Z`);
+        if (Number.isFinite(t)) {
+          const date = new Date(t + m.days * 86400000).toISOString().slice(0, 10);
+          cooldownReleaseByDate[date] = (cooldownReleaseByDate[date] ?? 0) + 1;
+        }
+      }
       continue;
     }
     // Thin-data precheck: a `skip`-tier row never calls the LLM anyway
@@ -34222,6 +34255,10 @@ export function selectExperienceDescriptionQueue(
     // precheck and the cascade can never disagree on which rows are `skip`.
     if (selectExperienceDescriptionTier(row).level === "skip") {
       skippedThinDataPrecheck++;
+      const present = new Set(buildExperienceDescriptionFacts(row).map(([k]) => k));
+      for (const label of EXP_DESC_ALL_FACT_LABELS) {
+        if (!present.has(label)) thinDataMissingFields[label] = (thinDataMissingFields[label] ?? 0) + 1;
+      }
       continue;
     }
     eligibleRows.push(row);
@@ -34240,7 +34277,26 @@ export function selectExperienceDescriptionQueue(
     skipped_recently_attempted: skippedRecentlyAttempted,
     skipped_thin_data_precheck: skippedThinDataPrecheck,
   };
-  return { candidateRows, eligibleRows, queueCounts };
+  // Placeholder rows (blank/junk description) split by Opplevagent scope —
+  // one light parameterised read; informational only.
+  const placeholderIds = candidateRows.filter((r) => needsEnrichment.get(r.id)).map((r) => r.id);
+  let inScope = 0;
+  for (let i = 0; i < placeholderIds.length; i += 400) {
+    const chunk = placeholderIds.slice(i, i + 400);
+    const hit = db.prepare(
+      `SELECT COUNT(*) AS n FROM experiences e
+        WHERE e.id IN (${chunk.map(() => "?").join(",")})
+          AND ${experienceInScopeSql("e.category", "e.provider_id")}`
+    ).get(...chunk) as { n: number };
+    inScope += Number(hit?.n ?? 0);
+  }
+  const queueDiagnostics: ExperienceDescriptionQueueDiagnostics = {
+    cooldown_by_reason: cooldownByReason,
+    cooldown_release_by_date: cooldownReleaseByDate,
+    thin_data_missing_fields: thinDataMissingFields,
+    placeholder_by_scope: { in_scope: inScope, out_of_scope: placeholderIds.length - inScope },
+  };
+  return { candidateRows, eligibleRows, queueCounts, queueDiagnostics };
 }
 
 router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
@@ -34632,7 +34688,7 @@ router.get("/admin/experiences-description-candidates", requireAdmin, (req: Requ
   const db = getExpDb("experiences");
   // The SAME queue as the 4c route (no `ids` -> cooldown applies). Pure
   // read: no fetch, no LLM, no write.
-  const { eligibleRows, queueCounts } = selectExperienceDescriptionQueue(db, null);
+  const { eligibleRows, queueCounts, queueDiagnostics } = selectExperienceDescriptionQueue(db, null);
   // Target one already eligible row without changing candidate, owner,
   // publication or cooldown gates. Filtering before the page limit lets an
   // administrator inspect a specific correction anywhere in the queue.
@@ -34672,6 +34728,7 @@ router.get("/admin/experiences-description-candidates", requireAdmin, (req: Requ
     success: true,
     limit,
     ...queueCounts,
+    queue_diagnostics: queueDiagnostics,
     returned: items.length,
     rules: {
       sentinel: EXP_DESC_SENTINEL,
