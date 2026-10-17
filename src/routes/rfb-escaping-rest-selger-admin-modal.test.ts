@@ -23,9 +23,12 @@
  *       or "<a href=javascript:…" (and a page-view source the server would
  *       pass on) is text; "constructor" is the key, not Object's source;
  *       well-formed stats are byte-identical to main's.
- *   (b) trust breakdown: a detail (from a stored Google rating) and tips with
- *       those values are text; the real breakdown of a well-formed agent is
- *       byte-identical to main's.
+ *   (b) trust breakdown: details and tips with those values are text; the
+ *       real breakdown of a well-formed agent is byte-identical to main's.
+ *       Since S4-A1b (dev-request 2026-10-16-rfb-strukturerte-data-
+ *       tredjepartsrating-og-places-treffvakt) a stored Google rating no
+ *       longer reaches the community detail, so the odd values stored there
+ *       must not show up at all.
  *   (c) showAlert with the e-mail: an address with those values is text and
  *       is sent as typed; a plain address gives main's HTML.
  *   (d) showAlert with server errors, err.message and the verification code,
@@ -57,6 +60,8 @@ export interface TestSummary {
 }
 
 const XSS = "<img src=x onerror=alert(1)>";
+/** trust-score-service's community detail since S4-A1b (no stored Google rating in it). */
+const COMMUNITY_DETAIL = "Ingen egne omtaler på Rett fra Bonden ennå – samme nøytrale verdi for alle";
 const BREAK_DQ = "\"><svg onload=alert(2)>";
 const JS_LINK = "<a href=javascript:alert(3)>klikk</a>";
 const JS_OPEN = "<a href=javascript:alert(4) style=position:fixed;inset:0 x";
@@ -324,10 +329,11 @@ export async function runRfbEscapingRestSelgerAdminModalTests(opts: { log?: bool
     }
     await section("b trust", async () => {
       const realOdd = await trust(ODD);
-      assertEq(realOdd.body.data?.signals?.community?.detail, `Google: ${XSS}/5 (${BREAK_DQ} anmeldelser)`, "b fixture: the real breakdown puts the stored rating into the detail");
+      assertEq(realOdd.body.data?.signals?.community?.detail, COMMUNITY_DETAIL, "b fixture: the real breakdown no longer puts the stored rating into the detail (S4-A1b)");
       const odd = await trustBreakdown(ODD);
       assertEq(injectionProblems(odd.signals, new Set(["div", "span"]), []), [], "b stored rating: the signals have only their own tags, no on* attribute");
-      assertTrue(visibleText(odd.signals).includes(`Google: ${XSS}/5 (${BREAK_DQ} anmeldelser)`), "b stored rating: the detail is shown as text");
+      assertTrue(visibleText(odd.signals).includes(COMMUNITY_DETAIL) && !visibleText(odd.signals).includes(XSS) && !visibleText(odd.signals).includes(BREAK_DQ),
+        "b stored rating: the community detail is the fixed text, without the stored values");
 
       const real = await trust(WF);
       const crafted = JSON.parse(JSON.stringify(real.body));
@@ -342,7 +348,7 @@ export async function runRfbEscapingRestSelgerAdminModalTests(opts: { log?: bool
 
       // Well-formed: the real breakdown, byte-identical to main's.
       assertTrue(real.body.success === true && real.body.data.tips.length > 0, "b fixture: the real breakdown of WF has tips");
-      assertEq(real.body.data.signals.community.detail, "Google: 4.6/5 (12 anmeldelser)", "b fixture: WF's community detail");
+      assertEq(real.body.data.signals.community.detail, COMMUNITY_DETAIL, "b fixture: WF's community detail (no Google 4.6/12 since S4-A1b)");
       assertEq(await trustBreakdown(WF), mainTrust(real.body.data), "b well-formed: the real breakdown is byte-identical to main's (signals and tips)");
       const noTips = JSON.parse(JSON.stringify(real.body));
       noTips.data.tips = [];

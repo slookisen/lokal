@@ -186,11 +186,14 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       assertEq(Object.keys(r.body), ["count", "agents"], "R6: response shape {count, agents}");
       assertEq(r.body.agents.map((a: any) => a.id), ids, "R7: same rows in the same order as the old query");
       const { isDisplayablePhone } = require("./contact-normalizer") as typeof import("./contact-normalizer");
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+      // places-treffvakt, S4-A1b: the route leaves the stored Google rating
+      // (rating, rating_count, rating_source) out, so the snapshot does too.
       const snapshot = ids.map((id) => {
-        const a = store.getDentalAgentById(id)!;
+        const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...a } = store.getDentalAgentById(id)!;
         return { ...a, telefon: isDisplayablePhone(a.telefon) ? a.telefon : null, mobil: isDisplayablePhone(a.mobil) ? a.mobil : null };
       });
-      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot");
+      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys");
       const q = await callRoute(route, "/agents", { limit: "200", name_terms: "solo", postnummer_in: "0150" });
       assertEq(q.body.count, ids.length, "R9: the new fields are not read from GET /agents query params");
     }

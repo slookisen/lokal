@@ -79,6 +79,20 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt, S4-A1b: the two public REST answers below leave out the stored
+// Google rating (rating, rating_count, rating_source; PR-130, written only
+// from Places), as the clinic card and the A2A answer do
+// (dental-clinic-card.ts). Passing it on is «reshare» under the Places terms
+// (protocols/juridisk-sjekk-google-ratinger-2026-10-17.md). The stored values
+// stay untouched.
+function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknown; rating_source?: unknown }>(
+  agent: T
+): Omit<T, "rating" | "rating_count" | "rating_source"> {
+  const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...rest } = agent;
+  return rest;
+}
+
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
 //   ?fylke=Oslo
 //   ?chain_brand=Volvat
@@ -144,7 +158,7 @@ router.get("/agents", (req: Request, res: Response) => {
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
     const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((a) => ({
-      ...a,
+      ...withoutGoogleRating(a),
       telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
       mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
     }));
@@ -193,7 +207,7 @@ router.get("/agents/:id", (req: Request, res: Response) => {
 
   res.json({
     agent: {
-      ...agent,
+      ...withoutGoogleRating(agent),
       telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
       mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
       ...(provenance ? { provenance } : {}),

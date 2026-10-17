@@ -1683,27 +1683,26 @@ function getCommunity(id: string): number {
 seedAgent("test-no-rating", null, 0);
 assertEq(Math.round(getCommunity("test-no-rating") * 1000), 300, "no rating → 0.3 neutral");
 
-// Case 2: 4.7/5 with 22 reviews → ~0.925 (Homme Gård profile in prod)
+// Cases 2–5 (rewritten for dev-request 2026-10-16-rfb-strukturerte-data-
+// tredjepartsrating-og-places-treffvakt, S4-A1b): community v2 read the stored
+// Google rating (Homme-like 4.7/22 gave ~0.925, 5.0/1 ~0.6, 5.0/20 1.0 and
+// 2.0/100 <0.3). v3 takes first-party reviews only and none exist yet, so
+// every one of them is the neutral 0.3: no lift and no penalty from Google.
 seedAgent("test-homme", 4.7, 22);
-const homme = getCommunity("test-homme");
-assertTrue(homme > 0.9 && homme < 0.95, `Homme-like (4.7, 22 reviews) → ${homme.toFixed(3)} expected ~0.925`);
+assertEq(Math.round(getCommunity("test-homme") * 1000), 300, "Homme-like (Google 4.7, 22 reviews) → 0.3: a Google rating is not read");
 
-// Case 3: 5.0 with only 1 review → moderate, NOT 1.0 (volume guard)
 seedAgent("test-cherrypicked", 5.0, 1);
-const cherry = getCommunity("test-cherrypicked");
-assertTrue(cherry > 0.5 && cherry < 0.7, `5.0 + 1 review → ${cherry.toFixed(3)}, expected 0.5–0.7 (volume guard)`);
+assertEq(Math.round(getCommunity("test-cherrypicked") * 1000), 300, "Google 5.0 + 1 review → 0.3 (no volume guard needed: not read)");
 
-// Case 4: 5.0 with 20 reviews → exactly 1.0 ceiling
 seedAgent("test-perfect", 5.0, 20);
-const perfect = getCommunity("test-perfect");
-assertEq(Math.round(perfect * 1000), 1000, "5.0 + 20 reviews → 1.0 ceiling");
+assertEq(Math.round(getCommunity("test-perfect") * 1000), 300, "Google 5.0 + 20 reviews → 0.3, no longer the 1.0 ceiling");
 
-// Case 5: 2.0 with 100 reviews → genuine penalty
 seedAgent("test-bad", 2.0, 100);
-const bad = getCommunity("test-bad");
-assertTrue(bad < 0.3, `2.0 + 100 reviews → ${bad.toFixed(3)}, expected <0.3 (real penalty)`);
+assertEq(Math.round(getCommunity("test-bad") * 1000), 300, "Google 2.0 + 100 reviews → 0.3, no longer a penalty");
 
-// Case 6: full trust score with all signals at max — confirms 100% is now reachable
+// Case 6: full trust score with every other signal at max. With community
+// neutral until own reviews exist, the ceiling is 0.9 + 0.1 × 0.3 = 0.93
+// (v2 reached ≥ 0.99 through a 5.0/20 Google rating).
 memdb.prepare("UPDATE agents SET is_verified = 1, last_seen_at = ?, created_at = ? WHERE id = ?")
   .run(new Date().toISOString(), new Date().toISOString(), "test-perfect");
 memdb.prepare("UPDATE agent_knowledge SET address = \'x\', postal_code = \'1\', website = \'x\', phone = \'1\', email = \'x@y\', opening_hours = \'[1]\', products = \'[1]\', about = \'x\', specialties = \'[1]\', certifications = \'[1]\', payment_methods = \'[1]\', delivery_options = \'[1]\', images = \'[1]\', owner_updated_at = ? WHERE agent_id = ?")
@@ -1711,7 +1710,7 @@ memdb.prepare("UPDATE agent_knowledge SET address = \'x\', postal_code = \'1\', 
 memdb.prepare("INSERT INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen, last_interaction_at) VALUES (?, 100, 30, 10, ?)")
   .run("test-perfect", new Date().toISOString());
 const fullScore = trustScoreService.calculate("test-perfect");
-assertTrue(fullScore >= 0.99, `max-everything agent → ${fullScore}, expected ≥ 0.99 (100% now reachable)`);
+assertEq(fullScore, 0.93, `max-everything agent with a Google 5.0/20 rating → ${fullScore}, expected 0.93 (community neutral)`);
 
 memdb.close();
 
@@ -48773,5 +48772,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-forside-copy: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt, S4-A1b (Daniel's decision 2=A): trust_score's community signal
+// no longer reads the stored Google rating (neutral 0.3 for every agent until
+// own reviews exist), GET /agents/:id/trust shows no Google text, the boot
+// recalculation stamps per TRUST_SCORE_FORMULA_VERSION, and the finn-tannlege
+// REST answers leave rating/rating_count/rating_source out. Swaps the getDb()
+// singleton, the dental db-factory path and the module cache (all restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S4-A1b: trust_score, /trust and dental REST without Google ratings ──");
+  try {
+    const { runTrustScoreUtenGoogleRatingTests } = require("../src/services/trust-score-uten-google-rating.test") as
+      typeof import("../src/services/trust-score-uten-google-rating.test");
+    const tg = await runTrustScoreUtenGoogleRatingTests({ log: false });
+    passed += tg.passed;
+    failed += tg.failed;
+    for (const f of tg.failures) failures.push("trust-score-uten-google-rating: " + f);
+    console.log(`  trust-score-uten-google-rating: ${tg.passed} passed, ${tg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("trust-score-uten-google-rating: unexpected error: " + String(err?.message || err));
   }
 });

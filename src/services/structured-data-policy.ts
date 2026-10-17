@@ -1,6 +1,6 @@
 // ─── Structured-data policy: what JSON-LD may claim, how ratings are shown ──
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
-// S1 + S2 and S4-A1a.
+// S1 + S2, S4-A1a and S4-A1b.
 //
 // Measured live 2026-10-16: 35 of 40 /produsent/:slug pages carried Google's
 // rating as their own LocalBusiness.aggregateRating (plus a copy on every
@@ -19,9 +19,18 @@
 //      source, with a count only when the count is known, and not at all in
 //      RATING_DISPLAY_MODE 'hidden' (the mode since S4-A1a, for RFB and
 //      finn-tannlege).
-//   5. A stored Google rating is never passed on in API, A2A or MCP output
-//      (S4-A1a). knowledgeService.getAgentInfo leaves it out unless one of the
-//      site's own pages asks for it, and there rule 4 decides.
+//   5. A stored Google rating is not passed on in public API, A2A or MCP
+//      output. knowledgeService.getAgentInfo leaves it out unless one of the
+//      site's own pages asks for it, and there rule 4 decides (S4-A1a).
+//      GET /api/marketplace/agents/:id/trust and the finn-tannlege REST
+//      answers (GET /api/tannlege/agents, /agents/:id) leave it out too
+//      (S4-A1b). Reads behind owner or admin authentication (GET
+//      /agents/:id/knowledge, the owner portal, the admin outreach tools)
+//      still return it; S4-A3 decides those.
+//   6. trust_score does not read it either (S4-A1b). Its community signal
+//      takes first-party reviews only, and is neutral (0.3) for every agent
+//      until an own-review flow exists; that flow feeds both
+//      RATING_MARKUP_SOURCES_ALLOWED and trust-score-service.ts.
 //
 // The page tests check the same rules against the rendered RFB, Opplevagent
 // and dental JSON-LD (tests/helpers/jsonld-invariants.ts).
