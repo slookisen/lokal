@@ -1634,6 +1634,11 @@ export function extractJsonLdOpeningHours(html: string): string | null {
  * The platform's category vocabulary — the canonical keys the `agents.categories`
  * column stores and the /sok category filter understands. MUST stay aligned with
  * routes/seo.ts CATEGORY_LABELS_NO + services/marketplace-registry.ts categoryMap.
+ * Integration test 2026-10-17, slice I-W: the search's keys (marketplace-
+ * registry.ts PRODUCT_CATEGORY_KEYWORDS) are these keys, and a test pins it
+ * (src/routes/rfb-sok-ukjente-ord-bakeri-sted.test.ts); the search's
+ * «bread» left out every «bakery» producer. Its one other key is «berries»,
+ * which the platform sells under fruit (PRODUCT_KEY_TO_PLATFORM below).
  * `other` is the catch-all when a producer is clearly a food producer but no
  * specific category matched (kept last; only used as a fallback, never mixed in).
  */

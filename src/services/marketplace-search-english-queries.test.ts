@@ -265,8 +265,9 @@ export function runMarketplaceSearchEnglishQueryTests(opts: { log?: boolean } = 
     // ════════════════════════════════════════════════════════════════════
     // D — «bakeri» selected no category, in EITHER language
     // ════════════════════════════════════════════════════════════════════
-    ok(cats("bakeri Trondheim").includes("bread"), `NO "bakeri Trondheim" → bread (was: no category at all)`);
-    ok(cats("bakery in Trondheim").includes("bread"), `EN "bakery in Trondheim" → bread`);
+    // Integration test 2026-10-17, slice I-W: the key is the platform's «bakery» (it was «bread»).
+    ok(cats("bakeri Trondheim").includes("bakery"), `NO "bakeri Trondheim" → bakery (was: no category at all)`);
+    ok(cats("bakery in Trondheim").includes("bakery"), `EN "bakery in Trondheim" → bakery`);
 
     // ════════════════════════════════════════════════════════════════════
     // E — no regression in the Norwegian name search
