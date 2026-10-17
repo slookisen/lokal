@@ -42482,6 +42482,37 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-H (FUNN
+// rfb-apningstider-alternative-former, rfb-isopennow-lange-dagnavn and
+// a2a-produsent-agent-json-404 from the lokal#1114 review): one reading of
+// opening hours (src/utils/opening-hours.ts) for the producer page, the front
+// page's "open now", lokal_info and the A2A auto-reply — every stored form
+// ({day, hours}, {day, from, to}, {days, …}, {period, …}, notes) and day names
+// in English and Norwegian, short and long, and ranges; "open now" in
+// Europe/Oslo; JSON-LD with valid weekdays only; /agents/:id/agent.json stays
+// seed-only and unlinked. The pure suite needs no DB; the route suite has its
+// own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-H (one opening-hours normalizer + open now) ──");
+  type Summary = { passed: number; failed: number; failures: string[] };
+  const suites: Array<[string, () => Summary | Promise<Summary>]> = [
+    ["opening-hours", () => (require("../src/utils/opening-hours.test") as typeof import("../src/utils/opening-hours.test")).runOpeningHoursTests({ log: false })],
+    ["rfb-apningstider-normaliserer", () => (require("../src/routes/rfb-apningstider-normaliserer.test") as typeof import("../src/routes/rfb-apningstider-normaliserer.test")).runRfbApningstiderNormalisererTests({ log: false })],
+  ];
+  for (const [name, run] of suites) {
+    try {
+      const r = await run();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${name}: ` + f);
+      console.log(`  ${name}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${name}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

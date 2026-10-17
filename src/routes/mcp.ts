@@ -22,6 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
+import { openingHoursText } from "../utils/opening-hours";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -275,35 +276,19 @@ function buildAgentKnowledgeSummary(agentId: string): { contact?: any; productSu
 // it is re-exported here so this module's exports stay as they were.
 export { textEntries };
 
-const OPENING_DAY_NAMES_NO: ReadonlyMap<string, string> = new Map([
-  ["mon", "Man"], ["tue", "Tir"], ["wed", "Ons"], ["thu", "Tor"], ["fri", "Fre"], ["sat", "Lør"], ["sun", "Søn"],
-]);
-
-/** One entry of an openingHours array as text: "" when it says nothing usable. */
-function openingHourEntryText(h: unknown): string {
-  if (typeof h === "string") return h.trim();
-  if (!h || typeof h !== "object") return "";
-  const { day, open, close } = h as Record<string, unknown>;
-  if (typeof open !== "string" || !open.trim() || typeof close !== "string" || !close.trim()) return "";
-  const dayLabel = typeof day === "string" ? OPENING_DAY_NAMES_NO.get(day) || day : "";
-  return `${dayLabel} ${open}–${close}`.trim();
-}
-
 /**
- * The «Åpningstider» section of lokal_info. An array is today's format:
- * {day, open, close} entries with text open/close render as before, a text
- * entry is shown as it is, and anything else is skipped (it used to render
- * as "undefined"). A string is free text such as "Man–fre 10–17" and is
- * shown as it is, like the producer page (seo.ts) and the agent card
- * (marketplace.ts) do. Any other value is left out.
+ * The «Åpningstider» section of lokal_info. Slice I-H: the entries and their
+ * text come from utils/opening-hours.ts (openingHoursText), the reading the
+ * producer page and the A2A auto-reply use too, so every stored form shows
+ * the same hours on all three: {day, open, close} renders as before ("Man
+ * 10:00–17:00"), {day, hours}, {day, from, to}, {days, …}, a period, a note
+ * without times and day names such as "monday", "Lørdag" or "Man-fre" are
+ * shown, a text entry or free text for the whole field ("Man–fre 10–17") is
+ * shown as it is, and anything else is left out (I-A: it used to render as
+ * "undefined").
  */
 export function formatOpeningHoursForMcp(openingHours: unknown): string {
-  let text = "";
-  if (Array.isArray(openingHours)) {
-    text = openingHours.map(openingHourEntryText).filter(Boolean).join(", ");
-  } else if (typeof openingHours === "string") {
-    text = openingHours.trim();
-  }
+  const text = openingHoursText(openingHours);
   return text ? `\n## Åpningstider\n${text}` : "";
 }
 

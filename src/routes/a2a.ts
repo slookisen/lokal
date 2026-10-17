@@ -617,6 +617,22 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 });
 
 // GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
+//
+// SEED STORE ONLY. agentCardService.generateCard() reads the legacy in-memory
+// store (services/store.ts), not the marketplace registry, and that store is
+// filled only by seedData() on an empty database (index.ts). In production it
+// is empty, so this route answers 404 for every marketplace producer (the
+// lokal#1114 review measured 500 of 500), and the `producers` list of
+// /.well-known/agent-card.json above, built from the same store, is empty too.
+// Integration test 2026-10-17, slice I-H (FUNN a2a-produsent-agent-json-404)
+// checked that no discovery surface points here: llms.txt, llms-full.txt,
+// openapi.json and /.well-known/agent-card.json do not, and the search and
+// discover answers give /api/marketplace/agents/:id/card as card_url /
+// agentCardUrl. That route already builds the per-producer card from
+// marketplaceRegistry.getAgentCard() with the knowledge fields, so this one
+// is left as it is. Before linking this path from a discovery surface, build
+// it the same way. (rfb-apningstider-normaliserer.test.ts fails if a
+// non-test source file links it.)
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // Same public by-id gate as /api/marketplace/agents/:id/card (dev-request
   // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id

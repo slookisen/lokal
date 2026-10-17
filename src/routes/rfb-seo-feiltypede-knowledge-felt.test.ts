@@ -21,12 +21,16 @@
  * JSON.stringify(), so a value with "</script>" ended the element.
  *
  * Covers:
- *   (a) pure: openingHourRows() — which entries the pages show and how each
- *       field is read; buildProducerFaqJsonLd / buildProducerAnswerFirstOpening
- *       with product names that are not text.
+ *   (a) pure: which opening-hours entries the pages show and how each field
+ *       is read (openingHourRows() here until slice I-H moved it to
+ *       utils/opening-hours.ts normalizeOpeningHours());
+ *       buildProducerFaqJsonLd / buildProducerAnswerFirstOpening with product
+ *       names that are not text.
  *   (b) parity: well-formed knowledge renders exactly as on main (goldens
  *       taken from main 1f92ad56): the product, hours, delivery and
- *       certification cards, the LocalBusiness and FAQPage JSON-LD, and the
+ *       certification cards, the LocalBusiness and FAQPage JSON-LD (since
+ *       I-H, openingHoursSpecification has valid days for range keys and
+ *       long names, which main wrote as "https://schema.org/mon-fri"), and the
  *       whole inline script for a UUID agent id (no and en); the well-formed
  *       ultra-rich card is checked against main in (d).
  *   (c) regression, one producer per repro: object/boolean/negative/array
@@ -37,8 +41,9 @@
  *       months and object product/note; junk in the list fields; legacy
  *       numeric times keep their text.
  *   (d) front page with claimed producers whose products and hours are of the
- *       wrong type: 200, text products by name, closed without
- *       "undefined–undefined", number times on the hour, no junk.
+ *       wrong type: 200, text products by name, no "undefined–undefined"
+ *       (and, since I-H, no open-now claim when no entry has weekdays and
+ *       times), number times on the hour, no junk.
  *   (e) inline script: an agent id with `</script><!--<script>&` and U+2028
  *       cannot end the element (parser view, tests/helpers/
  *       html-script-elements.ts) and evaluates back to the id.
@@ -127,22 +132,27 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
 
     delete require.cache[require.resolve("./seo")];
     const seo = require("./seo") as typeof import("./seo");
-    const { openingHourRows, buildProducerFaqJsonLd, buildProducerAnswerFirstOpening } = seo;
+    const { buildProducerFaqJsonLd, buildProducerAnswerFirstOpening } = seo;
+    // Slice I-H moved the reading of an openingHours list from seo.ts's
+    // openingHourRows() to utils/opening-hours.ts (normalizeOpeningHours),
+    // shared with lokal_info and the auto-reply. The I-G cases below keep
+    // their inputs and which entries are kept; the entry shape is the util's.
+    const { normalizeOpeningHours } = require("../utils/opening-hours") as typeof import("../utils/opening-hours");
 
     // ══ (a) pure ═════════════════════════════════════════════════════════
-    assertEq(openingHourRows([
+    assertEq(normalizeOpeningHours([
       { day: "mon", open: "10:00", close: "17:00" },
       { day: "sat", open: "11:00", close: "15:00", note: "Kun i sesong" },
     ]), [
-      { kind: "times", day: "mon", open: "10:00", close: "17:00", note: "" },
-      { kind: "times", day: "sat", open: "11:00", close: "15:00", note: "Kun i sesong" },
+      { days: [0], label: "mon", open: "10:00", close: "17:00" },
+      { days: [5], label: "sat", open: "11:00", close: "15:00", note: "Kun i sesong" },
     ], "a rows: well-formed entries keep their text, in order");
-    assertEq(openingHourRows([{ day: "mon-fri", open: 10, close: 17 }]),
-      [{ kind: "times", day: "mon-fri", open: "10", close: "17", note: "" }],
+    assertEq(normalizeOpeningHours([{ day: "mon-fri", open: 10, close: 17 }]),
+      [{ days: [0, 1, 2, 3, 4], label: "mon-fri", open: "10", close: "17" }],
       "a rows: a number time is its digits (main showed \"10 – 17\")");
-    assertEq(openingHourRows(["  Lørdag 10–14 ", "", "   "]), [{ kind: "text", text: "Lørdag 10–14" }],
+    assertEq(normalizeOpeningHours(["  Lørdag 10–14 ", "", "   "]), [{ days: [], label: "", note: "Lørdag 10–14" }],
       "a rows: a text entry is shown trimmed; an empty one is left out");
-    assertEq(openingHourRows([
+    assertEq(normalizeOpeningHours([
       { day: "tue", closed: true },
       { day: "sun", open: "", close: "" },
       { day: "sat", open: "10:00" },
@@ -152,12 +162,16 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       { day: "mon", open: Infinity, close: "17:00" },
       null, 5, true, [{ day: "mon", open: "10:00", close: "17:00" }],
     ]), [], "a rows: entries without both usable times, and non-entries, are left out");
-    assertEq(openingHourRows([{ day: 1, open: "10:00", close: "17:00", note: { x: 1 } }]),
-      [{ kind: "times", day: "", open: "10:00", close: "17:00", note: "" }],
+    assertEq(normalizeOpeningHours([{ day: 1, open: "10:00", close: "17:00", note: { x: 1 } }]),
+      [{ days: [], label: "", open: "10:00", close: "17:00" }],
       "a rows: a day or note that is not text counts as none");
-    for (const v of ["Man–fre 10–17", null, undefined, 5, { mon: "10-17" }]) {
-      assertEq(openingHourRows(v), [], `a rows: ${JSON.stringify(v) ?? "undefined"} (not a list) has no entries`);
+    for (const v of [null, undefined, 5, { mon: "10-17" }]) {
+      assertEq(normalizeOpeningHours(v), [], `a rows: ${JSON.stringify(v) ?? "undefined"} (not a list or text) has no entries`);
     }
+    // Free text for the whole field is one text entry for lokal_info and the
+    // auto-reply; the producer page keeps showing it in its own row (hoursText).
+    assertEq(normalizeOpeningHours("Man–fre 10–17"), [{ days: [], label: "", note: "Man–fre 10–17" }],
+      "a rows: free text for the whole field is one text entry");
 
     {
       const products = [{ name: { x: 1 } }, { name: 5 }, null, "Honning", { name: "Egg" }, { name: "" }];
@@ -357,8 +371,19 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       assertEq(cardGrid(no.body, "del-grid"), "<div class=\"del-item\"><strong>Leveringsmetoder:</strong> Henting på gården, REKO-ring</div><div class=\"del-item\"><strong>Betaling:</strong> Vipps, Kontant</div>", "b W no: delivery and payment card byte-identical to main");
       assertEq(cardGrid(no.body, "certs-row"), "<div class=\"cert-item\"><span style=\"font-size:1.1rem;\">&#127942;</span><span class=\"cert-text\">Nyt Norge</span></div><div class=\"cert-item\"><span style=\"font-size:1.1rem;\">&#127942;</span><span class=\"cert-text\">Spesialitet</span></div>", "b W no: certifications card byte-identical to main");
       const lb = localBusiness(no.body);
-      assertEq(JSON.stringify({ h: lb?.openingHoursSpecification, o: lb?.makesOffer, c: lb?.hasOfferCatalog, p: lb?.paymentAccepted, k: lb?.keywords }),
-        "{\"h\":[{\"@type\":\"OpeningHoursSpecification\",\"dayOfWeek\":\"https://schema.org/mon-fri\",\"opens\":\"10:00\",\"closes\":\"17:00\"},{\"@type\":\"OpeningHoursSpecification\",\"dayOfWeek\":\"https://schema.org/sat-sun\",\"opens\":\"11:00\",\"closes\":\"15:00\"},{\"@type\":\"OpeningHoursSpecification\",\"dayOfWeek\":\"https://schema.org/Monday\",\"opens\":\"09:00\",\"closes\":\"16:00\"},{\"@type\":\"OpeningHoursSpecification\",\"dayOfWeek\":\"https://schema.org/saturday\",\"opens\":\"10:00\",\"closes\":\"14:00\"}],\"o\":[{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Honning\",\"description\":\"Honning fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Lammelår\",\"description\":\"Lammelår fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Egg\",\"description\":\"Egg fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"description\":\"Syltetøy & gelé <hjemmelaget> fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"  Smør  \",\"description\":\"  Smør   fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no: LocalBusiness hours, offers, catalog, paymentAccepted and keywords byte-identical to main");
+      // Slice I-H: dayOfWeek is a schema.org DayOfWeek for every weekday
+      // spelling. Main (and I-G) wrote the stored key after the prefix, so a
+      // range or a long name gave an invalid value ("https://schema.org/mon-fri",
+      // ".../saturday"); the "mon" entry is as on main.
+      const sd = (d: string) => `https://schema.org/${d}`;
+      assertEq(lb?.openingHoursSpecification, [
+        { "@type": "OpeningHoursSpecification", dayOfWeek: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map(sd), opens: "10:00", closes: "17:00" },
+        { "@type": "OpeningHoursSpecification", dayOfWeek: ["Saturday", "Sunday"].map(sd), opens: "11:00", closes: "15:00" },
+        { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Monday"), opens: "09:00", closes: "16:00" },
+        { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Saturday"), opens: "10:00", closes: "14:00" },
+      ], "b W no: LocalBusiness openingHoursSpecification has valid days for ranges and long names (I-H); a short key as on main");
+      assertEq(JSON.stringify({ o: lb?.makesOffer, c: lb?.hasOfferCatalog, p: lb?.paymentAccepted, k: lb?.keywords }),
+        "{\"o\":[{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Honning\",\"description\":\"Honning fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Lammelår\",\"description\":\"Lammelår fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Egg\",\"description\":\"Egg fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"description\":\"Syltetøy & gelé <hjemmelaget> fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"  Smør  \",\"description\":\"  Smør   fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no: LocalBusiness offers, catalog, paymentAccepted and keywords byte-identical to main");
       assertEq(JSON.stringify(faqPage(no.body)), "{\"@context\":\"https://schema.org\",\"@type\":\"FAQPage\",\"@id\":\"https://rettfrabonden.com/produsent/wenche-gard#faq\",\"mainEntity\":[{\"@type\":\"Question\",\"name\":\"Hva selger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard tilbyr Honning, Lammelår – kr 275/kg, Egg, Syltetøy & gelé <hjemmelaget>, Ost,   Smør  , Rabarbra, 🐑 LAM.\"}},{\"@type\":\"Question\",\"name\":\"Hvor ligger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard holder til i Wtown.\"}},{\"@type\":\"Question\",\"name\":\"Kan jeg besøke eller bestille fra Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Ja — Wenche Gard har åpningstider oppført på profilen.\"}}]}", "b W no: FAQPage byte-identical to main");
       assertEq(junk(no.body).concat(junk(en.body)), [], "b W: no junk text (no, en)");
     }
@@ -416,10 +441,11 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
         "<div class=\"hrs-day\">Torsdag</div><div class=\"hrs-time\">&lt;b&gt;10&lt;/b&gt; – 17:00</div>" +
         "<div class=\"hrs-day\">Fredag</div><div class=\"hrs-time\">10:00 – 17:00</div>",
         "c hours: a text entry is shown as text; entries without both times are left out (main: \"undefined – undefined\", \"[object Object] – 17:00\", \"10:00 – undefined\"); times are escaped; an object note is left out");
+      // Slice I-H: JSON-LD takes only clock times, so the "<b>10</b>" entry
+      // (I-G wrote it as opens) is left out of it; the card still shows it.
       assertEq(localBusiness(r.body)?.openingHoursSpecification, [
-        { "@type": "OpeningHoursSpecification", dayOfWeek: "https://schema.org/Thursday", opens: "<b>10</b>", closes: "17:00" },
         { "@type": "OpeningHoursSpecification", dayOfWeek: "https://schema.org/Friday", opens: "10:00", closes: "17:00" },
-      ], "c hours: JSON-LD has the entries with a day and both times only (main: \"https://schema.org/undefined\", an object as opens)");
+      ], "c hours: JSON-LD has the entries with a day and two clock times only (main: \"https://schema.org/undefined\", an object as opens; I-G: \"<b>10</b>\" as opens)");
       assertTrue(!/<b>10<\/b>/.test(r.body.replace(/<script[\s\S]*?<\/script>/g, "")), "c hours: no raw HTML from a time in the page");
       assertEq(junk(r.body), [], "c hours: no junk text");
     }
@@ -429,8 +455,9 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       assertEq(withoutToday(cardGrid(r.body, "hrs-grid") ?? ""),
         "<div class=\"hrs-day\"></div><div class=\"hrs-time\">10:00 – 17:00</div><div class=\"hrs-day\">Mandag–Fredag</div><div class=\"hrs-time\">09:00 – 15:00</div>",
         "c numeric day: the entry keeps its times without a day name");
-      assertEq((localBusiness(r.body)?.openingHoursSpecification || []).map((s: any) => s.dayOfWeek), ["https://schema.org/mon-fri"],
-        "c numeric day: no JSON-LD entry without a day");
+      assertEq((localBusiness(r.body)?.openingHoursSpecification || []).map((s: any) => s.dayOfWeek),
+        [["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((d) => `https://schema.org/${d}`)],
+        "c numeric day: no JSON-LD entry without a day; the range lists its days (I-H)");
     }
     {
       const r = producer("mette-sesong");
@@ -497,9 +524,11 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
           ? "<div class=\"pc-products\">&#127793; Rhubarb, &#127793; Honey, &#129370; Eggs <span class=\"pc-more\">+1 products</span></div>"
           : "<div class=\"pc-products\">&#127793; Rabarbra, &#127793; Honning, &#129370; Egg <span class=\"pc-more\">+1 produkter</span></div>",
         `d / ${lang}: a text product is shown by its name; an object category gets the default emoji`);
-      assertEq(text.match(/<div class="pc-meta-line">🕒[\s\S]*?<\/div>/)?.[0],
-        `<div class="pc-meta-line">🕒 <span class="pc-closed">${lang === "en" ? "Closed" : "Stengt"}</span></div>`,
-        `d / ${lang}: no entry with times for today -> closed, no "undefined–undefined"`);
+      // Slice I-H: its only timed entry has a number as day, so no entry says
+      // which days it is open; the card claims nothing ("Stengt" before) and
+      // shows no "undefined–undefined".
+      assertTrue(!/🕒/.test(text) && !/undefined/.test(text),
+        `d / ${lang}: no entry with weekdays and times -> no open-now line, no "undefined–undefined"`);
       assertEq(num.match(/<div class="pc-meta-line">🕒[\s\S]*?<\/div>/)?.[0],
         `<div class="pc-meta-line">🕒 <span class="pc-open-now">${lang === "en" ? "Open now" : "Åpent nå"}</span> <span class="pc-hours">0–24</span></div>`,
         `d / ${lang}: number times are hours on the hour (0–24 is open all day)`);
