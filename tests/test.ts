@@ -44481,6 +44481,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-L: the same
+// sanitizeInput filter ran its three strippers once, so a deletion could
+// rebuild a pattern (`onjavascript:error=` → `onerror=`,
+// `javajavascript:script:` → `javascript:`). The pass now repeats to a
+// fixpoint, bounded (fail-closed). Proves the repros, the bound, a seeded fuzz
+// against the unbounded reference, the linear tag stripper, byte-identical
+// real-text corpora, and the pass/time cost. Synchronous — registered next to
+// its sibling suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-L: sanitizeInput fixpoint ──");
+  try {
+    const { runSecuritySanitizeFixpointTests } = require("../src/middleware/security-sanitize-fixpoint.test") as
+      typeof import("../src/middleware/security-sanitize-fixpoint.test");
+    const sfp = runSecuritySanitizeFixpointTests({ log: false });
+    passed += sfp.passed;
+    failed += sfp.failed;
+    for (const f of sfp.failures) failures.push("security-sanitize-fixpoint: " + f);
+    console.log(`  security-sanitize-fixpoint: ${sfp.passed} passed, ${sfp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("security-sanitize-fixpoint: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-08-opplevagent-slik-fungerer-det: the producer-facing
 // explainer page the gårdssalg outreach email points at ("hva er dette, og
 // hvordan havner vi i ChatGPT?"). Beyond the render/SEO/cross-link checks,

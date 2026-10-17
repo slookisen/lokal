@@ -61,28 +61,78 @@ export const MAX_REQUEST_SIZE = "1mb";
 
 // ─── Input sanitization ──────────────────────────────────────
 // Fix #10: Deep sanitization of nested objects/arrays
+//
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-L: the three
+// strippers in stripOnce() used to run ONCE. Each of them deletes text, and a
+// deletion can glue the two halves of a pattern back together — `javascript:`
+// goes last, so `onjavascript:error=` came out as `onerror=` and
+// `javajavascript:script:` as `javascript:`. sanitizeString() therefore
+// repeats the SAME pass until the string stops changing. What a pass removes
+// is deliberately NOT widened (a broader filter corrupted stored data, see the
+// 2026-08-08 notes in stripOnce). Text the pass leaves alone still costs
+// exactly one pass; text that loses something costs one extra pass to confirm
+// it is stable. Escaping at output (escapeHtml / esc() on every surface) is
+// the real defence; this filter is a second layer.
+//
+// Bound: only a nested (rebuilt) pattern needs more than two passes, so a
+// string that is STILL changing after SANITIZE_MAX_PASSES passes is dropped
+// ("") — fail-closed. Returning it would hand back a rebuilt pattern, and
+// looping on would let one 1 MB body buy tens of thousands of passes. It is
+// dropped silently, like everything else this filter strips: a body can hold
+// any number of such strings, so a log line per string would be a log flood.
+export const SANITIZE_MAX_PASSES = 10;
+
+/**
+ * Same result as `s.replace(/<[^>]*>/g, "")`, in linear time. A "<" can only
+ * start a match if some ">" follows it, so the "<"s after the LAST ">" never
+ * match, and the regex runs on the text up to and including that ">" only.
+ * Unbounded, every one of those "<"s re-scans the rest of the string (main
+ * before I-L: 200 000 "<" blocked the event loop for ~17 s), and the fixpoint
+ * loop would pay that again on every pass.
+ */
+function stripTags(s: string): string {
+  const end = s.lastIndexOf(">") + 1;
+  if (end === 0) return s;
+  return s.slice(0, end).replace(/<[^>]*>/g, "") + s.slice(end);
+}
+
+/** One pass of the three strippers. I-L changes how often it runs, not what it removes. */
+function stripOnce(s: string): string {
+  return stripTags(s)                  // strip HTML tags
+    // dev-request 2026-08-08-crm-html-sanitizer-oedelegger-utgaaende-epost:
+    // the inline-event-handler pattern used to be /on\w+\s*=/gi, which
+    // matches INSIDE ordinary words that merely contain "on" before an "="
+    // — Norwegian text is full of them, so `sesong=` silently became `ses`
+    // and `stasjon=1` became `stasj1`. \b anchors the match to a word
+    // START, which is the only position a real HTML attribute can occupy
+    // (`<a onclick=…>`, ` onerror=…`); an event handler never begins
+    // mid-word, so nothing that was caught for a security reason stops
+    // being caught.
+    .replace(/\bon\w+\s*=/gi, "")      // strip inline event handlers
+    .replace(/javascript:/gi, "");     // strip javascript: URIs
+  // The two numeric/hex HTML-entity strippers that used to sit here are
+  // deliberately GONE (same dev-request). They removed `&#39;`/`&#x27;`
+  // from every string in every request body — legitimate text harvested
+  // from producer websites included — while defending nothing on their
+  // own: an entity is inert until something renders it, and every surface
+  // that renders user data escapes at output (escapeHtml/epEscape). What
+  // they actually did was corrupt stored data.
+}
+
+/** stripOnce() until the string is stable; "" if it still changes on pass SANITIZE_MAX_PASSES. */
+function sanitizeString(s: string): string {
+  let current = s;
+  for (let pass = 0; pass < SANITIZE_MAX_PASSES; pass++) {
+    const next = stripOnce(current);
+    if (next === current) return current;
+    current = next;
+  }
+  return "";
+}
+
 function sanitizeValue(value: any): any {
   if (typeof value === "string") {
-    return value
-      .replace(/<[^>]*>/g, "")          // strip HTML tags
-      // dev-request 2026-08-08-crm-html-sanitizer-oedelegger-utgaaende-epost:
-      // the inline-event-handler pattern used to be /on\w+\s*=/gi, which
-      // matches INSIDE ordinary words that merely contain "on" before an "="
-      // — Norwegian text is full of them, so `sesong=` silently became `ses`
-      // and `stasjon=1` became `stasj1`. \b anchors the match to a word
-      // START, which is the only position a real HTML attribute can occupy
-      // (`<a onclick=…>`, ` onerror=…`); an event handler never begins
-      // mid-word, so nothing that was caught for a security reason stops
-      // being caught.
-      .replace(/\bon\w+\s*=/gi, "")      // strip inline event handlers
-      .replace(/javascript:/gi, "");     // strip javascript: URIs
-    // The two numeric/hex HTML-entity strippers that used to sit here are
-    // deliberately GONE (same dev-request). They removed `&#39;`/`&#x27;`
-    // from every string in every request body — legitimate text harvested
-    // from producer websites included — while defending nothing on their
-    // own: an entity is inert until something renders it, and every surface
-    // that renders user data escapes at output (escapeHtml/epEscape). What
-    // they actually did was corrupt stored data.
+    return sanitizeString(value);
   }
   if (Array.isArray(value)) {
     return value.map(sanitizeValue);
