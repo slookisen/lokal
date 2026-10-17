@@ -36154,6 +36154,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental aggregate lastmod (F1-S2): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3b, IDX-3): /sted/<slug>
+  //    lists, counts and dates every stored spelling of the place, with one
+  //    chip per slug on / and /fylke ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3b): dental /sted stavemåter ──");
+  try {
+    const { runDentalStedStavematerTests } = require("../src/routes/dental-sted-stavemater.test") as
+      typeof import("../src/routes/dental-sted-stavemater.test");
+    const dss = await runDentalStedStavematerTests({ log: false });
+    passed += dss.passed;
+    failed += dss.failed;
+    for (const f of dss.failures) failures.push("dental /sted stavemåter (D3b): " + f);
+    console.log(`  dental /sted stavemåter (D3b): ${dss.passed} passed, ${dss.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental /sted stavemåter (D3b): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──

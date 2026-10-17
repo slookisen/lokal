@@ -9,6 +9,8 @@
  *      cards (count, order, positions from the page offset).
  *   D  paginationHtml: a window of real links, every page reachable, the last
  *      page linked from page 1 (it linked 1–10 and «... N» as plain text).
+ *      /sok resolves ?side= like the other lists, so a page past the last
+ *      one is page 1, never an empty «side 999» (D3b).
  *   E  page N ≥ 2 of /fylke, /sted and /spesialitet is its own canonical,
  *      with its own <title> and description; page 1 keeps the bare canonical
  *      and its title; a bad or too high ?side= is page 1.
@@ -16,6 +18,9 @@
  *   G  every HTML 404 (all eight sendDentalNotFound paths, the catch-all
  *      included) is "noindex, follow" (I-Q) and has no canonical link and no
  *      og:url (they pointed at the homepage); other pages keep both.
+ *   H  <title>, og:title and twitter:title on /sok, /fylke (and its 404) and
+ *      /sted are escaped once (dev-request 2026-10-17-dental-d3-rettelser,
+ *      D3b): «A&B» was «A&amp;amp;B».
  *
  * Same harness as dental-seo-lastmod-antall-404-agents-txt.test.ts
  * (in-memory dental DB, the router driven through router.handle()); this
@@ -153,6 +158,7 @@ export async function runDentalIndexingHygieneTests(
     // OSLO: 120 public clinics (3 pages of 50), 60 of them with
     // kjeveortopedi (2 pages), plus a closed one the lists leave out.
     // BERGEN (3) and TRONDHEIM (2) have /sted pages; Stavanger has none.
+    // SANKT HANS' HAUGEN has an apostrophe in its name (H4).
     let orgSeq = 918960000;
     const mk = (navn: string, poststed: string, fylke: string, extra: { inactive?: boolean; specialty?: string } = {}): string => {
       const id = store.createDentalAgent({
@@ -168,6 +174,7 @@ export async function runDentalIndexingHygieneTests(
     mk("Nedlagt Oslo Klinikk AS", "OSLO", "Oslo", { inactive: true, specialty: "kjeveortopedi" });
     for (let i = 1; i <= 3; i++) mk(`Bergen Tann ${i} AS`, "BERGEN", "Vestland");
     for (let i = 1; i <= 2; i++) mk(`Trondheim Tann ${i} AS`, "TRONDHEIM", "Trøndelag");
+    mk("Haugen Tann AS", "SANKT HANS' HAUGEN", "Innlandet");
 
     // ── A. /sok noindex, out of the sitemap ──────────────────────────────
     {
@@ -310,9 +317,25 @@ export async function runDentalIndexingHygieneTests(
       assertEq(navHrefs(past), ["/sok?q=x&side=3", "/sok?q=x", "/sok?q=x&side=2", "/sok?q=x&side=3"], "D22: paginationHtml(999, 3): Forrige -> side=3, then pages 1-3 (regression: Forrige -> side=998)");
       assertTrue(past.includes('href="/sok?q=x&amp;side=3" class="page-btn" rel="prev"') && !past.includes('rel="next"') && !past.includes("aria-current"), "D23: …rel=prev to the last page, no rel=next, no page marked current");
       assertEq(navHrefs(paginationHtml(4, 3, "/sok?q=x"))[0], "/sok?q=x&side=3", "D24: one past the last page: Forrige -> the last page");
+      // /sok resolves ?side= with resolveListPage, like /fylke and /sted (D3b):
+      // a page past the last one is page 1, with its cards.
+      const sokPage = (html: string): string | null => (html.match(/viser side (\d+ av \d+)/) || [])[1] ?? null;
+      const sokFirst = await callRoute(router, "/sok?fylke=Oslo");
       const sokPast = await callRoute(router, "/sok?fylke=Oslo&side=999");
       const sokPastPages = navHrefs(sokPast.text).map((h) => Number((h.match(/[?&]side=(\d+)/) || [])[1] ?? 1));
-      assertTrue(sokPast.status === 200 && sokPastPages.length > 0 && Math.max(...sokPastPages) === 3, `D25: /sok?fylke=Oslo&side=999 (3 pages) links no page past 3 (got ${JSON.stringify(sokPastPages)})`);
+      assertEq([sokPast.status, sokPage(sokPast.text), cardCount(sokPast.text)], [200, "1 av 3", pageSize], "D25: /sok?fylke=Oslo&side=999 (3 pages) is page 1 with 50 cards (regression: «side 999 av 3» and no cards)");
+      assertTrue(!sokPast.text.includes("Ingen klinikker funnet") && sokPastPages.length > 0 && Math.max(...sokPastPages) === 3, `D25b: …no «Ingen klinikker funnet», and no page past 3 linked (got ${JSON.stringify(sokPastPages)})`);
+      for (const side of ["0", "-3", "abc", "4", "999", "99999999999999999999", ""]) {
+        const r = await callRoute(router, `/sok?fylke=Oslo&side=${encodeURIComponent(side)}`);
+        assertEq([r.status, sokPage(r.text), cardHrefs(r.text)], [200, "1 av 3", cardHrefs(sokFirst.text)], `D26: /sok?fylke=Oslo&side=${side || "(empty)"} renders page 1`);
+      }
+      const sok2 = await callRoute(router, "/sok?fylke=Oslo&side=2");
+      assertEq([sokPage(sok2.text), cardCount(sok2.text)], ["2 av 3", pageSize], "D27: control — side=2 is page 2 of 3, 50 cards");
+      assertTrue(cardHrefs(sok2.text).every((h) => !cardHrefs(sokFirst.text).includes(h)), "D27b: …other clinics than page 1");
+      const sok3 = await callRoute(router, "/sok?fylke=Oslo&side=3");
+      assertEq([sokPage(sok3.text), cardCount(sok3.text)], ["3 av 3", 20], "D28: the last page, side=3, is page 3 of 3 with 20 cards");
+      const sokNone = await callRoute(router, "/sok?q=finnes-ikke-noe-sted&side=2");
+      assertEq([sokNone.status, sokPage(sokNone.text), cardCount(sokNone.text)], [200, "1 av 1", 0], "D29: no hits with side=2 is «side 1 av 1» (regression: «side 2 av 1»)");
 
       // On the route: the last page of /fylke/Oslo is linked from page 1.
       const f1 = await callRoute(router, "/fylke/Oslo");
@@ -405,6 +428,41 @@ export async function runDentalIndexingHygieneTests(
       for (const [p, want] of [["/", base], ["/om", `${base}/om`], ["/sted/oslo", `${base}/sted/oslo`]] as const) {
         const r = await callRoute(router, p);
         assertEq([r.status, canonicalOf(r.text), ogUrlOf(r.text)], [200, want, want], `G5: ${p} keeps canonical and og:url = ${want}`);
+      }
+    }
+
+    // ── H. titles escaped once (D3b) ─────────────────────────────────────
+    {
+      const head = (html: string): string => html.slice(0, html.indexOf("</head>"));
+      /** <title>, og:title and twitter:title, as written in the HTML. */
+      const titles = (html: string): Array<string | null> => [
+        titleOf(html),
+        (html.match(/<meta property="og:title" content="([^"]*)">/) || [])[1] ?? null,
+        (html.match(/<meta name="twitter:title" content="([^"]*)">/) || [])[1] ?? null,
+      ];
+      const cases: Array<[string, number, string, string]> = [
+        ["/sok?q=A%26B", 200, "A&amp;B — Tannlege søk", "H1"],
+        [`/sok?q=${encodeURIComponent('<b>"x"')}`, 200, "&lt;b&gt;&quot;x&quot; — Tannlege søk", "H2"],
+        ["/fylke/A%26B", 404, "A&amp;B — Fylke ikke funnet | Finn-tannlege.com", "H3"],
+        ["/sted/sankt-hans-haugen", 200, "Tannlege i Sankt Hans&#39; Haugen — Finn-tannlege.com", "H4"],
+      ];
+      for (const [url, status, want, id] of cases) {
+        const r = await callRoute(router, url);
+        assertEq([r.status, titles(r.text)], [status, [want, want, want]], `${id}: ${url} has «${want}» in <title>, og:title and twitter:title`);
+        assertTrue(!/&amp;(amp|lt|gt|quot|#39);/.test(head(r.text)), `${id}b: ${url} has no doubly escaped entity in the head (regression: &amp;amp;)`);
+      }
+      assertTrue(!/<b>/.test(head((await callRoute(router, `/sok?q=${encodeURIComponent('<b>"x"')}`)).text)), "H2c: no raw <b> in the head");
+      // Controls: titles with nothing to escape are byte-identical to before.
+      const controls: Array<[string, string]> = [
+        ["/fylke/Oslo", "Tannleger i Oslo — Finn-tannlege.com"],
+        ["/sted/oslo", "Tannlege i Oslo — Finn-tannlege.com"],
+        ["/fylke/Oslo?side=2", "Tannleger i Oslo – side 2 — Finn-tannlege.com"],
+        ["/sok", "Søk etter tannlege — Finn-tannlege.com"],
+        ["/sok?q=Bergen", "Bergen — Tannlege søk"],
+        ["/fylke/Atlantis", "Atlantis — Fylke ikke funnet | Finn-tannlege.com"],
+      ];
+      for (const [url, want] of controls) {
+        assertEq(titles((await callRoute(router, url)).text), [want, want, want], `H5: ${url} title unchanged`);
       }
     }
   } catch (err: any) {
